@@ -8,6 +8,8 @@ import pytest
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.cute.tensor_layout_relations import prove_tensor_layout_relations
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _prove(prefix: str, *, rank: int = 2, arguments: str = "x, out, n"):
     body = ast.parse(

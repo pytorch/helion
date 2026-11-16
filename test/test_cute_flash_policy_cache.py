@@ -13,6 +13,8 @@ from helion._compiler.cute.flash_tuning import FlashTuningDType
 from helion._compiler.cute.flash_tuning import FlashTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashTuningWorkload
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.cute.flash_policy import FlashTargetPolicy
 

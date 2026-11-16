@@ -420,7 +420,7 @@ def run_shape(
     a, b, layout, ref, worklist = make_case(shape, actual_ms, device, args.m_alignment)
     kernel_args = (a, b, worklist)
     bound = kernel.bind(kernel_args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
 
     def helion_fn() -> torch.Tensor:
         return bound(*kernel_args)

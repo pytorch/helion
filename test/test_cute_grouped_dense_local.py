@@ -6,12 +6,10 @@ import functools
 import itertools
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_full_coverage import FLAG
 from test.test_cute_grouped_full_coverage import KEY
 from test.test_cute_grouped_full_coverage import _dump
@@ -20,10 +18,14 @@ from test.test_cute_grouped_k128_full_coverage import _bound
 from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_shared_rhs_grouped import _target
 
-from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_config
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _tcgen05_grouped_worklist_config,
+)
 from helion._compiler.cute.grouped_full_coverage import Tcgen05GroupedFullCoveragePlan
 from helion._compiler.cute.grouped_full_coverage import full_coverage_index_domain
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -47,10 +49,7 @@ MATRIX = (
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
+    with cpu_render_target():
         yield
     torch.set_num_threads(previous)
 
@@ -293,7 +292,6 @@ def _projection(source: str, value: bool, erase_lines: set[int]) -> ast.Module:
 
 
 @pytest.mark.parametrize("shape", MATRIX)
-@skipUnlessBackends(["cute"])
 def test_complete_source_inverse_fallback_and_host_contract(
     shape: tuple[int, ...],
 ) -> None:
@@ -375,7 +373,6 @@ def _consumer_code(role: ast.If) -> tuple[CodeType, dict[str, int], str]:
 
 
 @pytest.mark.parametrize("shape", (MATRIX[0], MATRIX[2], MATRIX[6], MATRIX[7]))
-@skipUnlessBackends(["cute"])
 def test_all_consumers_match_actual_dense_mailbox_sequence(
     shape: tuple[int, ...],
 ) -> None:

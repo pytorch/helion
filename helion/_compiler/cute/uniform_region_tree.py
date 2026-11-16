@@ -29,7 +29,7 @@ from ..device_ir import RootGraphInfo
 from ..device_ir import WhileConditionGraphInfo
 from ..device_ir import WhileLoopGraphInfo
 from ..device_ir import control_flow_parent_entries
-from .scan_helper import additive_scan_helper
+from .scan_analysis import additive_scan_helper
 from .uniform_control import _carry_map
 from .uniform_control import _outputs
 from .uniform_control import _signature
@@ -863,8 +863,11 @@ def uniform_local_regions(graphs: Sequence[GraphInfo]) -> UniformRegionTree:
                             "no mutation through parent captures",
                         )
                         require(
-                            user.args[3] == "relaxed"
-                            and (not user.users or dtype == torch.int32),
+                            bool(
+                                isinstance(user.args[3], str)
+                                and user.args[3] == "relaxed"
+                                and (not user.users or dtype is torch.int32)
+                            ),
                             "local atomic type/order",
                         )
                         require(
@@ -945,8 +948,8 @@ def uniform_output_stores_are_writeonly(
     distinct output. Repeated stores through one exact tensor retain order.
     """
     from ...language import memory_ops
-    from .memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
-    from .memory_ops import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
     from .register_loads import host_load_is_readonly
 
     if not tree.output_stores:
@@ -958,7 +961,7 @@ def uniform_output_stores_are_writeonly(
     }
     for target in targets.values():
         storage = target.untyped_storage()
-        fresh = storage in env._symbolically_exact_layout_storages
+        fresh = env.tensor_storage_is_compiler_allocated(target)
         if not fresh:
             source = env.tensor_input_source(target)
             specialization = env.runtime_input_specializations.get(
@@ -975,7 +978,8 @@ def uniform_output_stores_are_writeonly(
                 )
             ):
                 return False
-        # Fake storage inequality is only sufficient for compiler allocations.
+        # Check origins even for fresh outputs: another target can be a
+        # synthetic join that includes that allocation.
         others = {id(value): value for value in env.input_sources}
         others.update(targets)
         for other in others.values():
@@ -984,12 +988,8 @@ def uniform_output_stores_are_writeonly(
             other_storage = other.untyped_storage()
             if storage == other_storage:
                 return False
-            if (
-                not fresh
-                and other_storage not in env._symbolically_exact_layout_storages
-                and not runtime_tensors_are_proven_disjoint(
-                    env, target, other, allow_unbound=allow_unbound
-                )
+            if not tensors_have_proven_disjoint_storage(
+                env, target, other, allow_unbound=allow_unbound
             ):
                 return False
     local_reads = {read.node for read in tree.indexed_reads}
@@ -1014,7 +1014,7 @@ def uniform_region_domains(
     from ...language import memory_ops
     from ...language import scan_ops
     from ..inductor_lowering import ReductionLowering
-    from .computed_fragment import _fragment_logical_shape
+    from .fragment_context import _fragment_logical_shape
     from .gather_domains import GatherDomainFacts
     from .register_loads import host_load_is_readonly
 

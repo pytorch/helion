@@ -12,6 +12,7 @@ import torch
 from helion.autotuner.base_search import _AutotunableKernel
 from helion.autotuner.config_spec import ConfigSpec
 from helion.runtime.config import Config
+from helion.runtime.config_cache import ConfigCache
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ class UserConfigSpec(ConfigSpec):
         fn: Callable[[ConfigSpecFragment], object],
         *,
         advanced_controls_files: list[str] | None = None,
+        flash_pipeline_family: str | None = None,
     ) -> helion.Config:
         return Config.from_dict(
             {key: fn(fragment) for key, fragment in self.user_defined_tunables.items()}
@@ -66,7 +68,7 @@ class UserConfigSpec(ConfigSpec):
 def create_user_config_spec(
     tunables: dict[str, ConfigSpecFragment],
 ) -> UserConfigSpec:
-    from helion._compiler.backend import TritonBackend
+    from helion._compiler.triton.backend import TritonBackend
 
     return UserConfigSpec(
         backend=TritonBackend(),
@@ -101,7 +103,7 @@ class _ExternalKernelAdapter(_AutotunableKernel):
         self._config_spec = config_spec
         self._configs: list[Config] = []
         self._compile_fn = compile_fn
-        self._compile_cache: dict[Config, Callable[..., Any]] = {}
+        self._compile_cache: ConfigCache[Callable[..., Any]] = ConfigCache()
 
         self._env = _FakeEnv(
             device

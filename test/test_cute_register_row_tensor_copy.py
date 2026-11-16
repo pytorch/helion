@@ -9,9 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_rolled_online_epilogue import row_logsumexp
 from .test_cute_rolled_online_epilogue import row_shifted_other
@@ -19,11 +16,19 @@ import helion
 from helion import exc
 from helion._compiler.cute import cluster_online_pair as pair
 from helion._compiler.cute import register_row_reduction
+from helion._compiler.cute._ast_pass_utils import is_name_assign
+from helion._compiler.cute.analysis.online_pair import _assigned_name
+from helion._compiler.cute.analysis.online_pair import _find_sites
+from helion._compiler.cute.analysis.online_pair import _prove
 from helion._compiler.cute.register_row_tensor_copy import TensorCopyContext
 from helion._compiler.cute.register_row_tensor_copy import _original_vector_element
 from helion._compiler.cute.register_row_tensor_copy import prove_tensor_copy
-from helion._compiler.cute.rolled_cluster_online_pair import _prove
 from helion._compiler.cute.rolled_cluster_online_pair import _wrap_sites
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _config(
@@ -57,8 +62,8 @@ def _generate(
 ) -> str:
     x = torch.empty((3, 32000), dtype=dtype)
     args = (x, torch.empty_like(x)) if kernel is row_shifted_other else (x,)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         assert not bound.settings.fast_math
         return bound.to_code(_config(threads, tensor_copy, vector_width))
 
@@ -95,16 +100,16 @@ def _graph(dtype: torch.dtype, vector_width: int) -> SimpleNamespace:
 
 def _plan(body, constants, context):
     working, _owners = _wrap_sites(body)
-    sites = pair._find_sites(working)
+    sites = _find_sites(working)
     if sites is None or len(sites) < 2:
         return None
     first, second = sites[:2]
     if _prove(working, first, second) is None:
         return None
     caches = {
-        pair._assigned_name(statement)
+        _assigned_name(statement)
         for statement in working
-        if pair._is_name_assign(statement)
+        if is_name_assign(statement)
         and isinstance(statement.value, ast.Call)
         and ast.unparse(statement.value.func) == "cute.make_rmem_tensor"
     }
@@ -115,8 +120,8 @@ def _plan(body, constants, context):
     fold = next(
         node
         for node in ast.walk(first.for_node)
-        if pair._is_name_assign(node)
-        and pair._assigned_name(node) == cast("ast.Name", first.call.args[0]).id
+        if is_name_assign(node)
+        and _assigned_name(node) == cast("ast.Name", first.call.args[0]).id
         and isinstance(node.value, ast.Call)
         and ast.unparse(node.value.func) == "cute.arch.fmax"
     )
@@ -169,23 +174,30 @@ def test_complete_tensor_copy_uses_proved_thread_geometry(threads: int) -> None:
     assignment = next(
         node
         for node in ast.walk(device)
-        if pair._is_name_assign(node) and pair._assigned_name(node) == lane
+        if is_name_assign(node) and _assigned_name(node) == lane
     )
     assert assignment.lineno < call.lineno
 
 
 @pytest.mark.parametrize("threads", [128, 256, 512])
-@pytest.mark.parametrize("vector_width", [4, 8])
-def test_fp32_tensor_copy_keeps_original_precision_and_geometry(
-    threads: int, vector_width: int
-) -> None:
-    code = _generate(threads=threads, dtype=torch.float32, vector_width=vector_width)
+def test_fp32_tensor_copy_keeps_original_precision_and_geometry(threads: int) -> None:
+    code = _generate(threads=threads, dtype=torch.float32, vector_width=4)
     assert code.count("_cute_complete_row_tensor_copy(") == 1
-    assert f"columns=16384, threads={threads}, vector_width={vector_width}" in code
+    assert f"columns=16384, threads={threads}, vector_width=4" in code
     assert "cutlass.BFloat16" not in code
     assert "cutlass.Float16" not in code
     assert code.count(".reduce(cute.ReductionOp.MAX") == 1
     assert code.count(".reduce(cute.ReductionOp.ADD") == 1
+
+
+def test_fp32_copy_past_the_declared_pointer_alignment_keeps_the_loader() -> None:
+    """Eight fp32 lanes copy 32 bytes, but the launcher declares each pointer
+    at most 16-byte aligned: the DSL refused the copy atom on the GPU ("S ptr
+    alignment (128 bits) does not meet requirement (256 bits)"), however the
+    input was aligned, so the row keeps its loader."""
+    code = _generate(dtype=torch.float32, vector_width=8)
+    assert "_cute_complete_row_tensor_copy(" not in code
+    assert "_register_row = cute.make_rmem_tensor" in code
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -240,7 +252,7 @@ def test_fp32_cache_storage_must_keep_all_uint32_bits(fp32_graph) -> None:
     allocation = next(
         node
         for node in body
-        if pair._is_name_assign(node)
+        if is_name_assign(node)
         and isinstance(node.value, ast.Call)
         and ast.unparse(node.value.func) == "cute.make_rmem_tensor"
     )
@@ -271,8 +283,8 @@ def test_default_and_false_keep_original_loader() -> None:
 
 def test_tensor_copy_requires_register_row() -> None:
     x = torch.empty((3, 32000), dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(row_logsumexp, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(row_logsumexp, (x,))
         config = _config()
         config.config["cute_register_row"] = False
         with pytest.raises(exc.InvalidConfig, match="requires cute_register_row"):
@@ -285,8 +297,8 @@ def test_tensor_copy_requires_register_row() -> None:
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_tensor_copy_requires_boolean(value) -> None:
     x = torch.empty((3, 32000), dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(row_logsumexp, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(row_logsumexp, (x,))
         config = _config()
         config.config["cute_register_row_tensor_copy"] = value
         with pytest.raises(exc.InvalidConfig, match="must be a boolean"):
@@ -320,6 +332,13 @@ def test_tensor_copy_rejects_unproved_metadata(graph, change) -> None:
 
 def test_multirow_thread_mapping_declines(graph) -> None:
     context = replace(graph.context, threads=(128, 2, 1))
+    assert _plan(graph.body, graph.constants, context) is None
+
+
+def test_unproven_launch_shape_declines(graph) -> None:
+    # ``threads=None`` (no proven launch shape) matches no row copy site; the
+    # ``(0, 0, 0)`` placeholder that once stood in for it is gone.
+    context = replace(graph.context, threads=None)
     assert _plan(graph.body, graph.constants, context) is None
 
 
@@ -359,8 +378,7 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
         mask = next(
             node
             for node in ast.walk(second)
-            if pair._is_name_assign(node)
-            and pair._assigned_name(node).startswith("mask_")
+            if is_name_assign(node) and _assigned_name(node).startswith("mask_")
         )
         cast("ast.Compare", mask.value).comparators[0] = ast.Constant(value=31992)
     elif mutation in ("row_bias", "thread_row", "loaded_row_alias", "impure_row_alias"):
@@ -406,7 +424,7 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
     elif mutation in ("narrowing", "arithmetic"):
         for node in list(ast.walk(root)):
             if (
-                pair._is_name_assign(node)
+                is_name_assign(node)
                 and isinstance(node.value, ast.Call)
                 and ast.unparse(node.value.func) == "cutlass.Float32"
                 and isinstance(node.value.args[0], ast.Name)
@@ -451,7 +469,7 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
         allocation = next(
             node
             for node in body
-            if pair._is_name_assign(node)
+            if is_name_assign(node)
             and isinstance(node.value, ast.Call)
             and ast.unparse(node.value.func) == "cute.make_rmem_tensor"
         )
@@ -463,17 +481,16 @@ def test_tensor_copy_rejects_changed_values_masks_or_effects(graph, mutation) ->
             cast("ast.Call", allocation.value).args[0] = ast.Constant(value=32)
     elif mutation == "escaped_load":
         name = next(
-            pair._assigned_name(node)
+            _assigned_name(node)
             for node in ast.walk(first)
-            if pair._is_name_assign(node)
-            and pair._assigned_name(node).startswith("load")
+            if is_name_assign(node) and _assigned_name(node).startswith("load")
         )
         body.append(ast.parse(f"observed = {name}").body[0])
     elif mutation == "initial_max":
         node = next(
             node
             for node in body
-            if pair._is_name_assign(node) and pair._assigned_name(node) == "maximum_acc"
+            if is_name_assign(node) and _assigned_name(node) == "maximum_acc"
         )
         node.value = ast.parse("cutlass.Float32(1)", mode="eval").body
     assert _plan(body, graph.constants, graph.context) is None, mutation

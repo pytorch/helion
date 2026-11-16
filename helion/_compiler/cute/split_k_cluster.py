@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import torch
+
 from ... import exc
 from ...runtime.config import Config
+from . import target_facts
 from .split_k_cluster_config import CLUSTER8_K4
 from .split_k_cluster_config import SCHEDULE_KEY
-from .tcgen05_config import CuteTcgen05Config
 
 if TYPE_CHECKING:
     from ...autotuner.config_spec import ConfigSpec
@@ -100,10 +102,12 @@ def cluster_facts(env: CompileEnvironment, ir: DeviceIR) -> ClusterKFacts | None
     from .split_k_workspace import analyze_split_k_reduction
 
     proof = analyze_split_k_reduction(env, ir)
-    if proof is None:
+    # The cluster-K schedule is validated on fp32 (or promoted fp16)
+    # destinations; the workspace schedule owns the bfloat16 ones.
+    if proof is None or proof.output.dtype is not torch.float32:
         return None
     s = CLUSTER_K_SCHEDULE
-    capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+    capacity = target_facts.per_cta_smem_capacity_bytes(env.device)
     if (
         proof.m % s.bm
         or proof.n % s.bn

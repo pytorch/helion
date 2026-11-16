@@ -44,10 +44,13 @@ from __future__ import annotations
 import ast
 import os
 import textwrap
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 import torch
+
+from test._cute_kernels import _reduction_kernel
 
 import helion
 from helion._compiler.cute.hoist_loop_invariant_recip import hoist_loop_invariant_recips
@@ -57,6 +60,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.cute_codegen import with_exact_division
 import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
@@ -71,29 +75,6 @@ def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
     ``test_cute_online_to_3pass.py``.
     """
     monkeypatch.setenv("HELION_DISABLE_ONLINE_TO_3PASS", "1")
-
-
-@helion.kernel(backend="cute")
-def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
-    m, n = x.size()
-    out = torch.empty_like(x)
-    block_size_m = hl.register_block_size(m)
-    block_size_n = hl.register_block_size(n)
-    for tile_m in hl.tile(m, block_size=block_size_m):
-        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        di = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            local_amax = torch.amax(values, dim=1)
-            mi_next = torch.maximum(mi, local_amax)
-            di = di * torch.exp(mi - mi_next) + torch.exp(
-                values - mi_next[:, None]
-            ).sum(dim=1)
-            mi = mi_next
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
-    return out
 
 
 # The scale hoist distributes ``(x - max) * log2(e)``, so it needs fast_math.
@@ -147,9 +128,11 @@ class TestCuteHoistRecip(TestCase):
         """``num_threads`` below the block size puts each thread's elements
         in a lane loop, where the scale is loop-invariant.  Configs must
         never change numerics: without ``fast_math`` that config divides
-        exactly as the one-element-per-thread config (and eager) does."""
+        exactly as the one-element-per-thread config does (``div.full``
+        gives the same bits whether or not ptxas hoists the divisor's
+        reciprocal), and under ``cute_exact_division`` as eager does."""
         torch.manual_seed(0)
-        for kernel, dtype, scale, eager in (
+        for plain, dtype, scale, eager in (
             (_divide_by_scale, torch.float32, 0.0517, torch.div),
             (
                 _round_divide_by_scale,
@@ -160,15 +143,27 @@ class TestCuteHoistRecip(TestCase):
         ):
             x = torch.randn(1 << 16, device=DEVICE, dtype=dtype) * 4
             s = torch.tensor([scale], device=DEVICE, dtype=dtype)
-            expected = eager(x, s[0])
-            for num_threads in (1024, 128):
-                with self.subTest(kernel=kernel.fn.__name__, num_threads=num_threads):
-                    code, out = code_and_output(
-                        kernel, (x, s), block_sizes=[1024], num_threads=[num_threads]
-                    )
-                    self.assertEqual(num_threads < 1024, "for lane_" in code)
-                    self.assertNotIn("_helion_inv_div_", code)
-                    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+            for exact in (False, True):
+                kernel = with_exact_division(plain) if exact else plain
+                outputs = []
+                for num_threads in (1024, 128):
+                    with self.subTest(
+                        kernel=kernel.fn.__name__, exact=exact, num_threads=num_threads
+                    ):
+                        code, out = code_and_output(
+                            kernel,
+                            (x, s),
+                            block_sizes=[1024],
+                            num_threads=[num_threads],
+                        )
+                        self.assertEqual(num_threads < 1024, "for lane_" in code)
+                        self.assertNotIn("_helion_inv_div_", code)
+                        outputs.append(out)
+                        if exact:
+                            torch.testing.assert_close(
+                                out, eager(x, s[0]), rtol=0, atol=0
+                            )
+                torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
 
     @skipIfRefEager("checks the generated code")
     def test_recip_hoist_fires_under_fast_math(self) -> None:
@@ -185,25 +180,38 @@ class TestCuteHoistRecip(TestCase):
         self.assertIn("* _helion_inv_div_0", code)
 
     def test_recip_hoist_needs_fast_math(self) -> None:
-        """Without ``fast_math`` the consume sweep keeps its IEEE divide by
-        ``di``: the reciprocal would round differently, and only where a
-        config creates the loop."""
+        """Without ``fast_math`` the consume sweep keeps the quotient by
+        ``di``: the ``1.0 / d`` + multiply rewrite would round differently,
+        and only where a config creates the loop.  (ptxas hoists the
+        reciprocal of ``div.full`` itself, with the same bits.)  Under
+        ``cute_exact_division`` the exact hoist
+        (``test_cute_exact_division.py``) takes the sweep: the correctly
+        rounded reciprocal and the Markstein sequence, with the original
+        divide kept in the redo copy."""
         x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            _reduction_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
         ref = torch.nn.functional.softmax(x, dim=1)
+        config: dict[str, Any] = {
+            "block_sizes": [1, 128],
+            "num_threads": [0, 32],
+            "cute_vector_widths": [1, 4],
+        }
+        code, out = code_and_output(_reduction_kernel, (x,), **config)
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertNotIn("_helion_inv_div_", code)
-        self.assertIn("/ di", code)
+        self.assertNotIn("_helion_exdiv_", code)
+        self.assertIn("/ di\n", code)
+        code, out = code_and_output(
+            with_exact_division(_reduction_kernel), (x,), **config
+        )
+        torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+        self.assertNotIn("_helion_inv_div_", code)
+        self.assertIn("_helion_exdiv_y_0 = 1.0 / di", code)
+        self.assertIn("_cute_exact_div_fast_f32(", code)
+        self.assertIn("/ di\n", code)
 
     def test_recip_hoist_does_not_fire_on_loop_dependent_divisor(self) -> None:
-        """When the divisor changes per-iteration (e.g. ``local_sum``
-        computed inside the loop), the pass must NOT hoist it.
+        """When the divisor changes per iteration (here per element), the
+        pass must NOT hoist it.
         """
 
         @helion.kernel(backend="cute", fast_math=True)
@@ -213,9 +221,8 @@ class TestCuteHoistRecip(TestCase):
             for tile_m in hl.tile(m):
                 for tile_n in hl.tile(n):
                     values = x[tile_m, tile_n]
-                    # The divisor changes per tile_n iteration.
-                    local_sum = torch.sum(values, dim=1, keepdim=True)
-                    out[tile_m, tile_n] = values / local_sum
+                    # The divisor changes per element and tile_n iteration.
+                    out[tile_m, tile_n] = values / (values + 1)
             return out
 
         x = torch.randn(4096, 1024, device=DEVICE, dtype=HALF_DTYPE)
@@ -226,7 +233,7 @@ class TestCuteHoistRecip(TestCase):
             num_threads=[0, 32],
             cute_vector_widths=[1, 4],
         )
-        # No reciprocal hoist — local_sum is recomputed every iter.
+        # No reciprocal hoist: the divisor is recomputed for every element.
         self.assertNotIn("_helion_inv_div_", code)
 
     def test_recip_hoist_disable_env(self) -> None:
@@ -301,10 +308,15 @@ class TestCuteFMAScaleHoist(TestCase):
     def test_lane_loop_config_exponentiates_like_one_element_per_thread(
         self,
     ) -> None:
-        """``exp(x - shift[0])`` lowers to ``exp2((x - shift) * log2(e))``.
-        In a lane loop ``shift`` is loop-invariant; without ``fast_math``
-        that config must still match the one-element-per-thread config bit
-        for bit."""
+        """``exp(x - shift[0])`` in a lane loop, where ``shift`` is
+        loop-invariant: without ``fast_math`` that config must still match
+        the one-element-per-thread config bit for bit.  (The exact exp has no
+        ``(x - shift) * log2(e)`` product to distribute, and ``torch.exp2((x
+        - m) * C)`` binds ``C`` to its own name, which the hoist does not
+        match.  The hoist's ``fast_math`` gate is checked end to end on the
+        gdn recurrence's ``exp2((g_last - g) * log2(e))`` gate in
+        ``test_cute_gdn_recurrence.py``, and on the pass in
+        ``test_cute_scaled_sub_fusion.py``.)"""
         torch.manual_seed(0)
         x = torch.randn(1 << 16, device=DEVICE) * 4
         shift = torch.tensor([1.37], device=DEVICE)
@@ -317,25 +329,6 @@ class TestCuteFMAScaleHoist(TestCase):
             self.assertNotIn("_helion_scaled_", code)
             outputs.append(out)
         torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
-
-    @skipIfRefEager("checks the generated code")
-    def test_fma_scale_hoist_needs_fast_math(self) -> None:
-        """Without ``fast_math`` both softmax sweeps keep the exact
-        ``(x - max) * log2(e)`` exponent."""
-        x = torch.randn(4096, 12672, device=DEVICE, dtype=HALF_DTYPE)
-        code, out = code_and_output(
-            _reduction_kernel,
-            (x,),
-            block_sizes=[1, 128],
-            num_threads=[0, 32],
-            cute_vector_widths=[1, 4],
-        )
-        torch.testing.assert_close(
-            out, torch.nn.functional.softmax(x, dim=1), atol=1e-2, rtol=1e-2
-        )
-        self.assertNotIn("_helion_scaled_", code)
-        self.assertIn("v_10 = v_9 - mi\n", code)
-        self.assertIn("v_6 = v_5 - v_1\n", code)
 
     def test_fma_scale_hoist_above_consume(self) -> None:
         """The consume loop's ``exp2((v_9 - mi) * 1.4427)`` pattern with
@@ -500,6 +493,30 @@ def _normalize(source: str) -> str:
 @onlyBackends(["cute"])
 class TestCuteSharedRecip(TestCase):
     """Block-local reciprocal sharing sub-pass (AST-level, no GPU)."""
+
+    def test_loop_carried_alias_divisor_is_not_hoisted(self) -> None:
+        """``d = e`` at the end of the loop (directly, or through a rename
+        group) rebinds the divisor for the next iteration: the first
+        iteration divides by the pre-loop ``d``, so ``d`` is not invariant
+        and no reciprocal is hoisted.  Without the rebinding the
+        per-iteration snapshot ``d_copy_0`` resolves to ``d`` and the
+        reciprocal is hoisted above the loop."""
+        source = """\
+            for i in range(cutlass.Int32(0), cutlass.Int32(n), cutlass.Int32(16)):
+                d_copy_0 = d
+                load = (x.iterator + cutlass.Int32(i)).load()
+                v_0 = load / d_copy_0
+                (out.iterator + cutlass.Int32(i)).store(cutlass.Float32(v_0))
+                d = e
+            """
+        code = _run_pass(source)
+        self.assertNotIn("_helion_inv_div", code)
+        self.assertIn("v_0 = load / d", code)
+        code = _run_pass(source.replace("    d = e\n", "    v_9 = e\n"), {"v_9": "d"})
+        self.assertNotIn("_helion_inv_div", code)
+        code = _run_pass(source.replace("    d = e\n", ""))
+        self.assertIn("_helion_inv_div_0 = 1.0 / d", code)
+        self.assertIn("v_0 = load * _helion_inv_div_0", code)
 
     def test_three_divisions_by_one_divisor_share_one_reciprocal(self) -> None:
         """``swiglu_bwd``: three IEEE divides by ``v_9`` become one

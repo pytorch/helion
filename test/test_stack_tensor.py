@@ -319,26 +319,27 @@ def _stack_memory_proof_kernel(x, dev_ptrs, write: hl.constexpr):
     return out
 
 
+@onlyBackends(["cute"])
 class TestStackTensorOwnershipCPU(TestCase):
     def test_indirect_memory_keeps_load_ownership_conservative(self):
         from unittest.mock import patch
 
         from torch.fx import Node
 
-        from test._cute_binding import _cpu_bind
-        from test._cute_binding import _forbid_native_compile
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.local_atomic import _reachable_graphs
         from helion._compiler.cute.register_loads import host_load_is_readonly
         from helion._compiler.cute.register_loads import lane_private_load
+        from helion._testing.cute_codegen import cpu_bind
+        from helion._testing.cute_codegen import forbid_native_compile
+        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import memory_ops
 
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
-            _forbid_native_compile(),
+            forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         ):
             for width in (5, 16):
@@ -346,7 +347,7 @@ class TestStackTensorOwnershipCPU(TestCase):
                     with self.subTest(width=width, write=write):
                         x = torch.arange(width).float()
                         pointers = torch.zeros(3, dtype=torch.uint64)
-                        bound = _cpu_bind(
+                        bound = cpu_bind(
                             _stack_memory_proof_kernel, (x, pointers, write)
                         )
                         code = bound.to_code(bound.config_spec.default_config())

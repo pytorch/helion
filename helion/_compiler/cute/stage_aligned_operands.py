@@ -1,0 +1,534 @@
+"""Stage TensorMap-unaligned GEMM operands through padded host copies.
+
+The tcgen05 pipeline loads A and B through TMA only when both operands pass
+the TensorMap proof (``_tcgen05_tma_tensor_is_aligned``: a 16-byte base, one
+unit stride, every other stride a 16-byte multiple). An operand whose rows
+are odd-sized fails it -- bf16 rows of ``K = 4097`` are 8194 bytes -- and
+``_emit_mma_pipeline`` then keeps the scalar shared-memory producers for both
+operands: one load warp copying elements one at a time, which ran a 4097^3
+bf16 GEMM in 22 ms on a B200 (cuBLAS 0.87 ms, the Triton backend 0.5 ms, the
+TMA pipeline at 4096^3 0.12 ms).
+
+This source-level pass (``Backend.customize_ast``, before type propagation)
+rewrites such kernels to re-lay the offending operand out on the host::
+
+    x = torch.constant_pad_nd(x, [0, 63])[..., :4097]
+
+a row-major copy whose row stride is a 128-byte multiple and whose logical
+shape is unchanged (the slice bounds the view, so the pad columns are never
+read). The copy is a fresh allocation at storage offset 0, which the TMA
+proof accepts (``_fresh_tensors`` lists ``torch.constant_pad_nd`` as a fresh
+factory). It costs one read and one write of the operand per call, against
+a GEMM that reads the operand once per output tile column.
+
+An argument is staged when it (1) is a tensor of rank 2 or 3 with static
+strides and at least ``STAGING_MIN_ELEMENTS`` elements, (2) fails the
+TensorMap stride rule (the compile environment's fake arguments sit at
+storage offset 0, so a misaligned base is not visible here and keeps the
+scalar producers), (3) is read as a matmul operand -- the bare name or its
+tile subscript inside a device loop (``x[tile_m, tile_k]``, every index a
+plain name) passed to ``torch.addmm`` / ``baddbmm`` / ``matmul`` / ``mm`` /
+``bmm``, ``hl.dot`` or ``@`` -- and (4) is mentioned nowhere else except
+through such device-loop reads and its logical metadata (``size``,
+``shape``, ``dtype``, ...): a store, a rebinding, an alias, a view, a host
+subscript (``x[0]`` is a view of the copy), a layout query, a ``return`` or
+any other call would observe the copy as a different tensor or write into
+it instead of the caller's (``_uses_are_benign``). The exception is an
+M-contiguous 16-bit A of the kernel's only matmul beside an aligned B at
+most ``CP_ASYNC_MAX_N`` wide, on a 16-byte bound base: the flat one-CTA
+kernel's epilogue warps copy it with ``cp.async`` instead
+(``_cp_async_lhs_names``). Dynamic shapes are left alone;
+``cute_stage_unaligned_operands=False`` disables the pass.
+"""
+
+from __future__ import annotations
+
+import ast
+import math
+from typing import TYPE_CHECKING
+
+import torch
+from torch._subclasses.fake_tensor import FakeTensor
+
+from ..ast_extension import ExtendedAST
+from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
+from . import mma_support
+from .cp_async_operand import tcgen05_cp_async_a_strided_layout
+from .full_slice_matmul import _bound_names
+from .full_slice_matmul import _global_value
+from .tcgen05_config.knobs import _tcgen05_mma_impl_allowed
+import helion.language as hl
+
+if TYPE_CHECKING:
+    from ..host_function import HostFunction
+
+# Operands below this many elements keep the scalar producers: the copy's
+# launch is a visible fraction of a latency-bound GEMM, and the small-shape
+# lowerings (row-resident contractions, materialized fission, the paired
+# fan-out epilogue) match the kernel's host prelude as written.
+STAGING_MIN_ELEMENTS = 1 << 18
+# TensorMap bases and outer strides must be 16-byte multiples; a 128-byte
+# row stride additionally keeps every 64-element bf16 TMA box row inside one
+# 128-byte line (4097^3 bf16 on the pre-existing two-CTA edge family:
+# 0.315 ms at 128 vs 0.333 ms at a 32-byte stride) and satisfies the
+# packet-alignment facts.
+STAGED_ALIGNMENT_BYTES = 128
+_TMA_ALIGNMENT_BYTES = 16
+
+# (function, positional operand indices, keyword operand names): the two
+# MMA operands only, never the accumulator (``addmm``'s ``input``).
+_MATMUL_OPERANDS: tuple[tuple[object, tuple[int, ...], tuple[str, ...]], ...] = (
+    (torch.addmm, (1, 2), ("mat1", "mat2")),
+    (torch.baddbmm, (1, 2), ("batch1", "batch2")),
+    (torch.matmul, (0, 1), ("input", "other")),
+    (torch.mm, (0, 1), ("input", "mat2")),
+    (torch.bmm, (0, 1), ("input", "mat2")),
+    (hl.dot, (0, 1), ("mat1", "mat2")),
+)
+# The accumulator operand of the matmul-family calls that take one: its
+# position and keyword.
+_MATMUL_ACCUMULATORS: tuple[tuple[object, int, str], ...] = (
+    (torch.addmm, 0, "input"),
+    (torch.baddbmm, 0, "input"),
+    (hl.dot, 2, "acc"),
+)
+# Tensor attributes the padded copy answers like the original: its logical
+# shape and dtype. Layout queries (``stride``, ``is_contiguous``,
+# ``storage_offset``, ``data_ptr``) and ``data`` are not among them.
+_METADATA_ATTRIBUTES = frozenset(
+    {
+        "size",
+        "shape",
+        "dtype",
+        "device",
+        "ndim",
+        "dim",
+        "numel",
+        "element_size",
+        "is_cuda",
+    }
+)
+
+
+def _tma_aligned(tensor: torch.Tensor) -> bool:
+    """Whether ``tensor``'s static layout passes the TMA rule, whatever its
+    size: a 16-byte aligned base, one unit stride, and every other stride a
+    multiple of 16 bytes (axes of extent one ignored)."""
+    strides = tensor.stride()
+    sizes = tensor.size()
+    offset = tensor.storage_offset()
+    if not all(type(value) is int for value in (*strides, *sizes, offset)):
+        return False
+    element_size = tensor.element_size()
+    if offset * element_size % _TMA_ALIGNMENT_BYTES:
+        return False
+    unit_strides = 0
+    for size, stride in zip(sizes, strides, strict=True):
+        if size == 1:
+            continue
+        if stride == 1:
+            unit_strides += 1
+        elif stride == 0 or stride * element_size % _TMA_ALIGNMENT_BYTES:
+            return False
+    return unit_strides == 1
+
+
+def _needs_staging(tensor: torch.Tensor) -> int | None:
+    """Pad (in elements of the last axis) when ``tensor`` fails the TMA rule.
+
+    Returns None for tensors the TensorMap proof accepts, whose strides are
+    symbolic, that are not rank 2 or 3, that hold fewer than
+    ``STAGING_MIN_ELEMENTS`` elements, or that broadcast an axis (a stride-0
+    axis: the copy would materialize every repeat). Axes of extent one carry
+    no addressable stride and are ignored.
+    """
+    # GEMM operands: a matrix or a batch of matrices. Rank-4 attention
+    # operands go through the flash matcher, which has its own layout rules.
+    if tensor.ndim not in (2, 3):
+        return None
+    strides = tensor.stride()
+    sizes = tensor.size()
+    offset = tensor.storage_offset()
+    if not all(type(value) is int for value in (*strides, *sizes, offset)):
+        return None
+    if math.prod(sizes) < STAGING_MIN_ELEMENTS:
+        return None
+    if any(
+        size != 1 and stride == 0 for size, stride in zip(sizes, strides, strict=True)
+    ):
+        return None
+    if _tma_aligned(tensor):
+        return None
+    align_elements = STAGED_ALIGNMENT_BYTES // tensor.element_size()
+    # A whole alignment block when the extent is already a multiple: the
+    # operand then fails the rule through its layout (a misaligned base or a
+    # non-unit inner stride), and a zero pad would clone that layout.
+    return (-sizes[-1]) % align_elements or align_elements
+
+
+def _plain_tile_subscript(node: ast.Subscript) -> bool:
+    """``x[tile_m, tile_k]``: every index a plain name. Offset arithmetic,
+    slices and ``hl.load`` forms belong to the grouped, row-union, attention
+    and full-slice lowerings, which keep their own operand protocols."""
+    indices = (
+        list(node.slice.elts) if isinstance(node.slice, ast.Tuple) else [node.slice]
+    )
+    return all(isinstance(index, ast.Name) for index in indices)
+
+
+def _matmul_operands(
+    call: ast.Call, host: HostFunction, local_names: set[str]
+) -> list[ast.AST]:
+    """The MMA operand expressions of a matmul-family call (else empty), in
+    operand order (A, then B) whether passed by position or by keyword
+    (``torch.addmm(input=acc, mat2=b, mat1=a)`` reads ``a`` as A)."""
+    callee = _global_value(call.func, host, local_names)
+    keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    for function, positions, keyword_names in _MATMUL_OPERANDS:
+        if callee is function:
+            operands = (
+                call.args[position] if position < len(call.args) else keywords.get(name)
+                for position, name in zip(positions, keyword_names, strict=True)
+            )
+            return [operand for operand in operands if operand is not None]
+    return []
+
+
+def _tile_read_aliases(module: ast.Module) -> dict[str, str]:
+    """Names bound exactly once to a plain tile read of another name
+    (``x_tile = x[tile_m, tile_k]``), mapped to that name."""
+    aliases: dict[str, str | None] = {}
+    for node in ast.walk(module):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        target = node.targets[0].id
+        root = None
+        if (
+            isinstance(node.value, ast.Subscript)
+            and _plain_tile_subscript(node.value)
+            and isinstance(node.value.value, ast.Name)
+        ):
+            root = node.value.value.id
+        aliases[target] = None if target in aliases else root
+    return {name: root for name, root in aliases.items() if root is not None}
+
+
+def _root_name(node: ast.AST, aliases: dict[str, str]) -> str | None:
+    """The argument a matmul operand reads: a name, its plain tile subscript,
+    or a name bound once to such a subscript."""
+    if isinstance(node, ast.Subscript) and _plain_tile_subscript(node):
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return aliases.get(node.id, node.id)
+
+
+def _matmul_operand_roots(
+    host: HostFunction, local_names: set[str]
+) -> list[list[str | None]]:
+    """The arguments each matmul of the kernel reads as its operands, in
+    operand order (``None`` for an operand that is not a plain read)."""
+    module = ast.Module(body=host.body, type_ignores=[])
+    aliases = _tile_read_aliases(module)
+    matmuls: list[list[str | None]] = []
+    for node in ast.walk(module):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            operands: list[ast.AST] = [node.left, node.right]
+        elif isinstance(node, ast.Call):
+            operands = _matmul_operands(node, host, local_names)
+            if not operands:
+                continue
+        else:
+            continue
+        matmuls.append([_root_name(operand, aliases) for operand in operands])
+    return matmuls
+
+
+def _matmul_operand_names(matmuls: list[list[str | None]]) -> set[str]:
+    """Argument names read as a matmul operand somewhere in the kernel (of
+    ``_matmul_operand_roots``)."""
+    return {root for roots in matmuls for root in roots if root is not None}
+
+
+def _device_loop_nodes(
+    module: ast.Module, host: HostFunction, local_names: set[str]
+) -> set[int]:
+    """ids of the nodes inside ``for ... in hl.tile(...)`` / ``hl.grid(...)``
+    loops: the code that runs on the device, where a tile subscript is a
+    load and not a view."""
+    inside: set[int] = set()
+    for node in ast.walk(module):
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and _global_value(node.iter.func, host, local_names) in (hl.tile, hl.grid)
+        ):
+            for statement in node.body:
+                inside.update(id(child) for child in ast.walk(statement))
+    return inside
+
+
+def _uses_are_benign(host: HostFunction, name: str, local_names: set[str]) -> bool:
+    """Whether every mention of the argument ``name`` reads it in a form the
+    padded copy answers like the original.
+
+    Allowed: a plain tile subscript read inside a device loop, a metadata
+    attribute (``_METADATA_ATTRIBUTES``), and the bare name as an MMA
+    operand (``@`` or a ``_MATMUL_OPERANDS`` call). Everything else -- a
+    store or augmented assignment, a rebinding, an alias of any form
+    (``s = a.detach()``, tuple unpacking, an annotated assignment), a view,
+    a host subscript (``row = a[0]`` is a view of the copy), a layout
+    query, a ``return``, or the name passed to any other call -- keeps the
+    argument unstaged: the copy would then be observed as a different
+    tensor, or a write into it would never reach the caller.
+    """
+    module = ast.Module(body=host.body, type_ignores=[])
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(module):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    device_nodes = _device_loop_nodes(module, host, local_names)
+    for node in ast.walk(module):
+        if not (isinstance(node, ast.Name) and node.id == name):
+            continue
+        if not isinstance(node.ctx, ast.Load):
+            return False
+        parent = parents.get(id(node))
+        if isinstance(parent, ast.Subscript) and parent.value is node:
+            if (
+                isinstance(parent.ctx, ast.Load)
+                and id(parent) in device_nodes
+                and _plain_tile_subscript(parent)
+            ):
+                continue
+            return False
+        if (
+            isinstance(parent, ast.Attribute)
+            and parent.value is node
+            and parent.attr in _METADATA_ATTRIBUTES
+        ):
+            continue
+        if isinstance(parent, ast.BinOp) and isinstance(parent.op, ast.MatMult):
+            continue
+        call = parent
+        if isinstance(parent, ast.keyword):
+            call = parents.get(id(parent))
+        if isinstance(call, ast.Call) and any(
+            operand is node for operand in _matmul_operands(call, host, local_names)
+        ):
+            continue
+        return False
+    return True
+
+
+# A narrow GEMM reads A once per tile column; up to two 128-wide columns the
+# padded copy (one more read and one write of A) costs more than the
+# ``cp.async`` producer's slower loads (``cp_async_operand``).
+CP_ASYNC_MAX_N = 256
+
+
+def _fixes_a_tile_block_size(host: HostFunction) -> bool:
+    """Whether a ``hl.tile`` loop supplies a block size other than ``None``
+    (``hl.tile([m, n], block_size=[128, None])``, or a size held in a name,
+    ``block_size=[block_m, None]``): its axis may be no config block size,
+    which the ``cp.async`` producer's proof needs."""
+    local_names = _bound_names(host)
+    for node in ast.walk(ast.Module(body=host.body, type_ignores=[])):
+        if not (
+            isinstance(node, ast.Call)
+            and _global_value(node.func, host, local_names) is hl.tile
+        ):
+            continue
+        sizes = [kw.value for kw in node.keywords if kw.arg == "block_size"]
+        sizes += node.args[2:3]
+        for size in sizes:
+            entries = size.elts if isinstance(size, (ast.List, ast.Tuple)) else [size]
+            if any(
+                not (isinstance(entry, ast.Constant) and entry.value is None)
+                for entry in entries
+            ):
+                return True
+    return False
+
+
+def _matmuls_are_zero_seeded_mmas(host: HostFunction) -> bool:
+    """Whether every matmul has the form of an MMA the ``cp.async``
+    producer's proof (``cute_mma.host_function_cp_async_a_provable``)
+    decodes: a ``torch.addmm``, ``torch.baddbmm`` or ``hl.dot(..., acc=)``
+    (``@``, ``torch.mm``, ``torch.matmul`` and an ``hl.dot`` without an
+    accumulator take no tcgen05 MMA) whose accumulator is a name bound only
+    to ``hl.zeros`` or to a matmul-family call (its loop-carried update),
+    not a seeded one (``acc = residual[tile_m, tile_n].to(torch.float32)``).
+    Any other matmul keeps its A on the staged copy. A syntactic check: a K
+    loop that also stores A elsewhere passes it yet leaves the kernel off
+    tcgen05, where A is read through scalar loads either way."""
+    local_names = _bound_names(host)
+    module = ast.Module(body=host.body, type_ignores=[])
+    accumulators: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.MatMult):
+            return False
+        if not isinstance(node, ast.Call):
+            continue
+        callee = _global_value(node.func, host, local_names)
+        if callee in (torch.matmul, torch.mm, torch.bmm):
+            return False
+        for function, position, keyword in _MATMUL_ACCUMULATORS:
+            if callee is not function:
+                continue
+            accumulator = (
+                node.args[position]
+                if position < len(node.args)
+                else next((kw.value for kw in node.keywords if kw.arg == keyword), None)
+            )
+            if accumulator is None:
+                # ``hl.dot`` without ``acc=`` (its product added outside)
+                # decodes to no MMA
+                if function is hl.dot:
+                    return False
+                continue
+            if not isinstance(accumulator, ast.Name):
+                return False
+            accumulators.add(accumulator.id)
+    starts = {hl.zeros, *(function for function, _, _ in _MATMUL_OPERANDS)}
+    for node in ast.walk(module):
+        if isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name) and node.target.id in accumulators:
+                return False
+            continue
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if any(
+            isinstance(target, ast.Name) and target.id in accumulators
+            for target in targets
+        ) and not (
+            isinstance(node.value, ast.Call)
+            and _global_value(node.value.func, host, local_names) in starts
+        ):
+            return False
+    return True
+
+
+def _cp_async_lhs_names(
+    env: CompileEnvironment,
+    host: HostFunction,
+    matmuls: list[list[str | None]],
+    tensors: dict[str, torch.Tensor],
+    pads: dict[str, int],
+) -> set[str]:
+    """Unaligned A operands the tcgen05 kernel copies with ``cp.async``.
+
+    The first operand of the kernel's only matmul (the default's gate,
+    ``host_function_cp_async_a_provable``, proves every MMA) when its layout
+    is one the flat one-CTA kernel's epilogue-warp producer serves
+    (``tcgen05_cp_async_a_strided_layout``) on a 16-byte aligned base: the
+    bound argument's pointer, whose residue the kernel's cache key records
+    (``register_persistent_vec_alignment_specializations``) and codegen
+    re-proves (``tcgen05_cp_async_a_operand_layout``); the fake tensor's
+    storage offset is always zero. Beside a B operand that needs no staging
+    and is at most ``CP_ASYNC_MAX_N`` wide:
+    staging re-lays out all of A through a transposing copy, which a narrow
+    GEMM reads only once or twice. The producer runs whole tiles or the
+    flat-edge TMA path (``cute_flat_edge_tma``); without that path A is
+    staged.
+    """
+    if len(matmuls) != 1 or len(matmuls[0]) != 2:
+        return set()
+    lhs, rhs = matmuls[0]
+    if (
+        lhs not in pads
+        or rhs is None
+        or rhs not in tensors
+        # B keeps its TMA pipeline: a small B the pass leaves unpadded may
+        # still fail the TensorMap rule
+        or not _tma_aligned(tensors[rhs])
+        # only the tcgen05 kernel runs the producer: a device without
+        # tcgen05 or a forced universal MMA (``HELION_CUTE_MMA_IMPL``) keeps
+        # the staged copy
+        or not mma_support.get_cute_mma_support().tcgen05_f16bf16
+        or not _tcgen05_mma_impl_allowed()
+        # the producer's envelope is judged on the config's tile
+        # (``cp_async_a_config_ok``), which a fixed block size leaves out
+        or _fixes_a_tile_block_size(host)
+        or not _matmuls_are_zero_seeded_mmas(host)
+    ):
+        return set()
+    lhs_tensor, rhs_tensor = tensors[lhs], tensors[rhs]
+    bound = env.runtime_value_for_tensor(lhs_tensor)
+    if (
+        env.settings.cute_flat_edge_tma
+        and rhs_tensor.ndim == 2
+        and isinstance(rhs_tensor.size(-1), int)
+        and rhs_tensor.size(-1) <= CP_ASYNC_MAX_N
+        and isinstance(bound, torch.Tensor)
+        # a FakeTensor bind (Dynamo's output-spec capture) proves no pointer
+        and not isinstance(bound, FakeTensor)
+        and bound.data_ptr() % 16 == 0
+        and tcgen05_cp_async_a_strided_layout(lhs_tensor) is not None
+    ):
+        return {lhs}
+    return set()
+
+
+def stage_unaligned_matmul_operands(host: HostFunction) -> bool:
+    """Pad TensorMap-unaligned matmul operands on the host; True when rewritten."""
+    env = CompileEnvironment.current()
+    if not env.settings.cute_stage_unaligned_operands or not env.settings.static_shapes:
+        return False
+    tensors = {
+        name: value
+        for name, value in host.params.arguments.items()
+        if isinstance(value, torch.Tensor)
+    }
+    pads = {
+        name: pad
+        for name, tensor in tensors.items()
+        if (pad := _needs_staging(tensor)) is not None
+    }
+    if not pads:
+        return False
+    local_names = _bound_names(host)
+    matmuls = _matmul_operand_roots(host, local_names)
+    operands = _matmul_operand_names(matmuls)
+    cp_async = _cp_async_lhs_names(env, host, matmuls, tensors, pads)
+    stageable = [
+        name
+        for name in pads
+        if name in operands and _uses_are_benign(host, name, local_names)
+    ]
+    # A left for the cp.async producer that would have been padded: the
+    # producer's envelope is then the only fast one (``validate_cp_async_a_config``).
+    env.config_spec.tcgen05.cp_async_a_unstaged = any(
+        name in cp_async for name in stageable
+    )
+    staged = [name for name in stageable if name not in cp_async]
+    if not staged:
+        return False
+    torch_alias = next(
+        (
+            name
+            for name, value in host.fn.__globals__.items()
+            if value is torch and name.isidentifier() and name not in local_names
+        ),
+        None,
+    )
+    if torch_alias is None:
+        return False
+    statements = []
+    for name in staged:
+        statement = statement_from_string(
+            f"{name} = {torch_alias}.constant_pad_nd({name}, [0, {pads[name]}])"
+            f"[..., :{tensors[name].size(-1)}]"
+        )
+        for node in ast.walk(statement):
+            if isinstance(node, ExtendedAST):
+                node._compiler_inserted = True
+        statements.append(statement)
+    host.body[:0] = statements
+    return True

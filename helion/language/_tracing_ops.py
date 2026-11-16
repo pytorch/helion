@@ -6,7 +6,6 @@ from typing import TypeVar
 
 import sympy
 import torch
-from torch._inductor.codegen.simd import constant_repr
 from torch.fx import has_side_effect
 from torch.fx.experimental.sym_node import SymNode
 
@@ -57,18 +56,50 @@ def _get_symnode(debug_name: str) -> int:
     raise AssertionError("this should never be called")
 
 
+# The value a ``_get_symnode`` capture prints when its traced value stays for
+# a shape (``resolve_reduction_sizes``): the one computed from the extents.
+EXTENT_VALUE = "helion_extent_value"
+
+
+def symnode_value(node: torch.fx.Node) -> object:
+    """The value a ``_get_symnode`` capture's code prints (``EXTENT_VALUE``)."""
+    return node.meta.get(EXTENT_VALUE, node.meta["val"])
+
+
 @_decorators.codegen(_get_symnode, "common")
 def _(state: CodegenState) -> ast.AST:
-    # pyrefly: ignore [missing-attribute]
-    val = state.fx_node.meta["val"]
+    # pyrefly: ignore [bad-argument-type]
+    val = symnode_value(state.fx_node)
 
-    # Handle the case where val is a regular integer (e.g., from reduction_loops config)
-    if isinstance(val, int):
-        return expr_from_string(str(val))
+    # A constant: an integer from the config (reduction_loops), or a value
+    # computed from a reduction dim's extent (``resolve_reduction_sizes``).
+    if isinstance(val, (int, float, bool)):
+        return expr_from_string(state.device_function.literal_expr(val))
 
     assert isinstance(val, (torch.SymInt, torch.SymFloat, torch.SymBool)), val
     sym_expr = _val_to_sympy(val)
-    origin_info = HostFunction.current().expr_to_origin.get(sym_expr)
+    host = HostFunction.current()
+    origins = host.expr_to_origin
+    origin_info = origins.get(sym_expr)
+    # A nested graph can import a scalar registered in an outer device loop.
+    # It has config provenance, but no replayable host origin. Preserve its
+    # selected value and Python type instead of inventing a runtime argument.
+    if origin_info is None:
+        resolved = host.resolve_tunable_expr(sym_expr, state.config)
+        if isinstance(resolved, (int, float, bool)):
+            return expr_from_string(
+                CompileEnvironment.current().backend.scalar_literal_expr(resolved)
+            )
+        if resolved != sym_expr:
+            sym_expr = resolved
+            if not sym_expr.free_symbols:
+                # An integral zero can cancel the remaining runtime symbols.
+                # Retain the original expression's scalar type in that case.
+                selected = val.node.pytype(sym_expr)
+                return expr_from_string(
+                    CompileEnvironment.current().backend.scalar_literal_expr(selected)
+                )
+            origin_info = origins.get(sym_expr)
 
     if origin_info is not None and isinstance(origin_info.origin, BlockSizeOrigin):
         block_size_var = state.device_function.block_size_var(
@@ -111,8 +142,11 @@ def _(state: CodegenState) -> ast.AST:
     dtype = state.proxy_arg(1)
     assert isinstance(value, (int, float, bool))
     assert isinstance(dtype, torch.dtype)
+    assert state.fx_node is not None
+    shape = ["1"] * state.fx_node.meta["val"].ndim
+    backend = CompileEnvironment.current().backend
     return expr_from_string(
-        CompileEnvironment.current().backend.full_expr([], constant_repr(value), dtype)
+        backend.full_expr(shape, backend.scalar_literal_expr(value), dtype)
     )
 
 
@@ -215,6 +249,10 @@ def _(lhs: object, rhs: object) -> object:
         assert isinstance(rhs, Tile)
         assert lhs.block_id == rhs.block_id
         return lhs
+    if isinstance(lhs, torch.SymFloat) and isinstance(rhs, torch.SymFloat):
+        shape_env = CompileEnvironment.current().shape_env
+        with shape_env.ignore_fresh_unbacked_symbols():
+            return shape_env.create_unbacked_symfloat()
     assert isinstance(lhs, torch.Tensor), lhs
     assert isinstance(rhs, torch.Tensor), rhs
     assert lhs.size() == rhs.size()
@@ -392,6 +430,55 @@ def _(node: torch.fx.Node) -> float | bool:
     return value
 
 
+@_decorators.api()
+def _mask_select(
+    tensor: torch.Tensor,
+    other: torch.Tensor | float | bool,
+    block_ids: tuple[int, ...],
+    /,
+) -> torch.Tensor:
+    """
+    ``tensor`` with the values outside the tiles of ``block_ids`` taken from
+    ``other``, a tensor of the same shape or a scalar: ``_mask_to`` limited to
+    some blocks.  The compiler applies it to the operands of a loop carry's
+    update that read a partial tile of the loop, or to the whole update
+    (``mask_loop_carries``), so that the tile's padded lanes add nothing to
+    the carried value.
+
+    Args:
+        tensor: The tensor to apply the mask to.
+        other: The tensor whose values the masked out elements take, or the
+            value they all take.
+        block_ids: The canonical block ids whose tile masks apply.
+
+    Returns:
+        torch.Tensor: ``tensor`` where those tile masks are true, else ``other``.
+    """
+    raise NotInsideKernel
+
+
+@_decorators.register_fake(_mask_select)
+def _(
+    tensor: torch.Tensor,
+    other: torch.Tensor | float | bool,
+    block_ids: tuple[int, ...],
+) -> torch.Tensor:
+    return torch.empty_like(tensor)
+
+
+@_decorators.get_masked_value(_mask_select)
+def _(node: torch.fx.Node) -> float | bool | None:
+    from .._compiler.node_masking import cached_masked_value
+
+    # The masked lanes of other blocks keep the tensor's values.
+    tensor, other = node.args[:2]
+    assert isinstance(tensor, torch.fx.Node)
+    value = cached_masked_value(tensor)
+    if isinstance(other, torch.fx.Node):
+        other = cached_masked_value(other)
+    return value if value == other else None
+
+
 @_decorators.api(allow_host_tensor=True)
 def _new_var(value: _T, /) -> _T:
     """
@@ -415,6 +502,11 @@ def _(value: _T) -> _T:
     if isinstance(value, torch.SymInt):
         # pyrefly: ignore [bad-return]
         return CompileEnvironment.current().create_unbacked_symint()
+    if isinstance(value, torch.SymFloat):
+        shape_env = CompileEnvironment.current().shape_env
+        with shape_env.ignore_fresh_unbacked_symbols():
+            # pyrefly: ignore [bad-return]
+            return shape_env.create_unbacked_symfloat()
     if isinstance(value, (int, float, bool)) or value is None:
         # pyrefly: ignore [bad-return]
         return value

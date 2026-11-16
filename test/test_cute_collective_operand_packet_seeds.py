@@ -3,40 +3,26 @@ from __future__ import annotations
 from copy import deepcopy
 import random
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
-from test.test_cute_collective_tf32 import _jagged_inputs
-from test.test_cute_collective_tf32 import _kernel
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import collective_kernel
+from helion._testing.cute_collective import jagged_inputs
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from helion.runtime.kernel import BoundKernel
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
 
 
 def _population(
@@ -77,8 +63,8 @@ def _population(
 def test_real_full_lfbo_population_reaches_packets_and_retains_other_families(
     batch: int, rows: int, k: int, n: int
 ) -> None:
-    arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n)
-    bound = _cpu_bind(_kernel(), arguments)
+    arguments = jagged_inputs(batch=batch, rows=rows, k=k, n=n)
+    bound = cpu_bind(collective_kernel(), arguments)
     population = _population(bound, arguments)
     assert population == _population(bound, arguments)
     packet_seeds = [
@@ -115,7 +101,7 @@ def test_real_full_lfbo_population_reaches_packets_and_retains_other_families(
 
 def test_ordinary_computed_batched_matmul_reaches_packets() -> None:
     arguments = (torch.empty((3, 130, 64)), torch.empty((3, 64, 70)))
-    bound = _cpu_bind(_kernel(batched=True), arguments)
+    bound = cpu_bind(collective_kernel(batched=True), arguments)
     choices = [
         config
         for config in _population(bound, arguments)
@@ -132,8 +118,8 @@ def test_ordinary_computed_batched_matmul_reaches_packets() -> None:
 def test_direct_packet_seed_mutation_cannot_change_scalar_or_packet_siblings(
     batch: int, rows: int, k: int, n: int
 ) -> None:
-    arguments = _jagged_inputs(batch=batch, rows=rows, k=k, n=n)
-    bound = _cpu_bind(_kernel(), arguments)
+    arguments = jagged_inputs(batch=batch, rows=rows, k=k, n=n)
+    bound = cpu_bind(collective_kernel(), arguments)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -189,11 +175,11 @@ def test_unrelated_full_populations_do_not_get_packet_seeds(kind: str) -> None:
             torch.empty((3, 130, 64), dtype=torch.bfloat16),
             torch.empty((3, 64, 70), dtype=torch.bfloat16),
         )
-        kernel = _kernel(batched=True)
+        kernel = collective_kernel(batched=True)
     else:
         arguments = (torch.empty((130, 70)),)
         kernel = _pointwise
-    bound = _cpu_bind(kernel, arguments)
+    bound = cpu_bind(kernel, arguments)
     assert all(
         not config.get("cute_collective_operand_packets", False)
         for config in bound.config_spec.compiler_seed_configs

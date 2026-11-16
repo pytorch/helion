@@ -13,6 +13,8 @@ from test.test_cute_consumer_packet_prefetch import inverse_motion
 from test.test_cute_consumer_packet_prefetch import run_pass
 from test.test_cute_consumer_packet_prefetch import source
 
+pytestmark = pytest.mark.cpu_only
+
 
 def affine_source(
     *,

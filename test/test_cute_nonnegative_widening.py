@@ -10,6 +10,8 @@ from test.test_cute_full_tile_bounds import _rewrite
 from test.test_cute_full_tile_bounds import _sdk
 from test.test_cute_full_tile_bounds import _text
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _source(expression: str) -> str:
     return SOURCE.replace(

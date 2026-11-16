@@ -34,12 +34,20 @@ import math
 import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
+from typing import TypeVar
 
 import sympy
 import torch
 import torch.fx
 from torch.utils._sympy.functions import FloorDiv
 
+from ..utils import is_full_slice
+from .analysis.match_common import host_tensor_name as _host_tensor_name
+from .analysis.match_common import is_call as _is_call
+from .analysis.match_common import is_neg_inf
+from .analysis.match_common import scalar_value
+from .analysis.match_common import strip_new_var as _strip_new_var
+from .analysis.match_common import unit_fixed_block as _unit_fixed_block
 from .attention_plan import AttentionScorePlan
 from .attention_plan import FlexAuxBuffer
 from .attention_plan import FlexKvWalk
@@ -48,6 +56,7 @@ from .attention_plan import flash_head_dims_supported
 from .attention_plan import flash_pair_head_dims_supported
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
 
@@ -72,8 +81,6 @@ LOG2E = 1.4426950408889634
 FLEX_OPERAND_ALIGN_BYTES = 16
 
 log = logging.getLogger(__name__)
-# Coordinates in region order: the placeholder names and the plan contract.
-FLEX_COORDS = ("b", "h", "q", "kv")
 _COORD_PLACEHOLDER_NAMES = {
     "score": "score",
     "b": "b_idx",
@@ -92,6 +99,7 @@ _COORD_PLACEHOLDER_SHAPES = {
 
 _aten = torch.ops.aten
 _prims = torch.ops.prims
+_MatchT = TypeVar("_MatchT")
 
 # Pointwise ``aten`` ops a region may contain (per element, IEEE order).
 _REGION_ATEN_TARGETS: frozenset[object] = frozenset(
@@ -230,6 +238,9 @@ class FlexMatch:
     o_name: str
     lse_name: str | None
     lse_log_base: str | None
+    # The optional store of the running row max beside the LSE (same
+    # ``[B, H, M]`` fp32 geometry; ``plan.row_max_scale`` its factor).
+    row_max_name: str | None
     batch: int
     heads: int
     kv_heads: int
@@ -323,32 +334,6 @@ class _Dep(NamedTuple):
 _CONST_DEP = _Dep(frozenset(), (0.0, 0.0))
 
 
-def _is_call(node: object, *targets: object) -> bool:
-    return (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target in targets
-    )
-
-
-def _strip_new_var(node: object) -> object:
-    from ...language._tracing_ops import _new_var
-
-    while _is_call(node, _new_var):
-        assert isinstance(node, torch.fx.Node)
-        node = node.args[0]
-    return node
-
-
-def _is_full_slice(value: object) -> bool:
-    return (
-        isinstance(value, slice)
-        and value.start is None
-        and value.stop is None
-        and value.step is None
-    )
-
-
 def _is_identity_view(node: object) -> bool:
     from ...language import view_ops
 
@@ -359,7 +344,7 @@ def _is_identity_view(node: object) -> bool:
     assert isinstance(node, torch.fx.Node)
     indices = node.args[1] if len(node.args) > 1 else None
     return isinstance(indices, (list, tuple)) and all(
-        index is None or _is_full_slice(index) for index in indices
+        index is None or is_full_slice(index) for index in indices
     )
 
 
@@ -372,16 +357,6 @@ def _strip_identity(node: object) -> object:
             node = node.args[0]
             continue
         return node
-
-
-def _host_tensor_name(node: object) -> str | None:
-    from ...language._tracing_ops import _host_tensor
-
-    if _is_call(node, _host_tensor):
-        assert isinstance(node, torch.fx.Node)
-        name = node.args[0] if node.args else None
-        return name if isinstance(name, str) else None
-    return None
 
 
 def _host_tensor_value(node: object) -> torch.Tensor | None:
@@ -491,30 +466,13 @@ def _int_literal(node: object) -> int | None:
 
 
 def _scalar_value(node: object) -> float | None:
-    """A python number or a 0-d constant tensor node (``scalar_tensor`` /
-    ``full([], c)``)."""
-    from ...language import creation_ops
-
-    if isinstance(node, bool):
-        return float(node)
-    if isinstance(node, (int, float)):
-        return float(node)
-    if _is_call(node, _aten.scalar_tensor.default):
-        assert isinstance(node, torch.fx.Node)
-        value = node.args[0] if node.args else None
-        return float(value) if isinstance(value, (int, float)) else None
-    if _is_call(node, _aten.full.default, creation_ops.full):
-        assert isinstance(node, torch.fx.Node)
-        if len(node.args) < 2 or node.args[0] not in ([], ()):
-            return None
-        value = node.args[1]
-        return float(value) if isinstance(value, (int, float)) else None
-    return None
+    """The flex literal acceptance: a python number, ``scalar_tensor`` or a
+    0-d constant tensor node (``full([], c)``)."""
+    return scalar_value(node, allow_full=True)
 
 
 def _is_neg_inf(node: object) -> bool:
-    value = _scalar_value(node)
-    return value is not None and value == float("-inf")
+    return is_neg_inf(node, allow_full=True)
 
 
 def _const_true(node: object) -> bool:
@@ -588,6 +546,9 @@ class _UnmappedRegionValue(Exception):
 
 class _Ctx:
     """Per-match state: the graph set, the parent map and the decline log."""
+
+    # Decline prefix of the envelope this context matches.
+    prefix = "flex"
 
     def __init__(
         self,
@@ -795,31 +756,50 @@ class _Ctx:
 
 
 class _OuterLoop(NamedTuple):
+    """One counted list walk: the ``_for_loop`` over a count-table load."""
+
     loop: torch.fx.Node
     graph_id: int
     block_id: int
     cnt_name: str
     cnt_value: torch.Tensor
     cnt_index: list[object]
-    q_block: int | None
+    # The block size the count table's last index divides the tile start by
+    # (``QB`` of ``m_begin // QB`` forward, ``KB`` of ``n_begin // KB``
+    # backward); None when that index is the literal 0.
+    table_block: int | None
 
 
 class _InnerLoop(NamedTuple):
+    """The data-dependent tile loop of one list body (over KV blocks in the
+    forward, Q blocks in the backward) with its index-table load."""
+
     loop: torch.fx.Node
     graph_id: int
     block_id: int
     idx_name: str
     idx_value: torch.Tensor
     idx_index: list[object]
-    kv_block: int
-    kv_len: int
+    block_size: int
+    axis_len: int
+
+
+class FlexOuterSpec(NamedTuple):
+    """The words of one envelope's list body for ``_match_outer_graph``: the
+    names of the inner loop's axis, block size and length (``KV``/``KB``/``N``
+    forward, ``Q``/``QB``/``M`` backward)."""
+
+    loop_word: str
+    block_word: str
+    len_word: str
+
+
+_FLEX_OUTER = FlexOuterSpec("KV", "KB", "N")
 
 
 class _Regions(NamedTuple):
-    score: torch.fx.Graph | None
-    score_output: torch.fx.Node | None
-    mask: torch.fx.Graph | None
-    mask_output: torch.fx.Node | None
+    score: FlexRegion | None
+    mask: FlexRegion | None
     aux: tuple[FlexAuxBuffer, ...]
     host_scalars: tuple[str, ...]
     score_key: tuple[object, ...] | None
@@ -845,6 +825,44 @@ class _Body(NamedTuple):
     role_placeholders: tuple[int, int, int]
 
 
+def flex_dense_plan(
+    *,
+    trivial: bool,
+    score_region: bool,
+    mask_region: bool,
+    scale_peeled: bool,
+    q_seq: int,
+    kv_seq: int,
+    head_dim: int,
+    head_dim_v: int,
+    contiguous_operands: bool,
+) -> bool:
+    """Whether a flex envelope is dense attention on the dense surface's
+    geometry (``AttentionScorePlan.flex_dense``).
+
+    The walk must be trivial (one KV block covering the sequence: the
+    tables are never read) with neither region (a constant-true mask
+    predicate and the identity ``score_mod``, the scale peeled), so every
+    query row attends every key; and the geometry must be the dense
+    surface's own -- equal Q and K/V lengths that are a multiple of the
+    128-row tile (the dense bodies have no ragged last tile), symmetric
+    head dims (the asymmetric pair is the plain fa4 body's alone) and
+    contiguous operands (the rank-3 TMA maps; strided operands take the
+    rank-4 maps of the flex body).  Anything else keeps the flex body,
+    which hosts it today: fail closed.
+    """
+    return (
+        trivial
+        and not score_region
+        and not mask_region
+        and scale_peeled
+        and q_seq == kv_seq
+        and q_seq % FLEX_KV_BLOCK == 0
+        and head_dim == head_dim_v
+        and contiguous_operands
+    )
+
+
 def single_tile_pair_walk_decline(match: FlexMatch) -> str | None:
     """Why the single-tile body's cooperative pair cannot host this flex
     envelope, or ``None``.
@@ -856,11 +874,15 @@ def single_tile_pair_walk_decline(match: FlexMatch) -> str | None:
     -- ragged lengths, grouped-query heads, the score region, the host
     words table's cursor walk (long KV lengths) and strided operands
     (rank-4 TMA maps) included; the trivial (table-less) walk and the
-    asymmetric widths still take the generic lowering.
+    asymmetric widths still take the generic lowering.  A dense flex plan
+    (``flex_dense``) walks nothing: it takes the dense surface's families at
+    every width the fused flash bodies host.
     """
     plan = match.plan
     walk = plan.kv_walk
     assert walk is not None
+    if plan.flex_dense:
+        return None
     if flash_pair_head_dims_supported(match.head_dim, match.head_dim_v):
         return None
     if match.head_dim != match.head_dim_v:
@@ -891,14 +913,40 @@ def match_flex_envelope(
     (``HELION_LOGS=+helion._compiler.cute.flex_match``). The result's node
     identities belong to ``graphs``; callers must not mix the two graph sets.
     """
-    logged = reasons is None and log.isEnabledFor(logging.DEBUG)
+    return _match_envelope_with_log(
+        _match_flex_envelope,
+        "flex forward envelope",
+        log,
+        graphs,
+        root_grid_ids,
+        env=env,
+        host_function=host_function,
+        reasons=reasons,
+    )
+
+
+def _match_envelope_with_log(
+    matcher: Callable[..., _MatchT | None],
+    label: str,
+    logger: logging.Logger,
+    graphs: Iterable[GraphInfo],
+    root_grid_ids: Sequence[int],
+    *,
+    env: CompileEnvironment,
+    host_function: HostFunction | None,
+    reasons: list[str] | None,
+) -> _MatchT | None:
+    """Run ``matcher`` (``_match_flex_envelope``, ``_match_flex_attention_bwd``)
+    over the graph set; without a ``reasons`` list its first decline is
+    logged at DEBUG level as ``"<label> declined: <reason>"``."""
+    logged = reasons is None and logger.isEnabledFor(logging.DEBUG)
     if logged:
         reasons = []
-    match = _match_flex_envelope(
+    match = matcher(
         graphs, root_grid_ids, env=env, host_function=host_function, reasons=reasons
     )
     if match is None and logged and reasons:
-        log.debug("flex forward envelope declined: %s", reasons[0])
+        logger.debug("%s declined: %s", label, reasons[0])
     return match
 
 
@@ -910,8 +958,6 @@ def _match_flex_envelope(
     host_function: HostFunction | None,
     reasons: list[str] | None,
 ) -> FlexMatch | None:
-    from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import RootGraphInfo
     from ..host_function import HostFunction
 
     if host_function is None:
@@ -922,29 +968,15 @@ def _match_flex_envelope(
             reasons.append("flex: the root grid must have three axes (b, h, m)")
         return None
     ctx = _Ctx(graphs, root_grid_ids, env, host_function, reasons)
-    roots = [info for info in graphs if isinstance(info, RootGraphInfo)]
-    if len(roots) != 1:
-        ctx.decline("flex: exactly one root graph")
+    root = _match_envelope_root(ctx, graphs, (ctx.b_id, ctx.h_id))
+    if root is None:
         return None
-    root = roots[0]
-    for block_id in (ctx.b_id, ctx.h_id):
-        if not _unit_fixed_block(env, block_id):
-            ctx.decline(f"flex: root axis {block_id} is not pinned to block size 1")
-            return None
-    for info in graphs:
-        if isinstance(info, ForLoopGraphInfo) and len(info.block_ids) != 1:
-            ctx.decline("flex: multi-dimensional device loop")
-            return None
-        if not isinstance(info, (ForLoopGraphInfo, RootGraphInfo)):
-            ctx.decline(f"flex: unsupported graph {type(info).__name__}")
-            return None
-
     outer_loops = _root_outer_loops(ctx, root)
     if outer_loops is None:
         return None
     nests: list[tuple[_OuterLoop, _InnerLoop, _Body]] = []
     for outer in outer_loops:
-        inner = _match_outer_graph(ctx, outer)
+        inner = _match_outer_graph(ctx, outer, _FLEX_OUTER)
         if inner is None:
             return None
         body = _match_inner_body(ctx, inner)
@@ -954,15 +986,32 @@ def _match_flex_envelope(
     return _assemble(ctx, root, nests)
 
 
-def _unit_fixed_block(env: CompileEnvironment, block_id: int) -> bool:
-    from ..compile_environment import FixedBlockSizeSource
+def _match_envelope_root(
+    ctx: _Ctx, graphs: Sequence[GraphInfo], pinned: Sequence[int]
+) -> GraphInfo | None:
+    """The checks both envelopes open with: exactly one root graph, the
+    ``pinned`` root axes at block size 1, every device loop one-dimensional
+    and no graph kind beyond the root and ``for`` loops. Returns the root."""
+    from ..device_ir import ForLoopGraphInfo
+    from ..device_ir import RootGraphInfo
 
-    source = env.block_sizes[block_id].block_size_source
-    return (
-        isinstance(source, FixedBlockSizeSource)
-        and isinstance(source.value, int)
-        and source.value == 1
-    )
+    prefix = ctx.prefix
+    roots = [info for info in graphs if isinstance(info, RootGraphInfo)]
+    if len(roots) != 1:
+        ctx.decline(f"{prefix}: exactly one root graph")
+        return None
+    for block_id in pinned:
+        if not _unit_fixed_block(ctx.env, block_id):
+            ctx.decline(f"{prefix}: root axis {block_id} is not pinned to block size 1")
+            return None
+    for info in graphs:
+        if isinstance(info, ForLoopGraphInfo) and len(info.block_ids) != 1:
+            ctx.decline(f"{prefix}: multi-dimensional device loop")
+            return None
+        if not isinstance(info, (ForLoopGraphInfo, RootGraphInfo)):
+            ctx.decline(f"{prefix}: unsupported graph {type(info).__name__}")
+            return None
+    return roots[0]
 
 
 def _root_outer_loops(ctx: _Ctx, root: GraphInfo) -> list[_OuterLoop] | None:
@@ -1074,10 +1123,13 @@ def _loop_targets() -> tuple[object, ...]:
     )
 
 
-def _match_outer_graph(ctx: _Ctx, outer: _OuterLoop) -> _InnerLoop | None:
+def _match_outer_graph(
+    ctx: _Ctx, outer: _OuterLoop, spec: FlexOuterSpec
+) -> _InnerLoop | None:
     """The outer list body: one inner ``_for_loop([start], [end])`` with
-    ``start = load(idx[b', h', row, tile_id]) * KB`` and
-    ``end = minimum(start + KB, full([], N))``; nothing else."""
+    ``start = load(idx[b', h', pos, tile_id]) * KB`` and
+    ``end = minimum(start + KB, full([], N))``; nothing else. ``spec`` names
+    the envelope's words (``KB``/``N`` forward, ``QB``/``M`` backward)."""
     from ...language import creation_ops
     from ...language import memory_ops
     from ...language import tile_ops
@@ -1088,6 +1140,8 @@ def _match_outer_graph(ctx: _Ctx, outer: _OuterLoop) -> _InnerLoop | None:
     from ...language._tracing_ops import _phi
     from ..device_ir import ForLoopGraphInfo
 
+    prefix = ctx.prefix
+    loop_word, block_word, len_word = spec
     allowed = (
         _new_var,
         _get_symnode,
@@ -1111,14 +1165,16 @@ def _match_outer_graph(ctx: _Ctx, outer: _OuterLoop) -> _InnerLoop | None:
         if node.op != "call_function":
             continue
         if node.target not in allowed:
-            ctx.decline(f"flex: list body has {node.target}")
+            ctx.decline(f"{prefix}: list body has {node.target}")
             return None
         if node.target is _for_loop:
             inner_loops.append(node)
         elif node.target is memory_ops.load:
             loads.append(node)
     if len(inner_loops) != 1 or len(loads) != 1:
-        ctx.decline("flex: the list body must hold one KV loop and one index load")
+        ctx.decline(
+            f"{prefix}: the list body must hold one {loop_word} loop and one index load"
+        )
         return None
     loop = inner_loops[0]
     graph_id, begins, ends = loop.args[0], loop.args[1], loop.args[2]
@@ -1129,23 +1185,23 @@ def _match_outer_graph(ctx: _Ctx, outer: _OuterLoop) -> _InnerLoop | None:
         or len(begins) != 1
         or len(ends) != 1
     ):
-        ctx.decline("flex: the KV loop must have one begin and one end")
+        ctx.decline(f"{prefix}: the {loop_word} loop must have one begin and one end")
         return None
     start, end = begins[0], ends[0]
     # start = load(idx[...]) * KB
     if not isinstance(start, torch.fx.Node) or not _is_call(start, _aten.mul.Tensor):
-        ctx.decline("flex: KV loop begin is not idx * KB")
+        ctx.decline(f"{prefix}: {loop_word} loop begin is not idx * {block_word}")
         return None
     if len(start.args) != 2:
-        ctx.decline("flex: KV loop begin is not idx * KB")
+        ctx.decline(f"{prefix}: {loop_word} loop begin is not idx * {block_word}")
         return None
-    load_arg, kb_arg = start.args
-    if _is_call(kb_arg, memory_ops.load):
-        load_arg, kb_arg = kb_arg, load_arg
-    if load_arg is not loads[0] or not isinstance(kb_arg, int) or kb_arg <= 0:
-        ctx.decline("flex: KB must be a specialized positive int")
+    load_arg, block_arg = start.args
+    if _is_call(block_arg, memory_ops.load):
+        load_arg, block_arg = block_arg, load_arg
+    if load_arg is not loads[0] or not isinstance(block_arg, int) or block_arg <= 0:
+        ctx.decline(f"{prefix}: {block_word} must be a specialized positive int")
         return None
-    kv_block = kb_arg
+    block_size = block_arg
     parts = _load_parts(load_arg)
     assert parts is not None
     tensor, indices = parts
@@ -1158,57 +1214,56 @@ def _match_outer_graph(ctx: _Ctx, outer: _OuterLoop) -> _InnerLoop | None:
         or value.dtype != torch.int32
         or len(indices) != 4
     ):
-        ctx.decline("flex: the index table must be a 4-D int32 tensor")
+        ctx.decline(f"{prefix}: the index table must be a 4-D int32 tensor")
         return None
     if not ctx.unit_axis_index(indices[3], outer.block_id):
-        ctx.decline("flex: the index table's last index is not the list position")
+        ctx.decline(f"{prefix}: the index table's last index is not the list position")
         return None
     # end = minimum(start + KB, full([], N))
+    end_form = (
+        f"{prefix}: {loop_word} loop end is not "
+        f"minimum(start + {block_word}, {len_word})"
+    )
     if not isinstance(end, torch.fx.Node) or not _is_call(end, _aten.minimum.default):
-        ctx.decline("flex: KV loop end is not minimum(start + KB, N)")
+        ctx.decline(end_form)
         return None
     if len(end.args) != 2:
-        ctx.decline("flex: KV loop end is not minimum(start + KB, N)")
+        ctx.decline(end_form)
         return None
-    sum_node, n_node = end.args
+    sum_node, len_node = end.args
     if _scalar_value(sum_node) is not None:
-        sum_node, n_node = n_node, sum_node
-    kv_len_value = _scalar_value(n_node)
+        sum_node, len_node = len_node, sum_node
+    len_value = _scalar_value(len_node)
     if (
         not _is_call(sum_node, _aten.add.Tensor)
-        or kv_len_value is None
-        or kv_len_value != int(kv_len_value)
+        or len_value is None
+        or len_value != int(len_value)
     ):
-        ctx.decline("flex: KV loop end is not minimum(start + KB, N)")
+        ctx.decline(end_form)
         return None
     assert isinstance(sum_node, torch.fx.Node)
     add_args = list(sum_node.args)
     if start not in add_args:
-        ctx.decline("flex: KV loop end does not add KB to the begin")
+        ctx.decline(
+            f"{prefix}: {loop_word} loop end does not add {block_word} to the begin"
+        )
         return None
     add_args.remove(start)
-    if add_args != [kv_block]:
-        ctx.decline("flex: KV loop end adds a different block size")
+    if add_args != [block_size]:
+        ctx.decline(f"{prefix}: {loop_word} loop end adds a different block size")
         return None
     info = ctx.graphs.get(graph_id)
     if not isinstance(info, ForLoopGraphInfo):
-        ctx.decline("flex: KV loop graph missing")
+        ctx.decline(f"{prefix}: {loop_word} loop graph missing")
         return None
     block_id = info.block_ids[0]
     if ctx.kv_id is None:
         ctx.kv_id = block_id
     elif ctx.kv_id != block_id:
-        ctx.decline("flex: the two KV loops use different block sizes")
+        ctx.decline(f"{prefix}: the two {loop_word} loops use different block sizes")
         return None
     return _InnerLoop(
-        loop,
-        graph_id,
-        block_id,
-        name,
-        value,
-        indices,
-        kv_block,
-        int(kv_len_value),
+        loop, graph_id, block_id, name, value, indices, block_size, int(len_value)
     )
 
 
@@ -1272,7 +1327,7 @@ def _match_inner_body(ctx: _Ctx, inner: _InnerLoop) -> _Body | None:
         or not ctx.unit_axis_index(q_indices[0], ctx.b_id)
         or not ctx.unit_axis_index(q_indices[1], ctx.h_id)
         or ctx.block_symnode_id(q_indices[2]) != ctx.m_id
-        or not _is_full_slice(q_indices[3])
+        or not is_full_slice(q_indices[3])
     ):
         ctx.decline("flex: the Q load is not query[b, h, tile_m, :]")
         return None
@@ -1447,7 +1502,7 @@ def _kv_load_facts(ctx: _Ctx, load: object) -> tuple[str, torch.Tensor, int] | N
         return None
     if ctx.kv_id is None or ctx.block_symnode_id(indices[2]) != ctx.kv_id:
         return None
-    if not _is_full_slice(indices[3]):
+    if not is_full_slice(indices[3]):
         return None
     return name, value, head.div
 
@@ -1613,10 +1668,9 @@ class _RegionBuilder:
     classifies the leaves and copies the nodes into a fresh FX graph with
     the canonical placeholder order."""
 
-    def __init__(self, ctx: _Ctx, inner: _InnerLoop, score_root: torch.fx.Node) -> None:
+    def __init__(self, ctx: _Ctx, graph_id: int, score_root: torch.fx.Node) -> None:
         self.ctx = ctx
-        self.inner = inner
-        self.graph_id = inner.graph_id
+        self.graph_id = graph_id
         self.score_root = score_root
         self.leaves: dict[torch.fx.Node, _Leaf] = {}
         self.aux_order: list[str] = []
@@ -1626,10 +1680,29 @@ class _RegionBuilder:
         self.host_scalar_nodes: dict[str, torch.fx.Node] = {}
         self.deps: dict[object, _Dep] = {}
         self.failed: str | None = None
+        # Collected regions by label: their nodes and output.
+        self.collected: dict[str, tuple[list[torch.fx.Node], torch.fx.Node]] = {}
 
     def fail(self, reason: str) -> None:
         if self.failed is None:
             self.failed = reason
+
+    def collect_region(self, label: str, output: object) -> bool:
+        """Collect the region feeding ``output`` under ``label``; on a
+        rejection the context gets the builder's reason and this is False."""
+        nodes = self.collect(output)
+        if nodes is None:
+            self.ctx.decline(
+                self.failed or f"{self.ctx.prefix}: {label} region rejected"
+            )
+            return False
+        assert isinstance(output, torch.fx.Node)
+        self.collected[label] = (nodes, output)
+        return True
+
+    def reads(self, kind: str) -> bool:
+        """Whether a classified leaf is of ``kind`` (``score``, ``grad``, ...)."""
+        return any(leaf.kind == kind for leaf in self.leaves.values())
 
     # -- classification ----------------------------------------------------
 
@@ -1888,9 +1961,9 @@ class _RegionBuilder:
             placeholder.meta["val"] = self.host_scalar_nodes[name].meta.get("val")
             placeholder.meta["flex_source_name"] = name
             placeholders[f"hs:{name}"] = placeholder
-        mapping: dict[torch.fx.Node, torch.fx.Node] = {}
+        mapping: dict[torch.fx.Node, Argument] = {}
 
-        def transform(node: torch.fx.Node) -> torch.fx.Node:
+        def transform(node: torch.fx.Node) -> Argument:
             if node in mapping:
                 return mapping[node]
             leaf = self.leaf_of(node)
@@ -1898,12 +1971,7 @@ class _RegionBuilder:
                 # Not a region value (a shape query the admission let through
                 # as metadata, say) used as one: decline, never render it.
                 raise _UnmappedRegionValue(node.name)
-            if leaf.kind == "score":
-                result = placeholders["score"]
-            elif leaf.kind == "coord":
-                result = placeholders[leaf.key]
-            else:
-                result = placeholders[f"hs:{leaf.key}"]
+            result = self._leaf_value(leaf, placeholders)
             mapping[node] = result
             return result
 
@@ -1950,11 +2018,85 @@ class _RegionBuilder:
                 copied.meta["flex_index_class"] = self.classify_load(node)
                 mapping[node] = copied
                 continue
-            mapping[node] = graph.node_copy(node, transform)
+            mapping[node] = self._copy_node(graph, node, transform)
         result = mapping[output] if output in mapping else transform(output)
+        assert isinstance(result, torch.fx.Node)
         graph.output(result)
         graph.lint()
         return graph, result
+
+    def _leaf_value(
+        self, leaf: _Leaf, placeholders: dict[str, torch.fx.Node]
+    ) -> Argument:
+        """The region graph's value for a leaf: its placeholder."""
+        if leaf.kind == "score":
+            return placeholders["score"]
+        if leaf.kind == "coord":
+            return placeholders[leaf.key]
+        return placeholders[f"hs:{leaf.key}"]
+
+    def _copy_node(
+        self,
+        graph: torch.fx.Graph,
+        node: torch.fx.Node,
+        transform: Callable[[torch.fx.Node], Argument],
+    ) -> Argument:
+        """Copy one pointwise node into the region graph."""
+        return graph.node_copy(node, transform)
+
+    def build_regions(self, score_node: torch.fx.Node) -> dict[str, FlexRegion] | None:
+        """Copy every collected region into its own graph once all leaves
+        are known (``score_node`` types the score placeholder); declines on a
+        value no leaf maps."""
+        coord_meta: dict[str, object] = {"score": score_node.meta.get("val")}
+        for node, leaf in self.leaves.items():
+            if leaf.kind == "coord" and leaf.key not in coord_meta:
+                coord_meta[leaf.key] = node.meta.get("val")
+        for key, shape in _COORD_PLACEHOLDER_SHAPES.items():
+            if key not in coord_meta:
+                # A coordinate no region reads still gets a typed placeholder
+                # (int32, tile-shaped like the kernel's broadcast vectors).
+                coord_meta[key] = torch.empty(
+                    shape, dtype=torch.int32, device=self.ctx.env.device
+                )
+        aux_order = list(self.aux_order)
+        host_scalars = list(self.host_scalars)
+        regions: dict[str, FlexRegion] = {}
+        try:
+            for label, (nodes, output) in self.collected.items():
+                regions[label] = FlexRegion(
+                    *self.build(nodes, output, aux_order, host_scalars, coord_meta)
+                )
+        except _UnmappedRegionValue as error:
+            self.ctx.decline(
+                f"{self.ctx.prefix}: region value {error} is not a score, "
+                "coordinate or scalar"
+            )
+            return None
+        return regions
+
+    def aux_buffers(self) -> tuple[FlexAuxBuffer, ...]:
+        """The lifted host tensors the regions load, in placeholder order."""
+        buffers: list[FlexAuxBuffer] = []
+        for name in self.aux_order:
+            value = _host_tensor_value(self.aux_nodes[name])
+            assert value is not None
+            classes = {self.classify_load(load) for load in self.aux_loads[name]}
+            index_class = classes.pop() if len(classes) == 1 else "general"
+            buffers.append(
+                FlexAuxBuffer(
+                    name=name,
+                    dtype=value.dtype,
+                    shape=tuple(int(size) for size in value.shape),
+                    strides=tuple(int(stride) for stride in value.stride()),
+                    index_class=index_class,
+                )
+            )
+        return tuple(buffers)
+
+    def load_nodes(self) -> frozenset[torch.fx.Node]:
+        """The body's ``hl.load`` nodes the regions captured."""
+        return frozenset(load for loads in self.aux_loads.values() for load in loads)
 
 
 def _region_key(graph: torch.fx.Graph) -> tuple[object, ...]:
@@ -1996,81 +2138,31 @@ def _capture_regions(
 ) -> _Regions | None:
     """Capture the score region (``score_src`` back to ``score_root``) and
     the mask region (``mask_pred`` back to the leaves) of one KV body."""
-    builder = _RegionBuilder(ctx, inner, score_root)
-    score_nodes: list[torch.fx.Node] | None = None
-    mask_nodes: list[torch.fx.Node] | None = None
+    builder = _RegionBuilder(ctx, inner.graph_id, score_root)
     if score_src is not None:
-        score_nodes = builder.collect(score_src)
-        if score_nodes is None:
-            ctx.decline(builder.failed or "flex: score region rejected")
+        if not builder.collect_region("score", score_src):
             return None
-        if not any(leaf.kind == "score" for leaf in builder.leaves.values()):
+        if not builder.reads("score"):
             ctx.decline("flex: the score region does not read the QK score")
             return None
-    if mask_pred is not None:
-        mask_nodes = builder.collect(mask_pred)
-        if mask_nodes is None:
-            ctx.decline(builder.failed or "flex: mask region rejected")
-            return None
+    if mask_pred is not None and not builder.collect_region("mask", mask_pred):
+        return None
     # Any leaf that is the QK dot itself while the scale was peeled means a
     # mask that reads the score; the peel would change its units.
-    if score_src is None and any(
-        leaf.kind == "score" for leaf in builder.leaves.values()
-    ):
+    if score_src is None and builder.reads("score"):
         ctx.decline("flex: the mask predicate reads the score")
         return None
-    coord_meta: dict[str, object] = {"score": qk_dot.meta.get("val")}
-    for node, leaf in builder.leaves.items():
-        if leaf.kind == "coord" and leaf.key not in coord_meta:
-            coord_meta[leaf.key] = node.meta.get("val")
-    for key, shape in _COORD_PLACEHOLDER_SHAPES.items():
-        if key not in coord_meta:
-            # A coordinate no region reads still gets a typed placeholder
-            # (int32, tile-shaped like the kernel's broadcast vectors).
-            coord_meta[key] = torch.empty(
-                shape, dtype=torch.int32, device=ctx.env.device
-            )
-    aux_order = list(builder.aux_order)
-    host_scalars = list(builder.host_scalars)
-    score_graph = score_output = mask_graph = mask_output = None
-    try:
-        if score_nodes is not None:
-            assert isinstance(score_src, torch.fx.Node)
-            score_graph, score_output = builder.build(
-                score_nodes, score_src, aux_order, host_scalars, coord_meta
-            )
-        if mask_nodes is not None:
-            assert isinstance(mask_pred, torch.fx.Node)
-            mask_graph, mask_output = builder.build(
-                mask_nodes, mask_pred, aux_order, host_scalars, coord_meta
-            )
-    except _UnmappedRegionValue as error:
-        ctx.decline(f"flex: region value {error} is not a score, coordinate or scalar")
+    regions = builder.build_regions(qk_dot)
+    if regions is None:
         return None
-    aux_buffers: list[FlexAuxBuffer] = []
-    for name in aux_order:
-        value = _host_tensor_value(builder.aux_nodes[name])
-        assert value is not None
-        classes = {builder.classify_load(load) for load in builder.aux_loads[name]}
-        index_class = classes.pop() if len(classes) == 1 else "general"
-        aux_buffers.append(
-            FlexAuxBuffer(
-                name=name,
-                dtype=value.dtype,
-                shape=tuple(int(size) for size in value.shape),
-                strides=tuple(int(stride) for stride in value.stride()),
-                index_class=index_class,
-            )
-        )
+    score = regions.get("score")
     return _Regions(
-        score_graph,
-        score_output,
-        mask_graph,
-        mask_output,
-        tuple(aux_buffers),
-        tuple(host_scalars),
-        None if score_graph is None else _region_key(score_graph),
-        frozenset(load for loads in builder.aux_loads.values() for load in loads),
+        score,
+        regions.get("mask"),
+        builder.aux_buffers(),
+        tuple(builder.host_scalars),
+        None if score is None else _region_key(score.graph),
+        builder.load_nodes(),
     )
 
 
@@ -2114,18 +2206,20 @@ def _assemble(
         ctx.decline("flex: the two bodies disagree on captured tables or scalars")
         return None
     if (
-        full_inner.kv_block != part_inner.kv_block
-        or full_inner.kv_len != part_inner.kv_len
+        full_inner.block_size != part_inner.block_size
+        or full_inner.axis_len != part_inner.axis_len
     ):
         ctx.decline("flex: the two walks disagree on KB or N")
         return None
     q_block = (
-        part_outer.q_block if part_outer.q_block is not None else full_outer.q_block
+        part_outer.table_block
+        if part_outer.table_block is not None
+        else full_outer.table_block
     )
     if (
-        full_outer.q_block is not None
-        and part_outer.q_block is not None
-        and full_outer.q_block != part_outer.q_block
+        full_outer.table_block is not None
+        and part_outer.table_block is not None
+        and full_outer.table_block != part_outer.table_block
     ):
         ctx.decline("flex: the two walks disagree on QB")
         return None
@@ -2177,10 +2271,10 @@ def _assemble(
     if batch <= 0 or heads <= 0 or q_seq <= 0 or kv_seq <= 0:
         ctx.decline("flex: empty tensors")
         return None
-    if full_inner.kv_len != kv_seq:
+    if full_inner.axis_len != kv_seq:
         ctx.decline("flex: the KV loop clamps to a length other than N")
         return None
-    kv_block = full_inner.kv_block
+    kv_block = full_inner.block_size
     trivial = kv_block >= kv_seq
     if q_block is None:
         if not trivial:
@@ -2243,10 +2337,12 @@ def _assemble(
         (batch, heads, q_seq),
         head_dim_v,
         io_dtype,
+        part_body.exp_base,
     )
     if epilogue is None:
         return None
-    o_name, o_strides, lse_name, lse_log_base = epilogue
+    o_name, o_strides, lse_name, lse_log_base = epilogue[:4]
+    row_max_name = epilogue.row_max_name
 
     # Closed world of host tensors.
     aux_names = tuple(buffer.name for buffer in part_body.regions.aux)
@@ -2254,6 +2350,8 @@ def _assemble(
     allowed.update(name for name, _, _ in tables)
     if lse_name is not None:
         allowed.add(lse_name)
+    if row_max_name is not None:
+        allowed.add(row_max_name)
     present: set[str] = set()
     for info in ctx.graphs.values():
         for node in info.graph.nodes:
@@ -2277,16 +2375,20 @@ def _assemble(
         qk_scale_log2 = scale_literal * multiplier
     else:
         qk_scale_log2 = multiplier
+    # ``_match_epilogue`` proved the stored units agree with the exp base.
     lse_scale = math.log(2.0) if lse_log_base == "log" else 1.0
+    # The stored row max is the kernel's ``m`` (times ``ln 2`` in its
+    # natural-log form): the log2-unit row max the fused body tracks
+    # (``row_max * qk_scale_log2``) for an ``exp2`` kernel, ``ln 2`` times it
+    # for an ``exp`` kernel (whose ``m`` is in natural units).
+    row_max_scale: float | None = None
+    if row_max_name is not None:
+        row_max_scale = (math.log(2.0) if part_body.exp_base == "exp" else 1.0) * (
+            math.log(2.0) if epilogue.row_max_log_base == "log" else 1.0
+        )
     regions = part_body.regions
-    score_region = (
-        None
-        if regions.score is None
-        else FlexRegion(regions.score, regions.score_output)  # pyrefly: ignore[bad-argument-type]
-    )
-    mask_region = (
-        None if regions.mask is None else FlexRegion(regions.mask, regions.mask_output)  # pyrefly: ignore[bad-argument-type]
-    )
+    score_region = regions.score
+    mask_region = regions.mask
     walk = FlexKvWalk(
         part_cnt_name=part_outer.cnt_name,
         part_idx_name=part_inner.idx_name,
@@ -2314,6 +2416,29 @@ def _assemble(
         host_scalars=regions.host_scalars,
         scale_arg=part_body.scale_symbol,
         scale_peeled=part_body.scale_peeled,
+        # The dense bodies store no row max: a row-max plan keeps the flex
+        # body, which hosts the dense geometry too.
+        flex_dense=row_max_name is None
+        and flex_dense_plan(
+            trivial=trivial,
+            score_region=score_region is not None,
+            mask_region=mask_region is not None,
+            scale_peeled=part_body.scale_peeled,
+            q_seq=q_seq,
+            kv_seq=kv_seq,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            contiguous_operands=all(
+                strides == contiguous_strides(shape)
+                for strides, shape in (
+                    (q_strides, (batch, heads, q_seq, head_dim)),
+                    (k_strides, (batch, kv_heads, kv_seq, head_dim)),
+                    (v_strides, (batch, kv_heads, kv_seq, head_dim_v)),
+                    (o_strides, (batch, heads, q_seq, head_dim_v)),
+                )
+            ),
+        ),
+        row_max_scale=row_max_scale,
     )
     match = FlexMatch(
         plan=plan,
@@ -2345,6 +2470,7 @@ def _assemble(
         o_name=o_name,
         lse_name=lse_name,
         lse_log_base=lse_log_base,
+        row_max_name=row_max_name,
         batch=batch,
         heads=heads,
         kv_heads=kv_heads,
@@ -2437,6 +2563,19 @@ def _phi_chain(
     return final[0], final[1], final[2]
 
 
+class _Epilogue(NamedTuple):
+    """The stores ``_match_epilogue`` proved: O, the optional LSE and the
+    optional row max (each row store with its log base, ``"log2"`` or
+    ``"log"``)."""
+
+    o_name: str
+    o_strides: tuple[int, ...]
+    lse_name: str | None
+    lse_log_base: str | None
+    row_max_name: str | None
+    row_max_log_base: str | None
+
+
 def _match_epilogue(
     ctx: _Ctx,
     root: GraphInfo,
@@ -2446,10 +2585,12 @@ def _match_epilogue(
     bhm: tuple[int, int, int],
     head_dim_v: int,
     io_dtype: torch.dtype,
-) -> tuple[str, tuple[int, ...], str | None, str | None] | None:
-    """``l_safe`` guard, ``acc / l_safe[:, None]`` -> O store and the
-    optional LSE store; returns ``(o_name, o_strides, lse_name,
-    lse_log_base)``."""
+    exp_base: str,
+) -> _Epilogue | None:
+    """``l_safe`` guard, ``acc / l_safe[:, None]`` -> O store, the optional
+    LSE store and the optional row-max store (the running max ``m`` itself,
+    FlexAttention's ``max_scores``, beside the LSE). ``exp_base`` is the
+    softmax's (``"exp2"`` or ``"exp"``), whose units ``m`` is in."""
     from ...language import memory_ops
 
     l_safe: torch.fx.Node = final_l
@@ -2479,6 +2620,8 @@ def _match_epilogue(
     o_strides: tuple[int, ...] = ()
     lse_name: str | None = None
     lse_log_base: str | None = None
+    row_max_name: str | None = None
+    row_max_log_base: str | None = None
     batch, heads, q_seq = bhm
     for store in stores:
         if len(store.args) < 3 or (len(store.args) > 3 and store.args[3] is not None):
@@ -2500,7 +2643,7 @@ def _match_epilogue(
             return None
         stored = _strip_identity(value)
         if host.ndim == 4:
-            if len(indices) != 4 or not _is_full_slice(indices[3]):
+            if len(indices) != 4 or not is_full_slice(indices[3]):
                 ctx.decline("flex: the O store needs a trailing full slice")
                 return None
             if _is_call(stored, _prims.convert_element_type.default):
@@ -2535,39 +2678,67 @@ def _match_epilogue(
             o_name, o_strides = name, strides
             continue
         if host.ndim == 3:
+            # A row store: the LSE or the running row max, both ``[B, H, M]``
+            # fp32 rows the fused epilogue stores from the final statistics.
             if len(indices) != 3:
-                ctx.decline("flex: the LSE store must index [b, h, tile_m]")
-                return None
-            base = _lse_log_base(stored, final_m, l_safe)
-            if base is None:
-                ctx.decline(
-                    "flex: the LSE value is not m + log2(l) (or its natural-log form)"
-                )
+                ctx.decline(f"flex: the row store to {name} must index [b, h, tile_m]")
                 return None
             if (
                 tuple(int(size) for size in host.shape) != (batch, heads, q_seq)
                 or host.dtype != torch.float32
                 or not host.is_contiguous()
-                or lse_name is not None
             ):
-                ctx.decline("flex: the LSE tensor geometry is wrong or duplicated")
+                ctx.decline(f"flex: the row tensor {name} geometry is wrong")
                 return None
-            lse_name, lse_log_base = name, base
-            continue
+            lse = _lse_log_base(stored, final_m, l_safe)
+            if lse is not None:
+                log, base = lse
+                # ``m`` is in the units of the softmax's exp base: a row-sum
+                # log in the other base mixes units, a value no one scale of
+                # the fused body's log2-unit LSE gives.
+                if log != ("log2" if exp_base == "exp2" else "log"):
+                    ctx.decline(
+                        f"flex: the LSE store to {name} adds {log}(l) to the "
+                        f"{exp_base} softmax's running max (mixed units)"
+                    )
+                    return None
+                if lse_name is not None:
+                    ctx.decline("flex: duplicated LSE store")
+                    return None
+                lse_name, lse_log_base = name, base
+                continue
+            base = _row_max_log_base(stored, final_m)
+            if base is not None:
+                if row_max_name is not None:
+                    ctx.decline("flex: duplicated row-max store")
+                    return None
+                row_max_name, row_max_log_base = name, base
+                continue
+            ctx.decline(
+                f"flex: the row store to {name} is neither the LSE (m + log2(l), "
+                "or its natural-log form) nor the row max m"
+            )
+            return None
         ctx.decline(f"flex: unexpected store to {name}")
         return None
     if o_name is None:
         ctx.decline("flex: no O store")
         return None
-    return o_name, o_strides, lse_name, lse_log_base
+    if row_max_name is not None and lse_name is None:
+        # The fused bodies store the row max beside the LSE, from the same
+        # final statistics and under the same row guards.
+        ctx.decline("flex: a row-max store needs the LSE store beside it")
+        return None
+    return _Epilogue(
+        o_name, o_strides, lse_name, lse_log_base, row_max_name, row_max_log_base
+    )
 
 
-def _lse_log_base(
-    value: object, final_m: torch.fx.Node, l_safe: torch.fx.Node
-) -> str | None:
-    """``"log2"`` for ``m + log2(l)``, ``"log"`` for ``(m + log2(l)) / log2e``,
-    ``(m + log2(l)) * ln2`` or ``m + log(l)``."""
-    natural = False
+def _peel_natural_log_factor(value: object) -> tuple[object, bool] | None:
+    """``(inner, natural)``: ``x / log2e`` and ``x * ln2`` (a base-2 value
+    converted to natural units) peel to ``(x, True)``, anything else is
+    ``(value, False)``; ``None`` for a division or multiplication by another
+    factor."""
     value = _strip_identity(value)
     if _is_call(value, _aten.div.Tensor) and isinstance(value, torch.fx.Node):
         factor = value.args[1]
@@ -2576,9 +2747,8 @@ def _lse_log_base(
             and math.isclose(factor, LOG2E, rel_tol=1e-6)
         ):
             return None
-        natural = True
-        value = _strip_identity(value.args[0])
-    elif _is_call(value, _aten.mul.Tensor) and isinstance(value, torch.fx.Node):
+        return _strip_identity(value.args[0]), True
+    if _is_call(value, _aten.mul.Tensor) and isinstance(value, torch.fx.Node):
         lhs, rhs = value.args[:2]
         factor = rhs if isinstance(lhs, torch.fx.Node) else lhs
         tensor = lhs if isinstance(lhs, torch.fx.Node) else rhs
@@ -2587,8 +2757,33 @@ def _lse_log_base(
             and math.isclose(factor, math.log(2.0), rel_tol=1e-6)
         ):
             return None
-        natural = True
-        value = _strip_identity(tensor)
+        return _strip_identity(tensor), True
+    return value, False
+
+
+def _row_max_log_base(value: object, final_m: torch.fx.Node) -> str | None:
+    """``"log2"`` for the running max ``m`` itself, ``"log"`` for ``m /
+    log2e`` or ``m * ln2``. Any of them is a plain multiple of ``m``, so
+    every exp base compiles: ``_assemble`` folds the base's units into
+    ``row_max_scale``."""
+    peeled = _peel_natural_log_factor(value)
+    if peeled is None or peeled[0] is not final_m:
+        return None
+    return "log" if peeled[1] else "log2"
+
+
+def _lse_log_base(
+    value: object, final_m: torch.fx.Node, l_safe: torch.fx.Node
+) -> tuple[str, str] | None:
+    """``(log, base)``: the log of the row sum (``"log2"`` or ``"log"``) and
+    the stored units, ``"log2"`` for ``m + log2(l)``, ``"log"`` for ``(m +
+    log2(l)) / log2e``, ``(m + log2(l)) * ln2`` or ``m + log(l)``. The units
+    hold when ``m`` is in the log's base; ``_match_epilogue`` checks that
+    against the softmax's exp base."""
+    peeled = _peel_natural_log_factor(value)
+    if peeled is None:
+        return None
+    value, natural = peeled
     if not (_is_call(value, _aten.add.Tensor) and isinstance(value, torch.fx.Node)):
         return None
     lhs, rhs = value.args[:2]
@@ -2601,8 +2796,8 @@ def _lse_log_base(
     if _strip_identity(log_node.args[0]) is not l_safe:
         return None
     if log_node.target is _aten.log.default:
-        return None if natural else "log"
-    return "log" if natural else "log2"
+        return None if natural else ("log", "log")
+    return ("log2", "log" if natural else "log2")
 
 
 def _root_graph_admitted(ctx: _Ctx, root: GraphInfo) -> bool:

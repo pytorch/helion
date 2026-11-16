@@ -8,11 +8,29 @@ from ...exc import InvalidConfig
 
 BLOCK_SCALED_CHOICES: dict[str, tuple[object, ...]] = {
     "cute_scaled_mma": (False, True),
-    "cute_scaled_tile_n": (256, 128),
+    # bn=128 with the 2-CTA pair (cute_scaled_cluster_m=2, the first cluster
+    # choice) is the default: it halves the B traffic per K step and wins the
+    # cold autotunes at 512^3 and 1024^3 against the 256-wide tile.
+    "cute_scaled_tile_n": (128, 256, 64),
     "cute_scaled_tile_k": (256, 128, 64),
     "cute_scaled_stages": (4, 2, 3, 5),
     "cute_scaled_cluster_m": (2, 1),
     "cute_scaled_persistent": (True, False),
+    # Preparation of a row-contiguous (transposed) packed operand: through a
+    # shared-memory tile with coalesced qword and scale stores, or one thread
+    # per (row, group) with coalesced byte loads (fewer phases; wins when the
+    # problem is a single small wave).
+    # ``fused``: no preparation kernel; the consumer reads the packed sides and
+    # swizzled scales directly (``block_scaled_fused``), falling back to the
+    # tiled preparation where the sources do not allow it.
+    "cute_scaled_prepare": ("tiled", "linear", "fused"),
+    # Rows of a tiled-preparation tile (``block_scaled_prepare.PREPARE_ROWS_CHOICES``).
+    "cute_scaled_prepare_rows": (32, 16),
+    # Columns per epilogue chunk of the NVFP4 consumer (TMEM load, convert,
+    # shared staging, store): 64 holds a whole 64-wide tile in one chunk, 32
+    # halves the register tile and pipelines two chunks (wins at
+    # 512x1024x512 and 1024x2048x1024, loses at 128x256x128).
+    "cute_scaled_epilogue_n": (64, 32),
 }
 MXFP8_CONFIG_KEYS = frozenset(
     {
@@ -47,6 +65,11 @@ def block_scaled_choices(*, mxfp8: bool = False) -> dict[str, tuple[object, ...]
         choices["cute_scaled_sf_tma"] = (False, True)
         choices["cute_scaled_sf_inplace"] = (False, True)
         choices["cute_scaled_epilogue_mode"] = tuple(MXFP8_EPILOGUE_MODES)
+        # The MXFP8 preparation has no tiled transpose and the MXFP8 epilogue
+        # modes own their widths: the two NVFP4 knobs collapse to one choice
+        # (no inert search dimension; ``normalize`` repairs / rejects others).
+        choices["cute_scaled_prepare_rows"] = (32,)
+        choices["cute_scaled_epilogue_n"] = (64,)
     return choices
 
 
@@ -181,6 +204,11 @@ def normalize_block_scaled_config(
             config["cute_scaled_mma"] = False
         else:
             raise InvalidConfig("native block scaling requires SM100-family hardware")
+    if mxfp8 and config["cute_scaled_prepare"] == "fused":
+        if fix_invalid:
+            config["cute_scaled_prepare"] = "tiled"
+        else:
+            raise InvalidConfig("the fused preparation applies to NVFP4 only")
     if mxfp8 and config["cute_scaled_tile_k"] == 64:
         if fix_invalid:
             config["cute_scaled_tile_k"] = 128

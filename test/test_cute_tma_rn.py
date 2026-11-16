@@ -14,7 +14,7 @@ from test.test_cute_flat_grouped_public import _native_source
 from test.test_cute_flat_grouped_public import _source
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
 from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
@@ -39,8 +39,11 @@ from helion._compiler.cute.tcgen05_tma_rn import CONVERSION_KEY
 from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
 from helion._compiler.cute.tcgen05_tma_rn import Tcgen05TmaRnRoles
+from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+pytestmark = pytest.mark.cpu_only
 
 
 def rn_config(bound, bk=32, wrapped=True):
@@ -309,6 +312,7 @@ def test_wrapper_rejects_policy_geometry_mismatch(field, value):
             _append_cute_wrapper_plan([], [], plan, num_sm=148)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("bk,stages", [(32, 6), (64, 3)])
 @pytest.mark.parametrize("operand", ["A", "B"])
 def test_actual_SDK_TMA_RN_format_and_all_stage_spans(bk, stages, operand):

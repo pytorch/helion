@@ -5,9 +5,6 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -15,6 +12,9 @@ from helion._testing import DEVICE
 from helion._testing import code_and_output
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -67,8 +67,8 @@ def _config(rows=1, threads=256, cluster=2, *, online=True, epilogue=True):
 def _program(kernel=row_logsumexp, *, rows=3, columns=32000, config=None):
     x = torch.empty((rows, columns), dtype=torch.bfloat16)
     arguments = (x, torch.empty_like(x)) if kernel is row_shifted_other else (x,)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, arguments)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, arguments)
         code = bound.to_code(config or _config())
     tree = ast.parse(code)
     device = next(
@@ -229,3 +229,25 @@ def test_warp_pair_and_owner_match_logsumexp(columns, dtype):
         actual, x.double().logsumexp(-1).float(), atol=1e-5, rtol=2e-5
     )
     assert "_cute_grouped_reduce_cluster_warp_online_pair(" in code
+
+
+@skipIfNotCUDA()
+@pytest.mark.cuda
+@skipUnlessBackends(["cute"])
+def test_register_row_matches_logsumexp():
+    """Each thread exponentiates its register slice of the row as one vector
+    with ``torch.exp``'s natural exp, and the warp pair rescales in that base."""
+    x = torch.randn((3, 32000), device=DEVICE, dtype=torch.bfloat16)
+    config = _config()
+    config.config.update(
+        reduction_loops=[16384],
+        cute_lane_layouts=["strided", "blocked"],
+        cute_register_row=True,
+        cute_warp_fp32_redux=True,
+    )
+    code, actual = code_and_output(row_logsumexp, (x,), **config.config)
+    torch.testing.assert_close(
+        actual, x.double().logsumexp(-1).float(), atol=1e-5, rtol=2e-5
+    )
+    assert "_register_exponents = cute.math.exp(" in code
+    assert "scale=None, fastmath=False" in code

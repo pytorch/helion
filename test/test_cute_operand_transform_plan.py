@@ -9,16 +9,17 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 import pytest
-import torch
-
-from test._cute_binding import _mock_cuda_unavailable
 
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandDescriptorPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformKind
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandTransformPlan
 from helion._compiler.cute.tcgen05_operand_transform import Tcgen05OperandType
 from helion._compiler.cute.tcgen05_operand_transform import prove_operand_stage_span
+from helion._testing import skipUnlessCuteAvailable
 from helion.runtime.cute.launcher import _cute_disk_cache_key
+
+# The SDK swizzle checks compile through the CuTe DSL on the host.
+pytestmark = pytest.mark.cpu_render(forbid_native=False)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,17 +28,6 @@ cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 ir = pytest.importorskip("cutlass._mlir.ir")
 sm100 = pytest.importorskip("cutlass.utils.blackwell_helpers")
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    with _mock_cuda_unavailable():
-
-        def forbidden(*args: object, **kwargs: object) -> None:
-            raise AssertionError("GPU forbidden in the operand plan proof")
-
-        monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
-        yield
 
 
 @pytest.fixture
@@ -92,6 +82,7 @@ def test_separate_operand_spans_and_barrier_units(context: None) -> None:
             replace(plan, converter_warps=unproved_count)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("stages", (1, 2, 3, 6))
 @pytest.mark.parametrize("rhs_k_major", (False, True))
 def test_actual_sdk_has_separate_dense_stage_proofs(
@@ -174,6 +165,7 @@ def _record_stage_addresses(
         output[linear] = cute.crd2idx((base_words + relative) * 4, addresses)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("stages", (1, 3, 6))
 @pytest.mark.parametrize(
     "operand,rhs_k_major",
@@ -289,6 +281,7 @@ def test_descriptor_policy_cannot_substitute_tma_rn(context: None) -> None:
         )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("operand", ("A", "B"))
 def test_actual_raw_tma_descriptor_preserves_tf32_compute_geometry(
     context: None, operand: str

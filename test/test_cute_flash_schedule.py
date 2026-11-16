@@ -17,6 +17,8 @@ from helion._compiler.cute.flash_schedule import build_fa4_schedule
 from helion._compiler.cute.flash_schedule import max_fa4_kv_depth
 from helion._compiler.cute.flash_schedule import verify_flash_schedule
 
+pytestmark = pytest.mark.cpu_only
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 

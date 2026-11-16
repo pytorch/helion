@@ -1,23 +1,24 @@
 from __future__ import annotations
 
 import ast
+import math
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from ._cute_aux import _config
-from ._cute_aux import _cpu_codegen
-from ._cute_aux import _rank_two_code
-from ._cute_aux import _rank_two_inputs
-from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
-from .test_cute_grouped_gemm_split_sizes import _selected_config
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from test._cute_grouped_gemm_split_sizes import _selected_config
+
 from .test_cute_scheduler_mailbox import _plain_matmul
-from helion import exc
 from helion._compiler.cute import tcgen05_constants
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import rank_two_code
+from helion._testing.cute_aux import rank_two_inputs
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _literal_int(node: ast.expr) -> int:
@@ -44,21 +45,47 @@ def _assert_full_empty_storage(code: str) -> dict[str, int]:
         ):
             continue
         allocations[node.targets[0].id] = _literal_int(node.value.args[1])
+    # The AB / accumulator pipelines' constructor follows the launch: a
+    # clustered kernel (its ``_helion_cute_cluster_shape`` attribute names a
+    # cluster of more than one CTA) builds them through the runtime's no-init
+    # constructors (``_tcgen05_prologue_runtime``), a one-CTA kernel through
+    # the DSL constructors; the other pipelines keep the DSL constructors.
+    cluster_shape = next(
+        (
+            ast.literal_eval(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and node.targets[0].attr == "_helion_cute_cluster_shape"
+        ),
+        (1, 1, 1),
+    )
+    clustered = math.prod(cluster_shape) > 1
+    ab_acc_constructors = (
+        {
+            "_helion_tc_pro.make_tma_umma_pipeline",
+            "_helion_tc_pro.make_umma_async_pipeline",
+        }
+        if clustered
+        else {
+            "cutlass.pipeline.PipelineTmaUmma.create",
+            "cutlass.pipeline.PipelineUmmaAsync.create",
+        }
+    )
+    accepted = ab_acc_constructors | {
+        f"cutlass.pipeline.{kind}.create"
+        for kind in ("PipelineAsync", "PipelineTmaAsync")
+    }
     pipelines = {}
+    seen_ab_acc = False
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         constructor = ast.unparse(node.func)
-        if constructor not in {
-            f"cutlass.pipeline.{kind}.create"
-            for kind in (
-                "PipelineTmaUmma",
-                "PipelineUmmaAsync",
-                "PipelineAsync",
-                "PipelineTmaAsync",
-            )
-        }:
+        if constructor not in accepted:
             continue
+        seen_ab_acc = seen_ab_acc or constructor in ab_acc_constructors
         kwargs = {keyword.arg: keyword.value for keyword in node.keywords}
         storage = kwargs["barrier_storage"]
         assert isinstance(storage, ast.Name)
@@ -70,6 +97,7 @@ def _assert_full_empty_storage(code: str) -> dict[str, int]:
         )
         pipelines[storage.id] = stages
     assert pipelines
+    assert seen_ab_acc, (clustered, sorted(pipelines))
     return pipelines
 
 
@@ -99,7 +127,7 @@ def test_ab_full_empty_allocation_all_stages_and_cta_groups(
         tcgen05_aux_load_mode="simt",
         tcgen05_warp_spec_c_input_warps=0,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _plain_matmul._bind_isolated(args).to_code(config)
     pipelines = _assert_full_empty_storage(code)
     assert pipelines["tcgen05_ab_pipeline_mbars"] == stages
@@ -121,7 +149,7 @@ def test_clc_full_empty_allocations(wait_mode: str, sched_stages: int) -> None:
         tcgen05_sched_stage_count=sched_stages,
         tcgen05_sched_consumer_wait_mode=wait_mode,
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _plain_matmul._bind_isolated(args).to_code(config)
     pipelines = _assert_full_empty_storage(code)
     assert pipelines["tcgen05_sched_pipeline_mbars"] == sched_stages
@@ -130,17 +158,9 @@ def test_clc_full_empty_allocations(wait_mode: str, sched_stages: int) -> None:
 
 @pytest.mark.parametrize("stages", [1, 2, 3])
 def test_auxiliary_full_empty_allocations(stages: int) -> None:
-    if stages == 3:
-        # Productive AUX currently excludes this depth independently of the
-        # AB storage correction. Preserve that public admission restriction.
-        with pytest.raises(exc.BackendUnsupported, match="incompatible"):
-            _rank_two_code(
-                _rank_two_inputs(),
-                _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),
-            )
-        return
-    code = _rank_two_code(
-        _rank_two_inputs(),
+    # Three 64-deep 128x128 stages (96 KiB) fit beside the producer's ring.
+    code = rank_two_code(
+        rank_two_inputs(),
         _config(block_sizes=[128, 128, 64], tcgen05_ab_stages=stages),
     )
     pipelines = _assert_full_empty_storage(code)
@@ -155,7 +175,7 @@ def test_grouped_full_empty_allocations(block_k: int) -> None:
         torch.empty((8, 224, 128), dtype=torch.bfloat16),
         torch.tensor((0, 1, 127, 224, 256, 449, 0, 991), dtype=torch.int32),
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _device_split_sizes_kernel._bind_isolated(args).to_code(
             _selected_config(block_k)
         )

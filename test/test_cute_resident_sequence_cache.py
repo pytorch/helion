@@ -14,6 +14,8 @@ from test.test_cute_resident_sequence import _Tensor
 
 from helion._compiler.cute.resident_sequence_cache import memory_key
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.mark.parametrize("coordinate", ["origin", "lane", "vector"])
 def test_cache_key_distinguishes_coordinates_from_real_boundary_names(

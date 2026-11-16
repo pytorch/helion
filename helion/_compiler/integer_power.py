@@ -10,7 +10,6 @@ from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
-from .. import exc
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .tile_strategy import DeviceLoopState
@@ -18,6 +17,7 @@ from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
+    from .backend import Backend
     from .device_function import DeviceFunction
 
 
@@ -30,15 +30,17 @@ class IntegerPowerOfTwo(sympy.Function):
 
 
 def lower_integer_powers(
-    expression: sympy.Expr, ranges: dict[sympy.Symbol, ValueRanges], *, backend: str
+    expression: sympy.Expr, ranges: dict[sympy.Symbol, ValueRanges], *, backend: Backend
 ) -> sympy.Expr:
     """Lower only powers whose entire integer result range is representable.
 
     PowByNatural is integer shape arithmetic, not floating exponentiation.
     A constant power-of-two base admits an exact shift when its effective
-    exponent lies in [0, 62]. CuTe requires this proof for scalar integer
-    powers; other backends keep their existing printer for unproved powers.
+    exponent lies in [0, 62]. A backend with ``requires_proved_integer_powers``
+    refuses an unproved scalar integer power; the others keep their existing
+    printer for it.
     """
+    require_proof = backend.requires_proved_integer_powers
     replacements: dict[sympy.Basic, sympy.Basic] = {}
     for power in sympy.postorder_traversal(expression):
         if not isinstance(power, PowByNatural):
@@ -52,16 +54,15 @@ def lower_integer_powers(
             or base <= 0
             or int(base).bit_count() != 1
         ):
-            if backend == "cute":
-                raise exc.BackendUnsupported(backend, "unproved scalar integer power")
+            if require_proof:
+                raise backend.unsupported("unproved scalar integer power")
             continue
         shift = sympy.Mul(sympy.Integer(int(base).bit_length() - 1), exponent)
         bounds = bound_sympy(shift, ranges)
         if not (bounds.lower >= 0 and bounds.upper <= 62):
-            if backend == "cute":
-                raise exc.BackendUnsupported(
-                    backend,
-                    "scalar integer power requires a proved exponent in [0, 62]",
+            if require_proof:
+                raise backend.unsupported(
+                    "scalar integer power requires a proved exponent in [0, 62]"
                 )
             continue
         replacements[power] = cast(
@@ -117,4 +118,4 @@ def prepare_integer_powers(
         else:
             continue
         ranges[symbol] = ranges.get(symbol, ValueRanges.unknown_int()) & interval
-    return lower_integer_powers(expression, ranges, backend=env.backend.name)
+    return lower_integer_powers(expression, ranges, backend=env.backend)

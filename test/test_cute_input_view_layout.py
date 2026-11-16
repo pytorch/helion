@@ -8,13 +8,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.cute.input_view_layout import input_view_copy_facts
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 from helion.language import memory_ops
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
@@ -172,7 +173,7 @@ def _assert_mutated_view(x: torch.Tensor) -> torch.Tensor:
 )
 @skipUnlessBackends(["cute"])
 def test_host_view_origin_and_effects_are_checked(kernel: Kernel[torch.Tensor]) -> None:
-    bound = _cpu_bind(kernel, (torch.empty((3, 4)),))
+    bound = cpu_bind(kernel, (torch.empty((3, 4)),))
     host = bound.host_function
     assert host is not None
     source = next(

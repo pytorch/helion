@@ -246,3 +246,12 @@ class TileIRChunkReductionHeuristic(AutotunerHeuristic):
         spec = env.config_spec
         sizes = _block_sizes(spec, {spec.block_sizes[0].block_id: cls.CHUNK_TILE})
         return _seed(spec, sizes, stages=2)
+
+
+# Ranked registry (``TileIRBackend.autotuner_heuristics``).
+TILEIR_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
+    TileIRMatmulSeedHeuristic,
+    TileIRRowReductionHeuristic,
+    TileIRSmallReductionHeuristic,
+    TileIRChunkReductionHeuristic,
+)

@@ -230,6 +230,16 @@ class _IndexEvaluator:
             if not np.all(np.asarray(right) != 0):
                 return None
             return left // right if isinstance(node.op, ast.FloorDiv) else left % right
+        if isinstance(node.op, (ast.RShift, ast.LShift, ast.BitAnd)):
+            # The tcgen05 persistent pid decomposition divides non-negative
+            # pids by power-of-two counts with shifts and masks
+            # (``tcgen05_prologue``); on non-negative integers these equal the
+            # floor forms above.
+            if isinstance(node.op, ast.BitAnd):
+                return left & right
+            if not np.all(np.asarray(right) >= 0):
+                return None
+            return left >> right if isinstance(node.op, ast.RShift) else left << right
         return None
 
 

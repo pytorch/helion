@@ -10,32 +10,20 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_host_paired_sum import _config
 from test.test_cute_host_paired_sum import _literal
 from test.test_cute_host_paired_sum_seeds import _population
 
 import helion
-from helion._compiler.cute.host_paired_sum import PAIRED_SUM_KEY
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.host_sum_site import PAIRED_SUM_KEY
+from helion._testing.cute_codegen import cpu_bind
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -110,7 +98,7 @@ def test_helper_name_collisions_decline_before_search_and_execute_original_host(
         torch.arange(17 * 20, dtype=torch.float32).view(17, 20),
         -torch.arange(17 * 20, dtype=torch.float32).view(17, 20),
     )
-    bound = _cpu_bind(kernel, values)
+    bound = cpu_bind(kernel, values)
     assert not bound.config_spec.cute_host_paired_sum_available
     population = _population(bound, values)
     assert all(PAIRED_SUM_KEY not in config for config in population)
@@ -184,7 +172,7 @@ def test_helper_name_collisions_decline_before_search_and_execute_original_host(
 
 def test_no_collision_retains_typed_choice_and_initial_population() -> None:
     values = (torch.ones(17, 20), torch.ones(17, 20))
-    bound = _cpu_bind(_literal, values)
+    bound = cpu_bind(_literal, values)
     assert bound.config_spec.cute_host_paired_sum_available
     first = _population(bound, values)[:5]
     assert {config[PAIRED_SUM_KEY] for config in first} == {

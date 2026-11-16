@@ -153,6 +153,47 @@ def red_add_f32_vec(ptr: object, vals: list) -> None:
     )
 
 
+def _red_add_half_vec(ptr: object, vals: list, dtype: object, suffix: str) -> None:
+    width = len(vals)
+    assert width in (2, 4, 8), width
+    i16 = ir.IntegerType.get_signless(16)
+    halves = [arith.bitcast(i16, dtype(v).ir_value()) for v in vals]  # pyrefly: ignore
+    words = width // 2
+    pack = " ".join(
+        f"mov.b32 w{i}, {{${2 * i + 1}, ${2 * i + 2}}};" for i in range(words)
+    )
+    regs = ", ".join(f"w{i}" for i in range(words))
+    vector = "" if words == 1 else f".v{words}"
+    operand = regs if words == 1 else f"{{{regs}}}"
+    llvm.inline_asm(
+        None,
+        [ptr, *halves],
+        f"{{ .reg .b32 {regs}; {pack} "
+        f"red.global.add.noftz{vector}.{suffix} [$0], {operand}; }}",
+        ",".join(["l", *(["h"] * width)]),
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+def red_add_f16_vec(ptr: object, vals: list) -> None:
+    """``red_add_f32_vec`` for ``cutlass.Float16`` lanes: one
+    ``red.global.add.noftz{.v2,.v4}.f16x2`` of 2 / 4 / 8 consecutive halves
+    at ``ptr`` (4-, 8- or 16-byte aligned).  Each half is added with the
+    same ``noftz`` fp16 arithmetic as the scalar ``atom.add.noftz.f16``, so
+    the per-element result is the one the scalar atomic produces; on sm_100
+    ptxas lowers the scalar form to a compare-and-swap loop, this one to a
+    native ``REDG.E.ADD.F16``.  The ``.v2`` / ``.v4`` forms need sm_90."""
+    _red_add_half_vec(ptr, vals, cutlass.Float16, "f16x2")
+
+
+def red_add_bf16_vec(ptr: object, vals: list) -> None:
+    """``red_add_f16_vec`` for ``cutlass.BFloat16`` lanes
+    (``red.global.add.noftz{.v2,.v4}.bf16x2``, sm_90+)."""
+    _red_add_half_vec(ptr, vals, cutlass.BFloat16, "bf16x2")
+
+
 def signed_bitfield_to_bf16_packed(
     packet: object, bit_offset: int, bit_width: int, lanes: int
 ) -> list:

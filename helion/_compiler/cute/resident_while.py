@@ -23,6 +23,9 @@ from ...language import creation_ops
 from ...language import inline_asm_ops
 from ...language import memory_ops
 from ...language import scan_ops
+from ..compile_environment import CompileEnvironment
+from ..device_function import DeviceFunction
+from ..device_function import NoCurrentFunction
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import GraphInfo
 from ..device_ir import RootGraphInfo
@@ -30,6 +33,8 @@ from ..device_ir import WhileConditionGraphInfo
 from ..device_ir import WhileLoopGraphInfo
 from ..inductor_lowering import SympyExprLowering
 from .bounded_gather import inline_asm_shape
+from .state import cute_codegen_state
+from .state import cute_env_state
 from .uniform_control import _carry_map
 from .uniform_control import _outputs
 from .uniform_control import _require
@@ -38,7 +43,6 @@ from .uniform_control import _signature
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from ..compile_environment import CompileEnvironment
     from .gather_domains import GatherDomainFacts
     from .uniform_region_tree import UniformRegionFrame
 
@@ -402,7 +406,70 @@ def _legacy_resident_while_plan(
     )
 
 
+# The memo of ``resident_while_plan``: ``(id(call), ids of graphs) -> (call,
+# graphs, plan or refusal message)``.  The entry keeps the call and the graphs
+# alive so their ids cannot be reused by later nodes within the memo's
+# lifetime.  A refusal is kept as its message, never as the raised exception:
+# an exception object accumulates the traceback frames of every raise, and
+# those frames reach the compile environment through the callers' locals.
+ResidentWhileMemo = dict[
+    tuple[int, tuple[int, ...]],
+    tuple[Node, tuple[GraphInfo, ...], ResidentWhilePlan | str],
+]
+
+
+def _plan_memo() -> ResidentWhileMemo | None:
+    """The memo a plan lives in: the state of whatever owns the graphs.
+
+    Inside a code generation pass (a ``DeviceFunction`` is current) the graphs
+    are that pass's copies -- ``DeviceIR.build_codegen_graphs`` copies every
+    ``GraphInfo`` per config, and reduction rolling, epilogue subtiling, poll
+    hoisting and the backend's IR passes edit only the copies -- so the memo
+    lives on the pass (``CuteCodegenState``) and dies with it.  Outside a
+    pass but inside a compile environment (the binding-time heuristics, the
+    seeds, the per-config validation) the graphs are the traced ones, final
+    once the device IR is lowered and alive as long as the environment, so
+    the memo lives on the environment (``CuteEnvState``).  Outside a compile
+    environment nothing is cached: the structural tests mutate a graph in
+    place and re-plan the same call.
+    """
+    try:
+        codegen = DeviceFunction.current().codegen
+    except NoCurrentFunction:
+        if CompileEnvironment.has_current():
+            return cute_env_state(CompileEnvironment.current()).resident_while_plans
+        return None
+    return cute_codegen_state(codegen).resident_while_plans
+
+
 def resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
+    """The plan of one while call, memoized for the graphs' lifetime.
+
+    The fragment compiler, the bounded-gather admission, the local-atomic and
+    register-snapshot proofs and the register-snapshot heuristic all plan the
+    same call over the same graphs; the plan depends on nothing but the two,
+    so each memo (``_plan_memo``) computes it, or its refusal, once.  A
+    memoized refusal raises a fresh ``InvalidConfig`` per lookup.
+    """
+    memo = _plan_memo()
+    if memo is None:
+        return _resident_while_plan(call, graphs)
+    key = (id(call), tuple(id(info) for info in graphs))
+    entry = memo.get(key)
+    if entry is None:
+        result: ResidentWhilePlan | str
+        try:
+            result = _resident_while_plan(call, graphs)
+        except exc.InvalidConfig as error:
+            result = str(error)[: error.base_msg_len]
+        entry = memo[key] = (call, tuple(graphs), result)
+    if isinstance(entry[2], str):
+        raise exc.InvalidConfig(entry[2])
+    return entry[2]
+
+
+def _resident_while_plan(call: Node, graphs: Sequence[GraphInfo]) -> ResidentWhilePlan:
+    """Run the legacy planner, then the region-tree planner on ``InvalidConfig``."""
     try:
         return _legacy_resident_while_plan(call, graphs)
     except exc.InvalidConfig as legacy_error:
@@ -467,7 +534,7 @@ def resident_while_domain_facts(
     captures with a closed index recipe may retain their entry interval.
     """
     from .bounded_gather import integer_bounds
-    from .computed_fragment import _fragment_logical_shape
+    from .fragment_context import _fragment_logical_shape
     from .gather_domains import GatherDomainFacts
     from .gather_domains import _readonly_index_recipe
     from .register_loads import host_load_is_readonly

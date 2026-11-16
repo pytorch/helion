@@ -7,9 +7,6 @@ from test.test_cute_lowerings import _make_tcgen05_persistent_config
 from test.test_cute_scalar_staging_sync import _native_matmul
 
 from helion._compiler.cute.mma_support import get_cute_mma_support
-from helion._testing import skipUnlessBackends
-
-pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
 

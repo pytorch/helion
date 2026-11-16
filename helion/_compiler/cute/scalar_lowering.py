@@ -1,4 +1,12 @@
-"""Reuse invariant Inductor handlers within one CuTe register program."""
+"""Scalar pointwise lowering shared by the CuTe register, fragment and epilogue emitters.
+
+Every register-resident emitter re-enters Inductor's pointwise codegen one
+scalar at a time, supplying its own operand ASTs: ``scalar_lowering_context``
+builds the ``LoweringContext`` those calls read and ``lower_pointwise_scalar``
+runs one node through it, returning the lowering's raw result for the caller
+to validate and cast.  ``ScalarLoweringContextCache`` reuses the invariant
+Inductor graph / kernel handlers within one register program.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +14,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING
+from typing import cast
 
 import sympy
 from torch._inductor.codegen.simd import SIMDKernelFeatures
@@ -19,12 +28,54 @@ from ..inductor_lowering import _patched_inductor_config
 if TYPE_CHECKING:
     import ast
     from collections.abc import Iterator
+    from collections.abc import Mapping
 
     from torch.fx import Graph
     from torch.fx import Node
+    from torch.fx.node import Argument
 
+    from ..aten_lowering import LoweringContext
     from ..generate_ast import GenerateAST
+    from ..helper_function import CodegenInterface
     from ..inductor_lowering import PointwiseLowering
+
+
+def scalar_lowering_context(
+    cg: CodegenInterface, env: Mapping[Node, object]
+) -> LoweringContext:
+    """A ``LoweringContext`` over *cg* whose fx environment is *env*.
+
+    The scalar emitters lower one node with explicitly supplied operand
+    ASTs instead of the device function's environment; this is the context
+    Inductor's ``codegen_from_input_asts`` / ``codegen`` read.
+    """
+    from ..aten_lowering import LoweringContext
+
+    ctx = LoweringContext.__new__(LoweringContext)
+    ctx.cg = cg
+    ctx.env = cast("dict[Node, Argument]", env)
+    return ctx
+
+
+def lower_pointwise_scalar(
+    cg: GenerateAST,
+    node: Node,
+    lowering: PointwiseLowering,
+    input_asts: list[ast.AST],
+    *,
+    env: Mapping[Node, object],
+    statements: list[ast.AST],
+) -> object:
+    """Run Inductor's pointwise codegen for *node* over *input_asts*.
+
+    The statements the lowering emits are collected into *statements*.  The
+    RAW result is returned: each caller decides what a non-AST result means
+    (a decline, an unsupported error) and whether to cast it to the node's
+    dtype.
+    """
+    ctx = scalar_lowering_context(cg, env)
+    with cg.set_statements(statements), V.set_current_node(node):
+        return lowering.codegen_from_input_asts(ctx, node, input_asts)
 
 
 @dataclass

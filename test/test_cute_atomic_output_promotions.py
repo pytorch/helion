@@ -8,22 +8,43 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
 from helion._compiler.cute.atomic_output_promotions import fresh_half_atomic_outputs
+from helion._compiler.cute.state import cute_env_state
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
 
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
+
 CUDA_DEVICE = "cuda"
+
+
+@pytest.fixture(autouse=True)
+def _promotion_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the fp32 promotion; pin it on for the module's
+    kernels (the Setting defaults to accumulating in the half storage)."""
+    for kernel in (
+        _partitioned_matmul,
+        _unhashable_host_factory_output,
+        _atomic_into_argument,
+        matmul_split_k,
+    ):
+        monkeypatch.setattr(
+            kernel,
+            "settings",
+            kernel.settings.copy(cute_promote_half_atomic_outputs=True),
+        )
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,27 +92,6 @@ def test_output_promotion_requires_single_fresh_factory_binding(
     assert result == ({"out": torch.float16} if accepted else {})
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _aliased_output_matmul(
-    a: torch.Tensor, b: torch.Tensor, broadcast: bool
-) -> torch.Tensor:
-    m, k = a.shape
-    n = b.size(1)
-    out = torch.zeros((m, n), dtype=a.dtype, device=a.device)
-    alias = out[:1, :].expand(m, n) if broadcast else out.view(m, n)
-    for row, column in hl.tile([m, n]):
-        acc = hl.zeros([row, column], dtype=torch.float32)
-        for reduction in hl.tile(k):
-            acc = torch.addmm(acc, a[row, reduction], b[reduction, column])
-        previous = alias[row, column]
-        hl.atomic_add(out, [row, column], acc + previous, sem="relaxed")
-    return out
-
-
-def _metadata_receiver(method: Any) -> torch.Tensor:
-    return method.__self__
-
-
 @dataclass
 class _HostFactory:
     def __call__(self, value: torch.Tensor) -> torch.Tensor:
@@ -106,24 +106,6 @@ def _unhashable_host_factory_output(a: torch.Tensor) -> torch.Tensor:
     out = _host_factory(a)
     for index in hl.tile(a.numel()):
         hl.atomic_add(out, [index], a[index], sem="relaxed")
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _metadata_alias_output_matmul(
-    a: torch.Tensor, b: torch.Tensor, broadcast: bool
-) -> torch.Tensor:
-    m, k = a.shape
-    n = b.size(1)
-    out = torch.zeros((m, n), dtype=a.dtype, device=a.device)
-    receiver = _metadata_receiver(out.size)
-    alias = receiver[:1, :].expand(m, n) if broadcast else receiver.view(m, n)
-    for row, column in hl.tile([m, n]):
-        acc = hl.zeros([row, column], dtype=torch.float32)
-        for reduction in hl.tile(k):
-            acc = torch.addmm(acc, a[row, reduction], b[reduction, column])
-        previous = alias[row, column]
-        hl.atomic_add(out, [row, column], acc + previous, sem="relaxed")
     return out
 
 
@@ -157,28 +139,10 @@ def _assert_fp32_atomic_output(code: str, input_name: str) -> None:
 
 @skipUnlessBackends(["cute"])
 def test_unhashable_host_callable_is_not_a_proven_fresh_factory() -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _unhashable_host_factory_output, (torch.empty(32, dtype=torch.float16),)
     )
-    assert not bound.env.cute_half_atomic_output_promotions
-
-
-@pytest.mark.parametrize("collective", [False, True])
-@pytest.mark.parametrize("broadcast", [False, True])
-@pytest.mark.parametrize("metadata_alias", [False, True])
-@skipUnlessBackends(["cute"])
-def test_output_storage_aliases_preserve_requested_half_atomics(
-    collective: bool, broadcast: bool, metadata_alias: bool
-) -> None:
-    kernel = _metadata_alias_output_matmul if metadata_alias else _aliased_output_matmul
-    bound = _cpu_bind(kernel, (*_inputs(), broadcast))
-    assert not bound.env.cute_half_atomic_output_promotions
-    config = _config(collective=collective).config.copy()
-    config.pop("partitions")
-    code = bound.to_code(helion.Config.from_dict(config))
-    assert "dtype=a.dtype, device=a.device" in code
-    assert "val=cutlass.Float16(" in code
-    assert "return out.to(torch.float16)" not in code
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -194,8 +158,8 @@ def test_argument_atomic_destination_keeps_its_requested_dtype(
     dtype: torch.dtype,
 ) -> None:
     args = (torch.empty(32, dtype=dtype), torch.empty(32, dtype=torch.float32))
-    bound = _cpu_bind(_atomic_into_argument, args)
-    assert not bound.env.cute_half_atomic_output_promotions
+    bound = cpu_bind(_atomic_into_argument, args)
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     code = bound.to_code(helion.Config(block_sizes=[32], num_threads=[32]))
     name = "Float16" if dtype == torch.float16 else "Float32"
     assert f"val=cutlass.{name}(" in code
@@ -208,8 +172,10 @@ def test_argument_atomic_destination_keeps_its_requested_dtype(
 def test_all_accumulation_schedules_keep_fp32_storage_and_the_final_cast(
     collective: bool,
 ) -> None:
-    bound = _cpu_bind(_partitioned_matmul, _inputs())
-    assert bound.env.cute_half_atomic_output_promotions == {"out": torch.float16}
+    bound = cpu_bind(_partitioned_matmul, _inputs())
+    assert cute_env_state(bound.env).half_atomic_output_promotions == {
+        "out": torch.float16
+    }
     config = _config(collective=collective)
     code = bound.to_code(config)
     _assert_fp32_atomic_output(code, "a")
@@ -228,7 +194,7 @@ def test_all_accumulation_schedules_keep_fp32_storage_and_the_final_cast(
 def test_retired_accumulation_override_is_not_a_valid_config(
     collective: bool, value: object
 ) -> None:
-    bound = _cpu_bind(_partitioned_matmul, _inputs())
+    bound = cpu_bind(_partitioned_matmul, _inputs())
     config = _config(collective=collective).config | {"cute_native_half_atomics": value}
     with pytest.raises(
         InvalidConfig, match="Invalid config keys.*cute_native_half_atomics"
@@ -239,8 +205,8 @@ def test_retired_accumulation_override_is_not_a_valid_config(
 @pytest.mark.parametrize("collective", [False, True])
 @skipUnlessBackends(["cute"])
 def test_nonpromoted_output_dtype_remains_unchanged(collective: bool) -> None:
-    bound = _cpu_bind(_partitioned_matmul, _inputs(torch.bfloat16))
-    assert not bound.env.cute_half_atomic_output_promotions
+    bound = cpu_bind(_partitioned_matmul, _inputs(torch.bfloat16))
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
     code = bound.to_code(_config(collective=collective))
     assert "val=cutlass.BFloat16(" in code
     assert "dtype=a.dtype, device=a.device" in code
@@ -261,11 +227,12 @@ def test_original_conditional_epilogue_keeps_fp32_output(
         backend="cute",
         static_shapes=static_shapes,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     a, b = _inputs()
     bias = torch.empty(b.size(1), dtype=a.dtype)
     inputs = (a, b, lambda acc, tile: acc + bias[tile[1]]) if with_bias else (a, b)
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     options = _config(collective=collective, compute=compute).config.copy()
     options["split_k"] = options.pop("partitions")
     _assert_fp32_atomic_output(bound.to_code(helion.Config.from_dict(options)), "x")
@@ -273,7 +240,7 @@ def test_original_conditional_epilogue_keeps_fp32_output(
 
 @skipUnlessBackends(["cute"])
 def test_search_and_chunk_seeds_cannot_restore_half_accumulation() -> None:
-    bound = _cpu_bind(_partitioned_matmul, _inputs())
+    bound = cpu_bind(_partitioned_matmul, _inputs())
     with bound.env:
         assert "cute_native_half_atomics" not in bound.config_spec._flat_fields()
         generation = ConfigGeneration(bound.config_spec)
@@ -300,7 +267,7 @@ def test_generated_host_resets_fp32_destination_and_casts_once(
     collective: bool, compute: str
 ) -> None:
     inputs = _inputs()
-    bound = _cpu_bind(_partitioned_matmul, inputs)
+    bound = cpu_bind(_partitioned_matmul, inputs)
     code = bound.to_code(_config(collective=collective, compute=compute))
     module = ast.parse(code)
     host = next(
@@ -399,6 +366,7 @@ def test_fp32_atomic_original_example_and_poisoned_graph_reset(
         backend="cute",
         static_shapes=False,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     inputs = (a, b, lambda acc, tile: acc + bias[tile[1]]) if with_bias else (a, b)
     bound = kernel._bind_isolated(inputs)
@@ -457,3 +425,29 @@ def test_fp32_atomic_original_example_and_poisoned_graph_reset(
         result, scratch = replay()
         torch.testing.assert_close(result, torch.zeros_like(result), rtol=0, atol=0)
         torch.testing.assert_close(scratch, torch.zeros_like(scratch), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("collective", [False, True])
+@skipUnlessBackends(["cute"])
+def test_promotion_setting_off_keeps_the_requested_half_storage(
+    collective: bool,
+) -> None:
+    """``cute_promote_half_atomic_outputs=False``: the fresh float16 output is
+    neither widened nor cast back; every add rounds to float16 in place, as
+    the program and the Triton backend do."""
+    kernel = helion.kernel(
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=False,
+    )
+    bound = cpu_bind(kernel, _inputs())
+    assert not cute_env_state(bound.env).half_atomic_output_promotions
+    options = _config(collective=collective).config.copy()
+    options["split_k"] = options.pop("partitions")
+    code = bound.to_code(helion.Config.from_dict(options))
+    assert "val=cutlass.Float16(" in code
+    assert "return out.to(" not in code
+    assert "dtype=torch.float32, device=" not in code
+    assert "dtype=torch.promote_types(x.dtype, y.dtype), device=" in code

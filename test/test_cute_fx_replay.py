@@ -12,8 +12,12 @@ import torch
 
 from helion import exc
 from helion._compiler.ast_extension import create
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.direct_affine_lowering import try_lower_direct_affine_root
 from helion._compiler.generate_ast import GenerateAST
 from helion._compiler.inductor_lowering import GraphInterpreter
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _Lowering:
@@ -26,6 +30,7 @@ class _Lowering:
 
 def _codegen() -> GenerateAST:
     codegen = object.__new__(GenerateAST)
+    codegen.backend = CuteBackend()
     codegen._statement_owner_fx_node = None
     codegen._statements_by_owner_node_id = {}
     codegen._codegen_results_by_owner_node_id = {}
@@ -35,14 +40,16 @@ def _codegen() -> GenerateAST:
     codegen.device_function = cast(
         "Any",
         SimpleNamespace(
-            cute_state=SimpleNamespace(has_tcgen05_fragment_epilogue_plan=False),
+            cute_state=SimpleNamespace(
+                has_tcgen05_fragment_epilogue_plan=False,
+                root_plans=SimpleNamespace(),
+            ),
             expr_to_var_info={},
             inband_polls=[],
             new_var=lambda prefix: f"{prefix}_normalized",
         ),
     )
-    codegen._record_statement_thread_references = lambda statements: None
-    codegen._record_tcgen05_owned_statement = lambda statement: None
+    codegen._record_statement_thread_references = lambda *args: None
     return codegen
 
 
@@ -188,7 +195,9 @@ def test_owned_span_replacement_rolls_back_thread_dimensions_on_error() -> None:
         codegen.append_statement(body, source)
     replacement = create(ast.Expr, value=create(ast.Constant, value=1))
 
-    def fail_after_update(statements: list[ast.AST]) -> None:
+    def fail_after_update(
+        statements: list[ast.AST], axis_sizes: dict[int, int] | None = None
+    ) -> None:
         codegen.referenced_thread_block_dims[0] = 32
         raise RuntimeError("injected recorder failure")
 
@@ -205,7 +214,7 @@ def test_direct_affine_root_commit_installs_all_integration_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from helion._compiler.cute import direct_affine_lowering
-    from helion._compiler.cute import direct_affine_replay
+    from helion._compiler.cute import direct_affine_replay_core
 
     codegen = _codegen()
     root = SimpleNamespace(graph_id=7)
@@ -227,8 +236,10 @@ def test_direct_affine_root_commit_installs_all_integration_metadata(
     codegen.device_function.config = SimpleNamespace(
         cute_affine_scan_schedule="direct_m16n8_v1"
     )
-    codegen.device_function.cute_state.direct_affine_candidates = (candidate,)
-    codegen.device_function.cute_state.direct_affine_plan = None
+    codegen.device_function.cute_state.root_plans.direct_affine_candidates = (
+        candidate,
+    )
+    codegen.device_function.cute_state.root_plans.direct_affine_plan = None
     codegen.device_function.has_barrier = False
     original = create(ast.Pass)
     body: list[ast.AST] = [original]
@@ -243,12 +254,14 @@ def test_direct_affine_root_commit_installs_all_integration_metadata(
         body[:] = [replacement]
         return True
 
-    monkeypatch.setattr(direct_affine_replay, "replace_direct_affine_replay", replace)
+    monkeypatch.setattr(
+        direct_affine_replay_core, "replace_direct_affine_replay", replace
+    )
 
-    assert codegen._try_lower_direct_affine_root(cast("Any", object()), body)
+    assert try_lower_direct_affine_root(codegen, cast("Any", object()), body)
     assert body == [replacement]
     assert codegen.module_statements == [module_import]
-    assert codegen.device_function.cute_state.direct_affine_plan is plan
+    assert codegen.device_function.cute_state.root_plans.direct_affine_plan is plan
     assert codegen.device_function.has_barrier is True
 
 
@@ -264,10 +277,10 @@ def test_direct_affine_root_rejects_failed_late_validation_without_metadata(
     codegen.device_function.config = SimpleNamespace(
         cute_affine_scan_schedule="direct_m16n8_v1"
     )
-    codegen.device_function.cute_state.direct_affine_candidates = (
+    codegen.device_function.cute_state.root_plans.direct_affine_candidates = (
         SimpleNamespace(graph_id=7),
     )
-    codegen.device_function.cute_state.direct_affine_plan = None
+    codegen.device_function.cute_state.root_plans.direct_affine_plan = None
     codegen.device_function.has_barrier = False
     original = create(ast.Pass)
     body: list[ast.AST] = [original]
@@ -279,11 +292,11 @@ def test_direct_affine_root_rejects_failed_late_validation_without_metadata(
     )
 
     with pytest.raises(exc.BackendUnsupported, match="failed late validation"):
-        codegen._try_lower_direct_affine_root(cast("Any", object()), body)
+        try_lower_direct_affine_root(codegen, cast("Any", object()), body)
 
     assert body == [original]
     assert codegen.module_statements == []
-    assert codegen.device_function.cute_state.direct_affine_plan is None
+    assert codegen.device_function.cute_state.root_plans.direct_affine_plan is None
     assert codegen.device_function.has_barrier is False
 
 
@@ -291,7 +304,7 @@ def test_direct_affine_root_rolls_back_splice_if_metadata_install_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from helion._compiler.cute import direct_affine_lowering
-    from helion._compiler.cute import direct_affine_replay
+    from helion._compiler.cute import direct_affine_replay_core
 
     class FailingModuleStatements(list[ast.stmt]):
         def extend(self, values: object) -> None:
@@ -317,8 +330,10 @@ def test_direct_affine_root_rolls_back_splice_if_metadata_install_fails(
     codegen.device_function.config = SimpleNamespace(
         cute_affine_scan_schedule="direct_m16n8_v1"
     )
-    codegen.device_function.cute_state.direct_affine_candidates = (candidate,)
-    codegen.device_function.cute_state.direct_affine_plan = None
+    codegen.device_function.cute_state.root_plans.direct_affine_candidates = (
+        candidate,
+    )
+    codegen.device_function.cute_state.root_plans.direct_affine_plan = None
     codegen.device_function.has_barrier = False
     body: list[ast.AST] = [source]
 
@@ -332,12 +347,14 @@ def test_direct_affine_root_rolls_back_splice_if_metadata_install_fails(
         body[:] = [replacement]
         return True
 
-    monkeypatch.setattr(direct_affine_replay, "replace_direct_affine_replay", replace)
+    monkeypatch.setattr(
+        direct_affine_replay_core, "replace_direct_affine_replay", replace
+    )
 
     with pytest.raises(RuntimeError, match="injected module install failure"):
-        codegen._try_lower_direct_affine_root(cast("Any", object()), body)
+        try_lower_direct_affine_root(codegen, cast("Any", object()), body)
 
     assert body == [source]
     assert codegen.module_statements == []
-    assert codegen.device_function.cute_state.direct_affine_plan is None
+    assert codegen.device_function.cute_state.root_plans.direct_affine_plan is None
     assert codegen.device_function.has_barrier is False

@@ -18,6 +18,8 @@ from helion.autotuner.handoff_agent import _noise
 from helion.autotuner.handoff_agent import _write_sources
 from helion.autotuner.handoff_agent import run_agent_rounds
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def bundle(tmp_path: Path) -> HandoffBundle:

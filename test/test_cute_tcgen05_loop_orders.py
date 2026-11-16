@@ -13,12 +13,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -40,14 +38,13 @@ _MMA_TIDX = (
 
 
 @pytest.mark.parametrize("loop_order", [[0, 1], [1, 0]])
-@skipUnlessBackends(["cute"])
 def test_role_coordinates_follow_the_launch_axes(loop_order: list[int]) -> None:
     args = (
         torch.empty((200, 96), dtype=torch.float16),
         torch.empty((96, 136), dtype=torch.float16),
         torch.empty((136,), dtype=torch.float32),
     )
-    with _mock_cuda_unavailable(), _cpu_target():
+    with mock_cuda_unavailable(), cpu_target():
         bound = _matmul_bias._bind_isolated(args)
         with bound.env:
             config = dict(bound.config_spec.default_config().config)
@@ -60,7 +57,6 @@ def test_role_coordinates_follow_the_launch_axes(loop_order: list[int]) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("collective", [None, "warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_permuted_loop_order_matches_on_partial_tiles(collective: str | None) -> None:
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")

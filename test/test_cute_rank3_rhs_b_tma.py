@@ -26,14 +26,12 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._testing import DEVICE
 from helion._testing import matchesBackends
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 import helion.runtime as helion_runtime
-from helion.runtime import _append_cute_wrapper_plan
-from helion.runtime.cute.launcher import _tcgen05_grouped_static_quotas
+from helion.runtime.cute.host_wrappers.grouped_static import grouped_static_quotas
+from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
-pytestmark = skipUnlessBackends(["cute"])
 if matchesBackends(["cute"]):
     pytest.importorskip("cutlass")
     pytest.importorskip("cutlass.cute")
@@ -492,12 +490,12 @@ def _code_for(
     if config is None:
         config = _rank3_rhs_tma_config()
     bound = kernel.bind(args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
     with (
         patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False),
         patch_cute_mma_support(),
     ):
-        return bound.to_triton_code(config)
+        return bound.to_code(config)
 
 
 def _wrapper_plans(code: str) -> list[dict[str, Any]]:
@@ -571,7 +569,7 @@ def test_rank3_rhs_grouped_nt_codegen_uses_nkg_tma_view() -> None:
     assert any(
         re.search(
             r"cute\.local_tile\(tma_tensor_b, \(128, 128\), "
-            r"\([^,]+ // cutlass\.Int32\(128\), None, tcgen05_rhs_safe_group\)\)",
+            r"\((?:[^,]+ // cutlass\.Int32\(128\)|_helion_tc_pro\.floordiv_nonneg\([^,]+, 128\)), None, tcgen05_rhs_safe_group\)\)",
             line.strip(),
         )
         for line in code.splitlines()
@@ -614,7 +612,7 @@ def test_rank3_rhs_grouped_static_codegen_uses_group_scheduler() -> None:
     assert ".layout.iterator" not in code
     assert re.search(
         r"cute\.local_tile\(tma_tensor_b, \(128, 128\), "
-        r"\([^,]+ // cutlass\.Int32\(128\), None, tcgen05_grouped_group_idx\)\)",
+        r"\((?:[^,]+ // cutlass\.Int32\(128\)|_helion_tc_pro\.floordiv_nonneg\([^,]+, 128\)), None, tcgen05_grouped_group_idx\)\)",
         code,
     )
     assert grouped_plan["group_count"] == 4
@@ -773,7 +771,7 @@ def test_rank3_rhs_grouped_static_problem_signature_rejects_l2_swizzle(
         80,
         16,
     ]
-    with pytest.raises(exc.BackendUnsupported, match=message):
+    with pytest.raises(exc.InvalidConfig, match=message):
         _code_for(
             _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes,
             _make_documented_mixed_k_args(),
@@ -844,7 +842,7 @@ def test_grouped_static_quota_allocation(
     expected: tuple[int, ...],
 ) -> None:
     assert (
-        _tcgen05_grouped_static_quotas(
+        grouped_static_quotas(
             problem_shapes,
             bm=128,
             bn=64,
@@ -856,7 +854,7 @@ def test_grouped_static_quota_allocation(
 
 
 def test_rank3_rhs_grouped_direct_deep_pipeline_checks_target_smem() -> None:
-    from helion.autotuner.config_spec import ConfigSpec
+    from helion._compiler.cute.tcgen05_config import smem
 
     _require_cuda("rank3 RHS B TMA codegen test needs CUDA fake inputs")
     args = _make_documented_mixed_k_args()
@@ -866,8 +864,8 @@ def test_rank3_rhs_grouped_direct_deep_pipeline_checks_target_smem() -> None:
 
     with (
         patch.object(
-            ConfigSpec,
-            "_tcgen05_grouped_dynamic_stages_fit_for_target",
+            smem,
+            "grouped_dynamic_stages_fit_for_target",
             autospec=True,
             return_value=False,
         ) as fit,
@@ -1018,7 +1016,17 @@ def test_grouped_proof_rejects_unproven_aten_targets(target: Any) -> None:
 @pytest.mark.parametrize(
     ("kernel", "args_fn", "config_fn"),
     [
-        (_rank3_rhs_grouped_nt, _make_non_k_contiguous_args, _rank3_rhs_tma_config),
+        # The staging pass would relay the strided B out into a contiguous
+        # copy; the generic fallback is tested on the operand as passed.
+        (
+            helion.kernel(
+                _rank3_rhs_grouped_nt.fn,
+                backend="cute",
+                cute_stage_unaligned_operands=False,
+            ),
+            _make_non_k_contiguous_args,
+            _rank3_rhs_tma_config,
+        ),
         (_rank3_rhs_grouped_nt, _make_mn_major_args, _grouped_config),
         (
             _bad_mn_tail_zero_store,
@@ -1082,7 +1090,7 @@ def _run_configured(
 ) -> torch.Tensor:
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
         bound = kernel.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec.tcgen05.search_enabled = True
         bound.set_config(config)
         out = bound(*args)
         torch.cuda.synchronize()
@@ -1127,7 +1135,7 @@ def test_rank3_rhs_grouped_static_exact_signature_runtime() -> None:
 
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
         bound = _rank3_rhs_grouped_nt.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec.tcgen05.search_enabled = True
         bound.set_config(config)
         out = bound(*args)
         torch.cuda.synchronize()
@@ -1181,7 +1189,7 @@ def test_rank3_rhs_grouped_exact_signature_low_capacity_fallback_runtime() -> No
 
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
         bound = _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec.tcgen05.search_enabled = True
         bound.set_config(config)
         out = bound(*args)
         torch.cuda.synchronize()
@@ -1279,7 +1287,7 @@ def test_rank3_rhs_grouped_deep_pipeline_runtime(
 
     with patch.dict(os.environ, {"HELION_CUTE_MMA_IMPL": "tcgen05"}, clear=False):
         bound = _rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes.bind(args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec.tcgen05.search_enabled = True
         bound.set_config(config)
         out = bound(*args)
         torch.cuda.synchronize()

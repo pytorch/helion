@@ -12,9 +12,11 @@ across its lanes and the cross-thread combine runs once per row tile.
 
 from __future__ import annotations
 
+import contextlib
 import re
 from typing import TYPE_CHECKING
 from typing import Callable
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -23,7 +25,10 @@ import helion
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessCuteAvailable
+from helion._testing.lane_stash_kernels import online_softmax_stats
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -177,13 +182,15 @@ class TestCuteLaneLoopReduceTwoPass(TestCase):
         self.assertNotIn("_cute_grouped_reduce", _lane_loop_body(code))
 
 
-@onlyBackends(["cute"])
 def test_owned_marker_restore_when_two_pass_split_is_unsafe() -> None:
     """jagged_layer_norm at 256 threads x 2 lanes: the lane loop carries extra
     cross-lane sums, so the two-pass split is refused and the owned marker is
     restored with its own running accumulator (finalized every lane)."""
-    from examples.jagged_layer_norm import jagged_layer_norm_kernel
-    from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
+    _examples_jagged_layer_norm = import_example("jagged_layer_norm")
+    jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
+    reference_jagged_layer_norm_pytorch = (
+        _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
+    )
 
     torch.manual_seed(0)
     lengths = torch.randint(1, 65, (32,), device=DEVICE)
@@ -214,6 +221,7 @@ def test_owned_marker_restore_when_two_pass_split_is_unsafe() -> None:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_two_lane_nested_row_seeds_match_their_static_twin_under_dynamic_shapes() -> (
     None
@@ -227,10 +235,13 @@ def test_two_lane_nested_row_seeds_match_their_static_twin_under_dynamic_shapes(
     rsqrt(eps)``).  The dynamic render now takes the static twin's per-lane
     schedule, so the two agree bitwise.
     """
-    from examples.jagged_layer_norm import jagged_layer_norm_kernel
-    from examples.jagged_layer_norm import reference_jagged_layer_norm_pytorch
+    _examples_jagged_layer_norm = import_example("jagged_layer_norm")
+    jagged_layer_norm_kernel = _examples_jagged_layer_norm.jagged_layer_norm_kernel
+    reference_jagged_layer_norm_pytorch = (
+        _examples_jagged_layer_norm.reference_jagged_layer_norm_pytorch
+    )
 
-    from helion._compiler.autotuner_heuristics.cute import CuteNestedRowHeuristic
+    from helion._compiler.cute.autotune.heuristics.cute import CuteNestedRowHeuristic
 
     torch.manual_seed(0)
     lengths = torch.randint(0, 40, (17,))
@@ -318,6 +329,7 @@ def _column_lanes_config(lanes: int) -> helion.Config:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -350,6 +362,7 @@ def test_a_stored_accumulator_restarts_in_every_lane_of_the_consume_pass(
     torch.testing.assert_close(tot, x.sum(dim=(1, 2)), rtol=1e-4, atol=1e-3)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -466,6 +479,7 @@ def _jagged_rows_config(lanes: int) -> helion.Config:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -492,6 +506,7 @@ def test_a_stored_strided_reduction_totals_the_lanes_shares(
     torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -629,6 +644,7 @@ def _jagged_kernel(fn: Callable[..., object], *, static_shapes: bool) -> helion.
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -651,6 +667,7 @@ def test_a_running_max_carry_keeps_the_per_lane_restore(
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -672,6 +689,7 @@ def test_an_atomic_add_of_the_row_total_runs_once_on_the_lanes_total(
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [2, 4])
 def test_two_stored_reductions_of_one_accumulator_take_one_schedule_in_both_shape_modes(
@@ -723,6 +741,7 @@ def _jagged_expectations(
     }
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
 @pytest.mark.parametrize(
@@ -759,6 +778,7 @@ def test_one_row_tiles_take_the_plain_two_pass_split(
         torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [1, 2])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -811,6 +831,7 @@ def _grid_lane_config(bound: BoundKernel, lanes: int) -> helion.Config:
     return helion.Config.from_dict(config)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("lanes", [8, 4])
 @pytest.mark.parametrize("static_shapes", [True, False], ids=["static", "dynamic"])
@@ -845,6 +866,7 @@ def _first_column_then_overwrite_beside_row_sums(
     return sums
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("num_threads", "refused"),
@@ -895,6 +917,7 @@ def _column_zeroed_then_copied(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("threads", [64, 128])
 def test_a_column_zeroed_before_its_copy_beside_a_row_sum_rejects_the_config(
@@ -915,6 +938,7 @@ def test_a_column_zeroed_before_its_copy_beside_a_row_sum_rejects_the_config(
         bound.to_code(config)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_a_column_zeroed_before_its_copy_is_never_left_zero() -> None:
     """Without the row sum the same body gets its barrier, and one thread per
@@ -931,3 +955,39 @@ def test_a_column_zeroed_before_its_copy_is_never_left_zero() -> None:
             result = compiled(x)
             out = result[0] if isinstance(result, tuple) else result
             torch.testing.assert_close(out, x, rtol=0, atol=0)
+
+
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_the_sum_pass_reusing_the_max_passs_loads_is_bitwise_neutral() -> None:
+    """The online softmax's sum pass reads the elements the max pass loaded
+    from a trace-time stash (``cute/stash_lane_loads.py``) instead of loading
+    them again: the results are bit for bit those of the reloading code."""
+    # Rows ending mid-vector keep the loads per element, four 8-wide lanes
+    # per thread, a CTA-wide reduction between the passes.
+    x = torch.randn(64, 8200, device=DEVICE, dtype=torch.bfloat16)[:, :8195]
+    config = helion.Config(
+        block_sizes=[1, 2048],
+        num_threads=[1, 64],
+        cute_vector_widths=[1, 8],
+        cute_lane_layouts=["blocked", "strided"],
+    )
+    results = []
+    for stash in (True, False):
+        with (
+            contextlib.nullcontext()
+            if stash
+            else patch(
+                "helion._compiler.cute.stash_lane_loads.stash_sibling_lane_loads",
+                lambda body, new_var, **_: body,
+            )
+        ):
+            kernel = helion.kernel(
+                online_softmax_stats, backend="cute", static_shapes=True, config=config
+            )
+            code = kernel.bind((x,)).to_code(config)
+            assert ("_lane_stash_loads_" in code) is stash
+            results.append(kernel(x))
+    for stashed, reloaded in zip(*results, strict=True):
+        assert torch.equal(stashed, reloaded)
+    torch.testing.assert_close(results[0][0], x.float().amax(-1), rtol=0, atol=0)

@@ -1,6 +1,6 @@
 # Helion Tutorials
 
-Programming for accelerators such as GPUs is critical for modern AI systems. This often means programming directly in proprietary low-level languages such as CUDA. Helion is a Python-embedded domain-specific language (DSL) for authoring machine learning kernels, designed to compile down to Triton, a performant backend for programming GPUs and other devices.
+Programming for accelerators such as GPUs is critical for modern AI systems. This often means programming directly in proprietary low-level languages such as CUDA. Helion is a Python-embedded domain-specific language (DSL) for authoring machine learning kernels. It expresses an algorithm as PyTorch operations over tiles and compiles it through one of several backends (Triton by default, as well as TileIR, CuTe DSL and Pallas), autotuning the result for each hardware target.
 
 Helion aims to raise the level of abstraction compared to Triton, making it easier to write correct and efficient kernels while enabling more automation in the autotuning process.
 

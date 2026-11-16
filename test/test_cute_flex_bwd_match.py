@@ -4,7 +4,7 @@ Every test binds ``examples/flex_attention.py::helion_flex_attention_backward_ke
 on the CPU with real ``create_block_mask`` BlockMasks and asserts the plan the
 matcher produces, the regions it captures (score / mask / Jacobian, in the
 renderer's transposed frame), the autotune surface it feeds and the loops it
-claims. Nothing here compiles or launches CuTe.
+claims. No test launches CuTe; one separately opted-in test assembles offline.
 """
 
 from __future__ import annotations
@@ -26,11 +26,10 @@ from torch.nn.attention.flex_attention import noop_mask
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-from test._cute_aux import _cpu_codegen
-
 import helion
 from helion._compiler.cute import flex_bwd_match as flex_bwd_match_module
 from helion._compiler.cute import flex_match
+from helion._compiler.cute.autotune.flash_surface import cute_flash_bwd_seed_configs
 from helion._compiler.cute.backend import _attention_config_envelope_ok
 from helion._compiler.cute.cute_flash_bwd_flex import _fit_smem_budget
 from helion._compiler.cute.cute_flash_bwd_flex import additive_bias_region
@@ -43,7 +42,7 @@ from helion._testing import EXAMPLES_DIR
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import as_sm100
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
@@ -56,9 +55,9 @@ if TYPE_CHECKING:
     from helion._compiler.host_function import HostFunction
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
 _aten = torch.ops.aten
 _CPU = torch.device("cpu")
+pytestmark = pytest.mark.cpu_only
 
 
 @functools.cache
@@ -133,20 +132,14 @@ def _args(
 
 
 @contextlib.contextmanager
-def _as_sm100() -> Iterator[None]:
-    with (
-        _cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
-        patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
-        ),
-        patch.object(flex_match, "FLEX_PLAN_ENABLED", True),
-    ):
+def _as_sm100_flex() -> Iterator[None]:
+    """The shared SM100 CPU codegen context with the flex plan enabled."""
+    with as_sm100(), patch.object(flex_match, "FLEX_PLAN_ENABLED", True):
         yield
 
 
 def _bind(args: tuple[Any, ...]) -> BoundKernel:
-    with _as_sm100():
+    with _as_sm100_flex():
         return _bwd_kernel()._bind_isolated(args)
 
 
@@ -226,7 +219,7 @@ def _render(bound: BoundKernel, **overrides: object) -> str:
     config = bound.config_spec.default_config()
     if overrides:
         config = helion.Config(**{**config.config, **overrides})
-    with _as_sm100():
+    with _as_sm100_flex():
         return bound.to_code(config)
 
 
@@ -400,6 +393,79 @@ def test_softcap_jacobian_region() -> None:
             assert all(not isinstance(a, float) for a in node.args), node.args
 
 
+def _softcap_20(score, b, h, q_idx, kv_idx):
+    return 20.0 * torch.tanh(score / 20.0)
+
+
+def _softcap_20_bwd_scaled(grad, score, b, h, q_idx, kv_idx):
+    th = torch.tanh(score / 20.0)
+    return (grad * 20.0) * (1.0 - th * th) / 20.0
+
+
+def _softcap_20_bwd_divided(grad, score, b, h, q_idx, kv_idx):
+    th = torch.tanh(score / 20.0)
+    return grad / 20.0 * (20.0 * (1.0 - th * th))
+
+
+@pytest.mark.parametrize(
+    "score_mod_bwd", [_softcap_20_bwd_scaled, _softcap_20_bwd_divided]
+)
+def test_softcap_jacobian_region_with_gradient_arithmetic(
+    score_mod_bwd: Callable[..., Any],
+) -> None:
+    """A ``score_mod_bwd`` whose gradient meets literal arithmetic before (or
+    besides) the Jacobian factor, as in a VJP traced from ``score_mod``: the
+    unit gradient and ``grad * c`` stand in as typed literal nodes, so the
+    region nodes consuming them keep their prepared lowerings and the
+    Jacobian hook renders."""
+    t = _tensors()
+    bound = _bind(_args(t, _causal, _softcap_20, score_mod_bwd))
+    plan = _match_or_fail(bound).plan
+    assert plan.grad_region is not None
+    assert "fbwd_mul_pairs_packed" in _render(bound)
+
+
+def test_transformed_gradient_operands_keep_tensor_slots() -> None:
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score * 5.0
+
+    def score_mod_bwd(grad, score, b, h, q_idx, kv_idx):
+        return grad * 2.0 + grad * 3.0
+
+    bound = _bind(_args(_tensors(), None, score_mod, score_mod_bwd))
+    match = _match_or_fail(bound)
+    assert match.plan.grad_region is not None
+    add = next(
+        n for n in match.plan.grad_region.graph.nodes if n.target is _aten.add.Tensor
+    )
+    for operand, expected in zip(add.args, (2.0, 3.0), strict=True):
+        assert isinstance(operand, torch.fx.Node)
+        assert operand.target is _aten.full.default
+        assert operand.args == ([], expected)
+        assert operand.kwargs["dtype"] == add.meta["val"].dtype == torch.float32
+        assert operand.meta["val"].dtype == torch.float32
+    # Typed constant nodes preserve the recipe's tensor operand slots.
+    _render(bound)
+
+
+def test_bare_constant_gradient_region() -> None:
+    def score_mod(score, b, h, q_idx, kv_idx):
+        return score * 5.0
+
+    def score_mod_bwd(grad, score, b, h, q_idx, kv_idx):
+        return grad * 5.0
+
+    bound = _bind(_args(_tensors(), None, score_mod, score_mod_bwd))
+    match = _match_or_fail(bound)
+    region = match.plan.grad_region
+    assert region is not None
+    assert region.output.target is _aten.full.default
+    assert region.output.args == ([], 5.0)
+    assert region.output.kwargs["dtype"] == torch.float32
+    assert region.output.meta["val"].dtype == torch.float32
+    _render(bound)
+
+
 def test_ragged_lengths_match() -> None:
     t = _tensors(q_seq=192, kv_seq=320)
     match = _match_or_fail(_bind(_args(t, _causal)))
@@ -487,7 +553,7 @@ def test_head_dim_256_pair_assembles_without_gpu(tmp_path: Path) -> None:
     namespace: dict[str, object] = {}
     exec(compile(code, str(path), "exec"), namespace)
     host = namespace["helion_flex_attention_backward_kernel"]
-    with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_100a"}), _as_sm100():
+    with patch.dict(os.environ, {"CUTE_DSL_ARCH": "sm_100a"}), _as_sm100_flex():
         host(*args, _launcher=_ptx_dump_launcher(tmp_path))  # pyrefly: ignore[not-callable]
     ptx_files = sorted(tmp_path.glob("*.ptx"))
     assert ptx_files, list(tmp_path.iterdir())
@@ -1051,7 +1117,7 @@ def test_declines_dk_store_with_another_factor(tmp_path: pathlib.Path) -> None:
     )
     kernel = _cute_kernel(import_path(path).helion_flex_attention_backward_kernel)
     t = _tensors()
-    with _as_sm100():
+    with _as_sm100_flex():
         bound = kernel._bind_isolated(_args(t, _causal))
     reasons: list[str] = []
     assert _match(bound, reasons) is None
@@ -1136,7 +1202,7 @@ def test_contiguous_operands_keep_the_rank3_maps() -> None:
     plan = match.plan
     assert plan.strides == ((131072, 32768, 64, 1),) * 6
     assert plan.operand_strides is None
-    with _as_sm100():
+    with _as_sm100_flex():
         code = bound.to_code(bound.config_spec.default_config())
     wrapper = _wrapper_plan(code)
     assert "flex_strides" not in wrapper
@@ -1170,7 +1236,7 @@ def test_transposed_operands_take_the_rank4_maps(kv_heads: int, head_dim: int) -
     contiguous = _bind(_args(_tensors(head_dim=head_dim, kv_heads=kv_heads), _causal))
     assert sorted(spec._flat_fields()) == sorted(contiguous.config_spec._flat_fields())
     assert spec.default_config() == contiguous.config_spec.default_config()
-    with _as_sm100():
+    with _as_sm100_flex():
         code = bound.to_code(spec.default_config())
     assert "fbwd_sSteps" in code
     wrapper = _wrapper_plan(code)
@@ -1438,7 +1504,7 @@ def _assert_kv_ring(code: str, *, slots: int) -> None:
         assert "'kv_stage': 1" in code
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestContiguousRenderPin(TestCase):
     """The exact text of one contiguous backward render (the
@@ -1491,7 +1557,7 @@ class TestContiguousRenderPin(TestCase):
 
     def test_contiguous_backward_render(self) -> None:
         bound = _bind(_args(_tensors(), _causal))
-        with _as_sm100():
+        with _as_sm100_flex():
             code = bound.to_code(bound.config_spec.default_config())
         assert "'flex_strides'" not in code
         self.assertExpectedJournal(_without_source_comments(code))
@@ -1745,7 +1811,7 @@ def test_two_cta_search_surface_and_seed() -> None:
         assert other.config_spec._flat_fields()["cute_flash_bwd_two_cta"].choices == (
             0,
         )
-        assert not other.config_spec.cute_flash_bwd_seed_configs()
+        assert not cute_flash_bwd_seed_configs(other.config_spec)
         # Pinned anyway, the knob renders the 1-CTA kernel, whose knobs all
         # apply: it reads 0 and strips nothing.
         config = other.config_spec.default_config()
@@ -1762,7 +1828,7 @@ def test_two_cta_search_surface_and_seed() -> None:
         assert config.config["cute_flash_bwd_stats_mma"] == 1
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestTwoCtaRenderPin(TestCase):
     """The exact text of one 2-CTA backward render (dense walk, GQA, head
@@ -1770,7 +1836,7 @@ class TestTwoCtaRenderPin(TestCase):
 
     def test_two_cta_backward_render(self) -> None:
         bound = _bind_d128(None, heads=4, kv_heads=2, q_seq=512, kv_seq=512)
-        with _as_sm100():
+        with _as_sm100_flex():
             config = bound.config_spec.default_config()
             code = bound.to_code(
                 helion.Config(**{**config.config, "cute_flash_bwd_two_cta": 1})

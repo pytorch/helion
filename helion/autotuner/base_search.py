@@ -23,7 +23,9 @@ from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Literal
 from typing import NamedTuple
+from typing import ParamSpec
 from typing import Protocol
+from typing import TypeVar
 from typing import cast
 from unittest.mock import patch
 
@@ -34,12 +36,20 @@ from torch.utils._pytree import tree_flatten
 from .. import exc
 from .._compat import extract_device
 from .._compat import get_device_name
-from ..runtime.cute_structural_config import CuteStructuralConfig
-from ..runtime.cute_structural_config import StructuralPolicyError
-from ..runtime.cute_structural_config import bound_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.config import _config_key
+from ..runtime.config import _config_value_key
+from ..runtime.config import _copy_config_structure
+from ..runtime.config_cache import ConfigCache
+from ..runtime.config_cache import ConfigSet
+from ..runtime.config_cache import _stored_config
 from ..runtime.settings import _env_get_int
 from ..runtime.settings import _env_get_optional_int
+from ..runtime.structural_policy import StructuralConfig
+from ..runtime.structural_policy import StructuralPolicyError
+from ..runtime.structural_policy import bound_structural_policy
+from ..runtime.structural_policy import require_same_structural_policy
+from .accuracy import effective_fp8_accuracy
+from .accuracy import keyable_accuracy_check
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -52,14 +62,30 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 from .benchmark_provider import _unset_fn
 from .benchmark_worker import BenchmarkWorkerUnkillable
+from .benchmarking import _FINAL_L2_FLUSH_ENV
+from .benchmarking import _L2_FLUSH_ENV
+from .benchmarking import _TARGET_REGIME_ENV
 from .benchmarking import MirroredBenchmarkTrace
+from .benchmarking import _mirrored_bench_call_layout
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
+from .benchmarking import do_bench_generic
+from .benchmarking import final_selection_l2_flush_mode
+from .benchmarking import final_selection_second_regime
+from .benchmarking import final_selection_target_regime
 from .benchmarking import interleaved_bench
+from .benchmarking import kernel_timer_available
 from .benchmarking import mirrored_bench_generic
+from .benchmarking import untraced_regime
+from .compiler_refinement import MAX_REFINEMENT_TRIALS
+from .compiler_refinement import compiler_refinement_candidates
+from .compiler_refinement import compiler_refinement_policy
+from .compiler_refinement import same_refinement_value
 from .effort_profile import get_effort_profile
 from .handoff import _observe_handoff
 from .handoff import _refresh_handoff
+from .input_banks import InputBankError
+from .input_banks import InputBankMemoryError
 from .logger import AutotuneLogEntry
 from .logger import AutotuningLogger
 from .metrics import AutotuneMetrics
@@ -72,13 +98,18 @@ from helion._dist_utils import is_master_rank
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Mapping
+    from collections.abc import MutableMapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
     from typing_extensions import Self
 
+    from .._compiler.backend import Backend
     from ..runtime.config import Config
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
     from ..runtime.settings import Settings
+    from ..runtime.structural_policy import StructuralPolicy
     from . import ConfigSpec
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
@@ -86,6 +117,28 @@ if TYPE_CHECKING:
     from .search_space_logger import SearchSpaceTracker
     from helion.autotuner.effort_profile import AutotuneEffortProfile
     from helion.autotuner.effort_profile import FinalSelectionConfig
+
+_T = TypeVar("_T")
+
+_P = ParamSpec("_P")
+
+
+class _RetryWithoutPrivateCopies(Exception):
+    """Discard a finalist phase's readings after its optional copies ran out."""
+
+
+def _retry_without_private_copies(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+    @functools.wraps(fn)
+    def wrapped(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        try:
+            return fn(*args, **kwargs)
+        except _RetryWithoutPrivateCopies:
+            pass
+        # The worker was reaped and copies disabled. Starting the phase over
+        # discards every earlier reading, including mirrored sweep positions.
+        return fn(*args, **kwargs)
+
+    return wrapped
 
 
 @functools.cache
@@ -109,12 +162,8 @@ _SUSPICIOUS_REBENCHMARK_REP = 100
 # confirming costs a fresh worker process per finalist.
 _SUSPICIOUS_REBENCHMARK_MIN_DELTA_MS = 0.001
 _FINAL_REBENCHMARK_TOP_K_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K"
+# A backend may verify more finalists (``Backend.final_rebenchmark_top_k``).
 _FINAL_REBENCHMARK_TOP_K_DEFAULT = 8
-# The cute/flash-attention search surface has a wide config space where verifying
-# more finalists materially improves the final pick. Other backends do not need
-# the extra rebenchmark cost (it ~2.5x'd autotune wall-time on cheap kernels), so
-# the larger finalist set is scoped to cute only.
-_FINAL_REBENCHMARK_TOP_K_CUTE = 32
 _FINAL_REBENCHMARK_TARGET_MS_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS"
 _FINAL_REBENCHMARK_TARGET_MS_DEFAULT = 5000.0
 _FINAL_REBENCHMARK_TARGET_MS_MAX = 60000.0
@@ -123,6 +172,25 @@ _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV = (
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"
 )
 _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT = 0.0
+# The single-pass final verification re-times only the shortlist entries the
+# search measured within this factor of its best reading: a finalist 1.5x
+# slower by the search's own (median, L2-flushed) timing cannot overturn the
+# ranking, and every isolated steady window costs seconds (the target window
+# plus a worker round trip). The clock regimes a search spans (boost vs. the
+# sustained power-limited clock) move a reading by 10-15%, well inside the
+# margin; ``inf`` keeps the whole ``top_k``.
+_FINAL_REBENCHMARK_MAX_SPREAD_ENV = "HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD"
+_FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT = 1.5
+# Among the finalists the final verification cannot tell apart (within this
+# fraction of the fastest one's steady reading) the backend's preference
+# decides (``Backend.finalist_preference``): what a config costs or saves
+# outside the kernel's own isolated timing, such as the dependent launch a
+# CuTe kernel's successor overlaps with its tail.  The final selection's
+# alternating steady windows read identical configs ~0.3-0.5% apart.
+_FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV = (
+    "HELION_AUTOTUNE_FINAL_SELECTION_PREFERENCE_TOLERANCE"
+)
+_FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT = 0.005
 _REBENCHMARK_TARGET_MS_DEFAULT = 200.0
 _REBENCHMARK_INTERLEAVED_REPEAT_MAX = 20_000
 # The only env override of the harness-grade final selection (full effort):
@@ -145,8 +213,11 @@ _INITIAL_POPULATION_BUDGET_FRACTION = 0.5
 _FINAL_SELECTION_IGNORED_ENVS = (
     _FINAL_REBENCHMARK_TARGET_MS_ENV,
     _FINAL_REBENCHMARK_ISOLATED_ENV,
+    _FINAL_REBENCHMARK_MAX_SPREAD_ENV,
 )
 _final_selection_ignored_envs_warned = False
+# The final selection's kernel-timer fallback is said once per process.
+_kernel_timer_fallback_warned = False
 _CUTE_FLASH_CONFIG_GENERATION_POLICY_VERSION = 8
 
 
@@ -244,25 +315,27 @@ _CODE_OBJECT_RE = re.compile(r"<code object .+?, line \d+>")
 def normalize_autotune_seed_configs(
     settings: Settings,
     *,
-    structural_policy: CuteStructuralPolicy
-    | Callable[[], CuteStructuralPolicy | None]
+    structural_policy: StructuralPolicy
+    | Callable[[], StructuralPolicy | None]
     | None = None,
 ) -> tuple[Config, ...]:
     """Return user-provided autotune seed configs from settings as concrete Configs."""
+    from .._compiler.backend_registry import get_backend
     from ..runtime.config import Config
 
     seed_configs = settings.autotune_seed_configs
     if seed_configs is None:
         return ()
-    if isinstance(seed_configs, CuteStructuralConfig):
+    if isinstance(seed_configs, StructuralConfig):
         seed_configs = (seed_configs,)
     if isinstance(seed_configs, Config):
         return (seed_configs,)
     if isinstance(seed_configs, dict):
         return (Config.from_dict(seed_configs),)
     result = []
+    policy_type = get_backend(settings.backend).structural_policy_type()
     for seed_config in seed_configs:
-        if isinstance(seed_config, CuteStructuralConfig):
+        if isinstance(seed_config, StructuralConfig):
             # Legacy search-policy inspection can run before binding. Only a
             # new envelope needs the captured bound's policy, so resolve lazily.
             policy = (
@@ -272,8 +345,8 @@ def normalize_autotune_seed_configs(
             )
             require_same_structural_policy(
                 seed_config.policy,
-                policy or settings.get_cute_structural_policy()
-                if settings.backend == "cute"
+                (policy or policy_type.from_settings(settings))
+                if policy_type is not None
                 else None,
                 context="Late autotune seed envelope",
             )
@@ -412,6 +485,9 @@ class BaseSearch(BaseAutotuner):
         counters: A counter to track various metrics during the search.
     """
 
+    # Snapshot the timing policy for all queued measurements in this search.
+    _input_bank_count: int = 1
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -430,7 +506,8 @@ class BaseSearch(BaseAutotuner):
         super().__init__()
         self.kernel = kernel
         self.settings: Settings = kernel.settings
-        if isinstance(self.settings.autotune_config_overrides, CuteStructuralConfig):
+        self._input_bank_count = self.settings.autotune_benchmark_input_banks
+        if isinstance(self.settings.autotune_config_overrides, StructuralConfig):
             raise StructuralPolicyError(
                 "Policy-bearing autotune overrides must be supplied before "
                 "creating a new Kernel; late overrides must be an ordinary "
@@ -445,6 +522,17 @@ class BaseSearch(BaseAutotuner):
             self.settings.autotune_precompile = autotune_precompile_mode(
                 self.config_spec.backend, self.settings.autotune_precompile
             )
+        from ..runtime.kernel import BoundKernel
+
+        # Direct search construction bypasses BoundKernel.autotune(), which
+        # normally fills evaluated defaults. Workers reload generated source
+        # without nonportable defaults, so ship the complete argument list.
+        # Multi-shape cases are already normalized; retain their carrier so
+        # provider selection and aggregate measurements still see every case.
+        if isinstance(kernel, BoundKernel) and not isinstance(
+            args, _MultiShapeAutotuneArgs
+        ):
+            args = kernel.kernel.normalize_args(*args)
         self.args: Sequence[object] = args
         self.log = AutotuningLogger(self.settings)
         self.best_perf_so_far = inf
@@ -452,15 +540,19 @@ class BaseSearch(BaseAutotuner):
         self._prepared = False
         self._skip_cache = False
         self._autotune_budget_start: float | None = None
-        self._benchmarked_members: dict[Config, PopulationMember] = {}
-        self._pinned_finalist_configs: set[Config] = set()
-        self._pinned_finalist_members: dict[Config, PopulationMember] = {}
-        # configs whose isolated benchmark worker could not be reaped: their
-        # kernel may have hung, so they are never returned as the result
-        self._unkillable_configs: set[Config] = set()
+        self._benchmarked_members: MutableMapping[Config, PopulationMember] = (
+            ConfigCache()
+        )
+        self._pinned_finalist_configs = ConfigSet()
+        self._pinned_finalist_members: MutableMapping[Config, PopulationMember] = (
+            ConfigCache()
+        )
+        # Configs excluded from fallback after an unkillable worker: the
+        # kernel that may have hung and earlier conclusive selection failures.
+        self._fallback_excluded_configs = ConfigSet()
         self._search_space_tracker: SearchSpaceTracker | None = None
         self._uncacheable_search_policy_nonce: str | None = None
-        self._search_policy_cacheable = True
+        self._search_policy_cacheable = benchmark_provider_cls is LocalBenchmarkProvider
 
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
         """Return explicit behavior-affecting state for a built-in search."""
@@ -472,13 +564,16 @@ class BaseSearch(BaseAutotuner):
     def cache_policy(self) -> dict[str, object] | None:
         """Return the effective search policy used by CuTe-flash cache keys.
 
-        Unknown search subclasses and arbitrary callbacks fail closed: callers
-        give them a one-shot cache key instead of risking reuse across different
-        candidate sets or benchmark objectives.
+        Unknown search subclasses, benchmark providers and arbitrary callbacks
+        fail closed: callers give them a one-shot cache key instead of risking
+        reuse across different candidate sets, validation or benchmark objectives.
         """
         from . import search_algorithms
 
-        if type(self) not in search_algorithms.values():
+        if (
+            type(self) not in search_algorithms.values()
+            or self._benchmark_provider_cls is not LocalBenchmarkProvider
+        ):
             return None
         algorithm = self._algorithm_cache_policy()
         settings = self.settings
@@ -487,6 +582,7 @@ class BaseSearch(BaseAutotuner):
             if settings.autotune_baseline_fn is None
             else _python_function_cache_policy(settings.autotune_baseline_fn)
         )
+        accuracy_check = keyable_accuracy_check(settings)
         if (
             algorithm is None
             or any(
@@ -494,8 +590,13 @@ class BaseSearch(BaseAutotuner):
                 for callback in (
                     settings.autotune_config_filter,
                     settings.autotune_benchmark_fn,
-                    settings.autotune_baseline_accuracy_check_fn,
                 )
+            )
+            # Of accuracy checks only Helion's own can be keyed: an arbitrary
+            # callback cannot be fingerprinted safely.
+            or (
+                settings.autotune_baseline_accuracy_check_fn is not None
+                and accuracy_check is None
             )
             or (
                 settings.autotune_baseline_fn is not None and baseline_fn_policy is None
@@ -516,6 +617,11 @@ class BaseSearch(BaseAutotuner):
             "search_class": f"{type(self).__module__}.{type(self).__qualname__}",
             "algorithm": algorithm,
             "settings": {
+                **(
+                    {"autotune_benchmark_input_banks": self._input_bank_count}
+                    if self._input_bank_count > 1
+                    else {}
+                ),
                 "autotune_effort": settings.autotune_effort,
                 "autotune_budget_seconds": settings.autotune_budget_seconds,
                 "autotune_config_overrides": settings.autotune_config_overrides,
@@ -539,8 +645,21 @@ class BaseSearch(BaseAutotuner):
                 "disable_autotuner_heuristics": settings.disable_autotuner_heuristics,
                 "autotune_accuracy_check": settings.autotune_accuracy_check,
                 "autotune_baseline_fn": baseline_fn_policy,
-                "autotune_baseline_atol": settings.autotune_baseline_atol,
-                "autotune_baseline_rtol": settings.autotune_baseline_rtol,
+                # What the default check accepts, or the AccuracyCheck that
+                # replaces it.
+                **(
+                    {
+                        "autotune_baseline_atol": settings.autotune_baseline_atol,
+                        "autotune_baseline_rtol": settings.autotune_baseline_rtol,
+                        "autotune_fp8_accuracy": effective_fp8_accuracy(settings),
+                    }
+                    if accuracy_check is None
+                    else {
+                        "autotune_baseline_accuracy_check_fn": (
+                            accuracy_check.cache_policy()
+                        )
+                    }
+                ),
                 "autotune_adaptive_timeout": settings.autotune_adaptive_timeout,
                 "autotune_compile_timeout": settings.autotune_compile_timeout,
                 "autotune_benchmark_subprocess": (
@@ -718,6 +837,7 @@ class BaseSearch(BaseAutotuner):
             self.benchmark_provider.set_compiler_seed_configs(
                 [config for _flat, config in seed_config_gen.seed_flat_config_pairs()]
             )
+        self.benchmark_provider.set_config_roles(self._search_config_roles())
         self.benchmark_provider.set_budget_exceeded_fn(self._autotune_budget_exceeded)
 
     def _is_restricted_search(self) -> bool:
@@ -881,10 +1001,9 @@ class BaseSearch(BaseAutotuner):
             and self.config_spec.backend.supports_precompile()
         ):
             # The adapted timeout kills precompile subprocesses. Render
-            # workers (CuTe) keep the configured timeout and only fall back
-            # to an in-process render past it, and the kernel's settings
-            # are shared by every bound shape of the kernel: a timeout fitted
-            # on one shape's render times would time out a larger shape's.
+            # workers (CuTe) keep the configured timeout: past a narrower one
+            # fitted on the population's render times they would only fall
+            # back to rendering the slower configs in this process.
             self.log.debug("No precompile pool; the compile timeout is not adapted")
             return
 
@@ -1086,6 +1205,16 @@ class BaseSearch(BaseAutotuner):
         best: Config | None = None
         try:
             with exit_stack:
+                # set_adaptive_compile_timeout narrows the compile deadline
+                # for this search. The kernel's settings are shared by every
+                # shape the kernel is bound to, whose searches (and accuracy
+                # baselines) would otherwise inherit the narrowed deadline.
+                exit_stack.callback(
+                    setattr,
+                    self.settings,
+                    "autotune_compile_timeout",
+                    self.settings.autotune_compile_timeout,
+                )
                 exit_stack.enter_context(_searching_candidates())
                 if self.settings.autotune_log:
                     # .csv/.log follow the log path; the dataset (.meta.jsonl) also
@@ -1124,10 +1253,18 @@ class BaseSearch(BaseAutotuner):
                             raise exc.NoConfigFound
                         if not self.args.defer_selected_log:
                             self.benchmark_provider.log_selected(best)
+                except exc.NoConfigFound as error:
+                    # Every candidate dropped by the worker's compile deadline
+                    # is a deadline (or host) problem, not a kernel without a
+                    # working config: say so where the search's caller looks.
+                    cascade = self.benchmark_provider.compile_deadline_cascade()
+                    if cascade is None:
+                        raise
+                    raise exc.NoConfigFound(f": {cascade}") from error
                 finally:
                     self._finalize_autotune_metrics(best)
         except BenchmarkWorkerUnkillable as error:
-            if best is None or best in self._unkillable_configs:
+            if best is None or best in self._fallback_excluded_configs:
                 raise
             # The search already selected a config; only the post-search
             # teardown of a benchmark worker failed (a hung kernel keeps the
@@ -1153,12 +1290,25 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed due "
                 "to accuracy checks."
             )
-        if self._autotune_metrics.num_compile_failures:
+        if not self.settings.autotune_accuracy_check:
+            # Say so where the selection is reported: a log that names a
+            # selected config without this line reads as if the config had
+            # passed a check it never saw (a kernel that disables the check
+            # relies on its caller's own comparison).
             self.log.warning(
-                f"{self._autotune_metrics.num_compile_failures} of "
-                f"{self._autotune_metrics.num_configs_tested} configs failed due "
-                "to compile failures."
+                "Accuracy checks were disabled (autotune_accuracy_check=False): "
+                f"the selected config was ranked among "
+                f"{self._autotune_metrics.num_configs_tested} configs by timing "
+                "alone and was never compared with the baseline output."
             )
+        if self._autotune_metrics.num_compile_failures:
+            # Not "N of num_configs_tested": a config that fails to compile is
+            # counted here but never benchmarked, so N can exceed that count.
+            self.log.warning(
+                f"{self._autotune_metrics.num_compile_failures} configs failed to "
+                "compile or run."
+            )
+            self._log_unmeasured_config_values()
         if self._autotune_metrics.num_worker_failures:
             self.log.warning(
                 f"{self._autotune_metrics.num_worker_failures} of "
@@ -1260,11 +1410,14 @@ class BaseSearch(BaseAutotuner):
         seeds under forced autotuning, which forces a fresh search rather than
         discarding prior measurements.
         """
+        from .base_cache import _requires_uncached_tuning
         from .base_cache import should_skip_cache
 
         if (
-            self._skip_cache and self.config_spec.cute_flash_search_enabled
-        ) or should_skip_cache():
+            _requires_uncached_tuning(self.kernel, self.args)
+            or (self._skip_cache and self.config_spec.cute_flash_search_enabled)
+            or should_skip_cache()
+        ):
             return []
 
         from .local_cache import get_helion_cache_dir
@@ -1364,8 +1517,44 @@ class BaseSearch(BaseAutotuner):
             ),
         )
 
+    def _search_config_roles(self) -> MutableMapping[Config, str]:
+        """The configs this search benchmarks for a reason of their own, by
+        role (see :meth:`BenchmarkProvider.set_config_roles`); a search over
+        user-given configs has none."""
+        return ConfigCache()
+
     def set_generation(self, generation: int) -> None:
         self._autotune_metrics.num_generations = generation
+
+    # Most lines the unmeasured-values summary prints.
+    _UNMEASURED_CONFIG_VALUES_SHOWN = 8
+
+    def _log_unmeasured_config_values(self) -> None:
+        """Surface the lowerings the search could not reach.
+
+        A config value every attempted candidate failed to compile with (a
+        tensor-core family on a kernel its matcher declines, a lane layout the
+        lowering rejects) never appears in the result: the winner simply has
+        the knob off, and only ``HELION_AUTOTUNE_LOG_LEVEL=DEBUG`` or a
+        hand-compiled config shows why. One INFO line per such value names the
+        first failure's reason.
+        """
+        facts = self.benchmark_provider.unmeasured_config_values()
+        if not facts:
+            return
+        shown = facts[: self._UNMEASURED_CONFIG_VALUES_SHOWN]
+        lines = [
+            f"  {fact.key}={fact.value!r}: {fact.count} config(s) failed to "
+            f"compile; first: {fact.first_error}"
+            for fact in shown
+        ]
+        if len(facts) > len(shown):
+            lines.append(f"  ... and {len(facts) - len(shown)} more")
+        self.log(
+            "Config values no measured candidate carried (every config using "
+            "them failed to compile, so the selected config has none):\n"
+            + "\n".join(lines)
+        )
 
     def _finalize_autotune_metrics(self, best_config: Config | None = None) -> None:
         """Finalize run metrics and link population winners to measured source.
@@ -1393,7 +1582,7 @@ class BaseSearch(BaseAutotuner):
                     *getattr(self, "_pinned_finalist_members", {}).values(),
                 ]
                 for member in retained_members:
-                    if member.config != best_config:
+                    if _config_key(member.config) != _config_key(best_config):
                         continue
                     source_hash = self.config_spec.backend.generated_source_hash(
                         member.fn
@@ -1474,6 +1663,15 @@ class PopulationMember:
         return self.perfs[-1]
 
 
+def _config_family(config: Config, keys: Sequence[str]) -> tuple[object, ...]:
+    """The kernel body a config selects: its values of the family knobs."""
+    return tuple(config.config.get(key) for key in keys)
+
+
+def _family_label(family: Sequence[object]) -> str:
+    return "/".join(str(value) for value in family)
+
+
 def performance(member: PopulationMember) -> float:
     """
     Retrieve the performance of a population member.  Used as a sort key.
@@ -1500,6 +1698,16 @@ class _PrivateBenchmarkArgs(NamedTuple):
     by_member: list[Sequence[object]]
 
 
+def _classify_final_selection_result(
+    result: IsolatedBenchmarkTiming,
+) -> tuple[float | None, Literal["ok", "incomplete", "error", "timeout"]]:
+    if isinstance(result, IsolatedBenchmarkFailure):
+        return None, result.status
+    if result is None or not math.isfinite(result) or result <= 0:
+        return None, "incomplete"
+    return float(result), "ok"
+
+
 class _FinalSelectionMeasurer(Protocol):
     """Steady-window timer the final selection drives one finalist at a time.
 
@@ -1511,15 +1719,20 @@ class _FinalSelectionMeasurer(Protocol):
 
     def __exit__(self, exc_type: object, *exc_info: object) -> None: ...
 
-    def warm(self, index: int, duration_ms: int) -> None:
-        """Run finalist ``index`` for ``duration_ms`` to settle the clocks."""
+    def warm(self, index: int, duration_ms: int) -> IsolatedBenchmarkTiming:
+        """Settle clocks, returning the warmup outcome without a rank sample."""
         ...
 
     def measure(
-        self, index: int, warmup_ms: int, rep_ms: int
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
     ) -> IsolatedBenchmarkTiming:
         """Median of one ``warmup_ms``+``rep_ms`` steady window of finalist
-        ``index``; ``None`` when no reading could be taken."""
+        ``index``; ``None`` when no reading could be taken. ``l2_flush_mode``
+        names the window's L2 regime, else the measurer's own."""
         ...
 
 
@@ -1536,6 +1749,8 @@ class _WorkerFinalSelectionMeasurer:
         *,
         private_copies: bool,
         timeout_s: float,
+        l2_flush_mode: str | None = None,
+        desc: str = "Final selection",
     ) -> None:
         self.provider = provider
         self.fns = list(fns)
@@ -1544,6 +1759,15 @@ class _WorkerFinalSelectionMeasurer:
             index if private_copies else None for index in range(len(self.fns))
         ]
         self.timeout_s = timeout_s
+        self.l2_flush_mode = l2_flush_mode
+        # what the worker's timer really does with L2: do_bench honours the
+        # regime, the wall-clock bench (do_bench_generic) always flushes
+        self.regime_label = (
+            "call (wall clock, always flushed)"
+            if provider._subprocess_benchmark_uses_wall_clock()
+            else l2_flush_mode or "call"
+        )
+        self.desc = desc
 
     def __enter__(self) -> Self:
         return self
@@ -1555,26 +1779,63 @@ class _WorkerFinalSelectionMeasurer:
         if self.private_copies and exc_type is None:
             self.provider.release_private_argument_copies()
 
-    def warm(self, index: int, duration_ms: int) -> None:
-        self._window(index, warmup=duration_ms, rep=1, desc="Final selection warmup")
+    def warm(self, index: int, duration_ms: int) -> IsolatedBenchmarkTiming:
+        return self._window(
+            index,
+            warmup=duration_ms,
+            rep=1,
+            desc=f"{self.desc} warmup",
+            l2_flush_mode=untraced_regime(self.l2_flush_mode),
+        )
 
     def measure(
-        self, index: int, warmup_ms: int, rep_ms: int
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
+        *,
+        fixed_repetitions: int | None = None,
     ) -> IsolatedBenchmarkTiming:
-        return self._window(index, warmup=warmup_ms, rep=rep_ms, desc="Final selection")
+        return self._window(
+            index,
+            warmup=warmup_ms,
+            rep=rep_ms,
+            desc=self.desc,
+            l2_flush_mode=l2_flush_mode or self.l2_flush_mode,
+            fixed_repetitions=fixed_repetitions,
+        )
 
     def _window(
-        self, index: int, *, warmup: int, rep: int, desc: str
+        self,
+        index: int,
+        *,
+        warmup: int,
+        rep: int,
+        desc: str,
+        l2_flush_mode: str | None = None,
+        fixed_repetitions: int | None = None,
     ) -> IsolatedBenchmarkTiming:
+        benchmark = self.provider.benchmark_isolated
+        if fixed_repetitions is not None:
+            benchmark = functools.partial(
+                benchmark, fixed_repetitions=fixed_repetitions
+            )
         try:
-            results = self.provider.benchmark_isolated(
+            results = benchmark(
                 [self.fns[index]],
                 warmup=warmup,
                 rep=rep,
                 desc=desc,
                 args_slots=[self.slots[index]],
                 timeout=self.timeout_s,
+                l2_flush_mode=l2_flush_mode,
             )
+        except InputBankMemoryError as error:
+            if not self.private_copies:
+                raise
+            self.provider.disable_private_argument_copies(index, str(error))
+            raise _RetryWithoutPrivateCopies from error
         except BenchmarkWorkerUnkillable as error:
             # the batch held this one finalist
             error.fn_index = index
@@ -1596,6 +1857,7 @@ class _InProcessFinalSelectionMeasurer:
         *,
         process_group_name: str | None,
         log: AutotuningLogger,
+        l2_flush_mode: str | None = None,
     ) -> None:
         self.fns = list(fns)
         # the private clones stay alive (with their sacrificial clone) until exit
@@ -1608,6 +1870,18 @@ class _InProcessFinalSelectionMeasurer:
         self.steady_bench = steady_bench
         self.process_group_name = process_group_name
         self.log = log
+        # Only the shared timers know the L2 regimes; a backend's own steady
+        # bench (Metal) times in its one regime, and the wall-clock bench
+        # (Pallas) accepts the regime but always flushes.
+        self.l2_flush_mode = (
+            l2_flush_mode if steady_bench in (do_bench, do_bench_generic) else None
+        )
+        if steady_bench is do_bench:
+            self.regime_label = l2_flush_mode or "call"
+        elif steady_bench is do_bench_generic:
+            self.regime_label = "call (wall clock, always flushed)"
+        else:
+            self.regime_label = "backend bench"
 
     def __enter__(self) -> Self:
         return self
@@ -1618,16 +1892,30 @@ class _InProcessFinalSelectionMeasurer:
         self.args_by_fn = []
         self.args = None
 
-    def warm(self, index: int, duration_ms: int) -> None:
-        self._bench(index, duration_ms, 1)
+    def warm(self, index: int, duration_ms: int) -> IsolatedBenchmarkTiming:
+        return self._bench(index, duration_ms, 1)
 
     def measure(
-        self, index: int, warmup_ms: int, rep_ms: int
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
     ) -> IsolatedBenchmarkTiming:
-        return self._bench(index, warmup_ms, rep_ms)
+        return self._bench(index, warmup_ms, rep_ms, l2_flush_mode=l2_flush_mode)
 
-    def _bench(self, index: int, warmup_ms: int, rep_ms: int) -> float:
+    def _bench(
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
+    ) -> float:
         run = functools.partial(self.fns[index], *self.args_by_fn[index])
+        kwargs: dict[str, object] = {}
+        # a timer that knows the regimes takes the window's, else its own
+        if self.l2_flush_mode is not None:
+            kwargs["l2_flush_mode"] = l2_flush_mode or self.l2_flush_mode
         try:
             timing = self.steady_bench(
                 run,
@@ -1635,6 +1923,7 @@ class _InProcessFinalSelectionMeasurer:
                 rep=rep_ms,
                 return_mode="median",
                 process_group_name=self.process_group_name,
+                **kwargs,
             )
         finally:
             clear_jit_fast_path_caches(self.fns[index], self.log)
@@ -1658,6 +1947,7 @@ class PopulationBasedSearch(BaseSearch):
     # rather than a search-algorithm knob, so it is not a constructor
     # argument and ``_final_rebenchmark_cache_policy`` carries it.
     final_selection: FinalSelectionConfig | None = None
+    _compiler_refinement_keys: tuple[str, ...] = ()
 
     # The first compile error of the last benchmarked batch (None when every
     # config compiled), for the initial population's summary line.
@@ -1694,32 +1984,75 @@ class PopulationBasedSearch(BaseSearch):
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self._selected_member: PopulationMember | None = None
-        self._terminal_refinement_members: dict[Config, PopulationMember] | None = None
+        self._terminal_refinement_members: (
+            MutableMapping[Config, PopulationMember] | None
+        ) = None
         self.config_gen: ConfigGeneration = self.config_spec.create_config_generation(
             overrides=self.settings.autotune_config_overrides or None,
             advanced_controls_files=self.settings.autotune_search_acf or None,
             process_group_name=kernel.env.process_group_name,
             compiler_coverage_enabled=not self.settings.disable_autotuner_heuristics,
         )
+        self._compiler_refinement_keys = (
+            self.config_spec.search_surface.compiler_refinement_keys
+        )
+
+    def _prepare(self) -> None:
+        super()._prepare()
+        if (
+            self._terminal_refinement_members is None
+            and self._compiler_refinement_enabled()
+        ):
+            # Reuse measured successes and remember failed trials, including
+            # configurations pruned from the final-selection shortlist.
+            # The provider and effective verification policy are available now.
+            # Leave any independent terminal-refinement registry intact.
+            self._terminal_refinement_members = ConfigCache()
 
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count
 
+    def _search_config_roles(self) -> MutableMapping[Config, str]:
+        # The normalized forms the population builders benchmark: the user's
+        # seeds, the compiler's seeds and the fragment default (which differs
+        # from the execution default whenever a seed is promoted or a knob is
+        # overridden). The default's role wins when a seed coincides with it.
+        roles: MutableMapping[Config, str] = ConfigCache()
+        for _flat, config in self.config_gen.user_seed_flat_config_pairs(
+            self._autotune_seed_configs()
+        ):
+            roles[config] = "user seed config"
+        for _flat, config in self.config_gen.seed_flat_config_pairs():
+            roles[config] = "compiler seed"
+        try:
+            default = self.config_gen.unflatten(self.config_gen.default_flat())
+        except exc.InvalidConfig:
+            # A fragment default the spec refuses to normalize (seen under
+            # HELION_INTERPRET=1) is never benchmarked, so it names no role.
+            return roles
+        roles[default] = "default config"
+        return roles
+
     def _final_rebenchmark_cache_policy(self) -> dict[str, object]:
-        return {
+        policy: dict[str, object] = {
             "enabled": True,
             # 2: the non-isolated finalist shootout uses paired interleaved
             # timing instead of sequential steady windows.
             # 3: an in-process fallback for a mutated-argument kernel gives
             # every finalist private storage, preventing cross-config L2
             # eviction-priority leakage.
-            # Fresh finalist processes cannot inherit cached argument storage
-            # or live allocations from candidates measured earlier in search.
-            "timing_version": 4,
+            # 4: fresh finalist processes cannot inherit cached argument
+            # storage or live allocations from candidates measured earlier
+            # in search.
+            # 5: isolated finalists read private argument copies in one
+            # long-lived worker (fresh processes only when the copies do not
+            # fit), and the shortlist is sized to the search's spread.
+            "timing_version": 5,
             "top_k": self._final_rebenchmark_top_k(),
             "target_ms": self._final_rebenchmark_target_ms(),
             "isolated": self._final_rebenchmark_use_isolated(),
             "pinned_tolerance": self._final_rebenchmark_pinned_tolerance(),
+            "max_spread": self._final_rebenchmark_max_spread(),
             "repeat_cap": os.getenv("HELION_CAP_REBENCHMARK_REPEAT"),
             # The harness-grade final selection replaces the pass above at
             # full effort; like the knobs above it decides which finalist is
@@ -1730,6 +2063,18 @@ class PopulationBasedSearch(BaseSearch):
                 else dataclasses.asdict(self.final_selection)
             ),
         }
+        if self._compiler_refinement_keys:
+            policy["compiler_refinement"] = compiler_refinement_policy(
+                self._compiler_refinement_keys
+            )
+        if self.final_selection is not None:
+            backend_regime = self._backend_final_regime()
+            if backend_regime is not None:
+                # A backend's own final-selection timer (CuTe: the trace
+                # kernel timer) picks other finalists than the search's
+                # regime would.
+                policy["backend_final_regime"] = backend_regime
+        return policy
 
     @staticmethod
     def _final_selection_from_profile(
@@ -1780,16 +2125,57 @@ class PopulationBasedSearch(BaseSearch):
 
     def _final_selection_shortlist_estimate(self) -> int:
         """Longest shortlist ``final_rebenchmark_best`` can hand the selection:
-        the retained ``top_k``, the pinned seeds and the incumbent (appended
-        when a later phase re-timed it above the shortlist's numbers)."""
-        return self._final_rebenchmark_top_k() + len(self._pinned_finalist_configs) + 1
+        the retained ``top_k``, the pinned seeds, the incumbent (appended
+        when a later phase re-timed it above the shortlist's numbers) and
+        the family quota's representatives where the spec names family
+        knobs."""
+        return (
+            self._final_rebenchmark_top_k()
+            + len(self._pinned_finalist_configs)
+            + 1
+            + self._final_selection_sizing_policy().family_finalists
+        )
+
+    def _final_selection_family_keys(self) -> tuple[str, ...]:
+        """The config knobs whose values pick a distinct kernel body
+        (``ConfigSpec.final_selection_family_keys``); empty when the surface
+        names none, which disables the final selection's family quota."""
+        return tuple(self.config_spec.final_selection_family_keys)
+
+    def _final_selection_sizing_policy(self) -> FinalSelectionConfig:
+        """The policy the phase is sized by under a budget: the profile's,
+        less the second regime's column when the regimes call for none
+        (``final_selection_second_regime``), so a per-call flushed selection
+        (the default) neither reserves search time for a column it never
+        takes nor sheds rounds to fit one, and less the family quota where
+        the spec names no family knob. The cache policy keeps the
+        profile's fields (``_final_rebenchmark_cache_policy``), so the key
+        ignores the regime environment variables. The regimes are read from
+        the environment and the backend here, a superset of what the
+        measurer will honour (an upper bound): a timer without regimes (a
+        backend's own bench) still reserves the column under ``replay``, and
+        ``kernel`` and ``call`` reserve a second column for each other
+        without asking the worker whether it can trace (``_traceable``: the
+        probe is a profiling session in the worker that times the search, so
+        only the selection itself asks).
+        """
+        policy = self.final_selection
+        assert policy is not None
+        backend_regime = self._backend_final_regime()
+        regime = final_selection_l2_flush_mode(backend_regime)
+        second = final_selection_second_regime(regime, backend_regime)
+        if policy.tiebreak_rounds > 0 and second is None:
+            policy = dataclasses.replace(policy, tiebreak_rounds=0)
+        # the family quota admits nothing where the spec names no family knob
+        if policy.family_finalists > 0 and not self._final_selection_family_keys():
+            policy = dataclasses.replace(policy, family_finalists=0)
+        return policy
 
     def _budget_reserve_seconds(self) -> float:
         budget = self.settings.autotune_budget_seconds
         if budget is None or not self._final_selection_enabled():
             return 0.0
-        policy = self.final_selection
-        assert policy is not None
+        policy = self._final_selection_sizing_policy()
         return min(
             policy.estimated_seconds(self._final_selection_shortlist_estimate()),
             _FINAL_SELECTION_RESERVE_FRACTION * budget,
@@ -1798,9 +2184,7 @@ class PopulationBasedSearch(BaseSearch):
     def _minimum_final_selection_seconds(self) -> float:
         if not self._final_selection_enabled():
             return 0.0
-        policy = self.final_selection
-        assert policy is not None
-        smallest = policy.budget_ladder()[-1]
+        smallest = self._final_selection_sizing_policy().budget_ladder()[-1]
         return smallest.estimated_seconds(self._final_selection_shortlist_estimate())
 
     def _final_selection_plan(self, shortlist: int) -> FinalSelectionConfig | None:
@@ -1814,27 +2198,36 @@ class PopulationBasedSearch(BaseSearch):
         budget = self.settings.autotune_budget_seconds
         if budget is not None and self._autotune_budget_start is not None:
             remaining = budget - (time.perf_counter() - self._autotune_budget_start)
-            plan = policy.fit_to_seconds(remaining, shortlist)
+            sizing = self._final_selection_sizing_policy()
+            plan = sizing.fit_to_seconds(remaining, shortlist)
             if plan is None:
-                smallest = policy.budget_ladder()[-1].estimated_seconds(shortlist)
+                smallest = sizing.budget_ladder()[-1].estimated_seconds(shortlist)
                 self.log(
                     f"Final selection skipped: {remaining:.0f}s of the "
                     f"{budget}s budget remain, less than the {smallest:.0f}s of "
                     "its smallest plan; returning the search's best."
                 )
-            elif plan != policy:
+                policy = None
+            elif plan != sizing:
                 self.log(
                     f"Final selection sized to the {remaining:.0f}s left of the "
                     f"{budget}s budget: up to {plan.finalists(shortlist)} finalists x "
                     f"{plan.rounds} rounds"
-                    + (", no screen" if policy.screens(shortlist) else "")
+                    + (", no screen" if sizing.screens(shortlist) else "")
+                    + (
+                        ", one regime"
+                        if plan.tiebreak_rounds == 0 < sizing.tiebreak_rounds
+                        else ""
+                    )
                     + (
                         ", no thermal warmup"
-                        if plan.thermal_warmup_ms == 0 < policy.thermal_warmup_ms
+                        if plan.thermal_warmup_ms == 0 < sizing.thermal_warmup_ms
                         else ""
                     )
                 )
-            policy = plan
+                policy = plan
+            # else the whole plan fits: the profile's policy runs as is (the
+            # column the sizing left out cannot run in this regime anyway)
         return sync_object(
             policy, process_group_name=self.kernel.env.process_group_name
         )
@@ -2001,7 +2394,7 @@ class PopulationBasedSearch(BaseSearch):
         """Pad an initial population with normalized, unique random configs."""
         generation = self.config_gen if generation is None else generation
         result: list[FlatConfig] = []
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         invalid = 0
         duplicate = 0
 
@@ -2086,9 +2479,9 @@ class PopulationBasedSearch(BaseSearch):
         generation = self.config_gen if generation is None else generation
         max_configs = self.settings.autotune_best_available_max_configs
 
-        seen: set[Config] = set()
+        seen: MutableSet[Config] = ConfigSet()
         result: list[FlatConfig] = []
-        pinned_configs: set[Config] = set()
+        pinned_configs: MutableSet[Config] = ConfigSet()
 
         # User seed configs are explicit requests, so try them before compiler-owned
         # seeds, the raw default, and cached configs while still deduplicating
@@ -2128,9 +2521,7 @@ class PopulationBasedSearch(BaseSearch):
             seen.add(default_config)
             pinned_configs.add(default_config)
             result.append(default_flat)
-        self._pinned_finalist_configs.update(
-            copy.deepcopy(config) for config in pinned_configs
-        )
+        self._pinned_finalist_configs.update(pinned_configs)
         self.log("Starting with seed/default configs")
 
         cached_entries = (
@@ -2311,7 +2702,9 @@ class PopulationBasedSearch(BaseSearch):
         """
         if total <= 0 or not self.config_spec.cute_flash_search_enabled:
             return 0
-        return min(total, self.config_gen.flash_structural_qualification_prefix_count())
+        return min(
+            total, self.config_gen.extension.structural_qualification_prefix_count()
+        )
 
     @contextlib.contextmanager
     def _initial_population_budget(
@@ -2400,7 +2793,7 @@ class PopulationBasedSearch(BaseSearch):
         *,
         desc: str,
         raise_if_no_viable_config: bool,
-        visited: set[Config] | None,
+        visited: MutableSet[Config] | None,
     ) -> None:
         """Benchmark one batch of the initial population under its budget share.
 
@@ -2443,7 +2836,7 @@ class PopulationBasedSearch(BaseSearch):
         members: list[PopulationMember],
         *,
         random_fallback_target: int | None = None,
-        visited: set[Config] | None = None,
+        visited: MutableSet[Config] | None = None,
         desc: str = "Initial population",
     ) -> list[PopulationMember]:
         """Benchmark the initial population, recovering from an all-failing seed set.
@@ -2479,7 +2872,11 @@ class PopulationBasedSearch(BaseSearch):
         ):
             return members
         compile_error = self.benchmark_provider.take_no_viable_config_error()
-        seen = {member.config for member in members} if visited is None else visited
+        seen = (
+            ConfigSet(member.config for member in members)
+            if visited is None
+            else visited
+        )
         fallback: list[PopulationMember] = []
         # The padding helper re-adds the seeds first, so pad past them.
         for flat in self._pad_initial_population_with_unique_random(
@@ -2512,7 +2909,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _apply_effective_source_repairs(
         self,
-        repairs: dict[Config, BenchmarkResult],
+        repairs: MutableMapping[Config, BenchmarkResult],
         current_members: Sequence[PopulationMember],
     ) -> None:
         """Repair failed members after a later config proves the same source."""
@@ -2565,7 +2962,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _record_terminal_refinement_member(
         self,
-        target: dict[Config, PopulationMember],
+        target: MutableMapping[Config, PopulationMember],
         member: PopulationMember,
     ) -> None:
         """Refresh terminal history without replacing a reusable result by failure."""
@@ -2590,7 +2987,7 @@ class PopulationBasedSearch(BaseSearch):
 
     def _record_best_member_for_config(
         self,
-        target: dict[Config, PopulationMember],
+        target: MutableMapping[Config, PopulationMember],
         config: Config,
         member: PopulationMember,
         *,
@@ -2608,18 +3005,17 @@ class PopulationBasedSearch(BaseSearch):
             or member_perf < existing_perf
             or (replace_ties and member_perf == existing_perf)
         ):
-            # Config is mutable and hashes on its contents, and the autotuner
-            # mutates configs in place (normalize / neighbor generation). Store
-            # a private snapshot so a later mutation of the original config
-            # cannot change this key's hash (-> KeyError on prune / orphaned
-            # entries) or the config recompiled during final verification. The
-            # performance list is mutable too, so do not let later rebenchmarks
-            # silently alter a supposedly historical snapshot.
-            snapshot = copy.deepcopy(config)
+            # Own the built-in containers the search mutates, while preserving
+            # opaque selections' identity. Match ConfigCache snapshots without
+            # invoking arbitrary copy hooks or changing the compiled selection.
+            # Performance history remains independent of later rebenchmarks.
+            snapshot = _stored_config(config.config)
             target[snapshot] = dataclasses.replace(
                 member,
                 perfs=copy.deepcopy(member.perfs),
-                flat_values=copy.deepcopy(member.flat_values),
+                flat_values=cast(
+                    "FlatConfig", _copy_config_structure(member.flat_values)
+                ),
                 config=snapshot,
             )
 
@@ -2669,8 +3065,8 @@ class PopulationBasedSearch(BaseSearch):
 
         use_verified_history = self._uses_verified_finalist_history()
         top_k = self._final_rebenchmark_top_k()
-        refreshed_configs: dict[Config, None] = {}
-        finite_members: dict[Config, PopulationMember] = {}
+        refreshed_configs: MutableMapping[Config, None] = ConfigCache()
+        finite_members: MutableMapping[Config, PopulationMember] = ConfigCache()
         for member in members:
             if not member.perfs:
                 continue
@@ -2740,17 +3136,26 @@ class PopulationBasedSearch(BaseSearch):
         """Always include a seed/default config in final verification if benchmarked."""
         # Snapshot: configs are mutated in place after being added (see
         # _record_best_member_for_config), which would corrupt this set.
-        self._pinned_finalist_configs.add(copy.deepcopy(config))
+        self._pinned_finalist_configs.add(config)
 
     def pin_finalist_configs(self, configs: Sequence[Config]) -> None:
         for config in configs:
             self.pin_finalist_config(config)
 
-    def _final_rebenchmark_top_k_default(self) -> int:
+    def _final_rebenchmark_backend(self) -> Backend | None:
+        """The backend whose finalist policy applies, or ``None`` for a search
+        built without a config spec (the unit tests' bare searches)."""
+        from .._compiler.backend_registry import get_backend
+
         backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
-        if backend_name == "cute":
-            return _FINAL_REBENCHMARK_TOP_K_CUTE
-        return _FINAL_REBENCHMARK_TOP_K_DEFAULT
+        if backend_name is None:
+            return None
+        return get_backend(backend_name)
+
+    def _final_rebenchmark_top_k_default(self) -> int:
+        backend = self._final_rebenchmark_backend()
+        top_k = None if backend is None else backend.final_rebenchmark_top_k()
+        return _FINAL_REBENCHMARK_TOP_K_DEFAULT if top_k is None else top_k
 
     def _final_rebenchmark_top_k(self) -> int:
         default = self._final_rebenchmark_top_k_default()
@@ -2792,16 +3197,14 @@ class PopulationBasedSearch(BaseSearch):
     def _final_rebenchmark_use_isolated(self) -> bool:
         from ..runtime.settings import _env_get_bool
 
-        # Default to ISOLATED finalist timing on cute: the interleaved bench
-        # lets L2 cache-POLICY state leak between candidates that read the
-        # same input tensors (an ``l2_last`` candidate pins its inputs in L2
-        # and every rival free-rides on the hits, so the config CAUSING the
-        # speedup can never out-measure the others).  Isolated mode times
-        # each finalist in its own steady window — the same regime the
-        # deployment-style do_bench measures — with suspicious-result
-        # confirmation guarding against thermal drift between windows.
-        backend_name = getattr(getattr(self, "config_spec", None), "backend_name", None)
-        default = backend_name == "cute"
+        if self._input_bank_count > 1:
+            return True
+
+        # The backend decides whether finalists are timed ISOLATED (each in
+        # its own steady window) or interleaved by default
+        # (``Backend.final_rebenchmark_isolated``).
+        backend = self._final_rebenchmark_backend()
+        default = backend is not None and backend.final_rebenchmark_isolated()
         try:
             return _env_get_bool(_FINAL_REBENCHMARK_ISOLATED_ENV, default)
         except ValueError:
@@ -2812,24 +3215,141 @@ class PopulationBasedSearch(BaseSearch):
             return default
 
     def _final_rebenchmark_pinned_tolerance(self) -> float:
-        raw = os.getenv(_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV)
+        return self._tolerance_from_env(
+            _FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV,
+            _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT,
+        )
+
+    def _final_selection_preference_tolerance(self) -> float:
+        return self._tolerance_from_env(
+            _FINAL_SELECTION_PREFERENCE_TOLERANCE_ENV,
+            _FINAL_SELECTION_PREFERENCE_TOLERANCE_DEFAULT,
+        )
+
+    def _tolerance_from_env(self, name: str, default: float) -> float:
+        raw = os.getenv(name)
         if raw is None:
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            return default
         try:
             tolerance = float(raw)
         except ValueError:
-            self.log.warning(
-                f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
-            )
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
+            return default
         if not math.isfinite(tolerance) or tolerance < 0:
-            self.log.warning(
-                f"Ignoring invalid {_FINAL_REBENCHMARK_PINNED_TOLERANCE_ENV}={raw!r}; "
-                f"using {_FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT}."
-            )
-            return _FINAL_REBENCHMARK_PINNED_TOLERANCE_DEFAULT
+            self.log.warning(f"Ignoring invalid {name}={raw!r}; using {default}.")
+            return default
         return tolerance
+
+    def _final_rebenchmark_max_spread(self) -> float:
+        raw = os.getenv(_FINAL_REBENCHMARK_MAX_SPREAD_ENV)
+        if raw is None:
+            return _FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT
+        try:
+            spread = float(raw)
+        except ValueError:
+            spread = math.nan
+        if math.isnan(spread) or spread < 1.0:
+            self.log.warning(
+                f"Ignoring invalid {_FINAL_REBENCHMARK_MAX_SPREAD_ENV}={raw!r} "
+                f"(a factor >= 1, or inf); using "
+                f"{_FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT}."
+            )
+            return _FINAL_REBENCHMARK_MAX_SPREAD_DEFAULT
+        return spread
+
+    def _within_final_rebenchmark_spread(
+        self,
+        finalists: list[PopulationMember],
+        keep: Sequence[PopulationMember],
+    ) -> list[PopulationMember]:
+        """The finalists the search measured within ``max_spread`` of its
+        best shortlist reading, plus ``keep`` (pinned seeds, the incumbent).
+
+        The single-pass verification exists to correct a noisy reading of a
+        near-tied candidate, not to re-time configs the search already found
+        far slower; each dropped finalist saves one isolated steady window.
+        """
+        spread = self._final_rebenchmark_max_spread()
+        if not math.isfinite(spread):
+            return finalists
+        best = min(self._finalist_history_perf(member) for member in finalists)
+        kept_ids = {id(member) for member in keep}
+        kept = [
+            member
+            for member in finalists
+            if id(member) in kept_ids
+            or self._finalist_history_perf(member) <= best * spread
+        ]
+        if len(kept) < len(finalists):
+            self.log(
+                f"Final verification shortlist: {len(kept)} of {len(finalists)} "
+                f"configs measured within {spread:g}x of the best search reading "
+                f"({self.format_performance(best)}); the rest are not re-timed."
+            )
+        return kept
+
+    def _prefer_backend_preference_within_tolerance(
+        self, after: PopulationMember, live: Sequence[PopulationMember]
+    ) -> PopulationMember:
+        """Among the live finalists within the preference tolerance of the
+        fastest one, the config the backend ranks first wins
+        (``Backend.finalist_preference``: lower is better, the fastest of
+        equal rank keeps its place).
+
+        The isolated timing of a kernel cannot see everything a config
+        costs or saves in the sequence it will run in: a CuTe kernel whose
+        back-to-back calls are separated by a plain launch (a host zero fill)
+        reads the same with and without dependent launch, while its
+        successor in the real call sequence launches 0.3-1 us earlier when
+        the kernel releases its dependents.  Finalists that tie within the
+        steady windows' resolution are therefore ranked by the backend's
+        preference instead of by noise.
+
+        The backend is reached through its registered name in the kernel's
+        settings (``Settings.backend`` is validated against the registry):
+        the hook is a class method, so no backend instance is needed, and a
+        search built around a stand-in spec ranks by the real backend's rule.
+        The hook reads a finalist's lowering off its rendered module, which
+        it asks for on demand (``BoundKernel.to_code``, once per finalist).
+        """
+        from .._compiler.backend_registry import get_backend_class
+
+        hook = get_backend_class(self.settings.backend).finalist_preference
+        sources: MutableMapping[Config, str] = ConfigCache()
+        ranks: MutableMapping[Config, int] = ConfigCache()
+
+        def preference(member: PopulationMember) -> int:
+            config = member.config
+            if config not in ranks:
+
+                def source() -> str:
+                    if config not in sources:
+                        sources[config] = self.kernel.to_code(config) or ""
+                    return sources[config]
+
+                ranks[config] = hook(config, source)
+            return ranks[config]
+
+        best_rank = preference(after)
+        if best_rank == 0:
+            return after
+        tolerance = self._final_selection_preference_tolerance()
+        band = [
+            member
+            for member in live
+            if member is not after and member.perf <= after.perf * (1.0 + tolerance)
+        ]
+        preferred = [member for member in band if preference(member) < best_rank]
+        if not preferred:
+            return after
+        chosen = min(preferred, key=lambda m: (preference(m), m.perf))
+        self.log(
+            "Final selection preferred a config the backend ranks ahead within "
+            f"{tolerance:.2%} of the fastest finalist: "
+            f"{self.format_performance(chosen.perf)} vs "
+            f"{self.format_performance(after.perf)}"
+        )
+        return chosen
 
     @staticmethod
     def _repeat_for_target_ms(target_ms: float, best_perf_so_far: float) -> int:
@@ -2881,7 +3401,7 @@ class PopulationBasedSearch(BaseSearch):
         member and perform one apples-to-apples final verification over the best
         unique configs observed during the run.
         """
-        by_config: dict[Config, PopulationMember] = {}
+        by_config: MutableMapping[Config, PopulationMember] = ConfigCache()
         candidates = [
             *self._pinned_finalist_members.values(),
             *self._benchmarked_members.values(),
@@ -2925,21 +3445,45 @@ class PopulationBasedSearch(BaseSearch):
             for config, member in by_config.items()
             if config in self._pinned_finalist_configs
         ]
-        pinned_configs = {member.config for member in pinned}
+        pinned_configs = ConfigSet(member.config for member in pinned)
         remaining = [
             member
             for member in by_config.values()
             if member.config not in pinned_configs
         ]
-        finalists = [
-            *pinned,
-            *sorted(remaining, key=self._finalist_history_perf)[:top_k],
-        ]
+        ranked = sorted(remaining, key=self._finalist_history_perf)
+        finalists = [*pinned, *ranked[:top_k]]
         # The incumbent defends its title even when later phases re-timed it
         # above the shortlist's search numbers.
         incumbent = by_config.get(best.config)
         if incumbent is not None and incumbent not in finalists:
             finalists.append(incumbent)
+        if use_final_selection:
+            # The family quota: the best config of a body the search's
+            # readings rank below the cut still gets its screen window (and
+            # its rounds when it survives the screen), see
+            # ``FinalSelectionConfig.family_finalists``. The incumbent's
+            # family is represented already.
+            assert self.final_selection is not None
+            finalists.extend(
+                self._family_representatives(
+                    "shortlist",
+                    [member.config for member in finalists],
+                    [
+                        (member, member.config, self._finalist_history_perf(member))
+                        for member in ranked[top_k:]
+                        if member is not incumbent
+                    ],
+                    best=min(
+                        (
+                            self._finalist_history_perf(member)
+                            for member in by_config.values()
+                        ),
+                        default=inf,
+                    ),
+                    policy=self.final_selection,
+                )
+            )
         if len(finalists) < 2:
             live_finalists = [
                 member for member in finalists if math.isfinite(member.perf)
@@ -2967,6 +3511,15 @@ class PopulationBasedSearch(BaseSearch):
             # explicitly opts into isolated finalist timing, keep suspicious
             # confirmation enabled for the in-process fallback.
             use_isolated = self._final_rebenchmark_use_isolated()
+            finalists = self._within_final_rebenchmark_spread(
+                finalists,
+                [*pinned, *([incumbent] if incumbent is not None else [])],
+            )
+            if len(finalists) < 2:
+                live_finalists = [
+                    member for member in finalists if math.isfinite(member.perf)
+                ]
+                return min(live_finalists, key=performance, default=fallback)
             self.rebenchmark(
                 finalists,
                 desc=f"Final verification top {len(finalists)} configs",
@@ -2982,9 +3535,13 @@ class PopulationBasedSearch(BaseSearch):
             if not live_finalists:
                 raise exc.NoConfigFound
             after = self._prefer_pinned_within_tolerance(
-                min(live_finalists, key=performance), live_finalists, pinned_configs
+                self._prefer_backend_preference_within_tolerance(
+                    min(live_finalists, key=performance), live_finalists
+                ),
+                live_finalists,
+                pinned_configs,
             )
-        if after.config != before.config:
+        if _config_key(after.config) != _config_key(before.config):
             self.log(
                 "Final verification selected a different config: "
                 f"{self.format_performance(before.perf)} -> "
@@ -2992,19 +3549,74 @@ class PopulationBasedSearch(BaseSearch):
             )
         return after
 
+    def _family_representatives(
+        self,
+        stage: str,
+        represented: Iterable[Config],
+        candidates: Sequence[tuple[_T, Config, float]],
+        *,
+        best: float,
+        policy: FinalSelectionConfig,
+    ) -> list[_T]:
+        """The family quota of the final selection at one of its two cuts.
+
+        ``candidates`` are the configs the cut dropped, best first, each with
+        the reading the cut ranked by; ``represented`` the configs it kept.
+        Returns the first candidate of every family (the values of the
+        spec's ``final_selection_family_keys``) no kept config belongs to,
+        closest to ``best`` first, at most ``policy.family_finalists`` of
+        them, each reading within ``policy.family_spread`` of ``best``.
+        """
+        keys = self._final_selection_family_keys()
+        quota = policy.family_finalists
+        if not keys or quota <= 0 or not candidates or not math.isfinite(best):
+            return []
+        families = {
+            _config_value_key(_config_family(config, keys)) for config in represented
+        }
+        admitted: list[_T] = []
+        notes: list[str] = []
+        for item, config, reading in candidates:
+            family = _config_family(config, keys)
+            family_key = _config_value_key(family)
+            if family_key in families:
+                continue
+            if not math.isfinite(reading) or reading > best * policy.family_spread:
+                # the candidates are ranked, so no later one is closer
+                break
+            families.add(family_key)
+            admitted.append(item)
+            notes.append(
+                f"{_family_label(family)} at {self.format_performance(reading)} "
+                f"({reading / best - 1.0:+.1%})"
+            )
+            if len(admitted) >= quota:
+                break
+        if admitted:
+            self.log(
+                f"Final selection family quota ({stage}): kept the best config of "
+                f"{len(admitted)} more "
+                f"{'family' if len(admitted) == 1 else 'families'} "
+                f"({'/'.join(keys)}) within {policy.family_spread:g}x of the best "
+                f"{self.format_performance(best)}: " + "; ".join(notes)
+            )
+        return admitted
+
     def _prefer_pinned_within_tolerance(
         self,
         after: PopulationMember,
         live: Sequence[PopulationMember],
-        pinned_configs: set[Config],
+        pinned_configs: MutableSet[Config],
+        key: Callable[[PopulationMember], float] = performance,
     ) -> PopulationMember:
-        """A pinned seed within the tolerance of the best finalist wins the tie."""
+        """A pinned seed within the tolerance of the best finalist wins the
+        tie; ``key`` reads the timing compared (the member's perf)."""
         live_pinned = [member for member in live if member.config in pinned_configs]
         if not live_pinned:
             return after
-        pinned_after = min(live_pinned, key=performance)
+        pinned_after = min(live_pinned, key=key)
         tolerance = self._final_rebenchmark_pinned_tolerance()
-        if pinned_after.perf <= after.perf * (1.0 + tolerance):
+        if key(pinned_after) <= key(after) * (1.0 + tolerance):
             return pinned_after
         return after
 
@@ -3034,12 +3646,92 @@ class PopulationBasedSearch(BaseSearch):
             self.args, self.kernel.env.process_group_name, idx_to_clone=mutated
         )
 
+    def _final_selection_in_worker(self) -> bool:
+        """Whether the final selection times its finalists in the benchmark
+        worker (``_final_selection_measurer``) rather than in this process."""
+        provider = self.benchmark_provider
+        return (
+            isinstance(provider, LocalBenchmarkProvider)
+            and provider.steady_window_benchmark_available()
+        )
+
+    def _kernel_timer_usable(self) -> bool:
+        """Whether the final selection can time ``kernel`` windows: the
+        benchmark worker times the finalists, the build and the process group
+        admit the trace (``kernel_timer_available``), and the worker's trace
+        works (``LocalBenchmarkProvider.worker_kernel_timer_available``).
+        Profiling sessions stay out of this process: one leaves the activity
+        API attached, slowing every later launch."""
+        provider = self.benchmark_provider
+        return (
+            self._final_selection_in_worker()
+            and isinstance(provider, LocalBenchmarkProvider)
+            # a wall-clock worker always flushes and ignores the regime
+            and not provider._subprocess_benchmark_uses_wall_clock()
+            and kernel_timer_available(self.kernel.env.process_group_name)
+            and provider.worker_kernel_timer_available()
+        )
+
+    def _traceable(self, regime: str | None) -> str | None:
+        """``regime``, with ``kernel`` (from the backend or the environment)
+        replaced by ``call`` where the selection cannot time it
+        (``_kernel_timer_usable``): a selection labelled ``kernel`` must not
+        time with CUDA events unseen. Said once per process."""
+        global _kernel_timer_fallback_warned
+        if regime != "kernel" or self._kernel_timer_usable():
+            return regime
+        if not _kernel_timer_fallback_warned:
+            _kernel_timer_fallback_warned = True
+            message = (
+                "The final selection times per-call flushed with CUDA events: "
+                "the kernel trace timer runs in the benchmark worker only (not "
+                "a wall-clock one), on an NVIDIA build that collects CUDA "
+                "activity, outside a process group, where the worker's trace "
+                "works"
+            )
+            # loud only where ``kernel`` was asked for, not the backend default
+            # (a plain compare: ``_l2_flush_mode_from_env`` raises on the
+            # target regime's ``auto``)
+            if any(
+                os.environ.get(name, "").strip().lower() == "kernel"
+                for name in (_L2_FLUSH_ENV, _FINAL_L2_FLUSH_ENV, _TARGET_REGIME_ENV)
+            ):
+                self.log.warning(message)
+            else:
+                self.log.debug(message)
+        return "call"
+
+    def _backend_final_regime(self) -> str | None:
+        """The backend's final-selection regime
+        (``Backend.default_final_selection_regime``)."""
+        return self.config_spec.backend.default_final_selection_regime()
+
+    def _final_selection_second_regime(self, regime: str) -> str | None:
+        """``final_selection_second_regime`` where this process can time it,
+        ``None`` when that falls back to ``regime`` itself (a ``kernel``
+        target timed as ``call`` beside a ``call`` selection)."""
+        second = self._traceable(
+            final_selection_second_regime(regime, self._backend_final_regime())
+        )
+        return None if second == regime else second
+
+    def _final_selection_regime(self) -> str:
+        """The regime the final selection times its finalists in, with the
+        backend's default (``final_selection_l2_flush_mode``)."""
+        regime = self._traceable(
+            final_selection_l2_flush_mode(self._backend_final_regime())
+        )
+        assert regime is not None
+        return regime
+
     def _final_selection_measurer(
         self, finalists: Sequence[PopulationMember], policy: FinalSelectionConfig
     ) -> _FinalSelectionMeasurer:
         """Steady-window timer for the finalists: the killable benchmark worker
-        when the search benchmarks in one, otherwise in-process."""
+        when the search benchmarks in one, otherwise in-process. Both time in
+        the final selection's L2 regime (``_final_selection_regime``)."""
         provider = self.benchmark_provider
+        l2_flush_mode = self._final_selection_regime()
         window_s = (policy.warmup_ms + policy.rep_ms) / 1000.0
         thermal_s = (policy.thermal_warmup_ms + policy.rep_ms) / 1000.0
         # The timer sizes its repetitions from an estimate pass, so a kernel
@@ -3052,15 +3744,24 @@ class PopulationBasedSearch(BaseSearch):
         )
         if isinstance(provider, LocalBenchmarkProvider):
             private_copies = provider.private_argument_copies_affordable(len(finalists))
-            if provider.steady_window_benchmark_available():
+            if self._final_selection_in_worker():
+                provider.register_isolated_candidates(
+                    [member.fn for member in finalists],
+                    [member.config for member in finalists],
+                )
                 return _WorkerFinalSelectionMeasurer(
                     provider,
                     [member.fn for member in finalists],
                     private_copies=private_copies,
                     timeout_s=timeout_s,
+                    l2_flush_mode=l2_flush_mode,
                 )
         else:
             private_copies = False
+        if self._input_bank_count > 1:
+            raise exc.InvalidAPIUsage(
+                "rotating input banks require isolated final selection"
+            )
         args: _PrivateBenchmarkArgs | Sequence[object] | None = None
         if private_copies and not dist.is_initialized():
             try:
@@ -3078,12 +3779,14 @@ class PopulationBasedSearch(BaseSearch):
             self._steady_bench(),
             process_group_name=self.kernel.env.process_group_name,
             log=self.log,
+            l2_flush_mode=l2_flush_mode,
         )
 
+    @_retry_without_private_copies
     def _run_final_selection(
         self,
         finalists: list[PopulationMember],
-        pinned_configs: set[Config],
+        pinned_configs: MutableSet[Config],
         incumbent: PopulationMember,
         policy: FinalSelectionConfig,
     ) -> PopulationMember:
@@ -3093,45 +3796,235 @@ class PopulationBasedSearch(BaseSearch):
         is long enough to be worth it), the best ``top_k`` survivors plus the
         best pinned seed and the ``incumbent`` then run ``rounds`` rounds of
         steady windows whose order alternates every round, and the median
-        across rounds decides (see ``FinalSelectionConfig``). Every decision
-        that depends on a reading is taken by rank 0 and broadcast, so
-        distributed ranks time the same finalist in every window.
+        across rounds decides (see ``FinalSelectionConfig``). When the
+        selection's L2 regime calls for a second one
+        (``final_selection_second_regime``), the finalists tied within
+        ``policy.tie_tolerance`` of the best median (every complete finalist
+        under an explicit target regime) run ``policy.tiebreak_rounds`` more
+        rounds in it, and that column breaks the tie (selects outright under
+        the explicit target, whose medians then become the finalists' perf).
+        Every decision that depends on a reading is taken by rank 0 and
+        broadcast, so distributed ranks time the same finalist in every
+        window.
         """
         start = time.perf_counter()
         count = len(finalists)
+        # Rebenchmark failures can invalidate these lists in place, including
+        # source aliases that the screen drops. Keep the original readings.
+        search_perfs = [
+            member.perfs[0] if member.perfs else None for member in finalists
+        ]
         screen: list[float | None] = [None] * count
+        screen_attempted = [False] * count
         readings: list[list[float]] = [[] for _ in range(count)]
         failures: list[Literal["error", "timeout"] | None] = [None] * count
+        screen_failures: list[Literal["error", "timeout"] | None] = [None] * count
+        warmup_failures: list[Literal["error", "timeout"] | None] = [None] * count
+        broadcast_failures: list[Literal["error", "timeout"] | None] = [None] * count
+        warmup_status: Literal["not_run", "ok", "incomplete", "error", "timeout"] = (
+            "not_run"
+        )
+        # The second regime's column keeps its own readings and failures: a
+        # finalist that fails only there keeps its ranking-regime median.
+        second: list[list[float]] = [[] for _ in range(count)]
+        second_failures: list[Literal["error", "timeout"] | None] = [None] * count
+        second_regime: str | None = None
+        select_by_second = False
+        group: list[int] = []
+        family_survivors: list[int] = []
         process_group_name = self.kernel.env.process_group_name
 
-        def take(index: int, warmup_ms: int, rep_ms: int) -> float | None:
-            result = measurer.measure(index, warmup_ms, rep_ms)
-            if isinstance(result, IsolatedBenchmarkFailure):
-                failures[index] = result.status
-                return None
-            if result is None or not math.isfinite(result) or result <= 0:
-                return None
-            return float(result)
+        def policy_statuses(
+            failed: list[Literal["error", "timeout"] | None],
+        ) -> list[Literal["error", "timeout"] | None]:
+            _, statuses = self._resolve_isolated_rebenchmark_results(
+                finalists,
+                [
+                    IsolatedBenchmarkFailure(status) if status else None
+                    for status in failed
+                ],
+            )
+            return statuses
 
+        def commit_results(
+            members: Sequence[PopulationMember],
+            results: Sequence[IsolatedBenchmarkTiming],
+            failed: list[Literal["error", "timeout"] | None],
+        ) -> list[PopulationMember]:
+            # Share the failure policy between normal completion and a terminal
+            # local-worker abort. Retry attempts never reach this commit.
+            failed_members = [
+                (member, status)
+                for member, status in zip(
+                    finalists, policy_statuses(failed), strict=True
+                )
+                if status is not None
+            ]
+            observed = [*members, *(member for member, _ in failed_members)]
+            if not observed:
+                return []
+            timings, statuses = self._resolve_isolated_rebenchmark_results(
+                members, results
+            )
+            return self._apply_rebenchmark_timings(
+                observed,
+                [*timings, *([inf] * len(failed_members))],
+                failure_statuses=[*statuses, *(status for _, status in failed_members)],
+                trace_results=[
+                    *results,
+                    *(IsolatedBenchmarkFailure(status) for _, status in failed_members),
+                ],
+            )
+
+        def quarantine_targets(
+            failed: list[Literal["error", "timeout"] | None],
+        ) -> set[int]:
+            # Decide eligibility without changing search state: a private-copy
+            # retry must discard this attempt's observations in every phase.
+            targets, _ = self._rebenchmark_failure_targets(
+                finalists, policy_statuses(failed)
+            )
+            return {id(member) for member, _ in targets}
+
+        def take(
+            index: int,
+            warmup_ms: int,
+            rep_ms: int,
+            regime: str | None = None,
+            failed: list[Literal["error", "timeout"] | None] = failures,
+        ) -> float | None:
+            result = measurer.measure(index, warmup_ms, rep_ms, l2_flush_mode=regime)
+            reading, status = _classify_final_selection_result(result)
+            if status == "error" or status == "timeout":
+                failed[index] = status
+            return reading
+
+        def complete_medians(
+            samples: list[list[float]],
+            failed: list[Literal["error", "timeout"] | None],
+            rounds: int,
+        ) -> dict[int, float]:
+            # A finalist competes on the median of a reading from every
+            # round: a round it failed, timed out or produced no reading in
+            # disqualifies it (one lucky reading must not win over
+            # consistently timed rivals).
+            return {
+                index: statistics.median(samples[index])
+                for index in survivors
+                if failed[index] is None and len(samples[index]) == rounds > 0
+            }
+
+        def run_rounds(
+            order_base: list[int],
+            rounds: int,
+            samples: list[list[float]],
+            failed: list[Literal["error", "timeout"] | None],
+            regime: str | None,
+        ) -> None:
+            for round_index in range(rounds):
+                # A finalist that failed, timed out or missed a reading in
+                # an earlier round cannot compete (it needs a reading from
+                # every round), so it is not timed again: a hung finalist
+                # would otherwise cost every remaining round a timeout.
+                disqualified = sync_object(
+                    [
+                        index
+                        for index in order_base
+                        if failed[index] is not None
+                        or len(samples[index]) < round_index
+                    ],
+                    process_group_name=process_group_name,
+                )
+                order = order_base if round_index % 2 == 0 else order_base[::-1]
+                for index in order:
+                    if index in disqualified:
+                        continue
+                    reading = take(
+                        index, policy.warmup_ms, policy.rep_ms, regime, failed
+                    )
+                    if reading is not None:
+                        samples[index].append(reading)
+
+        regime_label = self._final_selection_regime()
         try:
             with self._final_selection_measurer(finalists, policy) as measurer:
+                regime_label = getattr(measurer, "regime_label", regime_label)
+                warmup_skipped: set[int] = set()
                 if policy.thermal_warmup_ms > 0:
-                    measurer.warm(finalists.index(incumbent), policy.thermal_warmup_ms)
+                    warmup_index = finalists.index(incumbent)
+                    warmup_result = measurer.warm(
+                        warmup_index, policy.thermal_warmup_ms
+                    )
+                    _, warmup_status = _classify_final_selection_result(warmup_result)
+                    if warmup_status == "error" or warmup_status == "timeout":
+                        warmup_failures[warmup_index] = warmup_status
+                    # Rank 0 decides which warmup failures must not run again.
+                    # Synchronize before choosing screen windows so every rank
+                    # takes the same windows even when local warmups disagree.
+                    warmup_quarantined = quarantine_targets(warmup_failures)
+                    warmup_skipped = {
+                        index
+                        for index in range(count)
+                        if warmup_failures[index] is not None
+                        or id(finalists[index]) in warmup_quarantined
+                    }
+                    # Rank-specialized source equivalence can differ. These
+                    # indices protect the screen-window schedule only; they
+                    # do not globalize later source-alias invalidation. The
+                    # distributed in-process measurer returns no typed failures.
+                    warmup_failures, warmup_status, warmup_skipped = sync_object(
+                        (warmup_failures, warmup_status, warmup_skipped),
+                        process_group_name=process_group_name,
+                    )
+                    broadcast_failures = warmup_failures
+                if warmup_status == "error" or warmup_status == "timeout":
+                    self.log.warning(
+                        f"Final selection warmup failed for {incumbent.config} "
+                        f"in this attempt: {warmup_status}."
+                    )
                 screened = policy.screens(count)
                 if screened:
                     for index in range(count):
+                        if index in warmup_skipped:
+                            continue
+                        screen_attempted[index] = True
                         screen[index] = take(
-                            index, policy.screen_warmup_ms, policy.screen_rep_ms
+                            index,
+                            policy.screen_warmup_ms,
+                            policy.screen_rep_ms,
+                            failed=screen_failures,
                         )
 
-                def rank_key(index: int) -> float:
-                    if not screened:
-                        return self._finalist_history_perf(finalists[index])
-                    reading = screen[index]
-                    return inf if reading is None else reading
-
-                alive = [index for index in range(count) if failures[index] is None]
-                ranked = sorted(alive, key=rank_key)
+                rank_perfs = (
+                    [inf if reading is None else reading for reading in screen]
+                    if screened
+                    else [self._finalist_history_perf(member) for member in finalists]
+                )
+                # All ranks report the evidence that rank 0 used for the cut,
+                # even if another rank saw a different reading or failure.
+                search_perfs, screen, screen_failures, rank_perfs = sync_object(
+                    (search_perfs, screen, screen_failures, rank_perfs),
+                    process_group_name=process_group_name,
+                )
+                # Failed warmups were not screened, so these observations are
+                # disjoint. Keep one failure per finalist for the later commit.
+                preselection_failures: list[Literal["error", "timeout"] | None] = [
+                    warmup_failure or screen_failure
+                    for warmup_failure, screen_failure in zip(
+                        warmup_failures, screen_failures, strict=True
+                    )
+                ]
+                broadcast_failures = preselection_failures
+                # Direct failures cannot compete on any backend. Only the
+                # existing flash policy also excludes config/source aliases.
+                preselection_quarantined = quarantine_targets(preselection_failures)
+                alive = [
+                    index
+                    for index in range(count)
+                    if preselection_failures[index] is None
+                    and id(finalists[index]) not in preselection_quarantined
+                ]
+                ranked = sorted(alive, key=rank_perfs.__getitem__)
                 survivors = ranked[: policy.top_k]
                 pinned_alive = [
                     index
@@ -3147,83 +4040,324 @@ class PopulationBasedSearch(BaseSearch):
                 incumbent_index = finalists.index(incumbent)
                 if incumbent_index in alive and incumbent_index not in survivors:
                     survivors.append(incumbent_index)
+                # The family quota: the best-ranked config of a body the cut
+                # dropped runs the rounds too (the screen is one window, the
+                # rounds a median of four at the sustained clock). The seed
+                # and the incumbent count as represented, so the quota goes
+                # to families neither of them belongs to.
+                family_survivors = self._family_representatives(
+                    "screen" if screened else "rounds",
+                    [finalists[index].config for index in survivors],
+                    [
+                        (index, finalists[index].config, rank_perfs[index])
+                        for index in ranked[policy.top_k :]
+                        if index not in survivors
+                    ],
+                    best=rank_perfs[ranked[0]] if ranked else inf,
+                    policy=policy,
+                )
+                survivors.extend(family_survivors)
                 # rank 0 decides who goes on so every rank runs the same windows
                 survivors = sync_object(
                     survivors, process_group_name=process_group_name
                 )
-                for round_index in range(policy.rounds):
-                    # A finalist that failed, timed out or missed a reading in
-                    # an earlier round cannot compete (it needs a reading from
-                    # every round), so it is not timed again: a hung finalist
-                    # would otherwise cost every remaining round a timeout.
-                    disqualified = sync_object(
-                        [
-                            index
-                            for index in survivors
-                            if failures[index] is not None
-                            or len(readings[index]) < round_index
-                        ],
+                run_rounds(survivors, policy.rounds, readings, failures, None)
+
+                if policy.tiebreak_rounds > 0:
+                    second_regime = self._final_selection_second_regime(regime_label)
+                if second_regime is not None:
+                    select_by_second = final_selection_target_regime() != "auto"
+                    round_quarantined = quarantine_targets(failures)
+                    group = sync_object(
+                        self._final_selection_second_group(
+                            {
+                                index: median
+                                for index, median in complete_medians(
+                                    readings, failures, policy.rounds
+                                ).items()
+                                if id(finalists[index]) not in round_quarantined
+                            },
+                            policy,
+                            select_by_second=select_by_second,
+                        ),
                         process_group_name=process_group_name,
                     )
-                    order = survivors if round_index % 2 == 0 else survivors[::-1]
-                    for index in order:
-                        if index in disqualified:
-                            continue
-                        reading = take(index, policy.warmup_ms, policy.rep_ms)
-                        if reading is not None:
-                            readings[index].append(reading)
+                    run_rounds(
+                        group,
+                        policy.tiebreak_rounds,
+                        second,
+                        second_failures,
+                        second_regime,
+                    )
         except BenchmarkWorkerUnkillable as error:
             self._record_unkillable(finalists, error)
+            # Worker benchmarks are local: the provider disables them when
+            # distributed is initialized. Preserve this attempt's known
+            # failures on a terminal abort, without committing retry attempts.
+            # Failed warmups skip screening; failed screens skip the rounds,
+            # so these three failure lists are disjoint at every index.
+            # Keep second-column failures under their existing separate policy.
+            # For a synthetic distributed abort, only already-broadcast
+            # evidence is safe here; never synchronize from this handler or
+            # promote partial rank-local screen/round observations.
+            distributed = dist.is_initialized()
+            abort_failures = (
+                list(broadcast_failures)
+                if distributed
+                else [
+                    warmup or screen or primary
+                    for warmup, screen, primary in zip(
+                        warmup_failures, screen_failures, failures, strict=True
+                    )
+                ]
+            )
+            if (
+                not distributed
+                and error.fn_index is not None
+                and 0 <= error.fn_index < count
+            ):
+                # The fatal local candidate needs the same flash alias policy
+                # as ordinary timeouts. Synthetic distributed aborts add no
+                # unbroadcast evidence beyond the existing direct exclusion.
+                abort_failures[error.fn_index] = "timeout"
+            # Non-flash history stays intact; direct failures cannot win this
+            # fallback. Flash also invalidates their config/source aliases.
+            self._fallback_excluded_configs.update(
+                member.config
+                for member, status in zip(finalists, abort_failures, strict=True)
+                if status is not None
+            )
+            commit_results([], [], abort_failures)
             raise
 
         members = [finalists[index] for index in survivors]
-        # A finalist competes on the median of a reading from every round: a
-        # round it failed, timed out or produced no reading in disqualifies
-        # it (one lucky reading must not win over consistently timed rivals).
         results: list[IsolatedBenchmarkTiming] = []
+        medians = complete_medians(readings, failures, policy.rounds)
         for index in survivors:
             status = failures[index]
             if status is not None:
                 results.append(IsolatedBenchmarkFailure(status))
-            elif len(readings[index]) == policy.rounds:
-                results.append(statistics.median(readings[index]))
             else:
-                results.append(None)
-        results = sync_object(results, process_group_name=process_group_name)
-        timings, failure_statuses = self._resolve_isolated_rebenchmark_results(
-            members, results
+                results.append(medians.get(index))
+        # The second column, per survivor: None where it was not timed or
+        # missed a round, the failure where it failed there.
+        second_results: list[IsolatedBenchmarkTiming] = []
+        second_medians = complete_medians(
+            second, second_failures, policy.tiebreak_rounds
         )
-        self._apply_rebenchmark_timings(
-            members, timings, failure_statuses=failure_statuses
+        for index in survivors:
+            status = second_failures[index]
+            if index not in group:
+                second_results.append(None)
+            elif status is not None:
+                second_results.append(IsolatedBenchmarkFailure(status))
+            else:
+                second_results.append(second_medians.get(index))
+        results, second_results, reported_readings, reported_second = sync_object(
+            (results, second_results, readings, second),
+            process_group_name=process_group_name,
         )
+        # Warmup and screen failures are absent from the survivors, but must
+        # quarantine their source just like failures in the rounds. Commit
+        # all stages only after completing without a private-copy retry.
+        invalidated = commit_results(members, results, preselection_failures)
+        quarantined = {id(member): member.status for member in invalidated}
+        selected_by = regime_label
+
+        def log_selection(selected: PopulationMember | None) -> None:
+            self._log_final_selection(
+                finalists,
+                survivors,
+                screen,
+                reported_readings,
+                results,
+                selected,
+                pinned_configs,
+                policy,
+                wall_s=time.perf_counter() - start,
+                regime_label=regime_label,
+                second=reported_second,
+                second_results=second_results,
+                second_group=group,
+                second_regime=second_regime,
+                select_by_second=select_by_second,
+                selected_by=selected_by if selected is not None else None,
+                family_indices=family_survivors,
+                incumbent=incumbent,
+                quarantined=quarantined,
+                screen_attempted=screen_attempted,
+                search_perfs=search_perfs,
+                rank_perfs=rank_perfs,
+                screen_failures=screen_failures,
+                warmup_status=warmup_status,
+            )
+
         live = [
             member
             for member, result in zip(members, results, strict=True)
             if isinstance(result, float) and math.isfinite(member.perf)
         ]
         if not live:
-            self.log.warning(
-                "Final selection took no complete steady-window readings; "
-                "keeping the search's best config."
+            live = [
+                member
+                for member, result in zip(members, results, strict=True)
+                if not isinstance(result, IsolatedBenchmarkFailure)
+                and math.isfinite(member.perf)
+            ]
+            if not live:
+                # A screen-passed finalist cut from the rounds still has a
+                # valid search measurement. A failure of every round survivor
+                # must not discard it, nor revive direct or source-alias failures.
+                live = [
+                    member
+                    for index, member in enumerate(finalists)
+                    if index not in survivors
+                    and screen[index] is not None
+                    and preselection_failures[index] is None
+                    and id(member) not in quarantined
+                    and math.isfinite(member.perf)
+                ]
+                if live:
+                    selected_by = "search fallback"
+            fallback = (
+                "keeping the best eligible search config."
+                if live
+                else "no eligible config remains."
             )
-            live = [member for member in members if math.isfinite(member.perf)]
+            self.log.warning(
+                "Final selection took no eligible complete steady-window readings; "
+                f"{fallback}"
+            )
+        elif len(live) < len(members):
+            # finalists rarely fail here: they all ran in the search
+            self.log.warning(
+                f"Final selection took no eligible complete steady-window readings for "
+                f"{len(members) - len(live)} of {len(members)} finalists; "
+                "selecting among the rest."
+            )
         if not live:
+            log_selection(None)
             raise exc.NoConfigFound
         after = self._prefer_pinned_within_tolerance(
-            min(live, key=performance), live, pinned_configs
-        )
-        self._log_final_selection(
-            finalists,
-            survivors,
-            screen,
-            readings,
-            results,
-            after,
+            self._prefer_backend_preference_within_tolerance(
+                min(live, key=performance), live
+            ),
+            live,
             pinned_configs,
-            policy,
-            wall_s=time.perf_counter() - start,
         )
+
+        # Group eligibility was proved before timing. Keep that invariant
+        # explicit when consuming its authoritative second-regime results.
+        second_by_position = {
+            position: result
+            for position, result in enumerate(second_results)
+            if isinstance(result, float)
+        }
+        assert all(
+            id(members[position]) not in quarantined for position in second_by_position
+        )
+        # the regime whose column selected ``after``
+        if select_by_second:
+            if second_by_position:
+                # The target regime is the one the kernel is scored in, so
+                # its medians are the finalists' perf from here on. A
+                # finalist that failed or missed a round in that column
+                # keeps the ranking regime's median as its perf (the table
+                # names the regime of each column and its
+                # ``second_disqualified`` verdict) and cannot be selected,
+                # as a finalist without a complete ranking median keeps the
+                # search's perf and cannot be.
+                timed = [members[position] for position in second_by_position]
+                self._apply_rebenchmark_timings(
+                    timed, list(second_by_position.values())
+                )
+                live_second = [member for member in timed if math.isfinite(member.perf)]
+                if live_second:
+                    after = self._prefer_pinned_within_tolerance(
+                        self._prefer_backend_preference_within_tolerance(
+                            min(live_second, key=performance), live_second
+                        ),
+                        live_second,
+                        pinned_configs,
+                    )
+                    selected_by = second_regime
+            if selected_by != second_regime:
+                self.log.warning(
+                    f"Final selection took no eligible complete readings in the L2 "
+                    f"{second_regime} regime; selecting by the L2 {regime_label} "
+                    "column."
+                )
+        elif second_by_position:
+            after = self._break_tie_by_second_column(
+                after, members, second_by_position, pinned_configs, policy
+            )
+        log_selection(after)
         return after
+
+    @staticmethod
+    def _final_selection_second_group(
+        medians: dict[int, float],
+        policy: FinalSelectionConfig,
+        *,
+        select_by_second: bool,
+    ) -> list[int]:
+        """The finalists the second regime times, in survivor order: every
+        finalist with a complete median under an explicit target regime,
+        else those tied within ``policy.tie_tolerance`` of the best median
+        (none when the best stands alone: nothing to break)."""
+        if not medians:
+            return []
+        if select_by_second:
+            return list(medians)
+        best = min(medians.values())
+        tied = [
+            index
+            for index, median in medians.items()
+            if median <= best * (1.0 + policy.tie_tolerance)
+        ]
+        return tied if len(tied) > 1 else []
+
+    def _break_tie_by_second_column(
+        self,
+        after: PopulationMember,
+        members: Sequence[PopulationMember],
+        second_by_position: dict[int, float],
+        pinned_configs: MutableSet[Config],
+        policy: FinalSelectionConfig,
+    ) -> PopulationMember:
+        """Among the finalists tied in the ranking regime, the fastest in the
+        second regime wins unless ``after`` (the ranking regime's pick) is
+        within ``policy.tie_tolerance`` of it there too; a pinned seed within
+        its tolerance of that fastest keeps its preference."""
+        positions = [
+            position for position in second_by_position if members[position] is after
+        ]
+        if not positions:
+            # ``after`` has no complete median in the second column: either
+            # the pinned preference reached outside the tied group, or the
+            # ranking regime's pick itself failed or missed a round there.
+            # Without cold evidence against it the ranking pick stands (a
+            # rival's cold reading alone is not evidence that ``after`` is
+            # slower cold).
+            return after
+        after_position = positions[0]
+        by_member = {
+            id(members[position]): median
+            for position, median in second_by_position.items()
+        }
+
+        def key(member: PopulationMember) -> float:
+            return by_member[id(member)]
+
+        candidates = [members[position] for position in second_by_position]
+        best = self._prefer_pinned_within_tolerance(
+            min(candidates, key=key), candidates, pinned_configs, key=key
+        )
+        if second_by_position[after_position] <= key(best) * (
+            1.0 + policy.tie_tolerance
+        ):
+            return after
+        return best
 
     def _log_final_selection(
         self,
@@ -3232,16 +4366,48 @@ class PopulationBasedSearch(BaseSearch):
         screen: Sequence[float | None],
         readings: Sequence[Sequence[float]],
         results: Sequence[IsolatedBenchmarkTiming],
-        selected: PopulationMember,
-        pinned_configs: set[Config],
+        selected: PopulationMember | None,
+        pinned_configs: MutableSet[Config],
         policy: FinalSelectionConfig,
         *,
         wall_s: float,
+        regime_label: str,
+        incumbent: PopulationMember,
+        quarantined: Mapping[int, str],
+        screen_attempted: Sequence[bool],
+        search_perfs: Sequence[float | None],
+        rank_perfs: Sequence[float],
+        screen_failures: Sequence[Literal["error", "timeout"] | None],
+        warmup_status: Literal["not_run", "ok", "incomplete", "error", "timeout"],
+        second: Sequence[Sequence[float]] | None = None,
+        second_results: Sequence[IsolatedBenchmarkTiming] | None = None,
+        second_group: Sequence[int] = (),
+        second_regime: str | None = None,
+        select_by_second: bool = False,
+        selected_by: str | None = None,
+        family_indices: Sequence[int] = (),
     ) -> None:
+        if selected_by is None and selected is not None:
+            selected_by = regime_label
+        family_keys = self._final_selection_family_keys()
         result_by_index = dict(zip(survivors, results, strict=True))
+        second_by_index: dict[int, IsolatedBenchmarkTiming] = (
+            {}
+            if second_results is None
+            else dict(zip(survivors, second_results, strict=True))
+        )
+        # the finalists whose windows the second column spent, whether or
+        # not they produced a reading
+        second_timed = {index for index in survivors if index in second_group}
+        second_eligible = {
+            index
+            for index in second_timed
+            if isinstance(second_by_index.get(index), float)
+        }
+        # the table is ordered by the column that selected
+        sort_by_second = second_regime is not None and selected_by == second_regime
 
-        def verdict(index: int) -> str | None:
-            result = result_by_index[index]
+        def verdict(result: IsolatedBenchmarkTiming) -> str | None:
             if isinstance(result, IsolatedBenchmarkFailure):
                 return result.status
             if result is None:
@@ -3249,58 +4415,175 @@ class PopulationBasedSearch(BaseSearch):
             return None
 
         def sort_key(index: int) -> float:
-            result = result_by_index[index]
+            result = (
+                second_by_index.get(index) if sort_by_second else result_by_index[index]
+            )
             return result if isinstance(result, float) else inf
 
         rows: list[dict[str, object]] = []
         lines: list[str] = []
+        survivor_indices = set(survivors)
+        shortlist_rows: list[dict[str, object]] = []
+        member_rows: list[dict[str, object]] = [
+            {
+                "config_id": canonical_config_id(member.config),
+                "pinned": member.config in pinned_configs,
+                "incumbent": member is incumbent,
+                "screen_family_quota": index in family_indices,
+                "quarantined": quarantined.get(id(member)),
+                "search_ms": search_perfs[index],
+                "screen_ms": screen[index],
+                "warmup_status": warmup_status if member is incumbent else "not_run",
+            }
+            for index, member in enumerate(finalists)
+        ]
+        if family_keys:
+            for member, row in zip(finalists, member_rows, strict=True):
+                row["family"] = _family_label(
+                    _config_family(member.config, family_keys)
+                )
+        for index in range(len(finalists)):
+            screen_status = "not_run"
+            if screen_attempted[index]:
+                screen_status = screen_failures[index] or (
+                    "ok" if screen[index] is not None else "incomplete"
+                )
+            shortlist_rows.append(
+                {
+                    **member_rows[index],
+                    "index": index,
+                    "rank_ms": rank_perfs[index]
+                    if math.isfinite(rank_perfs[index])
+                    else None,
+                    "screen_status": screen_status,
+                    "survived": index in survivor_indices,
+                }
+            )
         for index in sorted(survivors, key=sort_key):
             member = finalists[index]
             samples = list(readings[index])
             result = result_by_index[index]
             median = result if isinstance(result, float) else None
-            config_id = canonical_config_id(member.config)
-            rows.append(
-                {
-                    "config_id": config_id,
-                    "pinned": member.config in pinned_configs,
-                    "search_ms": member.perfs[0] if member.perfs else None,
-                    "screen_ms": screen[index],
-                    "rounds_ms": samples,
-                    "median_ms": median,
-                    "disqualified": verdict(index),
-                }
+            config_id = member_rows[index]["config_id"]
+            row: dict[str, object] = {
+                **member_rows[index],
+                # Preserve the existing survivor-table field for consumers.
+                "family_quota": index in family_indices,
+                "rounds_ms": samples,
+                "median_ms": median,
+                "disqualified": verdict(result),
+            }
+            second_text = ""
+            if index in second_timed:
+                second_result = second_by_index.get(index)
+                second_median = (
+                    second_result if isinstance(second_result, float) else None
+                )
+                second_samples = [] if second is None else list(second[index])
+                row["second_rounds_ms"] = second_samples
+                row["second_median_ms"] = second_median
+                row["second_disqualified"] = verdict(second_result)
+                second_median_text = (
+                    f"{second_median:.4g}"
+                    if second_median is not None
+                    else verdict(second_result) or "n/a"
+                )
+                second_text = (
+                    f" {second_regime}={second_median_text}"
+                    f"[{' '.join(f'{sample:.4g}' for sample in second_samples)}]"
+                )
+            rows.append(row)
+            marks = (
+                ("*" if member is selected else " ")
+                + ("P" if member.config in pinned_configs else " ")
+                + ("F" if index in family_indices else " ")
             )
-            marks = ("*" if member is selected else " ") + (
-                "P" if member.config in pinned_configs else " "
+            family_text = f" family={row['family']}" if family_keys else ""
+            quarantine_text = (
+                f" quarantined={row['quarantined']}" if row["quarantined"] else ""
             )
+            # four significant digits: microsecond kernels differ in the
+            # fourth decimal of a millisecond reading
             median_text = (
-                self.format_performance(median)
+                f"{median:.4g}{self.performance_suffix}"
                 if median is not None
-                else verdict(index) or "n/a"
+                else verdict(result) or "n/a"
             )
-            rounds_text = " ".join(f"{sample:.4f}" for sample in samples)
-            screen_text = "" if screen[index] is None else f"{screen[index]:.4f}"
+            rounds_text = " ".join(f"{sample:.4g}" for sample in samples)
+            screen_text = "" if screen[index] is None else f"{screen[index]:.4g}"
+            search_perf = search_perfs[index]
             search_text = (
-                self.format_performance(member.perfs[0]) if member.perfs else "n/a"
+                self.format_performance(search_perf)
+                if search_perf is not None
+                else "n/a"
             )
             lines.append(
-                f"  {marks} {median_text:>10} [{rounds_text}] screen={screen_text} "
-                f"search={search_text} {config_id}"
+                f"  {marks} {median_text:>10} [{rounds_text}]{second_text} "
+                f"screen={screen_text} search={search_text}{family_text}"
+                f"{quarantine_text} {config_id}"
             )
+        if second_regime is None:
+            second_clause = ""
+        elif select_by_second and selected_by == second_regime:
+            second_clause = (
+                f" by {policy.tiebreak_rounds} rounds of L2 {second_regime} windows"
+            )
+        elif select_by_second:
+            second_clause = (
+                f" by the L2 {regime_label} column (no eligible complete reading in "
+                f"{policy.tiebreak_rounds} rounds of L2 {second_regime} windows)"
+            )
+        elif len(second_eligible) > 1 and any(
+            finalists[index] is selected for index in second_eligible
+        ):
+            second_clause = (
+                f", the tie within {policy.tie_tolerance:.1%} broken by "
+                f"{policy.tiebreak_rounds} rounds of L2 {second_regime} windows"
+            )
+        elif second_eligible:
+            second_clause = (
+                f", the tie within {policy.tie_tolerance:.1%} unresolved: no "
+                f"eligible complete comparison in {policy.tiebreak_rounds} rounds "
+                f"of L2 {second_regime} windows"
+            )
+        elif second_timed:
+            second_clause = (
+                f", the tie within {policy.tie_tolerance:.1%} unresolved: no "
+                f"complete reading in {policy.tiebreak_rounds} rounds of L2 "
+                f"{second_regime} windows"
+            )
+        else:
+            second_clause = (
+                f", no tie within {policy.tie_tolerance:.1%} for L2 "
+                f"{second_regime} windows to break"
+            )
+        selected_text = (
+            self.format_performance(selected.perf)
+            if selected is not None
+            else "none (no eligible finalist)"
+        )
         self.log(
             f"Final selection: {len(finalists)} shortlisted, {len(survivors)} "
             f"finalists x {policy.rounds} rounds of {policy.warmup_ms}+{policy.rep_ms} ms "
-            f"windows in {wall_s:.1f}s; selected "
-            f"{self.format_performance(selected.perf)} (* selected, P pinned seed):\n"
-            + "\n".join(lines)
+            f"windows (L2 {regime_label}) in {wall_s:.1f}s; selected "
+            f"{selected_text}{second_clause} "
+            "(* selected, P pinned seed, F family quota):\n" + "\n".join(lines)
         )
         self._autotune_metrics.final_selection = {
             "policy": dataclasses.asdict(policy),
+            "family_keys": list(family_keys),
+            "input_banks": self._input_bank_count,
+            "l2_flush_mode": regime_label,
+            "second_l2_flush_mode": second_regime,
+            "target_regime": final_selection_target_regime(),
+            "selected_by": selected_by,
             "shortlisted": len(finalists),
             "finalists": len(survivors),
             "wall_s": wall_s,
-            "selected_config_id": canonical_config_id(selected.config),
+            "selected_config_id": canonical_config_id(selected.config)
+            if selected is not None
+            else None,
+            "shortlist_rows": shortlist_rows,
             "rows": rows,
         }
 
@@ -3365,7 +4648,7 @@ class PopulationBasedSearch(BaseSearch):
             # The provider records only fresh joint measurements; skipped work
             # can return retained timings that must not become new trace rows.
             self._apply_rebenchmark_timings(
-                members, provider_timings, trace_results=[None] * len(members)
+                members, provider_timings, record_trace=False
             )
             return
 
@@ -3381,14 +4664,13 @@ class PopulationBasedSearch(BaseSearch):
         in_process_isolation = False
         if use_isolated and self.settings.autotune_benchmark_fn is None:
             try:
-                isolated_results = self.benchmark_provider.benchmark_isolated(
-                    [m.fn for m in members],
-                    warmup=1,
+                isolated_results = self._isolated_rebenchmark_results(
+                    members,
                     rep=PopulationBasedSearch._isolated_rep_ms(
                         target_ms, self.settings.autotune_benchmark_timeout
                     ),
                     desc=desc,
-                    fresh_process=candidate_private_args,
+                    candidate_private_args=candidate_private_args,
                 )
             except BenchmarkWorkerUnkillable as error:
                 self._record_unkillable(members, error)
@@ -3416,6 +4698,11 @@ class PopulationBasedSearch(BaseSearch):
                     "for distributed in-process rebenchmarking."
                 )
             in_process_isolation = candidate_private_args and not dist.is_initialized()
+
+        if self._input_bank_count > 1:
+            raise exc.InvalidAPIUsage(
+                "rotating input banks require isolated rebenchmarking"
+            )
 
         private_args: _PrivateBenchmarkArgs | None = None
         if (
@@ -3546,6 +4833,76 @@ class PopulationBasedSearch(BaseSearch):
             trace_results=new_timings,
         )
 
+    @_retry_without_private_copies
+    def _isolated_rebenchmark_results(
+        self,
+        members: Sequence[PopulationMember],
+        *,
+        rep: int,
+        desc: str,
+        candidate_private_args: bool,
+    ) -> list[IsolatedBenchmarkTiming] | None:
+        """One isolated steady window per member in the killable worker;
+        ``None`` when the worker cannot time them (the caller falls back to
+        the in-process timers).
+
+        With ``candidate_private_args`` every member reads its own copy of the
+        kernel arguments in the one long-lived worker -- the regime of the
+        full-effort final selection: a candidate's L2-resident (or
+        ``evict_last``-pinned) input lines cannot become hits for the next
+        candidate because the next one reads different addresses. That keeps
+        the isolation a fresh process per finalist provided without its cost
+        (a spawn re-imports torch, the backend and the caller's ``__main__``,
+        then loads the arguments: 7 s per finalist here, 45-60 s under a heavy
+        ``__main__``). The copies are released when the batch ends. A fresh
+        process per finalist remains the fallback when the copies do not fit
+        on the device next to the originals.
+        """
+        provider = self.benchmark_provider
+        fns = [member.fn for member in members]
+        if isinstance(provider, LocalBenchmarkProvider):
+            # A failed re-timing names its candidate in the log.
+            provider.register_isolated_candidates(
+                fns, [member.config for member in members]
+            )
+        if (
+            candidate_private_args
+            and isinstance(provider, LocalBenchmarkProvider)
+            and provider.steady_window_benchmark_available()
+            and provider.private_argument_copies_affordable(len(fns))
+        ):
+            # The timer sizes its repetitions from an estimate pass, so a
+            # window can stretch; three windows plus the wrapper and argument
+            # loads still finish (see ``_final_selection_measurer``).
+            window_s = (1 + rep) / 1000.0
+            timeout_s = max(
+                float(self.settings.autotune_benchmark_timeout),
+                3.0 * window_s + 15.0,
+            )
+            results: list[IsolatedBenchmarkTiming] = []
+            with _WorkerFinalSelectionMeasurer(
+                provider,
+                fns,
+                private_copies=True,
+                timeout_s=timeout_s,
+                desc=desc,
+            ) as measurer:
+                for index in range(len(fns)):
+                    results.append(measurer.measure(index, 1, rep))
+                    if not provider.steady_window_benchmark_available():
+                        # A wrapper the worker cannot load disables it for
+                        # the rest of the batch; time every finalist
+                        # in-process rather than mixing regimes.
+                        return None
+            return results
+        return provider.benchmark_isolated(
+            fns,
+            warmup=1,
+            rep=rep,
+            desc=desc,
+            fresh_process=candidate_private_args,
+        )
+
     def mirrored_rebenchmark(
         self,
         members: list[PopulationMember],
@@ -3572,6 +4929,11 @@ class PopulationBasedSearch(BaseSearch):
             repeat = max(2, repeat - repeat % 2)
         else:
             repeat = max(2, repeat + repeat % 2)
+
+        if self._input_bank_count > 1:
+            return self._mirrored_bank_rebenchmark(
+                members, repeat, desc, target_ms, repeat_reference_perf_ms
+            )
 
         if self.benchmark_provider.mutated_arg_indices:
             benchmark_args = _clone_args(
@@ -3606,6 +4968,108 @@ class PopulationBasedSearch(BaseSearch):
         finally:
             for member in members:
                 clear_jit_fast_path_caches(member.fn, self.log)
+
+    @_retry_without_private_copies
+    def _mirrored_bank_rebenchmark(
+        self,
+        members: list[PopulationMember],
+        repeat: int,
+        desc: str,
+        target_ms: float,
+        reference_ms: float,
+    ) -> MirroredBenchmarkTrace:
+        """Keep mirrored ordering while each worker sample times complete cycles."""
+        provider = self.benchmark_provider
+        if not isinstance(provider, LocalBenchmarkProvider):
+            raise InputBankError("mirrored input banks require the isolated provider")
+        fns = [member.fn for member in members]
+        provider.register_isolated_candidates(
+            fns, [member.config for member in members]
+        )
+        sweeps, cycles, total_cycles = _mirrored_bench_call_layout(
+            math.ceil(repeat / self._input_bank_count)
+        )
+        samples: list[list[float]] = [[] for _ in members]
+        orders: list[list[int]] = []
+        elapsed: list[list[float]] = []
+        failures: list[Literal["error", "timeout"] | None] = [None] * len(members)
+        incomplete = [False] * len(members)
+        with _WorkerFinalSelectionMeasurer(
+            provider,
+            fns,
+            private_copies=provider.private_argument_copies_affordable(len(fns)),
+            timeout_s=float(self.settings.autotune_benchmark_timeout),
+            l2_flush_mode=final_selection_l2_flush_mode(),
+            desc=desc,
+        ) as measurer:
+            indices = list(range(len(members)))
+            for sweep in range(sweeps):
+                offset = (sweep // 2) % len(indices)
+                rotated = indices[offset:] + indices[:offset]
+                order = rotated if sweep % 2 == 0 else list(reversed(rotated))
+                values: list[float] = []
+                for index in order:
+                    if failures[index] is not None or incomplete[index]:
+                        samples[index].append(inf)
+                        values.append(inf)
+                        continue
+                    try:
+                        result = measurer.measure(
+                            index,
+                            0,
+                            1,
+                            fixed_repetitions=cycles,
+                        )
+                    except BenchmarkWorkerUnkillable as error:
+                        self._record_unkillable(members, error)
+                        raise
+                    if result is None:
+                        # An unavailable worker reading is not a config failure.
+                        # Keep its prior observation, but exclude this candidate
+                        # from the comparison rather than retrying part of it.
+                        incomplete[index] = True
+                        value = inf
+                    elif isinstance(result, IsolatedBenchmarkFailure):
+                        failures[index] = result.status
+                        value = inf
+                    else:
+                        value = result
+                    samples[index].append(value)
+                    values.append(value)
+                orders.append(order)
+                elapsed.append(values)
+        medians = [
+            inf if failed or missing else statistics.median(values)
+            for failed, missing, values in zip(
+                failures, incomplete, samples, strict=True
+            )
+        ]
+        raw_results: list[IsolatedBenchmarkTiming] = [
+            None if missing else IsolatedBenchmarkFailure(failed) if failed else median
+            for failed, missing, median in zip(
+                failures, incomplete, medians, strict=True
+            )
+        ]
+        timings, statuses = self._resolve_isolated_rebenchmark_results(
+            members, raw_results
+        )
+        self._apply_rebenchmark_timings(
+            members, timings, failure_statuses=statuses, trace_results=raw_results
+        )
+        return MirroredBenchmarkTrace(
+            orders,
+            elapsed,
+            medians,
+            target_ms=target_ms,
+            repeat_reference_perf_ms=reference_ms,
+            sweep_count=sweeps,
+            calls_per_sample=cycles * self._input_bank_count,
+            total_calls=total_cycles * self._input_bank_count,
+            statuses=[
+                failed or ("incomplete" if missing else "ok")
+                for failed, missing in zip(failures, incomplete, strict=True)
+            ],
+        )
 
     def _resolve_isolated_rebenchmark_results(
         self,
@@ -3647,7 +5111,9 @@ class PopulationBasedSearch(BaseSearch):
         *,
         failure_statuses: Sequence[Literal["error", "timeout"] | None] | None = None,
         trace_results: Sequence[IsolatedBenchmarkTiming] | None = None,
-    ) -> None:
+        record_trace: bool = True,
+    ) -> list[PopulationMember]:
+        """Apply observations and return every member quarantined by a failure."""
         if failure_statuses is None:
             failure_statuses = [None] * len(members)
         if trace_results is None:
@@ -3657,7 +5123,7 @@ class PopulationBasedSearch(BaseSearch):
         ):
             config_id = (
                 self.log.register_config(member.config)
-                if trace_result is not None and self.log.trace_enabled
+                if record_trace and trace_result is not None and self.log.trace_enabled
                 else None
             )
             if config_id is not None and trace_result is not None:
@@ -3689,7 +5155,14 @@ class PopulationBasedSearch(BaseSearch):
                     ),
                     event="rebenchmark",
                 )
-            if failure_status is not None:
+            if (
+                failure_status is not None
+                or trace_result is None
+                or (
+                    isinstance(trace_result, IsolatedBenchmarkFailure)
+                    and trace_result.status == "timeout"
+                )
+            ):
                 continue
             member.perfs.append(timing)
             if timing < self.best_perf_so_far:
@@ -3703,26 +5176,28 @@ class PopulationBasedSearch(BaseSearch):
         if invalidated:
             self._recompute_cute_flash_best_perf(refreshed)
         _refresh_handoff(refreshed)
+        return invalidated
 
-    def _invalidate_cute_flash_rebenchmark_failures(
+    def _rebenchmark_failure_targets(
         self,
         members: Sequence[PopulationMember],
         failure_statuses: Sequence[Literal["error", "timeout"] | None],
-    ) -> list[PopulationMember]:
+    ) -> tuple[list[tuple[PopulationMember, Literal["error", "timeout"]]], set[str]]:
+        """Find failed members and their config/source aliases without mutation."""
         failed_member_statuses = {
             id(member): status
             for member, status in zip(members, failure_statuses, strict=True)
             if status is not None
         }
         if not failed_member_statuses:
-            return []
+            return [], set()
 
         backend = self.config_spec.backend
-        failed_config_statuses = {
-            member.config: status
+        failed_config_statuses = ConfigCache(
+            (member.config, status)
             for member, status in zip(members, failure_statuses, strict=True)
             if status is not None
-        }
+        )
         failed_source_statuses: dict[str, Literal["error", "timeout"]] = {}
         for member, status in zip(members, failure_statuses, strict=True):
             if status is None:
@@ -3733,9 +5208,6 @@ class PopulationBasedSearch(BaseSearch):
                 if existing != "timeout":
                     failed_source_statuses[source_hash] = status
 
-        for source_hash in failed_source_statuses:
-            self.benchmark_provider.invalidate_effective_source_hash(source_hash)
-
         candidates = [
             *members,
             *getattr(self, "population", ()),
@@ -3744,8 +5216,7 @@ class PopulationBasedSearch(BaseSearch):
             *getattr(self, "_pinned_finalist_members", {}).values(),
             *(getattr(self, "_terminal_refinement_members", None) or {}).values(),
         ]
-        invalidated: list[PopulationMember] = []
-        invalidated_configs = set(failed_config_statuses)
+        targets: list[tuple[PopulationMember, Literal["error", "timeout"]]] = []
         seen: set[int] = set()
         for member in candidates:
             if id(member) in seen:
@@ -3760,19 +5231,37 @@ class PopulationBasedSearch(BaseSearch):
                     status = failed_source_statuses.get(source_hash)
             if status is None:
                 continue
+            targets.append((member, status))
+        return targets, set(failed_source_statuses)
+
+    def _invalidate_cute_flash_rebenchmark_failures(
+        self,
+        members: Sequence[PopulationMember],
+        failure_statuses: Sequence[Literal["error", "timeout"] | None],
+    ) -> list[PopulationMember]:
+        targets, source_hashes = self._rebenchmark_failure_targets(
+            members, failure_statuses
+        )
+        if not targets:
+            return []
+        for source_hash in source_hashes:
+            self.benchmark_provider.invalidate_effective_source_hash(source_hash)
+        invalidated = []
+        invalidated_configs = ConfigSet()
+        for member, status in targets:
             member.perfs[:] = [inf]
             member.status = status
             invalidated.append(member)
             invalidated_configs.add(member.config)
         self._invalidate_rebenchmark_training_targets(
             invalidated_configs,
-            set(failed_source_statuses),
+            source_hashes,
         )
         return invalidated
 
     def _invalidate_rebenchmark_training_targets(
         self,
-        failed_configs: set[Config],
+        failed_configs: MutableSet[Config],
         failed_source_hashes: set[str],
     ) -> None:
         """Let surrogate searches discard targets for quarantined CuTe sources."""
@@ -3897,13 +5386,17 @@ class PopulationBasedSearch(BaseSearch):
 
             # Generate candidates by resetting each parameter to its default
             for i in range(len(current.flat_values)):
-                if current.flat_values[i] != default_flat[i]:
+                if _config_value_key(current.flat_values[i]) != _config_value_key(
+                    default_flat[i]
+                ):
                     # Create a new config with this parameter reset to default
                     new_flat = [*current.flat_values]
                     new_flat[i] = default_flat[i]
                     candidate = self.make_unbenchmarked(new_flat)
                     # Only add if valid and produces a different config
-                    if candidate is not None and candidate.config != current.config:
+                    if candidate is not None and _config_key(
+                        candidate.config
+                    ) != _config_key(current.config):
                         candidates.append(candidate)
 
             if len(candidates) <= 1:
@@ -3946,10 +5439,14 @@ class PopulationBasedSearch(BaseSearch):
                 combined_flat = [*current.flat_values]
                 for c in good_candidates:
                     for i in range(len(combined_flat)):
-                        if c.flat_values[i] != current.flat_values[i]:
+                        if _config_value_key(c.flat_values[i]) != _config_value_key(
+                            current.flat_values[i]
+                        ):
                             combined_flat[i] = c.flat_values[i]
                 combined = self.make_unbenchmarked(combined_flat)
-                if combined is not None and combined.config != current.config:
+                if combined is not None and _config_key(combined.config) != _config_key(
+                    current.config
+                ):
                     self.benchmark_population(
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
@@ -4063,9 +5560,9 @@ class PopulationBasedSearch(BaseSearch):
     def _record_unkillable(
         self, members: list[PopulationMember], error: BenchmarkWorkerUnkillable
     ) -> None:
-        """Remember the candidate whose isolated worker could not be reaped."""
+        """Exclude the config under test when an isolated worker cannot be reaped."""
         if error.fn_index is not None and 0 <= error.fn_index < len(members):
-            self._unkillable_configs.add(members[error.fn_index].config)
+            self._fallback_excluded_configs.add(members[error.fn_index].config)
 
     def _finalize(self) -> Config:
         """Finishing phase, terminal refinement, final selection (or the
@@ -4087,6 +5584,7 @@ class PopulationBasedSearch(BaseSearch):
                 # are done.
                 best = self.run_finishing_phase(best, self.finishing_rounds)
                 best = self.run_terminal_refinement(best)
+                best = self.run_compiler_refinement(best)
                 self._budget_reserve_released = True
                 best = self.final_rebenchmark_best(best)
                 self._selected_member = best
@@ -4101,12 +5599,12 @@ class PopulationBasedSearch(BaseSearch):
             # A benchmark worker survived SIGKILL (a hung kernel), so no further
             # worker may be launched and the verification phases cannot run.
             # Keep the best config the search measured instead of discarding
-            # the search, except the candidate that hung the worker.
+            # the search, except configs already known to have failed.
             live = [
                 member
                 for member in (best, self.best, *self.population)
                 if math.isfinite(member.perf)
-                and member.config not in self._unkillable_configs
+                and member.config not in self._fallback_excluded_configs
             ]
             if not live:
                 raise
@@ -4121,6 +5619,135 @@ class PopulationBasedSearch(BaseSearch):
     def run_terminal_refinement(self, best: PopulationMember) -> PopulationMember:
         """Run an optional backend/search-specific post-search refinement."""
         return best
+
+    def _compiler_refinement_enabled(self) -> bool:
+        return bool(
+            self._compiler_refinement_keys
+            and self._final_selection_enabled()
+            and self._final_rebenchmark_top_k() > 1
+            and not self.settings.disable_autotuner_heuristics
+            # Rank-local histories need not agree. Do not introduce collective
+            # benchmark calls until the parent/candidate plan is synchronized.
+            and self.kernel.env.process_group_name is None
+        )
+
+    def run_compiler_refinement(self, best: PopulationMember) -> PopulationMember:
+        """Cross compiler options with the best measured structures, then verify.
+
+        This phase spends the search budget; it never opens the final-selection
+        reserve or records per-candidate checks as population generations. Its
+        short-window winner still enters the ordinary shootout.
+        """
+        if not self._compiler_refinement_enabled():
+            return best
+        registry = self._terminal_refinement_members
+        assert registry is not None
+
+        def reusable(member: PopulationMember) -> bool:
+            return (
+                member.status in {"ok", "deduplicated"}
+                and bool(member.perfs)
+                and math.isfinite(member.perf)
+                and member.config not in self._fallback_excluded_configs
+            )
+
+        def prior_outcome(
+            config: Config,
+        ) -> tuple[PopulationMember | None, str | None]:
+            """Check prior results and current admission limits for one trial."""
+            member = registry.get(config)
+            if member is not None:
+                return member, "reused" if reusable(member) else "prior_failure"
+            if config in self._fallback_excluded_configs:
+                return None, "quarantined"
+            if self._autotune_budget_exceeded():
+                return None, "budget_exhausted"
+            if not self._backend_config_is_viable(config):
+                return None, "invalid"
+            return None, None
+
+        trials: list[dict[str, object]] = []
+        transcript: dict[str, object] = {
+            **compiler_refinement_policy(self._compiler_refinement_keys),
+            "initial_config_id": canonical_config_id(best.config),
+            "trials": trials,
+            "new_trials": 0,
+            "budget_exhausted": False,
+            "completed": False,
+        }
+        self._autotune_metrics.compiler_refinement = transcript
+        try:
+            history = sorted(
+                (member for member in registry.values() if reusable(member)),
+                key=performance,
+            )
+            # A lucky earlier sample must not displace the actual incumbent.
+            # Rank other parents by the same latest timing used below to pick.
+            parents = [best, *history] if reusable(best) else history
+            candidates = compiler_refinement_candidates(
+                self.config_gen,
+                [member.config for member in parents],
+                self._compiler_refinement_keys,
+            )
+            new_trials = 0
+            for candidate in candidates:
+                trial: dict[str, object] = {
+                    "parent_config_id": canonical_config_id(candidate.parent),
+                    "config_id": canonical_config_id(candidate.config),
+                    "config": _copy_config_structure(candidate.config.config),
+                }
+                trials.append(trial)
+                member, outcome = prior_outcome(candidate.config)
+                if outcome is not None:
+                    trial["outcome"] = outcome
+                    if outcome == "budget_exhausted":
+                        transcript["budget_exhausted"] = True
+                    if member is None:
+                        continue
+                elif new_trials >= MAX_REFINEMENT_TRIALS:
+                    trial["outcome"] = "trial_limit"
+                    continue
+                elif self._autotune_budget_exceeded():
+                    trial["outcome"] = "budget_exhausted"
+                    transcript["budget_exhausted"] = True
+                    continue
+                else:
+                    # Admit one trial at a time: its compile/measurement spends
+                    # the search budget before the next admission check, and
+                    # an unkillable worker must stop all subsequent work.
+                    member = self.make_unbenchmarked(candidate.flat_values)
+                    if member is None or not same_refinement_value(
+                        member.config.config, candidate.config.config
+                    ):
+                        trial["outcome"] = "invalid"
+                        continue
+                    if self._autotune_budget_exceeded():
+                        trial["outcome"] = "budget_exhausted"
+                        transcript["budget_exhausted"] = True
+                        continue
+                    new_trials += 1
+                    transcript["new_trials"] = new_trials
+                    trial["outcome"] = "benchmarking"
+                    try:
+                        self.benchmark_population(
+                            [member],
+                            desc="Compiler-option refinement",
+                            raise_if_no_viable_config=False,
+                        )
+                    except BenchmarkWorkerUnkillable as error:
+                        self._record_unkillable([member], error)
+                        trial["outcome"] = "unkillable_worker"
+                        raise
+                    trial["outcome"] = member.status
+                if reusable(member):
+                    trial["perf"] = member.perf
+                    if member.perf < best.perf:
+                        best = member
+            transcript["completed"] = True
+            transcript["selected_config_id"] = canonical_config_id(best.config)
+            return best
+        finally:
+            self.log.record_compiler_refinement(transcript)
 
     def _resolve_device_micros_paired_bench(
         self,

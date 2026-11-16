@@ -16,14 +16,14 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
+from helion._testing import import_example
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 
 def _attention_kernel() -> helion.Kernel:
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     return helion.kernel(
         attention.fn, backend="cute", static_shapes=True, autotune_effort="none"
@@ -40,7 +40,6 @@ _LOCAL_TMA_160 = {
 }
 
 
-@onlyBackends(["cute"])
 def test_local_tma_partition_tiles_kv_with_the_configured_width() -> None:
     q, k, v = (
         torch.empty(1, 4, 256, 64, dtype=torch.float16, device=DEVICE) for _ in range(3)
@@ -51,7 +50,6 @@ def test_local_tma_partition_tiles_kv_with_the_configured_width() -> None:
     assert "cute.local_tile(flash_mV_cur, (64, 160), (0, None))" in code
 
 
-@onlyBackends(["cute"])
 def test_local_tma_partial_kv_tile_matches_reference() -> None:
     torch.manual_seed(0)
     q, k, v = (

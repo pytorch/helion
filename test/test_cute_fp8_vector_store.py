@@ -7,13 +7,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._testing import DEVICE
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 # CuTe's generated launcher resolves kernel annotations and DSL primitives in
@@ -69,8 +68,8 @@ def test_persistent_row_store_is_one_fp8_packet(
 ) -> None:
     # A partial outer row tile must predicate the packet as a whole.
     args = (torch.empty((37, 32), dtype=torch.bfloat16), dtype, hl.constexpr(32))
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_quantize_rows, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_quantize_rows, args)
         code = bound.to_code(_config(bound, vec_width))
     helper = (
         "_cute_store_fp8e4m3fn_vec"
@@ -91,8 +90,8 @@ def test_lane_mask_keeps_partial_packet_stores(limit: int) -> None:
         torch.float8_e4m3fn,
         hl.constexpr(limit),
     )
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_quantize_rows, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_quantize_rows, args)
         code = bound.to_code(_config(bound, 8))
     assert "_helion_persistent_branch_vec_store" not in code, code
     # An explicit lane mask retains scalar stores, even at a packet boundary.
@@ -145,6 +144,7 @@ def test_float_helper_emits_vector_conversion_and_integer_packet(
         assert len(stored) == 1 and type(stored[0]) is cutlass.Uint32
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     ("lanes", "stored_type"),
     [(2, "i16"), (4, "i32"), (8, "i64"), (16, "vector<2xi64>")],
@@ -185,6 +185,7 @@ def test_byte_packets_store_exactly_their_lane_bytes(
         assert str(raw.type) == stored_type
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_fp64_helper_keeps_scalar_conversion_precision() -> None:
     cutlass = pytest.importorskip("cutlass")
     from cutlass._mlir.dialects import arith
@@ -211,6 +212,7 @@ def test_fp64_helper_keeps_scalar_conversion_precision() -> None:
         assert "f64 to f8E4M3FN" in source
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     ("dtype_name", "midpoint", "rounded"),
     [("Float8E4M3FN", 1.0625, 1.125), ("Float8E5M2", 1.125, 1.25)],
@@ -258,6 +260,7 @@ def test_literal_fp32_helper_keeps_direct_fp8_rounding(
         assert "arith.truncf" not in source
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("source_dtype", ["bf16", "f16"])
 @pytest.mark.parametrize("destination_dtype", ["f8E4M3FN", "f8E5M2"])
 def test_half_scalar_and_vector_lower_to_same_native_rounding(

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
@@ -12,10 +11,13 @@ import helion
 from helion._compiler.cute.packed_operand import KEY
 from helion._compiler.cute.packed_operand import MODES
 from helion._compiler.cute.packed_operand import prove_packed_operand
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import check_config_compile_options
 from helion.autotuner.compiler_coverage import append_compiler_coverage
 
-pytestmark = skipUnlessBackends(["cute"])
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.mark.parametrize("reduction", (64, 128, 256))
@@ -79,6 +81,8 @@ def test_original_packed_operand_reaches_ordinary_codegen(reduction: int) -> Non
         isinstance(node, ast.Name) and node.id == plan.materialized_name
         for node in ast.walk(host_ast)
     )
+    if reduction == 64:
+        check_config_compile_options(bound, selected)
 
 
 @pytest.mark.parametrize("reduction", (512, 1024))

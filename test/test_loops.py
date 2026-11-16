@@ -11,6 +11,7 @@ import torch
 
 import helion
 from helion import _compat
+from helion import _utils
 from helion._compat import use_tileir_tunables
 from helion._compiler.static_loop_unroller import StaticLoopUnroller
 from helion._compiler.static_loop_unroller import unroll_static_loops
@@ -189,6 +190,38 @@ def store_with_output_read(x: torch.Tensor, out: torch.Tensor) -> None:
         hl.store(out, [tile], (x[tile] + prior).to(out.dtype))
 
 
+@helion.kernel()
+def reread_in_inner_loop(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    # ``d`` is stored and re-read inside the ``tile_n`` loop: that loop and
+    # the grid loop around it hold the pair; the K loop does not.
+    m, k = x.size()
+    n = w.size(1)
+    d = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_k, tile_n])
+            d[tile_m, tile_n] = acc.to(x.dtype)
+            out[tile_m, tile_n] = d[tile_m, tile_n] * 2
+    return out
+
+
+@helion.kernel()
+def reread_after_inner_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # The store precedes the inner loop that re-reads it: only the grid
+    # loop's region holds both.
+    m, n = y.size()
+    d = torch.empty_like(x)
+    out = torch.empty_like(y)
+    for tile_m in hl.tile(m):
+        d[tile_m] = x[tile_m] + 1
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = y[tile_m, tile_n] * d[tile_m][:, None]
+    return out
+
+
 @helion.kernel(autotune_effort="none")
 def long_elif_chain(x: torch.Tensor, op: hl.constexpr) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -249,9 +282,6 @@ def _thread_barrier() -> str:
 
 @onlyBackends(["triton", "cute", "pallas"])
 class TestLoops(RefEagerTestBase, TestCase):
-    @skipIfRefEager(
-        "a ref-eager load is a view of the input, so in-place ops mutate it"
-    )
     def test_inplace_ops_on_loop_values(self) -> None:
         """In-place ops on device-loop values (``acc.mul_(y)``) mutate SSA values
         and lower as their functional twins on every backend."""
@@ -271,6 +301,136 @@ class TestLoops(RefEagerTestBase, TestCase):
         y = torch.randn([1024], device=DEVICE)
         code, result = code_and_output(fn, (x, y), block_size=128)
         torch.testing.assert_close(result, x * y + 1.0 - x)
+
+    def test_a_constant_beside_an_outer_loops_flag_in_a_branch_test(self) -> None:
+        """``if True and flag:`` in an inner loop reads ``flag`` from the outer
+        loop: the traced ``and`` hands back its operand, which rebinds no
+        value (a check that took any new node of an input for an in-place
+        update refused this kernel)."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(x.size(0)):
+                flag = x[tile_m, 0].sum() > 0
+                for tile_n in hl.tile(x.size(1)):
+                    if True and flag:
+                        out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+                    else:
+                        out[tile_m, tile_n] = x[tile_m, tile_n]
+            return out
+
+        x = torch.rand([64, 32], device=DEVICE) + 0.5
+        for sign, scale in ((1.0, 2.0), (-1.0, 1.0)):
+            _code, result = code_and_output(fn, (sign * x,), block_sizes=[16, 16])
+            torch.testing.assert_close(result, sign * x * scale)
+
+    def test_inplace_ops_on_loop_carries(self) -> None:
+        """An in-place op on a value a device loop or a branch carries out
+        (``acc.add_(x)``) updates the carried value, as ``acc = acc + x`` does,
+        instead of leaving the value it had before."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(x: torch.Tensor, flags: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    acc.add_(x[tile_m, tile_n])
+                total = acc.sum(-1)
+                if flags[0] > 0:
+                    total.mul_(2.0)
+                out[tile_m] = total
+            return out
+
+        x = torch.randn([64, 256], device=DEVICE)
+        for flag in (0, 3):
+            flags = torch.tensor([flag], dtype=torch.int32, device=DEVICE)
+            code, result = code_and_output(fn, (x, flags), block_sizes=[32, 16])
+            expected = x.sum(-1) * (2.0 if flag else 1.0)
+            torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
+
+    def test_inplace_op_result_bound_to_a_second_name(self) -> None:
+        """An in-place op returns its receiver, so ``seen = acc.add_(x)`` binds
+        two names to one tensor; after the device loop or the branch each name
+        keeps its own value, on the branch's path that skips the op too."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, flags: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            totals = torch.empty([m], dtype=torch.float32, device=x.device)
+            doubled = torch.empty([m], dtype=torch.float32, device=x.device)
+            seen_sums = torch.empty([m], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                seen = hl.full([tile_m, block_n], 1.0, dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    seen = acc.add_(x[tile_m, tile_n])
+                total = acc.sum(-1)
+                twice = hl.zeros([tile_m], dtype=torch.float32)
+                if flags[0] > 0:
+                    twice = total.mul_(2.0)
+                totals[tile_m] = total
+                doubled[tile_m] = twice
+                seen_sums[tile_m] = seen.sum(-1)
+            return totals, doubled, seen_sums
+
+        x = torch.randn([64, 256], device=DEVICE)
+        row_sums = x.sum(-1)
+        for flag in (0, 3):
+            flags = torch.tensor([flag], dtype=torch.int32, device=DEVICE)
+            code, (totals, doubled, seen_sums) = code_and_output(
+                fn, (x, flags), block_sizes=[32, 16]
+            )
+            torch.testing.assert_close(
+                totals, row_sums * (2.0 if flag else 1.0), rtol=1e-4, atol=1e-4
+            )
+            torch.testing.assert_close(
+                doubled,
+                row_sums * 2.0 if flag else torch.zeros_like(row_sums),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+            torch.testing.assert_close(seen_sums, row_sums, rtol=1e-4, atol=1e-4)
+
+    @xfailIfPallas(
+        "Pallas lowers only statically counted while loops (StaticLoopUnroller)"
+    )
+    def test_inplace_ops_on_while_loop_carries(self) -> None:
+        """An in-place op in a ``while`` body updates the value the loop carries
+        out, and its result bound to a second name (``result = total.add_(1.0)``)
+        keeps its own value, also when the loop never runs."""
+
+        @helion.kernel(autotune_effort="none")
+        def fn(
+            x: torch.Tensor, flags: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            totals = torch.empty_like(x)
+            results = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                total = x[tile]
+                result = hl.zeros([tile], dtype=torch.float32)
+                count = flags[0]
+                while count > 0:
+                    result = total.add_(1.0)
+                    count = count - 1
+                totals[tile] = total
+                results[tile] = result
+            return totals, results
+
+        x = torch.randn([64], device=DEVICE)
+        for count in (0, 3):
+            flags = torch.tensor([count], dtype=torch.int32, device=DEVICE)
+            code, (totals, results) = code_and_output(fn, (x, flags), block_size=32)
+            torch.testing.assert_close(totals, x + count)
+            torch.testing.assert_close(
+                results, x + count if count else torch.zeros_like(x)
+            )
 
     @skipIfRefEager("StaticLoopUnroller unit test does not execute a kernel")
     def test_static_unroller_rejects_multiple_counter_updates(self) -> None:
@@ -388,6 +548,38 @@ class TestLoops(RefEagerTestBase, TestCase):
         x = torch.zeros(16, device=DEVICE, dtype=torch.float32)
         code, result = code_and_output(kernel, (x,))
         torch.testing.assert_close(result, torch.full_like(x, 4.0))
+
+    @xfailIfPallas(
+        "Pallas lowers only statically counted while loops (StaticLoopUnroller)"
+    )
+    def test_while_updates_carried_values_from_their_old_values(self) -> None:
+        # Both updates read the values before the iteration: the body must not
+        # read ``left`` after it holds the new value.
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor, limits: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for row in hl.grid(x.size(0)):
+                lane = hl.arange(x.size(1))
+                left = x[row, lane]
+                right = left + 1
+                steps = hl.full([], 0, dtype=torch.int32)
+                limit = limits[row]
+                while steps < limit:
+                    left, right = left + right, left - right
+                    steps = steps + 1
+                out[row, lane] = left + 10 * right
+            return out
+
+        x = torch.arange(48, device=DEVICE, dtype=torch.float32).reshape(3, 16)
+        limits = torch.tensor([0, 1, 3], device=DEVICE, dtype=torch.int32)
+        expected = torch.empty_like(x)
+        for row, limit in enumerate(limits.tolist()):
+            left, right = x[row], x[row] + 1
+            for _ in range(limit):
+                left, right = left + right, left - right
+            expected[row] = left + 10 * right
+        code, result = code_and_output(kernel, (x, limits))
+        torch.testing.assert_close(result, expected)
 
     @skipIfRefEager(
         "Ref eager mode does not raise StatementNotSupported for while/else"
@@ -819,14 +1011,17 @@ class TestLoops(RefEagerTestBase, TestCase):
     @skipIfRefEager("checks the CuTe lowering of a block-sized slice reduction")
     @skipUnlessBackends(["cute"])
     def test_full_slice_of_block_sized_buffer_reduction(self):
-        """``buf[:, :].sum(-1)`` of a buffer sized by a registered block: the
-        slice's reduction dim reuses the block's symbol after its loop ended.
-        Where CuTe lowers it, the dim combines across its threads, so each
-        row's total is the tile loop's atomics once, not once per lane. Where
-        CuTe has no lowering (e.g. ``BackendUnsupported: reduction lane owner
-        is not proven``), the refusal is the expected safe outcome: it must
-        refuse rather than reduce with that dim's synthetic lane loop, which
-        would repeat the tile loop's atomics once per lane."""
+        """``buf[:, :].sum(-1)`` of a buffer sized by the block the inner loop
+        tiles: the slice's reduction dim reuses that tile's variable after its
+        loop ended, and meets the loop only through the buffer's memory, so
+        CuTe does not refuse it as a slice beside the tile
+        (``test_block_sized_buffer_slices.py``).  Where CuTe lowers it, the
+        dim combines across its threads, so each row's total is the tile
+        loop's atomics once, not once per lane.  Where CuTe has no lowering (e.g.
+        ``BackendUnsupported: reduction lane owner is not proven``), the
+        refusal is the expected safe outcome: it must refuse rather than
+        reduce with that dim's synthetic lane loop, which would repeat the
+        tile loop's atomics once per lane."""
 
         @helion.kernel(static_shapes=True)
         def row_sums(y: torch.Tensor) -> torch.Tensor:
@@ -1303,9 +1498,12 @@ class TestLoops(RefEagerTestBase, TestCase):
             code3,
         )
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_range_num_stages_preserved_without_aliasing(self):
         args = (torch.randn([16, 16], device=DEVICE),)
         spec = nested_loop_kernel.bind(args).config_spec
@@ -1342,7 +1540,44 @@ class TestLoops(RefEagerTestBase, TestCase):
         normalized = spec.normalized_config(
             helion.Config(block_sizes=[16, 16], range_num_stages=[3] * slots)
         )
-        self.assertEqual(normalized.range_num_stages, [0] * slots)
+        if "range_num_stages" in spec.supported_config_keys():
+            self.assertEqual(normalized.range_num_stages, [0] * slots)
+        else:
+            # Backends without this hint retain the alias analysis but drop
+            # its config key during normalization.
+            self.assertNotIn("range_num_stages", normalized.config)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="range_warp_specialize is offered from Blackwell on"
+    )
+    @skipIfRefEager("not supported in ref eager mode")
+    def test_range_warp_specialize_pinned_for_rereads(self):
+        # Triton's warp specialization distributes a loop body over partitions
+        # by data flow, so a store and a later load of the same storage in one
+        # loop region end up unordered (the re-read saw stale memory).  Such a
+        # loop keeps its slot, pinned to None; loops whose region holds only
+        # one side of the pair keep the knob.
+        x = torch.randn([64, 32], device=DEVICE, dtype=torch.float16)
+        w = torch.randn([32, 64], device=DEVICE, dtype=torch.float16)
+        spec = reread_in_inner_loop.bind((x, w)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize],
+            [True, True, False],
+        )
+        normalized = spec.normalized_config(
+            helion.Config(
+                block_sizes=[16, 16, 16], range_warp_specializes=[True, True, True]
+            )
+        )
+        self.assertEqual(normalized.range_warp_specializes, [None, None, True])
+
+        x = torch.randn([64], device=DEVICE)
+        y = torch.randn([64, 32], device=DEVICE)
+        spec = reread_after_inner_loop.bind((x, y)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize], [True, False]
+        )
 
     @skipIfRefEager("not supported in ref eager mode")
     def test_range_num_stages_pinned_for_host_aliases(self):
@@ -1359,9 +1594,12 @@ class TestLoops(RefEagerTestBase, TestCase):
                 spec = kernel.bind(args).config_spec
                 self.assertTrue(all(item.pinned for item in spec.range_num_stages))
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_range_num_stages_preserved_for_fresh_host_buffers(self):
         # A nested-if rebinding to another fresh buffer, and a view of a fresh
         # buffer whose shape arguments come from x (scalars share no storage).
@@ -1375,9 +1613,12 @@ class TestLoops(RefEagerTestBase, TestCase):
                 self.assertGreater(len(spec.range_num_stages), 0)
                 self.assertFalse(any(item.pinned for item in spec.range_num_stages))
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_inplace_loop_only_disables_its_own_pipeline(self):
         args = (
             torch.randn([16], device=DEVICE),
@@ -1392,9 +1633,12 @@ class TestLoops(RefEagerTestBase, TestCase):
         }
         self.assertEqual(pinned, {0: True, 1: False, 2: False, 3: False})
 
-    @xfailIfPallas("range_num_stages is Triton-specific")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hint")
     @skipIfRefEager("not supported in ref eager mode")
+    @skipIfFn(
+        lambda: not _utils.triton_is_available(),
+        "range_num_stages metadata requires the installed Triton range API",
+    )
     def test_atomic_loop_only_disables_its_own_pipeline(self):
         args = (
             torch.randn([16, 16], device=DEVICE),

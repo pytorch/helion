@@ -1,7 +1,11 @@
-"""Dormant plans for a raw-TMA operand conversion before native MMA.
+"""Plans for the raw-TMA operand conversion ahead of the native MMA.
 
-No lowering selects these plans yet. A caller must separately prove its input,
-role, output and allocation contracts before using the pipeline helper.
+``Tcgen05OperandRolePlan`` is the role record of the flat grouped RNA kernel
+(``tcgen05_flat_grouped_plan``); ``Tcgen05OperandTransformPlan`` and
+``prove_operand_stage_span`` are the proof objects the operand pipeline
+(``tcgen05_operand_pipeline``) and its tests check. A caller separately proves
+its input, role, output and allocation contracts before using the pipeline
+helper.
 """
 
 from __future__ import annotations
@@ -139,8 +143,8 @@ class Tcgen05OperandResourceUsage:
     Shared sizes must come from the full compiled object and launch, not from
     summing the operand spans: allocator padding, metadata and epilogues also
     consume storage. Register allocation is uniform; a caller with runtime
-    register redistribution needs a separate proof. This dormant record is not
-    a runtime admission decision.
+    register redistribution needs a separate proof. This record is not a
+    runtime admission decision.
     """
 
     roles: Tcgen05OperandRolePlan
@@ -308,7 +312,7 @@ class Tcgen05OperandTransformPlan:
         """Fields that a future wrapper must include in its existing cache key.
 
         Compiled helper source hashes remain an additional required dependency;
-        this dormant plan does not register a new runtime wrapper family.
+        this plan does not register a new runtime wrapper family.
         """
         return (
             "tcgen05_operand_transform_v2",

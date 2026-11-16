@@ -15,12 +15,15 @@ from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import check_example
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessHostTensorDescriptor
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing.row_iota_kernels import onehot_row_update
 import helion.language as hl
 
 
@@ -195,6 +198,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn("_helion_tensor_descriptor(", dict_unaligned_code)
         self.assertEqual(len(static_dict_copy._bound_kernels), 2)
 
+    @skipIfXPU("XPU doesn't have CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE")
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")
     def test_unfixed_cuda_descriptor_extent_cache_caps_at_tma_limit(self):
@@ -594,6 +598,70 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIs(pointer_bound, pointer_copy_view.bind((unaligned,)))
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks keyed dispatch specialization")
+    def test_keyed_dispatch_rechecks_descriptor_alignment_every_call(self):
+        def make_copy(view_input: bool):
+            settings = {
+                "autotune_effort": "none",
+                "static_shapes": False,
+                "key": lambda x: x.size(0) > 16,
+                "config": helion.Config(
+                    block_sizes=[16, 16],
+                    indexing=["tensor_descriptor", "pointer"],
+                    host_tensor_descriptors=True,
+                ),
+            }
+
+            @helion.kernel(**settings)
+            def copy(x: torch.Tensor) -> torch.Tensor:
+                out = torch.empty_like(x)
+                for tile in hl.tile(x.size()):
+                    out[tile] = x[tile]
+                return out
+
+            @helion.kernel(**{**settings, "static_shapes": True})
+            def copy_view(x: torch.Tensor) -> torch.Tensor:
+                # A view has no direct source: its guard also requires a zero
+                # storage offset.
+                view = x.view(32, 64)
+                out = torch.empty_like(view)
+                for tile in hl.tile(view.size()):
+                    out[tile] = view[tile]
+                return out
+
+            return copy_view if view_input else copy
+
+        aligned = torch.randn([32, 64], device=DEVICE)
+        storage = torch.randn(32 * 64 + 4, device=DEVICE)
+        unaligned = storage[1 : 32 * 64 + 1].view(32, 64)
+        aligned_offset = storage[4:].view(32, 64)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        self.assertEqual(aligned_offset.data_ptr() % 16, 0)
+        for view_input in (False, True):
+            copy = make_copy(view_input)
+            inputs = (aligned, unaligned, aligned_offset)
+            # Identical exact metadata: only the base pointer (and storage
+            # offset) tells the inputs apart on a warm keyed dispatch.
+            for _ in range(3):
+                for x in inputs:
+                    torch.testing.assert_close(copy(x), x)
+            keys = [copy._fast_dispatch_key((x,)) for x in inputs]
+            self.assertEqual(len({key[:-1] for key in keys}), 1)
+            self.assertEqual(len(copy._fast_dispatch_schemas), 1)
+            bounds = [copy._dispatch_cache[key] for key in keys]
+            self.assertIsNot(bounds[0], bounds[1])
+            self.assertIn(
+                "_helion_tensor_descriptor(",
+                bounds[0].to_triton_code(bounds[0]._config),
+            )
+            self.assertNotIn(
+                "_helion_tensor_descriptor(",
+                bounds[1].to_triton_code(bounds[1]._config),
+            )
+            # A nonzero storage offset only matters without a direct source.
+            self.assertIs(bounds[2], bounds[1] if view_input else bounds[0])
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_dynamic_output_falls_back(self):
         @helion.kernel(
             static_shapes=False,
@@ -685,6 +753,38 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn(get_tensor_descriptor_fn_name(), code)
         # Should not contain permute calls since no permutation needed
         self.assertNotIn("tl.permute", code)
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("Test checks the code and the bound kernel specialization cache")
+    def test_bool_tensor_keeps_pointer_indexing(self):
+        """A bool tensor's ``*i1`` pointer has no byte size for a Triton
+        descriptor (``make_tensor_descriptor`` counts "256 * 0 = 0 bytes"),
+        so a bool mask loads through its pointer while the float operands
+        beside it take descriptors, and a misaligned mask reuses the bound
+        kernel of an aligned one: their code is the same."""
+        config = helion.Config(block_sizes=[1, 32], indexing="tensor_descriptor")
+
+        @helion.kernel(autotune_effort="none", static_shapes=True, config=config)
+        def masked_rows(scores: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+            b, q, _ = scores.shape
+            out = torch.empty_like(scores)
+            for tile_b, tile_q in hl.tile([b, q]):
+                mask = keep[tile_b, tile_q, :].to(torch.float32)
+                out[tile_b, tile_q, :] = scores[tile_b, tile_q, :] * mask
+            return out
+
+        scores = torch.randn([4, 64, 256], device=DEVICE, dtype=torch.float32)
+        keep = torch.rand([4, 64, 256], device=DEVICE) > 0.5
+        storage = torch.rand(4 * 64 * 256 + 1, device=DEVICE) > 0.5
+        unaligned = storage[1:].view(4, 64, 256)
+        self.assertNotEqual(unaligned.data_ptr() % 16, 0)
+        bound = masked_rows.bind((scores, keep))
+        code = bound.to_triton_code(config)
+        self.assertIn(f"{get_tensor_descriptor_fn_name()}(scores,", code)
+        self.assertNotIn(f"{get_tensor_descriptor_fn_name()}(keep,", code)
+        self.assertIs(bound, masked_rows.bind((scores, unaligned)))
+        torch.testing.assert_close(masked_rows(scores, keep), scores * keep)
+        torch.testing.assert_close(masked_rows(scores, unaligned), scores * unaligned)
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_3d_tensor_permutation(self):
@@ -889,7 +989,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         code, (loss, _) = code_and_output(jsd_forward_kernel, (log_q, log_p))
         torch.accelerator.synchronize()
 
-        from examples.jsd import TorchJSDBaseline
+        TorchJSDBaseline = import_example("jsd").TorchJSDBaseline
 
         baseline = TorchJSDBaseline(beta=0.5, ignore_index=-100).to(DEVICE)
         baseline_loss = baseline(log_q, log_p)
@@ -1959,6 +2059,112 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     code, result = code_and_output(kernel, args)
                     torch.testing.assert_close(result, expected)
                     self.assert_tensor_descriptor_not_used_for(code, tensor_name)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="range_warp_specialize is offered from Blackwell on"
+    )
+    @skipIfRefEager("asserts the generated code")
+    @skipIfTileIR("tileir backend ignores range_warp_specializes")
+    def test_loop_that_rereads_its_store_is_not_warp_specialized(self):
+        # ``d`` is stored and read back in one iteration of a loop the config
+        # warp-specializes, with descriptor loads feeding the dot and the
+        # epilogue.  Triton's partitioner put the epilogue (the ``y`` load,
+        # the re-read, the multiply and the ``out`` store) in the load
+        # partition and the ``d`` store in the MMA's, and the barrier between
+        # them was split per partition: ``out`` came back as ``y`` times the
+        # buffer's previous contents.  The loop's range_warp_specializes slot
+        # is pinned to None (see intra_loop_raw_reread_block_ids).
+        @helion.kernel(
+            config=helion.Config(
+                block_sizes=[32, 64, 64],
+                # Descriptor loads (x, b, y, d); pointer stores (d, out).
+                indexing=[
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                    "pointer",
+                ],
+                host_tensor_descriptors=True,
+                num_warps=4,
+                num_stages=2,
+                range_warp_specializes=[None, True, None],
+            ),
+            static_shapes=True,
+        )
+        def gate(
+            x: torch.Tensor, y: torch.Tensor, b: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, k = x.size()
+            n = b.size(1)
+            d = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+            for tile_m in hl.tile(m):
+                for tile_n in hl.tile(n):
+                    acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                    for tile_k in hl.tile(k):
+                        acc = torch.addmm(acc, x[tile_m, tile_k], b[tile_k, tile_n])
+                    d[tile_m, tile_n] = torch.sigmoid(acc.to(x.dtype))
+                    out[tile_m, tile_n] = y[tile_m, tile_n] * d[tile_m, tile_n]
+            return out, d
+
+        m, k, n = 128, 128, 256
+        x = torch.randn([m, k], device=DEVICE, dtype=torch.float16)
+        y = torch.randn([m, n], device=DEVICE, dtype=torch.float16)
+        b = torch.randn([k, n], device=DEVICE, dtype=torch.float16) * 0.1
+        # Leave freed blocks of the outputs' size holding 7.0: a stale re-read
+        # of ``d`` then shows instead of inheriting an earlier result.
+        stale = [
+            torch.full([m, n], 7.0, device=DEVICE, dtype=torch.float16)
+            for _ in range(2)
+        ]
+        del stale
+        code, (out, d) = code_and_output(gate, (x, y, b))
+        self.assertNotIn("warp_specialize", code)
+        torch.testing.assert_close(d, torch.sigmoid(x @ b), atol=1e-2, rtol=1e-2)
+        self.assertTrue(torch.equal(out, y * d))
+        # The grid loop's region holds the pair too; the K loop's does not.
+        spec = gate.bind((x, y, b)).config_spec
+        self.assertEqual(
+            [item.pinned for item in spec.range_warp_specialize], [True, True, False]
+        )
+        normalized = spec.normalized_config(gate.configs[0])
+        self.assertEqual(normalized.range_warp_specializes, [None, None, None])
+
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    @skipIfRefEager("asserts the generated code")
+    def test_looped_reduction_beside_a_row_iota(self):
+        # hl.arange(row.size(1)) lowers the row's size to its extent, which
+        # used to stand for the row's block size in its descriptors' block
+        # shapes: [_BLOCK_SIZE_0, 200] failed Triton's power-of-two check,
+        # [_BLOCK_SIZE_0, 256] the looped reduction's chunks of 64, and with
+        # dynamic shapes [_BLOCK_SIZE_0, cols] Triton's constexpr block shape.
+        for cols, static_shapes in ((200, True), (256, True), (200, False)):
+            with self.subTest(cols=cols, static_shapes=static_shapes):
+                kernel = helion.kernel(
+                    onehot_row_update,
+                    static_shapes=static_shapes,
+                    autotune_effort="none",
+                )
+                # A row stride of cols + 8 elements keeps x's descriptor aligned.
+                x = torch.rand(64, cols + 8, device=DEVICE, dtype=torch.bfloat16)
+                x = x[:, :cols]
+                label = torch.randint(0, cols, (64,), device=DEVICE)
+                code, out = code_and_output(
+                    kernel,
+                    (x, label),
+                    block_sizes=[16],
+                    reduction_loops=[64],
+                    indexing="tensor_descriptor",
+                )
+                columns = torch.arange(cols, device=DEVICE)
+                onehot = torch.where(columns[None, :] == label[:, None], -1.0, 0.0)
+                torch.testing.assert_close(
+                    out, x.float() + onehot * onehot.sum(-1, keepdim=True)
+                )
+                self.assertIn("[_BLOCK_SIZE_0, _REDUCTION_BLOCK_1])", code)
 
 
 if __name__ == "__main__":

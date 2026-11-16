@@ -9,6 +9,8 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from helion._compiler.cute.tcgen05_config import surface
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -16,11 +18,10 @@ import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
 
-from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_dense_row_union import _selected
-from test.test_cute_shared_rhs_grouped import _target
 
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY
 from helion._compiler.cute.grouped_row_union import RESIDENT_CTAS_KEY
@@ -28,21 +29,19 @@ from helion._compiler.cute.grouped_row_union import ROW_UNION_SHARED_UPPER_BOUND
 from helion._compiler.cute.grouped_row_union import ROW_UNION_TMEM_COLUMNS
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._compiler.cute.grouped_row_union import resident_ctas_supported
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
+from helion._testing import cpu_render_target
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 
 @pytest.fixture(scope="module", autouse=True)
 def cpu_only():
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch("cutlass.cute.compile", side_effect=AssertionError("native forbidden")),
-        _target(),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(previous)
 
@@ -284,7 +283,7 @@ def test_capacity_is_checked_again_at_codegen(case):
     bound, _args, _control, multi = case[:4]
     with (
         patch(
-            "helion._compiler.cute.tcgen05_config.CuteTcgen05Config.per_cta_smem_capacity_bytes",
+            "helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes",
             return_value=2 * ROW_UNION_SHARED_UPPER_BOUND - 1,
         ),
         pytest.raises(BackendUnsupported, match="dense row-union requires"),
@@ -319,7 +318,7 @@ def test_resource_bound_and_normal_search_coordinate(case):
         group.witnesses[0].carrier["block_sizes"]
         is not resident.witnesses[0].carrier["block_sizes"]
     )
-    fields = bound.config_spec._cute_tcgen05_config.flat_fields()
+    fields = surface.flat_fields(bound.config_spec._cute_tcgen05_config)
     assert fields[RESIDENT_CTAS_KEY].choices == (1, 2)
     search = _search(bound, args)
     with bound.env:

@@ -20,6 +20,7 @@ import torch
 from triton.testing import do_bench
 
 import helion
+from helion._compat import supported_launch_options
 from helion._testing import run_example
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
@@ -109,26 +110,34 @@ def _fma_f32x2(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tenso
 #       _triton_range_value_data_partition_factor=0,
 #       _triton_config_maxRegAutoWS=200,
 #   )
+# The pinned forward config is the AutoWS tuning above: its register cap and
+# data partitioning exist only in Triton builds with the AutoWS patches, and
+# its 256 x 128 tiles need the partitioned accumulators (plain Triton runs out
+# of tensor memory). Other builds, and the CuTe backend, autotune instead.
+_AUTOWS = "maxRegAutoWS" in (supported_launch_options() or ())
+_FWD_AUTOWS_CONFIG = helion.Config(
+    block_sizes=[256, 128],
+    range_warp_specializes=[True, None],
+    range_multi_buffers=[None, None],
+    pid_type="persistent_interleaved",
+    indexing=[
+        "tensor_descriptor",  # q load
+        "tensor_descriptor",  # k load
+        "tensor_descriptor",  # v load
+        "block_ptr",  # lse store — block_ptr is correctly partitioned
+        "tensor_descriptor",  # o store   under WS dpf=2; pointer stores are not
+    ],
+    num_warps=4,
+    num_stages=3,
+    _triton_range_id_data_partition_factor=0,
+    _triton_range_value_data_partition_factor=2,
+    _triton_config_maxRegAutoWS=152,
+)
+
+
 # pyrefly: ignore [no-matching-overload]
 @helion.kernel(
-    config=helion.Config(
-        block_sizes=[256, 128],
-        range_warp_specializes=[True, None],
-        range_multi_buffers=[None, None],
-        pid_type="persistent_interleaved",
-        indexing=[
-            "tensor_descriptor",  # q load
-            "tensor_descriptor",  # k load
-            "tensor_descriptor",  # v load
-            "block_ptr",  # lse store — block_ptr is correctly partitioned
-            "tensor_descriptor",  # o store   under WS dpf=2; pointer stores are not
-        ],
-        num_warps=4,
-        num_stages=3,
-        _triton_range_id_data_partition_factor=0,
-        _triton_range_value_data_partition_factor=2,
-        _triton_config_maxRegAutoWS=152,
-    ),
+    config=_FWD_AUTOWS_CONFIG if _AUTOWS else None,
     static_shapes=True,
     autotune_accuracy_check=False,
 )
@@ -170,6 +179,7 @@ def blackwell_attention_kernel(
     block_n = hl.register_block_size(N)
     assert M % block_m == 0
     assert N % block_n == 0
+    # AutoWS knobs; a Triton build without them drops them from the launch.
     hl.register_tunable(
         "_triton_range_id_data_partition_factor", EnumFragment(choices=(0,))
     )

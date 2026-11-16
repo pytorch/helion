@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import ast
-import importlib.util
-import sys
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import load_generated_module
+from helion._testing.cute_codegen import stage_sources
 import helion.language as hl
 
 
@@ -77,12 +76,12 @@ def _detach_phases(x: torch.Tensor) -> torch.Tensor:
 
 @pytest.fixture
 def cpu_only():
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 
 def _code(kernel, x):
-    bound = _cpu_bind(kernel, (x,))
+    bound = cpu_bind(kernel, (x,))
     config = bound.config_spec.default_config()
     config.config["pid_type"] = "flat"
     return bound.to_code(config)
@@ -95,12 +94,7 @@ def test_ordered_contiguous_view_captures(shape, offset, tmp_path):
     x = torch.arange(n + offset, dtype=torch.float32)[offset:].reshape(shape)
     original = x.clone()
     code = _code(_view_phases, x)
-    tree = ast.parse(code)
-    bodies = [
-        node.args[0].value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and ast.unparse(node.func) == "PyCodeCache.load"
-    ]
+    bodies = stage_sources(code)
     assert len(bodies) == 2
     for body in bodies:
         host = next(
@@ -117,10 +111,7 @@ def test_ordered_contiguous_view_captures(shape, offset, tmp_path):
         )
     path = tmp_path / "views_generated.py"
     path.write_text(code)
-    spec = importlib.util.spec_from_file_location("views_generated", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    module = load_generated_module(path)
     calls = []
 
     def launch(kernel, grid, *args, **kwargs):
@@ -147,7 +138,7 @@ def test_ordered_writable_input_view_is_not_fresh():
     eager = helion.kernel(
         _write_view_phases.fn, backend="cute", static_shapes=True, ref_mode="eager"
     )
-    actual = _cpu_bind(eager, (x,)).run_ref(x)
+    actual = cpu_bind(eager, (x,)).run_ref(x)
     assert torch.equal(actual, expected)
     assert torch.equal(x.flatten(), expected / 2)
 

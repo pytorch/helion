@@ -10,16 +10,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_persistent_reduction_coverage import _assert_fragment_norm_coverage
-
 import helion
 from helion._compiler.cute.loop_nesting import boundary_only_grid_blocks
 from helion._compiler.cute.thread_budget import tile_loop_thread_count
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_fragment_coverage import assert_fragment_norm_coverage
 import helion.language as hl
 from helion.language import tile_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
@@ -138,8 +138,8 @@ def test_boundary_only_grid_preserves_partial_tile_bounds() -> None:
 
 @pytest.fixture(scope="module", params=("rms_norm", "layer_norm"))
 def norm_bound(request: pytest.FixtureRequest) -> BoundKernel:
-    from examples.layer_norm import layer_norm_bwd
-    from examples.rms_norm import rms_norm_bwd
+    layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+    rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
 
     x = torch.empty(256, 1024, dtype=torch.float16)
     weight = torch.empty(1024, dtype=torch.float16)
@@ -180,7 +180,7 @@ def test_norm_backward_reuses_coarse_grid_threads(norm_bound: BoundKernel) -> No
     assert _inactive(norm_bound) == {0}
     config = norm_bound.env.config_spec.default_config()
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=128 * 1024,
     ):
         code = norm_bound.to_code(config)
@@ -195,7 +195,7 @@ def test_norm_backward_reuses_coarse_grid_threads(norm_bound: BoundKernel) -> No
         # Complete fragment ownership bypasses both scalar grid variants.
         # Check their equivalence and every feature/output coordinate.
         assert ast.dump(ast.parse(original)) == ast.dump(ast.parse(code))
-        _assert_fragment_norm_coverage(code, 256, 1024)
+        assert_fragment_norm_coverage(code, 256, 1024)
         return
 
     # The coarse grid's 32 redundant threads previously consumed the budget
@@ -243,7 +243,7 @@ def test_norm_backward_does_not_create_unused_coarse_lanes(
     # unused coarse tile. Inactivity must suppress both threads and lane loops.
     config = helion.Config(block_sizes=[64, 64], num_threads=[1, 64, 16])
     with patch(
-        "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+        "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
         return_value=128 * 1024,
     ):
         code = norm_bound.to_code(config)

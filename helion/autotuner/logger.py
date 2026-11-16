@@ -116,7 +116,7 @@ class _ElapsedFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         elapsed = self._elapsed_fn()
-        return f"[{elapsed}s] {record.getMessage()}"
+        return f"[{elapsed}s] {super().format(record)}"
 
 
 class AutotuningLogger:
@@ -236,6 +236,13 @@ class AutotuningLogger:
                 self._trace_algorithm,
                 config_id=canonical_config_id(config),
                 config=config.config,
+            )
+
+    @_logging_errors()
+    def record_compiler_refinement(self, transcript: dict[str, object]) -> None:
+        if self._trace_sink is not None:
+            self._trace_sink.record(
+                "compiler_refinement", self._trace_algorithm, transcript=transcript
             )
 
     @_logging_errors()
@@ -961,6 +968,19 @@ _UNRECOVERABLE_RUNTIME_ERROR_RE: re.Pattern[str] = re.compile(
 
 def match_unrecoverable_runtime_error(err: BaseException) -> bool:
     return bool(_UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(err)))
+
+
+# A device allocation that failed: in PyTorch's caching allocator, the CUDA /
+# HIP runtime, or the driver behind a Triton module load or launch.
+_DEVICE_OUT_OF_MEMORY_RE: re.Pattern[str] = re.compile(
+    r"(CUDA|HIP)( driver)?( error:)? out of memory|\[(CUDA|HIP)\]:.*out of memory"
+)
+
+
+def match_device_out_of_memory(err: BaseException) -> bool:
+    return isinstance(err, CudaOOMError) or bool(
+        _DEVICE_OUT_OF_MEMORY_RE.search(str(err))
+    )
 
 
 def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "debug"]:

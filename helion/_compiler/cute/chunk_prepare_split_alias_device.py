@@ -13,32 +13,33 @@ match predicate.
 
 from __future__ import annotations
 
-from typing import Any
-from typing import cast
-
 import cutlass
 from cutlass._mlir.dialects import llvm
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import dsl_user_op
 import cutlass.utils
 
-from .kda_device_primitives import _mma_m16n8k16
-from .kda_device_primitives import mma_m16n8k16_bf16
-from .kda_device_primitives import movmatrix_b16
-from .kda_device_primitives import pack_bf16x2
-from .kda_device_primitives import store_vec8_bf16
-from .kda_device_primitives import tma_store_3d
-from .kda_device_primitives import tma_store_commit_group
-from .kda_device_primitives import tma_store_wait_read
-from .kda_device_primitives import vec4_f32
-from .kda_device_primitives import vec8_bf16
-from .kda_device_primitives import vec_at
-from .kda_device_primitives import warp_arrive
+from .affine_recurrence_primitives import _mma_m16n8k16
+from .affine_recurrence_primitives import ldmatrix_x4
+from .affine_recurrence_primitives import mma_m16n8k16_bf16
+from .affine_recurrence_primitives import movmatrix_b16
+from .affine_recurrence_primitives import pack_bf16x2
+from .affine_recurrence_primitives import stmatrix_x4
+from .affine_recurrence_primitives import store_vec8_bf16
+from .affine_recurrence_primitives import tma_store_3d
+from .affine_recurrence_primitives import tma_store_commit_group
+from .affine_recurrence_primitives import tma_store_wait_read
+from .affine_recurrence_primitives import vec4_f32
+from .affine_recurrence_primitives import vec8_bf16
+from .affine_recurrence_primitives import vec_at
+from .affine_recurrence_primitives import warp_arrive
+from .device.ptx import fence_tensormap_acquire
+from .device.ptx import mul_bf16x2
+from .device.ptx import tma_load_4d
 
 BT = 16
 DK = 128
 make_rmem_tensor = cute.make_rmem_tensor
-_LLVM_STRUCT_TYPE = cast("Any", llvm).StructType
 
 PREPARE_DEVICE_THREADS = 128
 PREPARE_DEVICE_WARPS = 4
@@ -62,54 +63,6 @@ MBAR_SLOT_K_RELEASED = 9
 PREFIX_FLOOR = -126.0
 NORM_SS_FLOOR = 1.0e-24
 LOG2_E = 1.4426950408889634
-
-
-def ldmatrix_x4(smem_ptr, *, loc=None, ip=None):
-    """``ldmatrix.sync.aligned.m8n8.x4.shared.b16`` -> four b32 registers."""
-    from cutlass._mlir.extras import types as _T
-
-    struct = llvm.inline_asm(
-        _LLVM_STRUCT_TYPE.get_literal([_T.IntegerType.get_signless(32)] * 4),
-        [smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)],
-        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    return tuple(
-        cutlass.Int32(
-            llvm.extractvalue(
-                _T.IntegerType.get_signless(32), struct, [i], loc=loc, ip=ip
-            )
-        )
-        for i in range(4)
-    )
-
-
-@dsl_user_op
-def stmatrix_x4(smem_ptr, r0, r1, r2, r3, *, loc=None, ip=None):
-    """``stmatrix.sync.aligned.m8n8.x4.shared.b16`` from four b32 registers."""
-
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r2).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r3).ir_value(loc=loc, ip=ip),
-        ],
-        "stmatrix.sync.aligned.m8n8.x4.shared.b16 [$0], {$1, $2, $3, $4};",
-        "r,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
 
 
 @dsl_user_op
@@ -146,73 +99,6 @@ def pack_f16x2(lo: cutlass.Float32, hi: cutlass.Float32, *, loc=None, ip=None):
             loc=loc,
             ip=ip,
         )
-    )
-
-
-@dsl_user_op
-def mul_bf16x2(a, b, *, loc=None, ip=None):
-    """Packed BF16 multiply of two b32 registers, rounding each product."""
-    from cutlass._mlir.extras import types as _T
-
-    return cutlass.Int32(
-        llvm.inline_asm(
-            _T.IntegerType.get_signless(32),
-            [
-                cutlass.Int32(a).ir_value(loc=loc, ip=ip),
-                cutlass.Int32(b).ir_value(loc=loc, ip=ip),
-            ],
-            "mul.rn.bf16x2 $0, $1, $2;",
-            "=r,r,r",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
-def fence_tensormap_acquire(desc_addr, *, loc=None, ip=None):
-    """Publish a host-written tensor map to the tensormap proxy.
-
-    The descriptor is written by the host and read by the TMA unit through a
-    different proxy, so the kernel has to acquire it before first use.
-    """
-    llvm.inline_asm(
-        None,
-        [cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip)],
-        "fence.proxy.tensormap::generic.acquire.gpu [$0], 128;",
-        "l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def tma_load_4d(smem_ptr, desc_addr, mbar_ptr, c0, c1, c2, c3, *, loc=None, ip=None):
-    """One ``cp.async.bulk.tensor.4d`` box, global to shared."""
-    llvm.inline_asm(
-        None,
-        [
-            smem_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(desc_addr).ir_value(loc=loc, ip=ip),
-            mbar_ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c2).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(c3).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.4d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-        " [$0], [$1, {$3, $4, $5, $6}], [$2];",
-        "r,l,r,r,r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
     )
 
 

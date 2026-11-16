@@ -1,52 +1,50 @@
 """Codegen pins for the trimmed fixed chain of the plain tcgen05 GEMM launch.
 
-CPU-only (fake CUDA target): every test binds a kernel, pins a config and
-inspects the generated CuTe source.  Runtime coverage lives in
-``test_cute_tcgen05_fixed_chain_gpu.py``.
+CPU-only (the fake CUDA target of the module's ``cpu_render`` marker): every
+test binds a kernel, pins a config and inspects the generated CuTe source.
+The runtime numerics (sm_100 GPU) are at the end of the module.
 """
 
 from __future__ import annotations
 
 import re
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_shared_rhs_grouped import _target
-from test.test_cute_tcgen05_ordinary_exploration import _cuda_fake
-from test.test_cute_tcgen05_ordinary_exploration import _ordinary_gemm
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_lifecycle import Tcgen05LifecycleContext
-from helion._testing import skipUnlessBackends
+from helion._testing import DEVICE
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
+from helion._testing.cute_dense_tcgen05 import batched_gemm
+from helion._testing.cute_dense_tcgen05 import bind_bmm
+from helion._testing.cute_mma_dag import CPU_DEVICE
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+# The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
+# as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
+    ),
+]
 
-CPU_DEVICE = "cpu"
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable
 
     from helion.runtime.kernel import BoundKernel
-
-
-def _batched_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    batch, m, k = a.shape
-    _, _, n = b.shape
-    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
-    for tile_b, tile_m, tile_n in hl.tile((batch, m, n)):
-        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.baddbmm(
-                acc, a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n]
-            )
-        out[tile_b, tile_m, tile_n] = acc.to(out.dtype)
-    return out
 
 
 def _two_output_gemm(
@@ -109,56 +107,6 @@ def _bias_gemm(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Te
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = (acc + bias[tile_m, tile_n]).to(out.dtype)
     return out
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setenv("HELION_BACKEND", "cute")
-    monkeypatch.setenv("HELION_AUTOTUNE_EFFORT", "full")
-    with (
-        _target(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _mock_cuda_unavailable(),
-        patch("torch.cuda.current_device", return_value=0),
-        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
-        patch(
-            "helion.runtime.kernel._find_device", return_value=torch.device("cuda:0")
-        ),
-        patch(
-            "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=_cuda_fake,
-        ),
-        patch(
-            "torch._inductor.runtime.hints.DeviceProperties.create",
-            return_value=SimpleNamespace(
-                type="cuda", index=0, cc=100, warp_size=32, multi_processor_count=148
-            ),
-        ),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        yield
-
-
-def _bind_gemm(shape: tuple[int, int, int], dtype: torch.dtype) -> BoundKernel:
-    m, n, k = shape
-    args = (
-        torch.empty((m, k), dtype=dtype, device=CPU_DEVICE),
-        torch.empty((k, n), dtype=dtype, device=CPU_DEVICE),
-    )
-    return helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True).bind(args)
-
-
-def _bind_bmm(shape: tuple[int, int, int, int], dtype: torch.dtype) -> BoundKernel:
-    batch, m, n, k = shape
-    args = (
-        torch.empty((batch, m, k), dtype=dtype, device=CPU_DEVICE),
-        torch.empty((batch, k, n), dtype=dtype, device=CPU_DEVICE),
-    )
-    return helion.kernel(_batched_gemm, backend="cute", static_shapes=True).bind(args)
 
 
 def _bind_two_output_gemm(
@@ -348,12 +296,71 @@ def test_one_tile_per_cta_frees_tmem_inside_the_epilogue() -> None:
     assert kernel.rstrip().endswith("tcgen05_c_pipeline.producer_tail()")
 
 
+@pytest.mark.parametrize(
+    ("a_m_major", "b_k_major"), ((True, False), (False, True), (True, True))
+)
+def test_batched_gemm_column_major_operands_load_through_tma(
+    a_m_major: bool, b_k_major: bool
+) -> None:
+    """A batched GEMM's M-major A ([B, K, M] transposed) or K-major B
+    ([B, N, K] transposed) enters the tcgen05 search and loads through the
+    (M, K, L) / (N, K, L) TensorMap views of its own strides, in the major
+    mode the MMA reads (``bmm(q.transpose(1, 2), k)``, ``bmm(p, v.mT)``)."""
+    bound = bind_bmm(
+        (8, 256, 512, 256), torch.float16, a_m_major=a_m_major, b_k_major=b_k_major
+    )
+    assert bound.config_spec.tcgen05.search_enabled
+    source = _source(
+        bound,
+        _plain_config(block_sizes=[1, 128, 128, 64], loop_orders=[[0, 1, 2]]),
+    )
+    assert "'lhs_tma_order': (1, 2, 0)" in source
+    assert "'rhs_tma_order': (2, 1, 0)" in source
+    assert ("'a_k_major': False" in source) is a_m_major
+    assert ("'b_k_major': True" in source) is b_k_major
+    kernel = _kernel_body(source)
+    assert "cute.copy(tma_atom_a" in kernel
+    assert "cute.copy(tma_atom_b" in kernel
+
+
+@pytest.mark.parametrize("n", [16, 24])
+def test_narrow_k_major_b_batched_gemm_default_renders(n: int) -> None:
+    """A K-major B of 24 columns would tile N at 8 on the tcgen05 search,
+    whose 8-column K-major B stage needs 64-byte k-blocks the 16-deep default
+    lacks (``tcgen05 K-major B TMA with block_n=8``): it keeps the other
+    lowerings, and its default config renders. 16 columns tile N at 16 and
+    stay on tcgen05."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = bind_bmm((2, 64, n, 32), torch.float16, b_k_major=True)
+        source = _source(bound, bound.config_spec.default_config())
+    assert ("make_trivial_tiled_mma" in source) is (n == 16)
+
+
+def test_batched_m_major_a_keeps_the_pipeline_facts() -> None:
+    """The operand analysis stages a batched M-major A through TMA as the
+    emitter does (``lhs_tma_major_supported``), so the allocation proof and
+    the default tiles see it: 8 x 2048^3 defaults to the 256x256 pair, not
+    the flat 128x16 tile it ran."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        bound = bind_bmm((8, 2048, 2048, 2048), torch.bfloat16, a_m_major=True)
+        config = bound.config_spec.default_config()
+    assert bound.config_spec._cute_tcgen05_config.pipeline_smem_facts is not None
+    assert config.block_sizes == [1, 256, 256, 64]
+    assert config.config["tcgen05_cluster_m"] == 2
+
+
 def test_batched_gemm_one_tile_per_cta_uses_one_shot_scheduler() -> None:
     # 8 batches x (256/128) x (256/64) = 64 tiles <= 148 SMs; the batch axis
     # is the scheduler's L dimension and counts toward the one-shot proof.
     kernel = _kernel_body(
         _source(
-            _bind_bmm((8, 256, 256, 512), torch.float16),
+            bind_bmm((8, 256, 256, 512), torch.float16),
             _plain_config(block_sizes=[1, 128, 64, 64], loop_orders=[[0, 1, 2]]),
         )
     )
@@ -388,7 +395,7 @@ KLOOP_ACQUIRE = (
     ("bind", "config", "ab_stages", "fresh"),
     [
         (
-            lambda: _bind_bmm((8, 256, 256, 512), torch.float16),
+            lambda: bind_bmm((8, 256, 256, 512), torch.float16),
             lambda: _plain_config(
                 block_sizes=[1, 128, 64, 64],
                 loop_orders=[[0, 1, 2]],
@@ -451,10 +458,103 @@ def test_initial_prefill_acquires_skip_the_fresh_ring_wait(
     assert kernel.count(KLOOP_ACQUIRE) >= 1
 
 
+def test_batched_gemm_rides_the_two_cta_paired_schedule() -> None:
+    # A leading batch axis is admitted to the explicit CtaGroup.TWO family:
+    # the paired SMEM facts analyze the rank-3 operands, the search enables
+    # the paired family, and the kernel is the role-local two-CTA schedule with
+    # the batch as the scheduler's third dimension (bmm 8 x 256x256x512: 8 x
+    # (256/128) x (256/64) = 64 pairs). The 2x2 cluster of pairs rides along.
+    bound = bind_bmm((8, 256, 256, 512), torch.float16)
+    with bound.env:
+        state = bound.config_spec._cute_tcgen05_config
+        assert state.pipeline_smem_facts is not None
+        assert surface.paired_pipeline_search_enabled(state)
+    for cluster_n in (1, 2):
+        requested = helion.Config(
+            block_sizes=[1, 128, 64, 64],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+            tcgen05_cta_group="two",
+            tcgen05_cluster_m=2,
+            tcgen05_cluster_n=cluster_n,
+            tcgen05_ab_stages=8,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+        )
+        with bound.env:
+            config = bound.config_spec.normalized_config(requested)
+        assert config.config["tcgen05_cta_group"] == "two"
+        assert config.config["tcgen05_ab_stages"] == 8
+        source = bound.to_code(config)
+        kernel = _kernel_body(source)
+        assert f"_helion_cute_cluster_shape = (2, {cluster_n}, 1)" in source
+        assert "CtaGroup.TWO" in kernel
+        assert "'use_2cta_instrs': True" in source
+        params = re.search(r"PersistentTileSchedulerParams\(.*", kernel)
+        assert params is not None, kernel
+        assert "8" in params.group(0)
+
+
+def test_batched_cluster_n2_pairs_need_whole_n_tile_pairs() -> None:
+    # bmm 7 x 384x192x512 at bn=64: three N tiles cannot be paired on the
+    # scheduler's N dimension, so the paired two-CTA family rejects
+    # cluster_n=2 at normalization (codegen used to raise instead); the
+    # search repair projects the sample onto cluster_n=1.  The L2 raster
+    # knobs that would re-pair the cluster lanes on (batch, m) are rejected
+    # the same way on an even tile count.
+    bound = bind_bmm((7, 384, 192, 512), torch.float16)
+
+    def paired(bn: int, **overrides: object) -> helion.Config:
+        values: dict[str, object] = {
+            "block_sizes": [1, 128, bn, 64],
+            "loop_orders": [[0, 1, 2]],
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cta_group": "two",
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 2,
+            "tcgen05_ab_stages": 4,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+        }
+        values.update(overrides)
+        return helion.Config(**values)
+
+    with bound.env:
+        spec = bound.config_spec
+        # The config layer's odd-N rule (every 2x2 family) names the tile
+        # count ahead of the paired family's own check.
+        with pytest.raises(
+            helion.exc.InvalidConfig, match="cta_group='two'|tiles is odd"
+        ):
+            spec.normalized_config(paired(64))
+        repaired = dict(paired(64).config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert repaired["tcgen05_cta_group"] == "two"
+        assert repaired["tcgen05_cluster_n"] == 1
+    even = bind_bmm((8, 256, 256, 512), torch.float16)
+    with even.env:
+        spec = even.config_spec
+        for requested in (
+            paired(64, l2_groupings=[2]),
+            paired(64, tcgen05_l2_swizzle_size=2),
+        ):
+            with pytest.raises(helion.exc.InvalidConfig, match="cta_group='two'"):
+                spec.normalized_config(requested)
+            repaired = dict(requested.config)
+            spec.normalize(repaired, _fix_invalid=True)
+            # The repaired sample is a valid pair (the search projection
+            # keeps its own raster rule for cluster_n).
+            assert repaired["tcgen05_cta_group"] == "two"
+            assert spec.normalized_config(helion.Config(**repaired)).config == repaired
+        config = spec.normalized_config(paired(64))
+        assert config.config["tcgen05_cluster_n"] == 2
+    assert "_helion_cute_cluster_shape = (2, 2, 1)" in even.to_code(config)
+
+
 def test_batched_gemm_with_more_tiles_than_sms_keeps_the_persistent_loop() -> None:
     kernel = _kernel_body(
         _source(
-            _bind_bmm((64, 256, 256, 512), torch.float16),
+            bind_bmm((64, 256, 256, 512), torch.float16),
             _plain_config(block_sizes=[1, 128, 64, 64], loop_orders=[[0, 1, 2]]),
         )
     )
@@ -538,32 +638,6 @@ def test_compact_fragment_epilogue_of_one_tile_frees_tmem_in_the_teardown() -> N
     assert "while tcgen05_role_local" not in kernel
     _assert_merged_pipeline_init(kernel, launched_warps=6)
     _assert_single_teardown_free(kernel)
-
-
-def test_pure_matmul_lifecycle_merges_the_pipeline_init() -> None:
-    # The pure-matmul strategy is flat-grid only, so it never takes the
-    # one-shot in-epilogue free; it does get the merged init, the warp-1
-    # allocator and the short teardown through its own post-loop emitter.
-    kernel = _kernel_body(
-        _source(
-            _bind_gemm((512, 512, 256), torch.float16),
-            _plain_config(
-                pid_type="flat", tcgen05_strategy="pure_matmul_role_lifecycle"
-            ),
-        )
-    )
-    assert (
-        "tcgen05_pipeline_init_barrier = cutlass.pipeline.NamedBarrier("
-        "barrier_id=3, num_threads=96)"
-    ) in kernel
-    assert kernel.count(PUBLICATION) == 1
-    assert kernel.count("cute.arch.mbarrier_init_fence()") == 1
-    assert kernel.count("allocator_warp_id=1") == 2
-    assert kernel.count("allocator_warp_id=0") == 0
-    _assert_single_teardown_free(kernel)
-    free = kernel.index("tcgen05_tmem_allocator.free(")
-    assert kernel.index("tcgen05_acc_pipeline.producer_tail(") < free
-    assert free < kernel.index("tcgen05_c_pipeline.producer_tail()")
 
 
 def test_clc_one_cta_scheduler_merges_the_pipeline_init() -> None:
@@ -651,16 +725,32 @@ def test_two_cta_cluster_keeps_the_cluster_init_protocol() -> None:
     assert relinquish < kernel.index("tcgen05_tmem_allocator.wait_for_alloc()")
     # This CPU-mocked bind is a multi-tile persistent kernel (the SM count
     # mock keeps it off the one-shot path), so the TMA-load role stays after
-    # the prefix wait and the teardown frees TMEM after the store drain; the
-    # one-shot hoist / epilogue free are covered on a real device by
+    # the prefix wait and the teardown frees TMEM before the store drain (the
+    # two-CTA order: free, then drain); the one-shot hoist / epilogue
+    # free are covered on a real device by
     # ``test_matmul_mma_tcgen05_two_cta_one_shot_prologue_teardown``.
     assert "advance_to_next_work()" in kernel
-    assert "if not tcgen05_tma_warp:" not in kernel
+    assert (
+        "if not tcgen05_tma_warp:\n        cutlass.pipeline.pipeline_init_wait("
+        not in kernel
+    )
+    # The one-warp prologue blocks the TMA-load warp skips (the two-CTA TMEM
+    # dealloc barrier init, the pipeline inits, epilogue warp 0's store
+    # descriptor prefetch) sit behind one guard ahead of the cluster arrive.
+    assert kernel.count("initialize_mbarrier=False)") == 2
+    guarded = kernel.index(
+        "if not tcgen05_tma_warp:\n        if tcgen05_warp_idx == cutlass.Int32(0):"
+        "\n            with cute.arch.elect_one():"
+        "\n                cute.arch.mbarrier_init(tcgen05_tmem_dealloc_mbar_ptr, 32)"
+    )
+    assert guarded < kernel.index("cutlass.pipeline.pipeline_init_arrive(")
+    assert kernel.count("prefetch_descriptor(tcgen05_tma_store_atom)") == 1
+    assert guarded < kernel.index("prefetch_descriptor(tcgen05_tma_store_atom)")
     assert kernel.index("cutlass.pipeline.pipeline_init_wait(") < kernel.index(
         "cute.arch.griddepcontrol_wait()"
     )
-    assert kernel.index("tcgen05_c_pipeline.producer_tail()") < kernel.index(
-        "tcgen05_tmem_allocator.free("
+    assert kernel.index("tcgen05_tmem_allocator.free(") < kernel.index(
+        "tcgen05_c_pipeline.producer_tail()"
     )
 
 
@@ -738,6 +828,22 @@ def test_lifecycle_epilogue_free_leaves_only_the_tails_in_the_teardown() -> None
     ]
 
 
+def test_lifecycle_mma_warp_free_drains_the_stores_once() -> None:
+    # The two-CTA row-union teardown (MMA warp frees TMEM) issues the store
+    # drain exactly once, after the dealloc like every two-CTA teardown.
+    lines = _lifecycle(
+        is_two_cta=True,
+        tmem_permit_released_early=True,
+        mma_warp_frees_tmem=True,
+        exec_acc_tmem_ptr="exec_ptr",
+    ).render_store_post_loop_lines(tma_store_pipeline_tail="drain()")
+    assert lines.count("drain()") == 1
+    free = next(
+        i for i, line in enumerate(lines) if "tmem_alloc.free(exec_ptr)" in line
+    )
+    assert lines.index("drain()") > free
+
+
 def test_lifecycle_default_teardown_is_unchanged() -> None:
     lines = _lifecycle().render_store_post_loop_lines(
         tma_store_pipeline_tail="if w0:\n    c.producer_tail()"
@@ -749,3 +855,351 @@ def test_lifecycle_default_teardown_is_unchanged() -> None:
         "if epi_w:\n    tmem_alloc.free(epi_ptr)",
     ]
     assert "if epi_w:\n    tmem_alloc.relinquish_alloc_permit()" in lines
+
+
+# Runtime numerics for the trimmed tcgen05 GEMM fixed chain (sm_100 GPU).
+#
+# Each case pins a config that exercises one of the trimmed prologue/teardown
+# shapes (merged pipeline init, warp-1 TMEM allocator, early permit release,
+# one-tile-per-CTA scheduler with the in-epilogue TMEM free, short teardown)
+# and launches it many times: a TMEM leak or a barrier-count mismatch shows up
+# as a hang or a wrong result within a few launches per SM.
+
+
+def _sm100_gpu(test: Callable[..., object]) -> Callable[..., object]:
+    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer."""
+    return skipIfNotCUDA()(
+        skipIfCudaCapabilityLessThan((10, 0), reason="tcgen05 requires an sm_100 GPU")(
+            test
+        )
+    )
+
+
+LAUNCHES = 40
+
+
+def _gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=torch.float16, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(a[tile_m, tile_k], b[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc.to(torch.float16)
+    return out
+
+
+def _addmm_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.shape
+    _, n = b.shape
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile((m, n)):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def _config(**overrides: object) -> helion.Config:
+    values: dict[str, object] = {
+        "block_sizes": [128, 64, 64],
+        "loop_orders": [[0, 1]],
+        "indexing": ["tensor_descriptor"] * 3,
+        "pid_type": "persistent_blocked",
+        "tcgen05_cluster_m": 1,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_tvm_ffi_launch": False,
+    }
+    values.update(overrides)
+    return helion.Config(**values)
+
+
+def _run(
+    kernel_fn,
+    args: tuple[torch.Tensor, ...],
+    config: helion.Config,
+    expected: torch.Tensor,
+    *,
+    source_needle: str | tuple[str, str] | None = None,
+    **tol: float,
+) -> None:
+    kernel = helion.kernel(kernel_fn, backend="cute", static_shapes=True)
+    bound = kernel.bind(args)
+    bound.set_config(config)
+    if source_needle is not None:
+        with bound.env:
+            normalized = bound.config_spec.normalized_config(config)
+        source = bound.to_code(normalized)
+        if isinstance(source_needle, tuple):
+            # Both present, in this order (for the one-tile epilogue: the TMEM
+            # free follows the TMA store issue).
+            first, second = source_needle
+            assert source.index(first) < source.index(second), source
+        else:
+            assert source_needle in source, source
+    outputs = [bound(*args) for _ in range(LAUNCHES)]
+    torch.cuda.synchronize()
+    for out in outputs:
+        torch.testing.assert_close(out, expected.to(out.dtype), **tol)
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_one_tile_per_cta_fp16() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    _run(
+        _gemm,
+        (a, b),
+        _config(),
+        a @ b,
+        source_needle=(
+            "cute.copy(tcgen05_tma_store_atom",
+            "tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)",
+        ),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_plain_two_cta_narrow_subtile_fp16() -> None:
+    # Plain 16-bit two-CTA 256x256 tiles take the (128, 32) subtile and, at
+    # bk=64, the no-unroll K loop; the persistent kernel runs 3.5 tiles per
+    # CTA pair here.
+    torch.manual_seed(0)
+    a = torch.randn(4096, 512, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(512, 2048, device=DEVICE, dtype=torch.float16)
+    _run(
+        _addmm_gemm,
+        (a, b),
+        _config(
+            block_sizes=[256, 256, 64],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=2,
+            tcgen05_ab_stages=6,
+        ),
+        a @ b,
+        source_needle=(
+            "tcgen05_epi_tile = (cute.make_layout(128), cute.make_layout(32))",
+            "cutlass.Int32(_BLOCK_SIZE_2), unroll=1):",
+        ),
+        rtol=2e-2,
+        atol=2e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_multi_tile_persistent_fp16() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(2048, 1024, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(1024, 4096, device=DEVICE, dtype=torch.float16)
+    _run(
+        _gemm,
+        (a, b),
+        _config(tcgen05_ab_stages=3),
+        a @ b,
+        source_needle="while tcgen05_role_local_0_work_tile.is_valid_tile",
+        rtol=2e-2,
+        atol=2e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_batched_one_tile_per_cta_fp16() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(8, 256, 512, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(8, 512, 256, device=DEVICE, dtype=torch.float16)
+    _run(
+        batched_gemm,
+        (a, b),
+        _config(
+            block_sizes=[1, 128, 128, 64], loop_orders=[[0, 1, 2]], tcgen05_ab_stages=3
+        ),
+        torch.bmm(a, b),
+        source_needle=(
+            "cute.copy(tcgen05_tma_store_atom",
+            "tcgen05_tmem_allocator.free(tcgen05_epi_acc_tmem_ptr)",
+        ),
+        rtol=2e-2,
+        atol=1e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_fp8_e4m3_one_tile_per_cta() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(256, 256, device=DEVICE).to(torch.float8_e4m3fn)
+    b = torch.randn(256, 256, device=DEVICE).to(torch.float8_e4m3fn).T.contiguous().T
+    scale = torch.tensor(1.0, device=DEVICE)
+    expected = torch._scaled_mm(
+        a, b, scale, scale, use_fast_accum=False, out_dtype=torch.float16
+    )
+    _run(
+        _gemm,
+        (a, b),
+        _config(block_sizes=[128, 64, 128], tcgen05_ab_stages=4, tcgen05_c_stages=4),
+        expected,
+        source_needle="allocator_warp_id=1",
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_scheduler_warp_strategy_fp16() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(1024, 1024, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(1024, 1024, device=DEVICE, dtype=torch.float16)
+    _run(
+        _gemm,
+        (a, b),
+        _config(
+            block_sizes=[128, 64, 128],
+            tcgen05_ab_stages=3,
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+        ),
+        a @ b,
+        source_needle="barrier_id=3, num_threads=160",
+        rtol=2e-2,
+        atol=1e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_two_output_stores_one_tile_per_cta_bf16() -> None:
+    # One tile per CTA with two stores of the accumulator: TMEM must be
+    # handshaken + freed once (in the teardown), or the second epilogue
+    # handshake hangs the CTA.
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.bfloat16)
+    config = _config()
+    bound = helion.kernel(_two_output_gemm, backend="cute", static_shapes=True).bind(
+        (a, b)
+    )
+    bound.set_config(config)
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    source = bound.to_code(normalized)
+    assert source.count("tcgen05_tmem_allocator.free(") == 1, source
+    assert source.count("tcgen05_tmem_alloc_barrier.arrive_and_wait()") == 1, source
+    assert "tcgen05_pipeline_init_barrier.arrive_and_wait()" in source
+    expected = a @ b
+    outputs = [bound(a, b) for _ in range(LAUNCHES)]
+    torch.cuda.synchronize()
+    for out, out2 in outputs:
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=1e-1)
+        torch.testing.assert_close(out2, torch.relu(expected), rtol=2e-2, atol=1e-1)
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_compact_fragment_epilogue_one_tile_per_cta_bf16() -> None:
+    # The compact fragment epilogue renders no TMA store body; TMEM must
+    # still be freed (in the teardown) or the CTA exits with it allocated
+    # ("tensor memory not completely freed", a sticky CUDA error).
+    torch.manual_seed(17)
+    x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(1, 64, 128, device=DEVICE, dtype=torch.bfloat16)
+    acc = torch.einsum("mk,hkd->hmd", x.float(), weight.float())
+    groups = acc.view(1, 128, 32, 4)
+    expected = (
+        groups[..., 0]
+        + 2.0 * groups[..., 1]
+        - 3.0 * groups[..., 2]
+        + 4.0 * groups[..., 3]
+    )
+    _run(
+        _compact_group4_fragment,
+        (x, weight),
+        _config(
+            block_sizes=[1, 128, 128, 32],
+            loop_orders=[[0, 1, 2]],
+            pid_type="persistent_interleaved",
+        ),
+        expected,
+        source_needle=("for tcgen05_epi_position", "tcgen05_tmem_allocator.free("),
+        rtol=2e-2,
+        atol=2e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_clc_one_cta_scheduler_multiwave_bf16() -> None:
+    # 1024 tiles over 148 SMs: several CLC-scheduled waves per CTA.
+    torch.manual_seed(0)
+    a = torch.randn(2048, 256, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(256, 4096, device=DEVICE, dtype=torch.bfloat16)
+    _run(
+        _gemm,
+        (a, b),
+        _config(
+            pid_type="persistent_interleaved",
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_persistence_model="clc_persistent",
+        ),
+        a @ b,
+        source_needle=("barrier_id=3, num_threads=160", "cute.arch.clc_response"),
+        rtol=2e-2,
+        atol=1e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+@pytest.mark.parametrize("load_mode", ["simt", "tma"])
+def test_c_input_warp_aux_pipeline_bf16(load_mode: str) -> None:
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.bfloat16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn(512, 512, device=DEVICE, dtype=torch.bfloat16)
+    _run(
+        _bias_gemm,
+        (a, b, bias),
+        _config(
+            tcgen05_strategy="role_local_with_scheduler",
+            tcgen05_warp_spec_scheduler_warps=1,
+            tcgen05_warp_spec_c_input_warps=1,
+            tcgen05_aux_load_mode=load_mode,
+        ),
+        (a.float() @ b.float() + bias.float()).to(torch.bfloat16),
+        source_needle=(
+            "tcgen05_aux_pipeline = cutlass.pipeline.Pipeline",
+            "cute.arch.mbarrier_init_fence()",
+        ),
+        rtol=2e-2,
+        atol=1e-1,
+    )
+
+
+@_sm100_gpu
+@pytest.mark.cuda
+def test_flat_pid_type_fp16() -> None:
+    torch.manual_seed(0)
+    a = torch.randn(512, 256, device=DEVICE, dtype=torch.float16)
+    b = torch.randn(256, 512, device=DEVICE, dtype=torch.float16)
+    _run(
+        _gemm,
+        (a, b),
+        _config(pid_type="flat"),
+        a @ b,
+        source_needle="tcgen05_pipeline_init_barrier.arrive_and_wait()",
+        rtol=1e-2,
+        atol=1e-2,
+    )

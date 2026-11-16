@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ... import exc
+from ._ast_pass_utils import is_name_assign
+from ._ast_pass_utils import names_written
 from .published_scalars import _TYPES
 from .published_scalars import _clone
 from .published_scalars import _recipe
@@ -20,22 +22,6 @@ from .register_snapshots import SnapshotOwner
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-
-def _assignment(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Assign)
-        and len(node.targets) == 1
-        and isinstance(node.targets[0], ast.Name)
-    )
-
-
-def _stores(node: ast.AST) -> set[str]:
-    return {
-        n.id
-        for n in ast.walk(node)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)
-    }
 
 
 def _dtype(node: ast.AST) -> str | None:
@@ -111,7 +97,7 @@ def _contribution_domain(
         return None
 
     for statement in statements[:-1]:
-        if not _assignment(statement):
+        if not is_name_assign(statement):
             return None
         statement = cast("ast.Assign", statement)
         limit = bound(statement.value)
@@ -142,7 +128,7 @@ def _owner(
     index, guard = node.body
     slot = node.target.id
     if (
-        not _assignment(index)
+        not is_name_assign(index)
         or not isinstance(guard, ast.If)
         or any(not isinstance(n, ast.Pass) for n in guard.orelse)
     ):
@@ -166,7 +152,7 @@ def _owner(
     if (
         size <= 0
         or (size + threads - 1) // threads != slots
-        or _stores(guard) & {thread, slot, name}
+        or names_written(guard) & {thread, slot, name}
         or any(
             isinstance(n, (ast.Break, ast.Continue, ast.Return, ast.Raise))
             for n in ast.walk(guard)
@@ -212,7 +198,7 @@ def cache_register_producers(
         child: index for index, root in enumerate(body) for child in ast.walk(root)
     }
     if any(
-        _stores(root) & {"cutlass", "cute", "operator", "float"} for root in body
+        names_written(root) & {"cutlass", "cute", "operator", "float"} for root in body
     ) or any(
         isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
         for root in body
@@ -299,7 +285,7 @@ def cache_register_producers(
     ) -> None:
         closures: dict[str, frozenset[ast.Assign]] = {}
         for node in statements:
-            if _assignment(node):
+            if is_name_assign(node):
                 node = cast("ast.Assign", node)
                 name = cast("ast.Name", node.targets[0]).id
                 value = recipe(node.value, env, published, owner)
@@ -325,7 +311,7 @@ def cache_register_producers(
                                 _Use(node, owner, value, dtype, closure)
                             )
             elif isinstance(node, ast.If):
-                assigned = _stores(node)
+                assigned = names_written(node)
                 nested = {k: v for k, v in env.items() if k not in assigned}
                 # A masked first use may not seed storage. A later use can only
                 # reuse a cache filled by an earlier unconditional owner loop.
@@ -348,7 +334,7 @@ def cache_register_producers(
                     env.pop(name, None)
                     closures.pop(name, None)
             else:
-                for name in _stores(node):
+                for name in names_written(node):
                     env.pop(name, None)
                     closures.pop(name, None)
 
@@ -356,9 +342,11 @@ def cache_register_producers(
         published = {name for name, after in publications.items() if index > after}
         owner = _owner(node, thread, threads, index, True)
         if owner is not None:
-            env = {k: v for k, v in global_values.items() if k not in _stores(node)}
+            env = {
+                k: v for k, v in global_values.items() if k not in names_written(node)
+            }
             scan(owner.statements, env, published, owner)
-            for name in _stores(node):
+            for name in names_written(node):
                 global_values.pop(name, None)
         else:
             scan([node], global_values, published, None)
@@ -441,7 +429,7 @@ class RegisterProducerRequest:
         """
         allocations: dict[str, tuple[str, ast.Assign]] = {}
         for node in prefix:
-            if not _assignment(node):
+            if not is_name_assign(node):
                 continue
             node = cast("ast.Assign", node)
             name = cast("ast.Name", node.targets[0]).id
@@ -464,7 +452,7 @@ class RegisterProducerRequest:
             definitions = [
                 node
                 for node in prefix
-                if _assignment(node)
+                if is_name_assign(node)
                 and _text(cast("ast.Assign", node).targets[0]) == allocator
                 and _text(cast("ast.Assign", node).value)
                 == "cutlass.utils.SmemAllocator()"
@@ -497,12 +485,15 @@ class RegisterProducerRequest:
         matches = [
             index
             for index, node in enumerate(body)
-            if _assignment(node)
+            if is_name_assign(node)
             and _text(cast("ast.Assign", node).targets[0]) == thread
             and _text(cast("ast.Assign", node).value)
             == "cutlass.Int32(cute.arch.thread_idx()[0])"
         ]
-        if len(matches) != 1 or sum(thread in _stores(node) for node in body) != 1:
+        if (
+            len(matches) != 1
+            or sum(thread in names_written(node) for node in body) != 1
+        ):
             return 0
         index = matches[0]
         if not self.independent_allocations(body[:index], buffers):
@@ -519,7 +510,7 @@ class RegisterProducerRequest:
                 ).value,
             ).id
             for node in body[:index]
-            if _assignment(node)
+            if is_name_assign(node)
             and _text(cast("ast.Assign", node).targets[0]) in buffers
         }
         if any(

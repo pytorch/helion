@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from examples import nvfp4_gemv
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+nvfp4_gemv = import_example("nvfp4_gemv")
 
 
 @pytest.mark.parametrize("packed_input", [False, True])

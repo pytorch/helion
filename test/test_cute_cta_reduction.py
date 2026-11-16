@@ -5,14 +5,16 @@ import ast
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 from test.test_atomic_ops import _simulate_register_load_program
 
 import helion
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -47,8 +49,8 @@ def _readonly_count(x, limits, capacity: hl.constexpr, remap: hl.constexpr = Fal
 
 
 def _codegen(x, limits, threads, mode, *, remap=False):
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(
             _readonly_count,
             (x, limits, 1 << (x.size(1) - 1).bit_length(), remap),
         )
@@ -126,8 +128,8 @@ def test_cta_reductions_preserve_empty_stripes_and_typed_combines(mode, kind, dt
         expected = values.amax(-1)
     else:
         expected = values.prod(-1, dtype=dtype)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_factored_cta_reduction, (x, kind))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_factored_cta_reduction, (x, kind))
         config = bound.config_spec.default_config()
         config.config.update(cute_fragment_threads=128, cute_fragment_reduction=mode)
         source = bound.to_code(config)

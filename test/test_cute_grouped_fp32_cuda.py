@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from itertools import accumulate
 
-from examples.jagged_dense_bmm import jagged_dense_bmm
 import pytest
 import torch
 
 import helion
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
 
-pytestmark = skipUnlessBackends(["cute"])
+jagged_dense_bmm = import_example("jagged_dense_bmm").jagged_dense_bmm
 
 CUDA_DEVICE = "cuda"
 

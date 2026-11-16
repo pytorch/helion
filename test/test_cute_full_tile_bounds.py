@@ -11,43 +11,14 @@ import torch
 import helion
 from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import lower_full_tile_bounds
-from helion._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
+from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import full_tile_launch_plan as _plan
 import helion.language as hl
-
-
-def _plan(
-    prefix="n = input_tensor.numel(); flat = input_tensor.view(-1)",
-    *,
-    grid="((n + BLOCK - 1) // BLOCK,)",
-    block="(4, 1, 1)",
-    arguments="flat, out, n",
-    keyword="block",
-    integer_parameters=("n",),
-    constants=None,
-    rank=1,
-):
-    body = ast.parse(
-        prefix
-        + "\nout = torch.empty_like(flat)\nBLOCK = 8\n"
-        + f"_launcher(kernel, {grid}, {arguments}, {keyword}={block})\n"
-        + "return out\n"
-    ).body
-    return prove_full_tile_launch(
-        body,
-        kernel_name="kernel",
-        parameter_names=("x", "y", "n"),
-        tensor_parameters={"x": rank, "y": rank},
-        integer_parameters=integer_parameters,
-        tensor_inputs={"input_tensor": 2, "other": 2},
-        scalar_inputs={"length", "runtime"},
-        constexpr_values={"BLOCK": 8} if constants is None else constants,
-    )
 
 
 @pytest.mark.parametrize(
@@ -201,6 +172,7 @@ def test_guard_covers_positive_divisible_equal_contiguous_int32_domain(
     assert value is expected
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_guard_stays_linear_through_the_sdk_boolean_expansion():
     """The CuTe DSL preprocessor rewrites ``a and b`` into an expression that
     repeats ``a`` four times, so a flat chain of guards grows exponentially
@@ -233,7 +205,6 @@ def _reciprocal_times(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 @skipIfRefEager("compiles the generated kernel")
 @skipIfNotCUDA()
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("threads", [8, 512])
 def test_three_tensor_guard_compiles_with_dynamic_shapes(threads):
     """A dynamic-shape kernel over three tensors gets the 14-term guard; it

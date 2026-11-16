@@ -13,14 +13,15 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 import helion
+from helion import exc
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.ast_extension import unparse
 from helion._compiler.cute.fx_matcher import _xyz_grid_fits
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
 _single_token_rank1_recurrence = importlib.import_module(
     "helion._compiler.cute.single_token_rank1_recurrence"
 )
@@ -255,7 +256,7 @@ def _shorten_root_task_extent(device_ir: DeviceIR) -> None:
     )
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
     def _code(
@@ -278,6 +279,7 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
         num_warps: int = 8,
         num_threads: list[int] | None = None,
         mutate: Callable[[DeviceIR], None] | None = None,
+        dynamic_graph: str | None = None,
     ) -> str:
         with ExitStack() as stack:
             stack.enter_context(
@@ -364,9 +366,27 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
             if mutate is not None:
                 assert bound.host_function is not None
                 mutate(bound.host_function.device_ir)
-            return bound.to_triton_code(
-                _config(block_v, num_warps, num_threads=num_threads)
-            )
+            config = _config(block_v, num_warps, num_threads=num_threads)
+            if dynamic_graph is not None:
+                from helion._compiler._inductor.template_buffer import (
+                    inductor_call_facts,
+                )
+                from helion._compiler._inductor.template_buffer import (
+                    render_inductor_ast,
+                )
+
+                if dynamic_graph == "render":
+                    # Inductor's render of a dynamic-shape graph.
+                    return unparse(
+                        render_inductor_ast(bound, config, symbolic_input_layouts=True)
+                    )
+                # What the lowering's tuner compiles for that graph: the
+                # binding's code, from its example inputs, under the graph's
+                # facts.
+                assert dynamic_graph == "tuning"
+                with inductor_call_facts(bound, symbolic_input_layouts=True):
+                    return bound.to_code(config)
+            return bound.to_code(config)
 
     def test_structural_match_emits_packed_rank1_kernel(self) -> None:
         code = self._code()
@@ -479,9 +499,9 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
             self.assertFalse(_xyz_grid_fits((1, 1, 8)))
 
     def test_generated_locals_do_not_shadow_tensor_arguments(self) -> None:
-        from helion._compiler.cute import single_token_rank1_recurrence
+        from helion._compiler.cute import fx_matcher
 
-        original = single_token_rank1_recurrence._host_tensor_ref
+        original = fx_matcher._host_tensor_ref
 
         for batch_size, num_warps, colliding, renamed in (
             (1, 8, "rank1_work", "rank1_work_1"),
@@ -491,12 +511,12 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
 
                 def colliding_name(node: object, collision: str = colliding) -> object:
                     ref = original(node)
-                    if ref is not None and ref.suggested_name == "packed":
-                        return dataclasses.replace(ref, suggested_name=collision)
+                    if ref is not None and ref.name == "packed":
+                        return dataclasses.replace(ref, name=collision)
                     return ref
 
                 with patch.object(
-                    single_token_rank1_recurrence,
+                    fx_matcher,
                     "_host_tensor_ref",
                     side_effect=colliding_name,
                 ):
@@ -592,7 +612,7 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
                 tile_rows = transferred.block_sizes[0]
                 transferred_packed_seeds[tile_rows] = (
                     transferred,
-                    bound.to_triton_code(transferred),
+                    bound.to_code(transferred),
                 )
 
         self.assertIn(
@@ -622,6 +642,25 @@ class TestCuteSingleTokenRank1Recurrence(unittest.TestCase):
         for transferred, code in transferred_packed_seeds.values():
             self.assertEqual(transferred.num_threads, [1, 32])
             self.assertIn("packed_rank1_codegen_abi_version = 2", code)
+
+    @unittest.skipUnless(
+        supports_torch_compile_template_lowering(),
+        "this PyTorch build lacks Helion's Inductor template lowering",
+    )
+    def test_dynamic_graph_tuning_refuses_what_its_render_refuses(self) -> None:
+        # Both schedules bake the binding's exact sizes into the kernel (the
+        # state pool's slot count bounds the slot index), which a
+        # dynamic-shape graph's calls need not have.  Its render has no
+        # example input to plan from and refuses these configs; the tuner
+        # compiles from its binding's example inputs, and refuses them too
+        # rather than timing a schedule the render never emits.
+        for kwargs in ({}, {"batch_size": 32, "num_warps": 1}):
+            for dynamic_graph in ("render", "tuning"):
+                with (
+                    self.subTest(dynamic_graph=dynamic_graph, **kwargs),
+                    self.assertRaises(exc.BackendUnsupported),
+                ):
+                    self._code(dynamic_graph=dynamic_graph, **kwargs)
 
     def test_int64_state_index_uses_wide_immutable_load(self) -> None:
         code = self._code(slot_dtype=torch.int64)

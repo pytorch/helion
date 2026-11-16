@@ -9,6 +9,8 @@ from benchmarks.cute import compare_kda_prefill_backends as prefill
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _inputs() -> prefill.KDAInputs:
     value = torch.ones(1)

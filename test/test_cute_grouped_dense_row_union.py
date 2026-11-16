@@ -10,35 +10,40 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_binding import _mock_cuda_unavailable
+from test._cute_grouped_gemm_split_sizes import _device_offsets_kernel
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _bound
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_full_coverage import _config as _old_config
 from test.test_cute_grouped_full_coverage import _metadata
 from test.test_cute_grouped_full_coverage import _metadata_code
-from test.test_cute_grouped_gemm_split_sizes import _device_offsets_kernel
 from test.test_cute_shared_rhs_grouped import _bind
 from test.test_cute_shared_rhs_grouped import _explicit_offset_mm
 from test.test_cute_shared_rhs_grouped import _OffsetPointer
 from test.test_cute_shared_rhs_grouped import _plans
-from test.test_cute_shared_rhs_grouped import _target
 
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY as KEY
+from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
 from helion._compiler.cute.grouped_row_union import index_domain
+from helion._compiler.cute.grouped_row_union import schedule_supported
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
 from helion._compiler.program_id import ProgramIDs
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
+
+pytestmark = pytest.mark.cpu_only
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -53,11 +58,7 @@ if TYPE_CHECKING:
 def _cpu_only() -> Generator[None, None, None]:
     old_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _target(),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(old_threads)
 
@@ -77,7 +78,6 @@ def case() -> tuple[BoundKernel, tuple[torch.Tensor, ...], str, str]:
     return bound, args, old, new
 
 
-@skipUnlessBackends(["cute"])
 def test_dense_plan_uses_original_allocation_and_ordinary_wrapper(case: tuple) -> None:
     bound, _args, old, new = case
     assert "tcgen05_grouped_" not in new
@@ -105,6 +105,16 @@ def test_dense_plan_uses_original_allocation_and_ordinary_wrapper(case: tuple) -
         )
 
     old_host, new_host = host(old), host(new)
+    # The dense plan is a plain tcgen05 plan, so the launcher bakes its tensor
+    # layouts (static TMA coordinate strides); the legacy grouped schedule
+    # keeps the runtime layouts and its host carries the disable guard.
+    bake_guard = (
+        "_helion_grouped_gemm_jagged._helion_cute_disable_bake_tensor_shapes = True"
+    )
+    assert bake_guard in old and bake_guard not in new
+    old_host.body = [
+        child for child in old_host.body if ast.unparse(child) != bake_guard
+    ]
     # Only launch geometry and physical block roles change in the public host.
     for node in (old_host, new_host):
         launch = next(
@@ -149,7 +159,6 @@ def test_dense_plan_uses_original_allocation_and_ordinary_wrapper(case: tuple) -
 
 
 @pytest.mark.parametrize("mode", [None, "fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_false_retains_old_config_and_source(case: tuple, mode: str | None) -> None:
     bound = case[0]
     old = _old_config(mode)
@@ -165,7 +174,7 @@ def test_false_retains_old_config_and_source(case: tuple, mode: str | None) -> N
     "updates",
     [
         {KEY: 1},
-        {"block_sizes": [128, 64, 64]},
+        {"block_sizes": [256, 64, 128]},
         {"tcgen05_ab_stages": 3},
         {"tcgen05_grouped_mode": "worklist_nm"},
         {"tcgen05_grouped_full_coverage": "fixed_tma_dense_local"},
@@ -174,7 +183,6 @@ def test_false_retains_old_config_and_source(case: tuple, mode: str | None) -> N
         {"l2_groupings": [2]},
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_incompatible_explicit_tuple_rejects(case: tuple, updates: dict) -> None:
     config = _selected(case[0])
     config.config.update(updates)
@@ -185,7 +193,6 @@ def test_incompatible_explicit_tuple_rejects(case: tuple, updates: dict) -> None
 @pytest.mark.parametrize(
     "kind", ["fp16", "offset64", "m_tail", "n_tail", "k_tail", "transpose"]
 )
-@skipUnlessBackends(["cute"])
 def test_metadata_fallback_is_conservative(case: tuple, kind: str) -> None:
     _bound0, args, _old, _new = case
     a, b, offsets = args
@@ -208,7 +215,6 @@ def test_metadata_fallback_is_conservative(case: tuple, kind: str) -> None:
 
 
 @pytest.mark.parametrize("operand", [0, 1])
-@skipUnlessBackends(["cute"])
 def test_original_tma_base_alignment_gate_is_retained(
     case: tuple, operand: int
 ) -> None:
@@ -228,7 +234,6 @@ def test_original_tma_base_alignment_gate_is_retained(
 @pytest.mark.parametrize(
     "change", ["alias", "group_epilogue", "extra_store", "group_rhs"]
 )
-@skipUnlessBackends(["cute"])
 def test_semantic_proof_is_still_required(case: tuple, change: str) -> None:
     _bound0, args, _old, _new = case
     if change == "group_rhs":
@@ -260,33 +265,41 @@ def test_semantic_proof_is_still_required(case: tuple, change: str) -> None:
 
 
 @pytest.mark.parametrize("stride", [1, 2])
-@skipUnlessBackends(["cute"])
 def test_generated_int32_intervals_match_original_initializer(
     case: tuple, stride: int
 ) -> None:
     old, new = case[2:]
     old_code = _metadata_code(old)
     tree = ast.parse(new)
-    statements = []
-    for node in tree.body:
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_"):
-            statements = [
-                child
-                for child in node.body
-                if (
-                    isinstance(child, ast.Assign)
-                    and ast.unparse(child.targets[0])
-                    in {"row_union_starts", "row_union_ends"}
-                )
-                or (
-                    isinstance(child, ast.If)
-                    and any(
-                        isinstance(inner, ast.For)
-                        and ast.unparse(inner.target) == "row_union_group"
-                        for inner in child.body
-                    )
-                )
-            ]
+    device = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+    )
+    # The interval setup is epilogue-role prelude (inside the epilogue warps'
+    # role block, behind that role's dependent-launch wait), not prologue.
+    role_block = next(
+        node
+        for node in device.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(inner, ast.For)
+            and ast.unparse(inner.target) == "row_union_group"
+            for inner in node.body
+        )
+    )
+    statements = [
+        child
+        for child in role_block.body
+        if (
+            isinstance(child, ast.Assign)
+            and ast.unparse(child.targets[0]) in {"row_union_starts", "row_union_ends"}
+        )
+        or (
+            isinstance(child, ast.For)
+            and ast.unparse(child.target) == "row_union_group"
+        )
+    ]
     assert len(statements) == 3
     code = compile(ast.Module(body=statements, type_ignores=[]), "<row-union>", "exec")
     for offsets in (
@@ -331,7 +344,6 @@ def test_generated_int32_intervals_match_original_initializer(
 
 
 @pytest.mark.parametrize("strategy", [None, "from_random"])
-@skipUnlessBackends(["cute"])
 def test_full_search_delivers_new_witness_without_changing_old_seeds(
     strategy: str | None,
 ) -> None:
@@ -380,7 +392,6 @@ def test_full_search_delivers_new_witness_without_changing_old_seeds(
     assert "row_union_starts" in bound.to_code(accepted[0])
 
 
-@skipUnlessBackends(["cute"])
 def test_explicit_false_prevents_automatic_new_mode() -> None:
     bound, args = _bound(0, autotune_config_overrides={KEY: False})
     search = _search(bound, args)
@@ -399,9 +410,45 @@ def test_dense_index_envelope() -> None:
     assert not index_domain(1 << 30, 640, 128, 128)
     assert not index_domain(4, 640, 128, 129)
     assert not index_domain(True, 640, 128, 128)
+    # The legacy carrier also runs the one-CTA dense tiles: bm 64/128,
+    # bn 16/32/64, bk 64/128, each dividing its extent.
+    assert index_domain(4, 640, 128, 128, (128, 16, 128))
+    assert index_domain(4, 640, 128, 128, (64, 32, 64))
+    assert not index_domain(4, 640, 128, 128, (128, 8, 128))
+    assert not index_domain(4, 640, 128, 128, (256, 64, 128))
+    assert not index_domain(4, 640, 128, 128, (128, 16, 32))
+    assert not index_domain(4, 640, 120, 128, (128, 16, 128))
+    assert not index_domain(4, 600, 128, 128, (64, 16, 128))
+    assert schedule_supported({KEY: True}, (128, 16, 128))
+    assert schedule_supported({KEY: True}, (64, 32, 64))
+    assert not schedule_supported({KEY: True}, (128, 8, 128))
+    assert not schedule_supported({KEY: True}, (32, 64, 128))
+    # Physical profiles keep owning their geometry.
+    assert not schedule_supported(
+        {KEY: True, SCHEDULE_KEY: TRANSPOSED.name}, (128, 16, 128)
+    )
 
 
-@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("blocks", [(128, 16, 128), (128, 32, 64), (128, 32, 128)])
+def test_narrow_dense_tiles_keep_the_row_union_schedule(
+    case: tuple, blocks: tuple[int, int, int]
+) -> None:
+    bound = case[0]
+    config = _selected(bound)
+    config.config["block_sizes"] = list(blocks)
+    normalized = bound.config_spec.normalized_config(config)
+    assert normalized.config[KEY] is True
+    assert normalized.config["block_sizes"] == list(blocks)
+    source = bound.to_code(normalized)
+    bm, bn, bk = blocks
+    # The row-union epilogue (interval tables, per-row group predicates) runs
+    # on the narrower tile, and the persistent schedule covers 640 / bm by
+    # 128 / bn tiles.
+    assert "row_union_starts" in source and "row_union_ends" in source
+    assert f"PersistentTileSchedulerParams(({640 // bm}, {128 // bn}, 1)" in source
+    assert f"make_smem_layout_a(tiled_mma, ({bm}, {bn}, {bk})" in source
+
+
 def test_absent_grouped_flat_overrides_are_not_explicit_none(case: tuple) -> None:
     bound, args = case[:2]
     search = _search(bound, args)
@@ -434,12 +481,15 @@ def test_pid_mapping_retains_mn_for_every_original_axis_order(shape: tuple) -> N
                 SimpleNamespace(
                     block_id=block,
                     pid_var=f"pid_{block}",
+                    pack=1,
+                    pack_axis=0,
                     num_pids_expr=lambda *, is_device, value=extents[block]: str(value),
                 )
                 for block in order
             ],
             _tcgen05_plan=lambda: plan,
             _tcgen05_logical_m_coord_expr=lambda value: value,
+            pid_division_exprs=lambda state: None,
         )
         expression = (
             Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
@@ -594,3 +644,42 @@ def test_packet_predicate_stores_only_selected_in_bounds_elements(
         for value, (row, column) in zip(values, coords, strict=True)
     ]
     assert output == expected
+
+
+def test_grouped_kernels_wait_at_entry_under_cute_pdl(case: tuple) -> None:
+    """The grouped persistent kernel reads the group layout in its prologue,
+    ahead of any role-local wait, so ``cute_pdl`` gives it the entry wait
+    (the body's first statement) and the launch attribute.  The row-union
+    kernel reads the group offsets inside its epilogue role behind that
+    role's wait, so it needs no entry wait and its prologue overlaps the
+    previous kernel."""
+    from helion._compiler.cute.pdl_coverage import waits_cover_global_reads
+
+    bound = case[0]
+    for config, entry_wait in ((_old_config(None), True), (_selected(bound), False)):
+        with_knob = deepcopy(config)
+        with_knob.config["cute_pdl"] = True
+        source = bound.to_code(with_knob)
+        assert "'use_pdl': True" in source
+        device = next(
+            node
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        )
+        first = ast.unparse(device.body[0]) == "cute.arch.griddepcontrol_wait()"
+        assert first is entry_wait
+        if not entry_wait:
+            assert waits_cover_global_reads(device.body)
+            epilogue = next(
+                node
+                for node in device.body
+                if isinstance(node, ast.If)
+                and any("group_offsets.iterator" in ast.unparse(n) for n in node.body)
+            )
+            assert ast.unparse(epilogue.body[0]) == "cute.arch.griddepcontrol_wait()"
+        # (``cute_pdl`` defaults to True on the sm_90+ tcgen05 surface; the
+        # knob-off render pins it off)
+        without_knob = deepcopy(config)
+        without_knob.config["cute_pdl"] = False
+        plain = bound.to_code(without_knob)
+        assert "griddepcontrol" not in plain[plain.index("@cute.kernel") :]

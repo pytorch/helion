@@ -6,6 +6,8 @@ import inspect
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 mma = importlib.import_module("helion._compiler.cute.short_affine_scan_mma")

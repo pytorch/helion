@@ -3,21 +3,22 @@ from __future__ import annotations
 import ast
 from unittest.mock import patch
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 pytestmark = skipUnlessBackends(["cute"])
-
 CUDA_DEVICE = "cuda"
 
 
@@ -77,10 +78,10 @@ def _source(
         cute_collective_compute=compute,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        return _cpu_bind(kernel, (*inputs, computed_b)).to_code(config)
+        return cpu_bind(kernel, (*inputs, computed_b)).to_code(config)
 
 
 def _b_copy(source: str) -> ast.For:
@@ -106,7 +107,7 @@ def test_transposed_rhs_copies_along_proven_contiguous_k(
     assert "cute.gemm(" in source
     assert f"stride=({bk}, 1)" in source
     assert "LdMatrix8x8x16bOp(transpose=True" not in source
-    assert "cute.arch.cp_async_shared_global(" in body
+    assert "_cute_cp_async_shared_global(" in body
     assert f"collective_n = collective_flat // {bk}" in body
     assert f"collective_k = collective_flat % {bk}" in body
     # The physical vector traversal spans the whole tile; its scalar fallback
@@ -123,7 +124,7 @@ def test_n_contiguous_rhs_retains_existing_layout(copy: str) -> None:
     body = ast.unparse(_b_copy(source))
     assert "stride=(1, 32)" in source
     assert "LdMatrix8x8x16bOp(transpose=True" in source
-    assert "cute.arch.cp_async_shared_global(" in body
+    assert "_cute_cp_async_shared_global(" in body
     assert "collective_n = collective_flat % 32" in body
     assert "collective_k = collective_flat // 32" in body
 
@@ -140,7 +141,7 @@ def test_k_major_requires_direct_aligned_vector_copy(reason: str) -> None:
     )
     assert "stride=(1, 32)" in source
     assert "LdMatrix8x8x16bOp(transpose=True" in source
-    assert "cute.arch.cp_async_shared_global(" not in ast.unparse(_b_copy(source))
+    assert "_cute_cp_async_shared_global(" not in ast.unparse(_b_copy(source))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -224,10 +225,10 @@ def test_mamba_transposed_state_uses_k_copy(shape: int, static_shapes: bool) -> 
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         config = helion.Config.from_dict(
             bound.config_spec.default_config().config
             | {
@@ -241,7 +242,7 @@ def test_mamba_transposed_state_uses_k_copy(shape: int, static_shapes: bool) -> 
         )
         source = bound.to_code(config)
     assert source.count("cute.gemm(") == 2
-    assert source.count("cute.arch.cp_async_shared_global(") == 3
+    assert source.count("_cute_cp_async_shared_global(") == 3
     assert source.count("LdMatrix8x8x16bOp(transpose=True") == 1
     assert source.count("mul.rn.f32") == 5
     assert "prev_states.iterator" in ast.unparse(_b_copy(source))
@@ -289,7 +290,7 @@ def test_k_major_copy_preserves_dynamic_tails_and_graph_replays(
         assert "cute.nvgpu.cpasync.CopyG2SOp(" in ast.unparse(_b_copy(source))
     else:
         assert f"stride=({bk}, 1)" in source
-        assert "cute.arch.cp_async_shared_global(" in ast.unparse(_b_copy(source))
+        assert "_cute_cp_async_shared_global(" in ast.unparse(_b_copy(source))
     bound.set_config(config)
 
     def run() -> torch.Tensor:
@@ -360,9 +361,7 @@ def test_native_k_major_original_mamba_and_mutated_graphs(
     bound.set_config(config)
 
     def compare(actual: torch.Tensor, expected: torch.Tensor) -> None:
-        _chunked_assert_close(
-            actual, expected, atol=0.01, rtol=0.01, scale_atol_by_expected_rms=True
-        )
+        _chunked_assert_close(actual, expected, atol=0.01, rtol=0.01, atol_scale="rms")
 
     def run() -> torch.Tensor:
         return bound(*arguments)

@@ -73,12 +73,6 @@ def _name(value: str) -> ast.Name:
     return create(ast.Name, id=value, ctx=ast.Load())
 
 
-def _same(first: ast.AST, second: ast.AST) -> bool:
-    return ast.dump(first, include_attributes=False) == ast.dump(
-        second, include_attributes=False
-    )
-
-
 def _mapped(axes: _Axes) -> _Axes:
     if len(axes) == 3:
         if not (

@@ -14,6 +14,7 @@ from typing import Callable
 from typing import cast
 
 import torch
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 
 from ... import exc
 from ..._compat import num_compute_units
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
     from ...runtime.kernel import BoundKernel
     from ...runtime.settings import DotPrecision
     from ..aten_lowering import Lowering
+    from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..device_function import Argument
     from ..device_ir import GraphInfo
     from ..host_function import HostFunction
@@ -275,6 +277,26 @@ class PallasBackend(Backend):
     def name(self) -> str:
         return "pallas"
 
+    def __init__(self) -> None:
+        super().__init__()
+        # Filled by ``build_launcher_args``; the launcher returns these tensors.
+        self._output_only_names: list[str] = []
+        self._cacheable_output_only_names: list[str] = []
+
+    def output_only_names(self) -> list[str]:
+        return self._output_only_names
+
+    def cacheable_output_only_names(self) -> list[str]:
+        return self._cacheable_output_only_names
+
+    @property
+    def supports_autotune_multi(self) -> bool:
+        return True
+
+    @property
+    def lowers_mask_select(self) -> bool:
+        return True
+
     @property
     def state(self) -> BackendState:
         return BackendState.BETA
@@ -303,9 +325,9 @@ class PallasBackend(Backend):
 
     @property
     def requires_shape_specialized_module(self) -> bool:
-        # Pallas modules hold monomorphic, shape-specific cached state
-        # (output-meta descriptor, launcher cache, ds-pad decision, signature
-        # lock), so each static-shape specialization needs its own module.
+        # Static-shape output-meta slots are fixed for an input specialization,
+        # so those bindings need separate modules. Other output metadata is
+        # rebuilt per call; launcher entries separately key actual geometry.
         return True
 
     def max_reduction_threads(self) -> int | None:
@@ -476,6 +498,10 @@ class PallasBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         return key in self._PALLAS_SUPPORTED_KEYS
 
+    def flattened_tile_shares_one_index(self) -> bool:
+        # A flattened loop flattens the grid only; each tile keeps its block.
+        return False
+
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         return f"pl.program_id({dim})"
 
@@ -544,10 +570,26 @@ class PallasBackend(Backend):
             return f"{host_str}.reshape(1)"
         if isinstance(arg, (SymbolArgument, TensorSizeArg, TensorStrideArg)):
             from ..compile_environment import CompileEnvironment
+            from ..device_function import DeviceFunction
 
-            if tensor_host_args:
-                device_expr = f"{tensor_host_args[0]}.device"
-            elif CompileEnvironment.current().settings.pallas_interpret:
+            env = CompileEnvironment.current()
+            input_storages = {id(t.untyped_storage()) for t in env.input_sources}
+            # Body outputs can be retargeted to meta placeholders after this
+            # call. Use the same input-storage provenance as output classification
+            # so scalar data is allocated on a real input's device instead.
+            input_arg = next(
+                (
+                    candidate
+                    for candidate in DeviceFunction.current().sorted_args()
+                    if isinstance(candidate, TensorArg)
+                    and candidate.host_str() in tensor_host_args
+                    and id(candidate.fake_value.untyped_storage()) in input_storages
+                ),
+                None,
+            )
+            if input_arg is not None:
+                device_expr = f"{input_arg.host_str()}.device"
+            elif env.settings.pallas_interpret:
                 device_expr = "'cpu'"
             else:
                 device_expr = "'tpu'"
@@ -559,9 +601,7 @@ class PallasBackend(Backend):
             # The kernel dereferences the scalar with ``name[0]`` (see
             # ``scalar_arg_preamble``).
             if isinstance(arg, (TensorSizeArg, TensorStrideArg)):
-                from ..compile_environment import CompileEnvironment
-
-                idx_dtype = CompileEnvironment.current().index_dtype
+                idx_dtype = env.index_dtype
                 return f"torch.tensor([{host_str}], dtype={idx_dtype!r}, device={device_expr})"
             return f"torch.tensor([{host_str}], dtype=torch.float32 if isinstance({host_str}, float) else torch.int32, device={device_expr})"
         return host_str
@@ -924,6 +964,11 @@ class PallasBackend(Backend):
             if outer_spec is not None:
                 outer_spec.update_min(spec.min_size)
 
+    def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from ..autotuner_heuristics.pallas import PALLAS_HEURISTICS
+
+        return PALLAS_HEURISTICS
+
     def tunable_fragments(self) -> dict[str, ConfigSpecFragment]:
         return {}
 
@@ -1187,11 +1232,19 @@ class PallasBackend(Backend):
                     continue
                 dims_info = device_fn.pallas_pad_info.get(id(arg.fake_value))
                 if dims_info is not None:
-                    for dim, (block_id, extra_pad) in dims_info.items():
-                        bsi = env.block_sizes[block_id]
-                        bs = bsi.from_config(config)
-                        if isinstance(bs, int) and bs > 1:
-                            result.append((i, dim, bs, extra_pad))
+                    for dim, blocks in dims_info.items():
+                        # One entry per distinct block size.  The launcher
+                        # pads entries in turn and a pad never shrinks the
+                        # dim, so the result covers every loop's last tile.
+                        extra_by_bs: dict[int, int] = {}
+                        for block_id, extra_pad in blocks.items():
+                            bs = env.block_sizes[block_id].from_config(config)
+                            if isinstance(bs, int) and bs > 1:
+                                extra_by_bs[bs] = max(extra_by_bs.get(bs, 0), extra_pad)
+                        result.extend(
+                            (i, dim, bs, extra_pad)
+                            for bs, extra_pad in extra_by_bs.items()
+                        )
 
         result.extend(self._zero_row_resident_pad_info(sorted_args))
         return result or None
@@ -1249,9 +1302,12 @@ class PallasBackend(Backend):
 
         Eligible when: 2 input tensors + 1 output-only tensor; all 2D with
         matching M/K/N contiguous layout (BMM not covered yet); the device IR
-        has one ``aten.mm``/``addmm`` family op; and the picked block sizes
-        cover every dim (single launch, no inner K tile).  Returns the spec
-        dict consumed by ``_build_matmul_dot_general_jit_fn``, else ``None``.
+        is exactly ``out = x @ y`` (see ``_pure_matmul_operands``: the two
+        inputs loaded as they are, one ``mm``/``addmm`` over a zero
+        accumulator, the result cast and stored, nothing else); and the
+        picked block sizes cover every dim (single launch, no inner K tile).
+        Returns the spec dict consumed by ``_build_matmul_dot_general_jit_fn``,
+        else ``None``.
         """
         from ..compile_environment import CompileEnvironment
         from ..device_function import DeviceFunction
@@ -1286,19 +1342,8 @@ class PallasBackend(Backend):
         lhs_t = lhs_arg.fake_value
         rhs_t = rhs_arg.fake_value
         out_t = out_arg.fake_value
-        # 2D matmul, matching contraction dim, statically-known shapes.
+        # 2D matmul with statically-known shapes.
         if lhs_t.ndim != 2 or rhs_t.ndim != 2 or out_t.ndim != 2:
-            return None
-        try:
-            m = int(lhs_t.shape[0])
-            k_lhs = int(lhs_t.shape[1])
-            k_rhs = int(rhs_t.shape[0])
-            n = int(rhs_t.shape[1])
-            out_m = int(out_t.shape[0])
-            out_n = int(out_t.shape[1])
-        except (TypeError, ValueError):
-            return None
-        if k_lhs != k_rhs or out_m != m or out_n != n:
             return None
 
         # The device IR must contain an aten.mm/addmm/bmm family op
@@ -1315,15 +1360,29 @@ class PallasBackend(Backend):
         if not matmul_present:
             return None
 
-        # Orient to lhs=(M, K), rhs=(K, N); the user may have written
-        # ``f(y, x) -> x @ y``. For all-equal dims either ordering is the same.
-        if lhs_t.shape == (m, k_lhs) and rhs_t.shape == (k_lhs, n):
-            lhs_arg_pos, rhs_arg_pos = input_positions
-            lhs_resolved, rhs_resolved = lhs_t, rhs_t
-        elif lhs_t.shape == (k_lhs, n) and rhs_t.shape == (m, k_lhs):
-            rhs_arg_pos, lhs_arg_pos = input_positions
-            lhs_resolved, rhs_resolved = rhs_t, lhs_t
-        else:
+        # The body must be exactly ``out = x @ y``; the matmul's own operands
+        # say which input is lhs=(M, K) and which is rhs=(K, N) (the user may
+        # have written ``f(y, x) -> x @ y``).  A transposed or otherwise
+        # transformed operand, an epilogue, or any other work in the body
+        # keeps the ``pl.pallas_call`` path.
+        operands = self._pure_matmul_operands(
+            device_ir,
+            input_names={sorted_args[p].host_str(): p for p in input_positions},
+            out_name=out_arg.host_str(),
+        )
+        if operands is None:
+            return None
+        lhs_arg_pos, rhs_arg_pos = operands
+        lhs_resolved = cast("TensorArg", sorted_args[lhs_arg_pos]).fake_value
+        rhs_resolved = cast("TensorArg", sorted_args[rhs_arg_pos]).fake_value
+        # lhs=(M, K), rhs=(K, N), out=(M, N) with a matching contraction dim.
+        try:
+            m, k_lhs = (int(d) for d in lhs_resolved.shape)
+            k_rhs, n = (int(d) for d in rhs_resolved.shape)
+            out_m, out_n = (int(d) for d in out_t.shape)
+        except (TypeError, ValueError):
+            return None
+        if k_lhs != k_rhs or out_m != m or out_n != n:
             return None
 
         # Every block size must be >= max(M, N, K): a smaller block means a
@@ -1369,6 +1428,223 @@ class PallasBackend(Backend):
             "f32_accumulator": bool(f32_acc),
         }
 
+    @staticmethod
+    def _pure_matmul_operands(
+        device_ir: object,
+        *,
+        input_names: dict[str, int],
+        out_name: str,
+    ) -> tuple[int, int] | None:
+        """The (lhs, rhs) argument positions when the device IR is exactly
+        ``out = x @ y``, else ``None``.
+
+        Exactly: one root graph plus at most one plain ``for`` loop (the K
+        tile); one ``aten.mm`` / ``aten.addmm`` whose matrix operands are the
+        two inputs loaded as they are (no ``.T``, cast or arithmetic between
+        the load and the matmul); an ``addmm`` accumulator that is a zero
+        ``hl.zeros`` / ``hl.full`` carried through the loop; one store to
+        the output whose value is the matmul result, optionally cast; and no
+        other operation (an epilogue such as ``relu`` keeps the
+        ``pl.pallas_call`` path).  The launcher's ``lax.dot_general(x, y)``
+        replaces the whole kernel, so anything the body does beyond the
+        contraction would be dropped.
+        """
+        import operator
+
+        from ...language._decorators import is_api_func
+        from ..device_ir import ForLoopGraphInfo
+        from ..device_ir import ReductionLoopGraphInfo
+        from ..device_ir import RootGraphInfo
+
+        graphs = getattr(device_ir, "graphs", None)
+        if not isinstance(graphs, list):
+            return None
+        roots = [g for g in graphs if isinstance(g, RootGraphInfo)]
+        loops = [g for g in graphs if isinstance(g, ForLoopGraphInfo)]
+        if len(roots) != 1 or len(loops) > 1 or len(roots) + len(loops) != len(graphs):
+            return None
+        if any(isinstance(g, ReductionLoopGraphInfo) for g in loops):
+            return None
+        graph_by_id = {g.graph_id: g for g in graphs}
+
+        pass_through_api = {"_get_symnode", "_host_tensor", "_phi", "_new_var"}
+        matmul_targets = {torch.ops.aten.mm.default, torch.ops.aten.addmm.default}
+        loads: list[torch.fx.Node] = []
+        stores: list[torch.fx.Node] = []
+        matmuls: list[torch.fx.Node] = []
+        for_loops: list[torch.fx.Node] = []
+        zero_fills: set[torch.fx.Node] = set()
+
+        def api_name(node: torch.fx.Node) -> str | None:
+            if node.op == "call_function" and is_api_func(node.target):
+                return getattr(node.target, "__name__", None)
+            return None
+
+        for graph_info in graphs:
+            for node in graph_info.graph.nodes:
+                if node.op in ("placeholder", "output"):
+                    continue
+                if node.op != "call_function":
+                    return None
+                name = api_name(node)
+                if name in pass_through_api:
+                    continue
+                if name == "load":
+                    loads.append(node)
+                elif name == "store":
+                    stores.append(node)
+                elif name in ("full", "zeros"):
+                    value = node.args[1] if name == "full" else 0
+                    if isinstance(value, (int, float)) and value == 0:
+                        zero_fills.add(node)
+                    else:
+                        return None
+                elif name == "_for_loop":
+                    for_loops.append(node)
+                elif node.target in matmul_targets:
+                    matmuls.append(node)
+                elif node.target in (
+                    torch.ops.aten.sym_size.int,
+                    torch.ops.prims.convert_element_type.default,
+                    operator.getitem,
+                ):
+                    continue
+                else:
+                    return None
+        if len(matmuls) != 1 or len(loads) != 2 or len(stores) != 1:
+            return None
+        if len(for_loops) != len(loops):
+            return None
+
+        def host_tensor_name(node: object) -> str | None:
+            if isinstance(node, torch.fx.Node) and api_name(node) == "_host_tensor":
+                debug_name = node.args[0]
+                return debug_name if isinstance(debug_name, str) else None
+            return None
+
+        def plain_load_of(node: object) -> str | None:
+            """The loaded host tensor's name when ``node`` is a plain,
+            unmasked ``hl.load`` indexed by tiles and full slices."""
+            if not (isinstance(node, torch.fx.Node) and api_name(node) == "load"):
+                return None
+            if any(arg is not None for arg in node.args[2:]) or node.kwargs:
+                return None
+            indices = node.args[1]
+            if not isinstance(indices, (list, tuple)):
+                return None
+            for index in indices:
+                if isinstance(index, slice):
+                    if index != slice(None, None, None):
+                        return None
+                elif not (
+                    isinstance(index, torch.fx.Node)
+                    and (
+                        api_name(index) == "_get_symnode"
+                        or index.target is torch.ops.aten.sym_size.int
+                    )
+                ):
+                    return None
+            return host_tensor_name(node.args[0])
+
+        def loop_input(node: torch.fx.Node) -> object:
+            """The root-graph value a loop placeholder is bound to."""
+            graph_info = next(
+                (g for g in loops if node.graph is g.graph),
+                None,
+            )
+            if graph_info is None:
+                return None
+            for_loop = next(
+                (n for n in for_loops if n.args[0] == graph_info.graph_id), None
+            )
+            if for_loop is None or not isinstance(for_loop.args[3], (list, tuple)):
+                return None
+            placeholders = [n for n in graph_info.graph.nodes if n.op == "placeholder"]
+            if node not in placeholders:
+                return None
+            index = placeholders.index(node)
+            inputs = for_loop.args[3]
+            return inputs[index] if index < len(inputs) else None
+
+        def is_zero_accumulator(node: object) -> bool:
+            seen = 0
+            while isinstance(node, torch.fx.Node) and seen < 8:
+                seen += 1
+                if node in zero_fills:
+                    return True
+                name = api_name(node)
+                if name == "_new_var":
+                    node = node.args[0]
+                elif node.op == "placeholder":
+                    node = loop_input(node)
+                else:
+                    return False
+            return False
+
+        (matmul,) = matmuls
+        if matmul.target is torch.ops.aten.addmm.default:
+            if len(matmul.args) != 3 or any(
+                matmul.kwargs.get(key, 1) != 1 for key in ("alpha", "beta")
+            ):
+                return None
+            acc, lhs, rhs = matmul.args
+            if not is_zero_accumulator(acc):
+                return None
+        else:
+            if len(matmul.args) != 2 or matmul.kwargs:
+                return None
+            lhs, rhs = matmul.args
+        lhs_name = plain_load_of(lhs)
+        rhs_name = plain_load_of(rhs)
+        if (
+            lhs_name is None
+            or rhs_name is None
+            or lhs_name == rhs_name
+            or lhs_name not in input_names
+            or rhs_name not in input_names
+        ):
+            return None
+
+        # The store writes the matmul result (through the loop's carried
+        # value and an optional cast) to the output, and nothing else.
+        (store,) = stores
+        if host_tensor_name(store.args[0]) != out_name or len(store.args) < 3:
+            return None
+        if any(arg is not None for arg in store.args[3:]) or store.kwargs:
+            return None
+        value: object = store.args[2]
+        seen = 0
+        while isinstance(value, torch.fx.Node) and value is not matmul and seen < 16:
+            seen += 1
+            name = api_name(value)
+            if value.target is torch.ops.prims.convert_element_type.default:
+                value = value.args[0]
+            elif name == "_phi":
+                value = value.args[1]
+            elif name == "_new_var":
+                value = value.args[0]
+            elif value.target is operator.getitem:
+                for_loop, index = value.args
+                if not (
+                    isinstance(for_loop, torch.fx.Node)
+                    and api_name(for_loop) == "_for_loop"
+                    and isinstance(index, int)
+                ):
+                    return None
+                graph_info = graph_by_id.get(for_loop.args[0])  # type: ignore[arg-type]
+                if graph_info is None:
+                    return None
+                output = next(n for n in graph_info.graph.nodes if n.op == "output")
+                outputs = output.args[0]
+                if not isinstance(outputs, (list, tuple)) or index >= len(outputs):
+                    return None
+                value = outputs[index]
+            else:
+                return None
+        if value is not matmul:
+            return None
+        return input_names[lhs_name], input_names[rhs_name]
+
     def build_launcher_args(
         self,
         args: list[str],
@@ -1386,6 +1662,7 @@ class PallasBackend(Backend):
         from ..device_function import DeviceFunction
         from ..device_function import TensorArg
         from ..host_function import HostFunction
+        from ..variable_origin import BlockSizeOrigin
 
         device_fn = DeviceFunction.current()
 
@@ -1449,13 +1726,39 @@ class PallasBackend(Backend):
         # allocations to ``device='meta'`` and capture the launcher return.
         output_only_set = set(output_indices) - set(inplace_indices)
         output_only_names: list[str] = []
+        cacheable_output_only_names: list[str] = []
         if sorted_args is not None:
+            env = CompileEnvironment.current()
+            host_fn = HostFunction.current()
+            configured_symbols = {
+                symbol
+                for symbol, info in host_fn.expr_to_origin.items()
+                if isinstance(info.origin, BlockSizeOrigin)
+            }
             for i in output_indices:
                 if i in output_only_set:
                     arg = sorted_args[i]
                     assert isinstance(arg, TensorArg)
+                    # Backed input dimensions and configured block sizes are
+                    # fixed by a static-shape binding. Other metadata must be
+                    # recomputed before the launcher selects its specialization.
+                    metadata = (
+                        *arg.fake_value.shape,
+                        *arg.fake_value.stride(),
+                        arg.fake_value.storage_offset(),
+                    )
+                    if not any(
+                        isinstance(value, torch.SymInt)
+                        and free_unbacked_symbols(
+                            env.specialize_expr(env.shape_env.replace(value._sympy_()))
+                        )
+                        - configured_symbols
+                        for value in metadata
+                    ):
+                        cacheable_output_only_names.append(arg.host_str())
                     output_only_names.append(arg.host_str())
         self._output_only_names = output_only_names
+        self._cacheable_output_only_names = cacheable_output_only_names
 
         launcher_args = [*args]
         if has_rng_ops:
@@ -1502,7 +1805,7 @@ class PallasBackend(Backend):
             for scratch in scratch_shapes:
                 sources = scratch.shape_sources or (None,) * len(scratch.shape)
                 shape_dims = [
-                    host.literal_expr(size)
+                    host.literal_expr(size, device_fn.config)
                     if source is None
                     else f"{device_fn.tensor_arg(source[0]).host_str()}.size({source[1]})"
                     for size, source in zip(scratch.shape, sources, strict=True)
@@ -1531,6 +1834,11 @@ class PallasBackend(Backend):
                     dims.append((position, source[1]))
                 shape_sources.append(dims)
             launcher_args.append(f"_scratch_shape_sources={shape_sources!r}")
+
+        if device_fn.pallas_pipeline_vmem_bytes:
+            launcher_args.append(
+                f"_pipeline_vmem_bytes={device_fn.pallas_pipeline_vmem_bytes}"
+            )
 
         if device_fn.requires_remote_copy:
             launcher_args.append("_uses_remote_copy=True")

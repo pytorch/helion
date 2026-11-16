@@ -7,17 +7,17 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.nvfp4_gemm import _nvfp4_w4a4_matmul_kernel
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_scaled_contraction import _config
 from test.test_cute_scaled_contraction import _inputs
 
 import helion
 from helion import exc
-from helion._compiler.autotuner_heuristics.cute_block_scaled import (
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.ast_extension import unparse
+from helion._compiler.cute.autotune.heuristics.cute_block_scaled import (
     CuteBlockScaledMmaHeuristic,
 )
 from helion._compiler.cute.block_scaled_config import BLOCK_SCALED_CONFIG_KEYS
@@ -29,13 +29,17 @@ from helion._compiler.cute.block_scaled_provenance import IntegerRecipe
 from helion._compiler.cute.block_scaled_provenance import _plain_load
 from helion._compiler.cute.block_scaled_provenance import integer_recipe
 from helion._compiler.cute.block_scaled_provenance import operand_fingerprint
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.language import creation_ops
 from helion.language import memory_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+_nvfp4_w4a4_matmul_kernel = import_example("nvfp4_gemm")._nvfp4_w4a4_matmul_kernel
+
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -104,7 +108,7 @@ def _bind_native(
         )
     else:
         args = (*args[:4], torch.empty((m, n), dtype=dtype), args[5])
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _plain_scales.fn if generic else _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -134,23 +138,79 @@ def _wrapper_plan(source: str) -> dict[str, object]:
     "shape", [(128, 16, 128), (512, 64, 512), (1024, 128, 1024), (73, 5, 41)]
 )
 @pytest.mark.parametrize("static", [False, True])
-@skipUnlessBackends(["cute"])
 def test_original_and_dynamic_metadata_are_proved(
     shape: tuple[int, int, int], static: bool
 ) -> None:
     bound, _ = _bind_native(shape, static=static)
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     assert (plan["m"], plan["k"], plan["n"]) == (shape[0], shape[1] * 16, shape[2])
     assert plan["lhs_row_fast"] is False and plan["rhs_row_fast"] is True
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
 
 
+@pytest.mark.skipif(
+    not supports_torch_compile_template_lowering(),
+    reason="this PyTorch build lacks Helion's Inductor template lowering",
+)
+def test_dynamic_inductor_render_runs_the_generic_contraction() -> None:
+    """Inductor runs its render of a dynamic-shape graph at every size the
+    graph accepts, without the binding's dispatch guards, so the exact sizes
+    the native plan needs are no proof there.  The render takes the generic
+    contraction, as without the knob, rather than refusing a config
+    Inductor's tuner may have chosen; a static graph's keeps the native plan."""
+    from helion._compiler._inductor.template_buffer import render_inductor_ast
+
+    bound, _ = _bind_native((128, 16, 128), static=False)
+    with cpu_target():
+
+        def render(config: helion.Config, *, symbolic: bool) -> str:
+            return unparse(
+                render_inductor_ast(bound, config, symbolic_input_layouts=symbolic)
+            )
+
+        static = render(_native_config(), symbolic=False)
+        dynamic = render(_native_config(), symbolic=True)
+        generic = render(_native_config(cute_scaled_mma=False), symbolic=True)
+    assert _wrapper_plan(static)["kind"] == "block_scaled_mma"
+    assert "block_scaled_mma" not in dynamic
+    assert dynamic == generic
+
+
+def test_an_outer_trace_binding_refuses_a_declined_native_plan() -> None:
+    """Only Inductor's render of a dynamic graph skips the binding's dispatch
+    guards.  A binding from an outer trace's FakeTensors keeps them, but its
+    hints are that trace's, so the native plan declines there: the pinned
+    config is refused, as before, not replaced by the generic contraction."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _, args = _bind_native((128, 16, 128), static=False)
+    with FakeTensorMode(allow_non_fake_inputs=True) as mode, cpu_target():
+        fake_args = tuple(
+            mode.from_tensor(arg) if isinstance(arg, torch.Tensor) else arg
+            for arg in args
+        )
+        kernel = helion.kernel(
+            _nvfp4_w4a4_matmul_kernel.fn,
+            backend="cute",
+            static_shapes=False,
+            autotune_effort="none",
+        )
+        bound = kernel._bind_isolated(fake_args)
+    with (
+        cpu_target(),
+        pytest.raises(
+            exc.BackendUnsupported,
+            match="native block-scaled contraction proof declined",
+        ),
+    ):
+        bound.to_code(_native_config())
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@skipUnlessBackends(["cute"])
 def test_generic_scale_layout_and_output_dtype(dtype: torch.dtype) -> None:
     bound, _ = _bind_native(generic=True, static=False, dtype=dtype)
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(
             bound.to_code(
                 _native_config(
@@ -167,10 +227,9 @@ def test_generic_scale_layout_and_output_dtype(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
-@skipUnlessBackends(["cute"])
 def test_explicit_intermediate_rounding_is_retained(dtype: torch.dtype) -> None:
     bound, _ = _bind_native(dtype=dtype)
-    with _cpu_target():
+    with cpu_target():
         plan = _wrapper_plan(bound.to_code(_native_config()))
     assert plan["round_dtypes"] == ("torch.bfloat16", str(dtype))
 
@@ -191,7 +250,7 @@ def test_output_aliasing_an_input_declines_native_reordering() -> None:
     args = list(_inputs(4, 3, 4))
     packed = cast("torch.Tensor", args[0])
     args[4] = packed.view(torch.bfloat16).reshape(-1)[:16].view(4, 4)
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -212,7 +271,7 @@ def test_overlapping_output_elements_decline_native_reordering(
 ) -> None:
     args = list(_inputs(4, 3, 4))
     args[4] = torch.empty_strided((4, 4), strides, dtype=torch.bfloat16)
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -233,7 +292,7 @@ def test_noncontiguous_disjoint_output_layout_is_supported(
 ) -> None:
     args = list(_inputs(4, 3, 4))
     args[4] = torch.empty_strided((4, 4), strides, dtype=torch.bfloat16)
-    with _cpu_target():
+    with cpu_target():
         kernel = helion.kernel(
             _nvfp4_w4a4_matmul_kernel.fn,
             backend="cute",
@@ -244,21 +303,20 @@ def test_noncontiguous_disjoint_output_layout_is_supported(
         assert _wrapper_plan(bound.to_code(_native_config()))["m"] == 4
 
 
-@skipUnlessBackends(["cute"])
 def test_all_native_seeds_round_trip_and_emit() -> None:
     bound, _ = _bind_native()
     assert bound.host_function is not None
-    with bound.env, _cpu_target():
+    with bound.env, cpu_target():
         seeds = CuteBlockScaledMmaHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
         generation = ConfigGeneration(bound.config_spec)
-        assert len(seeds) == 8
+        assert len(seeds) == 18
         for seed in seeds:
             bound.config_spec.normalize(seed)
             restored = generation.unflatten(generation.flatten(seed))
             assert all(restored[key] == value for key, value in seed.items())
-    with _cpu_target():
+    with cpu_target():
         for seed in seeds:
             assert _wrapper_plan(bound.to_code(seed))["kind"] == "block_scaled_mma"
 
@@ -269,7 +327,9 @@ def test_all_native_seeds_round_trip_and_emit() -> None:
         ("cute_scaled_mma", 1),
         ("cute_scaled_cluster_m", True),
         ("cute_scaled_tile_k", 32),
-        ("cute_scaled_tile_n", 64),
+        ("cute_scaled_tile_n", 32),
+        ("cute_scaled_prepare_rows", 8),
+        ("cute_scaled_epilogue_n", 16),
         ("cute_scaled_stages", 1),
         ("cute_scaled_persistent", 0),
     ],
@@ -315,7 +375,6 @@ def test_native_configuration_requires_proven_format_and_hardware() -> None:
         "changed_scale_arithmetic",
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_native_region_proof_rejects_changed_semantics(change: str) -> None:
     bound, _ = _bind_native()
     checked = False
@@ -390,7 +449,7 @@ def test_native_region_proof_rejects_changed_semantics(change: str) -> None:
         raise _StoppedProof
 
     with (
-        _cpu_target(),
+        cpu_target(),
         patch(
             "helion._compiler.cute.block_scaled_mma.plan_block_scaled",
             side_effect=probe,
@@ -408,7 +467,6 @@ class _StoppedProof(Exception):
 @pytest.mark.parametrize(
     "target", [operator.getitem, operator.neg, torch.ops.aten.item.default]
 )
-@skipUnlessBackends(["cute"])
 def test_integer_recipe_rejects_opaque_values_even_with_concrete_metadata(
     target: Callable[..., object],
 ) -> None:
@@ -454,7 +512,6 @@ def test_integer_recipe_uses_strict_bounds_and_expansion_limit() -> None:
     assert render(row) is None
 
 
-@skipUnlessBackends(["cute"])
 def test_source_proof_declines_deep_dags_without_python_recursion_failure() -> None:
     bound, _ = _bind_native()
     graph = torch.fx.Graph()

@@ -4,9 +4,11 @@
 # These helpers are imported by the generated module and traced inline into
 # the kernel body.  Every helper is one PTX instruction, so the emitted body
 # is a straight line of SSA values that ptxas cannot reorder around the
-# cp.async wait that guards the operand data.  The MMA, ldmatrix, cp.async,
-# pack and global load / store helpers are the row_mma / warp_mma ones,
-# re-exported so the generated code names one runtime module.  (Unlike
+# cp.async wait that guards the operand data.  The single-instruction helpers
+# are ``device/ptx.py`` rows (the ragged root tile's predicated loads and the
+# L2-hinted ``cp.async`` forms among them), the MMA, pack and ``nc`` loads
+# the row_mma / warp_mma ones, re-exported so the generated code names one
+# runtime module.  (Unlike
 # _flash_runtime.py there is no ``@cute.struct`` here, so the stringified
 # annotations of the future import are harmless.)
 from __future__ import annotations
@@ -16,94 +18,92 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 
-from ._flash_row_mma_runtime import _ASM_KW
-from ._flash_row_mma_runtime import _floats
-from ._flash_row_mma_runtime import _words
-from ._flash_row_mma_runtime import cp_async_16  # noqa: F401
+from ._flash_row_mma_runtime import lane_group_max  # noqa: F401
 from ._flash_row_mma_runtime import lane_group_sum  # noqa: F401
-from ._flash_row_mma_runtime import ldmatrix_x4  # noqa: F401
-from ._flash_row_mma_runtime import ldmatrix_x4_trans  # noqa: F401
-from ._flash_row_mma_runtime import lds_f32  # noqa: F401
-from ._flash_row_mma_runtime import lds_v4_f32  # noqa: F401
 from ._flash_row_mma_runtime import mma_bf16  # noqa: F401
 from ._flash_row_mma_runtime import mma_f16  # noqa: F401
-from ._flash_row_mma_runtime import movmatrix_trans  # noqa: F401
+
+# The generic sum/max interface propagates NaNs; flash's octet_max uses fmax.
+from ._flash_row_mma_runtime import octet_max_nan as octet_max  # noqa: F401
 from ._flash_row_mma_runtime import octet_sum  # noqa: F401
 from ._flash_row_mma_runtime import pack_bf16x2  # noqa: F401
 from ._flash_row_mma_runtime import pack_f16x2  # noqa: F401
-from ._flash_row_mma_runtime import stg_f32  # noqa: F401
-from ._flash_row_mma_runtime import stg_v4_b32  # noqa: F401
-from ._flash_row_mma_runtime import sts_f32  # noqa: F401
+from ._warp_mma_runtime import _NC
 from ._warp_mma_runtime import ldg_b32  # noqa: F401
 from ._warp_mma_runtime import ldg_bf16_as_f32  # noqa: F401
 from ._warp_mma_runtime import ldg_f16_as_f32  # noqa: F401
 from ._warp_mma_runtime import ldg_f32  # noqa: F401
 from ._warp_mma_runtime import ldg_v2_f32  # noqa: F401
-from ._warp_mma_runtime import ldmatrix_x2  # noqa: F401
-from ._warp_mma_runtime import ldmatrix_x2_trans  # noqa: F401
-from ._warp_mma_runtime import mma_tf32  # noqa: F401
-from ._warp_mma_runtime import stg_b32  # noqa: F401
-from ._warp_mma_runtime import stg_bf16  # noqa: F401
-from ._warp_mma_runtime import stg_f16  # noqa: F401
-from ._warp_mma_runtime import stg_v2_f32  # noqa: F401
 from ._warp_mma_runtime import unpack_bf16x2  # noqa: F401
-from ._warp_mma_runtime import unpack_f16x2  # noqa: F401
-
-
-@dsl_user_op
-def sts_b32(
-    smem_address: object, word: object, *, loc: object = None, ip: object = None
-) -> None:
-    """``st.shared.b32``: one 4-byte word (a packed 16-bit element pair of a
-    cooperatively computed operand tile)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Uint32(word).ir_value(loc=loc, ip=ip),
-        ],
-        "st.shared.b32 [$0], $1;",
-        "r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
+from .device.ptx import ASM_KW
+from .device.ptx import bits_f32  # noqa: F401
+from .device.ptx import cp_async_4  # noqa: F401
+from .device.ptx import cp_async_16  # noqa: F401
+from .device.ptx import cp_async_16_ca  # noqa: F401
+from .device.ptx import cp_async_16_l2  # noqa: F401
+from .device.ptx import cp_async_16_l2_zfill  # noqa: F401
+from .device.ptx import cp_async_16_zfill  # noqa: F401
+from .device.ptx import f32_bits  # noqa: F401
+from .device.ptx import l2_policy_evict_first  # noqa: F401
+from .device.ptx import l2_policy_evict_last  # noqa: F401
+from .device.ptx import ldg_b32_pred  # noqa: F401
+from .device.ptx import ldg_bf16_as_f32_pred  # noqa: F401
+from .device.ptx import ldg_f16_as_f32_pred  # noqa: F401
+from .device.ptx import ldg_f32_pred  # noqa: F401
+from .device.ptx import ldg_s8_pred  # noqa: F401
+from .device.ptx import ldg_s32_pred  # noqa: F401
+from .device.ptx import ldg_s64  # noqa: F401
+from .device.ptx import ldg_u8_pred  # noqa: F401
+from .device.ptx import ldg_v2_f32_pred  # noqa: F401
+from .device.ptx import ldmatrix_x2  # noqa: F401
+from .device.ptx import ldmatrix_x2_trans  # noqa: F401
+from .device.ptx import ldmatrix_x4  # noqa: F401
+from .device.ptx import ldmatrix_x4_trans  # noqa: F401
+from .device.ptx import lds_b32  # noqa: F401
+from .device.ptx import lds_bf16_as_f32  # noqa: F401
+from .device.ptx import lds_f16_as_f32  # noqa: F401
+from .device.ptx import lds_f32  # noqa: F401
+from .device.ptx import lds_s32  # noqa: F401
+from .device.ptx import lds_v2_f32  # noqa: F401
+from .device.ptx import lds_v4_b32  # noqa: F401
+from .device.ptx import lds_v4_f32  # noqa: F401
+from .device.ptx import mma_tf32  # noqa: F401
+from .device.ptx import movmatrix_trans  # noqa: F401
+from .device.ptx import round_bf16_f32  # noqa: F401
+from .device.ptx import shfl_down_add_f32  # noqa: F401
+from .device.ptx import shfl_up_add_f32  # noqa: F401
+from .device.ptx import stg_b32  # noqa: F401
+from .device.ptx import stg_bf16  # noqa: F401
+from .device.ptx import stg_f16  # noqa: F401
+from .device.ptx import stg_f32  # noqa: F401
+from .device.ptx import stg_v2_f32  # noqa: F401
+from .device.ptx import stg_v4_b32  # noqa: F401
+from .device.ptx import sts_b32  # noqa: F401
+from .device.ptx import sts_f32  # noqa: F401
+from .device.ptx import sts_v2_b32  # noqa: F401
+from .device.ptx import sts_v2_f32  # noqa: F401
+from .device.ptx import sts_v4_b32  # noqa: F401
+from .device.ptx import sts_v4_f32  # noqa: F401
+from .device.ptx import unpack_f16x2  # noqa: F401
+from .device.ptx import words
 
 
 @dsl_user_op
 def ldg_s32(
-    gmem_address: object, *, loc: object = None, ip: object = None
+    gmem_address: object, *, nc: bool = False, loc: object = None, ip: object = None
 ) -> cutlass.Int32:
     """``ld.global.s32``: one int32 value (a side vector of window bounds)."""
     result = llvm.inline_asm(
         T.i32(),
         [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
-        "ld.global.s32 $0, [$1];",
+        f"ld.global{_NC[nc]}.s32 $0, [$1];",
         "=r,l,~{memory}",
         has_side_effects=True,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )
     return cutlass.Int32(result)
-
-
-@dsl_user_op
-def f32_bits(value: object, *, loc: object = None, ip: object = None) -> object:
-    """``mov.b32``: the bit pattern of an fp32 value (an operand word the
-    tensor core truncates to tf32)."""
-    result = llvm.inline_asm(
-        T.i32(),
-        [cutlass.Float32(value).ir_value(loc=loc, ip=ip)],
-        "mov.b32 $0, $1;",
-        "=r,f",
-        has_side_effects=False,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return cutlass.Uint32(result)
 
 
 @dsl_user_op
@@ -135,167 +135,25 @@ def shfl_pick_b32(
         has_side_effects=True,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )
     return cutlass.Uint32(result)
 
 
 @dsl_user_op
-def lds_b32(smem_address: object, *, loc: object = None, ip: object = None) -> object:
-    """``ld.shared.b32``: one 4-byte word (a packed 16-bit element pair of a
-    staged tile read at the lane's fragment coordinates)."""
-    result = llvm.inline_asm(
-        T.i32(),
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ld.shared.b32 $0, [$1];",
-        "=r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return cutlass.Uint32(result)
-
-
-@dsl_user_op
-def lds_v2_f32(
-    smem_address: object, *, loc: object = None, ip: object = None
+def ldg_v4_b32(
+    gmem_address: object, *, loc: object = None, ip: object = None
 ) -> tuple[object, ...]:
-    """``ld.shared.v2.f32``: two consecutive fp32 values (8-byte aligned; an
-    fp32 tile pair read at the lane's fragment coordinates)."""
-    result = llvm.inline_asm(
-        llvm.StructType.get_literal([T.f32()] * 2),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ld.shared.v2.f32 {$0, $1}, [$2];",
-        "=f,=f,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-    return _floats(result, 2, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def lds_v4_b32(
-    smem_address: object, *, loc: object = None, ip: object = None
-) -> tuple[object, ...]:
-    """``ld.shared.v4.b32``: one 16-byte packet (eight 16-bit elements)."""
+    """``ld.global.v4.b32``: one 16-byte packet (eight 16-bit or four
+    32-bit elements) at a 16-byte aligned address."""
     result = llvm.inline_asm(
         llvm.StructType.get_literal([T.i32()] * 4),  # pyrefly: ignore[missing-attribute]
-        [cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip)],
-        "ld.shared.v4.b32 {$0, $1, $2, $3}, [$4];",
-        "=r,=r,=r,=r,r,~{memory}",
-        has_side_effects=True,
+        [cutlass.Int64(gmem_address).ir_value(loc=loc, ip=ip)],
+        "ld.global.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=False,
         loc=loc,
         ip=ip,
-        **_ASM_KW,
+        **ASM_KW,
     )
-    return _words(result, 4, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def sts_v4_b32(
-    smem_address: object,
-    w0: object,
-    w1: object,
-    w2: object,
-    w3: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``st.shared.v4.b32``: one 16-byte packet."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            *[cutlass.Uint32(w).ir_value(loc=loc, ip=ip) for w in (w0, w1, w2, w3)],
-        ],
-        "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
-        "r,r,r,r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def sts_v4_f32(
-    smem_address: object,
-    x0: object,
-    x1: object,
-    x2: object,
-    x3: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``st.shared.v4.f32``: one 16-byte packet of four fp32 values (a
-    widened tf32 operand row chunk)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            *[cutlass.Float32(x).ir_value(loc=loc, ip=ip) for x in (x0, x1, x2, x3)],
-        ],
-        "st.shared.v4.f32 [$0], {$1, $2, $3, $4};",
-        "r,f,f,f,f,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def sts_v2_f32(
-    smem_address: object,
-    x0: object,
-    x1: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``st.shared.v2.f32``: two consecutive fp32 values (8-byte aligned)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(x0).ir_value(loc=loc, ip=ip),
-            cutlass.Float32(x1).ir_value(loc=loc, ip=ip),
-        ],
-        "st.shared.v2.f32 [$0], {$1, $2};",
-        "r,f,f,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
-
-
-@dsl_user_op
-def sts_v2_b32(
-    smem_address: object,
-    w0: object,
-    w1: object,
-    *,
-    loc: object = None,
-    ip: object = None,
-) -> None:
-    """``st.shared.v2.b32``: two packed 16-bit pairs (8-byte aligned)."""
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(smem_address).ir_value(loc=loc, ip=ip),
-            cutlass.Uint32(w0).ir_value(loc=loc, ip=ip),
-            cutlass.Uint32(w1).ir_value(loc=loc, ip=ip),
-        ],
-        "st.shared.v2.b32 [$0], {$1, $2};",
-        "r,r,r,~{memory}",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-        **_ASM_KW,
-    )
+    return words(result, 4, loc=loc, ip=ip)

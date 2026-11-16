@@ -24,6 +24,9 @@ from ...language import tile_ops
 from ...language import view_ops
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
+from .reduce_call import ReduceCall
+from .reduce_call import ReduceScope
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ..device_ir import ForLoopGraphInfo
@@ -187,10 +190,11 @@ def prepare(
         for g in cg.codegen_graphs
     ):
         return None
+    codegen_state = cute_codegen_state(cg)
     if (
-        cg._cute_branch_path
-        or cg.cute_synthetic_arange_axes
-        or cg.cute_synthetic_arange_lane_exprs
+        codegen_state.branch_path
+        or codegen_state.synthetic_arange_axes
+        or codegen_state.synthetic_arange_lane_exprs
     ):
         return None
     if any(
@@ -274,7 +278,8 @@ def defer_collective(
         1,
     ):
         return False
-    if cg.cute_synthetic_arange_axes or cg.cute_synthetic_arange_lane_exprs:
+    codegen_state = cute_codegen_state(cg)
+    if codegen_state.synthetic_arange_axes or codegen_state.synthetic_arange_lane_exprs:
         return False
     if plan.extent <= span:
         return False
@@ -288,6 +293,17 @@ def defer_collective(
         return False
     lane = "cutlass.Int32(cute.arch.thread_idx()[0])"
     plan.final_call = expr_from_string(
-        f"_cute_grouped_reduce_shared_two_stage(0, {operation!r}, {identity}, {lane}, ({lane}) % {span}, 0, pre=1, group_span={span}, group_count=1)"
+        ReduceCall(
+            scope=ReduceScope.SHARED_TWO_STAGE,
+            op=operation,
+            input="0",
+            identity=identity,
+            lane_expr=lane,
+            lane_in_group=f"({lane}) % {span}",
+            lane_mod_pre="0",
+            pre=1,
+            group_span=span,
+            group_count=1,
+        ).render()
     )
     return True

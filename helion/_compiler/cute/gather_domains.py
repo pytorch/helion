@@ -36,7 +36,7 @@ def _carry_map(
     call: Node, captures: list[Node], outputs: list[Node]
 ) -> dict[int, int] | None:
     """Match every backedge through its actual getitem/phi entry edge."""
-    from .computed_fragment import _loop_carry_slots
+    from .fragment_context import _loop_carry_slots
 
     slots: dict[int, int] = {}
     for item in call.users:
@@ -130,7 +130,7 @@ def loop_domain_facts(
     existing loop snapshots, storage dependencies and barriers are retained.
     """
     from .bounded_gather import integer_bounds
-    from .computed_fragment import _fragment_logical_shape
+    from .fragment_context import _fragment_logical_shape
 
     facts = GatherDomainFacts()
 

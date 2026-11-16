@@ -7,18 +7,27 @@ from operator import getitem
 from typing import TYPE_CHECKING
 from typing import cast
 
+import sympy
 import torch
 from torch._inductor.codegen.simd import constant_repr
+from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from .. import exc
+from ..language._decorators import BackendDispatchTable
+from ..language._decorators import is_api_func
+from ..language._tracing_ops import EXTENT_VALUE
+from ..language._tracing_ops import _get_symnode
 from ..language.matmul_ops import MATMUL_DIM_BLOCK_IDS_META
 from ..language.matmul_ops import MATMUL_FACT_ID_META
 from ..language.matmul_ops import enforce_dot_requirements
 from .ast_extension import expr_from_string
 from .compile_environment import CompileEnvironment
+from .compile_environment import _to_sympy
+from .compile_environment import shape_env_var_hints
+from .host_function import HostFunction
 from .node_masking import apply_masking
 from .node_masking import broadcasts_onto_masked_lanes
 from .node_masking import cached_masked_value
@@ -59,7 +68,9 @@ def _env_arg(ctx: LoweringContext, node: Node) -> Argument:
 class AtenLowering(Lowering):
     target: object | None = None
     masked_value_fn: MaskedValueFn | None = None
-    codegen_impls: dict[str, CodegenHandler] = dataclasses.field(default_factory=dict)
+    codegen_impls: BackendDispatchTable[CodegenHandler] = dataclasses.field(
+        default_factory=BackendDispatchTable
+    )
 
     def register_codegen(
         self, backend: str
@@ -74,18 +85,11 @@ class AtenLowering(Lowering):
 
     def codegen(self, ctx: LoweringContext, node: Node) -> object:
         env = CompileEnvironment.current()
-        from .backend_registry import repair_backend_codegen
-
-        repair_backend_codegen(env.codegen_name)
-        handler = self.codegen_impls.get(env.codegen_name)
-        if handler is None:
-            handler = self.codegen_impls.get("common")
-        if handler is None:  # pragma: no cover - defensive
-            target = self.target or "unknown"
-            raise exc.BackendImplementationMissing(
-                env.backend_name,
-                f"Aten lowering codegen not registered for {target!r}",
-            )
+        handler = self.codegen_impls.lookup(
+            env.codegen_name,
+            backend_name=env.backend_name,
+            what=f"Aten lowering codegen not registered for {self.target or 'unknown'!r}",
+        )
         return handler(ctx, node)
 
     def get_masked_value(self, node: Node) -> float | bool | None:
@@ -117,6 +121,223 @@ def register_lowering(
     lowering = AtenLowering(target=fn, masked_value_fn=masked_value_fn)
     aten_lowering_dispatch[fn] = lambda node: make_lowering(lowering, node)
     return lowering
+
+
+_ARANGES = (
+    torch.ops.aten.arange.default,
+    torch.ops.aten.arange.start,
+    torch.ops.aten.arange.start_step,
+)
+
+
+def _shape_arguments(user: Node) -> list[tuple[int | str, Argument]]:
+    """``user``'s arguments that give a tensor's shape (a size, shape, length
+    or output size, or an arange's end), each with its position in
+    ``user.args`` or its name in ``user.kwargs``."""
+    if isinstance(user.target, torch._ops.OpOverload):
+        parameters = [argument.name for argument in user.target._schema.arguments]
+    elif is_api_func(user.target):
+        parameters = list(user.target._signature.parameters)
+    else:
+        return []
+    found: list[tuple[int | str, Argument]] = []
+    for position, name in enumerate(parameters):
+        if name not in {"size", "shape", "length", "output_size"} and not (
+            user.target in _ARANGES and name == "end"
+        ):
+            continue
+        if position < len(user.args):
+            found.append((position, user.args[position]))
+        elif name in user.kwargs:
+            found.append((name, user.kwargs[name]))
+    return found
+
+
+def _keep_shape_size_reads(node: Node) -> None:
+    """Keep physical tile extents in shape parameters."""
+    physical: Node | None = None
+
+    def physical_size(arg: Node) -> Node:
+        nonlocal physical
+        if arg is not node:
+            return arg
+        if physical is None:
+            with node.graph.inserting_before(node):
+                physical = node.graph.call_function(
+                    _get_symnode,
+                    (
+                        CompileEnvironment.current().sympy_debug(
+                            _to_sympy(node.meta["val"])
+                        ),
+                    ),
+                )
+            physical.meta.update(node.meta)
+            physical.meta["helion_host_scalar"] = False
+        return physical
+
+    for user in list(node.users):
+        args, kwargs = list(user.args), dict(user.kwargs)
+        for key, argument in _shape_arguments(user):
+            if isinstance(key, int):
+                args[key] = map_arg(argument, physical_size)
+            else:
+                kwargs[key] = map_arg(argument, physical_size)
+        if tuple(args) != user.args or kwargs != user.kwargs:
+            user.args, user.kwargs = tuple(args), kwargs
+
+
+def _restated(
+    value: torch.SymInt | torch.SymFloat | torch.SymBool, expr: sympy.Basic
+) -> int | float | bool | torch.SymInt | torch.SymFloat | torch.SymBool:
+    """``value`` with the expression ``expr``: a constant once ``expr`` is one."""
+    shape_env = CompileEnvironment.current().shape_env
+    if isinstance(value, torch.SymBool):
+        if expr in (sympy.true, sympy.false):
+            return bool(expr)
+        # A SymBool's expression is a sympy boolean rather than an Expr.
+        # pyrefly: ignore [bad-argument-type]
+        return shape_env.create_symboolnode(expr)
+    assert isinstance(expr, sympy.Expr)
+    # An int kernel argument is an unbacked symbol, which Helion still gives
+    # a hint (``var_to_val``); a value over one must not take a hint.
+    hint = (
+        None
+        if free_unbacked_symbols(expr)
+        else expr.xreplace(shape_env_var_hints(shape_env))
+    )
+    if hint is not None and not hint.is_number:
+        hint = None
+    if isinstance(value, torch.SymInt):
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        return shape_env.create_symintnode(
+            expr, hint=None if hint is None else int(hint)
+        )
+    if isinstance(expr, sympy.Number):
+        return float(expr)
+    return shape_env.create_symfloatnode(
+        expr, hint=None if hint is None else float(hint)
+    )
+
+
+def restate_reduction_extents() -> dict[sympy.Symbol, sympy.Expr]:
+    """Each reduction dim's block size symbol -> the dim's extent, once the
+    sizes of the dims computed from another dim's size read that dim's
+    extent.
+
+    A read of a reduction dim's size (``row.size(1)`` for ``row =
+    x[tile, :]``) traces as the dim's block size symbol, which
+    ``resolve_reduction_sizes`` then reads as the extent.  A dim sized from
+    such a read (``x[tile, n:]`` for ``n = row.size(1) // 2``) was registered
+    over the symbol, so its mask and its block size read the block size where
+    the extent was meant.  A dim whose size is a block's own symbol (sized by
+    a shape read, ``_keep_shape_size_reads``) keeps it."""
+    env = CompileEnvironment.current()
+    extents: dict[sympy.Symbol, sympy.Expr] = {}
+    for info in env.block_sizes:
+        if not info.reduction or not isinstance(info.size, (int, torch.SymInt)):
+            continue
+        size = _to_sympy(info.size)
+        if env.get_block_id(size) is not None:
+            continue
+        # A dim's size reads only the dims registered before it.
+        extent = size.xreplace(extents)
+        if isinstance(info.size, torch.SymInt) and extent != size:
+            restated = _restated(info.size, extent)
+            assert isinstance(restated, (int, torch.SymInt))
+            info.size = restated
+        extents[info.symbol()] = extent
+    return extents
+
+
+def _shape_scalars(graph: torch.fx.Graph) -> set[Node]:
+    """The scalars a shape parameter of ``graph`` reads (``_shape_arguments``),
+    directly or through other scalars."""
+    pending: list[Node] = []
+    for user in graph.nodes:
+        for _key, argument in _shape_arguments(user):
+            map_arg(argument, pending.append)
+    scalars: set[Node] = set()
+    while pending:
+        node = pending.pop()
+        if node in scalars or not isinstance(
+            node.meta.get("val"), (torch.SymInt, torch.SymFloat, torch.SymBool)
+        ):
+            continue
+        scalars.add(node)
+        pending.extend(node.all_input_nodes)
+    return scalars
+
+
+def resolve_reduction_sizes(
+    graph: torch.fx.Graph, extents: dict[sympy.Symbol, sympy.Expr]
+) -> None:
+    """Read a full slice's logical extent, independent of padding or chunk
+    size, and so do the scalars computed from it (``extents``, from
+    ``restate_reduction_extents``), but for those a shape reads."""
+    env = CompileEnvironment.current()
+    for node in list(graph.nodes):
+        if node.op != "call_function" or node.target not in (
+            torch.ops.aten.sym_size.int,
+            _get_symnode,
+        ):
+            continue
+        block_id = env.get_block_id(node.meta["val"])
+        if block_id is None or not env.block_sizes[block_id].reduction:
+            continue
+        _keep_shape_size_reads(node)
+        size = env.block_sizes[block_id].size
+        assert isinstance(size, (int, torch.SymInt))
+        # Keep the scalar node's identity: nested graph captures can refer to
+        # it outside FX's users map. Inline literal values on ordinary FX edges
+        # as before, while keeping their source addressable for those captures.
+        node.target = _get_symnode
+        size_expr = _to_sympy(size)
+        node.args = (
+            str(size) if isinstance(size, int) else env.sympy_debug(size_expr),
+        )
+        node.kwargs = {}
+        node.meta["val"] = size
+        node.meta["helion_host_scalar"] = isinstance(size, int) or (
+            HostFunction.current().is_host_scalar_expr(size_expr)
+        )
+        if isinstance(size, int):
+            for user in list(node.users):
+                user.args, user.kwargs = map_arg(
+                    (user.args, user.kwargs),
+                    lambda arg, extent=size, source=node: (
+                        extent if arg is source else arg
+                    ),
+                )
+    # The scalars computed from a size read, here or in an enclosing graph
+    # (a nested graph reads those through ``_get_symnode``), traced over the
+    # dim's block size symbol too.  Those a shape reads keep it, as does a
+    # value that is exactly a block's symbol: the shapes traced over the
+    # symbol (an ``hl.arange`` of such a value, and the dims later lowering
+    # registers for them) read it as the block size.  A capture a shape reads
+    # still prints the extent's value for its uses, as a root graph's own
+    # lowering of such a value does (``user_sympy_expr``).
+    shape_scalars = _shape_scalars(graph)
+    for node in graph.nodes:
+        value = node.meta.get("val")
+        if not isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool)):
+            continue
+        expr = value.node.expr
+        if env.get_block_id(expr) is not None or not (
+            expr.free_symbols & extents.keys()
+        ):
+            continue
+        extent = expr.xreplace(extents)
+        if node in shape_scalars:
+            if node.target is _get_symnode:
+                node.meta[EXTENT_VALUE] = _restated(value, extent)
+            continue
+        node.meta["val"] = _restated(value, extent)
+        if node.target is _get_symnode:
+            node.args = (env.sympy_debug(extent),)
+            node.meta["helion_host_scalar"] = (
+                HostFunction.current().is_host_scalar_expr(extent)
+            )
 
 
 sym_size_lowering = register_lowering(torch.ops.aten.sym_size.int)
@@ -240,6 +461,9 @@ def codegen_unsqueeze(ctx: LoweringContext, node: Node) -> object:
     assert 0 <= dim <= ndim, f"Invalid dim {dim} for tensor with {ndim} dims"
     args = [":"] * ndim
     args.insert(dim, "None")
+    args = ctx.cg.device_function.tile_strategy.physical_keys(
+        node.meta["val"].size(), args
+    )
     return expr_from_string(
         f"{{tensor}}[{', '.join(args)}]",
         tensor=tensor,
@@ -312,72 +536,6 @@ def _normalize_argreduce_dim(node: Node) -> tuple[torch.Tensor, int]:
     return input_val, dim
 
 
-def _should_use_cute_argreduce_lowering(argreduce_node: Node) -> bool:
-    from ..language import _tracing_ops
-    from ..language._decorators import is_api_func
-    from .device_ir import DeviceIR
-
-    if CompileEnvironment.current().backend_name != "cute":
-        return False
-    if not argreduce_node.args or not isinstance(argreduce_node.args[0], Node):
-        return False
-
-    matmul_targets = {
-        torch.matmul,
-        torch.ops.aten.mm.default,
-        torch.ops.aten.addmm.default,
-        torch.ops.aten.bmm.default,
-        torch.ops.aten.baddbmm.default,
-    }
-    try:
-        device_ir = DeviceIR.current()
-        graph_by_id = {
-            idx: graph_info
-            for idx, graph_info in enumerate(getattr(device_ir, "graphs", ()))
-            if hasattr(graph_info, "graph")
-        }
-    except (AttributeError, IndexError):
-        graph_by_id = {}
-    seen_graph_ids: set[int] = set()
-    seen_nodes: set[Node] = set()
-
-    def graph_contains_matmul(graph_id: int) -> bool:
-        if graph_id in seen_graph_ids:
-            return False
-        seen_graph_ids.add(graph_id)
-        graph_info = graph_by_id.get(graph_id)
-        graph = getattr(graph_info, "graph", None)
-        if not isinstance(graph, torch.fx.Graph):
-            return False
-        return any(node_contains_matmul(node) for node in graph.nodes)
-
-    def node_contains_matmul(node: Node) -> bool:
-        if node in seen_nodes:
-            return False
-        seen_nodes.add(node)
-        if node.op != "call_function":
-            return False
-        if node.target in matmul_targets:
-            return True
-        if is_api_func(node.target):
-            name = getattr(node.target, "__name__", "")
-            if name == "dot":
-                return True
-            if _tracing_ops.is_for_loop_target(node.target):
-                graph_id = node.args[0] if node.args else None
-                if isinstance(graph_id, int) and graph_contains_matmul(graph_id):
-                    return True
-        for arg in node.args:
-            if isinstance(arg, Node) and node_contains_matmul(arg):
-                return True
-        for arg in node.kwargs.values():
-            if isinstance(arg, Node) and node_contains_matmul(arg):
-                return True
-        return False
-
-    return node_contains_matmul(argreduce_node.args[0])
-
-
 def _triton_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> ast.AST:
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     assert isinstance(tensor, ast.AST)
@@ -442,9 +600,56 @@ def _pallas_argreduce(ctx: LoweringContext, node: Node, reduction_type: str) -> 
     return expr_from_string(reduced, tensor=tensor)
 
 
+# The dtypes that read all-clear bits as zero (not float8_e8m0fnu, which reads
+# them as 2^-127, nor the packed sub-byte dtypes).
+_ZERO_BITS_READ_AS_ZERO = frozenset(
+    {
+        torch.bool,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+        torch.uint16,
+        torch.uint32,
+        torch.uint64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
+    }
+)
+
+
+def view_dtype_masked_value(node: Node) -> float | bool | None:
+    """A view reinterprets bits, so its masked lanes keep a known value only
+    where the source's is a known bit pattern: an integer or bool zero, all
+    bits clear.  A floating masked value of zero may be -0.0, since masked
+    values don't track the sign of zero (``-x`` of a masked 0 is tracked as
+    0).  All-clear bits read as zero in the target dtype if it is one of
+    ``_ZERO_BITS_READ_AS_ZERO``."""
+    source, dtype = node.args[:2]
+    assert isinstance(source, Node) and isinstance(dtype, torch.dtype)
+    source_dtype = source.meta["val"].dtype
+    if (
+        source_dtype.is_floating_point
+        or source_dtype.is_complex
+        or dtype not in _ZERO_BITS_READ_AS_ZERO
+        or cached_masked_value(source) != 0
+    ):
+        return None
+    if dtype == torch.bool:
+        return False
+    return 0.0 if dtype.is_floating_point else 0
+
+
 view_dtype_lowering = register_lowering(
     torch.ops.aten.view.dtype,
-    masked_value_fn=passthrough_masked_value,
+    masked_value_fn=view_dtype_masked_value,
 )
 
 

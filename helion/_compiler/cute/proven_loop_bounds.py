@@ -12,6 +12,7 @@ import ast
 from dataclasses import dataclass
 from dataclasses import field
 import math
+from typing import TYPE_CHECKING
 from typing import cast
 
 from .simplify_proven_bounds import _assigned_names
@@ -19,6 +20,9 @@ from .simplify_proven_bounds import _axis_index
 from .simplify_proven_bounds import _call_path
 from .simplify_proven_bounds import _checked_interval
 from .simplify_proven_bounds import _remove_true_and_operands
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 _LIMIT = (1 << 31) - 1
 _MAX_TERMS = 32
@@ -72,7 +76,7 @@ class _Context:
 
 @dataclass
 class _Proof:
-    threads: tuple[int, int, int]
+    threads: tuple[int, int, int] | None
     grid: tuple[int, int, int] | None = None
     symbols: dict[object, int] = field(default_factory=dict)
     intervals: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -98,6 +102,8 @@ class _Proof:
             return context.values.get(node.id)
         axis = _axis_index(node, "thread_idx")
         if axis is not None:
+            if self.threads is None:
+                return None
             high = self.threads[axis] - 1
             return _Value(0, high, self.symbol(("thread", axis), 0, high))
         axis = _axis_index(node, "block_idx")
@@ -357,7 +363,11 @@ class _Proof:
         return output
 
 
-def _supported(statements: list[ast.stmt]) -> bool:
+def supported_statements(statements: Sequence[ast.stmt], *, with_blocks: bool) -> bool:
+    """The statement grammar the bounds walkers understand: single-target
+    assignments to a name, subscript or tuple of names, ``if`` / ``for``
+    (plain name target) blocks of the same, expression statements and
+    ``pass``; ``with`` blocks only when ``with_blocks``."""
     for statement in statements:
         if isinstance(statement, ast.Assign):
             if len(statement.targets) != 1:
@@ -376,10 +386,12 @@ def _supported(statements: list[ast.stmt]) -> bool:
                 statement.target, ast.Name
             ):
                 return False
-            if not _supported(statement.body) or not _supported(statement.orelse):
+            if not supported_statements(
+                statement.body, with_blocks=with_blocks
+            ) or not supported_statements(statement.orelse, with_blocks=with_blocks):
                 return False
-        elif isinstance(statement, ast.With):
-            if not _supported(statement.body):
+        elif with_blocks and isinstance(statement, ast.With):
+            if not supported_statements(statement.body, with_blocks=with_blocks):
                 return False
         elif not isinstance(statement, (ast.Expr, ast.Pass)):
             return False
@@ -417,7 +429,7 @@ def simplify_proven_loop_bounds(
     module = ast.Module(body=body, type_ignores=[])
     if _assigned_names(module) & (set(constexpr_values) | {"cutlass", "cute", "range"}):
         return body
-    if not _supported(body) or any(
+    if not supported_statements(body, with_blocks=True) or any(
         isinstance(
             node,
             (
@@ -444,24 +456,34 @@ def simplify_proven_loop_bounds(
     )
     output = proof.block(body, context)
     if proof.changed:
-        occupied = {node.id for node in ast.walk(module) if isinstance(node, ast.Name)}
-        ordinal = 0
-        while f"_cute_proven_loop_bounds_{ordinal}_abi_version" in occupied:
-            ordinal += 1
-        output.insert(
-            0,
-            ast.Assign(
-                targets=[
-                    ast.Name(
-                        id=f"_cute_proven_loop_bounds_{ordinal}_abi_version",
-                        ctx=ast.Store(),
-                    )
-                ],
-                value=ast.Constant(value=1),
-            ),
-        )
-        ast.fix_missing_locations(ast.Module(body=output, type_ignores=[]))
+        return with_proof_marker(output)
     return output
+
+
+def with_proof_marker(body: list[ast.stmt]) -> list[ast.stmt]:
+    """``body`` after a ``_cute_proven_loop_bounds_<n>_abi_version = 1``
+    statement, ``<n>`` the first ordinal no name in ``body`` takes, which
+    marks code a bounds proof rewrote."""
+    occupied = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+    }
+    ordinal = 0
+    while f"_cute_proven_loop_bounds_{ordinal}_abi_version" in occupied:
+        ordinal += 1
+    marker = ast.Assign(
+        targets=[
+            ast.Name(
+                id=f"_cute_proven_loop_bounds_{ordinal}_abi_version", ctx=ast.Store()
+            )
+        ],
+        value=ast.Constant(value=1),
+    )
+    return ast.fix_missing_locations(
+        ast.Module(body=[marker, *body], type_ignores=[])
+    ).body
 
 
 def exact_static_grid(

@@ -7,7 +7,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
-from .contiguous_copy import _path
+from ._ast_pass_utils import call_path_str
 from .scalar_recipe import _GLOBALS
 from .scalar_recipe import ScalarRecipe
 from .scalar_recipe import _clone
@@ -321,7 +321,7 @@ def _load_pointer_roots(
                     continue
             if (
                 isinstance(node, ast.Call)
-                and _path(node.func) == "cute.crd2idx"
+                and call_path_str(node.func) == "cute.crd2idx"
                 and len(node.args) == 2
                 and not node.keywords
                 and isinstance(node.args[0], ast.Tuple)
@@ -350,7 +350,7 @@ def _load_pointer_roots(
             ):
                 continue
             pointer = node.func.value
-            if _path(pointer) == "cute.arch":
+            if call_path_str(pointer) == "cute.arch":
                 if len(node.args) != 2 or node.keywords:
                     return False
                 pointer = node.args[0]

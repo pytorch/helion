@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from .._compiler.device_ir import DeviceIR
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
 
 
 _post_autotune_hooks: list[Callable[[AutotuneMetrics], None]] = []
@@ -55,6 +55,7 @@ class AutotuneMetrics:
     selected_source_was_measured: bool = False
     search_phase_metrics: dict[str, object] | None = None
     final_selection: dict[str, object] | None = None
+    compiler_refinement: dict[str, object] | None = None
 
     def finalize(self) -> None:
         self.autotune_time = time.perf_counter() - self._start_time
@@ -91,6 +92,8 @@ class AutotuneMetrics:
             result["search_phase_metrics"] = self.search_phase_metrics
         if self.final_selection is not None:
             result["final_selection"] = self.final_selection
+        if self.compiler_refinement is not None:
+            result["compiler_refinement"] = self.compiler_refinement
         return result
 
 
@@ -143,7 +146,7 @@ class KernelMetadata:
     _device_ir: DeviceIR | None = dataclasses.field(
         default=None, repr=False, compare=False, hash=False
     )
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
     @functools.cached_property
     def run_id(self) -> str:

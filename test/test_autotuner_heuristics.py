@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 from contextlib import ExitStack
 from contextlib import contextmanager
 import dataclasses
@@ -12,49 +11,29 @@ from pathlib import Path
 import random
 import subprocess
 import sys
-from typing import TYPE_CHECKING
 from typing import Any
 from typing import Iterator
 from typing import cast
 from unittest.mock import MagicMock
+from unittest.mock import call
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
+from test._cute_kernels import cute_matmul_bias
+from test._cute_kernels import cute_matmul_bias_residual_gelu
+from test._cute_kernels import cute_matmul_mma
+from test._cute_kernels import fresh
 
 import helion
 from helion._argument_device import _ArgumentDeviceResolver as _DeviceResolver
+from helion._compiler.autotuner_heuristics import HEURISTICS_BY_BACKEND
+from helion._compiler.autotuner_heuristics import _registered_backend
 from helion._compiler.autotuner_heuristics import compiler_promotion_specialization_key
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
 from helion._compiler.autotuner_heuristics import compiler_seed_specialization_facts
-from helion._compiler.autotuner_heuristics.cute import (
-    _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES,
-)
-from helion._compiler.autotuner_heuristics.cute import (
-    _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT,
-)
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteFp8GemmSkinnyMHeuristic
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
-from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2Heuristic
-from helion._compiler.autotuner_heuristics.cute import (
-    CuteTcgen05GroupedWorklistHeuristic,
-)
-from helion._compiler.autotuner_heuristics.cute import (
-    _bounded_grouped_worklist_seed_families,
-)
-from helion._compiler.autotuner_heuristics.cute import (
-    _filter_reachable_block_size_configs,
-)
-from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_fact
-from helion._compiler.autotuner_heuristics.cute import _tcgen05_grouped_worklist_fact
-from helion._compiler.autotuner_heuristics.cute import (
-    _tcgen05_grouped_worklist_seed_family,
-)
+from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.autotuner_heuristics.registry import AutotunerHeuristic
 from helion._compiler.autotuner_heuristics.registry import (
     CompilerHeuristicSpecializationFact,
@@ -68,11 +47,65 @@ from helion._compiler.autotuner_heuristics.triton import TritonPointwiseSeedHeur
 from helion._compiler.autotuner_heuristics.triton import TritonReductionHeuristic
 from helion._compiler.autotuner_heuristics.triton import TritonSkinnyGemmHeuristic
 from helion._compiler.autotuner_heuristics.triton import _h100_matmul_tile
-from helion._compiler.backend import CuteBackend
-from helion._compiler.backend import TritonBackend
 from helion._compiler.compile_environment import _symint_free_symbols
 from helion._compiler.cute import cute_flash
-from helion._compiler.cute.cute_flash import FLASH_AUTOTUNE_CONFIG_KEYS
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.flash_surface import (
+    _legalize_cute_flash_compiler_seeds,
+)
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics import CUTE_HEURISTICS
+from helion._compiler.cute.autotune.heuristics import CUTE_SEED_FACT_HEURISTICS
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteFp8GemmSkinnyMHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteResidentMultiRowHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteResidentRowHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteResidentRowWideClusterHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteStridedReductionHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteTcgen05ClusterM2Heuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTcgen05GroupedWorklistHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import CuteTileVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTileVecWarpPerRowHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTileVecWarpReduceHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _bounded_grouped_worklist_seed_families,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _filter_reachable_block_size_configs,
+)
+from helion._compiler.cute.autotune.heuristics.cute import _tcgen05_grouped_fact
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _tcgen05_grouped_worklist_fact,
+)
+from helion._compiler.cute.autotune.heuristics.cute import (
+    _tcgen05_grouped_worklist_seed_family,
+)
+from helion._compiler.cute.autotune.heuristics.cute_full_chunk_row import (
+    CuteFullChunkRowHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute_launch_bounds import (
+    CutePointwiseMinBlocksHeuristic,
+)
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
+    CuteRolledClusterPacketHeuristic,
+)
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LOOP_SPLIT_KEY
 from helion._compiler.cute.cute_flash import FLASH_CAUSAL_LPT_L2_SHIFT_KEY
@@ -101,7 +134,6 @@ from helion._compiler.cute.cute_flash import FLASH_EXP2_PACKET_KEY
 from helion._compiler.cute.cute_flash import FLASH_FIRST_LOAD_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_ORDER_KEY
 from helion._compiler.cute.cute_flash import FLASH_KV_STAGE_KEY
-from helion._compiler.cute.cute_flash import FLASH_LEGACY_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_LEGACY_STRUCTURAL_CONFIG_KEYS
 from helion._compiler.cute.cute_flash import FLASH_LOCAL_TMA_PARTITION_KEY
 from helion._compiler.cute.cute_flash import FLASH_MASKED_E2E_SCHEDULE_KEY
@@ -112,7 +144,6 @@ from helion._compiler.cute.cute_flash import FLASH_PACKED_REDUCE_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_CTAS_PER_SM_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_KEY
 from helion._compiler.cute.cute_flash import FLASH_PERSISTENT_LOOP_KEY
-from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILIES
 from helion._compiler.cute.cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from helion._compiler.cute.cute_flash import FLASH_PRECOMPUTE_QK_DESC_KEY
 from helion._compiler.cute.cute_flash import FLASH_Q_TILE_COUNT_KEY
@@ -139,6 +170,9 @@ from helion._compiler.cute.cute_flash import flash_autotune_fragments
 from helion._compiler.cute.cute_flash import flash_effective_config_values
 from helion._compiler.cute.cute_flash import flash_exp2_packet_is_compound
 from helion._compiler.cute.cute_flash import resolve_flash_config
+from helion._compiler.cute.flash_knobs import FLASH_AUTOTUNE_CONFIG_KEYS
+from helion._compiler.cute.flash_knobs import FLASH_LEGACY_CONFIG_KEYS
+from helion._compiler.cute.flash_knobs import FLASH_PIPELINE_FAMILIES
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion._compiler.cute.flash_tuning import FlashCausalTuningPolicy
 from helion._compiler.cute.flash_tuning import FlashDenseTuningPolicy
@@ -175,6 +209,11 @@ from helion._compiler.cute.strategies import Tcgen05Strategy
 from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._compiler.cute.tcgen05_config import Tcgen05ClusterM2SearchConstraints
 from helion._compiler.cute.tcgen05_config import Tcgen05GroupedWorklistSmemFacts
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import smem
+from helion._compiler.cute.tcgen05_config import surface
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_ACC_WAIT_PLACEMENT_BEFORE_SUBTILE_LOOP,
 )
@@ -187,11 +226,15 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT,
+)
+from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY,
 )
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_C_ACQUIRE_PLACEMENT_FIRST_IN_LOOP,
 )
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLUSTER_N2_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
@@ -272,31 +315,43 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
 from helion._compiler.cute.tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
 from helion._compiler.cute.tcgen05_constants import tcgen05_default_epilogue_tile_size
+from helion._compiler.metal.backend import MetalBackend
+from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import TileIRBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._hardware import HardwareInfo
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import default_cute_mma_support
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_flash import memoized_flash_fragments
 from helion.autotuner import IntegerFragment
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_cache import StrictAutotuneCacheKey
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
-from helion.autotuner.config_fragment import ConfigSpecFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.config_spec import CuteVectorWidthSpec
 from helion.autotuner.config_spec import DotAxes
 from helion.autotuner.config_spec import DotAxisKind
 from helion.autotuner.config_spec import DotSite
 from helion.autotuner.config_spec import KernelMatmulFact
 from helion.autotuner.config_spec import LiveTile
 from helion.autotuner.config_spec import MatmulFact
+from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionCategory
 from helion.autotuner.config_spec import ReductionDescriptor
 from helion.autotuner.config_spec import ReductionKernelFact
@@ -312,9 +367,6 @@ from helion.runtime.kernel import _find_device as runtime_find_device
 from helion.runtime.kernel import _input_tensor_metadata
 from helion.runtime.settings import Settings
 from helion.runtime.settings import _get_backend
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 HOPPER_HARDWARE = HardwareInfo(
     device_kind="cuda",
@@ -345,6 +397,12 @@ A100_HARDWARE = HardwareInfo(
     hardware_name="NVIDIA A100",
     runtime_version="12.8",
     compute_capability="sm80",
+)
+RTX5080_HARDWARE = HardwareInfo(
+    device_kind="cuda",
+    hardware_name="NVIDIA GeForce RTX 5080",
+    runtime_version="13.0",
+    compute_capability="sm120",
 )
 
 
@@ -549,7 +607,7 @@ def _grouped_worklist_bind_patches(
         if runtime_n_ptx is not None:
             stack.enter_context(
                 patch(
-                    "helion._compiler.autotuner_heuristics.cute."
+                    "helion._compiler.cute.autotune.heuristics.cute."
                     "tcgen05_runtime_n_ptx_compatible",
                     return_value=runtime_n_ptx,
                 )
@@ -561,40 +619,6 @@ def _grouped_worklist_bind_patches(
                     return_value=True,
                 )
             )
-        yield
-
-
-@contextlib.contextmanager
-def _memoized_flash_fragments() -> Iterator[None]:
-    """Memoize ``flash_autotune_fragments`` for the duration of one test.
-
-    The structural coverage design calls it thousands of times per
-    ``ConfigGeneration`` with only a handful of distinct argument tuples (one
-    per pipeline-family override), and it is deterministic for fixed arguments
-    and environment. The first repeat of each key is re-verified against the
-    real function so a nondeterministic surface would still fail. Do not use
-    under a patched flash target policy or HELION_CUTE_FLASH_* environment.
-    """
-    real = cast(
-        "Callable[..., dict[str, ConfigSpecFragment]]",
-        cute_flash.flash_autotune_fragments,
-    )
-    surfaces: dict[tuple[object, ...], dict[str, ConfigSpecFragment]] = {}
-    verified: set[tuple[object, ...]] = set()
-
-    def wrapper(
-        head_dim: int, num_kv: int, **kwargs: object
-    ) -> dict[str, ConfigSpecFragment]:
-        key = (head_dim, num_kv, tuple(sorted(kwargs.items())))
-        cached = surfaces.get(key)
-        if cached is None:
-            cached = surfaces[key] = real(head_dim, num_kv, **kwargs)
-        elif key not in verified:
-            verified.add(key)
-            assert real(head_dim, num_kv, **kwargs) == cached
-        return dict(cached)
-
-    with patch.object(cute_flash, "flash_autotune_fragments", wrapper):
         yield
 
 
@@ -610,7 +634,8 @@ def _dense_fp16_hd64_bh64_flash_generation() -> ConfigGeneration:
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=48,
         num_bh=64,
@@ -762,6 +787,7 @@ class TestAutotunerHeuristic(TestCase):
 
         env = MagicMock()
         env.backend_name = "triton"
+        env.backend = TritonBackend()
         env.config_spec = MagicMock()
         env.settings = Settings()
         heuristics = (
@@ -802,6 +828,7 @@ class TestAutotunerHeuristic(TestCase):
 
         env = MagicMock()
         env.backend_name = "triton"
+        env.backend = TritonBackend()
         env.config_spec = MagicMock()
         env.config_spec.autotuner_heuristics = ["stale"]
         env.config_spec.compiler_seed_timeout_retry_repetitions = 3
@@ -845,6 +872,8 @@ class TestAutotunerHeuristic(TestCase):
 
         env = MagicMock()
         env.backend_name = "synthetic"
+        # Hook-free backend; the synthetic registry is planted below.
+        env.backend = TritonBackend()
         env.config_spec = MagicMock()
         env.settings = Settings(disable_autotuner_heuristics=True)
         device_ir = MagicMock()
@@ -878,6 +907,8 @@ class TestAutotunerHeuristic(TestCase):
 
         env = MagicMock()
         env.backend_name = "synthetic"
+        # Hook-free backend; the synthetic registry is planted below.
+        env.backend = TritonBackend()
         env.config_spec = MagicMock()
         env.settings = Settings(disable_autotuner_heuristics=True)
 
@@ -893,50 +924,15 @@ class TestAutotunerHeuristic(TestCase):
         ):
             compiler_seed_configs(env, MagicMock())
 
-    def test_cute_flash_disable_heuristics_keeps_structural_coverage(self) -> None:
-        spec = ConfigSpec(backend=CuteBackend())
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        for block_id, size_hint in enumerate((1, 128, 128)):
-            spec.block_sizes.append(
-                BlockSizeSpec(block_id=block_id, size_hint=size_hint)
-            )
-        spec.enable_cute_flash_search(
-            head_dim=64,
-            num_kv=64,
-            block_size_targets={0: 1, 1: 128, 2: 128},
-            is_causal=True,
-        )
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        env = MagicMock()
-        env.backend_name = "cute"
-        env.config_spec = spec
-        env.settings = Settings(disable_autotuner_heuristics=True)
-
-        self.assertEqual(compiler_seed_configs(env, MagicMock()), [])
-        self.assertIsNone(spec.compiler_seed_timeout_retry_repetitions)
-        self.assertEqual(spec.compiler_seed_configs, [])
-        self.assertEqual(spec.autotuner_heuristics, [])
-
-        config_gen = spec.create_config_generation()
-        self.assertEqual(config_gen.seed_flat_config_pairs(), [])
-        self.assertFalse(
-            set(FLASH_AUTOTUNE_CONFIG_KEYS) & set(config_gen._config_value_priors)
-        )
-        coverage = config_gen.flash_deterministic_population_configs()
-        self.assertTrue(coverage)
-        population = config_gen.random_population(100)
-
-        self.assertGreaterEqual(len(population), 100)
-        self.assertLessEqual(set(coverage), set(population))
-
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_heuristic_returns_all_legal_seeds(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, size_hint in enumerate((1, 128, 128)):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=64,
             block_size_targets={0: 1, 1: 128, 2: 128},
@@ -948,8 +944,8 @@ class TestAutotunerHeuristic(TestCase):
 
         assert seeds is not None
         self.assertEqual(spec.compiler_seed_timeout_retry_repetitions, 3)
-        candidates = spec._legalize_cute_flash_compiler_seeds(
-            flash_attention_seed_configs(64, 64)
+        candidates = _legalize_cute_flash_compiler_seeds(
+            spec, flash_attention_seed_configs(64, 64)
         )
         self.assertGreater(len(seeds), 2)
         self.assertEqual(seeds, candidates)
@@ -974,7 +970,8 @@ class TestAutotunerHeuristic(TestCase):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=64,
             block_size_targets={0: 1, 1: 128, 2: 128},
@@ -983,12 +980,99 @@ class TestAutotunerHeuristic(TestCase):
         env = MagicMock(config_spec=spec)
 
         seeds = CuteFlashAttentionHeuristic.get_seed_configs(env, MagicMock())
-        expected = spec._legalize_cute_flash_compiler_seeds(
-            flash_attention_seed_configs(64, 64, supports_tensor_4d_tma=False)
+        expected = _legalize_cute_flash_compiler_seeds(
+            spec, flash_attention_seed_configs(64, 64, supports_tensor_4d_tma=False)
         )
 
         self.assertEqual(seeds, expected)
         self.assertEqual(spec.compiler_seed_timeout_retry_repetitions, 3)
+
+    def test_cute_flash_heuristic_seeds_equal_spec_seeds_on_gqa_mla_flex(
+        self,
+    ) -> None:
+        # The heuristic and the spec once built their flash seed lists from
+        # different fact subsets (the spec dropped ``kv_group``; the heuristic
+        # dropped ``head_dim_v``, ``q_seq`` and the flex hook facts), so GQA,
+        # MLA and flex surfaces merged two different lists at bind. Both now
+        # come from ``flash_surface.cute_flash_seed_configs``; these three
+        # surfaces are the ones that exposed the divergence.
+        def attention_spec(
+            head_dim: int, *, head_dim_v: int | None = None, kv_group: int = 1
+        ) -> ConfigSpec:
+            spec = ConfigSpec(
+                backend=CuteBackend(), target_device_capability=(10, 0), num_sm=148
+            )
+            for block_id, target in enumerate((1, 128, 128)):
+                spec.block_sizes.append(
+                    BlockSizeSpec(block_id=block_id, size_hint=target)
+                )
+            enable_cute_flash_search(
+                spec,
+                head_dim=head_dim,
+                head_dim_v=head_dim_v,
+                num_kv=32,
+                num_bh=64,
+                dtype=torch.bfloat16,
+                block_size_targets={0: 1, 1: 128, 2: 128},
+                is_causal=True,
+                standard_causal_output=True,
+                causal_resident_compatible=True,
+                device_sm_count=148,
+                kv_group=kv_group,
+                fast_math=True,
+            )
+            return spec
+
+        def flex_spec() -> ConfigSpec:
+            spec = ConfigSpec(
+                backend=CuteBackend(), target_device_capability=(10, 0), num_sm=148
+            )
+            for block_id in (0, 1):
+                spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=128))
+            # A list walk whose pair grid cannot fill the device (seeds the
+            # split-KV knob from ``q_seq``) with a hook large enough to roll
+            # and staging candidates that fit (the fact-based flex defaults).
+            enable_cute_flash_search(
+                spec,
+                head_dim=128,
+                num_kv=8,
+                num_bh=4,
+                tensor_4d_heads=4,
+                dtype=torch.bfloat16,
+                block_size_targets={0: 128, 1: 128},
+                tmem_rowmax_compatible=False,
+                supports_tensor_4d_tma=False,
+                plain_row_body=False,
+                has_score_modifiers=True,
+                score_modifier_kinds=("flex",),
+                device_sm_count=148,
+                fast_math=True,
+                has_list_walk=True,
+                flex_has_score_region=True,
+                flex_has_mask_region=True,
+                q_seq=1024,
+                kv_seq=1024,
+                flex_aux_smem_candidates=(16384, 32768),
+                flex_prefetch_regs=(1, 2),
+                flex_coalesce_steps=(1, 2),
+                flex_hook_ops=16,
+            )
+            return spec
+
+        surfaces = (
+            ("mla_192_128_causal", attention_spec(192, head_dim_v=128)),
+            ("gqa4_causal_hd128", attention_spec(128, kv_group=4)),
+            ("flex_score_walk", flex_spec()),
+        )
+        for label, spec in surfaces:
+            with self.subTest(label):
+                env = MagicMock(config_spec=spec)
+                heuristic_seeds = CuteFlashAttentionHeuristic.get_seed_configs(
+                    env, MagicMock()
+                )
+                self.assertTrue(heuristic_seeds)
+                self.assertEqual(heuristic_seeds, spec.autotune_seed_configs())
+                self.assertEqual(spec.compiler_seed_timeout_retry_repetitions, 3)
 
     def test_cute_flash_normalization_uses_structural_schedule_defaults(self) -> None:
         cases = (
@@ -1005,7 +1089,8 @@ class TestAutotunerHeuristic(TestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=target)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=head_dim,
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
@@ -1066,14 +1151,18 @@ class TestAutotunerHeuristic(TestCase):
         # The autotuning reference produces the baseline only while it is what
         # the kernel runs by default; a promoted execution default (whose
         # arithmetic the fast candidates share) takes over as soon as it
-        # differs from the reference.
+        # differs from the reference -- which then runs as well, to agree
+        # with it (``_compute_reference_baseline``).
         reference = helion.Config(block_sizes=[32])
         execution_default = helion.Config(block_sizes=[128])
         for default in (reference, execution_default):
             with self.subTest(default=default):
                 provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
                 provider.args = ()
-                provider.settings = MagicMock(autotune_baseline_fn=None)
+                # No precompile pool: the baseline compiles in-process only.
+                provider.settings = MagicMock(
+                    autotune_baseline_fn=None, autotune_precompile=None
+                )
                 provider.config_spec = MagicMock()
                 provider.config_spec.autotune_reference_config.return_value = reference
                 provider.config_spec.default_config.return_value = default
@@ -1087,8 +1176,10 @@ class TestAutotunerHeuristic(TestCase):
                 self.assertEqual(output, "baseline")
                 self.assertEqual(mutated, [])
                 self.assertEqual(post_args, ())
-                provider.kernel.compile_config.assert_called_once_with(
-                    default, allow_print=False
+                compiled = [default] if default is reference else [default, reference]
+                self.assertEqual(
+                    provider.kernel.compile_config.call_args_list,
+                    [call(config, allow_print=False) for config in compiled],
                 )
 
     def test_should_promote_gate(self) -> None:
@@ -1321,6 +1412,7 @@ class TestAutotunerHeuristic(TestCase):
             frozenset({"config_num_sm", "input_tensor_metadata"}),
         )
         for heuristic in (
+            CuteStridedReductionHeuristic,
             CuteTcgen05ClusterM2Heuristic,
             TritonH100FormulaMatmulHeuristic,
             TritonH100MultiMatmulHeuristic,
@@ -1798,7 +1890,7 @@ class TestAutotunerHeuristic(TestCase):
 
     def test_grouped_worklist_seeds_are_packing_compatible_and_ranked(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
-        spec.cute_tcgen05_search_enabled = True
+        spec.tcgen05.search_enabled = True
         for block_id, size_hint in enumerate((256, 4096, 4096)):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
@@ -2545,7 +2637,7 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=(fact, analysis),
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "_tcgen05_grouped_worklist_source_analysis",
                 return_value=((256,), reviewed_rows),
             ),
@@ -2554,7 +2646,7 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=GB300_HARDWARE,
             ) as hardware_info,
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "get_grouped_worklist_target_policy",
                 wraps=get_grouped_worklist_target_policy,
             ) as policy_lookup,
@@ -2578,7 +2670,7 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=(fact, analysis),
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "_tcgen05_grouped_worklist_source_analysis",
                 return_value=((256,), None),
             ),
@@ -2620,7 +2712,7 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=(fact, device_split_analysis),
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "_tcgen05_grouped_worklist_source_analysis",
                 return_value=((224, 256), None),
             ),
@@ -2629,7 +2721,7 @@ class TestAutotunerHeuristic(TestCase):
                 return_value=GB300_HARDWARE,
             ) as device_split_hardware_info,
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "get_grouped_worklist_target_policy",
                 wraps=get_grouped_worklist_target_policy,
             ) as device_split_policy_lookup,
@@ -2714,7 +2806,7 @@ class TestAutotunerHeuristic(TestCase):
             backend=CuteBackend(),
             target_device_capability=(10, 0),
         )
-        bk128_only.cute_tcgen05_search_enabled = True
+        bk128_only.tcgen05.search_enabled = True
         for block_id, value in enumerate((256, 128, 128)):
             bk128_only.block_sizes.append(
                 BlockSizeSpec(
@@ -2746,7 +2838,7 @@ class TestAutotunerHeuristic(TestCase):
         analysis.seed_facts.k_hint = 128
         with (
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "tcgen05_runtime_n_ptx_compatible",
                 return_value=True,
             ),
@@ -2783,7 +2875,7 @@ class TestAutotunerHeuristic(TestCase):
 
     def test_grouped_worklist_seed_only_controls_survive_flattening(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
-        spec.cute_tcgen05_search_enabled = True
+        spec.tcgen05.search_enabled = True
         spec.allowed_pid_types = ("flat",)
         families = self._grouped_worklist_seed_families()
         spec.compiler_seed_configs = [
@@ -2791,7 +2883,7 @@ class TestAutotunerHeuristic(TestCase):
             *families["source256_n"],
             *families["source256_k"],
         ]
-        fields = spec._cute_tcgen05_config.flat_fields()
+        fields = surface.flat_fields(spec._cute_tcgen05_config)
 
         def enum(key: str) -> EnumFragment:
             fragment = fields[key]
@@ -2855,7 +2947,7 @@ class TestAutotunerHeuristic(TestCase):
         self,
     ) -> None:
         spec = ConfigSpec(backend=CuteBackend())
-        spec.cute_tcgen05_search_enabled = True
+        spec.tcgen05.search_enabled = True
         for block_id, size_hint in enumerate((256, 256, 128)):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
@@ -2878,7 +2970,7 @@ class TestAutotunerHeuristic(TestCase):
             with (
                 self.subTest(compute_capability=hardware.compute_capability),
                 patch(
-                    "helion._compiler.autotuner_heuristics.cute."
+                    "helion._compiler.cute.autotune.heuristics.cute."
                     "tcgen05_runtime_n_ptx_compatible",
                     return_value=True,
                 ),
@@ -2997,7 +3089,7 @@ class TestAutotunerHeuristic(TestCase):
         with (
             patch_cute_mma_support(),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "tcgen05_runtime_n_ptx_compatible",
                 return_value=True,
             ),
@@ -3006,7 +3098,7 @@ class TestAutotunerHeuristic(TestCase):
             ),
             patch("helion._hardware.get_hardware_info", return_value=GB300_HARDWARE),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "get_grouped_worklist_target_policy",
                 return_value=policy,
             ),
@@ -3055,7 +3147,7 @@ class TestAutotunerHeuristic(TestCase):
             target_device_capability=(10, 0),
             num_sm=148,
         )
-        spec.cute_tcgen05_search_enabled = True
+        spec.tcgen05.search_enabled = True
         for block_id, size_hint in enumerate((256, 256, 128)):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
@@ -3088,12 +3180,12 @@ class TestAutotunerHeuristic(TestCase):
 
         with (
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "tcgen05_runtime_n_ptx_compatible",
                 return_value=False,
             ),
             patch(
-                "helion._compiler.autotuner_heuristics.cute."
+                "helion._compiler.cute.autotune.heuristics.cute."
                 "warn_tcgen05_runtime_n_ptx_fallback"
             ) as warn_fallback,
             patch(
@@ -3133,7 +3225,9 @@ class TestAutotunerHeuristic(TestCase):
 
     @onlyBackends(["cute"])
     def test_grouped_worklist_dynamic_hints_do_not_narrow_search(self) -> None:
-        from helion.language.matmul_ops import _plan_cute_tcgen05_search_candidate
+        from helion._compiler.cute.tcgen05.search_plan import (
+            _plan_cute_tcgen05_search_candidate,
+        )
 
         kernel = helion.kernel(
             _grouped_worklist_kernel_body,
@@ -3158,7 +3252,7 @@ class TestAutotunerHeuristic(TestCase):
         with (
             _grouped_worklist_bind_patches(),
             patch(
-                "helion.language.matmul_ops._plan_cute_tcgen05_search_candidate",
+                "helion._compiler.cute.tcgen05.search_plan._plan_cute_tcgen05_search_candidate",
                 side_effect=capture_plan,
             ),
         ):
@@ -3212,14 +3306,14 @@ class TestAutotunerHeuristic(TestCase):
                 (256, None, None),
             )
         self.assertEqual(first.config_spec.allowed_pid_types, ("flat",))
-        self.assertEqual(first.config_spec._tcgen05_cluster_m_search_choices, (1,))
-        self.assertIsNone(first.config_spec._tcgen05_cluster_m2_search_constraints)
+        self.assertEqual(first.config_spec.tcgen05.cluster_m_search_choices, (1,))
+        self.assertIsNone(first.config_spec.tcgen05.cluster_m2_search_constraints)
         self.assertIsNone(first.config_spec.compiler_default_config)
         # The worklist's group/start/extent loads feed scheduling, indices, and
         # masks rather than the matmul's store value. They must not be mistaken
         # for per-subtile epilogue aux loads, which would expose a
         # ``pre_acc_wait`` search point that every identity-store config rejects.
-        self.assertFalse(first.config_spec.cute_tcgen05_aux_kernel_detected)
+        self.assertFalse(first.config_spec.tcgen05.aux_kernel_detected)
         self.assertNotIn(
             TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
             first.config_spec._flat_fields(),
@@ -3253,7 +3347,7 @@ class TestAutotunerHeuristic(TestCase):
             small = kernel.bind(small_args)
             large = kernel.bind(large_args)
 
-        self.assertFalse(small.config_spec.cute_tcgen05_search_enabled)
+        self.assertFalse(small.config_spec.tcgen05.search_enabled)
         small_fact = small.config_spec.matmul_facts[0]
         assert small_fact.m_block_id is not None
         small_m = small.env.block_sizes[small_fact.m_block_id].size
@@ -3263,7 +3357,7 @@ class TestAutotunerHeuristic(TestCase):
             _symint_free_symbols(small_m),
             small.env.specialized_vars,
         )
-        self.assertTrue(large.config_spec.cute_tcgen05_search_enabled)
+        self.assertTrue(large.config_spec.tcgen05.search_enabled)
         self.assertIsNot(large, small)
 
     @onlyBackends(["cute"])
@@ -3782,7 +3876,7 @@ class TestAutotunerHeuristic(TestCase):
             compile_default: bool = False,
         ) -> tuple[ConfigSpec, list[helion.Config], helion.Config, helion.Config]:
             spec = bound.config_spec
-            self.assertTrue(spec.cute_tcgen05_search_enabled)
+            self.assertTrue(spec.tcgen05.search_enabled)
             grouped = [
                 config
                 for config in spec.compiler_seed_configs
@@ -4116,9 +4210,9 @@ class TestAutotunerHeuristic(TestCase):
     @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
     def test_pointwise_seed_promotes_only_on_target_arch(self) -> None:
         # The pointwise seed fires arch-agnostically but its PROMOTION to the
-        # autotune-off default is gated to PROMOTE_TARGETS (sm90/sm100). On a
-        # target arch the promoted seed replaces the base default; off-target it
-        # is still offered as a search candidate but the base default is kept.
+        # autotune-off default is gated to PROMOTE_TARGETS. On a target arch the
+        # promoted seed replaces the base default; off-target it is still
+        # offered as a search candidate but the base default is kept.
         def make_add() -> object:
             @helion.kernel(backend="triton")
             def triton_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -4132,15 +4226,15 @@ class TestAutotunerHeuristic(TestCase):
         x = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
         y = torch.empty([1024, 1024], device=DEVICE, dtype=torch.float32)
 
-        self.assertIn(("cuda", "sm90"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
-        self.assertIn(("cuda", "sm100"), TritonPointwiseSeedHeuristic.PROMOTE_TARGETS)
-
         # A fresh kernel object per arch: bind() caches by args, so reusing one
         # kernel would return the first arch's config on the second bind.
         for name, hardware, promotes in (
             ("sm90", HOPPER_HARDWARE, True),
             ("sm100", BLACKWELL_HARDWARE, True),
+            ("sm120", RTX5080_HARDWARE, True),
+            ("sm103", GB300_HARDWARE, False),
             ("sm80", A100_HARDWARE, False),
+            ("gfx950", MI350_HARDWARE, False),
         ):
             with (
                 self.subTest(arch=name),
@@ -4154,14 +4248,224 @@ class TestAutotunerHeuristic(TestCase):
                 seed = spec.compiler_seed_configs[0]
                 if promotes:
                     self.assertEqual(spec.compiler_default_config, seed)
+                    self.assertEqual(
+                        spec.default_config().config["block_sizes"],
+                        seed.config["block_sizes"],
+                    )
                 else:
                     self.assertIsNone(spec.compiler_default_config)
+                    self.assertNotEqual(
+                        spec.default_config().config["block_sizes"],
+                        seed.config["block_sizes"],
+                    )
 
 
 # Matmul and pointwise facts come from backend-independent device IR analysis:
 # collect them with CuTe under HELION_BACKEND=cute and with Triton otherwise
 # (incl. tileir).
 _FACTS_BACKEND = "cute" if _get_backend() == "cute" else "triton"
+
+
+# The ranked cute registry as of the move into the cute package. Order is
+# part of every cute seed list's identity (prefix contracts, promoted defaults,
+# the autotune cache fingerprint), so a change here is a deliberate decision.
+_CUTE_HEURISTIC_ORDER = (
+    "cute_dot_row_reduction",
+    "cute_async_state_load",
+    "cute_fp8_gemm_skinny_m",
+    "cute_chunk_recurrence",
+    "cute_gdn_recurrence",
+    "cute_mma_dag",
+    "cute_register_subblocks",
+    "cute_chunk_prepare",
+    "cute_affine_scan",
+    "cute_topk",
+    "cute_flash_attention",
+    "cute_flash_gated_attention",
+    "cute_packed_single_token_rank1",
+    "cute_fixed_token_rank1",
+    "cute_split_k_workspace",
+    "cute_collective_matmul",
+    "cute_simt_mma",
+    "cute_grouped_rna",
+    "cute_block_scaled_mma",
+    "cute_materialized_mma",
+    "cute_materialized_operand",
+    "cute_tcgen05_cluster_m2_ffi",
+    "cute_tcgen05_dense_schedules",
+    "cute_tcgen05_cluster_m2",
+    "cute_tcgen05_default_tile",
+    "cute_tcgen05_grouped_worklist",
+    "cute_tcgen05_grouped_static_common_k",
+    "cute_tcgen05_grouped_dynamic_bk64",
+    "cute_tcgen05_thread_local_epilogue",
+    "cute_reduction_tile",
+    "cute_register_tile",
+    "cute_reduction_wide_chunk",
+    "cute_resident_reduction",
+    "cute_resident_sequence",
+    "cute_persistent_subwarp_rows",
+    "cute_async_persistent_subwarp_rows",
+    "cute_rolled_row_ladder",
+    "cute_rolled_cluster_ladder",
+    "cute_masked_rolled_cluster",
+    "cute_scan_tile",
+    "cute_tile_vec",
+    "cute_tile_vec_warp_reduce",
+    "cute_tile_vec_warp_per_row",
+    "cute_tile_pack_warp_per_row",
+    "cute_gemv_fragment_mma",
+    "cute_gemv_ring_mma",
+    "cute_column_reduction",
+    "cute_sibling_row",
+    "cute_nested_row",
+    "cute_resident_row",
+    "cute_resident_row_wide_cluster",
+    "cute_resident_multi_row",
+    "cute_pointwise_vec",
+    "cute_warp_atomic",
+    "cute_register_chain",
+    "cute_bounded_loop_cache",
+    "cute_host_paired_sum",
+    "cute_tcgen05_grouped_source64",
+    "cute_split_k_cluster",
+    "cute_fragment_scan",
+    "cute_fragment_reduction",
+    "cute_fp32_dot",
+    "cute_fragment_threads",
+    "cute_fragment_private_scalar_loops",
+    "cute_fragment_register_loads",
+    "cute_fragment_warp_results",
+    "cute_fragment_producer_cache",
+    "cute_fragment_warp_scan",
+    "cute_fragment_topk_network",
+    "cute_fragment_atomic_aggregation",
+    "cute_fragment_local_atomic_registers",
+    "cute_fragment_register_snapshots",
+    "cute_fragment_published_scalars",
+    "cute_fragment_skip_zero_atomics",
+    "cute_fragment_atomic_consumer_fusion",
+    "cute_integer_loop_reduction",
+    "cute_fragment_integer_atomic_epochs",
+    "cute_fragment_packet_loads",
+    "cute_fragment_padded_rows",
+    "cute_fragment_unrolled_loops",
+    "cute_fragment_vector_io",
+    "cute_fragment_batched_loads",
+    "cute_fragment_split_k",
+    "cute_fragment_mma_rows",
+    "cute_fragment_slab_loads",
+    "cute_fragment_register_producers",
+    "cute_fragment_scan_exports",
+    "cute_fragment_warp_producer_regions",
+    "cute_fragment_bounded_gather",
+    "cute_fragment_pure_producer_regions",
+    "cute_radix_selection",
+    "cute_fragment_half_mma",
+    "cute_strided_reduction",
+    "cute_privatize_atomics",
+    "cute_rolled_row_loads_first",
+    "cute_persistent_lane_unroll",
+    "cute_persistent_unpadded_rows",
+    "cute_grid_lane_jam",
+    "cute_transposed_store_seeds",
+    "cute_split_column_reduction",
+    "cute_reduction_lane_jam",
+    "cute_reduction_lane_jam_forwarding",
+    "cute_delinearized_row_reduction",
+)
+
+
+class TestHeuristicRegistry(TestCase):
+    def test_cute_registry_order_and_priorities_are_pinned(self) -> None:
+        names = [heuristic.name for heuristic in get_heuristics("cute")]
+        self.assertEqual(names, list(_CUTE_HEURISTIC_ORDER))
+        self.assertEqual(
+            [heuristic.priority for heuristic in CUTE_HEURISTICS],
+            list(range(len(_CUTE_HEURISTIC_ORDER))),
+        )
+        # Every entry declares its own priority (none inherits a parent's).
+        for heuristic in CUTE_HEURISTICS:
+            self.assertIn("priority", vars(heuristic), heuristic.name)
+        self.assertEqual(HEURISTICS_BY_BACKEND["cute"], CUTE_HEURISTICS)
+        self.assertEqual(CuteBackend().autotuner_heuristics(), CUTE_HEURISTICS)
+
+    def test_cute_appended_families_stay_outside_the_ranked_tuple(self) -> None:
+        # They are planted after every post-processing step, never ranked.
+        self.assertNotIn(CuteFullChunkRowHeuristic, CUTE_HEURISTICS)
+        self.assertNotIn(CuteRolledClusterPacketHeuristic, CUTE_HEURISTICS)
+        self.assertNotIn(CutePointwiseMinBlocksHeuristic, CUTE_HEURISTICS)
+        self.assertEqual(
+            CUTE_SEED_FACT_HEURISTICS,
+            (CuteRolledClusterPacketHeuristic, CutePointwiseMinBlocksHeuristic),
+        )
+        self.assertEqual(
+            CuteBackend().seed_fact_heuristics(), CUTE_SEED_FACT_HEURISTICS
+        )
+        for heuristic in CUTE_SEED_FACT_HEURISTICS:
+            self.assertEqual(
+                compiler_seed_specialization_facts("cute", (heuristic.name,)),
+                heuristic.CACHE_SPECIALIZATION_FACTS,
+            )
+
+    def test_other_backend_registries_are_pinned(self) -> None:
+        expected = {
+            "triton": (
+                "triton_h100_formula_matmul",
+                "triton_h100_multi_matmul",
+                "triton_skinny_gemm",
+                "triton_b200_formula_matmul",
+                "triton_b200_multi_matmul",
+                "triton_matmul_reduction_epilogue",
+                "triton_reduction",
+                "triton_reduction_narrow",
+                "triton_pointwise",
+            ),
+            "tileir": (
+                "tileir_matmul",
+                "tileir_row_reduction",
+                "tileir_small_reduction",
+                "tileir_chunk_reduction",
+            ),
+            "pallas": (
+                "pallas_matmul_no_tiling_seed",
+                "pallas_matmul_f32_no_tiling_seed",
+            ),
+            "metal": ("metal_row_reduction",),
+        }
+        for backend, names in expected.items():
+            with self.subTest(backend):
+                self.assertEqual(
+                    tuple(heuristic.name for heuristic in get_heuristics(backend)),
+                    names,
+                )
+        for backend in (
+            TritonBackend(),
+            TileIRBackend(),
+            PallasBackend(),
+            MetalBackend(),
+        ):
+            self.assertEqual(
+                backend.autotuner_heuristics(), HEURISTICS_BY_BACKEND[backend.name]
+            )
+        self.assertEqual(get_heuristics("synthetic"), ())
+
+    def test_backend_hook_defaults_are_no_ops(self) -> None:
+        env = MagicMock()
+        device_ir = MagicMock()
+        configs = [MagicMock()]
+        for backend in (MetalBackend(), TritonBackend()):
+            with self.subTest(backend.name):
+                self.assertEqual(backend.seed_fact_heuristics(), ())
+                self.assertEqual(
+                    backend.register_seed_facts(env, device_ir), frozenset()
+                )
+                self.assertIs(
+                    backend.postprocess_seed_configs(env, device_ir, configs), configs
+                )
+                self.assertIsNone(backend.register_coverage_groups(env, device_ir))
+        self.assertIsNone(_registered_backend("synthetic"))
+        self.assertIsInstance(_registered_backend("cute"), CuteBackend)
 
 
 class TestMatmulFacts(TestCase):
@@ -4443,9 +4747,19 @@ class TestMatmulFacts(TestCase):
             {axis.block_id for axis in region.loop_axes}
             for region in fact.pipelined_regions
         ]
-        self.assertTrue(
-            any({query_block_id, key_block_id}.issubset(axes) for axes in nested_axes)
-        )
+        # ``out[batch, :, tile_q, :]`` partitions the fresh output by the
+        # query tile, so the CuTe backend promotes that tile into the launch
+        # grid (promote_partitioned_output_axis); the key loop then nests
+        # directly under the grid.  Triton keeps both as nested loop axes.
+        if query_block_id in spec.grid_block_ids:
+            self.assertTrue(any(key_block_id in axes for axes in nested_axes))
+        else:
+            self.assertTrue(
+                any(
+                    {query_block_id, key_block_id}.issubset(axes)
+                    for axes in nested_axes
+                )
+            )
 
     @onlyBackends(["triton", "cute"])
     @skipIfRefEager("Compiler matmul facts are not collected in ref eager mode")
@@ -4523,6 +4837,7 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
         spec.block_sizes.append(BlockSizeSpec(block_id=2, size_hint=k_max))
         env = MagicMock()
         env.backend_name = "triton"
+        env.backend = TritonBackend()
         env.config_spec = spec
         env.device = DEVICE
         env.settings = Settings()
@@ -4579,9 +4894,9 @@ class TestTritonSkinnyGemmHeuristic(TestCase):
                 None,
             ),
         )
-        for name, hardware, facts, expected_skinny in cases:
+        for name, hardware, case_facts, expected_skinny in cases:
             env = self._make_triton_env_with_block_sizes()
-            env.config_spec.matmul_facts.extend(facts)
+            env.config_spec.matmul_facts.extend(case_facts)
             with (
                 self.subTest(name=name),
                 patch(
@@ -4763,6 +5078,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
             spec.block_sizes.append(BlockSizeSpec(block_id=bid, size_hint=8192))
         env = MagicMock()
         env.backend_name = "triton"
+        env.backend = TritonBackend()
         env.config_spec = spec
         env.device = DEVICE
         env.settings = Settings()
@@ -4855,12 +5171,12 @@ class TestTritonH100MatmulHeuristic(TestCase):
                 False,
             ),
         )
-        for name, hardware, facts, eligible in cases:
+        for name, hardware, case_facts, eligible in cases:
             env = self._make_env()
-            if len(facts) == 1:
-                self._attach_matmul(env, facts[0])
+            if len(case_facts) == 1:
+                self._attach_matmul(env, case_facts[0])
             else:
-                env.config_spec.matmul_facts.extend(facts)
+                env.config_spec.matmul_facts.extend(case_facts)
             with (
                 self.subTest(name=name),
                 patch("helion._hardware.get_hardware_info", return_value=hardware),
@@ -4908,7 +5224,7 @@ class TestTritonH100MatmulHeuristic(TestCase):
         # the seed pins every batch/outer axis to 1 (one CTA per batch — a no-reuse parallel axis)
         # while sizing only the dot's M/N/K by the budget. fp32 inputs keep this torch-version
         # independent (16-bit baddbmm needs torch>=2.8); the levers tested here are dtype-agnostic.
-        from examples.bmm import bmm
+        bmm = import_example("bmm").bmm
 
         a = torch.randn(16, 512, 512, device=DEVICE, dtype=torch.float32)
         b = torch.randn(16, 512, 512, device=DEVICE, dtype=torch.float32)
@@ -5655,6 +5971,7 @@ class TestTritonReductionHeuristicUnit(TestCase):
                 ),
                 TritonNarrowReductionHeuristic,
             ),
+            (RTX5080_HARDWARE, TritonNarrowReductionHeuristic),
         ]
         tracks = [
             TritonReductionHeuristic,
@@ -5676,6 +5993,12 @@ class TestTritonReductionHeuristicUnit(TestCase):
                 self.assertIsNotNone(seed)
                 self.assertEqual(len(seed.config["block_sizes"]), 1)
                 self.assertGreaterEqual(seed.config["block_sizes"][0], 1)
+                # Only the tuned track becomes the autotune-off default. The
+                # narrow fallback is never promoted, on any arch.
+                self.assertIs(
+                    expected.should_promote(env),
+                    expected is TritonReductionHeuristic,
+                )
 
 
 _FP8_SKINNY_M_SEED_BLOCK_SIZES = [1, 256]
@@ -5683,6 +6006,7 @@ _FP8_SKINNY_M_SEED_NUM_THREADS = [0, 32]
 _FP8_SKINNY_M_SEED_VECTOR_WIDTHS = [4, 8]
 
 
+@onlyBackends(["cute"])
 class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
     """Skinny-M FP8 GEMM heuristic: fires only for a single FP8 matmul with
     static M <= 16 and seeds the [1, 256] / nt=[0, 32] / vec=[4, 8] config that
@@ -5691,8 +6015,15 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
 
     def _make_cute_env(self) -> MagicMock:
         spec = ConfigSpec(backend=CuteBackend())
+        for block_id in (0, 1):
+            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=4096))
+            spec.num_threads.append(NumThreadsSpec(block_id=block_id, size_hint=4096))
+            spec.cute_vector_widths.append(
+                CuteVectorWidthSpec(block_id=block_id, size_hint=4096)
+            )
         env = MagicMock()
         env.backend_name = "cute"
+        env.backend = CuteBackend()
         env.config_spec = spec
         env.device = DEVICE
         env.settings = Settings()
@@ -5710,9 +6041,9 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
         return MatmulFact(
             lhs_ndim=2,
             rhs_ndim=2,
-            m_block_id=0,
-            n_block_id=1,
-            k_block_id=2,
+            m_block_id=None,
+            n_block_id=0,
+            k_block_id=1,
             static_m=static_m,
             static_n=static_n,
             static_k=static_k,
@@ -5738,9 +6069,9 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
             ("no_matmul", [], False),
             ("two_matmuls", [self._matmul_fact(), self._matmul_fact()], False),
         )
-        for name, facts, expected in cases:
+        for name, case_facts, expected in cases:
             env = self._make_cute_env()
-            env.config_spec.matmul_facts.extend(facts)
+            env.config_spec.matmul_facts.extend(case_facts)
             with self.subTest(name=name):
                 self.assertEqual(
                     CuteFp8GemmSkinnyMHeuristic.is_eligible(env, MagicMock()),
@@ -5758,33 +6089,38 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
             seed.config["cute_vector_widths"], _FP8_SKINNY_M_SEED_VECTOR_WIDTHS
         )
 
-    def test_compiler_seed_configs_records_heuristic(self) -> None:
-        # The heuristic must be wired into the cute backend registry so the
-        # generic compiler_seed_configs() path emits its seed and records it.
-        env = self._make_cute_env()
-        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1))
-        configs = compiler_seed_configs(env, MagicMock())
-        self.assertIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [config.config["block_sizes"] for config in configs],
-        )
-        self.assertIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            env.config_spec.autotuner_heuristics,
-        )
+    def test_seed_follows_axis_ids_in_each_config_sequence(self) -> None:
+        fact = self._matmul_fact()
+        for layout in (fact, fact._replace(m_block_id=0, n_block_id=1, k_block_id=2)):
+            with self.subTest(fact=layout):
+                env = self._make_cute_env()
+                spec = env.config_spec
+                spec.matmul_facts.append(layout)
+                spec.block_sizes.reverse()
+                spec.cute_vector_widths.reverse()
+                seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+                assert seed is not None
+                self.assertEqual(seed.block_sizes, [256, 1])
+                self.assertEqual(seed.config["num_threads"], [0, 32])
+                self.assertEqual(seed.config["cute_vector_widths"], [8, 4])
 
-    def test_compiler_seed_configs_skips_large_m(self) -> None:
-        env = self._make_cute_env()
-        env.config_spec.matmul_facts.append(self._matmul_fact(static_m=1024))
-        configs = compiler_seed_configs(env, MagicMock())
-        self.assertNotIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            env.config_spec.autotuner_heuristics,
-        )
-        self.assertNotIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [config.config["block_sizes"] for config in configs],
-        )
+    def test_seed_skips_unsupported_axis_layouts(self) -> None:
+        fact = self._matmul_fact()
+        for unsupported in (
+            fact._replace(n_block_id=None),
+            fact._replace(k_block_id=None),
+            fact._replace(k_block_id=0),
+            fact._replace(k_block_id=2),
+        ):
+            with self.subTest(fact=unsupported):
+                env = self._make_cute_env()
+                env.config_spec.matmul_facts.append(unsupported)
+                self.assertFalse(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(env, MagicMock())
+                )
+                self.assertIsNone(
+                    CuteFp8GemmSkinnyMHeuristic.get_seed_config(env, MagicMock())
+                )
 
     @onlyBackends(["cute"])
     @skipIfRefEager("Compiler seed configs are not generated in ref eager mode")
@@ -5795,49 +6131,75 @@ class TestCuteFp8GemmSkinnyMHeuristic(TestCase):
             y: torch.Tensor,
             scale_a: torch.Tensor,
             scale_b: torch.Tensor,
+            reverse: hl.constexpr,
         ) -> torch.Tensor:
             m, k = x.size()
             _, n = y.size()
+            if reverse:
+                block_k = hl.register_block_size(k)
+                block_n = hl.register_block_size(n)
+            else:
+                block_n = hl.register_block_size(n)
+                block_k = hl.register_block_size(k)
             out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
-            for tile_n in hl.tile(n):
+            for tile_n in hl.tile(n, block_size=block_n):
                 acc = hl.zeros([m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
+                for tile_k in hl.tile(k, block_size=block_k):
                     acc = hl.dot(x[:, tile_k], y[tile_k, tile_n], acc=acc)
                 acc = acc * scale_a[:, tile_n] * scale_b[tile_n]
                 out[:, tile_n] = acc.to(torch.bfloat16)
             return out
 
-        m, k, n = 1, 4096, 4096
-        x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
-            torch.float8_e4m3fn
-        )
+        k, n = 4096, 4096
         y = torch.randn([k, n], device=DEVICE, dtype=torch.float32).to(
             torch.float8_e4m3fn
         )
-        scale_a = torch.ones([m, n], device=DEVICE)
         scale_b = torch.ones([n], device=DEVICE)
 
-        with patch_cute_mma_support():
-            bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b))
+        for m, reverse in itertools.product((1, 16), (False, True)):
+            x = torch.randn([m, k], device=DEVICE, dtype=torch.float32).to(
+                torch.float8_e4m3fn
+            )
+            scale_a = torch.ones([m, n], device=DEVICE)
+            with self.subTest(m=m, reverse=reverse), patch_cute_mma_support():
+                bound = fp8_gemm_skinny_m.bind((x, y, scale_a, scale_b, reverse))
+                device_ir = bound.host_function.device_ir
+                self.assertTrue(
+                    CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir)
+                )
+                self.assertIn(
+                    CuteFp8GemmSkinnyMHeuristic.name,
+                    bound.config_spec.autotuner_heuristics,
+                )
+                seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
+                assert seed is not None
+                expected = [256, 1] if reverse else _FP8_SKINNY_M_SEED_BLOCK_SIZES
+                self.assertEqual(seed.block_sizes, expected)
+                self.assertIn(
+                    expected,
+                    [
+                        config.block_sizes
+                        for config in bound.config_spec.compiler_seed_configs
+                    ],
+                )
+                n_id, k_id = (1, 0) if reverse else (0, 1)
+                spec = bound.config_spec
+                self.assertEqual(len(seed.num_threads), len(spec.num_threads))
+                self.assertEqual(
+                    len(seed.config["cute_vector_widths"]), len(spec.cute_vector_widths)
+                )
+                self.assertEqual(
+                    spec.num_threads.config_get(seed.num_threads, k_id), 32
+                )
+                self.assertEqual(
+                    spec.cute_vector_widths.config_get(
+                        seed.config["cute_vector_widths"], n_id
+                    ),
+                    4,
+                )
 
-        device_ir = bound.host_function.device_ir
-        self.assertTrue(CuteFp8GemmSkinnyMHeuristic.is_eligible(bound.env, device_ir))
-        self.assertIn(
-            CuteFp8GemmSkinnyMHeuristic.name,
-            bound.config_spec.autotuner_heuristics,
-        )
-        seed = CuteFp8GemmSkinnyMHeuristic.get_seed_config(bound.env, device_ir)
-        assert seed is not None
-        self.assertEqual(seed.config["block_sizes"], _FP8_SKINNY_M_SEED_BLOCK_SIZES)
-        self.assertIn(
-            _FP8_SKINNY_M_SEED_BLOCK_SIZES,
-            [
-                config.config["block_sizes"]
-                for config in bound.config_spec.compiler_seed_configs
-            ],
-        )
 
-
+@onlyBackends(["cute"])
 class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     # Structural-coverage enumeration keeps a few of these tests above the
     # suite's default 60s per-test timeout on slower CI runners, which kills
@@ -5861,15 +6223,26 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # Callers decide whether both are expected in the supplied population;
         # every automatic cluster_m=2 seed must match a legacy validated tile
         # envelopes: the canonical 256x256 tile, the M-paired block_m=512 tile
-        # (two 256-row subtiles sharing B; baseline ab=2 only), or the
-        # deep-staged short-K variant (bk=64 with the ab=6 pipeline). At least
-        # one canonical-envelope seed must be present. Explicit paired-CTA
-        # seeds have independent geometry and allocation checks below.
+        # (two 256-row subtiles sharing B; baseline ab=2 at the expected K
+        # step, or its 64-wide deep ring: ab=3 next to a four-deep C ring),
+        # or the deep-staged bk=64 ab=6 pipeline, which the direct-entry seed
+        # runs where K takes 64-deep tiles (it then counts as canonical, and
+        # can be the first canonical seed returned). At least one
+        # canonical-envelope seed must be present. Explicit paired-CTA seeds
+        # have independent geometry and allocation checks below.
         self.assertGreaterEqual(len(seeded), 1)
         canonical: list[dict[str, object]] = []
         for seed in seeded:
             block_sizes = seed["block_sizes"][:3]
             if block_sizes[0] == 2 * TCGEN05_TWO_CTA_BLOCK_M:
+                if block_sizes[2] == 64 and expected_block_k != 64:
+                    self.assertEqual(
+                        block_sizes,
+                        [2 * TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
+                    )
+                    self.assertEqual(seed["tcgen05_ab_stages"], 3)
+                    self.assertEqual(seed["tcgen05_c_stages"], 4)
+                    continue
                 self.assertEqual(
                     block_sizes,
                     [
@@ -5884,6 +6257,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     block_sizes,
                     [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
                 )
+                if seed.get(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY) is True:
+                    # The direct-entry seed's deep pipeline (bk=64, ab=6) is
+                    # its canonical envelope wherever K takes 64-deep tiles.
+                    self.assertEqual(seed["tcgen05_c_stages"], 2)
+                    canonical.append(seed)
             else:
                 self.assertEqual(
                     block_sizes,
@@ -5974,24 +6352,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_seed_heuristic(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
+        kernel = fresh(cute_matmul_mma)
 
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_mma.bind(args)
+            bound = kernel.bind(args)
 
             heuristic = CuteTcgen05ClusterM2Heuristic
             self.assertIn(
@@ -6019,7 +6387,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 torch.empty([2048, 2048], device=DEVICE, dtype=HALF_DTYPE),
                 torch.empty([2048, 2048], device=DEVICE, dtype=HALF_DTYPE),
             )
-            unsupported_bound = cute_matmul_mma.bind(unsupported_args)
+            unsupported_bound = kernel.bind(unsupported_args)
             self.assertFalse(
                 heuristic.is_eligible(
                     unsupported_bound.env,
@@ -6260,7 +6628,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=target)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=head_dim,
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
@@ -6278,7 +6647,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     self.assertEqual(canonical, seed)
                     self.assertEqual(config_gen.unflatten(canonical_flat), seed)
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_full_population_covers_compound_schedule_dependencies(
         self,
     ) -> None:
@@ -6345,16 +6714,16 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             },
         )
         self.assertEqual(
-            config_gen.flash_structural_coverage_uncovered_interactions(),
+            config_gen.extension.flash_structural_coverage_uncovered_interactions(),
             [],
         )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_full_population_reserves_random_exploration(self) -> None:
         config_gen = _dense_fp16_hd64_bh64_flash_generation()
         spec = config_gen.config_spec
         spec.compiler_seed_configs = []
-        coverage = config_gen.flash_deterministic_population_configs()
+        coverage = config_gen.extension.deterministic_population_configs()
 
         random_state = random.getstate()
         try:
@@ -6369,7 +6738,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             random.setstate(random_state)
 
         self.assertEqual(len(population), 100)
-        coverage_budget = config_gen.flash_structural_population_budget(100)
+        coverage_budget = config_gen.extension.structural_population_budget(100)
         injected_design = coverage[:coverage_budget]
         self.assertEqual(len(injected_design), len(coverage))
         self.assertLessEqual(set(injected_design), set(population))
@@ -6378,16 +6747,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             100 - len(injected_design),
         )
         self.assertGreater(len(set(population) - set(injected_design)), 0)
-        for key, value in config_gen.flash_structural_coverage_active_values():
+        for (
+            key,
+            value,
+        ) in config_gen.extension.flash_structural_coverage_active_values():
             self.assertTrue(
                 any(config.config.get(key) == value for config in injected_design),
                 (key, value),
             )
         self.assertLessEqual(
-            config_gen.flash_structural_qualification_prefix_count(), coverage_budget
+            config_gen.extension.structural_qualification_prefix_count(),
+            coverage_budget,
         )
         self.assertEqual(
-            config_gen.flash_structural_coverage_underqualified_values(), []
+            config_gen.extension.flash_structural_coverage_underqualified_values(), []
         )
         fields = spec._flat_fields()
         family_fragment = fields[FLASH_PIPELINE_FAMILY_KEY]
@@ -6476,7 +6849,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertLessEqual(set(seeded_population), eligible_configs)
         self.assertLessEqual({*biased_users, compiler_seed}, set(seeded_population))
         self.assertLessEqual(
-            set(coverage[: config_gen.flash_structural_qualification_prefix_count()]),
+            set(
+                coverage[: config_gen.extension.structural_qualification_prefix_count()]
+            ),
             set(seeded_population),
         )
 
@@ -6504,7 +6879,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertLessEqual(biased_users, set(best_available_population))
         self.assertLessEqual(
-            set(coverage[: config_gen.flash_structural_qualification_prefix_count()]),
+            set(
+                coverage[: config_gen.extension.structural_qualification_prefix_count()]
+            ),
             set(best_available_population),
         )
         assert_qualified(best_available_population)
@@ -6518,12 +6895,14 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             for flat in search._generate_initial_population_flat()
         ]
         expected_quick = {
-            *coverage[: config_gen.flash_structural_population_budget(quick_size)],
+            *coverage[: config_gen.extension.structural_population_budget(quick_size)],
             compiler_seed,
             default_config,
         }
         self.assertEqual(set(quick_population), expected_quick)
-        parent_prefix_count = config_gen.flash_structural_parent_coverage_prefix_count()
+        parent_prefix_count = (
+            config_gen.extension.flash_structural_parent_coverage_prefix_count()
+        )
         self.assertLessEqual(parent_prefix_count, len(quick_population))
         for key, values in (
             (FLASH_PIPELINE_FAMILY_KEY, families),
@@ -6572,14 +6951,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             set(coverage[: search.initial_population]), partial_population
         )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_large_bh_population_covers_structural_axes_and_random(
         self,
     ) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=48,
             num_bh=2520,
@@ -6589,16 +6969,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         spec.compiler_seed_configs = []
         config_gen = ConfigGeneration(spec)
-        coverage = config_gen.flash_deterministic_population_configs()
+        coverage = config_gen.extension.deterministic_population_configs()
         coverage_set = set(coverage)
-        coverage_budget = config_gen.flash_structural_population_budget(100)
+        coverage_budget = config_gen.extension.structural_population_budget(100)
         self.assertEqual(len(coverage_set), coverage_budget)
         self.assertLess(coverage_budget, 100)
         self.assertLessEqual(
-            config_gen.flash_structural_qualification_prefix_count(), coverage_budget
+            config_gen.extension.structural_qualification_prefix_count(),
+            coverage_budget,
         )
         self.assertEqual(
-            config_gen.flash_structural_coverage_underqualified_values(), []
+            config_gen.extension.flash_structural_coverage_underqualified_values(), []
         )
 
         random_state = random.getstate()
@@ -6803,7 +7184,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=target)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=64,
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
@@ -6811,6 +7193,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 )
                 env = MagicMock()
                 env.backend_name = "cute"
+                env.backend = CuteBackend()
                 env.config_spec = spec
                 env.settings = Settings()
                 with patch(
@@ -6832,6 +7215,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     roundtrip.config,
                     {
                         **seed.config,
+                        "cute_compiler_pipeline": "default",
                         cute_flash.FLASH_SOFTMAX_LOWERING_KEY: "auto",
                         cute_flash.FLASH_ROW_SUM_SCHEDULE_KEY: "post_acquire",
                     },
@@ -6852,7 +7236,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 spec.block_sizes.append(
                     BlockSizeSpec(block_id=block_id, size_hint=size_hint)
                 )
-            spec.enable_cute_flash_search(
+            enable_cute_flash_search(
+                spec,
                 head_dim=64,
                 num_kv=1024,
                 block_size_targets={0: 1, 1: 128, 2: 128},
@@ -7386,7 +7771,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     )
                 )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_compound_families_reachable_without_compiler_seeds(
         self,
     ) -> None:
@@ -7489,7 +7874,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=size_hint)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=head_dim,
                     num_kv=384,
                     num_bh=64,
@@ -7501,11 +7887,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 self.assertEqual(generation.seed_flat_config_pairs(), [])
                 matching = []
                 structural_candidates = [
-                    *generation.flash_deterministic_population_configs(),
-                    *generation.flash_low_confound_schedule_anchor_configs(),
+                    *generation.extension.deterministic_population_configs(),
+                    *generation.extension.flash_low_confound_schedule_anchor_configs(),
                 ]
                 for candidate in structural_candidates:
-                    resolved = spec._resolve_cute_flash_config(candidate.config)
+                    resolved = _resolve_cute_flash_config(spec, candidate.config)
                     if (
                         resolved.pipeline_family == family
                         and resolved.exp2_packet == packet
@@ -7515,7 +7901,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 population = generation.random_population(100)
                 measured_structural_candidates = [
                     *population,
-                    *generation.flash_low_confound_schedule_anchor_configs(),
+                    *generation.extension.flash_low_confound_schedule_anchor_configs(),
                 ]
                 self.assertTrue(
                     any(
@@ -7550,7 +7936,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                         "descending",
                     )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_clc_head_search_uses_work_grid_divisors(self) -> None:
         fragments = flash_autotune_fragments(64, 1024, num_bh=6)
         heads = fragments[FLASH_CLC_HEADS_PER_BATCH_KEY]
@@ -7564,7 +7950,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=1024,
             num_bh=6,
@@ -7595,13 +7982,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config.config[FLASH_CLC_HEADS_PER_BATCH_KEY]
             for config in (
                 config_gen.unflatten(flat)
-                for flat in config_gen._flash_deterministic_coverage_flats()
+                for flat in config_gen.extension._flash_deterministic_coverage_flats()
             )
             if str(config.config[FLASH_PIPELINE_FAMILY_KEY]).startswith("fa4_clc")
         }
         self.assertEqual(structural_groups, {1, 2, 3, 6})
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_clc_head_search_preserves_tensor_head_geometry(
         self,
     ) -> None:
@@ -7655,7 +8042,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             spec.block_sizes.append(
                 BlockSizeSpec(block_id=block_id, size_hint=size_hint)
             )
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=1024,
             num_bh=120,
@@ -7676,7 +8064,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             config.config[FLASH_CLC_HEADS_PER_BATCH_KEY]
             for config in (
                 generation.unflatten(flat)
-                for flat in generation._flash_deterministic_coverage_flats()
+                for flat in generation.extension._flash_deterministic_coverage_flats()
             )
             if str(config.config[FLASH_PIPELINE_FAMILY_KEY]).startswith("fa4_clc")
         }
@@ -7934,12 +8322,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             configs.append(anchors[0].config)
         self.assertTrue(all(config == configs[0] for config in configs[1:]))
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_bf16_hd64_2cta_seed_transfers_to_2048(self) -> None:
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=2048,
             block_size_targets={0: 1, 1: 128, 2: 128},
@@ -7988,7 +8377,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 3))
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=2048,
             block_size_targets={0: 1, 1: 128, 2: 128},
@@ -8007,7 +8397,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             target_device_capability=spec.target_device_capability,
         )
         raw_snapshots = [dict(seed.config) for seed in raw_seeds]
-        expected = spec._legalize_cute_flash_compiler_seeds(raw_seeds)
+        expected = _legalize_cute_flash_compiler_seeds(spec, raw_seeds)
         env = MagicMock(config_spec=spec)
         heuristic_seeds = CuteFlashAttentionHeuristic.get_seed_configs(
             env,
@@ -8021,7 +8411,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         compiler_seeds = [*heuristic_seeds, *autotune_seeds]
         self.assertTrue(compiler_seeds)
         for seed in compiler_seeds:
-            resolved = spec._resolve_cute_flash_config(seed.config)
+            resolved = _resolve_cute_flash_config(spec, seed.config)
             self.assertEqual(resolved.pipeline_family, "fa4")
             self.assertTrue(resolved.epi_tma)
             self.assertFalse(resolved.epi_stg)
@@ -8274,7 +8664,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     1,
                 )
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_dense_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
@@ -8286,7 +8676,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=target)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=64,
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
@@ -8371,7 +8762,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         spec = ConfigSpec(backend=CuteBackend())
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=8192,
             block_size_targets={0: 1, 1: 128, 2: 128},
@@ -8536,7 +8928,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         self.assertIn("deg2_16x6", packet.search_choices or ())
 
-    @_memoized_flash_fragments()
+    @memoized_flash_fragments()
     def test_cute_flash_causal_degree2_seed_is_in_full_initial_population(
         self,
     ) -> None:
@@ -8548,7 +8940,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=target)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=64,
                     num_kv=num_kv,
                     block_size_targets={0: 1, 1: 128, 2: 128},
@@ -8895,7 +9288,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             assert large_ranked
             assert_all_legal_seeds(spec, large_ranked)
             for seed in large_ranked:
-                resolved = spec._resolve_cute_flash_config(seed.config)
+                resolved = _resolve_cute_flash_config(spec, seed.config)
                 self.assertIn(resolved.pipeline_family, ("fa4", "fa4_2cta"))
                 self.assertTrue(resolved.epi_tma)
                 self.assertFalse(resolved.epi_stg)
@@ -8957,17 +9350,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # part of ``autotune_seed_configs()`` (that chain is now only the
         # c-input family). This asserts the eligibility gate + the generalized
         # seed envelope plus the surviving search projection behavior.
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
+        kernel = fresh(cute_matmul_mma)
 
         args = (
             torch.empty([1024, 1024], device=DEVICE, dtype=torch.bfloat16),
@@ -8975,15 +9358,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
+            ),
             patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
             ),
         ):
-            bound = cute_matmul_mma.bind(args)
+            bound = kernel.bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec._tcgen05_full_tile_direct_entry_seed_eligible())
-        seed_config = spec._tcgen05_full_tile_direct_entry_seed_config()
+        self.assertTrue(seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05))
+        seed_config = seeds.full_tile_direct_entry_seed_config(spec.tcgen05)
         self.assertIsNotNone(seed_config)
         seed = seed_config.config
         self.assertIs(seed[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True)
@@ -8991,13 +9377,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             seed[TCGEN05_LAYOUT_STRATEGY_CONFIG_KEY],
             Tcgen05LayoutStrategy.EXPLICIT_EPI_TILE.value,
         )
-        bk = spec._tcgen05_full_tile_direct_entry_seed_bk()
-        self.assertIsNotNone(bk)
+        bk = seeds.full_tile_direct_entry_seed_bk(spec.tcgen05)
+        self.assertEqual(bk, 128)
+        # K=1024 also takes 64-deep tiles: the seed runs the same AB bytes as
+        # six 64-deep stages (nvjet's 64x6 staging).
         self.assertEqual(
             seed["block_sizes"],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, 64],
         )
-        self.assertEqual(seed["tcgen05_ab_stages"], 3)
+        self.assertEqual(seed["tcgen05_ab_stages"], 6)
         self.assertEqual(seed["tcgen05_cluster_m"], 2)
         self.assertEqual(seed["tcgen05_cluster_n"], 1)
         self.assertEqual(seed["tcgen05_c_stages"], 2)
@@ -9057,9 +9445,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             requested_ffi_config.config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY], True
         )
         self.assertEqual(
-            requested_ffi_config.config["block_sizes"],
-            [TCGEN05_TWO_CTA_BLOCK_M, TCGEN05_TWO_CTA_BLOCK_N, bk],
+            requested_ffi_config.config["block_sizes"], seed["block_sizes"]
         )
+        self.assertEqual(requested_ffi_config.config["tcgen05_ab_stages"], 6)
 
         # With the automatic CTA group, ab > 3 still requires the FFI stage
         # envelope. The explicit paired family must not relax these defaults:
@@ -9125,13 +9513,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         ):
             bound.config_spec.normalize(ffi_direct_entry_ab6_bk128)
 
-        search_ab_stages_fragment = bound.config_spec._tcgen05_optional_fragments(
-            for_search=True
+        search_ab_stages_fragment = surface.optional_fragments(
+            bound.config_spec.tcgen05, for_search=True
         )["tcgen05_ab_stages"]
         self.assertIsInstance(search_ab_stages_fragment, IntegerFragment)
         # The global fragment also represents explicit paired-CTA pipelines.
         # Automatic and FFI configs still obey the rejection checks above.
-        self.assertTrue(spec._cute_tcgen05_config.paired_pipeline_search_enabled())
+        self.assertTrue(
+            surface.paired_pipeline_search_enabled(spec._cute_tcgen05_config)
+        )
         self.assertEqual(
             search_ab_stages_fragment.high, TCGEN05_SMEM_AWARE_MAX_AB_STAGES
         )
@@ -9152,12 +9542,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-            patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
             ),
             patch.object(
-                CuteTcgen05Config,
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+            patch.object(
+                target_facts,
                 "per_cta_ab_smem_budget_bytes",
                 return_value=0,
             ),
@@ -9167,16 +9560,18 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # separate paired-CTA proof still has a known raw capacity here, so its
         # deeper choices remain represented by the shared search fragment.
         self.assertFalse(
-            no_ab3_budget_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+            seeds.full_tile_direct_entry_seed_eligible(
+                no_ab3_budget_bound.config_spec.tcgen05
+            )
         )
-        no_budget_ab_stages_fragment = (
-            no_ab3_budget_bound.config_spec._tcgen05_optional_fragments(
-                for_search=True
-            )["tcgen05_ab_stages"]
-        )
+        no_budget_ab_stages_fragment = surface.optional_fragments(
+            no_ab3_budget_bound.config_spec.tcgen05, for_search=True
+        )["tcgen05_ab_stages"]
         self.assertIsInstance(no_budget_ab_stages_fragment, IntegerFragment)
         self.assertTrue(
-            no_ab3_budget_bound.config_spec._cute_tcgen05_config.paired_pipeline_search_enabled()
+            surface.paired_pipeline_search_enabled(
+                no_ab3_budget_bound.config_spec._cute_tcgen05_config
+            )
         )
         self.assertEqual(
             no_budget_ab_stages_fragment.high, TCGEN05_SMEM_AWARE_MAX_AB_STAGES
@@ -9192,17 +9587,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
+            ),
             patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
             ),
         ):
-            fp16_bound = cute_matmul_mma.bind(fp16_args)
+            fp16_bound = kernel.bind(fp16_args)
         self.assertTrue(
-            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+            seeds.full_tile_direct_entry_seed_eligible(fp16_bound.config_spec.tcgen05)
         )
         self.assertIsNotNone(
-            fp16_bound.config_spec._tcgen05_full_tile_direct_entry_seed_config()
+            seeds.full_tile_direct_entry_seed_config(fp16_bound.config_spec.tcgen05)
         )
 
     @onlyBackends(["cute"])
@@ -9210,23 +9608,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self,
     ) -> None:
         # The structural shape guard for the generalized FFI seed lives entirely
-        # in ``_tcgen05_full_tile_direct_entry_seed_eligible`` (the per-shape
-        # TargetN codegen gate and the runtime direct-entry validator were
-        # removed). A shape whose N is not a multiple of the 256 CtaGroup.TWO
-        # CTA tile is not a full-tile matmul, so the seed must be ineligible and
-        # emit no config even though the dtype is a supported 16-bit type.
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
+        # in ``tcgen05_config.seeds.full_tile_direct_entry_seed_eligible`` (the
+        # per-shape TargetN codegen gate and the runtime direct-entry validator
+        # were removed). A shape whose N is not a multiple of the 256
+        # CtaGroup.TWO CTA tile is not a full-tile matmul, so the seed must be
+        # ineligible and emit no config even though the dtype is a supported
+        # 16-bit type.
         # N = 4080 is not divisible by the 256 CTA tile -> edge tile, not a
         # full-tile CtaGroup.TWO matmul.
         invalid_args = (
@@ -9235,12 +9622,15 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
+            ),
         ):
-            invalid_bound = cute_matmul_mma.bind(invalid_args)
+            invalid_bound = fresh(cute_matmul_mma).bind(invalid_args)
         spec = invalid_bound.config_spec
-        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
-        self.assertIsNone(spec._tcgen05_full_tile_direct_entry_seed_config())
+        self.assertFalse(seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05))
+        self.assertIsNone(seeds.full_tile_direct_entry_seed_config(spec.tcgen05))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_edge_k_tail_bk_requires_tail(self) -> None:
@@ -9250,13 +9640,13 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             allow_edge_k_tail_family=True,
         )
         self.assertTrue(
-            CuteTcgen05Config.cluster_m2_bk_is_valid(
+            repair.cluster_m2_bk_is_valid(
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
                 valid_tail,
             )
         )
         self.assertTrue(
-            CuteTcgen05Config.cluster_m2_bk_is_valid(
+            repair.cluster_m2_bk_is_valid(
                 TCGEN05_TWO_CTA_EDGE_K_TAIL_NARROW_BLOCK_K,
                 valid_tail,
             )
@@ -9269,7 +9659,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                     allow_edge_k_tail_family=True,
                 )
                 self.assertFalse(
-                    CuteTcgen05Config.cluster_m2_bk_is_valid(
+                    repair.cluster_m2_bk_is_valid(
                         TCGEN05_TWO_CTA_EDGE_K_TAIL_BLOCK_K,
                         constraints,
                     )
@@ -9288,39 +9678,19 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         env.config_spec._cute_tcgen05_config = state
         with (
             patch.object(
-                state,
+                facts,
                 "_matmul_block_fragments",
                 return_value=(MagicMock(), MagicMock(), k_fragment),
             ),
-            patch.object(state, "_matmul_block_indices", return_value=(0, 1, 2)),
+            patch.object(facts, "_matmul_block_indices", return_value=(0, 1, 2)),
         ):
-            self.assertEqual(state.cluster_m2_seed_bk_choices(), ())
+            self.assertEqual(seeds.cluster_m2_seed_bk_choices(state), ())
             self.assertIsNone(CuteTcgen05ClusterM2Heuristic._select_bk(env))
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_cluster_m2_seed_heuristic_for_edge_k_tail_family(
         self,
     ) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias_residual_gelu(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            bias: torch.Tensor,
-            residual: torch.Tensor,
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.nn.functional.gelu(
-                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
-                    approximate="tanh",
-                ).to(x.dtype)
-            return out
-
         args = (
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
@@ -9341,7 +9711,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch("helion.language.loops._supports_warp_specialize", return_value=True),
             patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
-            bound = cute_matmul_bias_residual_gelu.bind(args)
+            bound = fresh(cute_matmul_bias_residual_gelu).bind(args)
 
         spec = bound.config_spec
         (
@@ -9350,8 +9720,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             expected_clc_aux_tma_range_warp_specializes,
         ) = self._expected_clc_aux_tma_range_knobs(spec)
         self.assertIn(CuteTcgen05ClusterM2Heuristic.name, spec.autotuner_heuristics)
-        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
-        constraints = spec._tcgen05_cluster_m2_search_constraints
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
+        constraints = spec.tcgen05.cluster_m2_search_constraints
         assert constraints is not None
         self.assertTrue(constraints.allow_edge_k_tail_family)
         self.assertIn("persistent_interleaved", spec.allowed_pid_types)
@@ -9592,7 +9962,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             "range_warp_specializes",
         ):
             projected_wide_clc_aux_tma_config.pop(key, None)
-        spec._cute_tcgen05_config.fix_search_config(projected_wide_clc_aux_tma_config)
+        repair.fix_search_config(
+            spec._cute_tcgen05_config, projected_wide_clc_aux_tma_config
+        )
         self.assertEqual(
             projected_wide_clc_aux_tma_config["block_sizes"][:3],
             [
@@ -9869,25 +10241,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_tcgen05_clc_search_normalizes_valid_and_invalid_cases(
         self,
     ) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias_residual_gelu(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            bias: torch.Tensor,
-            residual: torch.Tensor,
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.nn.functional.gelu(
-                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
-                    approximate="tanh",
-                ).to(x.dtype)
-            return out
+        kernel = fresh(cute_matmul_bias_residual_gelu)
 
         args = (
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
@@ -9909,7 +10263,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch("helion.language.loops._supports_warp_specialize", return_value=True),
             patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
-            bound = cute_matmul_bias_residual_gelu.bind(args)
+            bound = kernel.bind(args)
         with (
             patch_cute_mma_support(),
             patch(
@@ -9927,7 +10281,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             ),
             patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
-            sm90_bound = cute_matmul_bias_residual_gelu.bind(args)
+            sm90_bound = kernel.bind(args)
         self.assertIsNot(sm90_bound, bound)
         (
             expected_clc_aux_tma_range_flattens,
@@ -10008,7 +10362,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             make_minimal_preprojection_clc_aux_tma_config()
         )
         with patch.object(
-            bound.config_spec._cute_tcgen05_config,
+            seeds,
             "_clc_aux_tma_matmul_k_range_index",
             return_value=None,
         ):
@@ -10056,7 +10410,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         reset_config = dict(valid_config)
         reset_config["pid_type"] = "flat"
-        bound.config_spec._cute_tcgen05_config.normalize_strategy(
+        repair.normalize_strategy(
+            bound.config_spec._cute_tcgen05_config,
             reset_config,
             fix_invalid=True,
         )
@@ -10092,26 +10447,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_narrow_n_seed_requires_n_edge_at_128(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias_residual_gelu(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            bias: torch.Tensor,
-            residual: torch.Tensor,
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.nn.functional.gelu(
-                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
-                    approximate="tanh",
-                ).to(x.dtype)
-            return out
-
         # N=4224 is an edge for block_n=256 but a full tile for block_n=128.
         # Keep the narrow-N seed out of this family so aux-TMA never turns the
         # validated double-output-edge + K-tail split into M-edge + K-tail.
@@ -10135,10 +10470,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             patch("helion.language.loops._supports_warp_specialize", return_value=True),
             patch("helion._compat._supports_tensor_descriptor", return_value=True),
         ):
-            bound = cute_matmul_bias_residual_gelu.bind(args)
+            bound = fresh(cute_matmul_bias_residual_gelu).bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
         seed_block_sizes = [
             config.config.get("block_sizes") for config in spec.autotune_seed_configs()
         ]
@@ -10263,33 +10598,17 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_aux_tma_seed_requires_exact_shape_aux(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            bias: torch.Tensor,
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
-            return out
-
         args = (
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([5000], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_bias.bind(args)
+            bound = fresh(cute_matmul_bias).bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
         flat_keys = {key for key, _count, _is_sequence in spec.flat_key_layout()}
         self.assertNotIn(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, flat_keys)
         self.assertNotIn(TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY, flat_keys)
@@ -10309,7 +10628,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_aux_tma_seed_rejects_mixed_exact_aux_dtype(self) -> None:
+    def test_cute_tcgen05_aux_tma_seed_admits_mixed_exact_aux_dtype(self) -> None:
+        """Each staged operand keeps its own dtype in its ring: a bf16 and an
+        FP32 residual of a 16-bit output both take the aux-TMA seeds."""
+
         @helion.kernel(backend="cute")
         def cute_matmul_two_residuals(
             x: torch.Tensor,
@@ -10339,9 +10661,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_two_residuals.bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
-        self.assertFalse(
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
+        self.assertTrue(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
                 == TCGEN05_AUX_LOAD_MODE_TMA
@@ -10350,7 +10672,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
 
     @onlyBackends(["cute"])
-    def test_cute_tcgen05_aux_tma_seed_rejects_unrelated_exact_aux_store(
+    def test_cute_tcgen05_aux_tma_seed_skips_an_adopted_aux_only_store(
         self,
     ) -> None:
         @helion.kernel(backend="cute")
@@ -10380,13 +10702,20 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_and_elementwise_store.bind(args)
 
         spec = bound.config_spec
-        # The residual load belongs to a separate elementwise store, not the
-        # matmul epilogue, so no aux-only matmul search axis is productive.
-        self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
-        self.assertNotIn(
-            TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
-            {key for key, _count, _is_sequence in spec.flat_key_layout()},
+        # The matmul's epilogue adopts the store of the residual alone, so the
+        # epilogue reads an aux operand (``aux_kernel_detected``); but the
+        # residual reaches no accumulator chain, so no aux TMA seed stages it,
+        # and no seed hoists aux loads ahead of the accumulator wait (``out``
+        # has none to hoist).
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.aux_loads_on_every_store)
+        self.assertFalse(
+            any(
+                config.config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+                == TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+                for config in spec.compiler_seed_configs
+            )
         )
         self.assertFalse(
             any(
@@ -10425,8 +10754,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         spec = bound.config_spec
         # The partial rank-2 load is outside the accepted per-subtile epilogue
         # contract, so codegen cannot use the C-input or placement controls.
-        self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
         self.assertNotIn(
             TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
             {key for key, _count, _is_sequence in spec.flat_key_layout()},
@@ -10470,8 +10799,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         spec = bound.config_spec
         # Reordered tile indices are rejected by the same chain analyzer used
         # at codegen, so they must not widen the aux search surface at bind.
-        self.assertFalse(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
         self.assertNotIn(
             TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY,
             {key for key, _count, _is_sequence in spec.flat_key_layout()},
@@ -10515,8 +10844,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             bound = cute_matmul_residual_fanout.bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertFalse(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
+        self.assertFalse(spec.tcgen05.exact_shape_aux_kernel_detected)
         self.assertFalse(
             any(
                 config.config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY)
@@ -10561,17 +10890,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         b200_budget = 232448 - 28 * 1024
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
+            ),
             patch.object(
-                CuteTcgen05Config,
+                target_facts,
                 "per_cta_ab_smem_budget_bytes",
                 return_value=b200_budget,
             ),
         ):
             bound = cute_matmul_residual_add.bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
-        self.assertTrue(spec._cute_tcgen05_config._aux_tma_full_tile_search_enabled())
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
+        self.assertTrue(
+            surface._aux_tma_full_tile_search_enabled(spec._cute_tcgen05_config)
+        )
         # The aux-TMA seed is present in the compiler seed pool.
         self.assertTrue(
             any(
@@ -10643,8 +10977,9 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # fits (the foundation depth); ab=3 + c=4 overflows (matching the
         # cycle-90 probe where a directly sampled 256x256 ab=3 + c=4 hit a raw
         # ``ptxas: too much shared`` error). Uses a plain (no-epilogue) matmul so
-        # the residual aux-TMA projection (which forces ab=2) does not claim the
-        # sampled candidate — the admission gate is the only thing acting on c=4.
+        # the residual aux-TMA projection (which sets the producer's ring) does
+        # not claim the sampled candidate — the admission gate is the only
+        # thing acting on c=4.
         # The SMEM budget is MOCKED to the B200 value so the gate is exercised
         # deterministically on any cute host (``@onlyBackends`` does not imply
         # B200).
@@ -10680,9 +11015,12 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
+            ),
             patch.object(
-                CuteTcgen05Config,
+                target_facts,
                 "per_cta_ab_smem_budget_bytes",
                 return_value=b200_budget,
             ),
@@ -10707,7 +11045,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # With source-C (residual family, 16 KB/stage): ab=2 + c=4 = 192 KB fits;
         # ab=3 + c=4 = 256 KB overflows.
         self.assertTrue(
-            tcfg.c_stages_fits(
+            smem.c_stages_fits(
+                tcfg,
                 bm=256,
                 bn=256,
                 bk=128,
@@ -10718,7 +11057,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             )
         )
         self.assertFalse(
-            tcfg.c_stages_fits(
+            smem.c_stages_fits(
+                tcfg,
                 bm=256,
                 bn=256,
                 bk=128,
@@ -10732,7 +11072,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # overflows the conservative budget (the cycle-90 probe confirmed the
         # plain 256x256 ab=3 + c=4 hits raw ptxas ``too much shared``).
         self.assertFalse(
-            tcfg.c_stages_fits(
+            smem.c_stages_fits(
+                tcfg,
                 bm=256,
                 bn=256,
                 bk=128,
@@ -10771,7 +11112,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         # The budget is already recorded in the constraints from bind (mocked to
         # B200 above), so the gate is deterministic here.
-        tcfg._fix_c_stages_search_config(ab3_c4.config)
+        repair._fix_c_stages_search_config(tcfg, ab3_c4.config)
         self.assertEqual(ab3_c4.config["tcgen05_ab_stages"], 3)
         self.assertEqual(ab3_c4.config["tcgen05_c_stages"], 2)
         # ab=2 + c=4 (fits) is preserved by the gate.
@@ -10787,7 +11128,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
             tcgen05_persistence_model="static_persistent",
         )
-        tcfg._fix_c_stages_search_config(ab2_c4.config)
+        repair._fix_c_stages_search_config(tcfg, ab2_c4.config)
         self.assertEqual(ab2_c4.config["tcgen05_c_stages"], 4)
         # Fail CLOSED: with no recorded SMEM budget (non-B200 / CPU host, where
         # ``ab_stages_three_search_constraints`` is None) a sampled c=4 cannot be
@@ -10805,7 +11146,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             tcgen05_strategy=Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC.value,
             tcgen05_persistence_model="static_persistent",
         )
-        tcfg._fix_c_stages_search_config(ab2_c4_no_budget.config)
+        repair._fix_c_stages_search_config(tcfg, ab2_c4_no_budget.config)
         self.assertEqual(ab2_c4_no_budget.config["tcgen05_c_stages"], 2)
 
     @onlyBackends(["cute"])
@@ -10838,19 +11179,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
                 out[tile_m, tile_n] = acc.to(x.dtype)
             return out
 
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias(
-            x: torch.Tensor, y: torch.Tensor, bias: torch.Tensor
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = (acc + bias[tile_n]).to(x.dtype)
-            return out
+        kernel = fresh(cute_matmul_bias)
 
         @helion.kernel(backend="cute")
         def cute_matmul_residual_add(
@@ -10891,19 +11220,22 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         )
         with (
             patch_cute_mma_support(),
-            patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-            patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+            patch(
+                "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+                return_value=132,
             ),
             patch.object(
-                CuteTcgen05Config,
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
+            ),
+            patch.object(
+                target_facts,
                 "per_cta_ab_smem_budget_bytes",
                 return_value=b200_budget,
             ),
         ):
             plain_bound = cute_matmul_plain.bind(plain_args)
-            bias_bound = cute_matmul_bias.bind(bias_args)
-            bias_t16_bound = cute_matmul_bias.bind(bias_t16_args)
+            bias_bound = kernel.bind(bias_args)
+            bias_t16_bound = kernel.bind(bias_t16_args)
             residual_bound = cute_matmul_residual_add.bind(residual_args)
 
         plain_tcfg = plain_bound.config_spec._cute_tcgen05_config
@@ -10920,22 +11252,37 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertTrue(residual_tcfg.exact_shape_aux_kernel_detected)
 
         # The plain output has an exact allocation proof for deeper paired-CTA
-        # pipelines. Auxiliary loads keep the legacy fragment, whose high is
-        # the operand dtype's deep-ring cap (12 for 16-bit operands: the
-        # one-wave 256x64x64 ring runs 9 stages, the one-CTA 128x64x64 ring
-        # 8); the separate AB/source-C budget checks below decide what fits.
-        self.assertTrue(plain_tcfg.paired_pipeline_search_enabled())
+        # pipelines, and so do the bias and residual epilogues below; the
+        # separate AB/source-C budget checks below decide what fits.
+        self.assertTrue(surface.paired_pipeline_search_enabled(plain_tcfg))
         self.assertEqual(
-            plain_tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"].high,
+            surface.optional_fragments(plain_tcfg, for_search=True)[
+                "tcgen05_ab_stages"
+            ].high,
             TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
         )
-        for tcfg in (bias_tcfg, residual_tcfg):
-            self.assertIsNone(tcfg.pipeline_smem_facts)
-            ab_fragment = tcfg.optional_fragments(for_search=True)["tcgen05_ab_stages"]
-            self.assertEqual(
-                ab_fragment.high, CuteTcgen05Config._get_dtype_ab_stages_hard_cap(2)
-            )
-            self.assertEqual(ab_fragment.high, 12)
+        # The broadcast (rowvec) bias records its row in the allocation proof
+        # (a ``pre_acc_wait`` row stage the model charges) and takes the
+        # budget-aware ring. An exact-shape 16-bit auxiliary load is a
+        # register-resident SIMT load that takes no shared memory, so the
+        # residual kernel keeps the complete allocation proof (facts that record
+        # the auxiliary loads) and the same budget-aware ring as the plain GEMM.
+        self.assertIsNotNone(bias_tcfg.pipeline_smem_facts)
+        self.assertEqual(len(bias_tcfg.pipeline_smem_facts.rows), 1)
+        self.assertEqual(
+            surface.optional_fragments(bias_tcfg, for_search=True)[
+                "tcgen05_ab_stages"
+            ].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
+        self.assertIsNotNone(residual_tcfg.pipeline_smem_facts)
+        self.assertTrue(residual_tcfg.pipeline_smem_facts.has_auxiliary_loads)
+        self.assertEqual(
+            surface.optional_fragments(residual_tcfg, for_search=True)[
+                "tcgen05_ab_stages"
+            ].high,
+            TCGEN05_SMEM_AWARE_MAX_AB_STAGES,
+        )
 
         def _ab3_config(cluster_m: int = 2) -> helion.Config:
             return helion.Config(
@@ -10959,7 +11306,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # the 199 KiB budget and the small no-source-C epilogue D ring rides the
         # non-AB reservation — the ab=3 winner is PRESERVED.
         plain_ab3 = _ab3_config()
-        plain_tcfg.fix_search_config(plain_ab3.config)
+        repair.fix_search_config(plain_tcfg, plain_ab3.config)
         self.assertEqual(plain_ab3.config["tcgen05_ab_stages"], 3)
 
         # BIAS (broad-aux True, source-C False): the rowvec bias has NO source-C
@@ -10972,7 +11319,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # can reproject a bias candidate to cluster_m=1 for K-cap reasons unrelated
         # to this gate; the gate itself must KEEP the bias cluster_m=2 ab=3.
         bias_ab3 = _ab3_config()
-        bias_tcfg._fix_ab_stages_search_config(bias_ab3.config)
+        repair._fix_ab_stages_search_config(bias_tcfg, bias_ab3.config)
         self.assertEqual(bias_ab3.config["tcgen05_ab_stages"], 3)
 
         # BIAS END-TO-END (the P2 guard): on a bias shape where cluster_m=2 search
@@ -10987,7 +11334,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         self.assertFalse(bias_t16_tcfg.exact_shape_aux_kernel_detected)
         self.assertIsNotNone(bias_t16_tcfg.cluster_m2_search_constraints)
         bias_t16_ab3 = _ab3_config()
-        bias_t16_tcfg.fix_search_config(bias_t16_ab3.config)
+        repair.fix_search_config(bias_t16_tcfg, bias_t16_ab3.config)
         self.assertEqual(bias_t16_ab3.config["tcgen05_ab_stages"], 3)
         self.assertEqual(bias_t16_ab3.config["tcgen05_cluster_m"], 2)
         self.assertEqual(bias_t16_ab3.config["block_sizes"][:3], [256, 256, 128])
@@ -10998,32 +11345,32 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         # residual candidate (which no projection claims): AB(ab=3) + (128, 64) C
         # ring overflows even at cluster_m=1, so it DEMOTES to 2.
         residual_cm1_ab3 = _ab3_config(cluster_m=1)
-        residual_tcfg._fix_ab_stages_search_config(residual_cm1_ab3.config)
+        repair._fix_ab_stages_search_config(residual_tcfg, residual_cm1_ab3.config)
         self.assertEqual(residual_cm1_ab3.config["tcgen05_ab_stages"], 2)
 
         # And the same residual source-C branch demotes a cluster_m=2 candidate too
         # (independent of the aux-TMA projection): call the gate in isolation.
         residual_cm2_ab3 = _ab3_config(cluster_m=2)
-        residual_tcfg._fix_ab_stages_search_config(residual_cm2_ab3.config)
+        repair._fix_ab_stages_search_config(residual_tcfg, residual_cm2_ab3.config)
         self.assertEqual(residual_cm2_ab3.config["tcgen05_ab_stages"], 2)
 
         # Full chain on the cluster_m=2 residual: the aux-TMA projection forces ab=2
         # first, and the gate is consistent (still 2).
         residual_full = _ab3_config(cluster_m=2)
-        residual_tcfg.fix_search_config(residual_full.config)
+        repair.fix_search_config(residual_tcfg, residual_full.config)
         self.assertEqual(residual_full.config["tcgen05_ab_stages"], 2)
 
         # cluster_m=1 256x256 plain ab=3 overflows bare-AB (384 KiB > budget) and is
         # demoted even without a source-C.
         plain_cm1_ab3 = _ab3_config(cluster_m=1)
-        plain_tcfg.fix_search_config(plain_cm1_ab3.config)
+        repair.fix_search_config(plain_tcfg, plain_cm1_ab3.config)
         self.assertEqual(plain_cm1_ab3.config["tcgen05_ab_stages"], 2)
 
         # Fail CLOSED: with no recorded SMEM budget the sampled plain ab=3 cannot be
         # proven to fit, so it is demoted to 2 rather than left to overflow.
         plain_tcfg.ab_stages_three_search_constraints = None
         plain_ab3_no_budget = _ab3_config()
-        plain_tcfg.fix_search_config(plain_ab3_no_budget.config)
+        repair.fix_search_config(plain_tcfg, plain_ab3_no_budget.config)
         self.assertEqual(plain_ab3_no_budget.config["tcgen05_ab_stages"], 2)
 
     @onlyBackends(["cute"])
@@ -11057,7 +11404,7 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         with patch_cute_mma_support():
             bound = cute_matmul_bias_residual_gelu.bind(args)
 
-        self.assertTrue(bound.config_spec.cute_tcgen05_aux_kernel_detected)
+        self.assertTrue(bound.config_spec.tcgen05.aux_kernel_detected)
         self.assertEqual(bound.config_spec.compiler_seed_configs, [])
         self.assertEqual(bound.config_spec.autotuner_heuristics, [])
 
@@ -11065,26 +11412,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
     def test_cute_tcgen05_cluster_m2_edge_ab2_seed_ignores_ab3_budget(
         self,
     ) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_bias_residual_gelu(
-            x: torch.Tensor,
-            y: torch.Tensor,
-            bias: torch.Tensor,
-            residual: torch.Tensor,
-        ) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = torch.nn.functional.gelu(
-                    1.25 * acc + 0.5 * residual[tile_m, tile_n] + bias[tile_n],
-                    approximate="tanh",
-                ).to(x.dtype)
-            return out
-
         args = (
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
@@ -11092,11 +11419,11 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             torch.empty([5000, 5000], device=DEVICE, dtype=HALF_DTYPE),
         )
         with patch_cute_mma_support():
-            bound = cute_matmul_bias_residual_gelu.bind(args)
+            bound = fresh(cute_matmul_bias_residual_gelu).bind(args)
 
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_search_enabled)
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
+        self.assertTrue(spec.tcgen05.search_enabled)
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
         config_dict: dict[str, object] = {
             "block_sizes": [128, 128, 64],
             "indexing": ["tensor_descriptor"] * spec.indexing.length,
@@ -11107,12 +11434,8 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
             "tcgen05_acc_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_ACC_STAGES,
             "tcgen05_c_stages": TCGEN05_TWO_CTA_EDGE_K_TAIL_C_STAGES,
         }
-        with patch.object(
-            spec._cute_tcgen05_config,
-            "ab_stages_three_fits",
-            return_value=False,
-        ):
-            spec._cute_tcgen05_config.fix_search_config(config_dict)
+        with patch.object(smem, "ab_stages_three_fits", return_value=False):
+            repair.fix_search_config(spec._cute_tcgen05_config, config_dict)
 
         self.assertEqual(config_dict["tcgen05_cluster_m"], 2)
         self.assertEqual(config_dict["pid_type"], "persistent_interleaved")
@@ -11132,18 +11455,6 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
 
     @onlyBackends(["cute"])
     def test_cute_tcgen05_two_cta_seeded_in_initial_populations(self) -> None:
-        @helion.kernel(backend="cute")
-        def cute_matmul_mma(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-            m, k = x.size()
-            _, n = y.size()
-            out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-            for tile_m, tile_n in hl.tile([m, n]):
-                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-                for tile_k in hl.tile(k):
-                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
-                out[tile_m, tile_n] = acc.to(x.dtype)
-            return out
-
         args = (
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
             torch.empty([4096, 4096], device=DEVICE, dtype=HALF_DTYPE),
@@ -11151,10 +11462,10 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         with (
             patch_cute_mma_support(),
             patch.object(
-                CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+                target_facts, "per_cta_smem_capacity_bytes", return_value=232448
             ),
         ):
-            bound = cute_matmul_mma.bind(args)
+            bound = fresh(cute_matmul_mma).bind(args)
         self.assertIn(
             CuteTcgen05ClusterM2Heuristic.name,
             bound.config_spec.autotuner_heuristics,
@@ -11257,15 +11568,71 @@ class TestCuteTcgen05ClusterM2Heuristic(TestCase):
         facts = bound.config_spec._cute_tcgen05_config.pipeline_smem_facts
         self.assertIsNotNone(facts)
         assert facts is not None
+        # The paired seeds are CTA pairs (cluster_n=1); the deepest bk=64
+        # SIMT ring of every 256-row pair tile with whole N-tile pairs also
+        # carries 2x2 multicast-cluster twins (cluster_n=2) that differ from
+        # their pair in nothing else but the raster: one ungrouped, one on
+        # the grouped raster.  fp16 4096^3 pairs every N tile width, so each
+        # of the three 256-row bk=64 tiles has both twins.
+        paired_by_tile: dict[tuple[int, ...], list[helion.Config]] = {}
+        for config in paired_configs:
+            paired_by_tile.setdefault(tuple(config.block_sizes), []).append(config)
+        self.assertEqual(
+            sorted(
+                (tuple(config.block_sizes), config.get("l2_groupings", [1])[0])
+                for config in paired_configs
+                if config["tcgen05_cluster_n"] == 2
+            ),
+            [
+                ((TCGEN05_TWO_CTA_BLOCK_M, bn, 64), grouping)
+                for bn in (64, 128, 256)
+                for grouping in (1, TCGEN05_CLUSTER_N2_SEED_L2_GROUPING)
+            ],
+        )
         for config in paired_configs:
             with self.subTest(paired_config=config):
                 self.assertEqual(config["tcgen05_cluster_m"], 2)
-                self.assertEqual(config["tcgen05_cluster_n"], 1)
+                self.assertIn(config["tcgen05_cluster_n"], (1, 2))
                 self.assertEqual(config["pid_type"], "persistent_blocked")
                 self.assertEqual(config["tcgen05_c_stages"], 2)
                 self.assertEqual(config["tcgen05_acc_stages"], 2)
                 self.assertFalse(config[TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY])
                 bm, bn, bk = config.block_sizes
+                siblings = paired_by_tile[(bm, bn, bk)]
+                deepest = max(
+                    cast("int", sibling["tcgen05_ab_stages"]) for sibling in siblings
+                )
+                if config["tcgen05_cluster_n"] == 2:
+                    # The twin sits on the 256-row pair tile at bk=64, at
+                    # the tile's deepest ring, beside exactly one pair seed
+                    # it matches in every other knob.
+                    self.assertEqual(bm, TCGEN05_TWO_CTA_BLOCK_M)
+                    self.assertEqual(bk, 64)
+                    self.assertEqual(config["tcgen05_ab_stages"], deepest)
+                    pairs = [
+                        sibling
+                        for sibling in siblings
+                        if sibling["tcgen05_cluster_n"] == 1
+                        and sibling["tcgen05_ab_stages"] == deepest
+                    ]
+                    self.assertEqual(len(pairs), 1)
+                    # The twin keeps its CTAs persistent over the co-resident
+                    # clusters; its sibling takes the default pair cap.
+                    self.assertEqual(
+                        config["tcgen05_persistent_grid_cap"], "resident_clusters"
+                    )
+                    self.assertEqual(
+                        {
+                            **config.config,
+                            "tcgen05_cluster_n": 1,
+                            "tcgen05_persistent_grid_cap": "sm_pairs",
+                            "l2_groupings": pairs[0].config.get("l2_groupings", [1]),
+                        },
+                        {
+                            **pairs[0].config,
+                            "l2_groupings": pairs[0].config.get("l2_groupings", [1]),
+                        },
+                    )
                 self.assertLessEqual(
                     pipeline_smem_bytes(
                         facts,
@@ -11337,7 +11704,7 @@ class TestTritonReductionHeuristic(TestCase):
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
     def test_rms_norm_wide_seeds_persistent_with_warps(self) -> None:
-        from examples.rms_norm import rms_norm_fwd
+        rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
         m, n = 2048, 16384
         args = (
@@ -11387,7 +11754,7 @@ class TestTritonReductionHeuristic(TestCase):
     @onlyBackends(["triton"])
     @skipIfRefEager("Compiler reduction facts are not collected in ref eager mode")
     def test_kl_div_wide_seeds_liveness_r_block_cap(self) -> None:
-        from examples.kl_div import kl_div_forward
+        kl_div_forward = import_example("kl_div").kl_div_forward
 
         m, n = 4096, 131072
         # Binding only inspects tensor metadata. Keep the wide, contiguous shape
@@ -11685,6 +12052,7 @@ class TestTritonReductionHeuristic(TestCase):
             self.assertEqual(seed["num_warps"], 8)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "width,strided",
@@ -11715,8 +12083,8 @@ def test_cute_narrow_pointwise_seeds_with_safe_loads(
 
     x = torch.empty(16384, width * (2 if strided else 1), dtype=dtype)
     args = (x[:, ::2] if strided else x,) * 2
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(add, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(add, args)
         spec = bound.config_spec
         assert "cute_pointwise_vec" in spec.autotuner_heuristics
         if width <= 8:
@@ -11766,6 +12134,7 @@ def test_cute_narrow_pointwise_seeds_with_safe_loads(
         assert len(lists) == len(set(lists))
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("width", [4095, 4096])
 def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
     @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -11775,8 +12144,8 @@ def test_cute_pointwise_transposed_axis_does_not_flatten(width: int) -> None:
             out[rows, columns] = x[rows, columns] + 1
         return out
 
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(add, (torch.empty(8, width, dtype=torch.bfloat16).T,))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(add, (torch.empty(8, width, dtype=torch.bfloat16).T,))
         assert bound.host_function is not None
         seeds = CutePointwiseVecHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
@@ -11813,7 +12182,7 @@ def _bind_cute_matmul_without_cutlass() -> None:
     assert sys.modules.get("cutlass", 0) is None
     with (
         _grouped_worklist_bind_patches(),
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         # This checks planning imports only; no CuTe source generation runs.
         patch("helion._compiler.cute.backend.CuteBackend.validate_environment"),
     ):
@@ -11829,12 +12198,19 @@ def _bind_cute_matmul_without_cutlass() -> None:
     assert bound.host_function is not None
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_heuristics_register_facts_without_cutlass() -> None:
     # Most CI runners lack the CuTe DSL, yet CPU binds still run every cute
     # heuristic's register_facts. Their planning imports must stay importable
     # without cutlass; only device helper modules may import it at module top.
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    # The child needs the parent's import path too: a packaged test binary has
+    # no site-packages for it to fall back on.
+    environment = dict(
+        os.environ,
+        CUDA_VISIBLE_DEVICES="",
+        PYTHONPATH=os.pathsep.join([str(root), *sys.path]),
+    )
     environment.pop("HELION_BACKEND", None)
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
     # Ref eager binding builds no device IR; the child always binds normally.
@@ -11861,3 +12237,179 @@ def test_cute_heuristics_register_facts_without_cutlass() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+_CUTE_ROW_HEURISTICS = (
+    CuteTileVecHeuristic,
+    CuteTileVecWarpReduceHeuristic,
+    CuteTileVecWarpPerRowHeuristic,
+    CuteResidentRowHeuristic,
+    CuteResidentRowWideClusterHeuristic,
+    CuteResidentMultiRowHeuristic,
+)
+
+
+@skipUnlessBackends(["cute"])
+@skipIfNotCUDA()
+@pytest.mark.parametrize("reversed_registration", [False, True])
+def test_cute_row_hints_follow_loop_axes_not_registration_order(
+    reversed_registration: bool,
+) -> None:
+    pytest.importorskip("cutlass.cute")
+
+    def rowsum(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+        if reverse:
+            columns = hl.register_block_size(x.size(1))
+            rows = hl.register_block_size(x.size(0))
+        else:
+            rows = hl.register_block_size(x.size(0))
+            columns = hl.register_block_size(x.size(1))
+        out = torch.empty(x.size(0), device=x.device, dtype=x.dtype)
+        for r in hl.tile(x.size(0), block_size=rows):
+            acc = hl.zeros([r], dtype=torch.float32)
+            for c in hl.tile(x.size(1), block_size=columns):
+                acc += x[r, c].sum(dim=1)
+            out[r] = acc
+        return out
+
+    args = (torch.randn(16, 2048, device=DEVICE), reversed_registration)
+    bound = helion.kernel(rowsum, backend="cute", static_shapes=True).bind(args)
+    outer, inner = (1, 0) if reversed_registration else (0, 1)
+    spec = bound.config_spec
+    for heuristic in _CUTE_ROW_HEURISTICS:
+        with bound.env, bound.host_function:
+            assert heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None, heuristic.name
+        assert spec.block_sizes.config_get(seed.block_sizes, inner) > 1
+        assert spec.block_sizes.config_get(seed.block_sizes, outer) <= 4
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], inner)
+            > 1
+        )
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], outer)
+            == 1
+        )
+        if heuristic is CuteTileVecHeuristic:
+            fn = bound.compile_config(seed, allow_print=False)
+            torch.testing.assert_close(
+                fn(*args), args[0].sum(dim=1), atol=1e-3, rtol=1e-3
+            )
+
+
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("reversed_registration", [False, True])
+def test_cute_row_hints_preserve_fixed_leading_axis(
+    reversed_registration: bool,
+) -> None:
+    @helion.kernel(backend="cute", static_shapes=True)
+    def copy(x: torch.Tensor, reverse: hl.constexpr) -> torch.Tensor:
+        if reverse:
+            columns = hl.register_block_size(x.size(2))
+            rows = hl.register_block_size(x.size(1))
+        else:
+            rows = hl.register_block_size(x.size(1))
+            columns = hl.register_block_size(x.size(2))
+        out = torch.empty_like(x)
+        for batch, row, col in hl.tile(x.shape, block_size=[1, rows, columns]):
+            out[batch, row, col] = x[batch, row, col]
+        return out
+
+    with mock_cuda_unavailable(), patch_cute_mma_support():
+        bound = cpu_bind(copy, (torch.empty(2, 16, 2048), reversed_registration))
+    row, col = (1, 0) if reversed_registration else (0, 1)
+    spec = bound.config_spec
+    assert len(spec.block_sizes) == 2
+    assert len(bound.host_function.device_ir.grid_block_ids[0]) == 3
+    for heuristic in _CUTE_ROW_HEURISTICS:
+        with bound.env, bound.host_function:
+            assert heuristic.is_eligible(bound.env, bound.host_function.device_ir)
+            seed = heuristic.get_seed_config(bound.env, bound.host_function.device_ir)
+        assert seed is not None, heuristic.name
+        assert spec.block_sizes.config_get(seed.block_sizes, row) <= 4
+        assert spec.block_sizes.config_get(seed.block_sizes, col) > 1
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], col)
+            > 1
+        )
+        assert (
+            spec.cute_vector_widths.config_get(seed.config["cute_vector_widths"], row)
+            == 1
+        )
+
+
+@skipUnlessBackends(["cute"])
+def test_cute_dot_row_reduction_seed_keeps_the_softmax_axis_in_thread() -> None:
+    """``hl.dot`` over head_dim whose result is reduced (``amax``/``sum``) over
+    the key tile: the key tile's ``num_threads`` slot seeds (and defaults to) 1,
+    so the row statistics and the ``p @ v`` running sum stay in registers."""
+    fp8_attention_kernel = import_example("fp8_attention").fp8_attention_kernel
+
+    from helion._compiler.cute.autotune.heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    kernel = helion.kernel(
+        fp8_attention_kernel.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    batch, heads, seq_len, head_dim = 1, 4, 256, 64
+    q = torch.empty((batch * heads, seq_len, head_dim), dtype=torch.float8_e4m3fn)
+    v = torch.empty((batch * heads, head_dim, seq_len), dtype=torch.float8_e4m3fn)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(kernel, (q, q, v, batch, heads))
+        assert bound.host_function is not None
+        device_ir = bound.host_function.device_ir
+        assert CuteDotRowReductionHeuristic.is_eligible(bound.env, device_ir)
+        seed = CuteDotRowReductionHeuristic.get_seed_config(bound.env, device_ir)
+        assert seed is not None
+        spec = bound.config_spec
+        key_tile = next(
+            graph.block_ids[0]
+            for graph in device_ir.graphs
+            if type(graph).__name__ == "ForLoopGraphInfo" and len(graph.block_ids) == 1
+        )
+        slot = [item.block_id for item in spec.num_threads].index(key_tile)
+        assert seed["num_threads"][slot] == 1
+        assert sum(seed["num_threads"]) == 1
+        assert "cute_dot_row_reduction" in spec.autotuner_heuristics
+        assert spec.default_config()["num_threads"] == seed["num_threads"]
+        code = bound.to_code(spec.default_config())
+        # The key tile runs as a per-thread lane loop: the row max and sum
+        # accumulate in registers instead of block-wide grouped reductions.
+        assert "qk_max_lane_acc" in code
+        assert "l_ij_lane_acc" in code
+
+
+@skipUnlessBackends(["cute"])
+def test_cute_dot_row_reduction_seed_needs_a_row_reduction() -> None:
+    """A dot whose N axis is only stored (no reduction over it) gets no seed."""
+    from helion._compiler.cute.autotune.heuristics.cute_dot_row_reduction import (
+        CuteDotRowReductionHeuristic,
+    )
+
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def scores(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+        batch_heads, seq_len, _ = q.shape
+        out = torch.empty(
+            [batch_heads, seq_len, seq_len], dtype=torch.float32, device=q.device
+        )
+        for bh in hl.grid(batch_heads):
+            for tile_m in hl.tile(seq_len):
+                q_tile = q[bh, tile_m, :]
+                for tile_n in hl.tile(seq_len):
+                    k_tile = k[bh, tile_n, :]
+                    out[bh, tile_m, tile_n] = hl.dot(q_tile, k_tile.transpose(0, 1))
+        return out
+
+    q = torch.empty(2, 64, 64, dtype=torch.bfloat16)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(scores, (q, q))
+        assert bound.host_function is not None
+        assert not CuteDotRowReductionHeuristic.is_eligible(
+            bound.env, bound.host_function.device_ir
+        )
+        assert "cute_dot_row_reduction" not in bound.config_spec.autotuner_heuristics

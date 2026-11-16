@@ -26,14 +26,14 @@ from helion._compiler.cute import cute_flash_gated
 from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
-from helion._testing import onlyBackends
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_flash import APPROX_GATE_DIVISION
+from helion._testing.cute_flash import PLAIN_GATE_DIVISION
+from helion._testing.cute_flash import gated_attention_match
 from helion.exc import InvalidConfig
 import helion.language as hl
+from helion.runtime import default_cute_launcher
 from helion.runtime.kernel import Kernel
-
-pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -41,6 +41,13 @@ if TYPE_CHECKING:
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
+
+# CuTe's launcher resolves a kernel's annotations and DSL helpers in module
+# globals (test_gate_vector_division_is_div_approx_ftz_bit_for_bit).
+import cutlass
+import cutlass.cute as cute
+
+from helion._compiler.cute._flash_runtime import gated_mul_ftz_vec
 
 
 def _hstu_module() -> Any:
@@ -80,16 +87,6 @@ def _with_fast_math(kernel: Any, enabled: bool) -> Any:
     through this twin, which keeps every other setting of the example.
     """
     return Kernel(kernel.fn, settings=kernel.settings.copy(fast_math=enabled))
-
-
-# The gate's division: the IEEE divide of the exact path, and the approximate
-# reciprocal multiply the ``fast_math`` setting selects (the only line of the
-# gate program that differs between the two modes).
-_IEEE_GATE_DIVISION = re.compile(r"flash_g\d+ = flash_g\d+ / flash_g\d+$", re.MULTILINE)
-_APPROX_GATE_DIVISION = re.compile(
-    r"flash_g\d+ = flash_g\d+ \* cute\.math\.rcp\(flash_g\d+, approx=True, ftz=True\)$",
-    re.MULTILINE,
-)
 
 
 def _hstu2_args(
@@ -139,14 +136,6 @@ def _gated_markers(code: str) -> bool:
     return (
         "'kind': 'helion_flash_gated'" in code and "flash_gated_shared_storage" in code
     )
-
-
-def _match(bound: Any) -> cute_flash_gated.GatedAttentionMatch | None:
-    """Run the config-independent matcher on a bound kernel's device IR."""
-    env, host_function = bound.env, bound.host_function
-    assert env is not None and host_function is not None
-    with env, host_function:
-        return cute_flash_gated.match_gated_attention(host_function.device_ir)
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +362,62 @@ def _pair_table_kernel(
 
 
 @helion.kernel()
+def _poisoned_output_kernel(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    masked_store: hl.constexpr = False,
+) -> torch.Tensor:
+    """The example's dataflow storing into a poisoned output, where rows the
+    program does not store stay NaN: unmasked or, with ``masked_store``, as
+    the example does, masked by the length."""
+    scale = 1.0 / max_seq_len
+    num_heads = hl.specialize(q.size(1))
+    num_batches = hl.specialize(seq_offsets.size(0) - 1)
+    dimV = hl.specialize(v.size(2))
+    out = torch.full_like(v, float("nan"))
+    for tile_b, tile_h, tile_q in hl.tile(
+        [num_batches, num_heads, max_seq_len], block_size=[1, 1, None]
+    ):
+        starts = seq_offsets[tile_b.begin]
+        ends = seq_offsets[tile_b.begin + 1]
+        seq_len = ends - starts
+        if tile_q.begin < seq_len:
+            mask_q = tile_q.index < seq_len
+            q_blk = q[tile_q.index + starts, tile_h.begin, :]
+            acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+            for tile_kv in hl.tile(0, tile_q.end, block_size=None):
+                mask_kv = tile_kv.index < seq_len
+                k_blk = k[tile_kv.index + starts, tile_h.begin, :]
+                v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+                scores = (
+                    torch.nn.functional.silu(torch.matmul(q_blk, k_blk.T) * alpha)
+                    * scale
+                )
+                scores = torch.where(
+                    (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
+                    & mask_q[:, None]
+                    & mask_kv[None, :],
+                    scores,
+                    0.0,
+                )
+                acc += torch.matmul(scores.to(v.dtype), v_blk)
+            if masked_store:
+                hl.store(
+                    out,
+                    [tile_q.index + starts, tile_h.begin, slice(None)],
+                    acc.to(out.dtype),
+                    extra_mask=mask_q[:, None],
+                )
+            else:
+                out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel()
 def _atomic_loop_kernel(
     max_seq_len: int,
     alpha: float,
@@ -496,6 +541,100 @@ def _erf_gate_kernel(
                 k_blk = k[tile_kv.index + starts, tile_h.begin, :]
                 v_blk = v[tile_kv.index + starts, tile_h.begin, :]
                 scores = torch.erf(torch.matmul(q_blk, k_blk.T) * alpha) * scale
+                scores = torch.where(
+                    (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
+                    & mask_q[:, None]
+                    & mask_kv[None, :],
+                    scores,
+                    0.0,
+                )
+                acc += torch.matmul(scores.to(v.dtype), v_blk)
+            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel()
+def _sigmoid_gate_kernel(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Accepted: ``torch.sigmoid`` gates of the scores and of a per-sequence
+    scalar, which reach the gate program as sigmoids (``F.silu`` arrives
+    decomposed into ``x / (1 + exp(-x))``)."""
+    scale = 1.0 / max_seq_len
+    num_heads = hl.specialize(q.size(1))
+    num_batches = hl.specialize(seq_offsets.size(0) - 1)
+    dimV = hl.specialize(v.size(2))
+    out = torch.zeros_like(v)
+    for tile_b, tile_h, tile_q in hl.tile(
+        [num_batches, num_heads, max_seq_len], block_size=[1, 1, None]
+    ):
+        starts = seq_offsets[tile_b.begin]
+        ends = seq_offsets[tile_b.begin + 1]
+        seq_len = ends - starts
+        if tile_q.begin < seq_len:
+            mask_q = tile_q.index < seq_len
+            q_blk = q[tile_q.index + starts, tile_h.begin, :]
+            acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+            for tile_kv in hl.tile(0, tile_q.end, block_size=None):
+                mask_kv = tile_kv.index < seq_len
+                k_blk = k[tile_kv.index + starts, tile_h.begin, :]
+                v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+                weight = torch.sigmoid(seq_len * scale)
+                scores = torch.sigmoid(torch.matmul(q_blk, k_blk.T) * alpha) * weight
+                scores = torch.where(
+                    (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
+                    & mask_q[:, None]
+                    & mask_kv[None, :],
+                    scores,
+                    0.0,
+                )
+                acc += torch.matmul(scores.to(v.dtype), v_blk)
+            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel()
+def _division_gate_kernel(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Accepted: a bf16 quotient (silu written out, which the fp32 opmath of
+    ``F.silu`` does not round to bf16) scaled by an fp32 reciprocal and an fp32
+    quotient of the sequence length, plus fp32 quotients of score vectors by a
+    vector (``F.silu`` itself) and by a scalar."""
+    num_heads = hl.specialize(q.size(1))
+    num_batches = hl.specialize(seq_offsets.size(0) - 1)
+    dimV = hl.specialize(v.size(2))
+    out = torch.zeros_like(v)
+    for tile_b, tile_h, tile_q in hl.tile(
+        [num_batches, num_heads, max_seq_len], block_size=[1, 1, None]
+    ):
+        starts = seq_offsets[tile_b.begin]
+        ends = seq_offsets[tile_b.begin + 1]
+        seq_len = ends - starts
+        if tile_q.begin < seq_len:
+            mask_q = tile_q.index < seq_len
+            q_blk = q[tile_q.index + starts, tile_h.begin, :]
+            acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+            for tile_kv in hl.tile(0, tile_q.end, block_size=None):
+                mask_kv = tile_kv.index < seq_len
+                k_blk = k[tile_kv.index + starts, tile_h.begin, :]
+                v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+                qk = torch.matmul(q_blk, k_blk.T) * alpha
+                scale = (1.0 / seq_len).to(qk.dtype)
+                fill = (seq_len / max_seq_len).to(qk.dtype)
+                scores = qk / (1.0 + torch.exp(-qk)) * scale * fill
+                tail = torch.nn.functional.silu(qk.float()) / seq_len
+                scores = scores + tail.to(qk.dtype)
                 scores = torch.where(
                     (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
                     & mask_q[:, None]
@@ -737,6 +876,53 @@ def _row_scaled_kernel(
     return out
 
 
+@helion.kernel()
+def _extrema_gate_kernel(
+    max_seq_len: int,
+    alpha: float,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    seq_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Accepted: a gate of ``relu``, ``maximum`` and ``minimum`` (which reach
+    the gate program as such: Inductor does not decompose them) against
+    per-sequence scalar bounds."""
+    scale = 1.0 / max_seq_len
+    num_heads = hl.specialize(q.size(1))
+    num_batches = hl.specialize(seq_offsets.size(0) - 1)
+    dimV = hl.specialize(v.size(2))
+    out = torch.zeros_like(v)
+    for tile_b, tile_h, tile_q in hl.tile(
+        [num_batches, num_heads, max_seq_len], block_size=[1, 1, None]
+    ):
+        starts = seq_offsets[tile_b.begin]
+        ends = seq_offsets[tile_b.begin + 1]
+        seq_len = ends - starts
+        if tile_q.begin < seq_len:
+            mask_q = tile_q.index < seq_len
+            q_blk = q[tile_q.index + starts, tile_h.begin, :]
+            acc = hl.zeros([tile_q, dimV], dtype=torch.float32)
+            for tile_kv in hl.tile(0, tile_q.end, block_size=None):
+                mask_kv = tile_kv.index < seq_len
+                k_blk = k[tile_kv.index + starts, tile_h.begin, :]
+                v_blk = v[tile_kv.index + starts, tile_h.begin, :]
+                qk = torch.matmul(q_blk, k_blk.T) * alpha
+                low = 0.5 / seq_len
+                high = 100.0 / seq_len
+                scores = torch.minimum(torch.maximum(torch.relu(qk), low), high)
+                scores = torch.where(
+                    (tile_q.index.unsqueeze(1) > tile_kv.index.unsqueeze(0))
+                    & mask_q[:, None]
+                    & mask_kv[None, :],
+                    scores * scale,
+                    0.0,
+                )
+                acc += torch.matmul(scores.to(v.dtype), v_blk)
+            out[tile_q.index + starts, tile_h.begin, :] = acc.to(out.dtype)
+    return out
+
+
 _ACCEPTED_VARIANTS: dict[str, Any] = {
     "tile_end": _tile_end_kernel,
     "row_scaled": _row_scaled_kernel,
@@ -772,7 +958,7 @@ def _rejected_variant(name: str) -> tuple[Any, tuple[Any, ...]]:
 def test_explicit_row_mask_requires_the_gate_sequence_bound(role: str) -> None:
     with _cpu_codegen_patches():
         bound = _bind_hstu(_hstu_args())
-        matched = _match(bound)
+        matched = gated_attention_match(bound)
         assert matched is not None
         access = {"q": matched.q, "k": matched.k, "v": matched.v, "o": matched.o}[role]
         mask = access.extra_mask
@@ -795,7 +981,7 @@ def test_explicit_row_mask_requires_the_gate_sequence_bound(role: str) -> None:
         arguments = list(access.node.args)
         arguments[3 if role == "o" else 2] = changed_mask
         access.node.args = tuple(arguments)
-        assert _match(bound) is None
+        assert gated_attention_match(bound) is None
 
 
 @pytest.mark.parametrize("q_tile", [64, 128])
@@ -826,6 +1012,66 @@ def test_gated_masked_v_tail_excludes_neighboring_sequence_nan(
     )
 
 
+@pytest.mark.parametrize(
+    ("kind", "config"),
+    [
+        # The tcgen05 body.
+        (
+            "helion_flash_gated",
+            helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=3),
+        ),
+        # A register-MMA row program (two 16-row m-tiles, two key groups).
+        (
+            "helion_flash_gated_row_mma",
+            helion.Config(
+                block_sizes=[32, 32],
+                cute_flash_kv_stage=2,
+                cute_flash_gated_row_warps=4,
+            ),
+        ),
+    ],
+    ids=["tcgen05", "row_mma"],
+)
+def test_rows_past_the_last_sequence_get_the_programs_zeros(
+    kind: str, config: helion.Config
+) -> None:
+    """A store without a row mask of its own writes every row of a query tile:
+    past a sequence's end the zero accumulator.  The fused body skips those
+    rows before the end of the last sequence, where a later sequence's tile
+    stores them, and stores the zeros past it (padding).  Two tiles of the
+    program store the rows a tile spills into the next sequence, so the
+    reference is ``_gated_reference``, not a config the body declines."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+    torch.manual_seed(17)
+    # Each sequence's last query tile ends past it: the first's spills into
+    # the second, the second's into the 128 padding rows.
+    q, k, v, seq_offsets = _jagged_inputs([173, 173], 2, 64, padding=128)
+    args = (256, 0.05, q, k, v, seq_offsets)
+    bound = _poisoned_output_kernel.bind(args)
+    assert f"'kind': '{kind}'" in bound.to_code(config)
+    fused = bound.compile_config(config)(*args)
+    torch.cuda.synchronize()
+    # The keep is strictly causal, so the KV loop's end past the row is moot.
+    expected = _gated_reference(
+        q,
+        k,
+        v,
+        seq_offsets,
+        alpha=0.05,
+        max_seq_len=256,
+        keep=_causal_keep,
+        kv_end="seq_len",
+    )
+    _assert_matches(fused[:346], expected[:346], 2e-2)
+    # Rows 346 up to the end of the last sequence's last query tile (428 under
+    # 128 rows, 364 under 32): past the last sequence.
+    q_tile = config.config["block_sizes"][0]
+    tiles_end = 173 + -(-173 // q_tile) * q_tile
+    assert (fused[346:tiles_end] == 0).all()
+    assert torch.isnan(fused[tiles_end:]).all()
+
+
 def test_gated_masked_v_preserves_the_kv_loop_bound() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100-family gated attention required")
@@ -849,6 +1095,33 @@ def test_gated_masked_v_preserves_the_kv_loop_bound() -> None:
     )
 
 
+def test_gate_extrema_keep_a_nan_score() -> None:
+    """A NaN score stays NaN through the gate's relu, maximum and minimum, in
+    the fused body as on the scalar path of a config it declines (and as in
+    eager); selects on ``x > 0`` and ``a > b`` used to turn it into a bound."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+    torch.manual_seed(3)
+    # The scalar path stores every row of a query tile, zeros past the
+    # sequence's end: the first length is a multiple of both query tiles and
+    # padding follows the second, so no tile stores into another sequence.
+    q, k, v, seq_offsets = _jagged_inputs([256, 173], 2, 64, padding=128)
+    # A NaN query row past each sequence's first row (that one keeps no key).
+    nan_rows = [5, 296]
+    q[nan_rows] = float("nan")
+    args = (256, 0.05, q, k, v, seq_offsets)
+    bound = _extrema_gate_kernel.bind(args)
+    config = helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=3)
+    assert _gated_markers(bound.to_code(config))
+    fused = bound.compile_config(config)(*args)
+    scalar = bound.compile_config(helion.Config(block_sizes=[64, 16]))(*args)
+    torch.cuda.synchronize()
+    assert torch.isnan(fused[nan_rows]).all()
+    assert torch.isnan(fused).sum() == torch.isnan(fused[nan_rows]).sum()
+    tol = 2e-2 * scalar.nan_to_num().abs().max().item()
+    torch.testing.assert_close(fused, scalar, atol=tol, rtol=2e-2, equal_nan=True)
+
+
 # ---------------------------------------------------------------------------
 # CPU codegen tests
 # ---------------------------------------------------------------------------
@@ -862,15 +1135,25 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
         assert spec.cute_flash_gated_search_enabled
         assert not spec.cute_flash_search_enabled
         # The fused body owns the root: no tcgen05 matmul fields hide the knob.
-        assert not spec.cute_tcgen05_search_enabled
+        assert not spec.tcgen05.search_enabled
         assert list(spec._flat_fields()) == [
             "block_sizes",
             "cute_flash_kv_stage",
             "cute_flash_gate_warpgroups",
+            "cute_flash_gated_row_warps",
+            "cute_compiler_pipeline",
         ]
-        seeds = [seed.config for seed in spec.autotune_seed_configs()]
-        assert seeds[0]["block_sizes"] == [128, 128]
-        assert seeds[0]["cute_flash_gate_warpgroups"] == 2
+        all_seeds = [seed.config for seed in spec.autotune_seed_configs()]
+        assert all_seeds[0]["block_sizes"] == [128, 128]
+        assert all_seeds[0]["cute_flash_gate_warpgroups"] == 2
+        # The fused tcgen05 seeds come first; the register-MMA row programs'
+        # seeds (16- and 32-row query tiles) follow (test_cute_flash_gated_row_mma).
+        seeds = [seed for seed in all_seeds if seed["block_sizes"][0] >= 64]
+        row_seeds = [seed for seed in all_seeds if seed["block_sizes"][0] < 64]
+        assert all_seeds == [*seeds, *row_seeds]
+        # This shape (8 sequences x 8 heads x 32 query tiles of 16 rows = 2048
+        # row programs) is past the row programs' seed cap: none here.
+        assert row_seeds == []
         # Every fused tile shape (both query tile heights, every KV tile width)
         # at every legal ring depth and every gate warpgroup count above one is
         # seeded (a count must split a thread's columns into chunks of at least
@@ -971,15 +1254,15 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
     )
     assert "flash_g7 = cutlass.select_(flash_g5, flash_g6, cutlass.Int32(0))" in code
     assert "flash_g9 = flash_g7 & flash_g8" in code
-    # ``exp`` feeding ``1 + e`` uses the flush-to-zero ex2 (identical result).
-    # The example ships with ``fast_math=True``, so the gate's division is the
-    # approximate reciprocal multiply; the exact twin's IEEE division is
-    # pinned in ``test_fast_math_setting_selects_approximate_gate_math``.
+    # The example ships with ``fast_math=True``, so the gate's ``exp`` is
+    # ``ex2.approx`` of the rounded product and its division the approximate
+    # reciprocal multiply; the plain twin's exact exp and ``/`` are pinned
+    # in ``test_fast_math_setting_selects_approximate_gate_math``.
     assert re.search(
         r"cute\.math\.exp2\(flash_g\d+ \* 1\.4426950408889634, fastmath=True\)", code
     )
-    assert _APPROX_GATE_DIVISION.search(code)
-    assert not _IEEE_GATE_DIVISION.search(code)
+    assert APPROX_GATE_DIVISION.search(code)
+    assert not PLAIN_GATE_DIVISION.search(code)
     # The P handoff ring: warp 0 waits for P, issues the PV MMAs and releases
     # the stage (the gate's second acquire of a stage waits on that release).
     assert "flash_p_full = flash_p_ready_cons.wait_and_advance()" in code
@@ -992,7 +1275,8 @@ def test_hstu_selects_gated_body_at_fused_tiles(head_dim: int) -> None:
     # materialized once, ahead of the scores, as an Int32 vector of all-ones /
     # zero lanes; both selects are bit selects on the fp32 patterns.  The
     # masked elements' scores are replaced by 1.0 so zero-filled rows never
-    # take the IEEE division's slow path; the mask statements are hoisted
+    # take the slow path of the IEEE division (``cute_exact_division``); the
+    # mask statements are hoisted
     # above the first score use.
     assert (
         "flash_p_keep_v = cute.where(cute.full((32,), flash_elem_in_tile_m & flash_g9, "
@@ -1196,7 +1480,7 @@ def test_hstu2_sequence_form_selects_gated_body(head_dim: int) -> None:
     with _cpu_codegen_patches():
         kernel.reset()
         bound = kernel.bind(args)
-        match = _match(bound)
+        match = gated_attention_match(bound)
         assert match is not None
         assert match.form == "sequence"
         assert match.io_dtype is torch.float32
@@ -1280,11 +1564,11 @@ def test_hstu2_sequence_form_selects_gated_body(head_dim: int) -> None:
     assert "tSTrS.store(flash_p_v)" in code
     assert "St32x32bOp(cute_tcgen05_flash.Repetition(32))" in code
     # The example ships with ``fast_math=True``: approximate gate division; the
-    # exact twin keeps the IEEE divide.
-    assert _APPROX_GATE_DIVISION.search(code)
-    assert not _IEEE_GATE_DIVISION.search(code)
-    assert _IEEE_GATE_DIVISION.search(exact)
-    assert not _APPROX_GATE_DIVISION.search(exact)
+    # twin without it keeps ``/``.
+    assert APPROX_GATE_DIVISION.search(code)
+    assert not PLAIN_GATE_DIVISION.search(code)
+    assert PLAIN_GATE_DIVISION.search(exact)
+    assert not APPROX_GATE_DIVISION.search(exact)
     assert "block=(384, 1, 1)" in code
 
 
@@ -1306,9 +1590,28 @@ def test_hstu2_wide_tile_rejected_at_head_dim_128() -> None:
 def test_hstu_other_tiles_keep_scalar_path_and_validate_knob() -> None:
     with _cpu_codegen_patches():
         bound = _bind_hstu(_hstu_args())
+        # The 16-row query tile takes the register-MMA row program, not the
+        # fused body (test_cute_flash_gated_row_mma covers it).
         code = bound.to_code(helion.Config(block_sizes=[16, 16]))
         assert not _gated_markers(code)
         assert "_flash_qk_mma" not in code
+        assert "'kind': 'helion_flash_gated_row_mma'" in code
+        # A tile neither body takes (a 64-row query tile with a 16-key KV
+        # tile) keeps the scalar path.
+        scalar = bound.to_code(helion.Config(block_sizes=[64, 16]))
+        assert not _gated_markers(scalar)
+        assert "_flash_qk_mma" not in scalar
+        assert "'kind': 'helion_flash_gated_row_mma'" not in scalar
+        assert "_cute_grouped_reduce" in scalar or "cute.arch" in scalar
+        # fp32 rows: the fused body runs them as tf32, the row programs
+        # decline them, so the 16-row tile falls back to the scalar path and
+        # the surface has no row tiles (and no warp knob).
+        seq, alpha, q, k, v, seq_offsets = _hstu_args()
+        fp32 = _bind_hstu((seq, alpha, q.float(), k.float(), v.float(), seq_offsets))
+        assert "cute_flash_gated_row_warps" not in fp32.config_spec._flat_fields()
+        scalar32 = fp32.to_code(helion.Config(block_sizes=[16, 16]))
+        assert not _gated_markers(scalar32)
+        assert "'kind': 'helion_flash_gated_row_mma'" not in scalar32
         with pytest.raises(InvalidConfig, match="cute_flash_kv_stage"):
             bound.config_spec.normalize(
                 helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=99)
@@ -1482,37 +1785,12 @@ def test_hstu_64_row_tile_codegen(
     )
 
 
-def test_fast_math_setting_selects_approximate_gate_math() -> None:
-    """The existing fast_math setting (never a config knob) switches the gate's
-    division and exp2 to the approximate forms; without it the gate stays IEEE.
-    The shipped example enables the setting; its exact twin is built here."""
-    mod = _hstu_module()
-    fast_kernel = mod._helion_jagged_attention_kernel
-    assert fast_kernel.settings.fast_math
-    exact_kernel = _with_fast_math(fast_kernel, False)
-    config = helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=2)
-    args = _hstu_args()
-    with _cpu_codegen_patches():
-        exact_kernel.reset()
-        exact = exact_kernel.bind(args).to_code(config)
-        fast = fast_kernel.bind(args).to_code(config)
-    assert _gated_markers(exact) and _gated_markers(fast)
-    assert "approx=True" not in exact
-    # The ``1 + exp(v)`` site is the only flush-to-zero exp2 in BOTH modes (the
-    # ftz form is provably identical there); the setting changes the division.
-    assert exact.count("fastmath=True") == fast.count("fastmath=True") == 1
-    assert _IEEE_GATE_DIVISION.search(exact)
-    assert not _APPROX_GATE_DIVISION.search(exact)
-    assert _APPROX_GATE_DIVISION.search(fast)
-    assert not _IEEE_GATE_DIVISION.search(fast)
-
-
 def test_gated_match_facts_and_online_softmax_rejection() -> None:
     from test.test_cute_backend import cute_causal_biased_attention
 
     with _cpu_codegen_patches():
         bound = _bind_hstu(_hstu_args())
-        match = _match(bound)
+        match = gated_attention_match(bound)
         assert match is not None
         assert match.head_dim == 64
         assert match.io_dtype is torch.bfloat16
@@ -1530,7 +1808,7 @@ def test_gated_match_facts_and_online_softmax_rejection() -> None:
         values.append(torch.empty((1, 2, 256, 256), dtype=torch.float16))
         cute_causal_biased_attention.reset()
         softmax_bound = cute_causal_biased_attention.bind(tuple(values))
-        assert _match(softmax_bound) is None
+        assert gated_attention_match(softmax_bound) is None
         assert softmax_bound.config_spec.cute_flash_search_enabled
         assert not softmax_bound.config_spec.cute_flash_gated_search_enabled
         code = softmax_bound.to_code(
@@ -1547,7 +1825,7 @@ def test_variant_kernels_match_and_lower(name: str) -> None:
         kernel.reset()
         bound = kernel.bind(_hstu_args())
         assert bound.config_spec.cute_flash_gated_search_enabled
-        match = _match(bound)
+        match = gated_attention_match(bound)
         assert match is not None
         code = bound.to_code(
             helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=2)
@@ -1614,6 +1892,102 @@ def test_variant_kernels_match_and_lower(name: str) -> None:
         )
 
 
+def test_fast_math_division_gate_compiles_without_gpu(tmp_path: Path) -> None:
+    """Compile the division gate's fused render (scalar ``div.approx.ftz``,
+    the flush-to-zero products of a reciprocal vector and of a broadcast
+    scalar reciprocal, a bf16 vector quotient by ``/``) through the CuTe DSL."""
+    env_patch = (
+        {}
+        if torch.cuda.is_available() or "CUTE_DSL_ARCH" in os.environ
+        else {"CUTE_DSL_ARCH": "sm_100a"}
+    )
+    args = _hstu_args()
+    kernel = _with_fast_math(_division_gate_kernel, True)
+    with _cpu_codegen_patches(), patch.dict(os.environ, env_patch):
+        kernel.reset()
+        code = kernel.bind(args).to_code(
+            helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=2)
+        )
+        assert _gated_markers(code)
+        assert "gated_mul_ftz_vec" in code
+        # The DSL re-reads the kernel source, so the module must live on disk.
+        source_path = tmp_path / "division_gate.py"
+        source_path.write_text(code)
+        namespace: dict[str, object] = {}
+        exec(compile(code, str(source_path), "exec"), namespace)
+        host_fn = namespace["_division_gate_kernel"]
+        assert callable(host_fn)
+        host_fn(*args, _launcher=_compile_only_launcher)
+
+
+def test_gate_vector_division_is_div_approx_ftz_bit_for_bit() -> None:
+    """The fused body's fp32 vector quotient under fast_math,
+    ``gated_mul_ftz_vec`` of the dividends and ``rcp.approx.ftz`` of the
+    divisors, has the bits of the pointwise lowering's ``div.approx.ftz`` per
+    element, specials included.  The TensorSSA product of the same
+    reciprocals keeps a subnormal dividend (``2**-127 / 2**-126`` gives 0.5
+    where the division flushes it to 0) and a subnormal quotient."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-family gated attention required")
+
+    @cute.kernel
+    def divide(
+        a: cute.Tensor,
+        b: cute.Tensor,
+        fused: cute.Tensor,
+        plain: cute.Tensor,
+        pointwise: cute.Tensor,
+    ) -> None:
+        i = cutlass.Int32(cute.arch.thread_idx()[0])
+        lhs = cute.make_rmem_tensor((2,), cutlass.Float32)
+        rhs = cute.make_rmem_tensor((2,), cutlass.Float32)
+        for j in cutlass.range_constexpr(2):
+            lhs[j] = cutlass.Float32(a[2 * i + j])
+            rhs[j] = cutlass.Float32(b[2 * i + j])
+        reciprocal = cute.math.rcp(rhs.load(), approx=True, ftz=True)
+        flushed = cute.make_rmem_tensor((2,), cutlass.Float32)
+        product = cute.make_rmem_tensor((2,), cutlass.Float32)
+        flushed.store(gated_mul_ftz_vec(lhs.load(), reciprocal))
+        product.store(lhs.load() * reciprocal)
+        for j in cutlass.range_constexpr(2):
+            fused[2 * i + j] = flushed[j]
+            plain[2 * i + j] = product[j]
+            pointwise[2 * i + j] = cute.math.div(lhs[j], rhs[j], approx=True, ftz=True)
+
+    inf, nan = float("inf"), float("nan")
+    special = [
+        (2.0**-127, 2.0**-126),  # subnormal dividend
+        (-(2.0**-127), 2.0**-126),
+        (1e-40, 1e-3),
+        (2.0**-100, 2.0**30),  # subnormal quotient
+        (1.0, 2.0**127),  # divisor above 2**126
+        (inf, 2.0**127),
+        (-1.0, 1e-40),  # subnormal divisor
+        (0.0, 0.0),
+        (1.0, 0.0),
+        (-0.0, 3.0),
+        (inf, 2.0),
+        (nan, 1.0),
+        (3.0, 7.0),
+        (-5.5, 0.1),
+    ]
+    torch.manual_seed(0)
+    # Normal operands whose quotients reach every scale, subnormal and
+    # overflowing ones included.
+    exponents = torch.randint(-100, 101, (2, 498)).float()
+    random = torch.randn(2, 498) * torch.exp2(exponents)
+    a = torch.cat([torch.tensor([x for x, _ in special]), random[0]]).to(DEVICE)
+    b = torch.cat([torch.tensor([y for _, y in special]), random[1]]).to(DEVICE)
+    fused, plain, pointwise = (torch.empty_like(a) for _ in range(3))
+    default_cute_launcher(
+        divide, (1, 1, 1), a, b, fused, plain, pointwise, block=(a.numel() // 2, 1, 1)
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(fused.view(torch.int32), pointwise.view(torch.int32))
+    assert pointwise[0].item() == 0.0 and plain[0].item() == 0.5
+    assert pointwise[3].item() == 0.0 and plain[3].item() == 2.0**-130
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -1634,7 +2008,7 @@ def test_mutations_are_rejected(name: str) -> None:
         bound = kernel.bind(args)
         spec = bound.config_spec
         assert not spec.cute_flash_gated_search_enabled
-        assert _match(bound) is None
+        assert gated_attention_match(bound) is None
         # Without a flash surface the ring-depth knob has no consumer: a
         # pinned config keeps working on the scalar path, minus the key.
         normalized = spec.normalized_config(
@@ -1953,7 +2327,6 @@ def _assert_matches(out: torch.Tensor, expected: torch.Tensor, tol: float) -> No
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("head_dim", "kv_stage", "kv_tile", "q_tile", "warpgroups"),
@@ -2008,7 +2381,6 @@ def test_gated_hstu_matches_reference_at_jagged_lengths(
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "name", ["tile_end", "no_if", "band", "row_only", "pair_table", "row_scaled"]
@@ -2067,7 +2439,6 @@ def test_gated_variants_match_reference_on_gpu(name: str) -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("q_tile", [128, 64])
 def test_gated_long_sequence_bitwise_across_warpgroups(q_tile: int) -> None:
@@ -2097,7 +2468,6 @@ def test_gated_long_sequence_bitwise_across_warpgroups(q_tile: int) -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("q_tile", [128, 64])
 def test_gated_oversubscribed_grid_is_deterministic(q_tile: int) -> None:
@@ -2129,11 +2499,11 @@ def test_gated_oversubscribed_grid_is_deterministic(q_tile: int) -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gated_exact_math_matches_reference_on_gpu() -> None:
     """The shipped example runs the fast_math gate in every other GPU test;
-    this one runs the exact (IEEE division) twin against the reference."""
+    this one runs the twin without it (the exact exp, ``/``) against the
+    reference."""
     torch.manual_seed(11)
     max_seq_len = 300
     q, k, v, seq_offsets = _jagged_inputs([300, 173, 261, 5], 2, 64)
@@ -2152,12 +2522,34 @@ def test_gated_exact_math_matches_reference_on_gpu() -> None:
     config = helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=3)
     out = _run_gated(kernel, args, config)
     code = kernel.bind(args).to_code(config)
-    assert _IEEE_GATE_DIVISION.search(code) and not _APPROX_GATE_DIVISION.search(code)
+    assert PLAIN_GATE_DIVISION.search(code) and not APPROX_GATE_DIVISION.search(code)
     _assert_matches(out, expected, 3e-2)
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_sigmoid_gate_matches_a_declined_config_on_gpu() -> None:
+    """The sigmoid gate (``SIGMOID_TEMPLATE`` of the scores and of a
+    per-sequence scalar) runs in the fused body and matches the scalar path
+    of a config the body declines."""
+    torch.manual_seed(13)
+    # The scalar path stores every row of a query tile, zeros past the
+    # sequence's end: the first length is a multiple of both query tiles and
+    # padding follows the second, so no tile stores into another sequence.
+    q, k, v, seq_offsets = _jagged_inputs([256, 173], 2, 64, padding=128)
+    args = (256, 0.05, q, k, v, seq_offsets)
+    fused = _run_gated(
+        _sigmoid_gate_kernel,
+        args,
+        helion.Config(block_sizes=[128, 128], cute_flash_kv_stage=3),
+    )
+    bound = _sigmoid_gate_kernel.bind(args)
+    declined = bound.compile_config(helion.Config(block_sizes=[64, 16]))(*args)
+    torch.cuda.synchronize()
+    _assert_matches(fused, declined.float(), 2e-2)
+
+
+# pyrefly: ignore [bad-argument-type]
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("head_dim", "kv_tile", "warpgroups", "q_tile"),

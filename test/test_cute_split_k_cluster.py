@@ -11,13 +11,11 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from test.cute_population_contracts import checked_initial_population
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_split_k_workspace import _embedded_sources
 from test.test_cute_split_k_workspace import _fp32_bias
 from test.test_cute_split_k_workspace import _nonlinear_partial
@@ -26,35 +24,40 @@ from test.test_cute_split_k_workspace import _output_alias
 from test.test_cute_split_k_workspace import _output_argument
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_split_k_cluster import cluster_carrier
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute_split_k_cluster import (
+    cluster_carrier,
+)
 from helion._compiler.cute.split_k_cluster import CLUSTER_K_SCHEDULE
 from helion._compiler.cute.split_k_cluster_config import CLUSTER8_K4
 from helion._compiler.cute.split_k_cluster_config import SCHEDULE_KEY
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.state import cute_env_state
+from helion._testing import default_cute_mma_support
+from helion._testing import import_example
+from helion._testing.cute_codegen import check_config_compile_options
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 
-pytestmark = skipUnlessBackends(["cute"])
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
+
+# ``tcgen05_cpu_target``: the B200 model with the default (tcgen05-on) MMA
+# support record and the full 227 KiB opt-in SMEM as the AB budget.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(
+        mma_support=default_cute_mma_support(), smem_budget_bytes=232448
+    ),
+]
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
     from pathlib import Path
 
 
-@pytest.fixture(autouse=True)
-def cpu_only() -> Iterator[None]:
-    with (
-        _cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-    ):
-        yield
-
-
 def _bind(shape=(32, 4096, 64), *, bias=False, disable_heuristics=False, **settings):
+    # The cluster-K schedule is validated on fp32 (promoted) destinations; the
+    # float16 output accumulates in place by default now.
+    settings.setdefault("cute_promote_half_atomic_outputs", True)
     m, k, n = shape
     a = torch.empty((m, k), dtype=torch.float16)
     b = torch.empty((k, n), dtype=torch.float16)
@@ -111,6 +114,8 @@ def test_original_family_normal_set_config_preserves_allocating_host(shape, bias
         assert len(values) == (4 if bias else 3)
     source = _embedded_sources(bound.to_code(config))[0]
     assert "atomic" not in source and "torch.zeros" not in source
+    if shape == (32, 4096, 64) and not bias:
+        check_config_compile_options(bound, config)
     assert "cluster_arrive_relaxed()" in source
     assert source.count("cluster_wait()") == 2
     if bias:
@@ -219,7 +224,7 @@ def test_observable_or_non_affine_reductions_not_admitted(kernel):
 
 def test_shared_capacity_covers_all_aligned_allocations_and_reserved_bytes():
     with patch.object(
-        CuteTcgen05Config,
+        target_facts,
         "per_cta_smem_capacity_bytes",
         return_value=CLUSTER_K_SCHEDULE.shared_upper_bound - 1,
     ):
@@ -247,7 +252,11 @@ def test_unaligned_input_rejects_before_default_launcher(shift):
     a = torch.empty(32 * 4096 + shift, dtype=torch.float16)[shift:].view(32, 4096)
     b = torch.empty((4096, 64), dtype=torch.float16)
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = kernel._bind_isolated((a, b))
     with pytest.raises(helion.exc.BackendUnsupported, match="aligned inputs"):
@@ -258,7 +267,11 @@ def test_positive_padded_input_strides_and_non_original_extents():
     a = torch.empty_strided((48, 8192), (8200, 1), dtype=torch.float16)
     b = torch.empty_strided((8192, 80), (88, 1), dtype=torch.float16)
     kernel = helion.kernel(
-        matmul_split_k.fn, backend="cute", static_shapes=True, autotune_effort="none"
+        matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     bound = kernel._bind_isolated((a, b))
     config = _carrier(bound)
@@ -359,6 +372,7 @@ def test_padded_element_offset_int32_boundary(operand, overflow):
             backend="cute",
             static_shapes=True,
             autotune_effort="none",
+            cute_promote_half_atomic_outputs=True,
         )
         args = (a, b, lambda acc, tile: acc + bias[tile[1]])
         bound = kernel._bind_isolated(args)
@@ -416,6 +430,7 @@ def test_generated_module_name_does_not_shadow_host_bindings(
         backend="cute",
         static_shapes=True,
         autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
     )
     args = (
         torch.empty((32, 4096), dtype=torch.float16),
@@ -449,3 +464,122 @@ def test_generated_module_name_does_not_shadow_host_bindings(
             and values[4] is outputs[index]
         )
         assert kwargs == {"block": (32, 4, 1)}
+
+
+@pytest.mark.parametrize("promote", (False, True))
+def test_half_output_cluster_facts_follow_the_promotion_setting(promote: bool) -> None:
+    """Cluster-K is validated on fp32 destinations: with the default
+    ``cute_promote_half_atomic_outputs=False`` matmul_split_k's float16
+    output accumulates in place and the schedule declines; with the
+    promotion on (the fp32 twin) the facts and the carrier exist."""
+    bound, _args = _bind(cute_promote_half_atomic_outputs=promote)
+    assert bool(cute_env_state(bound.env).half_atomic_output_promotions) == promote
+    assert (bound.config_spec.cute_split_k_cluster_facts is not None) == promote
+    assert (_carrier(bound) is not None) == promote
+
+
+# GPU numerics of the cluster split-K schedule: the finalizer warps execute
+# and replay under a CUDA graph (sm_90+).
+
+
+CUDA_DEVICE = "cuda"
+
+
+def _check_cluster(
+    shape: tuple[int, int, int],
+    *,
+    bias: bool,
+    finalizer_warps: int,
+    fp32_output: bool = False,
+) -> None:
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Cluster shared memory requires SM90 or newer")
+    m, k, n = shape
+    dtype = torch.bfloat16 if fp32_output else torch.float16
+    device = torch.device(CUDA_DEVICE)
+    generator = torch.Generator(device=device).manual_seed(7021)
+    # Offset by a complete vector to exercise aligned, padded input row strides.
+    padding = 8 if k > 4096 or fp32_output else 0
+    a = torch.empty((m, k + padding), dtype=dtype, device=device)[:, padding:]
+    b = torch.empty((k, n + padding), dtype=dtype, device=device)[:, padding:]
+    bias_tensor = torch.empty((n * 3,), dtype=dtype, device=device)[::3]
+
+    def refresh() -> None:
+        a.normal_(std=k**-0.5, generator=generator)
+        b.normal_(generator=generator)
+        bias_tensor.normal_(generator=generator)
+
+    refresh()
+    kernel = helion.kernel(
+        _fp32_bias.fn if fp32_output else matmul_split_k.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_promote_half_atomic_outputs=True,
+        cute_full_slice_matmul_tiling=False,
+        cute_region_fission=False,
+    )
+    args: tuple[object, ...]
+    if fp32_output:
+        args = (a, b, bias_tensor)
+    elif bias:
+        args = (a, b, lambda acc, tile: acc + bias_tensor[tile[1]])
+    else:
+        args = (a, b)
+    bound = kernel.bind(args)
+    with bound.env, bound.host_function:
+        config = cluster_carrier(bound.env, bound.host_function.device_ir)
+    assert config is not None
+    config.config["cute_split_k_finalizer_warps"] = finalizer_warps
+    bound.set_config(config)
+    assert bound._run is not None
+    compiled = cast("Any", bound._run)
+    metadata = compiled._helion_cute_split_k_schedule
+    assert metadata["cluster"] == (8, 1, 1)
+    assert metadata.get("finalizer_warps", 1) == finalizer_warps
+
+    def check(output: torch.Tensor) -> None:
+        expected = a.double() @ b.double()
+        if bias:
+            expected = expected + bias_tensor.double()
+        tolerance = 2e-4 if fp32_output else 2e-3
+        torch.testing.assert_close(
+            output,
+            expected.to(torch.float32 if fp32_output else dtype),
+            rtol=tolerance,
+            atol=tolerance,
+        )
+
+    first = compiled(*args)
+    second = compiled(*args)
+    assert first.data_ptr() != second.data_ptr()
+    check(first)
+    check(second)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replay_output = compiled(*args)
+    for _ in range(2):
+        refresh()
+        replay_output.fill_(float("nan"))
+        graph.replay()
+        check(replay_output)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize("shape", ((32, 4096, 64), (48, 8192, 80)))
+@pytest.mark.parametrize("bias", (False, True))
+@pytest.mark.parametrize("finalizer_warps", (1, 4))
+def test_cluster_finalizers_execute_and_replay(
+    shape: tuple[int, int, int], bias: bool, finalizer_warps: int
+) -> None:
+    _check_cluster(shape, bias=bias, finalizer_warps=finalizer_warps)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.cuda
+@pytest.mark.parametrize("finalizer_warps", (1, 4))
+def test_cluster_bfloat16_fp32_output_and_strided_bias(finalizer_warps: int) -> None:
+    _check_cluster(
+        (48, 8192, 80), bias=True, finalizer_warps=finalizer_warps, fp32_output=True
+    )

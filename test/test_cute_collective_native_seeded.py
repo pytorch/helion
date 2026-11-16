@@ -2,24 +2,27 @@ from __future__ import annotations
 
 import ast
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.test_cute_collective_dot import _invariant_seed_dot
 from test.test_cute_collective_seeds import _independent_matmuls
 from test.test_cute_collective_tcgen05 import _scalar_epilogues
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_tcgen05 import CollectiveTcgen05Plan
 from helion._compiler.cute.collective_tcgen05 import CollectiveTmemResource
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 
 CUDA_DEVICE = "cuda"
 
@@ -79,11 +82,10 @@ def _inputs(dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("tile", [(64, 32, 16), (64, 64, 32), (128, 64, 128)])
-@skipUnlessBackends(["cute"])
 def test_native_uploads_float32_carry_before_accumulating(
     dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(dtype))
+    bound = cpu_bind(_seeded_contraction, _inputs(dtype))
     source = bound.to_code(_config(*tile))
     warp = bound.to_code(_config(*tile, compute="warp"))
     assert "tcgen05.CtaGroup.ONE" in source
@@ -96,9 +98,8 @@ def test_native_uploads_float32_carry_before_accumulating(
     assert source.index("fence_view_async_tmem_store") < source.index("cute.gemm(")
 
 
-@skipUnlessBackends(["cute"])
 def test_seeded_native_is_optional_and_survives_config_roundtrip() -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     assert "tcgen05.CtaGroup.ONE" not in bound.to_code(_config(enabled=False))
     assert "tcgen05.CtaGroup.ONE" not in bound.to_code(_config(compute="warp"))
     with bound.env:
@@ -109,12 +110,11 @@ def test_seeded_native_is_optional_and_survives_config_roundtrip() -> None:
 
 
 @pytest.mark.parametrize("seeded", [False, True])
-@skipUnlessBackends(["cute"])
 def test_seed_search_distinguishes_nonzero_carries(seeded: bool) -> None:
     if seeded:
-        bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+        bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     else:
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _independent_matmuls,
             tuple(
                 torch.empty(shape, dtype=torch.bfloat16)
@@ -156,13 +156,12 @@ def test_seed_search_distinguishes_nonzero_carries(seeded: bool) -> None:
 
 
 @pytest.mark.parametrize("reason", ["invariant", "written_seed", "narrow_seed"])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_does_not_relax_carry_dtype_or_alias_proofs(reason: str) -> None:
     a, b, seed, _limit = _inputs(torch.float16)
     if reason == "invariant":
-        bound = _cpu_bind(_invariant_seed_dot, (a, b.T, seed))
+        bound = cpu_bind(_invariant_seed_dot, (a, b.T, seed))
     elif reason == "written_seed":
-        bound = _cpu_bind(_seed_written_in_place, (a, b, seed))
+        bound = cpu_bind(_seed_written_in_place, (a, b, seed))
         for enabled in (False, True):
             with pytest.raises(
                 helion.exc.BackendUnsupported,
@@ -171,7 +170,7 @@ def test_seeded_native_does_not_relax_carry_dtype_or_alias_proofs(reason: str) -
                 bound.to_code(_config(enabled=enabled))
         return
     else:
-        bound = _cpu_bind(_seeded_contraction, (a, b, seed.half(), 78))
+        bound = cpu_bind(_seeded_contraction, (a, b, seed.half(), 78))
     source = bound.to_code(_config())
     assert "tcgen05.CtaGroup.ONE" not in source
     assert "fence_view_async_tmem_store" not in source
@@ -200,9 +199,8 @@ def test_seed_store_wait_precedes_cta_handoff(bm: int, bn: int) -> None:
 
 
 @pytest.mark.parametrize("value", [0, 1, "true", None])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_requires_boolean_config(value: object) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.float16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.float16))
     config = helion.Config.from_dict(
         _config().config | {"cute_collective_native_seeded": value}
     )
@@ -211,11 +209,10 @@ def test_seeded_native_requires_boolean_config(value: object) -> None:
 
 
 @pytest.mark.parametrize("capability", [(8, 0), (9, 0), (12, 0), None])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_is_available_only_on_sm100(
     capability: tuple[int, int] | None,
 ) -> None:
-    bound = _cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
+    bound = cpu_bind(_seeded_contraction, _inputs(torch.bfloat16))
     bound.config_spec.target_device_capability = capability
     with pytest.raises(
         helion.exc.InvalidConfig,
@@ -254,14 +251,13 @@ def _mamba_kernel(*, static_shapes: bool) -> helion.Kernel:
 
 @pytest.mark.parametrize("shape", [1, 2])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_native_seed_search_covers_both_original_contractions(
     shape: int, static_shapes: bool
 ) -> None:
     inputs = tuple(
         torch.empty(size, dtype=torch.bfloat16) for size in _mamba_sizes(shape)
     )
-    bound = _cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs)
+    bound = cpu_bind(_mamba_kernel(static_shapes=static_shapes), inputs)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -290,7 +286,6 @@ def test_native_seed_search_covers_both_original_contractions(
 @pytest.mark.parametrize(
     "tile,stride", [((64, 32, 16), 80), ((64, 64, 32), 78), ((128, 64, 128), 80)]
 )
-@skipUnlessBackends(["cute"])
 def test_seeded_native_tails_empty_k_and_mutating_graphs(
     dtype: torch.dtype, tile: tuple[int, int, int], stride: int
 ) -> None:
@@ -342,7 +337,6 @@ def test_seeded_native_tails_empty_k_and_mutating_graphs(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_native_accumulates_into_seed_before_each_k_instruction(
     dtype: torch.dtype,
 ) -> None:
@@ -363,13 +357,20 @@ def test_native_accumulates_into_seed_before_each_k_instruction(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [1, 2])
 @pytest.mark.parametrize("tile", [(64, 32, 64), (64, 64, 64), (128, 64, 128)])
-@skipUnlessBackends(["cute"])
 def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     shape: int, dtype: torch.dtype, tile: tuple[int, int, int]
 ) -> None:
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")
     sizes = _mamba_sizes(shape)
+    bm, bn, bk = tile
+    chunk_size = sizes[0][3]
+    if bm > chunk_size:
+        # ``block_m`` is registered up to ``chunk_size`` and the autotuner
+        # never exceeds it, but a hand-written config can: the kernel's causal
+        # sweep ``(tile_m.id + 1) * block_m`` assumes whole row tiles, and a
+        # larger block reads ``cb`` past the row.
+        pytest.skip(f"block_m={bm} exceeds the kernel's chunk_size={chunk_size}")
     torch.manual_seed(20260911 + shape)
     x = torch.randn(sizes[1], device=CUDA_DEVICE, dtype=torch.bfloat16)
     dt = torch.rand(sizes[2], device=CUDA_DEVICE, dtype=x.dtype)
@@ -385,7 +386,6 @@ def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     reference = kernel._bind_isolated(arguments)
     reference.set_config(reference.config_spec.autotune_reference_config())
     bound = kernel._bind_isolated(arguments)
-    bm, bn, bk = tile
     config = helion.Config(
         block_sizes=[bm, bn, bk],
         num_threads=[128 // bn, bn, 1, 1],
@@ -403,9 +403,7 @@ def test_seeded_native_original_mamba_strict_accuracy_and_mutated_graphs(
     bound.set_config(config)
 
     def compare(actual: torch.Tensor, expected: torch.Tensor) -> None:
-        _chunked_assert_close(
-            actual, expected, atol=0.01, rtol=0.01, scale_atol_by_expected_rms=True
-        )
+        _chunked_assert_close(actual, expected, atol=0.01, rtol=0.01, atol_scale="rms")
 
     def run() -> torch.Tensor:
         return bound(*arguments)

@@ -1,4 +1,10 @@
-"""Typed proof and final-host rewrite for independent sum/cast pairs."""
+"""Typed proof and final-host rewrite for independent sum/cast pairs.
+
+The first of the three host-sum tails (:mod:`host_sums`): two adjacent
+``<name> = <2-D FP32>.sum(0).to(<dtype>)`` statements with the same dtype
+owner become one ``_cute_try_paired_sum_cast`` call that computes both
+column sums in one kernel (:mod:`helion.runtime.cute.paired_sum`).
+"""
 
 from __future__ import annotations
 
@@ -6,39 +12,24 @@ import ast
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import torch
-
 from ..ast_extension import ExtendedAST
 from ..ast_extension import statement_from_string
-from ..type_info import LiteralType
-from ..type_info import TensorAttributeType
-from ..type_info import TensorType
-from ..variable_origin import ArgumentOrigin
+from .host_sum_site import PAIRED_SUM_CHOICES
+from .host_sum_site import HostSumSite
+from .host_sum_site import assigned_names
+from .host_sum_site import bound_names
+from .host_sum_site import fold_constexpr_branches
+from .host_sum_site import fresh_temporary
+from .host_sum_site import prove_host_body
+from .host_sum_site import sum_cast_value
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    import torch
 
     from ..host_function import HostFunction
     from ..source_location import SourceLocation
-    from ..type_info import TypeInfo
 
-PAIRED_SUM_KEY = "cute_host_paired_sum"
-PAIRED_SUM_CHOICES = ("off", "mapped", "narrow")
 _PAIRED_SUM_HELPER = "_cute_try_paired_sum_cast"
-
-
-def _type(node: ast.AST) -> TypeInfo | None:
-    return node._type_info if isinstance(node, ExtendedAST) else None
-
-
-@dataclass(frozen=True)
-class SumCastValue:
-    """Typed, effect-free arguments to a canonical Tensor sum/cast expression."""
-
-    source: str
-    dtype_argument: str
-    dtype_is_tensor: bool
-    dtype: torch.dtype
 
 
 @dataclass(frozen=True)
@@ -54,87 +45,13 @@ class SumCast:
     dtype: torch.dtype
 
 
-def _sum_cast_value(
-    cast: ast.AST,
-    dtypes: tuple[torch.dtype, ...] = (torch.bfloat16, torch.float32),
-) -> SumCastValue | None:
-    if not (
-        isinstance(cast, ast.Call)
-        and not cast.keywords
-        and len(cast.args) == 1
-        and isinstance(cast.func, ast.Attribute)
-        and cast.func.attr == "to"
-        and isinstance(reduce := cast.func.value, ast.Call)
-        and not reduce.keywords
-        and len(reduce.args) == 1
-        and isinstance(reduce.args[0], ast.Constant)
-        and type(reduce.args[0].value) is int
-        and reduce.args[0].value == 0
-        and isinstance(reduce.func, ast.Attribute)
-        and reduce.func.attr == "sum"
-        and isinstance(source := reduce.func.value, ast.Name)
-    ):
-        return None
-    source_type = _type(source)
-    sum_method, cast_method = _type(reduce.func), _type(cast.func)
-    sum_type, cast_type, dtype_type = _type(reduce), _type(cast), _type(cast.args[0])
-    if not (
-        isinstance(source_type, TensorType)
-        and source_type.fake_value.ndim == 2
-        and source_type.fake_value.dtype == torch.float32
-        and isinstance(sum_method, TensorAttributeType)
-        and sum_method.attr() == "sum"
-        and isinstance(cast_method, TensorAttributeType)
-        and cast_method.attr() == "to"
-        and isinstance(sum_type, TensorType)
-        and sum_type.fake_value.ndim == 1
-        and sum_type.fake_value.dtype == torch.float32
-        and isinstance(cast_type, TensorType)
-        and cast_type.fake_value.ndim == 1
-        and isinstance(dtype_type, LiteralType)
-        and isinstance(dtype_type.value, torch.dtype)
-        and dtype_type.value in dtypes
-        and cast_type.fake_value.dtype == dtype_type.value
-    ):
-        return None
-    dtype_expression = cast.args[0]
-    # Pass a dtype owner, rather than reading its attribute ahead of the first
-    # original sum. The runtime gate checks exact Tensor identity before reading
-    # metadata; a subclass or unsupported case executes the original AST.
-    if (
-        isinstance(dtype_expression, ast.Attribute)
-        and dtype_expression.attr == "dtype"
-        and isinstance(dtype_expression.value, ast.Name)
-        and isinstance(_type(dtype_expression.value), TensorType)
-    ):
-        dtype_argument = dtype_expression.value.id
-        dtype_is_tensor = True
-    elif (
-        isinstance(dtype_expression, ast.Attribute)
-        and isinstance(dtype_expression.value, ast.Name)
-        and isinstance(module_type := _type(dtype_expression.value), LiteralType)
-        and module_type.value is torch
-        and dtype_expression.attr in ("float16", "bfloat16", "float32")
-    ):
-        dtype_argument = ast.unparse(dtype_expression)
-        dtype_is_tensor = False
-    else:
-        return None
-    return SumCastValue(
-        source.id,
-        dtype_argument,
-        dtype_is_tensor,
-        dtype_type.value,
-    )
-
-
 def _sum_cast(statement: ast.AST) -> SumCast | None:
     if not (
         isinstance(statement, ast.Assign)
         and isinstance(statement, ExtendedAST)
         and len(statement.targets) == 1
         and isinstance(statement.targets[0], ast.Name)
-        and (value := _sum_cast_value(statement.value)) is not None
+        and (value := sum_cast_value(statement.value)) is not None
     ):
         return None
     return SumCast(
@@ -146,43 +63,6 @@ def _sum_cast(statement: ast.AST) -> SumCast | None:
         value.dtype_is_tensor,
         value.dtype,
     )
-
-
-def _constant_condition(node: ast.AST, host: HostFunction) -> bool | None:
-    if isinstance(node, ast.Constant) and type(node.value) is bool:
-        return node.value
-    if isinstance(node, ast.Name) and isinstance(info := _type(node), LiteralType):
-        origin = info.origin
-        if isinstance(origin, ArgumentOrigin):
-            value = host.constexpr_args.get(origin.name)
-            if type(value) is bool and value is info.value:
-                return value
-    return None
-
-
-def _folded_body(
-    body: Sequence[ast.AST], conditions: dict[SourceLocation, tuple[str, bool]]
-) -> list[ast.AST]:
-    result: list[ast.AST] = []
-    for statement in body:
-        if (
-            isinstance(statement, ast.If)
-            and isinstance(statement, ExtendedAST)
-            and (condition := conditions.get(statement._location)) is not None
-            and (
-                ast.dump(statement.test) == condition[0]
-                or (
-                    isinstance(statement.test, ast.Constant)
-                    and type(statement.test.value) is bool
-                    and statement.test.value is condition[1]
-                )
-            )
-        ):
-            selected = statement.body if condition[1] else statement.orelse
-            result.extend(_folded_body(selected, conditions))
-        else:
-            result.append(statement)
-    return result
 
 
 @dataclass(frozen=True)
@@ -199,38 +79,11 @@ def prove_host_sum_pairs(host: HostFunction) -> HostSumProof:
     be fresh local names. This excludes early NameError, target destruction,
     pair dependencies and reordering across an effect or exception handler.
     """
-    nodes = list(ast.walk(ast.Module(body=host.body, type_ignores=[])))
-    # The generated helper is a module import. Any lexical binding of its
-    # name, even an assignment after the pair, can shadow that import. Keep
-    # such programs on their original host path before exposing choices/seeds.
-    if host.name == _PAIRED_SUM_HELPER or any(
-        (isinstance(node, ast.Name) and node.id == _PAIRED_SUM_HELPER)
-        or (isinstance(node, ast.arg) and node.arg == _PAIRED_SUM_HELPER)
-        or (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-            and node.name == _PAIRED_SUM_HELPER
-        )
-        or (
-            isinstance(node, ast.alias)
-            and (node.asname or node.name.split(".", 1)[0]) == _PAIRED_SUM_HELPER
-        )
-        for node in (*nodes, *ast.walk(host.args))
-    ):
+    facts = prove_host_body(host, (_PAIRED_SUM_HELPER,))
+    if facts is None:
         return HostSumProof((), {})
-    if any(
-        isinstance(node, (ast.Delete, ast.Try, ast.Global, ast.Nonlocal))
-        for node in nodes
-    ):
-        return HostSumProof((), {})
-    conditions = {
-        node._location: (ast.dump(node.test), condition)
-        for node in nodes
-        if isinstance(node, ast.If)
-        and isinstance(node, ExtendedAST)
-        and (condition := _constant_condition(node.test, host)) is not None
-    }
-    body = _folded_body(host.body, conditions)
-    defined = {argument.arg for argument in host.args.args}
+    body = facts.folded
+    defined = facts.defined
     written = set(defined)
     pairs: list[tuple[SumCast, SumCast]] = []
     index = 0
@@ -257,12 +110,7 @@ def prove_host_sum_pairs(host: HostFunction) -> HostSumProof:
                 written.update(targets)
                 index += 2
                 continue
-        if isinstance(statement, ast.Assign):
-            defined.update(
-                target.id
-                for target in statement.targets
-                if isinstance(target, ast.Name)
-            )
+        defined.update(assigned_names(statement))
         written.update(
             node.id
             for node in ast.walk(statement)
@@ -271,7 +119,7 @@ def prove_host_sum_pairs(host: HostFunction) -> HostSumProof:
         if isinstance(statement, (ast.Return, ast.Raise)):
             break
         index += 1
-    return HostSumProof(tuple(pairs), conditions)
+    return HostSumProof(tuple(pairs), facts.conditions)
 
 
 def lower_host_sum_pairs(
@@ -284,17 +132,11 @@ def lower_host_sum_pairs(
     proof = prove_host_sum_pairs(host)
     if not proof.pairs:
         return body
-    folded = _folded_body(body, proof.conditions)
+    folded = fold_constexpr_branches(body, proof.conditions)
     pairs = {
         (left.location, right.location): (left, right) for left, right in proof.pairs
     }
-    names = {
-        node.id
-        for statement in folded
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Name)
-    }
-    names.update(argument.arg for argument in host.args.args)
+    names = bound_names(host, folded)
     result: list[ast.AST] = []
     changed = False
     index = 0
@@ -317,32 +159,21 @@ def lower_host_sum_pairs(
             and ast.dump(right) == pair[1].statement
         ):
             first, second = pair
-            temporary = "_helion_paired_sum"
-            while temporary in names:
-                temporary += "_"
-            names.add(temporary)
+            temporary = fresh_temporary("_helion_paired_sum", names)
             result.extend(
-                (
-                    statement_from_string(
-                        f"{temporary} = {_PAIRED_SUM_HELPER}("
-                        f"{first.source}, {second.source}, {first.dtype_argument}, "
-                        f"dtype_is_tensor={first.dtype_is_tensor!r}, layout={layout!r}, "
-                        "_launcher=_launcher)"
-                    ),
-                    ast.If(
-                        test=ast.Compare(
-                            ast.Name(temporary, ast.Load()),
-                            [ast.Is()],
-                            [ast.Constant(None)],
+                HostSumSite(
+                    temporary,
+                    f"{_PAIRED_SUM_HELPER}("
+                    f"{first.source}, {second.source}, {first.dtype_argument}, "
+                    f"dtype_is_tensor={first.dtype_is_tensor!r}, layout={layout!r}, "
+                    "_launcher=_launcher)",
+                    (left, right),
+                    orelse=(
+                        statement_from_string(
+                            f"{first.target}, {second.target} = {temporary}"
                         ),
-                        body=[left, right],
-                        orelse=[
-                            statement_from_string(
-                                f"{first.target}, {second.target} = {temporary}"
-                            )
-                        ],
                     ),
-                )
+                ).emit()
             )
             changed = True
             index += 2

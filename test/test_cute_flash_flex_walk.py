@@ -24,12 +24,18 @@ import pytest
 import torch
 
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import FLEX_SCORE_KIND
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._testing import skipUnlessCuteAvailable
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -443,14 +449,14 @@ def test_flex_mask_form_knob_is_searched_only_with_a_mask_region() -> None:
     key = cute_flash.FLASH_FLEX_MASK_FORM_KEY
     # Appended behind the axes it was introduced after (an inserted axis
     # would reshuffle every later axis's coverage rows).
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(key) == 1
     assert keys.index(key) > keys.index(cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY)
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_mask_form"].default
         == "bitmask"
     )
-    assert (key, "element") in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+    assert (key, "element") in flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
 
     def active(fragments: dict[str, object]) -> tuple[object, ...]:
         fragment = fragments[key]
@@ -498,7 +504,7 @@ def test_flex_aux_smem_knob_is_searched_only_with_a_candidate_table() -> None:
     canonicalizes to the smallest one staging the same tables); resolved to
     0 off flex plans."""
     key = cute_flash.FLASH_FLEX_AUX_SMEM_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     # Appended behind the axes it was introduced after (later knobs follow).
     assert keys.count(key) == 1
     assert keys.index(key) > keys.index(cute_flash.FLASH_FLEX_MASK_FORM_KEY)
@@ -507,7 +513,7 @@ def test_flex_aux_smem_knob_is_searched_only_with_a_candidate_table() -> None:
         == 0
     )
     for value in (4096, 16384):
-        assert (key, value) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+        assert (key, value) in flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
 
     def active(fragments: dict[str, object]) -> tuple[object, ...]:
         fragment = fragments[key]
@@ -584,14 +590,14 @@ def test_flex_prefetch_knob_is_searched_only_with_per_chunk_table_loads() -> Non
     to the smallest one with the same loads and depth at the config's chunk
     width; resolved to 0 off flex plans."""
     key = cute_flash.FLASH_FLEX_PREFETCH_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys[keys.index(key) + 1] == cute_flash.FLASH_FLEX_COALESCE_KEY
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_prefetch"].default
         == 0
     )
     for value in (32, 64, 128):
-        assert (key, value) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+        assert (key, value) in flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
 
     def active(fragments: dict[str, object]) -> tuple[object, ...]:
         fragment = fragments[key]
@@ -686,14 +692,14 @@ def test_flex_coalesce_knob_is_searched_only_with_coalescible_runs() -> None:
     width (0 where its staging leaves no two-deep ring); resolved to 0 off
     flex plans."""
     key = cute_flash.FLASH_FLEX_COALESCE_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys[keys.index(key) + 1] == cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__["flex_coalesce"].default
         == 0
     )
     for value in (32, 64, 128):
-        assert (key, value) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+        assert (key, value) in flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
 
     def active(fragments: dict[str, object]) -> tuple[object, ...]:
         fragment = fragments[key]
@@ -811,7 +817,7 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
     16-column chunk axis; the cold autotune of edge s2048 failed with
     "uncovered values [(cute_flash_flex_coalesce, 128)]" while 128 was
     offered) and of the one-table surface (128 at 32 columns)."""
-    from helion._compiler.backend import CuteBackend
+    from helion._compiler.cute.backend import CuteBackend
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
@@ -822,7 +828,7 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
         with (
             patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
             patch(
-                "helion.autotuner.config_spec.get_target_device_capability",
+                "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
                 return_value=(10, 0),
             ),
         ):
@@ -831,7 +837,8 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
                 spec.block_sizes.append(
                     BlockSizeSpec(block_id=block_id, size_hint=target)
                 )
-            spec.enable_cute_flash_search(
+            enable_cute_flash_search(
+                spec,
                 head_dim=HEAD_DIM,
                 num_kv=16,
                 num_bh=NUM_BH,
@@ -851,14 +858,16 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
                 flex_coalesce_steps=steps,
                 flex_hook_ops=hook_ops,
             )
-            fragments = spec._cute_flash_autotune_fragments()
+            fragments = _cute_flash_autotune_fragments(spec)
             fragment = fragments[cute_flash.FLASH_FLEX_COALESCE_KEY]
             assert set(fragment.search_choices) == set(expected)  # pyrefly: ignore[missing-attribute]
             assert fragment.default() == max(expected)  # pyrefly: ignore[missing-attribute]
             rolled = fragments[cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY]
             assert rolled.default() is (hook_ops >= 16)  # pyrefly: ignore[missing-attribute]
             generation = spec.create_config_generation()
-            assert generation.flash_structural_coverage_uncovered_values() == []
+            assert (
+                generation.extension.flash_structural_coverage_uncovered_values() == []
+            )
             # The seeds carry the fact-based defaults (canonicalized per
             # body): the stream at every seed whose body holds it, the roll
             # for the large hook; the pass-2c walk seeds and the mid-length
@@ -887,6 +896,7 @@ def test_flex_coverage_design_covers_the_cooperative_widths() -> None:
             assert rolls == {hook_ops >= 16}
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_binds_the_cooperative_staging_buffer() -> None:
     """With a cooperative width the fa4 storage grows by the eight softmax
     warps' staging buffers (``flex_coop_bytes``: 32 rows at the widest
@@ -946,6 +956,7 @@ def test_codegen_binds_the_cooperative_staging_buffer() -> None:
     assert "sFlexCoop" not in plain
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> None:
     """``cute_flash_flex_rolled_chunks``: an appended schema axis, default
     on where the score hook renders 16 or more per-element operations
@@ -955,7 +966,7 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
     stream's next-tile choice a select, and the register prefetch budget
     resolves to 0 (its slot lists cannot take a runtime chunk index)."""
     key = cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys[keys.index(key) + 1] == cute_flash.FLASH_FLEX_ITEM_WORDS_KEY
     assert (
         cute_flash.FlashAttentionConfig.__dataclass_fields__[
@@ -963,7 +974,7 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
         ].default
         is False
     )
-    assert (key, True) in cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
+    assert (key, True) in flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES
     with patch.dict(os.environ, {}, clear=True):
         flex = cute_flash.flash_autotune_fragments(
             HEAD_DIM,
@@ -1043,7 +1054,7 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
     assert src.count("for flash_ci in cutlass.range(flash_LD_CHUNKS):") == 2
     assert "for flash_ci in cutlass.range_constexpr(flash_LD_CHUNKS):" not in src
     assert (
-        "flash_flex_pkv = cutlass.Int32(cutlass.select_(flash_ci + 4 < flash_LD_CHUNKS, "
+        "flash_flex_ikv = cutlass.Int32(cutlass.select_(flash_ci + 4 < flash_LD_CHUNKS, "
         "flash_kv, flash_kv_peek))"
     ) in src
     assert "flash_flex_ps = flash_ci % 4" in src
@@ -1054,6 +1065,7 @@ def test_flex_rolled_chunks_knob_rolls_pass1_and_pins_the_register_ring() -> Non
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_splices_the_cooperative_stream() -> None:
     """With a streamed run the softmax loop (a) issues chunks ``0 .. slots
     - 1`` of the walk's first tile before the KV loop after a full wait and
@@ -1120,7 +1132,7 @@ def test_codegen_splices_the_cooperative_stream() -> None:
         assert at < body.index("flash_flex_pc = (flash_ci + 4) % flash_LD_CHUNKS")
         assert "flash_flex_ps = flash_ci % 4" in body
         assert (
-            "flash_flex_pkv = flash_kv if flash_ci + 4 < flash_LD_CHUNKS else flash_kv_peek"
+            "flash_flex_ikv = flash_kv if flash_ci + 4 < flash_LD_CHUNKS else flash_kv_peek"
             in body
         )
         assert at < body.index(issue) < body.index("cute.copy(")
@@ -1133,7 +1145,7 @@ def test_codegen_splices_the_cooperative_stream() -> None:
         pre = stage_src[:loop_at]
         assert "flash_kv_peek = cutlass.Int32(0)" in pre
         assert pre.index("cute.arch.cp_async_wait_group(0)") < pre.index(
-            "flash_flex_pkv = flash_kv_peek"
+            "flash_flex_ikv = flash_kv_peek"
         )
         assert pre.count(issue) == 4
         assert "flash_flex_ps = 3" in pre
@@ -1145,7 +1157,7 @@ def test_codegen_splices_the_cooperative_stream() -> None:
     for text in (
         "flash_flex_pc",
         "flash_kv_peek",
-        "flash_flex_pkv",
+        "flash_flex_ikv",
         "cute.arch.cp_async_wait_group",
         "cute.arch.cp_async_commit_group",
     ):
@@ -1191,6 +1203,7 @@ def _gather_plan() -> AttentionScorePlan:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_stages_candidate_tables_in_shared_memory() -> None:
     """With a budget the fa4 storage grows by the padded table (``sFlexAux``),
     the CTA-wide setup binds the typed pointer and fills the copy (every
@@ -1253,6 +1266,7 @@ def test_codegen_stages_candidate_tables_in_shared_memory() -> None:
         assert text not in plain, text
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_codegen_splices_the_next_chunk_prefetch_around_the_t2r_copy() -> None:
     """With a prefetch budget the hook's prefetch block runs (a) before the
     KV loop for the walk's first tile (a peek of the initial words, the
@@ -1982,10 +1996,9 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
     """Render the probe kernel on CPU with the flex plan injected at codegen
     (what the matcher will do): the tables become ``kv_walk_args`` and the
     score plan carries a 128-row BlockMask walk with a mask region."""
-    from test._cute_aux import _cpu_codegen
-
     import helion
     from helion._compiler.host_function import HostFunction
+    from helion._testing.cute_aux import cpu_codegen
 
     batch, heads = 2, 4
     rows = -(-seq // 128)
@@ -2008,8 +2021,8 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
             for name in ("part_cnt", "part_idx", "full_cnt", "full_idx")
         )
         state = df.cute_state  # pyrefly: ignore[missing-attribute]
-        state.attention_flash_score_plan = dataclasses.replace(
-            state.attention_flash_score_plan,
+        state.flash.score_plan = dataclasses.replace(
+            state.flash.score_plan,
             q_seq=seq,
             kv_seq=seq,
             kv_walk=FlexKvWalk(*(arg.name for arg in args), 128, 128, batch, heads),
@@ -2023,7 +2036,7 @@ def _codegen_with_flex_plan(seq: int, config: dict[str, object]) -> str:
         _probe_attention, backend="cute", static_shapes=True, autotune_effort="none"
     )
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         patch.object(cute_flash, "flash_attention_tensor_plan", patched),
     ):
         bound = kernel._bind_isolated((q, k, v, part_cnt, part_idx, full_cnt, full_idx))
@@ -2126,10 +2139,10 @@ def test_flex_item_words_knob_is_an_appended_axis_on_by_default_for_list_walks()
     elsewhere, searched (both values) only with a list walk, carried as True
     by every list-walk seed."""
     key = cute_flash.FLASH_FLEX_ITEM_WORDS_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(key) == 1
     assert keys.index(key) == keys.index(cute_flash.FLASH_FLEX_ROLLED_CHUNKS_KEY) + 1
-    assert cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
+    assert flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
     }
@@ -2183,10 +2196,10 @@ def test_s_resident_knob_is_legal_on_the_rep32_chunked_body_only() -> None:
     searched only with a list walk without a score region; three resident
     seeds, none with a score region."""
     key = cute_flash.FLASH_S_RESIDENT_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert keys.count(key) == 1
     assert keys.index(key) == keys.index(cute_flash.FLASH_FLEX_ITEM_WORDS_KEY) + 1
-    assert cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
+    assert flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[(key, True)] == {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
         cute_flash.FLASH_SOFTMAX_DISC_KEY: True,
         cute_flash.FLASH_S_LOAD_REP_KEY: 32,
@@ -3401,7 +3414,7 @@ def test_persistent_list_walk_early_qk_hoists_the_next_items_first_qk() -> None:
     # design (the grid pins the knob off, so a grid row carrying either
     # value renders the same kernel and says nothing about the loop).
     for value in (True, False):
-        witness = cute_flash.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[
+        witness = flash_knobs.FLASH_AUTOTUNE_VALUE_DEPENDENCIES[
             (cute_flash.FLASH_FLEX_EARLY_QK_KEY, value)
         ]
         assert witness == {
@@ -4203,7 +4216,7 @@ def test_softmax_region_knob_is_legal_on_the_list_walk_only() -> None:
     is declined. One region runs one exp cadence: stage 0's offset follows
     stage 1's."""
     key = cute_flash.FLASH_SOFTMAX_REGION_KEY
-    keys = cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+    keys = flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     # Appended right behind the resident knob (axes added later sit behind it).
     assert keys.index(key) == keys.index(cute_flash.FLASH_S_RESIDENT_KEY) + 1
     assert _resolve(BODY).softmax_region == "per_stage"
@@ -4384,7 +4397,8 @@ def test_flex_hook_fast_full_knob_is_legal_on_the_list_walk() -> None:
     """``cute_flash_flex_hook_fast_full``: appended last; on the list walk
     (any walk form), off by default and off the list walk."""
     key = cute_flash.FLASH_FLEX_HOOK_FAST_FULL_KEY
-    assert cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS[-1] == key
+    # Appended after the flex axes (new axes go last; later knobs follow it).
+    assert key in flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
     assert _resolve(BODY).flex_hook_fast_full is False
     assert _resolve({**BODY, key: True}).flex_hook_fast_full is True
     assert (

@@ -17,12 +17,8 @@ from .affine_vector_io import _accesses
 from .affine_vector_io import _Decline
 from .affine_vector_io import _Vectorizer
 from .persistent_branch_vec import _binding_write_roots
-from .persistent_branch_vec import _definition_snapshots
 from .persistent_branch_vec import _expand
 from .persistent_branch_vec import _lane_scale_value
-from .persistent_branch_vec import _needed_definition_names
-from .persistent_branch_vec import _plain_scalar_load_pointer
-from .persistent_branch_vec import _plain_scalar_store_pointer
 from .persistent_branch_vec import _range_extent
 from .scalar_integer import _INTEGER_CASTS
 from .scalar_integer import _integer_expression
@@ -78,25 +74,73 @@ _OPERATORS = frozenset(f"operator.{operation}" for operation in _OPERATOR_CALLS)
 
 
 def _pure_packet_call(call: ast.Call) -> bool:
-    name = ast.unparse(call.func)
-    if name in _OPERATORS:
+    """A call the packet pass may stage: an operator or an unpacked
+    ``_cute_inline_asm_elementwise`` over pure scalar arithmetic.  Packed
+    calls (``pack`` keyword) stay out: the per-lane lowering replays their asm
+    once per element, which the packet staging does not model."""
+    if ast.unparse(call.func) in _OPERATORS:
         return True
-    if name != "_cute_inline_asm_elementwise" or len(call.args) != 1:
-        return False
+    return not any(
+        keyword.arg == "pack" for keyword in call.keywords
+    ) and is_pure_inline_asm_call(call)
+
+
+def inline_asm_operands(call: ast.Call) -> tuple[object, object, object] | None:
+    """``(asm, constraints, is_pure)`` of a ``_cute_inline_asm_elementwise``
+    call over one operand tuple whose keywords are those constants, a
+    ``dtype`` and an optional integer ``pack``; None for any other call."""
+    if not (
+        isinstance(call.func, ast.Name)
+        and call.func.id == "_cute_inline_asm_elementwise"
+        and len(call.args) == 1
+    ):
+        return None
     keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+    pack = keywords.pop("pack", None)
+    if pack is not None and not (
+        isinstance(pack, ast.Constant) and type(pack.value) is int
+    ):
+        return None
     if set(keywords) != {"asm", "constraints", "dtype", "is_pure"}:
-        return False
-    pure, asm, constraints = (
-        keywords["is_pure"],
+        return None
+    asm, constraints, pure = (
         keywords["asm"],
         keywords["constraints"],
+        keywords["is_pure"],
     )
-    return (
-        isinstance(pure, ast.Constant)
-        and isinstance(asm, ast.Constant)
+    if not (
+        isinstance(asm, ast.Constant)
         and isinstance(constraints, ast.Constant)
-        and is_pure_scalar_assembly(asm.value, constraints.value, pure.value)
-    )
+        and isinstance(pure, ast.Constant)
+    ):
+        return None
+    return asm.value, constraints.value, pure.value
+
+
+def is_pure_inline_asm_call(call: ast.Call) -> bool:
+    """Whether ``call`` is ``_cute_inline_asm_elementwise`` over pure scalar
+    arithmetic (:func:`is_pure_scalar_assembly`), packed or not.
+
+    The lane passes relocate and duplicate such a call like any other
+    arithmetic: with ``is_pure`` the lowering (``inline_asm_helpers``) runs
+    the same effect-free asm once per element whatever the pack, so the pack
+    width changes the register ABI, not the purity.
+    """
+    operands = inline_asm_operands(call)
+    if operands is None:
+        return False
+    asm, constraints, pure = operands
+    from .philox_stream import SCALAR_ASM
+
+    if asm == SCALAR_ASM:
+        # The compiler's own uniform stream.  Its lane loop belongs to
+        # ``lower_philox_packets``, which shares one Philox evaluation across
+        # the lanes and then vectorizes the fast path's memory itself (through
+        # this same machinery): packing the memory first would leave the
+        # per-lane RNG loop inside the vector path, where the packet guard's
+        # branches disagree on the collected store list.
+        return False
+    return is_pure_scalar_assembly(asm, constraints, pure)
 
 
 def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -> bool:
@@ -116,16 +160,24 @@ def is_pure_scalar_assembly(asm: object, constraints: object, is_pure: object) -
     # A declared-pure asm can still describe a memory read. Accept only scalar
     # arithmetic instructions; no pointers, special registers, branches,
     # barriers, memory clobbers, or opaque instructions enter this envelope.
+    # Braces only group: a nested ``{ ... }`` scope around register
+    # declarations, or the vector operand ``{ $2, $3 }`` that packs two
+    # registers into one (``mov.b64 ra, { $2, $3 }`` around ``mul.f32x2``);
+    # neither adds an effect, and the opcode allowlist still gates every
+    # instruction inside.
     text = asm.strip().removeprefix("{").removesuffix("}").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_$.,+;\s-]*", text):
+    # Double-colon opcode qualifiers do not add effects. Single colons remain
+    # excluded, so labels are not admitted by this scalar arithmetic proof.
+    if not re.fullmatch(r"(?:[A-Za-z0-9_$.,+;{}\s-]|::)*", text):
         return False
     for instruction in text.split(";"):
-        instruction = instruction.strip()
-        if not instruction:
+        instruction = instruction.strip().lstrip("{").strip()
+        if not instruction or instruction == "}":
             continue
         if instruction.startswith(".reg "):
             if re.fullmatch(
-                r"\.reg\s+\.[busf](8|16|32|64)\s+[A-Za-z_][\w, ]*", instruction
+                r"\.reg\s+\.(?:[busf](?:8|16|32|64)|pred)\s+[A-Za-z_][\w, ]*",
+                instruction,
             ):
                 continue
             return False
@@ -143,50 +195,6 @@ class _PacketExpression(_PureExpression):
                 self.visit(keyword.value)
             return
         super().visit_Call(node)
-
-
-def _memory_definition_names(statements: list[ast.stmt]) -> set[str]:
-    """Select addresses and their predicates, never unrelated value arithmetic."""
-    names: set[str] = set()
-
-    def visit(node: ast.AST, guards: tuple[ast.expr, ...]) -> None:
-        if isinstance(node, (ast.If, ast.IfExp)):
-            visit(node.test, guards)
-            branches = (
-                [*node.body, *node.orelse]
-                if isinstance(node, ast.If)
-                else [node.body, node.orelse]
-            )
-            for child in branches:
-                visit(child, (*guards, node.test))
-            return
-        if isinstance(node, ast.For):
-            names.update(_read_names(node.iter))
-        if isinstance(node, ast.Call):
-            pointer = _plain_scalar_load_pointer(node)
-            if pointer is None:
-                pointer = _plain_scalar_store_pointer(node)
-            if pointer is not None:
-                names.update(_read_names(pointer))
-                for guard in guards:
-                    names.update(_read_names(guard))
-        for child in ast.iter_child_nodes(node):
-            visit(child, guards)
-
-    for statement in statements:
-        visit(statement, ())
-    # A nested address can refer to an enclosing definition through its local
-    # aliases. Close over every definition version before selecting each
-    # scope's snapshots; their ordinary write invalidation remains unchanged.
-    return _needed_definition_names(
-        [
-            node
-            for statement in statements
-            for node in ast.walk(statement)
-            if isinstance(node, ast.stmt)
-        ],
-        names,
-    )
 
 
 def _scalar_leaf(node: ast.expr) -> bool:
@@ -286,11 +294,6 @@ class _PacketVectorizer(_Vectorizer):
     def accesses(self, body: list[ast.stmt]) -> list[_Access]:
         return _accesses(body, _pure_packet_call)
 
-    def snapshots(self, body: list[ast.stmt]) -> list[dict[str, ast.expr]] | None:
-        return _definition_snapshots(
-            body, required_names=_memory_definition_names(body)
-        )
-
     def memory_width(self, width: int, itemsize: int) -> int:
         return min(width, 16 // itemsize)
 
@@ -351,7 +354,7 @@ class _PacketVectorizer(_Vectorizer):
         return (
             not self.shadowed
             and isinstance(loop.target, ast.Name)
-            and _range_extent(loop) in (4, 8)
+            and _range_extent(loop) in (4, 8, 16)
             and not loop.orelse
         )
 

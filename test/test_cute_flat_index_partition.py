@@ -13,6 +13,8 @@ from helion._compiler.cute.flat_index_partition import is_flat_column_partition
 from helion.language import tile_ops
 from helion.language import view_ops
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.compile_environment import CompileEnvironment
 

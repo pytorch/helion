@@ -40,6 +40,16 @@ on:
         required: false
         type: string
         default: ""
+      rocm-gpu:
+        description: 'GPU index (taken modulo the GPU count) for ROCm runners, which expose every GPU of the host'
+        required: false
+        type: number
+        default: 0
+      torch-version:
+        description: 'PyTorch version, installed as torch==<version> (a trailing .* is allowed) from the runtime-version wheel index'
+        required: false
+        type: string
+        default: "2.13.*"
 
 jobs:
   benchmark:
@@ -117,11 +127,7 @@ jobs:
 
           # On OSDC, route through the pypi-cache /whl proxy (deps stay reachable behind the egress firewall) and clear the cache index vars so it wins over the cache default; off OSDC PYPI_CACHE_WHL_URL is unset so we hit download.pytorch.org.
           PYTORCH_INDEX="${PYPI_CACHE_WHL_URL:-https://download.pytorch.org/whl/cpu}"
-          TORCH_VERSION="2.13.*"
-          if [[ "${{ inputs.runtime-version }}" == "xpu" ]]; then
-            TORCH_VERSION="2.15.*"
-          fi
-          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==$TORCH_VERSION" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
+          UV_DEFAULT_INDEX= UV_INDEX= uv pip install -U "torch==${{ inputs.torch-version }}" --index-url "${PYTORCH_INDEX%/whl/*}/whl/${{ inputs.runtime-version }}"
 
       - name: Install Helion
         run: |
@@ -195,7 +201,12 @@ jobs:
           python install.py --liger
           if [[ "${{ inputs.runtime-version }}" == cu* ]]; then
             uv pip install einops
-            MAX_JOBS=4 uv pip install "mamba-ssm==2.3.2.post1" --no-build-isolation --no-deps
+            # mamba-ssm's setup.py hard-codes -std=c++17, but torch 2.15's
+            # headers need C++20 (std::bit_width), so build its release
+            # source with -std=c++20, which torch 2.13 also accepts.
+            git clone --depth 1 --branch v2.3.2.post1 https://github.com/state-spaces/mamba /tmp/mamba
+            sed -i 's/-std=c++17/-std=c++20/g' /tmp/mamba/setup.py
+            MAX_JOBS=4 uv pip install /tmp/mamba --no-build-isolation --no-deps
             FLA_COMMIT=$(cat $GITHUB_WORKSPACE/.github/ci_commit_pins/flash_linear_attention.txt)
             uv pip install "git+https://github.com/fla-org/flash-linear-attention@${FLA_COMMIT}" --no-deps
           fi
@@ -224,20 +235,30 @@ jobs:
       - name: Run TritonBench Benchmark
         if: inputs.suite == 'tritonbench'
         run: |
-          # Stop on benchmark failures so missing JSON errors don't obscure the cause.
           set -e
           rm -rf /tmp/torchinductor_*/ || true
 
           source .venv/bin/activate
 
+          if [[ "${{ inputs.image }}" == rocm* ]]; then
+            # The ROCm runners expose every GPU of the host to the container,
+            # so without a choice all the jobs a host takes share GPU 0 (and a
+            # hang there aborts all of them). Spread the shards over the GPUs.
+            # GPU agents are the KFD topology nodes with a nonzero gpu_id
+            NUM_GPUS=$(grep -L -x 0 /sys/class/kfd/kfd/topology/nodes/*/gpu_id | wc -l)
+            export ROCR_VISIBLE_DEVICES=$(( ${{ inputs.rocm-gpu }} % NUM_GPUS ))
+            echo "Using ROCm GPU $ROCR_VISIBLE_DEVICES of $NUM_GPUS"
+          fi
+
           TEST_REPORTS_DIR=$(pwd)/test/test-reports
           mkdir -p "$TEST_REPORTS_DIR"
           echo "$TEST_REPORTS_DIR"
 
+          FAILED_KERNELS=()
           KERNEL_LIST="${{ inputs.kernels }}"
-          # CUDA graphs are CUDA/ROCm-only; XPU also needs the device selected
-          # explicitly since tritonbench defaults to cuda.
-          DEVICE_ARGS=(--cudagraph)
+          # TritonBench defaults to CUDA, so select XPU explicitly while
+          # keeping CUDA graph timing enabled on every platform.
+          DEVICE_ARGS=()
           if [[ "${{ inputs.runtime-version }}" == "xpu" ]]; then
             DEVICE_ARGS=(--device xpu)
           fi
@@ -271,7 +292,10 @@ jobs:
             # set it manually when collecting the cost-model dataset. It is
             # intentionally left off here to keep CI artifacts small.
             # --autotune-metrics-json: per-run summary, overwrite-safe.
-            ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
+            # A crashed kernel (GPU hang, segfault) loses only its own rows:
+            # the shard's other kernels still run, and the step fails at the
+            # end after the completed results are written.
+            if ! ${{ inputs.env-vars }} HELION_PRINT_OUTPUT_CODE=1 \
             HELION_AUTOTUNE_LOG="$TEST_REPORTS_DIR/autotune-$kernel" \
             python benchmarks/run.py \
                 --op $kernel \
@@ -279,6 +303,7 @@ jobs:
                 --metrics speedup,accuracy,latency \
                 --measure-compile-time \
                 --latency-measure-mode triton_do_bench \
+                --cudagraph \
                 "${DEVICE_ARGS[@]}" \
                 --only $IMPLS \
                 --only-match-mode prefix-with-baseline \
@@ -290,7 +315,11 @@ jobs:
                 --append-to-output \
                 --autotune-metrics-json "$TEST_REPORTS_DIR/autotune-metrics-$kernel.json" \
                 --keep-going \
-                ${{ inputs.custom-args }}
+                ${{ inputs.custom-args }}; then
+              echo "❌ Benchmark for kernel $kernel failed; continuing with the rest"
+              FAILED_KERNELS+=("$kernel")
+              continue
+            fi
 
             echo "✅ Completed benchmark for kernel: $kernel"
           done
@@ -300,6 +329,11 @@ jobs:
             exit 1
           fi
           cat "$TEST_REPORTS_DIR/helionbench.json"
+          echo
+          if (( ${#FAILED_KERNELS[@]} )); then
+            echo "❌ Failed kernels: ${FAILED_KERNELS[*]}"
+            exit 1
+          fi
 
       - name: Run Linear-Attention Benchmark
         if: inputs.suite == 'linattn'
@@ -360,6 +394,9 @@ jobs:
           venv: .venv/bin/activate
 
       - name: Upload the benchmark results to GitHub
+        # The dashboard reads this artifact: keep the completed kernels' results
+        # when a crashed kernel failed the benchmark step.
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
           name: benchmark-results-${{ inputs.alias }}-${{ inputs.kernels }}

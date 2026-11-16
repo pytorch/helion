@@ -47,7 +47,10 @@ if TYPE_CHECKING:
 
 
 # %%
-@helion.kernel()
+# fast_math: approximate exp and division (the kernel rounds to the half
+# precision output; its backward would otherwise spend three IEEE fp32
+# divisions per element).
+@helion.kernel(fast_math=True)
 def _swiglu_fwd(a: Tensor, b: Tensor) -> Tensor:
     """
     Performs SwiGLU operation: SiLU(a) * b where SiLU is the Swish activation.
@@ -121,7 +124,7 @@ def _swiglu_fwd_pallas(a: Tensor, b: Tensor) -> Tensor:
 swiglu_fwd = _swiglu_fwd_pallas if _get_backend() == "pallas" else _swiglu_fwd
 
 
-@helion.kernel()
+@helion.kernel(fast_math=True)
 def swiglu_bwd(gout: Tensor, x1: Tensor, x2: Tensor) -> tuple[Tensor, Tensor]:
     """
     Implement the backward formula for swiglu.

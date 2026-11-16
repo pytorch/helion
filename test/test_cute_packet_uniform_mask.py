@@ -23,6 +23,8 @@ from helion._compiler.cute.contiguous_copy import ContiguousCopy
 from helion._compiler.cute.contiguous_copy import CopyTensorFacts
 from helion._compiler.cute.contiguous_copy import plan_contiguous_copy
 
+pytestmark = pytest.mark.cpu_only
+
 
 @dataclass
 class _Pointer:

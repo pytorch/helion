@@ -10,14 +10,15 @@ import torch
 from torch.fx import Graph
 from torch.fx import Node
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-from test.test_cute_signed_bitfield_bf16 import _graph
-
 import helion
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.materialize_operand import _exact_integer_cast
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.state import cute_env_state
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_signed_bitfield import signed_field_graph as _graph
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from torch._ops import OpOverload
@@ -154,7 +155,7 @@ def test_floating_arithmetic_recipe_is_unchanged() -> None:
     assert _exact_integer_cast(cast)
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+@helion.kernel(backend="cute", autotune_effort="none")
 def _direct_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     n = b.shape[1]
@@ -168,7 +169,7 @@ def _direct_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return output
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+@helion.kernel(backend="cute", autotune_effort="none")
 def _derived_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     n = b.shape[1]
@@ -193,7 +194,6 @@ def _derived_cast_rhs(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     ),
 )
 @pytest.mark.parametrize("derived", (False, True))
-@skipUnlessBackends(["cute"])
 def test_actual_recipe_admission_uses_integer_precision(
     source: torch.dtype, destination: torch.dtype, derived_expected: bool, derived: bool
 ) -> None:
@@ -202,15 +202,15 @@ def test_actual_recipe_admission_uses_integer_precision(
     # integer arithmetic still needs the proved-range check.
     expected = derived_expected if derived else True
     with (
-        _cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        cpu_target(),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         kernel = helion.kernel(
             (_derived_cast_rhs if derived else _direct_cast_rhs).fn,
             backend="cute",
-            static_shapes=True,
+            # Dynamic source shapes bypass the static-only fused cost gate,
+            # so this test reaches the materializer's integer range proof.
+            static_shapes=False,
             autotune_effort="none",
             cute_materialize_transformed_operands=True,
         )
@@ -219,4 +219,26 @@ def test_actual_recipe_admission_uses_integer_precision(
             torch.empty((32, 16), dtype=source),
         )
         bound = kernel._bind_isolated(args)
-        assert (bound.env.cute_fission_plan is not None) is expected
+        assert (cute_env_state(bound.env).fission_plan is not None) is expected
+
+
+def test_static_byte_recipe_keeps_fused_native_route() -> None:
+    kernel = helion.kernel(
+        _direct_cast_rhs.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+        cute_materialize_transformed_operands=True,
+    )
+    with (
+        cpu_target(),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
+    ):
+        bound = kernel._bind_isolated(
+            (
+                torch.empty((16, 32), dtype=torch.bfloat16),
+                torch.empty((32, 16), dtype=torch.int8),
+            )
+        )
+        assert cute_env_state(bound.env).fission_plan is None
+        assert bound.config_spec.cute_mma_dag_facts is not None

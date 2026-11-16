@@ -16,6 +16,8 @@ from helion._compiler.pallas.sparsecore_plan import SparseCorePlanContext
 from helion._compiler.pallas.sparsecore_plan import build_sparsecore_memory_plan
 from helion.language import memory_ops
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _placeholder(
     graph: torch.fx.Graph, name: str, value: torch.Tensor

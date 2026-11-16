@@ -9,12 +9,12 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 
@@ -50,8 +50,8 @@ def _input(rows, columns, operation):
 
 def _code(rows, columns, threads, row_threads, operation):
     x = _input(rows, columns, operation)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_tile_reduce, (x, operation))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_tile_reduce, (x, operation))
         config = bound.config_spec.default_config()
         config.config.update(
             block_sizes=[row_threads, 2 * threads],
@@ -287,9 +287,10 @@ def test_complete_tile_reduction_native(threads):
 
 @pytest.mark.parametrize("threads", [64, 128, 512])
 def test_multiwarp_finalize_without_group_proof_rejects(threads):
-    from helion._compiler import tile_strategy
+    from helion._compiler.cute.lane_loops.markers import _finalize_lane_reduce_marker
+    from helion._compiler.cute.lane_loops.markers import _LaneReduceMarker
 
-    marker = tile_strategy._LaneReduceMarker(
+    marker = _LaneReduceMarker(
         input_name="value",
         wrap_template="__HELION_FINALIZED__",
         reduction_type="max",
@@ -300,4 +301,4 @@ def test_multiwarp_finalize_without_group_proof_rejects(threads):
     with pytest.raises(
         helion.exc.BackendUnsupported, match="cross-warp grouped finalize"
     ):
-        tile_strategy._finalize_lane_reduce_marker(marker, "acc")
+        _finalize_lane_reduce_marker(marker, "acc")

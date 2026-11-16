@@ -10,7 +10,7 @@ from torch._environment import is_fbcode
 from torch._inductor import inductor_prims
 
 import helion
-from helion._compiler.backend import PallasBackend
+from helion._compiler.pallas.backend import PallasBackend
 from helion._compiler.rng_utils import philox_rand_ref
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
@@ -29,6 +29,13 @@ import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.ref_mode import is_ref_mode_enabled
 from helion.runtime.settings import _get_backend
+
+# Recent PyTorch versions reject integer random tensors during FakeTensor
+# tracing, before Helion's implicit RNG rewrite validates the dtype.
+_NON_FLOATING_RNG_ERROR = (
+    "implicit RNG only supports floating-point dtypes"
+    r'|"check_uniform_bounds" not implemented for torch\.int32'
+)
 
 try:
     triton = importlib.import_module("triton")
@@ -568,9 +575,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         x = torch.ones((13, 29), device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(
-            Exception, "implicit RNG only supports floating-point dtypes"
-        ):
+        with self.assertRaisesRegex(Exception, _NON_FLOATING_RNG_ERROR):
             code_and_output(bad_rand_dtype, (x,), block_sizes=[8, 16])
 
     @skipIfRefEager(
@@ -588,9 +593,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         x = torch.ones((13, 29), device=DEVICE, dtype=torch.int32)
-        with self.assertRaisesRegex(
-            Exception, "implicit RNG only supports floating-point dtypes"
-        ):
+        with self.assertRaisesRegex(Exception, _NON_FLOATING_RNG_ERROR):
             code_and_output(bad_rand_like_dtype, (x,), block_sizes=[8, 16])
 
     @skipIfRefEager(
@@ -611,9 +614,7 @@ class TestRNG(RefEagerTestBase, TestCase):
             return out
 
         x = torch.ones((13, 29), device=DEVICE, dtype=torch.float32)
-        with self.assertRaisesRegex(
-            Exception, "implicit RNG only supports floating-point dtypes"
-        ):
+        with self.assertRaisesRegex(Exception, _NON_FLOATING_RNG_ERROR):
             code_and_output(bad_aten_rand_dtype, (x,), block_sizes=[8, 16])
 
     @skipIfRefEager(
@@ -977,7 +978,7 @@ class TestPallasRNGRegression(TestCase):
         self.assertTrue(torch.equal(seed_buffer.cpu(), seeds64))
 
 
-@onlyBackends(["triton", "cute"])
+@onlyBackends(["cute"])
 @skipUnlessCuteAvailable("requires CUTLASS CuTe Python DSL")
 @unittest.skipIf(
     is_fbcode(),

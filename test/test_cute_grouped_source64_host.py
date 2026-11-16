@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_grouped_source64 import _bound
 from test.test_cute_grouped_source64 import _wide
 from test.test_cute_shared_rhs_grouped import _plans
@@ -18,30 +16,23 @@ from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES,
 )
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.exc import BackendUnsupported
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_source_m_tile_supported
 from helion.runtime.cute.launcher import _tcgen05_grouped_device_split_total_clusters
 from helion.runtime.cute.launcher import _validate_tcgen05_grouped_device_split_sizes
 
-pytestmark = skipUnlessBackends(["cute"])
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
-
-@pytest.fixture(autouse=True)
-def _cpu_only() -> Generator[None, None, None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipUnlessBackends(["cute"]),
+    pytest.mark.cpu_render,
+]
 
 
 @pytest.fixture(scope="module")
 def generated_plans() -> list[dict[str, object]]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         _target(),
     ):

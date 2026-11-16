@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import contextlib
 import dataclasses
 import inspect
@@ -26,6 +25,14 @@ from torch._subclasses.fake_tensor import FakeTensorMode
 
 import helion
 from helion import exc
+from helion._compiler.cute.autotune.config_keys import (
+    CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY,
+)
+from helion._compiler.cute.autotune.config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
+from helion._compiler.cute.autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
+from helion._compiler.cute.autotune.config_keys import (
+    CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY,
+)
 from helion._compiler.cute.gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
 from helion._compiler.cute.gdn_recurrence_geometry import GDN_MMA_M
 from helion._compiler.cute.gdn_recurrence_geometry import gdn_acc_load_cols
@@ -51,14 +58,10 @@ from helion._testing import DEVICE
 from helion._testing import EXAMPLES_DIR
 from helion._testing import code_and_output
 from helion._testing import import_path
-from helion._testing import skipUnlessBackends
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
-from helion.autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
+from helion._testing.cute_recurrence_host import gdn_test_wrapper as _gdn_test_wrapper
+from helion._testing.cute_recurrence_host import gdn_wrapper_plan as _wrapper_plan
+from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -143,6 +146,153 @@ def _gdn_fwd_h_with_head_end(
     return h
 
 
+@helion.kernel()
+def _gdn_fwd_h_with_floordiv_gate_index(
+    k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g: torch.Tensor, chunk_size: int
+) -> torch.Tensor:
+    """``examples/gdn_fwd_h.py`` with the gate's last-token index
+    ``min(t_i.id // 2, 3)``: a min over the chunk loop's index that is not
+    affine in it (a floor division), which the dag's bound fold cannot
+    resolve to one branch.
+    """
+
+    batch, seqlen, nheads, dhead = k.shape
+    dhead = hl.specialize(dhead)
+    chunk_size = hl.specialize(chunk_size)
+    dstate = u.shape[-1]
+
+    acc_dtype = torch.float32
+    dtype = k.dtype
+
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    block_v = hl.register_block_size(dstate)
+
+    for tile_b, tile_h, tile_v in hl.tile(
+        [batch, nheads, dstate], block_size=[1, 1, block_v]
+    ):
+        i_b = tile_b.id
+        i_h = tile_h.id
+        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+        for t_i in hl.tile(seqlen, block_size=chunk_size):
+            h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+            b_w = w[i_b, t_i, i_h, :]
+            c_h = b_h.to(dtype)
+            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+            p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+            b_v = p_v - b_v
+            m_t = t_i.index < seqlen
+            t_i_last = min(t_i.id // 2, 3)
+            b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+            b_g = g[i_b, t_i, i_h].to(acc_dtype)
+            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+            b_g_last = torch.exp(b_g_last)
+            b_h *= b_g_last
+            b_v = b_v.to(dtype)
+            p_k = k[i_b, t_i, i_h, :]
+            b_h = hl.dot(p_k.T, b_v, acc=b_h)
+    return h
+
+
+@helion.kernel(autotune_effort="none")
+def _gdn_with_runtime_float(
+    k: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int,
+    scale: float,
+    live: hl.constexpr,
+    root_live: hl.constexpr,
+) -> torch.Tensor:
+    """The example recurrence with a dead or live scalar capture before its state."""
+    batch, seqlen, nheads, dhead = k.shape
+    dhead = hl.specialize(dhead)
+    chunk_size = hl.specialize(chunk_size)
+    dstate = u.shape[-1]
+    acc_dtype = torch.float32
+    dtype = k.dtype
+    nchunks = (seqlen + chunk_size - 1) // chunk_size
+    h = torch.empty(batch, nchunks, nheads, dhead, dstate, dtype=dtype, device=k.device)
+    block_v = hl.register_block_size(dstate)
+    for tile_b, tile_h, tile_v in hl.tile(
+        [batch, nheads, dstate], block_size=[1, 1, block_v]
+    ):
+        i_b = tile_b.id
+        i_h = tile_h.id
+        scalar = scale
+        first_copy = scalar
+        scalar_copy = first_copy
+        b_h = hl.zeros([dhead, tile_v], dtype=acc_dtype)
+        for t_i in hl.tile(seqlen, block_size=chunk_size):
+            _unused = scalar_copy
+            h[i_b, t_i.id, i_h, :, tile_v] = b_h.to(dtype)
+            b_w = w[i_b, t_i, i_h, :]
+            c_h = b_h.to(dtype)
+            b_v = hl.dot(b_w, c_h, out_dtype=acc_dtype)
+            p_v = u[i_b, t_i, i_h, tile_v].to(acc_dtype)
+            b_v = p_v - b_v
+            m_t = t_i.index < seqlen
+            t_i_last = min(t_i.begin + chunk_size, seqlen) - 1
+            b_g_last = g[i_b, t_i_last, i_h].to(acc_dtype)
+            b_g = g[i_b, t_i, i_h].to(acc_dtype)
+            b_v *= torch.where(m_t, torch.exp(b_g_last - b_g), 0)[:, None]
+            if live:
+                b_v *= scalar_copy
+            b_g_last = torch.exp(b_g_last)
+            b_h *= b_g_last
+            b_v = b_v.to(dtype)
+            p_k = k[i_b, t_i, i_h, :]
+            b_h = hl.dot(p_k.T, b_v, acc=b_h)
+        if root_live:
+            h[i_b, 0, i_h, :, tile_v] = scalar
+    return h
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "live,root_live", [(False, False), (True, False), (False, True)]
+)
+def test_gdn_runtime_float_capture(live: bool, root_live: bool) -> None:
+    from helion._compiler.device_ir import ForLoopGraphInfo
+
+    kernel = _gdn_with_runtime_float
+    kernel.reset()
+    inputs = _fake_inputs()
+    with _sm100_environment():
+        args = (*inputs, 128, 0.25, live, root_live)
+        bound = kernel.bind(args)
+        config = _config(bound, 128)
+        source = bound.to_code(config)
+        assert (_PLAN_KIND in source) is not (live or root_live)
+        loop = next(
+            g
+            for g in bound.host_function.device_ir.graphs
+            if isinstance(g, ForLoopGraphInfo)
+        )
+        placeholders = [n for n in loop.graph.nodes if n.op == "placeholder"]
+        assert len(placeholders) == 2
+        scalar = next(
+            n for n in placeholders if isinstance(n.meta["val"], torch.SymFloat)
+        )
+        assert bool(scalar.users) is live
+        assert placeholders.index(scalar) == 0  # The tensor is input slot 1.
+        observed = []
+
+        def observe(_kernel, _grid, *args, **kwargs):
+            observed.append([arg for arg in args if type(arg) is float])
+
+        host = load_host_function(bound, config, observe)
+        for value in (0.25, 1.5, 0.25):
+            changed = (*inputs, 128, value, live, root_live)
+            assert kernel.bind(changed) is bound
+            with cast("FakeTensor", inputs[0]).fake_mode:
+                host(*changed)
+            assert observed[-1] == ([value] if live or root_live else [])
+        assert len(observed) == 3
+        assert bound.to_code(config) == source
+
+
 @contextlib.contextmanager
 def _sm100_environment(
     capability: tuple[int, int] = _CAPABILITY, num_sm: int = 148
@@ -195,6 +345,13 @@ def _bind(
 def _config(bound: object, block_v: int, **overrides: object) -> helion.Config:
     config = bound.config_spec.default_config()  # type: ignore[attr-defined]
     config.config["block_sizes"] = [block_v]
+    # These renders are the schedule's and the ordinary lowering's unless a
+    # test selects the register-MMA dataflow owner itself: on an SM100 the
+    # dag heuristic promotes its seed to the default where the schedule
+    # declines, and that seed's knobs are sized for its own tile, not for
+    # the ``block_v`` pinned here.
+    if "cute_mma_dag" in config.config and "cute_mma_dag" not in overrides:
+        config.config["cute_mma_dag"] = "off"
     config.config.update(overrides)
     return config
 
@@ -219,7 +376,7 @@ def _code(
             kernel=kernel,
             inputs=inputs,
         )
-        return bound.to_triton_code(  # type: ignore[attr-defined]
+        return bound.to_code(  # type: ignore[attr-defined]
             _config(bound, block_v, **(overrides or {}))
         )
 
@@ -240,8 +397,8 @@ def _captured_plan(
     captured: list[object] = []
     original = gdn_recurrence._plan_gdn_recurrence
 
-    def capture(graphs: object, tile_strategy: object) -> object:
-        result = original(graphs, tile_strategy)  # type: ignore[arg-type]
+    def capture(admitted: object, tile_strategy: object) -> object:
+        result = original(admitted, tile_strategy)  # type: ignore[arg-type]
         captured.append(result)
         return result
 
@@ -263,6 +420,7 @@ def _captured_plan(
     return captured[0]
 
 
+@pytest.mark.cpu_only
 def test_gdn_recurrence_codegen_emits_sm100_plan() -> None:
     code = _code()
     assert "from helion._compiler.cute.gdn_recurrence_sm100 import" in code
@@ -661,12 +819,14 @@ def _shorten_root_task_extent(device_ir: object) -> None:
         _shorten_root_task_extent,
     ),
 )
+@pytest.mark.cpu_only
 def test_gdn_recurrence_rejects_semantic_mutations(
     mutate: Callable[[object], None],
 ) -> None:
     assert _captured_plan(mutate=mutate) is None
 
 
+@pytest.mark.cpu_only
 def test_gdn_recurrence_search_knobs_and_seeds() -> None:
     with _sm100_environment():
         bound = _bind()
@@ -927,7 +1087,7 @@ def test_gdn_recurrence_small_dstate_seeds_its_own_tile() -> None:
     # The preference is a seed-order heuristic only: a config that omits the
     # knob still gets the search domain's default.
     with _sm100_environment():
-        code = bound.to_triton_code(helion.Config(block_sizes=[32]))  # type: ignore[attr-defined]
+        code = bound.to_code(helion.Config(block_sizes=[32]))  # type: ignore[attr-defined]
     assert "'epilogue_warps': 8" in code
     assert "'token_groups': 2" in code
     assert "'mma_m': 128" in code
@@ -1012,7 +1172,7 @@ def test_gdn_recurrence_every_searched_tile_compiles(
                 groups = 4 if 4 in legal_groups else legal_groups[0]
                 assert repaired.config[CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY] == groups
                 with _sm100_environment():
-                    code = bound.to_triton_code(repaired)  # type: ignore[attr-defined]
+                    code = bound.to_code(repaired)  # type: ignore[attr-defined]
                 assert _PLAN_KIND in code
                 assert f"'token_groups': {groups}" in code
                 assert f"'mma_m': {mma_m}" in code
@@ -1035,7 +1195,7 @@ def test_gdn_recurrence_every_searched_tile_compiles(
         == expected_stage_choices[(128, 128)][0]
     )
     with _sm100_environment():
-        assert _PLAN_KIND in bound.to_triton_code(partial)  # type: ignore[attr-defined]
+        assert _PLAN_KIND in bound.to_code(partial)  # type: ignore[attr-defined]
 
 
 def test_gdn_recurrence_declines_tiles_outside_the_schedule() -> None:
@@ -1067,7 +1227,7 @@ def test_gdn_recurrence_declines_tiles_outside_the_schedule() -> None:
             _sm100_environment(),
             patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"),
         ):
-            code = bound.to_triton_code(config)  # type: ignore[attr-defined]
+            code = bound.to_code(config)  # type: ignore[attr-defined]
         assert _PLAN_KIND not in code
         assert _SIMT_FALLBACK in code
     with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
@@ -1280,112 +1440,23 @@ def test_gdn_recurrence_geometry_helpers() -> None:
     assert not gdn_shape_admitted(dhead=64, chunk=128, dstate=128, block_v=256)
 
 
-def _wrapper_plan(**overrides: object) -> dict[str, object]:
-    layout = gdn_tmem_layout(64, 128)
-    assert layout is not None
-    plan: dict[str, object] = {
-        "kind": "gdn_recurrence_sm100",
-        "k_idx": 0,
-        "w_idx": 1,
-        "u_idx": 2,
-        "g_idx": 3,
-        "h_idx": 4,
-        "batch": 2,
-        "heads": 8,
-        "seqlen": 1024,
-        "chunk": 128,
-        "dhead": 64,
-        "dstate": 128,
-        "num_chunks": 8,
-        "block_v": 128,
-        "epilogue_warps": 8,
-        "stages": 3,
-        "token_groups": 2,
-        "mma_m": 128,
-        "threads": 288,
-        "tmem_cols": layout.alloc_cols,
-        "smem_bytes": gdn_smem_bytes(128, 64, 128, 3, 128),
-        "state_col": layout.state_col,
-        "state_image_col": layout.state_image_col,
-        "acc_col": layout.acc_col,
-        "update_image_col": layout.update_image_col,
-        "device_abi": 5,
-    }
-    plan.update(overrides)
-    return plan
-
-
-def _tensor_schema(dtype: torch.dtype, shape: tuple[int, ...]) -> tuple[object, ...]:
-    strides = []
-    stride = 1
-    for dim in reversed(shape):
-        strides.append(stride)
-        stride *= dim
-    return ("tensor", str(dtype), len(shape), shape, tuple(reversed(strides)))
-
-
-def _helion_imports(relative: str) -> set[str]:
-    """Package-relative paths of the Helion modules ``relative`` imports.
-
-    Follows the relative ``from . import`` statements transitively (type-only
-    imports excluded), so a new Helion import in the schedule shows up here.
-    """
-
-    root = Path(cast("str", helion.__file__)).resolve().parent
-    pending = [relative]
-    seen: set[str] = set()
-    while pending:
-        current = pending.pop()
-        if current in seen:
-            continue
-        seen.add(current)
-        package = Path(current).parent
-        statements = list(ast.parse((root / current).read_text()).body)
-        while statements:
-            statement = statements.pop()
-            if isinstance(statement, ast.If):
-                test = statement.test
-                if not (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING"):
-                    statements.extend(statement.body)
-                statements.extend(statement.orelse)
-                continue
-            if not isinstance(statement, ast.ImportFrom) or not statement.level:
-                continue
-            base = package
-            for _ in range(statement.level - 1):
-                base = base.parent
-            module = base.joinpath(*(statement.module or "").split("."))
-            candidates = (
-                [module.with_suffix(".py")]
-                if statement.module
-                else [module / f"{alias.name}.py" for alias in statement.names]
-            )
-            for candidate in candidates:
-                if (root / candidate).is_file():
-                    pending.append(candidate.as_posix())
-    return seen
-
-
 def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
     """Editing the schedule must change the on-disk compile cache key.
 
     The generated wrapper only imports the schedule, so the launcher's key has
     to hash the schedule sources themselves or a schedule fix would reload
-    obsolete machine code from an earlier build.  The expected set follows
-    the schedule's imports, so a new Helion import needs a table entry too.
+    obsolete machine code from an earlier build. Import closure for every
+    wrapper family is checked in test_cute_helper_cache_dependencies.
     """
 
     from helion.runtime.cute import source_dependencies
 
-    dependencies = source_dependencies._WRAPPER_DEPENDENCIES["gdn_recurrence_sm100"]
-    imported = _helion_imports("_compiler/cute/gdn_recurrence_sm100.py")
-    assert imported >= {
+    dependencies = source_dependencies.wrapper_dependencies()["gdn_recurrence_sm100"]
+    assert set(dependencies) >= {
         "_compiler/cute/gdn_recurrence_sm100.py",
         "_compiler/cute/gdn_recurrence_geometry.py",
         "_compiler/cute/affine_recurrence_primitives.py",
     }
-    assert set(dependencies) | set(source_dependencies._COMMON_DEPENDENCIES) >= imported
-    assert set(dependencies) >= imported - set(source_dependencies._COMMON_DEPENDENCIES)
     fingerprints = source_dependencies.wrapper_source_dependencies(
         ("gdn_recurrence_sm100",)
     )
@@ -1394,21 +1465,7 @@ def test_gdn_recurrence_schedule_sources_fingerprint_the_disk_cache() -> None:
 
 
 def test_gdn_recurrence_wrapper_calls_external_host_schedule() -> None:
-    from helion.runtime.cute.launcher import _create_cute_wrapper
-
-    def dummy_kernel(*_args: object) -> None:
-        pass
-
-    dummy_kernel._helion_cute_wrapper_plans = [_wrapper_plan()]  # type: ignore[attr-defined]
-    schema = (
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 64)),
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 64)),
-        _tensor_schema(torch.bfloat16, (2, 1024, 8, 128)),
-        _tensor_schema(torch.float32, (2, 1024, 8)),
-        _tensor_schema(torch.bfloat16, (2, 8, 8, 64, 128)),
-        ("scalar_constexpr", "int", 128, 128),
-    )
-    wrapper = _create_cute_wrapper(dummy_kernel, schema, (288, 1, 1))
+    wrapper = _gdn_test_wrapper()
     source = inspect.getsource(cast("Callable[..., object]", wrapper))
     assert "_helion_cute_kernel_tag = 'gdn_recurrence_sm100'" in source
     assert (
@@ -1441,11 +1498,13 @@ def test_gdn_recurrence_wrapper_calls_external_host_schedule() -> None:
 def test_gdn_recurrence_wrapper_rejects_invalid_abi(
     overrides: dict[str, object],
 ) -> None:
-    from helion.runtime.cute.launcher import _validate_gdn_recurrence_plan
+    from helion.runtime.cute.host_wrappers.recurrences import (
+        validate_gdn_recurrence_plan,
+    )
 
-    _validate_gdn_recurrence_plan(_wrapper_plan())
+    validate_gdn_recurrence_plan(_wrapper_plan())
     # The 64-row MMA on the 64-row tile: no store warps, no update image.
-    _validate_gdn_recurrence_plan(
+    validate_gdn_recurrence_plan(
         _wrapper_plan(
             block_v=64,
             mma_m=64,
@@ -1454,7 +1513,7 @@ def test_gdn_recurrence_wrapper_rejects_invalid_abi(
         )
     )
     with pytest.raises(exc.BackendUnsupported, match="gdn recurrence"):
-        _validate_gdn_recurrence_plan(_wrapper_plan(**overrides))
+        validate_gdn_recurrence_plan(_wrapper_plan(**overrides))
 
 
 def _fake_pointer_patches(
@@ -1481,7 +1540,9 @@ def _fake_pointer_patches(
 
 
 def test_gdn_recurrence_runtime_args_must_match_the_compiled_geometry() -> None:
-    from helion.runtime.cute.launcher import _validate_gdn_recurrence_launch_args
+    from helion.runtime.cute.host_wrappers.recurrences import (
+        validate_gdn_recurrence_launch_args,
+    )
 
     plan = _wrapper_plan()
     with FakeTensorMode():
@@ -1503,17 +1564,17 @@ def test_gdn_recurrence_runtime_args_must_match_the_compiled_geometry() -> None:
     tensors = (k, w, u, g, h, wrong_seqlen, fp16, shared, misaligned)
     storage_patch, tensor_patch = _fake_pointer_patches(tensors)
     with storage_patch, tensor_patch:
-        _validate_gdn_recurrence_launch_args(plan, (k, w, u, g, h, 128))
+        validate_gdn_recurrence_launch_args(plan, (k, w, u, g, h, 128))
         with pytest.raises(exc.BackendUnsupported, match="k_idx"):
-            _validate_gdn_recurrence_launch_args(plan, (wrong_seqlen, w, u, g, h, 128))
+            validate_gdn_recurrence_launch_args(plan, (wrong_seqlen, w, u, g, h, 128))
         with pytest.raises(exc.BackendUnsupported, match="w_idx"):
-            _validate_gdn_recurrence_launch_args(plan, (k, fp16, u, g, h, 128))
+            validate_gdn_recurrence_launch_args(plan, (k, fp16, u, g, h, 128))
         with pytest.raises(exc.BackendUnsupported, match="u_idx"):
-            _validate_gdn_recurrence_launch_args(
+            validate_gdn_recurrence_launch_args(
                 plan, (k, w, u.transpose(1, 2), g, h, 128)
             )
         with pytest.raises(exc.BackendUnsupported, match="must not alias"):
-            _validate_gdn_recurrence_launch_args(
+            validate_gdn_recurrence_launch_args(
                 plan,
                 (
                     k,
@@ -1525,7 +1586,7 @@ def test_gdn_recurrence_runtime_args_must_match_the_compiled_geometry() -> None:
                 ),
             )
         with pytest.raises(exc.BackendUnsupported, match="misaligned"):
-            _validate_gdn_recurrence_launch_args(
+            validate_gdn_recurrence_launch_args(
                 plan,
                 (misaligned[1 : 1 + k.numel()].view(2, 1024, 8, 64), w, u, g, h, 128),
             )
@@ -1633,6 +1694,29 @@ def _tensor_core_config(
     if mma_m is not None:
         config[CUTE_GDN_RECURRENCE_MMA_M_KEY] = mma_m
     return config
+
+
+def test_gdn_dead_float_capture_matches_reference_cuda() -> None:
+    device = _require_sm100_runtime()
+    args = _runtime_inputs(
+        device,
+        batch=1,
+        heads=2,
+        seqlen=256,
+        chunk=64,
+        dhead=32,
+        dstate=32,
+        seed=20261110,
+    )
+    _gdn_with_runtime_float.reset()
+    code, result = code_and_output(
+        _gdn_with_runtime_float,
+        (*args, 0.25, False, False),
+        **_tensor_core_config(32, 4, 3),
+    )
+    assert _PLAN_KIND in code
+    expected = _torch_reference(*args)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
 
 
 @pytest.mark.parametrize(
@@ -2081,15 +2165,22 @@ def test_gdn_recurrence_tightest_smem_budget_cuda(
 # store warps) registers, at the group counts that used to spill; then the
 # 64-row MMA's widest slices (a whole 256-token chunk per warp) and its
 # register-capped CTAs.
+# Each case compiles in a fresh interpreter with the SASS kept (~10s): the
+# first is the smoke test of the spill check, the rest are the slow tier.
 _WIDE_SLICE_CASES = (
     (128, 4, 1, 1, 128),
-    (128, 8, 1, 2, 128),
-    (128, 16, 1, 1, 128),
-    (128, 16, 1, 4, 128),
-    (64, 16, 1, 1, 128),
-    (64, 4, 1, 1, 64),
-    (64, 16, 1, 1, 64),
-    (32, 16, 1, 1, 64),
+    *(
+        pytest.param(*case, marks=pytest.mark.slow)
+        for case in (
+            (128, 8, 1, 2, 128),
+            (128, 16, 1, 1, 128),
+            (128, 16, 1, 4, 128),
+            (64, 16, 1, 1, 128),
+            (64, 4, 1, 1, 64),
+            (64, 16, 1, 1, 64),
+            (32, 16, 1, 1, 64),
+        )
+    ),
 )
 
 
@@ -2165,8 +2256,10 @@ def test_gdn_recurrence_wide_token_slices_do_not_spill_cuda(
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    sass_files = sorted(tmp_path.glob("*.sass"))
-    assert len(sass_files) == 1, sass_files
+    # Only the Helion kernel's: the DSL also dumps any other CuTe kernel the
+    # process compiles (e.g. ones PyTorch builds on import).
+    sass_files = sorted(tmp_path.glob("*_helion_cute_launch_*.sass"))
+    assert len(sass_files) == 1, sorted(tmp_path.glob("*.sass"))
     spills = [
         line
         for line in sass_files[0].read_text().splitlines()
@@ -2264,6 +2357,262 @@ def test_gdn_recurrence_unaligned_dstate_falls_back_cuda() -> None:
         block_sizes=[32],
     )
     assert _PLAN_KIND not in code
+    expected = _torch_reference(*args)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# The register-MMA dataflow owner (``cute_mma_dag``) beside the tcgen05 schedule
+# ---------------------------------------------------------------------------
+
+_SMALL_SHAPE = {"batch": 1, "heads": 4, "seqlen": 256, "dhead": 32, "dstate": 32}
+_DAG_WARP: dict[str, object] = {
+    "cute_mma_dag": "warp",
+    "cute_mma_dag_warps": 4,
+    "cute_mma_dag_stages": 2,
+}
+_DAG_MMA = "_helion_mma_dag.mma_bf16("
+
+
+def test_mma_dag_admits_the_fixed_size_chunk_loop() -> None:
+    """``hl.tile(seqlen, block_size=chunk)`` with a specialized ``chunk`` is a
+    tile loop over a fixed block size: the dag owner matches it (the axis is
+    sized by the kernel, not the config) and enters the search beside the
+    tcgen05 schedule, which keeps the promoted default."""
+    with _sm100_environment():
+        bound = cast("Any", _bind(chunk=64, shape=_SMALL_SHAPE))
+        spec = bound.config_spec
+        assert spec.cute_mma_dag is not None
+        assert "warp" in spec.cute_mma_dag.choices
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None
+        (chunk_axis,) = [axis for axis in facts.axes if axis.kind == "loop"]
+        assert (chunk_axis.extent, chunk_axis.fixed, chunk_axis.tunable) == (
+            256,
+            64,
+            False,
+        )
+        # Only the dstate tile is the config's.
+        assert [
+            axis.block_id for axis in facts.axes if axis.tunable
+        ] == spec.block_sizes.valid_block_ids()
+        assert spec.cute_gdn_recurrence_stages is not None
+        assert spec.default_config().config["cute_mma_dag"] == "off"
+
+
+def test_mma_dag_warp_mode_replaces_the_tcgen05_schedule() -> None:
+    code = _code(chunk=64, block_v=32, shape=_SMALL_SHAPE, overrides=_DAG_WARP)
+    assert _PLAN_KIND not in code
+    assert _DAG_MMA in code
+    assert _SIMT_FALLBACK not in code
+    # Four chunks of 64 tokens.  The gate of the chunk's last token,
+    # ``g[b, min(t_i.begin + 64, seqlen) - 1, h]``, is loaded at
+    # ``63 + 64 * i`` (the ``min`` folded: the loop walks ``seqlen`` in whole
+    # blocks) and prefetched for the next chunk inside the loop.
+    assert "for md_i in cutlass.range(0, 4):" in code
+    assert "63 + 64 * 0" in code
+    assert "63 + 64 * (md_i + 1)" in code
+    assert "Min(" not in code
+    # The knob off keeps the tcgen05 schedule.
+    off = _code(
+        chunk=64, block_v=32, shape=_SMALL_SHAPE, overrides={"cute_mma_dag": "off"}
+    )
+    assert _PLAN_KIND in off
+    assert _DAG_MMA not in off
+
+
+@pytest.mark.cpu_only
+def test_declined_configs_compute_the_schedules_exponentials() -> None:
+    """Without fast_math the configs the schedule declines (the SIMT and dag
+    lowerings) compute the gate ``exp(g_last - g)`` and the rescale
+    ``exp(g_last)`` as the schedule does, ``exp2(x * log2 e)`` keeping
+    denormals, so the configs differ only in reduction order; a target
+    without the schedule keeps the exactly reduced ``cute.math.exp``.
+
+    The FMA scale hoist would distribute the gate's product over the chunk
+    loop's invariant ``g_last``; it needs fast_math, and this pins that gate
+    end to end: the product stays whole without the setting, and the hoist
+    fires under it."""
+    template_exp2 = re.compile(
+        r"cute\.math\.exp2\(cutlass\.Float32\(\w+\) \* 1\.4426950408889634\)"
+    )
+    # A 256-row dstate tile is not admitted: the SIMT lowering.
+    shape = {"batch": 1, "heads": 2, "seqlen": 448, "dhead": 64, "dstate": 256}
+    simt: dict[str, object] = {"cute_collective_mma": True}
+    fast_math = helion.kernel(
+        cast("Any", _example_module()).helion_gdn_fwd_h.fn, fast_math=True
+    )
+    with patch.dict(os.environ, HELION_CUTE_MMA_IMPL="universal"):
+        declined = _code(chunk=128, block_v=256, shape=shape, overrides=simt)
+        hoisted = _code(
+            chunk=128, block_v=256, shape=shape, overrides=simt, kernel=fast_math
+        )
+        sm90 = _code(
+            chunk=128, block_v=256, shape=shape, overrides=simt, capability=(9, 0)
+        )
+    dag = _code(chunk=64, block_v=32, shape=_SMALL_SHAPE, overrides=_DAG_WARP)
+    assert _SIMT_FALLBACK in declined
+    assert _DAG_MMA in dag
+    assert len(template_exp2.findall(declined)) == 2
+    for code in (declined, dag):
+        assert _PLAN_KIND not in code
+        assert template_exp2.search(code)
+        assert "cute.math.exp(" not in code
+        assert "_helion_scaled_" not in code
+    assert "_helion_scaled_" in hoisted
+    assert sm90.count("cute.math.exp(") == 2
+    assert "cute.math.exp2(" not in sm90
+
+
+def test_mma_dag_declines_a_ragged_chunk_loop() -> None:
+    """A fixed block size that does not divide the extent (a ragged last
+    chunk) is the tcgen05 schedule's alone."""
+    with _sm100_environment():
+        bound = cast("Any", _bind(chunk=64, shape={**_SMALL_SHAPE, "seqlen": 200}))
+        assert bound.config_spec.cute_mma_dag is None
+        assert bound.config_spec.cute_gdn_recurrence_stages is not None
+
+
+def test_mma_dag_declines_a_non_affine_min_over_the_chunk_index() -> None:
+    """``min(t_i.id // 2, 3)`` over the fixed-size chunk loop: the fold has no
+    branch to pick (``sympy.degree`` would raise on the floor division), so
+    the dag declines the kernel instead of failing its compile; the render
+    of the ordinary lowering still goes through."""
+    with _sm100_environment():
+        bound = cast(
+            "Any",
+            _bind(
+                kernel=_gdn_fwd_h_with_floordiv_gate_index, chunk=64, shape=_SMALL_SHAPE
+            ),
+        )
+        assert bound.config_spec.cute_mma_dag is None
+        assert bound.config_spec.cute_mma_dag_facts is None
+    code = _code(
+        kernel=_gdn_fwd_h_with_floordiv_gate_index, chunk=64, shape=_SMALL_SHAPE
+    )
+    assert "def _helion__gdn_fwd_h_with_floordiv_gate_index(" in code
+    assert _DAG_MMA not in code
+
+
+def test_mma_dag_seeds_size_only_the_dstate_tile() -> None:
+    from helion._compiler.cute.autotune.heuristics.cute_mma_dag import (
+        CuteMmaDagHeuristic,
+    )
+
+    with _sm100_environment():
+        bound = cast("Any", _bind(chunk=64, shape=_SMALL_SHAPE))
+        env, host_function = bound.env, bound.host_function
+        with env, host_function:
+            seeds = CuteMmaDagHeuristic.get_seed_configs(env, host_function.device_ir)
+    assert seeds
+    for seed in seeds:
+        assert seed.config["cute_mma_dag"] in ("warp", "tcgen05")
+        block_sizes = seed.config["block_sizes"]
+        assert isinstance(block_sizes, list)
+        assert len(block_sizes) == 1
+        assert block_sizes[0] in (16, 32)
+    # Eight CTAs are short of one wave: the ladder's most-CTA tile ([16])
+    # joins the ranked seeds at every legal warp count, and both loads
+    # routes are seeded there -- the first warp seed and every [16] seed
+    # have a lane-route twin behind their TMA-ring seed; the measured best
+    # of the shape ([16] x 4 warps x 4 stages, lane) is one of them.
+    warp_seeds = [s.config for s in seeds if s.config["cute_mma_dag"] == "warp"]
+    keys = [
+        (
+            c["block_sizes"][0],
+            c["cute_mma_dag_warps"],
+            c["cute_mma_dag_stages"],
+            c["cute_mma_dag_loads"],
+        )
+        for c in warp_seeds
+    ]
+    assert {(k[0], k[1]) for k in keys} >= {(16, 2), (16, 4), (32, 4)}
+    first = keys[0]
+    assert first[3] == "tma"
+    assert (first[0], first[1], first[2], "lane") in keys
+    for key in keys:
+        if key[0] == 16:
+            assert (key[0], key[1], key[2], "tma") in keys
+            assert (key[0], key[1], key[2], "lane") in keys
+    assert (16, 4, 4, "lane") in keys
+    # (The first seed's eviction-hint and occupancy twins repeat its key.)
+    assert len({str(sorted(c.items())) for c in warp_seeds}) == len(warp_seeds)
+    # Only the twins take the lane route.
+    lane = [k for k in keys if k[3] == "lane"]
+    assert len(lane) == 1 + sum(1 for k in keys if k[0] == 16 and k[3] == "tma")
+
+
+@pytest.mark.parametrize(("block_v", "warps"), [(32, 4), (32, 8), (16, 2)])
+def test_mma_dag_warp_mode_matches_reference_cuda(block_v: int, warps: int) -> None:
+    device = _require_sm100_runtime()
+    module = _example_module()
+    args = _runtime_inputs(
+        device,
+        batch=1,
+        heads=4,
+        seqlen=256,
+        chunk=64,
+        dhead=32,
+        dstate=32,
+        seed=20260931,
+    )
+    code, result = code_and_output(
+        module.helion_gdn_fwd_h,  # type: ignore[attr-defined]
+        args,
+        block_sizes=[block_v],
+        cute_mma_dag="warp",
+        cute_mma_dag_warps=warps,
+        cute_mma_dag_stages=2,
+    )
+    assert _PLAN_KIND not in code
+    assert _DAG_MMA in code
+    expected = _torch_reference(*args)
+    torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
+
+
+def test_mma_dag_tcgen05_declines_the_loop_axis_tile_index() -> None:
+    """The gate's token mask reads the chunk loop's ``tile.index``: the
+    tensor-memory emitters evaluate derived values ahead of their iteration
+    (with the current iteration's axis base), so only the warp mode is a
+    choice -- for the admitted s0 shape and for a shape the tcgen05 schedule
+    does not admit (dhead 128), where the dag's seed is the promoted default
+    on an SM100."""
+    for shape in (_SMALL_SHAPE, {"batch": 2, "heads": 8, "dhead": 128, "dstate": 128}):
+        with _sm100_environment():
+            bound = cast(
+                "Any", _bind(chunk=128 if shape["dhead"] == 128 else 64, shape=shape)
+            )
+            spec = bound.config_spec
+            assert spec.cute_mma_dag is not None
+            assert spec.cute_mma_dag.choices == ("off", "warp")
+            assert spec.cute_mma_dag_facts is not None
+            assert spec.cute_mma_dag_facts.tcgen05 is None
+    assert bound.config_spec.cute_gdn_recurrence_stages is None
+
+
+def test_mma_dag_default_runs_an_unadmitted_shape_cuda() -> None:
+    """A shape the tcgen05 schedule does not admit (dhead 128): on an SM100
+    the dag heuristic promotes its warp seed to the autotune-off default,
+    which must compile and match the reference."""
+    device = _require_sm100_runtime()
+    module = _example_module()
+    args = _runtime_inputs(
+        device,
+        batch=1,
+        heads=2,
+        seqlen=256,
+        chunk=128,
+        dhead=128,
+        dstate=128,
+        seed=20260932,
+    )
+    kernel = module.helion_gdn_fwd_h  # type: ignore[attr-defined]
+    kernel.reset()
+    default = kernel.bind(args).config_spec.default_config().config
+    assert default["cute_mma_dag"] == "warp"
+    code, result = code_and_output(kernel, args, **default)
+    assert _PLAN_KIND not in code
+    assert _DAG_MMA in code
     expected = _torch_reference(*args)
     torch.testing.assert_close(result.float(), expected.float(), atol=1e-1, rtol=1e-2)
 

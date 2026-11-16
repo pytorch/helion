@@ -14,6 +14,8 @@ from test.test_cute_rolled_online_epilogue import _program
 from helion._compiler.cute import register_row_reduction
 from helion._compiler.cute import scalar_epilogue
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
 

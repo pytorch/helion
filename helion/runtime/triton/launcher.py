@@ -32,15 +32,28 @@ except ImportError:
     triton = None  # type: ignore[assignment]
 
 
+# (Triton driver, device of its scratch allocations): querying the driver's
+# target reads device properties, too slow to repeat on every kernel launch.
+# Top level, so the standalone runtime shim rewrites its ``global`` to
+# ``nonlocal``.
+_alloc_device: tuple[object, torch.device] | None = None
+
+
 if triton is not None:
 
     def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
-        # Dynamically get device from Triton backend
-        current_target = triton.runtime.driver.active.get_current_target()
-        if current_target is None:
-            raise RuntimeError("No active Triton target available")
-        backend = current_target.backend
-        return torch.empty(size, device=backend, dtype=torch.int8)
+        global _alloc_device
+        driver = triton.runtime.driver.active
+        cached = _alloc_device
+        if cached is None or cached[0] is not driver:
+            # Dynamically get device from Triton backend
+            current_target = driver.get_current_target()
+            if current_target is None:
+                raise RuntimeError("No active Triton target available")
+            # No device index: allocate on the current device, where Triton
+            # launches.
+            cached = _alloc_device = (driver, torch.device(current_target.backend))
+        return torch.empty(size, device=cached[1], dtype=torch.int8)
 
     def set_triton_allocator() -> None:
         try:

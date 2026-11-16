@@ -9,7 +9,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_philox_stream import _config
 from test.test_cute_philox_stream import _explicit_offsets
 from test.test_cute_philox_stream import _implicit_normal
@@ -22,17 +21,22 @@ from test.test_cute_philox_stream import cpu_only  # noqa: F401
 import helion
 from helion._compiler.rng_utils import philox_rand4x_ref
 from helion._compiler.rng_utils import philox_randint_ref
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_native_compile
 import helion.language as hl
 from helion.runtime.ref_mode import RefMode
 
-pytestmark = pytest.mark.usefixtures("cpu_only", "default_policy")
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.usefixtures("cpu_only", "default_policy"),
+]
 
 
 @pytest.fixture
 def default_policy(monkeypatch):
     monkeypatch.delenv("HELION_CUTE_RNG_STREAM", raising=False)
-    with _forbid_native_compile():
+    with forbid_native_compile():
         yield
 
 
@@ -76,7 +80,7 @@ def test_backend_environment_explicit_precedence_and_roundtrip(monkeypatch):
 def test_default_original_emission_matches_explicit_philox4(
     implementation, dtype, shape
 ):
-    from examples import low_mem_dropout as example
+    example = import_example("low_mem_dropout")
 
     function = vars(example)[implementation].fn
     args = (0.25, torch.empty(shape, dtype=dtype), -(2**63))
@@ -106,8 +110,9 @@ def test_default_original_emission_matches_explicit_philox4(
 @pytest.mark.parametrize("policy", (None, "philox4"), ids=("default", "philox4"))
 @skipUnlessBackends(["cute"])
 def test_default_view_dynamic_seed_and_probability_reference(dtype, policy):
-    from examples.low_mem_dropout import low_mem_dropout
-    from examples.low_mem_dropout import low_mem_dropout_bwd
+    _examples_low_mem_dropout = import_example("low_mem_dropout")
+    low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+    low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
     values = torch.linspace(-2, 2, 2 * 33, dtype=dtype)[1::2]
     assert not values.is_contiguous()
@@ -146,7 +151,7 @@ def test_default_view_dynamic_seed_and_probability_reference(dtype, policy):
 
 @skipUnlessBackends(["cute"])
 def test_original_nonflattenable_view_still_rejects():
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     values = torch.empty(33, 2).t()
     for policy in ("auto", "philox4", "word0"):

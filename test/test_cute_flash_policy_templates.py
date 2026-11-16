@@ -14,6 +14,8 @@ from helion._compiler.cute import cute_flash
 from helion._compiler.cute.flash_policy import get_flash_target_policy
 from helion.autotuner.config_fragment import EnumFragment
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -69,11 +71,8 @@ def _target_seeds(
 
 def _overrides(*, is_causal: bool) -> tuple[Mapping[str, object], ...]:
     tuning = get_flash_target_policy((10, 3)).tuning
-    return (
-        tuple(map(cute_flash._flash_causal_tuning_overrides, tuning.causal_policies))
-        if is_causal
-        else tuple(map(cute_flash._flash_dense_tuning_overrides, tuning.dense_policies))
-    )
+    policies = tuning.causal_policies if is_causal else tuning.dense_policies
+    return tuple(policy.knob_values() for policy in policies)
 
 
 @pytest.mark.parametrize("is_causal", (False, True))

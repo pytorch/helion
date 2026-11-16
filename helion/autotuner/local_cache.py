@@ -14,6 +14,7 @@ from pathlib import Path
 import platform
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 import uuid
 
 import torch
@@ -22,18 +23,25 @@ from torch._inductor.runtime.cache_dir_utils import cache_dir
 from .._compat import extract_device
 from .._compat import get_device_name
 from ..runtime.config import Config
-from ..runtime.cute_structural_config import bound_structural_policy
-from ..runtime.cute_structural_config import decode_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.cute.structural_config import decode_structural_policy
+from ..runtime.structural_policy import bound_structural_policy
+from ..runtime.structural_policy import require_same_structural_policy
+from .accuracy import keyable_accuracy_check
 from .base_cache import AutotuneCacheBase
 from .base_cache import LooseAutotuneCacheKey
 from .base_cache import StrictAutotuneCacheKey
+from .base_cache import _requires_uncached_tuning
+from .base_cache import _UncachedAutotuneCache
+from .base_search import PopulationBasedSearch
+from .benchmark_provider import LocalBenchmarkProvider
+from .benchmarking import _resolve_l2_flush_mode
+from .benchmarking import final_selection_l2_flush_mode
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from typing import Callable
 
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
     from .base_search import BaseSearch
 
 log: logging.Logger = logging.getLogger(__name__)
@@ -105,26 +113,123 @@ def _search_policy_json_value(
         active.remove(value_id)
 
 
-def _cute_flash_search_policy_hash(
-    autotuner: BaseSearch, *, cute_flash_search_enabled: bool
+def _hash_search_policy(encoded: bytes) -> str:
+    # Includes default one-bank searches: old winners may have been validated
+    # with changed metadata identity, uncloned callback captures, or undetected
+    # writes to callback-only operands (including with custom accuracy checks),
+    # or callbacks whose shared closure cells were split by partial cloning
+    # or serialization to the benchmark worker.
+    return hashlib.sha256(b"helion.input_clone.v6\0" + encoded).hexdigest()
+
+
+def _explicit_aot_policy(autotuner: BaseSearch) -> dict[str, object]:
+    # Explicit AOT artifacts belong to the user's kernel/data namespace. Unlike
+    # automatic winner caches, their shape identifiers must survive a new search
+    # instance. Unkeyable provider/callback changes require artifact regeneration.
+    autotuner._search_policy_cacheable = False
+    accuracy = keyable_accuracy_check(autotuner.settings)
+    return {
+        "schema": "explicit_aot_artifact_v1",
+        "search_class": f"{type(autotuner).__module__}.{type(autotuner).__qualname__}",
+        "input_banks": autotuner.settings.autotune_benchmark_input_banks,
+        "accuracy_check": (
+            accuracy.cache_policy()
+            if accuracy is not None and autotuner.settings.autotune_accuracy_check
+            else None
+        ),
+    }
+
+
+def _search_policy_hash(
+    autotuner: BaseSearch,
+    *,
+    cute_flash_search_enabled: bool,
+    explicit_aot: bool = False,
 ) -> str:
-    """Hash the effective built-in search policy for CuTe flash caches.
+    """Hash the effective clone, accuracy, search and timing policy.
 
-    A cached quick or explicitly truncated search must not satisfy a later full
-    request. Unknown/custom policies get a unique one-shot key; other kernels
-    retain their historical cache keys.
+    CuTe flash keys cover the full search policy. Other kernels also key an
+    enabled AccuracyCheck independently of their bank and final-selection
+    policies. Unknown/custom flash policies get a unique one-shot key. Clone
+    semantics version ordinary one-bank keys across every backend and AOT mode.
+    Explicit AOT artifacts use stable identifiers even when custom provider or
+    callback state cannot be fingerprinted; their owner must regenerate them
+    after changes to that state. This does not enable automatic winner reuse.
     """
-    if not cute_flash_search_enabled:
-        return ""
+    banks = autotuner.settings.autotune_benchmark_input_banks
+    resident_bank_policy = None
+    if banks > 1:
+        regimes = (_resolve_l2_flush_mode(None), final_selection_l2_flush_mode())
+        if "off" in regimes:
+            resident_bank_policy = {
+                "input_banks": banks,
+                "search_l2_flush_mode": regimes[0],
+                "final_l2_flush_mode": regimes[1],
+            }
+    custom_provider = autotuner._benchmark_provider_cls is not LocalBenchmarkProvider
+    if custom_provider:
+        # AOT owns its explicit artifacts, but must not grant this search
+        # permission to reuse an automatic winner (including late providers).
+        autotuner._search_policy_cacheable = False
+    if not explicit_aot and custom_provider:
+        # Providers can change validation as well as timing. Reject them before
+        # the non-flash legacy-key path, even if installed after construction.
+        policy = None
+    elif cute_flash_search_enabled:
+        policy = autotuner.cache_policy()
+    else:
+        policy = None
+        if isinstance(autotuner, PopulationBasedSearch):
+            default = autotuner._final_selection_from_settings(autotuner.settings)
+            if autotuner.final_selection != default:
+                policy = {
+                    "input_banks": banks,
+                    "final_selection": autotuner.final_selection,
+                }
+        accuracy_check = keyable_accuracy_check(autotuner.settings)
+        if accuracy_check is not None and autotuner.settings.autotune_accuracy_check:
+            # Accuracy validation applies independently of bank count, timing
+            # regime and an explicitly overridden final-selection policy.
+            policy = {
+                "schema": "accuracy_check_policy_v1",
+                "autotune_baseline_accuracy_check_fn": accuracy_check.cache_policy(),
+                "input_banks": banks,
+                "search_policy": policy,
+            }
+        if policy is None:
+            # Keep the existing bank/regime distinctions within the current
+            # clone version for local, remote and AOT selection alike.
+            if banks == 1:
+                return _hash_search_policy(b"")
+            if resident_bank_policy is not None:
+                return _hash_search_policy(
+                    json.dumps(resident_bank_policy, sort_keys=True).encode()
+                )
+            return _hash_search_policy(
+                f"helion.benchmark_input_banks.v1:{banks}".encode()
+            )
 
-    policy = autotuner.cache_policy()
     if policy is None:
-        log.warning(
-            "CuTe-flash autotune cache reuse is disabled for unsupported search "
-            "policy %s",
-            type(autotuner).__qualname__,
-        )
-        policy = _uncacheable_search_policy(autotuner)
+        if explicit_aot:
+            policy = _explicit_aot_policy(autotuner)
+        elif autotuner._benchmark_provider_cls is not LocalBenchmarkProvider:
+            log.warning(
+                "Autotune cache reuse is disabled for custom benchmark provider %s",
+                getattr(
+                    autotuner._benchmark_provider_cls,
+                    "__qualname__",
+                    type(autotuner._benchmark_provider_cls).__qualname__,
+                ),
+            )
+        else:
+            log.warning(
+                "Autotune cache reuse is disabled for unsupported search policy %s",
+                type(autotuner).__qualname__,
+            )
+        if not explicit_aot:
+            policy = _uncacheable_search_policy(autotuner)
+    if resident_bank_policy is not None:
+        policy = {"search_policy": policy, "resident_banks": resident_bank_policy}
     try:
         canonical_policy = _search_policy_json_value(policy)
         encoded = json.dumps(
@@ -134,13 +239,16 @@ def _cute_flash_search_policy_hash(
             allow_nan=False,
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
-        log.warning("CuTe-flash autotune cache reuse is disabled: %s", error)
+        if not explicit_aot:
+            log.warning("Autotune cache reuse is disabled: %s", error)
         encoded = json.dumps(
-            _uncacheable_search_policy(autotuner),
+            _explicit_aot_policy(autotuner)
+            if explicit_aot
+            else _uncacheable_search_policy(autotuner),
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return _hash_search_policy(encoded)
 
 
 def get_helion_cache_dir() -> Path:
@@ -169,7 +277,7 @@ class SavedBestConfig:
     config: Config
     config_spec_hash: str
     flat_config: tuple[object, ...] | None
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
     def to_mutable_flat_config(self) -> list[object]:
         """Return the stored flat_config as a mutable list."""
@@ -240,7 +348,26 @@ class LocalAutotuneCache(AutotuneCacheBase):
     which takes into account device and source code properties, but does
     not account for library level code changes such as Triton, Helion or
     PyTorch. Use StrictLocalAutotuneCache to consider these properties.
+
+    Direct construction of either built-in local cache uses uncached trial
+    orchestration for bindings that require a fresh frontend trace, just like
+    Cache[Search]. Custom subclasses retain their own constructor behavior.
     """
+
+    def __new__(
+        cls, *args: object, **kwargs: object
+    ) -> LocalAutotuneCache | _UncachedAutotuneCache:
+        if cls is LocalAutotuneCache or cls is StrictLocalAutotuneCache:
+            autotuner = cast(
+                "BaseSearch | None", args[0] if args else kwargs.get("autotuner")
+            )
+            if autotuner is not None and _requires_uncached_tuning(
+                autotuner.kernel, autotuner.args
+            ):
+                return cast(
+                    "Callable[..., _UncachedAutotuneCache]", _UncachedAutotuneCache
+                )(*args, **kwargs)
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -316,7 +443,7 @@ class LocalAutotuneCache(AutotuneCacheBase):
         config_spec_hash = self.kernel.config_spec.cache_fingerprint_hash(
             advanced_controls_files=self.autotuner.settings.autotune_search_acf or None
         )
-        search_policy_hash = _cute_flash_search_policy_hash(
+        search_policy_hash = _search_policy_hash(
             self.autotuner,
             cute_flash_search_enabled=bool(
                 getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
@@ -391,14 +518,6 @@ class LocalAutotuneCache(AutotuneCacheBase):
         data["flat_config"] = json.dumps(config_gen.flatten(config))
 
         backend_cache_key = self.kernel.backend_cache_key(config)
-        if backend_cache_key is None:
-            # Config may have been minimized (default values stripped),
-            # so it won't match the full config in _compile_cache.
-            # Expand it back by merging with defaults.
-            default = self.kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            backend_cache_key = self.kernel.backend_cache_key(full_config)
         if backend_cache_key is not None:
             data["backend_cache_key"] = backend_cache_key
 
@@ -469,7 +588,10 @@ def stable_autotune_hash(autotuner: BaseSearch) -> str | None:
     try:
         if not autotuner.kernel.is_cacheable():
             return None
-        return LocalAutotuneCache(autotuner)._generate_key().stable_hash()
+        cache = LocalAutotuneCache(autotuner)
+        if isinstance(cache, _UncachedAutotuneCache):
+            return None
+        return cache._generate_key().stable_hash()
     except Exception:
         log.debug("Could not compute autotune cache hash", exc_info=True)
         return None

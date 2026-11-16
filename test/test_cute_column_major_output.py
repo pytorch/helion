@@ -9,23 +9,24 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import atomic_output_mm
-from test._cute_dense_tcgen05 import column_major_args
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import gb300_target
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import scaled_mm_column_major
-from test._cute_dense_tcgen05 import wrapper_plans
-
 import helion
 from helion._compiler.cute import cute_mma
 from helion._compiler.cute.dense_gemm import prove_dense_gemm_facts
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import max_pipeline_ab_stages
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_schedule_facts import analyze_native_gemm
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import atomic_output_mm
+from helion._testing.cute_dense_tcgen05 import column_major_args
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import gb300_target
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import scaled_mm_column_major
+from helion._testing.cute_dense_tcgen05 import wrapper_plans
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
@@ -33,7 +34,7 @@ from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 # These are physical M/N/K tiles of the frontend's B.T @ A.T expression.
 # They are not compiler geometry requests or logical-axis projections.
@@ -43,7 +44,7 @@ _DEPTHS = (10, 8)
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 
@@ -108,7 +109,7 @@ def test_physical_operands_and_column_major_output_roundtrip(
     assert ab["ab_stage_count"] == _DEPTHS[index]
     assert output["c_stage_count"] == 2
     assert output["d_column_major"] is True
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "CtaGroup.TWO" in source
     assert "LayoutEnum.COL_MAJOR" in source
@@ -185,7 +186,7 @@ def test_overfull_column_major_pipeline_rejected_and_search_repairs(index: int) 
         bound.to_code(request)
     repaired = dict(request.config)
     with bound.env:
-        state.fix_search_config(repaired)
+        repair.fix_search_config(state, repaired)
     assert repaired["block_sizes"] == list(_TILES[index])
     assert repaired["tcgen05_cta_group"] == "two"
     assert repaired["tcgen05_ab_stages"] == _DEPTHS[index]
@@ -231,12 +232,13 @@ def test_column_major_budget_rejects_output_edges_and_partial_first_k_tile(
 ) -> None:
     bound = scaled_mm_column_major._bind_isolated(column_major_args(*shape))
     state = bound.config_spec._cute_tcgen05_config
-    assert state._paired_pipeline_parameters(_config().config) is None
+    assert seeds._paired_pipeline_parameters(state, _config().config) is None
     with pytest.raises(helion.exc.InvalidConfig):
         bound.to_code(_config())
 
 
-def test_dense_allocation_proof_requires_fresh_output_and_one_function() -> None:
+def test_dense_allocation_proof_requires_owned_output_and_one_function() -> None:
+    # A view of an argument output is not owned (an argument itself is).
     args = column_major_args()
     borrowed = _borrowed_column_major_output._bind_isolated(
         (*args[:2], torch.empty((256, 2048), dtype=torch.bfloat16))
@@ -244,9 +246,9 @@ def test_dense_allocation_proof_requires_fresh_output_and_one_function() -> None
     assert borrowed.config_spec._cute_tcgen05_config.dense_gemm_facts is None
     bound = scaled_mm_column_major._bind_isolated(args)
     assert bound.config_spec._cute_tcgen05_config.dense_gemm_facts is not None
-    with patch.object(bound.env, "cute_fission_plan", object()):
+    with patch.object(bound.env.backend_state, "fission_plan", object()):
         gemm = analyze_native_gemm(bound.env, bound.host_function.device_ir)
-        assert prove_dense_gemm_facts(bound.env, gemm) is None
+        assert prove_dense_gemm_facts(gemm) is None
     atomic = atomic_output_mm._bind_isolated(
         (*scaled_args()[:2], torch.empty((1,), dtype=torch.int32))
     )
@@ -257,13 +259,13 @@ def test_generic_paired_seed_keeps_independent_pid_vetoes() -> None:
     bound = scaled_mm_column_major._bind_isolated(column_major_args())
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
-    assert state._paired_pipeline_seed_configs()
+    assert seeds._paired_pipeline_seed_configs(state)
     for pid in ("persistent_interleaved", "persistent_blocked"):
         spec.disallow_pid_type(pid, "independent ownership restriction")
     causes = {
         pid: set(reasons) for pid, reasons in spec.disallowed_pid_type_causes.items()
     }
-    assert not state._paired_pipeline_seed_configs()
+    assert not seeds._paired_pipeline_seed_configs(state)
     assert spec.disallowed_pid_type_causes == causes
 
 
@@ -275,7 +277,11 @@ def test_physical_block_axes_survive_config_encoding_reordering() -> None:
         blocks[index] = original[old_index]
     state = bound.config_spec._cute_tcgen05_config
     request = _config(block_sizes=[256, 128, 64])
-    assert state._paired_pipeline_parameters(request.config)[:3] == (128, 64, 256)
+    assert seeds._paired_pipeline_parameters(state, request.config)[:3] == (
+        128,
+        64,
+        256,
+    )
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         flat, canonical = generation.canonicalize_flat(generation.flatten(request))
@@ -288,10 +294,10 @@ def test_column_major_config_observes_live_k_bounds(acc_stages: int) -> None:
     bound = scaled_mm_column_major._bind_isolated(column_major_args())
     state = bound.config_spec._cute_tcgen05_config
     request = _config(tcgen05_acc_stages=acc_stages)
-    assert state._paired_pipeline_parameters(request.config) is not None
+    assert seeds._paired_pipeline_parameters(state, request.config) is not None
     k_block = bound.config_spec.block_sizes.block_id_lookup(state.matmul_block_ids[2])
     k_block.update_max(128)
-    assert state._paired_pipeline_parameters(request.config) is None
+    assert seeds._paired_pipeline_parameters(state, request.config) is None
     with pytest.raises(helion.exc.InvalidConfig):
         bound.to_code(request)
 
@@ -323,7 +329,7 @@ def test_early_mma_selection_receives_already_physical_tiles(
     assert {
         "_detect_specialized_mma_loop",
         "_analyzed_specialized_mma_plan",
-        "_emit_mma_pipeline",
+        "plan_tcgen05_pipeline",
     } <= callers
     assert all(
         tile == _TILES[index] and result == "tcgen05" for _caller, tile, result in calls
@@ -335,7 +341,7 @@ def test_early_mma_selection_receives_already_physical_tiles(
 def test_column_major_acc1_pipeline_releases_after_last_tmem_load(index: int) -> None:
     bound = scaled_mm_column_major._bind_isolated(column_major_args())
     source = bound.to_code(_config(index, tcgen05_acc_stages=1))
-    assert "PipelineUmmaAsync.create(num_stages=1," in source
+    assert "make_umma_async_pipeline(num_stages=1," in source
     assert (
         "tcgen05_acc_pipeline_barriers = cute.arch.alloc_smem(cutlass.Int64, cutlass.Int32(2))"
         in source

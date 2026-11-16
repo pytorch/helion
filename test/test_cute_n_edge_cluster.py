@@ -7,15 +7,11 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
-from test._cute_dense_tcgen05 import blackwell_capability
-from test._cute_dense_tcgen05 import cpu_codegen_target
-from test._cute_dense_tcgen05 import extra_store_mm
-from test._cute_dense_tcgen05 import scaled_args
-from test._cute_dense_tcgen05 import vector_scaled_mm
-
 import helion
 from helion._compiler.cute.tcgen05_config import _TWO_CTA_PERSISTENT_PID_VETO
+from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from helion._compiler.cute.tcgen05_schedule_facts import (
     n_edge_cluster_schedule_defaults,
@@ -24,6 +20,12 @@ from helion._compiler.cute.tcgen05_schedule_facts import (
     n_edge_cluster_schedule_supported,
 )
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_dense_tcgen05 import blackwell_capability
+from helion._testing.cute_dense_tcgen05 import cpu_codegen_target
+from helion._testing.cute_dense_tcgen05 import extra_store_mm
+from helion._testing.cute_dense_tcgen05 import scaled_args
+from helion._testing.cute_dense_tcgen05 import vector_scaled_mm
 from helion.autotuner.config_generation import ConfigGeneration
 
 if TYPE_CHECKING:
@@ -32,12 +34,12 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 @pytest.fixture(autouse=True)
 def _cpu_codegen() -> Iterator[None]:
-    with cpu_codegen_target(), _forbid_cuda_work():
+    with cpu_codegen_target(), forbid_cuda_work():
         yield
 
 
@@ -73,17 +75,19 @@ def test_even_fringe_roundtrip_seeds_and_unsplit_codegen(dtype: torch.dtype) -> 
         flat, canonical = generator.canonicalize_flat(generator.flatten(config))
         assert generator.unflatten(flat) == canonical
         assert canonical.block_sizes == [256, 256, 128]
-        assert state.n_edge_cluster_schedule_config_supported(canonical.config)
-        seeds = state.n_edge_cluster_schedule_seed_configs()
-        assert seeds
-        for seed in seeds:
+        assert repair.n_edge_cluster_schedule_config_supported(state, canonical.config)
+        seed_configs = seeds.n_edge_cluster_schedule_seed_configs(state)
+        assert seed_configs
+        for seed in seed_configs:
             _flat, normalized = generator.canonicalize_flat(generator.flatten(seed))
             assert normalized.block_sizes == seed.block_sizes
-            assert state.n_edge_cluster_schedule_config_supported(normalized.config)
+            assert repair.n_edge_cluster_schedule_config_supported(
+                state, normalized.config
+            )
     source = bound.to_code(config)
     assert "cute.make_layout((2, 2, 1))" in source
     assert "CtaGroup.TWO" in source
-    assert "PipelineTmaUmma.create" in source
+    assert "make_tma_umma_pipeline(" in source
     assert "PipelineTmaStore.create" in source
     assert "tile_offset_1 < cutlass.Int32(832)" in source
     assert "if tcgen05_full_tile:" in source
@@ -105,34 +109,52 @@ def test_sm103_keeps_even_n_cluster_schedule() -> None:
             _flat, canonical = generation.canonicalize_flat(
                 generation.flatten(_config())
             )
-            assert state.n_edge_cluster_schedule_config_supported(canonical.config)
-            assert state.n_edge_cluster_schedule_seed_configs()
+            assert repair.n_edge_cluster_schedule_config_supported(
+                state, canonical.config
+            )
+            assert seeds.n_edge_cluster_schedule_seed_configs(state)
         source = bound.to_code(canonical)
         assert "cute.make_layout((2, 2, 1))" in source
-        assert "PipelineTmaUmma.create" in source
+        assert "make_tma_umma_pipeline(" in source
         assert "PipelineTmaStore.create" in source
         assert "tcgen05_sched_pipeline =" not in source
 
 
 @pytest.mark.parametrize(
-    "override",
+    "override,error,match",
     (
-        {
-            "tcgen05_strategy": "role_local_with_scheduler",
-            "tcgen05_warp_spec_scheduler_warps": 1,
-        },
-        {"tcgen05_l2_swizzle_size": 4},
-        {"l2_groupings": [2]},
-        {"block_sizes": [256, 128, 128]},  # Seven N tiles: padded peer.
+        (
+            {
+                "tcgen05_strategy": "role_local_with_scheduler",
+                "tcgen05_warp_spec_scheduler_warps": 1,
+            },
+            helion.exc.BackendUnsupported,
+            "N-edge cluster_n=2",
+        ),
+        (
+            {"tcgen05_l2_swizzle_size": 4},
+            helion.exc.BackendUnsupported,
+            "N-edge cluster_n=2",
+        ),
+        ({"l2_groupings": [2]}, helion.exc.BackendUnsupported, "N-edge cluster_n=2"),
+        # Seven N tiles: the padded peer is refused by the config layer
+        # (every 2x2 family pairs N tiles) before the render could.
+        (
+            {"block_sizes": [256, 128, 128]},
+            helion.exc.InvalidConfig,
+            r"cdiv\(832, 128\) = 7 tiles is odd",
+        ),
     ),
 )
-def test_unsafe_explicit_schedule_is_rejected(override: dict[str, object]) -> None:
+def test_unsafe_explicit_schedule_is_rejected(
+    override: dict[str, object], error: type[Exception], match: str
+) -> None:
     bound = vector_scaled_mm._bind_isolated(_args())
     config = _config(**override)
-    assert not bound.config_spec._cute_tcgen05_config.n_edge_cluster_schedule_config_supported(
-        config.config
+    assert not repair.n_edge_cluster_schedule_config_supported(
+        bound.config_spec._cute_tcgen05_config, config.config
     )
-    with pytest.raises(helion.exc.BackendUnsupported, match="N-edge cluster_n=2"):
+    with pytest.raises(error, match=match):
         bound.to_code(config)
 
 
@@ -188,8 +210,8 @@ def test_search_projects_phase_split_onto_the_proved_unsplit_protocol() -> None:
             l2_groupings=[2],
         )
         _flat, canonical = generator.canonicalize_flat(generator.flatten(candidate))
-        assert bound.config_spec._cute_tcgen05_config.n_edge_cluster_schedule_config_supported(
-            canonical.config
+        assert repair.n_edge_cluster_schedule_config_supported(
+            bound.config_spec._cute_tcgen05_config, canonical.config
         )
         assert canonical.config["tcgen05_cluster_n"] == 2
 
@@ -215,14 +237,16 @@ def test_unrelated_persistence_restriction_is_preserved(
     first_owned_reason: bool,
 ) -> None:
     # Positive control: registration lifts the CuTe-owned veto alone.
-    bound, facts = _unregistered_n_edge(_TWO_CTA_PERSISTENT_PID_VETO)
+    bound, schedule_facts = _unregistered_n_edge(_TWO_CTA_PERSISTENT_PID_VETO)
     state = bound.config_spec._cute_tcgen05_config
-    state.register_n_edge_cluster_schedule_facts(facts)
-    assert state.n_edge_cluster_schedule_facts == facts
+    facts.register_n_edge_cluster_schedule_facts(state, schedule_facts)
+    assert state.n_edge_cluster_schedule_facts == schedule_facts
     assert "persistent_interleaved" in bound.config_spec.allowed_pid_types
     owned = (_TWO_CTA_PERSISTENT_PID_VETO,) if first_owned_reason else ()
-    bound, facts = _unregistered_n_edge(*owned, "another loop owns this restriction")
+    bound, schedule_facts = _unregistered_n_edge(
+        *owned, "another loop owns this restriction"
+    )
     state = bound.config_spec._cute_tcgen05_config
-    state.register_n_edge_cluster_schedule_facts(facts)
+    facts.register_n_edge_cluster_schedule_facts(state, schedule_facts)
     assert state.n_edge_cluster_schedule_facts is None
     assert "persistent_interleaved" not in bound.config_spec.allowed_pid_types

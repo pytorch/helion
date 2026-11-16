@@ -9,22 +9,26 @@ import math
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.int4_gemm import matmul_bf16_int4
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
 
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 
 import helion
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.state import cute_env_state
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_structural_kernels import _se_args
 
-pytestmark = skipUnlessBackends(["cute"])
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
+
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,12 +39,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
-    with (
-        _cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-    ):
+    with cpu_target():
         yield
 
 
@@ -115,7 +114,7 @@ def _materialized_bound(dtype: torch.dtype) -> BoundKernel:
             torch.empty((512, 512), dtype=torch.int8),
         )
     )
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     return bound
 
 

@@ -16,6 +16,8 @@ from helion._compiler.cute.collective_operand_packet import (
 )
 from helion._compiler.cute.collective_vector_recipe import emit_vector_recipe
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _plan(**changes: Any):
     return plan_collective_operand_packet(

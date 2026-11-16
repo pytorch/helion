@@ -15,7 +15,7 @@ from test.test_cute_flat_grouped_public import _native_source
 from test.test_cute_flat_grouped_public import _source
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
 from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
@@ -38,6 +38,8 @@ from helion._compiler.cute.tcgen05_grouped_descriptors import (
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 from helion.runtime.cute.launcher import _create_cute_wrapper
+
+pytestmark = pytest.mark.cpu_only
 
 
 def signed(value: int, bits: int) -> int:

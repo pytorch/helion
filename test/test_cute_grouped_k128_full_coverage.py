@@ -6,25 +6,28 @@ import itertools
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_full_coverage import _dump
 from test.test_cute_grouped_full_coverage import _inverse
 from test.test_cute_shared_rhs_grouped import _plans
 from test.test_cute_shared_rhs_grouped import _serial_offset_initializer
-from test.test_cute_shared_rhs_grouped import _target
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import grouped_full_coverage_configs
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import grouped_full_coverage_configs
 from helion._compiler.cute.grouped_full_coverage import full_coverage_pipeline_supported
 from helion._compiler.cute.grouped_full_coverage import full_coverage_smem_upper_bound
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -39,11 +42,7 @@ KEY = "tcgen05_grouped_full_coverage"
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _target(),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(previous)
 
@@ -105,7 +104,6 @@ def test_pipeline_profile_rejects_equal_valued_float(index: int) -> None:
         (672, 256, 640, 4),
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_public_k128_complete_inverse_and_unchanged_allocations(
     m: int, n: int, k: int, groups: int
 ) -> None:
@@ -158,11 +156,9 @@ def test_public_k128_complete_inverse_and_unchanged_allocations(
         {"tcgen05_grouped_runtime_direct": True},
         {"tcgen05_sched_stage_count": 2},
         {"tcgen05_l2_swizzle_size": 2},
-        {"tcgen05_ab_producer_advance_mode": "skip"},
     ),
 )
 @pytest.mark.parametrize("mode", ["fixed_tma_dense", "fixed_tma_dense_local"])
-@skipUnlessBackends(["cute"])
 def test_k128_incomplete_or_other_schedule_is_not_admitted(
     updates: dict[str, object],
     mode: str,
@@ -176,7 +172,6 @@ def test_k128_incomplete_or_other_schedule_is_not_admitted(
 
 
 @pytest.mark.parametrize("capacity_delta", (-1, 0))
-@skipUnlessBackends(["cute"])
 def test_k128_capacity_guard_covers_alignment_and_both_ab_barriers(
     capacity_delta: int,
 ) -> None:
@@ -184,7 +179,7 @@ def test_k128_capacity_guard_covers_alignment_and_both_ab_barriers(
     _, dense = _configs(bound)
     upper = full_coverage_smem_upper_bound(4, 128, 4)
     with patch.object(
-        CuteTcgen05Config,
+        target_facts,
         "per_cta_smem_capacity_bytes",
         return_value=upper + capacity_delta,
     ):
@@ -196,7 +191,6 @@ def test_k128_capacity_guard_covers_alignment_and_both_ab_barriers(
                 bound.to_code(dense)
 
 
-@skipUnlessBackends(["cute"])
 def test_new_declaration_is_owned_and_old_pair_is_an_unchanged_prefix() -> None:
     bound, args = _bound()
     old_seeds = deepcopy(bound.config_spec.compiler_seed_configs)
@@ -225,7 +219,6 @@ def test_new_declaration_is_owned_and_old_pair_is_an_unchanged_prefix() -> None:
     assert bound.config_spec.compiler_seed_configs == old_seeds
 
 
-@skipUnlessBackends(["cute"])
 def test_k64_only_binding_preserves_its_original_two_declarations() -> None:
     bound, args = _bound(k=192)
     assert len(_configs(bound, 64)) == 2 and _configs(bound) == []

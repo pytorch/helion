@@ -9,7 +9,7 @@ where:
 - joint thread count <= 1024
 - no MMA
 
-``layout_propagation.py`` detects the shape and emits a
+``execution_plans.py`` detects the shape and emits a
 ``CuTeGridExecutionPlan(block_axis_priority={N: 0, M: 1})``. The
 thread-axis assignment then swaps so:
 
@@ -24,13 +24,13 @@ through to ``_cute_grouped_reduce_warp`` (single warp shuffle, no
 shared memory, no sync_threads).
 
 Lives in:
-- ``helion/_compiler/cute/layout_propagation.py``
+- ``helion/_compiler/cute/execution_plans.py``
   (``_plan_warp_per_row_execution`` shape detector)
 - ``helion/_compiler/tile_strategy.py`` (``_compute_thread_axis_offset``
   honors ``block_axis_priority``)
 - ``helion/_compiler/tile_dispatch.py`` (``thread_axis_for_strategy``
   dedups sibling strategies with identical block_ids in the same branch)
-- ``helion/_compiler/autotuner_heuristics/cute.py``
+- ``helion/_compiler/cute/autotune/heuristics/cute.py``
   (``CuteTileVecWarpPerRowHeuristic`` seeds the multi-row config)
 """
 
@@ -39,13 +39,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-import helion
+from test._cute_kernels import _reduction_kernel
+
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
-import helion.language as hl
 
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
@@ -59,29 +59,6 @@ def _disable_online_to_3pass(monkeypatch: pytest.MonkeyPatch) -> None:
     ``test_cute_online_to_3pass.py``.
     """
     monkeypatch.setenv("HELION_DISABLE_ONLINE_TO_3PASS", "1")
-
-
-@helion.kernel(backend="cute")
-def _reduction_kernel(x: torch.Tensor) -> torch.Tensor:
-    m, n = x.size()
-    out = torch.empty_like(x)
-    block_size_m = hl.register_block_size(m)
-    block_size_n = hl.register_block_size(n)
-    for tile_m in hl.tile(m, block_size=block_size_m):
-        mi = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        di = hl.zeros([tile_m], dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            local_amax = torch.amax(values, dim=1)
-            mi_next = torch.maximum(mi, local_amax)
-            di = di * torch.exp(mi - mi_next) + torch.exp(
-                values - mi_next[:, None]
-            ).sum(dim=1)
-            mi = mi_next
-        for tile_n in hl.tile(n, block_size=block_size_n):
-            values = x[tile_m, tile_n]
-            out[tile_m, tile_n] = torch.exp(values - mi[:, None]) / di[:, None]
-    return out
 
 
 @onlyBackends(["cute"])

@@ -11,15 +11,17 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from helion._compiler import tile_strategy
 from helion._compiler.ast_extension import expr_from_string
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute import affine_vector_io
 from helion._compiler.cute import factor_affine_reductions
 from helion._compiler.cute import hoist_lane_invariant_reductions
 from helion._compiler.cute import pipeline_state_loads
+from helion._compiler.cute._ast_pass_utils import _is_proven_relocatable_call
 from helion._compiler.cute.scalar_recipe import PURE_HELPERS
 from helion._compiler.cute.scalar_recipe import build_recipe
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -406,6 +408,63 @@ def test_side_effects_and_unsupported_expressions_are_rejected(expression: str) 
 
 
 @pytest.mark.parametrize(
+    ("dtype", "asm", "constraints"),
+    [
+        ("Float32", "mul.rn.f32 $0, $1, $2;", "=f,f,f"),
+        ("Float16", "mul.rn.f16 $0, $1, $2;", "=h,h,h"),
+        ("BFloat16", "mul.rn.bf16 $0, $1, $2;", "=h,h,h"),
+    ],
+)
+def test_explicitly_rounded_products_are_recipes(
+    dtype: str, asm: str, constraints: str
+) -> None:
+    """The rounded products ``scalar_recipe_rounding`` emits (the FP32 form
+    and the 16-bit forms of ``narrow_exact_products``) are pure register
+    arithmetic: a value depending on one is still a recipe, and the product
+    is replayed as written."""
+    statements = _body(
+        f"product = _cute_inline_asm_elementwise((cutlass.{dtype}(x), "
+        f"cutlass.{dtype}(y)), asm={asm!r}, constraints={constraints!r}, "
+        f"dtype=cutlass.{dtype}, is_pure=True)\n"
+        f"result = product - cutlass.{dtype}(z)"
+    )
+    recipe = build_recipe(_expr("result"), statements, {"x", "y", "z"})
+    assert recipe is not None
+    replay, value = recipe.emit({"x": _expr("copy_x")}, _fresh())
+    product, result = (ast.unparse(statement) for statement in replay)
+    assert product.count(asm) == 1 and product.count("copy_x") == 1
+    assert result.endswith(f" - cutlass.{dtype}(z)")
+    assert isinstance(value, ast.Name)
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        # No rounding modifier: not one of the emitted forms.
+        (
+            "_cute_inline_asm_elementwise((cutlass.Float16(x), cutlass.Float16(y)), "
+            "asm='mul.f16 $0, $1, $2;', constraints='=h,h,h', "
+            "dtype=cutlass.Float16, is_pure=True)"
+        ),
+        # A 16-bit spelling declaring an FP32 result.
+        (
+            "_cute_inline_asm_elementwise((cutlass.Float16(x), cutlass.Float16(y)), "
+            "asm='mul.rn.f16 $0, $1, $2;', constraints='=h,h,h', "
+            "dtype=cutlass.Float32, is_pure=True)"
+        ),
+        # Declared impure.
+        (
+            "_cute_inline_asm_elementwise((cutlass.BFloat16(x), cutlass.BFloat16(y)), "
+            "asm='mul.rn.bf16 $0, $1, $2;', constraints='=h,h,h', "
+            "dtype=cutlass.BFloat16, is_pure=False)"
+        ),
+    ],
+)
+def test_other_inline_asm_is_not_a_recipe(call: str) -> None:
+    assert build_recipe(_expr(call), [], {"x", "y"}) is None
+
+
+@pytest.mark.parametrize(
     "load", ["A.iterator.load()", "cute.arch.load(A.iterator, cutlass.Uint8)"]
 )
 @pytest.mark.parametrize(
@@ -470,7 +529,7 @@ def test_pure_helpers_are_pure_in_every_effect_proof(helper: str) -> None:
     call = _expr(f"{helper}(a, b)")
     assert isinstance(call, ast.Call)
     assert build_recipe(call, [], {"a", "b"}) is not None
-    assert tile_strategy._is_proven_relocatable_call(call, allow_load=False)
+    assert _is_proven_relocatable_call(call, allow_load=False)
     assert affine_vector_io._accesses(_body(f"c = {helper}(a, b)")) == []
     assert pipeline_state_loads._prefetch_overlap_call_is_safe(
         call,

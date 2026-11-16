@@ -17,7 +17,11 @@ import ast
 from collections import Counter
 from dataclasses import dataclass
 
+from ._ast_pass_utils import name_assignment
+from ._ast_pass_utils import reparse_expr
 from .hoist_warp_reduce import _match_carry_update
+from .reduce_call import ReduceCall
+from .reduce_call import ReduceScope
 
 _FLOAT_TYPES = frozenset({"Float16", "BFloat16", "Float32", "Float64"})
 _SCALAR_TYPES = _FLOAT_TYPES | frozenset(
@@ -33,16 +37,6 @@ _SCALAR_TYPES = _FLOAT_TYPES | frozenset(
         "Uint64",
     }
 )
-
-
-def _assignment(stmt: ast.AST) -> tuple[str, ast.expr] | None:
-    if (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    ):
-        return stmt.targets[0].id, stmt.value
-    return None
 
 
 def _lane_count(loop: ast.For) -> int | None:
@@ -276,7 +270,7 @@ def _effect_free_loop(
             ):
                 return False
             continue
-        assigned = _assignment(statement)
+        assigned = name_assignment(statement)
         if assigned is not None:
             name, value = assigned
             if name in vectors and _raw_vector_load(value):
@@ -296,10 +290,6 @@ def _effect_free_loop(
             continue
         return False
     return True
-
-
-def _copy(expr: ast.expr) -> ast.expr:
-    return ast.parse(ast.unparse(expr), mode="eval").body
 
 
 class _Recipe:
@@ -327,12 +317,12 @@ class _Recipe:
             if definition is not None:
                 # Definitions are snapshots made at their assignment, not
                 # aliases re-evaluated after a later scalar overwrite.
-                return _copy(definition)
+                return reparse_expr(definition)
             if expr.id in self.written and expr.id not in self.vectors:
                 return None
-            return _copy(expr)
+            return reparse_expr(expr)
         if isinstance(expr, ast.Constant):
-            return _copy(expr)
+            return reparse_expr(expr)
         if isinstance(expr, ast.Compare):
             if len(expr.ops) != 1 or len(expr.comparators) != 1:
                 return None
@@ -369,7 +359,7 @@ class _Recipe:
                 return value
             if dtype in _FLOAT_TYPES and _dtype(value) == dtype:
                 return value
-            result = _copy(expr)
+            result = reparse_expr(expr)
             assert isinstance(result, ast.Call)
             result.args = [value]
             return result
@@ -382,13 +372,15 @@ class _Recipe:
             index = self.expand(expr.slice)
             if index is None:
                 return None
-            return ast.Subscript(value=_copy(expr.value), slice=index, ctx=ast.Load())
+            return ast.Subscript(
+                value=reparse_expr(expr.value), slice=index, ctx=ast.Load()
+            )
         if isinstance(expr, ast.Call) and _dtype(expr) is not None:
             assert isinstance(expr.func, ast.Attribute)
             value = self.expand(expr.func.value)
             if value is None:
                 return None
-            result = _copy(expr)
+            result = reparse_expr(expr)
             assert isinstance(result, ast.Call) and isinstance(
                 result.func, ast.Attribute
             )
@@ -399,7 +391,7 @@ class _Recipe:
             and ast.unparse(expr.func) == "float"
             and _pure(expr, self.vectors)
         ):
-            return _copy(expr)
+            return reparse_expr(expr)
         return None
 
 
@@ -446,7 +438,7 @@ def _fold(
             if isinstance(inner.target, ast.Name)
         }
         for stmt in body:
-            assigned = _assignment(stmt)
+            assigned = name_assignment(stmt)
             if assigned is not None:
                 name, value = assigned
                 recipe = _Recipe(
@@ -541,27 +533,22 @@ def _carry(
     reads: Counter[str],
     writes: Counter[str],
 ) -> _Carry | None:
-    assigned = _assignment(loop.body[index])
+    assigned = name_assignment(loop.body[index])
     if assigned is None:
         return None
     result, value = assigned
+    reduce = ReduceCall.parse(value)
     if not (
-        isinstance(value, ast.Call)
-        and isinstance(value.func, ast.Name)
-        and value.func.id == "_cute_grouped_reduce_cluster"
-        and len(value.args) == 6
+        reduce is not None
+        and reduce.scope is ReduceScope.CLUSTER
+        and reduce.op == "max"
+        and isinstance(value, ast.Call)
         and isinstance(value.args[0], ast.Name)
-        and isinstance(value.args[1], ast.Constant)
-        and value.args[1].value == "max"
         and all(isinstance(arg, ast.Name) for arg in value.args[4:])
-        and {kw.arg for kw in value.keywords} == {"group_span", "cluster_n"}
-        and len(value.keywords) == 2
-        and all(
-            isinstance(kw.value, ast.Constant)
-            and type(kw.value.value) is int
-            and kw.value.value > 1
-            for kw in value.keywords
-        )
+        and reduce.group_span is not None
+        and reduce.group_span > 1
+        and reduce.cluster_n is not None
+        and reduce.cluster_n > 1
         and reads[result] == 1
         and writes[result] == 1
     ):
@@ -572,7 +559,7 @@ def _carry(
     }
     nodes = [loop.body[index]]
     for stmt in loop.body[index + 1 :]:
-        assigned = _assignment(stmt)
+        assigned = name_assignment(stmt)
         if assigned is None:
             return None
         target, expr = assigned
@@ -601,10 +588,10 @@ def _carry(
                     if renames.get(node.id, node.id) == carry:
                         return ast.Name(id="_carry", ctx=ast.Load())
                     if node.id in definitions:
-                        return self.visit(_copy(definitions[node.id]))
+                        return self.visit(reparse_expr(definitions[node.id]))
                     return node
 
-            normalized = Replace().visit(_copy(expr))
+            normalized = Replace().visit(reparse_expr(expr))
             nodes.append(stmt)
             return _Carry(value.args[0].id, canon, nodes, ast.dump(normalized), value)
         if not (isinstance(expr, ast.Name) or _scalar_cast(expr) in _FLOAT_TYPES):
@@ -676,7 +663,7 @@ def eliminate_duplicate_cluster_maxima(
         name
         for stmt in work
         for node in ast.walk(stmt)
-        if (assigned := _assignment(node)) is not None
+        if (assigned := name_assignment(node)) is not None
         for name, value in [assigned]
         if _raw_vector_load(value) and writes[name] == 1
     }
@@ -692,7 +679,7 @@ def eliminate_duplicate_cluster_maxima(
     caches = {
         name
         for stmt in work
-        if (assigned := _assignment(stmt)) is not None
+        if (assigned := name_assignment(stmt)) is not None
         for name, value in [assigned]
         if isinstance(value, ast.Call)
         and ast.unparse(value.func) == "cute.make_rmem_tensor"
@@ -735,7 +722,7 @@ def eliminate_duplicate_cluster_maxima(
             continue
         initializers = {}
         for stmt in work[:top_index]:
-            assigned = _assignment(stmt)
+            assigned = name_assignment(stmt)
             if assigned is not None:
                 name, value = assigned
                 canonical = rename_groups.get(name, name)
@@ -743,8 +730,8 @@ def eliminate_duplicate_cluster_maxima(
                     initializers[canonical] = stmt
         if set(initializers) != {first.carry, second.carry}:
             continue
-        first_init = _assignment(initializers[first.carry])
-        second_init = _assignment(initializers[second.carry])
+        first_init = name_assignment(initializers[first.carry])
+        second_init = name_assignment(initializers[second.carry])
         assert first_init is not None and second_init is not None
         if (
             ast.dump(first_init[1]) != ast.dump(second_init[1])
@@ -769,7 +756,7 @@ def eliminate_duplicate_cluster_maxima(
                 (
                     stmt
                     for stmt in loop.body
-                    if (assigned := _assignment(stmt)) is not None
+                    if (assigned := name_assignment(stmt)) is not None
                     and assigned[0] == carry.accumulator
                 ),
                 None,
@@ -804,7 +791,7 @@ def eliminate_duplicate_cluster_maxima(
             definitions = {
                 name: value
                 for stmt in loop.body[: loop.body.index(carry.nodes[0])]
-                if (assigned := _assignment(stmt)) is not None
+                if (assigned := name_assignment(stmt)) is not None
                 for name, value in [assigned]
             }
             if isinstance(arg, ast.Name) and arg.id in definitions:
@@ -856,7 +843,7 @@ def eliminate_duplicate_cluster_maxima(
         )
         private_preamble = []
         for stmt in work[:top_index]:
-            assigned = _assignment(stmt)
+            assigned = name_assignment(stmt)
             if assigned is not None and assigned[0] in {buf, barrier}:
                 if (
                     not isinstance(assigned[1], ast.Call)
@@ -951,7 +938,7 @@ def eliminate_duplicate_cluster_maxima(
                         self, node: ast.Assign, read_counts: Counter[str] = live
                     ) -> ast.AST | None:
                         nonlocal changed
-                        assigned = _assignment(node)
+                        assigned = name_assignment(node)
                         if (
                             assigned is not None
                             and not read_counts[

@@ -2,28 +2,29 @@ from __future__ import annotations
 
 import copy
 import re
-from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Literal
 from unittest.mock import patch
 
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensor
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_shared_rhs_grouped import _target
+from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.tcgen05_config import seeds
+from helion._compiler.cute.tcgen05_config import surface
+from helion._testing import cpu_render_target
+from helion._testing.cute_codegen import cuda_fake
+from helion._testing.cute_mma_dag import _ordinary_gemm
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = pytest.mark.cpu_only
 
 CPU_DEVICE = "cpu"
 
@@ -32,18 +33,6 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from helion.runtime.kernel import BoundKernel
-
-
-def _ordinary_gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    m, k = a.shape
-    _, n = b.shape
-    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
-    for tile_m, tile_n in hl.tile((m, n)):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-        out[tile_m, tile_n] = acc.to(out.dtype)
-    return out
 
 
 def _reshape_view_lhs_gemm(x3: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -66,29 +55,13 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     monkeypatch.setenv("HELION_BACKEND", "cute")
     monkeypatch.setenv("HELION_AUTOTUNE_EFFORT", "full")
-    with (
-        _target(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _mock_cuda_unavailable(),
-        patch("torch.cuda.current_device", return_value=0),
-        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
-        patch(
-            "helion.runtime.kernel._find_device", return_value=torch.device("cuda:0")
-        ),
-        patch(
-            "helion._compiler.cute.backend.CuteBackend.normalize_input_fake_tensor",
-            new=_cuda_fake,
-        ),
-        patch(
-            "torch._inductor.runtime.hints.DeviceProperties.create",
-            return_value=SimpleNamespace(
-                type="cuda", index=0, cc=100, warp_size=32, multi_processor_count=148
-            ),
-        ),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
+    # as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(),
+        forbid_native=False,
+        fake_device_sm_count=148,
+        reduction_smem_budget_bytes=232448,
     ):
         yield
 
@@ -111,8 +84,8 @@ def test_ordinary_search_and_validated_ffi_default(
     bound = _bind(dtype, shape)
     with bound.env:
         tc = bound.config_spec._cute_tcgen05_config
-        assert tc.full_tile_direct_entry_seed_eligible()
-        optional = tc.optional_fragments(for_search=True)
+        assert seeds.full_tile_direct_entry_seed_eligible(tc)
+        optional = surface.optional_fragments(tc, for_search=True)
         ffi = optional["tcgen05_tvm_ffi_launch"]
         assert isinstance(ffi, EnumFragment)
         assert ffi.default() is True
@@ -125,7 +98,7 @@ def test_ordinary_search_and_validated_ffi_default(
             "tcgen05_layout_overrides_d_store_box_n",
         ):
             assert optional[key].search_values() == [None]
-        layout = tc.strategy_autotune_fragments()["tcgen05_layout_strategy"]
+        layout = surface.strategy_autotune_fragments(tc)["tcgen05_layout_strategy"]
         assert isinstance(layout, EnumFragment)
         assert layout.default() == "default"
         assert layout.search_values() == ["default"]
@@ -133,7 +106,7 @@ def test_ordinary_search_and_validated_ffi_default(
 
         generator = ConfigGeneration(bound.config_spec)
         default = generator.unflatten(generator.default_flat())
-        seed = tc.full_tile_direct_entry_seed_config()
+        seed = seeds.full_tile_direct_entry_seed_config(tc)
         assert seed is not None
         seed_flat, transferred = generator.canonicalize_flat(generator.flatten(seed))
         assert generator.unflatten(seed_flat) == transferred
@@ -144,7 +117,7 @@ def test_ordinary_search_and_validated_ffi_default(
 
         # User validation keeps its original two Boolean controls. The
         # random-search restrictions must not narrow explicit configuration.
-        validation = tc.optional_fragments()
+        validation = surface.optional_fragments(tc)
         assert isinstance(validation["tcgen05_tvm_ffi_launch"], BooleanFragment)
         assert isinstance(validation["tcgen05_flat_role_coordinates"], BooleanFragment)
 
@@ -164,18 +137,22 @@ def test_ineligible_bind_has_no_ordinary_ffi_search_coordinate(
     bound = _bind(dtype, shape)
     with bound.env:
         tc = bound.config_spec._cute_tcgen05_config
-        assert not tc.full_tile_direct_entry_seed_eligible()
-        assert tc.full_tile_direct_entry_seed_config() is None
-        assert "tcgen05_tvm_ffi_launch" not in tc.optional_fragments(for_search=True)
+        assert not seeds.full_tile_direct_entry_seed_eligible(tc)
+        assert seeds.full_tile_direct_entry_seed_config(tc) is None
+        assert "tcgen05_tvm_ffi_launch" not in surface.optional_fragments(
+            tc, for_search=True
+        )
 
 
 def _assert_ffi_seed_declined(bound: BoundKernel) -> None:
     with bound.env:
         tc = bound.config_spec._cute_tcgen05_config
         assert tc.matmul_operands_tma_provable is False
-        assert not tc.full_tile_direct_entry_seed_eligible()
-        assert tc.full_tile_direct_entry_seed_config() is None
-        assert "tcgen05_tvm_ffi_launch" not in tc.optional_fragments(for_search=True)
+        assert not seeds.full_tile_direct_entry_seed_eligible(tc)
+        assert seeds.full_tile_direct_entry_seed_config(tc) is None
+        assert "tcgen05_tvm_ffi_launch" not in surface.optional_fragments(
+            tc, for_search=True
+        )
         # The fact is decided before the seed heuristics run, so the FFI
         # population seed is withheld as well, not just the default projection.
         assert all(
@@ -205,8 +182,10 @@ def test_reshape_view_lhs_keeps_ffi_seed() -> None:
     with bound.env:
         tc = bound.config_spec._cute_tcgen05_config
         assert tc.matmul_operands_tma_provable is True
-        assert tc.full_tile_direct_entry_seed_eligible()
-        assert "tcgen05_tvm_ffi_launch" in tc.optional_fragments(for_search=True)
+        assert seeds.full_tile_direct_entry_seed_eligible(tc)
+        assert "tcgen05_tvm_ffi_launch" in surface.optional_fragments(
+            tc, for_search=True
+        )
 
 
 @pytest.mark.parametrize("misalignment", ["stride", "base"])
@@ -223,22 +202,37 @@ def test_unaligned_input_declines_ffi_seed(misalignment: str) -> None:
         ].view(8192, 768)
     args = (lhs, torch.empty((768, 1024), dtype=torch.bfloat16, device=CPU_DEVICE))
     kernel = helion.kernel(_ordinary_gemm, backend="cute", static_shapes=True)
+    if misalignment == "stride":
+        # A statically under-aligned stride is relaid out by the staging pass
+        # (``stage_aligned_operands.py``: the host pads the operand into a
+        # 128-byte-stride copy), so the TMA proof and the FFI seed hold; the
+        # classifier declines only with the pass disabled.
+        staged = kernel.bind(args)
+        with staged.env:
+            assert staged.config_spec._cute_tcgen05_config.matmul_operands_tma_provable
+        assert staged.host_function.backend_rewrote_ast
+        kernel = helion.kernel(
+            _ordinary_gemm,
+            backend="cute",
+            static_shapes=True,
+            cute_stage_unaligned_operands=False,
+        )
     _assert_ffi_seed_declined(kernel.bind(args))
     # The identical GEMM over aligned inputs keeps the validated FFI default.
     bound = _bind(torch.bfloat16, (8192, 1024, 768))
     with bound.env:
         tc = bound.config_spec._cute_tcgen05_config
         assert tc.matmul_operands_tma_provable is True
-        assert tc.full_tile_direct_entry_seed_eligible()
+        assert seeds.full_tile_direct_entry_seed_eligible(tc)
 
 
 def test_missing_ab_budget_retains_ffi_decline() -> None:
-    with patch.object(
-        CuteTcgen05Config, "per_cta_ab_smem_budget_bytes", return_value=0
-    ):
+    with patch.object(target_facts, "per_cta_ab_smem_budget_bytes", return_value=0):
         bound = _bind(torch.bfloat16, (2048, 4096, 1024))
         with bound.env:
-            assert not bound.config_spec._cute_tcgen05_config.full_tile_direct_entry_seed_eligible()
+            assert not seeds.full_tile_direct_entry_seed_eligible(
+                bound.config_spec._cute_tcgen05_config
+            )
 
 
 @pytest.mark.parametrize("grouping", [1, 8, 16, 32])
@@ -257,6 +251,7 @@ def test_non_ffi_sibling_survives_flat_transfer(grouping: int) -> None:
             tcgen05_acc_stages=2,
             tcgen05_c_stages=2,
             tcgen05_tvm_ffi_launch=False,
+            cute_compiler_pipeline="default",
         )
         normalized = bound.config_spec.normalized_config(config)
         generator = ConfigGeneration(bound.config_spec)
@@ -295,7 +290,8 @@ def test_one_cta_n_multicast_repairs_only_search(
 @pytest.mark.parametrize(
     "invalid",
     [
-        {"tcgen05_ab_stages": 6, "tcgen05_c_stages": 4},
+        # The seed's 64-deep tiles cannot hold eight AB stages.
+        {"tcgen05_ab_stages": 8, "tcgen05_c_stages": 4},
         {"tcgen05_cta_group": "two"},
         {"tcgen05_num_epi_warps": 2},
         {"tcgen05_tvm_ffi_launch": 1},
@@ -306,8 +302,8 @@ def test_ffi_validation_rejects_existing_illegal_combinations(
 ) -> None:
     bound = _bind(torch.bfloat16, (2048, 4096, 1024))
     with bound.env:
-        seed = (
-            bound.config_spec._cute_tcgen05_config.full_tile_direct_entry_seed_config()
+        seed = seeds.full_tile_direct_entry_seed_config(
+            bound.config_spec._cute_tcgen05_config
         )
         assert seed is not None
         values = copy.deepcopy(seed.config)
@@ -316,17 +312,8 @@ def test_ffi_validation_rejects_existing_illegal_combinations(
             bound.config_spec.normalized_config(values)
 
 
-def _cuda_fake(backend: object, tensor: torch.Tensor) -> torch.Tensor:
-    assert isinstance(tensor, FakeTensor)
-    with torch._C._DisableTorchDispatch():
-        meta = torch.empty_strided(
-            tensor.shape,
-            tensor.stride(),
-            dtype=tensor.dtype,
-            device=torch.device("meta"),
-            requires_grad=tensor.requires_grad,
-        )
-    return FakeTensor(tensor.fake_mode, meta, torch.device("cuda:0"))
+# The ``cuda:0`` fake-input stand-in the fixture files share.
+_cuda_fake = cuda_fake
 
 
 _PREFETCH = "cute.nvgpu.cpasync.prefetch_descriptor("

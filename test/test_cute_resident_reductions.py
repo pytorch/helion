@@ -9,12 +9,14 @@ from typing import cast
 import numpy as np
 import pytest
 
+from helion._compiler.cute.resident_reductions import ResidentPassContext
 from helion._compiler.cute.resident_reductions import ResidentReductionLayout
+from helion._compiler.cute.resident_reductions import ResidentReductionOptions
 from helion._compiler.cute.resident_reductions import feature_index_expression
 from helion._compiler.cute.resident_reductions import materialize_resident_reductions
 from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 _FEATURES = 16
 _TENSORS = ("x", "dy", "weight", "mean", "scale", "out", "partial")
@@ -47,8 +49,8 @@ for lane in range({_FEATURES}):
         carry = old_carry + increment
         weighted = gradient * w
         product = weighted * normalized
-        reduced_product = cutlass.Float32(_helion_lane_reduce(product, 'sum', cutlass.Float32(0), 1, 1, 0, '', 1, 1))
-        reduced_gradient = cutlass.Float32(_helion_lane_reduce(weighted, 'sum', cutlass.Float32(0), 1, 1, 0, '', 1, 1))
+        reduced_product = cutlass.Float32(_helion_lane_reduce(product, 'sum', cutlass.Float32(0), threads_in_group=1))
+        reduced_gradient = cutlass.Float32(_helion_lane_reduce(weighted, 'sum', cutlass.Float32(0), threads_in_group=1))
         coefficient = reduced_product / {_FEATURES}
         average = reduced_gradient / {_FEATURES}
         first = normalized * coefficient
@@ -79,23 +81,29 @@ def _rewrite(
     result = materialize_resident_reductions(
         ast.parse(source).body,
         layouts={"lane": dataclasses.replace(_LAYOUT, vector_width=width)},
-        tensor_dtypes=dict.fromkeys(_TENSORS, "cutlass.Float32"),
-        tensor_strides={},
-        tensor_alignments=dict.fromkeys(_TENSORS, alignment),
-        group_rows=group_rows,
-        pipelined=pipelined,
-        pipeline_depth=pipeline_depth,
-        local_tree=local_tree,
-        row_schedule=row_schedule,
-        pack_output=pack_output,
-        shared_memory_budget=shared_memory_budget,
-        disjoint_pairs={frozenset(pair) for pair in itertools.combinations(_TENSORS, 2)}
-        if disjoint
-        else set(),
-        rename_groups={},
-        new_var=lambda hint: f"{hint}_{next(counter)}",
-        constexpr_values={},
-        uniform_names={*_TENSORS, "initial", "limit", "row_limit"},
+        context=ResidentPassContext(
+            tensor_dtypes=dict.fromkeys(_TENSORS, "cutlass.Float32"),
+            rename_groups={},
+            disjoint_pairs={
+                frozenset(pair) for pair in itertools.combinations(_TENSORS, 2)
+            }
+            if disjoint
+            else set(),
+            uniform_names={*_TENSORS, "initial", "limit", "row_limit"},
+            new_var=lambda hint: f"{hint}_{next(counter)}",
+            tensor_strides={},
+            tensor_alignments=dict.fromkeys(_TENSORS, alignment),
+            constexpr_values={},
+        ),
+        options=ResidentReductionOptions(
+            group_rows=group_rows,
+            pipelined=pipelined,
+            pipeline_depth=pipeline_depth,
+            row_schedule=row_schedule,
+            pack_output=pack_output,
+            local_tree=local_tree,
+            shared_memory_budget=shared_memory_budget,
+        ),
     )
     return ast.unparse(ast.Module(body=result, type_ignores=[]))
 
@@ -359,7 +367,7 @@ def test_grouped_rows_keep_int32_endpoint_semantics(
                 "limit": _FEATURES,
                 # The zero weight makes both reduction inputs zero, so this
                 # reference executes the original serial schedule exactly.
-                "_helion_lane_reduce": lambda value, *args: np.float32(0),
+                "_helion_lane_reduce": lambda value, *args, **kwargs: np.float32(0),
             }
         )
         with np.errstate(over="raise", invalid="raise"):
@@ -468,6 +476,17 @@ def test_resident_requires_nonaliasing_outputs() -> None:
 def test_resident_declines_alias_rebinding() -> None:
     source = _source().replace("    carry =", "    out = x\n    carry =", 1)
     assert "resident_state" not in _rewrite(source)
+
+
+def test_resident_declines_a_descending_lane_loop() -> None:
+    # The schedule re-emits the feature lanes ascending, inside the row loop:
+    # a reverse scan's descending lane loop would lose its order.
+    ascending = f"for lane in range({_FEATURES}):"
+    source = _source()
+    assert ascending in source
+    descending = f"for lane in range({_FEATURES - 1}, -1, -1):"
+    assert "resident_state" in _rewrite(source)
+    assert "resident_state" not in _rewrite(source.replace(ascending, descending))
 
 
 def test_resident_handles_partial_row_groups() -> None:

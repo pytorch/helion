@@ -6,23 +6,26 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.mamba2_chunk_scan import helion_mamba2_chunk_scan_kernel
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 
 if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
 
 import helion
 from helion import exc
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _is_scalar_carry_alias
 from helion._compiler.cute.collective_matmul import _remove_dead_staged_operands
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
 import helion.language as hl
+
+helion_mamba2_chunk_scan_kernel = import_example(
+    "mamba2_chunk_scan"
+).helion_mamba2_chunk_scan_kernel
 
 
 @helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
@@ -87,10 +90,9 @@ def _seed_inputs(dtype: torch.dtype, device: str = "cpu") -> tuple[torch.Tensor,
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_explicit_dot_stages_original_fp32_seed(dtype: torch.dtype) -> None:
     inputs = _seed_inputs(dtype)
-    source = _cpu_bind(_seeded_dot, inputs).to_code(_config())
+    source = cpu_bind(_seeded_dot, inputs).to_code(_config())
     ast.parse(source)
     assert source.count("cute.gemm(") == 1
     assert "_acc.fill(0.0)" not in source
@@ -101,23 +103,21 @@ def test_explicit_dot_stages_original_fp32_seed(dtype: torch.dtype) -> None:
     assert "_helion_pending_collective_mma" not in source
 
 
-@skipUnlessBackends(["cute"])
 def test_invariant_seed_is_not_a_loop_carry() -> None:
     inputs = _seed_inputs(torch.float16)
-    source = _cpu_bind(_invariant_seed_dot, inputs).to_code(_config())
+    source = cpu_bind(_invariant_seed_dot, inputs).to_code(_config())
     assert "cute.gemm(" not in source
     assert "_helion_pending_collective_mma" not in source
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("k", [5, 21, 32, 128])
-@skipUnlessBackends(["cute"])
 def test_full_slice_dot_owns_entire_synthetic_k(dtype: torch.dtype, k: int) -> None:
     inputs = (
         torch.empty((130, k), dtype=dtype),
         torch.empty((k, 70), dtype=dtype),
     )
-    source = _cpu_bind(_full_slice_dot, inputs).to_code(_config(full_slice=True))
+    source = cpu_bind(_full_slice_dot, inputs).to_code(_config(full_slice=True))
     assert source.count("cute.gemm(") == 1
     assert "synthetic_lane_" not in source
     assert "_helion_pending_collective_mma" not in source
@@ -126,13 +126,11 @@ def test_full_slice_dot_owns_entire_synthetic_k(dtype: torch.dtype, k: int) -> N
         assert "collective_a[collective_m, collective_k] =" in source
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("collective_requested", [False, True])
-@pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
-def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
+def _partial_synthetic_k_render(
     dtype: torch.dtype, collective_requested: bool, static_shapes: bool
-) -> None:
+) -> str:
+    """``_full_slice_dot`` with K (64) on one thread x 64 synthetic lanes:
+    the config that cannot reduce K across a thread subset."""
     inputs = (
         torch.empty((130, 64), dtype=dtype),
         torch.empty((64, 70), dtype=dtype),
@@ -141,11 +139,11 @@ def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
     config["cute_collective_mma"] = collective_requested
     if collective_requested:
         # Vectorized operands do not satisfy the collective staging proof.
-        # A requested-but-ineligible collective must reject the same unsafe
-        # scalar fallback as a configuration that disables it explicitly.
+        # A requested-but-ineligible collective must take the same scalar
+        # path as a configuration that disables it explicitly.
         config["cute_vector_widths"] = [2, 1, 1]
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         kernel = helion.kernel(
@@ -154,14 +152,39 @@ def test_partial_synthetic_k_cannot_fall_back_to_a_thread_subset(
             static_shapes=static_shapes,
             autotune_effort="none",
         )
-        bound = _cpu_bind(kernel, inputs)
-        with pytest.raises(exc.BackendUnsupported, match="K axis split across"):
-            bound.to_code(helion.Config.from_dict(config))
+        bound = cpu_bind(kernel, inputs)
+        return bound.to_code(helion.Config.from_dict(config))
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("collective_requested", [False, True])
+def test_partial_synthetic_k_folds_the_full_k_per_thread(
+    dtype: torch.dtype, collective_requested: bool
+) -> None:
+    """A static K extent lets the scalar fallback re-read both operands over
+    the whole K axis in every thread (``_cute_fold_dot``) instead of reducing
+    a partial dot across a thread subset; no collective GEMM is emitted."""
+    source = _partial_synthetic_k_render(dtype, collective_requested, True)
+    ast.parse(source)
+    assert source.count("_cute_fold_dot(") == 1
+    assert "k=64" in source
+    assert "group_span=" not in source
+    assert "cute.gemm(" not in source
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("collective_requested", [False, True])
+def test_partial_synthetic_k_without_a_static_extent_cannot_fall_back(
+    dtype: torch.dtype, collective_requested: bool
+) -> None:
+    """Without ``static_shapes`` the fold has no K extent to re-read, and a
+    reduction over live threads would expose a partial dot: refuse."""
+    with pytest.raises(exc.BackendUnsupported, match="K axis split across"):
+        _partial_synthetic_k_render(dtype, collective_requested, False)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_full_thread_k_keeps_the_complete_scalar_dot(
     dtype: torch.dtype, static_shapes: bool
 ) -> None:
@@ -176,7 +199,7 @@ def test_full_thread_k_keeps_the_complete_scalar_dot(
         cute_collective_mma=False,
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         kernel = helion.kernel(
@@ -185,7 +208,7 @@ def test_full_thread_k_keeps_the_complete_scalar_dot(
             static_shapes=static_shapes,
             autotune_effort="none",
         )
-        source = _cpu_bind(kernel, inputs).to_code(config)
+        source = cpu_bind(kernel, inputs).to_code(config)
     assert "synthetic_lane_" not in source
     assert "cute.gemm(" not in source
     assert "group_span=64" in source
@@ -211,7 +234,9 @@ def test_staged_dce_preserves_effectful_rebinding_with_the_same_name() -> None:
     df = SimpleNamespace(
         dce_vars=[],
         cute_state=SimpleNamespace(
-            collective_mma_pure_stmt_ids={id(body[0])}, collective_mma_sites=[]
+            lanes=SimpleNamespace(
+                collective_mma_pure_stmt_ids={id(body[0])}, collective_mma_sites=[]
+            )
         ),
     )
     _remove_dead_staged_operands(body, cast("DeviceFunction", df))
@@ -222,7 +247,6 @@ def test_staged_dce_preserves_effectful_rebinding_with_the_same_name() -> None:
 
 @pytest.mark.parametrize("shape", [0, 1, 2])
 @pytest.mark.parametrize("static_shapes", [False, True])
-@skipUnlessBackends(["cute"])
 def test_mamba_contractions_receive_complete_ordinary_seeds(
     shape: int, static_shapes: bool
 ) -> None:
@@ -250,7 +274,7 @@ def test_mamba_contractions_receive_complete_ordinary_seeds(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(kernel, inputs)
+    bound = cpu_bind(kernel, inputs)
     assert bound.host_function is not None
     with bound.env:
         seeds = CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -283,7 +307,6 @@ def test_mamba_contractions_receive_complete_ordinary_seeds(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_seeded_dot_correctness(dtype: torch.dtype) -> None:
     torch.manual_seed(173)
     inputs = _seed_inputs(dtype, "cuda")

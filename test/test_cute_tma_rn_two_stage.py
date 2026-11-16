@@ -11,6 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from helion._testing import skipUnlessCuteAvailable
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -29,10 +31,10 @@ from test.test_cute_tma_rn import rn_config
 from test.test_cute_tma_rn import schedule
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute import tcgen05_flattened_prefix as prefix_module
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
-from helion._compiler.cute import tcgen05_flattened_prefix as prefix_module
 from helion._compiler.cute.tcgen05_flat_grouped_codegen import (
     flat_grouped_kernel_module,
 )
@@ -53,6 +55,8 @@ from helion._compiler.cute.tcgen05_tma_rn import CONVERSION_KEY
 from helion._compiler.cute.tcgen05_tma_rn import TMA_RN
 from helion._compiler.cute.tcgen05_tma_rn import WARP_RAW
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 
 def low_config(bound, ctas=1, wrapped=True):
@@ -81,6 +85,7 @@ def low_schedule(bound, ctas=1, **changes):
     return flat_grouped_rna_schedule(bound.env, proof, **kwargs)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("operand", ["A", "B"])
 def test_actual_SDK_two_stage_layout_and_TMA_bytes(operand):
     with ir.Context(), ir.Location.unknown():

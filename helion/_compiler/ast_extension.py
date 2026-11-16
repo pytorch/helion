@@ -20,6 +20,8 @@ from .source_location import UnknownLocation
 from .source_location import current_location
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from collections.abc import Iterator
     from collections.abc import Sequence
     import types
 
@@ -58,6 +60,7 @@ class ExtendedAST:
         _loop_type: LoopType = LoopType.UNSET,
         _is_kernel_call: bool = False,
         _root_id: int | None = None,
+        _compiler_inserted: bool = False,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -66,6 +69,9 @@ class ExtendedAST:
         self._loop_type: LoopType = _loop_type
         self._is_kernel_call: bool = _is_kernel_call
         self._root_id: int | None = _root_id
+        # Set on host statements a backend rewrite added (not user source);
+        # user-facing warnings about host tensor operations skip them.
+        self._compiler_inserted: bool = _compiler_inserted
 
     def new(self, fields: dict[str, object]) -> ExtendedAST:
         result = self.__class__(
@@ -75,6 +81,7 @@ class ExtendedAST:
             _loop_type=self._loop_type,
             _is_kernel_call=self._is_kernel_call,
             _root_id=self._root_id,
+            _compiler_inserted=self._compiler_inserted,
         )
         return self._location.to_ast(result)
 
@@ -153,6 +160,26 @@ def clone_ast(value: object) -> object:
     return value
 
 
+# In source order: a try statement's handlers and else come before its finally.
+_STATEMENT_LIST_FIELDS = ("body", "handlers", "orelse", "finalbody", "cases")
+
+
+def iter_statements(body: Iterable[ast.AST]) -> Iterator[ast.stmt]:
+    """Yield every statement of ``body`` and of the blocks nested in it.
+
+    A statement-only walk: the expressions of each statement are skipped, so
+    a pass whose trigger is a statement shape (a lane loop, an assignment) can
+    scan a kernel body for it at a fraction of ``ast.walk``'s cost.
+    """
+    for stmt in body:
+        if isinstance(stmt, ast.stmt):
+            yield stmt
+        for field in _STATEMENT_LIST_FIELDS:
+            child = getattr(stmt, field, None)
+            if isinstance(child, list):
+                yield from iter_statements(child)
+
+
 def create(cls: type[_T], **fields: object) -> _T:
     # pyrefly: ignore [unexpected-keyword]
     result = get_wrapper_cls(cls)(**fields, _location=current_location())
@@ -205,6 +232,10 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
                         offset=offset_ast, mask=mask_ast)
         # In the f-string, {name} is interpolated to "my_tensor",
         # while {{offset}} becomes {offset} for placeholder replacement
+
+    A placeholder alone on a line may be an ``ast.stmt``, which is substituted
+    as that statement (an indented ``{store}`` line under ``if mask:``); a
+    statement anywhere else fails an assertion.
     """
     location: SourceLocation = current_location()
 
@@ -247,8 +278,22 @@ def statement_from_string(template: str, **placeholders: ast.AST) -> ast.stmt:
         if not isinstance(node, ast.AST):
             return node
 
+        # A statement placeholder on a line of its own is that statement:
+        # the line's ``Expr`` around it would render the statement after a
+        # blank line, and the passes that match the statement would miss
+        # ``Expr(value=<statement>)``.
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Name)
+            and isinstance(mapping.get(node.value.id), ast.stmt)
+        ):
+            return mapping[node.value.id]
+
         # Replace placeholder names with their corresponding AST nodes
         if isinstance(node, ast.Name) and node.id in mapping:
+            assert not isinstance(mapping[node.id], ast.stmt), (
+                f"statement placeholder in an expression: {template!r}"
+            )
             return mapping[node.id]
 
         # Recursively transform all child nodes and wrap in ExtendedAST subclass

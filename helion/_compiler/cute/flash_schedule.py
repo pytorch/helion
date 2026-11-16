@@ -1,8 +1,23 @@
+"""The structural schedule of an FA4-style flash-attention body: nodes, barriers, SMEM.
+
+Role: planner.  ``build_fa4_schedule`` builds, from a ``FlashScheduleSpec``
+(head dim, KV depth, CTA count, the pipeline flags), the graph of a local
+schedule -- ``FlashNode`` / ``FlashEdge`` / ``FlashBarrier`` /
+``FlashMemoryRegion`` records in a ``FlashSchedule`` -- and
+``fa4_schedule_fits`` prices its shared memory against
+``FlashScheduleLimits``; ``build_fa4_alt_schedule`` is the
+alternating-warpgroup variant.  ``cute_flash`` and ``cute_flash_alt`` consult
+the schedule when they resolve a config's KV ring depth and staging;
+``FlashScheduleError`` is the refusal.  Pure planning: nothing is rendered
+here.
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict
 import dataclasses
 import enum
+import functools
 
 from .attention_plan import flash_pair_head_dims_supported
 
@@ -356,7 +371,9 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
     the PV warp issues PV(i) once P(i) is published and O rescaled. The running
     max is handed A -> B inside the pair and B -> A into the next pair; alpha
     goes to the correction warps per step; the even warpgroup hands its partial
-    row sum to the odd one once per work item. K and V have separate rings whose
+    row sum to the odd one once per work item, and the odd one hands the item's
+    row sum to the correction warps' epilogue through its (then dead) max slot.
+    K and V have separate rings whose
     slots are reused by the tile ``depth`` positions later, which is
     ``depth // 2`` pairs after an even step and ``(depth + 1) // 2`` after an
     odd one.
@@ -436,6 +453,7 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
         FlashBarrier("corr_epi_full_r0", 128, cta),
         FlashBarrier("part_sum_r0", 128, cta),
         FlashBarrier("part_sum_consumed_r0", 128, cta),
+        FlashBarrier("row_sum_r0", 128, cta),
         FlashBarrier("row_sum_consumed_r0", 128, cta),
     ]
     for tag in "ab":
@@ -523,13 +541,22 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
             barrier="part_sum_consumed_r0",
             arrival_count=128,
         ),
-        # the odd warpgroup's alpha slot carries the item's row sum to the
-        # correction warps; the next item's first alpha is written only after
-        # they read it (the PV chain orders the in-item alpha writes behind the
-        # previous read, but not this write across the item boundary)
+        # the odd warpgroup publishes the item's row sum to the correction
+        # warps' epilogue through its max slot (dead after its last publication
+        # of the item) as soon as it has it, ...
         FlashEdge(
-            "correction_b",
-            "stat_b",
+            "softmax_b",
+            output_stage,
+            barrier="row_sum_r0",
+            arrival_count=128,
+            resource="ROWSUM_r0",
+        ),
+        # ... and starts its next item (whose first max publication rewrites
+        # the slot and arrives on the row-sum barrier again) only after they
+        # read it: nothing else orders that publication behind the read
+        FlashEdge(
+            output_stage,
+            "softmax_b",
             iteration_delta=1,
             barrier="row_sum_consumed_r0",
             arrival_count=128,
@@ -755,9 +782,28 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
                 private,
                 f"stat_{tag}",
                 (f"softmax_{other}",),
+                alias_group="max_b_slot" if tag == "b" else None,
                 cta_rank=0,
             )
         )
+    # the odd warpgroup's max slot carries the item's row sum to the epilogue:
+    # the even warpgroup's last read of the max precedes the row-sum write
+    # (through the max handoff of the pair), the next max publication follows
+    # the epilogue's read (row_sum_consumed_r0)
+    regions.append(
+        FlashMemoryRegion(
+            "ROWSUM_r0",
+            FlashMemorySpace.SMEM,
+            overhead_offset + 1024 + 512,
+            512,
+            16,
+            private,
+            "softmax_b",
+            (output_stage,),
+            alias_group="max_b_slot",
+            cta_rank=0,
+        )
+    )
     phase_cycles: tuple[FlashPhaseCycle, ...] = ()
     if spec.persistent:
         assert spec.kv_iterations is not None
@@ -768,9 +814,9 @@ def build_fa4_alt_schedule(spec: FlashScheduleSpec) -> FlashSchedule:
             "v_ready_r0": steps,
             "v_reuse_r0": steps,
             # the even warpgroup hands alpha over at its steps after the first,
-            # the odd one at every step plus the final row sum
+            # the odd one at every step
             "alpha_a": steps // 2 - 1,
-            "alpha_b": steps // 2 + 1,
+            "alpha_b": steps // 2,
         }
         cycles = []
         for barrier in barriers:
@@ -807,10 +853,15 @@ def fa4_schedule_fits(
     return _shared_memory_bytes(spec) <= limits.shared_memory_bytes
 
 
+@functools.lru_cache(maxsize=4096)
 def max_fa4_kv_depth(
     spec: FlashScheduleSpec, limits: FlashScheduleLimits | None = None
 ) -> int:
-    """Return the largest K/V depth allowed by the schedule's SMEM layout."""
+    """Return the largest K/V depth allowed by the schedule's SMEM layout.
+
+    Memoized on the frozen spec and limits: the flash resolver asks this for
+    every normalized config, and the search revisits a few hundred specs.
+    """
     if limits is None:
         limits = FlashScheduleLimits()
     if spec.uneven_kv_ring:
@@ -1981,14 +2032,14 @@ def verify_flash_schedule(
                 ):
                     continue
                 require_consumption_guard(region)
-            # The odd warpgroup's alpha slot doubles as its row-sum slot at the
-            # end of every item. Inside an item each alpha write follows the
-            # correction warps' read of the previous one through the PV chain;
-            # the next item's first alpha has no such order against the
-            # row-sum read, so this slot needs the same guard from the
-            # correction warps back to its writer.
+            # The odd warpgroup's max slot doubles as its row-sum slot at the
+            # end of every item, read by the correction warps' epilogue over a
+            # named barrier. The next item's first max publication has no
+            # order against that read (the max handoffs only alternate between
+            # the two warpgroups), so the row-sum lifetime needs the same
+            # guard from its reader back to its writer.
             for region in schedule.memory_regions:
-                if region.name == "STAT_b":
+                if region.name == "ROWSUM_r0":
                     require_consumption_guard(region)
         elif schedule.spec.separate_kv:
             if (

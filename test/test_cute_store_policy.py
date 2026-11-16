@@ -10,21 +10,25 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_fp8_vector_store import _config
 from test.test_cute_fp8_vector_store import _quantize_rows
 
 import helion
 from helion import exc
-from helion._compiler.backend import CuteBackend
-from helion._compiler.backend import TritonBackend
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
-from helion._compiler.cute.packet_store_policy import _STORE_HELPERS
+from helion._compiler.cute.cache_policy_loads import MASKED_PACKET_LOAD_HELPER_NAMES
+from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_HELPER_NAMES
 from helion._compiler.cute.packet_store_policy import lower_packet_store_policy
+from helion._compiler.triton.backend import TritonBackend
+from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion.autotuner.config_fragment import EnumFragment
@@ -44,7 +48,7 @@ def test_store_policy_is_independent_of_async_recurrence_config() -> None:
         spec.normalize(config)
         field = cast("EnumFragment", spec._flat_fields()["cute_store_policy"])
     assert config.cute_store_policy == "l2_evict_last"
-    assert field.choices == ("default", "l2_evict_last")
+    assert field.choices == ("default", "streaming", "l2_evict_last")
 
 
 @pytest.mark.parametrize(
@@ -70,14 +74,17 @@ def test_store_policy_target_gate_controls_normalization_and_search(
         field = cast("EnumFragment", spec._flat_fields()["cute_store_policy"])
         prior = CuteBackend().config_value_priors(spec)["cute_store_policy"]
     assert config["cute_store_policy"] == ("l2_evict_last" if supported else "default")
+    # ``streaming`` (evict-first stores) needs no target gate.
     assert field.choices == (
-        ("default", "l2_evict_last") if supported else ("default",)
+        ("default", "streaming", "l2_evict_last")
+        if supported
+        else ("default", "streaming")
     )
     if not supported:
         assert prior(field, 0) == "default"
 
 
-@pytest.mark.parametrize("value", ["streaming", "last", True, 1, None])
+@pytest.mark.parametrize("value", ["evict", "last", True, 1, None])
 def test_store_policy_rejects_invalid_values(value: object) -> None:
     spec = ConfigSpec(backend=CuteBackend())
     with pytest.raises(exc.InvalidConfig, match="cute_store_policy"):
@@ -96,10 +103,12 @@ def test_store_policy_is_cute_only() -> None:
 
 def test_packet_policy_helper_names_are_registered_without_cuda() -> None:
     imports = CuteBackend().library_imports
-    assert set(_STORE_HELPERS.values()) <= imports.keys()
-    assert {
-        name for name in imports if name.startswith("_cute_load_")
-    } == _CUTE_CACHE_LOAD_HELPER_NAMES
+    # Every packet flush the matcher recognizes, plain and L2 evict-last.
+    assert PACKET_FLUSH_HELPER_NAMES.issubset(imports)
+    # Cache-hinted loads plus the predicated packet loads of the sunk V-loop.
+    assert {name for name in imports if name.startswith("_cute_load_")} == (
+        _CUTE_CACHE_LOAD_HELPER_NAMES | MASKED_PACKET_LOAD_HELPER_NAMES
+    )
 
 
 def _rewrite(
@@ -152,7 +161,12 @@ def test_only_full_sixteen_byte_packets_select_hint(
 ) -> None:
     original = _packet_source(helper, int(width * scale))
     rewritten = ast.unparse(_rewrite(original))
-    assert (hinted in rewritten) is (scale == 1)
+    # A lane twice as wide as one 16-byte packet issues two hinted packets
+    # (the u16/u32 helpers); a half-width lane stays on the scalar store.
+    whole_packets = scale == 1 or (
+        scale == 2 and helper in ("_cute_store_u16_vec", "_cute_store_u32_vec")
+    )
+    assert (hinted in rewritten) is whole_packets
     assert "if valid:" in rewritten
     assert "out.iterator, values" in rewritten
 
@@ -275,11 +289,11 @@ def test_fp8_codegen_selects_policy_after_packing(
 ) -> None:
     args = (torch.empty((37, 32), dtype=torch.bfloat16), dtype, hl.constexpr(32))
     with (
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
+        mock_cuda_unavailable(),
+        forbid_native_compile(),
         patch("helion.autotuner.config_spec.torch.version.cuda", "13.0"),
     ):
-        bound = _cpu_bind(_quantize_rows, args)
+        bound = cpu_bind(_quantize_rows, args)
         bound.config_spec.target_device_capability = (10, 3)
         config = _config(bound, vec_width)
         config.config["cute_store_policy"] = "l2_evict_last"
@@ -304,11 +318,11 @@ def test_misaligned_fp8_output_keeps_scalar_fallback() -> None:
     storage = torch.empty((37, 33), dtype=torch.float8_e4m3fn)
     out = storage[:, 1:]
     with (
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
+        mock_cuda_unavailable(),
+        forbid_native_compile(),
         patch("helion.autotuner.config_spec.torch.version.cuda", "13.0"),
     ):
-        bound = _cpu_bind(_convert_into, (x, out))
+        bound = cpu_bind(_convert_into, (x, out))
         bound.config_spec.target_device_capability = (10, 3)
         config = _config(bound, 16)
         config.config["cute_store_policy"] = "l2_evict_last"
@@ -343,6 +357,7 @@ def _constant_bytes(value: Any) -> bytes:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("carrier", ["u8", "u16", "u32", "u64"])
 def test_l2_store_preserves_every_bit_of_packed_carriers(carrier: str) -> None:
     cutlass = pytest.importorskip("cutlass")
@@ -432,6 +447,7 @@ def test_l2_store_preserves_every_bit_of_packed_carriers(carrier: str) -> None:
             )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype_name", ["Float8E4M3FN", "Float8E5M2"])
 @pytest.mark.parametrize("source_name", ["Float32", "Float16", "BFloat16"])
 @pytest.mark.parametrize("runtime", [False, True])

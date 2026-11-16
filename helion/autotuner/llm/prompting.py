@@ -9,6 +9,7 @@ from ..base_search import normalize_autotune_seed_configs
 from .configs import describe_config_space
 from .feedback import MAX_CHANGED_FIELDS_PER_CONFIG
 from .feedback import format_config_for_prompt
+from .profile import prompt_profile
 from .workload import compute_workload_hints
 from .workload import describe_kernel
 from .workload import detect_workload_traits
@@ -94,31 +95,18 @@ def _initial_strategy_lines(
     backend: str,
 ) -> list[str]:
     """Build the bullet list used for the initial search-strategy section."""
+    profile = prompt_profile(backend)
     lines = [
         (
             f"Generate up to {configs_per_round} UNIQUE candidate configs. "
             "Fewer is better than invalid JSON."
         ),
         *_INITIAL_STRATEGY_BASE_LINES,
+        *profile.tiling_family_lines(flat_fields),
+        SHAPE_RULE,
+        "Do not pretty-print or repeat unchanged defaults.",
+        profile.aggressive_knobs_line,
     ]
-    if backend != "cute" or "block_sizes" in flat_fields:
-        lines.extend(
-            [
-                "Use block_sizes to define families: include at least 3 materially different tiling families instead of tiny perturbations of one tile, where the displayed bounds permit it. Keep fixed fields and fixed coordinates unchanged."
-                if backend == "cute"
-                else "Use block_sizes to define families: include at least 3 materially different tiling families instead of tiny perturbations of one tile.",
-                "Vary block_sizes coherently across dimensions rather than by arbitrary skew.",
-            ]
-        )
-    lines.extend(
-        [
-            SHAPE_RULE,
-            "Do not pretty-print or repeat unchanged defaults.",
-            "Avoid configs that simultaneously max out several aggressive knobs, unless strongly justified."
-            if backend == "cute"
-            else "Avoid configs that simultaneously max out several aggressive knobs such as num_warps, num_stages, and maxnreg when present, unless strongly justified.",
-        ]
-    )
     if compile_timeout_s is not None:
         lines.append(
             f"Compile timeout is {compile_timeout_s}s, so avoid candidates that are likely to compile very slowly."
@@ -132,24 +120,12 @@ def _initial_strategy_lines(
             "Include both flat and persistent scheduling families when plausible; do not put every config on the same pid_type."
         )
     if "reduction_loops" in flat_fields:
-        lines.append(
-            "This is reduction-like: span the space — include conservative configs (small blocks) AND aggressive configs (large blocks up to the reduction dim), within the displayed bounds. Memory-bound reductions on modern accelerators often prefer the aggressive end."
-            if backend == "cute"
-            else "This is reduction-like: span the space — include conservative configs (small blocks, num_stages=1-2) AND aggressive configs (large blocks up to the reduction dim, num_stages=4-8 with deep range_num_stages pipelining). Memory-bound reductions on modern accelerators often prefer the aggressive end."
-        )
+        lines.append(profile.reduction_span_line)
     if any(name in flat_fields for name in _ADVANCED_TOGGLE_FIELDS):
         lines.append(
             "Use advanced toggles like warp_specialize, multi_buffer, and flatten in only a minority of otherwise sane configs."
         )
-    if backend == "cute":
-        if "num_threads" in flat_fields:
-            lines.append(
-                "num_threads specifies thread counts per tiled dimension: 0 selects automatic layout; positive values are powers of two within the displayed bounds. Coordinate these with tile sizes and preserve the array length."
-            )
-    else:
-        lines.append(
-            "Explicitly diversify num_stages and num_warps across the batch: don't cluster all suggestions at num_stages=1; include several with num_stages in {2, 4, 8} so LFBO refinement has aggressive seeds to anchor on."
-        )
+    lines.extend(profile.threading_lines(flat_fields))
     return lines
 
 
@@ -161,20 +137,13 @@ def _refinement_strategy_lines(
     total_count: int,
 ) -> list[str]:
     """Build the bullet list used for the refinement-step section."""
+    profile = prompt_profile(backend)
     if total_count > 0 and failed_count * 3 >= total_count:
         lines = list(_FAILURE_HEAVY_REFINEMENT_LINES)
-        lines.append(
-            "Back off aggressive settings first: smaller thread counts or pipeline depths where tunable, pointer indexing where available, fewer advanced toggles."
-            if backend == "cute"
-            else "Back off aggressive settings first: smaller num_stages/num_warps, pointer indexing, fewer advanced toggles."
-        )
+        lines.append(profile.back_off_line)
     else:
         lines = list(_DEFAULT_REFINEMENT_LINES)
-    lines.append(
-        "Prefer edits with attributable effects: change exposed tiling, threading, pipeline, scheduling, indexing, or l2_groupings controls instead of rewriting every field."
-        if backend == "cute"
-        else "Prefer edits with attributable effects: change block_sizes, num_warps, num_stages, pid_type, indexing, l2_groupings, or maxnreg instead of rewriting every field."
-    )
+    lines.append(profile.attributable_edits_line)
     lines.append(
         "Keep each config sparse: usually 1-4 changed fields, and no more than "
         f"{MAX_CHANGED_FIELDS_PER_CONFIG} unless absolutely necessary."
@@ -192,33 +161,21 @@ def _refinement_strategy_lines(
 
 def build_system_prompt(*, backend: str) -> str:
     """Build instructions for the selected backend."""
-    backend_label = {"cute": "CuTe", "triton": "Triton"}.get(backend, backend)
+    profile = prompt_profile(backend)
     key_knobs = [
         "block_sizes: per-dimension tile sizes. Good families usually change them coherently. For kernels with an inner or reduction dimension, very small values there are a separate aggressive family, not the default.",
-        "num_threads: thread counts per tiled dimension. 0 selects automatic layout; positive values are powers of two within the displayed bounds."
-        if backend == "cute"
-        else "num_warps: threads/32. 4-8 is typical; 16+ is mainly for clearly larger tiles.",
-        "Pipeline depth: use the staging controls exposed in the Configuration Space."
-        if backend == "cute"
-        else "num_stages: pipeline depth. 2-4 is common for streaming loops; 1 is safer when unsure.",
+        profile.threads_knob_line,
+        profile.pipeline_knob_line,
         "pid_type: flat, persistent_blocked, and persistent_interleaved are distinct scheduling families when available.",
         "indexing: pointer and tensor_descriptor are distinct families.",
-        "l2_groupings and other exposed controls are secondary knobs; change them selectively after choosing a coherent tiling family."
-        if backend == "cute"
-        else "l2_groupings, maxnreg, num_sm_multiplier, and advanced range toggles are secondary knobs; change them selectively after choosing a coherent tiling family.",
+        profile.secondary_knobs_line,
     ]
     heuristics = [
         "analyze the kernel source, input tensors, GPU hardware, and config space to infer likely optimization traits from the code itself and target hardware; if unsure, stay closer to default.",
-        "block_sizes and positive num_threads values should be powers of 2 when present."
-        if backend == "cute"
-        else "block_sizes and num_warps should be powers of 2 when present.",
-        "persistent pid_type, when available, is often worth trying when total tile count is comparable to or larger than SM count, and it may also be required for some kernels."
-        if backend == "cute"
-        else "persistent pid_type is often worth trying when total tile count is comparable to or larger than SM count, and it may also be required for some kernels.",
+        profile.powers_of_two_line,
+        profile.persistent_heuristic_line,
         "tensor_descriptor is a distinct family from pointer indexing.",
-        "higher pipeline depths and multi-buffering are more aggressive and should be used selectively."
-        if backend == "cute"
-        else "higher num_stages and multi-buffering are more aggressive and should be used selectively.",
+        profile.aggressive_depth_line,
     ]
     guidance = "\n".join(
         [
@@ -230,7 +187,7 @@ def build_system_prompt(*, backend: str) -> str:
         ]
     )
     return _join_sections(
-        f"You are an expert GPU kernel autotuner for Helion using the {backend_label} backend.",
+        f"You are an expert GPU kernel autotuner for Helion using the {profile.label} backend.",
         _SYSTEM_CONFIG_GUIDANCE,
         guidance,
         _SYSTEM_OUTPUT_CONTRACT,

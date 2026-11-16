@@ -11,9 +11,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
@@ -32,6 +29,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import pairwise
 from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
@@ -42,6 +40,9 @@ from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessBlockPtr
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 _LARGE_BF16_SHAPE = (51200, 51200)
@@ -2559,11 +2560,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         _code, result = code_and_output(bounded_tiles, (x, 40))
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @onlyBackends(["cute"])
     @skipIfRefEager(
         "the tiles kernel sorts and scans each 32-wide tile, so the result depends"
         " on block_sizes, which ref mode does not apply"
     )
+    @skipIfXPU("XPU returns wrong values for these slice sorts")
     def test_sort_and_scan_skip_the_padded_positions(self):
         """Positions past the end of a tile hold no element: a 24-long slice
         on 32 lanes (dynamic shapes) or the 16-element last tile of a 48-wide
@@ -2632,13 +2633,23 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 64], device=DEVICE)
+        # A sort along a tile dim pins the loop unflattened; the refusal backs
+        # that up for a flattened tile that still reaches it.
+        (spec,) = sort_tiles.bind((x,)).config_spec.flatten_loops
+        self.assertTrue(spec.pinned)
+        flattened = helion.kernel(
+            sort_tiles.fn, autotune_effort="none", static_shapes=True
+        )
         for loop_order in ([1, 0], [0, 1]):
             with (
                 self.subTest(loop_order=loop_order),
+                patch(
+                    "helion._compiler.compile_environment.BlockSizeInfo.pin_unflattened"
+                ),
                 self.assertRaisesRegex(exc.BackendUnsupported, "flattened multi-dim"),
             ):
                 code_and_output(
-                    sort_tiles,
+                    flattened,
                     (x,),
                     block_sizes=[16, 4],
                     flatten_loops=[True],
@@ -4421,10 +4432,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 )
 
     @onlyBackends(["cute"])
-    def test_topk_feeding_a_computation_is_refused(self):
-        """Top-k output sits on the lanes of the sorted input dim, which only
-        a store addresses; a reduction of it would fold the wrong lanes, and a
-        store index other than a slice or an affine arange cannot address it."""
+    def test_topk_values_feed_a_row_reduction(self):
+        """A complete row owner can reduce selected values into fresh storage."""
 
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def topk_sum(x: torch.Tensor) -> torch.Tensor:
@@ -4435,6 +4444,15 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 out[tile] = top_vals.sum(-1)
             return out
 
+        x = torch.randn([40, 64], device=DEVICE)
+        _code, result = code_and_output(topk_sum, (x,), block_sizes=[8])
+        expected = torch.topk(x, 4, dim=-1).values.sum(-1)
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["cute"])
+    def test_topk_gathered_store_is_refused(self):
+        """A gathered store index cannot address the selected values' lanes."""
+
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def topk_gathered(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0), 8], dtype=x.dtype, device=x.device)
@@ -4444,9 +4462,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 64], device=DEVICE)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "torch.topk output"):
-            code_and_output(topk_sum, (x,), block_sizes=[8])
-        # A gathered store index is no affine arange of the output position.
         cols = torch.tensor([7, 2, 5, 0], device=DEVICE)
         with self.assertRaisesRegex(exc.BackendUnsupported, "affine hl.arange"):
             code_and_output(topk_gathered, (x, cols), block_sizes=[8])
@@ -4957,6 +4972,7 @@ class TestIndexing(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, expected)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("mode", ["serial", "cooperative"])
 def test_computed_tile_grid_ownership_codegen(mode):
     kernel = helion.kernel(
@@ -4966,12 +4982,12 @@ def test_computed_tile_grid_ownership_codegen(mode):
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        bound = _cpu_bind(kernel, (torch.zeros(5, 65),))
+        bound = cpu_bind(kernel, (torch.zeros(5, 65),))
         config = bound.config_spec.default_config()
         config.config["cute_fragment_scan"] = mode
         code = bound.to_code(config)
@@ -4981,6 +4997,7 @@ def test_computed_tile_grid_ownership_codegen(mode):
     assert "thread_idx()[3]" not in code
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "source,valid",
     [
@@ -5004,6 +5021,7 @@ def test_cute_final_thread_axis_validation(source, valid):
             validate_thread_axis_accesses(ast.parse(source).body)
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_live_invalid_grid_axis_rejected_after_codegen():
     @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
     def add_one(x: torch.Tensor):
@@ -5018,13 +5036,13 @@ def test_cute_live_invalid_grid_axis_rejected_after_codegen():
         return original_grid_index(self, offset_var, block_size_var, dtype, axis=3)
 
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch.object(CuteBackend, "grid_index_expr", invalid_grid_index),
     ):
-        bound = _cpu_bind(add_one, (torch.zeros(5, 65),))
+        bound = cpu_bind(add_one, (torch.zeros(5, 65),))
         with pytest.raises(exc.BackendUnsupported, match="thread axis 3"):
             bound.to_code(bound.config_spec.default_config())
 
@@ -5061,16 +5079,16 @@ def test_partition_allocation_slices_preserve_configured_extent(backend, stepped
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, (torch.ones(3, 65), stepped))
+        bound = cpu_bind(kernel, (torch.ones(3, 65), stepped))
         loads = [
             node
             for graph in bound.host_function.device_ir.graphs
@@ -5300,31 +5318,21 @@ def _execute_pointwise_thread_program(source, inputs):
     return result, launches
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "shape,width,tiles",
     [((3, 67), 73, [4, 32]), ((5, 9), 17, [4, 8]), ((3, 5, 9), 17, [2, 4, 8])],
 )
 @pytest.mark.parametrize("reverse", [False, True])
-def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reverse):
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
+def test_cute_broadcast_coordinates_generated_values(shape, width, tiles, reverse):
     inputs = (torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape), width)
-    aliases = []
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        aliases.append(result)
-        return result
-
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
     ):
-        bound = _cpu_bind(
+        bound = cpu_bind(
             _broadcast_coordinate_pad_2d
             if len(shape) == 2
             else _broadcast_coordinate_pad_3d,
@@ -5336,7 +5344,9 @@ def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reve
             list(reversed(range(len(shape)))) if reverse else list(range(len(shape)))
         ]
         source = bound.to_code(config)
-    assert any(aliases)
+    # The broadcast coordinates keep their tiles' blocks: no reduction dim
+    # (and so no thread axis) is allocated for them.
+    assert not any(block.reduction for block in bound.env.block_sizes)
     validate_thread_axis_accesses(ast.parse(source).body)
     actual, launches = _execute_pointwise_thread_program(source, inputs)
     expected = torch.full((*shape[:-1], width), -7.0)
@@ -5345,6 +5355,7 @@ def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reve
     assert all(len(block) == 3 for block in launches)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("axis", [-1, 3, 4])
 def test_cute_pointwise_invalid_axis_rejects_structurally(axis):
     from helion._compiler.cute.backend import _pointwise_grid_thread_dims
@@ -5361,15 +5372,6 @@ def test_cute_pointwise_invalid_axis_rejects_structurally(axis):
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _broadcast_axis_free_iota(x: torch.Tensor):
-    out = torch.empty_like(x)
-    for row in hl.tile(x.size(0)):
-        index = hl.arange(x.size(1))
-        out[row, :] = x[row, :] + index[None, :]
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _broadcast_axis_nested(x: torch.Tensor):
     out = torch.empty_like(x)
     for row in hl.tile(x.size(0)):
@@ -5378,71 +5380,11 @@ def _broadcast_axis_nested(x: torch.Tensor):
     return out
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _broadcast_axis_matmul(x: torch.Tensor, y: torch.Tensor):
-    out = torch.empty((x.size(0), y.size(1)), dtype=x.dtype, device=x.device)
-    for row, col in hl.tile(out.shape):
-        out[row, col] = hl.dot(x[row, :], y[:, col])
-    return out
-
-
-@pytest.mark.parametrize("kind", ["reduction", "free_iota", "matmul"])
-def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
-    cases = {
-        "reduction": (
-            helion.kernel(
-                reduction_sum.fn,
-                backend="cute",
-                static_shapes=True,
-                autotune_effort="none",
-            ),
-            (torch.ones(3, 8),),
-        ),
-        "free_iota": (_broadcast_axis_free_iota, (torch.ones(3, 8),)),
-        "matmul": (
-            _broadcast_axis_matmul,
-            (
-                torch.ones(16, 16, dtype=torch.float16),
-                torch.ones(16, 16, dtype=torch.float16),
-            ),
-        ),
-    }
-    kernel, inputs = cases[kind]
-    aliases = []
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        aliases.append(result)
-        return result
-
-    with (
-        _mock_cuda_unavailable(),
-        _target(),
-        _forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
-        bound = _cpu_bind(kernel, inputs)
-        config = bound.config_spec.default_config()
-        with patch.object(
-            TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe
-        ):
-            actual = bound.to_code(config)
-        with patch.object(
-            TileStrategyDispatch, "_inactive_cute_broadcast_aliases", return_value=set()
-        ):
-            previous = bound.to_code(config)
-    assert aliases and not any(aliases)
-    assert ast.dump(ast.parse(actual)) == ast.dump(ast.parse(previous))
-
-
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "shape,width,tiles", [((3, 67), 73, [4, 32]), ((3, 5, 9), 17, [2, 4, 8])]
 )
-def test_cute_inactive_broadcast_axes_native(shape, width, tiles):
+def test_cute_broadcast_coordinates_native(shape, width, tiles):
     x = torch.arange(math.prod(shape), device=DEVICE, dtype=torch.float32).reshape(
         shape
     )
@@ -5498,12 +5440,12 @@ def test_scaled_tile_slices_preserve_shape_algebra(backend, divide, factor):
         autotune_effort="none",
     )
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
-        bound = _cpu_bind(kernel, (torch.ones(3, 64), divide, factor))
+        bound = cpu_bind(kernel, (torch.ones(3, 64), divide, factor))
         loads = [
             node
             for graph in bound.host_function.device_ir.graphs
@@ -5553,6 +5495,7 @@ def _singleton_cache_copy(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("widths", [(1, 5, 1, 9), (5, 1, 5, 1)])
 @pytest.mark.parametrize("block", [2, 4])
 def test_backed_singleton_slice_binding_cache(widths, block):
@@ -5568,9 +5511,9 @@ def test_backed_singleton_slice_binding_cache(widths, block):
     before = storage.clone()
     bound_by_width = {}
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
         for width in widths:
@@ -5611,13 +5554,14 @@ def test_backed_singleton_slice_binding_values(widths, block):
         torch.testing.assert_close(storage, before, rtol=0, atol=0)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("hint", [1, 5])
 def test_singleton_guard_only_specializes_true_backed_size(hint):
     from torch._dynamo.source import LocalSource
 
     from helion._compiler.compile_environment import CompileEnvironment
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="cute", static_shapes=False)
         )
@@ -5629,11 +5573,12 @@ def test_singleton_guard_only_specializes_true_backed_size(hint):
             assert env.specialized_vars == (symbols if hint == 1 else set())
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("derived", [False, True])
 def test_singleton_guard_does_not_specialize_configured_hint_one(derived):
     from helion._compiler.compile_environment import CompileEnvironment
 
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
         env = CompileEnvironment(
             torch.device("cpu"), helion.Settings(backend="cute", static_shapes=False)
         )
@@ -5678,38 +5623,33 @@ def _nested_broadcast_gather(col, val, table, flat: hl.constexpr):
     return out
 
 
-@pytest.mark.parametrize("shape", [(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)])
-@pytest.mark.parametrize("flat", [False, True])
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("static_shapes", [False, True])
-def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes):
-    from helion._compiler.compile_environment import CompileEnvironment
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
+# The first shape leaves a masked tail on every extent, the second mixes exact
+# and ragged ones; ``flat`` gathers through ``hl.load`` on the flattened table
+# instead of a 3-D subscript; ``reverse`` reverses the order of the four grid
+# axes; ``static_shapes`` bakes the extents in.  They are independent knobs, so
+# all pairs of them (six cases) replace the full product of sixteen.
+@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize(
+    ("shape", "flat", "reverse", "static_shapes"),
+    pairwise(
+        shape=[(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)],
+        flat=[False, True],
+        reverse=[False, True],
+        static_shapes=[False, True],
+    ),
+)
+def test_cute_nested_broadcast_coordinates_values(shape, flat, reverse, static_shapes):
     m, n, k, p, q = shape
     column = torch.arange(m * n * k).reshape(m, n, k) % k
     # Small integer-valued FP32 data makes every modeled add/multiply exact.
     values = (torch.arange(m * n * k).reshape(m, n, k) % 5).float()
     table = (torch.arange(k * p * q).reshape(k, p, q) % 7).float()
     inputs = column, values, table, flat
-    aliases = []
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        env = CompileEnvironment.current()
-        outer = set(function.codegen.host_function.device_ir.grid_block_ids[0])
-        assert result.isdisjoint(env.config_spec.reduction_loops.valid_block_ids())
-        assert all(env.canonical_block_id(block) in outer for block in result)
-        aliases.append(result)
-        return result
-
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
     ):
         kernel = helion.kernel(
             _nested_broadcast_gather.fn,
@@ -5717,22 +5657,24 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
             static_shapes=static_shapes,
             autotune_effort="none",
         )
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         config = bound.config_spec.default_config()
         config.config["block_sizes"] = [2, 2, 4, 4, 4]
         config.config["loop_orders"] = [[3, 2, 1, 0] if reverse else [0, 1, 2, 3]]
         source = bound.to_code(config)
-    assert any(aliases)
+    # The outer tiles' broadcast coordinates allocate no reduction dim.
+    assert not any(block.reduction for block in bound.env.block_sizes)
     actual, launches = _execute_pointwise_thread_program(source, inputs)
     expected = (values[..., None, None] * table[column]).sum(2)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert all(len(block) == 3 and math.prod(block) <= 1024 for block in launches)
 
 
-def test_cute_nested_pointwise_outer_alias_values():
+@skipUnlessBackends(["cute"])
+def test_cute_nested_pointwise_outer_index_values():
     inputs = (torch.arange(3 * 17, dtype=torch.float32).reshape(3, 17),)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_broadcast_axis_nested, inputs)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_broadcast_axis_nested, inputs)
         source = bound.to_code(helion.Config(block_sizes=[2, 8]))
     actual, _ = _execute_pointwise_thread_program(source, inputs)
     torch.testing.assert_close(
@@ -5740,82 +5682,10 @@ def test_cute_nested_pointwise_outer_alias_values():
     )
 
 
-@pytest.mark.parametrize(
-    "guard", ["second_root", "scalar_loop", "child_owner", "executable", "free_iota"]
-)
-def test_cute_nested_broadcast_alias_scope_guards(guard):
-    import dataclasses
-
-    from helion._compiler.device_ir import ForLoopGraphInfo
-    from helion._compiler.device_ir import RootGraphInfo
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
-    column = torch.arange(3 * 5 * 7).reshape(3, 5, 7) % 7
-    inputs = (
-        column,
-        torch.ones_like(column, dtype=torch.float32),
-        torch.ones(7, 9, 11),
-        False,
-    )
-    original = TileStrategyDispatch._inactive_cute_broadcast_aliases
-    checked = []
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        assert result
-        graphs = function.codegen.codegen_graphs
-        child = next(graph for graph in graphs if type(graph) is ForLoopGraphInfo)
-        root = next(graph for graph in graphs if isinstance(graph, RootGraphInfo))
-        if guard == "second_root":
-            replacement = [*graphs, root.copy()]
-            context = patch.object(function.codegen, "codegen_graphs", replacement)
-        elif guard == "scalar_loop":
-            replacement = [
-                dataclasses.replace(graph, block_ids=[]) if graph is child else graph
-                for graph in graphs
-            ]
-            context = patch.object(function.codegen, "codegen_graphs", replacement)
-        elif guard == "child_owner":
-            context = patch.object(
-                function.codegen.host_function.device_ir,
-                "grid_block_ids",
-                [child.block_ids],
-            )
-        elif guard == "executable":
-            context = patch.object(
-                bound.env.config_spec.reduction_loops,
-                "valid_block_ids",
-                return_value=[
-                    *bound.env.config_spec.reduction_loops.valid_block_ids(),
-                    *result,
-                ],
-            )
-        else:
-            changed_root = root.copy()
-            changed_root.graph.call_function(torch.ops.aten.arange.default, (4,))
-            replacement = [changed_root if graph is root else graph for graph in graphs]
-            context = patch.object(function.codegen, "codegen_graphs", replacement)
-        with context:
-            assert not original(dispatch, function)
-        checked.append(guard)
-        return result
-
-    with (
-        _mock_cuda_unavailable(),
-        _target(),
-        _forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_cute_broadcast_aliases", observe),
-    ):
-        bound = _cpu_bind(_nested_broadcast_gather, inputs)
-        bound.to_code(helion.Config(block_sizes=[2, 2, 4, 4, 4]))
-    assert checked == [guard]
-
-
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("flat", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_cute_nested_broadcast_alias_native(flat, reverse):
+def test_cute_nested_broadcast_coordinates_native(flat, reverse):
     m, n, k, p, q = 3, 5, 7, 9, 11
     column = torch.arange(m * n * k, device=DEVICE).reshape(m, n, k) % k
     values = (torch.arange(m * n * k, device=DEVICE).reshape(m, n, k) % 5).float()
@@ -6118,10 +5988,11 @@ class TestCuteIntegerModuloCPU(unittest.TestCase):
 
         import cutlass
 
-        from test._cute_binding import _cpu_bind
-        from test._cute_binding import _forbid_native_compile
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
+
+        from helion._testing.cute_codegen import cpu_bind
+        from helion._testing.cute_codegen import forbid_native_compile
+        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         for torch_dtype, sdk_dtype in (
             (torch.int8, cutlass.Int8),
@@ -6144,8 +6015,8 @@ class TestCuteIntegerModuloCPU(unittest.TestCase):
                         for value in values
                     ]
                     self.assertEqual(actual, torch.remainder(values, scalar).tolist())
-                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-                        bound = _cpu_bind(_cute_wrapped_remainder, (values, scalar))
+                    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+                        bound = cpu_bind(_cute_wrapped_remainder, (values, scalar))
                         source = bound.to_code(bound.config_spec.default_config())
                     calls = [
                         n
@@ -6167,8 +6038,8 @@ class TestCuteIntegerModuloCPU(unittest.TestCase):
         ):
             expected = torch.remainder(left, right)
             sdk_dtype = cutlass.Int8 if expected.dtype == torch.int8 else cutlass.Int32
-            with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-                bound = _cpu_bind(
+            with mock_cuda_unavailable(), _target(), forbid_native_compile():
+                bound = cpu_bind(
                     # The scalar operand is a rank-zero device value loaded
                     # from a rank-one host tensor, independent of scalar I/O.
                     _cute_promoted_remainder,
@@ -6205,18 +6076,19 @@ class TestCuteIntegerModuloCPU(unittest.TestCase):
     def test_codegen_distinguishes_python_remainder_and_c_style_mod(self):
         import ast
 
-        from test._cute_binding import _cpu_bind
-        from test._cute_binding import _forbid_native_compile
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
 
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        from helion._testing.cute_codegen import cpu_bind
+        from helion._testing.cute_codegen import forbid_native_compile
+        from helion._testing.cute_codegen import mock_cuda_unavailable
+
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
             for dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
                 for c_style in (False, True):
                     with self.subTest(dtype=dtype, c_style=c_style):
                         left = torch.tensor([-7, -1, 0, 1, 7], dtype=dtype)
                         right = torch.tensor([3, -3, 3, -3, 3], dtype=dtype)
-                        bound = _cpu_bind(
+                        bound = cpu_bind(
                             _cute_integer_remainders, (left, right, c_style)
                         )
                         source = bound.to_code(bound.config_spec.default_config())
@@ -6229,7 +6101,7 @@ class TestCuteIntegerModuloCPU(unittest.TestCase):
                         ]
                         self.assertEqual(len(calls), int(not c_style))
             values = torch.arange(3 * 17, dtype=torch.int32).reshape(3, 17)
-            bound = _cpu_bind(_cute_integer_modulo_offsets, (values,))
+            bound = cpu_bind(_cute_integer_modulo_offsets, (values,))
             config = bound.config_spec.default_config()
             config.config["block_sizes"] = [16]
             source = bound.to_code(config)
@@ -6403,18 +6275,19 @@ def _bounded_gather_maps(x: torch.Tensor, mode: hl.constexpr, offset: hl.constex
 
 def _bounded_gather_codegen(kernel, args):
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         _target(),
-        _forbid_native_compile(),
+        forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
     ):
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         config = bound.config_spec.default_config()
         config.config["cute_fragment_bounded_gather"] = True
         source = bound.to_code(config)
     return bound, source
 
 
+@onlyBackends(["cute"])
 class TestCuteBoundedGatherCPU(TestCase):
     def test_logical_exchange_maps_and_exact_float_payloads(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -6652,7 +6525,7 @@ class TestCuteBoundedGatherCPU(TestCase):
 
         from test.cute_population_contracts import checked_initial_population
 
-        from helion._compiler import autotuner_heuristics
+        from helion._compiler.cute.autotune import heuristics as cute_heuristics
         from helion.autotuner.pattern_search import InitialPopulationStrategy
         from helion.autotuner.pattern_search import PatternSearch
 
@@ -6661,14 +6534,14 @@ class TestCuteBoundedGatherCPU(TestCase):
 
         def capture(enabled):
             with patch(
-                "helion._compiler.autotuner_heuristics.register_fragment_bounded_gather_coverage",
-                wraps=autotuner_heuristics.register_fragment_bounded_gather_coverage
+                "helion._compiler.cute.autotune.heuristics.register_fragment_bounded_gather_coverage",
+                wraps=cute_heuristics.register_fragment_bounded_gather_coverage
                 if enabled
                 else None,
             ) as hook:
                 if not enabled:
                     hook.return_value = None
-                bound = _cpu_bind(_bounded_gather_rows, args)
+                bound = cpu_bind(_bounded_gather_rows, args)
             spec = bound.config_spec
             default = spec.default_config()
             self.assertNotIn(key, default)
@@ -6705,7 +6578,7 @@ class TestCuteBoundedGatherCPU(TestCase):
                 self.assertIn("fragment_buffer", bound.to_code(requested))
             return records
 
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
             previous, current = capture(False), capture(True)
         for (old, old_rng), (new, new_rng) in zip(previous, current, strict=True):
             self.assertEqual(old, new[: len(old)])
@@ -6834,6 +6707,7 @@ def _indexed_bounded_expected(x, mode):
     return first
 
 
+@onlyBackends(["cute"])
 class TestCuteIndexedGatherCPU(TestCase):
     def test_indexed_masked_tail_and_repeated_producers(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -7042,6 +6916,7 @@ def _loop_bounded_index_drift(x: torch.Tensor, clamp: hl.constexpr):
     return out
 
 
+@onlyBackends(["cute"])
 class TestCuteLoopGatherDomainsCPU(TestCase):
     def test_simultaneous_carries_keep_parallel_assignment(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -7348,6 +7223,7 @@ def _asm_gather_model_source(code):
     return ast.unparse(ast.fix_missing_locations(Model().visit(ast.parse(code))))
 
 
+@onlyBackends(["cute"])
 class TestCuteInlineAsmGatherCPU(TestCase):
     def test_exact_contract_and_opaque_range_declines(self):
         import operator
@@ -7567,6 +7443,7 @@ def _bounded_gather_mixed_scan(x: torch.Tensor, unsafe: hl.constexpr):
     return out
 
 
+@onlyBackends(["cute"])
 class TestCuteGatherWarpScanCPU(TestCase):
     def test_explicit_options_and_wide_generated_model(self):
         from test.test_cute_computed_fragment import _simulate_fragment_warp_reduction
@@ -7575,8 +7452,8 @@ class TestCuteGatherWarpScanCPU(TestCase):
             for reverse in (False, True):
                 with self.subTest(dtype=dtype, reverse=reverse):
                     x = (torch.arange(2 * 2049).reshape(2, 2049) % 29 - 14).to(dtype)
-                    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-                        bound = _cpu_bind(_bounded_gather_warp_scan, (x, reverse))
+                    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+                        bound = cpu_bind(_bounded_gather_warp_scan, (x, reverse))
                         for gather in (False, True):
                             for scan in (False, True):
                                 config = bound.config_spec.default_config()
@@ -7613,12 +7490,12 @@ class TestCuteGatherWarpScanCPU(TestCase):
                                 self.assertEqual("shuffle_sync_up" in code, scan)
 
     def test_dependent_carrier_and_strict_mutation(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_warp_scan import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_warp_scan import (
             register_gather_warp_scan_coverage,
         )
 
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-            bound = _cpu_bind(
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
+            bound = cpu_bind(
                 _bounded_gather_warp_scan, (torch.ones(2, 2049).int(), False)
             )
             spec = bound.config_spec
@@ -7650,14 +7527,14 @@ class TestCuteGatherWarpScanCPU(TestCase):
             self.assertEqual(spec.compiler_coverage_groups, groups)
 
     def test_mixed_roots_and_unsupported_gather(self):
-        from helion._compiler.autotuner_heuristics.cute_fragment_warp_scan import (
+        from helion._compiler.cute.autotune.heuristics.cute_fragment_warp_scan import (
             active_warp_scan_roots,
         )
 
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
             for unsafe in (False, True):
                 with self.subTest(unsafe=unsafe):
-                    bound = _cpu_bind(
+                    bound = cpu_bind(
                         _bounded_gather_mixed_scan, (torch.ones(2, 65).int(), unsafe)
                     )
                     spec = bound.config_spec
@@ -7710,8 +7587,8 @@ class TestCuteGatherWarpScanCPU(TestCase):
         from test.test_cute_computed_fragment import _simulate_fragment_warp_reduction
 
         x = (torch.arange(130).reshape(2, 65) % 11 - 5).int()
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-            bound = _cpu_bind(_bounded_gather_mixed_scan, (x, False))
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
+            bound = cpu_bind(_bounded_gather_mixed_scan, (x, False))
             for scan in (False, True):
                 with self.subTest(scan=scan):
                     config = bound.config_spec.default_config()
@@ -7748,14 +7625,14 @@ class TestCuteGatherWarpScanCPU(TestCase):
                     self.assertTrue(torch.equal(out, expected))
 
     def test_unsupported_capacity_and_resource_decline(self):
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
             for width, dtype in (
                 (0, torch.int32),
                 (2049, torch.float32),
                 (65537, torch.int64),
             ):
                 with self.subTest(width=width, dtype=dtype):
-                    bound = _cpu_bind(
+                    bound = cpu_bind(
                         _bounded_gather_warp_scan,
                         (torch.empty(1, width, dtype=dtype), False),
                     )
@@ -7875,6 +7752,7 @@ def _all_axis_bounded_loop(x: torch.Tensor, steps: int):
     return out
 
 
+@onlyBackends(["cute"])
 class TestCuteAllAxisGatherCPU(TestCase):
     def test_canonical_dims_keepdim_and_promotion(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -8024,13 +7902,11 @@ class TestCuteAllAxisGatherCPU(TestCase):
                         )
                     )
             self.assertEqual(prove(), ())
-        # The unchanged lowerer rejects truly multiple reduction dimensions.
+        # Implicit full reductions still report unsupported multiple axes.
         for op, mode, keep in (("min", "empty", True), ("max", "none", False)):
             with (
                 self.subTest(op=op),
-                self.assertRaisesRegex(
-                    NotImplementedError, "multiple reduction dimensions"
-                ),
+                self.assertRaises(exc.MultipleReductionDims),
             ):
                 _bounded_gather_codegen(
                     _all_axis_bounded_gather, (torch.ones(2, 4, 8), op, mode, keep)
@@ -8164,6 +8040,7 @@ def _nested_bounded_swapped_index(x: torch.Tensor, clamp: hl.constexpr):
     return out
 
 
+@onlyBackends(["cute"])
 class TestCuteNestedForGatherCPU(TestCase):
     def test_nested_scalar_vector_carries_and_zero_trips(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -8525,6 +8402,7 @@ def _nested_bounded_pure_asm(x: torch.Tensor, outer_steps: int, inner_steps: int
     return out
 
 
+@onlyBackends(["cute"])
 class TestCuteNestedAsmGatherCPU(TestCase):
     def test_actual_normalized_pure_assembly_and_tails(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -8552,16 +8430,16 @@ class TestCuteNestedAsmGatherCPU(TestCase):
                     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     def test_normalized_abi_effect_and_ambiguity_declines(self):
-        from test._cute_binding import _cpu_bind
-        from test._cute_binding import _forbid_native_compile
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
 
         from helion._compiler.cute.gather_domains import loop_domain_facts
+        from helion._testing.cute_codegen import cpu_bind
+        from helion._testing.cute_codegen import forbid_native_compile
+        from helion._testing.cute_codegen import mock_cuda_unavailable
         from helion.language import inline_asm_ops
 
-        with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-            bound = _cpu_bind(_nested_bounded_pure_asm, (torch.ones(2, 32).int(), 2, 2))
+        with mock_cuda_unavailable(), _target(), forbid_native_compile():
+            bound = cpu_bind(_nested_bounded_pure_asm, (torch.ones(2, 32).int(), 2, 2))
             graphs = bound.host_function.device_ir.graphs
             node = next(
                 node

@@ -9,6 +9,7 @@ from typing import TypeVar
 from .ast_extension import ExtendedAST
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
 
     _A = TypeVar("_A", bound=ast.AST)
@@ -19,6 +20,11 @@ HELION_LANE_LOOP_VAR_ATTR = "_helion_lane_loop_var"
 # whose tile axes the atomic is uniform (``cute/atomic_ops.py``); the lane-loop
 # distribution pins the atomic to their first lane when it runs inside them.
 HELION_ATOMIC_UNIFORM_LANES_ATTR = "_helion_atomic_uniform_lanes"
+# On a CuTe atomic call: the launch thread axes its guard decided at the call,
+# the ones the atomic varies along and the ones it runs on the leader of
+# (``cute/atomic_ops.py``); an axis the launch claims after the call gets its
+# leader once codegen is done (``guard_atomics_on_later_thread_axes``).
+HELION_ATOMIC_THREAD_AXES_ATTR = "_helion_atomic_thread_axes"
 # On a CuTe ``cute.arch.sync_threads()`` statement: the barrier ordering every
 # thread's accesses around a release / acquire atomic (``cute/atomic_ops.py``),
 # ``"release"`` before the atomic or ``"acquire"`` after it.  The lane-loop
@@ -43,6 +49,12 @@ HELION_LANE_ORDERED_ATTR = "_helion_lane_ordered"
 # CTA (``cute/block_uniform.py``), so a block-wide barrier may be placed inside
 # either side.
 HELION_BLOCK_UNIFORM_ATTR = "_helion_block_uniform"
+# On the CuTe ``cute.arch.sync_threads()`` a marked read-after-write load puts
+# before itself (``cute/memory_ops.py``): the frozenset of the tensor names
+# whose earlier stores it orders.  The barrier pass
+# (``cute/lane_loops/barriers.py``) removes the tag of one it counts on, so a
+# pass may treat only a still tagged barrier as ordering just those stores.
+HELION_RAW_BARRIER_TENSORS_ATTR = "_helion_raw_barrier_tensors"
 
 # Accessing these tensor attributes only reads host-side metadata, not tensor
 # storage.  Keep counting them as ordinary reads for liveness, but identify them
@@ -79,6 +91,7 @@ class _ReadWriteVisitor(ast.NodeVisitor):
             collections.Counter(),
             set(),
             set(),
+            collections.Counter(),
         )
 
     def _update(self, name: str, ctx: ast.expr_context) -> None:
@@ -118,6 +131,13 @@ class _ReadWriteVisitor(ast.NodeVisitor):
                 self.rw.inplace_writes[first_arg.id] += 1
                 if func.attr.startswith("atomic_"):
                     self.rw.atomic_reads.add(first_arg.id)
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.attr.endswith("_")
+            and not func.attr.endswith("__")
+        ):
+            self.rw.method_writes[func.value.id] += 1
         self.generic_visit(node)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
@@ -143,9 +163,9 @@ class ReadWrites(typing.NamedTuple):
     reads: dict[str, int]
     writes: dict[str, int]
     # TODO(tcombes): inplace_writes only tracks subscript stores (x[tile] = ...) and
-    # atomic ops (hl.atomic_*(x, ...)).  If Helion adds support for in-place
-    # methods inside kernels (e.g. x.copy_(), x.fill_()), the visitor should
-    # be updated to detect those as well.
+    # atomic ops (hl.atomic_*(x, ...)).  In-place tensor methods (x.copy_(),
+    # x.fill_()) land in ``method_writes``, which only the device IR reads, so
+    # the readers of this field (``_dynamo``'s mutated parameters) miss them.
     inplace_writes: dict[str, int]
     # Reads of tensor shape/type/device metadata do not access tensor storage.
     # They remain present in ``reads`` for general dependency tracking.
@@ -157,6 +177,12 @@ class ReadWrites(typing.NamedTuple):
     # Atomic operations are read-modify-writes even when the generic Name walk
     # sees only the synthetic first-argument read paired with the in-place write.
     atomic_reads: set[str]
+    # Receivers of trailing-underscore method calls (``acc.add_(x)``).  An
+    # in-place tensor method rebinds a device value to its result, which loops
+    # and branches carry out like an assignment (``device_ir``).  A module
+    # function ending in an underscore (``cutlass.select_``) lands here too, so
+    # only analyses that know their receivers are tensors read this.
+    method_writes: dict[str, int]
 
     def __iter__(self) -> typing.Iterator[str]:
         return iter({**self.reads, **self.writes})
@@ -189,15 +215,6 @@ class ReadWrites(typing.NamedTuple):
         return visitor.rw
 
 
-class _RenameVisitor(ast.NodeVisitor):
-    def __init__(self, renames: dict[str, str]) -> None:
-        super().__init__()
-        self.renames = renames
-
-    def visit_Name(self, node: ast.Name) -> None:
-        node.id = self.renames.get(node.id, node.id)
-
-
 def ast_rename(node: _A, renames: dict[str, str]) -> _A:
     """
     Rename variables in an Abstract Syntax Tree (AST) node, in-place.
@@ -212,19 +229,74 @@ def ast_rename(node: _A, renames: dict[str, str]) -> _A:
     Returns:
         The modified AST node with variables renamed.
     """
-    visitor = _RenameVisitor(renames)
-    visitor.visit(node)
+    # Every ``Name`` is reached the same way a visitor would reach it; the
+    # flat walk only saves the per-node dispatch of ``NodeVisitor``.
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name):
+            child.id = renames.get(child.id, child.id)
     return node
 
 
-class _DeleteAssignments(ast.NodeTransformer):
-    def __init__(self, to_remove: set[str]) -> None:
+class _PreserveRequiredSuites(ast.NodeTransformer):
+    def _visit_required_suite(
+        self,
+        node: ast.If
+        | ast.For
+        | ast.AsyncFor
+        | ast.While
+        | ast.With
+        | ast.AsyncWith
+        | ast.FunctionDef
+        | ast.AsyncFunctionDef
+        | ast.ClassDef
+        | ast.Try
+        | ast.ExceptHandler
+        | ast.match_case,
+    ) -> ast.AST:
+        self.generic_visit(node)
+        if not node.body:
+            # Keep the surrounding control flow and its effects when cleanup
+            # removes every statement from a required suite.
+            node.body = [ast.copy_location(ast.Pass(), node)]
+        return node
+
+    visit_If = _visit_required_suite
+    visit_For = _visit_required_suite
+    visit_AsyncFor = _visit_required_suite
+    visit_While = _visit_required_suite
+    visit_With = _visit_required_suite
+    visit_AsyncWith = _visit_required_suite
+    visit_FunctionDef = _visit_required_suite
+    visit_AsyncFunctionDef = _visit_required_suite
+    visit_ClassDef = _visit_required_suite
+    visit_ExceptHandler = _visit_required_suite
+    visit_match_case = _visit_required_suite
+
+    def visit_Try(self, node: ast.Try) -> ast.AST:
+        had_finally = bool(node.finalbody)
+        self._visit_required_suite(node)
+        if (had_finally or not node.handlers) and not node.finalbody:
+            node.finalbody = [ast.copy_location(ast.Pass(), node)]
+        return node
+
+    visit_TryStar = visit_Try
+
+
+class _DeleteAssignments(_PreserveRequiredSuites):
+    def __init__(
+        self,
+        to_remove: set[str],
+        removable: Callable[[ast.Assign], bool] | None = None,
+    ) -> None:
         super().__init__()
         self.to_remove = to_remove
+        self.removable = removable
+        self.changed = False
 
     def visit_Assign(self, node: ast.Assign) -> ast.Assign | None:
         """
-        Visit an assignment node and remove it if the target variable is in the to_remove set.
+        Visit an assignment node and remove it if the target variable is in
+        the to_remove set and ``removable``, when given, accepts it.
 
         Args:
             node: The assignment node to visit.
@@ -234,19 +306,31 @@ class _DeleteAssignments(ast.NodeTransformer):
         """
         if len(node.targets) == 1:
             (target,) = node.targets
-            if isinstance(target, ast.Name) and target.id in self.to_remove:
+            if (
+                isinstance(target, ast.Name)
+                and target.id in self.to_remove
+                and (self.removable is None or self.removable(node))
+            ):
+                self.changed = True
                 return None
         return node
 
 
-def ast_delete_assignments(body: list[ast.AST], to_remove: set[str]) -> list[ast.AST]:
+def _delete_assignments(
+    body: list[ast.AST],
+    to_remove: set[str],
+    removable: Callable[[ast.Assign], bool] | None = None,
+) -> tuple[list[ast.AST], bool]:
+    """``body`` without the plain assignments to ``to_remove`` that
+    ``removable`` accepts (every one without it), and whether any assignment
+    was removed."""
     new_body = []
-    transformer = _DeleteAssignments(to_remove)
+    transformer = _DeleteAssignments(to_remove, removable)
     for node in body:
         new_node = transformer.visit(node)
         if new_node is not None:
             new_body.append(new_node)
-    return new_body
+    return new_body, transformer.changed
 
 
 class _DeleteDeadLaneLoops(ast.NodeTransformer):
@@ -498,7 +582,7 @@ def definitely_does_not_have_side_effects(
         return False
 
 
-class _DeletePureExpressions(ast.NodeTransformer):
+class _DeletePureExpressions(_PreserveRequiredSuites):
     def visit_Expr(self, node: ast.Expr) -> ast.Expr | None:
         if definitely_does_not_have_side_effects(node.value):
             return None
@@ -510,13 +594,21 @@ def dead_assignment_elimination(
     dce_vars: list[str],
     num_iterations: int = 8,
     input_rw: ReadWrites | None = None,
-) -> None:
+    removable: Callable[[ast.Assign], bool] | None = None,
+) -> bool:
     """
-    Eliminates dead assignments from body
+    Eliminates dead assignments from body; returns whether any was removed.
+
+    Without ``removable`` every plain assignment to a dead name goes, for
+    names whose every assignment the caller knows to be removable (compiler
+    temporaries).  With it, only the assignments it accepts: a name the
+    caller chose for one pure assignment may have others that must run
+    (``flag = 0`` beside ``flag = x.add_(1)``).
     """
 
     # num_iterations and input_rw are not compatible with each other
     assert num_iterations == 1 or input_rw is None
+    changed = False
     for _ in range(num_iterations):
         rw = input_rw if input_rw is not None else ReadWrites.from_list(body)
         to_remove = set()
@@ -525,7 +617,13 @@ def dead_assignment_elimination(
                 to_remove.add(name)
         if not to_remove:
             break
-        body[:] = ast_delete_assignments(body, to_remove)
+        body[:], removed = _delete_assignments(body, to_remove, removable)
+        if not removed:
+            # The dead names are not simple assignments: another pass over
+            # the same body would find the same statements to keep.
+            break
+        changed = True
+    return changed
 
 
 def is_string_expr(node: ast.AST) -> bool:

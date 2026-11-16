@@ -15,7 +15,13 @@ import weakref
 import pytest
 import torch
 
+from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_launcher import mock_cute_launcher_runtime
 from helion.runtime.cute import launcher
+
+# Not a cpu_only module: test_fast_relaunch_capi_executor_raises_cuda_errors
+# raises the DSL's real CUDA error, whose name lookup loads libcuda, and the
+# CPU-lane runners have no driver library.
 
 
 @dataclasses.dataclass
@@ -45,12 +51,7 @@ def fake_runtime(monkeypatch: pytest.MonkeyPatch) -> list[_Pointer]:
         pointers.append(pointer)
         return pointer
 
-    monkeypatch.setattr(
-        launcher, "_get_cute_launcher_imports", lambda: (None, make_ptr, None)
-    )
-    monkeypatch.setattr(launcher, "_validate_cute_launcher_tensor", lambda tensor: None)
-    monkeypatch.setattr(launcher, "_torch_dtype_to_cutlass", str)
-    monkeypatch.setattr(launcher, "_cute_kernel_param_is_constexpr", lambda kernel: ())
+    mock_cute_launcher_runtime(monkeypatch, make_ptr)
     return pointers
 
 
@@ -427,6 +428,7 @@ def test_fast_relaunch_respects_compiled_alignment_before_patching(
         assert executor.calls == [(initial, 0xD00)]
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("by_reference", [False, True])
 def test_fast_relaunch_enters_capi_executor_with_owned_packed_args(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch, by_reference: bool
@@ -473,6 +475,7 @@ def test_fast_relaunch_enters_capi_executor_with_owned_packed_args(
     assert len(executor.calls) == 2
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_fast_relaunch_capi_executor_raises_cuda_errors(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -564,6 +567,7 @@ def test_fastpath_builder_rehosts_fresh_tvm_ffi_compiles_only_when_eligible(
     assert executor.calls == [(0x2000, 0xD00)]
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_fast_relaunch_wraps_capi_entry_failures_like_run_compiled_program(
     fake_runtime: list[_Pointer], monkeypatch: pytest.MonkeyPatch
 ) -> None:

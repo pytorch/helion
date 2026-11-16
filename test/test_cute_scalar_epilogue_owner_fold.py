@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import cast
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_cute_rolled_online_epilogue import _config as row_config
 from .test_cute_rolled_online_epilogue import _program
@@ -17,6 +17,14 @@ from .test_cute_rolled_online_epilogue import row_logsumexp
 import helion
 from helion import exc
 from helion._compiler.cute import scalar_epilogue
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
+
+pytestmark = pytest.mark.cpu_only
+
+if TYPE_CHECKING:
+    from helion._compiler.device_function import DeviceFunction
 
 
 def _config(owner: bool | None = True, *, rows: int = 1) -> helion.Config:
@@ -50,6 +58,15 @@ def test_proved_final_result_gets_owner_keyword() -> None:
     )
     assert code.count("_cute_complete_row_tensor_copy(") == 1
     assert "group_span=256, cluster_n=8" in code
+
+
+def test_unproven_launch_shape_leaves_the_body_alone() -> None:
+    # ``thread_block_dims=None`` (an unproven launch shape) is not a
+    # ``(1, 1, 1)`` launch: the pass hands the body back before it reads the
+    # environment or the device function.
+    body = ast.parse("x = cute.arch.thread_idx()[0]\ny = x + 1").body
+    fn = cast("DeviceFunction", SimpleNamespace())
+    assert scalar_epilogue.lower_scalar_epilogue(body, fn, None, None, set()) is body
 
 
 def test_default_and_false_preserve_original_kernel_code() -> None:
@@ -92,8 +109,8 @@ def test_unproved_scalar_suffix_retains_all_receivers(mutation: str) -> None:
 
 def test_flag_requires_scalar_epilogue_proof_control() -> None:
     x = torch.empty((3, 32000), dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(row_logsumexp, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(row_logsumexp, (x,))
         config = _config()
         config.config["cute_scalar_epilogue"] = False
         with pytest.raises(exc.InvalidConfig, match="requires cute_scalar_epilogue"):
@@ -106,8 +123,8 @@ def test_flag_requires_scalar_epilogue_proof_control() -> None:
 @pytest.mark.parametrize("value", [0, 1, "true", None])
 def test_flag_is_boolean(value) -> None:
     x = torch.empty((3, 32000), dtype=torch.bfloat16)
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(row_logsumexp, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(row_logsumexp, (x,))
         config = _config()
         config.config["cute_scalar_epilogue_owner_fold"] = value
         with pytest.raises(exc.InvalidConfig, match="must be a boolean"):

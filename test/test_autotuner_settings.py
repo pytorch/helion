@@ -10,6 +10,7 @@ import math
 import operator
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 from types import SimpleNamespace
@@ -31,9 +32,14 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import matchesBackends
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion._testing.search_harness import mock_kernel
+from helion._testing.search_harness import mock_search
+from helion._testing.search_harness import prepare_search
+from helion._testing.search_harness import skip_accuracy_baseline
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
 from helion.autotuner import LFBOTreeSearch
@@ -61,35 +67,71 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
+class TestWorkerStartTimeoutSetting(TestCase):
+    def test_rejects_non_positive_timeout(self) -> None:
+        for value in (0, -1):
+            with self.assertRaisesRegex(
+                ValueError, "autotune_worker_start_timeout must be a positive"
+            ):
+                Settings(autotune_worker_start_timeout=value)
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_WORKER_START_TIMEOUT": "0"}),
+            self.assertRaisesRegex(
+                ValueError, "autotune_worker_start_timeout must be a positive"
+            ),
+        ):
+            Settings()
+
+    def test_accepts_positive_timeout_and_default(self) -> None:
+        self.assertEqual(
+            Settings(autotune_worker_start_timeout=7).autotune_worker_start_timeout, 7
+        )
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_WORKER_START_TIMEOUT": "15"}):
+            self.assertEqual(Settings().autotune_worker_start_timeout, 15)
+        with without_env_var("HELION_AUTOTUNE_WORKER_START_TIMEOUT"):
+            self.assertIsNone(Settings().autotune_worker_start_timeout)
+
+
+class _NarrowingSearch(BaseSearch):
+    """A search that narrows the compile deadline, as
+    ``set_adaptive_compile_timeout`` does, then picks the default config or,
+    with ``finds_none``, finds no config."""
+
+    finds_none = False
+
+    def _autotune(self) -> helion.Config:
+        self.settings.autotune_compile_timeout = 5
+        if self.finds_none:
+            raise exc.NoConfigFound
+        return self.config_spec.default_config()
+
+
+class TestAdaptiveCompileTimeout(TestCase):
+    def test_a_search_restores_the_compile_timeout_it_narrowed(self) -> None:
+        # The kernel's settings are shared by every shape the kernel is bound
+        # to: the next shape's search inherited the deadline this one
+        # narrowed, so its precompiles (and a precompiled accuracy baseline)
+        # were killed sooner than configured.
+        for finds_none in (False, True):
+            with self.subTest(finds_none=finds_none):
+                settings = Settings(
+                    autotune_compile_timeout=60, autotune_log_level=logging.CRITICAL
+                )
+                search = _NarrowingSearch(
+                    mock_kernel(settings, get_cached_path=lambda config: None), ()
+                )
+                search.finds_none = finds_none
+                with skip_accuracy_baseline():
+                    if finds_none:
+                        with self.assertRaises(exc.NoConfigFound):
+                            search.autotune()
+                    else:
+                        search.autotune()
+                self.assertEqual(settings.autotune_compile_timeout, 60)
+
+
 @onlyBackends(["triton", "cute"])
 class TestAutotuneBudget(TestCase):
-    def _make_search(self, settings: Settings) -> BaseSearch:
-        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
-        # its attributes, so new __init__ fields don't need to be added here.
-        config_spec = SimpleNamespace(
-            backend=SimpleNamespace(supports_precompile=lambda: True),
-            default_config=lambda: helion.Config(block_sizes=[1]),
-            compiler_seed_timeout_retry_repetitions=None,
-            cute_flash_search_enabled=False,
-        )
-        kernel = SimpleNamespace(
-            settings=settings,
-            config_spec=config_spec,
-            format_kernel_decorator=lambda config, s: "decorator",
-            to_triton_code=lambda config: "code",
-            maybe_log_repro=lambda log_func, args, config=None: None,
-            supports_subprocess_benchmark=lambda: False,
-            env=SimpleNamespace(process_group_name=None),
-        )
-        search = BaseSearch(kernel, ())
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_compute_baseline",
-            return_value=(None, [], None),
-        ):
-            search._prepare()
-        return search
-
     def test_setting_default_is_none(self) -> None:
         with without_env_var("HELION_AUTOTUNE_BUDGET_SECONDS"):
             settings = Settings()
@@ -97,8 +139,8 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_uses_default_autotune_budget_without_mutating(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
         from helion._compiler.cute.backend import _CUTE_DEFAULT_AUTOTUNE_BUDGET_SECONDS
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
@@ -122,7 +164,7 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_leaves_full_autotune_unbudgeted_by_default(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
@@ -146,7 +188,7 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_restores_default_autotune_budget_on_error(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=None,
@@ -170,7 +212,7 @@ class TestAutotuneBudget(TestCase):
 
     def test_cute_backend_preserves_explicit_autotune_budget(self) -> None:
         from helion._compiler.backend import Backend
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         settings = Settings(
             autotune_budget_seconds=42,
@@ -209,7 +251,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search._autotune_budget_start = time.perf_counter() - 1e9
         self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
 
@@ -218,7 +260,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=600,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         self.assertEqual(list(search._budgeted_range(1, 4)), [1, 2, 3])
 
     def test_budget_stops_range_when_elapsed_exceeds(self) -> None:
@@ -226,7 +268,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=1,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search._autotune_budget_start = time.perf_counter() - 2.0
         search.log = Mock()
         self.assertEqual(list(search._budgeted_range(10)), [])
@@ -237,7 +279,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=600,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search.config_spec.cute_flash_search_enabled = True
         search.kernel.env.process_group_name = "autotune"
 
@@ -254,7 +296,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=600,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search.kernel.env.process_group_name = "autotune"
 
         with patch(
@@ -279,17 +321,12 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=60,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         search._autotune_budget_start = time.perf_counter() - 100.0
         self.assertEqual(list(search._budgeted_range(1)), [])
 
         search._prepared = False
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_compute_baseline",
-            return_value=(None, [], None),
-        ):
-            search._prepare()
+        prepare_search(search)
         self.assertEqual(list(search._budgeted_range(1)), [0])
 
     def test_budget_zero_immediately_exhausts(self) -> None:
@@ -297,7 +334,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=0,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         time.sleep(0.001)
         self.assertEqual(list(search._budgeted_range(10)), [])
 
@@ -403,7 +440,7 @@ class TestAutotuneBudget(TestCase):
             autotune_budget_seconds=1,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         self.assertEqual(
             search.benchmark_provider.budget_exceeded_fn,
             search._autotune_budget_exceeded,
@@ -464,7 +501,8 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=False,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
-                should_deduplicate_generated_sources=lambda config_spec: False
+                classify_autotune_exception=lambda error: None,
+                should_deduplicate_generated_sources=lambda config_spec: False,
             ),
         )
         provider.args = ()
@@ -602,6 +640,7 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=True,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                classify_autotune_exception=lambda error: None,
                 generated_source_hash=lambda fn: fn.source_hash,
                 should_deduplicate_generated_sources=lambda config_spec: True,
             ),
@@ -699,6 +738,7 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=True,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                classify_autotune_exception=lambda error: None,
                 generated_source_hash=lambda fn: fn.source_hash,
                 should_deduplicate_generated_sources=lambda config_spec: True,
             ),
@@ -779,6 +819,7 @@ class TestAutotuneBudget(TestCase):
             cute_flash_search_enabled=True,
             compiler_seed_timeout_retry_repetitions=None,
             backend=SimpleNamespace(
+                classify_autotune_exception=lambda error: None,
                 generated_source_hash=lambda fn: fn.source_hash,
                 should_deduplicate_generated_sources=lambda config_spec: True,
             ),
@@ -1497,7 +1538,7 @@ class TestAutotuneBudget(TestCase):
             self.assertFalse(provider._effective_source_dedup_enabled())
 
     def test_cute_backend_reports_attached_generated_source_hash(self) -> None:
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         backend = CuteBackend()
         compiled = SimpleNamespace(
@@ -1637,7 +1678,7 @@ class TestAutotuneBudget(TestCase):
         # run on the Torch current stream, so CUDA-event timing is accurate
         # and subprocess benchmark jobs must NOT switch to the wall-clock
         # path that charges per-launch host overhead to the kernel.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         backend = CuteBackend()
         self.assertIsNone(backend.get_do_bench())
@@ -1661,6 +1702,9 @@ class TestAutotuneBudget(TestCase):
             def get_do_bench(self):
                 return do_bench_generic
 
+            def prefers_wall_clock_bench(self) -> bool:
+                return False
+
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
         provider.config_spec = SimpleNamespace(backend=OtherBackend())
@@ -1671,7 +1715,7 @@ class TestAutotuneBudget(TestCase):
     def test_mtia_device_disables_subprocess_benchmark(self) -> None:
         # The MTIA runtime reserves the whole device for its first client,
         # so a spawned worker cannot open it while this process holds it.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         backend = CuteBackend()
         self.assertIsNone(backend.get_do_bench())
@@ -1685,10 +1729,24 @@ class TestAutotuneBudget(TestCase):
 
         self.assertFalse(provider._subprocess_benchmark_enabled())
 
+    def test_mutated_args_keep_subprocess_benchmark(self) -> None:
+        # A kernel writing into an ``out`` argument (most examples) must still
+        # compile and run in the killable worker: a stalled or crashing JIT of
+        # one config otherwise takes down the whole autotune.
+        from helion._compiler.cute.backend import CuteBackend
+
+        provider = self._make_stub_provider()
+        provider.kernel.supports_subprocess_benchmark = lambda: True
+        provider.config_spec = SimpleNamespace(backend=CuteBackend())
+        provider.mutated_arg_indices = [3]
+
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._subprocess_accuracy_check_enabled())
+
     def test_missing_device_env_does_not_break_subprocess_check(self) -> None:
         # Stub kernels mock env without a device; the MTIA carve-out must
         # tolerate that instead of raising AttributeError.
-        from helion._compiler.backend import CuteBackend
+        from helion._compiler.cute.backend import CuteBackend
 
         provider = self._make_stub_provider()
         provider.kernel.supports_subprocess_benchmark = lambda: True
@@ -2194,6 +2252,9 @@ class TestForcedAutotuneSeedCachePolicy(unittest.TestCase):
     @staticmethod
     def _search(*, cute_flash: bool) -> BaseSearch:
         search = BaseSearch.__new__(BaseSearch)
+        # Model an external autotunable kernel, without a bound Helion environment.
+        search.kernel = Mock(spec=[])
+        search.args = ()
         search._skip_cache = True
         search.config_spec = SimpleNamespace(
             cute_flash_search_enabled=cute_flash,
@@ -2334,7 +2395,8 @@ class TestBudgetedInitialPopulation(TestCase):
     compile returns at once and every search here runs in well under a
     second.  Each config's timing is a deterministic function of the config,
     so two searches with one seed walk the same trajectory; the rebenchmark
-    passes are disabled so the stubbed timings are the ones the search ranks.
+    passes and the backend's finalist preference are disabled so the stubbed
+    timings are the ones the search ranks.
     """
 
     COMPILE_SECONDS = 10.0
@@ -2344,12 +2406,16 @@ class TestBudgetedInitialPopulation(TestCase):
     def _make_bound(
         self, **settings: object
     ) -> tuple[object, tuple[torch.Tensor, torch.Tensor]]:
+        # CuTe's heuristics append coverage witnesses (``cute_pair_lane_math``)
+        # to this add's populations, which these tests count from the random
+        # draws alone.
         @helion.kernel(
             autotune_log_level=logging.CRITICAL,
             autotune_precompile=None,
             autotune_benchmark_subprocess=False,
             autotune_baseline_fn=operator.add,
             autotune_random_seed=1234,
+            disable_autotuner_heuristics=matchesBackends(["cute"]),
             **settings,
         )
         def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -2420,6 +2486,16 @@ class TestBudgetedInitialPopulation(TestCase):
             ),
             patch.object(search, "benchmark_batch", benchmark_batch),
             patch.object(search, "rebenchmark", lambda *args, **kwargs: None),
+            # The stubbed timings land a few tenths of a percent apart as
+            # often as not, and the backend's preference among finalists it
+            # cannot tell apart (CuTe: the kernel that releases its
+            # programmatic dependents, within 0.5%) would then pick by knob
+            # rather than by the stubbed timing these tests rank by.
+            patch.object(
+                search,
+                "_prefer_backend_preference_within_tolerance",
+                lambda after, live: after,
+            ),
             patch.object(search, "log", log),
         ):
             best = search.autotune()
@@ -2479,7 +2555,13 @@ class TestBudgetedInitialPopulation(TestCase):
                 ]
                 self.assertEqual(len(cut), 1)
                 self.assertIn("4 of 12", cut[0])
-                self.assertIn(f"{self.PER_CONFIG_SECONDS:.1f}s per config", cut[0])
+                # The estimate divides wall-clock time by configs attempted,
+                # so real time leaks into the stub clock's figure under load.
+                per_config = re.search(r"([\d.]+)s per config", cut[0])
+                assert per_config is not None, cut[0]
+                self.assertAlmostEqual(
+                    float(per_config.group(1)), self.PER_CONFIG_SECONDS, delta=0.5
+                )
                 summary = [
                     m for m in run.messages if m.startswith("Initial population:")
                 ]
@@ -2622,7 +2704,10 @@ class TestBudgetedInitialPopulation(TestCase):
         )
 
     def test_differential_evolution_random_population_is_cut(self) -> None:
-        bound, args = self._make_bound(autotune_budget_seconds=100)
+        # Half of 112 s pays for four 12 s configs (48 s) and not five (60 s);
+        # the 8 s between them absorbs the real wall time the stub clock also
+        # counts (a 100 s budget left under 2 s, which a loaded CI run exceeded).
+        bound, args = self._make_bound(autotune_budget_seconds=112)
         search = DifferentialEvolutionSearch(
             bound,
             args,
@@ -2665,7 +2750,9 @@ class TestBudgetedInitialPopulation(TestCase):
         flash = SimpleNamespace(
             config_spec=SimpleNamespace(cute_flash_search_enabled=True),
             config_gen=SimpleNamespace(
-                flash_structural_qualification_prefix_count=lambda: 9
+                extension=SimpleNamespace(
+                    structural_qualification_prefix_count=lambda: 9,
+                ),
             ),
         )
         floor = PopulationBasedSearch._initial_population_floor

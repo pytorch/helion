@@ -10,13 +10,17 @@ from typing import cast
 import torch
 
 from .pipeline_smem import has_other_store
+from .state import cute_env_state
 from .tcgen05_constants import TCGEN05_TWO_CTA_MAX_K_TILES
+from .tcgen05_constants import tcgen05_role_local_schedule
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
+    from ..device_ir import GraphInfo
     from .cute_epilogue import Tcgen05UnaryEpilogueChain
     from .cute_mma import _CuteMmaNode
 
@@ -34,20 +38,24 @@ class Tcgen05FullTileScheduleFacts:
     shape: tuple[int, int, int]
     dtype: torch.dtype
     rhs_k_major: bool = False
+    # False for an M-major (column-major) A, e.g. ``x.T @ grad`` in a matmul
+    # backward: the UMMA smem descriptor takes it directly
+    # (``make_smem_layout_a(is_k_major=False)``), so the full-tile and
+    # paired families apply; the proofs that read A through the K-major
+    # partial-tile TMA protocol (N-edge clusters, fp8 K tails) stay K-major.
+    lhs_k_major: bool = True
 
 
 def n_edge_cluster_schedule_defaults() -> dict[str, object]:
-    """The unsplit, direct-aux protocol for the additional N-edge family."""
+    """The unsplit, direct-aux protocol for the additional N-edge family.
+
+    The AB-load and MMA warp counts are left to the strategy's defaults.
+    """
     return {
-        "tcgen05_strategy": "role_local_monolithic",
-        "tcgen05_persistence_model": "static_persistent",
-        "tcgen05_layout_strategy": "default",
+        **tcgen05_role_local_schedule(
+            without=("tcgen05_warp_spec_ab_load_warps", "tcgen05_warp_spec_mma_warps")
+        ),
         "tcgen05_cta_group": "auto",
-        "tcgen05_warp_spec_scheduler_warps": 0,
-        "tcgen05_warp_spec_c_input_warps": 0,
-        "tcgen05_warp_spec_store_warps": 0,
-        "tcgen05_warp_spec_epi_load_warps": 0,
-        "tcgen05_num_epi_warps": 4,
         "tcgen05_l2_swizzle_size": 1,
         "l2_groupings": [1],
         "tcgen05_aux_load_mode": "simt",
@@ -64,8 +72,10 @@ def n_edge_cluster_geometry_supported(
     """
     if facts.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
         return False
-    if not facts.rhs_k_major or any(
-        type(value) is not int or value <= 0 for value in (*facts.shape, *tile)
+    if (
+        not facts.rhs_k_major
+        or not facts.lhs_k_major
+        or any(type(value) is not int or value <= 0 for value in (*facts.shape, *tile))
     ):
         return False
     m, n, k = facts.shape
@@ -156,6 +166,7 @@ def paired_k_tail_schedule_supported(
     if (
         facts.dtype != torch.float8_e4m3fn
         or not facts.rhs_k_major
+        or not facts.lhs_k_major
         or type(cluster_m) is not int
         or type(cluster_n) is not int
         or (cluster_m, cluster_n) != (2, 1)
@@ -206,9 +217,30 @@ class NativeGemm:
     chain: Tcgen05UnaryEpilogueChain
     output: torch.Tensor
     # A store ring the allocation proofs can price completely: one unfissioned
-    # function without atomics, and a fresh, TMA-legal destination
-    # written by the plain (non-fragment) epilogue.
+    # function without atomics, and a TMA-legal destination -- fresh, or a
+    # kernel argument the kernel never reads -- written by the plain
+    # (non-fragment) epilogue.
     owns_output_ring: bool
+
+
+def _tensor_base(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor if tensor._base is None else tensor._base
+
+
+def _tensor_is_loaded(graphs: Sequence[GraphInfo], tensor: torch.Tensor) -> bool:
+    """Whether any device graph loads from ``tensor`` or a view sharing its base."""
+    from ...language import memory_ops
+
+    base = _tensor_base(tensor)
+    return any(
+        node.op == "call_function"
+        and node.target is memory_ops.load
+        and isinstance(node.args[0], torch.fx.Node)
+        and isinstance(source := node.args[0].meta.get("val"), torch.Tensor)
+        and _tensor_base(source) is base
+        for graph in graphs
+        for node in graph.graph.nodes
+    )
 
 
 def analyze_native_gemm(
@@ -219,6 +251,7 @@ def analyze_native_gemm(
     from .aux_tensor import _output_tensor_from_store_node
     from .aux_tensor import _tcgen05_aux_detector_mma_nodes
     from .aux_tensor import analyze_tcgen05_matmul_store_chains
+    from .cute_mma import _host_function_tma_proof_scope
     from .cute_mma import _tcgen05_tma_destination_is_legal
     from .cute_mma import analyze_cute_mma_node
     from .promote_output_axis import _fresh_tensors
@@ -267,14 +300,26 @@ def analyze_native_gemm(
         if output is None or has_other_store(device_ir.graphs, store):
             return None
         owns_output_ring = (
-            env.cute_fission_plan is None
+            cute_env_state(env).fission_plan is None
             and not device_ir.has_atomic_ops()
             and not candidate.requires_fragment_epilogue
-            and output in _fresh_tensors(host)
-            and _tcgen05_tma_destination_is_legal(
-                env, store, output_column_major=candidate.output_column_major
+            and (
+                output in _fresh_tensors(host)
+                or (
+                    env.tensor_input_source(output) is not None
+                    and not _tensor_is_loaded(device_ir.graphs, output)
+                )
             )
         )
+        if owns_output_ring:
+            # An argument destination's alignment is the bound kernel's
+            # specialization, recorded after seed registration: prove it as
+            # the direct-entry seed gate does, over the active runtime
+            # arguments.
+            with _host_function_tma_proof_scope(env, host):
+                owns_output_ring = _tcgen05_tma_destination_is_legal(
+                    env, store, output_column_major=candidate.output_column_major
+                )
     return NativeGemm(
         axes,
         cast("tuple[int, int, int]", shape),
@@ -287,8 +332,11 @@ def analyze_native_gemm(
 
 def prove_full_tile_schedule_facts(
     gemm: NativeGemm | None,
+    *,
+    output_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.bfloat16),
 ) -> Tcgen05FullTileScheduleFacts | None:
-    """Admit one aligned rank-two MMA with a supported single epilogue."""
+    """Admit one aligned rank-two MMA with a supported single epilogue
+    storing one of ``output_dtypes``."""
     if gemm is None:
         return None
     operands = gemm.candidate.operands
@@ -300,7 +348,7 @@ def prove_full_tile_schedule_facts(
         or operands.lhs.source_fake.dtype
         not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         or operands.rhs.source_fake.dtype != operands.lhs.source_fake.dtype
-        or operands.lhs.matrix_major != "row"
+        or operands.lhs.matrix_major not in ("row", "col")
         or operands.rhs.matrix_major not in ("row", "col")
         or operands.lhs.source_to_logical_order is not None
         or operands.rhs.source_to_logical_order is not None
@@ -310,7 +358,7 @@ def prove_full_tile_schedule_facts(
             for leaf in gemm.chain.auxiliary_tensor_loads
         )
         or gemm.output.ndim != 2
-        or gemm.output.dtype not in (torch.float16, torch.bfloat16)
+        or gemm.output.dtype not in output_dtypes
     ):
         return None
     return Tcgen05FullTileScheduleFacts(
@@ -318,4 +366,5 @@ def prove_full_tile_schedule_facts(
         gemm.shape,
         operands.lhs.source_fake.dtype,
         rhs_k_major=operands.rhs.matrix_major == "col",
+        lhs_k_major=operands.lhs.matrix_major == "row",
     )

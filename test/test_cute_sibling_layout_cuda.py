@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from examples.welford import welford
 import pytest
 import torch
 import torch.nn.functional as F
@@ -8,9 +7,9 @@ import torch.nn.functional as F
 from test.test_cute_sibling_layout_safety import _config
 
 import helion
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
 
-pytestmark = skipUnlessBackends(["cute"])
+welford = import_example("welford").welford
 
 CUDA_DEVICE = "cuda"
 

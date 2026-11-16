@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Literal
+from typing import cast
 
 import torch
 
@@ -45,12 +46,17 @@ from .. import exc
 from .._hardware import get_hardware_info
 from .._utils import indexing_uses_tensor_descriptor
 from ..runtime.config import Config
-from ..runtime.cute_structural_config import CuteStructuralConfig
-from ..runtime.cute_structural_config import StructuralPolicyError
-from ..runtime.cute_structural_config import bound_structural_policy
-from ..runtime.cute_structural_config import config_artifact_json
-from ..runtime.cute_structural_config import decode_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.cute.structural_config import CuteStructuralConfig
+from ..runtime.cute.structural_config import config_artifact_json
+from ..runtime.cute.structural_config import decode_structural_policy
+from ..runtime.kernel import _BoolValueKey
+from ..runtime.kernel import _FloatValueKey
+from ..runtime.kernel import _FragmentSetValueKey
+from ..runtime.kernel import _FragmentValueKey
+from ..runtime.structural_policy import StructuralConfig
+from ..runtime.structural_policy import StructuralPolicyError
+from ..runtime.structural_policy import bound_structural_policy
+from ..runtime.structural_policy import require_same_structural_policy
 from .aot_kernel import _flatten_key_value
 from .aot_kernel import extract_key_features
 from .aot_kernel import extract_shape_features
@@ -62,15 +68,19 @@ from .aot_structural_policy import policy_path
 from .base_cache import AutotuneCacheBase
 from .base_cache import BoundKernelInMemoryCacheKey
 from .base_cache import LooseAutotuneCacheKey
+from .base_cache import _requires_uncached_tuning
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 
 if TYPE_CHECKING:
+    from collections.abc import Hashable
     from collections.abc import Sequence
     from typing import Callable
 
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
+    from .aot_structural_export import GuardedCallKey
     from .base_search import BaseSearch
+    from .config_fragment import ConfigSpecFragment
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -127,7 +137,7 @@ def find_heuristic_file(
     kernel_name: str | None = None,
     data_dir: Path | None = None,
     *,
-    policy: CuteStructuralPolicy | None = None,
+    policy: StructuralPolicy | None = None,
 ) -> Path | None:
     """
     Find the heuristic file for a kernel.
@@ -211,7 +221,7 @@ def load_kernel_source_files(
     data_dir: Path,
     hardware_id: str,
     *,
-    policy: CuteStructuralPolicy | None = None,
+    policy: StructuralPolicy | None = None,
 ) -> dict[str, str]:
     """
     Load kernel source file mappings from tuned configs JSON.
@@ -319,7 +329,7 @@ class TunedConfig:
     # [1] = input tensor hashes after kernel runs (to detect in-place modifications)
     # [2] = output tensor hashes
     tensor_hashes: list[list[str]] | None = None
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
 
 class AOTAutotuneCache(AutotuneCacheBase):
@@ -337,6 +347,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
     - measure_fn: In measure mode, only these inputs are measured
     - One-shot: If both set in collect mode, runs both phases in one invocation
     """
+
+    # Preserve explicit evaluate/compile dispatch for fresh bindings. This does
+    # not make their collect-mode search results reusable: that read is guarded
+    # separately by _search_policy_allows_cache_io.
+    _supports_fresh_bindings = True
 
     # Tracks which AOT modes have been announced to avoid repeated stderr messages.
     # Class-level so announcements happen only once per mode across all instances.
@@ -428,6 +443,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # they are not search-result cache reads and must never start tuning.
         if self.mode in ("disabled", "evaluate", "compile"):
             return True
+        if self.mode == "collect":
+            # Explicit collection owns its artifacts even for custom providers.
+            # A fresh binding still has no reusable automatic selection key.
+            return not _requires_uncached_tuning(self.kernel, self.args)
         return super()._search_policy_allows_cache_io()
 
     def _search_policy_allows_cache_write(self) -> bool:
@@ -607,13 +626,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     def _create_shape_key(self) -> ShapeKey:
         """Create a shape key for the current kernel invocation."""
-        from .local_cache import _cute_flash_search_policy_hash
+        from .local_cache import _search_policy_hash
 
-        search_policy_hash = _cute_flash_search_policy_hash(
+        search_policy_hash = _search_policy_hash(
             self.autotuner,
-            cute_flash_search_enabled=bool(
-                getattr(self.kernel.config_spec, "cute_flash_search_enabled", False)
-            ),
+            cute_flash_search_enabled=self.kernel.config_spec.cute_flash_search_enabled,
+            explicit_aot=True,
         )
         return ShapeKey(
             kernel_name=self.kernel.kernel.name,
@@ -884,7 +902,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
             )
             result = AOTAutotuneCache._heuristic_results[cache_key]
-            if isinstance(result, CuteStructuralConfig):
+            if isinstance(result, StructuralConfig):
                 require_same_structural_policy(
                     result.policy, policy, context="Cached AOT heuristic"
                 )
@@ -913,7 +931,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 else:
                     # No user key: pass raw args to heuristic
                     config_dict = autotune_fn(*args)
-                if isinstance(config_dict, CuteStructuralConfig):
+                if isinstance(config_dict, StructuralConfig):
                     require_same_structural_policy(
                         config_dict.policy, policy, context="AOT heuristic"
                     )
@@ -945,7 +963,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     @classmethod
     def _load_heuristic_module(
-        cls, path: Path, policy: CuteStructuralPolicy | None
+        cls, path: Path, policy: StructuralPolicy | None
     ) -> types.ModuleType | None:
         key: Path | tuple[Path, str] = path
         if policy is not None:
@@ -1113,7 +1131,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         self,
         heuristic_file: Path,
         codes: list[str],
-        policy: CuteStructuralPolicy,
+        policy: StructuralPolicy,
     ) -> None:
         from ..language.constexpr import ConstExpr
         from .aot_compile import generate_standalone_file
@@ -1135,7 +1153,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
             policy.identity(),
             source_digest,
             hashlib.sha256(heuristic_file.read_bytes()).hexdigest(),
-            repr(guards),
         )
         # Structural rewrites can specialize dimensions even with static_shapes
         # disabled (e.g. operand materialization's hl.specialize(shape)). These
@@ -1152,11 +1169,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             )
         )
         group = (
-            ("exact", (_export_call_key(tuple(self.args)), guard_key))
+            ("exact", (guards, _export_call_key(tuple(self.args)), guard_key))
             if requires_bound
             else (
                 "dynamic",
-                (_export_call_key(tuple(self.args), dynamic=True), guard_key),
+                (guards, _export_call_key(tuple(self.args), dynamic=True), guard_key),
             )
         )
         with self._compiled_kernel_variants_lock:
@@ -1185,7 +1202,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 kernel_source_file=source_file,
                 structural_policy=policy,
                 dynamic_groups=groups,
-                runtime_guards=guards,
+                runtime_guard_plans=tuple(
+                    cast("GuardedCallKey", signature[1])[0] for signature in updated
+                ),
                 user_key=getattr(self.kernel.kernel, "_aot_user_key", None),
             )
             variants[group] = tuple(codes)
@@ -1267,9 +1286,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
             from .aot_structural_export import export_runtime_guards
 
             guards, guard_key = export_runtime_guards(self.kernel, normalized_args)
-            call_key = (_export_call_key(normalized_args), guard_key)
-            variants_key = (*variants_key, repr(guards))
-            export_options = {"structural_policy": policy, "runtime_guards": guards}
+            call_key = (guards, _export_call_key(normalized_args), guard_key)
+            export_options = {"structural_policy": policy}
 
         # The compile workflow runs in one process. Serialize concurrent calls
         # in that process so two newly observed signatures cannot each rewrite
@@ -1292,6 +1310,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
             updated = {**variants, call_key: (config_fingerprint, code)}
             ordered = sorted(updated.items(), key=lambda item: repr(item[0]))
+            if policy is not None:
+                export_options["runtime_guard_plans"] = tuple(
+                    cast("GuardedCallKey", key)[0] for key in updated
+                )
             out_path = generate_standalone_file(
                 kernel_name=kernel_name,
                 triton_codes=[variant[1][1] for variant in ordered],
@@ -1497,12 +1519,26 @@ def _serialize_value(val: object) -> object:
     """Serialize a single value to JSON-compatible format.
 
     Supports: None, bool, int, float, str, type, tuple, frozenset, set,
-    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex.
+    torch.dtype, torch.device, list, dict, code, bytes, ellipsis, complex,
+    and the runtime's typed boolean, float and fragment specialization keys.
     """
     if val is None:
         return None
     if isinstance(val, (bool, int, float, str)):
         return val
+    if isinstance(val, _BoolValueKey):
+        return {"__bool_value_key__": val.value}
+    if isinstance(val, _FloatValueKey):
+        return {"__float_value_key__": val.bits.hex()}
+    if isinstance(val, _FragmentValueKey):
+        return {
+            "__fragment_value_key__": [
+                _serialize_value(val.fragment_type),
+                _serialize_value(val.fields),
+            ]
+        }
+    if isinstance(val, _FragmentSetValueKey):
+        return {"__fragment_set_value_key__": _serialize_value(val.entries)}
     if isinstance(val, type):
         return {"__type__": f"{val.__module__}.{val.__qualname__}"}
     if isinstance(val, tuple):
@@ -1534,12 +1570,29 @@ def _deserialize_value(val: object) -> object:
     """Deserialize a JSON value back to Python object.
 
     Handles tagged dicts: __tuple__, __frozenset__, __set__, __dtype__, __device__,
-    __type__, __bytes__, __ellipsis__, __complex__.
+    __type__, __bytes__, __ellipsis__, __complex__, and typed runtime keys.
 
     Note: __code__ is not turned back into a code object. This is fine because the AOT
     cache only compares specialization keys, it never calls the original function.
     """
     if isinstance(val, dict):
+        if "__bool_value_key__" in val:
+            return _BoolValueKey(val["__bool_value_key__"])
+        if "__float_value_key__" in val:
+            return _FloatValueKey(bytes.fromhex(val["__float_value_key__"]))
+        if "__fragment_value_key__" in val:
+            fragment_type, fields = val["__fragment_value_key__"]
+            return _FragmentValueKey(
+                cast("type[ConfigSpecFragment]", _deserialize_value(fragment_type)),
+                cast("Hashable", _deserialize_value(fields)),
+            )
+        if "__fragment_set_value_key__" in val:
+            return _FragmentSetValueKey(
+                cast(
+                    "frozenset[tuple[Hashable, int]]",
+                    _deserialize_value(val["__fragment_set_value_key__"]),
+                )
+            )
         if "__tuple__" in val:
             return tuple(_deserialize_value(v) for v in val["__tuple__"])
         if "__frozenset__" in val:
@@ -1568,6 +1621,10 @@ def _deserialize_value(val: object) -> object:
 
 def _import_type(type_name: str) -> type:
     """Import a type from its fully qualified name."""
+    if type_name == "builtins.NoneType":
+        # NoneType's qualified name has no matching builtins attribute. Do
+        # not fall back to the unrelated torch.NoneType IR class.
+        return type(None)
     parts = type_name.rsplit(".", 1)
     if len(parts) == 2:
         module_name, class_name = parts

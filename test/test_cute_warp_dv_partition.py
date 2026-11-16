@@ -9,9 +9,11 @@ from helion._testing import skipUnlessBackends
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 decomp = importlib.import_module("helion._compiler.cute.chunk_recurrence_dv4_sm100")
-primitives = importlib.import_module("helion._compiler.cute.kda_device_primitives")
+primitives = importlib.import_module(
+    "helion._compiler.cute.affine_recurrence_primitives"
+)
 
 
 def test_warp_dv4_geometry_and_arena() -> None:
@@ -67,6 +69,7 @@ def test_warp_dv4_uses_shared_device_primitives() -> None:
     for name in (
         "ldmatrix_x2",
         "ldmatrix_x2_trans",
+        "ldmatrix_x4",
         "ldmatrix_x4_trans",
         "mma_m16n8k16_bf16",
         "movmatrix_b16",

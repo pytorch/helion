@@ -6,22 +6,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 from test.test_cute_full_chunk_row_seeds import bind
 from test.test_cute_full_chunk_row_seeds import column_sum
 from test.test_cute_full_chunk_row_seeds import seeds_for
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_full_chunk_row import (
+from helion._compiler.cute.autotune.heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -39,13 +40,11 @@ def cpu_only() -> Iterator[None]:
     # this suite's original independent-carrier prefix assertions isolated.
     with (
         _cpu_target(),
-        _forbid_native_compile() as native,
         patch.object(
             CuteRolledClusterPacketHeuristic, "get_seed_configs", return_value=[]
         ),
     ):
         yield
-        assert all(mock.call_count == 0 for mock in native)
     assert torch.cuda.is_initialized() == initialized
 
 

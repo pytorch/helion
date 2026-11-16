@@ -5,8 +5,11 @@ loops, so the statements after the matmul run once per thread.  A load uniform
 across the tile (``w[0]``, ``w[tile.id]``) is lowered and reads its element,
 even though the root graph's first load shares the FX node name ``load`` with
 the K loop's operand load.  A statement that needs the tile's per-element
-coordinates (``out2[tile_m, tile_n] = x[tile_m, tile_n]``) is refused with
-``BackendUnsupported`` rather than failing inside the CuTe DSL.
+coordinates is refused with ``BackendUnsupported`` rather than failing inside
+the CuTe DSL, unless the matmul's tcgen05 epilogue stores it: a copy of epilogue
+inputs at the output tile after the K loop
+(``out2[tile_m, tile_n] = x[tile_m, tile_n] * 2``) walks the epilogue's subtiles
+like the accumulator's own store (test_cute_tcgen05_mixed_stores.py).
 """
 
 from __future__ import annotations
@@ -16,13 +19,11 @@ from typing import TYPE_CHECKING
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-
 import helion
 from helion import exc
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -70,20 +71,6 @@ def _tile_id_loads(
             acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
         out[tile_m, tile_n] = acc
         side[tile_m.id, tile_n.id] = w[tile_m.id] * 2.0 + hl.load(w, [tile_n.id])
-    return out
-
-
-@helion.kernel(**_KERNEL)
-def _tensor_copy(
-    a: torch.Tensor, b: torch.Tensor, x: torch.Tensor, side: torch.Tensor
-) -> torch.Tensor:
-    out = torch.empty((a.size(0), b.size(1)), dtype=torch.float32, device=a.device)
-    for tile_m, tile_n in hl.tile([a.size(0), b.size(1)]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(a.size(1)):
-            acc = torch.addmm(acc, a[tile_m, tile_k], b[tile_k, tile_n])
-        out[tile_m, tile_n] = acc
-        side[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
     return out
 
 
@@ -149,7 +136,6 @@ _SIDE: dict[str, tuple[object, Callable[..., torch.Tensor]]] = {
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
 @pytest.mark.parametrize("kernel_name", sorted(_SIDE))
-@skipUnlessBackends(["cute"])
 def test_uniform_loads_beside_collective_matmul(compute: str, kernel_name: str) -> None:
     if compute == "tcgen05" and torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family")
@@ -178,8 +164,7 @@ def test_uniform_loads_beside_collective_matmul(compute: str, kernel_name: str) 
 
 
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@pytest.mark.parametrize("kernel", [_tensor_copy, _tensor_loaded_before, _row_store])
-@skipUnlessBackends(["cute"])
+@pytest.mark.parametrize("kernel", [_tensor_loaded_before, _row_store])
 def test_per_element_statements_beside_collective_matmul_are_refused(
     compute: str, kernel: object
 ) -> None:
@@ -190,8 +175,8 @@ def test_per_element_statements_beside_collective_matmul_are_refused(
         torch.empty((256, 256), dtype=torch.float32),
     )
     with (
-        _mock_cuda_unavailable(),
-        _cpu_target(),
+        mock_cuda_unavailable(),
+        cpu_target(),
         pytest.raises(exc.BackendUnsupported, match="beside a collective matmul"),
     ):
         bound = kernel._bind_isolated(args)  # pyrefly: ignore [missing-attribute]

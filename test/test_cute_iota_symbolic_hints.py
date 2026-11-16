@@ -4,10 +4,7 @@ import pytest
 import torch
 
 import helion
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 CUDA_DEVICE = "cuda"
 

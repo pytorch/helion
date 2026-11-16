@@ -7,9 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from test._cute_binding import _forbid_cuda_work
 from test.test_cute_mxfp8_mma import _cpu_inputs
-from test.test_cute_mxfp8_mma import _cpu_target
 from test.test_cute_mxfp8_mma import _mxfp8
 from test.test_cute_mxfp8_mma import _wrapper_plan
 
@@ -17,9 +15,13 @@ import helion
 from helion._compiler.cute.block_scaled_config import MXFP8_EPILOGUE_MODES
 from helion._compiler.cute.block_scaled_config import mxfp8_shared_memory_bytes
 from helion._compiler.cute.block_scaled_config import normalize_block_scaled_config
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import forbid_cuda_work
 import helion.language as hl
 from helion.runtime.cute.launcher import _cute_stage_under_aligned_operands
 from helion.runtime.cute.launcher import _cute_staged_plan_operands
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(
@@ -87,7 +89,7 @@ def _config(bound, **changes: object) -> helion.Config:
 
 @pytest.fixture(autouse=True)
 def _no_cuda():
-    with _cpu_target(), _forbid_cuda_work():
+    with cpu_target(), forbid_cuda_work():
         yield
 
 
@@ -253,5 +255,8 @@ def test_cpu_tma_output_under_alignment_preserves_stride_values_and_padding() ->
     torch.as_strided(live, output.shape, output.stride(), storage_offset=1).fill_(True)
     assert torch.equal(backing[~live], original[~live])
     assert torch.equal(output, copy)
-    plan["tma_output"] = False
+    # The launch descriptor is built once per plan list (``cute_launch_descriptor``
+    # rebuilds it only when the kernel's plan list object changes), so the
+    # no-TMA-output variant is a fresh kernel with its own plan list.
+    kernel = SimpleNamespace(_helion_cute_wrapper_plans=[{**plan, "tma_output": False}])
     assert _cute_stage_under_aligned_operands(kernel, (output,)) is None

@@ -15,18 +15,18 @@ import importlib.util
 import json
 from typing import TYPE_CHECKING
 
-from ..runtime.cute_structural_config import CuteStructuralConfig
-from ..runtime.cute_structural_config import StructuralPolicyError
-from ..runtime.cute_structural_config import config_artifact_json
-from ..runtime.cute_structural_config import decode_structural_policy
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.cute.structural_config import CuteStructuralConfig
+from ..runtime.cute.structural_config import config_artifact_json
+from ..runtime.cute.structural_config import decode_structural_policy
+from ..runtime.structural_policy import StructuralPolicyError
+from ..runtime.structural_policy import require_same_structural_policy
 
 if TYPE_CHECKING:
     from pathlib import Path
     from types import ModuleType
 
     from ..runtime.config import Config
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
 
 MODEL_MANIFEST = "_HELION_AOT_STRUCTURAL_MANIFEST"
 _MODEL_SCHEMA = "helion.aot.structural_model"
@@ -47,11 +47,11 @@ def load_policy_module(path: Path, source: bytes) -> ModuleType:
     return module
 
 
-def policy_suffix(policy: CuteStructuralPolicy | None) -> str:
+def policy_suffix(policy: StructuralPolicy | None) -> str:
     return "" if policy is None else f"__policy_{policy.identity()}"
 
 
-def policy_path(path: Path, policy: CuteStructuralPolicy | None) -> Path:
+def policy_path(path: Path, policy: StructuralPolicy | None) -> Path:
     return path.with_name(f"{path.stem}{policy_suffix(policy)}{path.suffix}")
 
 
@@ -63,7 +63,7 @@ def measurement_files(data_dir: Path, hardware_id: str) -> list[Path]:
     )
 
 
-def measurement_metadata(policy: CuteStructuralPolicy | None) -> dict[str, str]:
+def measurement_metadata(policy: StructuralPolicy | None) -> dict[str, str]:
     if policy is None:
         return {}
     return {
@@ -73,7 +73,7 @@ def measurement_metadata(policy: CuteStructuralPolicy | None) -> dict[str, str]:
     }
 
 
-def measurement_policy(row: Mapping[str, str]) -> CuteStructuralPolicy | None:
+def measurement_policy(row: Mapping[str, str]) -> StructuralPolicy | None:
     fields = {
         "aot_policy_version",
         "cute_structural_policy",
@@ -92,7 +92,7 @@ def measurement_policy(row: Mapping[str, str]) -> CuteStructuralPolicy | None:
     return policy
 
 
-def measurement_config_hash(config: Config, policy: CuteStructuralPolicy | None) -> str:
+def measurement_config_hash(config: Config, policy: StructuralPolicy | None) -> str:
     return hashlib.sha256(config_artifact_json(config, policy).encode()).hexdigest()[
         :16
     ]
@@ -101,7 +101,7 @@ def measurement_config_hash(config: Config, policy: CuteStructuralPolicy | None)
 def model_configs(
     module: ModuleType,
     kernel_name: str,
-    policy: CuteStructuralPolicy | None,
+    policy: StructuralPolicy | None,
     *,
     required: bool = True,
 ) -> tuple[CuteStructuralConfig, ...] | None:
@@ -157,7 +157,7 @@ def model_configs(
 def attach_model_policy(
     code: str,
     configs: Mapping[str, Sequence[Config]],
-    policy: CuteStructuralPolicy | None,
+    policy: StructuralPolicy | None,
     *,
     feature_names: Mapping[str, Sequence[str]] | None = None,
 ) -> str:
@@ -213,7 +213,7 @@ def attach_model_policy(
     }
     result = (
         "".join(lines)
-        + f"\nfrom helion.runtime.cute_structural_config import CuteStructuralConfig as {_CONFIG_READER}\n"
+        + f"\nfrom helion.runtime.cute.structural_config import CuteStructuralConfig as {_CONFIG_READER}\n"
         + f"\n{MODEL_MANIFEST} = {payload!r}\n"
     )
     if feature_names is not None:

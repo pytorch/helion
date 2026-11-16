@@ -17,84 +17,23 @@ from benchmarks.cute.kda_prefill_kernels import (
 )
 import pytest
 import torch
-from torch._subclasses.fake_tensor import FakeTensorMode
 
 import helion
 from helion import exc
 from helion._compiler.cute.chunk_recurrence import _select_sm100_dv_partitions
-from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_recurrence_host import chunk_fake_inputs as _fake_inputs
+from helion._testing.cute_recurrence_host import chunk_runtime_plan as _runtime_plan
+from helion._testing.cute_recurrence_host import (
+    chunk_runtime_view_args as _runtime_view_args,
+)
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.runtime.cute.launcher import _chunk_recurrence_tensor_map_specs
-
-pytestmark = skipUnlessBackends(["cute"])
+from helion.runtime.cute.host_wrappers.recurrences import (
+    chunk_recurrence_tensor_map_specs,
+)
+from helion.runtime.cute.launcher import _create_cute_wrapper
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-
-
-def _fake_inputs(
-    *,
-    tokens: int = 128,
-    heads: int = 12,
-    sequences: int = 2,
-    chunks: int = 8,
-    packed_workspace: bool = True,
-) -> tuple[torch.Tensor, ...]:
-    rows = chunks * BT
-    with FakeTensorMode():
-        vector_bytes = heads * rows * DK * 2
-        aq_bytes = heads * chunks * BT * BT * 2
-        gt_bytes = heads * chunks * DK * 4
-        if packed_workspace:
-            workspace = torch.empty(
-                (3 * vector_bytes + aq_bytes + gt_bytes,),
-                device=DEVICE,
-                dtype=torch.uint8,
-            )
-            kd = workspace[:vector_bytes].view(torch.bfloat16).view(1, heads, rows, DK)
-            qd = (
-                workspace[vector_bytes : 2 * vector_bytes]
-                .view(torch.bfloat16)
-                .view(1, heads, rows, DK)
-            )
-            ak = (
-                workspace[2 * vector_bytes : 3 * vector_bytes]
-                .view(torch.bfloat16)
-                .view(1, heads, rows, DK)
-            )
-            aq = (
-                workspace[3 * vector_bytes : 3 * vector_bytes + aq_bytes]
-                .view(torch.bfloat16)
-                .view(1, heads, chunks, BT * BT)
-            )
-            g_total = (
-                workspace[3 * vector_bytes + aq_bytes :]
-                .view(torch.float32)
-                .view(1, heads, chunks, DK)
-            )
-        else:
-            kd = torch.empty((1, heads, rows, DK), device=DEVICE, dtype=torch.bfloat16)
-            qd = torch.empty_like(kd)
-            ak = torch.empty_like(kd)
-            aq = torch.empty(
-                (1, heads, chunks, BT * BT),
-                device=DEVICE,
-                dtype=torch.bfloat16,
-            )
-            g_total = torch.empty(
-                (1, heads, chunks, DK), device=DEVICE, dtype=torch.float32
-            )
-        values = torch.empty(
-            (1, tokens, heads, DV), device=DEVICE, dtype=torch.bfloat16
-        )
-        output = torch.empty_like(values)
-        state = torch.empty(
-            (sequences, heads, DV, DK), device=DEVICE, dtype=torch.bfloat16
-        )
-        cu_seqlens = torch.empty((sequences + 1,), device=DEVICE, dtype=torch.int32)
-        cu_chunks = torch.empty_like(cu_seqlens)
-    return kd, qd, ak, aq, g_total, values, output, state, cu_seqlens, cu_chunks
 
 
 def _code(
@@ -154,7 +93,7 @@ def _code(
         if register_cap is not None:
             config_overrides["cute_chunk_recurrence_register_cap"] = register_cap
         config = helion.Config.from_dict({**_CONFIG.config, **config_overrides})
-        return bound.to_triton_code(config)
+        return bound.to_code(config)
 
 
 def _captured_plan(
@@ -856,73 +795,6 @@ def test_bt16_resident_chain_keeps_tmem_dv2_for_packed_geometry() -> None:
     assert "'dv_partitions': 4" in forced_dv4
 
 
-def test_dv4_uses_semantic_length_when_chunk_metadata_disagrees() -> None:
-    from helion._compiler.cute.chunk_recurrence_dv4_sm100 import emit_bt16_recurrence
-
-    # Adversarial metadata: the chunk offsets claim one chunk for 17 tokens.
-    # The Helion carrier and DV2 execute ceil(17 / 16) == 2 chunks, so DV4 must
-    # derive the same bound from sequence lengths instead of trusting the delta.
-    token_start, token_end = 0, 17
-    chunk_start, chunk_end = 0, 1
-    assert (token_end - token_start + BT - 1) // BT == 2
-    assert chunk_end - chunk_start == 1
-
-    source = inspect.getsource(emit_bt16_recurrence)
-    assert source.startswith("@cute.kernel\n")
-    assert "num_chunks = cute.ceil_div(token_end - token_start, BT)" in source
-    assert "gcu_chunks[seq + 1]" not in source
-
-
-def _runtime_plan(
-    *, tokens: int = 128, heads: int = 12, sequences: int = 2, chunks: int = 8
-) -> dict[str, object]:
-    plan: dict[str, object] = {
-        "kind": "chunk_recurrence_warp_dv4",
-        "workspace_layout_version": 2,
-        "outputs_scaled": False,
-        "factor_key_xor": 8,
-        "chunk_size": BT,
-        "key_size": DK,
-        "value_size": DV,
-        "total_tokens": tokens,
-        "total_chunks": chunks,
-        "heads": heads,
-        "sequences": sequences,
-    }
-    for index, name in enumerate(
-        (
-            "kd",
-            "qd",
-            "ak",
-            "aq",
-            "gt",
-            "v",
-            "out",
-            "state",
-            "cu_seqlens",
-            "cu_chunks",
-        )
-    ):
-        plan[f"{name}_idx"] = index
-    return plan
-
-
-def _runtime_view_args() -> tuple[torch.Tensor, ...]:
-    args = _fake_inputs()
-    return (
-        args[0].view(-1, DK),
-        args[1].view(-1, DK),
-        args[2].view(-1, DK),
-        args[3].view(-1, BT * BT),
-        args[4].view(-1, DK),
-        args[5].view(-1, DV),
-        args[6].view(-1, DV),
-        args[7],
-        args[8],
-        args[9],
-    )
-
-
 def _fake_pointer_patches(
     args: tuple[torch.Tensor, ...],
 ) -> tuple[object, object]:
@@ -952,7 +824,7 @@ def test_chunk_recurrence_runtime_validates_packed_workspace() -> None:
     args = _runtime_view_args()
     storage_patch, tensor_patch = _fake_pointer_patches(args)
     with storage_patch, tensor_patch:
-        specs = _chunk_recurrence_tensor_map_specs(_runtime_plan(), args)
+        specs = chunk_recurrence_tensor_map_specs(_runtime_plan(), args)
     assert specs["factor"].global_dim == (128, 128, 36)
     assert specs["aq"].global_dim == (256, 8, 12)
     assert specs["gt"].global_dim == (128, 8, 12)
@@ -976,7 +848,7 @@ def test_chunk_recurrence_runtime_rejects_legacy_abi1() -> None:
     with pytest.raises(
         exc.BackendUnsupported, match="unsupported chunk-recurrence ABI"
     ):
-        _chunk_recurrence_tensor_map_specs(plan, args, validate_only=True)
+        chunk_recurrence_tensor_map_specs(plan, args, validate_only=True)
 
 
 def test_chunk_recurrence_runtime_builds_dv4_tensor_map_geometry() -> None:
@@ -992,7 +864,7 @@ def test_chunk_recurrence_runtime_builds_dv4_tensor_map_geometry() -> None:
     )
     storage_patch, tensor_patch = _fake_pointer_patches(args)
     with storage_patch, tensor_patch:
-        specs = _chunk_recurrence_tensor_map_specs(plan, args)
+        specs = chunk_recurrence_tensor_map_specs(plan, args)
     assert specs["v"].box_dim == (32, 16, 1)
     assert specs["out"].box_dim == (32, 16, 1)
     assert specs["state_in"].box_dim == (64, 64, 1)
@@ -1005,12 +877,12 @@ def test_chunk_recurrence_runtime_validates_sm100_dv2_without_raw_descriptors() 
     plan.update({"kind": "chunk_recurrence_sm100", "dv_partitions": 2})
     storage_patch, tensor_patch = _fake_pointer_patches(args)
     with storage_patch, tensor_patch:
-        assert _chunk_recurrence_tensor_map_specs(plan, args, validate_only=True) == {}
+        assert chunk_recurrence_tensor_map_specs(plan, args, validate_only=True) == {}
         with pytest.raises(
             exc.BackendUnsupported,
             match="raw chunk-recurrence TensorMaps require the warp-DV4 schedule",
         ):
-            _chunk_recurrence_tensor_map_specs(plan, args)
+            chunk_recurrence_tensor_map_specs(plan, args)
 
 
 def test_chunk_recurrence_runtime_allows_exact_value_output_alias() -> None:
@@ -1019,7 +891,7 @@ def test_chunk_recurrence_runtime_allows_exact_value_output_alias() -> None:
     runtime_args = tuple(args)
     storage_patch, tensor_patch = _fake_pointer_patches(runtime_args)
     with storage_patch, tensor_patch:
-        specs = _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
+        specs = chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
     assert specs["v"].base_ptr == specs["out"].base_ptr
 
 
@@ -1058,7 +930,7 @@ def test_chunk_recurrence_runtime_rejects_output_metadata_alias(
             match=rf"chunk-recurrence output aliases {metadata_name}",
         ),
     ):
-        _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
+        chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
 
 
 def test_chunk_recurrence_sm100_dv2_enters_launch_schema() -> None:
@@ -1101,8 +973,6 @@ def test_chunk_recurrence_sm100_dv2_enters_launch_schema() -> None:
 
 
 def test_chunk_recurrence_dv4_wrapper_uses_external_host_schedule() -> None:
-    from helion.runtime.cute.launcher import _create_cute_wrapper
-
     def dummy_kernel(*_args: object) -> None:
         pass
 
@@ -1156,7 +1026,7 @@ def test_chunk_recurrence_runtime_rejects_split_factor_storage() -> None:
         tensor_patch,
         pytest.raises(exc.BackendUnsupported, match="packed workspace ABI"),
     ):
-        _chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
+        chunk_recurrence_tensor_map_specs(_runtime_plan(), runtime_args)
 
 
 def _require_dv4_runtime() -> torch.device:

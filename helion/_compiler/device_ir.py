@@ -6,23 +6,27 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import itertools
 import logging
 import math
 import operator
 import re
 import textwrap
 import threading
+import types
 from typing import TYPE_CHECKING
 from typing import Callable
 from typing import Iterator
 from typing import NamedTuple
 from typing import Protocol
+from typing import TypeAlias
 from typing import cast
 from unittest.mock import patch
 
-import sympy
 import torch
 from torch._dynamo.convert_frame import compile_lock
+from torch._dynamo.source import TensorProperty
+from torch._dynamo.source import TensorPropertySource
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
@@ -32,14 +36,13 @@ from torch.utils import _pytree as pytree
 from .. import Config
 from .. import exc
 from .. import language as hl
+from .._utils import next_power_of_2
+from ..autotuner.config_fragment import _BUILTIN_TUNABLE_FRAGMENTS
+from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
-from ..autotuner.config_spec import CuteLaneLayoutSpec
-from ..autotuner.config_spec import CuteReductionReloadSpec
-from ..autotuner.config_spec import CuteVectorWidthSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
-from ..autotuner.config_spec import NumThreadsSpec
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
 from ..autotuner.config_spec import ReductionKernelFact
@@ -48,6 +51,7 @@ from ..language import _tracing_ops
 from ..language._decorators import _TENSOR_METHOD_REPLACEMENTS
 from ..language._decorators import args_to_proxies
 from ..language._decorators import get_device_func_replacement
+from ..language._decorators import is_api_func
 from ..language._tracing_ops import _new_var
 from ..language.tile_proxy import Tile
 from ..language.tile_proxy import _CheckForIndexCalls
@@ -58,20 +62,41 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .ast_read_writes import ReadWrites
+from .aten_lowering import resolve_reduction_sizes
+from .aten_lowering import restate_reduction_extents
+from .backend import DeviceIRStage
 from .compile_environment import CompileEnvironment
-from .cute.register_tile_admission import register_tile_body_admitted
+from .compile_environment import _symint_expr
+from .compile_environment import warning
+from .container_identity import compare_container_identity
+from .container_identity import record_opaque_container_result
+from .fragment_call import guard_fragment_call_input
+from .fragment_comparison import guard_fragment_comparison
+from .fx_side_effects import is_impure_node
 from .host_function import HostFunction
+from .host_function import SymbolOrigin
 from .inductor_lowering import APIFuncLowering
 from .inductor_lowering import CodegenState
+from .inductor_lowering import ReductionLowering
 from .inductor_lowering import codegen_call_with_graph
 from .inductor_lowering import prepare_graph_lowerings
+from .logical_reduction_dims import install_logical_reduction_decompositions
 from .matmul_utils import tensor_matmul_replacement
 from .matmul_utils import torch_matmul_replacement
+from .merge_reduction_dims import _MERGE_OPS
+from .merge_reduction_dims import chain_reduction_dims
+from .merge_reduction_dims import merge_reduction_dims
 from .node_masking import defer_pallas_load_masks
+from .node_masking import mask_loop_carries
 from .node_masking import remove_unnecessary_masking
+from .roll_reduction import EffectfulReductionReplay
 from .roll_reduction import ReductionRoller
 from .source_location import current_location
+from .tuple_constants import TupleConstants
 from .type_info import CallableType
+from .type_info import ClassType
+from .type_info import CollectionType
+from .type_info import ConfigFragmentType
 from .type_info import DictType
 from .type_info import GridIndexType
 from .type_info import IterType
@@ -81,6 +106,7 @@ from .type_info import NestedFunctionType
 from .type_info import NumericType
 from .type_info import SequenceType
 from .type_info import StackTensorType
+from .type_info import SymIntType
 from .type_info import TensorAttributeType
 from .type_info import TensorType
 from .type_info import TileIndexType
@@ -90,19 +116,29 @@ from .type_info import _eval_compare
 from .type_info import _eval_unary
 from .type_info import tensor_may_have_many_elements
 from .type_info import tile_spanned_by_slice
+from .unflattened_loops import pin_unflattened_loops
+from .variable_origin import AttributeOrigin
+from .variable_origin import CollectionLengthOrigin
+from .variable_origin import DeviceOrigin
+from .variable_origin import GetItemOrigin
+from .variable_origin import NameOrigin
+from .variable_origin import Origin
+from .variable_origin import TensorStrideOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Collection
     from collections.abc import Iterable
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from types import BuiltinMethodType
+
+    from torch._guards import Source
 
     from ..autotuner.config_spec import AccumulatorFact
-    from ..autotuner.config_spec import ConfigSpec
     from ..autotuner.config_spec import MemoryOpFact
-    from ..language.matmul_ops import _CuteTcgen05SearchPlanningResult
-    from .cute.layout import CuTeGridExecutionPlan
+    from .backend import Backend
+    from .compile_environment import BlockSizeInfo
+    from .cute.execution_plans import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
     from .tile_dependency import TaskFamily
@@ -117,23 +153,6 @@ tls: _TLS = cast("_TLS", threading.local())
 log = logging.getLogger(__name__)
 
 
-def _finalize_cute_tcgen05_search_planning(
-    env: CompileEnvironment,
-    planning_results: Sequence[_CuteTcgen05SearchPlanningResult],
-    analysis_keys: Collection[object],
-) -> bool:
-    """Publish every guard and report whether one cache-safe analysis remains."""
-    env.specialized_vars.update(
-        symbol
-        for result in planning_results
-        for symbol in result.required_specialized_vars
-    )
-    return (
-        all(result.guards_complete for result in planning_results)
-        and len(analysis_keys) == 1
-    )
-
-
 def _lerp_scalar_decomp(
     start: torch.Tensor, end: torch.Tensor, weight: float
 ) -> torch.Tensor:
@@ -144,18 +163,43 @@ def _lerp_scalar_decomp(
     return start + weight * (end - start)
 
 
+def _host_tensor_stride(
+    tensor: torch.Tensor, origin: Origin, source: Source | None, dim: int | None = None
+) -> int | torch.SymInt | tuple[int | torch.SymInt, ...]:
+    host = HostFunction.current()
+    env = CompileEnvironment.current()
+
+    def symbolic(value: int | torch.SymInt, axis: int) -> int | torch.SymInt:
+        stride_origin = TensorStrideOrigin(origin, axis)
+        result = (
+            env.input_symint(
+                value, TensorPropertySource(source, TensorProperty.STRIDE, axis)
+            )
+            if source is not None
+            else env.cached_create_unbacked_symint(
+                ("host_tensor_stride", id(tensor), axis), env.size_hint(value)
+            )
+        )
+        if isinstance(result, torch.SymInt):
+            host.expr_to_origin[result._sympy_()] = SymbolOrigin(
+                stride_origin, fake_value=tensor
+            )
+        return result
+
+    if dim is None:
+        return tuple(
+            symbolic(value, axis) for axis, value in enumerate(tensor.stride())
+        )
+    value = tensor.stride(dim)
+    return symbolic(value, dim % tensor.ndim)
+
+
 def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., object]]:
     from ..language._gelu_tanh_approx import install_gelu_decomp
 
     decomp_table = select_decomp_table().copy()
-    if (
-        CompileEnvironment.has_current()
-        and CompileEnvironment.current().backend_name == "cute"
-    ):
-        # CuTe lowers these native numeric extrema directly. Preserve their
-        # distinction from NaN-propagating minimum/maximum during tracing.
-        decomp_table.pop(torch.ops.aten.fmin.default, None)
-        decomp_table.pop(torch.ops.aten.fmax.default, None)
+    if CompileEnvironment.has_current():
+        CompileEnvironment.current().backend.decomp_table_overrides(decomp_table)
     # Normally, aten.stack is decomposed to aten.unsqueeze + aten.cat, but it's difficult to
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
@@ -166,6 +210,9 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # node so the cute epilogue chain analyzer can fuse it; the inductor
     # default decomp expands the polynomial form and breaks the chain.
     install_gelu_decomp(decomp_table)
+    install_logical_reduction_decompositions(decomp_table)
+    for op in _MERGE_OPS.values():
+        decomp_table[op] = chain_reduction_dims(op, decomp_table.get(op))
     return decomp_table
 
 
@@ -247,10 +294,8 @@ def _make_fx(fn: Callable[..., object], *args: object) -> torch.fx.Graph:
                 # context. Preserve the proof that a scalar can be lifted as
                 # a uniform runtime argument, rather than a device coordinate.
                 if isinstance(obj, (torch.SymInt, torch.SymFloat)):
-                    origins = HostFunction.current().expr_to_origin
-                    proxy.node.meta["helion_host_scalar"] = all(
-                        symbol in origins and origins[symbol].origin.is_host()
-                        for symbol in obj.node.expr.free_symbols
+                    proxy.node.meta["helion_host_scalar"] = (
+                        HostFunction.current().is_host_scalar_expr(obj.node.expr)
                     )
                 # pyrefly: ignore [missing-attribute]
                 proxy.force = lambda: proxy
@@ -354,7 +399,8 @@ class NodeArgsGraphInfo(GraphInfo):
         raise KeyError("Placeholder not found in node_args")
 
     def kwargs(self) -> dict[str, object]:
-        # TODO(jansel): do we need to map these to the new graph in the case of a copy?
+        # A single graph copy cannot remap its external captures. Collection
+        # copies rebind these once all parent and child graphs exist.
         return {
             "node_args": [*self.node_args],
         }
@@ -395,10 +441,6 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             device_loop = state.device_function.tile_strategy.codegen_device_loop(
                 state, self.block_ids
             )
-            if CompileEnvironment.current().backend_name == "cute":
-                from .cute.lane_merged_carries import check_lane_merged_carries
-
-                check_lane_merged_carries(state, self)
             if state.fx_node is not None:
                 from .tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
                 from .tile_dependency import TILE_DEPENDENCY_SITE_IDS_META
@@ -408,11 +450,10 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                 )
                 if (site_id := site_ids.get(0)) is not None:
                     setattr(device_loop.for_node, TILE_DEPENDENCY_SITE_ID_ATTR, site_id)
-            from .cute.integer_loop_reduction import prepare
-
-            device_loop.integer_reduction_hoist = prepare(self, state, device_loop)
+            CompileEnvironment.current().backend.prepare_device_loop(
+                self, state, device_loop
+            )
             initials = self._carried_initials(state)
-            joins = self._cute_carried_type_joins(state, initials)
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
@@ -424,37 +465,9 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                         args,
                     )
                 ]
-                hoist = device_loop.integer_reduction_hoist
-                if hoist is not None and hoist.final_call is not None:
-                    # The CTA collective after the loop finalizes the carry
-                    # from the per-thread partial the body carries, which
-                    # keeps its type.
-                    hoist.finish(outputs)
-                    joins = {}
-                device_function = state.device_function
-                for index, initial in joins.items():
-                    value = cast("ast.AST", outputs[index])
-                    if isinstance(
-                        value, ast.Name
-                    ) and device_function.cute_state.get_tcgen05_store_value(
-                        device_function.variable_aliases(value.id)
-                    ):
-                        # A tcgen05 accumulator: the MMA lowering owns its type.
-                        continue
-                    # The loop statement follows the enclosing statements
-                    # once its body is complete.
-                    before = device_function.new_var(f"{initial}_before_loop")
-                    state.codegen.statements_stack[-2].append(
-                        statement_from_string(f"{before} = {initial}")
-                    )
-                    joined = device_function.new_var(f"{before}_join")
-                    state.codegen.add_statement(
-                        statement_from_string(
-                            f"{joined} = _cute_join_cast({{value}}, {before})",
-                            value=value,
-                        )
-                    )
-                    outputs[index] = expr_from_string(joined)
+                CompileEnvironment.current().backend.finish_device_loop_body(
+                    state, device_loop, outputs, initials
+                )
                 # The phi after the loop merges each carried output with its
                 # initial value; the lane loop nest check reads the body's
                 # carries through them (``check_lane_loop_nest``).
@@ -485,57 +498,225 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
                     initials[cast("int", user.args[1])] = initial.id
         return initials
 
-    def _cute_carried_type_joins(
-        self, state: CodegenState, initials: dict[int, str]
-    ) -> dict[int, str]:
-        """The initial variable of each carried value CuTe DSL may retype.
 
-        CuTe DSL requires a loop-carried variable to keep the type it had
-        before the loop, but a value's DSL type can differ from its FX dtype:
-        a 16-bit value combined with a Python float becomes Float32, and int32
-        index math on Int64 shape arguments becomes Int64.  The end of the
-        body casts such a value to the type of an alias of its initial value,
-        which only tracing knows (``_cute_join_cast``, as for a value one
-        branch of a dynamic if reassigns).  fp32/fp64 values keep their DSL
-        type, so their loops (accumulators) stay as emitted.  Returns the
-        initial variable per loop output.
-        """
-        if CompileEnvironment.current().backend_name != "cute" or state.fx_node is None:
-            return {}
-        joins: dict[int, str] = {}
-        for user in state.fx_node.users:
-            if user.target is not operator.getitem:
-                continue
-            val = user.meta.get("val")
-            if not isinstance(val, torch.Tensor) or val.dtype in (
-                torch.float32,
-                torch.float64,
-            ):
-                continue
-            index = cast("int", user.args[1])
-            if index in initials:
-                joins[index] = initials[index]
-        return joins
+def _control_flow_graph_entries(
+    node: torch.fx.Node,
+) -> tuple[tuple[int, int | None], ...]:
+    """Child IDs and direct capture slots, excluding mutable while state."""
+    if node.op != "call_function":
+        return ()
+    if _tracing_ops.is_for_loop_target(node.target):
+        if len(node.args) >= 4 and isinstance(node.args[0], int):
+            return ((node.args[0], 3),)
+    elif node.target is _tracing_ops._if:
+        if (
+            len(node.args) >= 5
+            and isinstance(node.args[1], int)
+            and isinstance(node.args[2], int)
+        ):
+            return ((node.args[1], 3), (node.args[2], 4))
+    elif node.target is _tracing_ops._while_loop and len(node.args) >= 3:
+        if not isinstance(node.args[0], int) or not isinstance(node.args[1], int):
+            return ()
+        # While inputs are loop-carried state, not invariant captures. Graph
+        # ownership follows these edges, but value-origin proofs must stop here.
+        result = ((node.args[0], None), (node.args[1], None))
+        if len(node.args) > 3 and isinstance(node.args[3], int):
+            result = (*result, (node.args[3], None))
+        return result
+    return ()
+
+
+def control_flow_child_graph_ids(node: torch.fx.Node) -> tuple[int, ...]:
+    return tuple(graph_id for graph_id, _slot in _control_flow_graph_entries(node))
+
+
+def codegen_node_order(
+    graphs: Sequence[GraphInfo],
+    root_ids: Sequence[int],
+    *,
+    repeat_conditions: bool | None = None,
+    unreached: bool = True,
+) -> Iterator[tuple[int, torch.fx.Node]]:
+    """The nodes of ``graphs``, with their graph ids, in the order code
+    generation lowers them, which is the order loads and stores take their
+    config slots (``indexing``, ``load_eviction_policies``): the roots in
+    turn, each control-flow call followed by the graphs it runs (an ``if``
+    branch before the ``else``, a ``while`` condition before its body).
+    Code generation lowers a graph at every call of it (reduction rolling
+    copies an ``if`` into each loop it makes, every copy calling the same
+    branches) and lowers a ``while`` condition again at the end of the body
+    (``WhileLoopGraphInfo.codegen``).  With ``repeat_conditions`` the walk
+    does the same, by default where the current backend's loads and stores
+    take new slots each time they are lowered
+    (``Backend.relowered_memory_ops_take_new_slots``); otherwise it walks
+    each graph once.  With ``unreached``, the graphs no root runs follow in
+    list order, each called graph once: the loop graphs reduction rolling
+    registers, whose loads and stores take the slots the configs that roll
+    can use (a config that rolls has its own order,
+    ``codegen_memory_op_fact_pairs``).
+    """
+    if repeat_conditions is None:
+        repeat_conditions = (
+            CompileEnvironment.current().backend.relowered_memory_ops_take_new_slots
+        )
+    by_id = {info.graph_id: info for info in graphs}
+    # Rolling replaces a graph's payload and appends the new payload under
+    # an id of its own, which no call runs: a payload a call reached is not
+    # walked again among the unreached graphs.
+    walked: set[torch.fx.Graph] = set()
+
+    def walk(info: GraphInfo, every_call: bool) -> Iterator[tuple[int, torch.fx.Node]]:
+        walked.add(info.graph)
+        for node in info.graph.nodes:
+            yield info.graph_id, node
+            children = control_flow_child_graph_ids(node)
+            for child_id in children:
+                child = by_id[child_id]
+                if every_call or child.graph not in walked:
+                    yield from walk(child, every_call)
+            if repeat_conditions and node.target is _tracing_ops._while_loop:
+                yield from walk(by_id[children[0]], every_call=True)
+
+    for root_id in root_ids:
+        if by_id[root_id].graph not in walked:
+            yield from walk(by_id[root_id], every_call=repeat_conditions)
+    if unreached:
+        for info in graphs:
+            if info.graph not in walked:
+                yield from walk(info, every_call=False)
+
+
+# On each load and store node ``DeviceIRAnalysis.memory_op_facts`` describes:
+# its facts, one per set of slots it takes (two for one in a ``while``
+# condition on a backend that slots each lowering).  Node copies keep their
+# meta (``GraphInfo.copy``, reduction rolling), so the loads and stores of a
+# config's codegen graphs carry the facts of the nodes they copy.
+MEMORY_OP_FACT_META = "memory_op_fact"
+
+
+def takes_indexing_slot(node: torch.fx.Node) -> bool:
+    """Whether code generation gives a load or store an ``indexing`` slot.
+    A load of a ``tile.index`` value (``_maybe_materialize_tile_index_load``)
+    or of a stack tensor takes none: the Triton lowering gives it only its
+    ``load_eviction_policies`` slot, and the Pallas one neither."""
+    from ..language import memory_ops
+    from ..language import tile_index
+
+    if node.target is not memory_ops.load:
+        return True
+    tensor = node.args[0]
+    if isinstance(tensor, torch.fx.Node):
+        return tensor.target is not tile_index
+    return not isinstance(tensor, (tuple, list))
+
+
+def memory_op_slots(
+    graphs: Sequence[GraphInfo],
+    root_ids: Sequence[int],
+    *,
+    repeat_conditions: bool | None = None,
+    unreached: bool = True,
+) -> list[tuple[int, torch.fx.Node, int]]:
+    """The loads, stores and atomics of ``graphs`` in ``codegen_node_order``,
+    each with its graph id and the config slot code generation numbers it:
+    the loads and stores count up the ``indexing`` slots together, the
+    atomics the ``atomic_indexing`` ones.  The loads that take no
+    ``indexing`` slot (``takes_indexing_slot``) get the slots after the
+    others, which code generation never reads, so the ``indexing`` list
+    keeps one slot for each load and store.  The pieces of a subtiled
+    epilogue store or atomic share their primary's slot, so only the
+    primary is listed."""
+    from ..language import memory_ops
+    from ..language.atomic_ops import ATOMIC_OPS
+
+    ops = [
+        (graph_id, node)
+        for graph_id, node in codegen_node_order(
+            graphs, root_ids, repeat_conditions=repeat_conditions, unreached=unreached
+        )
+        if node.op == "call_function"
+        and (
+            node.target in (memory_ops.load, memory_ops.store)
+            or node.target in ATOMIC_OPS
+        )
+        and (
+            "epilogue_subtile_group_id" not in node.meta
+            or node.meta.get("epilogue_subtile_primary_output", False)
+        )
+    ]
+    indexed = [
+        node.target not in ATOMIC_OPS and takes_indexing_slot(node)
+        for _graph_id, node in ops
+    ]
+    atomic_slots = itertools.count()
+    indexing_slots = itertools.count()
+    unread_slots = itertools.count(sum(indexed))
+    return [
+        (
+            graph_id,
+            node,
+            next(
+                indexing_slots
+                if takes_slot
+                else atomic_slots
+                if node.target in ATOMIC_OPS
+                else unread_slots
+            ),
+        )
+        for (graph_id, node), takes_slot in zip(ops, indexed, strict=True)
+    ]
+
+
+def codegen_memory_op_fact_pairs(
+    graphs: Sequence[GraphInfo], root_ids: Sequence[int]
+) -> list[tuple[MemoryOpFact, MemoryOpFact]]:
+    """``DeviceIR.config_memory_op_fact_pairs`` of the config whose codegen
+    graphs are ``graphs``: the loads and stores of ``memory_op_slots`` with
+    the facts of the nodes they copy (``MEMORY_OP_FACT_META``, one per set of
+    slots the node takes), renumbered to their slots."""
+    from ..language import memory_ops
+
+    pairs: list[tuple[MemoryOpFact, MemoryOpFact]] = []
+    times: dict[torch.fx.Node, int] = {}
+    eviction_slots = itertools.count()
+    for _graph_id, node, slot in memory_op_slots(graphs, root_ids, unreached=False):
+        if node.target not in (memory_ops.load, memory_ops.store):
+            continue
+        # A pass that splits a load copies its meta to the split nodes too.
+        facts = node.meta.get(MEMORY_OP_FACT_META)
+        assert facts is not None, f"{node.name} has no memory-op facts"
+        # The node's facts, one per set of slots it takes, in turn.
+        times[node] = times.get(node, 0) + 1
+        fact = facts[min(times[node], len(facts)) - 1]
+        eviction = None if fact.eviction_index is None else next(eviction_slots)
+        pairs.append(
+            (fact, fact._replace(indexing_index=slot, eviction_index=eviction))
+        )
+    return pairs
 
 
 def control_flow_parent_entries(
     graphs: Sequence[GraphInfo],
 ) -> dict[int, tuple[torch.fx.Node, int]]:
     """Map child graph IDs to their parent call and captured-argument slot."""
-    result: dict[int, tuple[torch.fx.Node, int]] = {}
+    return {
+        child_id: (node, slot)
+        for info in graphs
+        for node in info.graph.nodes
+        for child_id, slot in _control_flow_graph_entries(node)
+        if slot is not None
+    }
+
+
+def control_flow_parent_ids(graphs: Sequence[GraphInfo]) -> dict[int, int]:
+    result: dict[int, int] = {}
     for info in graphs:
         for node in info.graph.nodes:
-            if node.op != "call_function" or not node.args:
-                continue
-            if _tracing_ops.is_for_loop_target(node.target) and isinstance(
-                node.args[0], int
-            ):
-                result[node.args[0]] = (node, 3)
-            elif node.target is _tracing_ops._if and len(node.args) >= 5:
-                if isinstance(node.args[1], int):
-                    result[node.args[1]] = (node, 3)
-                if isinstance(node.args[2], int):
-                    result[node.args[2]] = (node, 4)
+            for child_id in control_flow_child_graph_ids(node):
+                # Rolling appends graph aliases; the original owner is the one
+                # reachable from the root, not a later bookkeeping copy.
+                result.setdefault(child_id, info.graph_id)
     return result
 
 
@@ -563,6 +744,53 @@ def device_loop_bounds(
     return value(begins[position]), value(ends[position])
 
 
+def iter_loop_graph_nodes(
+    fn: DeviceFunction, block_ids: list[int]
+) -> Iterator[torch.fx.Node]:
+    """The nodes of the device loop over ``block_ids``, in pre-order.
+
+    Every codegen graph of the loop contributes its nodes; a ``_for_loop`` /
+    ``_for_loop_step`` node is followed by the nodes of the nested for-loop
+    graph it names (other nested graphs are not descended).  A graph belongs
+    to the loop when it is the for-loop graph over ``block_ids`` or the root
+    graph of the phase whose grid block ids are ``block_ids``.  Reads only
+    ``fn.codegen.codegen_graphs`` and the current device IR's ``grid_block_ids``.
+    """
+    from ..language._decorators import is_api_func
+
+    grid_block_ids = HostFunction.current().device_ir.grid_block_ids
+    graphs = fn.codegen.codegen_graphs
+    graph_by_id = {graph_info.graph_id: graph_info for graph_info in graphs}
+
+    def matches_loop(graph_info: GraphInfo) -> bool:
+        if isinstance(graph_info, ForLoopGraphInfo):
+            return graph_info.block_ids == block_ids
+        if not isinstance(graph_info, RootGraphInfo):
+            return False
+        phase_index = graph_info.phase_index
+        return (
+            0 <= phase_index < len(grid_block_ids)
+            and grid_block_ids[phase_index] == block_ids
+        )
+
+    def walk(graph: torch.fx.Graph) -> Iterator[torch.fx.Node]:
+        for node in graph.nodes:
+            yield node
+            if is_api_func(node.target) and node.target.__name__ in (
+                "_for_loop",
+                "_for_loop_step",
+            ):
+                graph_id = node.args[0] if node.args else None
+                if isinstance(graph_id, int):
+                    nested = graph_by_id.get(graph_id)
+                    if nested is not None:
+                        yield from walk(nested.graph)
+
+    for graph_info in graphs:
+        if matches_loop(graph_info):
+            yield from walk(graph_info.graph)
+
+
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
     @property
     def name(self) -> str:
@@ -572,7 +800,7 @@ class ReductionLoopGraphInfo(ForLoopGraphInfo):
 @dataclasses.dataclass
 class IfGraphInfo(NodeArgsGraphInfo):
     predicate_is_tensor: bool = False
-    else_branch: ElseGraphInfo | None = None
+    else_branch: int | None = None
 
     if_arg_names: list[str] | None = None
     else_arg_names: list[str] | None = None
@@ -596,6 +824,37 @@ class IfGraphInfo(NodeArgsGraphInfo):
             "else_arg_names": self.else_arg_names,
             "branches_outputs": self.branches_outputs,
         }
+
+    def result_source(
+        self, if_node: torch.fx.Node, index: int
+    ) -> tuple[int, int] | torch.fx.Node | None:
+        """Where result ``index`` of ``if_node``, the ``_if`` this graph is
+        the if branch of, comes from: a branch output, as ``(graph_id,
+        output_index)``, or for a variable this branch does not assign, the
+        outer value it passes through (an input of either branch), or None
+        when that value is not a node.
+
+        ``WalkDeviceAST._create_if_subgraph`` lays the results out as the if
+        branch's slot of each of ``branches_outputs``, then the else branch's.
+        """
+        assert self.branches_outputs is not None
+        side, entry = divmod(index, len(self.branches_outputs))
+        slot = self.branches_outputs[entry][side]
+        if isinstance(slot, int):
+            graph_id = if_node.args[1 + side]
+            assert isinstance(graph_id, int)
+            return graph_id, slot
+        # ``_if`` returns every joined variable for each side, including
+        # those the side did not assign: an input of one of the branches.
+        assert self.if_arg_names is not None and self.else_arg_names is not None
+        if_args, else_args = if_node.args[3:5]
+        assert isinstance(if_args, (list, tuple))
+        assert isinstance(else_args, (list, tuple))
+        inputs = dict(zip(self.if_arg_names, if_args, strict=True)) | dict(
+            zip(self.else_arg_names, else_args, strict=True)
+        )
+        value = inputs[slot]
+        return value if isinstance(value, torch.fx.Node) else None
 
     def copy_outer_outputs(
         self, state: CodegenState, outputs: list[object], branch: int
@@ -879,12 +1138,11 @@ class WhileLoopGraphInfo(NodeArgsGraphInfo):
             state.codegen.divergent_control_flow(),
             state.codegen.set_statements(body_statements),
         ):
-            outputs = codegen_call_with_graph(
-                state.codegen,
-                self.graph,
-                args,
-                copy_named_args=False,
-            )
+            # The body reads copies of its inputs, as a for loop's body does:
+            # the merges after the loop give an input's name to its updated
+            # value, which the body may compute before its last read of the
+            # input.
+            outputs = codegen_call_with_graph(state.codegen, self.graph, args)
             loop_condition_update: list[ast.AST] = []
             cond_expr_loop = emit_condition(loop_condition_update)
         body_statements.extend(loop_condition_update)
@@ -914,6 +1172,53 @@ class RolledReductionInfo(NamedTuple):
     can_be_rolled_by_caller: bool
 
 
+# Why a dim older versions rolled, and no loop computes, keeps its saved slot.
+_RETIRED_LOOP_REASON = "no loop over this reduction computes it correctly"
+# Why a dim whose reductions read a range it pads keeps its slot unrolled.
+_PADDED_RANGE_REASON = "its reductions read a range padded past its extent"
+
+
+def _rolled_reduction_info(
+    roller: ReductionRoller, graph_id: int
+) -> RolledReductionInfo:
+    """What ``roller`` made of the original graph ``graph_id``."""
+    return RolledReductionInfo(
+        rolled_block_ids=[roller.rdim.block_id],
+        original_graph_id=graph_id,
+        used_rdim=len(roller.graphs_added) > 0,
+        can_be_rolled_by_caller=roller.outer_count == 0
+        and len(roller.graphs_added) == 1,
+    )
+
+
+class _RdimRollAnalysis(NamedTuple):
+    """What ``register_rollable_reductions``'s first pass found for a dim."""
+
+    rdim: BlockSizeInfo
+    # A config may roll the dim: some original graph reduces over it.
+    allow_loop: bool
+    # The original graphs whose reductions over the dim roll.
+    used_graphs: set[int]
+    # Some graph reduces over the dim twice (``reduction_fusion``).
+    fusible: bool
+    # Why the dim stays persistent in a slot of its own
+    # (``ReductionLoopSpec.persistent_reason``), else None.
+    persistent_reason: str | None
+
+
+def _reduction_loop_spec(
+    block_id: int, size_hint: int, *, persistent_reason: str | None = None
+) -> ReductionLoopSpec:
+    backend = CompileEnvironment.current().backend
+    return ReductionLoopSpec(
+        block_id=block_id,
+        size_hint=size_hint,
+        allow_non_power_of_two=backend.reduction_loops_allow_non_power_of_two,
+        allow_full_extent=backend.reduction_loops_allow_full_extent,
+        persistent_reason=persistent_reason,
+    )
+
+
 @dataclasses.dataclass
 class KernelPhase:
     roots: list[int]  # store root indices
@@ -935,8 +1240,16 @@ class DeviceIR:
         # A CuTe codegen view can restrict reduction strategies to one launch.
         # Axis identities and configuration slots remain owned by the full IR.
         self.codegen_active_block_ids: frozenset[int] | None = None
+        # Reduction dims a backend rewrite removed reductions over (CuTe folds
+        # the sum of a one-hot row); the unused ones retire with merged dims.
+        self.retirable_reduction_block_ids: set[int] = set()
+        # The sums of a one-hot row CuTe folded into closed form, which leave
+        # the row's loads and stores as the kernel's traffic.
+        self.folded_one_hot_sums: int = 0
         # Owning HostFunction (captured in ``lower_to_device_ir``).
         self.host_function: HostFunction | None = None
+        # Root ``for`` statements in source order (captured in ``lower_to_device_ir``).
+        self.root_nodes: list[ast.For] = []
         self._has_atomic_ops: bool | None = None
 
     def has_atomic_ops(self) -> bool:
@@ -944,8 +1257,8 @@ class DeviceIR:
 
         Used to gate optimizations that would replay side effects — e.g.
         the CuTe cluster row-split executes every non-rolled statement once
-        per cluster CTA, which is benign for plain (idempotent) stores but
-        would repeat a read-modify-write ``cluster_n`` times.
+        per cluster CTA, which would repeat an atomic update ``cluster_n``
+        times (that split checks plain loads and stores separately).
         """
         if self._has_atomic_ops is None:
             from helion.language.atomic_ops import ATOMIC_OPS
@@ -979,7 +1292,7 @@ class DeviceIR:
         graph_info_cls: type[GraphInfo] = GraphInfo,
         **kwargs: object,
     ) -> int:
-        graph.eliminate_dead_code()
+        graph.eliminate_dead_code(is_impure_node=is_impure_node)
         graph_id = len(self.graphs)
         self.graphs.append(graph_info_cls(graph_id=graph_id, graph=graph, **kwargs))
         return graph_id
@@ -1044,8 +1357,6 @@ class DeviceIR:
         (``DeviceFunction.evaluate_constexpr_condition``) is no decision: only
         its taken side runs, and it is walked without extending the path.
         """
-        from .inductor_lowering import ReductionLowering
-
         result: dict[int, list[list[tuple[int, int]]]] = {}
 
         def walk(graph_id: int, path: list[tuple[int, int]]) -> None:
@@ -1093,127 +1404,115 @@ class DeviceIR:
         be rolled, records lightweight RolledReductionInfo entries, and registers
         config_spec entries for the autotuner. Subgraphs created by the roller
         (e.g. ReductionLoopGraphInfo) are kept so the analysis layer can account
-        for their loads/stores in the indexing config.
+        for their loads/stores in the indexing config; those of a reduction dim
+        the roller refuses are dropped.
         """
         env = CompileEnvironment.current()
-        if env.backend_name == "cute":
-            # Mark provably-FTZ-safe exp sites and explicitly rounded FP32
-            # products on the pre-roll graphs so the roller's node_copy
-            # carries the marks into the rolled sweeps (consumed by the cute
-            # op overrides; inert for other backends).
-            from .cute.exp2_fastmath import mark_ftz_safe_exp_nodes
-            from .cute.scalar_recipe_rounding import mark_narrowed_fp32_multiplies
-
-            for graph_info in self.graphs:
-                mark_ftz_safe_exp_nodes(graph_info.graph)
-                mark_narrowed_fp32_multiplies(graph_info.graph)
+        env.backend.rewrite_device_ir(
+            DeviceIRStage.REDUCTION_ROLLING_BEGIN, self.host_function, self
+        )
         rdims = [bs for bs in env.block_sizes if bs.reduction]
-        if env.backend_name == "cute":
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
-            from .cute.memory_ops import (
-                register_persistent_vec_alignment_specializations,
-            )
-
-            # Explicit tile loops can also use vector memory transactions,
-            # even when no persistent reduction block or contraction exists.
-            register_persistent_vec_alignment_specializations(env)
-            if rdims:
-                # Reduction kernels reorder input reads across warps. Grid
-                # kernels add these storage-dependent dispatch guards below
-                # only when a scan needs them.
-                register_cute_tensor_alias_specializations(env)
-            for tile_spec in env.config_spec.block_sizes:
-                if len(tile_spec.block_ids) == 1 and env.is_jagged_tile(
-                    tile_spec.block_id
-                ):
-                    # A device-resident length's generic size hint is not an
-                    # upper bound. Let the tuner explore up to 64 values per
-                    # thread across the hardware's 1024-thread CTA limit.
-                    # Fixed tiles and tiles bounded by an outer tile keep
-                    # their existing constraints.
-                    tile_spec.allow_overshoot(1024 * 64)
+        env.backend.rewrite_device_ir(
+            DeviceIRStage.REDUCTION_DIMS_COLLECTED, self.host_function, self
+        )
         env.config_spec.reduction_block_ids.update(rdim.block_id for rdim in rdims)
-        # Eager tile-slot registration (see _register_cute_tile_vec_slots).
-        # A present reduction must keep its slot at index 0, so reduction
-        # kernels register their tile slots after the reduction-loop pass below.
-        if env.backend_name == "cute" and not rdims:
-            from ..language.scan_ops import _associative_scan
-            from .cute.collective_matmul import has_collective_matmul_candidate
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
-            from .cute.memory_ops import stores_into_input_storage
-
-            self._register_cute_tile_vec_slots(env)
-            # Grid scans also reorder input reads across warps and need the
-            # same cache-specialized alias facts as reduction kernels.
-            # Collective MMA schedules prove operand loads disjoint from
-            # row-loop stores only through them, and vector memory passes
-            # likewise move input loads across a store into an external
-            # tensor only under a disjointness proof. Do not add
-            # storage-dependent dispatch guards to unrelated grid kernels,
-            # whose stores land in fresh host allocations.
-            if (
-                any(
-                    node.op == "call_function" and node.target is _associative_scan
-                    for graph_info in self.graphs
-                    for node in graph_info.graph.nodes
-                )
-                or has_collective_matmul_candidate(self.graphs)
-                or stores_into_input_storage(self.graphs, env)
-            ):
-                register_cute_tensor_alias_specializations(env)
+        env.backend.rewrite_device_ir(
+            DeviceIRStage.REDUCTION_BLOCK_IDS_REGISTERED, self.host_function, self
+        )
         if not rdims:
             return
-        from .inductor_lowering import ReductionLowering
-
         num_original_graphs = len(self.graphs)
 
         # First pass: run roller analysis for all reduction dims and
         # record which original graphs use each rdim.
-        rdim_results = []
+        rdim_results: list[_RdimRollAnalysis] = []
+        # The dims older versions rolled that the roller now refuses for a
+        # free range or a tie (``_legacy_loop_graphs``), with the original
+        # graphs of their loops.
+        retired: dict[int, set[int]] = {}
         for rdim in rdims:
             graph_to_info: dict[int, RolledReductionInfo] = {}
             allow_loop = False
 
-            # Check if any graph contains matmul, a gather or dev_prts
-            # stacking with rdim, or reduces over rdim along a non-tile
-            # (hl.arange) axis that cannot be sliced inside the reduction loop.
-            can_roll_graphs = True
-            for graph_info in self.graphs[:num_original_graphs]:
-                roller = ReductionRoller(self, rdim, {})
-                if (
-                    roller.has_matmul_with_rdim(graph_info.graph)
-                    or roller.has_gather_along_rdim(graph_info.graph)
-                    or roller.has_stack_tensor_with_rdim(graph_info.graph)
-                    or roller.has_unrollable_reduction(graph_info.graph)
-                ):
-                    can_roll_graphs = False
-                    break
+            # Check if any graph contains matmul, fixed indexing or dev_prts
+            # stacking with rdim, or uses rdim along a non-tile (hl.arange)
+            # axis that cannot be sliced inside the reduction loop.
+            can_roll_graphs = not any(
+                ReductionRoller(
+                    self, rdim, {}, allow_unbound_alias_facts=True
+                ).cannot_roll_graph(graph_info.graph)
+                for graph_info in self.graphs[:num_original_graphs]
+            )
 
-            if ReductionRoller(self, rdim, {}).has_pinned_rdim():
+            roller = ReductionRoller(self, rdim, {}, allow_unbound_alias_facts=True)
+            # Registered aliases still load through their owner's symbol.
+            # Rolling just the alias would leave full-domain loads unsliced.
+            if (
+                roller.has_pinned_rdim()
+                or roller.tied_rdims()
+                or (
+                    isinstance(rdim.size, torch.SymInt)
+                    and env.registered_extent_owner(rdim.block_id) is not None
+                )
+            ):
                 can_roll_graphs = False
 
             if not can_roll_graphs:
-                rdim_results.append((rdim, False, set()))
+                rdim_results.append(_RdimRollAnalysis(rdim, False, set(), False, None))
+                if env.backend_name != "pallas" and (
+                    graphs := self._legacy_loop_graphs(
+                        rdim.block_id, num_original_graphs
+                    )
+                ):
+                    retired[rdim.block_id] = graphs
                 continue
+
+            # A dim whose reductions read a range it pads stays persistent;
+            # its slot stays, pinned, for the configs older versions saved.
+            pinned = any(
+                roller.reads_padded_range(graph_info.graph)
+                for graph_info in self.graphs[:num_original_graphs]
+            )
 
             used_graphs: set[int] = set()
             all_graphs_processed = True
+            persistent_reason = None
+            fusible = False
+            num_graphs = len(self.graphs)
+            num_rolled = len(self.rolled_reductions)
             for graph_id in range(num_original_graphs):
                 graph_info = self.graphs[graph_id]
                 assert graph_id == graph_info.graph_id
-                roller = ReductionRoller(self, rdim, graph_to_info)
+                roller = ReductionRoller(
+                    self, rdim, graph_to_info, allow_unbound_alias_facts=True
+                )
                 try:
                     roller.process(graph_info.graph)
-                except NotImplementedError:
+                except NotImplementedError as error:
                     all_graphs_processed = False
+                    if isinstance(error, EffectfulReductionReplay):
+                        reason = str(error)
+                        persistent_reason = (
+                            reason
+                            if persistent_reason is None
+                            else min(persistent_reason, reason)
+                        )
+                        # Keep this child persistent while analyzing later
+                        # graphs, including its callers. The axis cannot roll,
+                        # but a plain refusal elsewhere must still veto its
+                        # compatibility slot regardless of graph order.
+                        reduction_info = _rolled_reduction_info(roller, graph_id)
+                        graph_to_info[graph_id] = reduction_info
+                        self.rolled_reductions.append(reduction_info)
+                        # The failed replay follows an already emitted sweep.
+                        # Retiring it must not give a later overlapping axis
+                        # the slot this graph occupied in saved configs.
+                        if reduction_info.used_rdim:
+                            used_graphs.add(graph_id)
+                        continue
+                    persistent_reason = None
                     break
-                reduction_info = RolledReductionInfo(
-                    rolled_block_ids=[rdim.block_id],
-                    original_graph_id=graph_id,
-                    used_rdim=len(roller.graphs_added) > 0,
-                    can_be_rolled_by_caller=roller.outer_count == 0
-                    and len(roller.graphs_added) == 1,
-                )
+                reduction_info = _rolled_reduction_info(roller, graph_id)
                 allow_loop = allow_loop or reduction_info.used_rdim
                 if reduction_info.used_rdim:
                     used_graphs.add(graph_id)
@@ -1227,178 +1526,286 @@ class DeviceIR:
                     if reduction_count >= 2 and env.config_spec.supports_config_key(
                         "reduction_fusion"
                     ):
-                        env.config_spec.reduction_fusion_available = True
+                        fusible = True
                 self.rolled_reductions.append(reduction_info)
                 graph_to_info[graph_id] = reduction_info
             if not all_graphs_processed:
                 allow_loop = False
-            rdim_results.append((rdim, allow_loop, used_graphs))
+                if persistent_reason is None:
+                    # The dim stays persistent, so no config emits the loops
+                    # its rollers registered: those of the graphs that rolled,
+                    # and any a roller registered in the graph it then
+                    # refused.  Drop them and their entries, or their loads
+                    # would take config slots.  (An effectful replay keeps
+                    # its analysis graphs, and with them its slots.)
+                    del self.graphs[num_graphs:]
+                    del self.rolled_reductions[num_rolled:]
+            elif pinned and allow_loop:
+                persistent_reason = _PADDED_RANGE_REASON
+            rdim_results.append(
+                _RdimRollAnalysis(
+                    rdim, allow_loop, used_graphs, fusible, persistent_reason
+                )
+            )
+
+        env.backend.rewrite_device_ir(
+            DeviceIRStage.REDUCTION_ROLLING_ANALYZED, self.host_function, self
+        )
 
         # Second pass: register reduction loop specs, ensuring that each
         # original graph is only rolled for one reduction dim at a time.
-        #
-        # CuTe's persistent reduction strategy can also split a static
-        # reduction over fewer live threads plus synthetic per-thread lanes.
-        # Those layout choices are independent of whether ReductionRoller can
-        # turn the reduction into an outer ``reduction_loop``.  In particular,
-        # an ``hl.arange``-indexed reduction is deliberately non-rollable but
-        # is still a profitable persistent subwarp reduction.  Register the
-        # orthogonal CuTe knobs for every static reduction block; only the
-        # ``ReductionLoopSpec`` below remains conditional on rollability.
-        if env.backend_name == "cute":
-            num_thread_blocks = set(env.config_spec.num_threads.valid_block_ids())
-            vector_blocks = set(env.config_spec.cute_vector_widths.valid_block_ids())
-            lane_layout_blocks = set(
-                env.config_spec.cute_lane_layouts.valid_block_ids()
-            )
-            reload_blocks = set(
-                env.config_spec.cute_reduction_reloads.valid_block_ids()
-            )
-            for rdim, _allow_loop, _used_graphs in rdim_results:
-                # Reduction lowering materializes output-range blocks even
-                # when the range is exactly an already-active tile symbol.
-                # CuTe reuses that tile's execution strategy, so separate
-                # reduction tuning slots would be dead dimensions in the
-                # search space.
-                if env.canonical_block_id(rdim.block_id) != rdim.block_id:
-                    continue
-                if not isinstance(rdim.size, (int, torch.SymInt)):
-                    continue
-                size_hint = rdim.size_hint()
-                if rdim.block_id not in num_thread_blocks:
-                    env.config_spec.num_threads.append(
-                        NumThreadsSpec(
-                            block_id=rdim.block_id,
-                            size_hint=size_hint,
-                        )
-                    )
-                    num_thread_blocks.add(rdim.block_id)
-                if rdim.block_id not in vector_blocks:
-                    env.config_spec.cute_vector_widths.append(
-                        CuteVectorWidthSpec(
-                            block_id=rdim.block_id,
-                            size_hint=size_hint,
-                        )
-                    )
-                    vector_blocks.add(rdim.block_id)
-                if rdim.block_id not in lane_layout_blocks:
-                    env.config_spec.cute_lane_layouts.append(
-                        CuteLaneLayoutSpec(block_id=rdim.block_id)
-                    )
-                    lane_layout_blocks.add(rdim.block_id)
-                if rdim.block_id not in reload_blocks:
-                    env.config_spec.cute_reduction_reloads.append(
-                        CuteReductionReloadSpec(block_id=rdim.block_id)
-                    )
-                    reload_blocks.add(rdim.block_id)
-
         graphs_with_rolled_rdim: set[int] = set()
-        register_tile_body = env.backend_name == "cute" and register_tile_body_admitted(
-            self.graphs
-        )
-        for rdim, allow_loop, used_graphs in rdim_results:
-            if not allow_loop:
+        for rdim, allow_loop, used_graphs, fusible, persistent_reason in rdim_results:
+            if not allow_loop and persistent_reason is None:
                 continue
             if used_graphs & graphs_with_rolled_rdim:
                 continue
             if env.backend_name != "pallas":
                 env.config_spec.reduction_loops.append(
-                    ReductionLoopSpec(
-                        block_id=rdim.block_id,
-                        size_hint=rdim.size_hint(),
-                        allow_non_power_of_two=env.backend_name == "cute",
-                        allow_full_extent=env.backend_name == "cute",
+                    _reduction_loop_spec(
+                        rdim.block_id,
+                        rdim.size_hint(),
+                        persistent_reason=persistent_reason,
                     )
                 )
-                env.backend.register_reduction_loop_config_slots(
-                    env, rdim.block_id, rdim.size_hint()
-                )
-            if register_tile_body:
-                # A persistent reduction lane may nest outside one-vector tile
-                # wrappers as a register tile only over a static, unmasked
-                # extent (the lane count is a trace-time constant) and a body
-                # the two-pass schedule can lower.  A CuTe-only decision: no
-                # other backend reads the extent here.
-                numel = rdim.numel
-                if (
-                    isinstance(numel, (int, sympy.Integer))
-                    and int(numel) > 0
-                    and env.backend.static_rdim_size(int(numel)) == int(numel)
-                ):
-                    env.config_spec.cute_register_tile_reduction_blocks.add(
-                        rdim.block_id
+                if allow_loop:
+                    env.backend.register_reduction_loop_config_slots(
+                        env, rdim.block_id, rdim.size_hint()
                     )
+                    # Only a dim whose loops a config can emit fuses them:
+                    # not one that stays persistent.
+                    if fusible and persistent_reason is None:
+                        env.config_spec.reduction_fusion_available = True
             graphs_with_rolled_rdim |= used_graphs
-
-        # Track which rdims appear as the reduction axis of an indexed
-        # reduction (argmin/argmax). On CuTe these can only be combined
-        # via cute.arch.warp_reduction (32 threads max), so the autotuner
-        # must keep their persistent thread count and looped chunk size
-        # within a single warp.
-        if env.backend_name == "cute":
-            indexed_blocks: set[int] = set()
-            indexed_targets = {
-                torch.ops.aten.argmin.default,
-                torch.ops.aten.argmax.default,
+        if env.backend_name != "pallas":
+            # The dims with a loop, and those an effectful replay keeps in a
+            # pinned slot: older versions rolled both.
+            rolled = {
+                rdim.block_id: used_graphs
+                for rdim, allow_loop, used_graphs, _, reason in rdim_results
+                if allow_loop or reason is not None
             }
-            for graph_info in self.graphs[:num_original_graphs]:
-                for node in graph_info.graph.nodes:
-                    if getattr(node, "target", None) not in indexed_targets:
-                        continue
-                    args = node.args or ()
-                    if not args:
-                        continue
-                    val = getattr(args[0], "meta", {}).get("val")
-                    if val is None:
-                        continue
-                    dim_arg = args[1] if len(args) >= 2 else -1
-                    dim_indices = (
-                        [int(cast("int", d)) for d in dim_arg]
-                        if isinstance(dim_arg, list)
-                        else [int(cast("int", dim_arg))]
-                    )
-                    for dim_idx in dim_indices:
-                        if dim_idx < 0:
-                            dim_idx += val.ndim
-                        if 0 <= dim_idx < val.ndim:
-                            reduce_dim = val.size(dim_idx)
-                            block_id = env.resolve_block_id(reduce_dim)
-                            if block_id is not None:
-                                indexed_blocks.add(block_id)
-            env.config_spec.cute_indexed_reduction_block_ids = indexed_blocks
+            self._record_legacy_reduction_loops(rolled, retired, num_original_graphs)
 
-        # Reduction-dim slots are registered above; add the remaining
-        # non-reduction tile slots after them (keeps the rdim slot at index 0).
-        if env.backend_name == "cute":
-            self._register_cute_tile_vec_slots(env)
+        env.backend.rewrite_device_ir(
+            DeviceIRStage.REDUCTION_LOOPS_REGISTERED, self.host_function, self
+        )
 
-    def _register_cute_tile_vec_slots(self, env: CompileEnvironment) -> None:
-        """Eagerly register cute_vector_widths slots for non-reduction tile blocks.
+    def _legacy_loop_graphs(self, block_id: int, num_original_graphs: int) -> set[int]:
+        """The original graphs of the loop an older version offered the
+        reduction dim ``block_id``, which the roller now refuses.
 
-        Eager (not lazy in codegen) keeps the config-spec width fixed before the
-        autotuner snapshots it; callers register reduction-dim slots first so
-        those keep index 0.
+        Older versions rolled a dim beside a free ``hl.arange`` that only
+        pointwise ops, loads and stores read inside the loop (the free-range
+        half of ``has_unrollable_rdim_use``, which they lacked) and a dim a guard
+        ties to another reduction dim (``tied_rdims``), and the configs
+        they saved have a reduction_loops entry for its loop.  Empty when they
+        refused the dim too, or did not have it: a subscript extent's dim was
+        a power of two then (``subscript_extent_block_ids``), and a full
+        slice meeting it got pinned to that power of two, as a tie with one
+        shows now.
         """
-        already_registered = set(env.config_spec.cute_vector_widths.valid_block_ids())
-        for tile_bs in env.block_sizes:
-            if tile_bs.reduction or tile_bs.block_id in already_registered:
+        env = CompileEnvironment.current()
+        subscript_dims = env.subscript_extent_block_ids
+        if block_id in subscript_dims:
+            return set()
+        rdim = env.block_sizes[block_id]
+        roller = ReductionRoller(self, rdim, {})
+        if (
+            roller.has_pinned_rdim()
+            or not subscript_dims.isdisjoint(roller.tied_rdims())
+            # A registered extent's alias: older versions reduced over the
+            # registered block itself, which takes no reduction_loops slot.
+            or (
+                isinstance(rdim.size, torch.SymInt)
+                and env.registered_extent_owner(block_id) is not None
+            )
+        ):
+            return set()
+        # The first pass refused the dim, which past these checks, and those
+        # of ``_old_loop_graphs``, only a tie or a free range read inside the
+        # loop does.
+        return self._old_loop_graphs(block_id, num_original_graphs)
+
+    def _old_loop_graphs(
+        self, block_id: int, num_original_graphs: int, *, subscript_extent: bool = False
+    ) -> set[int]:
+        """The original graphs of the loop older versions offered the reduction
+        dim ``block_id``, rolling it as they did: replaying in a later loop
+        whatever it reads, which the roller now refuses where that is unsafe
+        (``EffectfulReductionReplay``), and with ``subscript_extent``, using
+        the dim once on a value that has it on several axes
+        (``ReductionRoller``).  Empty when they refused the dim: for a use
+        no loop can take (``cannot_roll_graph``, less its free-range half,
+        which they lacked, and for a subscript extent less its other half
+        too: they offered the padded dim a loop beside the range the
+        reduction read), or in the roll itself."""
+        rdim = CompileEnvironment.current().block_sizes[block_id]
+        if any(
+            ReductionRoller(
+                self, rdim, {}, subscript_extent=subscript_extent
+            ).cannot_roll_graph(
+                graph_info.graph, free_ranges=False, reductions=not subscript_extent
+            )
+            for graph_info in self.graphs[:num_original_graphs]
+        ):
+            return set()
+        num_graphs = len(self.graphs)
+        graph_to_info: dict[int, RolledReductionInfo] = {}
+        try:
+            for graph_id in range(num_original_graphs):
+                roller = ReductionRoller(
+                    self, rdim, graph_to_info, subscript_extent=subscript_extent
+                )
+                # The roller finishes the graph before refusing a replay,
+                # which older versions rolled.
+                with contextlib.suppress(EffectfulReductionReplay):
+                    roller.process(self.graphs[graph_id].graph)
+                graph_to_info[graph_id] = _rolled_reduction_info(roller, graph_id)
+        except NotImplementedError:
+            return set()
+        finally:
+            # No config rolls the dim: drop the loop graphs the rollers made.
+            del self.graphs[num_graphs:]
+        return {i for i, info in graph_to_info.items() if info.used_rdim}
+
+    def _record_legacy_reduction_loops(
+        self,
+        rolled: dict[int, set[int]],
+        retired: dict[int, set[int]],
+        num_original_graphs: int,
+    ) -> None:
+        """Lay out the reduction_loops slots as older versions did when they
+        offered a loop to dims this one keeps persistent: each such dim keeps
+        a slot at its old position, pinned to None
+        (``ReductionLoopSpec.pinned``), so the entries of the configs they
+        saved, also with trailing ones left off, line up with this version's
+        by position.
+
+        Besides the dims ``rolled`` now or kept in a slot pinned for an
+        effectful replay, by block id with the original graphs of their loops,
+        older versions offered a loop to the dims in ``retired`` and to the
+        power-of-two dims that reductions over a subscript extent's dim
+        allocated (``_padded_range_dims``), at the block ids
+        ``CompileEnvironment.subscript_extent_reductions`` records.  Such a
+        reduction joined a dim of that power of two when one existed, or a
+        later one joined it; that dim, at the earliest position either had,
+        then carried the range's reads too, and had a loop only when they
+        rolled as well.  Their second pass, like this one, gave each
+        original graph to the first of those dims that rolls it.  A dim with
+        a slot that older versions did not offer a loop keeps it, after
+        theirs.
+        """
+        env = CompileEnvironment.current()
+        if not retired and not env.subscript_extent_reductions:
+            return
+        slots = env.config_spec.reduction_loops
+        # (block id or position, later-allocated, graphs, block id)
+        # (sort key, graphs, block id).  A key is the block id older versions
+        # allocated the dim at, then whether this version allocated it, then,
+        # for the power-of-two dims of reductions recorded at the same block
+        # count, the order of those reductions (each allocated one then).
+        candidates: list[tuple[tuple[int, bool, int], set[int], int]] = []
+        order = {
+            block_id: i for i, block_id in enumerate(env.subscript_extent_reductions)
+        }
+        # The dims of the powers of two a range's reads kept from rolling, and
+        # the original graphs older versions rolled them in for the others,
+        # with the earliest key older versions allocated them at.
+        refused: set[int] = set()
+        joined_graphs: dict[int, set[int]] = {}
+        joined_keys: dict[int, tuple[int, bool, int]] = {}
+        for size, block_ids in self._padded_range_dims(num_original_graphs).items():
+            old_graphs = [
+                self._old_loop_graphs(
+                    block_id, num_original_graphs, subscript_extent=True
+                )
+                for block_id in block_ids
+            ]
+            rolls = all(old_graphs)
+            graphs = set().union(*old_graphs)
+            key = min(
+                (env.subscript_extent_reductions[block_id], False, order[block_id])
+                for block_id in block_ids
+            )
+            joined = [
+                info.block_id
+                for info in env.block_sizes
+                if info.reduction
+                and isinstance(info.size, (int, torch.SymInt))
+                and env.known_equal(info.size, size)
+            ]
+            if joined:
+                # Older versions' reduction joined that dim, or it joined theirs.
+                for block_id in joined:
+                    if rolls:
+                        joined_graphs.setdefault(block_id, set()).update(graphs)
+                        joined_keys[block_id] = min(
+                            key, joined_keys.get(block_id, (block_id, True, 0))
+                        )
+                    else:
+                        refused.add(block_id)
+            elif rolls:
+                candidates.append((key, graphs, min(block_ids)))
+        for block_id, graphs in (*rolled.items(), *retired.items()):
+            if block_id in env.subscript_extent_block_ids or block_id in refused:
                 continue
-            # Non-static size (jagged / AutoSize) never forms a lane loop.
-            if not isinstance(tile_bs.size, (int, torch.SymInt)):
-                continue
-            try:
-                size_hint_val = int(tile_bs.size_hint())
-            except (TypeError, ValueError, AttributeError, AssertionError):
-                continue
-            env.config_spec.cute_vector_widths.append(
-                CuteVectorWidthSpec(
-                    block_id=tile_bs.block_id,
-                    size_hint=size_hint_val,
+            candidates.append(
+                (
+                    joined_keys.get(block_id, (block_id, True, 0)),
+                    graphs | joined_graphs.get(block_id, set()),
+                    block_id,
                 )
             )
-            env.config_spec.cute_lane_layouts.append(
-                CuteLaneLayoutSpec(block_id=tile_bs.block_id)
-            )
+        legacy: list[ReductionLoopSpec] = []
+        claimed: set[int] = set()
+        for _key, graphs, block_id in sorted(candidates, key=operator.itemgetter(0)):
+            if graphs & claimed:
+                continue
+            claimed |= graphs
+            if block_id in slots.valid_block_ids():
+                legacy.append(slots.block_id_lookup(block_id))
+            else:
+                hint = env.block_sizes[block_id].size_hint()
+                legacy.append(
+                    _reduction_loop_spec(
+                        block_id, hint, persistent_reason=_RETIRED_LOOP_REASON
+                    )
+                )
+        legacy_ids = [spec.block_id for spec in legacy]
+        if [spec.block_id for spec in slots][: len(legacy)] == legacy_ids:
+            return
+        added = [spec for spec in slots if spec.block_id not in legacy_ids]
+        slots.clear()
+        slots.extend([*legacy, *added])
+
+    def _padded_range_dims(self, num_original_graphs: int) -> dict[int, list[int]]:
+        """The subscript extents' dims that reductions are lowered over and
+        whose ranges older versions padded, by that power of two
+        (``CompileEnvironment.subscript_extent_reductions``).
+
+        A range typed beside a full slice of its extent read the slice's dim
+        then, unless an op between the two had guarded that dim to the power
+        of two (``ReductionRoller.range_meets_full_slice``).  The slice joins
+        the range's dim now (``subscript_extents_joined_by_slice``).
+        """
+        env = CompileEnvironment.current()
+        padded: dict[int, list[int]] = {}
+        for block_id in env.subscript_extent_reductions:
+            info = env.block_sizes[block_id]
+            if (
+                block_id in env.subscript_extents_joined_by_slice
+                and block_id not in env.subscript_extents_joined_in_loop
+                and not any(
+                    ReductionRoller(self, info, {}).range_meets_full_slice(
+                        graph_info.graph
+                    )
+                    for graph_info in self.graphs[:num_original_graphs]
+                )
+            ):
+                continue
+            padded.setdefault(next_power_of_2(info.size_hint()), []).append(block_id)
+        return padded
 
     def _categorize_reduction(
         self, block_id: int, grid_ids: set[int]
@@ -1699,15 +2106,104 @@ class DeviceIR:
 
         temp = copy.copy(self)
         temp.graphs = [g.copy() for g in self.graphs]
+        temp._rebind_control_flow_captures()
+        if self.host_function is not None:
+            from .selected_tunable_types import specialize_selected_tunable_types
+
+            specialize_selected_tunable_types(self.host_function, temp.graphs, config)
         if roll_reductions:
             temp._apply_rolling(config)
         temp._apply_epilogue_subtiling(config)
         temp._hoist_inband_polls()
-        if CompileEnvironment.current().backend_name == "metal":
-            from .metal.mpp_graph_transform import rewrite_mpp_graphs
-
-            rewrite_mpp_graphs(temp)
+        temp._rebind_control_flow_captures()
         return temp.graphs
+
+    def _rebind_control_flow_captures(self) -> None:
+        # The current call operands are authoritative. Earlier graph rewrites
+        # may already have removed the nodes recorded in node_args, and copies
+        # retain those old references. Helper graphs without a control-flow
+        # capture slot keep their separate argument convention unchanged.
+        parents: dict[int, tuple[torch.fx.Node, int]] = {}
+        graphs = {info.graph_id: info.graph for info in self.graphs}
+        pending = list(reversed(self.root_ids))
+        visited: set[int] = set()
+        while pending:
+            graph_id = pending.pop()
+            if graph_id in visited:
+                continue
+            visited.add(graph_id)
+            for node in graphs[graph_id].nodes:
+                for child_id, slot in _control_flow_graph_entries(node):
+                    # While arguments are mutable state, not invariant
+                    # captures, but still need the copied initial operands.
+                    capture_slot = 2 if slot is None else slot
+                    parents.setdefault(child_id, (node, capture_slot))
+                    pending.append(child_id)
+        # Reduction analysis appends unreachable copies of parent graphs.
+        # They must not replace the operands of a root-reachable call.
+        for info in self.graphs:
+            if isinstance(info, NodeArgsGraphInfo) and info.graph_id in parents:
+                parent, slot = parents[info.graph_id]
+                info.node_args = list(
+                    cast("Sequence[torch.fx.Node]", parent.args[slot])
+                )
+
+    def config_memory_op_facts(self, config: Config) -> list[MemoryOpFact]:
+        """The config facts of ``config_memory_op_fact_pairs``."""
+        return [fact for _persistent, fact in self.config_memory_op_fact_pairs(config)]
+
+    def config_memory_op_fact_pairs(
+        self, config: Config
+    ) -> list[tuple[MemoryOpFact, MemoryOpFact]]:
+        """The facts of the loads and stores the code for ``config`` lowers,
+        in the order it lowers them: each pairs the
+        ``config_spec.memory_op_facts`` entry of a load or store with that fact
+        renumbered to the config, whose ``indexing_index`` and
+        ``eviction_index`` are the slots that code gives it.
+
+        ``config_spec.memory_op_facts`` follows the slot order of the configs
+        that roll no reduction.  Rolling one reorders the slots: the loads its
+        loop does not need can land ahead of the loop, and a load whose value
+        a later loop needs is lowered again there, under a slot of its own.  A
+        seed that sets per-slot values for a config that rolls reads them
+        here.  As in ``memory_op_slots``, the loads that take no ``indexing``
+        slot have the slots after the others.
+
+        Both branches of an ``if`` count, as in ``memory_op_facts``: where the
+        config's block sizes decide the condition, the CuTe lowering emits
+        only the branch taken, so the loads after it take earlier
+        ``load_eviction_policies`` slots than these facts give them.
+        """
+        return codegen_memory_op_fact_pairs(
+            self.config_codegen_graphs(config), self.root_ids
+        )
+
+    def config_codegen_graphs(self, config: Config) -> list[GraphInfo]:
+        """The graphs whose loads and stores the code for ``config`` lowers in
+        their order: these graphs unless it rolls a reduction (the pieces of
+        a subtiled store and the hoisted polls keep their slots), else its
+        codegen graphs (``build_codegen_graphs``)."""
+        env = CompileEnvironment.current()
+        config = env.backend.codegen_config(config)
+        if not self._rolled_reduction_block_ids(config):
+            return self.graphs
+        assert self.host_function is not None
+        # A roll asks for the storage facts of the bound inputs (a store
+        # between two sweeps may alias the row the later one reloads), and
+        # seed registration reads these graphs before the runtime's storage
+        # snapshot: evaluate the registered classifiers here and restore the
+        # prior snapshot afterwards, as the CuTe facts hooks do.
+        saved = env.bound_runtime_input_specialization_results
+        try:
+            if not saved and env.runtime_arg_values_by_name:
+                env.snapshot_runtime_input_specialization_results(
+                    env.runtime_arg_values_by_name
+                )
+            # Rolling reads the host function's origins, as codegen does.
+            with self.host_function:
+                return self.build_codegen_graphs(config)
+        finally:
+            env.bound_runtime_input_specialization_results = saved
 
     def _hoist_inband_polls(self) -> None:
         """Move each inband peer load, with its pure inputs, up to the previous
@@ -1732,7 +2228,7 @@ class DeviceIR:
             )
 
         def reorderable(node: torch.fx.Node) -> bool:
-            # Impure asm (e.g. clock reads) is not marked side effecting.
+            # Poll hoisting conservatively leaves all inline assembly in place.
             return (
                 node.op == "call_function"
                 and node.target not in (memory_ops.load, inline_asm_elementwise)
@@ -1756,19 +2252,23 @@ class DeviceIR:
                         anchor.append(moved)
                         anchor = moved
 
+    def _rolled_reduction_block_ids(self, config: Config) -> list[int]:
+        """The reduction blocks whose loops ``config`` rolls: a dim kept
+        persistent (``ReductionLoopSpec.persistent_reason``) rolls for no
+        value, also one a seed sets before the config is normalized."""
+        loops = CompileEnvironment.current().config_spec.reduction_loops
+        return [
+            spec.block_id
+            for spec in loops
+            if spec.persistent_reason is None
+            and loops.config_get(config.reduction_loops, spec.block_id, None)
+            is not None
+        ]
+
     def _apply_rolling(self, config: Config) -> None:
         """Apply reduction rolling on the graph copies."""
         env = CompileEnvironment.current()
-        reduction_loops = config.reduction_loops
-
-        enabled_reduction_blocks = [
-            spec.block_id
-            for spec in env.config_spec.reduction_loops
-            if env.config_spec.reduction_loops.config_get(
-                reduction_loops, spec.block_id, None
-            )
-            is not None
-        ]
+        enabled_reduction_blocks = self._rolled_reduction_block_ids(config)
         if not enabled_reduction_blocks:
             return
 
@@ -1786,6 +2286,15 @@ class DeviceIR:
                 if info.rolled_block_ids == [block_id]:
                     graph_to_info[info.original_graph_id] = info
 
+            # A child that fits entirely in one sweep can run in its caller's
+            # sweep. Keep its original body for that context: the standalone
+            # entry below still needs its own reduction loop.
+            caller_bodies = {
+                graph_id: self.graphs[graph_id].copy()
+                for graph_id, info in graph_to_info.items()
+                if info.used_rdim and info.can_be_rolled_by_caller
+            }
+            inner_graph_ids: list[int] = []
             for graph_id in range(num_original_graphs):
                 info = graph_to_info.get(graph_id)
                 if info is None or not info.used_rdim:
@@ -1798,12 +2307,71 @@ class DeviceIR:
                     self, rdim, graph_to_info, enable_fusion=enable_fusion
                 )
                 new_graph = roller.process(graph_info.graph)
+                inner_graph_ids.extend(roller.graphs_added)
                 new_graph_id = self.add_graph(
                     new_graph, type(graph_info), **graph_info.kwargs()
                 )
                 # Replace only the graph payload to preserve root metadata
                 # (e.g., phase_index used for barrier phase splitting).
                 graph_info.graph = self.graphs[new_graph_id].graph
+
+            self._bind_caller_rolled_graphs(caller_bodies, inner_graph_ids)
+
+    def _bind_caller_rolled_graphs(
+        self, caller_bodies: dict[int, GraphInfo], inner_graph_ids: list[int]
+    ) -> None:
+        """Bind nested calls to bodies owned by this reduction sweep."""
+        caller_entries: dict[int, int] = {}
+
+        def caller_entry(graph_id: int, *, copy_branch_descriptor: bool = False) -> int:
+            if graph_id in caller_entries:
+                return caller_entries[graph_id]
+            if graph_id in caller_bodies:
+                body = caller_bodies[graph_id]
+            elif copy_branch_descriptor:
+                # Even an unchanged then body owns the paired else edge in
+                # IfGraphInfo. Give this caller its own descriptor when only
+                # the else body changes; standalone users keep the old pair.
+                assert isinstance(self.graphs[graph_id], IfGraphInfo)
+                body = self.graphs[graph_id].copy()
+            else:
+                return graph_id
+            new_id = self.add_graph(body.graph, type(body), **body.kwargs())
+            caller_entries[graph_id] = new_id
+            rebind_calls(body.graph)
+            entry = self.graphs[new_id]
+            if isinstance(entry, IfGraphInfo) and entry.else_branch is not None:
+                # If codegen also follows this edge through GraphInfo.
+                entry.else_branch = caller_entry(entry.else_branch)
+            return new_id
+
+        def rebind_calls(graph: torch.fx.Graph) -> None:
+            for node in graph.nodes:
+                if _tracing_ops.is_for_loop_target(node.target):
+                    slots = (0,)
+                elif node.target is _tracing_ops._if:
+                    slots = (1, 2)
+                else:
+                    continue
+                args = list(node.args)
+                for slot in slots:
+                    child_id = args[slot]
+                    assert isinstance(child_id, int)
+                    args[slot] = caller_entry(child_id)
+                if node.target is _tracing_ops._if:
+                    branch = self.graphs[args[1]]
+                    assert isinstance(branch, IfGraphInfo)
+                    if branch.else_branch != args[2]:
+                        original_if = node.args[1]
+                        assert isinstance(original_if, int)
+                        args[1] = caller_entry(original_if, copy_branch_descriptor=True)
+                node.args = tuple(args)
+
+        # Only calls already inside a sweep use these entries. Calls from
+        # outside it retain their independently rolled graph, including
+        # when the same child is reached in both contexts.
+        for graph_id in inner_graph_ids:
+            rebind_calls(self.graphs[graph_id].graph)
 
     def _apply_epilogue_subtiling(self, config: Config) -> None:
         """Apply epilogue subtiling on the graph copies if enabled."""
@@ -1812,54 +2380,45 @@ class DeviceIR:
             return
 
         from ..language import memory_ops
-        from ..language.atomic_ops import ATOMIC_OPS
         from .epilogue_subtiling import apply_epilogue_subtiling
 
         env = CompileEnvironment.current()
         configured_block_sizes = {
             info.block_id: info.from_config_assert(config)
             for info in env.block_sizes
-            if not info.reduction
+            if info.is_tile
+        }
+        # The extent ``config`` gives each tile, or None where it stays
+        # dynamic: which tiles the split may take.
+        configured_extents = {
+            block_id: env.config_value(size, config)
+            for block_id, size in configured_block_sizes.items()
         }
         descriptor_output_nodes_by_graph: dict[int, set[torch.fx.Node]] = {}
-        memory_op_index = 0
-        atomic_op_index = 0
-        for graph_info in self.graphs:
-            descriptor_output_nodes: set[torch.fx.Node] = set()
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                if node.target is memory_ops.load:
-                    memory_op_index += 1
-                elif node.target is memory_ops.store:
-                    if _indexing_uses_tensor_descriptor(
-                        config.indexing,
-                        memory_op_index,
-                    ):
-                        descriptor_output_nodes.add(node)
-                    memory_op_index += 1
-                elif node.target in ATOMIC_OPS:
-                    if _indexing_uses_tensor_descriptor(
-                        config.atomic_indexing,
-                        atomic_op_index,
-                    ):
-                        descriptor_output_nodes.add(node)
-                    atomic_op_index += 1
-            if descriptor_output_nodes:
-                descriptor_output_nodes_by_graph[graph_info.graph_id] = (
-                    descriptor_output_nodes
-                )
+        # The slots of these graphs, the ones this config lowers: numbered in
+        # the order codegen lowers them, as codegen does.
+        for graph_id, node, slot in memory_op_slots(
+            self.graphs, self.root_ids, unreached=False
+        ):
+            if node.target is memory_ops.load:
+                continue
+            indexing = (
+                config.indexing
+                if node.target is memory_ops.store
+                else config.atomic_indexing
+            )
+            if _indexing_uses_tensor_descriptor(indexing, slot):
+                descriptor_output_nodes_by_graph.setdefault(graph_id, set()).add(node)
 
         for graph_info in self.graphs:
             # Epilogue output ops can live in nested/reduction/control-flow graphs,
-            # not just roots.  The indexing configs are global across codegen_graphs:
-            # this mirrors the existing load/store/atomic counters used when
-            # registering indexing tunables and tensor-descriptor layout guards.
+            # not just roots.  The indexing configs are global across codegen_graphs.
             apply_epilogue_subtiling(
                 graph_info.graph,
                 split_factor,
                 configured_block_sizes,
                 descriptor_output_nodes_by_graph.get(graph_info.graph_id, set()),
+                configured_extents,
             )
 
     def __enter__(self) -> None:
@@ -1887,17 +2446,74 @@ def _is_static_slice_bound(bound: object) -> bool:
     return False
 
 
+@dataclasses.dataclass
+class _SequenceOrigin:
+    """Element paths and allocation provenance, shared by static aliases."""
+
+    items: list[_StaticOrigin]
+    constructed: bool = False
+    captured: bool = False
+
+
+@dataclasses.dataclass
+class _MappingOrigin:
+    """Paths of constructed dictionary values, including nested mappings."""
+
+    items: dict[object, _StaticOrigin]
+    constructed: bool = False
+
+
+_StaticOrigin: TypeAlias = Origin | _SequenceOrigin | _MappingOrigin | None
+
+
+def _item_origin(origin: _StaticOrigin, index: int | str) -> _StaticOrigin:
+    if isinstance(origin, _SequenceOrigin):
+        assert isinstance(index, int)
+        return origin.items[index]
+    if isinstance(origin, _MappingOrigin):
+        return origin.items[index]
+    return GetItemOrigin(origin, index) if origin is not None else None
+
+
 class WalkDeviceAST(NodeVisitor):
     def __init__(self, device_ir: DeviceIR) -> None:
         super().__init__()
         self.device_ir = device_ir
+        hf = device_ir.host_function
+        self.tuple_constants = (
+            TupleConstants(hf.fn.__code__) if hf is not None else None
+        )
         self.scope: dict[str, object] = {}
+        # Static unrolling changes values without changing the shared AST types.
+        # Preserve their actual input paths for folded comparison guards.
+        self.scope_origins: dict[str, _StaticOrigin] = {}
+        self.expression_origins: dict[ast.AST, _StaticOrigin] = {}
+
+    def _value_origin(self, node: ast.AST) -> _StaticOrigin:
+        if isinstance(node, ast.Name) and node.id in self.scope_origins:
+            return self.scope_origins[node.id]
+        if node in self.expression_origins:
+            return self.expression_origins[node]
+        assert isinstance(node, ExtendedAST)
+        return node._type_info.origin if node._type_info is not None else None
+
+    def _index_origin(self, node: ast.AST, index: int | str) -> _StaticOrigin:
+        return _item_origin(self._value_origin(node), index)
 
     def generic_visit(self, node: ast.AST) -> None:
         raise exc.StatementNotSupported(type(node).__name__)
 
-    def _assign(self, target: ast.AST, value: object) -> None:
+    def _assign(
+        self, target: ast.AST, value: object, origin: _StaticOrigin = None
+    ) -> None:
         if isinstance(target, ast.Name):
+            if isinstance(
+                value, torch.SymFloat
+            ) and HostFunction.current().is_host_scalar_expr(value.node.expr):
+                # A host expression may be a kernel argument. Loop/branch phi
+                # outputs can overwrite their input's generated name, so each
+                # device binding needs its own SSA value at the assignment.
+                value = _new_var(value)
             if isinstance(value, torch.Tensor):
                 # rename the node to match the variable name
                 mode = proxy_tensor.get_proxy_mode()
@@ -1911,13 +2527,18 @@ class WalkDeviceAST(NodeVisitor):
                             target.id, None
                         )
             self.scope[target.id] = value
+            self.scope_origins[target.id] = origin
         elif isinstance(target, (ast.Tuple, ast.List)):
             for i, n in enumerate(target.elts):
                 if isinstance(n, ast.Starred):
                     raise exc.StarredArgsNotSupportedOnDevice
 
-                # pyrefly: ignore [bad-index]
-                self._assign(n, value[i])
+                self._assign(
+                    n,
+                    # pyrefly: ignore [bad-index]
+                    value[i],
+                    _item_origin(origin, i),
+                )
         elif isinstance(target, ast.Subscript):
             dst = self.visit(target.value)
             assert isinstance(value, torch.Tensor)
@@ -1939,8 +2560,8 @@ class WalkDeviceAST(NodeVisitor):
     def _static_scope(self) -> dict[str, object]:
         return {k: v for k, v in self.scope.items() if not self.should_become_arg(v)}
 
-    def _lift_inputs(self, names: Iterable[str]) -> LiftTensorArgs:
-        return LiftTensorArgs(
+    def _lift_inputs(self, names: Iterable[str]) -> LiftGraphArgs:
+        return LiftGraphArgs(
             {
                 name: self.scope[name]
                 for name in names
@@ -1953,18 +2574,36 @@ class WalkDeviceAST(NodeVisitor):
         subgraph_scope: dict[str, object],
         writes: dict[str, int],
         include_new: bool = False,
-    ) -> LiftTensorArgs:
-        return LiftTensorArgs(
-            {
-                k: v
-                for k, v in subgraph_scope.items()
-                if k in writes
-                and (include_new or k in self.scope)
-                and self.scope.get(k) is not v
-                # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
-                and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
-            }
-        )
+    ) -> LiftGraphArgs:
+        outputs = {
+            k: v
+            for k, v in subgraph_scope.items()
+            if k in writes
+            and (include_new or k in self.scope)
+            and self.scope.get(k) is not v
+            # Host tensors bound in the body (e.g. `for peer in peers`) stay static.
+            and not (isinstance(v, torch.Tensor) and not self.should_become_arg(v))
+        }
+        # Each output gets its own variable, or the ``_phi`` merges after the
+        # loop or branch would make the names one: an in-place method returns
+        # its receiver (``result = acc.add_(1)`` binds both names to one
+        # tensor), and a ``while`` body traces the tensors bound outside it,
+        # which the loop's outputs are then tracked onto.
+        claimed = [*self.scope.values()]
+        for k, v in outputs.items():
+            if isinstance(v, torch.Tensor) and not isinstance(v, Tile):
+                if any(v is w for w in claimed):
+                    outputs[k] = _new_var(v)
+                claimed.append(v)
+        return LiftGraphArgs(outputs)
+
+    @staticmethod
+    def _rebound(rw: ReadWrites) -> dict[str, int]:
+        """The names ``rw``'s statements rebind: assigned ones and the tensors
+        an in-place method mutates (``acc.add_(x)``), which ``make_fx`` rebinds
+        to the in-place node's output, so a loop or branch must carry them out
+        as it does an assigned value."""
+        return {**rw.method_writes, **rw.writes}
 
     @staticmethod
     def _rw_names(rw: ReadWrites) -> tuple[str, ...]:
@@ -1978,21 +2617,22 @@ class WalkDeviceAST(NodeVisitor):
 
     def _trace_graph(
         self,
-        inputs: LiftTensorArgs,
-        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftTensorArgs]],
+        inputs: LiftGraphArgs,
+        build_fn: Callable[[WalkDeviceAST], tuple[object, LiftGraphArgs]],
         *,
         graph_info_cls: type[NodeArgsGraphInfo],
         copy_tensor_args: bool = True,
         **graph_kwargs: object,
-    ) -> tuple[int, LiftTensorArgs]:
-        outputs_holder: LiftTensorArgs | None = None
+    ) -> tuple[int, LiftGraphArgs]:
+        outputs_holder: LiftGraphArgs | None = None
 
         def runner(*args: object) -> object:
             nonlocal outputs_holder
             subgraph_walker = WalkDeviceAST(self.device_ir)
             subgraph_walker.scope.update(self._static_scope())
+            subgraph_walker.scope_origins.update(self.scope_origins)
             subgraph_walker.scope.update(
-                inputs.replace_tensor_args(args, copy_tensors=copy_tensor_args)
+                inputs.replace_graph_args(args, copy_tensors=copy_tensor_args)
             )
             result, outputs_holder = build_fn(subgraph_walker)
             return result
@@ -2000,7 +2640,7 @@ class WalkDeviceAST(NodeVisitor):
         with self.disable_tracing() as tracer:
             graph = proxy_tensor.make_fx(
                 runner, decomposition_table=_get_custom_decomp_table()
-            )(*inputs.get_tensor_args()).graph
+            )(*inputs.get_graph_args()).graph
             graph_id = self.device_ir.add_graph(
                 graph,
                 graph_info_cls=graph_info_cls,
@@ -2028,7 +2668,12 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_binary(node.op, left, right)
 
     def visit_UnaryOp(self, node: ast.UnaryOp) -> object:
-        operand = self.visit(node.operand)
+        length = (
+            self._host_collection_length(node.operand)
+            if isinstance(node.op, ast.Not)
+            else None
+        )
+        operand = length if length is not None else self.visit(node.operand)
         if isinstance(node.op, ast.Not):
             return self._trace_not(operand)
         return _eval_unary(node.op, operand)
@@ -2049,15 +2694,109 @@ class WalkDeviceAST(NodeVisitor):
         return _eval_unary(ast.Not(), operand)
 
     def visit_Compare(self, node: ast.Compare) -> object:
-        lhs = self.visit(node.left)
+        lhs_node = node.left
+        # Identity classification uses the existing input/capture provenance
+        # guards, including unproved origins. It does not interpret contents.
+        # Keep that path separate from equality or other value operations.
+        visit_operand = (
+            self._identity_operand
+            if all(isinstance(op, (ast.Is, ast.IsNot)) for op in node.ops)
+            else self.visit
+        )
+        lhs = visit_operand(lhs_node)
         results = []
-        for op, rhs in zip(node.ops, node.comparators, strict=True):
-            rhs = self.visit(rhs)
-            results.append(result := _eval_compare(op, lhs, rhs))
+        for op, rhs_node in zip(node.ops, node.comparators, strict=True):
+            rhs = visit_operand(rhs_node)
+            if isinstance(op, (ast.Is, ast.IsNot)) and (
+                type(lhs) in (tuple, list, dict) or type(rhs) in (tuple, list, dict)
+            ):
+                left_origin = self._value_origin(lhs_node)
+                right_origin = self._value_origin(rhs_node)
+                result = compare_container_identity(
+                    op,
+                    lhs,
+                    left_origin if isinstance(left_origin, Origin) else None,
+                    rhs,
+                    right_origin if isinstance(right_origin, Origin) else None,
+                    left_constructed=isinstance(
+                        left_origin, (_SequenceOrigin, _MappingOrigin)
+                    )
+                    and left_origin.constructed,
+                    right_constructed=isinstance(
+                        right_origin, (_SequenceOrigin, _MappingOrigin)
+                    )
+                    and right_origin.constructed,
+                    left_captured=isinstance(left_origin, _SequenceOrigin)
+                    and left_origin.captured,
+                    right_captured=isinstance(right_origin, _SequenceOrigin)
+                    and right_origin.captured,
+                )
+            else:
+                result = _eval_compare(op, lhs, rhs)
+            results.append(result)
+            assert isinstance(lhs_node, ExtendedAST)
+            assert isinstance(rhs_node, ExtendedAST)
+            left_type, right_type = lhs_node._type_info, rhs_node._type_info
+            if (
+                isinstance(op, ast.Eq)
+                and isinstance(left_type, SequenceType)
+                and isinstance(right_type, SequenceType)
+            ):
+                self._guard_sequence_equality(
+                    lhs, self._value_origin(lhs_node), rhs, self._value_origin(rhs_node)
+                )
+            if (
+                isinstance(left_type, LiteralType)
+                and isinstance(right_type, LiteralType)
+                and (
+                    isinstance(lhs, ConfigSpecFragment)
+                    or isinstance(rhs, ConfigSpecFragment)
+                )
+            ):
+                left_origin = self._value_origin(lhs_node)
+                right_origin = self._value_origin(rhs_node)
+                if isinstance(left_origin, Origin) and isinstance(right_origin, Origin):
+                    guard_fragment_comparison(
+                        op,
+                        LiteralType(left_origin, lhs),
+                        LiteralType(right_origin, rhs),
+                        result,
+                    )
             if not isinstance(result, _tracing_ops._symbolic_types) and not result:
                 break
             lhs = rhs
+            lhs_node = rhs_node
         return functools.reduce(_tracing_ops._and, results)
+
+    def _guard_sequence_equality(
+        self,
+        left: object,
+        left_origin: _StaticOrigin,
+        right: object,
+        right_origin: _StaticOrigin,
+    ) -> None:
+        if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)):
+            for index, (a, b) in enumerate(zip(left, right, strict=False)):
+                self._guard_sequence_equality(
+                    a,
+                    _item_origin(left_origin, index),
+                    b,
+                    _item_origin(right_origin, index),
+                )
+        elif (
+            isinstance(left_origin, Origin)
+            and isinstance(right_origin, Origin)
+            and (
+                isinstance(left, ConfigSpecFragment)
+                or isinstance(right, ConfigSpecFragment)
+            )
+        ):
+            guard_fragment_comparison(
+                ast.Eq(),
+                LiteralType(left_origin, left),
+                LiteralType(right_origin, right),
+                _eval_compare(ast.Eq(), left, right),
+            )
 
     def visit_BoolOp(self, node: ast.BoolOp) -> object:
         if isinstance(node.op, ast.And):
@@ -2165,23 +2904,26 @@ class WalkDeviceAST(NodeVisitor):
         )
 
         results = []
-        for element_value in sequence_value:
+        for index, element_value in enumerate(sequence_value):
+            element_origin = self._index_origin(sequence_iter, index)
             if preserve_scope:
                 # For loops: don't create new scope, allow state to persist
-                self._assign(target, element_value)
+                self._assign(target, element_value, element_origin)
                 result = element_processor()
                 if result is not None:
                     results.append(result)
             else:
                 # For comprehensions: create isolated scope for each iteration
                 old_scope = self.scope.copy()
+                old_origins = self.scope_origins.copy()
                 try:
-                    self._assign(target, element_value)
+                    self._assign(target, element_value, element_origin)
                     result = element_processor()
                     if result is not None:
                         results.append(result)
                 finally:
                     self.scope = old_scope
+                    self.scope_origins = old_origins
 
         return results
 
@@ -2266,11 +3008,13 @@ class WalkDeviceAST(NodeVisitor):
 
             def build_subgraph(
                 subgraph_walker: WalkDeviceAST,
-            ) -> tuple[list[object], LiftTensorArgs]:
+            ) -> tuple[list[object], LiftGraphArgs]:
                 subgraph_walker._assign(node.target, inner_type.proxy())
                 subgraph_walker._body(node.body)
-                loop_outputs = self._collect_outputs(subgraph_walker.scope, rw.writes)
-                return loop_outputs.get_tensor_args(), loop_outputs
+                loop_outputs = self._collect_outputs(
+                    subgraph_walker.scope, self._rebound(rw)
+                )
+                return loop_outputs.get_graph_args(), loop_outputs
 
             block_ids: list[int] = []
             for var in iter_vars:
@@ -2302,7 +3046,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph_idx,
                     begin,
                     end,
-                    inputs.get_tensor_args(),
+                    inputs.get_graph_args(),
                 )
                 loop_target = _tracing_ops._for_loop
             else:
@@ -2310,7 +3054,7 @@ class WalkDeviceAST(NodeVisitor):
                     graph_idx,
                     begin,
                     end,
-                    inputs.get_tensor_args(),
+                    inputs.get_graph_args(),
                     step_list,
                 )
                 loop_target = _tracing_ops._for_loop_step
@@ -2324,7 +3068,7 @@ class WalkDeviceAST(NodeVisitor):
                 *args_to_proxies(tracer, args),
             )
             proxy_tensor.track_tensor_tree(
-                outputs.get_tensor_args(),
+                outputs.get_graph_args(),
                 proxy_out,
                 constant=None,
                 tracer=tracer,
@@ -2358,9 +3102,9 @@ class WalkDeviceAST(NodeVisitor):
 
         def build_condition(
             subgraph_walker: WalkDeviceAST,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             result = subgraph_walker.visit(node.test)
-            return [result], LiftTensorArgs({})
+            return [result], LiftGraphArgs({})
 
         cond_graph_id, _ = self._trace_graph(
             inputs,
@@ -2371,10 +3115,23 @@ class WalkDeviceAST(NodeVisitor):
 
         def build_body(
             subgraph_walker: WalkDeviceAST,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(node.body)
-            loop_outputs = self._collect_outputs(subgraph_walker.scope, body_rw.writes)
-            return loop_outputs.get_tensor_args(), loop_outputs
+            # The body traces the loop's own tensors, not copies, so a tensor an
+            # in-place method mutated (``acc.add_(x)``) is still the object
+            # bound outside the loop: give it a fresh variable to carry out.
+            for name in body_rw.method_writes:
+                value = subgraph_walker.scope.get(name)
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value is self.scope.get(name)
+                    and self.should_become_arg(value)
+                ):
+                    subgraph_walker.scope[name] = _new_var(value)
+            loop_outputs = self._collect_outputs(
+                subgraph_walker.scope, self._rebound(body_rw)
+            )
+            return loop_outputs.get_graph_args(), loop_outputs
 
         body_graph_id, outputs = self._trace_graph(
             inputs,
@@ -2387,7 +3144,7 @@ class WalkDeviceAST(NodeVisitor):
         args = (
             cond_graph_id,
             body_graph_id,
-            inputs.get_tensor_args(),
+            inputs.get_graph_args(),
             None,
         )
         mode = proxy_tensor.get_proxy_mode()
@@ -2400,7 +3157,7 @@ class WalkDeviceAST(NodeVisitor):
             *args_to_proxies(tracer, args),
         )
         proxy_tensor.track_tensor_tree(
-            outputs.get_tensor_args(),
+            outputs.get_graph_args(),
             proxy_out,
             constant=None,
             tracer=tracer,
@@ -2422,7 +3179,8 @@ class WalkDeviceAST(NodeVisitor):
     def visit_If(self, node: ast.If) -> object:
         test = node.test
         if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
-            operand = self.visit(test.operand)
+            length = self._host_collection_length(test.operand)
+            operand = length if length is not None else self.visit(test.operand)
             if isinstance(operand, torch.Tensor) and tensor_may_have_many_elements(
                 operand
             ):
@@ -2432,7 +3190,8 @@ class WalkDeviceAST(NodeVisitor):
                 return
             test_proxy = self._trace_not(operand)
         else:
-            test_proxy = self.visit(test)
+            length = self._host_collection_length(test)
+            test_proxy = length if length is not None else self.visit(test)
         if not isinstance(test_proxy, _tracing_ops._symbolic_types):
             body = node.body if test_proxy else node.orelse
             if body:
@@ -2441,7 +3200,8 @@ class WalkDeviceAST(NodeVisitor):
         self._create_if_subgraph(test_proxy, node.body, node.orelse)
 
     def visit_IfExp(self, node: ast.IfExp) -> object:
-        test_proxy = self.visit(node.test)
+        length = self._host_collection_length(node.test)
+        test_proxy = length if length is not None else self.visit(node.test)
         if isinstance(test_proxy, _tracing_ops._symbolic_types):
             raise exc.StatementNotSupported("dynamic conditional expression")
         return self.visit(node.body if test_proxy else node.orelse)
@@ -2467,12 +3227,12 @@ class WalkDeviceAST(NodeVisitor):
             subgraph_walker: WalkDeviceAST,
             stmts: list[ast.stmt],
             rw: ReadWrites,
-        ) -> tuple[list[object], LiftTensorArgs]:
+        ) -> tuple[list[object], LiftGraphArgs]:
             subgraph_walker._body(stmts)
             outputs_local = self._collect_outputs(
-                subgraph_walker.scope, rw.writes, include_new=True
+                subgraph_walker.scope, self._rebound(rw), include_new=True
             )
-            return outputs_local.get_tensor_args(), outputs_local
+            return outputs_local.get_graph_args(), outputs_local
 
         else_graph_idx, else_outputs = self._trace_graph(
             else_branch_inputs,
@@ -2490,9 +3250,9 @@ class WalkDeviceAST(NodeVisitor):
         if_graph = cast("IfGraphInfo", self.device_ir.graphs[if_graph_idx])
 
         def get_arg_values_and_names(
-            inputs: LiftTensorArgs,
+            inputs: LiftGraphArgs,
         ) -> tuple[list[object], list[str]]:
-            input_tensor_arg_values = inputs.get_tensor_args()
+            input_tensor_arg_values = inputs.get_graph_args()
 
             def is_tensor_arg_value(v: object) -> bool:
                 return any(v is t for t in input_tensor_arg_values)
@@ -2575,32 +3335,75 @@ class WalkDeviceAST(NodeVisitor):
         # (i.e. same as ordering of values in track_tensor_tree above)
         if_graph.branches_outputs = []
 
-        def get_output_idx(name: str, output_values: dict[str, object]) -> int:
-            return next(i for i, n in enumerate(output_values) if n == name)
+        def get_output_idx(name: str, outputs: LiftGraphArgs) -> int:
+            # A branch graph returns only its graph outputs
+            # (``get_graph_args``), not every value the branch assigns.
+            value = outputs.values[name]
+            return next(
+                i for i, arg in enumerate(outputs.get_graph_args()) if arg is value
+            )
 
         for name in common_output_names:
             if_value = if_output_values[name]
             else_value = else_output_values[name]
             self.scope[name] = _tracing_ops._phi(if_value, else_value)
-            if_output_index = get_output_idx(name, if_output_values)
-            else_output_index = get_output_idx(name, else_output_values)
+            if_output_index = get_output_idx(name, if_outputs)
+            else_output_index = get_output_idx(name, else_outputs)
             if_graph.branches_outputs.append((if_output_index, else_output_index))
 
         for name in if_nonlocal_outputs_names:
             self.scope[name] = _tracing_ops._phi(
                 self.scope[name], if_output_values[name]
             )
-            if_output_index = get_output_idx(name, if_output_values)
+            if_output_index = get_output_idx(name, if_outputs)
             if_graph.branches_outputs.append((if_output_index, name))
 
         for name in else_nonlocal_output_names:
             self.scope[name] = _tracing_ops._phi(
                 self.scope[name], else_output_values[name]
             )
-            else_output_index = get_output_idx(name, else_output_values)
+            else_output_index = get_output_idx(name, else_outputs)
             if_graph.branches_outputs.append((name, else_output_index))
 
         return if_graph_idx
+
+    def _identity_operand(self, node: ast.AST) -> object:
+        if isinstance(node, ast.Name) and node.id not in self.scope:
+            assert isinstance(node, ExtendedAST)
+            info = node._type_info
+            if (
+                type(info) in (SequenceType, DictType)
+                and isinstance(info, CollectionType)
+                and info.origin.is_host()
+            ):
+                return info.tree_map(lambda item: item.proxy())
+        return self.visit(node)
+
+    def _host_collection_length(self, node: ast.AST) -> int | torch.SymInt | None:
+        if not isinstance(node, ast.Name) or node.id in self.scope:
+            return None
+        assert isinstance(node, ExtendedAST)
+        info = node._type_info
+        if (
+            type(info) not in (SequenceType, DictType)
+            or not isinstance(info, CollectionType)
+            or not info.contains_approximate_contents()
+            or not info.length_projection_safe
+            or not info.origin.is_host()
+        ):
+            return None
+        if info.contents_exact:
+            # Type propagation folds truth from the outer collection alone;
+            # approximate children must not turn that into a dynamic branch.
+            assert isinstance(info.element_types, (list, tuple, dict))
+            return len(info.element_types)
+        # Read the named host value already produced by the original code.
+        # Do not rerun its comprehension or an arbitrary producing helper.
+        value = CompileEnvironment.current().create_unbacked_symint()
+        HostFunction.current().expr_to_origin[value._sympy_()] = SymbolOrigin(
+            CollectionLengthOrigin(NameOrigin(node.id))
+        )
+        return value
 
     def visit_Name(self, node: ast.Name) -> object:
         if node.id in self.scope:
@@ -2623,10 +3426,36 @@ class WalkDeviceAST(NodeVisitor):
         return [result]
 
     def visit_Tuple(self, node: ast.Tuple) -> tuple[object, ...]:
-        return tuple([self.visit(x) for x in node.elts])
+        values = tuple([self.visit(x) for x in node.elts])
+        if (
+            self.tuple_constants is not None
+            and (constant := self.tuple_constants.resolve(node, values)) is not None
+        ):
+            self.expression_origins[node] = self._constant_tuple_origin(constant)
+            return constant
+        self.expression_origins[node] = _SequenceOrigin(
+            [self._value_origin(x) for x in node.elts], constructed=True
+        )
+        return values
+
+    @staticmethod
+    def _constant_tuple_origin(value: tuple[object, ...]) -> _SequenceOrigin:
+        return _SequenceOrigin(
+            [
+                WalkDeviceAST._constant_tuple_origin(item)
+                if type(item) is tuple
+                else None
+                for item in value
+            ],
+            captured=True,
+        )
 
     def visit_List(self, node: ast.List) -> list[object]:
-        return [self.visit(x) for x in node.elts]
+        values: list[object] = [self.visit(x) for x in node.elts]
+        self.expression_origins[node] = _SequenceOrigin(
+            [self._value_origin(x) for x in node.elts], constructed=True
+        )
+        return values
 
     def _visit_comprehension(
         self, node: ast.ListComp | ast.GeneratorExp, name: str
@@ -2644,7 +3473,7 @@ class WalkDeviceAST(NodeVisitor):
 
         # Check if we're iterating over a sequence (similar to tuple unrolling)
         if isinstance(iter_type, SequenceType):
-            return self._handle_comprehension_unrolling(node.elt, generator)
+            return self._handle_comprehension_unrolling(node, generator)
 
         # For non-sequence iterables, we could extend this later
         raise exc.StatementNotSupported(
@@ -2658,13 +3487,16 @@ class WalkDeviceAST(NodeVisitor):
         return self._visit_comprehension(node, "generator expression")
 
     def _handle_comprehension_unrolling(
-        self, elt: ast.expr, generator: ast.comprehension
+        self, node: ast.ListComp | ast.GeneratorExp, generator: ast.comprehension
     ) -> tuple[object, ...]:
         """Handle unrolling of comprehensions (list comp or generator exp) over sequences."""
+        elt = node.elt
+        origins = []
 
         def evaluate_expression() -> object:
             # Evaluate the comprehension expression
             result = self.visit(elt)
+            origins.append(self._value_origin(elt))
             # If the result is a SymInt that can be evaluated to a concrete value, do so
             if isinstance(result, torch.SymInt):
                 try:
@@ -2676,6 +3508,7 @@ class WalkDeviceAST(NodeVisitor):
         results = self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_expression, preserve_scope=False
         )
+        self.expression_origins[node] = _SequenceOrigin(origins)
         # Return as tuple to match the expected type for tuple unrolling
         return tuple(results)
 
@@ -2698,20 +3531,33 @@ class WalkDeviceAST(NodeVisitor):
             )
 
         result: dict[object, object] = {}
+        origins: dict[object, _StaticOrigin] = {}
 
         def evaluate_key_value() -> None:
             key = self.visit(node.key)
             value = self.visit(node.value)
             result[key] = value
+            origins[key] = self._value_origin(node.value)
 
         self._handle_sequence_unrolling(
             generator.iter, generator.target, evaluate_key_value, preserve_scope=False
         )
+        self.expression_origins[node] = _MappingOrigin(origins)
         return result
 
     def visit_Dict(self, node: ast.Dict) -> dict[object, object]:
         keys = [self.visit(key) if key is not None else None for key in node.keys]
         values = [self.visit(value) for value in node.values]
+        self.expression_origins[node] = _MappingOrigin(
+            dict(
+                zip(
+                    keys,
+                    (self._value_origin(value) for value in node.values),
+                    strict=True,
+                )
+            ),
+            constructed=True,
+        )
         return dict(zip(keys, values, strict=False))
 
     def visit_Slice(self, node: ast.Slice) -> slice | torch.Tensor | torch.SymInt:
@@ -2754,10 +3600,11 @@ class WalkDeviceAST(NodeVisitor):
             # For simple variable assignments like `a = b`, we need to create a new
             # variable to avoid phi node issues when the source variable gets mutated
             if isinstance(node.value, ast.Name) and (
-                isinstance(value, torch.Tensor) and not isinstance(value, Tile)
+                isinstance(value, (torch.Tensor, torch.SymFloat))
+                and not isinstance(value, Tile)
             ):
                 value = _new_var(value)
-            self._assign(target, value)
+            self._assign(target, value, self._value_origin(node.value))
             return None
         if isinstance(target, ast.Tuple):
             # Handle tuple unpacking
@@ -2766,9 +3613,9 @@ class WalkDeviceAST(NodeVisitor):
                 raise exc.InvalidAssignment
             if len(target.elts) != len(value):
                 raise exc.InvalidAssignment
-            for t, v in zip(target.elts, value, strict=True):
+            for index, (t, v) in enumerate(zip(target.elts, value, strict=True)):
                 if isinstance(t, ast.Name):
-                    self._assign(t, v)
+                    self._assign(t, v, self._index_origin(node.value, index))
                 elif isinstance(t, ast.Subscript):
                     # Handle subscript targets in tuple unpacking (e.g., a[i], b[j] = tuple)
                     self._assign_subscript(t, v)
@@ -2789,6 +3636,9 @@ class WalkDeviceAST(NodeVisitor):
             base_list = self.visit(target.value)
             assert isinstance(base_list, list)
             base_list[index_value] = val
+            origin = self._value_origin(target.value)
+            if isinstance(origin, _SequenceOrigin):
+                origin.items[index_value] = self._value_origin(node.value)
             return None
         assert isinstance(node.value, ExtendedAST)
         rhs_type = node.value._type_info
@@ -2860,6 +3710,7 @@ class WalkDeviceAST(NodeVisitor):
         self._assign(
             node.target,
             _eval_binary(node.op, self.visit(node.target), self.visit(node.value)),
+            DeviceOrigin(current_location()),
         )
 
     def visit_Subscript(self, node: ast.Subscript) -> object:
@@ -2869,8 +3720,10 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, SequenceType):
             index_value = self.visit(node.slice)
             if isinstance(index_value, int):
+                sequence = self.visit(value)
+                self.expression_origins[node] = self._index_origin(value, index_value)
                 # pyrefly: ignore [bad-index]
-                return self.visit(value)[index_value]
+                return sequence[index_value]
             raise exc.InvalidSequenceSubscription(node.slice)
         # Check StackTensorType before DictType since StackTensorType inherits from DictType
         if isinstance(type_info, StackTensorType):
@@ -2879,8 +3732,10 @@ class WalkDeviceAST(NodeVisitor):
         if isinstance(type_info, DictType):
             key_value = self.visit(node.slice)
             if isinstance(key_value, (str, int)):
+                mapping = self.visit(value)
+                self.expression_origins[node] = self._index_origin(value, key_value)
                 # pyrefly: ignore [bad-index]
-                return self.visit(value)[key_value]
+                return mapping[key_value]
             raise exc.TypeInferenceError(
                 f"Dict subscript must be a literal str or int, got {type(key_value).__name__}"
             )
@@ -2891,38 +3746,157 @@ class WalkDeviceAST(NodeVisitor):
         return hl.subscript(self.visit(value), self._subscript_slice_proxy(node.slice))
 
     def visit_Call(self, node: ast.Call) -> object:
-        args = []
-        kwargs = {}
-        for arg in node.args:
-            if isinstance(arg, ast.Starred):
-                # pyrefly: ignore [bad-argument-type]
-                args.extend(self.visit(arg.value))
-            else:
-                args.append(self.visit(arg))
-        for kwarg in node.keywords:
-            if kwarg.arg is None:
-                # pyrefly: ignore [no-matching-overload]
-                kwargs.update(self.visit(kwarg.value))
-            else:
-                kwargs[kwarg.arg] = self.visit(kwarg.value)
-
+        assert isinstance(node, ExtendedAST)
         # pyrefly: ignore [missing-attribute]
         func_type_info = node.func._type_info
+        if (
+            isinstance(func_type_info, CallableType)
+            and any(func_type_info.value is builtin for builtin in (len, bool))
+            and len(node.args) == 1
+            and not node.keywords
+            and (length := self._host_collection_length(node.args[0])) is not None
+        ):
+            return length if func_type_info.value is len else length != 0
+        builtin_fragment_constructor = isinstance(func_type_info, CallableType) and any(
+            func_type_info.value is cls for cls in _BUILTIN_TUNABLE_FRAGMENTS
+        )
+        if (
+            isinstance(node._type_info, ConfigFragmentType)
+            and builtin_fragment_constructor
+        ):
+            # Type propagation already constructed and validated this metadata,
+            # including recovery of recorded global literals. Custom constructors
+            # and helpers must still evaluate each iteration's actual values.
+            return node._type_info.as_literal()
+        args = []
+        arg_origins = []
+        kwargs = {}
+        kwarg_origins = {}
+        for arg in node.args:
+            if isinstance(arg, ast.Starred):
+                start = len(args)
+                # pyrefly: ignore [bad-argument-type]
+                args.extend(self.visit(arg.value))
+                arg_origins.extend(
+                    self._index_origin(arg.value, index)
+                    for index in range(len(args) - start)
+                )
+            else:
+                args.append(self.visit(arg))
+                arg_origins.append(self._value_origin(arg))
+        for kwarg in node.keywords:
+            if kwarg.arg is None:
+                mapping = self.visit(kwarg.value)
+                assert isinstance(mapping, dict)
+                kwargs.update(mapping)
+                kwarg_origins.update(
+                    (key, self._index_origin(kwarg.value, key)) for key in mapping
+                )
+            else:
+                kwargs[kwarg.arg] = self.visit(kwarg.value)
+                kwarg_origins[kwarg.arg] = self._value_origin(kwarg.value)
+
         if isinstance(func_type_info, NestedFunctionType):
-            return self._call_nested_function(func_type_info, args, kwargs)
+            return self._call_nested_function(
+                func_type_info, args, kwargs, arg_origins, node
+            )
+        # pyrefly: ignore [missing-attribute]
+        result_type_info = node._type_info
+        if (
+            isinstance(func_type_info, CallableType)
+            and func_type_info.value in CallableType._new_symint_on_host_fns()
+            and isinstance(result_type_info, SymIntType)
+            and _symint_expr(result_type_info.value)
+            in CompileEnvironment.current().config_value_expressions
+        ):
+            # A host helper over config values (``next_power_of_2(foo)``):
+            # the type pass recorded its value as an expression of the
+            # config, which running the helper again here would replace
+            # with the tunables' hints.
+            return result_type_info.value
         if isinstance(func_type_info, CallableType) and (
             replacement := get_device_func_replacement(func_type_info.value)
         ):
             func = replacement
+            opaque_call = False
         else:
             func = self.visit(node.func)
+            # Tensor methods have dedicated type propagation and operate on
+            # tracing proxies; they do not inspect opaque fragment state.
+            opaque_call = (
+                not builtin_fragment_constructor
+                and not isinstance(func_type_info, TensorAttributeType)
+                and not is_api_func(func)
+            )
+        if (
+            isinstance(func_type_info, TensorAttributeType)
+            and func_type_info.attr() == "stride"
+            and not CompileEnvironment.current().settings.static_shapes
+        ):
+            tensor = cast("torch.Tensor", cast("BuiltinMethodType", func).__self__)
+            origin = HostFunction.current().tensor_to_origin.get(tensor)
+            source = CompileEnvironment.current().tensor_stride_input_source(tensor)
+            if origin is not None and origin.is_host():
+                # Re-evaluate the actual receiver and dimension. The raw fake
+                # stride can be a size expression or lack a host symbol origin.
+                func = functools.partial(_host_tensor_stride, tensor, origin, source)
+
         # pyrefly: ignore [bad-argument-type]
-        return _CheckForIndexCalls.retry_call(func, args, kwargs)
+        result = _CheckForIndexCalls.retry_call(func, args, kwargs)
+        if (
+            func is tuple
+            and len(args) == 1
+            and not kwargs
+            and type(result) is tuple
+            and result is args[0]
+        ):
+            self.expression_origins[node] = arg_origins[0]
+        if opaque_call:
+            if not any(func is fn for fn in (tuple, list, dict)):
+                record_opaque_container_result(result)
+            callee_origin = self._value_origin(node.func)
+            if isinstance(callee_origin, Origin):
+                guard_fragment_call_input(callee_origin)
+            for arg, origin in zip(args, arg_origins, strict=True):
+                self._guard_fragment_call_inputs(arg, origin)
+            for key, arg in kwargs.items():
+                self._guard_fragment_call_inputs(arg, kwarg_origins[key])
+        return result
+
+    def _guard_fragment_call_inputs(self, value: object, origin: _StaticOrigin) -> None:
+        if isinstance(
+            value, (ConfigSpecFragment, types.FunctionType, types.MethodType)
+        ):
+            if isinstance(origin, Origin):
+                guard_fragment_call_input(origin)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                self._guard_fragment_call_inputs(item, _item_origin(origin, index))
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                self._guard_fragment_call_inputs(item, _item_origin(origin, key))
 
     def visit_Attribute(self, node: ast.Attribute) -> object:
         value = self.visit(node.value)
         # Apply the replacement here so saved bound methods use it too.
         assert isinstance(node, ExtendedAST)
+        assert isinstance(node.value, ExtendedAST)
+        if isinstance(node.value._type_info, ClassType):
+            origin = self._value_origin(node.value)
+            if isinstance(origin, _SequenceOrigin):
+                # Constructed field values retain their individual input paths.
+                index = list(node.value._type_info.element_types).index(node.attr)
+                field_origin = _item_origin(origin, index)
+            else:
+                field_origin = (
+                    AttributeOrigin(origin, node.attr)
+                    if isinstance(origin, Origin)
+                    else None
+                )
+            self.expression_origins[node] = field_origin
+            if isinstance(value, dict):
+                # ClassType models dataclass/namedtuple fields as a mapping.
+                return value[node.attr]
         if (
             isinstance(node._type_info, TensorAttributeType)
             and node.attr in _TENSOR_METHOD_REPLACEMENTS
@@ -2943,6 +3917,8 @@ class WalkDeviceAST(NodeVisitor):
         func: NestedFunctionType,
         args: list[object],
         kwargs: dict[str, object],
+        arg_origins: list[_StaticOrigin],
+        call_node: ast.Call,
     ) -> object:
         func_node = func.func_node
         params = func_node.args
@@ -2953,15 +3929,22 @@ class WalkDeviceAST(NodeVisitor):
             )
         func.find_effective_return()
         old_scope = self.scope.copy()
-        for param, arg_val in zip(params.args, args, strict=True):
+        old_origins = self.scope_origins.copy()
+        for param, arg_val, origin in zip(params.args, args, arg_origins, strict=True):
             self.scope[param.arg] = arg_val
+            self.scope_origins[param.arg] = origin
         try:
             for stmt in func_node.body:
                 if isinstance(stmt, ast.Return):
-                    return self.visit(stmt.value) if stmt.value is not None else None
+                    if stmt.value is None:
+                        return None
+                    value = self.visit(stmt.value)
+                    self.expression_origins[call_node] = self._value_origin(stmt.value)
+                    return value
                 self.visit(stmt)
         finally:
             self.scope = old_scope
+            self.scope_origins = old_origins
         return None
 
     def visit_Expr(self, node: ast.Expr) -> object:
@@ -2971,40 +3954,42 @@ class WalkDeviceAST(NodeVisitor):
         return node.value
 
 
-class LiftTensorArgs:
+class LiftGraphArgs:
     values: dict[str, object]
     flat_values: list[object]
     spec: pytree.TreeSpec
-    tensor_indices: list[int]
+    graph_indices: list[int]
 
     def __init__(self, values: dict[str, object]) -> None:
         self.values = values
         self.flat_values, self.spec = pytree.tree_flatten(values)
-        self.tensor_indices = [
+        # Host float expressions crossing a device branch need scalar SSA
+        # inputs/outputs, even though they do not have tensor metadata.
+        self.graph_indices = [
             i
             for i, v in enumerate(self.flat_values)
-            if isinstance(v, torch.Tensor) and not isinstance(v, Tile)
+            if isinstance(v, (torch.Tensor, torch.SymFloat)) and not isinstance(v, Tile)
         ]
 
     def unflatten(self) -> dict[str, object]:
         return pytree.tree_unflatten(self.flat_values, self.spec)
 
-    def replace_tensor_args(
+    def replace_graph_args(
         self, args: Sequence[object], *, copy_tensors: bool = True
     ) -> dict[str, object]:
         flat_values = [*self.flat_values]
-        assert len(self.tensor_indices) == len(args)
-        for i, v in zip(self.tensor_indices, args, strict=False):
+        assert len(self.graph_indices) == len(args)
+        for i, v in zip(self.graph_indices, args, strict=False):
             flat_values[i] = _new_var(v) if copy_tensors else v
         return pytree.tree_unflatten(flat_values, self.spec)
 
-    def get_tensor_args(self) -> list[object]:
-        return [self.flat_values[i] for i in self.tensor_indices]
+    def get_graph_args(self) -> list[object]:
+        return [self.flat_values[i] for i in self.graph_indices]
 
     def get_node_args(
         self, tracer: proxy_tensor.PythonKeyTracer
     ) -> list[torch.fx.Node]:
-        proxy_args = args_to_proxies(tracer, self.get_tensor_args())[0]
+        proxy_args = args_to_proxies(tracer, self.get_graph_args())[0]
         result = []
         for proxy in proxy_args:
             assert isinstance(proxy, torch.fx.Proxy)
@@ -3035,6 +4020,12 @@ def _root_loop_has_canonical_task_origin(
 ) -> bool:
     """Return whether local PIDs map to zero-based, unit-stride coordinates."""
     if not isinstance(iter_expr, ast.Call) or not iter_expr.args:
+        return False
+    if any(isinstance(arg, ast.Starred) for arg in iter_expr.args) or any(
+        keyword.arg is None for keyword in iter_expr.keywords
+    ):
+        # ``hl.tile(*ranges)`` or ``hl.grid(n, **options)``: the begin and
+        # the step are not spelled out.
         return False
     if len(iter_expr.args) == 1 or (
         len(iter_expr.args) >= 2
@@ -3173,15 +4164,17 @@ def _indexing_uses_tensor_descriptor(
 
 
 def _count_device_atomics(device_ir: DeviceIR) -> int:
-    """Count the number of atomic operations in device code for autotuning."""
-    from ..language import atomic_ops
+    """The ``atomic_indexing`` slots code generation numbers: one per atomic,
+    and one more each time a backend that slots each lowering lowers a
+    ``while`` condition's atomic again (``memory_op_slots``)."""
+    from ..language.atomic_ops import ATOMIC_OPS
 
-    atomic_count = 0
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op == "call_function" and node.target in vars(atomic_ops).values():
-                atomic_count += 1
-    return atomic_count
+    return sum(
+        node.target in ATOMIC_OPS
+        for _graph_id, node, _slot in memory_op_slots(
+            device_ir.graphs, device_ir.root_ids
+        )
+    )
 
 
 def _register_load_store_tunables(
@@ -3211,20 +4204,15 @@ def _register_load_store_tunables(
     from ..autotuner.config_spec import get_valid_eviction_policies
     from ..autotuner.config_spec import get_valid_load_cache_modifiers
     from ..autotuner.config_spec import get_valid_store_cache_modifiers
-    from .cute.cutedsl_compat import readonly_packet_load_supported
 
     # Register eviction policies only for loads without explicit eviction_policy
     if loads_without_eviction_policy > 0:
-        choices = get_valid_eviction_policies(env.backend_name)
-        search_choices = None
-        if "nc_l2_first" in choices and not readonly_packet_load_supported(
-            env.config_spec.target_device_capability, torch.version.cuda
-        ):
-            # Read-only packets lower to the ordinary load on this target, so
-            # searching them would only repeat "".  Explicit configs stay valid.
-            search_choices = tuple(
-                choice for choice in choices if choice != "nc_l2_first"
+        choices = get_valid_eviction_policies(env.backend)
+        search_choices = (
+            env.backend.config_spec_extension().eviction_policy_search_choices(
+                env.config_spec, choices
             )
+        )
         env.config_spec.load_eviction_policies = ListOf(
             EnumFragment(choices=choices, search_choices=search_choices),
             length=loads_without_eviction_policy,
@@ -3276,14 +4264,11 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
     env = CompileEnvironment.current()
 
     from .._compat import supports_tensor_descriptor
-    from ..language import atomic_ops
     from ..language import memory_ops
     from .indexing_strategy import _contiguous_integer_tensor_index
 
     if not supports_tensor_descriptor():
         return
-
-    atomic_targets = tuple(getattr(atomic_ops, name) for name in atomic_ops.__all__)
 
     def tensor_arg_value(arg: object) -> object:
         if isinstance(arg, torch.fx.Node):
@@ -3305,72 +4290,25 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 return True
         return False
 
-    memory_op_index = 0
-    atomic_op_index = 0
-    for graph_info in device_ir.graphs:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function":
-                continue
-            if node.target in (memory_ops.load, memory_ops.store):
-                tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor,
-                        memory_op_index=memory_op_index,
-                        has_derived_block_extent=has_derived_block_extent(node),
-                    )
-                memory_op_index += 1
-                continue
-            if node.target in atomic_targets:
-                tensor = tensor_arg_value(node.args[0])
-                if isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5:
-                    env.register_tensor_descriptor_layout_guard(
-                        tensor,
-                        atomic_op_index=atomic_op_index,
-                        has_derived_block_extent=has_derived_block_extent(node),
-                    )
-                atomic_op_index += 1
-
-
-def _register_cute_lane_vector_width_specs(config_spec: ConfigSpec) -> None:
-    """Pre-register CuTe vector-width slots for every lane-loop-eligible block.
-
-    On the CuTe backend a tile block whose configured ``block_size`` exceeds
-    its ``num_threads`` is traversed by a synthetic lane loop, and the tile
-    strategy lazily registers a ``cute_vector_widths`` slot for it during
-    codegen. That lazy append happens *per config* and is config dependent
-    (whether a lane loop appears depends on the config's block sizes and
-    num_threads), so the shared ``config_spec`` would grow after
-    ``ConfigGeneration`` has already captured its ``flat_spec`` — leaving the
-    flat layout stale and causing ``unflatten`` to over-walk the spec.
-
-    Registering the slots once here (config independently) keeps the lazy
-    append idempotent: any block that *could* be lane-looped under some config
-    already owns its slot, so the per-config append is a no-op and the spec
-    stays a fixed size for the lifetime of autotuning. Blocks that never end up
-    lane-looped simply keep ``V=1`` (the slot's default), which the tile
-    strategy ignores.
-    """
-    from ..autotuner.config_spec import CuteLaneLayoutSpec
-    from ..autotuner.config_spec import CuteVectorWidthSpec
-
-    num_thread_block_ids = set(config_spec.num_threads.valid_block_ids())
-    existing = set(config_spec.cute_vector_widths.valid_block_ids())
-    existing_layouts = set(config_spec.cute_lane_layouts.valid_block_ids())
-    for spec in config_spec.block_sizes:
-        block_id = spec.block_id
-        # ``max_size`` bounds the largest block_size the autotuner may pick;
-        # only blocks that can exceed a single thread can ever be lane-looped.
-        if block_id not in num_thread_block_ids or spec.max_size <= 1:
+    # The slots of the configs that roll no reduction; one that rolls can
+    # reorder them (``BoundKernel`` maps them through
+    # ``DeviceIR.config_memory_op_fact_pairs``).
+    for _graph_id, node, slot in memory_op_slots(device_ir.graphs, device_ir.root_ids):
+        tensor = tensor_arg_value(node.args[0])
+        if not (isinstance(tensor, torch.Tensor) and 2 <= tensor.ndim <= 5):
             continue
-        if block_id not in existing:
-            config_spec.cute_vector_widths.append(
-                CuteVectorWidthSpec(block_id=block_id, size_hint=spec.size_hint)
+        if node.target in (memory_ops.load, memory_ops.store):
+            env.register_tensor_descriptor_layout_guard(
+                tensor,
+                memory_op_index=slot,
+                has_derived_block_extent=has_derived_block_extent(node),
             )
-            existing.add(block_id)
-        if block_id not in existing_layouts:
-            config_spec.cute_lane_layouts.append(CuteLaneLayoutSpec(block_id=block_id))
-            existing_layouts.add(block_id)
+        else:
+            env.register_tensor_descriptor_layout_guard(
+                tensor,
+                atomic_op_index=slot,
+                has_derived_block_extent=has_derived_block_extent(node),
+            )
 
 
 def _root_phases(phases: list[KernelPhase], root_count: int) -> tuple[int, ...]:
@@ -3430,15 +4368,46 @@ def _install_dependency_phases(
             graph_info.phase_index = phase_index
 
 
+def fast_math_sensitive_ops(device_ir: DeviceIR, backend: Backend) -> list[str]:
+    """Names of the floating-point operations in ``device_ir`` that the
+    ``fast_math`` setting would lower to approximate forms on ``backend``,
+    sorted (``Backend.fast_math_name``)."""
+    names: set[str] = set()
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            val = node.meta.get("val")
+            if not (isinstance(val, torch.Tensor) and val.dtype.is_floating_point):
+                continue
+            name = backend.fast_math_name(node)
+            if name is not None:
+                names.add(name)
+    return sorted(names)
+
+
+def warn_fast_math_unused(device_ir: DeviceIR) -> None:
+    """Warn once per kernel when ``fast_math`` is off and the kernel has
+    operations the setting would speed up (``exc.FastMathUnused``)."""
+    env = CompileEnvironment.current()
+    if env.settings.fast_math or not env.backend.warns_fast_math_unused:
+        return
+    ops = fast_math_sensitive_ops(device_ir, env.backend)
+    if ops:
+        warning(exc.FastMathUnused(", ".join(ops)))
+
+
 def lower_to_device_ir(func: HostFunction) -> DeviceIR:
     device_ir = DeviceIR()
     device_ir.host_function = func
     with func, device_ir, compile_lock:
+        CompileEnvironment.current().renew_pinned_subscript_extents()
         visitor = WalkHostAST(device_ir)
         for stmt in func.body:
             visitor.visit(stmt)
         visitor.flush_phases()
         device_ir.phases = visitor.phases
+        device_ir.root_nodes = visitor.root_nodes
         source_root_phases = _root_phases(device_ir.phases, len(device_ir.root_ids))
         source_phase_starts = frozenset(
             phase.roots[0] for phase in device_ir.phases[1:]
@@ -3454,437 +4423,98 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
-        if CompileEnvironment.current().settings.cute_rng_stream in ("auto", "philox4"):
-            from .cute.philox_stream import rewrite_random_stream
-
-            for graph in device_ir.graphs:
-                rewrite_random_stream(graph.graph)
+        # Resolve source-level sizes before RNG lowering introduces internal
+        # size queries that identify physical tile coordinates.
+        extents = restate_reduction_extents()
+        for graph in device_ir.graphs:
+            resolve_reduction_sizes(graph.graph, extents)
+        merged_rdims = merge_reduction_dims(device_ir.graphs)
+        backend = CompileEnvironment.current().backend
+        backend.rewrite_device_ir(DeviceIRStage.BEFORE_RANDOM_OPS, func, device_ir)
         for graph in device_ir.graphs:
             rewrite_implicit_random_ops(graph.graph)
-        scaled_contractions = 0
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.canonicalize_reductions import canonicalize_reductions
-            from .cute.fold_noop_stores import fold_noop_stores
-            from .cute.fuse_mm_accumulation import fuse_mm_accumulation
-            from .cute.fuse_u32_multiply import fuse_u32_multiply
-            from .cute.mxfp8_mma import expose_mxfp8
-            from .cute.scaled_contraction import expose_scaled_contractions
-
-            canonicalize_reductions(device_ir)
-            scaled_contractions = expose_scaled_contractions(device_ir)
-            for graph_info in device_ir.graphs:
-                fold_noop_stores(graph_info.graph)
-                fuse_mm_accumulation(graph_info)
-                fuse_u32_multiply(graph_info.graph)
-            expose_mxfp8(device_ir)
-        if (
-            CompileEnvironment.current().backend.name == "cute"
-            and CompileEnvironment.current().settings.fast_math
-        ):
-            from .cute.factor_affine_reductions import factor_affine_reductions
-
-            for graph_info in device_ir.graphs:
-                factor_affine_reductions(graph_info.graph, fast_math=True)
-        if CompileEnvironment.current().backend.name == "cute":
-            promotions = collect_cute_half_atomic_output_promotions(device_ir.graphs)
-            if promotions:
-                env = CompileEnvironment.current()
-                host_fn = HostFunction.current()
-                env.cute_half_atomic_output_promotions = promotions
-                rewrite_cute_half_atomic_output_allocations(host_fn, promotions)
-                promote_cute_root_graph_host_tensors(device_ir.graphs, promotions)
+        warn_fast_math_unused(device_ir)
+        backend.rewrite_device_ir(DeviceIRStage.BEFORE_GRAPH_LOWERINGS, func, device_ir)
         for graph in device_ir.graphs:
             prepare_graph_lowerings(graph.graph)
-        if scaled_contractions:
-            from .cute.active_blocks import active_block_ids
+        backend.rewrite_device_ir(DeviceIRStage.AFTER_GRAPH_LOWERINGS, func, device_ir)
+        pin_unflattened_loops(device_ir)
+        is_pallas = CompileEnvironment.current().backend.name == "pallas"
+        if is_pallas:
+            from .pallas.canonicalize_jagged_bounds import canonicalize_jagged_bounds
 
-            device_ir.codegen_active_block_ids = active_block_ids(
-                device_ir.graphs,
-                (block_id for ids in device_ir.grid_block_ids for block_id in ids),
-                CompileEnvironment.current(),
-            )
-        defer_load_masks = CompileEnvironment.current().backend.name == "pallas"
+            canonicalize_jagged_bounds(device_ir.graphs)
         for graph in device_ir.graphs:
             validate_host_tensor_usage(graph.graph)
             add_tile_with_offset_metadata(graph)
             remove_unnecessary_tile_index(graph.graph)
-            if defer_load_masks:
+            if is_pallas:
                 defer_pallas_load_masks(graph.graph)
             remove_unnecessary_masking(graph.graph)
+        mask_loop_carries(device_ir.graphs)
 
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.dot_scaled_scales import expose_dot_scaled_scales
-            from .cute.promote_output_axis import promote_partitioned_output_axis
+        warp_specialize_specs = (
+            CompileEnvironment.current().config_spec.range_warp_specialize
+        )
+        if warp_specialize_specs:
+            from .loop_dependency_checker import intra_loop_raw_reread_block_ids
 
-            # After validate_host_tensor_usage: the rewired scale is a host tensor.
-            if any(
-                [expose_dot_scaled_scales(graph.graph) for graph in device_ir.graphs]
-            ):
-                from .cute.active_blocks import active_block_ids
+            # A loop that stores and then re-reads the same storage cannot be
+            # warp-specialized (see intra_loop_raw_reread_block_ids); its
+            # slot stays in the config space pinned to None.
+            reread_block_ids = intra_loop_raw_reread_block_ids(
+                device_ir.graphs,
+                device_ir.root_ids,
+                device_ir.grid_block_ids,
+                atomics=backend.intra_loop_barriers_order_atomics,
+            )
+            for spec in warp_specialize_specs:
+                if reread_block_ids.intersection(spec.block_ids):
+                    spec.pinned = True
 
-                device_ir.codegen_active_block_ids = active_block_ids(
-                    device_ir.graphs,
-                    (block_id for ids in device_ir.grid_block_ids for block_id in ids),
-                    CompileEnvironment.current(),
-                )
-            promote_partitioned_output_axis(func, device_ir, visitor.root_nodes)
-
-            if CompileEnvironment.current().cute_fission_plan is not None:
-                from .cute.materialized_fission import forward_materialized_self_loads
-                from .cute.scalar_recipe_rounding import FP32_MULTIPLY_ROUNDING_META_KEY
-
-                forward_materialized_self_loads(func, device_ir)
-                env = CompileEnvironment.current()
-                plan = env.cute_fission_plan
-                assert plan is not None
-                env.config_spec.cute_pointwise_region_block_ids = frozenset(
-                    block_id
-                    for index in plan.pointwise_region_indices
-                    for block_id in device_ir.grid_block_ids[index]
-                )
-                # The fission proof gives these roots separate launches. An
-                # axis reused by another root must retain the shared search
-                # floor, even if one of its owners is pointwise.
-                env.config_spec.cute_pointwise_region_grid_groups = tuple(
-                    tuple(device_ir.grid_block_ids[index])
-                    for index in plan.pointwise_region_indices
-                    if all(
-                        sum(block_id in grid for grid in device_ir.grid_block_ids) == 1
-                        for block_id in device_ir.grid_block_ids[index]
-                    )
-                )
-                for index in plan.pointwise_region_indices:
-                    graph = device_ir.graphs[device_ir.root_ids[index]].graph
-                    for node in graph.nodes:
-                        node.meta[FP32_MULTIPLY_ROUNDING_META_KEY] = True
-
-            env = CompileEnvironment.current()
-            if env.has_barrier and "flat" in env.config_spec.allowed_pid_types:
-                from ..language.barrier import BARRIER_PID_TYPE_REASON
-                from .cute.ordered_phases import ordered_phases_supported
-
-                spec = env.config_spec
-                if len(device_ir.phases) > 1 and ordered_phases_supported(
-                    func, device_ir
-                ):
-                    # The single persistent launch shares one thread block
-                    # across phases (and cannot host the tcgen05 pipeline).
-                    # Ordered per-phase launches tune each phase alone; the
-                    # persistent launch stays the default.
-                    spec.allowed_pid_types = (
-                        *(p for p in spec.allowed_pid_types if p != "flat"),
-                        "flat",
-                    )
-                else:
-                    spec.disallow_pid_type("flat", reason=BARRIER_PID_TYPE_REASON)
+        backend.rewrite_device_ir(
+            DeviceIRStage.AFTER_WARP_SPECIALIZE_PINNING, func, device_ir
+        )
 
         # TODO(hinriksnaer): extract into a separate step? everything below
         # is post-processing computed from the completed DeviceIR.
         from .epilogue_subtiling import has_epilogue_subtiling_candidate
 
-        has_epilogue_subtile_candidate = False
-        for graph_info in device_ir.graphs:
-            if has_epilogue_subtiling_candidate(graph_info.graph):
-                has_epilogue_subtile_candidate = True
-                break
+        has_epilogue_subtile_candidate = has_epilogue_subtiling_candidate(
+            graph_info.graph for graph_info in device_ir.graphs
+        )
         config_spec = CompileEnvironment.current().config_spec
         config_spec.epilogue_subtile_candidate_enabled = has_epilogue_subtile_candidate
         config_spec.epilogue_subtile_k_hint = 0
         config_spec.epilogue_subtile_autotune_choices = None
-
+        backend.rewrite_device_ir(
+            DeviceIRStage.AFTER_EPILOGUE_SUBTILE_DETECTION, func, device_ir
+        )
         # Phase 1: roll + register the reduction_loops spec. The ReductionKernelFact is built
         # in Phase 3 (after analysis derives memory_op_facts) so it can read the enriched
         # load/store facts.
+        retirable_rdims = merged_rdims | device_ir.retirable_reduction_block_ids
+        if retirable_rdims:
+            # Merged dims can leave their per-dim rdims unused, and so can a
+            # rewrite that removed the reductions over a dim.  Stop treating
+            # them as reductions, or they would gain unused tuning slots and
+            # rolling analysis. CuTe would also claim a thread axis for each.
+            # Only rdims nothing uses are demoted: a later slice of the same
+            # extent would come from a subscript that kept the rdim in use.
+            from .active_blocks import unused_block_ids
+
+            unused_rdims = unused_block_ids(
+                device_ir.graphs,
+                retirable_rdims,
+                used_block_ids=device_ir.codegen_active_block_ids,
+            )
+            for block_id in unused_rdims:
+                block = CompileEnvironment.current().block_sizes[block_id]
+                block.retire_reduction()
         device_ir.register_rollable_reductions()
-        if CompileEnvironment.current().backend.name == "cute":
-            _register_cute_lane_vector_width_specs(config_spec)
-            from .cute.signed_bitfield import has_signed_byte_field
-
-            config_spec.cute_signed_bitfield_bf16_available = (
-                config_spec.target_device_capability == (10, 0)
-                and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)
-            )
-            # Enable the flash-attention autotune surface when
-            # the dense flash dataflow is detected, analogous to how a matmul
-            # detection sets ``cute_tcgen05_search_enabled``. Default-off
-            # otherwise so the flash knobs never widen the search surface for
-            # ordinary cute kernels.
-            from .backend import detect_flash_search_surface
-            from .cute.cute_flash_bwd import detect_flash_bwd_search_surface
-            from .cute.cute_flash_gated import detect_flash_gated_search_surface
-
-            detect_flash_bwd_search_surface(device_ir)
-            flash_shape = detect_flash_search_surface(device_ir)
-            gated_surface = (
-                None
-                if flash_shape is not None
-                else detect_flash_gated_search_surface(device_ir)
-            )
-            if flash_shape is not None:
-                from ..language.matmul_ops import _cuda_num_sms_or_zero
-
-                config_spec.enable_cute_flash_search(
-                    head_dim=flash_shape.head_dim,
-                    head_dim_v=flash_shape.head_dim_v,
-                    num_kv=flash_shape.num_kv,
-                    num_bh=flash_shape.num_bh,
-                    tensor_4d_heads=flash_shape.tensor_4d_heads,
-                    dtype=flash_shape.io_dtype,
-                    block_size_targets=flash_shape.block_size_targets,
-                    is_causal=flash_shape.is_causal,
-                    has_kv_tile_pruning=flash_shape.has_kv_tile_pruning,
-                    requires_ws_overlap=flash_shape.requires_ws_overlap,
-                    small_biased_candidate=flash_shape.small_biased_candidate,
-                    standard_dense_output=flash_shape.standard_dense_output,
-                    standard_causal_output=flash_shape.standard_causal_output,
-                    tmem_rowmax_compatible=flash_shape.tmem_rowmax_compatible,
-                    causal_resident_compatible=flash_shape.causal_resident_compatible,
-                    output_requires_tma=flash_shape.output_requires_tma,
-                    supports_tensor_4d_tma=flash_shape.supports_tensor_4d_tma,
-                    has_row_epilogue=flash_shape.has_row_epilogue,
-                    plain_row_body=flash_shape.plain_row_body,
-                    has_score_modifiers=flash_shape.has_score_modifiers,
-                    score_modifier_kinds=flash_shape.score_modifier_kinds,
-                    device_sm_count=_cuda_num_sms_or_zero(
-                        CompileEnvironment.current().device
-                    ),
-                    kv_group=flash_shape.kv_group,
-                    fast_math=CompileEnvironment.current().settings.fast_math,
-                    has_list_walk=flash_shape.has_list_walk,
-                    flex_has_score_region=flash_shape.flex_has_score_region,
-                    flex_has_mask_region=flash_shape.flex_has_mask_region,
-                    flex_trivial_walk=flash_shape.flex_trivial_walk,
-                    q_seq=flash_shape.q_seq,
-                    kv_seq=flash_shape.kv_seq,
-                    flex_aux_smem_candidates=flash_shape.flex_aux_smem_candidates,
-                    flex_prefetch_regs=flash_shape.flex_prefetch_regs,
-                    flex_coalesce_steps=flash_shape.flex_coalesce_steps,
-                    flex_hook_ops=flash_shape.flex_hook_ops,
-                )
-            elif gated_surface is not None:
-                # The fused gated body owns the whole root; tcgen05 matmul
-                # planning would add search fields that hide the gated knob.
-                config_spec.enable_cute_flash_gated_search(
-                    block_size_targets=gated_surface.block_size_targets,
-                    kv_block_id=gated_surface.kv_block_id,
-                    q_block_id=gated_surface.q_block_id,
-                    q_tile_choices=gated_surface.q_tile_choices,
-                    kv_tile_choices=gated_surface.kv_tile_choices,
-                    kv_stage_choices=gated_surface.kv_stage_choices,
-                    kv_stage_default=gated_surface.kv_stage_default,
-                    gate_warpgroup_choices=gated_surface.gate_warpgroup_choices,
-                    gate_warpgroup_default=gated_surface.gate_warpgroup_default,
-                    kv_stage_choices_by_tile=dict(
-                        gated_surface.kv_stage_choices_by_tile
-                    ),
-                )
-            else:
-                from ..language.matmul_ops import _plan_cute_tcgen05_search_candidate
-                from ..language.matmul_ops import enable_cute_tcgen05_search
-                from .cute.cute_mma import _rank3_grouped_root_axes
-                from .cute.cute_mma import analyze_cute_mma_node
-                from .cute.cute_mma import (
-                    tcgen05_fragment_epilogue_source_tiles_reachable,
-                )
-
-                # The same structural analyzer gates tcgen05 search and codegen
-                # for every matrix rank. This prevents transformed loads from
-                # receiving a tcgen05-only search space that codegen later rejects.
-                root_grid_block_ids = {
-                    tuple(block_ids) for block_ids in device_ir.grid_block_ids
-                }
-                mma_candidates = []
-                for graph_info in device_ir.graphs:
-                    for node in graph_info.graph.nodes:
-                        candidate = analyze_cute_mma_node(node, device_ir=device_ir)
-                        if candidate is None or candidate.requires_accumulator_seed:
-                            continue
-                        if (
-                            candidate.operands.output_block_ids
-                            not in root_grid_block_ids
-                        ):
-                            if not candidate.operands.rhs.rhs_is_grouped:
-                                continue
-                            env = CompileEnvironment.current()
-                            grouped_axes = _rank3_grouped_root_axes(
-                                env,
-                                device_ir,
-                                m_block_id=candidate.operands.m_block_id,
-                                n_block_id=candidate.operands.n_block_id,
-                                k_block_id=candidate.operands.k_block_id,
-                            )
-                            leading_block_id = (
-                                candidate.operands.leading_passthrough_block_id
-                            )
-                            if (
-                                grouped_axes is None
-                                or grouped_axes.segment_block_id is None
-                                or leading_block_id is None
-                                or env.canonical_block_id(grouped_axes.segment_block_id)
-                                != env.canonical_block_id(leading_block_id)
-                            ):
-                                continue
-                        lhs = candidate.lhs.meta.get("val")
-                        rhs = candidate.rhs.meta.get("val")
-                        if not (
-                            isinstance(lhs, torch.Tensor)
-                            and isinstance(rhs, torch.Tensor)
-                        ):
-                            continue
-                        # Operand analysis may prove an FP32 upcast lossless.
-                        # Search must use the same source dtype as MMA codegen;
-                        # these are fake values, not changes to the FX inputs.
-                        lhs = lhs.to(dtype=candidate.operands.lhs.source_fake.dtype)
-                        rhs = rhs.to(dtype=candidate.operands.rhs.source_fake.dtype)
-                        mma_candidates.append((candidate, lhs, rhs, node))
-                supports_small_n_role_local_tma = bool(mma_candidates) and all(
-                    candidate.supports_small_n_role_local_tma
-                    for candidate, _lhs, _rhs, _node in mma_candidates
-                )
-                supports_small_n_scalar_fallback = bool(mma_candidates) and all(
-                    candidate.supports_small_n_scalar_fallback
-                    for candidate, _lhs, _rhs, _node in mma_candidates
-                )
-                search_candidates = []
-                planning_results = []
-                for candidate, lhs, rhs, _node in mma_candidates:
-                    planning_result = _plan_cute_tcgen05_search_candidate(
-                        lhs,
-                        rhs,
-                        has_leading_passthrough=(
-                            candidate.operands.has_leading_passthrough
-                        ),
-                        supports_small_n_role_local_tma=(
-                            supports_small_n_role_local_tma
-                        ),
-                        supports_small_n_scalar_fallback=(
-                            supports_small_n_scalar_fallback
-                        ),
-                        allow_dynamic_hints=(
-                            candidate.operands.rhs.rhs_segment_group is not None
-                            or candidate.operands.rhs.rhs_packed_group is not None
-                        ),
-                        lhs_source=candidate.operands.lhs.source_fake,
-                        rhs_source=candidate.operands.rhs.source_fake,
-                        operands_permuted=(
-                            candidate.operands.lhs.source_to_logical_order is not None
-                            or candidate.operands.rhs.source_to_logical_order
-                            is not None
-                        ),
-                    )
-                    planning_results.append(planning_result)
-                    search_plan = planning_result.plan
-                    if (
-                        search_plan is None
-                        or not candidate.supports_tcgen05_search_plan(search_plan)
-                    ):
-                        continue
-                    if not tcgen05_fragment_epilogue_source_tiles_reachable(
-                        candidate, search_plan, config_spec
-                    ):
-                        continue
-                    search_candidates.append((candidate, lhs, search_plan))
-                analysis_keys = {
-                    (
-                        candidate.operands.output_block_ids,
-                        candidate.operands.k_block_id,
-                        candidate.operands.lhs.source_fake.dtype,
-                    )
-                    for candidate, _lhs, _plan in search_candidates
-                }
-                # Every dynamic candidate can change the accepted analysis-key
-                # set on a later binding. Publish all source-backed guards only
-                # after every candidate has observed the same compile state.
-                env = CompileEnvironment.current()
-                if _finalize_cute_tcgen05_search_planning(
-                    env,
-                    planning_results,
-                    analysis_keys,
-                ):
-                    candidate, lhs, search_plan = search_candidates[0]
-                    enable_cute_tcgen05_search(
-                        lhs,
-                        plan=search_plan,
-                        m_block_id=candidate.operands.m_block_id,
-                        n_block_id=candidate.operands.n_block_id,
-                        k_block_id=candidate.operands.k_block_id,
-                        input_dtype=candidate.operands.lhs.source_fake.dtype,
-                        has_leading_passthrough=(
-                            candidate.operands.has_leading_passthrough
-                        ),
-                        explicit_epi_tile_compatible=all(
-                            item.explicit_epi_tile_compatible
-                            for item, _lhs, _plan in search_candidates
-                        ),
-                        leading_block_id=(
-                            candidate.operands.leading_passthrough_block_id
-                        ),
-                        # The register-MMA family replaces the whole device
-                        # body of ONE GEMM (its root tile loop around its K
-                        # loop); kernels with several matmuls keep tcgen05.
-                        warp_mma_plain_kernel=len(mma_candidates) == 1,
-                    )
-                    if len(mma_candidates) == 1 and not (
-                        config_spec.reduction_block_ids
-                        - {candidate.operands.k_block_id}
-                    ):
-                        from .cute.pipeline_smem import analyze_pipeline_smem_facts
-                        from .cute.pipeline_smem import pipeline_region_graphs
-
-                        tcgen05_config = config_spec._cute_tcgen05_config
-                        allocation_graphs = pipeline_region_graphs(
-                            device_ir,
-                            mma_candidates[0][3],
-                            separately_launched=env.cute_fission_plan is not None,
-                        )
-                        smem_facts = (
-                            analyze_pipeline_smem_facts(
-                                candidate,
-                                mma_candidates[0][3],
-                                allocation_graphs,
-                                allow_fp8_broadcasts=(
-                                    len(device_ir.root_ids) == 1
-                                    and env.cute_fission_plan is None
-                                ),
-                                capacity_bytes=(
-                                    tcgen05_config.per_cta_smem_capacity_bytes(
-                                        lhs.device
-                                    )
-                                ),
-                            )
-                            if allocation_graphs is not None
-                            else None
-                        )
-                        if smem_facts is not None:
-                            tcgen05_config.register_pipeline_smem_facts(smem_facts)
-                            from .cute.materialized_pdl import (
-                                prove_materialized_operand_pdl,
-                            )
-
-                            tcgen05_config.materialized_operand_pdl_roots = (
-                                prove_materialized_operand_pdl(
-                                    env, device_ir, candidate
-                                )
-                            )
-                elif env.cute_fission_plan is not None:
-                    from .cute.materialized_mma import enable_materialized_mma_search
-
-                    enable_materialized_mma_search(
-                        env,
-                        device_ir,
-                        planning_results,
-                        search_candidates,
-                        mma_nodes={
-                            id(candidate): node
-                            for candidate, _lhs, _rhs, node in mma_candidates
-                        },
-                    )
-        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
-        if grid_policy.raise_independent_axis_block_size_minimums:
-            config_spec.raise_grid_block_minimums()
-        if (
-            len(device_ir.root_ids) > 1
-            and CompileEnvironment.current().cute_fission_plan is None
+        backend.register_search_surface(device_ir, config_spec)
+        if len(device_ir.root_ids) > 1 and not backend.roots_fissioned(
+            CompileEnvironment.current()
         ):
             # xyz is not supported with shared program IDs. Non-tcgen05
             # persistent kernels are allowed; tcgen05 persistent has a
@@ -3894,30 +4524,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 reason="multiple root loops share program IDs; xyz grids are not "
                 "supported with shared program IDs",
             )
-            if config_spec.cute_tcgen05_search_enabled:
-                # The tcgen05 persistent launch grid is derived from a single
-                # root's PID space today. Keep persistent pid types out of
-                # multi-root autotune until the scheduler/grid spans all cases.
-                non_persistent_pid_types = tuple(
-                    pid_type
-                    for pid_type in config_spec.allowed_pid_types
-                    if pid_type not in ("persistent_blocked", "persistent_interleaved")
-                )
-                if not non_persistent_pid_types:
-                    raise exc.InvalidConfig(
-                        "CuTe tcgen05 multi-root kernels do not support "
-                        "persistent pid types yet, and no non-persistent "
-                        "pid type is available. Disable forced/distributed "
-                        "persistent-only mode or use a single root loop."
-                    )
-                for pid_type in config_spec.allowed_pid_types:
-                    if pid_type not in non_persistent_pid_types:
-                        config_spec.disallowed_pid_type_reasons.setdefault(
-                            pid_type,
-                            "CuTe tcgen05 multi-root kernels do not support "
-                            "persistent pid types yet (single-root launch grid)",
-                        )
-                config_spec.allowed_pid_types = non_persistent_pid_types
+        backend.rewrite_device_ir(
+            DeviceIRStage.AFTER_MULTI_ROOT_PID_RESTRICTION, func, device_ir
+        )
 
         # Build structural and liveness observations once, after reduction rolling has
         # finalized the graph set. Specialized fact passes consume this shared analysis.
@@ -3926,26 +4535,24 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         env = CompileEnvironment.current()
         analysis = DeviceIRAnalysis.build(device_ir, env)
         config_spec.kernel_grid_fact = analysis.kernel_grid_fact
-        if env.backend.name == "cute":
-            from .cute.loop_nesting import boundary_only_grid_blocks
-            from .cute.loop_nesting import tile_loop_paths
-
-            config_spec.cute_tile_loop_paths = tile_loop_paths(
-                device_ir, device_ir.graphs
-            )
-            config_spec.cute_inactive_tile_block_ids = boundary_only_grid_blocks(
-                env, device_ir, device_ir.graphs
-            )
+        # After the grid topology is recorded: the floors budget each root
+        # grid separately, so this must see ``kernel_grid_fact``.
+        grid_policy = config_spec.backend.autotune_grid_policy(config_spec)
+        if grid_policy.raise_independent_axis_block_size_minimums:
+            config_spec.raise_grid_block_minimums()
+        backend.rewrite_device_ir(
+            DeviceIRStage.AFTER_ANALYSIS, func, device_ir, analysis=analysis
+        )
 
         # Collect per-load/store metadata so heuristics can map each Config.indexing
         # slot to its graph op.
-        memory_op_facts = analysis.memory_op_facts(env, func)
+        memory_op_facts = analysis.memory_op_facts(device_ir, env, func)
         tile_accesses = analysis.tile_accesses(device_ir, env, func)
         config_spec.memory_op_facts = memory_op_facts
         from .. import _dist_utils
         from .tile_dependency import build_tile_dependency_graph
 
-        if len(device_ir.task_families) > 1 and env.cute_fission_plan is None:
+        if len(device_ir.task_families) > 1 and not env.backend.roots_fissioned(env):
             # Ranks check that they agree at the first launch, not here.
             group_name = env.process_group_name
             device_ir.tile_dependency_graph = build_tile_dependency_graph(
@@ -3967,7 +4574,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
-            if device_ir.implicit_dependency_starts:
+            if device_ir.implicit_dependency_starts and not (
+                env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
+            ):
                 if env.device.type != "cuda" or not config_spec.supports_config_key(
                     "cross_loop_pipeline"
                 ):
@@ -4010,8 +4619,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 config_spec.enable_cross_loop_pipeline(choices=choices)
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
-            config_spec.pallas_load_buffer_count.length = len(
-                LiftTensorArgs(dict(func.params.arguments)).get_tensor_args()
+            config_spec.pallas_load_buffer_count.length = sum(
+                isinstance(arg, torch.Tensor)
+                for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
             )
         if config_spec.supports_config_key("pallas_indirect_access_mode"):
             from .pallas.tensorcore_plan import indirect_access_modes
@@ -4042,16 +4652,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # so both matmul front ends read one description of the workload (axis roles, knob
         # competition, per-dot placement/work, peak liveness).
         device_ir.build_kernel_matmul_fact(analysis)
-        if env.backend_name == "cute" and (
-            config_spec.kernel_matmul_fact is not None
-            or analysis.writes_input_storage(env)
-        ):
-            from .cute.memory_ops import register_cute_tensor_alias_specializations
-
-            # Vectorized writes to inputs and collective matmuls need the same
-            # guarded disjoint-input facts as reductions. Fresh grid outputs
-            # cannot alias inputs and must not add storage-dependent cache keys.
-            register_cute_tensor_alias_specializations(env)
+        backend.rewrite_device_ir(
+            DeviceIRStage.AFTER_KERNEL_MATMUL_FACT, func, device_ir, analysis=analysis
+        )
         # Phase 4: compose a matmul + reduction-over-output epilogue fact when a matmul AND a
         # register-resident epilogue reduction co-occur (matmul_rms_norm etc.).
         device_ir.build_matmul_reduction_epilogue_facts()
@@ -4059,39 +4662,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         # reduction/matmul/accumulator fact) so the pointwise seed can size a BW-saturating
         # tile instead of the starved block_size=32 default.
         device_ir.build_pointwise_facts(analysis)
-        # Cute-only: re-register flatten_loops choices dropped by the
-        # vector-model partial-access gate now that the kernel is proven
-        # PURE pointwise (see ``update_allow_flattened``).  Flat V-chunks
-        # are the only way to vectorize odd-row-length pointwise kernels.
-        # Only when NO flatten spec survived: appending next to survivors
-        # would scramble the positional ``flatten_loops`` config semantics
-        # for multi-loop kernels.  Sorted by block id == declaration order.
-        # Not for a kernel that may re-bind a tile dim to another block (a
-        # blockwise transpose, a right-aligned lower-rank operand): its
-        # exchange pairs elements within the unflattened per-block tile.  Nor
-        # for a loop whose block size sizes an ``hl.arange``: it counts
-        # positions in a rectangular tile.
-        env = CompileEnvironment.current()
-        spec = env.config_spec
-        if (
-            env.backend_name == "cute"
-            and spec.pointwise_facts
-            and not len(spec.flatten_loops)
-            and spec.cute_reflatten_candidates
-        ):
-            from .cute.cute_reshape import block_size_arange_block_ids
-            from .cute.cute_reshape import kernel_may_rebind_block_ids
-
-            if not kernel_may_rebind_block_ids(device_ir.graphs):
-                arange_block_ids = block_size_arange_block_ids(device_ir.graphs)
-                for fspec in sorted(
-                    spec.cute_reflatten_candidates, key=lambda f: f.block_ids[0]
-                ):
-                    if not any(
-                        env.canonical_block_id(block_id) in arange_block_ids
-                        for block_id in fspec.block_ids
-                    ):
-                        spec.flatten_loops.append(fspec)
+        backend.rewrite_device_ir(
+            DeviceIRStage.AFTER_POINTWISE_FACTS, func, device_ir, analysis=analysis
+        )
 
         return device_ir
 
@@ -4257,200 +4830,3 @@ def remove_unnecessary_tile_index(graph: torch.fx.Graph) -> None:
                 user.args = tuple(new_args)
         if len(node.users) == 0:
             graph.erase_node(node)
-
-
-def collect_cute_half_atomic_output_promotions(
-    graph_infos: list[GraphInfo],
-) -> dict[str, torch.dtype]:
-    from ..language import atomic_add
-    from ..language._tracing_ops import _host_tensor
-    from .cute.atomic_output_promotions import fresh_half_atomic_outputs
-    from .variable_origin import ArgumentOrigin
-
-    promotions: dict[str, torch.dtype] = {}
-    host_fn = HostFunction.current()
-    host_tensor_nodes: dict[str, list[torch.fx.Node]] = {}
-    storage_names: dict[int, set[str]] = {}
-
-    for graph_info in graph_infos:
-        for node in graph_info.graph.nodes:
-            if node.op == "call_function" and node.target is _host_tensor:
-                target_name = node.args[0]
-                if isinstance(target_name, str):
-                    host_tensor_nodes.setdefault(target_name, []).append(node)
-                    value = node.meta.get("val")
-                    if isinstance(value, torch.Tensor):
-                        storage_names.setdefault(
-                            id(value.untyped_storage()), set()
-                        ).add(target_name)
-
-    def is_promotable_target(node: torch.fx.Node) -> bool:
-        target_val = node.meta.get("val")
-        if (
-            not isinstance(target_val, torch.Tensor)
-            or target_val.dtype != torch.float16
-        ):
-            return False
-        origin = host_fn.tensor_to_origin.get(target_val)
-        if origin is None or isinstance(origin, ArgumentOrigin):
-            return False
-        if not node.users:
-            return False
-        for user in node.users:
-            if user.op != "call_function" or user.target is not atomic_add:
-                return False
-            if len(user.args) < 3 or user.args[0] is not node or len(user.users) != 0:
-                return False
-            value_node = user.args[2]
-            if not isinstance(value_node, torch.fx.Node):
-                return False
-            value_val = value_node.meta.get("val")
-            if not isinstance(value_val, torch.Tensor) or value_val.dtype not in (
-                torch.float16,
-                torch.float32,
-            ):
-                return False
-        return True
-
-    for target_name, nodes in host_tensor_nodes.items():
-        # A second host name can read a view of this allocation without being a
-        # user of the atomic destination node. Check the original storage here:
-        # promoting FakeTensors below creates distinct float32 storage and can
-        # no longer establish this alias relationship.
-        if all(
-            is_promotable_target(node)
-            and storage_names[id(node.meta["val"].untyped_storage())] == {target_name}
-            for node in nodes
-        ):
-            promotions[target_name] = torch.float16
-
-    # Host indexing and control-flow type joins can construct fresh FakeTensor
-    # metadata even for runtime views. Storage identity therefore supplements
-    # the host reference proof; it cannot replace that proof.
-    factory_functions = (
-        torch.empty,
-        torch.empty_like,
-        torch.full,
-        torch.full_like,
-        torch.ones,
-        torch.ones_like,
-        torch.zeros,
-        torch.zeros_like,
-    )
-    proven_factories = set()
-    for assignment in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
-        if (
-            isinstance(assignment, ast.Assign)
-            and len(assignment.targets) == 1
-            and isinstance(assignment.targets[0], ast.Name)
-            and assignment.targets[0].id in promotions
-            and isinstance(assignment.value, ast.Call)
-            and isinstance(assignment.value.func, ExtendedAST)
-            and isinstance(assignment.value.func._type_info, CallableType)
-            and any(
-                assignment.value.func._type_info.value is factory
-                for factory in factory_functions
-            )
-        ):
-            # The spelling torch.zeros alone does not prove allocation if a
-            # local binding or closure shadows the imported module.
-            proven_factories.add(assignment.targets[0].id)
-    return fresh_half_atomic_outputs(
-        host_fn.body,
-        {name: dtype for name, dtype in promotions.items() if name in proven_factories},
-    )
-
-
-def rewrite_cute_half_atomic_output_allocations(
-    host_fn: HostFunction,
-    promotions: dict[str, torch.dtype],
-) -> None:
-    torch_factory_names = {
-        "empty",
-        "empty_like",
-        "full",
-        "full_like",
-        "ones",
-        "ones_like",
-        "zeros",
-        "zeros_like",
-    }
-
-    def dtype_expr(dtype: torch.dtype) -> ast.expr:
-        expr = expr_from_string(f"torch.{str(dtype).split('.', 1)[1]}")
-        assert isinstance(expr, ast.expr)
-        return expr
-
-    def is_torch_factory_call(call: ast.Call) -> bool:
-        return (
-            isinstance(call.func, ast.Attribute)
-            and call.func.attr in torch_factory_names
-            and isinstance(call.func.value, ast.Name)
-            and call.func.value.id == "torch"
-        )
-
-    def rewrite_allocation_dtype(call: ast.Call) -> None:
-        dtype = dtype_expr(torch.float32)
-        for kwarg in call.keywords:
-            if kwarg.arg == "dtype":
-                kwarg.value = dtype
-                return
-        if is_torch_factory_call(call):
-            call.keywords.append(create(ast.keyword, arg="dtype", value=dtype))
-
-    def rewrite_return_expr(expr: ast.expr) -> ast.expr:
-        if isinstance(expr, ast.Name) and expr.id in promotions:
-            cast_expr = expr_from_string(
-                "{value}.to({dtype})",
-                value=expr,
-                dtype=dtype_expr(promotions[expr.id]),
-            )
-            assert isinstance(cast_expr, ast.expr)
-            return cast_expr
-        if isinstance(expr, ast.Tuple):
-            return create(
-                ast.Tuple,
-                elts=[rewrite_return_expr(elt) for elt in expr.elts],
-                ctx=expr.ctx,
-            )
-        if isinstance(expr, ast.List):
-            return create(
-                ast.List,
-                elts=[rewrite_return_expr(elt) for elt in expr.elts],
-                ctx=expr.ctx,
-            )
-        return expr
-
-    for stmt in ast.walk(ast.Module(body=host_fn.body, type_ignores=[])):
-        if (
-            isinstance(stmt, ast.Assign)
-            and len(stmt.targets) == 1
-            and isinstance(stmt.targets[0], ast.Name)
-            and stmt.targets[0].id in promotions
-            and isinstance(stmt.value, ast.Call)
-        ):
-            rewrite_allocation_dtype(stmt.value)
-        elif isinstance(stmt, ast.Return) and stmt.value is not None:
-            stmt.value = rewrite_return_expr(stmt.value)
-
-
-def promote_cute_root_graph_host_tensors(
-    graph_infos: list[GraphInfo],
-    promotions: dict[str, torch.dtype],
-) -> None:
-    from ..language._tracing_ops import _host_tensor
-
-    host_fn = HostFunction.current()
-    for graph_info in graph_infos:
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target is not _host_tensor:
-                continue
-            target_name = node.args[0]
-            if not isinstance(target_name, str) or target_name not in promotions:
-                continue
-            value = node.meta.get("val")
-            if isinstance(value, torch.Tensor):
-                promoted_value = value.to(dtype=torch.float32)
-                if origin := host_fn.tensor_to_origin.get(value):
-                    host_fn.tensor_to_origin[promoted_value] = origin
-                node.meta["val"] = promoted_value

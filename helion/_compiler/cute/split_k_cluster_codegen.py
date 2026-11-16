@@ -15,15 +15,19 @@ from ..ast_extension import ExtendedAST
 from ..ast_extension import LoopType
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
-from ..output_header import get_needed_import_lines
 from ..type_info import CallableType
+from .compile_options import compile_options_keyword
+from .compile_options import config_compile_options
 from .materialized_fission_codegen import _empty_graph
+from .materialized_fission_codegen import prepend_missing_imports
 from .memory_ops import tensor_has_specialized_tma_alignment
 from .split_k_cluster import CLUSTER_K_SCHEDULE
 from .split_k_cluster import checked_cluster_proof
 from .split_k_cluster_config import CLUSTER8_K4
 from .split_k_cluster_config import FINALIZER_KEY
 from .split_k_cluster_config import FINALIZER_WARPS
+from .split_k_workspace import cutlass_dtype_name
+from .split_k_workspace import torch_dtype_name
 
 if TYPE_CHECKING:
     from ...runtime.config import Config
@@ -49,12 +53,8 @@ def kernel_source(
 ) -> str:
     assert type(finalizer_warps) is int and finalizer_warps in FINALIZER_WARPS
     s = CLUSTER_K_SCHEDULE
-    dtype = (
-        "cutlass.Float16" if proof.lhs.dtype is torch.float16 else "cutlass.BFloat16"
-    )
-    output_type = (
-        "cutlass.Float16" if proof.output_dtype is torch.float16 else "cutlass.Float32"
-    )
+    dtype = cutlass_dtype_name(proof.lhs.dtype)
+    output_type = cutlass_dtype_name(proof.output_dtype)
     chunk = facts.k // s.cluster_ctas
     warp_chunk = chunk // s.k_warps
     waves = warp_chunk // s.bk
@@ -121,12 +121,12 @@ def kernel_source(
     copy_body = f"""
 for ai in cutlass.range_constexpr({s.bm * s.bk // (32 * 8)}):
 {a_coordinates}
-    cute.arch.cp_async_shared_global(a.iterator + cute.crd2idx((m, k, warp), a.layout), x.iterator + (tile_m + m) * cutlass.Int32(x.layout.stride[0]) + (start_k + k) * cutlass.Int32(x.layout.stride[1]), 16, 'cg')
+    prims.cp_async_shared_global(a.iterator + cute.crd2idx((m, k, warp), a.layout), x.iterator + (tile_m + m) * cutlass.Int32(x.layout.stride[0]) + (start_k + k) * cutlass.Int32(x.layout.stride[1]), 16, 'cg')
 for bi in cutlass.range_constexpr({s.bn * s.bk // (32 * 8)}):
     flat = (lane + bi * 32) * 8
     n = flat % {s.bn}
     k = flat // {s.bn}
-    cute.arch.cp_async_shared_global(b.iterator + cute.crd2idx((n, k, warp), b.layout), y.iterator + (start_k + k) * cutlass.Int32(y.layout.stride[0]) + (tile_n + n) * cutlass.Int32(y.layout.stride[1]), 16, 'cg')
+    prims.cp_async_shared_global(b.iterator + cute.crd2idx((n, k, warp), b.layout), y.iterator + (start_k + k) * cutlass.Int32(y.layout.stride[0]) + (tile_n + n) * cutlass.Int32(y.layout.stride[1]), 16, 'cg')
 cute.arch.cp_async_commit_group()
 cute.arch.cp_async_wait_group(0)
 cute.arch.sync_threads()
@@ -149,6 +149,7 @@ for ki in cutlass.range_constexpr({s.bk // 16}):
     return f"""from __future__ import annotations
 import cutlass
 import cutlass.cute as cute
+import cutlass.experimental.primitives as prims
 from helion._compiler.cute.cluster_helpers import load_shared_remote_f32
 
 @cute.kernel
@@ -219,9 +220,7 @@ def generate_split_k_cluster(
             else:
                 shell.add_statement(shell.visit(statement))
     host = func.codegen_function_def(shell.host_statements)
-    output_dtype = (
-        "torch.float16" if proof.output_dtype is torch.float16 else "torch.float32"
-    )
+    output_dtype = torch_dtype_name(proof.output_dtype)
     allocations = 0
     for statement in host.body:
         if (
@@ -272,9 +271,10 @@ def generate_split_k_cluster(
     s = CLUSTER_K_SCHEDULE
     grid = (facts.m // s.bm) * (facts.n // s.bn) * s.cluster_ctas
     bias_arg = f", {proof.bias.host_expression}" if proof.bias is not None else ""
+    options = compile_options_keyword(config_compile_options(config))
     launch = statement_from_string(
         f"_launcher({kernel}, ({grid},), {proof.lhs_expression}, {proof.rhs_expression}, "
-        f"{proof.output_name}{bias_arg}, block=(32, 4, 1))"
+        f"{proof.output_name}{bias_arg}, block=(32, 4, 1){options})"
     )
     host.body[host.body.index(marker)] = launch
     metadata = {
@@ -321,14 +321,5 @@ def generate_split_k_cluster(
         ],
         type_ignores=[],
     )
-    imports = {
-        ast.unparse(statement)
-        for statement in result.body
-        if isinstance(statement, (ast.Import, ast.ImportFrom))
-    }
-    result.body[:0] = [
-        statement_from_string(line)
-        for line in get_needed_import_lines(result)
-        if line not in imports
-    ]
+    prepend_missing_imports(result)
     return result

@@ -5,14 +5,18 @@ The default exp2 lowering guards the denormal output range: each call
 costs an extra FSETP plus two predicated FMULs per element and lengthens
 live ranges (the input must survive until the fixup).  ``ex2.approx.ftz``
 skips the fixup; exp results below the normal f32 range flush to zero.
-The two knobs here:
+(The default exp lowering, ``cute.math.exp``, is libdevice's expf: an
+exact range reduction around ``ex2.approx.ftz`` and an exact scale, with
+no fixup to skip.  Its fast form also rounds ``x * log2(e)``, which is not
+output-identical, so exp sites are never marked.)  The two knobs here:
 
-- ``mark_ftz_safe_exp_nodes``: device-IR analysis marking exp sites where
-  flushing is PROVABLY output-identical (the ``sum(exp(x - amax(x)))``
+- ``mark_ftz_safe_exp2_nodes``: device-IR analysis marking exp2 sites where
+  flushing is PROVABLY output-identical (the ``sum(exp2(x - amax(x)))``
   cross-entropy / logsumexp / softmax-denominator pattern); the cute op
   overrides emit ``fastmath=True`` for marked sites unconditionally.
-  Measured +16% on cross-entropy fwd 32768x8192 fp16 on B200 (the exp
-  fixup was the entire gap to quack's handwritten kernel).
+  Measured +16% on cross-entropy fwd 32768x8192 fp16 on B200 while exp
+  still lowered to the guarded exp2 (the fixup was the entire gap to
+  quack's handwritten kernel).
 
 - ``apply_exp2_fastmath``: applies ``fastmath=True`` to EVERY exp2 call
   when the ``fast_math`` SETTING is enabled.  This one changes numerics,
@@ -35,7 +39,13 @@ import torch
 if TYPE_CHECKING:
     from torch.fx import Node
 
-FTZ_SAFE_EXP_META_KEY = "ftz_safe_exp"
+FTZ_SAFE_EXP2_META_KEY = "ftz_safe_exp2"
+# ``exp`` nodes a whole-root template computes as ``exp2(x * log2 e)``
+# keeping denormals: without ``fast_math`` the cute op overrides lower them
+# that way in every config of the kernel, so the configs the template
+# declines agree with it (``gdn_recurrence``).  Under ``fast_math`` they take
+# the fast form like any exp (that setting lets configs change numerics).
+TEMPLATE_EXP2_META_KEY = "template_exp2"
 
 
 def _is_neg_inf_mask_of(node: object, source: Node) -> bool:
@@ -129,19 +139,19 @@ def _users_are_sum_over_dims(node: Node, dims: tuple[int, ...]) -> bool:
     return True
 
 
-def mark_ftz_safe_exp_nodes(graph: torch.fx.Graph) -> None:
-    """Mark ``exp``/``exp2`` nodes whose ``ex2.approx.ftz`` lowering is
-    provably output-identical, so codegen can skip the denormal fixup.
+def mark_ftz_safe_exp2_nodes(graph: torch.fx.Graph) -> None:
+    """Mark ``exp2`` nodes whose ``ex2.approx.ftz`` lowering is provably
+    output-identical, so codegen can skip the denormal fixup.
 
-    The pattern is ``sum(exp(x - amax(x, dims)))`` over the same ``x``:
+    The pattern is ``sum(exp2(x - amax(x, dims)))`` over the same ``x``:
     the shifted argument is <= 0 with at least one element equal to 0
     among the lanes the amax covered, so the fp32 sum is >= 1, and exp
     outputs below 2^-126 — the only range where ``ex2.approx.ftz``
     differs from the guarded lowering — can never reach the sum's ulp
-    (their total mass is < N * 2^-126 << 2^-24).  The exp values must
+    (their total mass is < N * 2^-126 << 2^-24).  The exp2 values must
     not escape into anything but the sum.  This matches the numerics
     triton (libdevice) and handwritten CuTe kernels (quack) already
-    have on this pattern, without touching exp sites the proof does
+    have on this pattern, without touching exp2 sites the proof does
     not cover (those stay behind the ``fast_math`` setting).
 
     Runs on the pre-roll device IR graphs; the reduction roller's
@@ -149,14 +159,11 @@ def mark_ftz_safe_exp_nodes(graph: torch.fx.Graph) -> None:
     where the cute backend's op overrides consume the mark.
     """
     for node in graph.nodes:
-        if node.op != "call_function" or node.target not in (
-            torch.ops.aten.exp.default,
-            torch.ops.aten.exp2.default,
-        ):
+        if node.op != "call_function" or node.target is not torch.ops.aten.exp2.default:
             continue
         # The >= 1-sum ulp argument is written for fp32 accumulation; a
         # pure 16-bit pipeline flushes below 2^-14 where the error mass
-        # CAN reach the sum's ulp, so only fp32 exp sites are marked.
+        # CAN reach the sum's ulp, so only fp32 exp2 sites are marked.
         node_val = node.meta.get("val")
         if (
             not isinstance(node_val, torch.Tensor)
@@ -204,7 +211,7 @@ def mark_ftz_safe_exp_nodes(graph: torch.fx.Graph) -> None:
             continue
         if not _users_are_sum_over_dims(node, dims):
             continue
-        node.meta[FTZ_SAFE_EXP_META_KEY] = True
+        node.meta[FTZ_SAFE_EXP2_META_KEY] = True
 
 
 def apply_exp2_fastmath(body: list[ast.stmt]) -> list[ast.stmt]:

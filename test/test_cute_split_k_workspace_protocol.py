@@ -15,50 +15,26 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 from test.test_cute_split_k_workspace import _args
 from test.test_cute_split_k_workspace import _embedded_sources
 from test.test_cute_split_k_workspace import _fp32_bias
+from test.test_cute_split_k_workspace import _matrix_bias
 from test.test_cute_split_k_workspace import _proof
 
 import helion
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.split_k_workspace import workspace_schedule
 from helion._compiler.cute.split_k_workspace_codegen import _reducer_source
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
-from helion.autotuner.config_fragment import PowerOfTwoFragment
-import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
+from helion._testing.cute_codegen import cpu_target
 
 
 @pytest.fixture(autouse=True)
 def _cpu_protocol():
     with (
-        _cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        cpu_target(forbid_native=False),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         yield
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _matrix_bias(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
-    rows, inner_size = a.shape
-    columns = b.size(1)
-    chunk = hl.register_tunable("tile_extent", PowerOfTwoFragment(1, 256))
-    output = torch.zeros_like(bias, dtype=torch.float32)
-    for row, column, partition in hl.tile(
-        (rows, columns, inner_size), block_size=(None, None, chunk)
-    ):
-        acc = hl.zeros([row, column], dtype=torch.float32)
-        for inner in hl.tile(partition.begin, partition.end):
-            acc = torch.addmm(acc, a[row, inner], b[inner, column])
-        if partition.begin == 0:
-            acc = acc + bias[row, column]
-        hl.atomic_add(output, [row, column], acc)
-    return output
 
 
 class _Values(np.ndarray):
@@ -219,6 +195,8 @@ def _execute_reducer(source, partial_values, output_dtype, bias_storage=None):
                 thread_idx=lambda: (np.arange(128, dtype=np.int32), 0, 0),
                 block_idx=lambda: (state["block"], 0, 0),
                 shuffle_sync_bfly=lambda value, offset: value[np.arange(128) ^ offset],
+                # The reducer is a programmatic dependent of the producer.
+                griddepcontrol_wait=lambda: None,
             ),
         ),
     }

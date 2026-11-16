@@ -44,8 +44,10 @@ import torch
 
 from .logger import capture_output
 from .precompile_future import _write_result_file
+from .process_utils import isolate_forked_worker
 from .process_utils import signal_process_tree
 from .process_utils import start_isolated_process_group
+from .process_utils import start_without_collection
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -130,6 +132,7 @@ def _render_in_child(
 ) -> None:
     """Fork target: render ``config`` and leave the source at ``result_path``."""
     start_isolated_process_group()
+    isolate_forked_worker()
     status = 0
     captured: list[str] = [""]
     try:
@@ -312,7 +315,7 @@ class RenderAhead:
                 args=(self.kernel, future.config, self.facts, future.result_path),
             )
             process.daemon = True
-            process.start()
+            start_without_collection(process)
         except Exception as error:
             self.unavailable = True
             for pending in self.futures[self._next :]:

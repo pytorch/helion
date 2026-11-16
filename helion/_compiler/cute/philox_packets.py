@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from typing import TypeGuard
 from typing import cast
 
+from ._ast_pass_utils import substitute_names
 from .philox_stream import PACKET_ASM
 from .philox_stream import PACKET_CONSTRAINTS
 from .philox_stream import SCALAR_ASM
@@ -76,16 +77,6 @@ def _rng_call(node: ast.AST) -> TypeGuard[ast.Call]:
             )
         )
     )
-
-
-class _Substitute(ast.NodeTransformer):
-    def __init__(self, values: dict[str, ast.expr]) -> None:
-        self.values = values
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if isinstance(node.ctx, ast.Load) and node.id in self.values:
-            return _clone(self.values[node.id])
-        return node
 
 
 class _ReplaceCall(ast.NodeTransformer):
@@ -168,7 +159,7 @@ def _aligned_packet_adjacency(expression: ast.expr, lane: str, known: set[str]) 
 def lower_philox_packets(
     body: list[ast.stmt],
     *,
-    seed_names: set[str],
+    seed_exprs: set[str],
     integer_names: set[str],
     new_name: Callable[[str], str],
     vectorize_packet: Callable[[ast.For, ast.Subscript, frozenset[str]], list[ast.stmt]]
@@ -176,7 +167,9 @@ def lower_philox_packets(
 ) -> list[ast.stmt]:
     """Leave the scalar new stream unchanged whenever a packet proof declines.
 
-    Only immutable compiler-owned seed tensors may move their read. Integer
+    Only the compiler's own seed operands (``seed_exprs``: the ``cutlass.Int64``
+    constants and kernel scalar arguments ``stage_explicit_seed`` emitted,
+    which nothing in the kernel can write) may move their read. Integer
     replay excludes loads, divisions, shifts and conversions from unknown
     scalar types. A narrow cast/add proof can remove redundant equalities;
     other expressions retain runtime checks for narrow-integer wrap behavior.
@@ -204,13 +197,7 @@ def lower_philox_packets(
             return None
         call = calls[0]
         seed, offset = cast("ast.Tuple", call.args[0]).elts
-        if not (
-            isinstance(seed, ast.Subscript)
-            and isinstance(seed.value, ast.Name)
-            and seed.value.id in seed_names
-            and isinstance(seed.slice, ast.Constant)
-            and seed.slice.value == 0
-        ):
+        if ast.unparse(seed) not in seed_exprs:
             return None
         lane = loop.target.id
         definitions: dict[str, ast.expr] = {}
@@ -227,7 +214,9 @@ def lower_philox_packets(
                 found = True
                 break
             name = statement.targets[0].id
-            expression = _Substitute(definitions).visit(_clone(statement.value))
+            expression = substitute_names(
+                _clone(statement.value), definitions, clone=_clone
+            )
             if _integer(expression, available):
                 definitions[name] = expression
             else:
@@ -236,7 +225,7 @@ def lower_philox_packets(
             available.discard(name)
         if not found:
             return None
-        expanded = _Substitute(definitions).visit(_clone(offset))
+        expanded = substitute_names(_clone(offset), definitions, clone=_clone)
         if not _integer(expanded, known | {lane}):
             return None
         # An invariant used in replay cannot be changed anywhere in the loop.
@@ -250,7 +239,9 @@ def lower_philox_packets(
         aligned_adjacency = _aligned_packet_adjacency(expanded, lane, known)
         width = loop.iter.args[0].value
         offsets = [
-            _Substitute({lane: ast.Constant(index)}).visit(_clone(expanded))
+            substitute_names(
+                _clone(expanded), {lane: ast.Constant(index)}, clone=_clone
+            )
             for index in range(width)
         ]
         preamble: list[ast.stmt] = []

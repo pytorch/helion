@@ -1,3 +1,17 @@
+"""Compatibility probes for the installed CuTe DSL and CUDA toolchain.
+
+Role: analysis (environment facts).  ``check_cute_backend_requirements``
+raises ``CuteBackendUnavailable`` when the backend cannot run (missing or old
+``nvidia-cutlass-dsl``, missing tvm-ffi, CUDA < 13); ``installed_cute_dsl_version``
+and the ``*_supported`` predicates (``cp_async_supported``,
+``readonly_packet_load_supported``, ``fixed_l2_evict_last_store_policy_supported``,
+``hinted_cp_async_available``) gate emitter choices on the version and the
+target; ``emit_pipeline_advance`` / ``emit_producer_tail_tma_umma`` spell DSL
+calls whose names changed between versions.  Listed in
+``runtime/cute/source_dependencies._COMMON_DEPENDENCIES``: an edit here changes
+every kernel's disk-cache key, not its render.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -83,6 +97,11 @@ def _installed_cute_dsl_version() -> _CuteDSLVersionProbe:
         return _CuteDSLVersionProbe(missing=True)
     except InvalidVersion as error:
         return _CuteDSLVersionProbe(invalid=str(error))
+
+
+def installed_cute_dsl_version() -> Version | None:
+    """The installed ``nvidia-cutlass-dsl`` version; None when missing or invalid."""
+    return _installed_cute_dsl_version().version
 
 
 def tcgen05_runtime_n_ptx_compatible() -> bool:
@@ -198,16 +217,49 @@ def emit_producer_tail_tma_umma(
     state_expr: str,
     *,
     indent: str = "",
-    skip_advances: bool = False,
 ) -> str:
     """Emit ``<pipeline>.producer_tail(<state>)`` for a ``PipelineTmaUmma``
-    (sm100 TMA->UMMA) pipeline.
-
-    ``skip_advances`` is only for guarded invalid-output diagnostics that
-    isolate AB producer-state rollover: it preserves the tail acquire but drops
-    every state advance (including the ones ``producer_tail`` performs
-    internally), so it emits a bare ``producer_acquire`` instead.
-    """
-    if skip_advances:
-        return f"{indent}{pipeline_expr}.producer_acquire({state_expr})"
+    (sm100 TMA->UMMA) pipeline."""
     return f"{indent}{pipeline_expr}.producer_tail({state_expr})"
+
+
+@lru_cache(maxsize=1)
+def nvdisasm_path() -> str | None:
+    """The ``nvdisasm`` binary the SASS checks disassemble with: the one the
+    ``nvidia-cuda-nvdisasm`` wheel ships (a runtime dependency of the CuTe
+    DSL, which dumps SASS through it), else one on ``PATH`` or under
+    ``CUDA_HOME``; None when there is none."""
+    import os
+    import shutil
+
+    try:
+        dist = importlib.metadata.distribution("nvidia-cuda-nvdisasm")
+    except importlib.metadata.PackageNotFoundError:
+        dist = None
+    if dist is not None and dist.files is not None:
+        for entry in dist.files:
+            if entry.name == "nvdisasm":
+                path = str(dist.locate_file(entry))
+                if os.path.isfile(path):
+                    return path
+    found = shutil.which("nvdisasm")
+    if found is not None:
+        return found
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home:
+        candidate = os.path.join(cuda_home, "bin", "nvdisasm")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def hinted_cp_async_available() -> bool:
+    """Whether the mma_dag emitter may hint its staged operand packets
+    (``cp.async.cg.shared.global.L2::cache_hint``).
+
+    The DSL's assembler has misencoded that form (``sass_check.py``), so the
+    launcher verifies every hinted kernel's SASS before it runs; without a
+    disassembler nothing can be verified and the packets stay plain (the
+    normalizer pins every ``load_eviction_policies`` slot to "").
+    """
+    return nvdisasm_path() is not None

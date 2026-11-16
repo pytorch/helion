@@ -14,14 +14,11 @@ from .test_cute_grid_launch_extents import _code
 from .test_cute_grid_launch_extents import _launch_block
 import helion
 from helion import exc
-from helion._compiler.cute.backend import _live_grid_thread_extents
 from helion._compiler.cute.backend import _pointwise_grid_thread_dims
+from helion._compiler.cute.launch_shape import live_grid_thread_extents
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -182,7 +179,7 @@ def test_pointwise_launch_requires_complete_producer_ownership(
 
 def test_dead_producer_does_not_cover_an_independent_thread_axis() -> None:
     body = ast.parse("row = offset + tid\ncolumn = other_index\n").body
-    live = _live_grid_thread_extents(
+    live = live_grid_thread_extents(
         body, {"row": (2, 4), "column": (1, 64), "dead": (0, 8)}
     )
     assert live == {1: 64, 2: 4}
@@ -219,7 +216,7 @@ def test_pointwise_launch_keeps_total_thread_budget_guard() -> None:
 
 
 def test_unit_producer_is_distinct_from_a_missing_producer() -> None:
-    live = _live_grid_thread_extents(
+    live = live_grid_thread_extents(
         ast.parse("unit = tid\nrow = other\n").body, {"unit": (0, 1), "row": (1, 32)}
     )
     assert _pointwise_grid_thread_dims(

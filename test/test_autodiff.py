@@ -8,22 +8,32 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.codecache import PyCodeCache
+from torch.fx.experimental.proxy_tensor import make_fx
 
 import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
 from helion._testing import skipIfMTIA
 from helion._testing import skipIfRocm
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing.autodiff_shapes import ALIAS_SHAPE_CASES
+from helion._testing.autodiff_shapes import TRITON_ONLY_ALIAS_SHAPE_CASES
+from helion._testing.autodiff_shapes import alias_shape_backward
+from helion._testing.autodiff_shapes import alias_shape_case
 from helion.autotuner.effort_profile import _PROFILES
 from helion.autotuner.effort_profile import AutotuneEffortProfile
 from helion.autotuner.effort_profile import DifferentialEvolutionConfig
 from helion.autotuner.effort_profile import PatternSearchConfig
 from helion.autotuner.effort_profile import RandomSearchConfig
+from helion.experimental.autodiff import FXToHelionConverter
+from helion.experimental.autodiff import InputMapping
+from helion.experimental.autodiff import differentiate_graph
 import helion.language as hl
 
 # Triton writes its generated launcher source with the process locale encoding;
@@ -41,6 +51,47 @@ for _utf8_locale in ("C.UTF-8", "en_US.UTF-8", "C.utf8", "en_US.utf8"):
 @skipIfTileIR("autodiff not tested on TileIR")
 @skipIfXPU("autodiff scan-path backward aborts in torch scan-HOP autograd on XPU")
 class TestAutodiff(RefEagerTestDisabled, TestCase):
+    def test_aliased_shape_branches_replay(self):
+        self._check_alias_shape_replay(ALIAS_SHAPE_CASES)
+
+    @onlyBackends(["triton"])
+    def test_literal_singleton_expand_replay(self):
+        # The separate CuTe multidimensional-reduction limitation is unchanged.
+        self._check_alias_shape_replay(TRITON_ONLY_ALIAS_SHAPE_CASES)
+
+    def _check_alias_shape_replay(self, cases):
+        for case in cases:
+            with self.subTest(case=case):
+                forward, inputs, _blocks = alias_shape_case(case, DEVICE)
+                outputs = forward(*inputs)
+                gradients = tuple(torch.randn_like(value) for value in outputs)
+                _graph, _converter, module, _source = alias_shape_backward(
+                    forward, inputs, outputs
+                )
+                module.backward_kernel.settings.autotune_effort = "none"
+                for replay in range(2):
+                    actual = module.backward_kernel(*gradients, *inputs)
+                    if len(inputs) == 1:
+                        actual = (actual,)
+                    reference_inputs = tuple(
+                        value.detach().clone().requires_grad_(value.is_floating_point())
+                        for value in inputs
+                    )
+                    torch.autograd.backward(forward(*reference_inputs), gradients)
+                    for value, reference in zip(actual, reference_inputs, strict=True):
+                        if reference.is_floating_point():
+                            torch.testing.assert_close(
+                                value, reference.grad, rtol=1e-5, atol=1e-5
+                            )
+                    if replay == 0:
+                        inputs[0].neg_().add_(0.375)
+                        if len(inputs) == 2 and inputs[1].ndim != 0:
+                            if inputs[1].is_floating_point():
+                                inputs[1].mul_(-0.75).add_(0.125)
+                            else:
+                                inputs[1].logical_not_()
+                        gradients[0].mul_(-0.5)
+
     def _check_backward(
         self,
         kernel_fn,
@@ -657,18 +708,46 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
         self.assertIn("x.view([-1, 4, 8])", helion_code)
 
-    def test_sum_reduction_square_shape(self):
+    def test_loop_carry_on_its_loops_block(self):
+        # The carry's update takes a `_mask_select` (mask_loop_carries) that
+        # keeps a partial tile's padded lanes out of it: the scan re-applies
+        # it where the last tile is partial (500 columns) and passes the
+        # value through where every tile is full (512).
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
-            m, n = x.shape
-            out = torch.empty([m], dtype=x.dtype, device=x.device)
+            m, n = x.size()
+            block_size_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device)
             for tile_m in hl.tile(m):
-                out[tile_m] = x[tile_m, :].sum(-1)
+                acc = hl.zeros([tile_m, block_size_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n])
+                out[tile_m] = acc.sum(dim=1)
             return out
 
-        self._check_backward(
-            kernel, lambda x: x.sum(-1), 1, shape=(32, 32), grad_shape=(32,)
-        )
+        # The same carry with the loop's dim first: the scan lays its mask
+        # along that dim.
+        @helion.kernel(autotune_effort="none")
+        def transposed(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            block_size_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([block_size_n, tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_size_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n].T)
+                out[tile_m] = acc.sum(dim=0)
+            return out
+
+        for fn in (kernel, transposed):
+            for n in (512, 500):
+                self._check_backward(
+                    fn,
+                    lambda x: torch.exp(x).sum(dim=1),
+                    1,
+                    shape=(64, n),
+                    grad_shape=(64,),
+                )
 
     def test_multi_output_reordered_stores(self):
         @helion.kernel(autotune_effort="none")
@@ -1047,6 +1126,282 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             kernel, lambda x: x.mean(1), 1, shape=(8, 16, 32), grad_shape=(8, 32)
         )
 
+    def test_scalar_arithmetic_before_tangent_unsqueeze(self):
+        @helion.kernel(autotune_effort="none")
+        def scaled_mean(x: torch.Tensor) -> torch.Tensor:
+            a, b, _c = x.shape
+            out = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                out[tile_a, :] = 3 * x[tile_a, :, :].mean(-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def negated_sum(x: torch.Tensor) -> torch.Tensor:
+            a, _b, c = x.shape
+            out = torch.empty([a, c], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                out[tile_a, :] = -x[tile_a, :, :].sum(1)
+            return out
+
+        for kernel, reference, grad_shape in (
+            (scaled_mean, lambda x: 3 * x.mean(-1), (8, 16)),
+            (negated_sum, lambda x: -x.sum(1), (8, 32)),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check_backward(
+                    kernel, reference, 1, shape=(8, 16, 32), grad_shape=grad_shape
+                )
+
+    def test_dtype_cast_before_tangent_unsqueeze(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            a, _b, c = x.shape
+            out = torch.empty([a, c], dtype=torch.bfloat16, device=x.device)
+            for tile_a in hl.tile(a):
+                out[tile_a, :] = x[tile_a, :, :].mean(1).to(torch.bfloat16)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(8, 16, 32, device=DEVICE)
+        grad_out = torch.randn(8, 32, dtype=torch.bfloat16, device=DEVICE)
+        kernel(x)
+        grad = helion.experimental.backward(kernel, grad_out, x, autotune=False)
+        x_ref = x.detach().clone().requires_grad_(True)
+        x_ref.mean(1).to(torch.bfloat16).backward(grad_out)
+        torch.testing.assert_close(grad, x_ref.grad)
+
+    def test_mixed_output_tangent_inverse_views(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a, b, _c = x.shape
+            full = torch.empty_like(x)
+            reduced = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                values = x[tile_a, :, :]
+                full[tile_a, :, :] = (2 * values).unsqueeze(-1).squeeze(-1)
+                reduced[tile_a, :] = values.mean(-1)
+            return full, reduced
+
+        torch.manual_seed(0)
+        x = torch.randn(8, 16, 32, device=DEVICE)
+        grad_full = torch.randn_like(x)
+        grad_reduced = torch.randn(8, 16, device=DEVICE)
+        kernel(x)
+        grad = helion.experimental.backward(
+            kernel, (grad_full, grad_reduced), x, autotune=False
+        )
+        x_ref = x.detach().clone().requires_grad_(True)
+        first = (2 * x_ref).unsqueeze(-1).squeeze(-1)
+        torch.autograd.backward((first, x_ref.mean(-1)), (grad_full, grad_reduced))
+        torch.testing.assert_close(grad, x_ref.grad)
+
+    def test_mixed_output_tangent_arithmetic_between_views(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a, b, _c = x.shape
+            full = torch.empty_like(x, dtype=torch.bfloat16)
+            reduced = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                values = x[tile_a, :, :]
+                expanded = (3 * values.unsqueeze(1)).to(torch.bfloat16)
+                full[tile_a, :, :] = expanded.squeeze(1)
+                reduced[tile_a, :] = values.mean(-1)
+            return full, reduced
+
+        torch.manual_seed(0)
+        x = torch.randn(8, 16, 32, device=DEVICE)
+        grad_full = torch.randn_like(x, dtype=torch.bfloat16)
+        grad_reduced = torch.randn(8, 16, device=DEVICE)
+        kernel(x)
+        grad = helion.experimental.backward(
+            kernel, (grad_full, grad_reduced), x, autotune=False
+        )
+        x_ref = x.detach().clone().requires_grad_(True)
+        first = (3 * x_ref.unsqueeze(1)).to(torch.bfloat16).squeeze(1)
+        torch.autograd.backward((first, x_ref.mean(-1)), (grad_full, grad_reduced))
+        torch.testing.assert_close(grad, x_ref.grad)
+
+    def test_nonlinear_tangent_singleton_views(self):
+        @helion.kernel(autotune_effort="none")
+        def single(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                out[tile] = x[tile].view(-1, 1).sin().squeeze(-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def multiple(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                value = x[tile].view(1, -1, 1, 1).sin()
+                out[tile] = value.squeeze(0).squeeze(-1).squeeze(-1)
+            return out
+
+        for kernel in (single, multiple):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check_backward(kernel, torch.sin, 1)
+
+        @helion.kernel(autotune_effort="none")
+        def mixed(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a, b, c = x.shape
+            full = torch.empty_like(x)
+            reduced = torch.empty([a, b], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                value = x[tile_a, :, :]
+                full[tile_a, :, :] = value.view(-1, 1, b, c).sin().squeeze(1)
+                reduced[tile_a, :] = value.mean(-1)
+            return full, reduced
+
+        x = torch.randn(8, 16, 32, device=DEVICE)
+        outputs = mixed(x)
+        gradients = tuple(torch.randn_like(value) for value in outputs)
+        actual = helion.experimental.backward(mixed, gradients, x, autotune=False)
+        x_ref = x.detach().clone().requires_grad_(True)
+        torch.autograd.backward((x_ref.sin(), x_ref.mean(-1)), gradients)
+        torch.testing.assert_close(actual, x_ref.grad)
+
+    def test_nonlinear_tangent_arbitrary_view_controls(self):
+        # Differentiate real arbitrary-view graphs directly: the forward Helion
+        # tracer cannot specialize a tile's symbolic size to the literal 8*16.
+        def composed(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return ((2 * value.view(8, 16)).view(8, 16, 1).sin().view(128),)
+
+        def restored(value: torch.Tensor) -> tuple[torch.Tensor]:
+            value = (2 * value.view(8, 16)).view(128)
+            return (value.view(128, 1).sin().view(128),)
+
+        def noop(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.squeeze().sin(),)
+
+        def leading(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.squeeze(0).sin(),)
+
+        def trailing(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.squeeze(-1).sin(),)
+
+        def expanded_padding(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.view(8, 16).sin().view(8, 1, 16).sum(-1),)
+
+        def later_arbitrary(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.view(8, 16, 1).sin().view(128).cos().view(8, 16),)
+
+        def intermediate_padding(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.view(8, 16).sin().view(8, 16, 1),)
+
+        def multiple_padding(value: torch.Tensor) -> tuple[torch.Tensor]:
+            return (value.view(8, 16).sin(),)
+
+        def singleton_roundtrip(value: torch.Tensor) -> tuple[torch.Tensor, ...]:
+            value = value.squeeze()
+            return (value.sin(), (3 * value.unsqueeze(0)).sin().squeeze(0))
+
+        # Distinct view/loader proof edges, not a Cartesian knob product.
+        for forward, shape in (
+            (composed, (128,)),
+            (restored, (128,)),
+            (noop, (8, 16, 32)),
+            (leading, (1, 128)),
+            (trailing, (128, 1)),
+            (singleton_roundtrip, (1, 128)),
+            (singleton_roundtrip, (128, 1)),
+            (multiple_padding, (1, 8, 16, 1)),
+            (expanded_padding, (8, 1, 16)),
+            (intermediate_padding, (1, 8, 16, 1)),
+            (later_arbitrary, (8, 16)),
+        ):
+            with self.subTest(forward=forward.__name__, shape=shape):
+                x = torch.randn(shape, device=DEVICE)
+                gradients = tuple(torch.randn_like(value) for value in forward(x))
+                graph = differentiate_graph(make_fx(forward)(x).graph, (x,))
+                converter = FXToHelionConverter(
+                    graph,
+                    [InputMapping("x_1", "x", x)],
+                    (x,),
+                    tuple(tuple(gradient.shape) for gradient in gradients),
+                )
+                module = PyCodeCache.load(converter.convert())
+                module.backward_kernel.settings.autotune_effort = "none"
+                actual = module.backward_kernel(*gradients, x)
+                x_ref = x.detach().clone().requires_grad_(True)
+                torch.autograd.backward(forward(x_ref), gradients)
+                torch.testing.assert_close(actual, x_ref.grad, rtol=1e-5, atol=1e-5)
+
+    def test_tangent_inverse_views_after_branch_merge(self):
+        @helion.kernel(autotune_effort="none")
+        def vector(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            first = torch.empty_like(x)
+            second = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                values = (2 * x[tile]).unsqueeze(-1)
+                first[tile] = values.squeeze(-1)
+                second[tile] = (3 * values).squeeze(-1)
+            return first, second
+
+        @helion.kernel(autotune_effort="none")
+        def reduced(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a, _b, c = x.shape
+            first = torch.empty([a, c], dtype=x.dtype, device=x.device)
+            second = torch.empty_like(first)
+            for tile_a in hl.tile(a):
+                values = x[tile_a, :, :].mean(1).unsqueeze(-1)
+                first[tile_a, :] = values.squeeze(-1)
+                second[tile_a, :] = (3 * values).squeeze(-1)
+            return first, second
+
+        torch.manual_seed(0)
+        for kernel, shape, reference in (
+            (vector, (128,), lambda x: 2 * x),
+            (reduced, (8, 16, 32), lambda x: x.mean(1)),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__):
+                x = torch.randn(shape, device=DEVICE)
+                outputs = kernel(x)
+                gradients = tuple(torch.randn_like(value) for value in outputs)
+                actual = helion.experimental.backward(
+                    kernel, gradients, x, autotune=False
+                )
+                x_ref = x.detach().clone().requires_grad_(True)
+                value = reference(x_ref)
+                torch.autograd.backward((value, 3 * value), gradients)
+                torch.testing.assert_close(actual, x_ref.grad)
+
+    def test_tangent_inverse_view_chains(self):
+        @helion.kernel(autotune_effort="none")
+        def vector(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                values = 2 * x[tile]
+                out[tile] = (3 * values.view(-1, 1)).squeeze(-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def middle(x: torch.Tensor) -> torch.Tensor:
+            a, _b, c = x.shape
+            out = torch.empty([a, c], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                values = x[tile_a, :, :].mean(1)
+                out[tile_a, :] = (3 * values.unsqueeze(-1)).squeeze(-1)
+            return out
+
+        @helion.kernel(autotune_effort="none")
+        def rank_one(x: torch.Tensor) -> torch.Tensor:
+            a, _b = x.shape
+            out = torch.empty([a], dtype=x.dtype, device=x.device)
+            for tile_a in hl.tile(a):
+                values = x[tile_a, :].mean(1)
+                out[tile_a] = (3 * values.unsqueeze(0)).squeeze(0)
+            return out
+
+        for kernel, reference, shape, grad_shape in (
+            (vector, lambda x: (3 * (2 * x).view(-1, 1)).squeeze(-1), (128,), (128,)),
+            (middle, lambda x: 3 * x.mean(1), (8, 16, 32), (8, 32)),
+            (rank_one, lambda x: 3 * x.mean(1), (8, 16), (8,)),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check_backward(
+                    kernel, reference, 1, shape=shape, grad_shape=grad_shape
+                )
+
     def test_amax_reduction_3d(self):
         @helion.kernel(autotune_effort="none")
         def kernel(x: torch.Tensor) -> torch.Tensor:
@@ -1251,6 +1606,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     # A real autotune pass: CuTe compiles each candidate cold (~80s on B200).
+    @pytest.mark.slow
     @pytest.mark.timeout(300)
     @skipIfRocm("backward autotuning times out on ROCm")
     def test_backward_autotune(self):
@@ -1289,12 +1645,8 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
                 autotune_effort="quick",
             )
 
-    @skipIfCute(
-        "the scan-hop backward reduces over four full-slice dims at once "
-        "(batch, M, N, K chunk), one more than CuTe's three thread axes"
-    )
     def test_example_bmm(self):
-        from examples.bmm import bmm
+        bmm = import_example("bmm").bmm
 
         # examples/bmm.py uses check(16, 512, 768, 1024)
         B, M, K, N = 4, 32, 48, 64
@@ -1313,25 +1665,8 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
             atol=2e-2,
         )
 
-    def test_example_bmm_square(self):
-        from examples.bmm import bmm
-
-        B, M, K, N = 2, 32, 32, 32
-        self._check_backward(
-            bmm,
-            lambda a, b: torch.bmm(a, b),
-            2,
-            inputs_fn=lambda: [
-                torch.randn(B, M, K, device=DEVICE, dtype=torch.float32),
-                torch.randn(B, K, N, device=DEVICE, dtype=torch.float32),
-            ],
-            grad_shape=(B, M, N),
-            rtol=1e-2,
-            atol=1e-2,
-        )
-
     def test_example_softmax(self):
-        from examples.softmax import softmax
+        softmax = import_example("softmax").softmax
 
         # examples/softmax.py uses check(4096, 2560).
         # Use a reduction dim of 32 (not 160): the autograd-generated softmax
@@ -1350,7 +1685,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_batch_softmax(self):
-        from examples.batch_softmax import batch_softmax
+        batch_softmax = import_example("batch_softmax").batch_softmax
 
         # examples/batch_softmax.py uses check(16, 512, 1024)
         self._check_backward(
@@ -1363,7 +1698,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_geglu(self):
-        from examples.geglu import geglu
+        geglu = import_example("geglu").geglu
 
         # examples/geglu.py uses 1D shape from config (typically 8192)
         self._check_backward(
@@ -1376,7 +1711,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         )
 
     def test_example_swiglu(self):
-        from examples.swiglu import swiglu_fwd
+        swiglu_fwd = import_example("swiglu").swiglu_fwd
 
         # examples/swiglu.py uses 1D shape from config (typically 8192)
         self._check_backward(
@@ -1399,7 +1734,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
     # has the full description.
     @skipIfRocm("intermittent wrong rows from looped row reductions on ROCm")
     def test_example_matmul_layernorm(self):
-        from examples.matmul_layernorm import matmul_layernorm
+        matmul_layernorm = import_example("matmul_layernorm").matmul_layernorm
 
         # examples/matmul_layernorm.py uses check(32, 64, 200);
         # use 128 (power-of-2) for clean block_size alignment
@@ -1424,7 +1759,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         "computed gradient carry, which the CuTe matmul fallbacks cannot re-read"
     )
     def test_example_attention(self):
-        from examples.attention import attention
+        attention = import_example("attention").attention
 
         # examples/attention.py uses test(2, 32, 1024, 64, HALF_DTYPE)
         B, H, M, D = 2, 2, 64, 32
@@ -1450,7 +1785,7 @@ class TestAutodiff(RefEagerTestDisabled, TestCase):
         # Non-block-divisible sequence length: the scan zero-pads the key dim
         # and must re-apply the forward's OOB mask, else the softmax is
         # polluted. M=100 is not a multiple of typical block sizes.
-        from examples.attention import attention
+        attention = import_example("attention").attention
 
         B, H, M, D = 1, 2, 100, 32
         self._check_backward(

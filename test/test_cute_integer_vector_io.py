@@ -8,7 +8,6 @@ import torch
 import helion
 from helion._compiler.cute.affine_vector_io import _loaded_vector_register_reads
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 
 
@@ -47,7 +46,6 @@ def test_named_tensor_extract_is_not_a_loaded_vector_register() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.uint32])
 @pytest.mark.parametrize("width, offset", [(384, 0), (385, 0), (384, 1)])
-@skipUnlessBackends(["cute"])
 def test_integer_route_copy_preserves_bits_and_partial_tiles(
     dtype: torch.dtype, width: int, offset: int
 ) -> None:

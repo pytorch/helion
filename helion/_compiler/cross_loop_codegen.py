@@ -15,6 +15,7 @@ from torch.utils._sympy.functions import Min as SymbolicMin
 
 from .. import exc
 from .._dist_utils import _resolve_process_group
+from .._utils import indexing_uses_tensor_descriptor
 from .ast_extension import ExtendedAST
 from .ast_extension import create
 from .ast_extension import expr_from_string
@@ -790,11 +791,14 @@ def _outline_cross_loop_region(
     noinline: bool = False,
 ) -> ast.stmt:
     """Outline a scheduled region while keeping its computation opaque."""
+    # Warp specialization changes kernel-wide thread participation. Keep
+    # scheduler helpers inline so Triton lowers their explicit and implicit
+    # barriers for the caller's active warp group rather than the physical CTA.
     helper_name, arguments = device_function.register_triton_outlined_helper(
         name_hint,
         body,
         extra_argument_names=extra_argument_names,
-        noinline=noinline,
+        noinline=noinline and not any(device_function.config.range_warp_specializes),
     )
     return statement_from_string(f"{helper_name}({', '.join(arguments)})")
 
@@ -874,6 +878,9 @@ _PURE_TL_CALLS = frozenset(
         "zeros",
     }
 )
+# Exact compiler-owned fill helper: scalar conversion and tensor materialization
+# have no memory, synchronization or publication effects.
+_PURE_HELION_FILL_CALLS = frozenset({"integer_full"})
 # Hoisting these from a persistent task loop saves memory traffic or a reduction.
 _HOIST_ANCHOR_CALLS = frozenset(
     {"associative_scan", "cumsum", "load", "max", "min", "reduce", "sum"}
@@ -910,6 +917,10 @@ def _is_pure_call(node: ast.Call) -> bool:
     return isinstance(func.value, ast.Name) and (
         func.value.id in ("libdevice", "tl_math")
         or (func.value.id == "tl" and func.attr in _PURE_TL_CALLS)
+        or (
+            func.value.id == "helion_triton_helpers"
+            and func.attr in _PURE_HELION_FILL_CALLS
+        )
     )
 
 
@@ -1201,8 +1212,10 @@ _DRY_PASS_PURE_HELPERS = frozenset(
         *("welford", "welford_reduce", "welford_combine"),
     }
 )
-# Helion's own Triton helpers that only reduce; ``triton_wait_signal`` spins.
-_DRY_PASS_PURE_HELION_HELPERS = frozenset({"max_propagate_nan", "min_propagate_nan"})
+# Helion's pure fills/reductions; ``triton_wait_signal`` still spins.
+_DRY_PASS_PURE_HELION_HELPERS = _PURE_HELION_FILL_CALLS | frozenset(
+    {"max_propagate_nan", "min_propagate_nan"}
+)
 # Tensor methods; descriptor methods such as ``load`` and ``store`` are skipped.
 _DRY_PASS_PURE_METHODS = frozenset(
     {"to", "reshape", "view", "trans", "permute", "broadcast_to", "expand_dims"}
@@ -1441,10 +1454,26 @@ def emit_cross_loop_schedule(
             and indexing[memory_op_index] == "tensor_descriptor"
         )
 
+    # The stores this code indexes through tensor descriptors, by their
+    # ``memory_op_facts`` slot (``TileAccess.memory_op_index``): a config that
+    # rolls a reduction numbers its slots in an order of its own.
+    descriptor_stores: set[int] = set()
+    if indexing_uses_tensor_descriptor(indexing):
+        from .device_ir import codegen_memory_op_fact_pairs
+
+        descriptor_stores = {
+            fact.indexing_index
+            for fact, config_fact in codegen_memory_op_fact_pairs(
+                device_function.codegen.codegen_graphs,
+                HostFunction.current().device_ir.root_ids,
+            )
+            if fact.kind == "store"
+            and uses_tensor_descriptor(config_fact.indexing_index)
+        }
     unpublishable_site_ids = frozenset(
         site_id
         for access in dependency_graph.accesses
-        if access.kind == "store" and uses_tensor_descriptor(access.memory_op_index)
+        if access.kind == "store" and access.memory_op_index in descriptor_stores
         for site_id in dependency_graph.site_ids_by_access[access.access_id]
     )
     publishable_site_ids = (
@@ -1703,7 +1732,7 @@ def emit_cross_loop_schedule(
         return f"{peer_key_offsets[plan]} + ({key}) * {_PEER_SLOT_WORDS}"
 
     def peer_counter_publications(
-        root: int, coordinates: dict[int, str], sem: str
+        root: int, coordinates: dict[int, str], sem: str, guard: str | None = None
     ) -> list[ast.stmt]:
         result: list[ast.stmt] = []
         for plan in peer_counter_plans:
@@ -1728,7 +1757,9 @@ def emit_cross_loop_schedule(
                     ast.If, test=expr_from_string(membership), body=[add], orelse=[]
                 )
             )
-        return result
+        if guard is None or not result:
+            return result
+        return [create(ast.If, test=expr_from_string(guard), body=result, orelse=[])]
 
     def peer_counter_waits(
         root: int, coordinates: dict[int, str]
@@ -3000,7 +3031,13 @@ def emit_cross_loop_schedule(
                 )
             )
         peer_counter_adds = peer_counter_publications(
-            root, scheduled_coordinates, "release"
+            root,
+            scheduled_coordinates,
+            "release",
+            # A worker's last task releases from the next root's first task.
+            guard=f"{strategy.virtual_pid_var} != {deferred_last_task[root]}"
+            if root in deferred_last_task
+            else None,
         )
         if producer_counters or peer_counter_adds:
             has_task_scheduling = True
@@ -3042,6 +3079,48 @@ def emit_cross_loop_schedule(
     # Live-task counts of guarded resident roots emitted at kernel scope.
     resident_live_tasks: dict[int, tuple[str, int]] = {}
 
+    def warp_specialized(block_ids: list[int]) -> bool:
+        specializes = CompileEnvironment.current().config_spec.range_warp_specialize
+        return any(
+            specializes.config_get(
+                device_function.config.range_warp_specializes, block_id, None
+            )
+            for block_id in block_ids
+        )
+
+    # Each worker's last keyed peer release of a root moves into the next
+    # resident root's first task (StaticPipelinePlan.deferred_peer_releases):
+    # the source root keeps the worker's last task id at kernel scope (-1 for
+    # none) and the next root issues that release.
+    deferred_releases = static_pipeline_plan.deferred_peer_releases(
+        frozenset(
+            root
+            for root, case in enumerate(owner.cases)
+            if warp_specialized([info.block_id for info in _case_pid_info(case)])
+        )
+    )
+    deferred_last_task = {
+        prev: device_function.new_var("tile_dependency_deferred_task", dce=False)
+        for prev in deferred_releases.values()
+    }
+
+    def deferred_release(root: int, guard: str) -> ast.stmt:
+        """Under ``guard``, this worker's last release of the previous root."""
+        prev = deferred_releases[root]
+        last = deferred_last_task[prev]
+        coordinates = execution_coordinates(
+            prev, f"{last} - {static_pipeline_plan.static_base(prev)}"
+        )
+        return create(
+            ast.If,
+            test=expr_from_string(f"({guard}) and {last} >= 0"),
+            body=[
+                *_release_sync(device_function),
+                *peer_counter_publications(prev, coordinates, "release"),
+            ],
+            orelse=[],
+        )
+
     def root_lane(root: int) -> str:
         # A trailing root begins mid-wave, where the earlier roots' live tasks end:
         # rotate workers onto its lanes.
@@ -3077,13 +3156,7 @@ def emit_cross_loop_schedule(
         ], live
 
     def shared_captures(extent: _GuardedExtent, block_ids: list[int]) -> list[ast.stmt]:
-        specializes = CompileEnvironment.current().config_spec.range_warp_specialize
-        if not any(
-            specializes.config_get(
-                device_function.config.range_warp_specializes, block_id, None
-            )
-            for block_id in block_ids
-        ):
+        if not warp_specialized(block_ids):
             return []
         # Partitions share hoisted reductions and loads instead of each
         # recomputing them; cheap index math stays rematerialized.
@@ -3183,6 +3256,37 @@ def emit_cross_loop_schedule(
             hoisted.extend(shared_captures(extent, block_ids))
             segment_stop = f"tl.minimum({segment_begin} + {live}, {segment_end})"
             skipped_dispatch = skipped_task_dispatch(root, live)
+        first_task = f"((({lane}) - 0) + ({segment_begin}))"
+        has_task = f"{first_task} < {segment_stop}"
+        task_arguments = (
+            strategy.virtual_pid_var,
+            *(() if extent is None else extent.hoisted_names),
+        )
+        # Kernel-scope statements around the root (outside its membership guard)
+        # and the first statements of its task loop.
+        kernel_scope: list[ast.stmt] = []
+        trailer: list[ast.stmt] = []
+        task_prologue: list[ast.stmt] = []
+        if root in deferred_last_task:
+            last = deferred_last_task[root]
+            kernel_scope.append(statement_from_string(f"{last} = -1"))
+            hoisted.append(
+                statement_from_string(
+                    f"{last} = tl.where({has_task}, {first_task} + ({segment_stop}"
+                    f" - {first_task} - 1) // {launch_worker_count} * "
+                    f"{launch_worker_count}, -1)"
+                )
+            )
+            task_arguments = (*task_arguments, last)
+        if root in deferred_releases:
+            ran = device_function.new_var("tile_dependency_deferred_ran", dce=False)
+            kernel_scope.append(statement_from_string(f"{ran} = 0"))
+            hoisted.append(statement_from_string(f"{ran} = tl.where({has_task}, 1, 0)"))
+            task_prologue.append(
+                deferred_release(root, f"{strategy.virtual_pid_var} == {first_task}")
+            )
+            # A worker that runs no task here still owes the release.
+            trailer.append(deferred_release(root, f"{ran} == 0"))
         task_dispatch: list[ast.stmt] = [
             *hoisted,
             create(
@@ -3197,20 +3301,18 @@ def emit_cross_loop_schedule(
                     TileStrategy.get_range_call_str(
                         device_function.config,
                         block_ids,
-                        begin=f"(({lane}) - 0) + ({segment_begin})",
+                        begin=first_task,
                         end=segment_stop,
                         step=str(launch_worker_count),
                     )
                 ),
-                body=scheduled_root_task_body(
+                body=task_prologue
+                + scheduled_root_task_body(
                     root,
                     f"({strategy.virtual_pid_var}) - {segment_begin}",
                     f"{case_offsets[root]} + "
                     f"(({strategy.virtual_pid_var}) - {segment_begin})",
-                    (
-                        strategy.virtual_pid_var,
-                        *(() if extent is None else extent.hoisted_names),
-                    ),
+                    task_arguments,
                 ),
                 orelse=[],
                 type_comment=None,
@@ -3229,7 +3331,7 @@ def emit_cross_loop_schedule(
         ):
             if live is not None:
                 resident_live_tasks[root] = (live, task_count_value)
-            return task_dispatch
+            return [*kernel_scope, *task_dispatch, *trailer]
 
         active_body = _wait_for_dependencies(
             device_function=device_function,
@@ -3243,12 +3345,14 @@ def emit_cross_loop_schedule(
         active_body.extend(root_barrier_publication(root, synced=bool(publications)))
         active_body.extend(publications)
         return [
+            *kernel_scope,
             create(
                 ast.If,
                 test=expr_from_string(segment_membership),
                 body=active_body,
                 orelse=[],
-            )
+            ),
+            *trailer,
         ]
 
     if not uses_packet_dispatch:

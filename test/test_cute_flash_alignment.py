@@ -22,7 +22,6 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import code_and_output
-from helion._testing import onlyBackends
 import helion.language as hl
 from helion.runtime.cute import launcher as cute_launcher
 
@@ -30,6 +29,7 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
+from helion._testing import import_example
 
 FAMILY = cute_flash.FLASH_PIPELINE_FAMILY_KEY
 
@@ -307,7 +307,6 @@ def _run(
     return code, out, lse
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse"])
 @pytest.mark.parametrize("family", list(_FAMILIES))
 def test_under_aligned_operand_matches_the_reference(family: str, operand: str) -> None:
@@ -344,13 +343,12 @@ def test_under_aligned_operand_matches_the_reference(family: str, operand: str) 
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("family", ["ws_overlap", "fa4"])
 def test_example_attention_under_aligned_q_and_k_match_the_reference(
     family: str,
 ) -> None:
     """The reported case: the example kernel with an 8-byte-aligned q or k."""
-    from examples.attention import attention
+    attention = import_example("attention").attention
 
     kernel = helion.kernel(
         attention.fn, backend="cute", static_shapes=True, autotune_effort="none"
@@ -377,7 +375,6 @@ def test_example_attention_under_aligned_q_and_k_match_the_reference(
         torch.testing.assert_close(lse, expected_lse, atol=2e-2, rtol=2e-2)
 
 
-@onlyBackends(["cute"])
 @pytest.mark.parametrize("operand", ["q", "k", "v", "do"])
 def test_backward_under_aligned_operand_matches_the_reference(operand: str) -> None:
     """The fused backward (``helion_flash_bwd``) TMA-loads q, k, v and dO too."""

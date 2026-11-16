@@ -29,6 +29,8 @@ from helion._compiler.cute.cute_flash import _flash_fa4_pruned_split_proof
 from helion._compiler.cute.cute_flash import _flash_pruned_split_bounds
 from helion._compiler.cute.cute_flash import _flash_pruned_split_softmax_segments
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def full_tiles() -> TileLayout:

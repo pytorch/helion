@@ -17,14 +17,8 @@ import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
 
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
-from test.test_cute_full_slice_matmul import _matmul
-from test.test_cute_fuse_mm_accumulation import _cpu_target as _split_k_target
-from test.test_cute_repro_settings import _case
-from test.test_cute_repro_settings import _host
-from test.test_cute_repro_settings import _replay
-from test.test_cute_shared_rhs_grouped import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_split_k_workspace import _args as _split_k_args
 from test.test_cute_split_k_workspace import _config as _split_k_config
 from test.test_cute_split_k_workspace import _embedded_sources
@@ -32,21 +26,33 @@ from test.test_cute_split_k_workspace import _fp32_bias
 
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.state import cute_env_state
+from helion._testing import cpu_render_target
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target as _split_k_target
+from helion._testing.cute_structural import _case
+from helion._testing.cute_structural import _host
+from helion._testing.cute_structural import _pointwise_bound
+from helion._testing.cute_structural import _replay
+from helion._testing.cute_structural_kernels import _matmul
+from helion._testing.cute_structural_kernels import _pointwise
 from helion.autotuner.base_search import normalize_autotune_seed_configs
 from helion.autotuner.pattern_search import PatternSearch
-import helion.language as hl
-from helion.runtime.cute_structural_config import CuteStructuralConfig
-from helion.runtime.cute_structural_config import StructuralPolicyError
-from helion.runtime.cute_structural_config import resolve_cute_structural_policy
-from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
-from helion.runtime.cute_structural_policy import CuteStructuralPolicy
+from helion.runtime.cute.structural_config import CuteStructuralConfig
+from helion.runtime.cute.structural_config import StructuralPolicyError
+from helion.runtime.cute.structural_config import resolve_cute_structural_policy
+from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
+from helion.runtime.cute.structural_policy import CuteStructuralPolicy
 from helion.runtime.settings import Settings
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from helion.runtime.kernel import BoundKernel
+
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
 
 
 @pytest.fixture(autouse=True)
@@ -57,34 +63,11 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_AUTOTUNE_RANDOM_SEED", "0")
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _target(),
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(), reduction_smem_budget_bytes=232448
     ):
         yield
     torch.set_num_threads(previous_threads)
-
-
-def _pointwise(x: torch.Tensor) -> torch.Tensor:
-    out = torch.empty_like(x)
-    for tile in hl.tile(x.size(0)):
-        out[tile] = x[tile] + 1
-    return out
-
-
-def _pointwise_bound(policy: CuteStructuralPolicy | None) -> BoundKernel[Any]:
-    return helion.kernel(
-        _pointwise,
-        backend="cute",
-        static_shapes=True,
-        autotune_effort="none",
-        cute_structural_policy=policy,
-    )._bind_isolated((torch.empty(37),))
 
 
 def test_envelope_is_a_detached_versioned_round_trip() -> None:
@@ -361,7 +344,7 @@ def test_actual_structural_repro_rebinds_under_conflicting_environment(
     assert _host(rebound) == _host(bound)
     assert rebound.to_code() == source
     if marker == "fission":
-        assert rebound.env.cute_fission_plan is not None
+        assert cute_env_state(rebound.env).fission_plan is not None
     else:
         assert marker in _host(rebound)
     (tmp_path / "resolved.py").write_text(source)

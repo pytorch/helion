@@ -23,6 +23,8 @@ from benchmarks.cute import quack_grouped_gemm
 import pytest
 import torch
 
+pytestmark = pytest.mark.cpu_only
+
 SOURCE_IDENTITY = "commit"
 TELEMETRY_SAMPLE = campaign._TelemetrySample(
     pstate="P0",

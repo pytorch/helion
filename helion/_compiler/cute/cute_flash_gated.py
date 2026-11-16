@@ -15,9 +15,15 @@ This generalizes the CuTe flash-attention family in three directions:
   and materialized once at the select that consumes them; they also bound the
   KV range of a query tile (columns every row masks are skipped).  Masked
   scores are replaced by 1.0 before the gate runs (their gate values are
-  discarded) so TMA zero fill never sends the IEEE division down its slow
-  path.  ``exp`` feeding ``c + e`` uses the flush-to-zero ex2 (bit-identical
-  there); the division stays IEEE unless the ``fast_math`` setting is on.
+  discarded) so TMA zero fill never sends the IEEE division of
+  ``cute_exact_division`` down its slow path.  ``exp2`` feeding ``c + e``
+  uses the flush-to-zero ex2 (bit-identical
+  there); ``exp`` is the pointwise lowering's, as in the configs this body
+  declines: the exactly reduced ``cute.math.exp``, or ``ex2.approx`` of
+  ``x * log2(e)`` under the ``fast_math`` setting.  The division is the
+  pointwise lowering's too: the one the launch compiles ``/`` to
+  (``div.full.f32``, or the IEEE one under ``cute_exact_division``), or
+  ``div.approx.ftz`` for an fp32 quotient under that setting.
 * **Row loads.** Two forms.  *Root form*: Q/K/V/O rows are
   ``x[tile.index + offset, lane, :]`` on a rank-3 host tensor whose leading
   coordinate is a singleton root axis (the head), with a loop-invariant scalar
@@ -46,11 +52,16 @@ This generalizes the CuTe flash-attention family in three directions:
 Intentional semantic deviations from the FX program:
 
 * The output store: rows whose gate is forced to zero by a row-only mask term
-  (``mask_q``) are not stored.  The frontend would store zeros there, which
-  for jagged layouts alias the next sequence's rows (a write race the
-  reference does not have); skipping them yields the reference values.  This
-  is only done when the accumulator starts at zero and the masked value is
-  the constant zero.
+  of the exact jagged-length form
+  (``mask_q = tile_q.index < off[b + 1] - off[b]``) are not stored when they
+  lie before the end of the last sequence and the sequences share an output
+  lane.  The frontend would store zeros there, which alias a later
+  sequence's rows (a write race the reference does not have); skipping them
+  yields the reference values.  Rows past the last sequence are no
+  sequence's, and with one sequence per output lane no later sequence stores
+  into the lane, so those rows get the frontend's zeros, as do the rows any
+  other row-only term masks.  This is only done when the accumulator starts
+  at zero and the masked value is the constant zero.
 * Non-finite V rows only (finite data is bit-identical): KV tiles that the P
   mask provably zeroes are skipped, so a NaN/inf V row inside such a tile no
   longer poisons the output through ``0 * V`` as it does in the frontend; and
@@ -93,10 +104,26 @@ from ..device_ir import IfGraphInfo
 from ..device_ir import NodeArgsGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import RootGraphInfo
+from ..emitter_protocols import statements_and_reads_adapter
+from ..utils import is_full_slice
+from . import target_facts
+from .analysis.match_common import host_tensor_name
+from .analysis.match_common import root_grid_origin_is_canonical
 from .cute_flash import FLASH_KV_STAGE_KEY
 from .cute_flash import _flash_graph_host_tensors
 from .cute_flash import _flash_ws_qk_ahead
 from .cute_flash import emit_flash_module_statements
+from .dtypes import narrow_common_dtype
+from .dtypes import promotion_operand
+from .dtypes import round_scalar
+from .flash_template_runs import FLASH_QKV_TMA_PARTITIONS
+from .flash_template_runs import flash_ws_p_store_partitions
+from .flash_template_runs import flash_ws_pv_step
+from .flash_template_runs import flash_ws_qk_step
+from .flash_template_runs import flash_ws_s_load_partitions
+from .math_templates import SIGMOID_TEMPLATE
+from .math_templates import float_literal
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -128,6 +155,9 @@ GATED_GATE_WARPGROUP_CHOICES = (1, 2, 4)
 GATED_GATE_WARPGROUP_DEFAULT = 2
 FLASH_GATE_WARPGROUPS_KEY = "cute_flash_gate_warpgroups"
 GATED_IO_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# Gate vector width of the register-MMA row programs
+# (``cute_flash_gated_row_mma``): elements of one lane's S row per pass.
+GATED_ROW_GATE_WIDTH = 8
 # Reserve for mbarriers, the TMEM holding slot and allocator padding.
 _GATED_SMEM_RESERVE_BYTES = 1024
 # sm_100 opt-in per-CTA shared memory; used when the device is unknown (CPU
@@ -226,7 +256,6 @@ _UNARY_MATH_TARGETS: dict[object, str] = {
     torch.ops.aten.exp.default: "exp",
     torch.ops.aten.exp2.default: "exp2",
     torch.ops.aten.sigmoid.default: "sigmoid",
-    torch.ops.aten.silu.default: "silu",
     torch.ops.aten.tanh.default: "tanh",
     torch.ops.aten.relu.default: "relu",
     torch.ops.aten.sqrt.default: "sqrt",
@@ -237,8 +266,8 @@ _UNARY_MATH_TARGETS: dict[object, str] = {
     operator.neg: "neg",
 }
 _MINMAX_TARGETS: dict[object, str] = {
-    torch.ops.aten.maximum.default: ">",
-    torch.ops.aten.minimum.default: "<",
+    torch.ops.aten.maximum.default: "max",
+    torch.ops.aten.minimum.default: "min",
 }
 _VIEW_TARGETS: frozenset[object] = frozenset(
     {
@@ -297,15 +326,6 @@ def _gated_mma_dtype_str(dtype: torch.dtype) -> str:
     if dtype is torch.float32:
         return "cutlass.TFloat32"
     return _gated_io_dtype_str(dtype)
-
-
-def _is_full_slice(value: object) -> bool:
-    return (
-        isinstance(value, slice)
-        and value.start is None
-        and value.stop is None
-        and value.step is None
-    )
 
 
 def _node_val(node: torch.fx.Node) -> object:
@@ -438,8 +458,11 @@ class GatedAttentionMatch:
     score_node: torch.fx.Node
     p_node: torch.fx.Node
     # ``where`` conjuncts of the exact jagged-length form
-    # ``tile_q.index < off[b + 1] - off[b]``: rows they mask belong to the next
-    # sequence (or padding), so the fused body skips their store.
+    # ``tile_q.index < off[b + 1] - off[b]``: rows they mask before the end of
+    # the last sequence belong to a later sequence, which stores them into
+    # the same output lane, so the fused body skips their store (the rows past
+    # it: ``rows_end``).  Empty for an unmasked store when each sequence has
+    # an output lane of its own.
     store_skip_terms: tuple[torch.fx.Node, ...]
     scope: _GraphScope
     # ``root``: the query tile is the last root axis (jagged_hstu_attn).
@@ -453,6 +476,18 @@ class GatedAttentionMatch:
     q_end: object = None
     lane_extent: int | None = None
     v_row_bound: torch.fx.Node | None = None
+    # Dtype of the ``P @ V`` product the frontend adds into the fp32
+    # accumulator: a 16-bit dtype means every KV tile's partial product is
+    # rounded before the add (``acc += (P @ V)`` on 16-bit rows).  The fused
+    # tcgen05 body accumulates in TMEM and cannot honor it; the register row
+    # programs do.
+    pv_dtype: torch.dtype = torch.float32
+    # With ``store_skip_terms`` and a store the program does not mask itself:
+    # the ``off[b + 1]`` load of a skip term and the leading axis ``b`` runs
+    # over.  Rows from ``off[n]`` on (``n`` that axis's extent) are no
+    # sequence's, so the program's zero store there is its result and the
+    # fused body stores them too.
+    rows_end: tuple[torch.fx.Node, int] | None = None
 
     @property
     def leading_block_ids(self) -> tuple[int, ...]:
@@ -466,21 +501,35 @@ class GatedAttentionMatch:
 
 
 class GatedAttentionPlan(NamedTuple):
-    """Config-dependent selection of the fused gated body."""
+    """Config-dependent selection of a gated body: the fused tcgen05 body
+    (``row_warps == 0``) or the register-MMA row program of
+    ``cute_flash_gated_row_mma`` with ``row_warps`` warps per CTA."""
 
     match: GatedAttentionMatch
     kv_tile: int
     kv_stage: int
     gate_warpgroups: int = 1
     q_tile: int = GATED_Q_TILE
+    row_warps: int = 0
 
     @property
     def threads(self) -> int:
-        """One producer warpgroup plus the gate warpgroups."""
+        """One producer warpgroup plus the gate warpgroups, or the row
+        program's warps."""
+        if self.row_warps:
+            return 32 * self.row_warps
         return 128 * (1 + self.gate_warpgroups)
 
     @property
     def geometry(self) -> GatedChunkGeometry:
+        if self.row_warps:
+            # One lane's share of a row of the S fragment: pairs of adjacent
+            # columns eight apart (``mma.sync`` C layout), ``kv_tile // 4``
+            # elements per row half, replayed in passes of at most
+            # ``GATED_ROW_GATE_WIDTH`` elements (32 keys).
+            return GatedChunkGeometry(
+                min(self.kv_tile // 4, GATED_ROW_GATE_WIDTH), 1, 1, paired=True
+            )
         geometry = gated_chunk_geometry(self.q_tile, self.kv_tile, self.gate_warpgroups)
         assert geometry is not None
         return geometry
@@ -499,11 +548,23 @@ class GatedChunkGeometry(NamedTuple):
     chunk_cols: int
     col_stride: int
     chunk_iters: int
+    # ``mma.sync`` fragment rows: element ``e`` sits at column
+    # ``8 * (e // 2) + e % 2`` of the chunk (pairs of adjacent columns eight
+    # apart) instead of ``col_stride * e``.
+    paired: bool = False
 
     @property
     def chunk_span(self) -> int:
         """Score columns covered by one chunk."""
+        if self.paired:
+            return 4 * self.chunk_cols
         return self.chunk_cols * self.col_stride
+
+    def column_offsets(self) -> list[int]:
+        """Chunk-relative column of every element."""
+        if self.paired:
+            return [8 * (e // 2) + e % 2 for e in range(self.chunk_cols)]
+        return [self.col_stride * e for e in range(self.chunk_cols)]
 
 
 def gated_chunk_geometry(
@@ -541,6 +602,16 @@ class GatedSearchSurface(NamedTuple):
     # than a narrow one, and the 64-row Q tile fits one more than the 128-row.
     kv_stage_choices_by_tile: tuple[tuple[tuple[int, int], tuple[int, ...]], ...] = ()
     q_tile_choices: tuple[int, ...] = (GATED_Q_TILE,)
+    # Register-MMA row-program tiles (``cute_flash_gated_row_mma``): the warp
+    # counts legal at each (query rows, KV tile); their ring depths are in
+    # ``kv_stage_choices_by_tile`` with the fused tiles'.
+    row_warp_choices_by_tile: tuple[tuple[tuple[int, int], tuple[int, ...]], ...] = ()
+    # ... and the ring depths legal at each (query rows, KV tile, warps).
+    row_stage_choices: tuple[tuple[tuple[int, int, int], tuple[int, ...]], ...] = ()
+    # 16-row programs of the grid (leading axes times 16-row query tiles of
+    # the query extent's size hint): the row programs are seeded only on
+    # small grids (``GATED_ROW_SEED_MAX_PROGRAMS``).
+    row_programs: int | None = None
 
     @property
     def block_size_targets(self) -> dict[int, int]:
@@ -672,7 +743,7 @@ class _ProgramChecker:
             if target is view_ops.subscript:
                 index = node.args[1] if len(node.args) > 1 else None
                 if not isinstance(index, (list, tuple)) or not all(
-                    item is None or _is_full_slice(item) for item in index
+                    item is None or is_full_slice(item) for item in index
                 ):
                     return None
             return self.check(node.args[0])
@@ -771,18 +842,6 @@ def _is_zero_constant(value: object, scope: _GraphScope) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _host_tensor_name(node: object) -> str | None:
-    if (
-        isinstance(node, torch.fx.Node)
-        and node.op == "call_function"
-        and node.target is _tracing_ops._host_tensor
-        and node.args
-        and isinstance(node.args[0], str)
-    ):
-        return node.args[0]
-    return None
-
-
 def _parse_row_access(
     env: CompileEnvironment,
     scope: _GraphScope,
@@ -798,7 +857,7 @@ def _parse_row_access(
         memory_ops.store,
     ):
         return None
-    name = _host_tensor_name(node.args[0])
+    name = host_tensor_name(node.args[0])
     if name is None:
         return None
     indices = node.args[1] if len(node.args) > 1 else None
@@ -822,9 +881,9 @@ def _parse_row_access(
             or mask_val.shape[1] != 1
         ):
             return None
-    if not _is_full_slice(indices[2]):
+    if not is_full_slice(indices[2]):
         return None
-    if _is_full_slice(indices[1]):
+    if is_full_slice(indices[1]):
         # ``x[tile, :, :]`` on the row block: the block-size symnode indexes
         # the whole tile (rows are absolute), every lane is loaded.
         first = scope.resolve(indices[0])
@@ -870,7 +929,11 @@ def _parse_row_access(
             continue
         row_index = resolved
         row_offset: torch.fx.Node | None = None
-        if resolved.target in _ADD_TARGETS and len(resolved.args) == 2:
+        if (
+            resolved.target in _ADD_TARGETS
+            and len(resolved.args) == 2
+            and resolved.kwargs.get("alpha", 1) == 1
+        ):
             lhs, rhs = (scope.resolve(arg) for arg in resolved.args)
             candidates = [(lhs, rhs), (rhs, lhs)]
             row_index = None
@@ -995,7 +1058,7 @@ def _scalar_load_parts(node: object) -> tuple[str, object] | None:
         and node.op == "call_function"
         and node.target is memory_ops.load
     ):
-        name = _host_tensor_name(node.args[0])
+        name = host_tensor_name(node.args[0])
         indices = node.args[1] if len(node.args) > 1 else None
         if name is not None and isinstance(indices, (list, tuple)):
             if len(indices) == 1:
@@ -1003,7 +1066,7 @@ def _scalar_load_parts(node: object) -> tuple[str, object] | None:
     return None
 
 
-def _is_jagged_length_term(
+def _jagged_sequence_end(
     env: CompileEnvironment,
     scope: _GraphScope,
     term: torch.fx.Node,
@@ -1011,16 +1074,18 @@ def _is_jagged_length_term(
     row_offset: torch.fx.Node | None,
     q_block_id: int,
     leading_block_ids: tuple[int, ...],
-) -> bool:
-    """``tile_q.index < off[b + 1] - off[b]`` where ``off[b]`` is the row offset."""
+) -> tuple[torch.fx.Node, int] | None:
+    """The ``off[b + 1]`` load and the leading axis ``b`` runs over when
+    ``term`` is ``tile_q.index < off[b + 1] - off[b]`` and ``off[b]`` is the
+    row offset."""
     if row_offset is None:
-        return False
+        return None
     if term.target in _LT_TARGETS:
         index_side, length_side = term.args
     elif term.target in _GT_TARGETS:
         length_side, index_side = term.args
     else:
-        return False
+        return None
     index_node = scope.resolve(index_side)
     if (
         not isinstance(index_node, torch.fx.Node)
@@ -1028,7 +1093,7 @@ def _is_jagged_length_term(
         or index_node.target is not tile_ops.tile_index
         or _tile_index_block_id(env, index_node) != q_block_id
     ):
-        return False
+        return None
     length = scope.resolve(length_side)
     if (
         not isinstance(length, torch.fx.Node)
@@ -1037,15 +1102,19 @@ def _is_jagged_length_term(
         or len(length.args) != 2
         or length.kwargs.get("alpha", 1) != 1
     ):
-        return False
+        return None
     ends, starts = (scope.resolve(arg) for arg in length.args)
     if starts is not row_offset:
-        return False
+        return None
     starts_parts = _scalar_load_parts(starts)
     ends_parts = _scalar_load_parts(ends)
     if starts_parts is None or ends_parts is None or starts_parts[0] != ends_parts[0]:
-        return False
-    return _is_successor(env, scope, ends_parts[1], starts_parts[1], leading_block_ids)
+        return None
+    if not _is_successor(env, scope, ends_parts[1], starts_parts[1], leading_block_ids):
+        return None
+    block_id = _leading_axis_coordinate(env, scope, starts_parts[1], leading_block_ids)
+    assert isinstance(ends, torch.fx.Node) and block_id is not None
+    return ends, block_id
 
 
 def _unwrap_permute(node: object) -> torch.fx.Node | None:
@@ -1071,6 +1140,10 @@ def _unwrap_permute(node: object) -> torch.fx.Node | None:
 def match_gated_attention(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     """Config-independent detector for the fused gated attention body (either
     form; see ``GatedAttentionMatch.form``)."""
+    # The fused bodies number the root grid's work items from 0 in steps of 1
+    # (``_GatedEmitter.tile_scalar_expr``).
+    if not root_grid_origin_is_canonical(device_ir):
+        return None
     match = _match_root_form(device_ir)
     if match is None:
         match = _match_sequence_form(device_ir)
@@ -1091,6 +1164,216 @@ def _permute_source(node: object, order: list[int], scope: _GraphScope) -> objec
     return None
 
 
+class _GatedGraphs(NamedTuple):
+    """A kernel's graph set as both forms read it."""
+
+    graphs: tuple[GraphInfo, ...]
+    scope: _GraphScope
+    root: RootGraphInfo
+    # Device ``for`` loops (reductions are not loops here).
+    loops: list[ForLoopGraphInfo]
+
+
+def _gated_graphs(device_ir: DeviceIR) -> _GatedGraphs | None:
+    graphs = tuple(device_ir.graphs)
+    root_graphs = [info for info in graphs if isinstance(info, RootGraphInfo)]
+    if len(root_graphs) != 1:
+        return None
+    loop_graphs = [
+        info
+        for info in graphs
+        if isinstance(info, ForLoopGraphInfo)
+        and not isinstance(info, ReductionLoopGraphInfo)
+    ]
+    return _GatedGraphs(graphs, _GraphScope(graphs), root_graphs[0], loop_graphs)
+
+
+def _gated_io_fakes(
+    graphs: Sequence[GraphInfo], accesses: Sequence[GatedRowAccess]
+) -> tuple[list[torch.Tensor], int] | None:
+    """The host tensors behind the Q/K/V/O accesses and the head dim: all
+    rank-3 and contiguous in one ``GATED_IO_DTYPES`` dtype with a supported
+    head dim and 32-bit row counts (row coordinates are TMA coordinates;
+    element offsets are 64-bit)."""
+    host_tensors = _flash_graph_host_tensors(graphs)
+    fakes = [host_tensors.get(access.name) for access in accesses]
+    if any(fake is None for fake in fakes):
+        return None
+    fakes = cast("list[torch.Tensor]", fakes)
+    q_fake = fakes[0]
+    if q_fake.ndim != 3 or q_fake.dtype not in GATED_IO_DTYPES:
+        return None
+    head_dim = q_fake.shape[2]
+    if not isinstance(head_dim, int) or head_dim not in GATED_HEAD_DIMS:
+        return None
+    for access, fake in zip(accesses, fakes, strict=True):
+        if (
+            fake.ndim != 3
+            or fake.dtype != q_fake.dtype
+            or not fake.is_contiguous()
+            or fake.shape[2] != head_dim
+        ):
+            return None
+        rows = fake.shape[access.row_dim]
+        if isinstance(rows, int) and rows >= 2**31:
+            return None
+    return fakes, head_dim
+
+
+def _match_accumulator(
+    scope: _GraphScope,
+    loop_graph: ForLoopGraphInfo,
+    loop_node: torch.fx.Node,
+    pv_node: torch.fx.Node,
+    fused_target: object,
+) -> tuple[torch.fx.Node, torch.fx.Node, torch.fx.Node] | None:
+    """The fp32 accumulator the KV loop carries: its single output (``pv``
+    itself when the contraction is the fused ``fused_target`` --
+    ``addmm`` / ``baddbmm`` -- else ``acc + pv``), the zero ``full`` seeding
+    it (a loop input) and the P operand of the PV contraction. Returns
+    ``(acc_out, acc_carry, p_node)``."""
+    outputs = next(node for node in loop_graph.graph.nodes if node.op == "output")
+    output_values = outputs.args[0]
+    if not isinstance(output_values, (list, tuple)) or len(output_values) != 1:
+        return None
+    acc_out = output_values[0]
+    if not isinstance(acc_out, torch.fx.Node):
+        return None
+    if pv_node.target is fused_target:
+        if acc_out is not pv_node:
+            return None
+        acc_carry = scope.resolve(pv_node.args[0])
+        p_node = pv_node.args[1]
+    else:
+        if (
+            acc_out.op != "call_function"
+            or acc_out.target is not torch.ops.aten.add.Tensor
+            or len(acc_out.args) != 2
+            or acc_out.kwargs.get("alpha", 1) != 1
+        ):
+            return None
+        if acc_out.args[0] is pv_node:
+            carry_arg = acc_out.args[1]
+        elif acc_out.args[1] is pv_node:
+            carry_arg = acc_out.args[0]
+        else:
+            return None
+        acc_carry = scope.resolve(carry_arg)
+        p_node = pv_node.args[0]
+    acc_val = _node_val(acc_out)
+    if not isinstance(acc_val, torch.Tensor) or acc_val.dtype != torch.float32:
+        return None
+    if not isinstance(p_node, torch.fx.Node):
+        return None
+    if (
+        not isinstance(acc_carry, torch.fx.Node)
+        or acc_carry.op != "call_function"
+        or acc_carry.target is not creation_ops.full
+        or not _is_zero_constant(acc_carry, scope)
+    ):
+        return None
+    # The zero accumulator must be the loop input feeding the carry.
+    loop_inputs = loop_node.args[3]
+    if not isinstance(loop_inputs, (list, tuple)) or acc_carry not in loop_inputs:
+        return None
+    return acc_out, acc_carry, p_node
+
+
+def _convert_source(value: object, io_dtype: torch.dtype) -> object:
+    """``value`` behind a ``convert`` to ``io_dtype`` (``value`` itself when
+    it is no convert); None for a convert to another dtype."""
+    if (
+        isinstance(value, torch.fx.Node)
+        and value.op == "call_function"
+        and value.target in _CONVERT_TARGETS
+    ):
+        target_dtype = (
+            value.args[1] if len(value.args) > 1 else value.kwargs.get("dtype")
+        )
+        if target_dtype != io_dtype:
+            return None
+        return value.args[0]
+    return value
+
+
+def _match_phi_carry(
+    scope: _GraphScope,
+    body_graph: torch.fx.Graph,
+    loop_node: torch.fx.Node,
+    value: object,
+    acc_carry: torch.fx.Node,
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    """``value`` is the fp32 ``_phi(zeros, loop result)`` joining the zero
+    accumulator with the KV loop's single result in ``body_graph``. Returns
+    ``(value, loop_result)``."""
+    if (
+        not isinstance(value, torch.fx.Node)
+        or value.op != "call_function"
+        or value.target is not _tracing_ops._phi
+        or len(value.args) != 2
+    ):
+        return None
+    phi_sources = {scope.resolve(arg) for arg in value.args}
+    loop_results = [
+        node
+        for node in body_graph.nodes
+        if node.op == "call_function"
+        and node.target is operator.getitem
+        and node.args[0] is loop_node
+        and node.args[1] == 0
+    ]
+    if len(loop_results) != 1 or phi_sources != {acc_carry, loop_results[0]}:
+        return None
+    value_val = _node_val(value)
+    if not isinstance(value_val, torch.Tensor) or value_val.dtype != torch.float32:
+        return None
+    return value, loop_results[0]
+
+
+def _gate_program_checker(
+    env: CompileEnvironment,
+    scope: _GraphScope,
+    *,
+    score_node: torch.fx.Node,
+    p_node: torch.fx.Node,
+    q_block_id: int,
+    kv_block_id: int,
+    leading_block_ids: tuple[int, ...],
+) -> _ProgramChecker | None:
+    """The gate program between the score and P, checked: P must vary along
+    both the query rows and the KV columns and derive from the score."""
+    checker = _ProgramChecker(
+        env,
+        scope,
+        score_node=score_node,
+        q_block_id=q_block_id,
+        kv_block_id=kv_block_id,
+        leading_block_ids=leading_block_ids,
+    )
+    p_domain = checker.check(p_node)
+    if p_domain is None or _Q_ROW not in p_domain or _KV_COL not in p_domain:
+        return None
+    if score_node not in checker.domains:
+        return None
+    return checker
+
+
+def _calls_accounted(
+    call_nodes: Iterable[torch.fx.Node],
+    accounted: set[torch.fx.Node],
+    accesses: Iterable[GatedRowAccess],
+) -> bool:
+    """Whole-graph audit: every call in the root, ``if`` and loop graphs must
+    be a matched structural node, part of a checked program, an access index
+    or a pure leaf. Anything else (atomics, other stores or loops,
+    reductions) is rejected."""
+    for access in accesses:
+        accounted.update(access.index_nodes)
+    return all(
+        node in accounted or node.target in _PURE_LEAF_TARGETS for node in call_nodes
+    )
+
+
 def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     """``for s in hl.grid(B): start, end = off[s], off[s + 1]; for tile_q in
     hl.tile(start, end): ...; for tile_kv in hl.tile(start, end): bmm over the
@@ -1099,18 +1382,10 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
     if len(device_ir.grid_block_ids) != 1 or len(device_ir.grid_block_ids[0]) != 1:
         return None
     seq_block_id = device_ir.grid_block_ids[0][0]
-    graphs = tuple(device_ir.graphs)
-    scope = _GraphScope(graphs)
-    root_graphs = [info for info in graphs if isinstance(info, RootGraphInfo)]
-    if len(root_graphs) != 1:
+    graph_set = _gated_graphs(device_ir)
+    if graph_set is None:
         return None
-    root_graph = root_graphs[0]
-    loop_graphs = [
-        info
-        for info in graphs
-        if isinstance(info, ForLoopGraphInfo)
-        and not isinstance(info, ReductionLoopGraphInfo)
-    ]
+    graphs, scope, root_graph, loop_graphs = graph_set
     if len(loop_graphs) != 2 or any(len(info.block_ids) != 1 for info in loop_graphs):
         return None
     call_nodes = _gated_call_nodes(graphs)
@@ -1232,34 +1507,16 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         return None
     if len({access.name for access in accesses}) != 4:
         return None
-    host_tensors = _flash_graph_host_tensors(graphs)
-    fakes = [host_tensors.get(access.name) for access in accesses]
-    if any(fake is None for fake in fakes):
+    io_facts = _gated_io_fakes(graphs, accesses)
+    if io_facts is None:
         return None
-    q_fake = fakes[0]
-    assert q_fake is not None
-    if q_fake.ndim != 3 or q_fake.dtype not in GATED_IO_DTYPES:
-        return None
-    head_dim = q_fake.shape[2]
-    lane_extent = q_fake.shape[1]
-    if not isinstance(head_dim, int) or head_dim not in GATED_HEAD_DIMS:
-        return None
+    fakes, head_dim = io_facts
+    lane_extent = fakes[0].shape[1]
     if not isinstance(lane_extent, int) or lane_extent < 1:
         return None
-    for fake in fakes:
-        assert fake is not None
-        if (
-            fake.ndim != 3
-            or fake.dtype != q_fake.dtype
-            or not fake.is_contiguous()
-            or fake.shape[1] != lane_extent
-            or fake.shape[2] != head_dim
-        ):
-            return None
-        rows = fake.shape[0]
-        if isinstance(rows, int) and rows >= 2**31:
-            return None
-    io_dtype = q_fake.dtype
+    if any(fake.shape[1] != lane_extent for fake in fakes):
+        return None
+    io_dtype = fakes[0].dtype
     score_val = _node_val(score_node)
     pv_val = _node_val(pv_node)
     if not isinstance(score_val, torch.Tensor) or not isinstance(pv_val, torch.Tensor):
@@ -1277,98 +1534,33 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
 
     # Accumulator carried by the KV loop, seeded with zeros, permuted back and
     # stored once.
-    outputs = next(node for node in kv_graph.graph.nodes if node.op == "output")
-    output_values = outputs.args[0]
-    if not isinstance(output_values, (list, tuple)) or len(output_values) != 1:
+    accumulator = _match_accumulator(
+        scope, kv_graph, kv_loop_node, pv_node, torch.ops.aten.baddbmm.default
+    )
+    if accumulator is None:
         return None
-    acc_out = output_values[0]
-    if not isinstance(acc_out, torch.fx.Node):
-        return None
-    if pv_node.target is torch.ops.aten.baddbmm.default:
-        if acc_out is not pv_node:
-            return None
-        acc_carry = scope.resolve(pv_node.args[0])
-        p_node = pv_node.args[1]
-    else:
-        if (
-            acc_out.op != "call_function"
-            or acc_out.target is not torch.ops.aten.add.Tensor
-            or len(acc_out.args) != 2
-            or acc_out.kwargs.get("alpha", 1) != 1
-        ):
-            return None
-        if acc_out.args[0] is pv_node:
-            carry_arg = acc_out.args[1]
-        elif acc_out.args[1] is pv_node:
-            carry_arg = acc_out.args[0]
-        else:
-            return None
-        acc_carry = scope.resolve(carry_arg)
-        p_node = pv_node.args[0]
-    acc_val = _node_val(acc_out)
-    if not isinstance(acc_val, torch.Tensor) or acc_val.dtype != torch.float32:
-        return None
-    if not isinstance(p_node, torch.fx.Node):
-        return None
-    if (
-        not isinstance(acc_carry, torch.fx.Node)
-        or acc_carry.op != "call_function"
-        or acc_carry.target is not creation_ops.full
-        or not _is_zero_constant(acc_carry, scope)
-    ):
-        return None
-    loop_inputs = kv_loop_node.args[3]
-    if not isinstance(loop_inputs, (list, tuple)) or acc_carry not in loop_inputs:
-        return None
+    acc_out, acc_carry, p_node = accumulator
     store_value = store_node.args[2]
-    value = store_value
-    if isinstance(value, torch.fx.Node) and value.op == "call_function":
-        if value.target in _CONVERT_TARGETS:
-            target_dtype = (
-                value.args[1] if len(value.args) > 1 else value.kwargs.get("dtype")
-            )
-            if target_dtype != io_dtype:
-                return None
-            value = value.args[0]
+    value = _convert_source(store_value, io_dtype)
     permuted = _permute_source(value, [1, 0, 2], scope)
     if not isinstance(permuted, torch.fx.Node):
         return None
     store_view = scope.resolve(value)
-    value = permuted
-    if (
-        not isinstance(value, torch.fx.Node)
-        or value.op != "call_function"
-        or value.target is not _tracing_ops._phi
-        or len(value.args) != 2
-    ):
+    carry = _match_phi_carry(scope, q_graph.graph, kv_loop_node, permuted, acc_carry)
+    if carry is None:
         return None
-    phi_sources = {scope.resolve(arg) for arg in value.args}
-    loop_results = [
-        node
-        for node in q_graph.graph.nodes
-        if node.op == "call_function"
-        and node.target is operator.getitem
-        and node.args[0] is kv_loop_node
-        and node.args[1] == 0
-    ]
-    if len(loop_results) != 1 or phi_sources != {acc_carry, loop_results[0]}:
-        return None
-    value_val = _node_val(value)
-    if not isinstance(value_val, torch.Tensor) or value_val.dtype != torch.float32:
-        return None
+    value, loop_result = carry
 
-    checker = _ProgramChecker(
+    checker = _gate_program_checker(
         env,
         scope,
         score_node=score_node,
+        p_node=p_node,
         q_block_id=q_block_id,
         kv_block_id=kv_block_id,
         leading_block_ids=(seq_block_id,),
     )
-    p_domain = checker.check(p_node)
-    if p_domain is None or _Q_ROW not in p_domain or _KV_COL not in p_domain:
-        return None
-    if score_node not in checker.domains:
+    if checker is None:
         return None
     for scalar in (q_begin, q_end):
         domain = checker.check(scalar)
@@ -1382,7 +1574,7 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             kv_loop_node,
             store_node,
             value,
-            loop_results[0],
+            loop_result,
             score_node,
             pv_node,
             q_src,
@@ -1397,11 +1589,7 @@ def _match_sequence_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         accounted.add(store_value)
     if isinstance(store_view, torch.fx.Node):
         accounted.add(store_view)
-    for access in accesses:
-        accounted.update(access.index_nodes)
-    for node in call_nodes:
-        if node in accounted or node.target in _PURE_LEAF_TARGETS:
-            continue
+    if not _calls_accounted(call_nodes, accounted, accesses):
         return None
     return GatedAttentionMatch(
         root_block_ids=(seq_block_id,),
@@ -1448,18 +1636,10 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         return None
     q_block_id = root_block_ids[-1]
     leading_block_ids = root_block_ids[:-1]
-    graphs = tuple(device_ir.graphs)
-    scope = _GraphScope(graphs)
-    root_graphs = [info for info in graphs if isinstance(info, RootGraphInfo)]
-    if len(root_graphs) != 1:
+    graph_set = _gated_graphs(device_ir)
+    if graph_set is None:
         return None
-    root_graph = root_graphs[0]
-    loop_graphs = [
-        info
-        for info in graphs
-        if isinstance(info, ForLoopGraphInfo)
-        and not isinstance(info, ReductionLoopGraphInfo)
-    ]
+    graphs, scope, root_graph, loop_graphs = graph_set
     if len(loop_graphs) != 1 or len(loop_graphs[0].block_ids) != 1:
         return None
     loop_graph = loop_graphs[0]
@@ -1613,31 +1793,11 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         return None
     if len({access.offset for access in accesses}) != 1:
         return None
-    host_tensors = _flash_graph_host_tensors(graphs)
-    fakes = [host_tensors.get(access.name) for access in accesses]
-    if any(fake is None for fake in fakes):
+    io_facts = _gated_io_fakes(graphs, accesses)
+    if io_facts is None:
         return None
-    q_fake = fakes[0]
-    assert q_fake is not None
-    if q_fake.ndim != 3 or q_fake.dtype not in GATED_IO_DTYPES:
-        return None
-    head_dim = q_fake.shape[2]
-    if not isinstance(head_dim, int) or head_dim not in GATED_HEAD_DIMS:
-        return None
-    for access, fake in zip(accesses, fakes, strict=True):
-        assert fake is not None
-        if (
-            fake.ndim != 3
-            or fake.dtype != q_fake.dtype
-            or not fake.is_contiguous()
-            or fake.shape[2] != head_dim
-        ):
-            return None
-        # Row coordinates are 32-bit (TMA); element offsets are 64-bit.
-        rows = fake.shape[access.row_dim]
-        if isinstance(rows, int) and rows >= 2**31:
-            return None
-    io_dtype = q_fake.dtype
+    fakes, head_dim = io_facts
+    io_dtype = fakes[0].dtype
     score_val = _node_val(score_node)
     pv_val = _node_val(pv_node)
     if not isinstance(score_val, torch.Tensor) or not isinstance(pv_val, torch.Tensor):
@@ -1657,99 +1817,32 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
 
     # Accumulator: ``acc = acc + pv`` (or ``addmm(acc, P, v)``) carried by the
     # loop, seeded with zeros, converted once and stored.
-    outputs = next(node for node in loop_graph.graph.nodes if node.op == "output")
-    output_values = outputs.args[0]
-    if not isinstance(output_values, (list, tuple)) or len(output_values) != 1:
+    accumulator = _match_accumulator(
+        scope, loop_graph, loop_node, pv_node, torch.ops.aten.addmm.default
+    )
+    if accumulator is None:
         return None
-    acc_out = output_values[0]
-    if not isinstance(acc_out, torch.fx.Node):
-        return None
-    if pv_node.target is torch.ops.aten.addmm.default:
-        if acc_out is not pv_node:
-            return None
-        acc_carry = scope.resolve(pv_node.args[0])
-        p_node = pv_node.args[1]
-    else:
-        if (
-            acc_out.op != "call_function"
-            or acc_out.target is not torch.ops.aten.add.Tensor
-            or len(acc_out.args) != 2
-            or acc_out.kwargs.get("alpha", 1) != 1
-        ):
-            return None
-        if acc_out.args[0] is pv_node:
-            carry_arg = acc_out.args[1]
-        elif acc_out.args[1] is pv_node:
-            carry_arg = acc_out.args[0]
-        else:
-            return None
-        acc_carry = scope.resolve(carry_arg)
-        p_node = pv_node.args[0]
-    acc_val = _node_val(acc_out)
-    if not isinstance(acc_val, torch.Tensor) or acc_val.dtype != torch.float32:
-        return None
-    if not isinstance(p_node, torch.fx.Node):
-        return None
-    if (
-        not isinstance(acc_carry, torch.fx.Node)
-        or acc_carry.op != "call_function"
-        or acc_carry.target is not creation_ops.full
-        or not _is_zero_constant(acc_carry, scope)
-    ):
-        return None
-    # The zero accumulator must be the loop input feeding the carry.
-    loop_inputs = loop_node.args[3]
-    if not isinstance(loop_inputs, (list, tuple)) or acc_carry not in loop_inputs:
-        return None
+    acc_out, acc_carry, p_node = accumulator
 
     # Store value: convert(_phi(zeros, loop result)) or the phi itself.
     store_value = store_node.args[2]
-    value = store_value
-    if isinstance(value, torch.fx.Node) and value.op == "call_function":
-        if value.target in _CONVERT_TARGETS:
-            target_dtype = (
-                value.args[1] if len(value.args) > 1 else value.kwargs.get("dtype")
-            )
-            if target_dtype != io_dtype:
-                return None
-            value = value.args[0]
-    if (
-        not isinstance(value, torch.fx.Node)
-        or value.op != "call_function"
-        or value.target is not _tracing_ops._phi
-        or len(value.args) != 2
-    ):
+    value = _convert_source(store_value, io_dtype)
+    carry = _match_phi_carry(scope, body_info.graph, loop_node, value, acc_carry)
+    if carry is None:
         return None
-    phi_sources = {scope.resolve(arg) for arg in value.args}
-    loop_results = [
-        node
-        for node in body_info.graph.nodes
-        if node.op == "call_function"
-        and node.target is operator.getitem
-        and node.args[0] is loop_node
-        and node.args[1] == 0
-    ]
-    if len(loop_results) != 1 or phi_sources != {acc_carry, loop_results[0]}:
-        return None
-    value_val = _node_val(value)
-    if not isinstance(value_val, torch.Tensor) or value_val.dtype != torch.float32:
-        return None
+    value, loop_result = carry
 
     # The gate program between the score and P plus every scalar program.
-    checker = _ProgramChecker(
+    checker = _gate_program_checker(
         env,
         scope,
         score_node=score_node,
+        p_node=p_node,
         q_block_id=q_block_id,
         kv_block_id=kv_block_id,
         leading_block_ids=leading_block_ids,
     )
-    p_domain = checker.check(p_node)
-    if p_domain is None:
-        return None
-    if _Q_ROW not in p_domain or _KV_COL not in p_domain:
-        return None
-    if score_node not in checker.domains:
+    if checker is None:
         return None
     # The KV bound and the guard may depend on the query tile (per work item);
     # the row offset must be a CTA-level scalar.
@@ -1763,14 +1856,35 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         domain = checker.check(scalar)
         if domain is None or not domain <= allowed:
             return None
+    # The rows a jagged-length term masks (store skipping, below) belong to a
+    # later sequence only where it stores into the same output lane.  With the
+    # offsets indexed by the lane's own axis (``starts = off[tile_h.begin]``
+    # and ``out[tile_q.index + starts, tile_h.begin, :]``) every sequence has
+    # a lane of its own, so an unmasked store's zeros there are the program's
+    # result and the body stores them too.  A store masked by the sequence
+    # length still skips them, as the program does.
+    offset_load = _scalar_load_parts(scope.resolve(q_access.offset))
+    own_lane_sequences = (
+        o_access.extra_mask is None
+        and offset_load is not None
+        and q_access.lane_block_id is not None
+        and _leading_axis_coordinate(env, scope, offset_load[1], leading_block_ids)
+        == q_access.lane_block_id
+    )
     # Store skipping. A ``where`` conjunct of the exact jagged-length form
     # ``tile_q.index < off[b + 1] - off[b]`` (``off[b]`` being the row offset
     # and ``b`` a leading-axis coordinate, so consecutive entries bound the
-    # sequence) masks rows that belong to the next sequence or to padding; the
-    # frontend's zero store there races with that sequence's own store, so the
-    # fused body skips it. Every other row-only term keeps the frontend
-    # semantics: the gate zeroes P, so the zero accumulator is stored.
+    # sequence) masks rows that belong to a later sequence or lie past the
+    # last one. Before the end of the last sequence the frontend's zero store
+    # races with that sequence's own store, so the fused body skips it; past
+    # it (``rows_end``), with one sequence per output lane
+    # (``own_lane_sequences``: no later sequence stores into the lane), and for
+    # every other row-only term, the body keeps the frontend semantics: the
+    # gate zeroes P, so where the program stores, it stores the zero
+    # accumulator.
     store_skip_terms: list[torch.fx.Node] = []
+    # The ``off[b + 1]`` load and leading axis of the first of them.
+    sequence_end: tuple[torch.fx.Node, int] | None = None
     jagged_mask_blocks: set[int] = set()
     gate = p_node
     while isinstance(gate, torch.fx.Node) and gate.op == "call_function":
@@ -1794,17 +1908,20 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             ):
                 if checker.domains.get(resolved) != frozenset({domain}):
                     continue
-                if _is_jagged_length_term(
+                end = _jagged_sequence_end(
                     env,
                     scope,
                     resolved,
                     row_offset=q_access.offset,
                     q_block_id=block_id,
                     leading_block_ids=leading_block_ids,
-                ):
-                    jagged_mask_blocks.add(block_id)
-                    if block_id == q_block_id:
-                        store_skip_terms.append(resolved)
+                )
+                if end is None:
+                    continue
+                jagged_mask_blocks.add(block_id)
+                if block_id == q_block_id and not own_lane_sequences:
+                    store_skip_terms.append(resolved)
+                    sequence_end = sequence_end or end
 
     # Explicit row masks must be the same sequence bounds already enforced
     # by the gate. Q/K masked rows cannot affect retained scores or stores;
@@ -1823,7 +1940,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             block_id not in jagged_mask_blocks
             or checker.check(access.extra_mask) != frozenset({domain})
             or not isinstance(mask, torch.fx.Node)
-            or not _is_jagged_length_term(
+            or _jagged_sequence_end(
                 env,
                 scope,
                 mask,
@@ -1831,6 +1948,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
                 q_block_id=block_id,
                 leading_block_ids=leading_block_ids,
             )
+            is None
         ):
             return None
         if access is v_access:
@@ -1839,17 +1957,18 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
             )
             assert isinstance(bound, torch.fx.Node)
             v_row_bound = bound
+    # A store without a row mask of its own writes every row of the query
+    # tile, so the rows past the last sequence get the zero accumulator (see
+    # ``GatedAttentionMatch.rows_end``).
+    rows_end = sequence_end if o_access.extra_mask is None else None
 
-    # Whole-graph audit: every call in the root, ``if`` and loop graphs must be
-    # a matched structural node, part of a checked program, or a pure leaf.
-    # Anything else (atomics, other stores or loops, reductions) is rejected.
     accounted: set[torch.fx.Node] = set(checker.domains)
     accounted.update(
         (
             loop_node,
             store_node,
             value,
-            loop_results[0],
+            loop_result,
             score_node,
             pv_node,
             kt_node,
@@ -1864,11 +1983,7 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         accounted.add(store_value)
     if if_node is not None:
         accounted.add(if_node)
-    for access in accesses:
-        accounted.update(access.index_nodes)
-    for node in call_nodes:
-        if node in accounted or node.target in _PURE_LEAF_TARGETS:
-            continue
+    if not _calls_accounted(call_nodes, accounted, accesses):
         return None
     return GatedAttentionMatch(
         root_block_ids=root_block_ids,
@@ -1891,6 +2006,8 @@ def _match_root_form(device_ir: DeviceIR) -> GatedAttentionMatch | None:
         store_skip_terms=tuple(store_skip_terms),
         scope=scope,
         v_row_bound=v_row_bound,
+        pv_dtype=pv_val.dtype,
+        rows_end=rows_end,
     )
 
 
@@ -1917,9 +2034,7 @@ def gated_smem_bytes(
 
 
 def _gated_smem_capacity(env: CompileEnvironment) -> int:
-    from .tcgen05_config import CuteTcgen05Config
-
-    capacity = CuteTcgen05Config.per_cta_smem_capacity_bytes(env.device)
+    capacity = target_facts.per_cta_smem_capacity_bytes(env.device)
     return capacity if capacity > 0 else _GATED_DEFAULT_SMEM_CAPACITY
 
 
@@ -1979,9 +2094,9 @@ def _config_envelope_ok(config: Config) -> bool:
 
 def detect_flash_gated_search_surface(device_ir: DeviceIR) -> GatedSearchSurface | None:
     """Config-independent search-surface detector for the gated body."""
-    from ..backend import _attention_flash_gate_enabled
-    from ..backend import _attention_flash_supported
-    from ..backend import _flash_block_sizes_reachable
+    from .analysis.attention_match import _attention_flash_gate_enabled
+    from .analysis.attention_match import _attention_flash_supported
+    from .analysis.attention_match import _flash_block_sizes_reachable
 
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return None
@@ -2020,6 +2135,29 @@ def detect_flash_gated_search_surface(device_ir: DeviceIR) -> GatedSearchSurface
     by_tile = {tile: stages for tile, stages in by_tile.items() if stages}
     if not by_tile:
         return None
+    # The register-MMA row programs at the 16- and 32-row query tiles (every
+    # KV tile the block-size ranges reach).
+    from .cute_flash_gated_row_mma import gated_row_tile_surface
+
+    row_stages, row_warps, row_stages_by_warps = gated_row_tile_surface(
+        match, smem_capacity=capacity
+    )
+    row_stages = {
+        tile: stages
+        for tile, stages in row_stages.items()
+        if _flash_block_sizes_reachable(
+            env, {match.q_block_id: tile[0], match.kv_block_id: tile[1]}
+        )
+    }
+    by_tile.update(row_stages)
+    row_programs: int | None = None
+    q_size = env.block_sizes[match.q_block_id].size
+    if row_stages and isinstance(q_size, (int, torch.SymInt)):
+        row_programs = -(-env.size_hint(q_size) // 16)
+        for block_id in match.leading_block_ids:
+            extent = env.block_sizes[block_id].size
+            assert isinstance(extent, int)
+            row_programs *= extent
     union = tuple(sorted({stage for stages in by_tile.values() for stage in stages}))
     return GatedSearchSurface(
         head_dim=match.head_dim,
@@ -2032,7 +2170,20 @@ def detect_flash_gated_search_surface(device_ir: DeviceIR) -> GatedSearchSurface
         gate_warpgroup_choices=GATED_GATE_WARPGROUP_CHOICES,
         gate_warpgroup_default=GATED_GATE_WARPGROUP_DEFAULT,
         kv_stage_choices_by_tile=tuple(sorted(by_tile.items())),
-        q_tile_choices=q_tile_choices,
+        q_tile_choices=tuple(sorted({q_tile for q_tile, _ in by_tile})),
+        row_warp_choices_by_tile=tuple(
+            sorted(
+                (tile, warps) for tile, warps in row_warps.items() if tile in row_stages
+            )
+        ),
+        row_stage_choices=tuple(
+            sorted(
+                (key, stages)
+                for key, stages in row_stages_by_warps.items()
+                if key[:2] in row_stages
+            )
+        ),
+        row_programs=row_programs,
     )
 
 
@@ -2049,12 +2200,12 @@ def detect_gated_attention_loop(
     if not env.config_spec.cute_flash_gated_search_enabled:
         return None
     state = fn.cute_state
-    if not state.attention_flash_gated_probed:
-        state.attention_flash_gated_probe = match_gated_attention(
+    if not state.flash.gated_probed:
+        state.flash.gated_probe = match_gated_attention(
             HostFunction.current().device_ir
         )
-        state.attention_flash_gated_probed = True
-    match = state.attention_flash_gated_probe
+        state.flash.gated_probed = True
+    match = state.flash.gated_probe
     if match is None:
         return None
     trigger = match.q_block_id if match.form == "sequence" else match.kv_block_id
@@ -2069,12 +2220,14 @@ def detect_gated_attention_loop(
             return None
     bm = env.block_sizes[match.q_block_id].from_config(config)
     bn = env.block_sizes[match.kv_block_id].from_config(config)
-    if (
-        not isinstance(bm, int)
-        or bm not in GATED_Q_TILE_CHOICES
-        or not isinstance(bn, int)
-        or bn not in GATED_KV_TILE_CHOICES
-    ):
+    if not isinstance(bm, int) or not isinstance(bn, int):
+        return None
+    if bm not in GATED_Q_TILE_CHOICES:
+        # The 16- and 32-row query tiles take the register-MMA row program.
+        from .cute_flash_gated_row_mma import detect_gated_row_plan
+
+        return detect_gated_row_plan(match, env, config, q_tile=bm, kv_tile=bn)
+    if bn not in GATED_KV_TILE_CHOICES:
         return None
     choices = gated_kv_stage_choices(
         match.head_dim,
@@ -2170,21 +2323,21 @@ def _dtype_kind(dtype: torch.dtype) -> str:
 
 def _exact_float_dtypes(value: float) -> frozenset[torch.dtype]:
     """Narrow dtypes in which the fp32 constant ``value`` is exactly representable."""
-    value = float(torch.tensor(value, dtype=torch.float32).item())
+    value = round_scalar(value, torch.float32)
     return frozenset(
-        dtype
-        for dtype in _NARROW_FLOAT_DTYPES
-        if float(torch.tensor(value, dtype=dtype).float().item()) == value
+        dtype for dtype in _NARROW_FLOAT_DTYPES if round_scalar(value, dtype) == value
     )
 
 
-def _approx_rcp_flags(vec: bool) -> str:
-    """``cute.math.rcp`` flags for the ``fast_math`` approximate reciprocal.
-
-    The vector form (``nvgpu.rcp``) only exists as approx+ftz; the scalar form
-    keeps the plain approximate reciprocal.
-    """
-    return "approx=True, ftz=True" if vec else "approx=True"
+def _float_const(value: float) -> _Value:
+    """The fp32 literal ``value``, a codegen-time constant (already rounded to
+    its dtype; an infinity or a NaN included)."""
+    return _Value(
+        f"cutlass.Float32({float_literal(value)})",
+        "f",
+        False,
+        _exact_float_dtypes(value),
+    )
 
 
 def _bcast(value: _Value) -> str:
@@ -2268,6 +2421,8 @@ def _col_mask(op: str, n_expr: str) -> str:
     width = geometry.chunk_cols
     stride = geometry.col_stride
     assert stride in (1, 2)
+    if geometry.paired:
+        return _col_mask_paired(op, n_expr, width)
 
     def below(bound: str) -> str:  # elements j with stride * j < bound
         if stride == 2:
@@ -2297,6 +2452,52 @@ def _col_mask(op: str, n_expr: str) -> str:
             f" & (({n_expr} & cutlass.Int32(1)) == cutlass.Int32(0))"
         )
         index = f"({n_expr} >> cutlass.Int32(1))"
+    bit = (
+        f"cutlass.select_({in_range}, "
+        f"cutlass.Int32(cutlass.Int64(1) << cutlass.Int64(cutlass.min(cutlass.max({index}, "
+        f"cutlass.Int32(0)), cutlass.Int32({width - 1})))), cutlass.Int32(0))"
+    )
+    if op == "==":
+        return bit
+    assert op == "!="
+    return f"(~{bit})"
+
+
+def _col_mask_paired(op: str, n_expr: str, width: int) -> str:
+    """``_col_mask`` for the ``mma.sync`` fragment rows (``paired`` geometry):
+    element ``e`` is column ``8 * (e // 2) + e % 2``, so the elements below a
+    bound ``n`` are the first ``2 * (n // 8) + min(n % 8, 2)`` ones."""
+
+    def below(bound: str) -> str:
+        n = f"cutlass.max({bound}, cutlass.Int32(0))"
+        count = (
+            f"(cutlass.Int32(2) * ({n} >> cutlass.Int32(3))"
+            f" + cutlass.min({n} & cutlass.Int32(7), cutlass.Int32(2)))"
+        )
+        clamped = f"cutlass.min({count}, cutlass.Int32({width}))"
+        return (
+            f"cutlass.Int32((cutlass.Int64(1) << cutlass.Int64({clamped}))"
+            " - cutlass.Int64(1))"
+        )
+
+    if op == "<":
+        return below(n_expr)
+    if op == "<=":
+        return below(f"({n_expr} + cutlass.Int32(1))")
+    if op == ">":
+        return f"(~{below(f'({n_expr} + cutlass.Int32(1))')})"
+    if op == ">=":
+        return f"(~{below(n_expr)})"
+    # ``==`` / ``!=``: column ``n`` is held when it is in range and sits in
+    # the first two columns of its eight.
+    in_range = (
+        f"({n_expr} >= cutlass.Int32(0)) & ({n_expr} < cutlass.Int32({4 * width}))"
+        f" & (({n_expr} & cutlass.Int32(7)) < cutlass.Int32(2))"
+    )
+    index = (
+        f"(cutlass.Int32(2) * ({n_expr} >> cutlass.Int32(3))"
+        f" + ({n_expr} & cutlass.Int32(1)))"
+    )
     bit = (
         f"cutlass.select_({in_range}, "
         f"cutlass.Int32(cutlass.Int64(1) << cutlass.Int64(cutlass.min(cutlass.max({index}, "
@@ -2396,6 +2597,31 @@ def _select(cond: _Value, a: _Value, b: _Value, kind: str) -> _Value:
     )
 
 
+def _pointwise_extremum(a: _Value, b: _Value, reduction: str) -> _Value:
+    """The fp32 ``max`` or ``min`` (``reduction``) of ``a`` and ``b`` as the
+    pointwise lowering computes ``torch.maximum`` / ``torch.minimum``:
+    ``cute.math.max`` / ``min`` with ``propagate_nan=True``, NaN-propagating,
+    so a NaN operand gives NaN as torch's does (a select on ``a > b`` would
+    return ``b`` for a NaN ``a``).  It does not order signed zeros: a tie
+    returns ``b``, as the select did.  The op costs two compares and two
+    selects where the select took one of each; being the pointwise
+    lowering's own op, it keeps the configs the body declines equal bit for
+    bit (the one-instruction FMNMX of ``math_templates.nan_extremum_expr``
+    takes scalars only).  The result is one of the operands or NaN, so it is
+    exact where both are."""
+    a = _as_kind(a, "f")
+    b = _as_kind(b, "f")
+    vec = a.vec or b.vec
+    # The DSL op takes two scalars or two vectors of one shape.
+    x, y = (_bcast(a), _bcast(b)) if vec else (a.expr, b.expr)
+    return _Value(
+        f"cute.math.{reduction}({x}, {y}, propagate_nan=True)",
+        "f",
+        vec,
+        a.exact & b.exact,
+    )
+
+
 class _GatedEmitter:
     """Replay the captured FX programs as CuTe scalar statements.
 
@@ -2433,11 +2659,15 @@ class _GatedEmitter:
         self.value_section: dict[str, str] = {}
         self.final_mask_terms: tuple[str, ...] = ()
         self.values: dict[torch.fx.Node, _Value] = {}
+        # Operands rounded to a narrow common dtype (``_common_dtype_operands``),
+        # by expression, dtype and the section holding the rounding.
+        self.rounded_operands: dict[tuple[str, torch.dtype, str], _Value] = {}
         self.counter = 0
         self.tensor_names: set[str] = set()
         # Under the existing ``fast_math`` setting the gate uses the hardware
-        # ex2 without the denormal fixup and an approximate reciprocal for
-        # divisions (Triton's div.full contract); the default is IEEE.
+        # ex2 without the denormal fixup and divides fp32 as the pointwise
+        # lowering does (``div.approx.ftz``); the default, and the division of
+        # other dtypes, is the ``/`` the launch compiles.
         self.fast_math = bool(self.env.settings.fast_math)
 
     # -- helpers -----------------------------------------------------------
@@ -2469,7 +2699,8 @@ class _GatedEmitter:
         self.value_section[name] = section
         # Per-element values are ``GATED_CHUNK_COLS``-wide TensorSSA vectors:
         # one statement per node keeps the chunk a straight-line block of
-        # vector arithmetic (the IEEE division stays per element inside it).
+        # vector arithmetic (the IEEE division of ``cute_exact_division``
+        # stays per element inside it).
         self.sections[section].append(f"{name} = {value.expr}")
         return _Value(
             name,
@@ -2537,9 +2768,7 @@ class _GatedEmitter:
         if isinstance(value, int):
             return _Value(f"cutlass.Int32({value})", "i")
         if isinstance(value, float):
-            return _Value(
-                f"cutlass.Float32({value!r})", "f", False, _exact_float_dtypes(value)
-            )
+            return _float_const(value)
         assert isinstance(value, torch.fx.Node), value
         node = value
         cached = self.values.get(node)
@@ -2563,10 +2792,7 @@ class _GatedEmitter:
             return _Value(f"cutlass.Int32({int(value)})", "i")  # pyrefly: ignore [bad-argument-type]
         # Constants are rounded to the node dtype at codegen time (round to
         # nearest even, like the device conversion would).
-        rounded = float(torch.tensor(float(value), dtype=dtype).float().item())  # pyrefly: ignore [bad-argument-type]
-        return _Value(
-            f"cutlass.Float32({rounded!r})", "f", False, _exact_float_dtypes(rounded)
-        )
+        return _float_const(round_scalar(value, dtype))  # pyrefly: ignore [bad-argument-type]
 
     def _node_result_dtype(self, node: torch.fx.Node) -> torch.dtype | None:
         val = _node_val(node)
@@ -2646,12 +2872,7 @@ class _GatedEmitter:
             dtype = self._node_result_dtype(node) or torch.float32
             in_tile = _Value("flash_elem_in_tile_m", "m")
             if inner.kind == "f":
-                fill = _Value(
-                    f"cutlass.Float32({float(other)!r})",  # pyrefly: ignore [bad-argument-type]
-                    "f",
-                    False,
-                    _exact_float_dtypes(float(other)),  # pyrefly: ignore [bad-argument-type]
-                )
+                fill = _float_const(float(other))  # pyrefly: ignore [bad-argument-type]
                 return self._bind(
                     "elem", _round_to_dtype(_select(in_tile, inner, fill, "f"), dtype)
                 )
@@ -2676,8 +2897,13 @@ class _GatedEmitter:
             return self._bind(section, selected)
         if target in _COMPARE_TARGETS:
             op = _COMPARE_TARGETS[target]
-            a = self.emit(node.args[0])
-            b = self.emit(node.args[1])
+            a, b = self._common_dtype_operands(
+                node,
+                section,
+                self.emit(node.args[0]),
+                self.emit(node.args[1]),
+                round_scalars=True,
+            )
             for col, other, cop in ((a, b, op), (b, a, _COL_COMPARE_FLIP[op])):
                 if (
                     col.col_offset is not None
@@ -2708,16 +2934,16 @@ class _GatedEmitter:
                 return bound
             return self._bind(section, self._binary_expr(a, b, symbol, "i", "i"))
         if target in _MINMAX_TARGETS:
-            op = _MINMAX_TARGETS[target]
+            reduction = _MINMAX_TARGETS[target]
             a = self.emit(node.args[0])
             b = self.emit(node.args[1])
             dtype = self._node_result_dtype(node) or torch.float32
-            kind = "f" if _dtype_kind(dtype) == "f" else "i"
-            cond = self._binary_expr(a, b, op, kind, "b")
-            selected = _select(cond, a, b, kind)
-            if kind == "f":
-                return self._bind(section, _round_to_dtype(selected, dtype))
-            return self._bind(section, selected)
+            if _dtype_kind(dtype) == "f":
+                extremum = _pointwise_extremum(a, b, reduction)
+                return self._bind(section, _round_to_dtype(extremum, dtype))
+            symbol = ">" if reduction == "max" else "<"
+            cond = self._binary_expr(a, b, symbol, "i", "b")
+            return self._bind(section, _select(cond, a, b, "i"))
         if (
             target in _ADD_TARGETS
             or target in _SUB_TARGETS
@@ -2746,10 +2972,74 @@ class _GatedEmitter:
             return _Value(f"({_bcast(a)} {symbol} {_bcast(b)})", out_kind, True)
         return _Value(f"({a.expr} {symbol} {b.expr})", out_kind, False)
 
+    def _common_dtype_operands(
+        self,
+        node: torch.fx.Node,
+        section: str,
+        a: _Value,
+        b: _Value,
+        *,
+        round_scalars: bool = False,
+    ) -> tuple[_Value, _Value]:
+        """The operands of the binary ``node`` converted as torch and the
+        pointwise lowering convert them when their common dtype is a 16-bit
+        float: a tensor operand of another dtype (a 0-d fp32 tensor beside
+        bf16 scores) is rounded to it first.  A Python scalar keeps its value
+        in most arithmetic (a wrapped number computes in opmath); with
+        ``round_scalars`` (a compare, a remainder or fmod) it is rounded too:
+        ``bf16 > 0.3`` tests against ``bf16(0.3)``."""
+        args = node.args[:2]
+        common = narrow_common_dtype(*args)
+        if common is None:
+            return a, b
+        converted = []
+        for arg, value in zip(args, (a, b), strict=True):
+            operand = promotion_operand(arg)
+            if isinstance(operand, torch.Tensor):
+                if operand.dtype not in (common, torch.bool):
+                    value = self._rounded_operand(value, common, section)
+            elif round_scalars and not isinstance(operand, bool):
+                value = self._rounded_scalar(arg, value, common, section)
+            converted.append(value)
+        return converted[0], converted[1]
+
+    def _rounded_scalar(
+        self, arg: object, value: _Value, dtype: torch.dtype, section: str
+    ) -> _Value:
+        """The Python or symbolic scalar ``arg`` (emitted as ``value``)
+        rounded to ``dtype``; a literal at codegen time."""
+        if isinstance(arg, (int, float)):
+            return _float_const(round_scalar(arg, dtype))
+        return self._rounded_operand(value, dtype, section)
+
+    def _rounded_operand(
+        self, value: _Value, dtype: torch.dtype, section: str
+    ) -> _Value:
+        """``value`` rounded to ``dtype``, bound once where ``value`` is (a
+        per-CTA or per-row scalar beside per-element operands).  An unbound
+        expression (an index, a constant) is rounded once per section that
+        uses it: a section runs before the later ones (``row`` before
+        ``elem``), so another section must not read its binding."""
+        rounded = _round_to_dtype(_as_kind(value, "f"), dtype)
+        if rounded is value:
+            return value
+        bind_section = self.value_section.get(value.expr, section)
+        key = (value.expr, dtype, bind_section)
+        if key not in self.rounded_operands:
+            self.rounded_operands[key] = self._bind(bind_section, rounded)
+        return self.rounded_operands[key]
+
     def _emit_binary(self, node: torch.fx.Node, section: str) -> _Value:
         target = node.target
-        a = self.emit(node.args[0])
-        b = self.emit(node.args[1])
+        # Eager remainder and fmod convert a scalar operand to the tensor's
+        # dtype first (bf16 remainder(1, 0.3) is 1 - 3 * bf16(0.3)).
+        a, b = self._common_dtype_operands(
+            node,
+            section,
+            self.emit(node.args[0]),
+            self.emit(node.args[1]),
+            round_scalars=target in _MOD_TARGETS,
+        )
         dtype = self._node_result_dtype(node)
         assert dtype is not None
         kind = _dtype_kind(dtype)
@@ -2767,12 +3057,25 @@ class _GatedEmitter:
             symbol = "%"
         if target in _MOD_TARGETS:
             return self._emit_floor_mod(a, b, kind, dtype, section)
-        if target in _DIV_TARGETS and self.fast_math:
+        if target in _DIV_TARGETS and self.fast_math and dtype == torch.float32:
             fa, fb = _as_kind(a, "f"), _as_kind(b, "f")
-            rcp = _Value(
-                f"cute.math.rcp({fb.expr}, {_approx_rcp_flags(fb.vec)})", "f", fb.vec
-            )
-            expr = self._binary_expr(fa, rcp, "*", "f", "f")
+            if fa.vec or fb.vec:
+                # The DSL's div.approx takes scalars only.  ptxas lowers
+                # div.approx.ftz to rcp.approx.ftz and a flush-to-zero
+                # multiply, which zeroes a subnormal dividend or product
+                # that a plain ``*`` keeps.
+                rcp = _Value(
+                    f"cute.math.rcp({fb.expr}, approx=True, ftz=True)", "f", fb.vec
+                )
+                expr = _Value(
+                    f"_helion_flash_rt.gated_mul_ftz_vec({_bcast(fa)}, {_bcast(rcp)})",
+                    "f",
+                    True,
+                )
+            else:
+                expr = _Value(
+                    f"cute.math.div({fa.expr}, {fb.expr}, approx=True, ftz=True)", "f"
+                )
             return self._bind(section, _round_to_dtype(expr, dtype))
         if kind == "f" or target in _DIV_TARGETS:
             expr = self._binary_expr(a, b, symbol, "f", "f")
@@ -2865,7 +3168,8 @@ class _GatedEmitter:
         program runs: their gate values are discarded by the select, so the
         result is unchanged, and the substitution keeps zero-filled rows (TMA
         fill past the tensor end gives S = 0, hence a zero dividend) off the
-        IEEE division's slow path, which otherwise serializes the whole warp.
+        slow path of the IEEE division (``cute_exact_division``), which
+        otherwise serializes the whole warp.
         The bitmask statements the select needs are hoisted ahead of the
         first use of the scores; they depend on scalars only.
         """
@@ -2956,13 +3260,15 @@ class _GatedEmitter:
         return self._bind(section, expr)
 
     def _exp_feeds_add_one(self, node: torch.fx.Node) -> bool:
-        """Whether ``exp(...)`` is consumed only by ``e + c`` with ``|c| >= 2**-100``.
+        """Whether ``exp2(...)`` is consumed only by ``e + c`` with ``|c| >= 2**-100``.
 
         At such a site the ex2 denormal handling is dead: a flushed result
         (``e < 2**-126``) and the unflushed one both round ``c + e`` to ``c``
         (``ulp(c) / 2 > 2**-125``), and a denormal argument gives exactly 1.0
         either way.  The result is therefore bit-identical with the
         ``ex2.approx.ftz`` form, which saves the range check and two scalings.
+        (Not so for ``exp``: the exactly reduced ``cute.math.exp`` it lowers
+        to does not round ``x * log2(e)``.)
         """
         users = list(node.users)
         if len(users) != 1:
@@ -3002,36 +3308,31 @@ class _GatedEmitter:
             )
         x = _as_kind(inner, "f")
         vec = x.vec
-        one = _Value("cutlass.Float32(1.0)", "f")
-
-        def sigmoid() -> _Value:
-            # The exp2 feeds ``1 + e`` directly, so the ftz form is exact here.
-            e = self._exp2(
-                _Value(f"((-({x.expr})) * {_LOG2_E!r})", "f", vec), ftz_exact=True
-            )
-            denom = self._binary_expr(e, one, "+", "f", "f")
-            if self.fast_math:
-                return _Value(
-                    f"cute.math.rcp({denom.expr}, {_approx_rcp_flags(vec)})", "f", vec
-                )
-            return _Value(f"cute.math.rcp({denom.expr})", "f", vec)
-
         if op == "exp":
-            expr = self._exp2(
-                _Value(f"(({x.expr}) * {_LOG2_E!r})", "f", vec),
-                ftz_exact=self._exp_feeds_add_one(node),
-            )
+            # The pointwise lowering's exp, as in the configs this body
+            # declines: ``ex2.approx`` of the rounded product under
+            # fast_math, else the exactly reduced ``cute.math.exp``, at
+            # ``c + e`` sites too (an exp2 of the rounded ``x * log2(e)`` is
+            # not output-identical to it there either).
+            if self.fast_math:
+                expr = self._exp2(
+                    _Value(f"(({x.expr}) * {_LOG2_E!r})", "f", vec), ftz_exact=False
+                )
+            else:
+                expr = _Value(f"cute.math.exp({x.expr})", "f", vec)
         elif op == "exp2":
             expr = self._exp2(x, ftz_exact=self._exp_feeds_add_one(node))
         elif op == "sigmoid":
-            expr = sigmoid()
-        elif op == "silu":
-            expr = self._binary_expr(x, sigmoid(), "*", "f", "f")
+            # The pointwise lowering's sigmoid (rcp.approx.ftz of ex2.approx.ftz
+            # with or without fast_math), so the configs this body declines
+            # compute the same gate.
+            expr = _Value(SIGMOID_TEMPLATE.format(x=x.expr), "f", vec)
         elif op == "tanh":
             expr = _Value(f"cute.math.tanh({x.expr})", "f", vec)
         elif op == "relu":
+            # ``maximum(x, 0)``, as the pointwise lowering computes it.
             zero = _Value("cutlass.Float32(0.0)", "f", False, _exact_float_dtypes(0.0))
-            expr = _select(self._binary_expr(x, zero, ">", "f", "b"), x, zero, "f")
+            expr = _pointwise_extremum(x, zero, "max")
         elif op == "sqrt":
             expr = _Value(f"cute.math.sqrt({x.expr})", "f", vec)
         elif op == "rsqrt":
@@ -3040,30 +3341,59 @@ class _GatedEmitter:
             expr = _Value(f"cute.math.log({x.expr})", "f", vec)
         else:
             assert op == "reciprocal"
-            if self.fast_math:
+            # The pointwise lowering's ``1 / x``: under fast_math, an fp32
+            # div.approx.ftz, which is one rcp.approx.ftz.  Otherwise the
+            # division the launch compiles ``/`` to: the DSL's ``rcp`` of a
+            # vector is that ``1 / x``, and of a scalar the ``rcp.rn``
+            # intrinsic, which the launch's division option does not reach.
+            if self.fast_math and dtype == torch.float32:
                 expr = _Value(
-                    f"cute.math.rcp({x.expr}, {_approx_rcp_flags(vec)})", "f", vec
+                    f"cute.math.rcp({x.expr}, approx=True, ftz=True)", "f", vec
                 )
-            else:
+            elif vec:
                 expr = _Value(f"cute.math.rcp({x.expr})", "f", vec)
+            else:
+                expr = _Value(f"(cutlass.Float32(1.0) / {x.expr})", "f")
         return self._bind(section, _round_to_dtype(expr, dtype))
 
+    def store_row_terms(self) -> list[str]:
+        """The output store's row conditions: the store-skip terms, each also
+        true from the end of the last sequence on when the program stores
+        those rows (``GatedAttentionMatch.rows_end``).  They read
+        ``flash_o_row``, the absolute output row."""
+        terms = [_to_b(self.emit(term)) for term in self.match.store_skip_terms]
+        if self.match.rows_end is None:
+            return terms
+        rows_end = _to_i(self.last_sequence_end(*self.match.rows_end))
+        return [f"({term} | (flash_o_row >= {rows_end}))" for term in terms]
+
+    def last_sequence_end(self, ends: torch.fx.Node, block_id: int) -> _Value:
+        """``off[n]`` for the rank-1 offsets load ``ends`` (``off[b + 1]``) and
+        the extent ``n`` of the leading axis ``b``: the row the last sequence
+        ends at."""
+        return self._load_element(ends, [self.extent_expr(block_id)])
+
     def _emit_scalar_load(self, node: torch.fx.Node) -> _Value:
-        host_tensors = _flash_graph_host_tensors(self.scope.infos)
-        name = _host_tensor_name(node.args[0])
-        assert name is not None
-        fake = host_tensors[name]
-        arg = self.df.tensor_arg(fake, prefer_name=name)
-        self.tensor_names.add(arg.name)
         indices = node.args[1]
         assert isinstance(indices, (list, tuple))
+        return self._load_element(node, [_to_i(self.emit(index)) for index in indices])
+
+    def _load_element(self, load: torch.fx.Node, indices: list[str]) -> _Value:
+        """The element at the index expressions ``indices`` of the tensor the
+        scalar load ``load`` reads, a CTA-level fp32 or int32 value as
+        ``load``'s dtype is floating or not."""
+        host_tensors = _flash_graph_host_tensors(self.scope.infos)
+        name = host_tensor_name(load.args[0])
+        assert name is not None
+        arg = self.df.tensor_arg(host_tensors[name], prefer_name=name)
+        self.tensor_names.add(arg.name)
         # 64-bit element offsets: the tensor may exceed 2**31 elements.
         terms = [
-            f"cutlass.Int64({_to_i(self.emit(index))}) * cutlass.Int64({arg.name}.layout.stride[{dim}])"
+            f"cutlass.Int64({index}) * cutlass.Int64({arg.name}.layout.stride[{dim}])"
             for dim, index in enumerate(indices)
         ]
         pointer = f"({arg.name}.iterator + {' + '.join(terms)})"
-        val = _node_val(node)
+        val = _node_val(load)
         assert isinstance(val, torch.Tensor)
         if val.dtype.is_floating_point:
             return self._bind("cta", _Value(f"cutlass.Float32({pointer}.load())", "f"))
@@ -3140,17 +3470,7 @@ def _gated_producer_body(
     pv_current = f"""
                 flash_p_full = flash_p_ready_cons.wait_and_advance()
                 flash_v_full = flash_v_cons.wait_and_advance(){v_mask}
-                flash_first_acc = flash_o_started
-                if (flash_p_idx % 2) == 0:
-                    for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
-                        _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_first_acc | (flash_kp != 0))
-                        cute.gemm(_flash_pv_mma, tOtO, tOrP0[None, None, flash_kp, 0],
-                                  tOrV[None, None, flash_kp, flash_v_full.index], tOtO)
-                else:
-                    for flash_kp in cutlass.range(flash_nk2, unroll_full=True):
-                        _flash_pv_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_first_acc | (flash_kp != 0))
-                        cute.gemm(_flash_pv_mma, tOtO, tOrP1[None, None, flash_kp, 0],
-                                  tOrV[None, None, flash_kp, flash_v_full.index], tOtO)
+{flash_ws_pv_step("                ")}
                 flash_v_full.release()
                 flash_p_full.release()
                 flash_p_idx = (flash_p_idx + 1) % 2
@@ -3178,21 +3498,7 @@ if warp_idx == 0:
             flash_o_started = cutlass.Boolean(False)
             flash_q_full = flash_q_cons.wait_and_advance()
             if cutlass.Int32(0) < flash_num_kv_active:
-                flash_k_full = flash_k_cons.wait_and_advance()
-                flash_s_handle = flash_mma_s_prod.acquire_and_advance()
-                if (flash_qk_idx % 2) == 0:
-                    for flash_kp in cutlass.range(flash_nk, unroll_full=True):
-                        _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
-                        cute.gemm(_flash_qk_mma, tStS0, tSrQ[None, None, flash_kp, flash_q_full.index],
-                                  tSrK[None, None, flash_kp, flash_k_full.index], tStS0)
-                else:
-                    for flash_kp in cutlass.range(flash_nk, unroll_full=True):
-                        _flash_qk_mma.set(cute_tcgen05_flash.Field.ACCUMULATE, flash_kp != 0)
-                        cute.gemm(_flash_qk_mma, tStS1, tSrQ[None, None, flash_kp, flash_q_full.index],
-                                  tSrK[None, None, flash_kp, flash_k_full.index], tStS1)
-                flash_s_handle.commit()
-                flash_k_full.release()
-                flash_qk_idx = (flash_qk_idx + 1) % 2{qk0_pf}
+{flash_ws_qk_step("                ")}{qk0_pf}
             flash_o_handle = flash_mma_o_prod.acquire_and_advance()
             for flash_active_kv in cutlass.range(flash_num_kv_active, unroll=1):
                 flash_kv = flash_active_kv{qk_next}{pv_current}
@@ -3526,6 +3832,15 @@ tStS = flash_qkt.make_fragment_C(flash_qk_acc_shape)
 flash_pv_acc_shape = flash_pvt.partition_shape_C(({q_tile}, {hd}))
 tOtO = flash_pvt.make_fragment_C(flash_pv_acc_shape)
 """
+    s_load_partitions = flash_ws_s_load_partitions(ld_atom)
+    p_store_partitions = flash_ws_p_store_partitions(
+        kv_cols=bn,
+        io_dtype=mma_dtype,
+        q_rows=q_tile,
+        p_base="flash_p_base",
+        p1_offset=p1_offset,
+        st_atom=st_atom,
+    )
     part_a2 = f"""
 flash_tmem.wait_for_alloc()
 _helion_flash_rt.tcgen05_fence_after_thread_sync()
@@ -3558,29 +3873,9 @@ tOrP1 = cute.make_tensor(
 
 cS = cute.make_identity_tensor(({q_tile}, {bn}))
 tScS = flash_qkt.partition_C(cS)
-flash_ld_atom = cute.make_copy_atom({ld_atom}, cutlass.Float32)
-flash_tiled_ld0 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS0)
-flash_tiled_ld1 = cute_tcgen05_flash.make_tmem_copy(flash_ld_atom, tStS1)
-flash_thr_ld0 = flash_tiled_ld0.get_slice(flash_local_tidx)
-flash_thr_ld1 = flash_tiled_ld1.get_slice(flash_local_tidx)
-tLDtS0 = flash_thr_ld0.partition_S(tStS0)
-tLDtS1 = flash_thr_ld1.partition_S(tStS1)
-tLDcS = flash_thr_ld0.partition_D(tScS)
+{s_load_partitions}
 
-flash_tilePlikeFP32 = {bn} // cutlass.Float32.width * {mma_dtype}.width
-flash_P_layout = cute.composition(flash_s_layout, cute.make_layout(({q_tile}, flash_tilePlikeFP32)))
-tStS_P0 = cute.make_tensor(flash_p_base, flash_P_layout)
-tStS_P1 = cute.make_tensor(flash_p_base + {p1_offset}, flash_P_layout)
-flash_tScS_P_layout = cute.composition(tScS.layout, cute.make_layout(({q_tile}, flash_tilePlikeFP32)))
-tScS_P = cute.make_tensor(tScS.iterator, flash_tScS_P_layout)
-flash_st_atom = cute.make_copy_atom({st_atom}, cutlass.Float32)
-flash_tiled_st0 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS_P0)
-flash_tiled_st1 = cute_tcgen05_flash.make_tmem_copy(flash_st_atom, tStS_P1)
-flash_thr_st0 = flash_tiled_st0.get_slice(flash_local_tidx)
-flash_thr_st1 = flash_tiled_st1.get_slice(flash_local_tidx)
-tSTtS0 = flash_thr_st0.partition_D(tStS_P0)
-tSTtS1 = flash_thr_st1.partition_D(tStS_P1)
-tSTcS = flash_thr_st0.partition_S(tScS_P)
+{p_store_partitions}
 """
     slices = f"""
 # Jagged rows: shift the TMA coordinate tensors by the per-CTA row base so
@@ -3592,18 +3887,7 @@ flash_mV_rows = cute.domain_offset((0, flash_row_base, 0), _flash_mVt)
 gQ = cute.flat_divide(flash_mQ_rows, cute.select(({q_tile}, {bn}, {hd}), mode=[0, 2]))
 gK = cute.flat_divide(flash_mK_rows, cute.select(({q_tile}, {bn}, {hd}), mode=[1, 2]))
 gV = cute.flat_divide(flash_mV_rows, cute.select(({q_tile}, {hd}, {bn}), mode=[1, 2]))
-tSgQ = flash_qkt.partition_A(gQ)
-tSgK = flash_qkt.partition_B(gK)
-tOgV = flash_pvt.partition_B(gV)
-tQsQ, tQgQ_qdl = cute_cpasync_flash.tma_partition(
-    _flash_tma_q, 0, cute.make_layout(1),
-    cute.group_modes(sQ, 0, 3), cute.group_modes(tSgQ, 0, 3))
-tKsK, tKgK_kdl = cute_cpasync_flash.tma_partition(
-    _flash_tma_k, 0, cute.make_layout(1),
-    cute.group_modes(sK, 0, 3), cute.group_modes(tSgK, 0, 3))
-tVsV, tVgV_dkl = cute_cpasync_flash.tma_partition(
-    _flash_tma_v, 0, cute.make_layout(1),
-    cute.group_modes(sV, 0, 3), cute.group_modes(tOgV, 0, 3))
+{FLASH_QKV_TMA_PARTITIONS}
 tQgQ = tQgQ_qdl[None, None, 0, flash_lane]
 tKgK = tKgK_kdl[None, None, 0, flash_lane]
 tVgV = tVgV_dkl[None, 0, None, flash_lane]
@@ -3701,6 +3985,9 @@ def emit_gated_flash_device_body(
         _GEOMETRY.reset(token)
 
 
+emit_gated_flash_body = statements_and_reads_adapter(emit_gated_flash_device_body)
+
+
 def _emit_gated_flash_device_body(
     df: DeviceFunction,
     plan: GatedAttentionPlan,
@@ -3774,7 +4061,7 @@ def _emit_gated_flash_device_body(
             assert match.q.lane_constant is not None
             lane_expr = f"cutlass.Int32({match.q.lane_constant})"
     predicate_value = emitter.emit(match.if_predicate)
-    row_terms = [_to_b(emitter.emit(term)) for term in match.store_skip_terms]
+    row_terms = emitter.store_row_terms()
     v_row_bound = (
         None
         if match.v_row_bound is None
@@ -3910,9 +4197,13 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
     wrapper-only kernel params and emits the whole device body.
     """
     df = cg.device_function
-    plan = df.cute_state.attention_flash_gated_match
+    plan = df.cute_state.flash.gated_match
     if plan is None:
         return False
+    if plan.row_warps:
+        from .cute_flash_gated_row_mma import codegen_gated_row_mma
+
+        return codegen_gated_row_mma(cg, plan)
     match = plan.match
     host_tensors = _flash_graph_host_tensors(df.codegen.codegen_graphs)
     accesses = {"q": match.q, "k": match.k, "v": match.v, "o": match.o}
@@ -3930,7 +4221,7 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
         ):
             return False
         args[key] = arg
-    body, scalar_tensor_names = emit_gated_flash_device_body(df, plan)
+    emitted = emit_gated_flash_body(df, plan)
     emit_flash_module_statements(cg)
     wrapper_plan: dict[str, object] = {
         "kind": GATED_WRAPPER_KIND,
@@ -3949,16 +4240,17 @@ def codegen_gated_attention_flash(cg: GenerateAST) -> bool:
     for key, access in accesses.items():
         wrapper_plan[f"{key}_row_dim"] = access.row_dim
         wrapper_plan[f"{key}_lane_dim"] = access.lane_dim
-    cg.cute_wrapper_plans.append(wrapper_plan)
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(GATED_KERNEL_PARAMS)
     df.placeholder_args.update(arg.name for arg in args.values())
-    df.placeholder_args.update(scalar_tensor_names)
-    cg.cute_uses_matmul = True
-    df.cute_state.attention_flash_threads = plan.threads
+    df.placeholder_args.update(emitted.reads)
+    codegen_state.declare_matmul()
+    df.cute_state.flash.threads = plan.threads
     if match.form == "sequence":
         assert match.lane_extent is not None
-        df.cute_state.launch_grid_multiplier = match.lane_extent
-    df.body = body
+        df.cute_state.lanes.launch_grid_multiplier = match.lane_extent
+    df.body = emitted.statements
     df.preamble = []
     return True
 

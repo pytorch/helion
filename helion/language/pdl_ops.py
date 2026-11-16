@@ -25,8 +25,10 @@ def pdl_wait() -> None:
 
     Call it on the host before the first ``hl.tile`` / ``hl.grid`` loop; the kernel
     waits at entry. Any PDL op launches the kernel with programmatic dependent
-    launch, so its launch overlaps the previous kernel's tail. On non-NVIDIA
-    targets and before sm_90 the ops do nothing and kernels run in stream order.
+    launch, so its launch overlaps the previous kernel's tail on supported
+    NVIDIA targets. Triton uses ordinary stream order on non-NVIDIA targets
+    and before sm_90. Other backends may reject PDL operations; support is not
+    implied by a non-NVIDIA target.
     """
     raise exc.NotInsideKernel
 

@@ -16,6 +16,7 @@ from torch._dynamo.convert_frame import compile_lock
 from torch._inductor import config as inductor_config
 from torch._inductor import ir
 from torch._inductor.codegen.simd import SIMDKernelFeatures
+from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.codegen.triton import TritonKernel
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer
@@ -31,6 +32,8 @@ from torch._inductor.utils import triton_type
 from torch._inductor.virtualized import OpsValue
 from torch._inductor.virtualized import V
 from torch._ops import OpOverload
+from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
+from torch._prims_common import elementwise_dtypes
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
@@ -49,15 +52,13 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .aten_lowering import Lowering
 from .aten_lowering import LoweringContext
-from .aten_lowering import _should_use_cute_argreduce_lowering
 from .aten_lowering import aten_lowering_dispatch
 from .compile_environment import CompileEnvironment
+from .compile_environment import ConfigValueExpression
 from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_sympy_expr
-from .cute.cute_reshape import REBOUND_CHECK_TARGETS
-from .cute.cute_reshape import check_pointwise_rebound_block_ids
-from .cute.view_subtile import check_view_coord_consumers
+from .device_function import DeviceFunction
 from .device_function import VarInfo
 from .device_function import contains_only_block_size_symbols
 from .node_masking import inductor_masked_value
@@ -66,15 +67,13 @@ from .node_masking import mask_node_inputs
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from torch.utils._ordered_set import OrderedSet
 
     from .. import Config
+    from .backend import HandlerOpOverrides
     from .backend import InductorOpOverrides
-    from .cute.layout import MatmulAxisModel
-    from .cute.layout import MatmulExecutionPlan
-    from .cute.layout import ThreadLayout
-    from .device_function import DeviceFunction
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .helper_function import CodegenInterface
@@ -122,6 +121,18 @@ def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
                             lowering._check_reduction_broadcast_keepdim(node)
 
 
+def prepare_added_node_lowering(graph: torch.fx.Graph, node: Node) -> None:
+    """``prepare_graph_lowerings`` for one node added to ``graph`` after the
+    graph's lowerings were prepared (its inputs already carry ``meta["val"]``)."""
+    with compile_lock:
+        graph_lowering = GraphLowering(
+            _LazyGraphModule({}, graph),
+            shape_env=CompileEnvironment.current().shape_env,
+        )
+        with V.set_graph_handler(graph_lowering), node.meta["location"]:
+            prepare_node_lowering(graph_lowering, node)
+
+
 @functools.cache
 def _functional_twins() -> dict[OpOverload, OpOverload]:
     """In-place aten overloads Inductor lowers, mapped to the functional
@@ -163,21 +174,52 @@ _OPMATH_SCALAR_TARGETS = {
 }
 
 
+def _value_input_occurrences(node: Node) -> list[Node]:
+    """Current operand occurrences, without post-lowering scheduler edges."""
+    inputs: list[Node] = []
+    map_arg(
+        (node.args, {**node.kwargs, "_extra_deps": None}),
+        lambda source: inputs.append(source),
+    )
+    return inputs
+
+
+def lowering_input_nodes(node: Node) -> list[Node]:
+    """Inductor input slots, or unique value operands for other lowerings.
+
+    Prepared slots remain distinct after CSE merges their source nodes.
+    Nodes without an InductorLowering have no named slots, including unprepared
+    nodes and AtenLowering/APIFuncLowering nodes; each source is listed once.
+    """
+    if isinstance(lowering := node.meta.get("lowering"), InductorLowering):
+        return lowering.input_nodes(node)
+    return list(dict.fromkeys(_value_input_occurrences(node)))
+
+
 def opmath_scalar_dtype(node: Node) -> torch.dtype | None:
     """The fp16/bf16 dtype of ``node`` when it combines a SymFloat or SymInt
     (a Python host scalar) with 16-bit tensors and torch computes it at
-    float32 opmath, otherwise None.
+    float32 opmath, otherwise None.  So does a float or an int a scalar node
+    holds: a value computed from a reduction dim's extent
+    (``resolve_reduction_sizes``).
 
     Such a node keeps the scalar at float32 and rounds its result to this
     dtype, as a static-shape literal scalar does.
     """
     if node.target not in _OPMATH_SCALAR_TARGETS or not any(
         isinstance(arg, Node)
-        and isinstance(arg.meta["val"], (torch.SymFloat, torch.SymInt))
+        and isinstance(arg.meta["val"], (torch.SymFloat, torch.SymInt, float, int))
+        and not isinstance(arg.meta["val"], bool)
         for arg in node.args
     ):
         return None
-    tensors = InductorLowering.input_fake_tensors(node)
+    # Preparation may replace a stale lowering after an operand rewrite.
+    # Dtype promotion uses the current operands, never the previous slots.
+    tensors = [
+        value
+        for source in _value_input_occurrences(node)
+        if isinstance(value := source.meta["val"], torch.Tensor)
+    ]
     if not tensors:
         return None
     dtype = functools.reduce(torch.promote_types, [t.dtype for t in tensors])
@@ -192,8 +234,14 @@ def _rounded_result_dtype(node: Node) -> torch.dtype | None:
     if (dtype := opmath_scalar_dtype(node)) is not None:
         # The float32 scalar promoted the math to float32.
         return dtype
-    if node.target is torch.ops.aten.reciprocal.default:
-        # Lowered as 1.0 / x with a float32 1.0.
+    if node.target is torch.ops.aten.reciprocal.default or (
+        node.target in _OPMATH_SCALAR_TARGETS
+        and any(
+            isinstance(arg, (int, float)) for arg in (*node.args, *node.kwargs.values())
+        )
+    ):
+        # A literal can promote the backend's arithmetic to fp32, including
+        # reciprocal's 1.0 / x. Round the completed FX op, not its inner math.
         dtype = node.meta["val"].dtype
         if dtype in (torch.float16, torch.bfloat16):
             return dtype
@@ -225,18 +273,24 @@ def prepare_node_lowering(
         if node.target in {
             torch.ops.aten.argmax.default,
             torch.ops.aten.argmin.default,
-        } and not _should_use_cute_argreduce_lowering(node):
+        } and not CompileEnvironment.current().backend.argreduce_uses_aten_lowering(
+            node
+        ):
             pass
         else:
             node.meta["lowering"] = aten_lowering_dispatch[node.target](node)
             return
 
     if isinstance(
-        val := node.meta["val"], (torch.SymInt, torch.SymFloat, torch.SymBool)
+        val := node.meta["val"],
+        (torch.SymInt, torch.SymFloat, torch.SymBool, int, float, bool),
     ):
-        # SymBool's `_sympy_()` is a boolean rather than the Expr the field holds.
+        # A constant is a value computed from a reduction dim's extent
+        # (``resolve_reduction_sizes``).  ``sympify`` takes a Sym value's
+        # `_sympy_()`, for a SymBool a boolean rather than the Expr the field
+        # holds.
         # pyrefly: ignore [bad-argument-type]
-        node.meta["lowering"] = SympyExprLowering(val._sympy_())
+        node.meta["lowering"] = SympyExprLowering(sympy.sympify(val))
         return
 
     # Track arguments to reuse names for duplicates
@@ -254,16 +308,16 @@ def prepare_node_lowering(
             arg_to_name[arg] = name
             input_names.append(name)
 
-        if isinstance(example, (torch.SymInt, torch.SymFloat, torch.SymBool)):
-            dtype = {
-                torch.SymInt: torch.int64,
-                torch.SymFloat: torch.float32,
-                torch.SymBool: torch.bool,
-            }[type(example)]
-            if (
-                isinstance(example, (torch.SymFloat, torch.SymInt))
-                and opmath_dtype is not None
-            ):
+        if isinstance(
+            example, (int, float, bool, torch.SymInt, torch.SymFloat, torch.SymBool)
+        ):
+            if isinstance(example, (bool, torch.SymBool)):
+                dtype = torch.bool
+            elif isinstance(example, (int, torch.SymInt)):
+                dtype = torch.int64
+            else:
+                dtype = torch.float32
+            if dtype != torch.bool and opmath_dtype is not None:
                 # Typed as the op's dtype, promotion leaves it unrounded; the
                 # kernel value is float32 (see opmath_scalar_dtype).
                 dtype = opmath_dtype
@@ -373,12 +427,14 @@ def prepare_node_lowering(
         for inp_node in current_input_nodes:
             current_input_names.append(node_to_buf_name_mapping[inp_node])
 
-        used_input_names = strip_unused_inputs(
+        used_input_names, input_slots = strip_unused_inputs(
             new_node,
             buffer.get_read_names(),
             dict(zip(current_input_nodes, current_input_names, strict=True)),
         )
-        new_node.meta["lowering"] = lowering = lowering_cls(buffer, used_input_names)
+        new_node.meta["lowering"] = lowering = lowering_cls(
+            buffer, used_input_names, input_slots
+        )
         lowering.input_layouts = input_layouts
         new_node.meta["orig_node"] = node
         if isinstance(lowering, ReductionLowering):
@@ -409,10 +465,12 @@ def strip_unused_inputs(
     node: torch.fx.Node,
     used_input_names: OrderedSet[str],
     input_names: dict[torch.fx.Node, str],
-) -> list[str]:
+) -> tuple[list[str], tuple[int, ...]]:
     """
-    Remove unused inputs from the node.  Inplace updates node.args and
-    node.kwargs to replace unused inputs with None.
+    Replace unused inputs with None, retaining repeated used operands.
+
+    The FX arguments also describe the operation to semantic matchers. Their
+    multiplicity must survive even though Inductor names each input only once.
 
     Args:
         node: Node to mutate args of
@@ -420,21 +478,24 @@ def strip_unused_inputs(
         input_names: Mapping of node inputs to their names.
 
     Returns:
-        list[str]: List of names that were used in the lowering.
+        Used names and a lowering slot for each occurrence. Slots preserve the
+        input-name association if CSE later merges distinct nodes.
     """
 
     def mask_unused_inputs(n: torch.fx.Node) -> torch.fx.Node | None:
-        if (name := input_names[n]) in used_input_names and name not in seen_names:
-            seen_names.setdefault(name)
+        if (name := input_names[n]) in used_input_names:
+            slot = seen_names.setdefault(name, len(seen_names))
+            input_slots.append(slot)
             return n
         return None
 
     assert len(input_names) == len(node._input_nodes)
-    seen_names: dict[str, None] = {}
+    seen_names: dict[str, int] = {}
+    input_slots: list[int] = []
     node.args = map_arg(node.args, mask_unused_inputs)
     node.kwargs = map_arg(node.kwargs, mask_unused_inputs)
     assert len(seen_names) == len(used_input_names)
-    return [*seen_names]
+    return [*seen_names], tuple(input_slots)
 
 
 def create_extra_node(
@@ -489,10 +550,37 @@ def _unpack_symint(x: torch.SymInt | int) -> sympy.Expr:
 class InductorLowering(Lowering):
     buffer: ComputedBuffer
     input_names: list[str]
+    # Each occurrence retains its original lowering slot. Slots are numbered
+    # in first-seen order; CSE may merge them, but a repeated group cannot split.
+    input_slots: tuple[int, ...]
     # Size and stride of each node input the inner function loads, by name.
     input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = (
         dataclasses.field(default_factory=dict)
     )
+
+    def input_nodes(self, node: torch.fx.Node) -> list[torch.fx.Node]:
+        """Value inputs aligned with lowering names, excluding scheduler edges."""
+        if node.op != "call_function":
+            # Rolled graph-boundary values can inherit a producer's metadata;
+            # they do not call that producer or consume its operand slots.
+            return []
+        inputs = _value_input_occurrences(node)
+        if len(inputs) != len(self.input_slots):
+            raise exc.InternalError(
+                AssertionError(
+                    f"{node.name}: lowered value inputs changed "
+                    f"({len(self.input_slots)} occurrences expected, {len(inputs)} found)"
+                )
+            )
+        values: list[torch.fx.Node] = []
+        for source, slot in zip(inputs, self.input_slots, strict=True):
+            if slot == len(values):
+                values.append(source)
+            elif source is not values[slot]:
+                raise exc.InternalError(
+                    AssertionError(f"{node.name}: repeated lowered value input changed")
+                )
+        return values
 
     def input_asts(self, ctx: LoweringContext, node: torch.fx.Node) -> list[ast.AST]:
         def visit(n: torch.fx.Node) -> None:
@@ -515,11 +603,17 @@ class InductorLowering(Lowering):
                             "{tensor}[" + ", ".join(expand) + "]",
                             tensor=ast_val,
                         )
-            elif isinstance(fake_val, torch.SymFloat):
+            elif isinstance(fake_val, (torch.SymFloat, float)):
+                # Or a float a scalar node holds: a value computed from a
+                # reduction dim's extent (``resolve_reduction_sizes``).
                 ast_val = backend.scalar_float_operand_ast(
                     ast_val, fake_val, computes_in_float64=computes_in_float64
                 )
-            elif isinstance(fake_val, torch.SymInt) and opmath_dtype is not None:
+            elif (
+                isinstance(fake_val, (torch.SymInt, int))
+                and not isinstance(fake_val, bool)
+                and opmath_dtype is not None
+            ):
                 # An integer would take the 16-bit operand's type.
                 ast_val = backend.cast_ast(ast_val, torch.float32)
             if (
@@ -552,21 +646,17 @@ class InductorLowering(Lowering):
         )
         opmath_dtype = opmath_scalar_dtype(node)
         input_asts: list[ast.AST] = []
-        # _extra_deps should not be included in the inductor node inputs
-        map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
+        for source in self.input_nodes(node):
+            visit(source)
         assert len(input_asts) == len(self.input_names)
         return input_asts
 
-    @staticmethod
-    def input_fake_tensors(node: torch.fx.Node) -> list[torch.Tensor]:
-        def visit(n: torch.fx.Node) -> torch.fx.Node:
-            if isinstance(val := n.meta["val"], torch.Tensor):
-                result.append(val)
-            return n
-
-        result: list[torch.Tensor] = []
-        map_arg((node.args, node.kwargs), visit)
-        return result
+    def input_fake_tensors(self, node: torch.fx.Node) -> list[torch.Tensor]:
+        return [
+            val
+            for source in self.input_nodes(node)
+            if isinstance(val := source.meta["val"], torch.Tensor)
+        ]
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
         raise NotImplementedError(
@@ -612,15 +702,50 @@ class FakeGraphLowering(GraphLowering):
         self.current_device = env.device
 
 
+def size1_reduction_positions(
+    value_sizes: Sequence[int | torch.SymInt],
+    result_sizes: Sequence[int | torch.SymInt],
+) -> list[int] | None:
+    """The result dim each dim of a size-1 reduction's input meets, or
+    ``None`` when ``value_sizes`` are no such input's.
+
+    Inductor lowers a reduction whose reduced dims all have extent 1
+    element-wise (``Reduction.create``; ``PointwiseLowering`` then reshapes
+    the result, ``_reshape_for_size1_reduction``), which is how a pointwise
+    operand gets more dims than the result: ``x[tile][:, :, None].sum(-1)``
+    reads a ``[tile0, tile1, 1]`` input for a ``[tile0, tile1]`` result.  The
+    result drops the reduced dims and keeps the others in order, so the
+    input's dims wider than 1 meet the result's in order, where
+    right-aligning would pair ``tile1`` with ``tile0``.  A dim of extent 1,
+    reduced or kept, binds nothing and meets none (-1).  Dims wider than 1
+    that do not pair up, in order and with known-equal extents (a size-1
+    reduction keeps its kept dims' very sizes), make no such input.  The
+    backends' dim analyses place such an operand by it (CuTe's
+    ``operand_positions``, Metal's ``positional_rebind``).
+    """
+    env = CompileEnvironment.current()
+
+    def wide(sizes: Sequence[int | torch.SymInt]) -> list[int]:
+        return [dim for dim, size in enumerate(sizes) if not env.known_equal(size, 1)]
+
+    value_dims = wide(value_sizes)
+    result_dims = wide(result_sizes)
+    if len(value_dims) != len(result_dims) or not all(
+        env.known_equal(value_sizes[dim], result_sizes[position])
+        for dim, position in zip(value_dims, result_dims, strict=True)
+    ):
+        return None
+    positions = [-1] * len(value_sizes)
+    for dim, position in zip(value_dims, result_dims, strict=True):
+        positions[dim] = position
+    return positions
+
+
 class PointwiseLowering(InductorLowering):
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
-        if (
-            node.target is torch.ops.aten.clone.default
-            and CompileEnvironment.current().backend_name == "cute"
-        ):
-            from .cute.cute_reshape import codegen_cute_virtual_clone
-
-            if (result := codegen_cute_virtual_clone(ctx, node)) is not None:
+        if node.target is torch.ops.aten.clone.default:
+            result = CompileEnvironment.current().backend.emit_virtual_clone(ctx, node)
+            if result is not None:
                 return result
         return self.codegen_from_input_asts(ctx, node, self.input_asts(ctx, node))
 
@@ -989,14 +1114,14 @@ class ReductionLowering(InductorLowering):
         self,
         buffer: ComputedBuffer,
         input_names: list[str],
+        input_slots: tuple[int, ...],
     ) -> None:
-        super().__init__(buffer, input_names)
+        super().__init__(buffer, input_names, input_slots)
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         reduction_ranges = reduction.reduction_ranges
         if len(reduction_ranges) != 1:
-            # TODO(jansel): can this happen?
-            raise NotImplementedError("multiple reduction dimensions")
+            raise exc.MultipleReductionDims
         # In Inductor IR, reduction_ranges holds sizes, not loop vars.
         # Support both symbolic and constant sizes by allocating/looking up
         # a matching reduction dimension in the current environment.
@@ -1005,6 +1130,15 @@ class ReductionLowering(InductorLowering):
         env = CompileEnvironment.current()
         if isinstance(reduction_size, sympy.Symbol):
             block_index: int | None = env.get_block_id(reduction_size)
+            if block_index is not None:
+                env.record_reduction_over(block_index)
+                # A registered extent is a config value, not a tile coordinate.
+                # Its reduction alias carries the full symbolic domain and can
+                # own lanes independently in a materialized consumer stage.
+                if env.registered_extent_owner(block_index) is not None:
+                    block_index = env.allocate_reduction_dimension(
+                        to_symint(reduction_size)
+                    ).block_id
         elif isinstance(reduction_size, (int, sympy.Integer)):
             # Allocate or find a reduction dimension matching this size.
             # Convert to a SymInt when needed.
@@ -1016,10 +1150,25 @@ class ReductionLowering(InductorLowering):
                 size_symint = to_symint(reduction_size)
                 block_index = env.allocate_reduction_dimension(size_symint).block_id
             else:
-                raise exc.ReductionOnNonTile(reduction_size)
+                block_index = None
         else:
             raise exc.ReductionOnNonTile(reduction_size)
-        assert block_index is not None
+        if block_index is None:
+            # A dim no block covers: a bare symbol that is not a block size
+            # (a runtime int), or one a config value sizes
+            # (``hl.zeros([tile, helion.next_power_of_2(foo)])``).
+            size: object = reduction_size
+            config_size = (
+                env.config_value_expression(reduction_size)
+                if isinstance(reduction_size, sympy.Expr)
+                else None
+            )
+            if isinstance(config_size, ConfigValueExpression):
+                size = (
+                    f"{config_size}, a size the config sets (size a tunable "
+                    "reduction dim with hl.register_block_size)"
+                )
+            raise exc.ReductionOnNonTile(size)
         self.block_index: int = block_index
 
     @property
@@ -1042,12 +1191,11 @@ class ReductionLowering(InductorLowering):
         mask_node_inputs(node, default)
 
     def codegen(self, ctx: LoweringContext, node: torch.fx.Node) -> object:
-        if CompileEnvironment.current().backend.name == "cute":
-            from .cute.completed_matmul_sum import completed_matmul_sum_input
-
-            completed = completed_matmul_sum_input(ctx, node)
-            if completed is not None:
-                return completed
+        completed = CompileEnvironment.current().backend.emit_completed_matmul_sum(
+            ctx, node
+        )
+        if completed is not None:
+            return completed
         reduction = self.buffer.data
         assert isinstance(reduction, Reduction)
         indices = [sympy.Symbol(f"i{n}") for n in range(len(reduction.ranges))]
@@ -1074,104 +1222,49 @@ class ReductionLowering(InductorLowering):
 
         if len(inputs) == 1:
             repr_input = inputs[0]
-        elif node.meta["orig_node"].target == torch.ops.aten.var_mean.correction:
-            assert len(inputs) == 2
-            # `inputs[0]` is the original input tensor to var_mean
-            repr_input = inputs[0]
         else:
             # TODO(jansel): combine multiple inputs into a single fake value
             raise NotImplementedError("reductions with >1 input")
 
         dims = self._get_reduction_dims(node.meta["orig_node"], repr_input)
         if len(dims) != 1:
-            # TODO(jansel): support multiple reduction dims
             raise exc.MultipleReductionDims
 
         env = CompileEnvironment.current()
 
-        def match_active_block_id(size: object) -> int | None:
-            candidates: set[int] = set()
-            block_id = env.resolve_block_id(size)
-            if block_id is not None:
-                block_id = env.resolve_codegen_block_id(
-                    block_id,
-                    state.codegen,
-                    node.graph,
-                )
-                if state.codegen.active_device_loops.get(block_id) or (
-                    state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
-                        block_id
-                    )
-                    is not None
-                ):
-                    candidates.add(block_id)
-            for strategy in state.codegen.device_function.tile_strategy.strategies:
-                for candidate_block_id in strategy.block_ids:
-                    if (
-                        state.codegen.device_function.tile_strategy.thread_axis_for_block_id(
-                            candidate_block_id
-                        )
-                        is None
-                    ):
-                        continue
-                    candidate_size = env.block_sizes[candidate_block_id].size
-                    candidate_source = getattr(
-                        env.block_sizes[candidate_block_id].block_size_source,
-                        "value",
-                        None,
-                    )
-                    if (
-                        isinstance(size, torch.SymInt)
-                        and isinstance(candidate_source, torch.SymInt)
-                        and candidate_source._sympy_() == size._sympy_()
-                    ):
-                        candidates.add(candidate_block_id)
-                        continue
-                    if isinstance(size, (int, torch.SymInt)) and isinstance(
-                        candidate_size, (int, torch.SymInt)
-                    ):
-                        if env.known_equal(candidate_size, size):
-                            candidates.add(candidate_block_id)
-
-            seen: set[int] = set()
-            for loops in state.codegen.active_device_loops.values():
-                for loop_state in loops:
-                    key = id(loop_state)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    for candidate_block_id, info in loop_state.block_id_to_info.items():
-                        if isinstance(
-                            size, (int, torch.SymInt)
-                        ) and info.is_end_matching(size):
-                            candidates.add(candidate_block_id)
-            if len(candidates) == 1:
-                return next(iter(candidates))
-            return None
-
         active_block_id = (
-            match_active_block_id(repr_input.size(dims[0]))
-            if env.backend.name == "cute"
-            and not env.block_sizes[self.block_index].reduction
+            env.backend.reduction_active_block_id(state, node, repr_input.size(dims[0]))
+            if not env.block_sizes[self.block_index].reduction
             else None
         )
         if active_block_id is not None:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, active_block_id)
+            strategy = env.backend.create_block_reduction_strategy(
+                state, active_block_id
+            )
         elif env.block_sizes[self.block_index].reduction:
             strategy = ctx.cg.device_function.tile_strategy.get_reduction_strategy(
                 self.block_index
             )
         else:
-            from .reduction_strategy import BlockReductionStrategy
-
-            strategy = BlockReductionStrategy(state, self.block_index)
+            strategy = env.backend.create_block_reduction_strategy(
+                state, self.block_index
+            )
 
         env.backend.validate_reduction_input(strategy.block_index, repr_input)
-        from .reduction_strategy import cute_mark_cross_block_vec_lanes
+        if (emitter := strategy.emitter) is not None:
+            emitter.mark_cross_block_vec_lanes(state)
+        from .reduction_strategy import PersistentReductionStrategy
 
-        cute_mark_cross_block_vec_lanes(state, strategy.block_index)
+        if isinstance(strategy, PersistentReductionStrategy):
+            output_name = self._mask_padded_range_lanes(
+                ctx,
+                node,
+                output_name,
+                reduction,
+                dims[0],
+                repr_input,
+                env.block_sizes[strategy.block_index].size,
+            )
         result_ast = strategy.codegen_reduction(
             state,
             output_name,
@@ -1208,13 +1301,62 @@ class ReductionLowering(InductorLowering):
         return None
 
     @staticmethod
+    def _mask_padded_range_lanes(
+        ctx: LoweringContext,
+        node: torch.fx.Node,
+        input_name: str,
+        reduction: Reduction,
+        dim: int,
+        fake_input: torch.Tensor,
+        block_size: object,
+    ) -> str:
+        """The reduction's input with the lanes of a padded ``hl.arange``
+        past its length set to the reduction's identity.
+
+        ``hl.load(x, [i, hl.arange(200)])`` has 256 lanes, and an op between
+        the load and the reduction makes the 56 past the range nonzero
+        (``row + 1.0``, an ``amax`` of a negative row): reduced, they would
+        count as elements, also in a mean that divides by 200.  A reduction
+        dim of the range's own length (a tile kernel's) masks them already, and
+        a backend that masks them itself leaves the input alone
+        (``Backend.mask_padded_range_lanes``).  ``codegen`` takes reductions
+        of one tensor input, whose fake value ``fake_input`` is.
+        """
+        from .inductor_lowering_extra import padded_range_lengths
+
+        (value,) = [
+            arg
+            for arg in node.all_input_nodes
+            if isinstance(arg.meta["val"], torch.Tensor)
+        ]
+        lengths = padded_range_lengths(value, fake_input.ndim)
+        if (length := lengths[dim]) is None or block_size == length:
+            return input_name
+        identity = Reduction.default_accumulator(
+            reduction.reduction_type, reduction.src_dtype
+        )
+        # A scalar, as ``add_input_mask`` asserts of every reduction.
+        assert isinstance(identity, (bool, int, float))
+        masked = CompileEnvironment.current().backend.mask_padded_range_lanes(
+            input_name, length, dim, fake_input.ndim, constant_repr(identity)
+        )
+        if masked is None:
+            return input_name
+        return ctx.cg.lift(expr_from_string(masked), prefix="padded_range_masked").id
+
+    @staticmethod
     def _get_reduction_dims(node: torch.fx.Node, fake_input: torch.Tensor) -> list[int]:
         if fake_input.ndim == 1:
             return [0]
 
         dims = node.kwargs.get("dim", node.kwargs.get("dims"))
         if dims is None:
-            schema = node.meta["original_aten"]._schema
+            # Decomposition may change the overload (e.g. any.default into
+            # amax.default). Positional arguments belong to the actual FX target,
+            # while original_aten describes the user operation for diagnostics.
+            target = node.target
+            assert isinstance(target, torch._ops.OpOverload)
+            schema = target._schema
             assert isinstance(schema, torch._C.FunctionSchema)
             for index, arg in enumerate(schema.arguments):
                 if arg.name in {"dim", "dims"}:
@@ -1255,13 +1397,11 @@ class APIFuncLowering(Lowering):
         proxy_args = [*map_arg(node.args, lambda arg: arg.meta["val"])]
 
         env = CompileEnvironment.current()
-        try:
-            codegen_fn = self.api_func._codegen[env.codegen_name]
-        except KeyError:
-            raise exc.BackendImplementationMissing(
-                env.backend_name,
-                f"codegen for API function {self.api_func.__qualname__}",
-            ) from None
+        codegen_fn = self.api_func._codegen.lookup(
+            env.codegen_name,
+            backend_name=env.backend_name,
+            what=f"codegen for API function {self.api_func.__qualname__}",
+        )
         from .generate_ast import GenerateAST
 
         if not isinstance(ctx.cg, GenerateAST):
@@ -1323,6 +1463,13 @@ _MODE_DIVISION_TARGETS: frozenset[object] = frozenset(
 )
 
 
+def functional_target(node: torch.fx.Node) -> object:
+    """``node``'s target, or for an in-place aten op the functional overload
+    it lowers as (``_functional_twins``): ``x.div_(y)`` is ``aten.div.Tensor``
+    to a table keyed by target."""
+    return _functional_twins().get(node.target, node.target)  # pyrefly: ignore [no-matching-overload]
+
+
 def _is_plain_true_division(node: torch.fx.Node) -> bool:
     """Whether ``node`` is a true division whose quotient is the node's result.
 
@@ -1330,7 +1477,7 @@ def _is_plain_true_division(node: torch.fx.Node) -> bool:
     division and remainder lower their quotient into a rounding step inside the
     same node, so an approximate quotient would change the integer result.
     """
-    target = node.target
+    target = functional_target(node)
     if target in _PLAIN_TRUE_DIVISION_TARGETS:
         return True
     if target in _MODE_DIVISION_TARGETS:
@@ -1341,6 +1488,61 @@ def _is_plain_true_division(node: torch.fx.Node) -> bool:
     return False
 
 
+# Quotient dtypes the GPU backends divide in fp32 (16-bit operands widened).
+_FP32_DIVIDED_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+def rounds_its_quotient(node: torch.fx.Node) -> bool:
+    """Whether ``node`` divides and then truncates or floors the quotient:
+    ``div`` with a rounding mode, which ``//`` and ``floor_divide`` decompose
+    to.  One wrong last bit in such a quotient is a whole unit in the result
+    (an approximate 33 / 33 truncates to 0), so it needs the correctly
+    rounded division."""
+    return node.target in _MODE_DIVISION_TARGETS and not _is_plain_true_division(node)
+
+
+def _rounds_before_truncating(
+    node: torch.fx.Node, dtype: torch.dtype, device: torch.device
+) -> bool:
+    """Whether eager on ``device`` rounds the quotient of ``node``, a
+    truncating division computed in ``dtype``, to that dtype before it
+    truncates it.  Its tensor-by-tensor kernel divides in the dtype, so a
+    16-bit quotient of 2.9998 is 3 by then; with a host scalar for a divisor
+    it multiplies by the scalar's fp32 reciprocal and truncates that product.
+    XPU's fp16 kernel truncates the unrounded quotient (2144 / 65 is 32
+    there and 33 on CUDA); its bf16 kernel rounds first."""
+    if dtype == torch.float16 and device.type == "xpu":
+        return False
+    divisor = node.args[1]
+    return (
+        dtype in (torch.float16, torch.bfloat16)
+        and isinstance(divisor, torch.fx.Node)
+        and isinstance(divisor.meta["val"], torch.Tensor)
+    )
+
+
+def division_dtype(node: torch.fx.Node) -> torch.dtype | None:
+    """The dtype ``node`` divides in: its result dtype, or the wider one its
+    tensor operands promote to.  ``x.div_(y)`` with a float32 ``x`` and a
+    float64 ``y`` lowers as ``aten.div`` on operands Inductor has promoted to
+    float64, and only the result is cast back to the dtype of ``x``
+    (``prepare_node_lowering``).  None when the result is not a tensor."""
+    result = node.meta.get("val")
+    if not isinstance(result, torch.Tensor):
+        return None
+    operands = [
+        value
+        for source in _value_input_occurrences(node)
+        if isinstance(value := source.meta["val"], torch.Tensor)
+    ]
+    if not operands:
+        return result.dtype
+    _, promoted = elementwise_dtypes(
+        *operands, type_promotion_kind=ELEMENTWISE_TYPE_PROMOTION_KIND.DEFAULT
+    )
+    return torch.promote_types(result.dtype, promoted)
+
+
 class GenerateASTFromInductor(DefaultHandler):
     def __init__(
         self,
@@ -1349,9 +1551,9 @@ class GenerateASTFromInductor(DefaultHandler):
         load_check: Callable[[str, sympy.Expr], None] | None = None,
     ) -> None:
         super().__init__()
-        self.parent_handler: InductorOpOverrides = (
-            CompileEnvironment.current().backend.inductor_op_overrides()
-        )
+        backend = CompileEnvironment.current().backend
+        self.parent_handler: InductorOpOverrides = backend.inductor_op_overrides()
+        self.handler_overrides: HandlerOpOverrides = backend.handler_op_overrides()
         self.cg = cg
         self.input_name_lookup = input_name_lookup
         self.load_check = load_check
@@ -1370,7 +1572,13 @@ class GenerateASTFromInductor(DefaultHandler):
     def _to_ast(self, x: object) -> ast.AST:
         if isinstance(x, ast.AST):
             return x
-        return expr_from_string(_unpack_opsvalue(x))
+        return self._parse_op(x)
+
+    def _parse_op(self, x: object) -> ast.AST:
+        """The AST of an expression the parent handler returned (or one of
+        its operands), which is written in the backend's device language."""
+        backend = CompileEnvironment.current().backend
+        return backend.parse_op_expression(_unpack_opsvalue(x))
 
     def _lift(self, expr: ast.AST) -> str:
         return self.cg.lift(expr).id
@@ -1415,14 +1623,9 @@ class GenerateASTFromInductor(DefaultHandler):
     def _default(
         self, name: str, args: tuple[object, ...], kwargs: dict[str, object]
     ) -> str:
-        result_str = _unpack_opsvalue(
-            getattr(self.parent_handler, name)(*args, **kwargs)
+        return self._lift(
+            self._parse_op(getattr(self.parent_handler, name)(*args, **kwargs))
         )
-        # C++ namespace syntax (::) is not valid Python.  Replace with dot
-        # notation so expr_from_string can parse it as attribute access.
-        if CompileEnvironment.current().backend_name == "metal" and "::" in result_str:
-            result_str = result_str.replace("::", ".")
-        return self._lift(expr_from_string(result_str))
 
     def to_dtype(
         self,
@@ -1437,16 +1640,9 @@ class GenerateASTFromInductor(DefaultHandler):
         device context during compute-type selection, and to guarantee a visible
         cast in generated code that matches PyTorch's dtype semantics.
         """
-        if (
-            CompileEnvironment.current().backend.name == "cute"
-            and src_dtype is torch.float8_e4m3fn
-            and dtype is torch.float32
-        ):
-            cast_expr = expr_from_string(
-                "_cute_fp8e4m3fn_to_float32({x})",
-                x=self._to_ast(x),
-            )
-            return self._lift(cast_expr)
+        override = self.handler_overrides.to_dtype(self, x, dtype, src_dtype)
+        if override is not None:
+            return override
         cast_expr = self._create_cast_expr(x, dtype)
         return self._lift(cast_expr)
 
@@ -1461,48 +1657,104 @@ class GenerateASTFromInductor(DefaultHandler):
         if env.settings.fast_math and env.backend.name == "triton":
             # libdevice's fast_dividef / fast_expf exist on the Triton backend
             # only; TileIR shares the Triton codegen and keeps the exact form.
+            # The exponent is of -|x| so it never overflows (``fast_expf`` of a
+            # large argument gave inf, and 1 / inf NaN on XPU): for x >= 0
+            # sigmoid is 1 / (1 + e), for x < 0 it is e / (1 + e) = e * r.
+            exponential = self._lift(
+                expr_from_string(f"fast_expf(-tl.abs({inner_name}))")
+            )
+            reciprocal = self._lift(
+                expr_from_string(f"fast_dividef(1.0, 1.0 + {exponential})")
+            )
             result = expr_from_string(
-                f"fast_dividef(1.0, 1.0 + fast_expf(-{inner_name}))"
+                f"tl.where({inner_name} >= 0, {reciprocal}, {exponential} * {reciprocal})"
             )
         else:
-            result = expr_from_string(
-                _unpack_opsvalue(self.parent_handler.sigmoid(inner_name))
-            )
+            result = self._parse_op(self.parent_handler.sigmoid(inner_name))
 
         expected_dtype = self._expected_tensor_dtype()
         if expected_dtype is not None and expected_dtype != torch.float32:
             result = self._maybe_cast_to_expected_dtype(result)
         return self._lift(result)
 
+    def _division_dtype(self) -> torch.dtype | None:
+        """The dtype the current FX node divides in (``division_dtype``)."""
+        node = V.current_node
+        return None if node is None else division_dtype(node)
+
+    def _div_rn(self, a: object, b: object, dtype: torch.dtype | None) -> str | None:
+        """The correctly rounded fp32 quotient of a division computed in
+        ``dtype`` when that is done in fp32 (32-bit and 16-bit floats) and the
+        backend's ``/`` is not correctly rounded
+        (``HandlerOpOverrides.div_rn``), else None."""
+        if dtype not in _FP32_DIVIDED_DTYPES:
+            return None
+        return self.handler_overrides.div_rn(self, a, b)
+
+    def div_rn(self, a: object, b: object) -> str:  # type: ignore[override]
+        """The round-to-nearest quotient a lowering asks for (floor division,
+        ``addcdiv``).
+
+        Inductor's Triton ``div_rn`` picks ``tl.div_rn`` by the dtype its
+        operands carry, and the names this handler passes carry none, so it
+        fell back to ``/``: floor division then floored the approximate
+        quotient (``div.full`` gives 33 / 33 just below 1, so ``33 // 33``
+        was 0).
+
+        ``addcdiv`` asks so that its quotient rounds as eager's, not because
+        an integer comes out of it: under ``fast_math`` it keeps ``/``.
+        """
+        node = V.current_node
+        if (
+            CompileEnvironment.current().settings.fast_math
+            and node is not None
+            and not rounds_its_quotient(node)
+        ):
+            return self._default("div_rn", (a, b), {})
+        exact = self._div_rn(a, b, self._division_dtype())
+        return self._default("div_rn", (a, b), {}) if exact is None else exact
+
     def truediv(self, a: object, b: object) -> str:  # type: ignore[override]
         """Divide; under ``fast_math`` the Triton backend takes the approximate divide.
 
-        Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range).
-        ``fast_dividef`` is ``div.approx.ftz.f32``: cheaper at the same 2 ulp,
-        but a subnormal divisor gives +-inf, a subnormal quotient flushes to
-        zero and a divisor above 2**126 gives 0, so it is only emitted when the
-        ``fast_math`` setting opts the kernel into approximations -- the same
-        contract the CuTe backend follows (IEEE divide by default, approximate
-        reciprocal multiply under the setting).  It is emitted only for the
-        plain true divisions (``aten.div`` without a rounding mode); a quotient
-        that feeds ``trunc``/``floor`` in the same node must be exact, so the
-        rounding-mode divisions, ``floor_divide`` and ``remainder`` keep the
-        default.  Like Triton's ``/``, the result stays fp32 (half-precision
-        and integer operands are promoted to fp32 first); the consumer casts.
-        TileIR shares the Triton codegen but has no libdevice ``fast_dividef``,
-        so it keeps the exact divide under the setting.
+        Triton's ``/`` on fp32 is ``div.full.f32`` (2 ulp over the full range,
+        a reciprocal and a multiply), and so is the CuTe backend's
+        (``HelionCuteDSLOpOverrides.truediv``).  ``fast_dividef`` is
+        ``div.approx.ftz.f32``: cheaper at the same 2 ulp, but a subnormal
+        divisor gives +-inf, a subnormal quotient flushes to zero and a
+        divisor above 2**126 gives 0, so it is only emitted when the
+        ``fast_math`` setting opts the kernel into approximations.  Like
+        Triton's ``/``, the result stays fp32 (half-precision and integer
+        operands are promoted to fp32 first); the consumer casts.  TileIR
+        shares the Triton codegen but has no libdevice ``fast_dividef``, so
+        it keeps ``/`` under the setting.
+
+        A quotient its node truncates (``div`` with ``rounding_mode="trunc"``;
+        the floor mode's comes through ``div_rn``) is the correctly rounded
+        one where the backend has it (``HandlerOpOverrides.div_rn``),
+        with or without ``fast_math``: one wrong last bit there is a whole
+        unit in the result.  Inductor's lowering truncates ``/``, which gave
+        ``torch.div(33., 33., rounding_mode="trunc")`` as 0.  That quotient
+        is then rounded to a 16-bit dtype where eager's is
+        (``_rounds_before_truncating``) and widened again, for a backend's
+        ``trunc`` that takes no 16-bit value.
         """
         env = CompileEnvironment.current()
+        node = V.current_node
+        if node is not None and rounds_its_quotient(node):
+            dtype = division_dtype(node)
+            exact = self._div_rn(a, b, dtype)
+            if exact is None:
+                return self._default("truediv", (a, b), {})
+            if dtype is not None and _rounds_before_truncating(node, dtype, env.device):
+                rounded = self._cast_ast(self._to_ast(exact), dtype)
+                return self._lift(self._cast_ast(rounded, torch.float32))
+            return exact
         if env.backend.name != "triton" or not env.settings.fast_math:
             return self._default("truediv", (a, b), {})
-        node = V.current_node
         if node is None or not _is_plain_true_division(node):
             return self._default("truediv", (a, b), {})
-        if self._expected_tensor_dtype() not in (
-            torch.float32,
-            torch.float16,
-            torch.bfloat16,
-        ):
+        if self._division_dtype() not in _FP32_DIVIDED_DTYPES:
             return self._default("truediv", (a, b), {})
         return self._lift(
             expr_from_string(
@@ -1513,16 +1765,10 @@ class GenerateASTFromInductor(DefaultHandler):
         )
 
     def rsqrt(self, x: object) -> str:  # type: ignore[override]
+        override = self.handler_overrides.rsqrt(self, x)
+        if override is not None:
+            return override
         backend_name = CompileEnvironment.current().backend_name
-        if backend_name == "cute":
-            suffix = (
-                ", fastmath=True"
-                if CompileEnvironment.current().settings.fast_math
-                else ""
-            )
-            return self._lift(
-                expr_from_string(f"cute.math.rsqrt({{x}}{suffix})", x=self._to_ast(x))
-            )
         if backend_name == "pallas":
             return self._lift(expr_from_string("lax.rsqrt({x})", x=self._to_ast(x)))
         try:
@@ -1533,24 +1779,10 @@ class GenerateASTFromInductor(DefaultHandler):
             return self.reciprocal(self.sqrt(x))
 
     def _integer_shift(self, name: str, x: object, y: object) -> str:
-        dtype = self._expected_tensor_dtype()
-        if (
-            dtype is None
-            or CompileEnvironment.current().backend_name != "cute"
-            or dtype
-            not in (
-                torch.int8,
-                torch.uint8,
-                torch.int16,
-                torch.uint16,
-            )
-        ):
-            return self._default(name, (x, y), {})
-        # CuTe promotes a narrow integer combined with a Python shift count
-        # to Int32. Torch truncates each tensor operation to its result dtype,
-        # before any subsequent shift or conversion.
-        result = _unpack_opsvalue(getattr(self.parent_handler, name)(x, y))
-        return self._lift(self._create_cast_expr(expr_from_string(result), dtype))
+        override = self.handler_overrides.integer_shift(self, name, x, y)
+        if override is not None:
+            return override
+        return self._default(name, (x, y), {})
 
     def bitwise_left_shift(self, x0: object, x1: object) -> str:
         return self._integer_shift("bitwise_left_shift", x0, x1)
@@ -1559,72 +1791,48 @@ class GenerateASTFromInductor(DefaultHandler):
         return self._integer_shift("bitwise_right_shift", x0, x1)
 
     def neg(self, x: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("neg", (x,), {})
-        return self._lift(expr_from_string("-({x})", x=self._to_ast(x)))
+        override = self.handler_overrides.neg(self, x)
+        if override is not None:
+            return override
+        return self._default("neg", (x,), {})
 
     def abs(self, x: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("abs", (x,), {})
-        dtype = self._expected_tensor_dtype()
-        if dtype is not None and not dtype.is_signed:
-            # The DSL's abs reads an unsigned value as signed.
-            return _unpack_opsvalue(x)
-        return self._lift(expr_from_string("abs({x})", x=self._to_ast(x)))
+        override = self.handler_overrides.abs(self, x)
+        if override is not None:
+            return override
+        return self._default("abs", (x,), {})
 
     def maximum(self, a: object, b: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("maximum", (a, b), {})
-        dtype = self._expected_tensor_dtype()
-        if dtype is not None:
-            a = self._create_cast_expr(a, dtype)
-            b = self._create_cast_expr(b, dtype)
-        return self._lift(
-            expr_from_string(
-                "cute.math.max({a}, {b}, propagate_nan=True)",
-                a=self._to_ast(a),
-                b=self._to_ast(b),
-            )
-        )
+        override = self.handler_overrides.maximum(self, a, b)
+        if override is not None:
+            return override
+        return self._default("maximum", (a, b), {})
 
     def minimum(self, a: object, b: object) -> str:  # type: ignore[override]
-        if CompileEnvironment.current().backend_name != "cute":
-            return self._default("minimum", (a, b), {})
-        dtype = self._expected_tensor_dtype()
-        if dtype is not None:
-            a = self._create_cast_expr(a, dtype)
-            b = self._create_cast_expr(b, dtype)
-        return self._lift(
-            expr_from_string(
-                "cute.math.min({a}, {b}, propagate_nan=True)",
-                a=self._to_ast(a),
-                b=self._to_ast(b),
-            )
-        )
+        override = self.handler_overrides.minimum(self, a, b)
+        if override is not None:
+            return override
+        return self._default("minimum", (a, b), {})
 
     def mul(self, a: object, b: object) -> str:  # type: ignore[override]
-        # Triton promotes scalar*tensor results to float32, deviating from
-        # PyTorch semantics (e.g. x_bf16 * 0.1).  Emit an explicit cast back.
+        # Retain the legacy dtype correction for non-opmath Triton products.
+        # Opmath products round once at the FX node boundary instead, including
+        # fused inner math such as the scalar multiplication in add(alpha=...).
         if CompileEnvironment.current().backend.name != "triton":
             return self._default("mul", (a, b), {})
 
-        def has_scalar_operand() -> bool:
-            current_node = V.current_node
-            if current_node is None:
-                return False
-            return any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
+        result_expr = self._parse_op(self.parent_handler.mul(a, b))
 
-        result_str = _unpack_opsvalue(self.parent_handler.mul(a, b))
-        result_expr = expr_from_string(result_str)
-
-        # Only cast if we have a scalar operand and expected dtype is not float32.
-        # This is to handle cases like `x_bf16 * 0.1` where Triton would promote the result to float32,
-        # deviating from PyTorch semantics.
         expected_dtype = self._expected_tensor_dtype()
+        current_node = V.current_node
+        # Keep the legacy args-only scope; kwargs must not newly enable this
+        # inner-operation cast for unrelated FX operators.
         if (
-            has_scalar_operand()
+            current_node is not None
+            and any(isinstance(arg, (int, float, bool)) for arg in current_node.args)
             and expected_dtype is not None
             and expected_dtype != torch.float32
+            and _rounded_result_dtype(current_node) != expected_dtype
         ):
             result_expr = self._maybe_cast_to_expected_dtype(result_expr)
 
@@ -1678,39 +1886,6 @@ class GraphInterpreter(LoweringContext, Interpreter):
         if isinstance(value, ast.AST):
             return value
         raise TypeError(f"Unsupported value type for AST conversion: {type(value)}")
-
-    @property
-    def cute_layout(self) -> ThreadLayout | None:
-        if V.current_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = V.current_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.primary_layout()
-
-    @property
-    def cute_matmul_axes(self) -> MatmulAxisModel | None:
-        if V.current_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = V.current_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_axes
-
-    @property
-    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
-        if V.current_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = V.current_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_plan
 
     def _create_named_result(self, node: Node, result: ast.expr) -> str:
         """Create a named variable for a node result, handling block-size-only expressions as constexpr."""
@@ -1841,49 +2016,19 @@ class GraphInterpreter(LoweringContext, Interpreter):
                 V.set_current_node(n),
             ):
                 try:
-                    cute_state = self.cg.device_function.cute_state
-                    if cute_state.has_tcgen05_fragment_epilogue_plan:
-                        if cute_state.is_deferred_tcgen05_fragment_epilogue_node(n):
-                            n.meta["codegen"] = _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-                            return _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-                        if (
-                            any(
-                                self.env.get(input_node)
-                                is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-                                for input_node in n.all_input_nodes
-                            )
-                            and cute_state.tcgen05_fragment_epilogue_plan_for_store(n)
-                            is None
-                        ):
-                            raise exc.BackendUnsupported(
-                                "cute",
-                                "deferred tcgen05 fragment epilogue escaped its "
-                                "committed store",
-                            )
                     # Operands exchanged between threads for this node only.
                     exchanged: dict[torch.fx.Node, ast.AST] = {}
                     # ``has_current``: test_cute_fx_replay replays ``run_node``
                     # with no CompileEnvironment.
-                    if (
-                        CompileEnvironment.has_current()
-                        and CompileEnvironment.current().backend.name == "cute"
-                    ):
-                        # Local import: at module level, cute.repeated_block_ids
-                        # -> completed_matmul_sum -> device_ir -> ``from helion
-                        # import Config`` fails while helion/__init__ is still
-                        # importing (via language -> ... -> runtime.kernel ->
-                        # generate_ast -> this module).
-                        from .cute.repeated_block_ids import check_repeated_block_ids
-
-                        check_repeated_block_ids(self.cg, n)
-                        check_view_coord_consumers(self.cg, n)
-                        if (
-                            isinstance(n.meta["lowering"], PointwiseLowering)
-                            or n.target in REBOUND_CHECK_TARGETS
-                        ):
-                            exchanged = check_pointwise_rebound_block_ids(
-                                self.cg, n, operand_env=self.env
-                            )
+                    if CompileEnvironment.has_current():
+                        backend = CompileEnvironment.current().backend
+                        deferred = backend.deferred_node_codegen(self.cg, n, self.env)
+                        if deferred is not None:
+                            n.meta["codegen"] = deferred
+                            return deferred
+                        exchanged = backend.exchanged_node_operands(
+                            self.cg, n, self.env
+                        )
                     lowering: Lowering = n.meta["lowering"]
                     own_values = {operand: self.env[operand] for operand in exchanged}
                     # pyrefly: ignore [no-matching-overload]
@@ -1923,20 +2068,36 @@ class GraphInterpreter(LoweringContext, Interpreter):
                         ):
                             expr = val._sympy_()
                         if isinstance(expr, sympy.Expr) and len(expr.free_symbols) > 0:
+                            env = CompileEnvironment.current()
                             # Keep track of what variable symints are stored in to support DeviceFunction.sympy_expr()
                             with contextlib.suppress(Exception):
-                                expr = CompileEnvironment.current().shape_env.simplify(
-                                    expr
-                                )
-                            if isinstance(result, ast.Name):
-                                self.cg.device_function.expr_to_var_info[expr] = (
-                                    VarInfo(result.id, n)
-                                )
-                            else:
-                                assert isinstance(result, ast.Constant)
-                                self.cg.device_function.expr_to_var_info[expr] = (
-                                    VarInfo(repr(result.value), n)
-                                )
+                                expr = env.shape_env.simplify(expr)
+                            # A value that is exactly a reduction dim's block
+                            # size symbol may lower to the dim's extent: the reduction
+                            # lowering inlines the extent where the dim's size
+                            # is read (``resolve_reduction_sizes``), but the
+                            # read's users (an iota's sub and floordiv) keep
+                            # the symbol in their fake values and lower to the
+                            # extent, a constant or with dynamic shapes the
+                            # size's name.  Recorded, that would print wherever
+                            # the symbol means the block size (a tensor
+                            # descriptor's block shape).  A value computed from
+                            # the symbol is recorded under its own expression,
+                            # which a nested graph's capture of it prints.
+                            block_id = env.get_block_id(expr)
+                            if (
+                                block_id is None
+                                or not env.block_sizes[block_id].reduction
+                            ):
+                                if isinstance(result, ast.Name):
+                                    self.cg.device_function.expr_to_var_info[expr] = (
+                                        VarInfo(result.id, n)
+                                    )
+                                else:
+                                    assert isinstance(result, ast.Constant)
+                                    self.cg.device_function.expr_to_var_info[expr] = (
+                                        VarInfo(repr(result.value), n)
+                                    )
                         self._record_final_codegen_result(n, result)
                         return result
                     if not isinstance(result, (ast.Name, ast.Constant)):
@@ -1952,13 +2113,6 @@ class GraphInterpreter(LoweringContext, Interpreter):
         return super().run_node(n)
 
 
-_DEFERRED_TCGEN05_FRAGMENT_EPILOGUE = object()
-
-
-def is_deferred_tcgen05_fragment_epilogue(value: object) -> bool:
-    return value is _DEFERRED_TCGEN05_FRAGMENT_EPILOGUE
-
-
 def codegen_call_with_graph(
     cg: GenerateAST,
     graph: torch.fx.Graph,
@@ -1967,9 +2121,7 @@ def codegen_call_with_graph(
     copy_named_args: bool = True,
 ) -> list[object]:
     with compile_lock:
-        from .cute.cute_mma import prepare_cute_collective_lane_loop_suppression
-
-        prepare_cute_collective_lane_loop_suppression(cg, graph)
+        CompileEnvironment.current().backend.prepare_graph_codegen(cg, graph)
         new_args = []
         placeholders = graph.find_nodes(op="placeholder")
         for arg, placeholder in zip(args, placeholders, strict=True):
@@ -2004,6 +2156,15 @@ class CodegenState(NamedTuple):
     def proxy_arg(self, i: int) -> object:
         return self.proxy_args[i]
 
+    def proxy_tensor_arg(self, i: int) -> torch.Tensor:
+        """``proxy_arg(i)``, a tensor or a tuple of them (the input of
+        ``hl.reduce`` or ``hl.associative_scan``): the first tensor."""
+        value = self.proxy_args[i]
+        if isinstance(value, (tuple, list)):
+            value = value[0]
+        assert isinstance(value, torch.Tensor)
+        return value
+
     def ast_arg(self, i: int) -> ast.AST:
         rv = self.ast_args[i]
         if isinstance(rv, int | float | bool | None):
@@ -2037,39 +2198,3 @@ class CodegenState(NamedTuple):
 
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)
-
-    @property
-    def cute_layout(self) -> ThreadLayout | None:
-        """Return the resolved CuTe ThreadLayout for the current FX node, if any."""
-        if self.fx_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = self.fx_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.primary_layout()  # type: ignore[return-value]
-
-    @property
-    def cute_matmul_axes(self) -> MatmulAxisModel | None:
-        """Return the planner-owned CuTe matmul axis model for the current FX node."""
-        if self.fx_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = self.fx_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_axes
-
-    @property
-    def cute_matmul_plan(self) -> MatmulExecutionPlan | None:
-        """Return the planner-owned CuTe matmul execution plan for the node."""
-        if self.fx_node is None:
-            return None
-        from .cute.layout_propagation import META_KEY
-
-        constraint = self.fx_node.meta.get(META_KEY)
-        if constraint is None:
-            return None
-        return constraint.matmul_plan

@@ -20,6 +20,8 @@ from helion.autotuner.compiler_coverage import append_compiler_coverage
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.runtime.config import Config
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from helion.autotuner.config_spec import ConfigSpec
 

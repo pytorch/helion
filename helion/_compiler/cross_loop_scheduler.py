@@ -1055,6 +1055,45 @@ class StaticPipelinePlan:
             if root not in self.continuation_roots
         )
 
+    def deferred_peer_releases(
+        self, warp_specialized_roots: frozenset[int]
+    ) -> dict[int, int]:
+        """Map a resident root to the previous one whose last keyed peer release
+        each worker issues from its first task there.
+
+        A worker's last release otherwise waits for its remote stores' acks
+        with nothing to overlap. A warp-specialized next root overlaps that wait
+        with its other partitions; entry waits there would hold the release, and
+        only later roots may consume the keys.
+        """
+        if self.dispatch_mode != "static":
+            return {}
+        resident = self.resident_roots
+        order = {root: index for index, root in enumerate(resident)}
+        deferred: dict[int, int] = {}
+        for prev, nxt in itertools.pairwise(resident):
+            plans = [
+                plan
+                for plan in self.peer_counters
+                if plan.producers[0].producer_root == prev
+                and plan.producers[0].incidence.keys_by_item is not None
+            ]
+            if (
+                plans
+                and nxt in warp_specialized_roots
+                and not any(
+                    consumer == nxt
+                    for _, consumer in self.root_barrier_edges | self.peer_edges
+                )
+                and all(
+                    order.get(consumer.consumer_root, -1) > order[prev]
+                    for plan in plans
+                    for consumer in plan.consumers
+                )
+            ):
+                deferred[nxt] = prev
+        return deferred
+
     def static_base(self, root: int) -> int:
         """Return one root's immutable ownership base, W-aligned unless trailing."""
         previous = [index for index in self.resident_roots if index < root]

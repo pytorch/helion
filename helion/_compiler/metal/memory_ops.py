@@ -17,83 +17,197 @@ from ... import exc
 from ...language import _decorators
 from ...language.memory_ops import load
 from ...language.memory_ops import store
+from ..ast_extension import expr_from_string
+from ..ast_extension import statement_from_string
+from ..compile_environment import CompileEnvironment
+from ..indexing_strategy import SubscriptIndexing
+from . import mpp_matmul
+from .factored_dims import FactoredValue
+from .factored_dims import factored_load
+from .factored_dims import factored_store
 
 if TYPE_CHECKING:
+    from ..indexing_strategy import PerDimIndexing
     from ..inductor_lowering import CodegenState
 
 
-def _reject_aliased_slice_dims(
-    tensor: torch.Tensor, subscript: list[object] | tuple[object, ...]
-) -> None:
-    """Reject an access whose full slices share one reduction index.
+def _position_lane_indices(
+    state: CodegenState, tensor: torch.Tensor, subscript: list[object]
+) -> tuple[dict[int, str], list[str]]:
+    """Tensor dim -> index of each slice dim of an access that sits at a
+    position lane of its block (``repeated_blocks``), empty for none, and
+    the surplus-thread masks of the positions on a thread axis.
 
-    ``CompileEnvironment.allocate_reduction_dimension`` caches by size, so two
-    ``:`` axes of equal length get the same block id and therefore the same
-    ``tid`` component.  A tile-level backend keeps them apart by broadcasting;
-    Metal, where each value is a scalar per thread, would collapse them and
-    walk the diagonal -- ``out[tile, :, :] = a[tile, :, None] * b[None, None, :]``
-    over ``[m, n, n]`` writes only ``out[m, i, i]``.
+    Such an access is emitted here, not by ``PointerIndexingStrategy``, so
+    the strategy's index for that dim can be replaced.  What it adds besides
+    can't apply: the store's scalar-pointer reshape (a position dim keeps the
+    offset block-shaped), FP8's float ``other`` (Metal has no FP8), and the
+    eviction and contiguity hints (Metal's walker drops them).
 
-    ``MetalBackend.validate_reduction_input`` catches the same mistake once a
-    reduction consumes the axes; this covers accesses that never reach a
-    reduction at all.
-
-    Sizes are compared pairwise with ``known_equal`` rather than looked up in a
-    dict keyed by the size itself.  Under dynamic shapes a size is a ``SymInt``,
-    which is unhashable and whose ``__eq__`` compares symbols; the sizes that
-    actually alias are the ones ``allocate_reduction_dimension`` unifies, and
-    ``known_equal`` is the predicate it unifies them with.
+    The shared mask still tests the block's thread index on a position dim.
+    That only drops repeated work: a thread past the block's extent has every
+    access to the block masked, and the threads within it cover every lane.
     """
-    from ..compile_environment import CompileEnvironment
+    from .reduction_strategy import MetalPersistentReductionStrategy
+    from .repeated_blocks import slice_output_dims
+    from .repeated_blocks import slice_start_step
 
     env = CompileEnvironment.current()
-    full_slices: list[tuple[int, int | torch.SymInt]] = []
-    dim = -1
-    for index in subscript:
-        if index is None:
-            continue  # inserts a new axis; consumes no tensor dimension
-        dim += 1
-        if not (isinstance(index, slice) and index == slice(None)):
-            continue
-        size = tensor.size(dim)
-        # A length-1 slice never reaches allocate_reduction_dimension (see
-        # ``indexing_strategy``, which indexes it with a constant 0), so it
-        # claims no thread axis and cannot collapse onto another dimension.
-        if isinstance(size, int) and size == 1:
-            continue
-        full_slices.append((dim, size))
+    shape = SubscriptIndexing.compute_shape(tensor, subscript, state)
 
-    for position, (first, first_size) in enumerate(full_slices):
-        for other, other_size in full_slices[position + 1 :]:
-            if env.known_equal(first_size, other_size):
-                raise exc.BackendUnsupported(
-                    "metal",
-                    f"dimensions {first} and {other} are both indexed by a "
-                    f"full slice of length {first_size}; equal-length slices "
-                    "share one reduction index, and Metal maps one index to "
-                    "one thread axis, so the two axes would collapse onto the "
-                    "same thread",
-                )
+    def lane(out_dim: int) -> tuple[str, str | None] | None:
+        block_id = env.get_block_id(shape[out_dim])
+        if block_id is None:
+            return None
+        strategy = state.tile_strategy.block_id_to_strategy.get((block_id,))
+        if not isinstance(strategy, MetalPersistentReductionStrategy):
+            return None
+        position = len(shape) - 1 - out_dim
+        if (index := strategy.position_lane(position)) is None:
+            return None
+        return index, strategy.position_lane_mask(position)
+
+    dims = slice_output_dims(subscript)
+    if dims is None:
+        if any(lane(out_dim) for out_dim in range(len(shape))):
+            raise exc.BackendUnsupported(
+                "metal",
+                f"a tensor index beside a repeated `:` slice block: {subscript}",
+            )
+        return {}, []
+    indices: dict[int, str] = {}
+    masks: list[str] = []
+    for out_dim, (tensor_dim, k) in dims.items():
+        if (position_lane := lane(out_dim)) is not None:
+            lane_var, mask = position_lane
+            start, step = (
+                state.device_function.literal_expr(v) for v in slice_start_step(k)
+            )
+            indices[tensor_dim] = f"({start} + ({lane_var}) * {step})"
+            if mask is not None:
+                masks.append(mask)
+    return indices, masks
+
+
+def _position_lane_offset(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    per_dim: PerDimIndexing,
+    lanes: dict[int, str],
+) -> ast.AST:
+    """``SubscriptIndexing.create``'s offset, with the position lanes' indices."""
+    env = CompileEnvironment.current()
+    return expr_from_string(
+        "+".join(
+            f"{lanes.get(i, index)} * "
+            f"{state.device_function.tensor_stride(tensor, i).name}"
+            for i, index in enumerate(per_dim.dim_index_exprs)
+            if not env.known_equal(tensor.size(i), 1)
+        )
+    )
+
+
+def _lane_mask(per_dim: PerDimIndexing, masks: list[str]) -> ast.AST:
+    """The access's mask, and the surplus-thread masks of its hosted positions."""
+    if not masks:
+        return per_dim.mask_expr
+    extra = " & ".join(masks)
+    if not per_dim.has_mask():
+        return expr_from_string(extra)
+    return expr_from_string(f"{{mask}} & {extra}", mask=per_dim.mask_expr)
+
+
+def _position_lane_load(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    extra_mask: ast.AST | None,
+    lanes: dict[int, str],
+    masks: list[str],
+) -> ast.AST:
+    per_dim = SubscriptIndexing.compute_per_dim_indexing(
+        state, tensor, subscript, extra_mask
+    )
+    loaded = expr_from_string(
+        f"tl.load({state.device_function.tensor_arg(tensor).name} + {{offset}}, "
+        "{mask}, other=0)",
+        offset=_position_lane_offset(state, tensor, per_dim, lanes),
+        mask=_lane_mask(per_dim, masks),
+    )
+    if per_dim.broadcast_mask_expr is None:
+        return loaded
+    backend = CompileEnvironment.current().backend
+    return expr_from_string(
+        backend.where_expr(
+            "{mask}", "{loaded}", backend.full_expr([], "0", tensor.dtype)
+        ),
+        mask=per_dim.broadcast_mask_expr,
+        loaded=loaded,
+    )
+
+
+def _position_lane_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object],
+    value: ast.AST,
+    extra_mask: ast.AST | None,
+    lanes: dict[int, str],
+    masks: list[str],
+) -> ast.AST:
+    per_dim = SubscriptIndexing.compute_per_dim_indexing(
+        state, tensor, subscript, extra_mask, for_store=True
+    )
+    return expr_from_string(
+        f"tl.store({state.device_function.tensor_arg(tensor).name} + {{offset}}, "
+        "{value}, {mask})",
+        offset=_position_lane_offset(state, tensor, per_dim, lanes),
+        value=value,
+        mask=_lane_mask(per_dim, masks),
+    )
 
 
 @_decorators.codegen(store, "metal")
-def _(state: CodegenState) -> ast.AST:
-    # Metal delegates to the same PointerIndexingStrategy as Triton.
-    # This produces tl.store(ptr + offset, val, mask) in the AST;
+def _(state: CodegenState) -> ast.AST | None:
+    # Metal delegates to the same PointerIndexingStrategy as Triton, except
+    # at a position lane, and at a widened hl.arange() index, where it is
+    # called once per part.  This produces tl.store(ptr + offset, val, mask);
     # the MSL walker translates it to Metal.
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
-    value = state.ast_arg(2)
+    ast_subscript = state.ast_args[1]
+    assert isinstance(ast_subscript, (list, tuple))
+    raw_value = state.ast_args[2]
     extra_mask = state.ast_args[3]
     assert isinstance(extra_mask, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
-        _reject_aliased_slice_dims(tensor, subscript)
         device_fn = state.device_function
         device_fn.device_store_index += 1
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
+        if isinstance(raw_value, FactoredValue) or any(
+            isinstance(k, FactoredValue) for k in ast_subscript
+        ):
+            strategy = device_fn.get_indexing_strategy(indexing_idx)
+            factored_store(
+                state,
+                tensor,
+                [*subscript],
+                [*ast_subscript],
+                raw_value,
+                lambda part_state, sub, part: strategy.codegen_store(
+                    part_state, tensor, sub, part, extra_mask, None
+                ),
+            )
+            return None
+        value = state.ast_arg(2)
+        lanes, masks = _position_lane_indices(state, tensor, [*subscript])
+        if lanes:
+            return _position_lane_store(
+                state, tensor, [*subscript], value, extra_mask, lanes, masks
+            )
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_store(
             state, tensor, [*subscript], value, extra_mask, None
@@ -102,9 +216,10 @@ def _(state: CodegenState) -> ast.AST:
 
 
 @_decorators.codegen(load, "metal")
-def _(state: CodegenState) -> ast.AST:
-    # Metal delegates to the same PointerIndexingStrategy as Triton.
-    # This produces tl.load(ptr + offset, mask, other=0) in the AST;
+def _(state: CodegenState) -> ast.AST | FactoredValue:
+    # Metal delegates to the same PointerIndexingStrategy as Triton, except
+    # at a position lane, and at a widened hl.arange() index, where it is
+    # called once per part.  This produces tl.load(ptr + offset, mask, other=0);
     # the MSL walker translates it to Metal.
     tensor = state.proxy_arg(0)
     subscript = state.proxy_arg(1)
@@ -117,11 +232,28 @@ def _(state: CodegenState) -> ast.AST:
     assert isinstance(eviction_policy, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
-        _reject_aliased_slice_dims(tensor, subscript)
+        if mpp_matmul.fenced(state.fx_node):
+            state.add_statement(statement_from_string(f"{mpp_matmul.FENCE}()"))
         device_fn = state.device_function
         device_fn.device_load_index += 1
         indexing_idx = device_fn.device_memory_op_index
         device_fn.device_memory_op_index += 1
+        if any(isinstance(k, FactoredValue) for k in ast_subscript):
+            strategy = device_fn.get_indexing_strategy(indexing_idx)
+            return factored_load(
+                state,
+                tensor,
+                [*subscript],
+                [*ast_subscript],
+                lambda part_state, sub: strategy.codegen_load(
+                    part_state, tensor, sub, extra_mask, eviction_policy, None
+                ),
+            )
+        lanes, masks = _position_lane_indices(state, tensor, [*subscript])
+        if lanes:
+            return _position_lane_load(
+                state, tensor, [*subscript], extra_mask, lanes, masks
+            )
         strategy = device_fn.get_indexing_strategy(indexing_idx)
         return strategy.codegen_load(
             state, tensor, [*subscript], extra_mask, eviction_policy, None

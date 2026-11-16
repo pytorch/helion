@@ -5,27 +5,27 @@ from __future__ import annotations
 import ast
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_radix_selection import _args
 from test.test_cute_radix_selection import _device_kernel
 from test.test_cute_radix_selection import _payload_selection
 from test.test_cute_radix_selection import _radix_config
 
 from helion import exc
-from helion._compiler.cute.radix_selection import radix_schedule
-from helion._compiler.cute.radix_selection_codegen import _compact
-from helion._compiler.cute.radix_selection_codegen import _compact_packet_work
-from helion._compiler.cute.radix_selection_codegen import _histogram_choose
-from helion._compiler.cute.radix_selection_codegen import _RadixCodegenSpec
-from helion._compiler.cute.radix_selection_codegen import _Writer
+from helion._compiler.cute.selection.radix_selection import radix_schedule
+from helion._compiler.cute.selection.radix_selection_codegen import _compact
+from helion._compiler.cute.selection.radix_selection_codegen import _compact_packet_work
+from helion._compiler.cute.selection.radix_selection_codegen import _histogram_choose
+from helion._compiler.cute.selection.radix_selection_codegen import _RadixCodegenSpec
+from helion._compiler.cute.selection.radix_selection_codegen import _Writer
+from helion._testing import cpu_render_target
+from helion._testing.cute_codegen import cpu_bind
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,12 +33,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        _target(),
-        _forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
 
 
@@ -58,7 +53,7 @@ def _primary(source: str) -> ast.For:
 def test_deferred_output_has_one_owner_and_ignores_incomplete_candidate_band(
     dtype: torch.dtype, capacity: int, resident: bool
 ) -> None:
-    bound = _cpu_bind(_payload_selection, _args(dtype))
+    bound = cpu_bind(_payload_selection, _args(dtype))
     config = _radix_config(
         bound,
         cute_radix_threads=256,
@@ -111,7 +106,7 @@ def test_deferred_output_has_one_owner_and_ignores_incomplete_candidate_band(
 def test_named_scan_barrier_has_exact_warp_ownership_and_full_publication(
     dtype: torch.dtype, threads: int, cluster: int
 ) -> None:
-    bound = _cpu_bind(_payload_selection, _args(dtype))
+    bound = cpu_bind(_payload_selection, _args(dtype))
     config = _radix_config(
         bound,
         cute_radix_threads=threads,
@@ -153,7 +148,7 @@ def test_named_scan_barrier_has_exact_warp_ownership_and_full_publication(
 def test_short_packets_have_guarded_alignment_and_scalar_fallback(
     dtype: torch.dtype,
 ) -> None:
-    bound = _cpu_bind(_payload_selection, _args(dtype, cols=32))
+    bound = cpu_bind(_payload_selection, _args(dtype, cols=32))
     source = bound.to_code(_radix_config(bound, cute_radix_packet_bits=64))
     assert "num_bits_per_copy=64" in source
     assert "align(8)" in source
@@ -167,7 +162,7 @@ def test_short_packets_have_guarded_alignment_and_scalar_fallback(
     shifted = arena[1:].reshape(3, 32)
     assert shifted.data_ptr() % 8 != 0
     lengths = torch.tensor([0, 5, 32])
-    unaligned = _cpu_bind(_payload_selection, (shifted, lengths, 17))
+    unaligned = cpu_bind(_payload_selection, (shifted, lengths, 17))
     fallback = unaligned.to_code(_radix_config(unaligned, cute_radix_packet_bits=64))
     assert "num_bits_per_copy=64" not in fallback
     assert "align(8)" not in fallback
@@ -177,7 +172,7 @@ def test_short_packets_have_guarded_alignment_and_scalar_fallback(
     "field", ["cute_radix_defer_output", "cute_radix_partial_scan"]
 )
 def test_efficiency_coordinates_remain_typed_and_legacy_opt_in(field: str) -> None:
-    bound = _cpu_bind(_payload_selection, _args())
+    bound = cpu_bind(_payload_selection, _args())
     for value in (0, 1, None, "true"):
         with pytest.raises(exc.InvalidConfig, match="Boolean"):
             bound.config_spec.normalized_config(_radix_config(bound, **{field: value}))
@@ -202,7 +197,7 @@ def _compile_statements(statements: list[ast.stmt]):
 def test_emitted_deferred_boundary_predicates_keep_original_topk(
     dtype: torch.dtype, scenario: str
 ) -> None:
-    bound = _cpu_bind(_payload_selection, _args(dtype))
+    bound = cpu_bind(_payload_selection, _args(dtype))
     graph = bound.config_spec.cute_radix_selection_graph
     assert graph is not None
     config = _radix_config(

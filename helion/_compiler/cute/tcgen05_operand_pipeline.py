@@ -1,8 +1,14 @@
-"""Dormant raw-FP32 TMA to exact-RNA UMMA pipeline helpers.
+"""Raw-FP32 TMA to exact-RNA UMMA operand pipeline of the flat grouped kernel.
 
-These helpers do not enable a lowering. Their caller must own every lane of
-each conversion warp, prove each operand's physical span, initialize pipelines
-in a converged region, and register every active warp with the scheduler.
+Traced into the generated kernel: ``tcgen05_flat_grouped_codegen`` renders the
+``make_converted_operand_pipeline`` / ``convert_and_publish_operand_stage``
+imports into the kernel module and the flat grouped kernel template
+(``tcgen05_flat_grouped_kernel.py``) calls them per operand stage. The caller
+owns every lane of each conversion warp, proves each operand's physical span,
+initializes the pipelines in a converged region and registers every active
+warp with the scheduler. The file is part of the compiled helper source
+fingerprint (``GROUPED_RNA_DEPENDENCIES`` in
+``runtime/cute/host_wrappers/tcgen05.py``).
 """
 
 from __future__ import annotations

@@ -14,10 +14,6 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-from test._cute_binding import _require_cute_codegen
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_d_shift import _config as _ordinary_config
 from test.test_cute_grouped_large_device_seeds import _kernel
@@ -29,7 +25,12 @@ from test.test_cute_grouped_prefix_adaptive_n_codegen import _plans
 
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _is_role
 from helion._compiler.cute.grouped_prefix_adaptive_n_codegen import _role_payload
+from helion._compiler.cute.tcgen05_config import facts
 from helion._testing import DEVICE
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import require_cute_codegen
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
 if TYPE_CHECKING:
@@ -58,8 +59,8 @@ def _recipe(spec: ConfigSpec, *, balanced: bool = False) -> helion.Config:
         return deepcopy(
             next(value for value in recipes if value.get(BALANCED, False) is balanced)
         )
-    profile = spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-        {SOURCE: 256}
+    profile = facts.get_grouped_prefix_adaptive_n_profile(
+        spec._cute_tcgen05_config, {SOURCE: 256}
     )
     assert profile is not None
     config = _ordinary_config("mn")
@@ -82,14 +83,14 @@ def _recipe(spec: ConfigSpec, *, balanced: bool = False) -> helion.Config:
 @pytest.fixture(scope="module")
 def sources() -> dict[str, str]:
     result: dict[str, str] = {}
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(m=8192, k=256))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(m=8192, k=256))
         spec = bound.config_spec
         for balanced in (False, True):
             config = spec.normalized_config(_recipe(spec, balanced=balanced))
             result[str(balanced)] = bound.to_code(config)
-        profile = spec._cute_tcgen05_config.get_grouped_prefix_adaptive_n_profile(
-            config.config
+        profile = facts.get_grouped_prefix_adaptive_n_profile(
+            spec._cute_tcgen05_config, config.config
         )
         assert profile is not None
         for branch in (profile.primary, profile.alternate):
@@ -202,8 +203,8 @@ def test_general_tail_dtypes_and_group_counts_use_proved_native_descriptors(
     dtype: torch.dtype,
     offset_dtype: torch.dtype,
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(
             _kernel(),
             _args(groups=groups, m=m, n=n, k=k, dtype=dtype, offset_dtype=offset_dtype),
         )
@@ -372,8 +373,8 @@ def test_actual_global_choice_stride_and_inactive_cluster_bounds(
 def test_actual_complete_entry_and_both_cores_have_typed_verified_ir(
     offset_dtype: torch.dtype, tmp_path: Path
 ) -> None:
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_kernel(), _args(m=8192, k=256, offset_dtype=offset_dtype))
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), _args(m=8192, k=256, offset_dtype=offset_dtype))
         source = bound.to_code(
             bound.config_spec.normalized_config(_recipe(bound.config_spec))
         )
@@ -382,7 +383,7 @@ def test_actual_complete_entry_and_both_cores_have_typed_verified_ir(
     entry.decorator_list = [ast.parse("cute.jit", mode="eval").body]
     path = tmp_path / "complete_m256_entry.py"
     path.write_text(ast.unparse(ast.fix_missing_locations(tree)) + "\n")
-    with _forbid_cuda_work(), _sdk() as sdk:
+    with forbid_cuda_work(), _sdk() as sdk:
         spec = importlib.util.spec_from_file_location("complete_m256_entry", path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
@@ -458,7 +459,7 @@ def test_m256_live_graph_branch_changes_and_input_preservation(
         pytest.skip("requires CUDA")
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("requires SM100-family tcgen05")
-    _require_cute_codegen()
+    require_cute_codegen()
     groups, rows, columns, reduction = 8, 4096, 768, 256
     generator = torch.Generator().manual_seed(419)
     left = torch.randint(0, 5, (rows, reduction), generator=generator).float() / 8

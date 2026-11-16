@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import inspect
 import math
 import operator
 import re
@@ -69,9 +68,7 @@ from typing import cast
 from unittest.mock import patch
 
 import torch
-from torch._inductor.virtualized import V
 from torch.fx import Node
-from torch.fx import map_arg
 from torch.fx.experimental import proxy_tensor
 from torch.fx.traceback import preserve_node_meta
 
@@ -83,10 +80,12 @@ from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
 from ..device_function import DeviceFunction
 from ..source_location import SourceLocation
+from ._ast_pass_utils import rename_names
 from .attention_plan import FlexAuxBuffer
 from .attention_plan import FlexRegion
 from .flex_coop_layout import COOP_WIDTHS
 from .flex_coop_layout import coop_pitch
+from .math_templates import float_literal
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -119,7 +118,7 @@ class FlexHookCode(NamedTuple):
     prefetch_depth: int = 0
     # The warp-cooperative table stream (``render_flex_hook(coalesce=...,
     # coop_slots=S)``): ``chunk_issue`` copies chunk ``flash_flex_pc`` of
-    # KV tile ``flash_flex_pkv`` into staging slot ``flash_flex_ps`` (Python
+    # KV tile ``flash_flex_ikv`` into staging slot ``flash_flex_ps`` (Python
     # ints the emitter binds) with ``cp.async`` and commits the group;
     # ``chunk_consume`` waits for chunk ``flash_ci``'s group (``S - 1``
     # newer groups may stay in flight), reads the lane's staged rows of
@@ -128,7 +127,9 @@ class FlexHookCode(NamedTuple):
     # the top of every PASS1 iteration ahead of the t2r copy and the issue
     # block right after it for chunk ``ci + S`` (the walk's next tile once
     # past the chunk count), issues chunks ``0 .. S - 1`` of the first tile
-    # before the KV loop and of the next tile at an absent step.
+    # before the KV loop and of the next tile at an absent step, and
+    # re-issues them with the masked hook's block for a partial tile that
+    # follows a full one (whose PASS1 issued fewer runs or none).
     chunk_issue: str = ""
     chunk_consume: str = ""
     coop_slots: int = 0
@@ -157,7 +158,7 @@ _ELEMENT = 4
 _PCHUNK = 5
 _PGROUP = 6
 # The cooperative stream's issue block (chunk ``flash_flex_pc`` of tile
-# ``flash_flex_pkv`` into slot ``flash_flex_ps``) and its consume block (the
+# ``flash_flex_ikv`` into slot ``flash_flex_ps``) and its consume block (the
 # staged rows of chunk ``flash_ci``).
 _PISSUE = 7
 _PCONSUME = 8
@@ -171,6 +172,12 @@ _PREFETCH_INIT = "flash_flex_pf_init"
 # The KV tile the prefetch block loads from (the current tile for the
 # in-tile chunks, the walk's next tile for the cross-tile fill).
 _PREFETCH_TILE = "flash_flex_pkv"
+# The KV tile the cooperative issue block copies from.  A name apart from
+# the prefetch's: the emitter binds the prefetch's tile once ahead of
+# PASS1's chunk loop, while the stream rebinds its own per chunk (the walk's
+# next tile for its last ``coop_slots`` issues), ahead of prefetches that
+# may still load the current tile.
+_ISSUE_TILE = "flash_flex_ikv"
 
 # Dependence tokens.
 _T_B = "b"
@@ -264,16 +271,8 @@ _BOOL_NOT_TARGETS = frozenset(
     {torch.ops.aten.bitwise_not.default, torch.ops.aten.logical_not.default}
 )
 _ABS_TARGET = torch.ops.aten.abs.default
-# ``a cmp b`` as ``b cmp' a`` and as ``not (a cmp b)``.
+# ``a cmp b`` as ``b cmp' a``.
 _FLIP_COMPARE = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
-_NEGATE_COMPARE = {
-    "lt": "ge",
-    "le": "gt",
-    "gt": "le",
-    "ge": "lt",
-    "eq": "ne",
-    "ne": "eq",
-}
 # Mask forms of ``render_flex_hook``: the per-chunk keep word applied through
 # the R2P select chain, or the per-element predicate.
 
@@ -296,8 +295,6 @@ _INT_DTYPES = frozenset(
     {torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64}
 )
 
-# Natural 16-byte vector width per element size.
-_VECTOR_WIDTH = {1: 16, 2: 8, 4: 4}
 _VECTOR_BYTES = 16
 # Lanes of one window vector (``load_window``): a lane-affine gather
 # ``table[.., a*kv_idx + rest]`` with ``a = +-1`` reads ``chunk_cols``
@@ -319,11 +316,7 @@ def _py_literal(value: object) -> str:
     if isinstance(value, bool):
         return repr(value)
     if isinstance(value, float):
-        if math.isinf(value):
-            return "float('inf')" if value > 0 else "float('-inf')"
-        if math.isnan(value):
-            return "float('nan')"
-        return repr(value)
+        return float_literal(value)
     if isinstance(value, int):
         return repr(value)
     raise _unsupported(f"unsupported literal {value!r}")
@@ -582,19 +575,6 @@ def _floordiv_operands(node: Node) -> tuple[Node, object] | None:
     return x, node.args[1]
 
 
-def _lowering_inputs(node: Node) -> list[Node]:
-    """The node's lowering inputs in ``InductorLowering.input_asts`` order."""
-    inputs: list[Node] = []
-
-    def visit(value: Node) -> Node:
-        if value not in inputs:
-            inputs.append(value)
-        return value
-
-    map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
-    return inputs
-
-
 class _Analyzer:
     """Dependence / affine analysis of one region."""
 
@@ -657,8 +637,11 @@ class _Analyzer:
         return _NodeInfo("hs", frozenset(), None, scalar_index=slot - 5 - self.num_aux)
 
     def _input_deps(self, node: Node, nodes: dict[Node, _NodeInfo]) -> frozenset[str]:
+        # This module is also imported during ConfigSpec bootstrap.
+        from ..inductor_lowering import lowering_input_nodes
+
         deps: set[str] = set()
-        for value in _lowering_inputs(node):
+        for value in lowering_input_nodes(node):
             info = nodes.get(value)
             if info is None:
                 raise _unsupported(
@@ -1267,7 +1250,7 @@ class _HookEmitter:
             # The issued tile's first column (the emitter binds the tile).
             self.emit(
                 _PISSUE,
-                f"{var} = cutlass.Int32({_PREFETCH_TILE}) * cutlass.Int32(128)",
+                f"{var} = cutlass.Int32({_ISSUE_TILE}) * cutlass.Int32(128)",
             )
         elif name == "icbase":
             # The issued chunk's first column.
@@ -1955,8 +1938,9 @@ class _HookEmitter:
     def _pointwise(
         self, info: _RegionInfo, node: Node, meta: _NodeInfo, name: str
     ) -> None:
-        from ..aten_lowering import LoweringContext
         from ..inductor_lowering import PointwiseLowering
+        from ..inductor_lowering import lowering_input_nodes
+        from .scalar_lowering import lower_pointwise_scalar
 
         lowering = node.meta.get("lowering")
         if not isinstance(lowering, PointwiseLowering):
@@ -1972,19 +1956,12 @@ class _HookEmitter:
                 f"{node.name} ({node.target}) has no pointwise lowering "
                 f"({type(lowering).__name__})"
             )
-        inputs = _lowering_inputs(node)
-        if len(inputs) != len(lowering.input_names):
-            raise _unsupported(
-                f"{node.name}: {len(inputs)} inputs for lowering names "
-                f"{lowering.input_names}"
-            )
+        inputs = lowering_input_nodes(node)
         input_asts = [expr_from_string(self.value(info, value)) for value in inputs]
-        ctx = LoweringContext.__new__(LoweringContext)
-        ctx.cg = self.codegen
-        ctx.env = {}
         statements: list[ast.AST] = []
-        with self.codegen.set_statements(statements), V.set_current_node(node):
-            result = lowering.codegen_from_input_asts(ctx, node, input_asts)
+        result = lower_pointwise_scalar(
+            self.codegen, node, lowering, input_asts, env={}, statements=statements
+        )
         if not isinstance(result, ast.AST):
             raise _unsupported(f"{node.name}: invalid pointwise result {result!r}")
         statements, result = _rename_temporaries(statements, result, name)
@@ -2452,18 +2429,6 @@ def _join_lines(lines: list[str]) -> str:
     return "".join(f"{line}\n" for line in lines)
 
 
-class _RenameNames(ast.NodeTransformer):
-    def __init__(self, mapping: dict[str, str]) -> None:
-        super().__init__()
-        self.mapping = mapping
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        renamed = self.mapping.get(node.id)
-        if renamed is None:
-            return node
-        return ast.copy_location(ast.Name(id=renamed, ctx=node.ctx), node)
-
-
 def _rename_temporaries(
     statements: list[ast.AST], result: ast.AST, prefix: str
 ) -> tuple[list[ast.AST], ast.AST]:
@@ -2481,9 +2446,8 @@ def _rename_temporaries(
                     mapping[target.id] = f"{prefix}_t{len(mapping)}"
     if not mapping:
         return statements, result
-    transformer = _RenameNames(mapping)
-    return [transformer.visit(statement) for statement in statements], (
-        transformer.visit(result)
+    return [rename_names(statement, mapping) for statement in statements], (
+        rename_names(result, mapping)
     )
 
 
@@ -2568,7 +2532,10 @@ def render_flex_hook(
     element) is decided over all of the plan's regions regardless of the
     flags, so the two hooks of a stage (masked and unmasked) emit identical
     prelude / prologue lines for shared values and the emitter can
-    deduplicate them by exact text.
+    deduplicate them by exact text.  So are the group width, the staging
+    layout and the prefetch plan: the two hooks' register rings and staging
+    slots of a shared load have one shape, and the emitter's fills serve
+    both.
     """
     if device_function is None:
         device_function = DeviceFunction.current()
@@ -2581,9 +2548,9 @@ def render_flex_hook(
     for _tag, region in regions:
         _ensure_lowerings(region.graph)
     analyzer = _Analyzer(plan, chunk_cols, coord_bounds)
-    infos = [analyzer.analyze(region, tag) for tag, region in regions]
-    _demote_item_values(infos, ITEM_LIVE_CAP)
-    infos = [info for info in infos if info.tag in emit_tags]
+    plan_infos = [analyzer.analyze(region, tag) for tag, region in regions]
+    _demote_item_values(plan_infos, ITEM_LIVE_CAP)
+    infos = [info for info in plan_infos if info.tag in emit_tags]
     if row_coord_expr is None:
         base = re.sub(rf"\b{re.escape(chunk_expr)}\b", "0", coord_tensor)
         row_coord_expr = f"{base}[0][0]"
@@ -2607,16 +2574,25 @@ def render_flex_hook(
             entry.aux_index for entry in flex_aux_smem_layout(plan, aux_smem_budget)
         )
     )
-    # The natural lane counts are powers of two dividing the chunk: the
-    # largest covers every run in whole vectors.
-    emitter.vector_width = _group_width(infos)
+    # The group width, the staging layout and the prefetch plan are decided
+    # over all of the plan's regions regardless of the flags, like
+    # placement: the two hooks of a stage share their register rings by
+    # name and the warp's staging ring (the emitter's fills run both hooks'
+    # prefetch / issue blocks into them, and a step's hook reads what the
+    # previous step's hook issued), so a ring has one shape in both: its
+    # slots (the lead), entries per slot (the groups) and staging stride.
+    # Planned from its own regions, the unmasked hook of a plan with a mask
+    # region took a deeper lead, narrower groups and a smaller staging
+    # stride than the masked hook.  The natural lane counts are powers of
+    # two dividing the chunk: the largest covers every run in whole vectors.
+    emitter.vector_width = _group_width(plan_infos)
     emitter.coop_layout, emitter.coop_warp_bytes = _coop_layout(
-        _coop_runs(plan, infos), coalesce, chunk_cols
+        _coop_runs(plan, plan_infos), coalesce, chunk_cols
     )
     emitter.coop_slots = coop_slots
     emitter.prefetched, emitter.prefetch_depth = _prefetch_plan(
         plan,
-        infos,
+        plan_infos,
         chunk_cols,
         emitter.vector_width,
         prefetch_regs,
@@ -3317,14 +3293,16 @@ def build_flex_region(
         aux_tensors.append(tensor)
     scalars: list[object] = []
     scalar_names: list[str] = []
-    for name, kind in host_scalar_specs:
-        scalar_names.append(name)
-        if kind is float:
-            scalars.append(env.shape_env.create_unbacked_symfloat())
-        elif kind is int:
-            scalars.append(env.shape_env.create_unbacked_symint())
-        else:
-            raise _unsupported(f"host scalar {name}: unsupported kind {kind!r}")
+    # These symbols represent caller inputs, not data-dependent results of fn.
+    with env.shape_env.ignore_fresh_unbacked_symbols():
+        for name, kind in host_scalar_specs:
+            scalar_names.append(name)
+            if kind is float:
+                scalars.append(env.shape_env.create_unbacked_symfloat())
+            elif kind is int:
+                scalars.append(env.shape_env.create_unbacked_symint())
+            else:
+                raise _unsupported(f"host scalar {name}: unsupported kind {kind!r}")
     score = torch.empty(128, 128, dtype=torch.float32)
     b = torch.empty(1, 1, dtype=torch.int32)
     h = torch.empty(1, 1, dtype=torch.int32)
@@ -3366,8 +3344,3 @@ def build_flex_region(
         for buffer, index_class in zip(buffers, classes, strict=True)
     )
     return region, classified, tuple(scalar_names)
-
-
-def region_signature(fn: Callable[..., object]) -> list[str]:
-    """Parameter names of a region function (for harness plumbing)."""
-    return list(inspect.signature(fn).parameters)

@@ -5,20 +5,26 @@ from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
 from test.cute_population_contracts import checked_initial_population
 
 import helion
+from helion._compiler.cute.host_metadata import has_complete_static_collectives
+from helion._compiler.cute.state import CuteCodegenState
+from helion._compiler.cute.state import cute_codegen_state
 from helion._compiler.generate_ast import GenerateAST
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
+
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
 
 KEY = "cute_collective_static_layouts"
 
@@ -32,6 +38,8 @@ def _body(source):
 
 
 def _bound(m=32, k=4096, n=64, **settings):
+    # These codegen facts are stated on the fp32-promoted output form.
+    settings.setdefault("cute_promote_half_atomic_outputs", True)
     kernel = helion.kernel(
         matmul_split_k.fn,
         backend="cute",
@@ -43,7 +51,7 @@ def _bound(m=32, k=4096, n=64, **settings):
         torch.empty((m, k), dtype=torch.float16),
         torch.empty((k, n), dtype=torch.float16),
     )
-    return _cpu_bind(kernel, args)
+    return cpu_bind(kernel, args)
 
 
 def _config():
@@ -59,7 +67,6 @@ def _config():
 
 
 @pytest.mark.parametrize("shape", ((32, 4096, 64), (37, 4123, 69)))
-@skipUnlessBackends(["cute"])
 def test_only_layout_guard_changes_on_complete_warp_lowering(shape):
     bound = _bound(*shape)
     config = _config()
@@ -78,30 +85,52 @@ def test_only_layout_guard_changes_on_complete_warp_lowering(shape):
     assert bound.to_code(config) == before
 
 
+def test_unproved_input_cannot_grant_promoted_allocation_provenance():
+    bound = _bound()
+    with bound.env:
+        original = bound.host_function.local_types["x"].fake_value
+        replacement = original.to(dtype=torch.float32)
+        bound.env.register_compiler_allocation_replacement(original, replacement)
+        assert not bound.env.tensor_storage_is_compiler_allocated(replacement)
+        assert not bound.env.tensor_storage_is_zero_filled_allocation(replacement)
+
+
+@pytest.mark.parametrize("pad", [(0, 3), (0, 0), (-1, 0)])
+def test_constant_padding_registers_fresh_storage_without_zero_fill(pad):
+    original = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    padded = torch.constant_pad_nd(original, pad)
+    assert padded.untyped_storage() != original.untyped_storage()
+    bound = _bound()
+    bound.env.register_tensor_factory_layout(
+        torch.constant_pad_nd, (original, pad), {}, padded
+    )
+    assert bound.env.tensor_storage_is_compiler_allocated(padded)
+    assert not bound.env.tensor_storage_is_zero_filled_allocation(padded)
+
+
 def test_incomplete_or_mixed_lowerings_keep_runtime_layouts():
     codegen = GenerateAST.__new__(GenerateAST)
-    codegen._cute_uses_matmul = False
-    codegen._cute_matmul_declaration_count = 0
-    codegen.cute_wrapper_plans = []
+    codegen.backend_state = CuteCodegenState()
     state = SimpleNamespace(
-        collective_mma_static_layouts=True, collective_mma_sites=[object()]
+        lanes=SimpleNamespace(
+            collective_mma_static_layouts=True, collective_mma_sites=[object()]
+        )
     )
     codegen.device_function = SimpleNamespace(config={KEY: True}, cute_state=state)
-    codegen.cute_uses_matmul = True
-    assert codegen._cute_has_complete_static_collectives()
+    cute_codegen_state(codegen).declare_matmul()
+    assert has_complete_static_collectives(codegen)
     # A second matmul declaration must not inherit the first site's proof.
-    codegen.cute_uses_matmul = True
-    assert not codegen._cute_has_complete_static_collectives()
-    state.collective_mma_sites.append(object())
-    assert codegen._cute_has_complete_static_collectives()
-    state.collective_mma_static_layouts = False
-    assert not codegen._cute_has_complete_static_collectives()
-    state.collective_mma_static_layouts = True
-    codegen.cute_wrapper_plans = [{"kind": "unrelated"}]
-    assert not codegen._cute_has_complete_static_collectives()
+    cute_codegen_state(codegen).declare_matmul()
+    assert not has_complete_static_collectives(codegen)
+    state.lanes.collective_mma_sites.append(object())
+    assert has_complete_static_collectives(codegen)
+    state.lanes.collective_mma_static_layouts = False
+    assert not has_complete_static_collectives(codegen)
+    state.lanes.collective_mma_static_layouts = True
+    cute_codegen_state(codegen).wrapper_plans = [{"kind": "unrelated"}]
+    assert not has_complete_static_collectives(codegen)
 
 
-@skipUnlessBackends(["cute"])
 def test_option_validation_and_full_search_seeds():
     bound = _bound()
     config = _config()
@@ -134,7 +163,6 @@ def test_option_validation_and_full_search_seeds():
                 assert generation.unflatten(flat) == seed
 
 
-@skipUnlessBackends(["cute"])
 def test_full_search_retains_old_population_and_transfers_static_witness():
     bound = _bound()
     args = (
@@ -192,7 +220,6 @@ def test_full_search_retains_old_population_and_transfers_static_witness():
 
 @pytest.mark.parametrize("disabled", (False, True))
 @pytest.mark.parametrize("requested", (False, True))
-@skipUnlessBackends(["cute"])
 def test_explicit_override_and_disabled_seed_use(disabled, requested):
     bound = _bound(disable_autotuner_heuristics=disabled)
     args = (
@@ -242,12 +269,11 @@ def test_explicit_override_and_disabled_seed_use(disabled, requested):
             assert admitted is requested
 
 
-@skipUnlessBackends(["cute"])
 def test_nonwarp_carriers_do_not_declare_static_coverage():
     nonwarp = _config()
     nonwarp.config["cute_collective_compute"] = "tcgen05"
     with patch(
-        "helion._compiler.autotuner_heuristics.CuteCollectiveMatmulHeuristic.get_seed_configs",
+        "helion._compiler.cute.autotune.heuristics.CuteCollectiveMatmulHeuristic.get_seed_configs",
         return_value=[nonwarp],
     ):
         bound = _bound(disable_autotuner_heuristics=True)

@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 import weakref
 
+import pytest
 import sympy
 import torch
 from torch._dynamo.source import LocalSource
@@ -31,16 +32,25 @@ from helion._compiler.compile_environment import _symint_free_symbols
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
-from helion._compiler.cute.memory_ops import _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_matrix_signature
 from helion._compiler.cute.memory_ops import _persistent_vec_alignment_prepared_guard
-from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_matrix_signature
-from helion._compiler.cute.memory_ops import _tensor_storage_disjoint_prepared_guard
 from helion._compiler.cute.memory_ops import runtime_tensor_has_specialized_alignment
-from helion._compiler.cute.memory_ops import runtime_tensors_are_proven_disjoint
+from helion._compiler.cute.search_surface import _finalize_cute_tcgen05_search_planning
+from helion._compiler.cute.tcgen05.search_plan import (
+    _plan_cute_tcgen05_search_candidate,
+)
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import StaticShape
-from helion._compiler.device_ir import _finalize_cute_tcgen05_search_planning
+from helion._compiler.runtime_tensor_guards import (
+    _TENSOR_DISJOINT_MATRIX_SPECIALIZATION_KEY,
+)
+from helion._compiler.runtime_tensor_guards import (
+    _tensor_storage_disjoint_matrix_signature,
+)
+from helion._compiler.runtime_tensor_guards import (
+    _tensor_storage_disjoint_prepared_guard,
+)
+from helion._compiler.runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 from helion._compiler.type_info import CallableType
 from helion._compiler.type_info import TensorType
 from helion._compiler.type_info import TypeInfo
@@ -49,17 +59,17 @@ from helion._compiler.variable_origin import NameOrigin
 from helion._testing import DEVICE
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.binding_state import with_binding_state
 from helion.autotuner.base_cache import BoundKernelInMemoryCacheKey
 import helion.language as hl
 from helion.language.constexpr import ConstExpr
-from helion.language.matmul_ops import _plan_cute_tcgen05_search_candidate
 from helion.runtime.cute.launcher import _Tcgen05GroupedWorklistCompatibilityClassifier
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
+from helion.runtime.kernel import PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _input_tensor_aliases
 from helion.runtime.kernel import _partition_prepared_extra_guards
 from helion.runtime.kernel import _PreparedCall
-from helion.runtime.kernel import _PreparedMetadataSpecializationExtractor
 from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 
 if TYPE_CHECKING:
@@ -419,6 +429,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         env._runtime_arg_values_by_name = contextvars.ContextVar(
             "test_runtime_arg_values", default=None
         )
+        with_binding_state(env)
         env.tensor_input_source = lambda _tensor: source  # type: ignore[method-assign]
 
         backing = torch.empty(17, dtype=torch.bfloat16)
@@ -505,11 +516,13 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             reusable_tensor_properties=frozenset(("data_ptr",)),
         )
         env = cast("CompileEnvironment", object.__new__(CompileEnvironment))
+        env.requires_fresh_binding = False
         env.runtime_input_specializations = {key: specialization}
         env.bound_runtime_input_specialization_results = {}
         env._runtime_arg_values_by_name = contextvars.ContextVar(
             "test_late_rekey_runtime_args", default=None
         )
+        with_binding_state(env)
         env.tensor_input_source = lambda _tensor: source  # type: ignore[method-assign]
 
         backing = torch.empty(17, dtype=torch.bfloat16)
@@ -625,6 +638,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         self.assertEqual(replacement_calls, 1)
         self.assertEqual(stale_calls, 0)
 
+    @pytest.mark.cpu_only
     def test_disjoint_fact_rejects_post_bind_alias_change(self) -> None:
         state_source = LocalSource("state", is_input=True)
         other_source = LocalSource("other", is_input=True)
@@ -642,8 +656,8 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         bound_values = (backing[:32], backing[16:48])
         current_values = (torch.empty(32), torch.empty(32))
         bound_result = specialization.classifier(bound_values)
-        fake_state = object()
-        fake_other = object()
+        fake_state = torch.empty(32)
+        fake_other = torch.empty(32)
         env = SimpleNamespace(
             input_sources={},
             bound_runtime_input_specialization_results={
@@ -659,11 +673,22 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             tensor_input_source=lambda tensor: (
                 state_source if tensor is fake_state else other_source
             ),
+            tensor_storage_provenance=lambda tensor: (
+                (tensor.untyped_storage(), False),
+            ),
+        )
+        host = SimpleNamespace(
+            params=SimpleNamespace(arguments={"state": fake_state, "other": fake_other})
         )
 
-        with patch(
-            "helion._compiler.cute.memory_ops._tensor_alias_sources",
-            return_value=sources,
+        with (
+            patch(
+                "helion._compiler.runtime_tensor_guards._tensor_alias_sources",
+                return_value=sources,
+            ),
+            patch(
+                "helion._compiler.host_function.HostFunction.current", return_value=host
+            ),
         ):
             self.assertFalse(
                 runtime_tensors_are_proven_disjoint(
@@ -734,6 +759,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             bind=lambda _args: replacement,
         )
         bound = cast("Any", object.__new__(BoundKernel))
+        bound._env = SimpleNamespace(requires_fresh_binding=False)
         bound.kernel = kernel
         bound._cache_managed = True
         bound._reset_generation = 1
@@ -751,6 +777,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             _specialization_generation=0,
         )
         bound = cast("Any", object.__new__(BoundKernel))
+        bound._env = SimpleNamespace(requires_fresh_binding=False)
         bound.kernel = kernel
         bound._cache_managed = True
         bound._reset_generation = 0
@@ -1008,7 +1035,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
         def content_extractor(args: Sequence[object]) -> int:
             return content_classifier((args[0],))
 
-        metadata_extractor = _PreparedMetadataSpecializationExtractor(
+        metadata_extractor = PreparedMetadataSpecializationExtractor(
             lambda args: cast("torch.Tensor", args[0]).size(0)
         )
         unknown_property_extractor = _RuntimeInputSpecializationExtractor(
@@ -1204,7 +1231,7 @@ class TestLayoutProvenance(unittest.TestCase):
         real_input = torch.empty_strided((2, 3), (1, 2))
         origin = NameOrigin("allocation")
 
-        with env:
+        with env, env.use_runtime_arg_values({"x": real_input}):
             fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
             assert isinstance(fake_input, torch.Tensor)
             input_type = TensorType(ArgumentOrigin("x"), fake_input)
@@ -1262,7 +1289,7 @@ class TestLayoutProvenance(unittest.TestCase):
         )
         real_input = torch.empty_strided((2, 3, 4), (12, 4, 1))
 
-        with env:
+        with env, env.use_runtime_arg_values({"x": real_input}):
             fake_input = env.to_fake(real_input, ArgumentOrigin("x"))
             assert isinstance(fake_input, torch.Tensor)
             flattened = fake_input.view(6, 4)
@@ -1452,8 +1479,8 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                     self.assertIsNone(env.tensor_descriptor_alignment_source(view))
 
     def test_derived_storage_disjointness_uses_real_guard_and_lifetime(self) -> None:
-        from helion._compiler.cute.memory_ops import (
-            register_cute_tensor_alias_specializations,
+        from helion._compiler.runtime_tensor_guards import (
+            register_tensor_alias_specializations,
         )
 
         real_x, real_out = torch.empty(4, 8), torch.empty(4)
@@ -1480,7 +1507,7 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                             env, derived, out, allow_unbound=True
                         )
                     )
-                    register_cute_tensor_alias_specializations(env)
+                    register_tensor_alias_specializations(env)
                     self.assertFalse(
                         runtime_tensors_are_proven_disjoint(env, derived, out)
                     )
@@ -1520,8 +1547,9 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
                     )
 
     def test_derived_storage_dispatch_rejects_later_aliasing_inputs(self) -> None:
-        from test._cute_binding import _mock_cuda_unavailable
         from test.cute_population_contracts import _target
+
+        from helion._testing.cute_codegen import mock_cuda_unavailable
 
         @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
         def viewed_scan(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -1532,7 +1560,7 @@ class TestDerivedInputStorageProvenance(unittest.TestCase):
 
         x, out = torch.empty(4, 8), torch.empty(32)
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
             patch(
                 "torch.cuda._lazy_init", side_effect=AssertionError("CUDA forbidden")

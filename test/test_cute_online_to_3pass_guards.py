@@ -11,13 +11,9 @@ import textwrap
 from types import FunctionType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
-from examples.aot_example import row_softmax
 import pytest
 import torch
-
-from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion._compiler.cute.online_to_3pass import _detect_online_softmax
@@ -26,7 +22,13 @@ from helion._compiler.cute.online_to_3pass import rewrite_online_to_3pass
 from helion._compiler.host_function import HostFunction
 from helion._compiler.host_function import KernelDefinition
 from helion._compiler.source_location import UnknownLocation
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
+
+row_softmax = import_example("aot_example").row_softmax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -67,14 +69,7 @@ _TYPED = (
 def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.delenv("HELION_DISABLE_ONLINE_TO_3PASS", raising=False)
     monkeypatch.setenv("HELION_ONLINE_TO_3PASS_MIN_N", "0")
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 

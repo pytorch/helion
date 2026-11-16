@@ -19,16 +19,48 @@
 # Usage:
 #   ./scripts/install_cute.sh           # verifies torch CUDA is 13.x
 #   ./scripts/install_cute.sh cu13
+#   ./scripts/install_cute.sh cu13 --install-only  # before rebuilding torch
+#   ./scripts/install_cute.sh cu13 --verify-only   # after rebuilding torch
 #
 # Outside CI (no `uv` on PATH) this falls back to plain `python -m pip`.
 
 set -euo pipefail
 
+VARIANT=""
+MODE=""
+for arg in "$@"; do
+  case "$arg" in
+    --install-only|--verify-only)
+      if [[ -n "$MODE" ]]; then
+        echo "error: choose only one of --install-only and --verify-only" >&2
+        exit 1
+      fi
+      MODE="$arg"
+      ;;
+    cu13)
+      if [[ -n "$VARIANT" ]]; then
+        echo "error: specify cu13 only once" >&2
+        exit 1
+      fi
+      VARIANT="$arg"
+      ;;
+    *)
+      echo "error: unsupported argument '$arg' (expected cu13, --install-only or --verify-only)" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# An editable torch may not import until its native library has been rebuilt.
+# Never probe torch in install-only mode, even to choose the CUDA variant.
+if [[ "$MODE" == --install-only && -z "$VARIANT" ]]; then
+  echo "error: --install-only requires an explicit cu13 argument" >&2
+  exit 1
+fi
+
 # Helion's cute backend requires CUDA 13.x. Verify the installed torch matches,
 # either implicitly or via an explicit ``cu13`` argument.
-if [[ $# -ge 1 ]]; then
-  VARIANT="$1"
-else
+if [[ -z "$VARIANT" ]]; then
   TORCH_CUDA="$(python -c 'import torch; print(torch.version.cuda or "")' 2>/dev/null || echo "")"
   case "$TORCH_CUDA" in
     13.*|13)  VARIANT="cu13" ;;
@@ -44,9 +76,20 @@ else
   echo "==> Detected torch CUDA $TORCH_CUDA -> variant $VARIANT"
 fi
 
-if [[ "$VARIANT" != "cu13" ]]; then
-  echo "error: unsupported variant '$VARIANT' (expected cu13)" >&2
-  exit 1
+verify_install() {
+  echo "==> Verifying install"
+  python -c "
+import cutlass
+version = getattr(cutlass, '__version__', None) or 'installed'
+print(f'nvidia-cutlass-dsl: {version}')
+import tvm_ffi
+print(f'apache-tvm-ffi: {getattr(tvm_ffi, \"__version__\", \"installed\")}')
+"
+}
+
+if [[ "$MODE" == --verify-only ]]; then
+  verify_install
+  exit 0
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -102,11 +145,8 @@ echo "==> Reinstalling nvidia-cutlass-dsl-libs-cu13 (no deps) so its files win"
 echo "==> Installing apache-tvm-ffi (required for tcgen05 TVM FFI launch)"
 "${PIP_INSTALL[@]}" apache-tvm-ffi
 
-echo "==> Verifying install"
-python -c "
-import cutlass
-version = getattr(cutlass, '__version__', None) or 'installed'
-print(f'nvidia-cutlass-dsl: {version}')
-import tvm_ffi
-print(f'apache-tvm-ffi: {getattr(tvm_ffi, \"__version__\", \"installed\")}')
-"
+if [[ "$MODE" == --install-only ]]; then
+  echo "==> Verification deferred; run scripts/install_cute.sh cu13 --verify-only after rebuilding torch"
+else
+  verify_install
+fi

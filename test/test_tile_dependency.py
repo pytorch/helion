@@ -2583,6 +2583,90 @@ class TestTileDependency(TestCase):
         )
         self.assertEqual(incidence.count_by_key.value_bounds(), (1, 1))
 
+    def test_point_composition_keeps_bounded_intermediate_support(self) -> None:
+        producers = CoordinateDomain.scalar(9, axis=1, kind="site")
+        fine_keys = CoordinateDomain.scalar(8, axis=0, kind="site")
+        event = CoordinateDomain((), (), kind="event")
+        item = coordinate_axis_symbol(1)
+        first = CoordinateRelation.point_map(
+            producers, fine_keys, ((((1, 0, 9, 1),), (item,)),)
+        )
+        projection = CoordinateRelation.projection(fine_keys, event)
+        assert projection is not None
+        composed = first.then(projection)
+        assert composed is not None
+        self.assertEqual(
+            _materialize(first),
+            (*(frozenset((i,)) for i in range(8)), frozenset()),
+        )
+        self.assertEqual(
+            _materialize(composed), (frozenset((0,)),) * 8 + (frozenset(),)
+        )
+
+    def test_point_composition_preserves_in_range_projection(self) -> None:
+        producers = CoordinateDomain.scalar(8, axis=1, kind="site")
+        fine_keys = CoordinateDomain.scalar(8, axis=0, kind="site")
+        event = CoordinateDomain((), (), kind="event")
+        first = CoordinateRelation.point_map(
+            producers,
+            fine_keys,
+            ((((1, 0, 8, 1),), (coordinate_axis_symbol(1),)),),
+        )
+        projection = CoordinateRelation.projection(fine_keys, event)
+        assert projection is not None
+        composed = first.then(projection)
+        assert composed is not None
+        self.assertEqual(_materialize(composed), (frozenset((0,)),) * 8)
+
+    def test_point_composition_discards_disjoint_intermediate_support(self) -> None:
+        producers = CoordinateDomain.scalar(9, axis=1, kind="site")
+        fine_keys = CoordinateDomain.scalar(8, axis=0, kind="site")
+        event = CoordinateDomain((), (), kind="event")
+        first = CoordinateRelation.point_map(
+            producers,
+            fine_keys,
+            ((((1, 0, 9, 1),), (coordinate_axis_symbol(1) + 8,)),),
+        )
+        projection = CoordinateRelation.projection(fine_keys, event)
+        assert projection is not None
+        composed = first.then(projection)
+        assert composed is not None
+        self.assertEqual(_materialize(composed), (frozenset(),) * 9)
+
+    def test_coarsened_arrival_count_matches_bounded_publication_support(self) -> None:
+        producers = CoordinateDomain.scalar(9, axis=1, kind="site")
+        fine_keys = CoordinateDomain.scalar(8, axis=0, kind="site")
+        event = CoordinateDomain((), (), kind="event")
+        key, item = coordinate_axis_symbol(0), coordinate_axis_symbol(1)
+        partition = KeyPartition.projection(fine_keys, event)
+        assert partition is not None
+        event_key = frozenset((0,))
+        empty = frozenset()
+        for offset, expected_publications in (
+            (0, (event_key,) * 8 + (empty,)),
+            (1, (empty,) + (event_key,) * 8),
+        ):
+            with self.subTest(offset=offset):
+                forward = CoordinateRelation.point_map(
+                    fine_keys, producers, ((((0, 0, 8, 1),), (key + offset,)),)
+                )
+                reverse = CoordinateRelation.point_map(
+                    producers, fine_keys, ((((1, 0, 9, 1),), (item - offset,)),)
+                )
+                incidence = Incidence.from_fibers(forward, keys_by_item=reverse)
+                coarse = incidence.coarsen(partition)
+                assert coarse is not None and coarse.keys_by_item is not None
+                assert coarse.count_by_key is not None
+                self.assertEqual(coarse.count_by_key.value_bounds(), (8, 8))
+                self.assertEqual(
+                    _materialize(coarse.items_by_key),
+                    (frozenset(range(offset, offset + 8)),),
+                )
+                publications = _materialize(coarse.keys_by_item)
+                self.assertEqual(publications, expected_publications)
+                actual_arrivals = sum(bool(keys) for keys in publications)
+                self.assertEqual(actual_arrivals, coarse.count_by_key.value_bounds()[0])
+
     def test_source_axes_ignore_known_domain_parameters(self) -> None:
         extent = sympy.Symbol("extent", integer=True, positive=True)
         unknown = sympy.Symbol("unknown", integer=True, nonnegative=True)

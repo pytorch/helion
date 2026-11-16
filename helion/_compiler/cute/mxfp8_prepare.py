@@ -32,6 +32,11 @@ def preparation_source(plan: Mapping[str, object]) -> str:
     lines = [
         "@cute.kernel",
         "def _prepare(sa: cute.Tensor, sb: cute.Tensor, workspace: cute.Tensor):",
+        *(
+            ("    cute.arch.griddepcontrol_launch_dependents()",)
+            if plan.get("pdl")
+            else ()
+        ),
         "    linear = cutlass.Int64(cute.arch.block_idx()[0]) * 256 + cutlass.Int64(cute.arch.thread_idx()[0])",
     ]
     for side, source, rows, offset, slot in (
@@ -153,6 +158,7 @@ def make_mxfp8_entry(plan: Mapping[str, object]) -> object:
                 else "rhs_scale_column_stride",
                 0,
             ),
+            pdl=bool(plan.get("pdl", False)),
         ),
     }
     linecache.cache[filename] = (

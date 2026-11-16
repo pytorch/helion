@@ -20,7 +20,6 @@ from typing import cast
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.virtualized import V
-from torch.fx.node import map_arg
 
 from ... import exc
 from ...language._tracing_ops import _mask_to
@@ -30,14 +29,14 @@ from ...language.tile_ops import tile_index
 from ...language.view_ops import subscript
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
-from ..aten_lowering import LoweringContext
 from ..compile_environment import CompileEnvironment
 from ..inductor_lowering import PointwiseLowering
+from ..inductor_lowering import lowering_input_nodes
+from .scalar_lowering import scalar_lowering_context
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from torch.fx.node import Argument
     from torch.fx.node import Node
 
     from ..generate_ast import GenerateAST
@@ -215,15 +214,7 @@ def _tensor(node: Node) -> torch.Tensor | None:
 
 def row_fragment_tensor_inputs(node: Node) -> list[Node]:
     """Tensor operands in ordinary lowering order, excluding scheduler edges."""
-    inputs: list[Node] = []
-
-    def visit(argument: Node) -> Node:
-        if _tensor(argument) is not None:
-            inputs.append(argument)
-        return argument
-
-    map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
-    return inputs
+    return [value for value in lowering_input_nodes(node) if _tensor(value) is not None]
 
 
 def row_fragment_logical_extent(size: int | torch.SymInt) -> int | None:
@@ -461,10 +452,8 @@ class RowFragmentEmitter:
             inputs = row_fragment_tensor_inputs(node)
             if len(inputs) != len(input_values):
                 raise self._unsupported(node, "unexpected scalar operand")
-            context = LoweringContext.__new__(LoweringContext)
-            context.cg = self.cg
             input_by_node = dict(zip(inputs, input_values, strict=True))
-            context.env = cast("dict[Node, Argument]", input_by_node)
+            context = scalar_lowering_context(self.cg, input_by_node)
             lowering = node.meta.get("lowering")
             if lowering is None:
                 from ..inductor_lowering import FakeGraphLowering
@@ -474,7 +463,7 @@ class RowFragmentEmitter:
                 with V.set_graph_handler(graph_lowering):
                     prepare_node_lowering(graph_lowering, node)
                 lowering = node.meta.get("lowering")
-                # Preparation may remove duplicate/unused tensor operands.
+                # Preparation names only unique, used tensor operands.
                 input_values = [
                     input_by_node[argument]
                     for argument in row_fragment_tensor_inputs(node)

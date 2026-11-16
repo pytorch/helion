@@ -12,22 +12,21 @@ import torch
 
 from test.test_cute_mxfp8_mma import _config
 from test.test_cute_mxfp8_mma import _cpu_inputs
-from test.test_cute_mxfp8_mma import _cpu_target
 from test.test_cute_mxfp8_mma import _mxfp8
 from test.test_cute_mxfp8_mma import _wrapper_plan
 
-import helion
 from helion._compiler.cute.block_scaled_config import BLOCK_SCALED_CHOICES
 from helion._compiler.cute.block_scaled_config import block_scaled_choices
 from helion._compiler.cute.block_scaled_config import normalize_block_scaled_config
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.runtime import cute_cuda_graph
 
 pytestmark = skipUnlessBackends(["cute"])
 
 
-def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
+def test_cpu_n64_is_in_both_config_vocabularies() -> None:
     assert block_scaled_choices() == BLOCK_SCALED_CHOICES
     assert block_scaled_choices(mxfp8=True)["cute_scaled_tile_n"] == (
         256,
@@ -39,15 +38,14 @@ def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
         8,
     )
     raw_config: dict[str, object] = {"cute_scaled_mma": True, "cute_scaled_tile_n": 64}
-    with pytest.raises(helion.exc.InvalidConfig):
-        normalize_block_scaled_config(
-            dict(raw_config), available=True, capability=(10, 3), fix_invalid=False
-        )
+    normalize_block_scaled_config(
+        dict(raw_config), available=True, capability=(10, 3), fix_invalid=False
+    )
     normalize_block_scaled_config(
         raw_config, available=True, capability=(10, 3), fix_invalid=False, mxfp8=True
     )
     assert raw_config["cute_scaled_tile_n"] == 64
-    with _cpu_target():
+    with cpu_target():
         bound = _mxfp8._bind_isolated(_cpu_inputs((137, 273, 288)))
         config = _config(bound, cute_scaled_tile_n=64)
         source = bound.to_code(config)
@@ -60,7 +58,17 @@ def test_cpu_n64_is_only_in_mxfp8_config_vocabulary() -> None:
             )
 
 
-@pytest.mark.parametrize("cluster,bk", [(1, 128), (1, 256), (2, 128), (2, 256)])
+# Each case compiles the pipeline in a fresh interpreter: the first is the
+# smoke test, the other cluster/BK combinations are the slow tier.
+@pytest.mark.parametrize(
+    "cluster,bk",
+    [
+        (1, 128),
+        pytest.param(1, 256, marks=pytest.mark.slow),
+        pytest.param(2, 128, marks=pytest.mark.slow),
+        pytest.param(2, 256, marks=pytest.mark.slow),
+    ],
+)
 def test_cpu_n64_native_pipeline_compiles(
     cluster: int, bk: int, tmp_path: Path
 ) -> None:
@@ -72,7 +80,12 @@ def test_cpu_n64_native_pipeline_compiles(
         CUTE_DSL_ARCH="sm_100a",
         CUTE_DSL_CACHE_DIR=str(tmp_path / "cutlass-cache"),
         HELION_BACKEND="cute",
-        PYTHONPATH=str(Path(__file__).resolve().parents[1]),
+    )
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            str(Path(__file__).resolve().parents[1]),
+            *filter(None, [environment.get("PYTHONPATH")]),
+        ]
     )
     # CUTLASS caches the selected architecture in its process-wide DSL object.
     # A subprocess keeps fake SM100 compilation away from later CUDA tests.

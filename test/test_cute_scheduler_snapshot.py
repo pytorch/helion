@@ -10,22 +10,25 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_aux import _config
-from ._cute_aux import _cpu_codegen
-from ._cute_aux import _rank_two_code
-from ._cute_aux import _rank_two_inputs
-from .test_cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
-from .test_cute_grouped_gemm_split_sizes import _selected_config
+from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
+from test._cute_grouped_gemm_split_sizes import _selected_config
+
 from .test_cute_scheduler_mailbox import _plain_matmul
 from helion import exc
-from helion._compiler import program_id
+from helion._compiler.cute.tcgen05 import scheduler_pids
+from helion._compiler.cute.tcgen05.scheduler_pids import (
+    _build_sched_pipeline_consumer_wait_block,
+)
+from helion._compiler.cute.tcgen05.scheduler_pids import _literal_mailbox_access_fields
+from helion._compiler.cute.tcgen05.scheduler_pids import _sched_mailbox_load_expr
+from helion._compiler.cute.tcgen05.scheduler_pids import _SchedMailboxSnapshot
 from helion._compiler.device_function import DeviceFunction
-from helion._compiler.program_id import _build_sched_pipeline_consumer_wait_block
-from helion._compiler.program_id import _literal_mailbox_access_fields
-from helion._compiler.program_id import _sched_mailbox_load_expr
-from helion._compiler.program_id import _SchedMailboxSnapshot
 from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
+from helion._testing.cute_aux import rank_two_code
+from helion._testing.cute_aux import rank_two_inputs
 
 pytestmark = skipUnlessBackends(["cute"])
 
@@ -187,8 +190,8 @@ def _assert_snapshots(code: str) -> None:
 @pytest.mark.parametrize("order", [[0, 1], [1, 0]])
 def test_aux_all_consumers_use_snapshots(tile: list[int], order: list[int]) -> None:
     _assert_snapshots(
-        _rank_two_code(
-            _rank_two_inputs(),
+        rank_two_code(
+            rank_two_inputs(),
             _config(
                 block_sizes=tile,
                 loop_orders=[order],
@@ -213,7 +216,7 @@ def test_clc_staged_leader_snapshot_codegen(stages: int) -> None:
         tcgen05_sched_stage_count=stages,
         tcgen05_sched_consumer_wait_mode="warp_leader",
     )
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _plain_matmul._bind_isolated(args).to_code(config)
     _assert_snapshots(code)
     if stages == 2:
@@ -230,7 +233,7 @@ def test_selected_grouped_snapshots_preserve_publication_proof() -> None:
         torch.tensor((0, 1, 127, 224, 256, 449, 0, 991), dtype=torch.int32),
     )
     config = _selected_config(128)
-    with _cpu_codegen():
+    with cpu_codegen():
         bound = _device_split_sizes_kernel._bind_isolated(args)
         unsupported = _selected_config(128)
         unsupported.config["tcgen05_sched_consumer_wait_mode"] = "warp_leader"
@@ -280,7 +283,7 @@ def test_selected_grouped_snapshots_preserve_publication_proof() -> None:
         with (
             patch.object(_SchedMailboxSnapshot, "create", side_effect=create_snapshot),
             patch.object(
-                program_id,
+                scheduler_pids,
                 "_build_sched_pipeline_consumer_wait_block",
                 side_effect=wait_snapshot,
             ),

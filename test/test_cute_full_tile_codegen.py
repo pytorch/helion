@@ -6,43 +6,40 @@ import json
 import random
 from unittest.mock import patch
 
-from examples.low_mem_dropout import low_mem_dropout
-from examples.low_mem_dropout import low_mem_dropout_bwd
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _target
+from test.cute_population_contracts import checked_initial_population
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_pure_lane_packets_codegen import _capture
 from test.test_cute_pure_lane_packets_codegen import _execute
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CutePointwiseVecHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CutePointwiseVecHeuristic
 from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._compiler.rng_utils import philox_rand_ref
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
+from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = pytest.mark.cpu_only
+
+_examples_low_mem_dropout = import_example("low_mem_dropout")
+low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
 
 @pytest.fixture(autouse=True)
 def _cpu_only():
-    with (
-        _target(),
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
+    with cpu_render_target(
+        mma_support=tcgen05_mma_support(), reduction_smem_budget_bytes=232448
     ):
         yield
 
@@ -78,7 +75,7 @@ def _bound(
         autotune_effort=effort,
         cute_rng_stream="word0",
     )
-    return _cpu_bind(
+    return cpu_bind(
         kernel,
         (0.25, torch.empty(33554432, dtype=dtype) if tensor is None else tensor, 123),
     )
@@ -113,9 +110,29 @@ def test_original_dropout_host_abi_and_fallback_are_unchanged(
         if isinstance(node, ast.Compare)
     ]
     assert len(comparisons) == 1
-    assert ast.unparse(comparisons[0]) == (
-        "cutlass.Uint32(cutlass.Uint32(v_161) - _helion_uniform_first) < _helion_uniform_span"
-    )
+    # The control has packet and scalar fallbacks with the same RNG predicate.
+    # Derive its exact input from those bodies: temporary names are not an ABI.
+    original_uniform = {
+        ast.dump(node): node
+        for node in ast.walk(control_device)
+        if isinstance(node, ast.Compare)
+        and len(node.comparators) == 1
+        and ast.unparse(node.comparators[0]) == "_helion_uniform_span"
+    }
+    assert len(original_uniform) == 1
+    uniform = next(iter(original_uniform.values()))
+    assert isinstance(uniform.left, ast.Call)
+    difference = uniform.left.args[0]
+    assert isinstance(difference, ast.BinOp)
+    assert isinstance(difference.left, ast.Call)
+    random_word = difference.left.args[0]
+    expected_uniform = ast.parse(
+        f"cutlass.Uint32(cutlass.Uint32({ast.unparse(random_word)})"
+        " - _helion_uniform_first) < _helion_uniform_span",
+        mode="eval",
+    ).body
+    assert ast.dump(uniform) == ast.dump(expected_uniform)
+    assert ast.dump(comparisons[0]) == ast.dump(uniform)
     # The only new scalar expression is lossless widening of the proved
     # nonnegative index. All Philox rounds and floating-point expressions,
     # including the full runtime seed/probability/scale, remain unchanged.
@@ -130,12 +147,28 @@ def test_original_dropout_host_abi_and_fallback_are_unchanged(
         for node in ast.walk(statement)
         if isinstance(node, ast.Assign) and ast.dump(node) not in original_values
     ]
-    widened = "v_0 = cutlass.Int64(cutlass.Uint32(indices_0))"
-    assert sum(ast.unparse(node) == widened for node in changed) == 1
+    parameters = {arg.arg for arg in control_device.args.args}
+    original_index_casts = {
+        ast.dump(node): node
+        for node in ast.walk(control_device)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "cutlass.Int64"
+        and len(node.value.args) == 1
+        and isinstance(node.value.args[0], ast.Name)
+        and node.value.args[0].id not in parameters
+    }
+    assert len(original_index_casts) == 1
+    widened = deepcopy(next(iter(original_index_casts.values())))
+    assert isinstance(widened.value, ast.Call)
+    widened.value.args[0] = ast.parse(
+        f"cutlass.Uint32({ast.unparse(widened.value.args[0])})", mode="eval"
+    ).body
+    assert sum(ast.dump(node) == ast.dump(widened) for node in changed) == 1
     assert all(
         isinstance(node.value, ast.Constant)
         and node.value.value is True
-        or ast.unparse(node) == widened
+        or ast.dump(node) == ast.dump(widened)
         for node in changed
     )
     assert "seed" in fast and "_uniform_cutoff(p)" in fast and " * scale" in fast
@@ -205,14 +238,14 @@ def _metadata_length(values: torch.Tensor) -> torch.Tensor:
 
 
 def test_general_pointwise_metadata_extent_admits_without_rng_or_flatten():
-    bound = _cpu_bind(_metadata_length, (torch.empty(1024),))
+    bound = cpu_bind(_metadata_length, (torch.empty(1024),))
     source = bound.to_code(_config(enabled=True))
     assert "cute.is_static(" in source
     assert "cutlass.Int64(cute.size(" in source
 
 
 def test_equal_example_length_is_not_a_metadata_relation():
-    bound = _cpu_bind(_independent_length, (torch.empty(1024), 1024))
+    bound = cpu_bind(_independent_length, (torch.empty(1024), 1024))
     source = bound.to_code(_config(enabled=True))
     assert "cute.is_static(" not in source
 
@@ -232,7 +265,8 @@ def _population(bound, *, count=100, explicit=None):
                 == InitialPopulationStrategy.FROM_RANDOM
             )
             random.seed(2026091523)
-            flats = search._generate_initial_population_flat()
+            # The budgeted rows; compiler coverage witnesses follow them.
+            flats = checked_initial_population(search)[:count]
             configs = [search.config_gen.unflatten(flat) for flat in flats]
             assert len(configs) == len(set(configs)) == count
             assert [search.config_gen.flatten(config) for config in configs] == flats
@@ -369,3 +403,30 @@ def test_full_tile_preserves_runtime_probability_and_ieee_values(width):
         expected = _execute(before, width, data, -1, probability, helpers)
         actual = _execute(specialized, width, data, -1, probability, helpers)
         assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+
+
+def test_compile_options_preserve_full_tile_specialization():
+    bound = _bound(tensor=torch.empty(1024))
+    default = ast.parse(bound.to_code(_config(enabled=True)))
+    config = _config(enabled=True)
+    config.config["advanced_controls_file"] = "compile-controls.txt"
+    probe = ast.parse(bound.to_code(config))
+    device = next(
+        node
+        for node in default.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_helion_low_mem_dropout"
+    )
+    assert len(device.body) == 1 and isinstance(device.body[0], ast.If)
+    options = []
+    for node in ast.walk(probe):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_launcher"
+        ):
+            for keyword in list(node.keywords):
+                if keyword.arg == "cute_compile_options":
+                    options.append(ast.literal_eval(keyword.value))
+                    node.keywords.remove(keyword)
+    assert options == ["--ptxas-options='--apply-controls compile-controls.txt'"]
+    assert ast.dump(probe) == ast.dump(default)

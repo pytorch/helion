@@ -25,8 +25,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_lane_loop_distribution import _accesses
 from test.test_cute_lane_loop_distribution import _escaping_names
 from test.test_cute_lane_loop_distribution import _kernel_function
@@ -34,9 +32,11 @@ from test.test_cute_lane_loop_distribution import _loops
 
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _row_sum_then_zero_rows_fn(
@@ -181,8 +181,8 @@ def _render(
     variant: str, d: int, shape: tuple[int, int, int], rolled: int | None
 ) -> str:
     args = row_sum_store_args(variant, d, d, shape)
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(row_sum_store_kernel(variant), args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(row_sum_store_kernel(variant), args)
         config = row_sum_store_config(bound, rolled=rolled)
         return bound.to_code(helion.Config(**config))
 
@@ -288,3 +288,69 @@ def test_full_slice_store_at_a_small_batch_takes_the_slices_own_block(
         assert terms[3] in {"cutlass.Int32(indices_3)", "cutlass.Int32(rindex_3)"}, (
             terms
         )
+
+
+CUDA_DEVICE = "cuda"
+
+
+_CASES = [
+    *[(v, SMALL_BATCH_SHAPE, 64, 64) for v in sorted(ROW_SUM_STORE_FNS)],
+    *[(v, SMALL_BATCH_SHAPE, 128, 64) for v in sorted(ROW_SUM_STORE_FNS)],
+    *[(v, SMALL_BATCH_SHAPE, 128, 128) for v in REPLAYED_VARIANTS],
+    *[(v, BATCH_IS_HEAD_DIM_SHAPES[64], 64, 64) for v in REPLAYED_VARIANTS],
+    *[(v, BATCH_IS_HEAD_DIM_SHAPES[128], 128, 128) for v in REPLAYED_VARIANTS],
+]
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("variant", "shape", "d", "dv"),
+    _CASES,
+    ids=[f"{v}-b{s[0]}-d{d}-dv{dv}" for v, s, d, dv in _CASES],
+)
+def test_full_slice_store_beside_a_row_reduction_stores_every_element(
+    variant: str, shape: tuple[int, int, int], d: int, dv: int
+) -> None:
+    """The attention backward's preprocess shape on the generic lowering: a
+    full-slice store of a broadcast value (zeros, ones, a scalar, a row
+    vector, zeros under a per-row mask) over head dim ``d`` beside
+    ``sum(o * do)`` over head dim ``dv`` in one ``hl.tile`` body, the
+    reduction persistent.  With the batch extent equal to the head dim the
+    slice must take the reduction's block, not the batch tile's: every
+    element is stored, matching torch and the Triton backend's store
+    bitwise."""
+    torch.manual_seed(0)
+    b, h, m = shape
+    o = torch.randn((b, h, m, dv), dtype=torch.bfloat16, device=CUDA_DEVICE)
+    do = torch.randn_like(o)
+    row = torch.randn((d,), dtype=torch.float32, device=CUDA_DEVICE)
+    flag = (torch.rand((b, h, m), device=CUDA_DEVICE) < 0.4).to(torch.int32)
+    expected_delta = (o.float() * do.float()).sum(-1)
+    outputs: dict[str, torch.Tensor] = {}
+    for backend in ("cute", "triton"):
+        fill = 7.0 if variant == "masked" else float("nan")
+        dq = torch.full((b, h, m, d), fill, dtype=torch.float32, device=CUDA_DEVICE)
+        extra: tuple[torch.Tensor, ...] = {"rowvec": (row,), "masked": (flag,)}.get(
+            variant, ()
+        )
+        args = (o, do, *extra, dq)
+        bound = row_sum_store_kernel(variant, backend).bind(args)  # pyrefly: ignore [missing-attribute]
+        config = row_sum_store_config(bound, rolled=None)
+        delta = bound.compile_config(helion.Config(**config))(*args)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(delta, expected_delta, rtol=1e-3, atol=1e-2)
+        if variant == "masked":
+            absent = (flag != 0)[..., None].expand_as(dq)
+            assert torch.all(dq[absent] == 0), backend
+            assert torch.all(dq[~absent] == 7.0), backend
+        else:
+            assert not torch.isnan(dq).any(), backend
+            if variant == "rowvec":
+                assert torch.equal(dq, row.expand_as(dq)), backend
+            else:
+                assert torch.all(dq == (1.0 if variant == "ones" else 0.0)), backend
+        outputs[backend] = dq.clone()
+    # delta is a bf16-product sum whose order differs per backend; dq is
+    # the stored broadcast value and must agree bitwise.
+    assert torch.equal(outputs["cute"], outputs["triton"])

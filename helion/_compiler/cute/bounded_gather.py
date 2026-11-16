@@ -463,7 +463,7 @@ def prove_gather(
     graphs: Sequence[GraphInfo] | None = None,
     allow_unbound: bool = False,
 ) -> GatherBounds | None:
-    from .computed_fragment import _fragment_logical_shape
+    from .fragment_context import _fragment_logical_shape
     from .gather_domains import loop_domain_facts
 
     if node.target is not torch.ops.aten.gather.default:

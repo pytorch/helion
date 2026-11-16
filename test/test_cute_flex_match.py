@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
+import os
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -26,14 +27,13 @@ from torch.nn.attention.flex_attention import noop_mask
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _cpu_codegen
-
 import helion
-from helion._compiler import backend as _compiler_backend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import flex_match
+from helion._compiler.cute.analysis import attention_match as _attention_match
 from helion._compiler.cute.attention_plan import causal_score_plan
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
 from helion._compiler.cute.flex_match import FlexMatch
 from helion._compiler.cute.flex_match import flex_host_scalar_symbol
 from helion._compiler.cute.flex_match import match_flex_envelope
@@ -44,6 +44,8 @@ from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import as_sm100
+from helion._testing.cute_aux import cpu_codegen
 import helion.language as hl
 from helion.runtime.kernel import Kernel
 
@@ -55,7 +57,7 @@ if TYPE_CHECKING:
     from helion._compiler.host_function import HostFunction
     from helion.runtime.kernel import BoundKernel
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 _aten = torch.ops.aten
 # Every BlockMask here is built on the CPU on purpose: these tests exercise
@@ -144,22 +146,15 @@ def _flex_args(
 
 
 @contextlib.contextmanager
-def _as_sm100(*, flex: bool) -> Iterator[None]:
-    """CPU codegen with the flash gate forced on; ``flex`` sets the flag."""
-    with (
-        _cpu_codegen(),
-        patch("helion._compiler.backend._attention_flash_supported", return_value=True),
-        patch(
-            "helion._compiler.backend._attention_flash_gate_enabled", return_value=True
-        ),
-        patch.object(flex_match, "FLEX_PLAN_ENABLED", flex),
-    ):
+def _as_sm100_flex(*, flex: bool) -> Iterator[None]:
+    """The shared SM100 CPU codegen context; ``flex`` sets the flex-plan flag."""
+    with as_sm100(), patch.object(flex_match, "FLEX_PLAN_ENABLED", flex):
         yield
 
 
 def _bind(kernel: Kernel, args: tuple[Any, ...], *, flex: bool = False) -> BoundKernel:
     """Bind on the CPU as if on SM100; ``flex`` turns the integration on."""
-    with _as_sm100(flex=flex):
+    with _as_sm100_flex(flex=flex):
         # ``_bind_isolated``: a fresh BoundKernel per test, independent of the
         # process-wide bind cache (the flag above changes the surface).
         return kernel._bind_isolated(args)
@@ -690,9 +685,9 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
 
     def spy(cg: Any) -> bool:
         state = cg.device_function.cute_state
-        captured["block_ids"] = list(state.attention_flash_block_ids or [])
-        captured["plan"] = state.attention_flash_score_plan
-        captured["match"] = state.attention_flex_match
+        captured["block_ids"] = list(state.flash.block_ids or [])
+        captured["plan"] = state.flash.score_plan
+        captured["match"] = state.flash.flex_match
         captured["tensor_plan"] = cute_flash.flash_attention_tensor_plan(
             cg.device_function
         )
@@ -701,7 +696,7 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
     config = spec.default_config()
     assert config.block_sizes == [128, 128]
     with (
-        _cpu_codegen(),
+        cpu_codegen(),
         patch.object(flex_match, "FLEX_PLAN_ENABLED", True),
         patch.object(cute_flash, "codegen_attention_flash", spy),
     ):
@@ -720,8 +715,7 @@ def test_surface_and_codegen_claim_every_walk_loop() -> None:
     assert (tensor_plan.tensor_4d_batch, tensor_plan.tensor_4d_heads) == (2, 4)
     assert (tensor_plan.batch, tensor_plan.seq) == (8, 1024)
     assert (tensor_plan.q_seq, tensor_plan.kv_seq) == (1024, 1024)
-    assert tensor_plan.flex_scale_expr == "cutlass.Float32(scale)"
-    assert tensor_plan.flex_scale_arg_name == "scale"
+    assert tensor_plan.scale_arg_name == "scale"
     assert tensor_plan.flex_scalar_exprs == ()
     assert tensor_plan.flex_scalar_arg_names == ()
     assert tuple(tensor_plan.q_arg.fake_value.shape) == (2, 4, 1024, 64)
@@ -774,8 +768,8 @@ def test_collapsed_envelope_surface_unchanged(name: str) -> None:
         bound = _bind(kernel, args, flex=flex)
         host_function = _host(bound)
         device_ir = host_function.device_ir
-        with _as_sm100(flex=flex), bound.env, host_function:
-            surfaces.append(_compiler_backend.detect_flash_search_surface(device_ir))
+        with _as_sm100_flex(flex=flex), bound.env, host_function:
+            surfaces.append(_attention_match.detect_flash_search_surface(device_ir))
         assert bound.config_spec.cute_flash_search_enabled
     before, after = surfaces
     assert before is not None
@@ -843,12 +837,12 @@ def test_short_query_lengths_enable_the_search(q_seq: int) -> None:
 
     def spy(cg: Any) -> bool:
         state = cg.device_function.cute_state
-        captured["block_ids"] = list(state.attention_flash_block_ids or [])
-        captured["match"] = state.attention_flex_match
+        captured["block_ids"] = list(state.flash.block_ids or [])
+        captured["match"] = state.flash.flex_match
         return real_codegen(cg)
 
     with (
-        _as_sm100(flex=True),
+        _as_sm100_flex(flex=True),
         patch.object(cute_flash, "codegen_attention_flash", spy),
     ):
         code = bound.to_code(config)
@@ -944,7 +938,7 @@ def test_contiguous_operands_keep_the_rank3_maps() -> None:
         match.q_strides == match.k_strides == match.o_strides == (262144, 65536, 64, 1)
     )
     assert match.operand_strides is None
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(bound.config_spec.default_config())
     plan = _wrapper_plan(code)
     assert "operand_strides" not in plan
@@ -1000,7 +994,7 @@ def test_transposed_operands_take_the_rank4_maps(kv_heads: int) -> None:
     assert sorted(spec._flat_fields()) == sorted(contiguous.config_spec._flat_fields())
     config = spec.default_config()
     assert config == contiguous.config_spec.default_config()
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(config)
     assert "flash_flex_status" in code
     plan = _wrapper_plan(code)
@@ -1042,7 +1036,7 @@ def test_strided_epilogues_address_o_by_its_strides() -> None:
     bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
     base = bound.config_spec.default_config().config
     renders: dict[str, str] = {}
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         for name, overrides in (
             (
                 "tma",
@@ -1098,7 +1092,7 @@ def test_packed_qkv_slices_are_admitted() -> None:
     )
     assert match.o_strides == (262144, 64, 256, 1)
     assert bound.config_spec.cute_flash_search_enabled
-    with _as_sm100(flex=True):
+    with _as_sm100_flex(flex=True):
         code = bound.to_code(bound.config_spec.default_config())
     assert _wrapper_plan(code)["operand_strides"] == match.operand_strides
 
@@ -1176,9 +1170,9 @@ def _without_source_comments(code: str) -> str:
     return re.sub(r"^[ \t]*# src\[.*\n", "", code, flags=re.MULTILINE)
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
-class TestContiguousRenderPin(TestCase):
+class TestContiguousForwardRenderPin(TestCase):
     """The exact text of one contiguous forward render (the
     ``.expected_cute`` journal next to this file): the strided-operand
     support must not change the code contiguous inputs produce."""
@@ -1191,7 +1185,7 @@ class TestContiguousRenderPin(TestCase):
         bound = _bind(
             _flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True
         )
-        with _as_sm100(flex=True):
+        with _as_sm100_flex(flex=True):
             code = bound.to_code(bound.config_spec.default_config())
         assert "'operand_strides'" not in code
         self.assertExpectedJournal(_without_source_comments(code))
@@ -1234,7 +1228,7 @@ def test_long_kv_render_does_not_grow_with_the_sequence() -> None:
         assert bound.config_spec.cute_flash_search_enabled
         config = bound.config_spec.default_config()
         assert config.config[cute_flash.FLASH_FLEX_ITEM_WORDS_KEY] is True
-        with _as_sm100(flex=True):
+        with _as_sm100_flex(flex=True):
             renders[seq] = bound.to_code(config)
     short, long = renders[16384], renders[131072]
     assert short.count("\n") == long.count("\n")
@@ -1243,3 +1237,639 @@ def test_long_kv_render_does_not_grow_with_the_sequence() -> None:
     assert "flash_flex_rem1" not in long
     # The words argument carries the header: 4 + 4 * words entries per item.
     assert "_helion_flash_flex_item_words(" in long
+
+
+# -- the dense flex plan ------------------------------------------------------
+#
+# torch's empty BlockMask (``_create_empty_block_mask``: one KV block over the
+# whole sequence, ``noop_mask``) with the identity ``score_mod`` is dense
+# attention dressed as flex.  The matcher records it as ``flex_dense`` on the
+# dense surface's geometry; the surface, the resolver and the bodies then treat
+# the plan as the dense attention plan (its families, seeds and knobs), while
+# the operands, the LSE and the runtime scale stay the flex envelope's.
+
+
+def _empty_mask_args(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    score_mod: Callable[..., Any] = _identity,
+    enable_gqa: bool = False,
+) -> tuple[Any, ...]:
+    return _flex_args(
+        q, k, v, score_mod, _create_empty_block_mask(q, k), enable_gqa=enable_gqa
+    )
+
+
+def test_empty_block_mask_is_the_dense_flex_plan() -> None:
+    q, k, v = _qkv()
+    plan = _match_or_fail(_bind(_flex_kernel(), _empty_mask_args(q, k, v))).plan
+    assert plan.is_flex and plan.flex_dense and not plan.flex_envelope
+    assert not plan.has_list_walk
+    assert not plan.flex_has_mask_region and not plan.flex_has_score_region
+    # Every surface and body sees the dense plan.
+    assert plan.modifier_kinds == ("dense",)
+    assert plan.has_lowering()
+    assert cute_flash.flash_tmem_rowmax_score_plan_supported(plan)
+    # The runtime scale and the natural-log LSE stay the envelope's.
+    assert plan.scale_arg is not None and plan.scale_peeled
+    assert plan.lse_scale == pytest.approx(0.6931471805599453)
+
+
+def test_all_full_noop_block_mask_is_a_list_walk_not_a_dense_plan() -> None:
+    """A real 128-block BlockMask walks its tables (the data decide which
+    tiles are visible), even when every block happens to be full."""
+    q, k, v = _qkv()
+    dense = create_block_mask(noop_mask, 2, 4, 1024, 1024, BLOCK_SIZE=128, device=_CPU)
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, dense))
+    plan = _match_or_fail(bound).plan
+    assert plan.has_list_walk and not plan.flex_dense and plan.flex_envelope
+    assert plan.modifier_kinds == ("flex",)
+
+
+def test_dense_flex_plan_admits_grouped_query_heads() -> None:
+    q, k, v = _qkv(kv_heads=2)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v, enable_gqa=True))
+    plan = _match_or_fail(bound).plan
+    assert plan.flex_dense and plan.kv_group == 2
+
+
+def _tanh_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+    return torch.tanh(score)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["mask_region", "score_region", "ragged_length", "unequal_lengths", "strided"],
+)
+def test_dense_flex_plan_fails_closed_off_the_dense_geometry(case: str) -> None:
+    """Trivial walks that are not dense attention on the dense geometry keep
+    the flex envelope (the body that hosts them today): a mask region on the
+    one block, a score region, a length that is not a multiple of the
+    128-row tile, unequal Q / K/V lengths, strided operands."""
+    if case == "mask_region":
+        q, k, v = _qkv(q_seq=64, kv_seq=64)
+        block_mask = create_block_mask(
+            _causal, 2, 4, 64, 64, BLOCK_SIZE=128, device=_CPU
+        )
+        args = _flex_args(q, k, v, _identity, block_mask)
+    elif case == "score_region":
+        q, k, v = _qkv()
+        args = _empty_mask_args(q, k, v, score_mod=_tanh_mod)
+    elif case == "ragged_length":
+        q, k, v = _qkv(q_seq=1088, kv_seq=1088)
+        args = _empty_mask_args(q, k, v)
+    elif case == "unequal_lengths":
+        q, k, v = _qkv(q_seq=1024, kv_seq=2048)
+        args = _empty_mask_args(q, k, v)
+    else:
+        q = _transposed(2, 4, 1024, 64)
+        k = _transposed(2, 4, 1024, 64)
+        v = _transposed(2, 4, 1024, 64)
+        args = _empty_mask_args(q, k, v)
+    plan = _match_or_fail(_bind(_flex_kernel(), args)).plan
+    assert plan.is_flex and not plan.has_list_walk
+    assert not plan.flex_dense and plan.flex_envelope
+    assert plan.modifier_kinds == ("flex",)
+    assert plan.flex_has_mask_region == (case == "mask_region")
+    assert plan.flex_has_score_region == (case == "score_region")
+
+
+@functools.cache
+def _attention_kernel() -> Kernel:
+    module = import_path(EXAMPLES_DIR / "attention.py")
+    return _cute_kernel(module.attention)
+
+
+def _bind_dense_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> BoundKernel:
+    with _as_sm100_flex(flex=False):
+        return _attention_kernel()._bind_isolated((q, k, v))
+
+
+def _flash_choices(spec: Any) -> dict[str, tuple[object, ...]]:
+    """The searched values of every flash knob of a surface."""
+    with patch.dict(os.environ, {}, clear=True):
+        fragments = _cute_flash_autotune_fragments(spec)
+    return {
+        key: tuple(
+            getattr(fragment, "search_choices", None)
+            or getattr(fragment, "choices", ())
+        )
+        for key, fragment in fragments.items()
+    }
+
+
+def _seeded_families(spec: Any) -> set[tuple[object, object]]:
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = spec.compiler_seed_configs or ()
+    return {
+        (
+            seed.config.get(cute_flash.FLASH_PIPELINE_FAMILY_KEY),
+            seed.config.get(cute_flash.FLASH_PERSISTENT_KEY),
+        )
+        for seed in seeds
+    }
+
+
+def test_dense_flex_plan_takes_the_dense_surface() -> None:
+    """At the campaign's (1, 4, 256, 64) cell the dense flex plan gets the
+    dense attention kernel's surface: the dense facts, every family of the
+    dense surface (the row programs on this small grid, the persistent fa4
+    bodies), the same searched values knob for knob, the dense seeds (a row
+    program among them), a complete coverage design and every seed
+    transferring."""
+    q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
+    spec = bound.config_spec
+    assert spec.cute_flash_search_enabled
+    assert spec._cute_flash_score_modifier_kinds == ("dense",)
+    assert not spec._cute_flash_has_list_walk
+    assert not spec._cute_flash_flex_trivial_walk
+    assert not spec._cute_flash_flex_has_mask_region
+    assert not spec._cute_flash_flex_has_score_region
+    assert not spec._cute_flash_has_score_modifiers
+    assert spec._cute_flash_plain_row_body
+    assert spec._cute_flash_tmem_rowmax_compatible
+    # The LSE output and the runtime scale: no standard output-only lowering.
+    assert not spec._cute_flash_standard_dense_output
+    assert not spec._cute_flash_supports_tensor_4d_tma
+    assert spec._cute_flash_block_size_targets == {0: 128, 1: 128}
+    assert (spec._cute_flash_num_kv, spec._cute_flash_num_bh) == (2, 4)
+    choices = _flash_choices(spec)
+    families = choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    assert "row_mma" in families and "fa4" in families and "ws_overlap" in families
+    assert set(choices[cute_flash.FLASH_PERSISTENT_KEY]) == {True, False}
+    assert set(choices[cute_flash.FLASH_ROW_WARPS_KEY]) == {2, 4, 8}
+    # Knob for knob the dense attention kernel's search at the same cell,
+    # less the 4-D TMA families: the attention example's reshape-view
+    # operands prove them, the flex emitter reads its 4-D operands directly.
+    dense = _bind_dense_attention(q, k, v).config_spec
+    assert dense._cute_flash_score_modifier_kinds == ("dense",)
+    dense_choices = _flash_choices(dense)
+    assert "fa4_tma_4d" in dense_choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    assert families == tuple(
+        family
+        for family in dense_choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+        if not str(family).endswith("_tma_4d")
+    )
+    assert {
+        key: value
+        for key, value in choices.items()
+        if key != cute_flash.FLASH_PIPELINE_FAMILY_KEY
+    } == {
+        key: value
+        for key, value in dense_choices.items()
+        if key != cute_flash.FLASH_PIPELINE_FAMILY_KEY
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = list(spec.compiler_seed_configs or ())
+    assert seeds
+    assert all(seed.config["block_sizes"] == [128, 128] for seed in seeds)
+    families_seeded = _seeded_families(spec)
+    assert ("row_mma", False) in families_seeded
+    assert ("fa4", True) in families_seeded
+    assert families_seeded == {
+        seeded
+        for seeded in _seeded_families(dense)
+        if not str(seeded[0]).endswith("_tma_4d")
+    }
+    from helion.autotuner.config_generation import ConfigGeneration
+
+    with patch.dict(os.environ, {}, clear=True):
+        generation = ConfigGeneration(spec)
+        generation.extension.validate_flash_structural_coverage()
+        assert generation.extension.flash_structural_coverage_uncovered_values() == []
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
+        messages: list[str] = []
+        pairs = generation.seed_flat_config_pairs(messages.append)
+    assert not messages
+    # Every seed transfers (two of the dense surface's seeds may fold into
+    # one flat config on this small grid, as on the attention example's).
+    assert len(pairs) >= len(seeds) - 1
+
+
+_FLEX_BODY_MARKERS = (
+    "flash_flex_status",
+    "_flash_mFlexPartCnt",
+    "_flash_mFlexFullIdx",
+    "flash_flex_needs_mask",
+    "_flash_mFlexItems",
+    "flash_flex_cp0",
+)
+
+
+def _seed_of(spec: Any, family: str, persistent: bool) -> helion.Config:
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = spec.compiler_seed_configs or ()
+    return next(
+        seed
+        for seed in seeds
+        if seed.config.get(cute_flash.FLASH_PIPELINE_FAMILY_KEY) == family
+        and seed.config.get(cute_flash.FLASH_PERSISTENT_KEY) is persistent
+    )
+
+
+def test_dense_flex_plan_renders_the_dense_bodies() -> None:
+    """The dense flex plan renders the dense bodies: the persistent fa4 pair
+    body (the default) and the persistent ws_overlap body, with none of the
+    list-walk / hook markers, and the runtime scale handed to the launcher
+    (``scale_idx``: ``_flash_scale_log2 = _flash_scale * log2(e)``)."""
+    q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
+    spec = bound.config_spec
+    default = spec.default_config()
+    assert default.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4"
+    assert default.config[cute_flash.FLASH_PERSISTENT_KEY] is True
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(default)
+    assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
+    plan = _wrapper_plan(code)
+    assert plan["kind"] == "helion_flash"
+    assert (plan["topology"], plan["persistent"]) == ("fa4", True)
+    assert plan["scale_peeled"] is True
+    assert "scale_idx" in plan and "lse_idx" in plan
+    assert (plan["seq"], plan["batch"], plan["head_dim"]) == (256, 4, 64)
+    host = "\n".join(_host_lines(plan))
+    assert (
+        "_flash_scale_log2 = _flash_scale * cutlass.Float32(1.4426950408889634)" in host
+    )
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(_seed_of(spec, "ws_overlap", True))
+    assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
+    plan = _wrapper_plan(code)
+    assert (plan["topology"], plan["persistent"]) == ("ws_overlap", True)
+    assert "scale_idx" in plan
+
+
+def test_dense_flex_plan_renders_the_row_programs_with_the_runtime_scale() -> None:
+    """The row programs (``row_mma``) host the dense flex plan: the kernel
+    reads the runtime scale as a scalar parameter (``rm_scale = scale *
+    log2(e)``, the tcgen05 wrapper's derivation) instead of baking the
+    plan's multiplier, writes the natural-log LSE, and the never-read
+    BlockMask tables leave the kernel signature."""
+    q, k, v = _qkv(batch=1, heads=4, q_seq=256, kv_seq=256, head_dim=64)
+    bound = _bind(_flex_kernel(), _empty_mask_args(q, k, v), flex=True)
+    seed = _seed_of(bound.config_spec, "row_mma", False)
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(seed)
+    assert not any(marker in code for marker in _FLEX_BODY_MARKERS)
+    plan = _wrapper_plan(code)
+    assert plan["kind"] == "helion_flash_row_mma"
+    assert (plan["row_warps"], plan["row_tile_m"]) == (4, 8)
+    # The operand names resolve to launcher argument positions; the LSE is
+    # among them.
+    assert "lse_idx" in plan
+    assert (
+        "rm_scale = cutlass.Float32(scale) * cutlass.Float32(1.4426950408889634)"
+        in code
+    )
+    assert "rm_scale = cutlass.Float32(1.44269504)" not in code
+    (kernel_def,) = [
+        line
+        for line in code.splitlines()
+        if line.startswith("def _helion_helion_flex_attention_kernel(")
+    ]
+    assert kernel_def == (
+        "def _helion_helion_flex_attention_kernel(query, key, value, out, lse, scale):"
+    )
+
+
+def test_trivial_walk_with_a_mask_region_keeps_the_flex_surface() -> None:
+    """``M == N == 64`` under a causal BlockMask: the one 128-wide block
+    covers the sequence (a trivial walk) but the mask region runs on it, so
+    the plan keeps the flex envelope's surface and body (the trivial-walk
+    pins: no persistent list walk, no row programs)."""
+    q, k, v = _qkv(q_seq=64, kv_seq=64)
+    block_mask = create_block_mask(_causal, 2, 4, 64, 64, BLOCK_SIZE=128, device=_CPU)
+    bound = _bind(_flex_kernel(), _flex_args(q, k, v, _identity, block_mask), flex=True)
+    spec = bound.config_spec
+    assert spec._cute_flash_score_modifier_kinds == ("flex",)
+    assert spec._cute_flash_flex_trivial_walk and not spec._cute_flash_has_list_walk
+    assert spec._cute_flash_flex_has_mask_region
+    choices = _flash_choices(spec)
+    assert choices[cute_flash.FLASH_PERSISTENT_KEY] == (False,)
+    assert "row_mma" not in choices[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(spec.default_config())
+    assert "flash_flex_needs_mask" in code and "flash_flex_status" in code
+
+
+# -- the row-max store ------------------------------------------------------------
+#
+# FlexAttention's ``max_scores``: a third ``[B, H, M]`` fp32 output holding the
+# running row max ``m`` (base-2 units, or natural ones) beside the LSE.
+
+_LSE_ALLOC = (
+    "    lse = torch.empty((B, H, M), dtype=torch.float32, device=out.device)\n"
+)
+_LSE_STORE = "        lse[tile_b, tile_h, tile_m] = lse_row[None, None, :]\n"
+_RETURN = "    return out, lse\n"
+
+
+def _row_max_edits(value: str, *, lse: bool = True) -> list[tuple[str, str]]:
+    """Edits storing ``value`` (an expression of the epilogue's names) to a
+    third output ``row_max``; ``lse=False`` drops the LSE store."""
+    store = f"        row_max[tile_b, tile_h, tile_m] = ({value})[None, None, :]\n"
+    return [
+        (
+            _LSE_ALLOC,
+            _LSE_ALLOC + "    row_max = torch.empty((B, H, M), dtype=torch.float32,"
+            " device=out.device)\n",
+        ),
+        (
+            _LSE_STORE + _RETURN,
+            (_LSE_STORE if lse else "") + store + "    return out, lse, row_max\n",
+        ),
+    ]
+
+
+def _row_max_kernel(tmp_path: pathlib.Path, value: str, *, lse: bool = True) -> Kernel:
+    """The example kernel with ``_row_max_edits(value, lse=lse)``."""
+    return _variant_kernel(
+        tmp_path,
+        "row_max_" + re.sub(r"\W+", "_", value) + ("" if lse else "_no_lse"),
+        *_row_max_edits(value, lse=lse),
+    )
+
+
+def _causal_args() -> tuple[Any, ...]:
+    q, k, v = _qkv()
+    block_mask = create_block_mask(
+        _causal, None, None, 1024, 1024, BLOCK_SIZE=128, device=_CPU
+    )
+    return _flex_args(q, k, v, _identity, block_mask)
+
+
+@pytest.mark.parametrize(
+    ("value", "scale"),
+    [
+        ("m_i", 1.0),
+        ("m_i / log_2_e", 0.6931471805599453),
+        ("m_i * 0.6931471805599453", 0.6931471805599453),
+    ],
+)
+def test_row_max_store_matches_beside_the_lse(
+    tmp_path: pathlib.Path, value: str, scale: float
+) -> None:
+    """The running max ``m`` itself (base 2, the kernel's own units) or in
+    natural units (``/ log2e``, ``* ln2``) stored beside the LSE: the match
+    names the row-max output and the plan carries the factor from the
+    fused body's log2-unit row max to the stored value."""
+    kernel = _row_max_kernel(tmp_path, value)
+    match = _match_or_fail(_bind(kernel, _causal_args()))
+    assert (match.lse_name, match.row_max_name) == ("lse", "row_max")
+    assert match.plan.row_max_scale == pytest.approx(scale)
+    assert match.plan.lse_scale == pytest.approx(0.6931471805599453)
+    assert match.plan.flex_envelope and match.plan.has_list_walk
+    plain = _match_or_fail(_bind(_flex_kernel(), _causal_args()))
+    assert plain.row_max_name is None and plain.plan.row_max_scale is None
+
+
+_NOT_A_ROW_STORE = (
+    "flex: the row store to row_max is neither the LSE (m + log2(l), "
+    "or its natural-log form) nor the row max m"
+)
+
+
+@pytest.mark.parametrize(
+    ("value", "lse", "reason"),
+    [
+        (
+            "l_i",
+            True,
+            _NOT_A_ROW_STORE,
+        ),
+        (
+            "m_i * 2.0",
+            True,
+            _NOT_A_ROW_STORE,
+        ),
+        ("m_i", False, "flex: a row-max store needs the LSE store beside it"),
+    ],
+)
+def test_row_max_store_declines(
+    tmp_path: pathlib.Path, value: str, lse: bool, reason: str
+) -> None:
+    """Another row value (the row sum, a rescaled max) or a row max without
+    the LSE beside it (the fused bodies store both from the same final
+    statistics, under the same row guards) keeps the generic path."""
+    kernel = _row_max_kernel(tmp_path, value, lse=lse)
+    reasons: list[str] = []
+    assert _match(_bind(kernel, _causal_args()), reasons) is None
+    assert reasons == [reason]
+
+
+def test_row_max_store_keeps_the_flex_body_on_an_empty_block_mask(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The dense flex plan routes to the dense bodies, which store no row
+    max: with the row-max store the empty BlockMask keeps the flex plan."""
+    q, k, v = _qkv()
+    kernel = _row_max_kernel(tmp_path, "m_i")
+    plan = _match_or_fail(_bind(kernel, _empty_mask_args(q, k, v))).plan
+    assert plan.row_max_scale == 1.0
+    assert plan.is_flex and not plan.flex_dense and plan.flex_envelope
+    bound = _bind(kernel, _empty_mask_args(q, k, v), flex=True)
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(bound.config_spec.default_config())
+    assert "flash_flex_status" in code and "_flash_mRowMax[" in code
+
+
+# The split renders' last-step unpin.
+_UNPIN = "& (flash_true_row_max > flash_row_max):"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "tracks", "unpins"),
+    [
+        # The one-CTA walk: the softmax warps store the tracked true max.
+        ({cute_flash.FLASH_KV_SPLIT_KEY: 1}, True, False),
+        # Split renders: the merges fold the published row max, so the walk's
+        # last step unpins it.
+        ({cute_flash.FLASH_KV_SPLIT_KEY: 2}, True, True),
+        (
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 1,
+                cute_flash.FLASH_PERSISTENT_KEY: False,
+                cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: 2,
+            },
+            True,
+            True,
+        ),
+        (
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 1,
+                cute_flash.FLASH_PERSISTENT_KEY: False,
+                cute_flash.FLASH_FLEX_SKIP_ABSENT_KEY: True,
+                cute_flash.FLASH_FLEX_DEAD_STAGE_SPLIT_KEY: True,
+            },
+            True,
+            True,
+        ),
+        # No alpha pin: the row max is exact.
+        (
+            {
+                cute_flash.FLASH_KV_SPLIT_KEY: 1,
+                cute_flash.FLASH_RESCALE_THRESHOLD_KEY: 0.0,
+            },
+            False,
+            False,
+        ),
+        # The cooperative pair (ws_overlap, 2-CTA).
+        ({cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_2cta"}, True, False),
+    ],
+)
+def test_row_max_store_renders_beside_the_lse(
+    tmp_path: pathlib.Path,
+    overrides: dict[str, object],
+    tracks: bool,
+    unpins: bool,
+) -> None:
+    """The row-max store renders as a kernel output beside the LSE (the
+    launcher's view of the same geometry) in every schedule, with the true
+    max tracked apart under the alpha pin and the split renders' last step
+    unpinned."""
+    kernel = _row_max_kernel(tmp_path, "m_i")
+    bound = _bind(kernel, _causal_args(), flex=True)
+    config = bound._normalized_config_copy(
+        helion.Config(**{**bound.config_spec.default_config().config, **overrides})
+    )
+    with _as_sm100_flex(flex=True):
+        code = bound.to_code(config)
+    assert "_flash_mRowMax[" in code
+    # The device view follows the LSE's among the kernel parameters.
+    (kernel_def,) = [
+        line
+        for line in code.splitlines()
+        if line.startswith("def _helion_helion_flex_attention_kernel(")
+    ]
+    assert "lse, row_max, " in kernel_def
+    assert "_flash_mLSE, _flash_mRowMax, " in kernel_def
+    assert ("flash_true_row_max" in code) is tracks
+    assert (_UNPIN in code) is unpins
+    plan = _wrapper_plan(code)
+    assert plan["kind"] == "helion_flash"
+    assert plan["row_max_idx"] == plan["lse_idx"] + 1
+    host = "\n".join(_host_lines(plan))
+    assert (
+        f"_flash_mRowMax = cute.make_tensor(arg{plan['row_max_idx']}.iterator, " in host
+    )
+
+
+# -- the LSE store's units --------------------------------------------------------
+#
+# The running max ``m`` is in the units of the softmax's exp base (base 2 for
+# ``exp2``, natural for ``exp``) and the fused body's LSE is base 2: the plan
+# stores it or ``ln 2`` times it, so the row-sum log must share ``m``'s base.
+
+_LSE_ROW = (
+    "        lse_row = (m_i + torch.log2(l_i)) / log_2_e"
+    "  # Convert back to natural log\n"
+)
+_LN2 = 0.6931471805599453
+
+
+def _exp_softmax_edits() -> list[tuple[str, str]]:
+    """Edits turning the example's ``exp2`` softmax into an ``exp`` one with
+    no trailing ``* log2(e)`` (``m`` in natural units), in both bodies."""
+    edits: list[tuple[str, str]] = []
+    for indent in (" " * 16, " " * 20):
+        edits += [
+            (f"\n{indent}qk *= log_2_e\n", "\n"),
+            (f"\n{indent}p = torch.exp2(qk)\n", f"\n{indent}p = torch.exp(qk)\n"),
+            (
+                f"\n{indent}alpha = torch.exp2(m_i - m_safe)\n",
+                f"\n{indent}alpha = torch.exp(m_i - m_safe)\n",
+            ),
+        ]
+    return edits
+
+
+def _lse_kernel(
+    tmp_path: pathlib.Path,
+    exp_base: str,
+    lse_value: str,
+    row_max: str | None = None,
+) -> Kernel:
+    """The example kernel with an ``exp_base`` softmax storing ``lse_value``
+    (an expression of the epilogue's names) as the LSE and, with
+    ``row_max``, that expression as a row max beside it."""
+    name = f"lse_{exp_base}_" + re.sub(r"\W+", "_", lse_value)
+    edits = [(_LSE_ROW, f"        lse_row = {lse_value}\n")]
+    if exp_base == "exp":
+        edits += _exp_softmax_edits()
+    if row_max is not None:
+        name += "_row_max_" + re.sub(r"\W+", "_", row_max)
+        edits += _row_max_edits(row_max)
+    return _variant_kernel(tmp_path, name, *edits)
+
+
+@pytest.mark.parametrize(
+    ("exp_base", "lse_value", "log_base"),
+    [
+        ("exp2", "m_i + torch.log2(l_i)", "log2"),
+        ("exp2", "(m_i + torch.log2(l_i)) / log_2_e", "log"),
+        ("exp2", f"(m_i + torch.log2(l_i)) * {_LN2}", "log"),
+        ("exp", "m_i + torch.log(l_i)", "log"),
+    ],
+)
+def test_lse_store_units_follow_the_exp_base(
+    tmp_path: pathlib.Path, exp_base: str, lse_value: str, log_base: str
+) -> None:
+    """An LSE whose row-sum log shares ``m``'s base (base 2 for an ``exp2``
+    softmax, possibly converted to natural units, natural for ``exp``)
+    matches with the stored units' scale of the fused log2-unit LSE."""
+    kernel = _lse_kernel(tmp_path, exp_base, lse_value)
+    match = _match_or_fail(_bind(kernel, _causal_args()))
+    assert match.exp_base == exp_base
+    assert (match.lse_name, match.lse_log_base) == ("lse", log_base)
+    assert match.plan.lse_scale == pytest.approx(1.0 if log_base == "log2" else _LN2)
+
+
+@pytest.mark.parametrize(
+    ("exp_base", "lse_value", "log"),
+    [
+        ("exp", "m_i + torch.log2(l_i)", "log2"),
+        ("exp", "(m_i + torch.log2(l_i)) / log_2_e", "log2"),
+        ("exp", f"(m_i + torch.log2(l_i)) * {_LN2}", "log2"),
+        ("exp2", "m_i + torch.log(l_i)", "log"),
+    ],
+)
+def test_lse_store_mixing_units_declines(
+    tmp_path: pathlib.Path, exp_base: str, lse_value: str, log: str
+) -> None:
+    """``m + log2(l)`` beside an ``exp`` softmax's natural-unit ``m`` (or
+    its natural conversion) and ``m + log(l)`` beside an ``exp2`` softmax's
+    base-2 ``m`` add terms of different units, which no scale of the fused
+    log2-unit LSE gives: the generic path keeps the kernel's value."""
+    kernel = _lse_kernel(tmp_path, exp_base, lse_value)
+    reasons: list[str] = []
+    assert _match(_bind(kernel, _causal_args()), reasons) is None
+    assert reasons == [
+        (
+            f"flex: the LSE store to lse adds {log}(l) to the {exp_base} "
+            "softmax's running max (mixed units)"
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("value", "scale"), [("m_i", _LN2), ("m_i / log_2_e", _LN2 * _LN2)]
+)
+def test_row_max_store_scale_follows_the_exp_base(
+    tmp_path: pathlib.Path, value: str, scale: float
+) -> None:
+    """A row max is a plain multiple of ``m``, so an ``exp`` softmax (``m``
+    in natural units, ``ln 2`` times the fused log2-unit row max) matches
+    with that factor folded into ``row_max_scale``."""
+    kernel = _lse_kernel(tmp_path, "exp", "m_i + torch.log(l_i)", value)
+    match = _match_or_fail(_bind(kernel, _causal_args()))
+    assert (match.lse_name, match.row_max_name) == ("lse", "row_max")
+    assert match.plan.lse_scale == pytest.approx(_LN2)
+    assert match.plan.row_max_scale == pytest.approx(scale)

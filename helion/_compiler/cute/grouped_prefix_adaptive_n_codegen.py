@@ -22,6 +22,9 @@ from ...runtime.config import Config
 from .grouped_prefix_adaptive_n import GroupedPrefixAdaptiveNProfile
 from .grouped_prefix_adaptive_n import GroupedPrefixNBranch
 from .grouped_prefix_adaptive_n import grouped_prefix_adaptive_n_input_domain
+from .state import cute_env_state
+from .tcgen05_config import facts
+from .tcgen05_config import repair
 from .tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY
 
@@ -1399,8 +1402,8 @@ def generate_grouped_prefix_adaptive_n_candidate(
 
     env = CompileEnvironment.current()
     model = env.config_spec._cute_tcgen05_config
-    model._normalize_grouped_prefix_adaptive_n(config.config, fix_invalid=False)
-    profile = model.get_grouped_prefix_adaptive_n_profile(config.config)
+    repair._normalize_grouped_prefix_adaptive_n(model, config.config, fix_invalid=False)
+    profile = facts.get_grouped_prefix_adaptive_n_profile(model, config.config)
     _require(
         model.grouped_prefix_adaptive_n_supported and profile is not None,
         "native purity/resource proof is unavailable",
@@ -1451,5 +1454,5 @@ def generate_grouped_prefix_adaptive_n_candidate(
         and isinstance(node.targets[0], ast.Attribute)
         and node.targets[0].attr == "_helion_cute_wrapper_plans"
     )
-    env.cute_resolved_wrapper_plans = ast.literal_eval(plan_assignment.value)
+    cute_env_state(env).resolved_wrapper_plans = ast.literal_eval(plan_assignment.value)
     return module

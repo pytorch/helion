@@ -3,12 +3,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.matmul_split_k import matmul_split_k
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import checked_initial_population
 from test.test_cute_atomic_output_promotions import _assert_fp32_atomic_output
 from test.test_cute_collective_chunk_seeds import _direct_chunk_matmul
@@ -16,14 +13,19 @@ from test.test_cute_collective_chunk_seeds import _matmul_with_unrelated_knob
 from test.test_cute_collective_chunk_seeds import _partitioned_matmul
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
+matmul_split_k = import_example("matmul_split_k").matmul_split_k
+
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -35,7 +37,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _forbid_cuda_init() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
     ):
         yield
@@ -50,10 +52,12 @@ def partitioned_case() -> tuple[BoundKernel, tuple[torch.Tensor, torch.Tensor]]:
     kernel = helion.kernel(
         matmul_split_k.fn,
         backend="cute",
+        # The fp32-promoted atomic output is the form these seeds are stated on.
+        cute_promote_half_atomic_outputs=True,
         static_shapes=True,
         autotune_effort="none",
     )
-    return _cpu_bind(kernel, args), args
+    return cpu_bind(kernel, args), args
 
 
 def _legacy_order(
@@ -220,7 +224,7 @@ def test_initial_population_uses_config_provenance_not_parameter_spelling(
         torch.empty((128, 16384), dtype=torch.float16),
         torch.empty((16384, 256), dtype=torch.float16),
     )
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     population = _initial_population(bound, args)
     for stages in (2, 4):
         coupled = []
@@ -289,7 +293,7 @@ def test_no_config_owned_k_chunk_preserves_initial_population(
         static_shapes=static_shapes,
         autotune_effort="none",
     )
-    bound = _cpu_bind(variant, args)
+    bound = cpu_bind(variant, args)
     legacy_seeds = _legacy_registered_seeds(bound)
     assert legacy_seeds == bound.config_spec.compiler_seed_configs
     assert _initial_population(bound, args, seeds=legacy_seeds) == _initial_population(
@@ -302,7 +306,7 @@ def test_unrelated_knob_does_not_group_computed_operand_schedules() -> None:
         torch.empty((128, 512), dtype=torch.float16),
         torch.empty((512, 256), dtype=torch.float16),
     )
-    bound = _cpu_bind(_matmul_with_unrelated_knob, args)
+    bound = cpu_bind(_matmul_with_unrelated_knob, args)
     assert bound.host_function is not None
     # This checks this heuristic's permutation, before later independent
     # overlays append their own policy siblings to the merged registry.

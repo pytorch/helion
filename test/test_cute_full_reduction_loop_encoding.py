@@ -10,12 +10,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 
 import helion
-from helion._compiler.backend import TritonBackend
 from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.triton.backend import TritonBackend
+from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
@@ -23,6 +23,8 @@ from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
 from helion.exc import InvalidConfig
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,7 +35,7 @@ def cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # These tests inspect compiler IR, which eager interpretation does not build.
     monkeypatch.setenv("HELION_INTERPRET", "0")
     initialized = torch.cuda.is_initialized()
-    with _cpu_target(), _forbid_native_compile() as calls:
+    with _cpu_target(), forbid_native_compile() as calls:
         yield
         assert all(call.call_count == 0 for call in calls)
     assert torch.cuda.is_initialized() == initialized
@@ -145,7 +147,7 @@ def test_backend_chunk_and_indexed_reduction_caps_still_apply() -> None:
     config = spec.default_config()
     config.config["reduction_loops"] = [4096]
     spec.normalize(config.config)
-    assert config.config["reduction_loops"] == [1024]
+    assert config.config["reduction_loops"] == [2048]
     indexed = make_spec(64, full=True)
     indexed.cute_indexed_reduction_block_ids.add(1)
     config = indexed.default_config()
@@ -385,7 +387,8 @@ def test_padded_chunk_does_not_bypass_live_backend_caps(
         config.config["reduction_loops"] = [requested]
         generation = ConfigGeneration(new)
         flat, effective = generation.strict_config_pair(config)
-        assert effective.config["reduction_loops"] == [threshold]
+        expected = threshold if requested is None else max_loop
+        assert effective.config["reduction_loops"] == [expected]
         assert generation.strict_unflatten(deepcopy(flat)) == effective
 
 

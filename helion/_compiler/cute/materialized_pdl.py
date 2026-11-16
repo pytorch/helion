@@ -9,6 +9,7 @@ from ...language import memory_ops
 from .materialized_fission_codegen import _region_graph_ids
 from .promote_output_axis import _access_tensor
 from .promote_output_axis import _fresh_tensors
+from .state import cute_env_state
 
 if TYPE_CHECKING:
     from ..compile_environment import CompileEnvironment
@@ -35,7 +36,7 @@ def prove_materialized_operand_pdl(
     accepted exactly one guarded native MMA and its complete region SMEM facts.
     Join those independent proofs by actual graph and tensor identities.
     """
-    plan = env.cute_fission_plan
+    plan = cute_env_state(env).fission_plan
     host = device_ir.host_function
     if (
         plan is None

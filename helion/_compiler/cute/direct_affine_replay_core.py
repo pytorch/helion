@@ -21,6 +21,8 @@ from typing import cast
 import torch  # noqa: TC002
 
 from ..ast_extension import ExtendedAST
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import names_written
 from .direct_affine_candidate import DirectAffineCandidate
 from .direct_affine_candidate import revalidate_direct_affine_candidate
 from .direct_affine_plan import STATE_VECTOR_BYTES
@@ -111,17 +113,6 @@ def _ast_identity_set(trees: Iterable[ast.AST]) -> set[int]:
         for node in ast.walk(tree)
         if not isinstance(node, singleton_types)
     }
-
-
-def _qualified_name(node: ast.AST) -> str | None:
-    parts: list[str] = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name):
-        return None
-    parts.append(node.id)
-    return ".".join(reversed(parts))
 
 
 def _ordered_unique_nodes(
@@ -509,7 +500,7 @@ def _thread_axis(node: ast.AST) -> int | None:
     if not (
         isinstance(node, ast.Subscript)
         and isinstance(node.value, ast.Call)
-        and _qualified_name(node.value.func) == "cute.arch.thread_idx"
+        and call_path_str(node.value.func) == "cute.arch.thread_idx"
         and not node.value.args
         and not node.value.keywords
         and isinstance(node.slice, ast.Constant)
@@ -545,7 +536,7 @@ def _evaluate_coordinate(
         return -value if value is not None else None
     if isinstance(expression, ast.Call):
         if (
-            _qualified_name(expression.func) not in _INTEGER_CASTS
+            call_path_str(expression.func) not in _INTEGER_CASTS
             or len(expression.args) != 1
             or expression.keywords
         ):
@@ -934,13 +925,11 @@ class _RenameLocals(ast.NodeTransformer):
         return ast.copy_location(ast.Name(id=replacement, ctx=node.ctx), node)
 
 
-def _bound_names(statements: Sequence[ast.stmt]) -> set[str]:
-    return {
-        node.id
-        for statement in statements
-        for node in ast.walk(statement)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-    }
+def _bound_names(statements: Iterable[ast.AST]) -> set[str]:
+    bound: set[str] = set()
+    for statement in statements:
+        bound |= names_written(statement)
+    return bound
 
 
 def _instantiate_nodes(

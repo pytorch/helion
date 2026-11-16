@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import contextlib
 import copy
 import dataclasses
 import functools
@@ -11,7 +10,6 @@ import json
 import os
 import random
 from typing import TYPE_CHECKING
-from typing import Any
 from typing import TypedDict
 from typing import TypeVar
 from typing import cast
@@ -21,28 +19,34 @@ import pytest
 import torch
 
 import helion
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute import cute_flash_row_mma
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import dense_score_plan
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.autotune.flash_search import _flash_log_maximin_refinements
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
+from helion._compiler.cute.compile_options import CUTE_COMPILER_PIPELINE_CHOICES
+from helion._testing.cute_flash import flash_config_spec
+from helion._testing.cute_flash import memoized_flash_fragments
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
-from helion.autotuner.config_generation import _flash_log_maximin_refinements
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 from helion.exc import InvalidConfig
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
+pytestmark = pytest.mark.cpu_only
 
+if TYPE_CHECKING:
     from helion._compiler.device_function import DeviceFunction
 
-pytestmark = skipUnlessBackends(["cute"])
 
 # Length-invariance is an equality chain, so comparing the two extreme lengths
 # of a legality class gives the same guarantee as comparing every member;
@@ -166,7 +170,7 @@ def _seed_config_fingerprints(
     dtype: torch.dtype,
     is_causal: bool,
 ) -> frozenset[str]:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim,
         num_kv=num_kv,
         dtype=dtype,
@@ -182,33 +186,6 @@ def _seed_config_fingerprints(
         generation.canonicalize_flat(generation.flatten(seed))[1] for seed in seeds
     ]
     return _config_fingerprints(normalized)
-
-
-@contextlib.contextmanager
-def _memoized_flash_fragments() -> Iterator[None]:
-    """Memoize flash_autotune_fragments while a coverage design is built.
-
-    The structural-coverage design calls it tens of thousands of times with
-    only a handful of distinct argument tuples, dominating its cost. The first
-    repeat of each key is re-verified against the real function so
-    nondeterminism would still fail, and every hit returns a fresh dict.
-    """
-    real = cute_flash.flash_autotune_fragments
-    cache: dict[object, dict[str, Any]] = {}
-    verified: set[object] = set()
-
-    def wrapper(*args: Any, **kwargs: Any) -> dict[str, Any]:
-        key = (args, tuple(sorted(kwargs.items())))
-        hit = cache.get(key)
-        if hit is None:
-            hit = cache[key] = real(*args, **kwargs)
-        elif key not in verified:
-            verified.add(key)
-            assert real(*args, **kwargs) == hit
-        return dict(hit)
-
-    with patch.object(cute_flash, "flash_autotune_fragments", wrapper):
-        yield
 
 
 @functools.cache
@@ -234,8 +211,8 @@ def _shared_flash_generation(
         is_causal=is_causal,
         fast_math=fast_math,
     ).create_config_generation()
-    with _memoized_flash_fragments():
-        generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        generation.extension.deterministic_population_configs()
     return generation
 
 
@@ -248,7 +225,7 @@ def _structural_coverage_configs(
     fast_math: bool = False,
 ) -> tuple[ConfigGeneration, list[helion.Config]]:
     generation = _shared_flash_generation(head_dim, num_kv, dtype, is_causal, fast_math)
-    return generation, generation.flash_deterministic_population_configs()
+    return generation, generation.extension.deterministic_population_configs()
 
 
 def _effective_pipeline_families(
@@ -324,7 +301,7 @@ def _assert_structural_coverage(
     axes = {
         key: fragment
         for key, fragment in fields.items()
-        if key in cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+        if key in flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
         and isinstance(fragment, EnumFragment)
     }
     goals = {
@@ -340,8 +317,8 @@ def _assert_structural_coverage(
 
     assert configs
     assert goals <= covered, goals - covered
-    assert generation.flash_structural_coverage_uncovered_values() == []
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
     assert all(
         generation.canonicalize_flat(generation.flatten(config))[1] == config
         for config in configs
@@ -386,7 +363,8 @@ def _flash_config_spec(
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=None)
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=num_bh,
@@ -450,14 +428,14 @@ def test_tensor_4d_tma_capability_requires_bhsd_inputs_and_dense_scores() -> Non
 
 
 def test_tensor_4d_tma_capability_filters_and_canonicalizes_search_families() -> None:
-    capable = _flash_config_spec(
+    capable = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
         supports_tensor_4d_tma=True,
     )
-    incapable = _flash_config_spec(
+    incapable = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -580,14 +558,14 @@ def test_flash_structural_design_is_length_invariant(is_causal: bool) -> None:
                 cute_flash.flash_structural_leaf_from_config(config.config)
                 for config in configs
             )
-            anchors = generation.flash_low_confound_schedule_anchor_configs()
+            anchors = generation.extension.flash_low_confound_schedule_anchor_configs()
             assert anchors
             anchor_fingerprints[num_kv] = tuple(
                 json.dumps(config.config, sort_keys=True, separators=(",", ":"))
                 for config in anchors
             )
             starting_path_limits[num_kv] = tuple(
-                generation.flash_structural_starting_path_limit(
+                generation.extension.flash_structural_starting_path_limit(
                     minimum=14,
                     retained_families=None,
                     retained_candidates_per_leaf=retained,
@@ -595,9 +573,11 @@ def test_flash_structural_design_is_length_invariant(is_causal: bool) -> None:
                 for retained in (1, 2)
             )
             family_probe_limits[num_kv] = (
-                generation.flash_structural_family_probe_path_limit(4, 1)
+                generation.extension.flash_structural_family_probe_path_limit(4, 1)
             )
-            catalog = generation.flash_terminal_coordinate_surface_catalog(radius=2)
+            catalog = generation.extension.flash_terminal_coordinate_surface_catalog(
+                radius=2
+            )
             assert catalog["schema_version"] == 1
             assert catalog["radius"] == 2
             assert catalog["leaves"]
@@ -673,7 +653,7 @@ def test_flash_structural_design_is_length_invariant(is_causal: bool) -> None:
             generation = _shared_flash_generation(
                 64, _ALIGNED_LENGTHS[0], torch.float16, False
             )
-            leaves = generation.flash_structural_leaf_catalog()
+            leaves = generation.extension.flash_structural_leaf_catalog()
             ordinary_families = {
                 leaf.pipeline_family
                 for leaf in leaves
@@ -752,18 +732,22 @@ def test_flash_structural_coverage_reaches_and_qualifies_every_active_value(
         is_causal=is_causal,
     )
     assert len(configs) == len(set(configs))
-    assert generation.flash_structural_coverage_underqualified_values() == []
-    assert generation.flash_structural_coverage_underqualified_leaves() == []
+    assert generation.extension.flash_structural_coverage_underqualified_values() == []
+    assert generation.extension.flash_structural_coverage_underqualified_leaves() == []
     qualification_prefix_count = (
-        generation.flash_structural_qualification_prefix_count()
+        generation.extension.structural_qualification_prefix_count()
     )
-    parent_prefix_count = generation.flash_structural_parent_coverage_prefix_count()
+    parent_prefix_count = (
+        generation.extension.flash_structural_parent_coverage_prefix_count()
+    )
     assert 0 < parent_prefix_count <= qualification_prefix_count
     assert 0 < qualification_prefix_count <= len(configs)
     parent_prefix = configs[:parent_prefix_count]
     qualification_prefix = configs[:qualification_prefix_count]
-    leaf_catalog = generation.flash_structural_leaf_catalog()
-    assert leaf_catalog == generation.flash_structural_coverage_active_leaves()
+    leaf_catalog = generation.extension.flash_structural_leaf_catalog()
+    assert (
+        leaf_catalog == generation.extension.flash_structural_coverage_active_leaves()
+    )
     for leaf in leaf_catalog:
         total_count = sum(
             cute_flash.flash_structural_leaf_from_config(config.config) == leaf
@@ -823,7 +807,7 @@ def test_flash_structural_coverage_reaches_and_qualifies_every_active_value(
 
 
 def test_flash_structural_coverage_does_not_consult_compiler_seeds() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -835,17 +819,17 @@ def test_flash_structural_coverage_does_not_consult_compiler_seeds() -> None:
             "autotune_seed_configs",
             side_effect=AssertionError("coverage must come from live fragments"),
         ),
-        _memoized_flash_fragments(),
+        memoized_flash_fragments(),
     ):
         coverage = (
-            spec.create_config_generation().flash_deterministic_population_configs()
+            spec.create_config_generation().extension.deterministic_population_configs()
         )
 
     assert coverage
 
 
 def test_flash_low_confound_schedule_anchors_follow_live_fragments() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -873,7 +857,7 @@ def test_flash_low_confound_schedule_anchors_follow_live_fragments() -> None:
         )
         axis_indices[key] = index
 
-    anchors = generation.flash_low_confound_schedule_anchor_configs()
+    anchors = generation.extension.flash_low_confound_schedule_anchor_configs()
     expected_values = list(itertools.product(*axis_choices.values()))
     actual_values = [
         tuple(config.config[key] for key in axis_choices) for config in anchors
@@ -900,18 +884,18 @@ def test_flash_low_confound_schedule_anchors_follow_live_fragments() -> None:
 def test_flash_low_confound_schedule_anchors_restrict_to_schedule_overrides(
     overrides: dict[str, object],
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
     )
     generation = spec.create_config_generation(overrides=overrides)
-    anchors = generation.flash_low_confound_schedule_anchor_configs()
+    anchors = generation.extension.flash_low_confound_schedule_anchor_configs()
     unoverridden = spec.create_config_generation()
     expected = [
         config
-        for config in unoverridden.flash_low_confound_schedule_anchor_configs()
+        for config in unoverridden.extension.flash_low_confound_schedule_anchor_configs()
         if all(config.config[key] == value for key, value in overrides.items())
     ]
 
@@ -936,7 +920,7 @@ def test_flash_starting_path_limit_handles_asymmetric_family_widths(
         cute_flash.FlashStructuralLeaf("fa4_2cta", "deg2_16x6", False),
         cute_flash.FlashStructuralLeaf("fa4_2cta", "deg1_16x8", False),
     ]
-    generation = _flash_config_spec(
+    generation = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -944,9 +928,9 @@ def test_flash_starting_path_limit_handles_asymmetric_family_widths(
     ).create_config_generation()
 
     with patch.object(
-        generation, "flash_structural_leaf_catalog", return_value=leaves
+        generation.extension, "flash_structural_leaf_catalog", return_value=leaves
     ) as catalog:
-        limit = generation.flash_structural_starting_path_limit(
+        limit = generation.extension.flash_structural_starting_path_limit(
             minimum=1,
             retained_families=2,
             retained_candidates_per_leaf=retained_candidates_per_leaf,
@@ -973,15 +957,17 @@ def test_flash_starting_path_limit_covers_every_live_family_when_unlimited(
         cute_flash.FlashStructuralLeaf("fa4_2cta", "deg2_16x6", False),
         cute_flash.FlashStructuralLeaf("fa4_2cta", "deg1_16x8", False),
     ]
-    generation = _flash_config_spec(
+    generation = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
     ).create_config_generation()
 
-    with patch.object(generation, "flash_structural_leaf_catalog", return_value=leaves):
-        limit = generation.flash_structural_starting_path_limit(
+    with patch.object(
+        generation.extension, "flash_structural_leaf_catalog", return_value=leaves
+    ):
+        limit = generation.extension.flash_structural_starting_path_limit(
             minimum=1,
             retained_families=None,
             retained_candidates_per_leaf=retained_candidates_per_leaf,
@@ -999,15 +985,17 @@ def test_flash_starting_path_limit_reserves_every_compound_only_leaf(
         cute_flash.FlashStructuralLeaf("fa4_2cta", "deg1_16x8", False),
         cute_flash.FlashStructuralLeaf("fa4", "deg1_8x2_corr10", False),
     ]
-    generation = _flash_config_spec(
+    generation = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
     ).create_config_generation()
 
-    with patch.object(generation, "flash_structural_leaf_catalog", return_value=leaves):
-        limit = generation.flash_structural_starting_path_limit(
+    with patch.object(
+        generation.extension, "flash_structural_leaf_catalog", return_value=leaves
+    ):
+        limit = generation.extension.flash_structural_starting_path_limit(
             minimum=1,
             retained_families=4,
             retained_candidates_per_leaf=retained_candidates_per_leaf,
@@ -1021,13 +1009,13 @@ def test_flash_starting_path_limit_reserves_every_compound_only_leaf(
 def test_flash_path_limits_follow_live_compound_catalog() -> None:
     # The compound (polynomial packet) leaves exist on the fast_math surface.
     generation = _shared_flash_generation(64, 48, torch.float16, False, True)
-    leaves = generation.flash_structural_leaf_catalog()
+    leaves = generation.extension.flash_structural_leaf_catalog()
     compound_count = sum(leaf.compound_exp2_packet is not None for leaf in leaves)
     live_family_count = len(
         {leaf.pipeline_family for leaf in leaves if leaf.compound_exp2_packet is None}
     )
 
-    limit = generation.flash_structural_starting_path_limit(
+    limit = generation.extension.flash_structural_starting_path_limit(
         minimum=14,
         retained_families=None,
         retained_candidates_per_leaf=2,
@@ -1037,11 +1025,14 @@ def test_flash_path_limits_follow_live_compound_catalog() -> None:
 
     # The family probe is disabled when the cap is unlimited or already covers
     # every live family, or when no candidates are retained per leaf.
-    assert generation.flash_structural_family_probe_path_limit(None, 1) == 0
+    assert generation.extension.flash_structural_family_probe_path_limit(None, 1) == 0
     assert (
-        generation.flash_structural_family_probe_path_limit(live_family_count, 1) == 0
+        generation.extension.flash_structural_family_probe_path_limit(
+            live_family_count, 1
+        )
+        == 0
     )
-    assert generation.flash_structural_family_probe_path_limit(4, 0) == 0
+    assert generation.extension.flash_structural_family_probe_path_limit(4, 0) == 0
 
 
 # The two semantic cases span both dtypes, both head dims, and dense+causal;
@@ -1062,7 +1053,7 @@ def test_flash_full_population_is_length_invariant(
     try:
         populations = {}
         for num_kv in num_kv_values:
-            spec = _flash_config_spec(
+            spec = flash_config_spec(
                 head_dim=head_dim,
                 num_kv=num_kv,
                 dtype=dtype,
@@ -1073,17 +1064,24 @@ def test_flash_full_population_is_length_invariant(
             )
             generation = spec.create_config_generation()
             random.seed(20260815)
-            with _memoized_flash_fragments():
+            with memoized_flash_fragments():
                 configs = [
                     generation.unflatten(flat)
                     for flat in generation.random_population_flat(100)
                 ]
             assert len(configs) == 100
-            exact = generation.flash_exact_effective_search_space_configs(100)
-            if exact is None:
+            # A raw product larger than the requested population can still
+            # normalize to fewer than 100 configs (34 schedules x 2 pipelines).
+            # Use the same bounded proof budget as structural qualification.
+            exact = generation.extension.exact_effective_search_space_configs(
+                FLASH_EXACT_SPACE_RAW_FLOOR
+            )
+            if exact is None or len(exact) > 100:
                 assert len(set(configs)) == 100
             else:
                 assert set(configs) == set(exact)
+            if exact is not None:
+                assert set(configs) <= set(exact)
             populations[num_kv] = tuple(
                 json.dumps(config.config, sort_keys=True, separators=(",", ":"))
                 for config in configs
@@ -1101,7 +1099,7 @@ def test_flash_structural_coverage_distinguishes_ordinary_and_compound_2cta() ->
         is_causal=False,
         fast_math=True,
     )
-    prefix = configs[: generation.flash_structural_qualification_prefix_count()]
+    prefix = configs[: generation.extension.structural_qualification_prefix_count()]
     expected = {
         cute_flash.FlashStructuralLeaf("fa4_2cta", None, True),
         cute_flash.FlashStructuralLeaf("fa4_2cta", None, False),
@@ -1110,7 +1108,7 @@ def test_flash_structural_coverage_distinguishes_ordinary_and_compound_2cta() ->
         cute_flash.FlashStructuralLeaf("fa4_2cta", "deg1_8x2_corr10", False),
     }
 
-    catalog = set(generation.flash_structural_leaf_catalog())
+    catalog = set(generation.extension.flash_structural_leaf_catalog())
     assert expected <= catalog
     for leaf in expected:
         required = 1 if leaf.compound_exp2_packet is not None else 2
@@ -1165,15 +1163,15 @@ def test_flash_structural_coverage_reaches_every_legality_class(
         dtype=torch.float16,
         is_causal=False,
     )
-    assert generation.flash_structural_coverage_underqualified_values() == []
-    assert generation.flash_structural_coverage_underqualified_leaves() == []
-    leaf_catalog = set(generation.flash_structural_leaf_catalog())
+    assert generation.extension.flash_structural_coverage_underqualified_values() == []
+    assert generation.extension.flash_structural_coverage_underqualified_leaves() == []
+    leaf_catalog = set(generation.extension.flash_structural_leaf_catalog())
     assert leaf_catalog == {
         cute_flash.flash_structural_leaf_from_config(config.config)
         for config in configs
     }
     qualification_prefix = configs[
-        : generation.flash_structural_qualification_prefix_count()
+        : generation.extension.structural_qualification_prefix_count()
     ]
     for leaf in leaf_catalog:
         total_count = sum(
@@ -1201,7 +1199,7 @@ def test_flash_structural_coverage_reaches_every_legality_class(
 
 
 def test_flash_clc_single_head_coverage_rejects_auto_aliases() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         num_bh=1,
@@ -1209,8 +1207,8 @@ def test_flash_clc_single_head_coverage_rejects_auto_aliases() -> None:
         is_causal=False,
     )
     generation = spec.create_config_generation()
-    with _memoized_flash_fragments():
-        coverage = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        coverage = generation.extension.deterministic_population_configs()
     clc_configs = [
         config
         for config in coverage
@@ -1223,7 +1221,7 @@ def test_flash_clc_single_head_coverage_rejects_auto_aliases() -> None:
         config.config[cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY] == 1
         for config in clc_configs
     )
-    assert generation.flash_structural_coverage_underqualified_values() == []
+    assert generation.extension.flash_structural_coverage_underqualified_values() == []
 
 
 @pytest.mark.parametrize("head_dim", (64, 128), ids=("d64", "d128"))
@@ -1250,11 +1248,11 @@ def test_flash_staged_epilogue_interaction_covers_every_combination(
         ("whole", "stage"),
         ("whole", "pair"),
     }
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
 
 
 def test_flash_staged_epilogue_interaction_keeps_fixed_dependencies() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=128,
         num_kv=48,
         dtype=torch.float16,
@@ -1263,8 +1261,8 @@ def test_flash_staged_epilogue_interaction_keeps_fixed_dependencies() -> None:
     generation = spec.create_config_generation(
         overrides={cute_flash.FLASH_EPI_TMA_KEY: False}
     )
-    with _memoized_flash_fragments():
-        coverage = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        coverage = generation.extension.deterministic_population_configs()
     staged = {
         (
             config.config[cute_flash.FLASH_EPI_STG_STORE_KEY],
@@ -1279,21 +1277,21 @@ def test_flash_staged_epilogue_interaction_keeps_fixed_dependencies() -> None:
         ("whole", "stage"),
         ("whole", "pair"),
     }
-    active = generation.flash_structural_coverage_active_interactions()
+    active = generation.extension.flash_structural_coverage_active_interactions()
     assert active
     assert all(
         values[0] is False
         for keys, values in active
-        if keys == cute_flash.FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS[0]
+        if keys == flash_knobs.FLASH_AUTOTUNE_INTERACTION_KEY_GROUPS[0]
     )
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
 
 
 @pytest.mark.parametrize("num_bh", (360, 720))
 def test_flash_clc_all_divisors_have_bounded_anchors_and_full_qualification(
     num_bh: int,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         num_bh=num_bh,
@@ -1331,15 +1329,15 @@ def test_flash_clc_all_divisors_have_bounded_anchors_and_full_qualification(
         assert fragment.random() == refinements[0]
 
     generation = spec.create_config_generation()
-    with _memoized_flash_fragments():
-        coverage = generation.flash_deterministic_population_configs()
-    assert len(coverage) <= generation.flash_structural_population_budget(100)
-    assert generation.flash_structural_coverage_uncovered_values() == []
-    assert generation.flash_structural_coverage_underqualified_values() == []
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    with memoized_flash_fragments():
+        coverage = generation.extension.deterministic_population_configs()
+    assert len(coverage) <= generation.extension.structural_population_budget(100)
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_underqualified_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
 
-    catalogs = generation.flash_clc_lane_catalog()
-    witnesses = generation.flash_clc_lane_witnesses()
+    catalogs = generation.extension.flash_clc_lane_catalog()
+    witnesses = generation.extension.flash_clc_lane_witnesses()
     assert catalogs
     for leaf, catalog in catalogs.items():
         assert catalog["legal_values"] == legal
@@ -1361,7 +1359,7 @@ def test_flash_clc_all_divisors_have_bounded_anchors_and_full_qualification(
 
 def test_flash_clc_effective_default_is_reserved_inside_coverage_budget() -> None:
     with patch.dict(os.environ, {"HELION_CUTE_FLASH_CLC_HEADS": "10"}):
-        spec = _flash_config_spec(
+        spec = flash_config_spec(
             head_dim=64,
             num_kv=130,
             num_bh=180,
@@ -1407,7 +1405,7 @@ def test_flash_clc_effective_default_is_reserved_inside_coverage_budget() -> Non
         }
         overrides["block_sizes"] = [1, 128, 128]
         generation = spec.create_config_generation(overrides=overrides)
-        catalogs = generation.flash_clc_lane_catalog()
+        catalogs = generation.extension.flash_clc_lane_catalog()
         assert catalogs
         assert all(catalog["search_values"] == legal for catalog in catalogs.values())
         assert all(len(catalog["anchor_values"]) <= 8 for catalog in catalogs.values())
@@ -1417,7 +1415,7 @@ def test_flash_clc_effective_default_is_reserved_inside_coverage_budget() -> Non
         )
         assert all(18 in catalog["attempted_values"] for catalog in catalogs.values())
 
-        exact = generation.flash_exact_effective_search_space_configs(100)
+        exact = generation.extension.exact_effective_search_space_configs(100)
         assert exact is not None
         assert {
             config.config[cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY] for config in exact
@@ -1446,7 +1444,7 @@ def test_flash_clc_effective_default_is_reserved_inside_coverage_budget() -> Non
 
 
 def test_flash_clc_legacy_divisor_override_outside_coverage_remains_legal() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         num_bh=4096,
@@ -1459,8 +1457,8 @@ def test_flash_clc_legacy_divisor_override_outside_coverage_remains_legal() -> N
             cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY: 128,
         }
     )
-    with _memoized_flash_fragments():
-        coverage = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        coverage = generation.extension.deterministic_population_configs()
     assert coverage
     assert all(
         config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "fa4_clc"
@@ -1539,7 +1537,7 @@ def test_singleton_kv_stage_is_canonicalized_before_search(
     )
     assert resolved.kv_stage == 1
 
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=1,
         dtype=torch.float16,
@@ -1586,7 +1584,7 @@ def test_small_flash_search_spaces_are_exhaustive(
     num_kv: int,
     expected_by_shape: dict[tuple[int, bool], int],
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim,
         num_kv=num_kv,
         dtype=dtype,
@@ -1597,23 +1595,43 @@ def test_small_flash_search_spaces_are_exhaustive(
     # the distinct rows: the three-tile d64 ws_overlap family multiplies the
     # kv_stage triple by six binary knobs (192 raw rows for 102 distinct) once
     # the single-tile body searches its issue-stream knobs; d128 is 64 raw
-    # rows for 34.  The autotuner's own floor is ``_FLASH_EXACT_SPACE_RAW_FLOOR``
-    # (1024); this test's is its own, kept at the next power of two above d64.
-    exact = generation.flash_exact_effective_search_space_configs(256)
+    # rows for 34. Every structural row has each compiler pipeline choice;
+    # scale the next-power-of-two raw bound by that independent coordinate.
+    raw_bound = 256 * len(CUTE_COMPILER_PIPELINE_CHOICES)
+    exact = generation.extension.exact_effective_search_space_configs(raw_bound)
     assert exact is not None
-    assert len(exact) == expected_by_shape[(head_dim, is_causal)]
+    expected_structural_count = expected_by_shape[(head_dim, is_causal)]
+    assert len(exact) == expected_structural_count * len(CUTE_COMPILER_PIPELINE_CHOICES)
+    by_pipeline = {
+        choice: {
+            helion.Config.from_dict(
+                {
+                    key: value
+                    for key, value in config.config.items()
+                    if key != "cute_compiler_pipeline"
+                }
+            )
+            for config in exact
+            if config.cute_compiler_pipeline == choice
+        }
+        for choice in CUTE_COMPILER_PIPELINE_CHOICES
+    }
+    assert all(
+        len(configs) == expected_structural_count for configs in by_pipeline.values()
+    )
+    assert all(configs == by_pipeline["default"] for configs in by_pipeline.values())
 
     # The population passes its own size as that raw bound, so a population
     # at least the raw product holds every distinct row (the fill repeats
-    # them; 100 draws would sample the 192-row d64 families instead).
+    # them; 100 draws would sample the expanded d64 families instead).
     random_state = random.getstate()
     try:
         random.seed(20260815)
-        population = generation.random_population_flat(256)
+        population = generation.random_population_flat(raw_bound)
     finally:
         random.setstate(random_state)
     population_configs = {generation.unflatten(flat) for flat in population}
-    assert len(population) == 256
+    assert len(population) == raw_bound
     assert population_configs == set(exact)
 
 
@@ -1635,7 +1653,7 @@ def _flash_family_search_rows(
     }
     rows = []
     for family in families:
-        fragments = spec._cute_flash_autotune_fragments(None, cast("str", family))
+        fragments = _cute_flash_autotune_fragments(spec, None, cast("str", family))
         value_sets: list[list[object]] = []
         for index, fragment in enumerate(generation.flat_spec):
             if index == family_index:
@@ -1672,7 +1690,7 @@ def test_issue_stream_knobs_add_no_aliases_at_the_pair_widths(
         cute_flash.FLASH_WS_MASK_PHASES_KEY,
         cute_flash.FLASH_WS_K_STAGE_EXTRA_KEY,
     )
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim, num_kv=32, dtype=torch.bfloat16, is_causal=is_causal
     )
     generation = spec.create_config_generation()
@@ -1702,13 +1720,13 @@ def test_issue_stream_knobs_add_no_aliases_at_the_pair_widths(
 
 
 def test_large_flash_search_space_is_not_partially_enumerated() -> None:
-    generation = _flash_config_spec(
+    generation = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
         is_causal=False,
     ).create_config_generation()
-    assert generation.flash_exact_effective_search_space_configs(100) is None
+    assert generation.extension.exact_effective_search_space_configs(100) is None
 
 
 @pytest.mark.parametrize(
@@ -1773,7 +1791,7 @@ def test_causal_unsplit_loop_uses_one_exp2_cadence() -> None:
 
     coverage = _shared_flash_generation(
         64, 48, torch.float16, True
-    ).flash_deterministic_population_configs()
+    ).extension.deterministic_population_configs()
     assert any(
         config.config[cute_flash.FLASH_MASKED_E2E_SCHEDULE_KEY] == "16/4"
         and config.config[cute_flash.FLASH_CAUSAL_LOOP_SPLIT_KEY] is True
@@ -1836,7 +1854,7 @@ def test_ws_legacy_kv_stage_is_canonicalized_before_fixed_config_validation(
 ) -> None:
     with (
         patch(
-            "helion.autotuner.config_spec.get_target_device_capability",
+            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
             return_value=(10, 0),
         ),
         patch(
@@ -1846,7 +1864,7 @@ def test_ws_legacy_kv_stage_is_canonicalized_before_fixed_config_validation(
         patch("helion.autotuner.config_spec.get_num_xcd", return_value=1),
         patch("helion.autotuner.config_spec.device_num_sm", return_value=148),
     ):
-        spec = _flash_config_spec(
+        spec = flash_config_spec(
             head_dim=head_dim,
             num_kv=48,
             dtype=torch.float16,
@@ -1917,7 +1935,7 @@ def test_direct_output_kv_depth_fixed_override_remains_legal(
     head_dim: int,
     kv_stage: int,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim,
         num_kv=48,
         dtype=torch.float16,
@@ -2158,9 +2176,11 @@ def test_ws_search_has_bounded_effective_active_value_coverage(
     # hooked PASS1's all-kept fast path one more (87), the tail split's
     # singleton one more (88), the shared staged output tile's singleton
     # (``cute_flash_o_stage``, live only on the one-CTA fa4 pair's TMA
-    # epilogue) one more (89). Keep the upstream bound on all other values
-    # and round-trip every value below.
-    assert len(active_values) - len(resident_defaults) <= 89
+    # epilogue) one more (89), the tensor bias's staging singleton
+    # (``cute_flash_bias_stage``, live only on dense fa4 plans with one
+    # tensor bias) one more (90). Keep the upstream bound on all other
+    # values and round-trip every value below.
+    assert len(active_values) - len(resident_defaults) <= 90
     for key, value in active_values:
         requested = {**base, key: value}
         resolved = cute_flash.resolve_flash_config(
@@ -2195,7 +2215,7 @@ def test_ws_structural_generation_is_bounded_and_complete(
 ) -> None:
     with (
         patch(
-            "helion.autotuner.config_spec.get_target_device_capability",
+            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
             return_value=(10, 0),
         ),
         patch(
@@ -2205,7 +2225,7 @@ def test_ws_structural_generation_is_bounded_and_complete(
         patch("helion.autotuner.config_spec.get_num_xcd", return_value=1),
         patch("helion.autotuner.config_spec.device_num_sm", return_value=148),
     ):
-        spec = _flash_config_spec(
+        spec = flash_config_spec(
             head_dim=head_dim,
             num_kv=48,
             dtype=torch.float16,
@@ -2218,14 +2238,14 @@ def test_ws_structural_generation_is_bounded_and_complete(
         else {cute_flash.FLASH_PIPELINE_FAMILY_KEY: "ws_overlap"}
     )
     generation = spec.create_config_generation(overrides=overrides)
-    with _memoized_flash_fragments():
-        configs = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        configs = generation.extension.deterministic_population_configs()
 
     assert configs
     # Three rows cover the ring depths; the extra K ring slot's dependency
     # witness (the two-stage body with the slot) is one more.
     assert len(configs) <= 4
-    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
     assert {
         config.config[cute_flash.FLASH_KV_STAGE_KEY] for config in configs
     } == expected_stages
@@ -2235,7 +2255,7 @@ def test_ws_structural_generation_is_bounded_and_complete(
 def test_output_tma_structural_design_covers_every_advertised_value(
     head_dim: int,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim,
         num_kv=48,
         dtype=torch.float16,
@@ -2244,9 +2264,9 @@ def test_output_tma_structural_design_covers_every_advertised_value(
         output_requires_tma=True,
     )
     generation = spec.create_config_generation()
-    with _memoized_flash_fragments():
-        assert generation.flash_deterministic_population_configs()
-    assert generation.flash_structural_coverage_uncovered_values() == []
+    with memoized_flash_fragments():
+        assert generation.extension.deterministic_population_configs()
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
     packed_reduce = cast(
         "EnumFragment", spec._flat_fields()[cute_flash.FLASH_PACKED_REDUCE_KEY]
     )
@@ -2254,7 +2274,7 @@ def test_output_tma_structural_design_covers_every_advertised_value(
 
 
 def test_output_tma_rejects_an_explicit_non_tma_override() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2315,7 +2335,7 @@ def test_pinned_two_cta_search_excludes_canonicalized_child_values() -> None:
 def test_fixed_family_search_surface_has_complete_deterministic_coverage(
     family: str,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=512,
         num_bh=2,
@@ -2338,19 +2358,19 @@ def test_fixed_family_search_surface_has_complete_deterministic_coverage(
         spec,
         _flash_pipeline_family_override=family,
     )
-    with _memoized_flash_fragments():
-        configs = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        configs = generation.extension.deterministic_population_configs()
 
     assert configs
     assert {
         config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] for config in configs
     } == {family}
-    assert generation.flash_structural_coverage_uncovered_values() == []
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
 
 
 def test_output_tma_fix_invalid_repairs_non_tma_family() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2373,7 +2393,7 @@ def test_output_tma_fix_invalid_repairs_non_tma_family() -> None:
 
 @pytest.mark.parametrize("family", ("fa4_local_tma", "fa4_local_tma_4d"))
 def test_local_tma_family_override_pins_persistence(family: str) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2403,7 +2423,7 @@ def test_local_tma_family_override_pins_persistence(family: str) -> None:
 def test_compound_packet_override_pins_its_parent_schedule(
     head_dim: int, dtype: torch.dtype
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim,
         num_kv=48,
         dtype=dtype,
@@ -2441,7 +2461,7 @@ def test_compound_packet_override_pins_its_parent_schedule(
 
 
 def test_exact_effective_enumeration_counts_overrides_as_singletons() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2461,7 +2481,7 @@ def test_exact_effective_enumeration_counts_overrides_as_singletons() -> None:
     overrides[cute_flash.FLASH_PIPELINE_FAMILY_KEY] = "fa4"
     generation = spec.create_config_generation(overrides=overrides)
 
-    configs = generation.flash_exact_effective_search_space_configs(2)
+    configs = generation.extension.exact_effective_search_space_configs(2)
     assert configs is not None
     assert len(configs) == 2
     assert {config.config[cute_flash.FLASH_WAIT_HINT_KEY] for config in configs} == {
@@ -2471,7 +2491,7 @@ def test_exact_effective_enumeration_counts_overrides_as_singletons() -> None:
 
 
 def test_exact_effective_enumeration_does_not_require_legal_default_point() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2487,7 +2507,7 @@ def test_exact_effective_enumeration_does_not_require_legal_default_point() -> N
     overrides[cute_flash.FLASH_CORR_REGS_KEY] = 88
     generation = spec.create_config_generation(overrides=overrides)
 
-    configs = generation.flash_exact_effective_search_space_configs(7)
+    configs = generation.extension.exact_effective_search_space_configs(7)
 
     assert configs is not None
     assert len(configs) == 1
@@ -2496,7 +2516,7 @@ def test_exact_effective_enumeration_does_not_require_legal_default_point() -> N
 
 
 def test_override_collapsed_flash_search_does_not_require_two_witnesses() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2505,26 +2525,28 @@ def test_override_collapsed_flash_search_does_not_require_two_witnesses() -> Non
     fragments = spec._flat_fields()
     overrides = {
         key: fragment.default()
-        for key in cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS
+        for key in flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS
         if key != cute_flash.FLASH_PIPELINE_FAMILY_KEY
         and isinstance((fragment := fragments[key]), EnumFragment)
     }
     generation = spec.create_config_generation(overrides=overrides)
 
-    with _memoized_flash_fragments():
-        assert generation.flash_deterministic_population_configs()
-    assert generation.flash_structural_coverage_uncovered_values()
-    assert generation.flash_structural_coverage_underqualified_values()
+    with memoized_flash_fragments():
+        assert generation.extension.deterministic_population_configs()
+    assert generation.extension.flash_structural_coverage_uncovered_values()
+    assert generation.extension.flash_structural_coverage_underqualified_values()
 
 
 def test_flash_leaf_conditional_generator_uses_real_family_surfaces() -> None:
     generation = _shared_flash_generation(64, 48, torch.float16, False)
     representatives = {}
-    for config in generation.flash_deterministic_population_configs():
+    for config in generation.extension.deterministic_population_configs():
         leaf = cute_flash.flash_structural_leaf_from_config(config.config)
         if leaf is not None:
             representatives.setdefault(leaf, config)
-    assert set(representatives) == set(generation.flash_structural_leaf_catalog())
+    assert set(representatives) == set(
+        generation.extension.flash_structural_leaf_catalog()
+    )
 
     search = LFBOPatternSearch.__new__(LFBOPatternSearch)
     search.config_spec = generation.config_spec
@@ -2536,7 +2558,7 @@ def test_flash_leaf_conditional_generator_uses_real_family_surfaces() -> None:
     random_state = random.getstate()
     try:
         random.seed(123)
-        with _memoized_flash_fragments():
+        with memoized_flash_fragments():
             for leaf, config in representatives.items():
                 current = PopulationMember(
                     fn=lambda: None,
@@ -2569,7 +2591,7 @@ def _pipeline_lanes_by_leaf(
     search.config_gen = generation
     return {
         leaf: search._flash_pipeline_lanes(leaf)
-        for leaf in generation.flash_structural_leaf_catalog()
+        for leaf in generation.extension.flash_structural_leaf_catalog()
     }
 
 
@@ -2606,9 +2628,9 @@ def test_high_depth_pipeline_witnesses_select_direct_output(
 ) -> None:
     generation = _shared_flash_generation(head_dim, 48, torch.float16, False)
     leaf = cute_flash.FlashStructuralLeaf("fa4", None, True)
-    witnesses = generation.flash_pipeline_lane_witnesses()
+    witnesses = generation.extension.flash_pipeline_lane_witnesses()
 
-    assert generation.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
     for depth in direct_only_depths:
         config = witnesses[(leaf, cute_flash.FLASH_KV_STAGE_KEY, depth)]
         assert config.config[cute_flash.FLASH_KV_STAGE_KEY] == depth
@@ -2629,8 +2651,8 @@ def test_pipeline_lane_catalog_has_deterministic_witnesses(
     is_causal: bool,
 ) -> None:
     generation = _shared_flash_generation(head_dim, 48, dtype, is_causal, True)
-    catalog = generation.flash_pipeline_lane_catalog()
-    witnesses = generation.flash_pipeline_lane_witnesses()
+    catalog = generation.extension.flash_pipeline_lane_catalog()
+    witnesses = generation.extension.flash_pipeline_lane_witnesses()
     expected_witness_keys = {
         (leaf, key, value) for leaf, lanes in catalog.items() for key, value in lanes
     }
@@ -2656,7 +2678,7 @@ def test_singleton_pipeline_space_adds_no_qualification_lanes() -> None:
 
 
 def test_fixed_pipeline_depths_add_no_qualification_lanes() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=128,
         num_kv=34,
         dtype=torch.float16,
@@ -2672,15 +2694,15 @@ def test_fixed_pipeline_depths_add_no_qualification_lanes() -> None:
     search.config_spec = spec
     search.config_gen = generation
 
-    with _memoized_flash_fragments():
-        leaves = generation.flash_structural_leaf_catalog()
+    with memoized_flash_fragments():
+        leaves = generation.extension.flash_structural_leaf_catalog()
     assert leaves
     for leaf in leaves:
         assert search._flash_pipeline_lanes(leaf) == ()
 
 
 def test_inactive_small_biased_setting_is_canonicalized() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2707,7 +2729,7 @@ def test_unsupported_role_chain_setting_is_canonicalized(
     head_dim: int,
     is_causal: bool,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=head_dim,
         num_kv=48,
         dtype=torch.float16,
@@ -2734,7 +2756,7 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
     for key in tuple(os.environ):
         if key.startswith("HELION_CUTE_FLASH"):
             monkeypatch.delenv(key)
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=768,
         dtype=dtype,
@@ -2754,10 +2776,10 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
     expected_masked_schedules = frozenset(("inherit", "xu", "16/4", "8/2"))
     assert frozenset(masked_schedule_fragment.choices) >= expected_masked_schedules
     assert _active_choices(masked_schedule_fragment) == expected_masked_schedules
-    with _memoized_flash_fragments():
+    with memoized_flash_fragments():
         coverage = spec.create_config_generation(
             overrides={}
-        ).flash_deterministic_population_configs()
+        ).extension.deterministic_population_configs()
     assert {
         config.config[cute_flash.FLASH_SOFTMAX_DISC_KEY] for config in coverage
     } == {True}
@@ -2778,7 +2800,7 @@ def test_causal_search_excludes_unacknowledged_whole_row_transport(
 
 
 def test_fa4_ineligible_causal_config_accepts_legacy_masked_cadence() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=47,
         dtype=torch.float16,
@@ -2815,7 +2837,7 @@ def test_family_pinned_generation_rejects_structurally_ineligible_family(
     is_causal: bool,
     requires_ws_overlap: bool,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=num_kv,
         dtype=torch.float16,
@@ -2965,7 +2987,7 @@ def test_causal_split_rep32_timeout_configs_are_canonicalized(
 def test_family_pinned_generation_rejects_conflicting_manual_packet(
     family: str,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -2997,7 +3019,7 @@ def test_compound_packet_rejects_conflicting_explicit_children(
     conflicting_value: object,
     required_value: object,
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -3022,7 +3044,7 @@ def test_compound_packet_rejects_conflicting_explicit_children(
 
 
 def test_compound_packet_preserves_parameterized_required_child() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.bfloat16,
@@ -3041,7 +3063,7 @@ def test_compound_packet_preserves_parameterized_required_child() -> None:
 
 
 def test_unpinned_compound_packet_rejects_conflicting_explicit_child() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -3059,7 +3081,7 @@ def test_unpinned_compound_packet_rejects_conflicting_explicit_child() -> None:
 
 
 def test_ws_pinned_generation_removes_dead_packet_aliases() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -3103,7 +3125,7 @@ def test_ws_pinned_generation_removes_dead_packet_aliases() -> None:
     ),
 )
 def test_pinned_clc_families_reject_disabled_persistence(family: str) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -3214,7 +3236,7 @@ def test_validated_bf16_d128_values_survive_config_normalization(
     values: dict[str, object],
     preserved: dict[str, object],
 ) -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=128,
         num_kv=num_kv,
         dtype=torch.bfloat16,
@@ -3228,7 +3250,7 @@ def test_validated_bf16_d128_values_survive_config_normalization(
 
 
 def test_legacy_exp2_schedule_normalization_preserves_valid_cadence() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=768,
         dtype=torch.float16,
@@ -3282,7 +3304,7 @@ def test_legacy_exp2_schedule_normalization_preserves_valid_cadence() -> None:
             repaired.config[cute_flash.FLASH_E2E_OFFSET0_KEY],
         ) == expected
 
-    causal_spec = _flash_config_spec(
+    causal_spec = flash_config_spec(
         head_dim=64,
         num_kv=768,
         dtype=torch.float16,
@@ -3352,7 +3374,7 @@ def test_causal_lpt_swizzle_defaults_to_the_l2_sized_group() -> None:
     )
     assert over.causal_lpt_swizzle == 48
 
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -3448,7 +3470,7 @@ def _emit_dense_source(
 
 
 def test_new_aliased_kv_depths_remain_distinct_after_normalization() -> None:
-    spec = _flash_config_spec(
+    spec = flash_config_spec(
         head_dim=64,
         num_kv=48,
         dtype=torch.float16,
@@ -3616,7 +3638,7 @@ def test_unsafe_cga2_local_stage_local_softmax_canonicalizes(num_kv: int) -> Non
 
     with (
         patch(
-            "helion.autotuner.config_spec.get_target_device_capability",
+            "helion._compiler.cute.autotune.search_surface.get_target_device_capability",
             return_value=(10, 0),
         ),
         patch(
@@ -3626,7 +3648,7 @@ def test_unsafe_cga2_local_stage_local_softmax_canonicalizes(num_kv: int) -> Non
         patch("helion.autotuner.config_spec.get_num_xcd", return_value=1),
         patch("helion.autotuner.config_spec.device_num_sm", return_value=148),
     ):
-        spec = _flash_config_spec(
+        spec = flash_config_spec(
             head_dim=64,
             num_kv=num_kv,
             dtype=torch.float16,
@@ -3726,7 +3748,8 @@ def test_flex_list_walk_surface_has_a_complete_coverage_design(num_kv: int) -> N
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=num_kv,
         num_bh=64,
@@ -3738,14 +3761,14 @@ def test_flex_list_walk_surface_has_a_complete_coverage_design(num_kv: int) -> N
         score_modifier_kinds=("flex",),
     )
     generation = ConfigGeneration(spec)
-    with _memoized_flash_fragments():
-        configs = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        configs = generation.extension.deterministic_population_configs()
     assert configs
-    assert generation.flash_structural_coverage_uncovered_values() == []
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
-    generation.validate_flash_structural_coverage()
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
+    generation.extension.validate_flash_structural_coverage()
     for config in configs:
-        resolved = spec._resolve_cute_flash_config(config.config)
+        resolved = _resolve_cute_flash_config(spec, config.config)
         assert resolved.pipeline_family == "fa4"
         # v1.5: static persistence (host-sorted item order) is searched.
         assert resolved.persistent_loop == "while" or not resolved.persistent
@@ -3772,7 +3795,8 @@ def test_pruned_mask_surfaces_have_a_complete_coverage_design(
     spec = ConfigSpec(backend=CuteBackend())
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=64,
         num_kv=num_kv,
         num_bh=64,
@@ -3785,9 +3809,9 @@ def test_pruned_mask_surfaces_have_a_complete_coverage_design(
         score_modifier_kinds=(mask_kind,),
     )
     generation = ConfigGeneration(spec)
-    with _memoized_flash_fragments():
-        configs = generation.flash_deterministic_population_configs()
+    with memoized_flash_fragments():
+        configs = generation.extension.deterministic_population_configs()
     assert configs
-    assert generation.flash_structural_coverage_uncovered_values() == []
-    assert generation.flash_structural_coverage_uncovered_interactions() == []
-    generation.validate_flash_structural_coverage()
+    assert generation.extension.flash_structural_coverage_uncovered_values() == []
+    assert generation.extension.flash_structural_coverage_uncovered_interactions() == []
+    generation.extension.validate_flash_structural_coverage()

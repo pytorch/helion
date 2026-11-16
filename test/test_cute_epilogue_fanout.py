@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import replace
 from itertools import count
@@ -9,20 +8,15 @@ from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
-from unittest.mock import patch
 
-from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
 import pytest
 import torch
-from torch._inductor.runtime.hints import DeviceProperties
-from torch._subclasses.fake_tensor import FakeTensor
-
-from test._cute_binding import _mock_cuda_unavailable
-from test.cute_population_contracts import _target
 
 import helion
 from helion._compiler.ast_extension import ExtendedAST
-from helion._compiler.compile_environment import CompileEnvironment
+from helion._compiler.cute.autotune.heuristics.cute_epilogue_fanout import (
+    _fits_one_wave,
+)
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.epilogue_fanout import FANOUT_CONFIG_KEY
 from helion._compiler.cute.epilogue_fanout import FanoutIteration
@@ -34,13 +28,24 @@ from helion._compiler.cute.epilogue_fanout import prove_paired_fanout
 from helion._compiler.cute.epilogue_fanout import render_chain
 from helion._compiler.cute.epilogue_fanout import render_shared_suffix
 from helion._compiler.cute.epilogue_fanout import schedule_supported
+from helion._compiler.cute.tcgen05_config import repair
+from helion._compiler.cute.tcgen05_constants import (
+    TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY,
+)
 from helion._compiler.cute.tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
 from helion._compiler.type_info import LiteralType
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
+from helion._testing.cute_codegen import cuda_metadata_trace
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl
 import helion.runtime.cute.launcher as launcher
+
+pytestmark = pytest.mark.cpu_only
+
+squeeze_and_excitation_net_fwd = import_example(
+    "squeeze_and_excitation_net"
+).squeeze_and_excitation_net_fwd
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -137,6 +142,80 @@ def unrounded(
         first[i, j] = gate
         second[i, j] = residual[i, j] * gate
     return first, second
+
+
+def bias_gelu_aux(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rows, reduction = left.shape
+    columns = right.size(1)
+    out = torch.empty((rows, columns), dtype=left.dtype, device=left.device)
+    aux = torch.empty_like(out)
+    for i, j in hl.tile((rows, columns)):
+        accumulator = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(reduction):
+            accumulator = torch.addmm(accumulator, left[i, k], right[k, j])
+        pre = accumulator * 1.25
+        pre = pre + bias[j]
+        aux[i, j] = pre.to(left.dtype)
+        out[i, j] = torch.nn.functional.gelu(pre).to(left.dtype)
+    return out, aux
+
+
+def bias_gelu_aux_single(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # One-step prefix ``acc + bias[j]``: a 16-bit row the FP32 root promotes.
+    rows, reduction = left.shape
+    columns = right.size(1)
+    out = torch.empty((rows, columns), dtype=left.dtype, device=left.device)
+    aux = torch.empty_like(out)
+    for i, j in hl.tile((rows, columns)):
+        accumulator = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(reduction):
+            accumulator = torch.addmm(accumulator, left[i, k], right[k, j])
+        pre = accumulator + bias[j]
+        aux[i, j] = pre.to(left.dtype)
+        out[i, j] = torch.nn.functional.gelu(pre).to(left.dtype)
+    return out, aux
+
+
+def bias_gelu_aux_single_cast(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Inductor's spelling of ``bias_gelu_aux_single``: the row is converted to
+    # FP32 explicitly, which the FP32 root reads unrounded like the bare load.
+    rows, reduction = left.shape
+    columns = right.size(1)
+    out = torch.empty((rows, columns), dtype=left.dtype, device=left.device)
+    aux = torch.empty_like(out)
+    for i, j in hl.tile((rows, columns)):
+        accumulator = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(reduction):
+            accumulator = torch.addmm(accumulator, left[i, k], right[k, j])
+        pre = bias[j].to(torch.float32) + accumulator
+        aux[i, j] = pre.to(left.dtype)
+        out[i, j] = torch.nn.functional.gelu(pre).to(left.dtype)
+    return out, aux
+
+
+def gelu_aux_scaled(
+    left: torch.Tensor, right: torch.Tensor, bias: torch.Tensor, out_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # A rank-0 device scalar in the second chain only.
+    rows, reduction = left.shape
+    columns = right.size(1)
+    out = torch.empty((rows, columns), dtype=left.dtype, device=left.device)
+    aux = torch.empty_like(out)
+    for i, j in hl.tile((rows, columns)):
+        accumulator = hl.zeros([i, j], dtype=torch.float32)
+        for k in hl.tile(reduction):
+            accumulator = torch.addmm(accumulator, left[i, k], right[k, j])
+        pre = accumulator * 1.25
+        pre = pre + bias[j]
+        aux[i, j] = pre.to(left.dtype)
+        out[i, j] = (torch.nn.functional.gelu(pre) * out_scale[()]).to(left.dtype)
+    return out, aux
 
 
 def aliased_outputs(
@@ -275,62 +354,8 @@ def known_metadata(
 
 @pytest.fixture(autouse=True)
 def cuda_trace() -> Generator[None, None, None]:
-    """Real static converter, with only the traced device replaced by CUDA."""
-    old_init = CompileEnvironment.__init__
-    old_convert = CompileEnvironment._to_fake_tensor
-    old_threads = torch.get_num_threads()
-    initial_cuda_state = torch.cuda.is_initialized()
-    torch.set_num_threads(1)
-
-    def initialize(env: Any, device: torch.device, *args: Any, **kwargs: Any) -> None:
-        assert device.type in ("cpu", "cuda")
-        old_init(env, torch.device("cuda:0"), *args, **kwargs)
-
-    def convert(env: Any, tensor: torch.Tensor, origin: Any) -> FakeTensor:
-        result = old_convert(env, tensor, origin)
-        assert isinstance(result, FakeTensor) and result.fake_mode is env.fake_mode
-        result.fake_device = torch.device("cuda:0")
-        return result
-
-    try:
-        with ExitStack() as stack:
-            stack.enter_context(_target())
-            stack.enter_context(
-                patch.object(CompileEnvironment, "__init__", initialize)
-            )
-            stack.enter_context(
-                patch.object(CompileEnvironment, "_to_fake_tensor", convert)
-            )
-            stack.enter_context(_mock_cuda_unavailable())
-            stack.enter_context(
-                patch(
-                    "torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")
-                )
-            )
-            stack.enter_context(
-                patch("torch.cuda.get_device_capability", return_value=(10, 0))
-            )
-            stack.enter_context(
-                patch.object(
-                    DeviceProperties,
-                    "create",
-                    return_value=DeviceProperties(
-                        type="cuda",
-                        index=0,
-                        multi_processor_count=148,
-                        cc=100,
-                        major=10,
-                        regs_per_multiprocessor=65536,
-                        max_threads_per_multi_processor=2048,
-                        max_threads_per_block=1024,
-                        warp_size=32,
-                    ),
-                )
-            )
-            yield
-    finally:
-        torch.set_num_threads(old_threads)
-        assert torch.cuda.is_initialized() == initial_cuda_state
+    with cuda_metadata_trace():
+        yield
 
 
 def bind(
@@ -339,12 +364,15 @@ def bind(
     dtype: torch.dtype = torch.float16,
     rows: int = 256,
     columns: int = 128,
+    k: int = 64,
     **settings: Any,
 ) -> BoundKernel[Any]:
     args = (
-        torch.empty((rows, 64), dtype=dtype),
-        torch.empty((64, columns), dtype=dtype),
-        torch.empty((rows, columns), dtype=dtype),
+        torch.empty((rows, k), dtype=dtype),
+        torch.empty((k, columns), dtype=dtype),
+        torch.empty(
+            (columns,) if fn is bias_gelu_aux else (rows, columns), dtype=dtype
+        ),
     )
     kernel = helion.kernel(
         fn, backend="cute", static_shapes=True, autotune_effort="full", **settings
@@ -372,9 +400,10 @@ def plan_for(bound: BoundKernel[Any]) -> PairedFanoutPlan:
     return plan
 
 
-@pytest.mark.parametrize("fn", (paired, rounded_sigmoid, renamed_relu, duplicate))
+@pytest.mark.parametrize(
+    "fn", (paired, rounded_sigmoid, renamed_relu, duplicate, unrounded, bias_gelu_aux)
+)
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
-@skipUnlessBackends(["cute"])
 def test_typed_public_fanout_and_default_source(
     fn: Callable[..., object], dtype: torch.dtype
 ) -> None:
@@ -387,11 +416,194 @@ def test_typed_public_fanout_and_default_source(
     off.config[FANOUT_CONFIG_KEY] = "off"
     assert bound.to_code(off) == bound.to_code(config(bound, "off"))
     assert plan.rounded_suffix is (fn is not duplicate)
+    # ``unrounded`` / ``bias_gelu_aux``: the second chain continues from the
+    # shared prefix's FP32 value (sigmoid(acc); acc * 1.25 + bias), the value
+    # the first store rounds, as the FX graph does.
+    assert plan.unrounded_prefix is (fn in (unrounded, bias_gelu_aux))
 
 
-@pytest.mark.parametrize("fn", (unrounded, aliased_outputs, output_reload))
-@skipUnlessBackends(["cute"])
-def test_unproved_rounding_alias_and_reload_decline(fn: Callable[..., object]) -> None:
+def test_bias_gelu_aux_shares_one_tmem_read_and_the_fp32_prefix() -> None:
+    # The cuBLASLt GELU_AUX pattern: ``aux = pre.to(dt); out = gelu(pre)`` with a
+    # row-vector bias in the shared prefix. One subtile loop reads TMEM once,
+    # the gelu consumes the FP32 prefix local (not the rounded aux value), and
+    # both TMA stores issue from the same traversal.
+    bound = bind(bias_gelu_aux)
+    plan = plan_for(bound)
+    assert plan.prefix_steps == 2 and plan.rounded_suffix and plan.unrounded_prefix
+    assert plan.chains[0].auxiliary_tensor_loads[0].broadcast_axis == 1
+    code = bound.to_code(config(bound))
+    body = code[code.index("@cute.kernel") : code.index("_helion_cute_wrapper_plans")]
+    assert body.count("for _tcgen05_subtile in") == 1
+    assert body.count("cute.copy(tcgen05_tiled_copy_t2r") == 1
+    assert body.count("cute.copy(tcgen05_tma_store_atom") == 2
+    lines = [line.strip() for line in body.splitlines()]
+    (gelu,) = [line for line in lines if "_cute_gelu_erf_exact_f32x2(" in line]
+    prefix = gelu[gelu.index("(") + 1 : -1]
+    assert prefix.startswith("tcgen05_chain_step")
+    # the prefix local is the FP32 value the first output rounds
+    assert any(
+        line.startswith("tcgen05_acc_vec = ")
+        and line.endswith(f"{prefix}.to(cutlass.Float16)")
+        for line in lines
+    )
+    plain = bound.to_code(config(bound, "off"))
+    plain_body = plain[
+        plain.index("@cute.kernel") : plain.index("_helion_cute_wrapper_plans")
+    ]
+    assert plain_body.count("for _tcgen05_subtile in") == 2
+    assert plain_body.count("cute.copy(tcgen05_tiled_copy_t2r") == 2
+
+
+def _bind_args(fn: Callable[..., object], *args: torch.Tensor) -> BoundKernel[Any]:
+    kernel = helion.kernel(
+        fn, backend="cute", static_shapes=True, autotune_effort="full"
+    )
+    return kernel._bind_isolated(args)
+
+
+def _pre_wait_shared(bn: int) -> helion.Config:
+    requested = helion.Config(
+        block_sizes=[128, bn, 64],
+        pid_type="persistent_interleaved",
+        tcgen05_cluster_m=1,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=2,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=4,
+        tcgen05_num_epi_warps=4,
+        tcgen05_aux_load_placement="pre_acc_wait",
+    )
+    requested.config[FANOUT_CONFIG_KEY] = "shared"
+    return requested
+
+
+@pytest.mark.parametrize(
+    ("fn", "bias_dtype", "bn", "staged"),
+    (
+        # 16-bit row consumed by the FP32 root alone: the promoted shared stage.
+        (bias_gelu_aux_single, torch.float16, 128, True),
+        (bias_gelu_aux_single, torch.float16, 64, True),
+        # Inductor's explicit FP32 conversion of that row promotes the same way.
+        (bias_gelu_aux_single_cast, torch.float16, 128, True),
+        # 32-bit row on bn=128: the warp-private stage; bn=64 does not split
+        # into whole 32-lane copies of four, so it stays a per-subtile read.
+        (bias_gelu_aux, torch.float32, 128, True),
+        (bias_gelu_aux, torch.float32, 64, False),
+        # 16-bit row behind a scaling step: per-subtile reads, no stage.
+        (bias_gelu_aux, torch.float16, 128, False),
+    ),
+)
+def test_pre_wait_shared_fanout_decides_smem_staged_rowvec_leaves_at_normalization(
+    fn: Callable[..., object], bias_dtype: torch.dtype, bn: int, staged: bool
+) -> None:
+    # The splice declines SMEM-staged row-vector leaves under fan-out (a
+    # per-store stage and barrier do not compose); the config gate mirrors
+    # the staging decision so such a config is invalid (repaired to no
+    # fan-out) instead of normalizing and failing at codegen.
+    bound = _bind_args(
+        fn,
+        torch.empty((256, 64), dtype=torch.float16),
+        torch.empty((64, 128), dtype=torch.float16),
+        torch.empty((128,), dtype=bias_dtype),
+    )
+    spec = bound.config_spec
+    assert spec._cute_tcgen05_config.epilogue_fanout_plans
+    requested = _pre_wait_shared(bn)
+    if staged:
+        with pytest.raises(InvalidConfig, match=FANOUT_CONFIG_KEY):
+            spec.normalized_config(requested)
+        repaired = dict(requested.config)
+        spec.normalize(repaired, _fix_invalid=True)
+        assert FANOUT_CONFIG_KEY not in repaired
+        assert repaired["tcgen05_aux_load_placement"] == "pre_acc_wait"
+        # The single-output traversal stages the row.
+        source = bound.to_code(helion.Config(**repaired))
+        assert "tcgen05_aux_rowvec_tiled_copy" in source
+    else:
+        normalized = spec.normalized_config(requested)
+        assert normalized.config[FANOUT_CONFIG_KEY] == "shared"
+        source = bound.to_code(normalized)
+        assert "tcgen05_aux_rowvec_tiled_copy" not in source
+        assert source.count("cute.copy(tcgen05_tma_store_atom") == 2
+    # Without ``pre_acc_wait`` the same kernels share the traversal.
+    requested.config.pop("tcgen05_aux_load_placement")
+    assert spec.normalized_config(requested).config[FANOUT_CONFIG_KEY] == "shared"
+
+
+def test_shared_fanout_second_chain_binds_rank0_scalars_once() -> None:
+    # ``out = (gelu(pre) * out_scale[()])``: the scalar belongs to the second
+    # chain's suffix.  The shared traversal renders that suffix against the
+    # per-tile scalar binding of the second store's setup, not an inline
+    # global read inside the subtile loop.
+    bound = _bind_args(
+        gelu_aux_scaled,
+        torch.empty((256, 64), dtype=torch.float16),
+        torch.empty((64, 128), dtype=torch.float16),
+        torch.empty((128,), dtype=torch.float16),
+        torch.empty((), dtype=torch.float32),
+    )
+    code = bound.to_code(config(bound))
+    body = code[code.index("@cute.kernel") : code.index("_helion_cute_wrapper_plans")]
+    lines = [line.strip() for line in body.splitlines()]
+    reads = [line for line in lines if "out_scale.iterator.load()" in line]
+    assert len(reads) == 1 and reads[0].startswith("tcgen05_scalar"), reads
+    (binding,) = reads
+    local = binding.split(" = ")[0]
+    (scaled,) = [
+        line
+        for line in lines
+        if line.startswith("tcgen05_chain_step") and f" * {local}" in line
+    ]
+    subtile = next(
+        i for i, line in enumerate(lines) if "for _tcgen05_subtile in" in line
+    )
+    assert lines.index(binding) < subtile < lines.index(scaled)
+    assert body.count("cute.copy(tcgen05_tiled_copy_t2r") == 1
+
+
+def test_c_stages_gate_charges_every_output_store_ring() -> None:
+    # Two 16-bit outputs with four-stage TMA-store rings on a 128x64 tile:
+    # 4 AB stages of 48 KiB plus 2 x 4 x 8 KiB of rings overflow the 227 KiB
+    # SMEM, which used to surface as an NVVM failure at compile time because
+    # the one-CTA C-stages gate priced a single ring. The gate now charges a
+    # ring per output store and demotes the sampled c=4 to 2; the c=2 twin and
+    # the narrower 64x64 tiles (whose two rings fit) keep their depths.
+    kernel = helion.kernel(
+        bias_gelu_aux, backend="cute", static_shapes=True, autotune_effort="full"
+    )
+    args = (
+        torch.empty((1024, 1024), dtype=torch.float16),
+        torch.empty((1024, 1024), dtype=torch.float16),
+        torch.empty((1024,), dtype=torch.float16),
+    )
+    bound = kernel._bind_isolated(args)
+    spec = bound.config_spec
+    constraints = spec._cute_tcgen05_config.ab_stages_three_search_constraints
+    assert constraints is not None
+    assert constraints.output_dtype_bytes == 2 and constraints.output_stores == 2
+
+    def projected(block_sizes: list[int], ab: int, c: int) -> tuple[int, int]:
+        config = helion.Config(
+            block_sizes=block_sizes,
+            loop_orders=[[0, 1]],
+            pid_type="persistent_interleaved",
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=ab,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=c,
+        )
+        spec.normalize(config, _fix_invalid=True)
+        return config.config["tcgen05_ab_stages"], config.config["tcgen05_c_stages"]
+
+    assert projected([128, 64, 128], 4, 4) == (4, 2)
+    assert projected([128, 64, 128], 4, 2) == (4, 2)
+    assert projected([64, 64, 128], 4, 4) == (4, 4)
+    assert projected([64, 64, 128], 6, 4) == (6, 4)
+
+
+@pytest.mark.parametrize("fn", (aliased_outputs, output_reload))
+def test_unproved_alias_and_reload_decline(fn: Callable[..., object]) -> None:
     bound = bind(fn)
     assert not bound.config_spec._cute_tcgen05_config.epilogue_fanout_plans
     with pytest.raises(InvalidConfig, match=FANOUT_CONFIG_KEY):
@@ -404,7 +616,6 @@ def test_unproved_rounding_alias_and_reload_decline(fn: Callable[..., object]) -
 
 
 @pytest.mark.parametrize("rows,columns", ((257, 128), (256, 129), (130, 65)))
-@skipUnlessBackends(["cute"])
 def test_partial_tiles_retain_separate_fallback(rows: int, columns: int) -> None:
     bound = bind(rows=rows, columns=columns)
     assert plan_for(bound)
@@ -419,7 +630,6 @@ def test_partial_tiles_retain_separate_fallback(rows: int, columns: int) -> None
 
 
 @pytest.mark.parametrize("value", (None, True, False, 0, 1, "invalid"))
-@skipUnlessBackends(["cute"])
 def test_mode_is_typed_and_normalized(value: object) -> None:
     bound = bind()
     raw = deepcopy(config(bound, "off").config)
@@ -431,7 +641,7 @@ def test_mode_is_typed_and_normalized(value: object) -> None:
 @pytest.mark.parametrize(
     "key,value",
     (
-        ("tcgen05_cluster_n", 2),
+        ("tcgen05_cluster_n", 4),
         ("tcgen05_c_stages", 3),
         ("tcgen05_num_epi_warps", 2),
         ("tcgen05_aux_load_mode", "tma"),
@@ -467,7 +677,6 @@ def original_bound() -> BoundKernel[Any]:
     return kernel._bind_isolated(args)
 
 
-@skipUnlessBackends(["cute"])
 def test_original_cuda_traced_two_region_binding() -> None:
     bound = original_bound()
     plan = plan_for(bound)
@@ -500,7 +709,6 @@ def test_original_cuda_traced_two_region_binding() -> None:
         "gate_out[0] = 1",
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_typed_host_freshness_rejects_effects_and_rebinding(statement: str) -> None:
     bound = bind()
     host = bound.host_function
@@ -519,7 +727,6 @@ def test_typed_host_freshness_rejects_effects_and_rebinding(statement: str) -> N
 
 
 @pytest.mark.parametrize("fn", (opaque_scalar, opaque_property, opaque_factory))
-@skipUnlessBackends(["cute"])
 def test_actual_typed_opaque_metadata_declines(fn: Callable[..., object]) -> None:
     reads = _metadata_provider.reads
     bound = bind(fn)
@@ -551,7 +758,6 @@ def test_actual_typed_opaque_metadata_declines(fn: Callable[..., object]) -> Non
         assert literals
 
 
-@skipUnlessBackends(["cute"])
 def test_opaque_scalar_fallback_preserves_actual_allocating_host_effect() -> None:
     global _mutate_output_storage
     values = (
@@ -589,14 +795,12 @@ def test_opaque_scalar_fallback_preserves_actual_allocating_host_effect() -> Non
         defaults["_launcher"] = launcher.default_cute_launcher
 
 
-@skipUnlessBackends(["cute"])
 def test_known_metadata_constants_and_fp32_outputs_remain_supported() -> None:
     bound = bind(known_metadata)
     assert plan_for(bound).output_dtype is torch.float32
     assert bound.to_code(config(bound))
 
 
-@skipUnlessBackends(["cute"])
 def test_carrierless_binding_keeps_old_search_registry() -> None:
     # A 256x128 output has fewer 128x128 tiles than SMs, so the tcgen05 seeds
     # include one-CTA small-grid tiles (128x{16,32,64}x64), and those carry
@@ -626,7 +830,6 @@ def test_carrierless_binding_keeps_old_search_registry() -> None:
 @pytest.mark.parametrize(
     "change", ("mask", "indices", "third_store", "wrong_graph", "dtype")
 )
-@skipUnlessBackends(["cute"])
 def test_live_typed_store_proof_negatives(change: str) -> None:
     bound = bind()
     plan = plan_for(bound)
@@ -670,7 +873,6 @@ def test_live_typed_store_proof_negatives(change: str) -> None:
         target.meta["val"] = target_value
 
 
-@skipUnlessBackends(["cute"])
 def test_store_mode_field_survives_the_fanout_registration() -> None:
     # The fan-out carriers are normalized before the heuristic flips
     # ``epilogue_fanout_search_enabled``; a store-mode field that left the
@@ -702,7 +904,6 @@ def test_store_mode_field_survives_the_fanout_registration() -> None:
             spec.normalize(dict(carrier.config))
 
 
-@skipUnlessBackends(["cute"])
 def test_registered_witnesses_are_independent_and_cache_visible() -> None:
     bound = original_bound()
     spec = bound.config_spec
@@ -742,6 +943,174 @@ def test_registered_witnesses_are_independent_and_cache_visible() -> None:
             assert gen.strict_config_pair(effective) == (flat, effective)
 
 
+def _fanout_witnesses(
+    bound: BoundKernel[Any],
+) -> list[tuple[object, tuple[int, ...], int]]:
+    (group,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == FANOUT_CONFIG_KEY
+    ]
+    return [
+        (w.value, tuple(w.carrier.block_sizes), w.carrier.config["tcgen05_c_stages"])
+        for w in group.witnesses
+    ]
+
+
+def _hoist_geometries(bound: BoundKernel[Any]) -> list[tuple[int, ...]]:
+    groups = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+    ]
+    if not groups:
+        return []
+    seen: list[tuple[int, ...]] = []
+    for witness in groups[0].witnesses:
+        blocks = tuple(witness.carrier.block_sizes)
+        if blocks not in seen:
+            seen.append(blocks)
+    return seen
+
+
+def test_one_wave_geometry_fills_a_free_fanout_witness_slot() -> None:
+    # 1024x512 has 32 standard tiles, so the small-grid seeds spread the
+    # output over 64x64 (128 tiles: one wave on 148 SMs) and 128x{16,32,64}.
+    # The largest tile's C-ring twins witness the fanout. With K = 64 both
+    # twins fit SMEM and take the whole four-witness budget: the C ring
+    # pipelines the epilogue sub-tile stores inside one tile, so the deep
+    # twin is never displaced, even on a one-wave grid.
+    assert _fanout_witnesses(bind(rows=1024, columns=512)) == [
+        ("off", (128, 64, 64), 4),
+        ("shared", (128, 64, 64), 4),
+        ("off", (128, 64, 64), 2),
+        ("shared", (128, 64, 64), 2),
+    ]
+    # With K = 512 the seeds take a 128-deep K tile and the deep twin
+    # overflows SMEM: the free slot goes to the finest one-wave tile, 64x64
+    # (128x32 also walks 128 tiles; the squarer tile reads fewer operand
+    # rows). The second geometry's ``off`` control is the seed itself.
+    bound = bind(rows=1024, columns=512, k=512)
+    assert _fanout_witnesses(bound) == [
+        ("off", (128, 64, 128), 2),
+        ("shared", (128, 64, 128), 2),
+        ("off", (64, 64, 128), 2),
+        ("shared", (64, 64, 128), 2),
+    ]
+    (group,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == FANOUT_CONFIG_KEY
+    ]
+    with bound.env:
+        seeds = []
+        for seed in bound.config_spec.compiler_seed_configs:
+            candidate = helion.Config.from_dict(deepcopy(seed.config))
+            try:
+                bound.config_spec.normalize(candidate)
+            except InvalidConfig:
+                continue
+            seeds.append(candidate)
+    assert group.witnesses[2].carrier in seeds
+    # The hoist (and the swizzle riding it) witness both geometries, so the
+    # complete small-grid recipe -- fanout, pre-wait aux, hoist -- is seeded.
+    assert _hoist_geometries(bound) == [(128, 64, 128), (64, 64, 128)]
+    # 2048x256: 64x64 and 128x32 both walk 128 tiles; the squarer tile wins.
+    assert _fanout_witnesses(bind(rows=2048, columns=256, k=512))[2:] == [
+        ("off", (64, 64, 128), 2),
+        ("shared", (64, 64, 128), 2),
+    ]
+    # 4096x512 walks 256 tiles of 128x64 (two waves) and every smaller seed
+    # tile needs more: the free slot stays empty rather than taking a
+    # multi-wave tile.
+    assert _fanout_witnesses(bind(rows=4096, columns=512, k=512)) == [
+        ("off", (128, 64, 128), 2),
+        ("shared", (128, 64, 128), 2),
+    ]
+    # A geometry no ordinary seed carries (4096x4096: the machine-filling
+    # pairs only) keeps the synthesized 128x128 twins and nothing else.
+    assert _fanout_witnesses(bind(rows=4096, columns=4096)) == [
+        ("off", (128, 128, 64), 4),
+        ("shared", (128, 128, 64), 4),
+        ("off", (128, 128, 64), 2),
+        ("shared", (128, 128, 64), 2),
+    ]
+
+
+def test_an_admitted_pair_seed_leaves_the_fanout_group_one_cta() -> None:
+    # 4096x4096 at K = 64 is seeded with the machine-filling 256x256x64 CTA
+    # pairs alone, and the pair fanout admits that seed by budget (three AB
+    # stages beside two (128, 64) C rings; its four-stage twin overflows).
+    # The seed-derived carriers are one-CTA tiles, so the pair does not take
+    # the fanout group with its shallow twin alone: the group keeps the
+    # synthesized 128x128 twins, and the hoist group keeps its one-CTA slot
+    # beside the pair carrier it builds itself (256x128: the 256-wide
+    # fragment is over the hoist's budget).
+    bound = bind(rows=4096, columns=4096)
+    spec = bound.config_spec
+    state = spec._cute_tcgen05_config
+    with bound.env:
+        seeds = []
+        for seed in spec.compiler_seed_configs:
+            candidate = helion.Config.from_dict(deepcopy(seed.config))
+            try:
+                spec.normalize(candidate)
+            except InvalidConfig:
+                continue
+            seeds.append(candidate)
+    assert seeds and all(
+        tuple(seed.block_sizes) == (256, 256, 64)
+        and seed.config["tcgen05_cluster_m"] == 2
+        for seed in seeds
+    )
+    admitted = [
+        seed
+        for seed in seeds
+        if schedule_supported(seed.config)
+        and repair.epilogue_fanout_refusal(
+            state, dict(seed.config) | {FANOUT_CONFIG_KEY: "shared"}
+        )
+        is None
+    ]
+    assert admitted
+    assert _fanout_witnesses(bound) == [
+        ("off", (128, 128, 64), 4),
+        ("shared", (128, 128, 64), 4),
+        ("off", (128, 128, 64), 2),
+        ("shared", (128, 128, 64), 2),
+    ]
+    assert _hoist_geometries(bound) == [(256, 128, 64), (128, 128, 64)]
+
+
+def test_one_wave_counts_the_cluster_footprint() -> None:
+    # 2048x2048 in 256x128 pair tiles is 128 tiles -- within the 148 SMs as
+    # tiles, but each pair occupies two SMs. The hoist group's synthesized
+    # pair carrier is the admitted ``tcgen05_cluster_m=2`` fanout geometry.
+    bound = bind(rows=2048, columns=2048, k=512)
+    state = bound.config_spec._cute_tcgen05_config
+    (hoist,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+    ]
+    pair = hoist.witnesses[0].carrier
+    assert tuple(pair.block_sizes) == (256, 128, 128)
+    assert pair.config["tcgen05_cluster_m"] == 2
+    assert not _fits_one_wave(state, pair)
+    single = helion.Config.from_dict(deepcopy(pair.config) | {"tcgen05_cluster_m": 1})
+    assert _fits_one_wave(state, single)
+    # Half the rows: 64 pairs on 128 SMs fit one wave.
+    bound = bind(rows=1024, columns=2048, k=512)
+    (hoist,) = [
+        g
+        for g in bound.config_spec.compiler_coverage_groups
+        if g.key == TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
+    ]
+    pair = hoist.witnesses[0].carrier
+    assert pair.config["tcgen05_cluster_m"] == 2
+    assert _fits_one_wave(bound.config_spec._cute_tcgen05_config, pair)
+
+
 def _rendered_plan(
     dtype: torch.dtype,
     fn: Callable[..., object] = paired,
@@ -755,7 +1124,6 @@ def _rendered_plan(
 
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16))
 @pytest.mark.parametrize("fn", (paired, rounded_sigmoid))
-@skipUnlessBackends(["cute"])
 def test_actual_typed_suffix_ieee_bits_and_required_rounding(
     dtype: torch.dtype,
     fn: Callable[..., object],
@@ -865,7 +1233,6 @@ def _store_records() -> tuple[FanoutStore, FanoutStore]:
         "missing_advance",
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_pair_lifetime_negatives(fault: str) -> None:
     first, second = _store_records()
     if fault == "reversed":
@@ -884,7 +1251,6 @@ def test_pair_lifetime_negatives(fault: str) -> None:
         combine_stores(first, second)
 
 
-@skipUnlessBackends(["cute"])
 def test_complete_store_registration_and_single_commit_group() -> None:
     first, second = _store_records()
     state = CuteDeviceFunctionState()
@@ -893,9 +1259,9 @@ def test_complete_store_registration_and_single_commit_group() -> None:
         state.register_tcgen05_epi_role_stmts([store.main])
     assert not state.register_paired_fanout_store(first, [])
     with pytest.raises(BackendUnsupported, match="incomplete"):
-        state.finalize_tcgen05_pure_lifecycle_stores()
+        state.finalize_tcgen05_paired_fanout_stores()
     assert state.register_paired_fanout_store(second, [])
-    state.finalize_tcgen05_pure_lifecycle_stores()
+    state.finalize_tcgen05_paired_fanout_stores()
     emitted = ast.unparse(first.main)
     assert emitted.count("commit()") == 1
     assert emitted.count("barrier0.arrive_and_wait()") == 2

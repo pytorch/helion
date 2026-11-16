@@ -5,20 +5,42 @@ from __future__ import annotations
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
 from test.cute_population_contracts import _target
 
 import helion
-from helion._compiler.cute.selection_coarse import coarse_rank_full_keys
-from helion._compiler.cute.selection_coarse import coarse_rank_guard
-from helion._compiler.cute.selection_coarse import coarse_rank_keys
-from helion._compiler.cute.selection_coarse import coarse_rank_recover
-from helion._compiler.cute.selection_coarse import trace_coarse_rank_selection
-from helion._compiler.cute.selection_network import selection_network
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_full_keys
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_guard
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_keys
+from helion._compiler.cute.selection.selection_coarse import coarse_rank_recover
+from helion._compiler.cute.selection.selection_coarse import trace_coarse_rank_selection
+from helion._compiler.cute.selection.selection_network import selection_network
 from helion._compiler.device_ir import IfGraphInfo
+from helion._testing import cpu_render_target
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
+
+
+def test_topk_aliased_destination_keeps_consumer_refusal():
+    """Without disjoint storage, the fallback cannot reduce selected lanes."""
+
+    @helion.kernel(autotune_effort="none", static_shapes=True)
+    def topk_sum_aliased(x: torch.Tensor) -> torch.Tensor:
+        out = x[:, 0]
+        for tile in hl.tile(x.size(0)):
+            top_vals, _ = torch.topk(x[tile, :], 4, dim=-1)
+            out[tile] = top_vals.sum(-1)
+        return out
+
+    with cpu_render_target():
+        bound = cpu_bind(topk_sum_aliased, (torch.empty(40, 64),))
+        config = bound.config_spec.default_config()
+        config.config["block_sizes"] = [8]
+        with pytest.raises(helion.exc.BackendUnsupported, match="torch.topk output"):
+            bound.to_code(config)
 
 
 def _expected(
@@ -217,8 +239,8 @@ def test_selection_tensor_helpers_trace_directly_in_helion(coarse):
         if coarse
         else torch.ones((3, 4, 8), dtype=torch.int64)
     )
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(kernel, (x,))
     graphs = bound.host_function.device_ir.graphs
     targets = {node.target for info in graphs for node in info.graph.nodes}
     assert torch.ops.aten.topk.default not in targets

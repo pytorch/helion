@@ -9,7 +9,6 @@ import torch
 import helion
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
-from helion._testing import onlyBackends
 import helion.language as hl
 
 pytest.importorskip("cutlass")
@@ -173,7 +172,7 @@ def _run_and_check(
     if bound_out is not None:
         bound_out.append(bound)
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     output = bound(q, k, v)
     for _ in range(repeat_count - 1):
         assert torch.equal(output, bound(q, k, v))
@@ -204,7 +203,6 @@ def _run_and_check(
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_odd_kv_required_tma_generic_fallback_initial_config_is_correct() -> None:
     fallback_kernel = helion.kernel(backend="cute", static_shapes=True)(
         _dense_attention.fn
@@ -222,7 +220,7 @@ def test_odd_kv_required_tma_generic_fallback_initial_config_is_correct() -> Non
     initial = spec.default_config()
     assert initial.config["block_sizes"] == [1, 64, 64]
     bound.set_config(initial)
-    code = bound.to_triton_code(initial)
+    code = bound.to_code(initial)
     output = bound(q, k, v)
     repeated = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -235,7 +233,6 @@ def test_odd_kv_required_tma_generic_fallback_initial_config_is_correct() -> Non
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_causal_two_cta_long_repeated_runtime_is_deterministic_and_correct() -> None:
     code, resolved = _run_and_check(
         dtype=torch.float16,
@@ -269,7 +266,6 @@ def test_causal_two_cta_long_repeated_runtime_is_deterministic_and_correct() -> 
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_odd_kv_extent_automatically_uses_ws_overlap(
     dtype: torch.dtype,
     head_dim: int,
@@ -295,7 +291,6 @@ def test_odd_kv_extent_automatically_uses_ws_overlap(
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_even_unclustered_kv_extent_uses_one_cta_fa4(
     dtype: torch.dtype,
     head_dim: int,
@@ -339,7 +334,6 @@ def test_even_unclustered_kv_extent_uses_one_cta_fa4(
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_aliased_kv_depths_wrap_repeatedly_and_match_sdpa(
     family: str,
     kv_stage: int,
@@ -371,7 +365,6 @@ def test_aliased_kv_depths_wrap_repeatedly_and_match_sdpa(
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_deepest_direct_output_aliased_kv_depth_matches_sdpa(
     head_dim: int,
     kv_stage: int,
@@ -395,7 +388,6 @@ def test_deepest_direct_output_aliased_kv_depth_matches_sdpa(
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_non_tile_aligned_extent_falls_back_and_matches_sdpa() -> None:
     torch.manual_seed(2819)
     q, k, v = (
@@ -404,7 +396,7 @@ def test_non_tile_aligned_extent_falls_back_and_matches_sdpa() -> None:
     config = helion.Config(block_sizes=[1, 128, 128])
     bound = _dense_attention.bind((q, k, v))
     bound.set_config(config)
-    code = bound.to_triton_code(config)
+    code = bound.to_code(config)
     output = bound(q, k, v)
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
@@ -415,7 +407,6 @@ def test_non_tile_aligned_extent_falls_back_and_matches_sdpa() -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_dense_source_policy_variants_are_deterministic_and_match_sdpa() -> None:
     values: dict[str, object] = {
         cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4",
@@ -443,14 +434,13 @@ def test_dense_source_policy_variants_are_deterministic_and_match_sdpa() -> None
     assert resolved.softmax_setup == "stage_local"
     assert resolved.epi_tma_setup == "role_local"
     assert "for flash_tile_iter in cutlass.range(flash_tile_count, unroll=1)" in code
-    assert "fa4_sp_exp_convert_store_whole_rowsum" in code
+    assert "whole_row_sum=True" in code
     assert "flash_tiled_ld_coord" in code
     epilogue_role = code.index("gO_tma = cute.flat_divide")
     assert code.rfind("warp_idx", 0, epilogue_role) >= 0
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_dense_d128_counted_persistent_loop_is_deterministic_and_correct() -> None:
     code, resolved = _run_and_check(
         dtype=torch.float16,
@@ -472,7 +462,6 @@ def test_dense_d128_counted_persistent_loop_is_deterministic_and_correct() -> No
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_dense_whole_row_path_with_lse_is_deterministic_and_correct() -> None:
     torch.manual_seed(2901)
     q, k, v = (
@@ -490,7 +479,7 @@ def test_dense_whole_row_path_with_lse_is_deterministic_and_correct() -> None:
     active_config = helion.Config.from_dict({"block_sizes": [1, 128, 128], **values})
     bound = _dense_attention_with_lse.bind((q, k, v))
     bound.set_config(active_config)
-    code = bound.to_triton_code(active_config)
+    code = bound.to_code(active_config)
     outputs = [bound(q, k, v) for _ in range(3)]
 
     expected_out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
@@ -498,7 +487,7 @@ def test_dense_whole_row_path_with_lse_is_deterministic_and_correct() -> None:
     expected_lse = torch.logsumexp(scores, dim=-1) * math.log2(math.e)
     out, lse = outputs[0]
 
-    assert "fa4_sp_exp_convert_store_whole_rowsum" in code
+    assert "whole_row_sum=True" in code
     assert all(
         torch.equal(out, repeated_out) and torch.equal(lse, repeated_lse)
         for repeated_out, repeated_lse in outputs[1:]
@@ -564,7 +553,6 @@ def test_source_policy_variants_canonicalize_for_ws_overlap() -> None:
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_head_dims_beyond_64_and_128_match_sdpa(
     head_dim: int,
     dtype: torch.dtype,
@@ -603,7 +591,6 @@ def test_head_dims_beyond_64_and_128_match_sdpa(
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_head_dims_above_128_run_the_single_tile_body(
     head_dim: int,
     dtype: torch.dtype,
@@ -650,7 +637,6 @@ def test_head_dims_above_128_run_the_single_tile_body(
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_head_dims_run_the_single_tile_cooperative_pair(
     head_dim: int,
     dtype: torch.dtype,
@@ -689,7 +675,6 @@ def test_head_dims_run_the_single_tile_cooperative_pair(
 @pytest.mark.parametrize("is_causal", (False, True), ids=("dense", "causal"))
 @pytest.mark.parametrize("family", ("ws_2cta", "ws_overlap"))
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_direct_store_at_widths_between_the_64_multiples(
     head_dim: int, is_causal: bool, family: str
 ) -> None:
@@ -716,7 +701,6 @@ def test_direct_store_at_widths_between_the_64_multiples(
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_odd_tile_count_above_128_keeps_the_single_cta_body() -> None:
     """An odd query tile count has no pair for its last tile: the resolver
     keeps the single CTA's body (the pair family is not on the surface)."""
@@ -734,7 +718,6 @@ def test_odd_tile_count_above_128_keeps_the_single_cta_body() -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_persistent_cluster_loop_matches_sdpa() -> None:
     """On request the pair strides the cluster ids (one cluster per SM pair)
     over the pair work items and carries its pipelines across tiles: 32
@@ -760,7 +743,6 @@ def test_cooperative_pair_persistent_cluster_loop_matches_sdpa() -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_two_pair_cluster_matches_sdpa() -> None:
     """Two pairs per cluster sharing every K/V tile by TMA multicast across
     the pairs (four consecutive query tiles; the causal group walks to its
@@ -783,7 +765,6 @@ def test_cooperative_pair_two_pair_cluster_matches_sdpa() -> None:
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_residual_launch_group_matches_sdpa() -> None:
     """An explicit launch group that does not divide the heads (six heads in
     groups of four) takes FA4's residual group on the pair's decode."""
@@ -806,7 +787,6 @@ def test_cooperative_pair_residual_launch_group_matches_sdpa() -> None:
 
 @pytest.mark.parametrize("pair_cluster", (1, 2))
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_odd_pair_count_matches_sdpa(pair_cluster: int) -> None:
     """A tile count that is not a power of two (twelve tiles: six pairs,
     three two-pair clusters) with three heads: the launch group clamps to
@@ -832,7 +812,6 @@ def test_cooperative_pair_odd_pair_count_matches_sdpa(pair_cluster: int) -> None
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_persistent_two_pair_cluster_grid_is_the_resident_count() -> (
     None
 ):
@@ -848,7 +827,7 @@ def test_cooperative_pair_persistent_two_pair_cluster_grid_is_the_resident_count
 
     from helion.runtime import get_max_active_clusters
     from helion.runtime import get_num_sm
-    from helion.runtime.cute.launcher import _cute_resident_clusters
+    from helion.runtime.cute.occupancy import resident_clusters
 
     bound_out: list[helion.runtime.kernel.BoundKernel] = []
     code, resolved = _run_and_check(
@@ -889,9 +868,9 @@ def test_cooperative_pair_persistent_two_pair_cluster_grid_is_the_resident_count
     # nothing extra.
     (cache_key,) = cute_kernel._helion_cute_compiled_launchers
     assert cache_key[-1] == clusters
-    assert _cute_resident_clusters((4, 1, 1), DEVICE) == clusters
-    assert _cute_resident_clusters((2, 1, 1), DEVICE) is None
-    assert _cute_resident_clusters((4, 1, 1), None) is None
+    assert resident_clusters((4, 1, 1), DEVICE) == clusters
+    assert resident_clusters((2, 1, 1), DEVICE) is None
+    assert resident_clusters((4, 1, 1), None) is None
 
 
 @pytest.mark.parametrize(
@@ -907,7 +886,6 @@ def test_cooperative_pair_persistent_two_pair_cluster_grid_is_the_resident_count
     ),
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_issue_knobs_run(
     head_dim: int,
     dtype: torch.dtype,
@@ -959,7 +937,6 @@ def test_cooperative_pair_issue_knobs_run(
 
 
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_cooperative_pair_persistent_loop_runs_past_the_resident_clusters() -> None:
     """The persistent pair with its issue-stream knobs on more items than
     the resident clusters (8 heads x 16 items of 256 rows = 128 items
@@ -1107,7 +1084,6 @@ _SINGLE_TILE_KNOB_CASES = (
     ("head_dim", "dtype", "is_causal", "extra", "knobs"), _SINGLE_TILE_KNOB_CASES
 )
 # pyrefly: ignore [bad-argument-type]
-@onlyBackends(["cute"])
 def test_single_tile_body_issue_knobs_run(
     head_dim: int,
     dtype: torch.dtype,

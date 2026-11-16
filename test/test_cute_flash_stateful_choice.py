@@ -11,28 +11,34 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.attention import causal_attention_output
 import pytest
 import torch
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .test_cute_flash_exp2 import _emit_causal_resident_native_source
 from .test_cute_flash_exp2 import _flash_runtime
 from .test_cute_flash_resident_choice import _emit as _emit_explicit_dense
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash as flash
 from helion._compiler.cute.attention_plan import SOFTCAP_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import causal_score_plan
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.flash_tuning import FlashTuningPolicy
 from helion._compiler.cute.mma_support import CuteMmaSupport
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
+
+causal_attention_output = import_example("attention").causal_attention_output
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -45,8 +51,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
+        cpu_render_target(),
         patch.dict(os.environ, {}, clear=True),
     ):
         yield
@@ -266,7 +271,8 @@ def _spec(
     )
     for index, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=index, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         dtype=dtype,
@@ -332,7 +338,7 @@ def test_stateful_seed_routes_and_round_trip(head_dim: int, dtype: torch.dtype) 
                 }
             )
             spec.normalize(candidate)
-            effective = spec._resolve_cute_flash_config(candidate.config)
+            effective = _resolve_cute_flash_config(spec, candidate.config)
             assert effective.softmax_lowering == "resident_stateful"
             assert effective.rowmax == rowmax
             assert effective.kv_stage == 3
@@ -354,7 +360,7 @@ def test_stateful_is_unavailable_without_detector_proof() -> None:
         seed.config.get(flash.FLASH_SOFTMAX_LOWERING_KEY) != "resident_stateful"
         for seed in seeds
     )
-    fragment = spec._cute_flash_autotune_fragments()[flash.FLASH_SOFTMAX_LOWERING_KEY]
+    fragment = _cute_flash_autotune_fragments(spec)[flash.FLASH_SOFTMAX_LOWERING_KEY]
     assert "resident_stateful" not in fragment.search_choices
 
 
@@ -395,7 +401,6 @@ def test_stateful_detector_proof_reaches_real_codegen(
     support = CuteMmaSupport(
         universal=True,
         warp_f16bf16=True,
-        warpgroup_f16bf16=True,
         tcgen05_f16bf16=True,
         tcgen05_f8=True,
         tcgen05_tf32=True,

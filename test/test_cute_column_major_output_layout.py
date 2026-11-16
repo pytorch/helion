@@ -6,11 +6,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from test._cute_binding import _forbid_cuda_work
-
 from helion._compiler.cute.pipeline_smem import Tcgen05PipelineSmemFacts
 from helion._compiler.cute.pipeline_smem import pipeline_smem_bytes
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import forbid_cuda_work
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -22,7 +21,7 @@ helpers = pytest.importorskip("cutlass.utils.blackwell_helpers")
 epilogue = pytest.importorskip("cutlass.utils.gemm.sm100")
 LayoutEnum = pytest.importorskip("cutlass.utils.layout").LayoutEnum
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 _TILES = ((256, 64, 128), (128, 64, 256))
 
@@ -30,7 +29,7 @@ _TILES = ((256, 64, 128), (128, 64, 256))
 @pytest.fixture(autouse=True)
 def _mlir_module() -> Iterator[None]:
     # Also protects full-suite workers whose CUDA context already exists.
-    with _forbid_cuda_work(), ir.Context(), ir.Location.unknown():
+    with forbid_cuda_work(), ir.Context(), ir.Location.unknown():
         module = ir.Module.create()
         with ir.InsertionPoint(module.body):
             yield

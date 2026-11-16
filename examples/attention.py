@@ -97,6 +97,11 @@ def _attention_reference_lse(
     return lse
 
 
+# The reference only feeds accuracy checks. Under autograd, inputs that require
+# grad (tritonbench passes such) would make its output keep every score block
+# of the LSE loop alive: ~50 GiB at (4, 48, 8192, 128), pinned for the whole
+# autotune since the baseline output is kept for the comparisons.
+@torch.no_grad()
 def _attention_reference(
     q: torch.Tensor,
     k: torch.Tensor,

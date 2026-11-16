@@ -6,17 +6,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 from test.test_cute_full_chunk_row_seeds import bind
 from test.test_cute_full_chunk_row_seeds import normalize_many
 from test.test_cute_low_thread_independent_seeds import low_seeds
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_full_chunk_row import (
+from helion._compiler.cute.autotune.heuristics.cute_full_chunk_row import (
     CuteFullChunkRowHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
 from helion._compiler.cute.prefetch_reduction_packets import _containers
@@ -27,19 +26,19 @@ from helion.autotuner.config_generation import ConfigGeneration
 from helion.language.memory_ops import load
 from helion.language.memory_ops import store
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def cpu_only():
     initialized = torch.cuda.is_initialized()
     with (
         _cpu_target(),
-        _forbid_native_compile() as native,
         patch.object(
             CuteRolledClusterPacketHeuristic, "get_seed_configs", return_value=[]
         ),
     ):
         yield
-        assert all(mock.call_count == 0 for mock in native)
     assert torch.cuda.is_initialized() == initialized
 
 

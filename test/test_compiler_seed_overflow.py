@@ -7,20 +7,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_cuda_work
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 from .test_compiler_coverage import DOMAINS
 from .test_compiler_coverage import make_search
 from .test_compiler_coverage import make_spec
 from .test_cute_grouped_ab_k import _unsupported_k_loop
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
 from helion.runtime.config import Config
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _effective_registry(generation):
@@ -186,6 +189,7 @@ def test_overflow_cache_identity_changes_only_for_an_active_request() -> None:
     assert spec.cache_fingerprint_hash() == empty
 
 
+@skipUnlessBackends(["cute"])
 def test_impure_grouped_worklist_does_not_request_overflow() -> None:
     args = (
         torch.empty((512, 256), dtype=torch.bfloat16),
@@ -193,8 +197,8 @@ def test_impure_grouped_worklist_does_not_request_overflow() -> None:
         torch.tensor([0, 128, 256, 384, 512], dtype=torch.int32),
         1,
     )
-    with _forbid_cuda_work(), _target(), _mock_cuda_unavailable():
-        bound = _cpu_bind(_unsupported_k_loop, args)
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_unsupported_k_loop, args)
     assert not bound.config_spec.compiler_seed_overflow_requested
 
 

@@ -5,24 +5,27 @@ from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.softmax import softmax_bwd
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import checked_initial_population
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 
-pytestmark = skipUnlessBackends(["cute"])
+softmax_bwd = import_example("softmax").softmax_bwd
+
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,10 +36,10 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def _forbid_cuda() -> Iterator[None]:
     with (
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
@@ -61,7 +64,7 @@ def _bind(
         torch.empty((rows, columns), dtype=torch.float16),
         torch.empty((rows, columns), dtype=torch.float16),
     )
-    return _cpu_bind(kernel, args), args
+    return cpu_bind(kernel, args), args
 
 
 def _seeds(bound: BoundKernel) -> list[helion.Config]:
@@ -95,7 +98,8 @@ def _initial_population(
             initial_population=profile.initial_population if count is None else count,
             initial_population_strategy=InitialPopulationStrategy.FROM_RANDOM,
         )
-        flats = search._generate_initial_population_flat()
+        # The budgeted rows; compiler coverage witnesses follow them.
+        flats = checked_initial_population(search)[: search.initial_population]
         configs = [search.config_gen.unflatten(flat) for flat in flats]
         assert [search.config_gen.flatten(config) for config in configs] == flats
         assert configs[0] == search.config_gen.unflatten(

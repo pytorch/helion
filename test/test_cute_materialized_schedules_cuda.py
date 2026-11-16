@@ -4,16 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
 import helion
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
-
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
 if TYPE_CHECKING:
     from collections.abc import Callable
 

@@ -252,6 +252,8 @@ def _quack_compiled_kernel(x, weight, config=None):  # noqa: ANN001, ANN202
 def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
+    from helion._testing import import_example
+
     x, weight = _make_inputs(args)
     elem_bytes = x.element_size()
     config_used: object = None
@@ -306,7 +308,7 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
             "driver must set HELION_BACKEND to match --impl"
         )
         os.environ["HELION_BACKEND"] = backend
-        from examples.rms_norm import rms_norm_fwd
+        rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
         import helion
 

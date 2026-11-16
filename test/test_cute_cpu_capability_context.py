@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import nullcontext
 import os
 from pathlib import Path
-import subprocess
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,17 +10,23 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import _compat
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.subprocess_startup import run_test_subprocess
+from helion._testing.subprocess_startup import subprocess_ready
 from helion.autotuner import config_spec
 import helion.language as hl
 from helion.language import loops
 
+pytestmark = pytest.mark.cpu_only
+
 pytest.importorskip("triton")
+
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
 
 
 def _cached_capabilities():
@@ -45,10 +50,10 @@ def test_cpu_capabilities_preserve_process_caches(nested: bool, raises: bool) ->
     with (
         patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         expected,
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
     ):
         outer = _cached_capabilities()
-        with _mock_cuda_unavailable() if nested else nullcontext():
+        with mock_cuda_unavailable() if nested else nullcontext():
             assert torch.cuda.is_available() is False
             assert [function() for function in _cached_capabilities()] == [
                 False,
@@ -72,6 +77,7 @@ def _pointwise(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def _check_codegen_cache_isolation(warm: bool) -> None:
+    subprocess_ready()
     original = _cached_capabilities()
     assert original[0].cache_info().currsize == 0
     assert not torch.cuda.is_initialized()
@@ -103,9 +109,9 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
             ]
         before = [function.cache_info() for function in original]
         args = (torch.empty(64), torch.empty(64))
-        with _mock_cuda_unavailable():
+        with mock_cuda_unavailable():
             kernel = helion.kernel(_pointwise, backend="cute", autotune_effort="none")
-            code = _cpu_bind(kernel, args).to_code(helion.Config(block_sizes=[32]))
+            code = cpu_bind(kernel, args).to_code(helion.Config(block_sizes=[32]))
             assert "@cute.kernel" in code
         assert all(
             a is b for a, b in zip(original, _cached_capabilities(), strict=True)
@@ -122,7 +128,7 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
             patch("helion.runtime.get_num_sm", return_value=148),
         ):
             kernel = helion.kernel(_pointwise, backend="triton", autotune_effort="none")
-            code = _cpu_bind(kernel, args).to_code(
+            code = cpu_bind(kernel, args).to_code(
                 helion.Config(
                     block_sizes=[32],
                     num_warps=4,
@@ -137,15 +143,40 @@ def _check_codegen_cache_isolation(warm: bool) -> None:
         assert not torch.cuda.is_initialized()
 
 
+@skipUnlessBackends(["cute"])
+def test_cpu_codegen_preserves_process_caches() -> None:
+    # The in-process part of the cold-process check below: CuTe codegen under
+    # mock_cuda_unavailable() neither fills nor replaces the capability caches
+    # (a direct import of a cached probe would bypass the patch).
+    original = _cached_capabilities()
+    before = [function.cache_info() for function in original]
+    args = (torch.empty(64), torch.empty(64))
+    with mock_cuda_unavailable():
+        kernel = helion.kernel(_pointwise, backend="cute", autotune_effort="none")
+        code = cpu_bind(kernel, args).to_code(helion.Config(block_sizes=[32]))
+    assert "@cute.kernel" in code
+    assert all(a is b for a, b in zip(original, _cached_capabilities(), strict=True))
+    assert [function.cache_info() for function in original] == before
+
+
+# Each case starts an interpreter that imports torch, Triton and Helion, which
+# the Test Budget Rules put in the slow tier.  Only a cold process shows that
+# a later Triton codegen still reads the real capabilities (maxnreg, the SM
+# count); test_cpu_codegen_preserves_process_caches checks the caches on pull
+# requests.
 @pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.slow
 @skipUnlessBackends(["cute"])
 def test_cpu_codegen_keeps_later_triton_maxnreg(warm: bool) -> None:
     # Each child starts with a real cold cache; no process-wide cache is cleared.
     root = Path(__file__).resolve().parents[1]
-    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="", PYTHONPATH=str(root))
+    environment = dict(os.environ, CUDA_VISIBLE_DEVICES="")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [str(root), *filter(None, [environment.get("PYTHONPATH")])]
+    )
     environment.pop("HELION_BACKEND", None)
     environment.pop("HELION_AUTOTUNE_EFFORT", None)
-    result = subprocess.run(
+    result = run_test_subprocess(
         [
             sys.executable,
             "-B",
@@ -157,9 +188,5 @@ def test_cpu_codegen_keeps_later_triton_maxnreg(warm: bool) -> None:
         ],
         cwd=root,
         env=environment,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr

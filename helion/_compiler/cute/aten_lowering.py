@@ -32,13 +32,17 @@ from ..aten_lowering import argmax_lowering
 from ..aten_lowering import argmin_lowering
 from ..aten_lowering import baddbmm_lowering
 from ..aten_lowering import bmm_lowering
+from ..aten_lowering import codegen_full
+from ..aten_lowering import codegen_scalar_tensor
 from ..aten_lowering import expand_lowering
+from ..aten_lowering import full_lowering
 from ..aten_lowering import gather_lowering
 from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
 from ..aten_lowering import rolled_reduction_iota_index
+from ..aten_lowering import scalar_tensor_lowering
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import stack_lowering
@@ -48,6 +52,7 @@ from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
 from ..aten_lowering import where_lowering
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import _to_sympy
 from ..dtype_utils import cast_ast
 from .argreduce import codegen_cute_tile_argreduce
 from .cute_mma import codegen_cute_mma
@@ -63,6 +68,7 @@ from .iota_utils import cute_free_arange_lanes
 from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
+from .iota_utils import cute_padded_range_reduction_block
 from .matmul_fallback import _emit_cute_matmul
 from .matmul_fallback import _emit_cute_matmul_n_collapse
 from .matmul_utils import cute_lower_rhs_for_matmul
@@ -80,20 +86,19 @@ from .matmul_utils import cute_synthetic_lane_k_extent
 from .matmul_utils import emit_cute_serial_mm_from_load_views
 from .matmul_utils import emit_cute_serial_scalar_mm_from_loads
 from .matmul_utils import emit_cute_synthetic_lane_fold_mm
-from .strategies import is_pure_matmul_role_lifecycle_config
+from .state import cute_codegen_state
+from .synthetic_axes import allocate_arange_coord
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..generate_ast import GenerateAST
 
 _SYNTHETIC_LANE_FOLD_UNSUPPORTED = (
     "CuTe synthetic-lane K matmul fold only supports scaled or permuted "
     "direct-load operands"
 )
-
-
-def _requested_pure_matmul_role_lifecycle(ctx: LoweringContext) -> bool:
-    return is_pure_matmul_role_lifecycle_config(ctx.cg.device_function.config)
 
 
 def _requested_tcgen05_flat_role_coordinates(ctx: LoweringContext) -> bool:
@@ -142,13 +147,41 @@ def _serial_mm_from_load_views(
     if result is not None:
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_pure_matmul_role_lifecycle(ctx):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-                "active-K-loop tcgen05 matmul lowering, not serial scalar fallback",
-            )
     return result
+
+
+def _integer_fill_cute(ctx: LoweringContext, node: Node, value: object) -> object:
+    """One element per thread: the fill's ``value``, an integer or a bool
+    converted to the float dtype as in the pointwise lowering
+    (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+    conversion into it; None for any other fill."""
+    from .handler_ops import integer_to_float_expr
+    from .handler_ops import scalar_value_dtype
+
+    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
+    if not (isinstance(value, Node) and isinstance(dtype, torch.dtype)):
+        return None
+    value_ast = _env_arg(ctx, value)
+    if not isinstance(value_ast, ast.AST):
+        return None
+    return integer_to_float_expr(
+        value_ast,
+        dtype,
+        scalar_value_dtype(value.meta.get("val")),
+        ctx.cg.device_function,
+    )
+
+
+@full_lowering.register_codegen("cute")
+def codegen_full_cute(ctx: LoweringContext, node: Node) -> object:
+    converted = _integer_fill_cute(ctx, node, node.args[1])
+    return codegen_full(ctx, node) if converted is None else converted
+
+
+@scalar_tensor_lowering.register_codegen("cute")
+def codegen_scalar_tensor_cute(ctx: LoweringContext, node: Node) -> object:
+    converted = _integer_fill_cute(ctx, node, node.args[0])
+    return codegen_scalar_tensor(ctx, node) if converted is None else converted
 
 
 @where_lowering.register_codegen("cute")
@@ -434,19 +467,10 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         if k_block_id is not None or static_k_extent is not None
         else cute_static_serial_matmul_k_extent(lhs_node, rhs_node)
     )
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
-
+    size_hint = CompileEnvironment.current().size_hint
     k_is_one = (
-        hinted(lhs_node.meta["val"].shape[-1]) == 1
-        and hinted(rhs_node.meta["val"].shape[-2]) == 1
+        _hinted_size(lhs_node.meta["val"].shape[-1], size_hint) == 1
+        and _hinted_size(rhs_node.meta["val"].shape[-2], size_hint) == 1
     )
     out_dtype = node.meta["val"].dtype if "val" in node.meta else None
     outer_acc_dtype = cute_outer_accumulator_dtype(node, is_acc_none=True)
@@ -480,12 +504,6 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if direct_mma_result is not None:
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_pure_matmul_role_lifecycle(ctx):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-                "active-K-loop tcgen05 matmul lowering, not direct-mm fallback",
-            )
         # The direct warp-MMA path always yields its fp32 accumulator; round it
         # to the declared (non-fp32) output dtype so a later widening cast
         # observes the same bf16/fp16 result as every other matmul lowering.
@@ -502,12 +520,6 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     if serial_result is not None:
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
-        if _requested_pure_matmul_role_lifecycle(ctx):
-            raise exc.BackendUnsupported(
-                "cute",
-                "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-                "active-K-loop tcgen05 matmul lowering, not serial scalar fallback",
-            )
         return serial_result
     if serial_k_extent is not None:
         view_result = _serial_mm_from_load_views(ctx, node, effective_out_dtype)
@@ -517,19 +529,13 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             "cute",
             "CuTe direct mm without an active K tile only supports contiguous direct-load operands",
         )
-    if _requested_pure_matmul_role_lifecycle(ctx):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires aten.mm "
-            "to lower through the tcgen05 K-loop path",
-        )
     if _requested_tcgen05_flat_role_coordinates(ctx):
         _reject_tcgen05_flat_role_coordinates_fallback()
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
         assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
-            ctx,
+            ctx.cg,
             lhs_node,
             rhs_node,
             k_block_id=k_block_id,
@@ -565,9 +571,20 @@ def codegen_mm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     )
 
 
-@addmm_lowering.register_codegen("cute")
-def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
-    assert not node.kwargs, "addmm kwargs not supported"
+def _hinted_size(
+    size: int | torch.SymInt, size_hint: Callable[[int | torch.SymInt], int]
+) -> int:
+    """``size`` as an int, through the environment's ``size_hint``."""
+    hinted_size = size_hint(size)
+    assert isinstance(hinted_size, int)
+    return hinted_size
+
+
+def _codegen_fused_mm_add_cute(
+    ctx: LoweringContext, node: Node, *, batched: bool
+) -> ast.AST:
+    """Shared ``aten.addmm`` / ``aten.baddbmm`` lowering (``batched`` selects
+    the baddbmm-only N-collapse fold and its error text)."""
     from .cute_mma import codegen_cute_mma
 
     result = codegen_cute_mma(ctx, node, with_acc=True)
@@ -575,12 +592,6 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         return result
     if _requested_tcgen05_flat_role_coordinates(ctx):
         _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_pure_matmul_role_lifecycle(ctx):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires the "
-            "active-K-loop tcgen05 addmm lowering",
-        )
     acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
     assert isinstance(acc, ast.AST)
     assert isinstance(lhs, (ast.AST, CutePackedAffineLoad, CutePackedTerms))
@@ -617,19 +628,10 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     )
     if collective is not None:
         return collective
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
-
+    size_hint = CompileEnvironment.current().size_hint
     k_is_one = (
-        hinted(lhs_node.meta["val"].shape[-1]) == 1
-        and hinted(rhs_node.meta["val"].shape[-2]) == 1
+        _hinted_size(lhs_node.meta["val"].shape[-1], size_hint) == 1
+        and _hinted_size(rhs_node.meta["val"].shape[-2], size_hint) == 1
     )
     if static_k_extent is None and k_block_id is None and not k_is_one:
         view_result = _serial_mm_from_load_views(
@@ -641,11 +643,25 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
             "cute",
             "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
         )
+    if batched:
+        n_collapse_result = _maybe_codegen_cute_baddbmm_n_collapse(
+            ctx,
+            node,
+            lhs=lhs,
+            acc=acc,
+            lhs_node=lhs_node,
+            rhs_node=rhs_node,
+            acc_node=acc_node,
+            k_block_id=k_block_id,
+            static_k_extent=static_k_extent,
+        )
+        if n_collapse_result is not None:
+            return n_collapse_result
     lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
     if lane_fold_k is not None:
         assert k_block_id is not None
         fold_result = emit_cute_synthetic_lane_fold_mm(
-            ctx,
+            ctx.cg,
             lhs_node,
             rhs_node,
             k_block_id=k_block_id,
@@ -678,6 +694,12 @@ def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
         acc_node=acc_node,
         fx_node=node,
     )
+
+
+@addmm_lowering.register_codegen("cute")
+def codegen_addmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
+    assert not node.kwargs, "addmm kwargs not supported"
+    return _codegen_fused_mm_add_cute(ctx, node, batched=False)
 
 
 def _cute_baddbmm_result_reduced_over_block(
@@ -836,129 +858,7 @@ def _maybe_codegen_cute_baddbmm_n_collapse(
 @baddbmm_lowering.register_codegen("cute")
 def codegen_baddbmm_cute(ctx: LoweringContext, node: Node) -> ast.AST:
     assert not node.kwargs, "baddbmm kwargs not supported"
-    from .cute_mma import codegen_cute_mma
-
-    result = codegen_cute_mma(ctx, node, with_acc=True)
-    if result is not None:
-        return result
-    if _requested_tcgen05_flat_role_coordinates(ctx):
-        _reject_tcgen05_flat_role_coordinates_fallback()
-    if _requested_pure_matmul_role_lifecycle(ctx):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires "
-            "aten.baddbmm to lower through the tcgen05 K-loop path",
-        )
-    acc, lhs, rhs = map_arg(node.args, lambda arg: _env_arg(ctx, arg))
-    assert isinstance(acc, ast.AST)
-    assert isinstance(lhs, (ast.AST, CutePackedAffineLoad))
-    acc_node = node.args[0]
-    lhs_node = node.args[1]
-    rhs_node = node.args[2]
-    assert isinstance(acc_node, Node)
-    assert isinstance(lhs_node, Node)
-    assert isinstance(rhs_node, Node)
-    assert isinstance(rhs, ast.AST)
-    rhs, packed_rhs = cute_lower_rhs_for_matmul(ctx.env, lhs, rhs_node, rhs)
-    k_block_id = cute_resolve_active_matmul_k_block_id(
-        ctx.cg,
-        lhs_node.meta["val"].shape[-1],
-        rhs_node.meta["val"].shape[-2],
-        rhs_node.meta["val"].shape[-1],
-        lhs_m_size=lhs_node.meta["val"].shape[-2],
-    )
-    if k_block_id is None and packed_rhs is not None:
-        packed_nodes, _ = packed_rhs
-        packed_node = packed_nodes[0]
-        k_block_id = cute_resolve_active_block_id(
-            ctx.cg, packed_node.meta["val"].shape[0]
-        )
-    static_k_extent = (
-        None
-        if k_block_id is not None
-        else cute_static_k_invariant_extent(lhs_node, rhs_node)
-    )
-    from .collective_matmul import mark_collective_matmul
-
-    collective = mark_collective_matmul(
-        ctx, node, k_block_id=k_block_id, lhs=lhs, rhs=rhs, acc=acc
-    )
-    if collective is not None:
-        return collective
-    env = CompileEnvironment.current()
-    size_hint = getattr(env, "size_hint", None)
-
-    def hinted(size: int | torch.SymInt) -> int:
-        if callable(size_hint):
-            hinted_size = size_hint(size)
-            assert isinstance(hinted_size, int)
-            return hinted_size
-        return int(size)
-
-    k_is_one = (
-        hinted(lhs_node.meta["val"].shape[-1]) == 1
-        and hinted(rhs_node.meta["val"].shape[-2]) == 1
-    )
-    if static_k_extent is None and k_block_id is None and not k_is_one:
-        view_result = _serial_mm_from_load_views(
-            ctx, node, node.meta["val"].dtype, acc=acc
-        )
-        if view_result is not None:
-            return view_result
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
-        )
-    n_collapse_result = _maybe_codegen_cute_baddbmm_n_collapse(
-        ctx,
-        node,
-        lhs=lhs,
-        acc=acc,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
-        acc_node=acc_node,
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-    )
-    if n_collapse_result is not None:
-        return n_collapse_result
-    lane_fold_k = cute_synthetic_lane_k_extent(ctx.cg, k_block_id)
-    if lane_fold_k is not None:
-        assert k_block_id is not None
-        fold_result = emit_cute_synthetic_lane_fold_mm(
-            ctx,
-            lhs_node,
-            rhs_node,
-            k_block_id=k_block_id,
-            k_extent=lane_fold_k,
-            acc=acc,
-            out_dtype=node.meta["val"].dtype if "val" in node.meta else None,
-            acc_dtype=acc_node.meta["val"].dtype,
-            lhs_dtype=lhs_node.meta["val"].dtype,
-            rhs_dtype=rhs_node.meta["val"].dtype,
-        )
-        if fold_result is None:
-            fold_result = _serial_mm_from_load_views(
-                ctx, node, node.meta["val"].dtype, acc=acc
-            )
-        if fold_result is not None:
-            return fold_result
-        raise exc.BackendUnsupported("cute", _SYNTHETIC_LANE_FOLD_UNSUPPORTED)
-    return _emit_cute_matmul(
-        ctx.cg,
-        lhs,
-        rhs,
-        k_block_id=k_block_id,
-        static_k_extent=static_k_extent,
-        acc=acc,
-        acc_dtype=acc_node.meta["val"].dtype,
-        lhs_dtype=lhs_node.meta["val"].dtype,
-        rhs_dtype=rhs_node.meta["val"].dtype,
-        lhs_node=lhs_node,
-        rhs_node=rhs_node,
-        acc_node=acc_node,
-        fx_node=node,
-    )
+    return _codegen_fused_mm_add_cute(ctx, node, batched=True)
 
 
 def _cute_compacted_tile_begin_lane_expr(
@@ -1045,7 +945,7 @@ def _cute_free_arange_axis_expr(
     # collapse: Helion indexes two tensor entries as a cartesian tile, so
     # ``x[r.unsqueeze(1), r.unsqueeze(0)]`` and ``x[r + 1, r + 2]`` both need a
     # second lane coordinate that this arange's one axis cannot provide.
-    positions = cg.cute_synthetic_arange_access_positions
+    positions = cute_codegen_state(cg).synthetic_arange_access_positions
     claimed: set[Node] = set()
     for access, position in cute_free_arange_memory_index_positions(source_node):
         if (
@@ -1058,7 +958,7 @@ def _cute_free_arange_axis_expr(
                 "the SIMT lowering addresses one lane coordinate per thread axis",
             )
         claimed.add(access)
-    return cg.allocate_cute_synthetic_arange_coord(key, length_hint)
+    return allocate_arange_coord(cg, key, length_hint)
 
 
 def _arange_endpoint_key(value: object) -> object:
@@ -1381,6 +1281,17 @@ def _cute_iota_expr(
                 ]
                 if len(grid_candidates) == 1:
                     block_id = grid_candidates[0]
+            if (
+                block_id is None
+                and (
+                    padded := cute_padded_range_reduction_block(
+                        cg, source_node, length_hint
+                    )
+                )
+                is not None
+            ):
+                block_id = padded
+                cute_codegen_state(cg).padded_range_blocks[source_node] = padded
     if block_id is None:
         if (active_expr := active_iota_expr()) is not None:
             return active_expr
@@ -1489,6 +1400,7 @@ def _cute_iota_expr(
 
 @iota_lowering.register_codegen("cute")
 def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
+    _refuse_size_derived_range(ctx, node.args[0])
     return _cute_iota_expr(
         ctx,
         source_node=node,
@@ -1499,8 +1411,56 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+def _refuse_size_derived_range(ctx: LoweringContext, length: object) -> None:
+    """Refuse a range whose length is computed from a reduction dim's size
+    (``hl.arange(row.size(1) // 2)``) other than the size itself, unless the
+    dim's block size gives it the value the dim's extent gives, with any other
+    block size in it (``row.size(1) // row.size(0)``) from the config on both
+    sides.  The range runs over the lanes of the dim registered for its
+    shape, which keeps the length traced over the block size
+    (``resolve_reduction_sizes``): half of 129 columns, in 64-column chunks,
+    would run 32 lanes, not 64."""
+    from ..generate_ast import GenerateAST
+    from .cute_reshape import _resolve_tile_extent
+
+    value = length.meta.get("val") if isinstance(length, Node) else length
+    if not isinstance(value, torch.SymInt):
+        return
+    env = CompileEnvironment.current()
+    expr = value.node.expr
+    if env.get_block_id(expr) is not None:
+        return
+    reductions = [
+        (symbol, env.block_sizes[block_id])
+        for symbol in expr.free_symbols
+        if (block_id := env.get_block_id(symbol)) is not None
+        and env.block_sizes[block_id].reduction
+    ]
+    if not reductions:
+        return
+    extents = {
+        symbol: _to_sympy(info.size)
+        for symbol, info in reductions
+        if isinstance(info.size, (int, torch.SymInt))
+    }
+    assert isinstance(ctx.cg, GenerateAST)
+    config = ctx.cg.device_function.config
+    traced = _resolve_tile_extent(value, env, config)
+    extent = expr.xreplace(extents)
+    assert isinstance(extent, sympy.Expr)
+    if (
+        traced is None
+        or len(extents) < len(reductions)
+        or _resolve_tile_extent(extent, env, config) != traced
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "a range whose length is computed from a reduction dim's size"
+        )
+
+
 @arange_default_lowering.register_codegen("cute")
 def codegen_arange_default_cute(ctx: LoweringContext, node: Node) -> object:
+    _refuse_size_derived_range(ctx, node.args[0])
     return _cute_iota_expr(
         ctx,
         source_node=node,
@@ -1598,10 +1558,10 @@ def codegen_gather_cute(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(dim, int)
     assert isinstance(index_node, Node)
 
-    from ...language.memory_ops import _cute_combined_mask
-    from ...language.memory_ops import _cute_index_exprs
     from ...language.memory_ops import load
     from ..inductor_lowering import CodegenState
+    from .emitters.memory_access import _cute_combined_mask
+    from .emitters.memory_access import _cute_index_exprs
 
     if input_node.target is not load:
         raise exc.BackendUnsupported("cute", "torch.gather input")

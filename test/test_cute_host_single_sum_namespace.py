@@ -2,35 +2,25 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_host_paired_sum import _config
 from test.test_cute_host_paired_sum_seeds import _population
 
 import helion
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.exc import InvalidConfig
 import helion.language as hl
 
-pytestmark = skipUnlessBackends(["cute"])
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipUnlessBackends(["cute"]),
+    pytest.mark.cpu_render,
+]
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -77,7 +67,7 @@ def test_collision_retains_real_caller_fallback_and_never_seeds(
 ) -> None:
     initial_cuda_state = torch.cuda.is_initialized()
     original = torch.arange(17 * 20, dtype=torch.float32).view(17, 20)
-    bound = _cpu_bind(kernel, (original,))
+    bound = cpu_bind(kernel, (original,))
     assert not bound.config_spec.cute_host_paired_sum_available
     assert all(
         "cute_host_paired_sum" not in config

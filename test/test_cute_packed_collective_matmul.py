@@ -6,22 +6,27 @@ import operator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
-from examples.int4_gemm import _unpack_int4_matrix
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteCollectiveMatmulHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._compiler.cute.collective_matmul import _tensor_roots
+from helion._compiler.cute.packed_matmul import packed_axis_for_fact
 from helion._compiler.cute.packed_matmul import packed_matmul_axis
-from helion._testing import skipUnlessBackends
+from helion._compiler.tile_strategy import PerThreadNDTileStrategy
+from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import BackendUnsupported
 import helion.language as hl
 from helion.language.matmul_ops import dot
+
+pytestmark = pytest.mark.cpu_only
+
+_examples_int4_gemm = import_example("int4_gemm")
+_unpack_int4_matrix = _examples_int4_gemm._unpack_int4_matrix
+matmul_bf16_int4 = _examples_int4_gemm.matmul_bf16_int4
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
@@ -86,7 +91,7 @@ def _original_bound(
         autotune_effort="none",
         **settings,
     )
-    return _cpu_bind(
+    return cpu_bind(
         kernel,
         (torch.empty((m, k), dtype=dtype), torch.empty((k // 2, n), dtype=torch.int8)),
     )
@@ -95,9 +100,8 @@ def _original_bound(
 @pytest.mark.parametrize(
     "shape", [(128, 256, 128), (512, 1024, 512), (1024, 2048, 1024)]
 )
-@skipUnlessBackends(["cute"])
 def test_original_int4_has_searchable_packed_collective_seeds(
-    shape: tuple[int, int, int],
+    shape: tuple[int, int, int], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bound = _original_bound(shape)
     assert bound.host_function is not None
@@ -119,6 +123,22 @@ def test_original_int4_has_searchable_packed_collective_seeds(
     assert "input_tensor_metadata" in bound.env.compiler_fact_specialization_facts
     # Direct-load native facts must retain their logical, expanded K semantics.
     assert bound.config_spec.matmul_facts[0].k_block_id is None
+    with bound.env:
+        packed = packed_axis_for_fact(
+            bound.env, bound.host_function.device_ir, bound.config_spec.matmul_facts[0]
+        )
+    assert packed is not None
+    original = PerThreadNDTileStrategy.use_shared_thread_extents
+
+    def normalize_sibling(
+        strategy: PerThreadNDTileStrategy, extents: dict[int, int]
+    ) -> None:
+        assert packed.block_id not in strategy.block_ids
+        original(strategy, extents)
+
+    monkeypatch.setattr(
+        PerThreadNDTileStrategy, "use_shared_thread_extents", normalize_sibling
+    )
     for compute in ("warp", "tcgen05"):
         seed = next(
             value
@@ -135,7 +155,6 @@ def test_original_int4_has_searchable_packed_collective_seeds(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("factor", [2, 4])
 @pytest.mark.parametrize("use_addmm", [False, True])
-@skipUnlessBackends(["cute"])
 def test_packed_collective_is_not_specific_to_int4(
     dtype: torch.dtype, factor: int, use_addmm: bool
 ) -> None:
@@ -146,7 +165,7 @@ def test_packed_collective_is_not_specific_to_int4(
         factor,
         use_addmm,
     )
-    source = _cpu_bind(_expanded_matmul, inputs).to_code(_config(factor=factor))
+    source = cpu_bind(_expanded_matmul, inputs).to_code(_config(factor=factor))
     assert "tcgen05.CtaGroup.ONE" in source
     assert "cute.gemm(" in source
     for lane in range(factor):
@@ -155,13 +174,12 @@ def test_packed_collective_is_not_specific_to_int4(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("n_first", [False, True])
-@skipUnlessBackends(["cute"])
 def test_packed_collective_preserves_input_alias_rejection(
     dtype: torch.dtype, n_first: bool
 ) -> None:
     a = torch.empty((73, 78), dtype=dtype)
     inputs = (a, torch.empty((39, 41), dtype=torch.int8), a[:, :41], 2, False)
-    bound = _cpu_bind(_expanded_matmul, inputs)
+    bound = cpu_bind(_expanded_matmul, inputs)
     # The output aliases an operand: the thread-race check sees the store race
     # the operand loads before the collective lowering sees the aliasing.
     with pytest.raises(BackendUnsupported, match="a body a later pass rewrites"):
@@ -176,7 +194,6 @@ def test_tensor_subscript_reads_participate_in_alias_proof() -> None:
 @pytest.mark.parametrize(
     "mutation", ["interleave", "extent", "term_dtype", "affine_start"]
 )
-@skipUnlessBackends(["cute"])
 def test_packed_axis_rejects_unproved_interleaving(mutation: str) -> None:
     bound = _original_bound()
     assert bound.host_function is not None
@@ -209,7 +226,6 @@ def test_packed_axis_rejects_unproved_interleaving(mutation: str) -> None:
     assert packed_matmul_axis(bound.env, lhs, rhs) is None
 
 
-@skipUnlessBackends(["cute"])
 def test_nonintegral_mma_expansion_has_no_collective_seed() -> None:
     inputs = (
         torch.empty((73, 117), dtype=torch.bfloat16),
@@ -218,7 +234,7 @@ def test_nonintegral_mma_expansion_has_no_collective_seed() -> None:
         3,
         False,
     )
-    bound = _cpu_bind(_expanded_matmul, inputs)
+    bound = cpu_bind(_expanded_matmul, inputs)
     assert bound.host_function is not None
     with bound.env:
         assert not CuteCollectiveMatmulHeuristic.get_seed_configs(
@@ -259,7 +275,6 @@ class _ScalarTensor:
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("compute", ["warp", "tcgen05"])
-@skipUnlessBackends(["cute"])
 def test_actual_staging_replays_all_nibbles_and_mnk_tail_masks(
     dtype: torch.dtype, compute: str
 ) -> None:

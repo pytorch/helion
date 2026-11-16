@@ -16,11 +16,12 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from torch.fx.experimental.symbolic_shapes import statically_known_true
 
+from ..ast_extension import iter_statements
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
-from .memory_ops import tensor_has_specialized_base_alignment
+from ._ast_pass_utils import _bound_names
+from .memory_ops import tensor_proven_base_alignment
 from .persistent_branch_vec import _DTYPE_INFO
 from .persistent_branch_vec import _and_terms
 from .persistent_branch_vec import _binding_write_roots
@@ -28,11 +29,13 @@ from .persistent_branch_vec import _clone_expr
 from .persistent_branch_vec import _definition_snapshots
 from .persistent_branch_vec import _expand
 from .persistent_branch_vec import _lane_scale_value
+from .persistent_branch_vec import _memory_definition_snapshots
 from .persistent_branch_vec import _plain_scalar_load_pointer
 from .persistent_branch_vec import _plain_scalar_store_pointer
 from .persistent_branch_vec import _pointer_integer_affine_form
 from .persistent_branch_vec import _range_extent
 from .persistent_branch_vec import _single_tensor_iterator_root
+from .persistent_branch_vec import _tensor_stride_reference
 from .scalar_integer import _integer_expression
 from .scalar_recipe import PURE_HELPERS
 
@@ -42,12 +45,16 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from .bounded_loop_cache import OwnedFragment
 
-_LANE = re.compile(r"vec_lane_(\d+)")
+_LANE = re.compile(r"(?:vec_lane_|synthetic_lane_)(\d+)")
 _CASTS = frozenset(
     f"cutlass.{name}"
     for name in (
+        "Int8",
+        "Int16",
         "Int32",
         "Int64",
+        "Uint8",
+        "Uint16",
         "Uint32",
         "Uint64",
         "Float32",
@@ -60,12 +67,18 @@ _COORDINATE_CALLS = frozenset(("cute.arch.thread_idx", "cute.arch.block_idx"))
 _COMPARISON_CALLS = frozenset(
     f"operator.{name}" for name in ("lt", "le", "gt", "ge", "eq", "ne")
 )
+# Elementwise ``cute.math`` calls, including the fast-math forms the setting
+# rewrites exp/division into (``exp2(fma(x, log2e, -m), fastmath=True)``,
+# ``div(a, b, approx=True, ftz=True)``): all pure, so a body using them still
+# vectorizes its loads and stores.
 _PURE = frozenset(
     f"cute.math.{name}"
     for name in (
         "abs",
+        "div",
         "exp",
         "exp2",
+        "fma",
         "log",
         "log2",
         "max",
@@ -78,11 +91,99 @@ _PURE = frozenset(
 )
 
 
+def _offset_affine_form(
+    node: ast.AST,
+    definitions: dict[str, ast.expr],
+    strides: dict[tuple[str, int], int],
+    constexpr: dict[str, int],
+    *,
+    depth: int = 0,
+) -> tuple[dict[str, int], int] | None:
+    """``(linear, constant)`` of an integer pointer offset in elements.
+
+    Names are read through ``definitions`` (the loop's and the enclosing
+    scopes') and ``constexpr`` (the module constants); a name without either,
+    and any expression this parser does not model (an integer division, a
+    coordinate call, a product of two non-constant factors), is a leaf keyed
+    by its source text, so two offsets built from the same definitions agree
+    on every leaf.  ``cutlass.Int32`` / ``Int64`` casts are transparent and a
+    ``T.layout.stride[d]`` reference takes its proven value.  ``None`` only
+    when the definition chain is too deep.
+    """
+    if depth > 32:
+        return None
+    stride = _tensor_stride_reference(node)
+    if stride is not None:
+        value = strides.get(stride)
+        return ({ast.unparse(node): 1}, 0) if value is None else ({}, value)
+    if isinstance(node, ast.Constant):
+        value = node.value
+        return ({}, value) if type(value) is int else ({ast.unparse(node): 1}, 0)
+    if isinstance(node, ast.Name):
+        if node.id in constexpr:
+            return {}, constexpr[node.id]
+        definition = definitions.get(node.id)
+        if definition is None:
+            return ({node.id: 1}, 0)
+        return _offset_affine_form(
+            definition, definitions, strides, constexpr, depth=depth + 1
+        )
+    if (
+        isinstance(node, ast.Call)
+        and ast.unparse(node.func) in ("cutlass.Int32", "cutlass.Int64")
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        return _offset_affine_form(
+            node.args[0], definitions, strides, constexpr, depth=depth + 1
+        )
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        form = _offset_affine_form(
+            node.operand, definitions, strides, constexpr, depth=depth + 1
+        )
+        if form is None or isinstance(node.op, ast.UAdd):
+            return form
+        return {k: -v for k, v in form[0].items()}, -form[1]
+    if isinstance(node, ast.BinOp) and isinstance(
+        node.op, (ast.Add, ast.Sub, ast.Mult)
+    ):
+        left = _offset_affine_form(
+            node.left, definitions, strides, constexpr, depth=depth + 1
+        )
+        right = _offset_affine_form(
+            node.right, definitions, strides, constexpr, depth=depth + 1
+        )
+        if left is None or right is None:
+            return None
+        if isinstance(node.op, ast.Mult):
+            if left[0] and right[0]:
+                return ({ast.unparse(node): 1}, 0)
+            scale, (linear, constant) = (
+                (left[1], right) if not left[0] else (right[1], left)
+            )
+            return (
+                {k: v * scale for k, v in linear.items() if v * scale},
+                constant * scale,
+            )
+        sign = -1 if isinstance(node.op, ast.Sub) else 1
+        linear = dict(left[0])
+        for k, v in right[0].items():
+            linear[k] = linear.get(k, 0) + sign * v
+        return {k: v for k, v in linear.items() if v}, left[1] + sign * right[1]
+    return ({ast.unparse(node): 1}, 0)
+
+
+# Lane-loop extents the vectorizer packs: every ``cute_vector_widths`` choice
+# above one.  A width wider than one sixteen-byte packet (16 lanes of a 16-bit
+# dtype) issues several packets per access site (``memory_width``).
+_LANE_EXTENTS = (2, 4, 8, 16)
+
+
 def _affine_loop_candidate(loop: ast.For) -> bool:
     return (
         isinstance(loop.target, ast.Name)
         and _LANE.fullmatch(loop.target.id) is not None
-        and _range_extent(loop) in (2, 4, 8)
+        and _range_extent(loop) in _LANE_EXTENTS
     )
 
 
@@ -449,7 +550,8 @@ def _accesses(
             # A predicate may not itself perform memory accesses or effects.
             if any(
                 isinstance(item, ast.Call)
-                and ast.unparse(item.func) not in _CASTS | PURE_HELPERS
+                and ast.unparse(item.func)
+                not in _CASTS | PURE_HELPERS | _COMPARISON_CALLS
                 and not (extra_pure_call is not None and extra_pure_call(item))
                 for item in ast.walk(node.test)
             ):
@@ -504,9 +606,10 @@ def _accesses(
                     visit(arg, statement, guards)
                 return
             name = ast.unparse(node.func)
-            if name not in _CASTS | _PURE | PURE_HELPERS and name not in (
-                "cute.arch.thread_idx",
-                "cute.arch.block_idx",
+            # Scalar comparisons (``operator.ge(a, b)``) are pure like the
+            # ``ast.Compare`` forms the scalar lowering also emits.
+            if name not in _CASTS | _PURE | PURE_HELPERS | _COMPARISON_CALLS and (
+                name not in ("cute.arch.thread_idx", "cute.arch.block_idx")
             ):
                 if not (
                     isinstance(node.func, ast.Attribute)
@@ -537,6 +640,7 @@ class _Vectorizer:
         integer_tensors: frozenset[str] = frozenset(),
         private_accesses: frozenset[str] = frozenset(),
         register_accesses: frozenset[str] = frozenset(),
+        unshadowed_abs: bool = False,
     ) -> None:
         self.strides = strides
         self.alignments = alignments
@@ -550,6 +654,29 @@ class _Vectorizer:
         }
         self.integer_parameters = integer_parameters - writes
         self.integer_tensors = integer_tensors - writes
+        # The caller proves the generated function/module bindings; reject
+        # local rebindings visible in the supplied body as well.
+        self.unshadowed_abs = (
+            unshadowed_abs
+            and "abs" not in (writes | dtypes.keys() | constexpr.keys())
+            and not any(
+                isinstance(
+                    node,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                        ast.Import,
+                        ast.ImportFrom,
+                        ast.Global,
+                        ast.Nonlocal,
+                    ),
+                )
+                and "abs" in _bound_names(node)
+                for statement in body
+                for node in ast.walk(statement)
+            )
+        )
         self.private_accesses = private_accesses
         self.register_accesses = register_accesses
         # Definitions are frozen clones that no pass mutates, so their read
@@ -571,12 +698,18 @@ class _Vectorizer:
         return name
 
     def accesses(self, body: list[ast.stmt]) -> list[_Access]:
-        if not self.private_accesses and not self.register_accesses:
+        if not (self.private_accesses or self.register_accesses or self.unshadowed_abs):
             return _accesses(body)
         return _accesses(
             body,
             extra_pure_call=lambda call: (
-                bool(self.private_accesses)
+                self.unshadowed_abs
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "abs"
+                and len(call.args) == 1
+                and not isinstance(call.args[0], ast.Starred)
+                and not call.keywords
+                or bool(self.private_accesses)
                 and (
                     ast.unparse(call.func) in {"cute.arch.fmax", "cute.arch.fmin"}
                     or ast.unparse(call.func) == "float"
@@ -600,14 +733,15 @@ class _Vectorizer:
         )
 
     def snapshots(self, body: list[ast.stmt]) -> list[dict[str, ast.expr]] | None:
-        return _definition_snapshots(body)
+        return _memory_definition_snapshots(body)
 
     def memory_width(self, width: int, itemsize: int) -> int:
-        if self.register_accesses:
-            # An eight-lane RNG packet may need two sixteen-byte transactions.
-            # Alignment and the complete-fragment guard still cover all lanes.
-            return min(width, 16 // itemsize)
-        return width
+        # Lanes per memory transaction: a lane loop wider than sixteen bytes
+        # (an eight-lane RNG packet of fp32, a ``cute_vector_widths`` of 16
+        # on a 16-bit dtype) issues several sixteen-byte packets per access
+        # site instead of declining to a scalar loop.  Alignment and the
+        # complete-fragment guard still cover all lanes.
+        return min(width, 16 // itemsize)
 
     def specialize_mask(
         self, loop: ast.For, predicate: ast.expr, lane: str, value: bool
@@ -874,21 +1008,35 @@ class _Vectorizer:
         assert isinstance(loop, ast.For)
         try:
             sites = self.accesses(loop.body)
-            if not sites or sum(site.store for site in sites) > 1:
+            if not sites:
                 return None
             roots = [_single_tensor_iterator_root(site.pointer) for site in sites]
             if any(root is None or root not in self.dtypes for root in roots):
                 return None
-            for left, site in enumerate(sites):
-                if site.store and any(
-                    index != left
-                    and frozenset((roots[left], root)) not in self.disjoint
-                    for index, root in enumerate(roots)
-                ):
-                    return None
             snapshots = self.snapshots(loop.body)
             if snapshots is None:
                 return None
+            # Every store's tensor must be disjoint from every other access's
+            # tensor, except another store into the same tensor whose
+            # addresses provably never meet this one's for any pair of lanes
+            # (``_disjoint_store_pair``: an interleaved operand written as
+            # rows ``2k`` and ``2k + 1`` from two sites).  Stores flush after
+            # the loop in site order, so two sites that never alias may
+            # reorder freely.
+            for left, site in enumerate(sites):
+                if not site.store:
+                    continue
+                for index, (other, root) in enumerate(zip(sites, roots, strict=True)):
+                    if index == left or frozenset((roots[left], root)) in self.disjoint:
+                        continue
+                    if not (
+                        other.store
+                        and root == roots[left]
+                        and self._disjoint_store_pair(
+                            site, other, snapshots, outer, lane, width
+                        )
+                    ):
+                        return None
             writes = {
                 name
                 for statement in loop.body
@@ -912,8 +1060,10 @@ class _Vectorizer:
                     raise _Decline
                 carrier, itemsize, helper = info
                 memory_width = self.memory_width(width, itemsize)
-                if memory_width * itemsize > 16 or self.alignments.get(root, 1) % (
-                    memory_width * itemsize
+                if (
+                    memory_width * itemsize > 16
+                    or width % memory_width
+                    or self.alignments.get(root, 1) % (memory_width * itemsize)
                 ):
                     raise _Decline
                 local = snapshots[site.statement]
@@ -1094,6 +1244,62 @@ class _Vectorizer:
         except _Decline:
             return None
 
+    def _disjoint_store_pair(
+        self,
+        first: _Access,
+        second: _Access,
+        snapshots: list[dict[str, ast.expr]],
+        outer: dict[str, ast.expr],
+        lane: str,
+        width: int,
+    ) -> bool:
+        """Whether two stores into one tensor never address the same element
+        for any pair of lanes ``l, l'`` of the V-loop.
+
+        Both pointer offsets, read through the loop's and the enclosing
+        scopes' definitions (``_offset_affine_form``), must advance one
+        element per lane, agree on every other term and differ by a constant
+        of at least ``width`` elements: ``l - l' + delta`` is then never zero.
+        """
+        forms = []
+        for site in (first, second):
+            # ``T.iterator + term + ... + term``: the root, then the offset.
+            terms: list[ast.expr] = []
+            node = site.pointer
+            while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                terms.insert(0, node.right)
+                node = node.left
+            if not terms:
+                return False
+            definitions = {**outer, **snapshots[site.statement]}
+            linear: dict[str, int] = {}
+            constant = 0
+            for term in terms:
+                form = _offset_affine_form(
+                    term, definitions, self.strides, self.constexpr
+                )
+                if form is None:
+                    return False
+                for key, value in form[0].items():
+                    linear[key] = linear.get(key, 0) + value
+                constant += form[1]
+            linear = {key: value for key, value in linear.items() if value}
+            if linear.get(lane) != 1:
+                return False
+            forms.append((ast.unparse(node), (linear, constant)))
+        (
+            (first_base, (first_linear, first_constant)),
+            (
+                second_base,
+                (second_linear, second_constant),
+            ),
+        ) = forms
+        return (
+            first_base == second_base
+            and first_linear == second_linear
+            and abs(first_constant - second_constant) >= width
+        )
+
     def definition_reads(self, value: ast.expr) -> frozenset[str]:
         reads = self._definition_reads.get(value)
         if reads is None:
@@ -1223,8 +1429,6 @@ def vectorize_affine_tile_lanes(
     from ..device_function import TensorPropertyArg
 
     env = CompileEnvironment.current()
-    inputs = list(env.input_sources)
-    input_storages = {id(tensor.untyped_storage()) for tensor in inputs}
     strides = device_function.proven_tensor_stride_values()
     alignments = {}
     dtypes = {}
@@ -1242,26 +1446,9 @@ def vectorize_affine_tile_lanes(
         for dim, stride in enumerate(tensor.stride()):
             if isinstance(stride, int):
                 strides[arg.name, dim] = stride
-        storage = id(tensor.untyped_storage())
-        offset = tensor.storage_offset() * tensor.element_size()
-        for alignment in (16, 8, 4):
-            aligned = storage not in input_storages and statically_known_true(
-                offset % alignment == 0
-            )
-            if not aligned:
-                aligned = any(
-                    id(source.untyped_storage()) == storage
-                    and tensor_has_specialized_base_alignment(env, source, alignment)
-                    and statically_known_true(
-                        (offset - source.storage_offset() * source.element_size())
-                        % alignment
-                        == 0
-                    )
-                    for source in inputs
-                )
-            if aligned:
-                alignments[arg.name] = alignment
-                break
+        alignment = tensor_proven_base_alignment(env, tensor)
+        if alignment is not None:
+            alignments[arg.name] = alignment
     if env.config_spec.pointwise_facts:
         from .pure_lane_packets import _PacketVectorizer
 
@@ -1274,6 +1461,15 @@ def vectorize_affine_tile_lanes(
             constexpr=constexpr_values,
         )
         body = packetizer.body(body)
+    if not any(
+        isinstance(stmt, ast.For) and _affine_loop_candidate(stmt)
+        for stmt in iter_statements(body)
+    ):
+        # ``_Vectorizer.body`` rewrites only such loops; without one, skip the
+        # binding, register-read and integer-fact analyses it would consume.
+        # Keep the location fix-up the full path applies: later passes unparse
+        # statements the packetizer created without locations.
+        return ast.fix_missing_locations(ast.Module(body=body, type_ignores=[])).body
     private_accesses: frozenset[str] = frozenset()
     renames = {
         name: aliases[0] for name, aliases in device_function._variable_renames.items()
@@ -1335,6 +1531,17 @@ def vectorize_affine_tile_lanes(
         ),
         private_accesses=private_accesses,
         register_accesses=register_accesses | _loaded_vector_register_reads(body),
+        # Only the compiler-emitted scalar builtin is pure here. A parameter
+        # or any generated module reference with this name keeps the refusal.
+        unshadowed_abs=(
+            all(argument.name != "abs" for argument in device_function.arguments)
+            and "abs"
+            not in _bound_names(
+                ast.Module(
+                    body=device_function.codegen.module_statements, type_ignores=[]
+                )
+            )
+        ),
     )
     return ast.fix_missing_locations(
         ast.Module(body=vectorizer.body(body), type_ignores=[])

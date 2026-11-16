@@ -6,10 +6,14 @@ import json
 import logging
 import os
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
+import pytest
+
 from helion.autotuner.config_spec import SearchDimensionInfo
+from helion.autotuner.logger import _ElapsedFormatter
 from helion.autotuner.search_space_logger import DimensionStats
 from helion.autotuner.search_space_logger import SearchSpaceReport
 from helion.autotuner.search_space_logger import SearchSpaceTracker
@@ -17,6 +21,38 @@ from helion.autotuner.search_space_logger import _dimension_from_info
 from helion.autotuner.search_space_logger import analyze_search_space
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.runtime.config import Config
+
+pytestmark = pytest.mark.cpu_only
+
+
+def test_elapsed_formatter_preserves_plain_messages() -> None:
+    record = logging.makeLogRecord({"msg": "compiled %s", "args": ("candidate",)})
+    assert _ElapsedFormatter(lambda: 7).format(record) == "[7s] compiled candidate"
+
+
+@pytest.mark.parametrize("with_exception", [False, True])
+def test_elapsed_formatter_preserves_diagnostics(with_exception: bool) -> None:
+    stack = "Stack (most recent call last):\n  caller requesting compilation"
+    try:
+        raise ValueError("candidate exceeds shared memory")
+    except ValueError:
+        record = logging.makeLogRecord(
+            {
+                "msg": "skipping %s",
+                "args": ("candidate",),
+                "exc_info": sys.exc_info() if with_exception else None,
+                "stack_info": stack,
+            }
+        )
+    output = _ElapsedFormatter(lambda: 11).format(record)
+    assert output.startswith("[11s] skipping candidate\n")
+    assert output.endswith(stack)
+    if with_exception:
+        assert "Traceback (most recent call last):" in output
+        assert "test_elapsed_formatter_preserves_diagnostics" in output
+        assert "ValueError: candidate exceeds shared memory\n" in output
+    else:
+        assert "ValueError" not in output
 
 
 def test_canonical_config_id_preserves_existing_ids() -> None:
@@ -330,7 +366,7 @@ class TestDimensionFromInfo(unittest.TestCase):
 
 class TestDisallowPidTypeReasons(unittest.TestCase):
     def _spec(self) -> object:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         return ConfigSpec(backend=TritonBackend())
@@ -394,7 +430,7 @@ class TestTotalSearchSpaceSize(unittest.TestCase):
     when a dimension's cardinality can't be determined."""
 
     def _spec(self) -> object:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         return ConfigSpec(backend=TritonBackend())
@@ -441,7 +477,7 @@ class TestTotalSearchSpaceSize(unittest.TestCase):
 
 class TestRestrictionReasons(unittest.TestCase):
     def _spec(self) -> object:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         return ConfigSpec(backend=TritonBackend())
@@ -463,7 +499,7 @@ class TestRestrictionReasons(unittest.TestCase):
         self.assertEqual(store, [("tcgen05 narrowed", "matmul cute backend")])
 
     def test_disallow_pid_type_logs_live_when_verbose(self) -> None:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner import config_spec as cs
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -473,7 +509,7 @@ class TestRestrictionReasons(unittest.TestCase):
         self.assertTrue(any("xyz" in line for line in captured.output))
 
     def test_no_live_log_when_flag_off(self) -> None:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner import config_spec as cs
         from helion.autotuner.config_spec import ConfigSpec
 
@@ -560,7 +596,7 @@ class TestConfigOverridesAndACF(unittest.TestCase):
     outside _flat_fields) is added as its own enum dimension."""
 
     def _spec(self) -> object:
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         return ConfigSpec(backend=TritonBackend())

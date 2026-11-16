@@ -18,9 +18,14 @@ from helion._compiler.cute.philox_packets import lower_philox_packets
 from helion._compiler.cute.philox_stream import PACKET_ASM
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 import helion.language as hl
-from helion.runtime.cute.rng import stage_explicit_seed
+
+pytestmark = pytest.mark.cpu_only
+
+# Backend-independent (runs under every HELION_BACKEND, like a non-cute test);
+# the conftest gate over test_cute_* files leaves it alone.
 
 cpu_only = test_cute_philox_policy.cpu_only
 
@@ -167,22 +172,22 @@ def test_distribution_and_repeat_determinism():
 
 
 def _packet_source(width=4):
-    return f"""def kernel(start, length, seed_tensor, out):
+    return f"""def kernel(start, length, seed, out):
     for lane in cutlass.range_constexpr({width}):
         index = cutlass.Int32(start) + cutlass.Int32(lane)
         offset = cutlass.Int64(index)
-        value = _cute_inline_asm_elementwise((seed_tensor[0], offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
+        value = _cute_inline_asm_elementwise((cutlass.Int64(seed), offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
         if index < length:
             out.append((index, value))
 """
 
 
-def _lower(source, seed_names=frozenset({"seed_tensor"})):
+def _lower(source, seed_exprs=frozenset({"cutlass.Int64(seed)"})):
     module = ast.parse(source)
     ids = itertools.count()
     module.body[0].body = lower_philox_packets(
         module.body[0].body,
-        seed_names=set(seed_names),
+        seed_exprs=set(seed_exprs),
         integer_names={"start", "length"},
         new_name=lambda prefix: f"{prefix}_{next(ids)}",
     )
@@ -209,7 +214,7 @@ def _run(module, start, length, seed):
         "_cute_inline_asm_elementwise": asm,
     }
     exec(compile(module, "<packet-proof>", "exec"), namespace)
-    namespace["kernel"](start, length, [seed], out)
+    namespace["kernel"](start, length, seed, out)
     return out, stats
 
 
@@ -250,14 +255,6 @@ def test_nonprivate_seed_and_small_lane_loop_decline():
     assert ast.dump(_lower(source)) == ast.dump(ast.parse(source))
 
 
-def test_fresh_seed_host_lifetime_and_signed_bits():
-    x = torch.empty(3)
-    outputs = [stage_explicit_seed(seed, x) for seed in SEEDS]
-    assert len({value.data_ptr() for value in outputs}) == len(SEEDS)
-    assert [value.item() for value in outputs] == list(SEEDS)
-    assert all(value.dtype == torch.int64 and value.shape == (1,) for value in outputs)
-
-
 def _config(width, packet):
     return helion.Config(
         block_sizes=[128 * width],
@@ -272,8 +269,9 @@ def _config(width, packet):
 
 @skipUnlessBackends(["cute"])
 def test_original_dynamic_reference_forward_backward_and_stream_choice(cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
-    from examples.low_mem_dropout import low_mem_dropout_bwd
+    _examples_low_mem_dropout = import_example("low_mem_dropout")
+    low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+    low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
     from helion._compiler.rng_utils import philox_rand_ref
     from helion.runtime.ref_mode import RefMode
@@ -331,7 +329,7 @@ def test_original_dynamic_reference_forward_backward_and_stream_choice(cpu_only)
 
 @skipUnlessBackends(["cute"])
 def test_original_emission_scalar_packet_normalizer_and_semantic_cache(cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     args = (0.25, torch.empty(1025), -(2**63))
     bound = helion.kernel(
@@ -341,21 +339,22 @@ def test_original_emission_scalar_packet_normalizer_and_semantic_cache(cpu_only)
         cute_rng_stream="philox4",
     )._bind_isolated(args)
     for width in (1, 4, 8):
-        source = bound.to_triton_code(_config(width, True))
-        assert "seed, x_flat)" in source and "_cute_stage_explicit_seed" in source
+        source = bound.to_code(_config(width, True))
+        assert "cutlass.Int64(seed)" in source
+        assert "_cute_stage_explicit_seed" not in source
         assert ("philox_packet_" in source) == (width in (4, 8))
         assert SCALAR_ASM in [
             node.value
             for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         ]
-    scalar = bound.to_triton_code(_config(4, False))
+    scalar = bound.to_code(_config(4, False))
     assert "philox_packet_" not in scalar
     original = helion.kernel(
         low_mem_dropout.fn, backend="cute", static_shapes=False, cute_rng_stream="word0"
     )._bind_isolated(args)
     with pytest.raises(helion.exc.InvalidConfig):
-        original.to_triton_code(_config(4, True))
+        original.to_code(_config(4, True))
     assert bound.settings.to_dict()["cute_rng_stream"] == "philox4"
     assert original.settings.to_dict()["cute_rng_stream"] == "word0"
 
@@ -398,9 +397,9 @@ def test_explicit_tensor_seed_offsets_reference_and_scalar_fallback(cpu_only):
         static_shapes=False,
         cute_rng_stream="philox4",
     )._bind_isolated((seed, offsets))
-    source = bound.to_triton_code(_config(4, True))
+    source = bound.to_code(_config(4, True))
     assert "philox_packet_" not in source
-    assert "_cute_stage_explicit_seed" not in source
+    assert "cutlass.Int64(seed" not in source
     assert "cute_rng_stream='philox4'" in bound.format_kernel_decorator(
         _config(4, True), bound.settings
     )
@@ -419,7 +418,7 @@ def test_unsupported_opt_in_rng_rejects_instead_of_old_stream(cpu_only):
 
 
 def test_environment_default_and_invalid_policy(cpu_only, monkeypatch):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     monkeypatch.delenv("HELION_CUTE_RNG_STREAM", raising=False)
     assert helion.Settings(backend="cute").cute_rng_stream == "auto"
@@ -477,9 +476,9 @@ def test_multiple_distinct_rng_sites_keep_their_own_seed_and_offset(cpu_only):
     bound = helion.kernel(
         _multiple_random, backend="cute", static_shapes=False, cute_rng_stream="philox4"
     )._bind_isolated((values, -1, 2**32 + 123))
-    source = bound.to_triton_code(_config(4, True))
-    assert "_cute_stage_explicit_seed(first, x)" in source
-    assert "_cute_stage_explicit_seed(second, x)" in source
+    source = bound.to_code(_config(4, True))
+    assert "cutlass.Int64(first)" in source
+    assert "cutlass.Int64(second)" in source
     assert "philox_packet_" not in source
 
 
@@ -488,7 +487,7 @@ def test_multiple_distinct_rng_sites_keep_their_own_seed_and_offset(cpu_only):
 )
 @skipUnlessBackends(["cute"])
 def test_unsupported_rng_both_compiled_and_reference(function, cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     from helion.runtime.ref_mode import RefMode
     from helion.runtime.ref_mode import RefModeContext
@@ -535,7 +534,7 @@ def test_device_derived_seed_keeps_scalar_new_stream(cpu_only):
     bound = helion.kernel(
         _grid_seed, backend="cute", static_shapes=False, cute_rng_stream="philox4"
     )._bind_isolated(args)
-    source = bound.to_triton_code(_config(4, True))
+    source = bound.to_code(_config(4, True))
     assert "_cute_stage_explicit_seed" not in source
     assert "philox_packet_" not in source
     assert "shr.s64 counter" in source
@@ -543,7 +542,7 @@ def test_device_derived_seed_keeps_scalar_new_stream(cpu_only):
 
 @skipUnlessBackends(["cute"])
 def test_config_mutation_cannot_change_the_stream_policy(cpu_only):
-    from examples.low_mem_dropout import low_mem_dropout
+    low_mem_dropout = import_example("low_mem_dropout").low_mem_dropout
 
     args = (0.25, torch.empty(1025), 123)
     bound = helion.kernel(

@@ -180,8 +180,8 @@ def _roll_load_expr(
     load: VmemScalarLoad,
 ) -> ast.AST:
     """Emit load, pad, roll to index zero, widen, and static extraction."""
-    from helion._compiler.backend import PallasBackend
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.backend import PallasBackend
 
     window_parts = [*index_parts]
     for dim in load.scalar_dims:

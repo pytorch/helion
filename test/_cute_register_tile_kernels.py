@@ -1,7 +1,8 @@
 """Small column-reduction kernels shared by the register-tile codegen (CPU) and
 numerics (GPU) tests.  Every kernel reduces a ``[m, n]`` tile along its strided
 axis while the stride-1 axis stays a free tile, the shape the CuTe register-tile
-lowering (``helion/_compiler/cute/register_tile_reductions.py``) targets."""
+lowering (``helion/_compiler/cute/register_tile_reductions.py``) targets.  The
+in-place recurrent step at the end exists only for the aliasing-rejection test."""
 
 from __future__ import annotations
 
@@ -112,6 +113,38 @@ def col_sum_guarded(x: torch.Tensor, flag: int) -> torch.Tensor:
     return out
 
 
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def recurrent_step_in_place(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    alpha: torch.Tensor,
+) -> torch.Tensor:
+    """The fused linear-attention recurrent step with the updated ``[D, dv]``
+    tile written back into ``state`` (the example's ``recurrent_step_fused``
+    returns a new state instead): the same-index read-modify-write that the
+    aliasing gate must reject when an input views the state storage."""
+    BH = q.size(0)
+    DV = v.size(1)
+    out = torch.empty([BH, DV], dtype=v.dtype, device=v.device)
+    for tile_bh, tile_dv in hl.tile([BH, DV], block_size=[1, None]):
+        idx = tile_bh.id
+        s = state[idx, :, tile_dv].float() * alpha[idx]
+        k_vec = k[idx, :].float()
+        v_vec = v[idx, tile_dv].float()
+        s = s + k_vec[:, None] * v_vec[None, :]
+        state[idx, :, tile_dv] = s.to(state.dtype)
+        q_vec = q[idx, :].float()
+        out[idx, tile_dv] = (q_vec[:, None] * s).sum(0).to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def col_scale_into(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """``col_scale`` into a caller-provided output, which may alias ``x``."""
@@ -147,6 +180,56 @@ def col_sum_nested(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
             acc = acc + w[i, tile_n].float()
         out[tile_n] = (s + acc).to(x.dtype)
     return out
+
+
+@helion.kernel(
+    backend="cute",
+    static_shapes=True,
+    autotune_effort="none",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def rms_norm_bwd(
+    grad_out: torch.Tensor,
+    grad_inv_rms: torch.Tensor,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The backward ``helion.experimental.backward`` generates for the
+    ``rms_norm_fwd`` of ``test_autodiff.py`` (``test_rms_norm_multiout``):
+    two chained feature reductions over the row tile's columns (the mean that
+    feeds ``inv_rms``, the ``grad_x`` sum) beside the ``grad_weight`` partial,
+    a reduction over the row tile itself."""
+    m, n = x.size()
+    grad_x = torch.empty_like(x)
+    block_m = hl.register_block_size(m)
+    num_blocks = (m + block_m - 1) // block_m
+    grad_weight_parts = torch.zeros(
+        [num_blocks, n], dtype=torch.float32, device=x.device
+    )
+    for tile_m in hl.tile(m, block_size=block_m):
+        go = grad_out[tile_m, :]
+        g_inv = grad_inv_rms[tile_m]
+        xt = x[tile_m, :]
+        w = weight[:]
+        mean = torch.mean(xt * xt, [-1])
+        inv_rms = torch.rsqrt(mean + 1e-5)
+        normalized = xt * inv_rms.reshape(-1, 1)
+        go_w = go * w
+        grad_weight_parts[tile_m.id, :] = torch.sum(go * normalized, [0], True)
+        d_inv = g_inv + torch.sum(go_w * xt, [1], True).reshape(-1)
+        d_mean = (d_inv * -0.5 * torch.pow(inv_rms, 3)).reshape(-1, 1) / n
+        grad_x[tile_m, :] = go_w * inv_rms.reshape(-1, 1) + 2 * (d_mean * xt)
+    return grad_x, grad_weight_parts.sum(0).to(weight.dtype)
+
+
+def rms_norm_bwd_arguments(m: int = 64, n: int = 32) -> tuple[torch.Tensor, ...]:
+    """``(grad_out, grad_inv_rms, x, weight)`` of ``rms_norm_bwd`` on CPU."""
+    return (
+        torch.empty((m, n), dtype=torch.float32),
+        torch.empty((m,), dtype=torch.float32),
+        torch.empty((m, n), dtype=torch.float32),
+        torch.empty((n,), dtype=torch.float32),
+    )
 
 
 def column_config(

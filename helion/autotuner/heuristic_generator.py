@@ -38,9 +38,10 @@ from typing import Literal
 import numpy as np
 
 from ..runtime.config import Config
-from ..runtime.cute_structural_config import CuteStructuralConfig
-from ..runtime.cute_structural_config import StructuralPolicyError
-from ..runtime.cute_structural_config import require_same_structural_policy
+from ..runtime.cute.structural_config import CuteStructuralConfig
+from ..runtime.structural_policy import StructuralConfig
+from ..runtime.structural_policy import StructuralPolicyError
+from ..runtime.structural_policy import require_same_structural_policy
 from .aot_structural_policy import attach_model_policy
 from .aot_structural_policy import load_policy_module
 from .aot_structural_policy import measurement_policy
@@ -49,7 +50,7 @@ from .aot_structural_policy import policy_path
 from .aot_structural_policy import policy_suffix
 
 if TYPE_CHECKING:
-    from ..runtime.cute_structural_policy import CuteStructuralPolicy
+    from ..runtime.structural_policy import StructuralPolicy
 
 log: logging.Logger = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ class ShapeConfigData:
     selected_config_indices: list[int] | None = (
         None  # Which configs were selected (set during heuristic generation)
     )
-    cute_structural_policy: CuteStructuralPolicy | None = None
+    cute_structural_policy: StructuralPolicy | None = None
 
 
 @dataclass
@@ -1212,7 +1213,7 @@ def evaluate_heuristic(
         for i, features in enumerate(data.shape_features):
             try:
                 selected_config = select_fn(features)
-                if isinstance(selected_config, CuteStructuralConfig):
+                if isinstance(selected_config, StructuralConfig):
                     require_same_structural_policy(
                         selected_config.policy,
                         data.cute_structural_policy,

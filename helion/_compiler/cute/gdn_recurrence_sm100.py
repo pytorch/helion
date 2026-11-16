@@ -61,8 +61,9 @@ the loads overlap the setup (the other warps prefetch the first chunk's rows
 into L2 at kernel entry, a few hundred nanoseconds before that burst can
 issue), stages the raw ``g`` rows of a chunk through the same ring with
 ``cp.async`` a full ring depth ahead, and publishes
-the per-row gate vector ``exp(g_last - g_row)`` (the ordinary exact ``exp2(x *
-log2 e)`` lowering) together with the tile through the stage's full barrier.
+the per-row gate vector ``exp(g_last - g_row)`` (``exp2(x * log2 e)`` keeping
+denormals; see ``gdn_recurrence``) together with the tile through the stage's
+full barrier.
 Every computed chunk is full: only the last chunk can be ragged, and it is
 never computed, so the source kernel's ``row < seqlen`` gate mask holds for
 every row the device code touches and it carries no mask of its own.  One
@@ -87,6 +88,8 @@ import cutlass.experimental.primitives as prims
 
 from .affine_recurrence_primitives import pack_bf16x2
 from .affine_recurrence_primitives import prefetch_global_l2
+from .device.sync import mbar_wait as mbarrier_wait
+from .device.sync import ring_advance as advance_ring
 from .gdn_recurrence_geometry import GDN_HALF_LANE_COLS
 from .gdn_recurrence_geometry import GDN_MAX_UNROLLED_K_STEPS
 from .gdn_recurrence_geometry import GDN_MMA_K
@@ -193,14 +196,6 @@ def tma_swizzle_for_row_bytes(row_bytes: int) -> cuda.TensorMapSwizzle:
 
 
 @cute.jit
-def mbarrier_wait(mbar, parity) -> None:
-    """Spin until the mbarrier phase with ``parity`` has completed."""
-
-    while not prims.mbarrier_wait_parity(mbar, parity, prims.MBarrierWait.TRY):
-        pass
-
-
-@cute.jit
 def tmem_row_ptr(tmem_base, quadrant, column, dtype: cutlass.Constexpr):
     """TMEM pointer at lane ``32 * quadrant`` and absolute column ``column``."""
 
@@ -259,16 +254,6 @@ def epilogue_sync(warps: cutlass.Constexpr) -> None:
     """Named barrier across the epilogue warps."""
 
     prims.barrier_cta_sync(EPILOGUE_BARRIER_ID, thread_count=THREADS_PER_WARP * warps)
-
-
-@cute.jit
-def advance_ring(stage, phase, STAGES: cutlass.Constexpr):
-    """Next ring slot and its parity without a division."""
-
-    wrapped = stage == STAGES - 1
-    next_stage = cutlass.Int32(0) if wrapped else stage + 1
-    next_phase = phase ^ 1 if wrapped else phase
-    return next_stage, next_phase
 
 
 @cute.jit
@@ -1407,7 +1392,7 @@ def host_gdn_recurrence(
         stride_order=TMA_STRIDE_ORDER,
         swizzle=cuda.TensorMapSwizzle.none,
     )
-    gdn_recurrence_kernel(
+    launcher = gdn_recurrence_kernel(
         tma_desc_w,
         tma_desc_k,
         tma_desc_u,
@@ -1429,12 +1414,12 @@ def host_gdn_recurrence(
         ACC_COL,
         UPDATE_IMAGE_COL,
         TMEM_COLS,
-    ).launch(
+    )
+    launcher.launch(
         grid=((dstate + BLOCK_V - 1) // BLOCK_V, heads, batch),
         block=(THREADS_PER_WARP * gdn_cta_warps(BLOCK_V, EPI_WARPS, MMA_M), 1, 1),
         stream=stream,
         min_blocks_per_mp=1,
-        preferred_smem_carveout=100,
     )
 
 

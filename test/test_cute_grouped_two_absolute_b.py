@@ -5,25 +5,28 @@ from copy import deepcopy
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.grouped_gemm import grouped_gemm_jagged
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_shared_rhs_grouped import _plans
-from test.test_cute_shared_rhs_grouped import _target
 
 import helion
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.grouped_full_coverage import (
     full_allocation_b_two_cta_profile_supported,
 )
 from helion._compiler.cute.grouped_full_coverage import (
     full_allocation_b_two_cta_smem_upper_bound,
 )
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -45,11 +48,7 @@ SHAPES = (
 def _cpu_only() -> Generator[None, None, None]:
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        _target(),
-    ):
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
         yield
     torch.set_num_threads(previous)
 
@@ -100,7 +99,6 @@ def _absolute_b(source: str) -> bool:
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@skipUnlessBackends(["cute"])
 def test_two_ordinary_uses_absolute_b_and_retains_D_and_problem_k(
     shape: tuple[int, ...],
 ) -> None:
@@ -129,7 +127,6 @@ def test_two_ordinary_uses_absolute_b_and_retains_D_and_problem_k(
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@skipUnlessBackends(["cute"])
 def test_correctness_port_does_not_admit_two_dense(shape: tuple[int, ...]) -> None:
     bound, _args = _bound(*shape)
     config = _config()
@@ -138,7 +135,6 @@ def test_correctness_port_does_not_admit_two_dense(shape: tuple[int, ...]) -> No
         bound.to_code(config)
 
 
-@skipUnlessBackends(["cute"])
 def test_two_values_fresh_storage_and_offset_stride_do_not_select_descriptor() -> None:
     bound, values = _bound(2560, 512, 512, 8)
     config = _config()
@@ -174,7 +170,6 @@ def test_two_values_fresh_storage_and_offset_stride_do_not_select_descriptor() -
         {"tcgen05_sched_stage_count": 2},
     ),
 )
-@skipUnlessBackends(["cute"])
 def test_other_two_profiles_keep_original_descriptor_or_decline(
     updates: dict[str, object],
 ) -> None:
@@ -189,7 +184,6 @@ def test_other_two_profiles_keep_original_descriptor_or_decline(
     assert "tma_desc_ptr=tcgen05_grouped_tensormap_b_desc_ptr" in source
 
 
-@skipUnlessBackends(["cute"])
 def test_failed_index_proof_keeps_ordinary_dynamic_b() -> None:
     bound, _args = _bound()
     with patch(
@@ -201,7 +195,6 @@ def test_failed_index_proof_keeps_ordinary_dynamic_b() -> None:
     assert "init_tensormap_from_atom(tma_atom_b" in source
 
 
-@skipUnlessBackends(["cute"])
 def test_failed_ownership_proof_retains_existing_semantic_rejection() -> None:
     bound, _args = _bound()
     with (
@@ -215,12 +208,11 @@ def test_failed_ownership_proof_retains_existing_semantic_rejection() -> None:
 
 
 @pytest.mark.parametrize("capacity_delta", (-1, 0))
-@skipUnlessBackends(["cute"])
 def test_shared_capacity_uses_conservative_complete_bound(capacity_delta: int) -> None:
     bound, _args = _bound()
     upper = full_allocation_b_two_cta_smem_upper_bound(4)
     with patch.object(
-        CuteTcgen05Config,
+        target_facts,
         "per_cta_smem_capacity_bytes",
         return_value=upper + capacity_delta,
     ):
@@ -229,7 +221,6 @@ def test_shared_capacity_uses_conservative_complete_bound(capacity_delta: int) -
 
 
 @pytest.mark.parametrize("offset_dtype", (torch.int32, torch.int64))
-@skipUnlessBackends(["cute"])
 def test_two_scope_is_typed_without_changing_other_metadata_paths(
     offset_dtype: torch.dtype,
 ) -> None:
@@ -255,7 +246,6 @@ def test_complete_two_profile_is_typed(index: int, kind: str) -> None:
 
 
 @pytest.mark.parametrize("shape", SHAPES)
-@skipUnlessBackends(["cute"])
 def test_dense_local_witness_preserves_one_cta_carriers(shape: tuple[int, ...]) -> None:
     bound, _args = _bound(*shape)
     (group,) = (

@@ -20,6 +20,7 @@ from ..device_ir import ElseGraphInfo
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import IfGraphInfo
 from ..device_ir import RootGraphInfo
+from ..device_ir import control_flow_child_graph_ids
 from ..device_ir import control_flow_parent_entries
 from ..inductor_lowering import PointwiseLowering
 from ..inductor_lowering import ReductionLowering
@@ -42,16 +43,9 @@ def _reachable_graphs(graphs: list[GraphInfo]) -> list[GraphInfo]:
             continue
         result[info.graph_id] = info
         for node in info.graph.nodes:
-            if _tracing_ops.is_for_loop_target(node.target):
-                pending.append(by_id[cast("int", node.args[0])])
-            elif node.target is _tracing_ops._if:
-                pending.extend(
-                    by_id[cast("int", graph_id)] for graph_id in node.args[1:3]
-                )
-            elif node.target is _tracing_ops._while_loop:
-                pending.extend(
-                    by_id[cast("int", graph_id)] for graph_id in node.args[:2]
-                )
+            pending.extend(
+                by_id[graph_id] for graph_id in control_flow_child_graph_ids(node)
+            )
     return list(result.values())
 
 

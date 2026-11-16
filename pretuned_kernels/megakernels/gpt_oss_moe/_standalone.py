@@ -48,7 +48,6 @@ CONFIGS: dict[str, dict[str, object]] = {
         "range_num_stages": [0],
         "range_multi_buffers": [None],
         "range_flattens": [None],
-        "reduction_loops": [None],
     },
     "gemm1_swiglu_oai": {
         "block_sizes": [16, 32],

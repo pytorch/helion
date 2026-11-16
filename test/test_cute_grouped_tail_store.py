@@ -13,7 +13,6 @@ import torch
 
 from test import test_cute_rank3_rhs_b_tma as grouped
 from test.test_autotuner_heuristics import _grouped_worklist_bind_patches
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.cute_mma import _MmaSearchGraphView
@@ -22,10 +21,12 @@ from helion._compiler.cute.cute_mma import _trace_to_mma_operand
 from helion._compiler.cute.cute_mma import (
     tcgen05_grouped_static_seed_has_common_k_proof,
 )
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
 from helion._testing import skipIfRefEager
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_target
 from helion.language import memory_ops
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -37,15 +38,7 @@ if TYPE_CHECKING:
 def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "tcgen05")
     monkeypatch.setattr(grouped, "DEVICE", torch.device("cpu"))
-    with (
-        _cpu_target(),
-        _grouped_worklist_bind_patches(),
-        patch(
-            "helion._compiler.cute.tcgen05_config."
-            "CuteTcgen05Config.per_cta_smem_capacity_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_target(), _grouped_worklist_bind_patches():
         yield
 
 
@@ -53,7 +46,6 @@ def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 @pytest.mark.parametrize(
     "k,block_k,ab_stages", [(16, 16, 2), (96, 32, 3), (192, 64, 3)]
 )
-@skipUnlessBackends(["cute"])
 def test_folded_grouped_tail_store_keeps_native_seed_and_codegen(
     dtype: torch.dtype, k: int, block_k: int, ab_stages: int
 ) -> None:
@@ -73,7 +65,6 @@ def test_folded_grouped_tail_store_keeps_native_seed_and_codegen(
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@skipUnlessBackends(["cute"])
 def test_folded_grouped_tail_store_keeps_dynamic_k_proof(dtype: torch.dtype) -> None:
     args = grouped._make_documented_mixed_k_args(dtype=dtype)
     kernel = grouped._rank3_rhs_grouped_nt_with_mn_tails_and_k_sizes
@@ -168,7 +159,14 @@ def test_grouped_operand_alignment_uses_physical_strides(
         strides = (k * (n + padding), 1, n + padding)
     storage = torch.empty(groups * strides[0] + offset, dtype=dtype)
     b = storage.as_strided((groups, n, k), strides, offset)
-    bound = grouped._rank3_rhs_grouped_nt._bind_isolated((a, b, layout))
+    # The proof reads the operand as passed: keep the staging pass from
+    # relaying the padded operand out.
+    kernel = helion.kernel(
+        grouped._rank3_rhs_grouped_nt.fn,
+        backend="cute",
+        cute_stage_unaligned_operands=False,
+    )
+    bound = kernel._bind_isolated((a, b, layout))
     host = bound.host_function
     assert host is not None
     ir = host.device_ir

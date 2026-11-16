@@ -8,18 +8,18 @@ import torch
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
-from test._cute_aux import _config
-from test._cute_aux import _cpu_codegen
 from test.test_cute_aux_read_fence import _assert_aux_read_fence_order
-from test.test_cute_aux_read_fence import _rank_two_inputs
 from test.test_cute_aux_read_fence import _rank_two_multi_aux
+from test.test_cute_aux_read_fence import rank_two_inputs
 
 from helion._compiler.cute.cute_mma import _emit_tcgen05_aux_pipeline_setup
 from helion._compiler.cute.cute_mma import _Tcgen05AuxPerDescriptorRingNames
 from helion._compiler.cute.cute_mma import _Tcgen05AuxPipelinePlan
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_aux import aux_config as _config
+from helion._testing.cute_aux import cpu_codegen
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 def _group_size(code: str, name: str) -> int:
@@ -87,10 +87,10 @@ def test_aux_consumer_count_derived_from_epilogue_warps(
 def test_simt_aux_arrival_codegen(
     dtype: torch.dtype, mixed: bool, fringe: bool, bn: int
 ) -> None:
-    args = list(_rank_two_inputs(2, m=513 if fringe else 512, n=8192, dtype=dtype))
+    args = list(rank_two_inputs(2, m=513 if fringe else 512, n=8192, dtype=dtype))
     if mixed:
         args[-1] = torch.empty_like(args[-1], dtype=torch.float32)
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _rank_two_multi_aux._bind_isolated(tuple(args)).to_code(
             _config(block_sizes=[128, bn, 64], tcgen05_aux_load_mode="simt")
         )
@@ -105,9 +105,9 @@ def test_simt_aux_arrival_codegen(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_tma_aux_keeps_elected_release(dtype: torch.dtype) -> None:
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _rank_two_multi_aux._bind_isolated(
-            _rank_two_inputs(2, dtype=dtype)
+            rank_two_inputs(2, dtype=dtype)
         ).to_code(_config(block_sizes=[128, 128, 64], tcgen05_aux_load_mode="tma"))
     assert _group_size(code, "tcgen05_aux_pipeline_consumer_group") == 4
     assert _assert_aux_read_fence_order(code, use_tma_load=True) > 0
@@ -116,9 +116,9 @@ def test_tma_aux_keeps_elected_release(dtype: torch.dtype) -> None:
 
 @pytest.mark.parametrize("fringe", [False, True])
 def test_direct_aux_has_no_empty_barrier_arrival(fringe: bool) -> None:
-    with _cpu_codegen():
+    with cpu_codegen():
         code = _rank_two_multi_aux._bind_isolated(
-            _rank_two_inputs(2, m=513 if fringe else 512, n=8192)
+            rank_two_inputs(2, m=513 if fringe else 512, n=8192)
         ).to_code(
             _config(
                 block_sizes=[128, 128, 64],

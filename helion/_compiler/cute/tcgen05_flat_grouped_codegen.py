@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import re
 from typing import TYPE_CHECKING
 from typing import cast
 
+from ... import exc
 from ._ast_pass_utils import _bound_names
+from .state import cute_env_state
 from .tcgen05_flat_grouped_config import CONFIG_KEYS
 from .tcgen05_flat_grouped_config import PREFIX_SCAN_KEY
 from .tcgen05_flat_grouped_config import RESIDENT_CTAS_KEY
@@ -175,6 +178,7 @@ def generate_flat_grouped_native_candidate(
         workspace_upper_bound=schedule.provider.tile_upper_bound,
         thread_block=schedule.thread_block,
         resident_ctas=schedule.resident_ctas,
+        dependent_launch=_dependent_launch_requested(config),
     )
 
 
@@ -217,7 +221,45 @@ def generate_grouped_warp_tf32_candidate(
         workspace_upper_bound=plan.workspace_upper_bound,
         thread_block=plan.thread_block,
         grid=plan.grid,
+        dependent_launch=_dependent_launch_requested(config),
     )
+
+
+_NATIVE_KERNEL = "_helion_native_grouped_rna"
+_NATIVE_DEF = re.compile(rf"^def {_NATIVE_KERNEL}\(.*\):\n", re.MULTILINE)
+
+
+def _dependent_launch_requested(config: Config) -> bool:
+    """Whether ``cute_pdl`` applies to a native grouped kernel.
+
+    The native modules bypass the device function, so the knob is honored
+    here: the kernel waits (``griddepcontrol_wait``) before its first global
+    access and the launcher adds ``use_pdl``. ``griddepcontrol`` needs sm_90.
+    """
+    from ..compile_environment import CompileEnvironment
+
+    if config.get("cute_pdl") is not True:
+        return False
+    capability = CompileEnvironment.current().config_spec.target_device_capability
+    return capability is not None and capability >= (9, 0)
+
+
+def _dependent_launch_source(native_source: str) -> str:
+    """Make the native kernel a programmatic dependent launch.
+
+    Every thread waits as the kernel's first statement, ahead of the shared
+    allocations, descriptor prefetches and the first offset load, so the
+    launch and that prologue overlap the previous kernel in the stream.
+    """
+    source, count = _NATIVE_DEF.subn(
+        lambda match: match.group(0) + "    cute.arch.griddepcontrol_wait()\n",
+        native_source,
+    )
+    if count != 1:
+        raise exc.BackendUnsupported(
+            "cute", "native grouped kernel without a single kernel definition"
+        )
+    return source + f"{_NATIVE_KERNEL}._helion_cute_use_pdl = True\n"
 
 
 def _compose_flat_grouped_host(
@@ -235,11 +277,14 @@ def _compose_flat_grouped_host(
     thread_block: tuple[int, int, int],
     resident_ctas: int = 1,
     grid: tuple[int, int, int] | None = None,
+    dependent_launch: bool = False,
 ) -> ast.Module:
     """Preserve original host statements and the ordinary six-tensor launcher."""
     from ..compile_environment import CompileEnvironment
 
     env = CompileEnvironment.current()
+    if dependent_launch:
+        native_source = _dependent_launch_source(native_source)
     host = next(
         node
         for node in module.body
@@ -287,6 +332,15 @@ def _compose_flat_grouped_host(
         f"{proof.b_argument}.transpose(1, 2), {proof.bias_argument}, {output}.view(({m}, {n})), "
         f"{workspace}, block={thread_block!r})\n"
     ).body
+    native_launch = replacement[-1]
+    assert isinstance(native_launch, ast.Expr) and isinstance(
+        native_launch.value, ast.Call
+    )
+    original_launch = launches[0].value
+    assert isinstance(original_launch, ast.Call)
+    native_launch.value.keywords.extend(
+        keyword for keyword in original_launch.keywords if keyword.arg != "block"
+    )
     position = host.body.index(launches[0])
     host.body[position : position + 1] = replacement
     loads = ast.parse(
@@ -302,5 +356,5 @@ def _compose_flat_grouped_host(
         f"{func.name}._helion_cute_kernels = ({native},)\n"
         f"{func.name}._helion_cute_native_grouped_plan = {identity!r}\n"
     ).body
-    env.cute_resolved_wrapper_plans = plans
+    cute_env_state(env).resolved_wrapper_plans = plans
     return module

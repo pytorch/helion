@@ -9,6 +9,7 @@ import torch
 
 from helion._testing import DEVICE
 import helion.runtime
+from helion.runtime.triton import launcher as triton_launcher
 from helion.runtime.triton.launcher import _get_persistent_state
 from helion.runtime.triton.launcher import default_launcher as triton_default_launcher
 
@@ -112,6 +113,36 @@ class TestTritonLauncher(unittest.TestCase):
                 num_warps=1,
                 num_stages=1,
             )
+
+    @unittest.skipIf(triton_launcher.triton is None, "requires Triton")
+    def test_scratch_allocator_queries_each_active_driver_once(self) -> None:
+        queried: list[object] = []
+
+        class FakeDriver:
+            def __init__(self, backend: str) -> None:
+                self.backend = backend
+
+            def get_current_target(self) -> object:
+                queried.append(self)
+                return SimpleNamespace(backend=self.backend)
+
+        cpu, meta = FakeDriver("cpu"), FakeDriver("meta")
+        drivers = SimpleNamespace(active=cpu)
+        fake_triton = SimpleNamespace(runtime=SimpleNamespace(driver=drivers))
+        buffers = []
+        with (
+            patch("helion.runtime.triton.launcher.triton", fake_triton),
+            patch("helion.runtime.triton.launcher._alloc_device", None),
+        ):
+            for active in (cpu, cpu, meta, cpu):
+                drivers.active = active
+                buffers.append(triton_launcher._alloc_fn(16, 128, None))
+
+        self.assertEqual(queried, [cpu, meta, cpu])
+        self.assertEqual(
+            [buffer.device.type for buffer in buffers], ["cpu", "cpu", "meta", "cpu"]
+        )
+        self.assertEqual((buffers[0].numel(), buffers[0].dtype), (16, torch.int8))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

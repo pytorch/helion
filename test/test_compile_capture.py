@@ -30,6 +30,8 @@ from helion.runtime.pallas._tpu_compile_capture import _signature
 from helion.runtime.pallas._tpu_compile_capture import _tensors
 from helion.runtime.pallas._tpu_compile_capture import register_decoration_op
 
+pytestmark = pytest.mark.cpu_only
+
 
 @helion.kernel(
     backend="pallas", static_shapes=True, config=helion.Config(block_sizes=[16, 16])

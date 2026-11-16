@@ -10,6 +10,8 @@ import torch
 
 from helion._compiler.cute.merge_sibling_v_loops import merge_sibling_v_loops
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _run(source: str, value: float) -> tuple[np.floating[Any], list[str]]:
     calls: list[str] = []

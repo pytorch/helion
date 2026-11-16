@@ -16,8 +16,7 @@ import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-from test.test_cute_cluster_online_pair import softmax_two_pass_kernel
+from test._cute_kernels import softmax_two_pass_kernel
 
 import helion
 from helion._compiler.cute.cluster_online_pair import fuse_cluster_online_pair
@@ -26,8 +25,11 @@ from helion._compiler.cute.duplicate_reduction_carries import (
 )
 from helion._compiler.cute.hoist_warp_reduce import validate_cluster_reduce_placement
 from helion._compiler.tile_strategy import NDTileStrategy
+from helion._testing import cpu_render_target
 from helion.language._decorators import is_api_func
 from helion.language.tile_ops import tile_begin
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -38,15 +40,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        # Complete lazy backend registration before tests patch handler helpers.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         assert is_api_func(tile_begin)
         assert callable(tile_begin._codegen["cute"])
         yield
@@ -525,17 +519,18 @@ def test_static_cluster_keeps_one_exchange_with_global_first_tile_poison(
 
 def test_default_settings_pair_with_exact_exponentials() -> None:
     """Without fast_math the exchanges still pair, but every exponential
-    keeps its exact ``(x - max) * C`` form: sweep B's in the zero-guarded
-    frame of the CTA maximum, sweep C's recomputed from the global one
-    instead of rescaling cached values."""
+    keeps its exact form, the natural ``exp(x - max)``: sweep B's in the
+    zero-guarded frame of the CTA maximum, sweep C's recomputed from the
+    global one instead of rescaling cached values, and the pair rescales the
+    CTA sums with the natural exponential too (``scale=None``)."""
     code = _cluster_source(torch.bfloat16, 32768, 2, fast_math=False)
     assert code.count("_cute_grouped_reduce_cluster_online_pair(") == 1
     assert "_cute_grouped_reduce_cluster(" not in code
-    assert "cluster_n=2, scale=1.4426950408889634, fastmath=False)" in code
+    assert "cluster_n=2, scale=None, fastmath=False)" in code
     assert "_pair_frame_0 = cutlass.Float32(0) if _pair_negative_inf_0 else mi" in code
     assert "v_5 = v_4 - _pair_frame_0" in code
     assert "v_12 = v_11 - mi\n" in code
-    assert "v_13 = cute.math.exp2(cutlass.Float32(v_12) * 1.4426950408889634)\n" in code
+    assert "v_13 = cute.math.exp(cutlass.Float32(v_12))\n" in code
     assert code.index("mi = _pair_gmax_0") < code.index("v_12 = v_11 - mi")
     for absent in (
         "_helion_scaled_",
@@ -591,6 +586,17 @@ for tile in range(cutlass.Int32(0), cutlass.Int32(N), cutlass.Int32(BLOCK)):
 """
 
 
+# The same row with ``torch.exp`` as lowered without fast_math: the natural
+# exponential, which the pair rescales with ``exp(m_r - m)`` (``scale=None``).
+_NATURAL_ONLINE_PAIR = _EXACT_ONLINE_PAIR.replace(
+    "cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)",
+    "cute.math.exp(cutlass.Float32(v_5))",
+).replace(
+    "cute.math.exp2(cutlass.Float32(v_12) * 1.4426950408889634)",
+    "cute.math.exp(cutlass.Float32(v_12))",
+)
+
+
 def _fuse_exact(source: str) -> str:
     body = fuse_cluster_online_pair(
         ast.parse(source).body, {"N": 4096, "BLOCK": 4096}, fast_math=False
@@ -598,14 +604,20 @@ def _fuse_exact(source: str) -> str:
     return ast.unparse(ast.Module(body=body, type_ignores=[]))
 
 
-def test_exact_pair_moves_only_sweep_b_into_the_cta_frame() -> None:
-    code = _fuse_exact(_EXACT_ONLINE_PAIR)
+@pytest.mark.parametrize(
+    "source,scale",
+    [(_EXACT_ONLINE_PAIR, "1.4426950408889634"), (_NATURAL_ONLINE_PAIR, "None")],
+)
+def test_exact_pair_moves_only_sweep_b_into_the_cta_frame(
+    source: str, scale: str
+) -> None:
+    code = _fuse_exact(source)
     assert "_cute_grouped_reduce_cluster(" not in code
     assert "_cute_grouped_reduce_block(acc_max, 'max'" in code
     assert (
         "_pair_gmax_0, result_2 = _cute_grouped_reduce_cluster_online_pair(acc, mi, "
         "lane_id_2, _cluster_red_buf_2, _cluster_red_mbar_2, group_span=256, "
-        "cluster_n=2, scale=1.4426950408889634, fastmath=False)\n    mi = _pair_gmax_0"
+        f"cluster_n=2, scale={scale}, fastmath=False)\n    mi = _pair_gmax_0"
     ) in code
     assert "_pair_frame_0 = cutlass.Float32(0) if _pair_negative_inf_0 else mi" in code
     assert "v_5 = v_4 - _pair_frame_0" in code
@@ -629,10 +641,14 @@ def test_exact_pair_moves_only_sweep_b_into_the_cta_frame() -> None:
         ),
         # A term that does not scale with the frame.
         ("acc = acc + cutlass.Float32(", "acc = acc * 2.0 + cutlass.Float32("),
-        # Two exponent scales.
+        # Two exponent scales, or an exponential in another base.
         (
             "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)",
             "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 2.0)",
+        ),
+        (
+            "v_6 = cute.math.exp2(cutlass.Float32(v_5) * 1.4426950408889634)",
+            "v_6 = cute.math.exp(cutlass.Float32(v_5))",
         ),
         # An exponential that escapes into a store.
         (

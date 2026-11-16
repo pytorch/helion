@@ -8,6 +8,7 @@ import torch
 
 from helion._testing import DEVICE
 from helion._testing import TestCase
+from helion._testing import import_example
 from helion._testing import skipIfRefEager
 from helion.autotuner._metadata import ir_features
 from helion.autotuner._metadata.ir_features import extract_ir_graph
@@ -29,7 +30,7 @@ class TestIrFeatures(TestCase):
     @unittest.skipUnless(_HAS_NETWORKX, "networkx>=3.4 required")
     def test_pointwise_dump_is_networkx_loadable(self) -> None:
         """A pointwise kernel yields a node-link DiGraph with data-only edges."""
-        from examples.add import add
+        add = import_example("add").add
 
         g = _extract(
             add,
@@ -58,7 +59,7 @@ class TestIrFeatures(TestCase):
     @unittest.skipUnless(_HAS_NETWORKX, "networkx>=3.4 required")
     def test_reduction_records_rolled_metadata_not_fake_edges(self) -> None:
         """Rolled reductions are captured as typed metadata, never as edges."""
-        from examples.softmax import softmax
+        softmax = import_example("softmax").softmax
 
         g = _extract(softmax, (torch.randn(128, 128, device=DEVICE),))
         rolled = g["graph"]["rolled_reductions"]
@@ -80,7 +81,7 @@ class TestIrFeatures(TestCase):
     @unittest.skipUnless(_HAS_NETWORKX, "networkx>=3.4 required")
     def test_control_flow_yields_resolved_region_edges(self) -> None:
         """An explicit _for_loop resolves live args into region edges."""
-        from examples.attention import attention
+        attention = import_example("attention").attention
 
         args = tuple(
             torch.randn(1, 2, 128, 64, device=DEVICE, dtype=torch.float16)
@@ -102,7 +103,7 @@ class TestIrFeatures(TestCase):
     @unittest.skipUnless(_HAS_NETWORKX, "networkx>=3.4 required")
     def test_symbolic_dims_not_specialized_to_concrete(self) -> None:
         """Symbolic dims yield concrete_shape None (not specialized to a value)."""
-        from examples.add import add
+        add = import_example("add").add
 
         g = _extract(
             add,

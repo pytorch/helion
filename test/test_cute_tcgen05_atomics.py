@@ -58,7 +58,7 @@ class TestCuteTcgen05Atomics(TestCase):
                         helion.exc.BackendUnsupported, "separate the warp roles"
                     ),
                 ):
-                    _matmul_then_count.bind(_args(512, sem)).to_triton_code(
+                    _matmul_then_count.bind(_args(512, sem)).to_code(
                         helion.Config(**config)
                     )
 
@@ -67,7 +67,7 @@ class TestCuteTcgen05Atomics(TestCase):
         with self.assertRaisesRegex(
             helion.exc.BackendUnsupported, "once per CTA, not once per tile"
         ):
-            _matmul_then_count.bind(_args(2048, "relaxed")).to_triton_code(
+            _matmul_then_count.bind(_args(2048, "relaxed")).to_code(
                 helion.Config(**_PERSISTENT)
             )
 
@@ -84,7 +84,7 @@ class TestCuteTcgen05Atomics(TestCase):
             helion.exc.BackendUnsupported,
             "two-CTA pairs share each tile: it would run once per CTA",
         ):
-            bound.to_triton_code(config)
+            bound.to_code(config)
 
     def test_relaxed_atomic_counts_each_tile_when_ctas_own_one(self) -> None:
         for size, config in (
@@ -96,7 +96,7 @@ class TestCuteTcgen05Atomics(TestCase):
                 a, b, counter, _ = args
                 bound = _matmul_then_count.bind(args)
                 cfg = helion.Config(**config)
-                self.assertIn("tcgen05", bound.to_triton_code(cfg))
+                self.assertIn("tcgen05", bound.to_code(cfg))
                 out = bound.compile_config(cfg)(*args)
                 torch.testing.assert_close(out, a @ b, atol=1e-1, rtol=1e-2)
                 self.assertEqual(counter.item(), (size // 128) ** 2)

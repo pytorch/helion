@@ -1,15 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
 import torch
 from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
-
-from test._cute_binding import _mock_cuda_unavailable
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
@@ -21,17 +19,7 @@ from helion.runtime.cute.paired_sum import sum_plan
 from helion.runtime.cute.single_sum import plan_for_single
 from helion.runtime.cute.single_sum import try_single_sum_cast
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-    ):
-        yield
+pytestmark = [pytest.mark.cpu_only, pytest.mark.cpu_render]
 
 
 @pytest.mark.parametrize("layout", ("mapped", "narrow"))
@@ -204,6 +192,17 @@ def test_singleton_cancellation_domain_retains_original_sum_and_cast(
 def test_half_header_identity_unknown_build_and_no_repeated_file_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Unknown nightly headers deliberately retain the original ATen sum/cast.
+    # Exercise the known/unknown identity and cache contract independently of
+    # which optional fast path the installed Torch build admits.
+    monkeypatch.setattr(torch, "__file__", str(tmp_path / "__init__.py"))
+    header = tmp_path / "include" / single_sum._ATEN_HALF_HEADER
+    header.parent.mkdir(parents=True)
+    known_header = b"known half header fixture\n"
+    header.write_bytes(known_header)
+    monkeypatch.setattr(
+        single_sum, "_ATEN_HALF_SHA256", hashlib.sha256(known_header).hexdigest()
+    )
     single_sum._compatible_aten_half_cast.cache_clear()
     try:
         with patch.object(
@@ -212,11 +211,9 @@ def test_half_header_identity_unknown_build_and_no_repeated_file_reads(
             assert single_sum._compatible_aten_half_cast()
             assert single_sum._compatible_aten_half_cast()
             assert read.call_count == 1
-        monkeypatch.setattr(torch, "__file__", str(tmp_path / "__init__.py"))
+        header.unlink()
         single_sum._compatible_aten_half_cast.cache_clear()
         assert not single_sum._compatible_aten_half_cast()
-        header = tmp_path / "include" / single_sum._ATEN_HALF_HEADER
-        header.parent.mkdir(parents=True)
         header.write_text("unknown half conversion")
         single_sum._compatible_aten_half_cast.cache_clear()
         assert not single_sum._compatible_aten_half_cast()

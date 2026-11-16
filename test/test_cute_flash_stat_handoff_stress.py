@@ -56,9 +56,12 @@ pytest.importorskip("cutlass.cute")
 
 from helion._compiler.cute import cute_flash
 from helion._testing import DEVICE
-from helion._testing import onlyBackends
+from helion._testing import import_example
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
+
+# Every test here compiles and launches in fresh subprocesses under a watchdog.
+pytestmark = pytest.mark.slow
 
 _SHAPE = (2, 16, 2048, 128)
 # The flex list walk: 16 query rows x 16 KV tiles per (batch, head).
@@ -193,7 +196,7 @@ def _stress(
     )
     bind_args: tuple[object, ...] = (q, k, v)
     if module == "attention":
-        from examples.attention import attention as example
+        example = import_example("attention").attention
 
         def call(fn: object) -> torch.Tensor:
             return fn(q, k, v)[0]  # pyrefly: ignore [not-callable]
@@ -201,8 +204,9 @@ def _stress(
         def reference() -> torch.Tensor:
             return torch.nn.functional.scaled_dot_product_attention(q, k, v)
     elif module == "flex":
-        from examples.flex_attention import _identity
-        from examples.flex_attention import helion_flex_attention_kernel as example
+        _examples_flex_attention = import_example("flex_attention")
+        _identity = _examples_flex_attention._identity
+        example = _examples_flex_attention.helion_flex_attention_kernel
 
         batch, heads, seq, head_dim = shape
         block_mask = _random_block_mask(batch, heads, seq // 128, seq // 128)
@@ -229,8 +233,9 @@ def _stress(
         def reference() -> torch.Tensor:
             return _block_visibility_reference(q, k, v, block_mask, scale)
     else:
-        from examples.xsa import ref_xsa
-        from examples.xsa import xsa_kernel as example
+        _examples_xsa = import_example("xsa")
+        ref_xsa = _examples_xsa.ref_xsa
+        example = _examples_xsa.xsa_kernel
 
         def call(fn: object) -> torch.Tensor:
             return fn(q, k, v)  # pyrefly: ignore [not-callable]
@@ -370,13 +375,11 @@ def _run_in_subprocesses(module: str, config: dict[str, object]) -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_whole_row_ring2_attention_survives_flushed_launches() -> None:
     _run_in_subprocesses("attention", _ATTENTION_WHOLE_ROW_RING2)
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 def test_flex_list_walk_survives_flushed_launches() -> None:
     """The BlockMask list walk over random tables (zero counts, an empty
     pair, an asymmetric pair) on the chunked fa4 body with the two-slot
@@ -386,7 +389,6 @@ def test_flex_list_walk_survives_flushed_launches() -> None:
 
 
 @skipIfNotCUDA()
-@onlyBackends(["cute"])
 @skipIfFn(
     lambda: not _soak_requested(),
     reason=f"soak run only: set {_LAUNCHES_ENV} (the chunked-body hang was rare)",

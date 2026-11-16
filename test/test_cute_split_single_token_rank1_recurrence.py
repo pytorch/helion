@@ -19,13 +19,11 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 import helion
 from helion._testing import onlyBackends
-from helion._testing import skipUnlessBackends
 import helion.language as hl
 from helion.language._tracing_ops import _get_symnode
 
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
-pytestmark = skipUnlessBackends(["cute"])
 _split_single_token_rank1_recurrence = importlib.import_module(
     "helion._compiler.cute.split_single_token_rank1_recurrence"
 )
@@ -276,10 +274,10 @@ def _compile_with_production_hooks(
             if not matching_seeds:
                 raise AssertionError("no flat 16-row compiler seed")
             config = matching_seeds[0]
-        return bound.to_triton_code(config)
+        return bound.to_code(config)
 
 
-# unittest runners ignore pytestmark.
+# unittest runners see neither pytest marks nor the conftest path gate.
 @onlyBackends(["cute"])
 class TestCuteSplitSingleTokenRank1Recurrence(unittest.TestCase):
     def _code(
@@ -353,18 +351,18 @@ class TestCuteSplitSingleTokenRank1Recurrence(unittest.TestCase):
         self.assertIn("split_t1_beta = cutlass.Float32(1.0) /", code)
 
     def test_generated_locals_do_not_shadow_tensor_arguments(self) -> None:
-        from helion._compiler.cute import single_token_rank1_recurrence
+        from helion._compiler.cute import fx_matcher
 
-        original = single_token_rank1_recurrence._host_tensor_ref
+        original = fx_matcher._host_tensor_ref
 
         def colliding_name(node: object) -> object:
             ref = original(node)
-            if ref is not None and ref.suggested_name == "first_vector":
-                return dataclasses.replace(ref, suggested_name="split_t1_work")
+            if ref is not None and ref.name == "first_vector":
+                return dataclasses.replace(ref, name="split_t1_work")
             return ref
 
         with patch.object(
-            single_token_rank1_recurrence,
+            fx_matcher,
             "_host_tensor_ref",
             side_effect=colliding_name,
         ):

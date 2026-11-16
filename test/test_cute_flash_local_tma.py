@@ -11,11 +11,12 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 from helion._compiler.cute import cute_flash
 from helion._compiler.cute.attention_plan import dense_score_plan
+from helion._testing import cpu_render_target
+from helion._testing import skipUnlessCuteAvailable
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -33,11 +34,7 @@ def _cpu_only() -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
     with (
         patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}, clear=True),
-        _mock_cuda_unavailable(),
-        _forbid_native_compile(),
-        patch.object(
-            torch.cuda, "_lazy_init", side_effect=AssertionError("CPU-only test")
-        ),
+        cpu_render_target(),
         ir.Context(),
         ir.Location.unknown(),
     ):
@@ -130,6 +127,7 @@ _FAMILY_DTYPES = tuple(
 )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(("family", "dtype"), _FAMILY_DTYPES)
 @pytest.mark.parametrize(("sequence", "stages"), ((25600, 3), (32768, 9)))
 @pytest.mark.parametrize("width", (128, 160))

@@ -10,10 +10,9 @@ import pytest
 import torch
 from torch._dynamo.source import LocalSource
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
+from helion._compiler.cute.emitters.lane_packets import _cute_unroll_vec_extract
+from helion._compiler.cute.emitters.lane_packets import _cute_unroll_vec_load_expr
 from helion._compiler.cute.memory_ops import (
     _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY,
 )
@@ -21,10 +20,12 @@ from helion._compiler.cute.memory_ops import _cute_tile_packet_is_aligned
 from helion._compiler.cute.memory_ops import (
     register_persistent_vec_alignment_specializations,
 )
-from helion._testing import skipUnlessBackends
+from helion._testing.binding_state import with_binding_state
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
-from helion.language.memory_ops import _cute_unroll_vec_extract
-from helion.language.memory_ops import _cute_unroll_vec_load_expr
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _Int8(int):
@@ -130,6 +131,8 @@ class _BindingFacts:
         self.input_sources = [tensor]
         self.source = LocalSource("argument")
         self.config_spec = SimpleNamespace(target_device_capability=None)
+        # The binding's own launches: dispatch checks every bound residue.
+        with_binding_state(self)
         self.runtime_input_specializations: dict[str, Any] = {}
         self.bound_runtime_input_specialization_results: dict[str, Any] = {}
 
@@ -242,9 +245,13 @@ def test_missing_bound_proof_declines(missing: str) -> None:
         (torch.float32, True),
         (torch.int16, True),
         (torch.int32, True),
-        (torch.uint8, False),
+        # Byte-packed storage: the literal-offset load merge reads the same
+        # base-alignment fact (``literal_offset_loads``).
+        (torch.uint8, True),
+        (torch.float4_e2m1fn_x2, True),
+        # Bool rows load as byte packets (``_CUTE_VECTOR_UNROLL_BYTE_DTYPES``).
+        (torch.bool, True),
         (torch.int64, False),
-        (torch.bool, False),
     ),
 )
 def test_alignment_cache_registration_dtype_boundary(
@@ -264,7 +271,6 @@ def _high_nibble_to_bf16(packed: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_grid_lane_flush_uses_packet_from_deferred_hoist(enabled: bool) -> None:
     """Grid-owned hoists and flushes are emitted when the root body is wrapped.
@@ -279,8 +285,8 @@ def test_grid_lane_flush_uses_packet_from_deferred_hoist(enabled: bool) -> None:
         cute_lane_layouts=["blocked"],
         cute_signed_bitfield_bf16=enabled,
     )
-    with _mock_cuda_unavailable():
-        code = _cpu_bind(
+    with mock_cuda_unavailable():
+        code = cpu_bind(
             _high_nibble_to_bf16, (torch.empty(4096, dtype=torch.int8),)
         ).to_code(config)
     assert ("_cute_signed_bitfield_to_bf16_packed(" in code) is enabled

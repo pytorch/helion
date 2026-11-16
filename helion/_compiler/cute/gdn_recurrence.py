@@ -14,8 +14,16 @@ tcgen05 contractions (a tile narrower than 128 rows is replicated across the
 TMEM quadrants so every SM sub-partition shares the per-chunk epilogue), the
 epilogue warps issue both MMAs themselves, the ``w``/``k``/``u`` chunk tiles
 stream through a TMA-fed shared-memory ring, and the gating and the fp32
-rescale are exact (``exp`` is the ordinary ``exp2(x * log2 e)`` lowering,
-never approximate).
+rescale keep denormals (``exp2(x * log2 e)``, never the fast-math
+``ex2.approx.ftz``).  The rounded product costs ``|x| * 2^-24`` of relative
+error, below the bf16 rounding of the gated values and the stored state;
+the pointwise lowering's exact ``cute.math.exp``, even for the per-stage
+rescale alone, spills registers in the widest token slices.  Tuned configs
+must not change numerics, so without ``fast_math`` the configs this lowering
+declines (the SIMT and MMA-DAG fallbacks) compute the two exps the same way
+(:func:`mark_gdn_recurrence_exponentials`): a kernel's configs differ only
+in their reduction order.  (Under ``fast_math``, which lets configs change
+numerics, those take ``ex2.approx`` and the FMA scale hoist.)
 
 Admission is fail-closed: SM100, static shapes, contiguous CUDA tensors, bf16
 ``k``/``w``/``u``/``h`` with fp32 ``g``, ``dhead`` in {16, 32, 64}, a
@@ -39,20 +47,27 @@ import sympy
 import torch
 
 from ... import exc
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_MMA_M_KEY
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_STAGES_KEY
-from ...autotuner.config_spec import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
+from ..utils import is_full_slice
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
+from .autotune.config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
+from .cute_mma_dag import MMA_DAG_KEY
+from .cute_mma_dag import MMA_DAG_OFF
+from .exp2_fastmath import TEMPLATE_EXP2_META_KEY
+from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
+from .fx_matcher import _is_convert
 from .fx_matcher import _linear_offsets_fit_i32
 from .fx_matcher import _load_ref
 from .fx_matcher import _memory_indices
 from .fx_matcher import _same_ref
 from .fx_matcher import _store_ref
+from .fx_matcher import _tensor_arg
 from .fx_matcher import _TensorRef
 from .fx_matcher import _xyz_grid_fits
 from .gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
@@ -69,6 +84,7 @@ from .gdn_recurrence_geometry import gdn_stage_choices
 from .gdn_recurrence_geometry import gdn_state_replicas
 from .gdn_recurrence_geometry import gdn_tmem_layout
 from .gdn_recurrence_geometry import gdn_token_group_choices
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -102,6 +118,8 @@ class _GdnRecurrenceMatch:
     g: _TensorRef
     h: _TensorRef
     grid_block_ids: tuple[int, int, int]
+    # The gate ``exp(g_last - g_chunk)`` and rescale ``exp(g_last)`` nodes.
+    exponentials: tuple[torch.fx.Node, torch.fx.Node]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,33 +172,6 @@ def _static_shape(fake: torch.Tensor) -> tuple[int, ...] | None:
     return cast("tuple[int, ...]", dims)
 
 
-def _binary_args(
-    node: object, targets: tuple[object, ...]
-) -> tuple[object, object] | None:
-    if (
-        not isinstance(node, torch.fx.Node)
-        or node.op != "call_function"
-        or node.target not in targets
-        or len(node.args) != 2
-    ):
-        return None
-    return node.args[0], node.args[1]
-
-
-def _is_convert(node: object, source: object, dtype: torch.dtype) -> bool:
-    return bool(
-        isinstance(node, torch.fx.Node)
-        and _is_call(node, torch.ops.prims.convert_element_type.default)
-        and len(node.args) == 2
-        and node.args[0] is source
-        and node.args[1] is dtype
-    )
-
-
-def _is_full_slice(value: object) -> bool:
-    return isinstance(value, slice) and value == slice(None)
-
-
 def _is_plain_load(node: object) -> bool:
     return bool(
         isinstance(node, torch.fx.Node)
@@ -197,7 +188,7 @@ def _indices_are(node: torch.fx.Node, expected: Sequence[object]) -> bool:
         return False
     for actual, wanted in zip(indices, expected, strict=True):
         if wanted == "full":
-            if not _is_full_slice(actual):
+            if not is_full_slice(actual):
                 return False
         elif actual is not wanted:
             return False
@@ -294,19 +285,62 @@ def _match_gdn_recurrence_graphs(
             torch.ops.aten.permute.default: 1,
         }
     )
-    if _call_counts(root_nodes) != expected_root:
+    loop_call = _single(root_nodes, _for_loop)
+    placeholders = [node for node in inner if node.op == "placeholder"]
+    if (
+        loop_call is None
+        or len(loop_call.args) != 4
+        or not isinstance(loop_call.args[3], (list, tuple))
+        or len(loop_call.args[3]) != len(placeholders)
+    ):
+        return None
+    # Scalar SSA captures can remain in the loop interface after their last
+    # use disappears. Ignore only unused float placeholders and their pure
+    # symbol reads/SSA copies used exclusively by this call. Keep tensor
+    # carriers and any scalar that reaches arithmetic, effects or outputs
+    # in the proof.
+    unused_float_reads: set[torch.fx.Node] = set()
+    used_inputs = []
+    for index, (node, argument) in enumerate(
+        zip(placeholders, loop_call.args[3], strict=True)
+    ):
+        if not node.users and isinstance(node.meta.get("val"), torch.SymFloat):
+            user = loop_call
+            while isinstance(argument, torch.fx.Node):
+                if not isinstance(argument.meta.get("val"), torch.SymFloat) or set(
+                    argument.users
+                ) != {user}:
+                    return None
+                unused_float_reads.add(argument)
+                if _is_call(argument, _get_symnode):
+                    break
+                if (
+                    not _is_call(argument, _new_var)
+                    or len(argument.args) != 1
+                    or argument.kwargs
+                ):
+                    return None
+                user, argument = argument, argument.args[0]
+            else:
+                return None
+        else:
+            used_inputs.append((index, node))
+    if len(used_inputs) != 1:
+        return None
+    state_index, state_in = used_inputs[0]
+    if not isinstance(state_in.meta.get("val"), torch.Tensor):
+        return None
+    if (
+        _call_counts([n for n in root_nodes if n not in unused_float_reads])
+        != expected_root
+    ):
         return None
     if _call_counts(inner) != expected_inner:
         return None
-    placeholders = [node for node in inner if node.op == "placeholder"]
-    if len(placeholders) != 1:
-        return None
-    state_in = placeholders[0]
 
     # Root: zero-initialized [dhead, block_v] fp32 carrier, one chunk loop over
     # [0, seqlen), nothing else.
     full_node = _single(root_nodes, full)
-    loop_call = _single(root_nodes, _for_loop)
     getitem = _single(root_nodes, operator.getitem)
     phi = _single(root_nodes, _phi)
     root_outputs = list(root.graph.find_nodes(op="output"))
@@ -350,8 +384,8 @@ def _match_gdn_recurrence_graphs(
         or not isinstance(loop_call.args[2], (list, tuple))
         or len(loop_call.args[2]) != 1
         or not isinstance(loop_call.args[3], (list, tuple))
-        or len(loop_call.args[3]) != 1
-        or loop_call.args[3][0] is not full_node
+        or len(loop_call.args[3]) != len(placeholders)
+        or loop_call.args[3][state_index] is not full_node
     ):
         return None
     seqlen = _static_int(loop_call.args[2][0])
@@ -501,7 +535,7 @@ def _match_gdn_recurrence_graphs(
     batch_coord, w_chunk, head_coord, w_feature = w_indices
     if (
         w_chunk is not chunk_sym
-        or not _is_full_slice(w_feature)
+        or not is_full_slice(w_feature)
         or not _is_call(batch_coord, _get_symnode)
         or not _is_call(head_coord, _get_symnode)
         or batch_coord is head_coord
@@ -655,7 +689,15 @@ def _match_gdn_recurrence_graphs(
         g=g,
         h=h,
         grid_block_ids=cast("tuple[int, int, int]", tuple(grid_ids)),
+        exponentials=(
+            cast("torch.fx.Node", gate_exp),
+            cast("torch.fx.Node", rescale_exp),
+        ),
     )
+
+
+# A matched recurrence and the dstate tiles the schedule admits for it.
+_GdnAdmission = tuple[_GdnRecurrenceMatch, tuple[int, ...]]
 
 
 def _geometry_admitted(geometry: GdnRecurrenceGeometry, block_v: int) -> bool:
@@ -667,18 +709,60 @@ def _geometry_admitted(geometry: GdnRecurrenceGeometry, block_v: int) -> bool:
     )
 
 
-def detect_gdn_recurrence_search_geometry(
-    graphs: Sequence[GraphInfo],
-) -> GdnRecurrenceGeometry | None:
-    """Recognize the recurrence before config generation (any dstate tile)."""
-
+def _admitted_gdn_recurrence(
+    graphs: Sequence[GraphInfo], target: tuple[int, int] | None
+) -> _GdnAdmission | None:
+    """The recurrence in ``graphs`` and the dstate tiles the schedule admits
+    for its geometry (``gdn_admitted_block_sizes``; a config still picks the
+    tile), when the ``target`` capability is SM100 and there is one."""
+    if target is None or target[0] != 10:
+        return None
     match = _match_gdn_recurrence_graphs(graphs)
     if match is None:
         return None
-    geometry = match.geometry
-    if not gdn_admitted_block_sizes(geometry):
+    block_sizes = gdn_admitted_block_sizes(match.geometry)
+    if not block_sizes:
         return None
-    return geometry
+    return match, block_sizes
+
+
+def detect_gdn_recurrence_search_geometry(
+    graphs: Sequence[GraphInfo], target: tuple[int, int] | None
+) -> GdnRecurrenceGeometry | None:
+    """Recognize the recurrence before config generation (any dstate tile).
+
+    ``target`` is the capability of the config spec being seeded: the seed
+    heuristics take their environment as an argument, not the current one.
+    """
+
+    admitted = _admitted_gdn_recurrence(graphs, target)
+    return None if admitted is None else admitted[0].geometry
+
+
+def mark_gdn_recurrence_exponentials(
+    graphs: Sequence[GraphInfo],
+) -> _GdnAdmission | None:
+    """Mark the gate and rescale exps of a recurrence on an SM100 target
+    (``TEMPLATE_EXP2_META_KEY``) in the graphs a config generates code from
+    (``CuteBackend.pre_codegen``), when the schedule admits a dstate tile for
+    its geometry, and return that admission for ``plan_gdn_recurrence``.
+
+    The schedule computes them as ``exp2(x * log2 e)`` keeping denormals;
+    without ``fast_math`` the configs it declines (the SIMT and MMA-DAG
+    lowerings) lower the marked nodes the same way, so a kernel's configs
+    differ only in their reduction order.  The planner's per-config checks
+    (the grid and 32-bit offset limits) can still decline every config; the
+    configs then keep the marked form with no schedule to match, which
+    costs accuracy but not agreement.  Elsewhere, and on other targets,
+    ``exp`` keeps the exactly reduced ``cute.math.exp``.
+    """
+    admitted = _admitted_gdn_recurrence(
+        graphs, CompileEnvironment.current().config_spec.target_device_capability
+    )
+    if admitted is not None:
+        for node in admitted[0].exponentials:
+            node.meta[TEMPLATE_EXP2_META_KEY] = True
+    return admitted
 
 
 def gdn_admitted_block_sizes(geometry: GdnRecurrenceGeometry) -> tuple[int, ...]:
@@ -792,7 +876,7 @@ def gdn_recurrence_warp_choices(
 
 
 def _plan_gdn_recurrence(
-    graphs: Sequence[GraphInfo],
+    admitted: _GdnAdmission | None,
     _tile_strategy: TileStrategyDispatch,
 ) -> CuteGdnRecurrencePlan | None:
     from ..device_function import DeviceFunction
@@ -800,19 +884,20 @@ def _plan_gdn_recurrence(
     df = DeviceFunction.current()
     if df.config.get("pid_type", "flat") != "flat":
         return None
-    match = _match_gdn_recurrence_graphs(graphs)
-    if match is None:
+    if df.config.get(MMA_DAG_KEY, MMA_DAG_OFF) not in (MMA_DAG_OFF, None):
+        # The config selects the register-MMA dataflow owner
+        # (``cute_mma_dag``): the search decides between the two whole-root
+        # lowerings of this recurrence, and that knob is its choice.
         return None
-    env = CompileEnvironment.current()
-    target = env.config_spec.target_device_capability
-    if target is None or target[0] != 10:
+    if admitted is None:
         return None
+    match, admitted_block_sizes = admitted
     geometry = match.geometry
     resolved = [df.resolved_block_size(block_id) for block_id in match.grid_block_ids]
     if resolved[0] != 1 or resolved[1] != 1:
         return None
     block_v = resolved[2]
-    if type(block_v) is not int or block_v not in gdn_admitted_block_sizes(geometry):
+    if type(block_v) is not int or block_v not in admitted_block_sizes:
         return None
     tmem = gdn_tmem_layout(geometry.dhead, geometry.chunk)
     if tmem is None:
@@ -888,17 +973,15 @@ def _plan_gdn_recurrence(
 
 
 def plan_gdn_recurrence(
-    graphs: Sequence[GraphInfo], tile_strategy: TileStrategyDispatch
+    admitted: _GdnAdmission | None, tile_strategy: TileStrategyDispatch
 ) -> None:
+    """Plan the schedule for the config's recurrence, ``admitted`` being what
+    ``mark_gdn_recurrence_exponentials`` matched in the same graphs."""
     from ..device_function import DeviceFunction
 
-    DeviceFunction.current().cute_state.gdn_recurrence_plan = _plan_gdn_recurrence(
-        graphs, tile_strategy
+    DeviceFunction.current().cute_state.root_plans.gdn_recurrence_plan = (
+        _plan_gdn_recurrence(admitted, tile_strategy)
     )
-
-
-def _tensor_arg(cg: GenerateAST, ref: _TensorRef) -> str:
-    return cg.device_function.tensor_arg(ref.fake, prefer_name=ref.name).name
 
 
 def _emit_module_imports(cg: GenerateAST) -> None:
@@ -914,7 +997,7 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     """Replace the matched root with the SM100 schedule's wrapper plan."""
 
     df = cg.device_function
-    plan = df.cute_state.gdn_recurrence_plan
+    plan = df.cute_state.root_plans.gdn_recurrence_plan
     root = cg.current_root_graph_info
     if plan is None or root is None or root.graph_id != plan.root_graph_id:
         return False
@@ -927,7 +1010,8 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     k, w, u, g, h = names
     _emit_module_imports(cg)
     geometry = plan.geometry
-    cg.cute_wrapper_plans.append(
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(
         {
             "kind": GDN_RECURRENCE_KIND,
             "k_name": k,
@@ -960,7 +1044,7 @@ def codegen_gdn_recurrence(cg: GenerateAST) -> bool:
     df.placeholder_args.update(names)
     df.preamble = []
     df.body = [ast.Pass()]
-    cg.cute_uses_matmul = True
+    codegen_state.declare_matmul()
     return True
 
 
@@ -975,5 +1059,6 @@ __all__ = [
     "gdn_recurrence_token_group_choices_by_tile",
     "gdn_recurrence_warp_choices",
     "gdn_seed_block_sizes",
+    "mark_gdn_recurrence_exponentials",
     "plan_gdn_recurrence",
 ]

@@ -9,14 +9,12 @@ from test import test_cute_rank3_rhs_b_tma as grouped
 from test.test_autotuner_heuristics import _grouped_worklist_bind_patches
 
 import helion
-from helion._compiler.autotuner_heuristics.register_chain import (
+from helion._compiler.cute import cute_epilogue
+from helion._compiler.cute.autotune.heuristics.cute_register_chain import (
     CuteRegisterChainHeuristic,
 )
-from helion._compiler.cute import cute_epilogue
 import helion.language as hl
 from helion.language import memory_ops
-
-pytestmark = grouped.pytestmark
 
 
 def _capture_tail() -> tuple:

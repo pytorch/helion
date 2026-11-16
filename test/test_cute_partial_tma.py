@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import logging
 
-from examples.broadcast_matmul import broadcast_matmul
-from examples.matmul import matmul
 import pytest
 import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import import_example
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
 
-pytestmark = skipUnlessBackends(["cute"])
+broadcast_matmul = import_example("broadcast_matmul").broadcast_matmul
+matmul = import_example("matmul").matmul
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

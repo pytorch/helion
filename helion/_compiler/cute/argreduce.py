@@ -1,3 +1,15 @@
+"""CuTe lowering of ``argmax`` / ``argmin`` over a tile.
+
+Role: general-purpose emitter.  ``codegen_cute_tile_argreduce`` renders the
+per-thread extreme-and-index walk of a tile argreduction through the lane
+loops and the ordered-key helpers; ``codegen_packed_reduction`` takes the
+bounded low-precision case through one ordered-key collective;
+``_should_use_cute_argreduce_lowering`` is the
+``Backend.argreduce_uses_aten_lowering`` decision for an argreduction fed by
+a matmul.  Called from ``aten_lowering``, ``reduction_emitter`` and
+``cute/backend.py``.
+"""
+
 from __future__ import annotations
 
 import ast
@@ -9,6 +21,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch.fx.node import Node
 
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
@@ -22,14 +35,79 @@ from .cute_reshape import resolve_cute_shape_chain_value
 from .indexing import CuteShapeChainView
 
 if TYPE_CHECKING:
-    from torch.fx.node import Node
-
     from ..aten_lowering import LoweringContext
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import LoopedReductionStrategy
     from ..reduction_strategy import PersistentReductionStrategy
     from ..tile_strategy import DeviceLoopState
+
+
+def _should_use_cute_argreduce_lowering(argreduce_node: Node) -> bool:
+    """Whether an ``argmax``/``argmin`` whose input is fed by a matmul (through
+    nested device loops too) takes the CuTe ATen argreduce lowering instead of
+    Inductor's reduction lowering (``Backend.argreduce_uses_aten_lowering``)."""
+    from ...language import _tracing_ops
+    from ...language._decorators import is_api_func
+    from ..device_ir import DeviceIR
+
+    if not argreduce_node.args or not isinstance(argreduce_node.args[0], Node):
+        return False
+
+    matmul_targets = {
+        torch.matmul,
+        torch.ops.aten.mm.default,
+        torch.ops.aten.addmm.default,
+        torch.ops.aten.bmm.default,
+        torch.ops.aten.baddbmm.default,
+    }
+    try:
+        device_ir = DeviceIR.current()
+        graph_by_id = {
+            idx: graph_info
+            for idx, graph_info in enumerate(getattr(device_ir, "graphs", ()))
+            if hasattr(graph_info, "graph")
+        }
+    except (AttributeError, IndexError):
+        graph_by_id = {}
+    seen_graph_ids: set[int] = set()
+    seen_nodes: set[Node] = set()
+
+    def graph_contains_matmul(graph_id: int) -> bool:
+        if graph_id in seen_graph_ids:
+            return False
+        seen_graph_ids.add(graph_id)
+        graph_info = graph_by_id.get(graph_id)
+        graph = getattr(graph_info, "graph", None)
+        if not isinstance(graph, torch.fx.Graph):
+            return False
+        return any(node_contains_matmul(node) for node in graph.nodes)
+
+    def node_contains_matmul(node: Node) -> bool:
+        if node in seen_nodes:
+            return False
+        seen_nodes.add(node)
+        if node.op != "call_function":
+            return False
+        if node.target in matmul_targets:
+            return True
+        if is_api_func(node.target):
+            name = getattr(node.target, "__name__", "")
+            if name == "dot":
+                return True
+            if _tracing_ops.is_for_loop_target(node.target):
+                graph_id = node.args[0] if node.args else None
+                if isinstance(graph_id, int) and graph_contains_matmul(graph_id):
+                    return True
+        for arg in node.args:
+            if isinstance(arg, Node) and node_contains_matmul(arg):
+                return True
+        for arg in node.kwargs.values():
+            if isinstance(arg, Node) and node_contains_matmul(arg):
+                return True
+        return False
+
+    return node_contains_matmul(argreduce_node.args[0])
 
 
 def _argreduce_extreme_literal(
@@ -169,9 +247,8 @@ def _argreduce_scan_ready_expr(
         # inner loop: the last element is the last vec lane of the last
         # outer iteration.
         wrapper = grid_state.vec_lane_wrappers.get(lane_var)
-        vec_width = getattr(strategy, "_cute_lane_vec_width_by_block", {}).get(
-            block_id, 1
-        )
+        lane = cg.device_function.lane_contexts.get(block_id)
+        vec_width = 1 if lane is None else lane.vec_width
         if wrapper is not None and vec_width > 1 and extent % vec_width == 0:
             terms.append(
                 f"(({lane_var}) == {extent // vec_width - 1} "
@@ -219,7 +296,6 @@ def codegen_packed_reduction(
     if isinstance(strategy, LoopedReductionStrategy):
         if (
             strategy._cute_rolled_cluster_n != 1
-            or strategy._cute_emitted_vec_load
             or strategy._cute_reduction_vec_width != 1
         ):
             return None

@@ -93,6 +93,79 @@ def _flydsl_col_tail_pred(
     return f"(({col_base}) + {iota}) < ({n_expr})"
 
 
+ROWS_ONLY_HINT = (
+    "tile only the rows with the top-level hl.tile and access whole rows "
+    "(x[tile, :]) or tile columns in an inner hl.tile loop"
+)
+
+
+def _reject_unsupported_subscript(
+    env: CompileEnvironment,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+) -> None:
+    """The access code only understands tile indices, whole ``:`` slices and
+    None, and skips anything else. Grid tiles map to rows (one warp per row) and
+    the first tiled index is taken as the row. Any other index or placement
+    would silently read/write the wrong elements."""
+    from ..host_function import HostFunction
+
+    for idx in subscript:
+        if idx is None or (isinstance(idx, slice) and idx == slice(None)):
+            continue
+        if isinstance(idx, torch.SymInt) and env.get_block_id(idx) is not None:
+            continue
+        if isinstance(idx, torch.Tensor):
+            what = "a tensor index (e.g. tile.index + 1)"
+        elif isinstance(idx, slice):
+            what = "a partial slice"
+        elif isinstance(idx, int):
+            what = f"the constant index {idx}"
+        else:
+            what = f"the index {idx!r}"
+        raise exc.BackendUnsupported(
+            "flydsl",
+            f"{what} in a tensor access is unsupported; index only with hl.tile "
+            "tiles, whole ':' slices or None",
+        )
+
+    grid_ids = {
+        b for ids in HostFunction.current().device_ir.grid_block_ids for b in ids
+    }
+    dims = [idx for idx in subscript if idx is not None]  # None adds no dim
+    grid_dims = [
+        pos
+        for pos, idx in enumerate(dims)
+        if isinstance(idx, torch.SymInt) and env.get_block_id(idx) in grid_ids
+    ]
+    if tensor.ndim == 1 and grid_dims:
+        raise exc.BackendUnsupported(
+            "flydsl",
+            f"indexing a 1-D tensor with the top-level hl.tile is unsupported; "
+            f"{ROWS_ONLY_HINT}",
+        )
+    if any(pos > 0 for pos in grid_dims):
+        raise exc.BackendUnsupported(
+            "flydsl",
+            "the column dimension of a tensor access is tiled by the top-level "
+            f"hl.tile; {ROWS_ONLY_HINT}",
+        )
+    if tensor.ndim > 1 and grid_dims != [0]:
+        raise exc.BackendUnsupported(
+            "flydsl",
+            "the row dimension of a tensor access must be indexed by the "
+            f"top-level hl.tile; {ROWS_ONLY_HINT}",
+        )
+
+
+def _reject_extra_mask(extra_mask: object) -> None:
+    # The access code applies only its own bounds masks.
+    if extra_mask is not None:
+        raise exc.BackendUnsupported(
+            "flydsl", "extra_mask on hl.load/hl.store is unsupported"
+        )
+
+
 def _flydsl_buffer_setup(
     env: CompileEnvironment,
     state: CodegenState,
@@ -107,6 +180,7 @@ def _flydsl_buffer_setup(
     predicate, then build the buffer/logical_divide/copy_atom trio (memoized per
     ``(tensor, is_vec, is_rolled_col)``). Only tail handling differs by caller.
     """
+    _reject_unsupported_subscript(env, tensor, subscript)
     row_block_id = 0
     col_block_id = None
     seen_row = False
@@ -283,6 +357,7 @@ def _(state: CodegenState) -> None:
     value = state.ast_arg(2)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+    _reject_extra_mask(state.proxy_arg(3))
 
     env = CompileEnvironment.current()
     backend = cast("FlyDSLBackend", env.backend)
@@ -448,6 +523,7 @@ def _(state: CodegenState) -> ast.AST:
     subscript = state.proxy_arg(1)
     assert isinstance(tensor, torch.Tensor)
     assert isinstance(subscript, (list, tuple))
+    _reject_extra_mask(state.proxy_arg(2))
 
     env = CompileEnvironment.current()
     backend = cast("FlyDSLBackend", env.backend)

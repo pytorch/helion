@@ -364,7 +364,7 @@ class TestXCDRemapCodegen(TestCase):
         # device like num_xcd -- not default to 1 -- so the interleaved alignment
         # check doesn't falsely disable xcd_remap.
         from helion._compat import device_num_sm
-        from helion._compiler.backend import TritonBackend
+        from helion._compiler.triton.backend import TritonBackend
         from helion.autotuner.config_spec import ConfigSpec
 
         spec = ConfigSpec(backend=TritonBackend())

@@ -18,23 +18,24 @@ from __future__ import annotations
 import ast
 import textwrap
 from typing import TYPE_CHECKING
+from typing import Any
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion import exc
-from helion._compiler.tile_strategy import _lane_invariant_tail_after_consume
+from helion._compiler.cute.lane_loops.split import _lane_invariant_tail_after_consume
+from helion._testing import DEVICE
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 
 # --- the placement rules, on generated-code-shaped statements ---------------
@@ -368,8 +369,8 @@ def test_persistent_vector_markers_are_loads_and_stores_of_their_tensors() -> No
 
 
 def _generate(kernel: object, args: tuple[torch.Tensor, ...], **config: object) -> str:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
         return bound.to_code(helion.Config.from_dict(config))
 
 
@@ -628,8 +629,8 @@ def test_store_between_two_per_lane_stores_of_its_tensor_rejects_the_config(
 
 
 def test_generated_pure_inline_asm_runs_once_between_lane_passes() -> None:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_reduction_inline_asm, (*_ARGS, True))
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_reduction_inline_asm, (*_ARGS, True))
         code = bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))
     function = _kernel_function(code)
     passes = _pass_indices(function)
@@ -656,7 +657,92 @@ def test_generated_pure_inline_asm_runs_once_between_lane_passes() -> None:
 
 
 def test_generated_impure_inline_asm_rejects_the_lane_split() -> None:
-    with _mock_cuda_unavailable():
-        bound = _cpu_bind(_reduction_inline_asm, (*_ARGS, False))
-        with pytest.raises(exc.BackendUnsupported, match="between per-lane statements"):
+    with mock_cuda_unavailable():
+        bound = cpu_bind(_reduction_inline_asm, (*_ARGS, False))
+        # This opaque effect consumes the reduction result; the proved snapshot
+        # schedule admits only a producer before the reduction.
+        with pytest.raises(
+            exc.BackendUnsupported,
+            match="impure inline assembly has no proved snapshot/order schedule",
+        ):
             bound.to_code(helion.Config.from_dict(_CONFIG_FEW_THREADS))
+
+
+# GPU numerics for the lane-invariant tail of a split lane loop.
+#
+# The codegen tests above check where the tail statements are emitted; these
+# kernels run them.  A row's zeroing store
+# after the copy of the row used to be overwritten by the consume pass, so
+# ``out[:, 0]`` held ``x[:, 0]`` instead of zero.
+
+
+def _run(kernel: object, x: torch.Tensor, **config: object) -> Any:
+    bound = kernel.bind((x,))  # pyrefly: ignore [missing-attribute]
+    return bound.compile_config(helion.Config.from_dict(config))(x)
+
+
+def _rows() -> torch.Tensor:
+    torch.manual_seed(0)
+    return torch.randn((8, 256), device=DEVICE)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "config", [_CONFIG, _CONFIG_FEW_THREADS], ids=["threads32", "threads8"]
+)
+def test_zero_after_the_copy_matches_reference(config: dict[str, object]) -> None:
+    x = _rows()
+    out, sums = _run(_copy_then_zero, x, **config)
+    expected = x.clone()
+    expected[:, 0] = 0.0
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+    torch.testing.assert_close(sums, x.sum(dim=1))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "config", [_CONFIG, _CONFIG_FEW_THREADS], ids=["threads32", "threads8"]
+)
+def test_zero_after_the_softmax_matches_reference(config: dict[str, object]) -> None:
+    x = _rows()
+    out = _run(_softmax_then_zero, x, **config)
+    expected = torch.softmax(x, dim=1)
+    expected[:, 0] = 0.0
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_reduced_value_stored_into_the_copied_row_matches_reference() -> None:
+    x = _rows()
+    out = _run(_copy_then_sum_into_the_row, x, **_CONFIG)
+    expected = x.clone()
+    expected[:, 0] = x.sum(dim=1)
+    torch.testing.assert_close(out, expected)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_store_into_another_tensor_matches_reference() -> None:
+    x = _rows()
+    out, out2, flags = _run(_copy_then_flag, x, **_CONFIG)
+    torch.testing.assert_close(out, x, rtol=0, atol=0)
+    torch.testing.assert_close(out2, x * 2, rtol=0, atol=0)
+    torch.testing.assert_close(flags, x.sum(dim=1))
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "kernel",
+    [_copy_zero_copy_again, _softmax_zero_softmax_again],
+    ids=["one_pass", "dependent"],
+)
+def test_store_between_two_per_lane_stores_of_its_tensor_rejects_the_config_on_device(
+    kernel: object,
+) -> None:
+    x = _rows()
+    with pytest.raises(exc.BackendUnsupported, match="a body a later pass rewrites"):
+        _run(kernel, x, **_CONFIG)

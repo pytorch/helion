@@ -12,12 +12,15 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .test_cute_flash_stateful_lpt import _spec
 from helion._compiler.cute import cute_flash as flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_config_topology
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._testing import cpu_render_target
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -25,7 +28,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -84,7 +87,7 @@ def test_causal_ws_leaf_retains_historical_width_aliases(
         requested = {**config.config, flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY: alias}
         assert spec.normalized_config(requested) == config
     root = ConfigGeneration(spec)
-    owned = root.flash_owned_coordinate_indices(config)
+    owned = root.extension.flash_owned_coordinate_indices(config)
     identities = root._flat_coordinate_identities()
     # No lowering owns the launch group; the WS leaf's fragment is what keeps
     # it at 0.
@@ -152,8 +155,8 @@ def test_wide_nonstateful_fixed_request_is_legal(topology: str) -> None:
 
 def test_full_qualification_terminal_catalog_retains_ws_zero() -> None:
     generation = ConfigGeneration(_spec(64))
-    surface = generation.flash_terminal_coordinate_surface_catalog()
-    leaves = generation.flash_structural_leaf_catalog()
+    surface = generation.extension.flash_terminal_coordinate_surface_catalog()
+    leaves = generation.extension.flash_structural_leaf_catalog()
     assert len(surface["leaves"]) == len(leaves)
     ws = [item for item in surface["leaves"] if item["leaf"]["family"] == "ws_overlap"]
     assert {item["leaf"]["softmax_disc"] for item in ws} == {True}
@@ -164,7 +167,7 @@ def test_full_qualification_terminal_catalog_retains_ws_zero() -> None:
             if coordinate["key"] == flash.FLASH_CAUSAL_LPT_SWIZZLE_KEY
         )
         assert width["active_values"] == [0]
-    assert not generation.flash_structural_coverage_underqualified_leaves()
+    assert not generation.extension.flash_structural_coverage_underqualified_leaves()
 
 
 @pytest.mark.parametrize(
@@ -194,8 +197,8 @@ def test_topology_lookup_uses_structural_selectors_before_children(
     }
     # These children are incompatible on a causal workload. Topology lookup
     # must leave their established ordered validation to its callers.
-    assert spec._cute_flash_config_topology(controls) == expected
-    assert spec._resolve_cute_flash_config(selectors).topology == expected
+    assert _cute_flash_config_topology(spec, controls) == expected
+    assert _resolve_cute_flash_config(spec, selectors).topology == expected
 
 
 @pytest.mark.parametrize("reason", ("forced_ws", "odd_kv"))
@@ -206,8 +209,8 @@ def test_topology_lookup_respects_workload_forced_ws(reason: str) -> None:
     else:
         spec._cute_flash_num_kv = 3
     request = {flash.FLASH_PIPELINE_FAMILY_KEY: "fa4"}
-    assert spec._cute_flash_config_topology(request) == "ws_overlap"
-    assert spec._resolve_cute_flash_config(request).topology == "ws_overlap"
+    assert _cute_flash_config_topology(spec, request) == "ws_overlap"
+    assert _resolve_cute_flash_config(spec, request).topology == "ws_overlap"
 
 
 def test_family_view_alone_retains_ws_conditional_domain() -> None:

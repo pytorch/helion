@@ -3,13 +3,10 @@ from __future__ import annotations
 import ast
 import copy
 import csv
-import importlib.util
-import inspect
 import json
 import operator
 import os
 import py_compile
-from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
@@ -18,12 +15,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_structural_cache import _cpu_only  # noqa: F401
-from test.test_cute_structural_cache import _search
-from test.test_cute_structural_compatibility import _pointwise
-
 import helion
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_structural import _cpu_only  # noqa: F401
+from helion._testing.cute_structural import _function
+from helion._testing.cute_structural import _module
+from helion._testing.cute_structural import _search
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import find_heuristic_file
@@ -46,10 +42,12 @@ from helion.autotuner.heuristic_generator import evaluate_heuristic
 from helion.autotuner.heuristic_generator import generate_heuristic
 from helion.autotuner.heuristic_generator import get_backend
 from helion.autotuner.heuristic_generator import load_measurements
-from helion.runtime.cute_structural_config import CuteStructuralConfig
-from helion.runtime.cute_structural_config import StructuralPolicyError
-from helion.runtime.cute_structural_policy import CUTE_STRUCTURAL_SETTINGS
-from helion.runtime.cute_structural_policy import CuteStructuralPolicy
+from helion.runtime.cute.structural_config import CuteStructuralConfig
+from helion.runtime.cute.structural_config import StructuralPolicyError
+from helion.runtime.cute.structural_policy import CUTE_STRUCTURAL_SETTINGS
+from helion.runtime.cute.structural_policy import CuteStructuralPolicy
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -63,22 +61,6 @@ def _key_cache() -> Iterator[None]:
     HeuristicKeyFunction.clear_cache()
     yield
     HeuristicKeyFunction.clear_cache()
-
-
-def _module(path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    assert spec is not None and spec.loader is not None
-    result = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(result)
-    return result
-
-
-def _function(tmp_path: Path) -> Callable[..., Any]:
-    source = tmp_path / "original.py"
-    source.write_text(
-        "import torch\nimport helion.language as hl\n" + inspect.getsource(_pointwise)
-    )
-    return _module(source)._pointwise
 
 
 def _measurements(
@@ -117,7 +99,6 @@ def _target_options(backend: str) -> PerformanceTarget:
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_real_measurement_partitions_preserve_legacy_and_equal_knob_identity() -> None:
     policies = (
         None,
@@ -156,7 +137,6 @@ def test_real_measurement_partitions_preserve_legacy_and_equal_knob_identity() -
 
 
 @pytest.mark.parametrize("change", ["version", "id", "config", "mixed", "filename"])
-@skipUnlessBackends(["cute"])
 def test_measurement_validation_precedes_config_interpretation(
     change: str, tmp_path: Path
 ) -> None:
@@ -193,7 +173,6 @@ def test_measurement_validation_precedes_config_interpretation(
 
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
 @pytest.mark.parametrize("combined", [False, True])
-@skipUnlessBackends(["cute"])
 def test_installed_training_backends_preserve_numeric_keys_and_config_order(
     backend: str,
     combined: bool,
@@ -267,7 +246,6 @@ def test_installed_training_backends_preserve_numeric_keys_and_config_order(
 
 
 @pytest.mark.parametrize("failure", [False, True])
-@skipUnlessBackends(["cute"])
 def test_measure_all_configs_uses_selected_partition_and_restores_provider(
     failure: bool,
 ) -> None:
@@ -307,7 +285,6 @@ def test_measure_all_configs_uses_selected_partition_and_restores_provider(
     assert search.settings.autotune_precompile == original_precompile
 
 
-@skipUnlessBackends(["cute"])
 def test_real_measure_fn_rebinds_and_times_complete_allocating_callable(
     tmp_path: Path,
 ) -> None:
@@ -467,7 +444,6 @@ def test_policy_lookup_never_falls_back_to_unversioned_model(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
-@skipUnlessBackends(["cute"])
 def test_actual_runner_partitions_train_and_evaluate_separately(
     backend: str, tmp_path: Path
 ) -> None:
@@ -542,7 +518,6 @@ def test_actual_runner_partitions_train_and_evaluate_separately(
             assert evaluation["_pointwise"]["max_slowdown"] == 1.0
 
 
-@skipUnlessBackends(["cute"])
 def test_content_scoped_model_cache_ignores_stale_same_size_bytecode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -585,7 +560,6 @@ def test_content_scoped_model_cache_ignores_stale_same_size_bytecode(
 
 @pytest.mark.parametrize("backend", ["decision_tree", "nearest_neighbor"])
 @pytest.mark.parametrize("user_key", [False, True])
-@skipUnlessBackends(["cute"])
 def test_feature_evaluation_reuses_real_dtype_and_user_key_features(
     backend: str, user_key: bool, tmp_path: Path
 ) -> None:

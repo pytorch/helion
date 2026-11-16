@@ -15,12 +15,22 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ... import exc
-from .. import tile_strategy
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import live_in
+from ._ast_pass_utils import loop_extent
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from .lane_loops.markers import _HELION_LANE_REDUCE_MARKER
+from .lane_loops.markers import _dtype_ctor_from_identity
+from .lane_loops.markers import _is_lane_reduce_marker_assign
+from .lane_loops.markers import _lane_reduce_marker_expr
+from .lane_loops.markers import _LaneReduceMarker
+from .packet_access import match_packet_access
+from .resident_reductions import ResidentPassContext
 from .resident_reductions import _pointer_parts
 from .scalar_recipe import _MATH_CALLS
 from .scalar_recipe import _NUMERIC_TYPES
@@ -35,7 +45,7 @@ if TYPE_CHECKING:
     import torch
 
     from ..inductor_lowering import CodegenState
-    from ..reduction_strategy import BlockReductionStrategy
+    from .reduction_emitter import CuteBlockReductionEmitter
     from .resident_sequence_cache import SequenceCache
 
 
@@ -87,7 +97,7 @@ class SequenceRegion:
 
 
 def sequence_reduction_expr(
-    strategy: BlockReductionStrategy,
+    emitter: CuteBlockReductionEmitter,
     state: CodegenState,
     input_name: str,
     reduction_type: str,
@@ -101,6 +111,7 @@ def sequence_reduction_expr(
     from ..compile_environment import CompileEnvironment
     from ..tile_strategy import DeviceLoopState
 
+    strategy = emitter.strategy
     env = CompileEnvironment.current()
     fn = state.device_function
     if (
@@ -162,7 +173,7 @@ def sequence_reduction_expr(
         raise exc.BackendUnsupported(
             "cute", "sequence reduction exceeds the resident lane bound"
         )
-    axes, sizes = strategy._active_thread_layout()
+    axes, sizes = emitter._active_thread_layout()
     axis = axes.get(strategy.block_index)
     threads = sizes.get(axis, 0) if axis is not None else 0
     pre = 1
@@ -182,7 +193,7 @@ def sequence_reduction_expr(
         or total > 1024
         or total % threads
         or not linear
-        or strategy._lane_reduce_cluster_n() != 1
+        or emitter._lane_reduce_cluster_n() != 1
         or any(size != sizes.get(dimension, 1) for dimension, size in enumerate(launch))
     ):
         raise exc.BackendUnsupported(
@@ -201,14 +212,14 @@ def sequence_reduction_expr(
         thread_count=total,
         linear_thread=linear,
     )
-    fn.cute_state.resident_sequence_regions[id(loop.for_node)] = region
+    fn.cute_state.lanes.resident_sequence_regions[id(loop.for_node)] = region
     identity = env.backend.cast_expr(
         constant_repr(default),
         env.backend.dtype_str(get_computation_dtype(fake_output.dtype)),
     )
-    return tile_strategy._lane_reduce_marker_expr(
+    return _lane_reduce_marker_expr(
         input_name, reduction_type, identity, min(threads, 32)
-    ).replace(tile_strategy._HELION_LANE_REDUCE_MARKER, _MARKER, 1)
+    ).replace(_HELION_LANE_REDUCE_MARKER, _MARKER, 1)
 
 
 class _Decline(Exception):
@@ -216,22 +227,11 @@ class _Decline(Exception):
 
 
 def _qualified(node: ast.AST) -> str | None:
-    return tile_strategy._qualified_name(node)
+    return call_path_str(node)
 
 
 def _literal_loop_extent(loop: ast.For) -> int | None:
-    iterator = loop.iter
-    if (
-        isinstance(iterator, ast.Call)
-        and _qualified(iterator.func) in {"range", "cutlass.range_constexpr"}
-        and len(iterator.args) == 1
-        and not iterator.keywords
-        and isinstance(iterator.args[0], ast.Constant)
-        and type(iterator.args[0].value) is int
-        and iterator.args[0].value > 0
-    ):
-        return iterator.args[0].value
-    return None
+    return loop_extent(loop, minimum=1)
 
 
 def _clone(node: ast.AST) -> ast.stmt:
@@ -252,44 +252,15 @@ def _canonical(node: ast.AST, renames: Mapping[str, str]) -> ast.AST:
     return Names().visit(_clone(node))
 
 
-def _live_in(statements: list[ast.AST], live_out: set[str]) -> set[str]:
-    """Scalar liveness with zero-trip loops and branch definition dominance."""
-    live = set(live_out)
-    for statement in reversed(statements):
-        name = _assignment(statement)
-        if name is not None:
-            live.discard(name)
-            live.update(_reads(statement))
-        elif isinstance(statement, ast.If):
-            live = (
-                _live_in(list(statement.body), live)
-                | _live_in(list(statement.orelse), live)
-                | _reads(statement.test)
-            )
-        elif isinstance(statement, ast.For) and isinstance(statement.target, ast.Name):
-            carried = set(live)
-            while True:
-                needed = _live_in(list(statement.body), carried) - {statement.target.id}
-                updated = carried | needed
-                if updated == carried:
-                    break
-                carried = updated
-            live |= carried | _reads(statement.iter)
-            live = _live_in(list(statement.orelse), live)
-        else:
-            live.update(_reads(statement))
-    return live
-
-
 def _reads(node: ast.AST) -> set[str]:
     return set(ReadWrites.from_ast(node).reads)
 
 
 def _assignment(node: ast.AST) -> str | None:
-    return tile_strategy._plain_assignment_name(node)
+    return assigned_name(node)
 
 
-def _marker(node: ast.AST) -> tile_strategy._LaneReduceMarker | None:
+def _marker(node: ast.AST) -> _LaneReduceMarker | None:
     if not isinstance(node, ast.Assign):
         return None
     calls = [
@@ -310,8 +281,8 @@ def _marker(node: ast.AST) -> tile_strategy._LaneReduceMarker | None:
             and isinstance(item.func, ast.Name)
             and item.func.id == _MARKER
         ):
-            item.func.id = tile_strategy._HELION_LANE_REDUCE_MARKER
-    result = tile_strategy._is_lane_reduce_marker_assign(copied)
+            item.func.id = _HELION_LANE_REDUCE_MARKER
+    result = _is_lane_reduce_marker_assign(copied)
     if result is None:
         raise _Decline
     return result
@@ -434,30 +405,34 @@ def _memory_roots(body: list[ast.AST]) -> tuple[set[str], set[str]]:
 
 
 def _valid_vector_load(node: ast.Call) -> bool:
+    """A plain or L2-hinted packet load whose keywords are string cache hints."""
+    access = match_packet_access(node)
     return (
-        _qualified(node.func) in _VECTOR_LOADS
-        and len(node.args) == 2
-        and isinstance(node.args[1], ast.Call)
-        and _qualified(node.args[1].func) == "ir.VectorType.get"
+        access is not None
+        and access.kind in ("packet", "hinted_packet")
         and all(
             keyword.arg
             in {"cop", "level1_eviction_priority", "level2_eviction_priority"}
             and isinstance(keyword.value, ast.Constant)
             and isinstance(keyword.value.value, str)
-            for keyword in node.keywords
+            for keyword in access.keywords
         )
     )
 
 
 def _vector_loads(statements: list[ast.stmt]) -> set[str]:
+    """Names assigned from a ``cute.arch.load`` (scalar or packet) or an
+    L2-hinted packet helper."""
     result: set[str] = set()
     for statement in statements:
         name = _assignment(statement)
-        if (
-            name is not None
-            and isinstance(statement, ast.Assign)
-            and isinstance(statement.value, ast.Call)
-            and _qualified(statement.value.func) in _VECTOR_LOADS
+        if name is None or not isinstance(statement, ast.Assign):
+            continue
+        access = match_packet_access(statement.value)
+        if access is not None and access.kind in (
+            "arch_load",
+            "packet",
+            "hinted_packet",
         ):
             result.add(name)
     return result
@@ -593,7 +568,7 @@ def _combine(kind: str, left: str, right: str) -> str:
 
 
 def _finalize(
-    marker: tile_strategy._LaneReduceMarker,
+    marker: _LaneReduceMarker,
     accumulator: str,
     region: SequenceRegion,
     new_var: Callable[..., str],
@@ -609,7 +584,7 @@ def _finalize(
                 f"{marker.result_var} = {marker.finalize_expr(partial)}"
             )
         ]
-    dtype = tile_strategy._dtype_ctor_from_identity(marker.identity_expr)
+    dtype = _dtype_ctor_from_identity(marker.identity_expr)
     assert dtype is not None
     warps = region.threads // 32
     pointer, buffer, tid, value, index = (
@@ -647,7 +622,7 @@ class _Step:
     reads: set[str]
     varying: bool
     level: int
-    marker: tile_strategy._LaneReduceMarker | None
+    marker: _LaneReduceMarker | None
 
 
 @dataclasses.dataclass
@@ -878,9 +853,7 @@ def _lower_region(
                 *(
                     _reads(
                         expr_from_string(
-                            cast(
-                                "tile_strategy._LaneReduceMarker", step.marker
-                            ).input_name
+                            cast("_LaneReduceMarker", step.marker).input_name
                         )
                     )
                     for step in steps
@@ -969,9 +942,7 @@ def _lower_region(
         roots = set().union(
             *(
                 _reads(
-                    expr_from_string(
-                        cast("tile_strategy._LaneReduceMarker", step.marker).input_name
-                    )
+                    expr_from_string(cast("_LaneReduceMarker", step.marker).input_name)
                 )
                 for step in current
             )
@@ -979,7 +950,7 @@ def _lower_region(
         selected = closure(roots, level)
         accumulators = {step.name: new_var("sequence_acc") for step in current}
         for step in current:
-            marker = cast("tile_strategy._LaneReduceMarker", step.marker)
+            marker = cast("_LaneReduceMarker", step.marker)
             result.append(
                 statement_from_string(
                     f"{accumulators[step.name]} = {marker.identity_expr}"
@@ -1007,8 +978,8 @@ def _lower_region(
                     )
                     cached.add(step.name)
         for step in current:
-            marker = cast("tile_strategy._LaneReduceMarker", step.marker)
-            dtype = tile_strategy._dtype_ctor_from_identity(marker.identity_expr)
+            marker = cast("_LaneReduceMarker", step.marker)
+            dtype = _dtype_ctor_from_identity(marker.identity_expr)
             if dtype is None:
                 raise _Decline
             accumulator = accumulators[step.name]
@@ -1024,7 +995,7 @@ def _lower_region(
         for step in current:
             result.extend(
                 _finalize(
-                    cast("tile_strategy._LaneReduceMarker", step.marker),
+                    cast("_LaneReduceMarker", step.marker),
                     accumulators[step.name],
                     region,
                     new_var,
@@ -1049,22 +1020,19 @@ def materialize_resident_sequences(
     body: list[ast.AST],
     *,
     regions: Mapping[int, SequenceRegion],
-    tensor_dtypes: Mapping[str, str],
-    rename_groups: Mapping[str, str],
-    disjoint_pairs: set[frozenset[str]],
-    boundary_names: set[str],
+    context: ResidentPassContext,
     resident: bool,
-    new_var: Callable[..., str],
 ) -> list[ast.AST]:
     """Apply all admitted regions transactionally, or decline this config."""
     from .resident_sequence_cache import reuse_sequence_cache
 
+    rename_groups = context.rename_groups
     try:
         if not regions:
             raise _Decline
         reads, writes = _memory_roots(body)
         if any(
-            frozenset((read, write)) not in disjoint_pairs
+            frozenset((read, write)) not in context.disjoint_pairs
             for read in reads
             for write in writes
         ):
@@ -1085,7 +1053,7 @@ def materialize_resident_sequences(
             live = set(live_out)
             for statement in reversed(statements):
                 live_after[id(statement)] = set(live)
-                live = _live_in([_canonical(statement, rename_groups)], live)
+                live = live_in([_canonical(statement, rename_groups)], live)
             for statement in statements:
                 region = regions.get(id(statement))
                 if region is not None:
@@ -1108,7 +1076,7 @@ def materialize_resident_sequences(
                     ):
                         raise _Decline
                     body_live = (
-                        _live_in(
+                        live_in(
                             [
                                 _canonical(item, rename_groups)
                                 for item in region.loop.body
@@ -1121,10 +1089,10 @@ def materialize_resident_sequences(
                         region,
                         prefix=dominating,
                         boundaries=boundaries,
-                        tensor_dtypes=tensor_dtypes,
+                        tensor_dtypes=context.tensor_dtypes,
                         rename_groups=rename_groups,
                         resident=resident,
-                        new_var=new_var,
+                        new_var=context.new_var,
                         live_out=body_live,
                         known_carries=known_carries,
                     )
@@ -1173,7 +1141,7 @@ def materialize_resident_sequences(
                     replacement = _clone(statement)
                     assert isinstance(replacement, ast.For)
                     body_live = (
-                        _live_in(
+                        live_in(
                             [
                                 _canonical(item, rename_groups)
                                 for item in statement.body
@@ -1232,7 +1200,7 @@ def materialize_resident_sequences(
                     dominating.append(statement)
             return result
 
-        result = visit(body, [], boundary_names, set())
+        result = visit(body, [], context.uniform_names, set())
         if encountered != set(regions):
             raise _Decline
         return result

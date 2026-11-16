@@ -6,28 +6,30 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .test_cute_flash_resident_choice import _spec as _dense_spec
 from .test_cute_flash_stateful_choice import _spec as _causal_spec
 import helion
 from helion._compiler.cute.cute_flash import _flash_resident_softmax_overrides
 from helion._compiler.cute.cute_flash import flash_structural_leaf_from_config
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.search_space_logger import canonical_config_id
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _no_native_compile():
-    with _forbid_native_compile():
+    with forbid_native_compile():
         yield
 
 
 @pytest.fixture
 def protected_cpu():
     # Keep local coordinate legality independent of the host GPU visibility.
-    with _mock_cuda_unavailable():
+    with mock_cuda_unavailable():
         yield
 
 
@@ -55,7 +57,7 @@ def test_owned_coordinates_follow_implementation_and_keep_lowering_switch(
     _specification, generation, base, parent = _surface(
         causal=causal, dtype=dtype, mode=mode
     )
-    owned = generation.flash_owned_coordinate_indices(parent)
+    owned = generation.extension.flash_owned_coordinate_indices(parent)
     identities = generation._flat_coordinate_identities()
     required = _flash_resident_softmax_overrides(mode)
     assert owned == [
@@ -85,7 +87,9 @@ def test_owned_coordinates_follow_implementation_and_keep_lowering_switch(
             # The causal launch group is a free coordinate of every lowering.
             assert [
                 identities[index][0]
-                for index in generation.flash_owned_coordinate_indices(switch.config)
+                for index in generation.extension.flash_owned_coordinate_indices(
+                    switch.config
+                )
             ] == ["cute_flash_row_sum_schedule"]
 
 
@@ -94,7 +98,7 @@ def test_ordinary_modes_retain_original_coordinates_and_skip_inactive_rowsum(
     mode, protected_cpu
 ):
     _specification, generation, base, parent = _surface(mode=mode)
-    owned = generation.flash_owned_coordinate_indices(parent)
+    owned = generation.extension.flash_owned_coordinate_indices(parent)
     identities = generation._flat_coordinate_identities()
     assert [identities[index][0] for index in owned] == [
         "cute_flash_row_sum_schedule",

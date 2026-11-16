@@ -39,6 +39,93 @@ _MUL_F32X2_ASM = """
 
 @onlyBackends(["triton", "cute"])
 class TestInlineAsmElementwise(RefEagerTestDisabled, TestCase):
+    def _check_discarded_impure_outputs(self, multiple_outputs: bool) -> None:
+        @helion.kernel(autotune_effort="none")
+        def kernel_discarded_impure(
+            x: torch.Tensor, addresses: torch.Tensor, multiple: hl.constexpr
+        ) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                value = x[tile]
+                address = addresses[tile]
+                if multiple:
+                    hl.inline_asm_elementwise(
+                        "atom.global.exch.b32 $0, [$2], $3; mov.b32 $1, $3;",
+                        "=r,=r,l,r",
+                        [address, value],
+                        dtype=(torch.int32, torch.int32),
+                        is_pure=False,
+                        pack=1,
+                    )
+                else:
+                    hl.inline_asm_elementwise(
+                        "atom.global.exch.b32 $0, [$1], $2;",
+                        "=r,l,r",
+                        [address, value],
+                        dtype=torch.int32,
+                        is_pure=False,
+                        pack=1,
+                    )
+                out[tile] = value + 9
+            return out
+
+        # Every physical lane has a valid pointer: use one complete tile, with
+        # no tail or masked address. Keep the pointed-to allocation alive until
+        # both the external effect and the ordinary output have been checked.
+        x = torch.arange(1, 129, dtype=torch.int32, device=DEVICE)
+        effects = torch.zeros_like(x)
+        addresses = (
+            torch.arange(128, dtype=torch.int64, device=DEVICE) * effects.element_size()
+            + effects.data_ptr()
+        )
+        code, out = code_and_output(
+            kernel_discarded_impure,
+            (x, addresses, multiple_outputs),
+            block_sizes=[128],
+            num_warps=4,
+        )
+        self.assertIn(_INLINE_ASM_CALL, code)
+        torch.testing.assert_close(out, x + 9)
+        # Exchange is idempotent: this proves retention and native execution,
+        # while the separate CPU tests check whether an effect is duplicated.
+        torch.testing.assert_close(effects, x)
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="inline assembly requires CUDA")
+    @skipIfRocm("PTX inline assembly requires CUDA")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_discarded_impure_single_output(self):
+        self._check_discarded_impure_outputs(False)
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="inline assembly requires CUDA")
+    @skipIfRocm("PTX inline assembly requires CUDA")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_discarded_impure_multiple_outputs(self):
+        self._check_discarded_impure_outputs(True)
+
+    @pytest.mark.skipif(DEVICE.type != "cuda", reason="inline assembly requires CUDA")
+    @skipIfRocm("PTX inline assembly requires CUDA")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_inline_asm_single_element_output_tuple(self):
+        @helion.kernel(autotune_effort="none")
+        def kernel_singleton_tuple(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.shape):
+                (value,) = hl.inline_asm_elementwise(
+                    "add.u32 $0, $1, 7;",
+                    "=r,r",
+                    [x[tile]],
+                    dtype=(torch.int32,),
+                    is_pure=False,
+                    pack=1,
+                )
+                out[tile] = value
+            return out
+
+        x = torch.arange(32, dtype=torch.int32, device=DEVICE)
+        code, out = code_and_output(kernel_singleton_tuple, (x,))
+        self.assertIn(_INLINE_ASM_CALL, code)
+        torch.testing.assert_close(out, x + 7)
+
     @pytest.mark.skipif(
         DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
     )
@@ -344,6 +431,81 @@ class TestInlineAsmElementwisePacked(RefEagerTestDisabled, TestCase):
 
 @onlyBackends(["cute"])
 class TestCuteInlineAsmElementwise(RefEagerTestDisabled, TestCase):
+    def test_input_constraint_codes(self) -> None:
+        """Inputs follow the outputs in operand order; a matching constraint
+        takes its output's register class; clobbers bind nothing; GCC's
+        read-write ``+`` is not LLVM syntax and is rejected."""
+        from helion._compiler.cute.inline_asm_helpers import input_constraint_codes
+
+        self.assertEqual(input_constraint_codes("=h,h,h"), ["h", "h"])
+        self.assertEqual(input_constraint_codes("=&r,r,0"), ["r", "r"])
+        self.assertEqual(input_constraint_codes("=h,0,h"), ["h", "h"])
+        self.assertEqual(input_constraint_codes("=r,=h,h,r,~{memory}"), ["h", "r"])
+        self.assertEqual(input_constraint_codes("=f, f, f"), ["f", "f"])
+        for constraints in ("+r,r", "=r,+h,h"):
+            with self.assertRaisesRegex(ValueError, "not an LLVM inline asm"):
+                input_constraint_codes(constraints)
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_read_write_constraint_rejected(self) -> None:
+        """LLVM has no ``+`` constraint prefix (``+r,r`` crashes the DSL
+        compiler; ``=r,+r,r`` silently binds a plain input), so the lowering
+        rejects it up front."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_read_write(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(x)
+            for tile in hl.tile(x.size(0), block_size=16):
+                result[tile] = hl.inline_asm_elementwise(
+                    "add.s32 $0, $0, $1;",
+                    "+r,r",
+                    [x[tile], y[tile]],
+                    dtype=torch.int32,
+                    is_pure=True,
+                    pack=1,
+                )
+            return result
+
+        x = torch.arange(16, device=DEVICE, dtype=torch.int32)
+        with self.assertRaisesRegex(
+            helion.exc.BackendUnsupported, r"'\+' \(read-write\) constraint"
+        ):
+            code_and_output(kernel_read_write, (x, x))
+
+    @pytest.mark.skipif(
+        DEVICE.type != "cuda", reason="inline_asm_elementwise is only supported on CUDA"
+    )
+    @skipIfRocm("only works on cuda")
+    @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+    def test_tied_half_operand_binds_as_bits(self) -> None:
+        """A half operand tied to an ``=h`` output through a matching
+        constraint is handed over as its 16 bits like a direct ``h`` input,
+        so ``=h,0,h`` multiplies exactly like ``=h,h,h``."""
+
+        @helion.kernel(autotune_effort="none")
+        def kernel_tied(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            result = torch.empty_like(a)
+            for tile in hl.tile(a.size(0), block_size=32):
+                result[tile] = hl.inline_asm_elementwise(
+                    "mul.rn.f16 $0, $1, $2;",
+                    "=h,0,h",
+                    [a[tile], b[tile]],
+                    dtype=torch.float16,
+                    is_pure=True,
+                    pack=1,
+                )
+            return result
+
+        a = torch.randn(256, device=DEVICE, dtype=torch.float16) * 64
+        b = torch.randn(256, device=DEVICE, dtype=torch.float16) / 64
+        _, result = code_and_output(kernel_tied, (a, b))
+        expected = (a.float() * b.float()).to(torch.float16)
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     def test_pure_inline_asm_computed_scan_and_reuse(self) -> None:
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def kernel(

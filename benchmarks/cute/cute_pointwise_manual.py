@@ -232,9 +232,19 @@ def _compile_manual(
 
 
 def make_manual_fn(
-    op: str, inputs: tuple[torch.Tensor, ...], sweep: bool = True
+    op: str,
+    inputs: tuple[torch.Tensor, ...],
+    sweep: bool = True,
+    allocate_output: bool = False,
 ) -> tuple[Callable[[], torch.Tensor], torch.Tensor, str, float]:
-    """Returns (fn, out_tensor, config_desc, tune_seconds)."""
+    """Returns (fn, out_tensor, config_desc, tune_seconds).
+
+    With ``allocate_output`` the returned ``fn`` allocates a fresh output
+    on every call and returns it (like a PyTorch op), instead of rewriting
+    the one ``out_tensor``; a benchmark that keeps every call's output
+    alive must use this form, or the baseline's stores stay L2-resident
+    while every allocating implementation's do not.
+    """
     bias = None
     tensor_inputs = inputs
     bias_n = 0
@@ -253,7 +263,7 @@ def make_manual_fn(
 
     configs = list(SWEEP_CONFIGS) if sweep else [SWEEP_CONFIGS[0]]
     t0 = time.time()
-    best: tuple[float, Any, str] | None = None
+    best: tuple[float, Any, str, Any] | None = None
     from triton.testing import do_bench
 
     for threads, vec_bytes, unroll in configs:
@@ -285,8 +295,23 @@ def make_manual_fn(
         ms = float(do_bench(fn, warmup=10, rep=50, return_mode="median"))  # pyrefly: ignore [bad-argument-type]
         desc = f"threads={threads} vec={vec} unroll={unroll}"
         if best is None or ms < best[0]:
-            best = (ms, fn, desc)
+            best = (ms, fn, desc, compiled)
     assert best is not None, f"no valid manual config for {op} numel={numel}"
-    _, fn, desc = best
+    _, fn, desc, compiled = best
     fn()  # repopulate `out` with the winning config's result
+    if allocate_output:
+        rest = [*flats]
+        while len(rest) < 3:
+            rest.append(None)
+        rest.append(bias)
+        rest_args = tuple(rest)
+        best_compiled = compiled
+        device = flats[0].device
+
+        def allocating_fn() -> torch.Tensor:
+            fresh = torch.empty(numel, dtype=out_dtype, device=device)
+            best_compiled(fresh, *rest_args)
+            return fresh.view(orig_shape)
+
+        fn = allocating_fn
     return fn, out.view(orig_shape), desc, round(time.time() - t0, 1)

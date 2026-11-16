@@ -16,6 +16,8 @@ from helion._compiler.cute.direct_affine_plan import resolve_direct_affine_plan
 from helion._compiler.cute.direct_affine_plan import select_direct_affine_mma
 from helion._compiler.cute.direct_affine_plan import select_direct_affine_schedule
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _state_proof(*, cp_async_supported: bool = True) -> DirectAffineStateAccessProof:
     return DirectAffineStateAccessProof(

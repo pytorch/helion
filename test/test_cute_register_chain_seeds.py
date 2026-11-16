@@ -10,15 +10,16 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import pytest
 import sympy
 import torch
 
-from test._cute_binding import _mock_cuda_unavailable
-
-from helion._compiler.autotuner_heuristics.register_chain import (
+from helion._compiler.cute.autotune.heuristics.cute_register_chain import (
     CuteRegisterChainHeuristic,
 )
-from helion._compiler.backend import CuteBackend
+from helion._compiler.cute.autotune.search_surface import enable_cute_proven_bounds
+from helion._compiler.cute.backend import CuteBackend
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
@@ -33,6 +34,8 @@ from helion.autotuner.config_spec import MatmulFact
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ResolvedMatmulFact
 from helion.autotuner.config_spec import RootGridFact
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     import helion
@@ -115,8 +118,8 @@ def _environment(
         resident_regions=(),
         attribution_complete=True,
     )
-    spec.cute_tile_loop_paths = tuple(
-        (pair, (k,)) for pair, k in zip(pairs, (2, 3), strict=True)
+    spec.cute_tile_loop_path_reductions = dict.fromkeys(
+        ((pair, (k,)) for pair, k in zip(pairs, (2, 3), strict=True)), frozenset()
     )
     env = SimpleNamespace(
         config_spec=spec,
@@ -149,7 +152,7 @@ class TestCuteRegisterChainSeeds(unittest.TestCase):
         super().setUp()
         stack = ExitStack()
         self.addCleanup(stack.close)
-        stack.enter_context(_mock_cuda_unavailable())
+        stack.enter_context(mock_cuda_unavailable())
         for name in (
             "_lazy_init",
             "current_device",
@@ -263,7 +266,7 @@ class TestCuteRegisterChainSeeds(unittest.TestCase):
         axes = CuteRegisterChainHeuristic._axes(env, device_ir)
         first = env.config_spec.matmul_facts[0]
         with patch(
-            "helion._compiler.autotuner_heuristics.register_chain.cute_matmul_root_placements",
+            "helion._compiler.cute.autotune.heuristics.cute_register_chain.cute_matmul_root_placements",
             return_value=((first, (0, 1)),),
         ):
             self.assertEqual(
@@ -338,7 +341,7 @@ class TestCuteRegisterChainSeeds(unittest.TestCase):
         for item in spec.block_sizes:
             if item.block_id in (0, 1):
                 item.update_max(16)
-        spec.enable_cute_proven_bounds()
+        enable_cute_proven_bounds(spec)
         seeds = _chain_seeds(env, device_ir)
         self.assertEqual(len(seeds), 4)
         self.assertTrue(all("cute_proven_bounds" not in seed.config for seed in seeds))

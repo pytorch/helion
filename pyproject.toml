@@ -22,6 +22,7 @@ dependencies = [
     "psutil",
     "rich",
     "numpy",
+    "packaging",
     "scikit-learn>=1.3.0",
 ]
 
@@ -34,6 +35,8 @@ dev = [
     "pre-commit",
     "hypothesis",
     "tabulate",
+    # torch.fx takes tqdm's lock; test_autotuner_render_pool covers it
+    "tqdm",
 ]
 # Helion integrates tightly with the cutlass DSL's internal APIs; each
 # upstream release tends to break the cute backend. The pin tracked in
@@ -98,7 +101,7 @@ select = [
     "RUF015", "RUF016", "RUF017", "RUF018", "RUF019", "RUF020", "RUF022", "RUF024",
     "RUF026", "RUF030", "RUF034", "RUF036", "RUF037", "RUF041", "RUF047", "RUF051",
     "RUF056", "RUF100", "RUF200", "S324", "SIM", "SLOT", "TCH", "TD001", "TD002",
-    "TD004", "TRY002", "TRY203", "TRY401", "UP", "W", "YTT",
+    "TD004", "TID251", "TRY002", "TRY203", "TRY401", "UP", "W", "YTT",
 ]
 ignore = [
     "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203", "PERF401",
@@ -107,6 +110,12 @@ ignore = [
 extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
 preview = true
 exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# examples/ is a directory of standalone scripts, not a package; a bare
+# ``import examples`` finds whichever ``examples`` directory is first on
+# sys.path.  Load an example by path instead.
+"examples".msg = "load example modules with helion._testing.import_example"
 
 [tool.ruff.lint.per-file-ignores]
 "test/*" = ["ANN"]
@@ -159,7 +168,7 @@ include = [
   "helion/**/*.py",
   "helion/**/*.pyi",
   "helion/**/*.json",
-  "helion/_compiler/cute/sorting_networks.LICENSE",
+  "helion/_compiler/cute/selection/sorting_networks.LICENSE",
   "LICENSE",
 ]
 exclude = [
@@ -173,7 +182,29 @@ allow-direct-references = true
 source = "vcs"
 
 [tool.pytest.ini_options]
-markers = ["cuda: requires an explicitly assigned CUDA device"]
+markers = [
+  # Also routes the item to the GPU lane when its module is ``cpu_only``.
+  "cuda: requires an explicitly assigned CUDA device",
+  # Selected by the CPU lane (`-m cpu_only`, no accelerator) and deselected by
+  # the GPU jobs. Apply at module level only when every test in the module
+  # passes with CUDA_VISIBLE_DEVICES="".
+  "cpu_only: passes without an accelerator",
+  # Fresh-interpreter replays, real autotune searches, and stress tests.
+  # Pull requests run `-m 'not slow'`; pushes to main run everything.
+  "slow: spawns interpreters or runs a real autotune search",
+  # Runs the test under helion._testing.cpu_render_target(**kwargs): CPU code
+  # generation against a fake B200 with CUDA and native compilation forbidden.
+  "cpu_render: run under cpu_render_target (CPU CuTe source generation, fake B200)",
+]
+# The CuTe DSL deprecates names the generated code and the vendored tile
+# schedulers still use; every tcgen05 compile emits them (about 249K records
+# per cute suite run before this filter).  Each entry matches one message.
+filterwarnings = [
+  "ignore:tcgen05.OperandMajorMode is deprecated:DeprecationWarning",
+  "ignore:cute.arch.exp2 is deprecated:DeprecationWarning",
+  "ignore:FastDivmodDivisor is deprecated:DeprecationWarning",
+  "ignore:Migrated to examples/CuTeDSL/helpers:DeprecationWarning",
+]
 # artifacts/ holds gitignored benchmark and probe outputs, some of them named
 # test_*.py with import-time side effects; pytest must never collect them
 # (pytest's built-in defaults plus artifacts and the docs build).
@@ -207,9 +238,16 @@ project-excludes = [
   "helion/_compiler/cute/_flash_gemm_ptx.py",
   "helion/_compiler/pallas/topk_impl.py",
   "benchmarks/cute/tilegym_attention.py",
+  # Hand ports of better-benchmark repros: Pyrefly cannot type arithmetic on
+  # hl.constexpr kernel arguments (Tensor + ConstExpr, int // ConstExpr) in
+  # the device code; check_port.py checks every port on both backends.
+  "benchmarks/cute/better_benchmark/kernels",
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]
+# MLX only installs on macOS; benchmarks/metal imports it as an optional
+# baseline provider.
+ignore-missing-imports = ["mlx", "mlx.*"]
 
 [tool.codespell]
 ignore-words = "scripts/dictionary.txt"

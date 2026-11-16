@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import ast
 
+import pytest
+
 from helion._compiler.ast_extension import create
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.ast_extension import unparse
 from helion._compiler.source_location import SourceLocation
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_unparse_inserts_source_location_comments(tmp_path) -> None:
@@ -57,3 +61,16 @@ def test_duplicate_locations_not_duplicated(tmp_path) -> None:
     assert rendered.count(line_comment) == 1
     assert "first = b" in rendered
     assert "second = b" in rendered
+
+
+def test_a_statement_placeholder_line_is_that_statement() -> None:
+    """A statement substituted for a ``{placeholder}`` line is the line's
+    statement, not ``Expr(value=<statement>)``: that renders alike, but the
+    passes that match the statement (a guarded store) miss it.  In an
+    expression position a statement is refused."""
+    store = statement_from_string("ptr.store(value)")
+    guarded = statement_from_string("if mask:\n    {store}", store=store)
+    assert isinstance(guarded, ast.If)
+    assert guarded.body == [store]
+    with pytest.raises(AssertionError, match="statement placeholder"):
+        statement_from_string("x = {store}", store=store)

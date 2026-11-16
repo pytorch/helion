@@ -279,6 +279,16 @@ class TunableTypeNotSupported(BaseError):
     message = "hl.register_tunable() only supports integer, float, and boolean types, got {0!s}."
 
 
+class TunableSpecialized(BaseError):
+    message = (
+        "hl.register_tunable({0!r}) is evaluated at its hint {1} here{2}, so "
+        "every config would compute with {1}: use the tunable in arithmetic and "
+        "in helion helpers (helion.next_power_of_2, helion.cdiv) over config "
+        "values only, called in the kernel with positional arguments, or size "
+        "the dim with hl.register_block_size."
+    )
+
+
 class TunableNameConflict(BaseError):
     message = (
         "Tunable parameter with name {0!s} already exists. Please use a different name."
@@ -396,7 +406,10 @@ class NotEnoughConfigs(BaseError):
 
 
 class NoConfigFound(BaseError):
-    message = "No working config found from autotuning"
+    message = "No working config found from autotuning{0}"
+
+    def __init__(self, detail: str = "") -> None:
+        super().__init__(detail)
 
 
 class ReductionOnNonTile(BaseError):
@@ -408,7 +421,10 @@ class InvalidReductionDim(BaseError):
 
 
 class MultipleReductionDims(BaseError):
-    message = "Multiple reduction dims are not supported."
+    message = (
+        "Only sum, mean, amax and amin over explicit, distinct dims can reduce "
+        "multiple dims at once."
+    )
 
 
 class ReductionDimInvalidForShape(BaseError):
@@ -425,6 +441,14 @@ class ErrorCompilingKernel(BaseError):
 
 class NoTensorArgs(BaseError):
     message = "Kernel took no tensor or device args, unclear what device to use."
+
+
+class CuteSassCheckFailed(BaseError):
+    message = (
+        "The SASS check {1} refused kernel {0!r}: {2}. "
+        "The kernel never launched; the autotuner drops the config (plain "
+        "packets are unaffected)."
+    )
 
 
 class _WrapException(BaseError):
@@ -480,11 +504,11 @@ Set autotune_ignore_errors=True or HELION_AUTOTUNE_IGNORE_ERRORS=1 to ignore Tri
 
 class TritonUnrecoverableRuntimeError(BaseError):
     message = """\
-An unrecoverable Triton runtime error occurred: {reason}.
-This likely indicates a bug in Triton and cannot be recovered from.
+An unrecoverable device-side error occurred while running a candidate in the autotuning process: {reason}.
+The error is sticky: the CUDA context is poisoned and tuning cannot continue.
 {decorator}
 Original error: {error}
-Set HELION_AUTOTUNE_PRECOMPILE="spawn" to isolate these errors in a subprocess so tuning can continue."""
+Candidates run in this process, not in the killable benchmark worker that would have isolated the fault, because {isolation}."""
 
 
 class BaseWarning(_FixedMessage):
@@ -498,6 +522,13 @@ class BlockPtrIndexingUnavailable(BaseWarning):
     message = (
         "indexing='block_ptr' was requested, but this Triton build has no block "
         "pointers (removed in Triton 3.9); using pointer indexing instead."
+    )
+
+
+class TritonOptionUnavailable(BaseWarning):
+    message = (
+        "The config asks for the Triton option {0!r}, which this Triton build "
+        "does not accept; the kernel runs without it."
     )
 
 
@@ -527,6 +558,27 @@ class WrongDevice(BaseWarning):
 
 class BlockSizeIgnoredInInterpretMode(BaseWarning):
     message = "block_size is specified to be {0}, but in interpret mode, the full dimension size is always used."
+
+
+class FastMathUnused(BaseWarning):
+    message = (
+        "This kernel computes {0}, which the fast_math setting lowers to faster "
+        "approximate forms (div.approx fp32 division and reciprocal, ex2.approx "
+        "exponentials, approximate erf/rsqrt, on CuTe also approximate sqrt, log, "
+        "log2, sin, cos and tanh, and on Triton approximate sigmoid and max/min "
+        "without NaN propagation) that typically change results by a few ulp, flush "
+        "denormals or drop NaNs; without it the more accurate forms are used "
+        "(fp32 division is then within 2 ulp). If the kernel's consumers "
+        "tolerate that, set @helion.kernel(fast_math=True) or HELION_FAST_MATH=1. "
+        "Silence with ignore_warnings=[helion.exc.FastMathUnused]."
+    )
+
+
+class LaunchShapeMismatch(BaseWarning):
+    message = (
+        "The structural launch shape {0} disagrees with the launch block {1} "
+        "derived from the kernel text (CuTe launch-shape check mode)."
+    )
 
 
 class TiledKMatmulAccumulationWarning(BaseWarning):

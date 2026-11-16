@@ -3,32 +3,30 @@
 from __future__ import annotations
 
 import ast
-import dataclasses
 from typing import TYPE_CHECKING
 from typing import cast
 from unittest.mock import patch
 
-from examples.int4_gemm import matmul_bf16_int4
 import pytest
 import torch
 
-from test.test_cute_fuse_mm_accumulation import _cpu_target
-from test.test_cute_materialized_fission import _CpuRefMode
-
 import helion
-from helion._compiler.compile_environment import CompileEnvironment
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute.state import cute_env_state
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import compile_reference
+from helion._testing.cute_codegen import cpu_target
+from helion._testing.cute_codegen import reference_host_function
+from helion._testing.cute_codegen import run_cpu_reference
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 import helion.language as hl
-from helion.runtime.ref_mode import RefMode
-from helion.runtime.ref_mode import RefModeContext
 
-pytestmark = skipUnlessBackends(["cute"])
+matmul_bf16_int4 = import_example("int4_gemm").matmul_bf16_int4
+
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Iterator
     from typing import Any
 
@@ -36,31 +34,9 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 
-class _OperandCpuRefMode(_CpuRefMode):
-    def __torch_function__(
-        self,
-        func: Callable[..., Any],
-        types: list[type[object]],
-        args: tuple[object, ...] = (),
-        kwargs: dict[str, object] | None = None,
-    ) -> Any:
-        if func is torch.mm and kwargs is not None and "out_dtype" in kwargs:
-            lhs, rhs = args
-            assert isinstance(lhs, torch.Tensor) and isinstance(rhs, torch.Tensor)
-            dtype = kwargs["out_dtype"]
-            assert dtype is torch.float32
-            return torch.mm(lhs.float(), rhs.float())
-        return super().__torch_function__(func, types, args, kwargs)
-
-
 @pytest.fixture(autouse=True)
 def _cpu_b200() -> Iterator[None]:
-    with (
-        _cpu_target(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
-    ):
+    with cpu_target():
         yield
 
 
@@ -300,15 +276,7 @@ def _reference(
     materialized_operand: bool = False,
 ) -> torch.Tensor:
     if transformed:
-        assert bound.host_function is not None
-        with bound.env, bound.host_function:
-            definition = bound.host_function.codegen_function_def(
-                bound.host_function.body
-            )
-        definition = ast.parse(ast.unparse(ast.fix_missing_locations(definition))).body[
-            0
-        ]
-        assert isinstance(definition, ast.FunctionDef)
+        definition = reference_host_function(bound)
         roots = [node for node in definition.body if isinstance(node, ast.For)]
         assert len(roots) == 2
         for root, blocks in zip(roots, ((4, 8), (8, 4)), strict=True):
@@ -330,34 +298,16 @@ def _reference(
             ast.keyword(arg="block_size", value=ast.Constant(value=8))
         ]
         if materialized_operand:
-            plan = bound.env.cute_fission_plan
+            plan = cute_env_state(bound.env).fission_plan
             assert plan is not None
             definition.body.remove(roots[1])
             result = definition.body[-1]
             assert isinstance(result, ast.Return)
             result.value = ast.Name(id=plan.materialized_names[-1], ctx=ast.Load())
-        namespace = dict(bound.kernel.fn.__globals__)
-        namespace["_default_cute_launcher"] = None
-        exec(
-            compile(
-                ast.fix_missing_locations(
-                    ast.Module(body=[definition], type_ignores=[])
-                ),
-                "<materialization-reference>",
-                "exec",
-            ),
-            namespace,
-        )
-        function = namespace[definition.name]
+        function = compile_reference(bound, definition, "<materialization-reference>")
     else:
         function = bound.kernel.fn
-    env = CompileEnvironment(
-        torch.device("cpu"), dataclasses.replace(bound.settings, ref_mode=RefMode.EAGER)
-    )
-    context = RefModeContext(env, None)
-    context.func_mode = _OperandCpuRefMode()
-    with context:
-        result = function(*args)
+    result = run_cpu_reference(bound, function, args)
     assert isinstance(result, torch.Tensor)
     return result
 
@@ -369,7 +319,7 @@ def test_original_packed_example_has_independent_axes_and_guarded_shapes(
 ) -> None:
     args = _args(dtype, packed=True)
     bound = _bind(matmul_bf16_int4, args, static_shapes=static_shapes)
-    plan = bound.env.cute_fission_plan
+    plan = cute_env_state(bound.env).fission_plan
     assert plan is not None and plan.region_count == 2
     assert bound.host_function is not None
     assert len(bound.host_function.device_ir.root_ids) == 2
@@ -391,7 +341,7 @@ def test_original_packed_example_has_independent_axes_and_guarded_shapes(
         assert generation.canonicalize_flat(first_flat) == (first_flat, first_config)
     assert bound.config_spec._cute_tcgen05_config.pipeline_smem_facts is not None
     original = _bind(matmul_bf16_int4, args, static_shapes=static_shapes, enabled=False)
-    assert original.env.cute_fission_plan is None
+    assert cute_env_state(original.env).fission_plan is None
     assert (
         bound.config_spec.cache_fingerprint_hash()
         != original.config_spec.cache_fingerprint_hash()
@@ -412,7 +362,7 @@ def test_cpu_reference_preserves_values_casts_and_unequal_stage_tiles(
         b = torch.randint(-8, 8, (k, 19), generator=generator).to(dtype) * 0.5
     args = (a, b)
     bound = _bind(kernel, args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     actual = _reference(bound, args, transformed=True)
     expected = _reference(bound, args, transformed=False)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -426,7 +376,7 @@ def test_materialized_interleave_preserves_every_packed_byte(
     packed = packed[:, None].expand(256, 19).contiguous()
     args = (torch.empty((1, 512), dtype=dtype), packed)
     bound = _bind(matmul_bf16_int4, args)
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     actual = _reference(bound, args, transformed=True, materialized_operand=True)
     low = (packed & 15).int()
     low = torch.where(low >= 8, low - 16, low)
@@ -451,7 +401,7 @@ def test_unsupported_memory_and_tile_semantics_keep_original_path(
 ) -> None:
     args = _args(shape=(16, 32, 24))
     bound = _bind(kernel, args)
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     assert bound.host_function is not None
     assert len(bound.host_function.device_ir.root_ids) == 1
 
@@ -466,11 +416,38 @@ def test_bare_integer_cast_of_loaded_tile_is_materialized() -> None:
         torch.empty((k, n), dtype=torch.int16),
     )
     bound = _bind(_int16_bare_cast_rhs, args)
-    plan = bound.env.cute_fission_plan
+    plan = cute_env_state(bound.env).fission_plan
     assert plan is not None and plan.region_count == 2
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     derived = _bind(_int16_derived_cast_rhs, args)
-    assert derived.env.cute_fission_plan is None
+    assert cute_env_state(derived.env).fission_plan is None
+
+
+def test_static_cast_gemm_in_the_register_mma_regime_stays_fused() -> None:
+    """A static bf16 x int16 GEMM small enough for the register-MMA family
+    (one 128x128 tile, 4M multiply-adds) keeps its single launch: the family
+    converts the int16 packets in registers, where a materialization launch
+    plus its DRAM round trip would cost more than the whole GEMM.  Beyond
+    the family's regime (and for dynamic shapes, which the fused program
+    would not specialize) the tcgen05 pipeline needs the materialized
+    operand and the fission proceeds."""
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
+        fused = _bind(
+            _int16_bare_cast_rhs, _int16_args((128, 256, 128)), static_shapes=True
+        )
+        assert cute_env_state(fused.env).fission_plan is None
+        state = fused.config_spec._cute_tcgen05_config
+        assert state.warp_mma_admitted and not state.tcgen05_family_admitted
+        large = _bind(
+            _int16_bare_cast_rhs, _int16_args((1024, 2048, 1024)), static_shapes=True
+        )
+        assert cute_env_state(large.env).fission_plan is not None
+        assert large.config_spec._cute_tcgen05_config.tcgen05_family_admitted
+        dynamic = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+        assert cute_env_state(dynamic.env).fission_plan is not None
 
 
 def test_bare_integer_cast_on_the_lhs_is_materialized() -> None:
@@ -483,10 +460,10 @@ def test_bare_integer_cast_on_the_lhs_is_materialized() -> None:
         torch.empty((k, n), dtype=torch.bfloat16),
     )
     bound = _bind(_int16_bare_cast_lhs, args)
-    plan = bound.env.cute_fission_plan
+    plan = cute_env_state(bound.env).fission_plan
     assert plan is not None and plan.region_count == 2
     assert plan.operand_interleave_factor == 1
-    assert bound.config_spec.cute_tcgen05_search_enabled
+    assert bound.config_spec.tcgen05.search_enabled
     assert plan.replacement_body is not None
     producer = ast.unparse(plan.replacement_body[-3])
     assert "_helion_materialize_m, _helion_materialize_k" in producer
@@ -504,13 +481,13 @@ def test_bare_integer_cast_on_the_lhs_is_materialized() -> None:
 def test_input_output_aliases_are_not_materialized() -> None:
     args = _args(shape=(16, 32, 32))
     bound = _bind(_aliased_output, (*args, args[0]))
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
 
 
 def test_incomplete_output_keeps_its_observable_zero_initialization() -> None:
     args = tuple(torch.ones_like(value) for value in _args(shape=(3, 8, 5)))
     bound = _bind(_incomplete_output, args)
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     output = _reference(bound, args, transformed=False)
     assert torch.count_nonzero(output[-1]).item() == 0
 
@@ -588,7 +565,7 @@ def test_dynamic_shape_specializations_separate_bound_kernel_cache_entries() -> 
         assert tuple(extract(other_args) for extract in extractors) != key
         other = kernel.bind(other_args)
         assert other is not bound
-        assert other.env.cute_fission_plan is not None
+        assert cute_env_state(other.env).fission_plan is not None
 
 
 def test_opaque_host_callback_is_not_executed_by_speculative_analysis() -> None:
@@ -599,7 +576,7 @@ def test_opaque_host_callback_is_not_executed_by_speculative_analysis() -> None:
     assert original_calls > 0
     _HOST_CALLBACKS.clear()
     bound = _bind(_opaque_prelude, args)
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     assert len(_HOST_CALLBACKS) == original_calls
 
 
@@ -716,7 +693,7 @@ def test_flat_materialization_seed_preserves_the_native_consumer(
 @pytest.mark.parametrize("value", ["flat", "persistent_blocked", False, 1, None])
 def test_pointwise_pid_override_requires_a_proved_region(value: object) -> None:
     bound = _bind(matmul_bf16_int4, _args(packed=True), enabled=False)
-    assert bound.env.cute_fission_plan is None
+    assert cute_env_state(bound.env).fission_plan is None
     with bound.env:
         config = helion.Config.from_dict(
             bound.config_spec.default_config().config
@@ -761,7 +738,7 @@ def _producer_seed(bound: BoundKernel[Any], **wanted: object) -> helion.Config:
 def test_int16_cast_producer_loads_vector_packets(lhs: bool) -> None:
     kernel = _int16_bare_cast_lhs if lhs else _int16_bare_cast_rhs
     bound = _bind(kernel, _int16_args((128, 256, 128), lhs=lhs))
-    assert bound.env.cute_fission_plan is not None
+    assert cute_env_state(bound.env).fission_plan is not None
     # Both recipes prove the producer/consumer edge, so their seeds carry PDL.
     assert bound.config_spec._cute_tcgen05_config.materialized_operand_pdl_roots
     with bound.env:
@@ -779,6 +756,23 @@ def test_int16_cast_producer_loads_vector_packets(lhs: bool) -> None:
     assert "_cute_store_u16_vec(" in producer
     assert ".load()" not in producer
     assert "CtaGroup.TWO" in consumer
+
+
+def test_a_materialized_buffer_is_not_a_scratch_tensor() -> None:
+    # Each fission stage compiles a partial host body (``partial_program``):
+    # the producer's materialized buffer is read only by the next stage, so
+    # with ``cute_scratch_forwarding`` its stores, parameter and allocation
+    # must stay (an unread scratch tensor's go).
+    bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    with bound.env:
+        config = _producer_seed(
+            bound, tcgen05_cta_group="two", tcgen05_materialized_pdl=True
+        )
+    forwarding = helion.Config.from_dict(
+        config.config | {"cute_scratch_forwarding": True}
+    )
+    producer, _consumer = _stage_sources(bound.to_code(forwarding))
+    assert "_cute_store_u16_vec(" in producer
 
 
 def test_producer_seed_geometry_is_one_packet_per_thread_in_a_warp_quartet() -> None:
@@ -810,7 +804,10 @@ def test_producer_seed_geometry_is_one_packet_per_thread_in_a_warp_quartet() -> 
 
 
 def test_small_grid_seeds_add_one_cta_tiles_with_pdl() -> None:
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
     spec = bound.config_spec
     state = spec._cute_tcgen05_config
@@ -875,7 +872,10 @@ def test_small_grid_seeds_add_one_cta_tiles_with_pdl() -> None:
 
 
 def test_small_grid_seeds_absent_when_standard_tiles_fill_the_device() -> None:
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((2048, 1024, 2048)))
     spec = bound.config_spec
     with bound.env:
@@ -892,7 +892,10 @@ def test_small_grid_seeds_absent_when_standard_tiles_fill_the_device() -> None:
 
 
 def test_one_cta_pdl_requires_the_persistent_role_local_schedule() -> None:
-    with patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=148):
+    with patch(
+        "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        return_value=148,
+    ):
         bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
     spec = bound.config_spec
     with bound.env:
@@ -909,3 +912,30 @@ def test_one_cta_pdl_requires_the_persistent_role_local_schedule() -> None:
             spec.normalized_config(flat)
         spec.normalize(flat, _fix_invalid=True)
         assert "tcgen05_materialized_pdl" not in flat.config
+
+
+def test_flat_producer_twins_precede_their_persistent_twins() -> None:
+    # The search population is the first seeds in list order, and the
+    # producer that inherits the bundle's persistent launch is never the
+    # better one for a cold pass over the operand: every flat twin precedes
+    # the persistent twin of the same native seed.
+    bound = _bind(_int16_bare_cast_rhs, _int16_args((128, 256, 128)))
+    with bound.env:
+        seeds = list(bound.config_spec.compiler_seed_configs)
+
+    def twin_key(config: helion.Config) -> frozenset[tuple[str, str]]:
+        return frozenset(
+            (key, repr(value))
+            for key, value in config.config.items()
+            if key != "cute_pointwise_pid_type"
+        )
+
+    twins: dict[frozenset[tuple[str, str]], dict[object, int]] = {}
+    for index, seed in enumerate(seeds):
+        twins.setdefault(twin_key(seed), {})[
+            seed.config.get("cute_pointwise_pid_type")
+        ] = index
+    pairs = [positions for positions in twins.values() if len(positions) == 2]
+    assert pairs
+    assert all(set(positions) == {"flat", None} for positions in pairs)
+    assert all(positions["flat"] < positions[None] for positions in pairs)

@@ -271,6 +271,8 @@ def _check(out: torch.Tensor, ref: torch.Tensor) -> dict[str, float]:
 def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
     import torch
 
+    from helion._testing import import_example
+
     sys.path.insert(0, str(REPO_ROOT))
     B, x, dt, dA_cumsum = make_inputs(args.shape, args.seed)
     kernel_args = (B, x, dt, dA_cumsum)
@@ -325,7 +327,9 @@ def _run_impl(args: argparse.Namespace) -> dict[str, Any]:
             "driver must set HELION_BACKEND to match --impl"
         )
         os.environ["HELION_BACKEND"] = backend
-        from examples.mamba2_chunk_state import helion_mamba2_chunk_state_kernel
+        helion_mamba2_chunk_state_kernel = import_example(
+            "mamba2_chunk_state"
+        ).helion_mamba2_chunk_state_kernel
 
         import helion
 

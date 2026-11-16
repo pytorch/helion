@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import dataclasses
 import inspect
+import json
 import logging
 import os
 import tempfile
 import time
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
+from typing import Literal
 from typing import cast
 import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -21,11 +25,13 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.search_harness import mock_kernel
 from helion.autotuner import PatternSearch
 from helion.autotuner import search_algorithms
 import helion.autotuner.base_search as base_search_module
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.base_search import _InProcessFinalSelectionMeasurer
 from helion.autotuner.base_search import _WorkerFinalSelectionMeasurer
 from helion.autotuner.benchmark_job import BenchmarkJob
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
@@ -38,6 +44,7 @@ from helion.autotuner.de_surrogate_hybrid import DESurrogateHybrid
 from helion.autotuner.differential_evolution import DifferentialEvolutionSearch
 from helion.autotuner.effort_profile import FinalSelectionConfig
 from helion.autotuner.effort_profile import get_effort_profile
+from helion.autotuner.input_banks import InputBankMemoryError
 from helion.autotuner.kernel_args import load_private_kernel_args
 from helion.autotuner.kernel_args import release_private_kernel_args
 from helion.autotuner.llm_search import LLMGuidedSearch
@@ -49,6 +56,8 @@ from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
+    from pathlib import Path
     from typing_extensions import Self
 
 
@@ -58,14 +67,25 @@ class _FakeMeasurer:
     ``model(member, window_number)`` returns the reading (ms) for the
     finalist ``member`` at the ``window_number``-th steady window of the whole
     phase, or an ``IsolatedBenchmarkFailure``. Windows are recorded as
-    ``(kind, member, warmup_ms, rep_ms)``.
+    ``(kind, member, warmup_ms, rep_ms)``; a window taken in a named L2
+    regime (the second column) is answered by ``second_model(member,
+    window_number)`` and recorded in ``second_windows`` as ``(regime,
+    member, warmup_ms, rep_ms)`` as well. ``regime_label`` names the regime
+    the measurer stands for; unset, the selection labels the phase from the
+    environment as it does for a measurer that does not say.
     """
 
     def __init__(
         self,
         model: Callable[[PopulationMember, int], object],
+        second_model: Callable[[PopulationMember, int], object] | None = None,
+        regime_label: str | None = None,
     ) -> None:
         self.model = model
+        self.second_model = second_model
+        if regime_label is not None:
+            self.regime_label = regime_label
+        self.second_windows: list[tuple[str, PopulationMember, int, int]] = []
         self.finalists: list[PopulationMember] = []
         self.policies: list[FinalSelectionConfig] = []
         self.windows: list[tuple[str, PopulationMember, int, int]] = []
@@ -87,17 +107,32 @@ class _FakeMeasurer:
     def __exit__(self, *exc_info: object) -> None:
         self.exited += 1
 
-    def warm(self, index: int, duration_ms: int) -> None:
+    def warm(self, index: int, duration_ms: int) -> float:
         self.windows.append(("warm", self.finalists[index], duration_ms, 0))
+        return 1.0
 
-    def measure(self, index: int, warmup_ms: int, rep_ms: int) -> object:
+    def measure(
+        self,
+        index: int,
+        warmup_ms: int,
+        rep_ms: int,
+        l2_flush_mode: str | None = None,
+    ) -> object:
         member = self.finalists[index]
         self.windows.append(("measure", member, warmup_ms, rep_ms))
         window_number = sum(1 for kind, *_ in self.windows if kind == "measure")
+        if l2_flush_mode is not None:
+            self.second_windows.append((l2_flush_mode, member, warmup_ms, rep_ms))
+            assert self.second_model is not None, "no second column expected"
+            return self.second_model(member, window_number)
         return self.model(member, window_number)
 
     def measured(self) -> list[PopulationMember]:
         return [window[1] for window in self.windows if window[0] == "measure"]
+
+
+# A backend that leaves the final selection in the search's regime.
+_BACKEND_WITHOUT_REGIME = SimpleNamespace(default_final_selection_regime=lambda: None)
 
 
 def _make_search(
@@ -122,6 +157,11 @@ def _make_search(
         env=SimpleNamespace(process_group_name=process_group_name)
     )
     search.benchmark_provider = SimpleNamespace(mutated_arg_indices=[])
+    # no family knobs: the family quota admits nothing (``_family_search``
+    # names some)
+    search.config_spec = SimpleNamespace(  # type: ignore[misc]
+        final_selection_family_keys=(), backend=_BACKEND_WITHOUT_REGIME
+    )
     search._autotune_metrics = AutotuneMetrics()
     search._autotune_budget_start = (
         None if budget_seconds is None else time.perf_counter() - budget_elapsed
@@ -131,9 +171,25 @@ def _make_search(
     search._benchmarked_members = {member.config: member for member in members}
     search._pinned_finalist_configs = {member.config for member in pinned}
     search._pinned_finalist_members = {member.config: member for member in pinned}
-    search._unkillable_configs = set()
+    search._fallback_excluded_configs = set()
     search.population = list(members)
     return search
+
+
+# test/conftest.py keeps the suite's shortlist at two; the cold tie-break
+# tests shortlist their three finalists
+_SHORTLIST_ALL = {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "4"}
+
+
+def _clear_regime_envs() -> None:
+    """The default regimes (a per-call flushed search and selection, the
+    ``auto`` target); call inside a ``patch.dict(os.environ, ...)``."""
+    for name in (
+        "HELION_AUTOTUNE_L2_FLUSH",
+        "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+        "HELION_AUTOTUNE_TARGET_REGIME",
+    ):
+        os.environ.pop(name, None)
 
 
 def _rows(search: PopulationBasedSearch) -> list[dict[str, object]]:
@@ -152,34 +208,144 @@ def _member(block: int, perf: float) -> PopulationMember:
     )
 
 
-def _mock_kernel(settings: Settings) -> SimpleNamespace:
-    config_spec = SimpleNamespace(
-        default_config=lambda: helion.Config(block_sizes=[1]),
-        cute_flash_search_enabled=False,
-        compiler_seed_timeout_retry_repetitions=None,
-        create_config_generation=lambda **kwargs: SimpleNamespace(
-            invalid_config_count=0
-        ),
-        backend=SimpleNamespace(
-            autotune_config_is_viable=lambda _config_spec, _config: True,
-            should_deduplicate_generated_sources=lambda config_spec: False,
-            get_do_bench=lambda: None,
-            classify_autotune_exception=lambda error: None,
-            probe_long_autotune_kernels=lambda _config_spec: False,
-            supports_precompile=lambda: True,
-        ),
-    )
+def _shared_source_spec(flash: bool, *members: PopulationMember) -> SimpleNamespace:
+    functions = tuple(member.fn for member in members)
     return SimpleNamespace(
-        settings=settings,
-        config_spec=config_spec,
-        format_kernel_decorator=lambda config, s: "decorator",
-        to_triton_code=lambda config: "code",
-        maybe_log_repro=lambda log_func, args, config=None: None,
-        supports_subprocess_benchmark=lambda: False,
-        env=SimpleNamespace(process_group_name=None),
+        cute_flash_search_enabled=flash,
+        final_selection_family_keys=(),
+        backend=SimpleNamespace(
+            default_final_selection_regime=lambda: None,
+            generated_source_hash=lambda fn: "shared" if fn in functions else None,
+        ),
     )
 
 
+def _mock_worker_provider(search: PopulationBasedSearch) -> Mock:
+    provider = Mock(spec=LocalBenchmarkProvider)
+    provider._subprocess_benchmark_uses_wall_clock.return_value = False
+    search.benchmark_provider = provider
+    return provider
+
+
+def _private_worker_provider(search: PopulationBasedSearch) -> LocalBenchmarkProvider:
+    provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+    provider._benchmark_worker = Mock()
+    provider.log = Mock()
+    provider._subprocess_benchmark_uses_wall_clock = lambda: False
+    provider.release_private_argument_copies = Mock()
+    provider.invalidate_effective_source_hash = Mock()
+    search.benchmark_provider = provider
+    return provider
+
+
+def _window_stage(desc: str, rep_ms: int, policy: FinalSelectionConfig) -> str:
+    if desc.endswith("warmup"):
+        return "warmup"
+    return "screen" if rep_ms == policy.screen_rep_ms else "round"
+
+
+def _replay_sync(rank: int, broadcasts: list[object]) -> Callable[..., object]:
+    def sync(value: object, process_group_name: str | None = None) -> object:
+        assert process_group_name == "autotune"
+        if rank == 0:
+            broadcasts.append(copy.deepcopy(value))
+            return value
+        return broadcasts.pop(0)
+
+    return sync
+
+
+@contextlib.contextmanager
+def _finalization_tail(
+    search: PopulationBasedSearch, measurer_factory: Callable[..., object]
+) -> Iterator[None]:
+    """Run the real final-selection/fallback tail without generating new configs."""
+    with (
+        patch.object(
+            search, "run_finishing_phase", side_effect=lambda member, _: member
+        ),
+        patch.object(
+            search, "run_terminal_refinement", side_effect=lambda member: member
+        ),
+        patch.object(search, "_final_pick_supported", return_value=False),
+        patch.object(search, "_final_selection_measurer", new=measurer_factory),
+    ):
+        yield
+
+
+def _family_member(block: int, family: str, perf: float) -> PopulationMember:
+    """A member whose config carries the family knob ``fam``."""
+    return PopulationMember(
+        lambda: None,
+        [perf],
+        (block,),
+        helion.Config(block_sizes=[block], fam=family),
+        status="ok",
+    )
+
+
+def _family_search(
+    members: list[PopulationMember],
+    *,
+    policy: FinalSelectionConfig | None,
+    pinned: list[PopulationMember] = (),  # type: ignore[assignment]
+    keys: tuple[str, ...] = ("fam",),
+    budget_seconds: int | None = None,
+) -> PopulationBasedSearch:
+    """A search whose config spec names ``keys`` as the family knobs."""
+    search = _make_search(
+        members, policy=policy, pinned=pinned, budget_seconds=budget_seconds
+    )
+    search.config_spec = SimpleNamespace(  # type: ignore[misc]
+        final_selection_family_keys=keys, backend=_BACKEND_WITHOUT_REGIME
+    )
+    return search
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("missing", [None, "timeout"])
+def test_final_selection_retains_raw_missing_readings(
+    tmp_path: Path, missing: Literal["timeout"] | None
+) -> None:
+    stale = _member(32, 0.5)
+    steady = _member(64, 1.0)
+    policy = FinalSelectionConfig(
+        top_k=2, rounds=2, screen_rep_ms=0, thermal_warmup_ms=0
+    )
+    search = _make_search([stale, steady], policy=policy)
+    log_path = tmp_path / "final-selection"
+    search.log = AutotuningLogger(
+        Settings(autotune_log=str(log_path), autotune_log_details=True)
+    )
+    absent = None if missing is None else IsolatedBenchmarkFailure(missing)
+    with (
+        patch.object(
+            search,
+            "_final_selection_measurer",
+            new=_FakeMeasurer(lambda member, _n: absent if member is stale else 0.9),
+        ),
+        search.log.autotune_tracing("PatternSearch"),
+    ):
+        selected = search.final_rebenchmark_best(stale)
+    assert selected is steady
+    assert stale.perfs == [0.5]
+    assert steady.perfs == [1.0, 0.9]
+    rows = [
+        json.loads(line)
+        for line in log_path.with_suffix(".trace.jsonl").read_text().splitlines()
+    ]
+    stale_rows = [
+        row
+        for row in rows
+        if row["event"] == "rebenchmark" and row["config"]["block_sizes"] == [32]
+    ]
+    assert [row["status"] for row in stale_rows] == (
+        [] if missing is None else ["timeout"]
+    )
+    assert all(row["perf_ms"] is None for row in stale_rows)
+
+
+@pytest.mark.cpu_only
 class TestFinalSelection(TestCase):
     def test_median_of_rounds_ignores_a_bimodal_flip(self) -> None:
         # The search's single reading favours B (a lucky 0.95 ms); the steady
@@ -224,6 +390,50 @@ class TestFinalSelection(TestCase):
         self.assertEqual(rows[0]["median_ms"], 1.00)
         self.assertEqual(rows[0]["rounds_ms"], [1.00, 1.08, 1.00])
         self.assertIsNone(rows[0]["disqualified"])
+
+    def test_bank_budget_retry_discards_all_private_rounds(self) -> None:
+        members = [_member(32, 1.0), _member(64, 2.0)]
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_rep_ms=0,
+            tiebreak_rounds=0,
+        )
+        search = _make_search(members, policy=policy)
+        provider = _private_worker_provider(search)
+        worker = provider._benchmark_worker
+        samples = []
+        fns = [member.fn for member in members]
+
+        def benchmark(functions, **kwargs):
+            index = fns.index(functions[0])
+            slot = kwargs["args_slots"][0]
+            samples.append((index, slot))
+            if index == 1 and slot is not None:
+                raise InputBankMemoryError("retained outputs exceed budget")
+            return [100.0 if slot is not None else 2.0 - index]
+
+        provider.benchmark_isolated = benchmark
+
+        def measurer(finalists, selected_policy):
+            return _WorkerFinalSelectionMeasurer(
+                provider,
+                fns,
+                private_copies=not provider._private_argument_copies_disabled,
+                timeout_s=1.0,
+            )
+
+        with patch.object(search, "_final_selection_measurer", new=measurer):
+            chosen = search._run_final_selection(members, set(), members[0], policy)
+        self.assertIs(chosen, members[1])
+        self.assertEqual(
+            samples, [(0, 0), (1, 1), (0, None), (1, None), (1, None), (0, None)]
+        )
+        worker.shutdown.assert_called_once_with()
+        self.assertEqual(
+            [row["rounds_ms"] for row in _rows(search)], [[1.0, 1.0], [2.0, 2.0]]
+        )
 
     def test_screen_cuts_shortlist_and_alternates_round_order(self) -> None:
         # Twelve candidates whose search readings are inverted relative to the
@@ -285,6 +495,1421 @@ class TestFinalSelection(TestCase):
         self.assertEqual(metrics["finalists"], 6)
         pinned_rows = [row for row in _rows(search) if row["pinned"]]
         self.assertEqual(len(pinned_rows), 1)
+        shortlist_rows = metrics["shortlist_rows"]
+        self.assertEqual(len(shortlist_rows), 12)
+        for index, row in enumerate(shortlist_rows):
+            member = measurer.finalists[index]
+            self.assertEqual(row["index"], index)
+            self.assertEqual(row["config_id"], canonical_config_id(member.config))
+            self.assertEqual(row["search_ms"], member.perfs[0])
+            self.assertEqual(row["screen_ms"], model(member, index + 1))
+            self.assertEqual(row["rank_ms"], row["screen_ms"])
+            self.assertEqual(row["screen_status"], "ok")
+            self.assertEqual(row["survived"], member in order_0)
+            self.assertEqual(row["pinned"], member is seed)
+            self.assertEqual(row["incumbent"], member is incumbent)
+            self.assertFalse(row["screen_family_quota"])
+
+    def test_screen_records_preserve_dropped_readings_and_failure_stage(self) -> None:
+        members = [_member(16 * (i + 1), 0.5 + i) for i in range(8)]
+        policy = FinalSelectionConfig(
+            top_k=1, rounds=2, thermal_warmup_ms=0, tiebreak_rounds=0
+        )
+        search = _make_search(members, policy=policy)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            final_selection_family_keys=(),
+            backend=SimpleNamespace(
+                default_final_selection_regime=lambda: None,
+                generated_source_hash=lambda fn: (
+                    "shared"
+                    if fn in (members[0].fn, members[2].fn, members[7].fn)
+                    else None
+                ),
+            ),
+        )
+        search.benchmark_provider.invalidate_effective_source_hash = Mock()
+        screen = [
+            1.0,
+            2.0,
+            3.0,
+            IsolatedBenchmarkFailure("error"),
+            IsolatedBenchmarkFailure("timeout"),
+            None,
+            float("nan"),
+            4.0,
+        ]
+
+        def model(member: PopulationMember, window: int) -> object:
+            if window <= len(members):
+                return screen[members.index(member)]
+            if member is members[0]:
+                return IsolatedBenchmarkFailure("timeout")
+            return 2.0
+
+        with patch.object(
+            search, "_final_selection_measurer", new=_FakeMeasurer(model)
+        ):
+            selected = search._run_final_selection(
+                members, {members[7].config}, members[1], policy
+            )
+        self.assertIs(selected, members[1])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        rows = metrics["shortlist_rows"]
+        self.assertEqual(
+            [row["screen_ms"] for row in rows], [1, 2, 3, None, None, None, None, 4]
+        )
+        self.assertEqual(
+            [row["screen_status"] for row in rows],
+            ["ok", "ok", "ok", "error", "timeout", "incomplete", "incomplete", "ok"],
+        )
+        self.assertEqual(
+            [row["survived"] for row in rows],
+            [True, True, False, False, False, False, False, True],
+        )
+        # The winner of the screen failed later; its screen still succeeded.
+        failed = next(
+            row for row in _rows(search) if row["config_id"] == rows[0]["config_id"]
+        )
+        self.assertEqual(failed["disqualified"], "timeout")
+        # The failed finalist quarantines both surviving and eliminated aliases.
+        # Both diagnostics must retain the timings from before invalidation.
+        self.assertEqual(members[0].perfs, [float("inf")])
+        self.assertEqual(members[2].perfs, [float("inf")])
+        self.assertEqual(members[7].perfs, [float("inf")])
+        self.assertEqual(
+            [row["search_ms"] for row in rows], [0.5 + i for i in range(8)]
+        )
+        self.assertEqual(failed["search_ms"], 0.5)
+        self.assertEqual(
+            [row["rank_ms"] for row in rows], [1, 2, 3, None, None, None, None, 4]
+        )
+        self.assertEqual(rows[2]["quarantined"], "timeout")
+        alias = next(
+            row for row in _rows(search) if row["config_id"] == rows[7]["config_id"]
+        )
+        self.assertEqual(alias["quarantined"], "timeout")
+        self.assertEqual(alias["median_ms"], 2.0)
+        self.assertIsNone(alias["disqualified"])
+
+    def test_second_regime_cannot_select_a_quarantined_source_alias(self) -> None:
+        for target in ("auto", "1"):
+            with self.subTest(target=target):
+                failed, alias, independent = members = [
+                    _member(16, 1.02),
+                    _member(32, 1.005),
+                    _member(64, 1.0),
+                ]
+                policy = FinalSelectionConfig(
+                    top_k=3,
+                    rounds=2,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=0,
+                    tiebreak_rounds=2,
+                    tie_tolerance=0.01,
+                )
+                search = _make_search(members, policy=policy)
+                search.config_spec = SimpleNamespace(
+                    cute_flash_search_enabled=True,
+                    final_selection_family_keys=(),
+                    backend=SimpleNamespace(
+                        default_final_selection_regime=lambda: None,
+                        generated_source_hash=lambda fn, failed=failed, alias=alias: (
+                            "shared" if fn in (failed.fn, alias.fn) else None
+                        ),
+                    ),
+                )
+                search.benchmark_provider.invalidate_effective_source_hash = Mock()
+                measurer = _FakeMeasurer(
+                    lambda member, _window, failed=failed: (
+                        IsolatedBenchmarkFailure("timeout")
+                        if member is failed
+                        else member.perf
+                    ),
+                    second_model=lambda member, _window, alias=alias: (
+                        0.5 if member is alias else 1.0
+                    ),
+                    regime_label="replay",
+                )
+                with (
+                    patch.dict(os.environ),
+                    patch.object(search, "_final_selection_measurer", new=measurer),
+                ):
+                    _clear_regime_envs()
+                    os.environ["HELION_AUTOTUNE_TARGET_REGIME"] = target
+                    selected = search._run_final_selection(
+                        members, set(), independent, policy
+                    )
+                self.assertIs(selected, independent)
+                self.assertEqual(alias.perfs, [float("inf")])
+                row = next(
+                    row
+                    for row in _rows(search)
+                    if row["config_id"] == canonical_config_id(alias.config)
+                )
+                self.assertEqual(row["quarantined"], "timeout")
+                self.assertEqual(row["median_ms"], 1.005)
+                self.assertNotIn("second_median_ms", row)
+                self.assertFalse(any(w[1] is alias for w in measurer.second_windows))
+
+    def test_worker_warmup_failure_skips_screen_and_applies_alias_policy(self) -> None:
+        # Failed warmups cannot consume another window or win selection.
+        # The existing flash policy additionally quarantines source aliases.
+        for flash in (False, True):
+            for status in ("error", "timeout"):
+                with self.subTest(flash=flash, status=status):
+                    failed, alias, best, other = members = [
+                        _member(16, 0.5),
+                        _member(32, 1.0),
+                        _member(64, 2.0),
+                        _member(128, 3.0),
+                    ]
+                    policy = FinalSelectionConfig(
+                        top_k=1, rounds=2, thermal_warmup_ms=100, tiebreak_rounds=0
+                    )
+                    search = _make_search(members, policy=policy)
+                    search.config_spec = _shared_source_spec(flash, failed, alias)
+                    provider = _mock_worker_provider(search)
+                    fns = [member.fn for member in members]
+                    calls = []
+
+                    def benchmark(
+                        functions,
+                        *,
+                        status=status,
+                        members=members,
+                        fns=fns,
+                        calls=calls,
+                        **kwargs,
+                    ):
+                        index = fns.index(functions[0])
+                        calls.append((index, kwargs["desc"]))
+                        if kwargs["desc"].endswith("warmup"):
+                            return [IsolatedBenchmarkFailure(status)]
+                        return [members[index].perf]
+
+                    provider.benchmark_isolated.side_effect = benchmark
+                    measurer = _WorkerFinalSelectionMeasurer(
+                        provider, fns, private_copies=False, timeout_s=1.0
+                    )
+                    with patch.object(
+                        search, "_final_selection_measurer", return_value=measurer
+                    ):
+                        selected = search._run_final_selection(
+                            members, {alias.config}, failed, policy
+                        )
+                    self.assertIs(selected, best if flash else alias)
+                    metrics = search._autotune_metrics.final_selection
+                    assert metrics is not None
+                    rows = metrics["shortlist_rows"]
+                    self.assertEqual(
+                        [row["warmup_status"] for row in rows],
+                        [status, "not_run", "not_run", "not_run"],
+                    )
+                    screened_indices = [2, 3] if flash else [1, 2, 3]
+                    self.assertEqual(
+                        [row["screen_status"] for row in rows],
+                        ["not_run", "not_run" if flash else "ok", "ok", "ok"],
+                    )
+                    self.assertEqual(
+                        [row["screen_ms"] for row in rows],
+                        [None, None if flash else 1.0, 2.0, 3.0],
+                    )
+                    self.assertEqual(
+                        calls,
+                        [
+                            (0, "Final selection warmup"),
+                            *[(i, "Final selection") for i in screened_indices],
+                            *[(2 if flash else 1, "Final selection")] * 2,
+                        ],
+                    )
+                    if flash:
+                        self.assertEqual(failed.perfs, [float("inf")])
+                        self.assertEqual(alias.perfs, [float("inf")])
+                        self.assertEqual(
+                            [row["quarantined"] for row in rows],
+                            [status, status, None, None],
+                        )
+                        provider.invalidate_effective_source_hash.assert_called_once_with(
+                            "shared"
+                        )
+                    else:
+                        self.assertEqual(
+                            [row["quarantined"] for row in rows], [None] * 4
+                        )
+                        self.assertEqual(failed.status, "ok")
+                        self.assertEqual(alias.status, "ok")
+                        self.assertEqual(failed.perfs, [0.5])
+                        provider.invalidate_effective_source_hash.assert_not_called()
+
+    def test_worker_warmup_failure_is_discarded_on_private_copy_retry(self) -> None:
+        failed, alias, other, last = members = [
+            _member(16, 0.5),
+            _member(32, 1.0),
+            _member(64, 2.0),
+            _member(128, 3.0),
+        ]
+        original = [list(member.perfs) for member in members]
+        policy = FinalSelectionConfig(
+            top_k=1, rounds=2, thermal_warmup_ms=100, tiebreak_rounds=0
+        )
+        search = _make_search(members, policy=policy)
+        search.config_spec = _shared_source_spec(True, failed, alias)
+        provider = _private_worker_provider(search)
+        worker = provider._benchmark_worker
+        fns = [member.fn for member in members]
+        warm_slots = []
+
+        def benchmark(functions, **kwargs):
+            index = fns.index(functions[0])
+            slot = kwargs["args_slots"][0]
+            self.assertEqual([member.perfs for member in members], original)
+            provider.invalidate_effective_source_hash.assert_not_called()
+            if kwargs["desc"].endswith("warmup"):
+                warm_slots.append(slot)
+                return [
+                    IsolatedBenchmarkFailure("timeout") if slot is not None else 1000.0
+                ]
+            if index == 3 and slot is not None:
+                raise InputBankMemoryError("retained outputs exceed budget")
+            return [members[index].perf]
+
+        provider.benchmark_isolated = benchmark
+
+        def measurer(finalists, selected_policy):
+            return _WorkerFinalSelectionMeasurer(
+                provider,
+                fns,
+                private_copies=not provider._private_argument_copies_disabled,
+                timeout_s=1.0,
+            )
+
+        with patch.object(search, "_final_selection_measurer", new=measurer):
+            selected = search._run_final_selection(
+                members, {alias.config}, failed, policy
+            )
+        self.assertIs(selected, failed)
+        self.assertEqual(warm_slots, [0, None])
+        worker.shutdown.assert_called_once_with()
+        self.assertIsNone(provider._benchmark_worker)
+        provider.invalidate_effective_source_hash.assert_not_called()
+        self.assertTrue(all(member.status == "ok" for member in members))
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["shortlist_rows"][0]["warmup_status"], "ok")
+        self.assertEqual(metrics["shortlist_rows"][0]["screen_status"], "ok")
+        self.assertEqual(_rows(search)[0]["rounds_ms"], [0.5, 0.5])
+        self.assertEqual(failed.perfs, [0.5, 0.5])
+
+    def test_finalize_excludes_failed_warmup_after_an_unkillable_worker(self) -> None:
+        # Both abort stages must retain either failure kind, with alias
+        # invalidation only under the existing flash policy (eight cases).
+        for flash in (False, True):
+            for status in ("error", "timeout"):
+                for stage in ("screen", "round"):
+                    with self.subTest(flash=flash, status=status, stage=stage):
+                        failed, alias, unkillable, safe = members = [
+                            _member(16, 0.5),
+                            _member(32, 1.0),
+                            _member(64, 2.0),
+                            _member(128, 3.0),
+                        ]
+                        policy = FinalSelectionConfig(
+                            top_k=2,
+                            rounds=2,
+                            thermal_warmup_ms=100,
+                            screen_rep_ms=20,
+                            rep_ms=50,
+                            tiebreak_rounds=0,
+                        )
+                        search = _make_search(members, policy=policy)
+                        search.finishing_rounds = 0
+                        search.config_spec = _shared_source_spec(flash, failed, alias)
+                        provider = _mock_worker_provider(search)
+                        functions = [member.fn for member in members]
+                        calls = []
+                        error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+
+                        def benchmark(
+                            fns,
+                            *,
+                            members=members,
+                            functions=functions,
+                            calls=calls,
+                            status=status,
+                            stage=stage,
+                            error=error,
+                            policy=policy,
+                            **kwargs,
+                        ):
+                            index = functions.index(fns[0])
+                            current_stage = _window_stage(
+                                kwargs["desc"], kwargs["rep"], policy
+                            )
+                            calls.append((index, current_stage))
+                            if current_stage == "warmup":
+                                self.assertEqual(index, 0)
+                                return [IsolatedBenchmarkFailure(status)]
+                            if index == 2 and current_stage == stage:
+                                raise error
+                            return [members[index].perf]
+
+                        provider.benchmark_isolated.side_effect = benchmark
+                        measurer = _WorkerFinalSelectionMeasurer(
+                            provider,
+                            functions,
+                            private_copies=False,
+                            timeout_s=1.0,
+                        )
+                        with (
+                            patch.dict(os.environ, _SHORTLIST_ALL),
+                            _finalization_tail(search, Mock(return_value=measurer)),
+                        ):
+                            config = search._finalize()
+                        self.assertEqual(config, (safe if flash else alias).config)
+                        self.assertEqual(calls[0], (0, "warmup"))
+                        self.assertEqual(calls[-1], (2, stage))
+                        self.assertEqual(sum(index == 0 for index, _ in calls), 1)
+                        self.assertEqual(error.fn_index, 2)
+                        self.assertEqual(
+                            search._fallback_excluded_configs,
+                            {failed.config, unkillable.config},
+                        )
+                        if flash:
+                            self.assertEqual(failed.status, status)
+                            self.assertEqual(alias.status, status)
+                            self.assertEqual(failed.perfs, [float("inf")])
+                            self.assertEqual(alias.perfs, [float("inf")])
+                            self.assertFalse(any(index == 1 for index, _ in calls))
+                            provider.invalidate_effective_source_hash.assert_called_once_with(
+                                "shared"
+                            )
+                        else:
+                            self.assertEqual(failed.status, "ok")
+                            self.assertEqual(alias.status, "ok")
+                            self.assertEqual(failed.perfs, [0.5])
+                            self.assertEqual(alias.perfs, [1.0])
+                            provider.invalidate_effective_source_hash.assert_not_called()
+
+    def test_finalize_reraises_when_warmup_and_worker_leave_no_safe_config(
+        self,
+    ) -> None:
+        for flash in (False, True):
+            for status in ("error", "timeout"):
+                with self.subTest(flash=flash, status=status):
+                    failed, unkillable = members = [_member(16, 0.5), _member(32, 1.0)]
+                    policy = FinalSelectionConfig(
+                        top_k=1, rounds=2, thermal_warmup_ms=100, tiebreak_rounds=0
+                    )
+                    search = _make_search(members, policy=policy)
+                    search.finishing_rounds = 0
+                    search.config_spec = _shared_source_spec(flash, failed)
+                    provider = _mock_worker_provider(search)
+                    functions = [member.fn for member in members]
+                    error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+                    calls = []
+
+                    def benchmark(
+                        fns,
+                        *,
+                        functions=functions,
+                        calls=calls,
+                        status=status,
+                        error=error,
+                        **kwargs,
+                    ):
+                        index = functions.index(fns[0])
+                        calls.append(index)
+                        if kwargs["desc"].endswith("warmup"):
+                            self.assertEqual(index, 0)
+                            return [IsolatedBenchmarkFailure(status)]
+                        self.assertEqual(index, 1)
+                        raise error
+
+                    provider.benchmark_isolated.side_effect = benchmark
+                    measurer = _WorkerFinalSelectionMeasurer(
+                        provider, functions, private_copies=False, timeout_s=1.0
+                    )
+                    with (
+                        patch.dict(os.environ, _SHORTLIST_ALL),
+                        _finalization_tail(search, Mock(return_value=measurer)),
+                        self.assertRaises(BenchmarkWorkerUnkillable) as caught,
+                    ):
+                        search._finalize()
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(calls, [0, 1])
+                    self.assertEqual(
+                        search._fallback_excluded_configs,
+                        {failed.config, unkillable.config},
+                    )
+
+    def test_finalize_preserves_local_failures_before_worker_abort(self) -> None:
+        # The three ordered stage pairs distinguish an unfinished screen,
+        # a completed screen and an unfinished primary round. Both failure
+        # kinds and both alias policies are necessary (12 cases).
+        for flash in (False, True):
+            for status in ("error", "timeout"):
+                for failure_stage, abort_stage in (
+                    ("screen", "screen"),
+                    ("screen", "round"),
+                    ("round", "round"),
+                ):
+                    with self.subTest(
+                        flash=flash,
+                        status=status,
+                        failure_stage=failure_stage,
+                        abort_stage=abort_stage,
+                    ):
+                        failed, alias, unkillable, safe = members = [
+                            _member(16, 0.5),
+                            _member(32, 1.0),
+                            _member(64, 2.0),
+                            _member(128, 3.0),
+                        ]
+                        policy = FinalSelectionConfig(
+                            top_k=2,
+                            rounds=2,
+                            thermal_warmup_ms=100,
+                            screen_rep_ms=20,
+                            rep_ms=50,
+                            tiebreak_rounds=0,
+                        )
+                        search = _make_search(
+                            members,
+                            policy=policy,
+                            pinned=[unkillable] if failure_stage == "round" else [],
+                        )
+                        search.finishing_rounds = 0
+                        search.config_spec = _shared_source_spec(flash, failed, alias)
+                        provider = _mock_worker_provider(search)
+                        functions = [member.fn for member in members]
+                        calls = []
+                        emitted_finalists = []
+                        error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+
+                        def benchmark(
+                            fns,
+                            *,
+                            functions=functions,
+                            members=members,
+                            calls=calls,
+                            status=status,
+                            failure_stage=failure_stage,
+                            abort_stage=abort_stage,
+                            policy=policy,
+                            error=error,
+                            **kwargs,
+                        ):
+                            index = functions.index(fns[0])
+                            stage = _window_stage(kwargs["desc"], kwargs["rep"], policy)
+                            calls.append((index, stage))
+                            if stage == "warmup":
+                                return [1.0]
+                            if index == 0 and stage == failure_stage:
+                                return [IsolatedBenchmarkFailure(status)]
+                            if index == 2 and stage == abort_stage:
+                                self.assertIn((0, failure_stage), calls)
+                                raise error
+                            return [members[index].perf]
+
+                        def measurer(
+                            finalists,
+                            selected_policy,
+                            *,
+                            emitted_finalists=emitted_finalists,
+                            provider=provider,
+                        ):
+                            emitted_finalists.extend(finalists)
+                            return _WorkerFinalSelectionMeasurer(
+                                provider,
+                                [member.fn for member in finalists],
+                                private_copies=False,
+                                timeout_s=1.0,
+                            )
+
+                        provider.benchmark_isolated.side_effect = benchmark
+                        with (
+                            patch.dict(os.environ, _SHORTLIST_ALL),
+                            _finalization_tail(search, measurer),
+                            patch.object(
+                                search,
+                                "_apply_rebenchmark_timings",
+                                wraps=search._apply_rebenchmark_timings,
+                            ) as apply,
+                        ):
+                            config = search._finalize()
+                        self.assertEqual(config, (safe if flash else alias).config)
+                        self.assertEqual(calls[-1], (2, abort_stage))
+                        self.assertEqual(calls.count((0, failure_stage)), 1)
+                        self.assertEqual(
+                            error.fn_index, emitted_finalists.index(unkillable)
+                        )
+                        self.assertEqual(
+                            search._fallback_excluded_configs,
+                            {failed.config, unkillable.config},
+                        )
+                        if flash:
+                            self.assertEqual(failed.status, status)
+                            self.assertEqual(alias.status, status)
+                            self.assertEqual(failed.perfs, [float("inf")])
+                            self.assertEqual(alias.perfs, [float("inf")])
+                            committed = [
+                                member
+                                for member in emitted_finalists
+                                if member is failed or member is unkillable
+                            ]
+                            apply.assert_called_once_with(
+                                committed,
+                                [float("inf")] * len(committed),
+                                failure_statuses=[
+                                    status if member is failed else "timeout"
+                                    for member in committed
+                                ],
+                                trace_results=[
+                                    IsolatedBenchmarkFailure(
+                                        status if member is failed else "timeout"
+                                    )
+                                    for member in committed
+                                ],
+                            )
+                            provider.invalidate_effective_source_hash.assert_called_once_with(
+                                "shared"
+                            )
+                        else:
+                            self.assertEqual(failed.status, "ok")
+                            self.assertEqual(alias.status, "ok")
+                            self.assertEqual(failed.perfs, [0.5])
+                            self.assertEqual(alias.perfs, [1.0])
+                            apply.assert_not_called()
+                            provider.invalidate_effective_source_hash.assert_not_called()
+
+    def test_finalize_primary_failure_and_abort_leave_no_safe_fallback(self) -> None:
+        for flash in (False, True):
+            for status in ("error", "timeout"):
+                with self.subTest(flash=flash, status=status):
+                    failed, unkillable = members = [_member(16, 0.5), _member(32, 1.0)]
+                    policy = FinalSelectionConfig(
+                        top_k=2,
+                        rounds=2,
+                        thermal_warmup_ms=0,
+                        screen_rep_ms=0,
+                        tiebreak_rounds=0,
+                    )
+                    search = _make_search(members, policy=policy)
+                    search.finishing_rounds = 0
+                    search.config_spec = _shared_source_spec(flash, failed)
+                    provider = _mock_worker_provider(search)
+                    functions = [member.fn for member in members]
+                    error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+                    calls = []
+
+                    def benchmark(
+                        fns,
+                        *,
+                        functions=functions,
+                        calls=calls,
+                        status=status,
+                        error=error,
+                        **kwargs,
+                    ):
+                        index = functions.index(fns[0])
+                        calls.append(index)
+                        if index == 0:
+                            return [IsolatedBenchmarkFailure(status)]
+                        raise error
+
+                    provider.benchmark_isolated.side_effect = benchmark
+                    measurer = _WorkerFinalSelectionMeasurer(
+                        provider, functions, private_copies=False, timeout_s=1.0
+                    )
+                    with (
+                        patch.dict(os.environ, _SHORTLIST_ALL),
+                        _finalization_tail(search, Mock(return_value=measurer)),
+                        self.assertRaises(BenchmarkWorkerUnkillable) as caught,
+                    ):
+                        search._finalize()
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(calls, [0, 1])
+                    self.assertEqual(
+                        search._fallback_excluded_configs,
+                        {failed.config, unkillable.config},
+                    )
+
+    def test_local_failure_evidence_is_discarded_on_private_copy_retry(self) -> None:
+        for failure_stage in ("screen", "round"):
+            with self.subTest(failure_stage=failure_stage):
+                failed, alias, other, last = members = [
+                    _member(16, 0.5),
+                    _member(32, 1.0),
+                    _member(64, 2.0),
+                    _member(128, 3.0),
+                ]
+                original = [list(member.perfs) for member in members]
+                policy = FinalSelectionConfig(
+                    top_k=2 if failure_stage == "screen" else 3,
+                    rounds=2,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=20,
+                    rep_ms=50,
+                    tiebreak_rounds=0,
+                )
+                search = _make_search(members, policy=policy)
+                search.config_spec = _shared_source_spec(True, failed, alias)
+                provider = _private_worker_provider(search)
+                worker = provider._benchmark_worker
+                functions = [member.fn for member in members]
+                calls = []
+
+                def benchmark(
+                    fns,
+                    *,
+                    functions=functions,
+                    members=members,
+                    calls=calls,
+                    search=search,
+                    provider=provider,
+                    original=original,
+                    **kwargs,
+                ):
+                    index = functions.index(fns[0])
+                    slot = kwargs["args_slots"][0]
+                    calls.append((index, slot))
+                    self.assertEqual([member.perfs for member in members], original)
+                    self.assertEqual(search._fallback_excluded_configs, set())
+                    provider.invalidate_effective_source_hash.assert_not_called()
+                    if slot is not None:
+                        if index == 0:
+                            return [IsolatedBenchmarkFailure("timeout")]
+                        if index == 2:
+                            self.assertIn((0, 0), calls)
+                            raise InputBankMemoryError("retained outputs exceed budget")
+                    return [members[index].perf]
+
+                provider.benchmark_isolated = benchmark
+
+                def measurer(finalists, selected_policy, *, provider=provider):
+                    return _WorkerFinalSelectionMeasurer(
+                        provider,
+                        [member.fn for member in finalists],
+                        private_copies=not provider._private_argument_copies_disabled,
+                        timeout_s=1.0,
+                    )
+
+                with patch.object(search, "_final_selection_measurer", new=measurer):
+                    selected = search._run_final_selection(
+                        members, set(), failed, policy
+                    )
+                self.assertIs(selected, failed)
+                self.assertIn((0, 0), calls)
+                self.assertIn((0, None), calls)
+                self.assertEqual(search._fallback_excluded_configs, set())
+                self.assertTrue(all(member.status == "ok" for member in members))
+                provider.invalidate_effective_source_hash.assert_not_called()
+                worker.shutdown.assert_called_once_with()
+                self.assertIsNone(provider._benchmark_worker)
+
+    def test_actual_measurer_gate_disables_workers_when_distributed_is_initialized(
+        self,
+    ) -> None:
+        for initialized in (False, True):
+            with self.subTest(initialized=initialized):
+                member = _member(16, 1.0)
+                search = _make_search([member], policy=FinalSelectionConfig())
+                search.settings.autotune_benchmark_subprocess = True
+                search.kernel.supports_subprocess_benchmark = Mock(return_value=True)
+                search.config_spec = SimpleNamespace(
+                    backend=SimpleNamespace(
+                        get_do_bench=lambda: None,
+                        default_final_selection_regime=lambda: None,
+                    )
+                )
+                provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+                provider.settings = search.settings
+                provider.kernel = search.kernel
+                provider.config_spec = search.config_spec
+                provider._args_unpicklable = False
+                provider._subprocess_wrapper_unloadable = False
+                provider._private_argument_copies_disabled = True
+                provider.mutated_arg_indices = []
+                search.benchmark_provider = provider
+                with (
+                    patch.object(
+                        torch.distributed, "is_initialized", return_value=initialized
+                    ),
+                    patch.object(provider, "register_isolated_candidates") as register,
+                    patch.object(
+                        provider,
+                        "_subprocess_benchmark_uses_wall_clock",
+                        return_value=False,
+                    ),
+                ):
+                    measurer = search._final_selection_measurer(
+                        [member], FinalSelectionConfig()
+                    )
+                self.assertIsInstance(
+                    measurer,
+                    _InProcessFinalSelectionMeasurer
+                    if initialized
+                    else _WorkerFinalSelectionMeasurer,
+                )
+                self.assertEqual(register.call_count, int(not initialized))
+
+    def test_synthetic_distributed_abort_does_not_commit_partial_local_failures(
+        self,
+    ) -> None:
+        failed, unkillable, safe = members = [
+            _member(16, 0.5),
+            _member(32, 1.0),
+            _member(64, 2.0),
+        ]
+        policy = FinalSelectionConfig(
+            top_k=1,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_rep_ms=20,
+            tiebreak_rounds=0,
+        )
+        search = _make_search(members, policy=policy, process_group_name="autotune")
+        search.config_spec = _shared_source_spec(True, failed)
+        search.benchmark_provider.invalidate_effective_source_hash = Mock()
+        error = BenchmarkWorkerUnkillable("synthetic distributed abort")
+        error.fn_index = 1
+
+        def model(member, window):
+            if member is failed:
+                return IsolatedBenchmarkFailure("timeout")
+            raise error
+
+        measurer = _FakeMeasurer(model)
+        with (
+            patch.object(torch.distributed, "is_initialized", return_value=True),
+            patch.object(
+                base_search_module,
+                "sync_object",
+                side_effect=AssertionError("No new collective on incomplete screen"),
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertRaises(BenchmarkWorkerUnkillable) as caught,
+        ):
+            search._run_final_selection(members, set(), failed, policy)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(search._fallback_excluded_configs, {unkillable.config})
+        self.assertEqual(failed.status, "ok")
+        self.assertEqual(failed.perfs, [0.5])
+        search.benchmark_provider.invalidate_effective_source_hash.assert_not_called()
+
+    def test_distributed_abort_retains_only_broadcast_screen_failures(self) -> None:
+        # Both authority directions matter: rank 1 must retain rank 0's
+        # failure and must not promote its own contrary local screen failure.
+        for flash in (False, True):
+            for rank0_failed in (False, True):
+                with self.subTest(flash=flash, rank0_failed=rank0_failed):
+                    broadcasts = []
+
+                    def run(
+                        rank,
+                        *,
+                        flash=flash,
+                        rank0_failed=rank0_failed,
+                        broadcasts=broadcasts,
+                    ):
+                        failed, alias, unkillable, safe = members = [
+                            _member(16, 0.5),
+                            _member(32, 1.0),
+                            _member(64, 2.0),
+                            _member(128, 3.0),
+                        ]
+                        policy = FinalSelectionConfig(
+                            top_k=2,
+                            rounds=2,
+                            thermal_warmup_ms=0,
+                            screen_rep_ms=20,
+                            rep_ms=50,
+                            tiebreak_rounds=0,
+                        )
+                        search = _make_search(
+                            members,
+                            policy=policy,
+                            pinned=[unkillable],
+                            process_group_name="autotune",
+                        )
+                        search.finishing_rounds = 0
+                        search.config_spec = _shared_source_spec(flash, failed, alias)
+                        invalidate = (
+                            search.benchmark_provider.invalidate_effective_source_hash
+                        ) = Mock()
+                        local_failure = rank0_failed if rank == 0 else not rank0_failed
+                        error = BenchmarkWorkerUnkillable("synthetic distributed abort")
+                        measurer = _FakeMeasurer(lambda member, window: member.perf)
+
+                        def model(member, window):
+                            is_screen = measurer.windows[-1][3] == policy.screen_rep_ms
+                            if is_screen:
+                                if member is failed and local_failure:
+                                    return IsolatedBenchmarkFailure("timeout")
+                                return member.perf
+                            if member is unkillable:
+                                error.fn_index = measurer.finalists.index(member)
+                                raise error
+                            return member.perf
+
+                        sync = _replay_sync(rank, broadcasts)
+
+                        measurer.model = model
+                        with (
+                            patch.dict(os.environ, _SHORTLIST_ALL),
+                            patch.object(
+                                torch.distributed, "is_initialized", return_value=True
+                            ),
+                            patch.object(
+                                base_search_module, "sync_object", side_effect=sync
+                            ),
+                            _finalization_tail(search, measurer),
+                        ):
+                            selected = search._finalize()
+                        expected = (
+                            safe
+                            if rank0_failed and flash
+                            else alias
+                            if rank0_failed
+                            else failed
+                        )
+                        self.assertEqual(selected, expected.config)
+                        self.assertEqual(
+                            search._fallback_excluded_configs,
+                            {unkillable.config, failed.config}
+                            if rank0_failed
+                            else {unkillable.config},
+                        )
+                        self.assertIs(measurer.measured()[-1], unkillable)
+                        if rank0_failed and flash:
+                            self.assertEqual(failed.status, "timeout")
+                            self.assertEqual(alias.status, "timeout")
+                            self.assertEqual(failed.perfs, [float("inf")])
+                            self.assertEqual(alias.perfs, [float("inf")])
+                            invalidate.assert_called_once_with("shared")
+                        else:
+                            self.assertEqual(failed.status, "ok")
+                            self.assertEqual(alias.status, "ok")
+                            self.assertEqual(failed.perfs, [0.5])
+                            self.assertEqual(alias.perfs, [1.0])
+                            invalidate.assert_not_called()
+                        return selected, [m.config for m in measurer.measured()]
+
+                    result0 = run(0)
+                    self.assertEqual(len(broadcasts), 4)
+                    result1 = run(1)
+                    self.assertEqual(result0, result1)
+                    self.assertEqual(broadcasts, [])
+
+    def test_fatal_worker_excludes_flash_alias_outside_shortlist(self) -> None:
+        for flash in (False, True):
+            for has_safe in (False, True):
+                with self.subTest(flash=flash, has_safe=has_safe):
+                    warm_failed, fatal, alias = members = [
+                        _member(16, 0.25),
+                        _member(32, 0.5),
+                        _member(64, 1.0),
+                    ]
+                    safe = _member(128, 2.0)
+                    if has_safe:
+                        members.append(safe)
+                    policy = FinalSelectionConfig(
+                        top_k=2,
+                        rounds=2,
+                        thermal_warmup_ms=100,
+                        screen_rep_ms=0,
+                        tiebreak_rounds=0,
+                    )
+                    search = _make_search(members, policy=policy)
+                    search.finishing_rounds = 0
+                    search.config_spec = _shared_source_spec(flash, fatal, alias)
+                    provider = _mock_worker_provider(search)
+                    error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+                    observed = []
+
+                    def benchmark(
+                        fns, *, observed=observed, fatal=fatal, error=error, **kwargs
+                    ):
+                        observed.extend(fns)
+                        if kwargs["desc"].endswith("warmup"):
+                            return [IsolatedBenchmarkFailure("error")]
+                        self.assertIs(fns[0], fatal.fn)
+                        raise error
+
+                    provider.benchmark_isolated.side_effect = benchmark
+
+                    def measurer(
+                        finalists,
+                        selected_policy,
+                        *,
+                        provider=provider,
+                        warm_failed=warm_failed,
+                        fatal=fatal,
+                    ):
+                        self.assertEqual(finalists, [warm_failed, fatal])
+                        return _WorkerFinalSelectionMeasurer(
+                            provider,
+                            [m.fn for m in finalists],
+                            private_copies=False,
+                            timeout_s=1.0,
+                        )
+
+                    with (
+                        patch.dict(
+                            os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}
+                        ),
+                        _finalization_tail(search, measurer),
+                    ):
+                        if flash and not has_safe:
+                            with self.assertRaises(BenchmarkWorkerUnkillable) as caught:
+                                search._finalize()
+                            self.assertIs(caught.exception, error)
+                        else:
+                            self.assertEqual(
+                                search._finalize(), (safe if flash else alias).config
+                            )
+                    self.assertEqual(observed, [warm_failed.fn, fatal.fn])
+                    self.assertEqual(
+                        search._fallback_excluded_configs,
+                        {warm_failed.config, fatal.config},
+                    )
+                    if flash:
+                        self.assertEqual(alias.status, "timeout")
+                        self.assertEqual(alias.perfs, [float("inf")])
+                        provider.invalidate_effective_source_hash.assert_called_once_with(
+                            "shared"
+                        )
+                    else:
+                        self.assertEqual(alias.status, "ok")
+                        self.assertEqual(alias.perfs, [1.0])
+                        self.assertEqual(fatal.perfs, [0.5])
+                        provider.invalidate_effective_source_hash.assert_not_called()
+
+    def test_failed_round_survivor_falls_back_to_screen_passed_finalist(self) -> None:
+        for flash in (False, True):
+            for status in ("error", "timeout"):
+                with self.subTest(flash=flash, status=status):
+                    failed, screen_failed, eligible, *others = members = [
+                        _member(16 * 2**i, 0.5 + i / 10) for i in range(6)
+                    ]
+                    policy = FinalSelectionConfig(
+                        top_k=1,
+                        rounds=2,
+                        thermal_warmup_ms=0,
+                        tiebreak_rounds=0,
+                    )
+                    search = _make_search(members, policy=policy)
+                    search.config_spec = _shared_source_spec(flash, failed)
+                    search.benchmark_provider.invalidate_effective_source_hash = Mock()
+                    count = len(members)
+
+                    def readings(
+                        member,
+                        window,
+                        *,
+                        screen_failed=screen_failed,
+                        status=status,
+                        count=count,
+                    ):
+                        if member is screen_failed or window > count:
+                            return IsolatedBenchmarkFailure(status)
+                        return member.perf
+
+                    measurer = _FakeMeasurer(readings)
+                    with patch.object(
+                        search, "_final_selection_measurer", new=measurer
+                    ):
+                        selected = search._run_final_selection(
+                            members, set(), failed, policy
+                        )
+                    self.assertIs(selected, eligible)
+                    self.assertEqual(measurer.measured(), [*members, failed])
+                    self.assertEqual(selected.perfs, [0.7])
+                    self.assertTrue(all(member.status == "ok" for member in others))
+                    metrics = search._autotune_metrics.final_selection
+                    assert metrics is not None
+                    self.assertEqual(
+                        metrics["selected_config_id"],
+                        canonical_config_id(eligible.config),
+                    )
+                    self.assertEqual(metrics["selected_by"], "search fallback")
+                    self.assertEqual(
+                        metrics["shortlist_rows"][1]["screen_status"], status
+                    )
+                    self.assertFalse(metrics["shortlist_rows"][2]["survived"])
+
+    def test_incomplete_fallback_excludes_failures_without_invalidating_history(
+        self,
+    ) -> None:
+        for status, all_failed in (
+            ("timeout", False),
+            ("timeout", True),
+            ("error", False),
+            ("error", True),
+        ):
+            with self.subTest(status=status, all_failed=all_failed):
+                failed, incomplete = members = [_member(16, 0.5), _member(32, 1.0)]
+                policy = FinalSelectionConfig(
+                    top_k=2,
+                    rounds=2,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=0,
+                    tiebreak_rounds=0,
+                )
+                search = _make_search(members, policy=policy)
+                search.config_spec = _shared_source_spec(False, failed, incomplete)
+                search.benchmark_provider.invalidate_effective_source_hash = Mock()
+                measurer = _FakeMeasurer(
+                    lambda member, _window, failed=failed, all_failed=all_failed, status=status: (
+                        IsolatedBenchmarkFailure(status)
+                        if member is failed or all_failed
+                        else None
+                    )
+                )
+                with patch.object(search, "_final_selection_measurer", new=measurer):
+                    if all_failed:
+                        with self.assertRaises(helion.exc.NoConfigFound):
+                            search._run_final_selection(members, set(), failed, policy)
+                    else:
+                        self.assertIs(
+                            search._run_final_selection(members, set(), failed, policy),
+                            incomplete,
+                        )
+                self.assertEqual(
+                    failed.perf, float("inf") if status == "error" else 0.5
+                )
+                self.assertEqual(
+                    failed.perfs, [0.5, float("inf")] if status == "error" else [0.5]
+                )
+                self.assertEqual(
+                    incomplete.perfs,
+                    [1.0, float("inf")] if all_failed and status == "error" else [1.0],
+                )
+                self.assertEqual(failed.status, "ok")
+                self.assertEqual(incomplete.status, "ok")
+                search.benchmark_provider.invalidate_effective_source_hash.assert_not_called()
+                self.assertEqual(_rows(search)[0]["disqualified"], status)
+
+    def test_warm_skip_indices_follow_rank_zero_source_partition(self) -> None:
+        for rank0_alias in (False, True):
+            with self.subTest(rank0_alias=rank0_alias):
+                broadcasts = []
+
+                def run(rank, *, rank0_alias=rank0_alias, broadcasts=broadcasts):
+                    failed, alias, best, other = members = [
+                        _member(16, 0.5),
+                        _member(32, 2.0),
+                        _member(64, 1.0),
+                        _member(128, 3.0),
+                    ]
+                    policy = FinalSelectionConfig(
+                        top_k=1, rounds=2, thermal_warmup_ms=100, tiebreak_rounds=0
+                    )
+                    search = _make_search(
+                        members, policy=policy, process_group_name="autotune"
+                    )
+                    local_alias = rank0_alias if rank == 0 else not rank0_alias
+                    search.config_spec = _shared_source_spec(
+                        True, failed, *([alias] if local_alias else [])
+                    )
+                    search.benchmark_provider.invalidate_effective_source_hash = Mock()
+                    measurer = _FakeMeasurer(lambda member, _window: member.perf)
+
+                    sync = _replay_sync(rank, broadcasts)
+
+                    with (
+                        patch.object(search, "_final_selection_measurer", new=measurer),
+                        patch.object(
+                            measurer,
+                            "warm",
+                            return_value=IsolatedBenchmarkFailure("timeout"),
+                        ),
+                        patch.object(
+                            base_search_module, "sync_object", side_effect=sync
+                        ),
+                    ):
+                        selected = search._run_final_selection(
+                            members, set(), failed, policy
+                        )
+                    self.assertIs(selected, best)
+                    metrics = search._autotune_metrics.final_selection
+                    self.assertIsNotNone(metrics)
+                    rows = metrics["shortlist_rows"]
+                    self.assertEqual(
+                        rows[1]["screen_status"], "not_run" if rank0_alias else "ok"
+                    )
+                    return [
+                        (m.config, warm, rep) for kind, m, warm, rep in measurer.windows
+                    ]
+
+                windows0 = run(0)
+                windows1 = run(1)
+                self.assertEqual(windows0, windows1)
+                self.assertEqual(broadcasts, [])
+
+    def test_worker_abort_preserves_the_separate_second_column_policy(self) -> None:
+        failed, unkillable, safe = members = [
+            _member(16, 1.0),
+            _member(32, 1.0),
+            _member(64, 1.0),
+        ]
+        policy = FinalSelectionConfig(
+            top_k=3,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_rep_ms=0,
+            tiebreak_rounds=2,
+        )
+        search = _make_search(members, policy=policy)
+        search.config_spec = _shared_source_spec(True, failed)
+        search.benchmark_provider.invalidate_effective_source_hash = Mock()
+        error = BenchmarkWorkerUnkillable("worker survived SIGKILL")
+        error.fn_index = 1
+
+        def second(member, window):
+            if member is failed:
+                return IsolatedBenchmarkFailure("timeout")
+            raise error
+
+        measurer = _FakeMeasurer(
+            lambda member, window: 1.0, second_model=second, regime_label="replay"
+        )
+        with (
+            patch.dict(os.environ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertRaises(BenchmarkWorkerUnkillable) as caught,
+        ):
+            _clear_regime_envs()
+            search._run_final_selection(members, set(), failed, policy)
+        self.assertIs(caught.exception, error)
+        self.assertEqual(
+            [member for _, member, _, _ in measurer.second_windows],
+            [failed, unkillable],
+        )
+        self.assertEqual(search._fallback_excluded_configs, {unkillable.config})
+        self.assertEqual(failed.status, "ok")
+        self.assertEqual(failed.perfs, [1.0])
+        search.benchmark_provider.invalidate_effective_source_hash.assert_not_called()
+
+    def test_screen_failure_excludes_source_alias_before_the_cut(self) -> None:
+        failed, alias, best, incumbent = members = [
+            _member(16, 0.9),
+            _member(32, 1.0),
+            _member(64, 1.1),
+            _member(128, 1.2),
+        ]
+        policy = FinalSelectionConfig(
+            top_k=1, rounds=2, thermal_warmup_ms=0, tiebreak_rounds=0
+        )
+        search = _make_search(members, policy=policy)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=True,
+            final_selection_family_keys=(),
+            backend=SimpleNamespace(
+                default_final_selection_regime=lambda: None,
+                generated_source_hash=lambda fn: (
+                    "shared" if fn in (failed.fn, alias.fn) else None
+                ),
+            ),
+        )
+        invalidate = search.benchmark_provider.invalidate_effective_source_hash = Mock()
+        measurer = _FakeMeasurer(
+            lambda member, _window: (
+                IsolatedBenchmarkFailure("timeout") if member is failed else member.perf
+            )
+        )
+        with patch.object(search, "_final_selection_measurer", new=measurer):
+            selected = search._run_final_selection(
+                members, {alias.config}, incumbent, policy
+            )
+        self.assertIs(selected, best)
+        self.assertEqual(
+            measurer.measured()[len(members) :], [best, incumbent, incumbent, best]
+        )
+        self.assertEqual(failed.perfs, [float("inf")])
+        self.assertEqual(alias.perfs, [float("inf")])
+        invalidate.assert_called_with("shared")
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        rows = metrics["shortlist_rows"]
+        self.assertEqual(rows[0]["screen_status"], "timeout")
+        self.assertEqual(rows[1]["screen_status"], "ok")
+        self.assertEqual(rows[1]["quarantined"], "timeout")
+        self.assertFalse(rows[1]["survived"])
+
+    def test_second_group_uses_eligible_anchor_and_retry_discards_observations(
+        self,
+    ) -> None:
+        # The alias is 1% faster than A, putting B outside its tie group.
+        # After the source fails, A and B are tied and B wins the second regime.
+        # A private-copy retry must not commit the first attempt's observations.
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                failed, alias, a, b = members = [
+                    _member(16, 0.98),
+                    _member(32, 1.0),
+                    _member(64, 1.009),
+                    _member(128, 1.015),
+                ]
+                original = [list(member.perfs) for member in members]
+                policy = FinalSelectionConfig(
+                    top_k=4,
+                    rounds=2,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=0,
+                    tiebreak_rounds=2,
+                    tie_tolerance=0.01,
+                )
+                search = _make_search(members, policy=policy)
+                search.config_spec = SimpleNamespace(
+                    cute_flash_search_enabled=True,
+                    final_selection_family_keys=(),
+                    backend=SimpleNamespace(
+                        default_final_selection_regime=lambda: None,
+                        generated_source_hash=lambda fn, failed=failed, alias=alias: (
+                            "shared" if fn in (failed.fn, alias.fn) else None
+                        ),
+                    ),
+                )
+                invalidate = (
+                    search.benchmark_provider.invalidate_effective_source_hash
+                ) = Mock()
+                measurer = _FakeMeasurer(
+                    lambda member, _window, failed=failed: (
+                        IsolatedBenchmarkFailure("timeout")
+                        if member is failed
+                        else member.perf
+                    ),
+                    regime_label="replay",
+                )
+
+                def second_model(
+                    member: PopulationMember,
+                    _window: int,
+                    *,
+                    measurer: _FakeMeasurer = measurer,
+                    members: list[PopulationMember] = members,
+                    original: list[list[float]] = original,
+                    invalidate: Mock = invalidate,
+                    retry: bool = retry,
+                    b: PopulationMember = b,
+                ) -> float:
+                    if retry and measurer.entered == 1:
+                        self.assertEqual([member.perfs for member in members], original)
+                        invalidate.assert_not_called()
+                        raise base_search_module._RetryWithoutPrivateCopies
+                    return 0.5 if member is b else 1.0
+
+                measurer.second_model = second_model
+                with (
+                    patch.dict(os.environ),
+                    patch.object(search, "_final_selection_measurer", new=measurer),
+                ):
+                    _clear_regime_envs()
+                    selected = search._run_final_selection(members, set(), a, policy)
+                self.assertIs(selected, b)
+                self.assertEqual(
+                    {id(w[1]) for w in measurer.second_windows}, {id(a), id(b)}
+                )
+                self.assertEqual(measurer.entered, 2 if retry else 1)
+                self.assertEqual(a.perfs, [1.009, 1.009])
+                self.assertEqual(b.perfs, [1.015, 1.015])
+                self.assertEqual(alias.perfs, [float("inf")])
+
+    def test_all_quarantined_records_failure_before_raising(self) -> None:
+        for phase in ("warmup", "screen", "rounds"):
+            with self.subTest(phase=phase):
+                screened = phase != "rounds"
+                members = [_member(16 * (index + 1), 1.0 + index) for index in range(4)]
+                failed = members[0]
+                policy = FinalSelectionConfig(
+                    top_k=1 if screened else 4,
+                    rounds=2,
+                    thermal_warmup_ms=100 if phase == "warmup" else 0,
+                    tiebreak_rounds=0,
+                )
+                search = _make_search(members, policy=policy)
+                search.config_spec = SimpleNamespace(
+                    cute_flash_search_enabled=True,
+                    final_selection_family_keys=(),
+                    backend=SimpleNamespace(
+                        default_final_selection_regime=lambda: None,
+                        generated_source_hash=lambda _fn: "shared",
+                    ),
+                )
+                search.benchmark_provider.invalidate_effective_source_hash = Mock()
+                measurer = _FakeMeasurer(
+                    lambda member, _window, failed=failed: (
+                        IsolatedBenchmarkFailure("error")
+                        if member is failed
+                        else member.perf
+                    )
+                )
+                with (
+                    patch.object(search, "_final_selection_measurer", new=measurer),
+                    patch.object(
+                        measurer,
+                        "warm",
+                        return_value=IsolatedBenchmarkFailure("error")
+                        if phase == "warmup"
+                        else 1.0,
+                    ),
+                    self.assertRaises(helion.exc.NoConfigFound),
+                ):
+                    search._run_final_selection(members, set(), failed, policy)
+                metrics = search._autotune_metrics.final_selection
+                assert metrics is not None
+                self.assertIsNone(metrics["selected_config_id"])
+                self.assertIsNone(metrics["selected_by"])
+                rows = metrics["shortlist_rows"]
+                self.assertEqual([row["search_ms"] for row in rows], [1, 2, 3, 4])
+                self.assertEqual([row["quarantined"] for row in rows], ["error"] * 4)
+                self.assertEqual([row["survived"] for row in rows], [not screened] * 4)
+                self.assertEqual(len(metrics["rows"]), 0 if screened else 4)
+                self.assertEqual(
+                    [member.perfs for member in members], [[float("inf")]] * 4
+                )
+                if phase == "warmup":
+                    self.assertEqual(measurer.measured(), [])
+                    self.assertEqual(
+                        [row["screen_status"] for row in rows], ["not_run"] * 4
+                    )
+                    self.assertEqual(
+                        [row["warmup_status"] for row in rows],
+                        ["error", "not_run", "not_run", "not_run"],
+                    )
+
+    def test_unscreened_records_explain_history_ranking(self) -> None:
+        for verified in (False, True):
+            with self.subTest(verified=verified):
+                incumbent = _member(16, 1.0)
+                lucky = _member(32, 0.9)
+                lucky.perfs.append(1.2)
+                members = [incumbent, lucky, _member(64, 1.1)]
+                policy = FinalSelectionConfig(
+                    top_k=1,
+                    rounds=1,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=0,
+                    tiebreak_rounds=0,
+                )
+                search = _make_search(members, policy=policy)
+                search.config_spec.cute_flash_search_enabled = verified
+                with patch.object(
+                    search,
+                    "_final_selection_measurer",
+                    new=_FakeMeasurer(lambda member, _window: member.perf),
+                ):
+                    search._run_final_selection(members, set(), incumbent, policy)
+                metrics = search._autotune_metrics.final_selection
+                assert metrics is not None
+                row = metrics["shortlist_rows"][1]
+                self.assertEqual(row["search_ms"], 0.9)
+                self.assertEqual(row["rank_ms"], 1.2 if verified else 0.9)
+                self.assertEqual(row["screen_status"], "not_run")
+                self.assertEqual(row["survived"], not verified)
 
     def test_screen_runs_only_when_the_shortlist_exceeds_the_finalists(
         self,
@@ -307,7 +1932,11 @@ class TestFinalSelection(TestCase):
         self.assertTrue(policy.screens(6))
         self.assertEqual(policy.finalists(5), 5)
         self.assertEqual(policy.finalists(6), 6)
-        self.assertEqual(policy.finalists(7), 6)
+        # plus the family quota's representatives (two by default)
+        self.assertEqual(policy.finalists(7), 7)
+        self.assertEqual(policy.finalists(9), 8)
+        no_quota = dataclasses.replace(policy, family_finalists=0)
+        self.assertEqual(no_quota.finalists(7), 6)
         self.assertEqual(policy.finalists(3), 3)
         # Without a screen the search's numbers rank the shortlist; the best
         # top_k go on, plus the best pinned seed when it is not among them.
@@ -341,6 +1970,12 @@ class TestFinalSelection(TestCase):
             self.assertEqual(len(round_windows), 2 * (5 if pinned_last else 4))
             survivors = {w[1].config for w in round_windows}
             self.assertEqual(survivors, {m.config for m in (*members[:4], *pinned)})
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(
+                {row["screen_status"] for row in metrics["shortlist_rows"]},
+                {"ok" if screened else "not_run"},
+            )
 
     def test_even_rounds_cancel_linear_drift(self) -> None:
         # Under a 0.1%/window slowdown the median of three alternating rounds
@@ -499,6 +2134,37 @@ class TestFinalSelection(TestCase):
         self.assertIsNone(rows[1.0]["disqualified"])
         self.assertEqual(rows[1.0]["rounds_ms"], [1.0] * 4)
 
+    def test_finalists_without_readings_are_reported(self) -> None:
+        # A benchmark worker whose device filled up fails every finalist but
+        # the pinned default (the smallest kernel, it still loads): picking
+        # the default, ~8x slower than the search's best, must not go
+        # unremarked.
+        default = _member(16, 120.0)
+        fast = [_member(32, 15.0), _member(64, 15.5), _member(128, 16.0)]
+        policy = FinalSelectionConfig(top_k=4, rounds=2, screen_rep_ms=0)
+        search = _make_search([*fast, default], policy=policy, pinned=[default])
+        search.log = Mock()
+
+        def model(member: PopulationMember, _window_number: int) -> object:
+            return 120.0 if member is default else None
+
+        with (
+            patch.dict(os.environ, _SHORTLIST_ALL),
+            patch.object(search, "_final_selection_measurer", new=_FakeMeasurer(model)),
+        ):
+            selected = search.final_rebenchmark_best(fast[0])
+
+        self.assertIs(selected, default)
+        self.assertEqual(
+            [row["disqualified"] for row in _rows(search)],
+            [None, "incomplete", "incomplete", "incomplete"],
+        )
+        self.assertIn(
+            "Final selection took no eligible complete steady-window readings for "
+            "3 of 4 finalists; selecting among the rest.",
+            [str(call.args[0]) for call in search.log.warning.call_args_list],
+        )
+
     def test_no_readings_at_all_keeps_the_search_best(self) -> None:
         best = _member(32, 0.9)
         other = _member(64, 1.0)
@@ -570,7 +2236,7 @@ class TestFinalSelection(TestCase):
             incumbent.perfs[:] = [2.0]
 
     def test_distributed_ranks_follow_rank_zero(self) -> None:
-        # Screen readings are rank-local; rank 0's survivors (with the
+        # Measurements are rank-local; rank 0's screen and survivors (with the
         # incumbent, ``members[0]``), their order, each round's skip list and
         # the final timings are broadcast so every rank takes the same
         # windows together and applies the same numbers.
@@ -587,7 +2253,7 @@ class TestFinalSelection(TestCase):
         policy = FinalSelectionConfig(
             top_k=2,
             rounds=2,
-            thermal_warmup_ms=0,
+            thermal_warmup_ms=1000,
             warmup_ms=100,
             rep_ms=500,
             screen_warmup_ms=50,
@@ -595,14 +2261,10 @@ class TestFinalSelection(TestCase):
         )
         broadcasts: list[object] = []
 
-        def rank0_sync(value: object, process_group_name: str | None = None) -> object:
-            self.assertEqual(process_group_name, "autotune")
-            broadcasts.append(copy.deepcopy(value))
-            return value
+        rank0_sync = _replay_sync(0, broadcasts)
+        rank1_sync = _replay_sync(1, broadcasts)
 
-        def rank1_sync(value: object, process_group_name: str | None = None) -> object:
-            self.assertEqual(process_group_name, "autotune")
-            return broadcasts.pop(0)
+        diagnostics = []
 
         def run(
             truth: dict[int, float], sync: Callable[..., object]
@@ -612,21 +2274,41 @@ class TestFinalSelection(TestCase):
                 id(new): truth[id(old)] for new, old in zip(fresh, members, strict=True)
             }
             search = _make_search(fresh, policy=policy, process_group_name="autotune")
-            measurer = _FakeMeasurer(lambda member, _n: fresh_truth[id(member)])
+
+            def model(member: PopulationMember, window: int) -> object:
+                # This rank-local failure must not overwrite rank 0's successful
+                # screen in either the survivor decision or its diagnostics.
+                if sync is rank1_sync and member is fresh[4] and window <= count:
+                    return IsolatedBenchmarkFailure("timeout")
+                return fresh_truth[id(member)]
+
+            measurer = _FakeMeasurer(model)
             with (
                 patch.dict(
                     os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "12"}
                 ),
                 patch.object(search, "_final_selection_measurer", new=measurer),
+                patch.object(
+                    measurer,
+                    "warm",
+                    return_value=1.0
+                    if sync is rank0_sync
+                    else IsolatedBenchmarkFailure("error"),
+                ),
                 patch.object(base_search_module, "sync_object", side_effect=sync),
             ):
-                return search.final_rebenchmark_best(fresh[0]), measurer, fresh
+                selected = search.final_rebenchmark_best(fresh[0])
+            diagnostics.append(search._autotune_metrics.final_selection)
+            return selected, measurer, fresh
 
         selected0, measurer0, fresh0 = run(rank0_truth, rank0_sync)
-        # plan, survivors, one skip list per round, results
-        self.assertEqual(len(broadcasts), 3 + policy.rounds)
+        # Plan, warmup evidence, shortlist evidence, survivors, each round's
+        # skip list, and results with their authoritative raw samples.
+        self.assertEqual(len(broadcasts), 5 + policy.rounds)
         selected1, measurer1, fresh1 = run(rank1_truth, rank1_sync)
         self.assertEqual(broadcasts, [])
+        self.assertEqual(diagnostics[0]["shortlist_rows"][0]["warmup_status"], "ok")
+        self.assertEqual(diagnostics[1]["shortlist_rows"][0]["warmup_status"], "ok")
 
         self.assertEqual(selected0.config, members[4].config)
         self.assertEqual(selected1.config, selected0.config)
@@ -648,6 +2330,99 @@ class TestFinalSelection(TestCase):
         self.assertEqual(fresh1[4].perf, fresh0[4].perf)
         self.assertEqual(fresh1[5].perf, fresh0[5].perf)
         self.assertEqual(fresh1[4].perf, 0.90)
+        self.assertEqual(
+            diagnostics[0]["shortlist_rows"], diagnostics[1]["shortlist_rows"]
+        )
+        self.assertEqual(diagnostics[0]["rows"], diagnostics[1]["rows"])
+        for row in diagnostics[1]["shortlist_rows"]:
+            member = next(
+                m for m in members if canonical_config_id(m.config) == row["config_id"]
+            )
+            self.assertEqual(row["screen_ms"], rank0_truth[id(member)])
+            self.assertEqual(row["rank_ms"], rank0_truth[id(member)])
+            self.assertEqual(row["screen_status"], "ok")
+
+    def test_flash_warmup_eligibility_follows_rank_zero(self) -> None:
+        # Exercise both directions: ignore rank 1's local failure when rank 0
+        # succeeds, and propagate rank 0's failure to a successful rank 1.
+        for rank0_failed in (False, True):
+            with self.subTest(rank0_failed=rank0_failed):
+                policy = FinalSelectionConfig(
+                    top_k=1, rounds=2, thermal_warmup_ms=100, tiebreak_rounds=0
+                )
+                broadcasts: list[object] = []
+
+                def run(
+                    rank: int,
+                    *,
+                    policy=policy,
+                    broadcasts=broadcasts,
+                    rank0_failed=rank0_failed,
+                ):
+                    members = [_member(16 * (i + 1), 0.5 + i) for i in range(4)]
+                    incumbent, alias, best, _other = members
+                    search = _make_search(
+                        members, policy=policy, process_group_name="autotune"
+                    )
+                    search.benchmark_provider.invalidate_effective_source_hash = Mock()
+                    search.config_spec = _shared_source_spec(True, incumbent, alias)
+                    measurer = _FakeMeasurer(lambda member, _window: member.perf)
+
+                    sync = _replay_sync(rank, broadcasts)
+
+                    local_failure = rank0_failed if rank == 0 else not rank0_failed
+                    with (
+                        patch.object(search, "_final_selection_measurer", new=measurer),
+                        patch.object(
+                            measurer,
+                            "warm",
+                            return_value=IsolatedBenchmarkFailure("timeout")
+                            if local_failure
+                            else 1.0,
+                        ),
+                        patch.object(
+                            base_search_module, "sync_object", side_effect=sync
+                        ),
+                    ):
+                        selected = search._run_final_selection(
+                            members, {alias.config}, incumbent, policy
+                        )
+                    self.assertIs(selected, best if rank0_failed else incumbent)
+                    if rank0_failed:
+                        self.assertEqual(incumbent.perfs, [float("inf")])
+                        self.assertEqual(alias.perfs, [float("inf")])
+                        self.assertNotIn(incumbent, measurer.measured())
+                        self.assertNotIn(alias, measurer.measured())
+                        search.benchmark_provider.invalidate_effective_source_hash.assert_called_once_with(
+                            "shared"
+                        )
+                    else:
+                        self.assertEqual(incumbent.status, "ok")
+                        self.assertEqual(alias.status, "ok")
+                        self.assertIn(incumbent, measurer.measured())
+                        self.assertIn(alias, measurer.measured())
+                        search.benchmark_provider.invalidate_effective_source_hash.assert_not_called()
+                    metrics = search._autotune_metrics.final_selection
+                    assert metrics is not None
+                    rows = metrics["shortlist_rows"]
+                    self.assertEqual(
+                        rows[0]["warmup_status"], "timeout" if rank0_failed else "ok"
+                    )
+                    self.assertEqual(
+                        [row["screen_status"] for row in rows[:2]],
+                        ["not_run"] * 2 if rank0_failed else ["ok"] * 2,
+                    )
+                    return (
+                        selected.config,
+                        [m.config for m in measurer.measured()],
+                        rows,
+                    )
+
+                result0 = run(0)
+                self.assertTrue(broadcasts)
+                result1 = run(1)
+                self.assertEqual(broadcasts, [])
+                self.assertEqual(result0, result1)
 
     def test_budget_sizes_the_phase_then_skips_it(self) -> None:
         noisy = _member(32, 0.9)
@@ -667,7 +2442,13 @@ class TestFinalSelection(TestCase):
             measurer.policies,
             [
                 dataclasses.replace(
-                    policy, rounds=2, top_k=2, thermal_warmup_ms=0, screen_rep_ms=0
+                    policy,
+                    rounds=2,
+                    top_k=2,
+                    thermal_warmup_ms=0,
+                    screen_rep_ms=0,
+                    tiebreak_rounds=0,
+                    family_finalists=0,
                 )
             ],
         )
@@ -703,18 +2484,155 @@ class TestFinalSelection(TestCase):
             self.assertIs(legacy.final_rebenchmark_best(noisy), noisy)
         rebenchmark.assert_not_called()
 
+    def test_budget_counts_the_second_column_only_where_it_can_run(self) -> None:
+        """A per-call flushed selection (the default) takes no second
+        column, so the reserve the search keeps for the phase and the plan
+        the phase is sized to leave the column out; a warm selection
+        (HELION_AUTOTUNE_L2_FLUSH=replay) or an explicit target regime
+        reserves it for every finalist, its upper bound. The cache policy
+        keeps the profile's fields in either regime."""
+        members = [_member(32, 1.0), _member(64, 1.1)]
+        # the spec of these searches names no family knob: the sizing
+        # policy drops the family quota as well (see
+        # ``test_budget_counts_the_family_quota_only_with_family_keys``)
+        policy = FinalSelectionConfig(family_finalists=0)
+        one_column = dataclasses.replace(policy, tiebreak_rounds=0)
+        self.assertGreater(policy.estimated_seconds(4), one_column.estimated_seconds(4))
+        search = _make_search(
+            members, policy=policy, pinned=members[:1], budget_seconds=1000
+        )
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}):
+            _clear_regime_envs()
+            self.assertEqual(search._final_selection_sizing_policy(), one_column)
+            self.assertAlmostEqual(
+                search._budget_reserve_seconds(), one_column.estimated_seconds(4)
+            )
+            # the smallest plan (4 finalists x 2 rounds) has no column in
+            # either regime
+            self.assertEqual(search._minimum_final_selection_seconds(), 17.0)
+            default_key = search._final_rebenchmark_cache_policy()
+            for env in (
+                {"HELION_AUTOTUNE_L2_FLUSH": "replay"},
+                {"HELION_AUTOTUNE_L2_FLUSH": "0"},
+                {"HELION_AUTOTUNE_FINAL_L2_FLUSH": "replay"},
+                {"HELION_AUTOTUNE_TARGET_REGIME": "replay"},
+            ):
+                with patch.dict(os.environ, env):
+                    self.assertEqual(search._final_selection_sizing_policy(), policy)
+                    self.assertAlmostEqual(
+                        search._budget_reserve_seconds(), policy.estimated_seconds(4)
+                    )
+                    self.assertEqual(search._minimum_final_selection_seconds(), 17.0)
+                    self.assertEqual(
+                        search._final_rebenchmark_cache_policy(), default_key
+                    )
+            with patch.dict(
+                os.environ,
+                {
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "replay",
+                },
+            ):
+                # the target is the ranking regime already: one column
+                self.assertEqual(search._final_selection_sizing_policy(), one_column)
+            # a ``kernel`` target reserves its column without asking whether
+            # the worker traces (an upper bound); where it cannot, the
+            # selection times it as ``call``, the ranking regime again, and
+            # takes one column
+            with (
+                patch.dict(os.environ, {"HELION_AUTOTUNE_TARGET_REGIME": "kernel"}),
+                patch.object(
+                    search, "_kernel_timer_usable", return_value=False
+                ) as usable,
+            ):
+                self.assertEqual(search._final_selection_sizing_policy(), policy)
+                usable.assert_not_called()
+                self.assertIsNone(search._final_selection_second_regime("call"))
+
+        # The phase is sized to the time left by the same policy: with room
+        # for the rounds but not the column, the default regime runs the
+        # profile's policy as is (its column cannot run) where a replay
+        # selection sheds the column.
+        noisy = _member(32, 0.9)
+        stable = _member(64, 1.0)
+        readings = {id(noisy): 1.05, id(stable): 1.00}
+        policy = FinalSelectionConfig(top_k=4, family_finalists=0)
+        fits_one_column = dataclasses.replace(
+            policy, screen_rep_ms=0, tiebreak_rounds=0
+        )
+        remaining = (
+            fits_one_column.estimated_seconds(2) + policy.estimated_seconds(2)
+        ) / 2
+        for regime, expected, sized in (
+            ("call", policy, False),
+            ("replay", fits_one_column, True),
+        ):
+            search = _make_search(
+                [noisy, stable],
+                policy=policy,
+                budget_seconds=1000,
+                budget_elapsed=1000.0 - remaining,
+            )
+            measurer = _FakeMeasurer(
+                lambda member, _n: readings[id(member)],
+                lambda member, _n: readings[id(member)],
+                regime_label=regime,
+            )
+            with (
+                patch.dict(
+                    os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": regime}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                search.log.level = logging.INFO
+                self.assertIs(search.final_rebenchmark_best(noisy), stable, regime)
+            self.assertEqual(measurer.policies, [expected], regime)
+            sizing_lines = [
+                line for line in logs.output if "Final selection sized to" in line
+            ]
+            self.assertEqual(len(sizing_lines), 1 if sized else 0, regime)
+            if sized:
+                self.assertIn("one regime", sizing_lines[0])
+            self.assertEqual(measurer.second_windows, [], regime)
+
     def test_fit_to_seconds_sheds_cost_in_order(self) -> None:
         policy = FinalSelectionConfig()
         ladder = policy.budget_ladder()
         self.assertEqual(ladder[0], policy)
         self.assertEqual(ladder[1], dataclasses.replace(policy, screen_rep_ms=0))
         self.assertEqual(
-            ladder[2], dataclasses.replace(policy, screen_rep_ms=0, rounds=2)
+            ladder[2],
+            dataclasses.replace(policy, screen_rep_ms=0, tiebreak_rounds=0),
+        )
+        self.assertEqual(
+            ladder[3],
+            dataclasses.replace(
+                policy, screen_rep_ms=0, tiebreak_rounds=0, family_finalists=0
+            ),
+        )
+        self.assertEqual(
+            ladder[4],
+            dataclasses.replace(
+                policy,
+                screen_rep_ms=0,
+                tiebreak_rounds=0,
+                family_finalists=0,
+                rounds=2,
+            ),
         )
         self.assertEqual(
             ladder[-1],
             dataclasses.replace(
-                policy, screen_rep_ms=0, rounds=2, top_k=2, thermal_warmup_ms=0
+                policy,
+                screen_rep_ms=0,
+                tiebreak_rounds=0,
+                family_finalists=0,
+                rounds=2,
+                top_k=2,
+                thermal_warmup_ms=0,
             ),
         )
         estimates = [plan.estimated_seconds(33) for plan in ladder]
@@ -736,13 +2654,16 @@ class TestFinalSelection(TestCase):
         )
         # test/conftest.py shrinks the retained shortlist to 2; the default
         # shortlist of 8 + 1 pinned seed + the incumbent (10 finalists x 4
-        # rounds) estimates ~86 s with the screen (71 s without), capped at a
-        # quarter of the budget.
+        # rounds) estimates ~86 s with the screen (71 s without) in the
+        # default per-call flushed regime, capped at a quarter of the budget.
+        one_column = dataclasses.replace(policy, tiebreak_rounds=0)
         with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}):
+            _clear_regime_envs()
             self.assertEqual(search._final_selection_shortlist_estimate(), 10)
             self.assertEqual(search._budget_reserve_seconds(), 25.0)
-            self.assertGreater(policy.estimated_seconds(10), 25.0)
+            self.assertGreater(one_column.estimated_seconds(10), 25.0)
         with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}):
+            _clear_regime_envs()
             # 2 + 1 pinned + the incumbent shortlisted: the estimate (~35 s)
             # is below the cap of a 200 s budget
             self.assertEqual(search._final_selection_shortlist_estimate(), 4)
@@ -750,7 +2671,7 @@ class TestFinalSelection(TestCase):
                 members, policy=policy, pinned=members[:1], budget_seconds=200
             )
             self.assertAlmostEqual(
-                roomy._budget_reserve_seconds(), policy.estimated_seconds(4)
+                roomy._budget_reserve_seconds(), one_column.estimated_seconds(4)
             )
             self.assertLess(roomy._budget_reserve_seconds(), 50.0)
         search._budget_reserve_seconds = lambda: 25.0  # type: ignore[method-assign]
@@ -781,7 +2702,11 @@ class TestFinalSelection(TestCase):
         )
         search.log = Mock()
         search._budget_reserve_seconds = lambda: 25.0  # type: ignore[method-assign]
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            final_selection_family_keys=(),
+            backend=_BACKEND_WITHOUT_REGIME,
+        )
         self.assertEqual(search._longest_generation_seconds, 0.0)
 
         generations: list[int] = []
@@ -983,7 +2908,7 @@ class TestFinalSelection(TestCase):
             with patch.dict(os.environ):
                 # test/conftest.py keeps the suite on the single-pass path
                 os.environ.pop("HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS", None)
-                search = DifferentialEvolutionSearch(_mock_kernel(settings), ())
+                search = DifferentialEvolutionSearch(mock_kernel(settings), ())
             self.assertEqual(search.final_selection, expected, effort)
             self.assertEqual(
                 search._final_rebenchmark_cache_policy()["final_selection"],
@@ -1048,6 +2973,11 @@ class TestFinalSelection(TestCase):
             released.append(search._budget_reserve_released)
             return refined
 
+        def compiler(best: PopulationMember) -> PopulationMember:
+            order.append("compiler")
+            released.append(search._budget_reserve_released)
+            return best
+
         def final(best: PopulationMember) -> PopulationMember:
             order.append("final")
             released.append(search._budget_reserve_released)
@@ -1056,9 +2986,9 @@ class TestFinalSelection(TestCase):
         for policy, expected_order, expected, expected_released in (
             (
                 FinalSelectionConfig(),
-                ["finishing", "terminal", "final"],
+                ["finishing", "terminal", "compiler", "final"],
                 verified,
-                [False, False, True],
+                [False, False, False, True],
             ),
             (None, ["final", "finishing", "terminal"], refined, [True, True, True]),
         ):
@@ -1069,6 +2999,7 @@ class TestFinalSelection(TestCase):
             with (
                 patch.object(search, "run_finishing_phase", side_effect=finishing),
                 patch.object(search, "run_terminal_refinement", side_effect=terminal),
+                patch.object(search, "run_compiler_refinement", side_effect=compiler),
                 patch.object(search, "final_rebenchmark_best", side_effect=final),
                 patch.object(search, "_final_pick_supported", return_value=False),
             ):
@@ -1163,11 +3094,19 @@ class TestFinalSelection(TestCase):
             thermal_warmup_ms=5000,
             screen_warmup_ms=50,
             screen_rep_ms=200,
+            tiebreak_rounds=0,
+            family_finalists=0,
         )
         # 0.2 s of worker/loader overhead per window; up to ten finalists
         # (top_k, the best pinned seed and the incumbent)
         expected = 1.25 * (5.0 + 40 * 0.45 + 10 * 4 * 0.8) + 5.0
         self.assertAlmostEqual(policy.estimated_seconds(40), expected)
+        # the family quota's representatives are counted too (its upper
+        # bound: every one of them admitted)
+        self.assertAlmostEqual(
+            dataclasses.replace(policy, family_finalists=2).estimated_seconds(40),
+            1.25 * (5.0 + 40 * 0.45 + 12 * 4 * 0.8) + 5.0,
+        )
         # no screen when the shortlist is the finalists already
         self.assertAlmostEqual(
             policy.estimated_seconds(9), 1.25 * (5.0 + 9 * 4 * 0.8) + 5.0
@@ -1180,12 +3119,1031 @@ class TestFinalSelection(TestCase):
             policy.estimated_seconds(11),
             1.25 * (5.0 + 11 * 0.45 + 10 * 4 * 0.8) + 5.0,
         )
+        # the second regime's column is counted for every finalist (its
+        # upper bound: all of them tied, or an explicit target regime)
+        self.assertAlmostEqual(
+            dataclasses.replace(policy, tiebreak_rounds=2).estimated_seconds(9),
+            1.25 * (5.0 + 9 * 4 * 0.8 + 9 * 2 * 0.8) + 5.0,
+        )
 
     def test_metrics_report_the_phase(self) -> None:
         metrics = AutotuneMetrics()
         self.assertNotIn("final_selection", metrics.to_dict())
         metrics.final_selection = {"finalists": 2}
         self.assertEqual(metrics.to_dict()["final_selection"], {"finalists": 2})
+
+    def test_finalists_are_timed_in_the_final_selection_regime(self) -> None:
+        """A resident search (HELION_AUTOTUNE_L2_FLUSH=0) ranks its finalists
+        in the replay regime, where configs that tie L2-resident separate;
+        the default per-call flush search keeps its regime. Both measurers
+        carry the regime to their timer; a backend's own steady bench does
+        not know the regimes and is called as before."""
+        member = _member(32, 1.0)
+        policy = FinalSelectionConfig(top_k=2, rounds=2, screen_rep_ms=0)
+        search = _make_search([member], policy=policy)
+        provider = Mock(spec=LocalBenchmarkProvider)
+        provider.mutated_arg_indices = []
+        provider.private_argument_copies_affordable.return_value = False
+        provider.steady_window_benchmark_available.return_value = True
+        provider._subprocess_benchmark_uses_wall_clock.return_value = False
+        provider.benchmark_isolated.return_value = [1.0]
+        search.benchmark_provider = provider
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                get_do_bench=lambda: None, default_final_selection_regime=lambda: None
+            )
+        )
+        for env, regime in [
+            ({"HELION_AUTOTUNE_L2_FLUSH": "0"}, "replay"),
+            ({}, "call"),
+            (
+                {
+                    "HELION_AUTOTUNE_L2_FLUSH": "0",
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH": "0",
+                },
+                "off",
+            ),
+        ]:
+            with patch.dict(os.environ, env, clear=False):
+                for name in (
+                    "HELION_AUTOTUNE_L2_FLUSH",
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                ):
+                    if name not in env:
+                        os.environ.pop(name, None)
+                provider.benchmark_isolated.reset_mock()
+                with search._final_selection_measurer([member], policy) as measurer:
+                    self.assertIsInstance(measurer, _WorkerFinalSelectionMeasurer)
+                    self.assertEqual(measurer.regime_label, regime)
+                    self.assertEqual(measurer.measure(0, 3, 4), 1.0)
+                kwargs = provider.benchmark_isolated.call_args.kwargs
+                self.assertEqual(kwargs["l2_flush_mode"], regime)
+                self.assertEqual((kwargs["warmup"], kwargs["rep"]), (3, 4))
+        # a backend's regime (CuTe: the trace kernel timer) replaces the
+        # default per-call flush, not an explicit one
+        search.config_spec.backend.default_final_selection_regime = lambda: "kernel"
+        for env, available, regime in [
+            ({}, True, "kernel"),
+            ({"HELION_AUTOTUNE_L2_FLUSH": "1"}, True, "call"),
+            # a worker that cannot trace times with CUDA events, labelled so
+            ({}, False, "call"),
+        ]:
+            provider.worker_kernel_timer_available.return_value = available
+            with (
+                patch.dict(os.environ, env, clear=False),
+                patch.object(
+                    base_search_module, "kernel_timer_available", return_value=True
+                ),
+            ):
+                for name in (
+                    "HELION_AUTOTUNE_L2_FLUSH",
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                ):
+                    if name not in env:
+                        os.environ.pop(name, None)
+                provider.benchmark_isolated.reset_mock()
+                with search._final_selection_measurer([member], policy) as measurer:
+                    self.assertEqual(measurer.regime_label, regime)
+                    self.assertEqual(measurer.measure(0, 3, 4), 1.0)
+                kwargs = provider.benchmark_isolated.call_args.kwargs
+                self.assertEqual(kwargs["l2_flush_mode"], regime)
+        search.config_spec.backend.default_final_selection_regime = lambda: None
+        # a wall-clock worker always flushes, whatever the regime says
+        provider._subprocess_benchmark_uses_wall_clock.return_value = True
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            with search._final_selection_measurer([member], policy) as measurer:
+                self.assertEqual(
+                    measurer.regime_label, "call (wall clock, always flushed)"
+                )
+        provider._subprocess_benchmark_uses_wall_clock.return_value = False
+
+        provider.steady_window_benchmark_available.return_value = False
+        seen: list[dict[str, object]] = []
+
+        def fake_do_bench(fn: Callable[[], object], **kwargs: object) -> float:
+            seen.append(kwargs)
+            return 2.0
+
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}),
+            patch.object(base_search_module, "do_bench", new=fake_do_bench),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            with search._final_selection_measurer([member], policy) as measurer:
+                self.assertIsInstance(measurer, _InProcessFinalSelectionMeasurer)
+                self.assertEqual(measurer.regime_label, "replay")
+                self.assertEqual(measurer.measure(0, 3, 4), 2.0)
+            self.assertEqual(seen[-1]["l2_flush_mode"], "replay")
+            self.assertEqual((seen[-1]["warmup"], seen[-1]["rep"]), (3, 4))
+            # a backend's own steady bench is called without the regime and
+            # the selection says so
+            search.config_spec.backend.get_do_bench = lambda: fake_do_bench
+            with (
+                patch.object(base_search_module, "do_bench", new=lambda: None),
+                search._final_selection_measurer([member], policy) as measurer,
+            ):
+                self.assertEqual(measurer.regime_label, "backend bench")
+                self.assertEqual(measurer.measure(0, 3, 4), 2.0)
+            self.assertNotIn("l2_flush_mode", seen[-1])
+            # the wall-clock bench takes the regime but always flushes
+            with (
+                patch.object(base_search_module, "do_bench", new=lambda: None),
+                patch.object(base_search_module, "do_bench_generic", new=fake_do_bench),
+                search._final_selection_measurer([member], policy) as measurer,
+            ):
+                self.assertEqual(
+                    measurer.regime_label, "call (wall clock, always flushed)"
+                )
+                self.assertEqual(measurer.measure(0, 3, 4), 2.0)
+            self.assertEqual(seen[-1]["l2_flush_mode"], "replay")
+
+    def test_final_selection_logs_and_reports_its_regime(self) -> None:
+        fast = _member(32, 1.00)
+        slow = _member(64, 0.95)
+        policy = FinalSelectionConfig(top_k=4, rounds=2, screen_rep_ms=0)
+        search = _make_search([slow, fast], policy=policy)
+        truth = {id(fast): 1.00, id(slow): 1.05}
+        measurer = _FakeMeasurer(lambda member, window: truth[id(member)])
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(slow), fast)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["l2_flush_mode"], "replay")
+        self.assertTrue(any("(L2 replay)" in line for line in logs.output))
+        # a measurer that times in another regime labels the phase itself
+        search = _make_search([slow, fast], policy=policy)
+        measurer = _FakeMeasurer(lambda member, window: truth[id(member)])
+        measurer.regime_label = "backend bench"  # type: ignore[attr-defined]
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_L2_FLUSH": "0"}),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(slow), fast)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["l2_flush_mode"], "backend bench")
+        self.assertTrue(any("(L2 backend bench)" in line for line in logs.output))
+
+    def _tied_warm_search(
+        self,
+        *,
+        cold: dict[str, float],
+        warm: dict[str, float] | None = None,
+        tiebreak_rounds: int = 2,
+    ) -> tuple[PopulationBasedSearch, _FakeMeasurer, dict[str, PopulationMember]]:
+        """Three finalists: ``a`` and ``b`` tie in the warm (replay) regime
+        at 3.055 ms, ``c`` trails by 10%; ``cold`` gives their per-call
+        flushed readings by name."""
+        members: dict[str, PopulationMember] = {
+            name: _member(32 * (i + 1), 3.2) for i, name in enumerate("abc")
+        }
+        warm = warm or {"a": 3.055, "b": 3.0551, "c": 3.36}
+        names = {id(member): name for name, member in members.items()}
+        policy = FinalSelectionConfig(
+            top_k=4, rounds=2, screen_rep_ms=0, tiebreak_rounds=tiebreak_rounds
+        )
+        search = _make_search(list(members.values()), policy=policy)
+        measurer = _FakeMeasurer(
+            lambda member, _n: warm[names[id(member)]],
+            lambda member, _n: cold[names[id(member)]],
+            regime_label="replay",
+        )
+        return search, measurer, members
+
+    def test_cold_column_breaks_a_warm_tie(self) -> None:
+        """Finalists tied in the replay regime (one flush, then a burst of
+        back-to-back calls) are timed again per call flushed, and the cold
+        medians break the tie: the pick carries the knob the burst cannot
+        see (the recurrent-step state load's L2 eviction hint read 3.90 vs
+        5.41 us cold behind a 3.055 us tie). Only the tied group pays for
+        the cold rounds, and the finalists keep their replay medians."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+        # two cold rounds over the tied pair only, alternating order
+        self.assertEqual(
+            [(w[0], w[1]) for w in measurer.second_windows],
+            [
+                ("call", members["a"]),
+                ("call", members["b"]),
+                ("call", members["b"]),
+                ("call", members["a"]),
+            ],
+        )
+        self.assertEqual(measurer.second_windows[0][2:], (500, 500))
+        # the ranking regime's medians stay the finalists' perf
+        self.assertAlmostEqual(members["b"].perf, 3.0551)
+        self.assertAlmostEqual(members["a"].perf, 3.055)
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        by_name = {
+            name: rows[canonical_config_id(member.config)]
+            for name, member in members.items()
+        }
+        self.assertEqual(by_name["b"]["second_median_ms"], 3.90)
+        self.assertEqual(by_name["b"]["second_rounds_ms"], [3.90, 3.90])
+        self.assertEqual(by_name["a"]["second_median_ms"], 5.41)
+        self.assertNotIn("second_median_ms", by_name["c"])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["l2_flush_mode"], "replay")
+        self.assertEqual(metrics["second_l2_flush_mode"], "call")
+        self.assertEqual(metrics["selected_by"], "replay")
+        self.assertEqual(metrics["target_regime"], "auto")
+        self.assertEqual(
+            metrics["selected_config_id"], canonical_config_id(members["b"].config)
+        )
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("(L2 replay)", line)
+        self.assertIn("the tie within 1.0% broken by 2 rounds of L2 call", line)
+        self.assertIn("call=3.9[3.9 3.9]", line)
+        self.assertIn("call=5.41[5.41 5.41]", line)
+
+    def test_explicit_regime_does_not_probe_the_trace(self) -> None:
+        """A regime named in the environment that is not ``kernel`` leaves
+        the trace alone: no profiling session or flush buffer in the
+        parent for a backend whose default would trace."""
+        search = _make_search([_member(32, 1.0)], policy=FinalSelectionConfig())
+        search.config_spec = SimpleNamespace(  # type: ignore[misc]
+            final_selection_family_keys=(),
+            backend=SimpleNamespace(default_final_selection_regime=lambda: "kernel"),
+        )
+        with (
+            patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_L2_FLUSH": "call"}),
+            patch.object(search, "_kernel_timer_usable") as probe,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            self.assertEqual(search._final_selection_regime(), "call")
+            self.assertIsNone(search._final_selection_second_regime("call"))
+        probe.assert_not_called()
+        # sizing the phase under a budget never asks the worker: a ``kernel``
+        # selection reserves no second column, and an explicit ``call``
+        # target on it does (an upper bound whether or not it traces)
+        assert search.final_selection is not None
+        for target, rounds in (
+            (None, 0),
+            ("call", search.final_selection.tiebreak_rounds),
+        ):
+            with (
+                patch.dict(os.environ, {}),
+                patch.object(search, "_kernel_timer_usable") as probe,
+            ):
+                for name in (
+                    "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                    "HELION_AUTOTUNE_L2_FLUSH",
+                    "HELION_AUTOTUNE_TARGET_REGIME",
+                ):
+                    os.environ.pop(name, None)
+                if target is not None:
+                    os.environ["HELION_AUTOTUNE_TARGET_REGIME"] = target
+                sized = search._final_selection_sizing_policy()
+            probe.assert_not_called()
+            self.assertEqual(sized.tiebreak_rounds, rounds)
+
+    def test_cold_column_takes_the_backend_kernel_timer(self) -> None:
+        """A warm CuTe selection's cold column times per call flushed from
+        the trace (the backend's ``kernel`` regime) where the benchmark worker
+        times the finalists and can trace, and with CUDA events (``call``)
+        where it cannot or the finalists run in this process (no profiling
+        session in the user's process)."""
+        for available, in_worker, cold_regime in (
+            (True, True, "kernel"),
+            (False, True, "call"),
+            (True, False, "call"),
+        ):
+            search, measurer, members = self._tied_warm_search(
+                cold={"a": 5.41, "b": 3.90, "c": 3.80}
+            )
+            search.config_spec = SimpleNamespace(  # type: ignore[misc]
+                final_selection_family_keys=(),
+                backend=SimpleNamespace(
+                    default_final_selection_regime=lambda: "kernel"
+                ),
+            )
+            with (
+                patch.dict(
+                    os.environ,
+                    {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"},
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                patch.object(
+                    search,
+                    "benchmark_provider",
+                    new=Mock(
+                        spec=LocalBenchmarkProvider,
+                        steady_window_benchmark_available=Mock(return_value=in_worker),
+                        worker_kernel_timer_available=Mock(return_value=available),
+                        _subprocess_benchmark_uses_wall_clock=Mock(return_value=False),
+                    ),
+                ),
+                patch.object(
+                    base_search_module, "kernel_timer_available", return_value=True
+                ),
+            ):
+                os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+            self.assertEqual(
+                {window[0] for window in measurer.second_windows}, {cold_regime}
+            )
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(metrics["second_l2_flush_mode"], cold_regime)
+
+    def test_cold_column_keeps_the_warm_pick_when_cold_ties_too(self) -> None:
+        """The replay ranking stands unless a tied rival is faster cold by
+        more than the tolerance; without a second column (tiebreak_rounds 0)
+        nothing is timed cold and the ranking regime decides alone."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 3.90, "b": 3.905, "c": 3.80}
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(len(measurer.second_windows), 4)
+
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}, tiebreak_rounds=0
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertIsNone(metrics["second_l2_flush_mode"])
+
+    def test_no_tie_means_no_cold_column(self) -> None:
+        """Finalists more than the tolerance apart in the ranking regime are
+        not timed again, and the default per-call flushed selection never
+        takes a second column (a cold reading carries the steady state)."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80},
+            warm={"a": 3.055, "b": 3.20, "c": 3.36},
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("no tie within 1.0% for L2 call windows to break", line)
+
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        measurer.regime_label = "call"
+        with patch.dict(os.environ, _SHORTLIST_ALL):
+            for name in (
+                "HELION_AUTOTUNE_L2_FLUSH",
+                "HELION_AUTOTUNE_FINAL_L2_FLUSH",
+                "HELION_AUTOTUNE_TARGET_REGIME",
+            ):
+                os.environ.pop(name, None)
+            with patch.object(search, "_final_selection_measurer", new=measurer):
+                self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+
+    def test_target_regime_selects_by_its_column(self) -> None:
+        """HELION_AUTOTUNE_TARGET_REGIME names the regime the kernel is
+        scored in: every complete finalist is timed in it as well and that
+        column selects outright, even against the ranking regime (dh: 10.4
+        vs 15.5 us cold behind a warm ranking the other way); the finalists'
+        perf becomes the target regime's median."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **_SHORTLIST_ALL,
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "call",
+                },
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+        self.assertEqual(
+            sorted({id(w[1]) for w in measurer.second_windows}),
+            sorted(id(member) for member in members.values()),
+        )
+        self.assertEqual(len(measurer.second_windows), 6)
+        self.assertEqual(members["b"].perf, 10.4)
+        self.assertEqual(members["a"].perf, 15.5)
+        self.assertEqual(members["b"].perfs, [3.2, 9.0, 10.4])
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["selected_by"], "call")
+        self.assertEqual(metrics["target_regime"], "call")
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("selected 10.4", line)
+        self.assertIn("by 2 rounds of L2 call windows", line)
+        # the table is ordered by the selecting column
+        table = line.split("\n")[1:]
+        self.assertIn(canonical_config_id(members["b"].config), table[0])
+        self.assertIn(canonical_config_id(members["a"].config), table[-1])
+
+        # a target that is the ranking regime already adds nothing; the
+        # per-call default search can be told to select by the burst
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **_SHORTLIST_ALL,
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "replay",
+                },
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(measurer.second_windows, [])
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        measurer.regime_label = "call"
+        with (
+            patch.dict(
+                os.environ,
+                {**_SHORTLIST_ALL, "HELION_AUTOTUNE_TARGET_REGIME": "replay"},
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+        ):
+            for name in ("HELION_AUTOTUNE_L2_FLUSH", "HELION_AUTOTUNE_FINAL_L2_FLUSH"):
+                os.environ.pop(name, None)
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["b"])
+        self.assertEqual({w[0] for w in measurer.second_windows}, {"replay"})
+
+    def test_second_regime_follows_the_target(self) -> None:
+        from helion.autotuner.benchmarking import final_selection_second_regime
+        from helion.autotuner.benchmarking import final_selection_target_regime
+
+        cases = [
+            # (target env, ranking regime) -> (target, second regime)
+            (None, "replay", "auto", "call"),
+            (None, "off", "auto", "call"),
+            (None, "call", "auto", None),
+            ("auto", "replay", "auto", "call"),
+            ("call", "replay", "call", "call"),
+            ("call", "call", "call", None),
+            ("replay", "call", "replay", "replay"),
+            ("replay", "replay", "replay", None),
+            ("0", "replay", "off", "off"),
+            # timers that cannot honour a regime take no second column
+            (None, "backend bench", "auto", None),
+            ("call", "call (wall clock, always flushed)", "call", None),
+        ]
+        for target, regime, expected_target, expected in cases:
+            with patch.dict(os.environ, {}):
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                if target is not None:
+                    os.environ["HELION_AUTOTUNE_TARGET_REGIME"] = target
+                self.assertEqual(
+                    final_selection_second_regime(regime), expected, (target, regime)
+                )
+                self.assertEqual(final_selection_target_regime(), expected_target)
+
+    def test_cold_failure_keeps_the_warm_ranking(self) -> None:
+        """A finalist that fails only in the cold column keeps its replay
+        median and is not timed cold again; the tie-break runs on the rest,
+        and the pinned preference reaches into the cold column."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        failing = members["a"]
+        measurer.second_model = lambda member, _n: (
+            IsolatedBenchmarkFailure("timeout")
+            if member is failing
+            else {"b": 3.90, "c": 3.80}[
+                next(name for name, m in members.items() if m is member)
+            ]
+        )
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            search.log.level = logging.INFO
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            # a's cold column failed: no cold evidence against a, so the
+            # replay pick stands
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        self.assertEqual(
+            [w[1] for w in measurer.second_windows],
+            [members["a"], members["b"], members["b"]],
+        )
+        self.assertAlmostEqual(members["a"].perf, 3.055)
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("unresolved: no eligible complete comparison", line)
+        self.assertNotIn("broken by", line)
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        self.assertEqual(
+            rows[canonical_config_id(members["a"].config)]["second_disqualified"],
+            "timeout",
+        )
+
+        # The pinned preference reaches into the cold column: with every
+        # finalist tied warm, the cold-best is c, and the pinned b within
+        # the pinned tolerance of it cold keeps the preference; without a
+        # tolerance c wins.
+        for tolerance, winner in (("0.02", "b"), (None, "c")):
+            search, measurer, members = self._tied_warm_search(
+                cold={"a": 5.41, "b": 3.95, "c": 3.90},
+                warm={"a": 3.055, "b": 3.0551, "c": 3.056},
+            )
+            search._pinned_finalist_configs = {members["b"].config}
+            search._pinned_finalist_members = {members["b"].config: members["b"]}
+            env = {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            if tolerance is not None:
+                env["HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE"] = tolerance
+            with (
+                patch.dict(os.environ, env),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+            ):
+                if tolerance is None:
+                    os.environ.pop(
+                        "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE", None
+                    )
+                os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+                os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+                self.assertIs(
+                    search.final_rebenchmark_best(members["a"]),
+                    members[winner],
+                    tolerance,
+                )
+            self.assertEqual(len(measurer.second_windows), 6)
+
+    def test_target_column_without_readings_falls_back_to_the_ranking(self) -> None:
+        """An explicit target regime whose column takes no complete reading
+        (every finalist failed or missed a round there) leaves the ranking
+        regime's pick, and the report says which column selected."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 15.5, "b": 10.4, "c": 12.0},
+            warm={"a": 8.0, "b": 9.0, "c": 9.5},
+        )
+        measurer.second_model = lambda member, _n: IsolatedBenchmarkFailure("timeout")
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    **_SHORTLIST_ALL,
+                    "HELION_AUTOTUNE_L2_FLUSH": "replay",
+                    "HELION_AUTOTUNE_TARGET_REGIME": "call",
+                },
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        # every finalist was tried cold once and not again after failing
+        self.assertEqual(len(measurer.second_windows), 3)
+        self.assertEqual(members["a"].perf, 8.0)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["selected_by"], "replay")
+        self.assertEqual(metrics["second_l2_flush_mode"], "call")
+        self.assertEqual(metrics["target_regime"], "call")
+        self.assertTrue(
+            any(
+                "no eligible complete readings in the L2 call regime" in message
+                for message in logs.output
+            )
+        )
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn("selected 8", line)
+        self.assertIn(
+            "by the L2 replay column (no eligible complete reading in 2 rounds of L2 call "
+            "windows)",
+            line,
+        )
+        # the table is ordered by the column that selected
+        table = line.split("\n")[1:]
+        self.assertIn(canonical_config_id(members["a"].config), table[0])
+        self.assertIn(canonical_config_id(members["c"].config), table[-1])
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        self.assertEqual(
+            {cast("str", row["second_disqualified"]) for row in rows.values()},
+            {"timeout"},
+        )
+
+    def test_tied_group_without_cold_readings_is_reported_as_timed(self) -> None:
+        """When every member of the tied group produced no cold reading
+        (the windows returned nothing, no failure), the windows were still
+        spent: the rows carry the empty column and the header does not
+        claim there was no tie to break; the replay pick stands."""
+        search, measurer, members = self._tied_warm_search(
+            cold={"a": 5.41, "b": 3.90, "c": 3.80}
+        )
+        measurer.second_model = lambda member, _n: None
+        with (
+            patch.dict(
+                os.environ, {**_SHORTLIST_ALL, "HELION_AUTOTUNE_L2_FLUSH": "replay"}
+            ),
+            patch.object(search, "_final_selection_measurer", new=measurer),
+            self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+        ):
+            os.environ.pop("HELION_AUTOTUNE_FINAL_L2_FLUSH", None)
+            os.environ.pop("HELION_AUTOTUNE_TARGET_REGIME", None)
+            search.log.level = logging.INFO
+            self.assertIs(search.final_rebenchmark_best(members["a"]), members["a"])
+        # a and b were tried once each; a finalist without a reading in a
+        # round is not timed again
+        self.assertEqual(
+            sorted(id(w[1]) for w in measurer.second_windows),
+            sorted(id(members[name]) for name in "ab"),
+        )
+        rows = {cast("str", row["config_id"]): row for row in _rows(search)}
+        by_name = {
+            name: rows[canonical_config_id(member.config)]
+            for name, member in members.items()
+        }
+        self.assertEqual(by_name["a"]["second_disqualified"], "incomplete")
+        self.assertEqual(by_name["a"]["second_rounds_ms"], [])
+        self.assertNotIn("second_disqualified", by_name["c"])
+        line = next(line for line in logs.output if "Final selection:" in line)
+        self.assertIn(
+            "the tie within 1.0% unresolved: no complete reading in 2 rounds of "
+            "L2 call windows",
+            line,
+        )
+        self.assertIn("call=incomplete[]", line)
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["selected_by"], "replay")
+
+    def test_family_quota_admits_the_other_family_at_the_screen(self) -> None:
+        # Six configs of family A and one of family B, shortlisted whole.
+        # The screen (the search's clock regime) ranks A's best 1% ahead of
+        # B and B below the top_k cut; the rounds (the sustained regime)
+        # read B 3% faster. With the quota B runs the rounds and wins; with
+        # the quota off, or without family knobs, A wins and B is never
+        # timed past the screen.
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            warmup_ms=100,
+            rep_ms=500,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+
+        def run(
+            search_policy: FinalSelectionConfig, *, keys: bool
+        ) -> tuple[PopulationBasedSearch, _FakeMeasurer, PopulationMember]:
+            a = [_family_member(16 * (i + 1), "a", 1.00 + 0.002 * i) for i in range(6)]
+            b = _family_member(256, "b", 1.03)
+            members = [*a, b]
+            screen = {id(member): member.perf for member in a}
+            screen[id(b)] = 1.01
+            rounds = {id(member): member.perf for member in a}
+            rounds[id(b)] = 0.97
+            measurer = _FakeMeasurer(lambda member, _n: 0.0)
+
+            def model(member: PopulationMember, _n: int) -> float:
+                window = measurer.windows[-1]
+                if window[2:] == (policy.screen_warmup_ms, policy.screen_rep_ms):
+                    return screen[id(member)]
+                return rounds[id(member)]
+
+            measurer.model = model
+            search = (
+                _family_search(members, policy=search_policy)
+                if keys
+                else _make_search(members, policy=search_policy)
+            )
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                search.log.level = logging.INFO
+                selected = search.final_rebenchmark_best(a[0])
+            search._quota_logs = [  # type: ignore[attr-defined]
+                line for line in logs.output if "Final selection family quota" in line
+            ]
+            return search, measurer, selected
+
+        search, measurer, selected = run(policy, keys=True)
+        self.assertEqual(selected.config["fam"], "b")
+        round_windows = [
+            w for w in measurer.windows if w[2:] == (policy.warmup_ms, policy.rep_ms)
+        ]
+        # the two best of A by the screen, plus B (the incumbent A0 is among them)
+        self.assertEqual(len(round_windows), 2 * 3)
+        self.assertEqual({w[1].config["fam"] for w in round_windows}, {"a", "b"})
+        metrics = search._autotune_metrics.final_selection
+        assert metrics is not None
+        self.assertEqual(metrics["shortlisted"], 7)
+        self.assertEqual(metrics["finalists"], 3)
+        self.assertEqual(metrics["family_keys"], ["fam"])
+        rows = {row["family"]: row for row in _rows(search)}
+        self.assertEqual(set(rows), {"a", "b"})
+        self.assertTrue(rows["b"]["family_quota"])
+        self.assertFalse(rows["a"]["family_quota"])
+        shortlist = {row["config_id"]: row for row in metrics["shortlist_rows"]}
+        self.assertEqual({row["family"] for row in shortlist.values()}, {"a", "b"})
+        self.assertTrue(
+            shortlist[canonical_config_id(selected.config)]["screen_family_quota"]
+        )
+        quota_logs = search._quota_logs  # type: ignore[attr-defined]
+        self.assertEqual(len(quota_logs), 1)
+        self.assertIn("family quota (screen)", quota_logs[0])
+        self.assertIn("(fam) within 1.25x", quota_logs[0])
+        self.assertIn("b at", quota_logs[0])
+
+        for search_policy, keys in (
+            (dataclasses.replace(policy, family_finalists=0), True),
+            (policy, False),
+        ):
+            search, measurer, selected = run(search_policy, keys=keys)
+            self.assertEqual(selected.config["fam"], "a")
+            self.assertEqual(selected.perf, 1.00)
+            round_windows = [
+                w
+                for w in measurer.windows
+                if w[2:] == (policy.warmup_ms, policy.rep_ms)
+            ]
+            self.assertEqual(len(round_windows), 2 * 2)
+            self.assertEqual({w[1].config["fam"] for w in round_windows}, {"a"})
+            self.assertEqual(search._quota_logs, [])  # type: ignore[attr-defined]
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(metrics["family_keys"], ["fam"] if keys else [])
+            for row in _rows(search):
+                self.assertEqual("family" in row, keys)
+
+    def test_family_quota_counts_the_seed_and_the_incumbent_as_represented(
+        self,
+    ) -> None:
+        # At the screen cut the best pinned seed and the incumbent survive
+        # outside the top_k on their own right; the quota is computed after
+        # them, so its (single) slot goes to a family neither of them
+        # belongs to (C), not to a second config of their family (B).
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            family_finalists=1,
+            thermal_warmup_ms=0,
+            warmup_ms=100,
+            rep_ms=500,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+
+        def check(role: str) -> None:
+            a = [_family_member(16 * (i + 1), "a", 1.00 + 0.002 * i) for i in range(3)]
+            b = [_family_member(128 + 16 * i, "b", 1.05 + 0.01 * i) for i in range(2)]
+            c = _family_member(512, "c", 1.08)
+            members = [*a, *b, c]
+            rounds = {id(member): member.perf for member in members}
+            rounds[id(c)] = 0.97
+            measurer = _FakeMeasurer(lambda member, _n: 0.0)
+
+            def model(member: PopulationMember, _n: int) -> float:
+                window = measurer.windows[-1]
+                if window[2:] == (policy.screen_warmup_ms, policy.screen_rep_ms):
+                    return member.perf
+                return rounds[id(member)]
+
+            measurer.model = model
+            search = _family_search(
+                members, policy=policy, pinned=[b[1]] if role == "pinned" else []
+            )
+            incumbent = b[1] if role == "incumbent" else a[0]
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                search.log.level = logging.INFO
+                selected = search.final_rebenchmark_best(incumbent)
+            self.assertIs(selected, c, role)
+            round_members = {
+                id(w[1])
+                for w in measurer.windows
+                if w[2:] == (policy.warmup_ms, policy.rep_ms)
+            }
+            # the top_k of A, B's representative (the seed / the incumbent,
+            # not its better-screened sibling) and the quota's C
+            self.assertEqual(
+                round_members, {id(m) for m in (a[0], a[1], b[1], c)}, role
+            )
+            rows = {row["family"]: row for row in _rows(search)}
+            self.assertEqual(set(rows), {"a", "b", "c"}, role)
+            self.assertTrue(rows["c"]["family_quota"], role)
+            self.assertFalse(rows["b"]["family_quota"], role)
+            quota_logs = [
+                line for line in logs.output if "Final selection family quota" in line
+            ]
+            self.assertEqual(len(quota_logs), 1, role)
+            self.assertIn("1 more family (fam)", quota_logs[0])
+            self.assertIn("c at", quota_logs[0])
+
+        check("incumbent")
+        check("pinned")
+
+    def test_family_quota_reaches_the_shortlist(self) -> None:
+        # The shortlist is cut by the search's own readings
+        # (HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K); B's best, ranked below
+        # the cut, is shortlisted by the quota and screened like the rest,
+        # while a family beyond the spread (C at 1.4x) is not.
+        a = [_family_member(16 * (i + 1), "a", 1.00 + 0.01 * i) for i in range(3)]
+        b = [_family_member(128 + 16 * i, "b", 1.05 + 0.01 * i) for i in range(2)]
+        c = _family_member(512, "c", 1.40)
+        members = [*a, *b, c]
+        policy = FinalSelectionConfig(
+            top_k=2,
+            rounds=2,
+            thermal_warmup_ms=0,
+            screen_warmup_ms=50,
+            screen_rep_ms=200,
+            tiebreak_rounds=0,
+        )
+        for search_policy, expected in (
+            (policy, [a[0], a[1], b[0]]),
+            (dataclasses.replace(policy, family_finalists=0), [a[0], a[1]]),
+        ):
+            search = _family_search(members, policy=search_policy)
+            measurer = _FakeMeasurer(lambda member, _n: member.perf)
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "2"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+                self.assertLogs(search.log._logger, level=logging.INFO) as logs,
+            ):
+                search.log.level = logging.INFO
+                self.assertIs(search.final_rebenchmark_best(a[0]), a[0])
+            self.assertEqual(measurer.finalists, expected)
+            quota_logs = [
+                line for line in logs.output if "Final selection family quota" in line
+            ]
+            if search_policy.family_finalists:
+                # admitted at the shortlist cut, then again at the rounds'
+                # cut (three shortlisted: no screen, the search's readings
+                # rank them and B is third)
+                self.assertEqual(len(quota_logs), 2)
+                self.assertIn("family quota (shortlist)", quota_logs[0])
+                self.assertIn("family quota (rounds)", quota_logs[1])
+                for line in quota_logs:
+                    self.assertIn("b at", line)
+                    self.assertNotIn("c at", line)
+            else:
+                self.assertEqual(quota_logs, [])
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(metrics["shortlisted"], len(expected))
+
+    def test_family_quota_is_capped_and_bounded(self) -> None:
+        # Without a screen the search's readings rank the shortlist; of the
+        # families behind the cut the closest ``family_finalists`` within
+        # the spread join the rounds, one config each, and a family beyond
+        # the spread never does.
+        a = [_family_member(16, "a", 1.00), _family_member(32, "a", 1.005)]
+        b, c, d = (
+            _family_member(64, "b", 1.01),
+            _family_member(80, "c", 1.02),
+            _family_member(96, "d", 1.03),
+        )
+        e = _family_member(112, "e", 1.30)
+        members = [*a, b, c, d, e]
+        base = FinalSelectionConfig(
+            top_k=1, rounds=2, thermal_warmup_ms=0, screen_rep_ms=0, tiebreak_rounds=0
+        )
+        for policy, expected in (
+            (base, [a[0], b, c]),
+            (dataclasses.replace(base, family_finalists=3), [a[0], b, c, d]),
+            (
+                dataclasses.replace(base, family_finalists=3, family_spread=1.015),
+                [a[0], b],
+            ),
+            (dataclasses.replace(base, family_finalists=0), [a[0]]),
+        ):
+            search = _family_search(members, policy=policy)
+            measurer = _FakeMeasurer(lambda member, _n: member.perf)
+            with (
+                patch.dict(
+                    os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}
+                ),
+                patch.object(search, "_final_selection_measurer", new=measurer),
+            ):
+                self.assertIs(search.final_rebenchmark_best(a[0]), a[0])
+            timed = []
+            for window in measurer.windows:
+                if window[0] == "measure" and window[1] not in timed:
+                    timed.append(window[1])
+            self.assertEqual(timed, expected, policy)
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            self.assertEqual(
+                [row["family_quota"] for row in _rows(search)],
+                [member is not a[0] for member in expected],
+            )
+
+    def test_budget_counts_the_family_quota_only_with_family_keys(self) -> None:
+        # The quota's representatives are reserved for (and counted in the
+        # shortlist estimate) only where the spec names family knobs; the
+        # ladder sheds them right after the second regime's column.
+        members = [_member(32, 1.0), _member(64, 1.1)]
+        policy = FinalSelectionConfig()
+        one_column = dataclasses.replace(policy, tiebreak_rounds=0)
+        self.assertEqual(policy.budget_ladder()[3].family_finalists, 0)
+        self.assertEqual(policy.budget_ladder()[3].rounds, policy.rounds)
+        with patch.dict(os.environ, {"HELION_AUTOTUNE_FINAL_REBENCHMARK_TOP_K": "8"}):
+            _clear_regime_envs()
+            plain = _make_search(
+                members, policy=policy, pinned=members[:1], budget_seconds=1000
+            )
+            self.assertEqual(
+                plain._final_selection_sizing_policy(),
+                dataclasses.replace(one_column, family_finalists=0),
+            )
+            self.assertEqual(plain._final_selection_shortlist_estimate(), 10)
+            self.assertAlmostEqual(
+                plain._budget_reserve_seconds(),
+                dataclasses.replace(one_column, family_finalists=0).estimated_seconds(
+                    10
+                ),
+            )
+            family = _family_search(
+                members, policy=policy, pinned=members[:1], budget_seconds=1000
+            )
+            self.assertEqual(family._final_selection_sizing_policy(), one_column)
+            self.assertEqual(family._final_selection_shortlist_estimate(), 12)
+            self.assertAlmostEqual(
+                family._budget_reserve_seconds(), one_column.estimated_seconds(12)
+            )
+            self.assertGreater(
+                family._budget_reserve_seconds(), plain._budget_reserve_seconds()
+            )
+            # the cache key keeps the profile's fields either way
+            self.assertEqual(
+                family._final_rebenchmark_cache_policy(),
+                plain._final_rebenchmark_cache_policy(),
+            )
 
 
 class TestPrivateKernelArgs(TestCase):
@@ -1307,6 +4265,58 @@ class TestPrivateKernelArgs(TestCase):
         job = BenchmarkJob(object(), "args.pt", args_slot=3)  # type: ignore[arg-type]
         self.assertEqual(job.args_slot, 3)
 
+    def test_worker_measurer_names_the_regime_of_every_window(self) -> None:
+        provider = Mock()
+        provider.benchmark_isolated.return_value = [0.5]
+        fn = lambda: None  # noqa: E731
+        with _WorkerFinalSelectionMeasurer(
+            provider, [fn], private_copies=False, timeout_s=1.0, l2_flush_mode="replay"
+        ) as measurer:
+            self.assertEqual(measurer.warm(0, 100), 0.5)
+            self.assertEqual(measurer.measure(0, 3, 4), 0.5)
+        calls = provider.benchmark_isolated.call_args_list
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1].kwargs,
+            {
+                "warmup": 3,
+                "rep": 4,
+                "desc": "Final selection",
+                "args_slots": [None],
+                "timeout": 1.0,
+                "l2_flush_mode": "replay",
+            },
+        )
+        self.assertEqual(calls[0].kwargs["l2_flush_mode"], "replay")
+
+    def test_benchmark_job_times_in_the_regime_it_names(self) -> None:
+        seen: list[dict[str, object]] = []
+
+        def fake_bench(fn: Callable[[], object], **kwargs: object) -> float:
+            seen.append(kwargs)
+            return 1.5
+
+        with (
+            patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn_for_worker",
+                return_value=lambda *args: args,
+            ),
+            patch("helion.autotuner.benchmark_job._unload_compiled_fn"),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=("shared",),
+            ),
+            patch("helion.autotuner.benchmark_job.do_bench", side_effect=fake_bench),
+        ):
+            self.assertEqual(BenchmarkJob(object(), "args.pt")(), 1.5)  # type: ignore[arg-type]
+            self.assertEqual(
+                BenchmarkJob(object(), "args.pt", l2_flush_mode="replay")(),  # type: ignore[arg-type]
+                1.5,
+            )
+        # the search's jobs keep the worker's HELION_AUTOTUNE_L2_FLUSH regime
+        self.assertIsNone(seen[0]["l2_flush_mode"])
+        self.assertEqual(seen[1]["l2_flush_mode"], "replay")
+
     def test_benchmark_job_reads_the_private_slot(self) -> None:
         seen: dict[str, object] = {}
 
@@ -1363,6 +4373,7 @@ class TestFinalSelectionOnDevice(TestCase):
     alike; the selection itself is backend independent and the CPU tests cover
     it."""
 
+    @pytest.mark.slow
     @skipIfRefEager("compiles and times configs on the device")
     def test_full_effort_selection_runs(self) -> None:
         args = (

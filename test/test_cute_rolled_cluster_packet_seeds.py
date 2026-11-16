@@ -8,7 +8,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_binding import _forbid_native_compile
 from test.test_cute_bounded_cache_codegen import _cpu_target
 from test.test_cute_full_chunk_row_seeds import bind
 from test.test_cute_full_chunk_row_seeds import column_sum
@@ -16,14 +15,17 @@ from test.test_cute_full_chunk_row_seeds import normalize_rows
 
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_specialization_facts
-from helion._compiler.autotuner_heuristics.cute_rolled_cluster_packet import (
+from helion._compiler.cute.autotune.heuristics.cute_rolled_cluster_packet import (
     CuteRolledClusterPacketHeuristic,
 )
 from helion._compiler.cute.prefetch_reduction_packets import _containers
+from helion._testing.cute_codegen import forbid_native_compile
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.effort_profile import get_effort_profile
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -34,7 +36,7 @@ if TYPE_CHECKING:
 @pytest.fixture(autouse=True)
 def cpu_only() -> Iterator[None]:
     initialized = torch.cuda.is_initialized()
-    with _cpu_target(), _forbid_native_compile() as native:
+    with _cpu_target(), forbid_native_compile() as native:
         yield
         assert all(mock.call_count == 0 for mock in native)
     assert torch.cuda.is_initialized() == initialized
@@ -191,7 +193,14 @@ def test_full_fused_population_contains_both_packet_profiles() -> None:
         retained.reduction_loops == [2048]
         and retained.config["cute_min_blocks_per_mp"] == 1
     )
-    assert retained.config["load_eviction_policies"] == ["first", *["l2_last"] * 7]
+    # The rolled code lowers five loads (x and the residual, then all three
+    # again in the second loop) into the first five slots and leaves the
+    # last three unused.
+    assert retained.config["load_eviction_policies"] == [
+        "first",
+        *["l2_last"] * 4,
+        *[""] * 3,
+    ]
     profile = get_effort_profile("full").pattern_search
     assert profile is not None and profile.initial_population_strategy == "from_random"
     with bound.env:
@@ -207,6 +216,18 @@ def test_full_fused_population_contains_both_packet_profiles() -> None:
         assert (
             "_consume_prefetch_" in source and "_cute_grouped_reduce_cluster(" in source
         )
+    # The retained profile's first source, x, evicts first; the other loads
+    # its rolled code lowers keep their lines.
+    loads = {
+        name: [line for line in source.splitlines() if f"({name}.iterator" in line]
+        for name in ("x", "residual", "weight")
+    }
+    assert all(loads.values()), loads
+    assert all("level1_eviction_priority='evict_first'" in line for line in loads["x"])
+    assert all(
+        "_cute_load_l2_evict_last(" in line
+        for line in loads["residual"] + loads["weight"]
+    )
 
 
 def test_legacy_seed_prefix_and_default_are_unchanged() -> None:
@@ -255,6 +276,32 @@ def test_unsupported_dtypes_decline(dtype: torch.dtype) -> None:
 def test_dynamic_or_high_grid_rows_decline() -> None:
     assert not _seeds(bind(4, 7168, torch.bfloat16, static=False))
     assert not _seeds(bind(149, 7168, torch.bfloat16))
+
+
+def _rows_beside_a_data_dependent_loop(
+    x: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m, block_size=1):
+        mean = x[tile_m, :].mean(dim=-1, keepdim=True)
+        start = offsets[tile_m.begin]
+        end = offsets[tile_m.begin + 1]
+        for tile_k in hl.tile(start, end):
+            out[tile_m, tile_k] = x[tile_m, tile_k] - mean
+    return out
+
+
+def test_a_loop_over_data_dependent_bounds_declines() -> None:
+    # The fixed row tile leaves the loop over ``offsets``' bounds the sole
+    # tunable block, which has no extent to seed a cluster by.
+    bound = helion.kernel(
+        _rows_beside_a_data_dependent_loop, backend="cute", static_shapes=True
+    )._bind_isolated((torch.empty((8, 512)), torch.arange(0, 513, 64)))
+    row = bound.config_spec.block_sizes[0].block_id
+    assert bound.env.block_sizes[row].size is None
+    assert not bound.env.is_jagged_tile(row)
+    assert not _seeds(bound)
 
 
 @pytest.mark.parametrize("reason", ["atomic", "indexed", "warp", "thread_domain"])

@@ -19,19 +19,12 @@ from typing import cast
 from ..ast_extension import create
 from .bounded_loop_cache import CachedLoops
 from .bounded_loop_cache import private_fragment_accesses
+from .reduce_call import CTA_REDUCES
 
 if TYPE_CHECKING:
     from collections.abc import Collection
     from collections.abc import Mapping
 
-_MAX_HELPERS = frozenset(
-    {
-        "_cute_grouped_reduce_warp",
-        "_cute_grouped_reduce_shared_two_stage",
-        "_cute_grouped_reduce_shared_serial",
-        "_cute_grouped_reduce_shared_tree",
-    }
-)
 _SCALARS = frozenset(
     {
         "cutlass.Boolean",
@@ -326,7 +319,7 @@ class _Interpreter:
                 and not call.keywords
             ):
                 call = call.args[0]
-            if isinstance(call, ast.Call) and ast.unparse(call.func) in _MAX_HELPERS:
+            if isinstance(call, ast.Call) and ast.unparse(call.func) in CTA_REDUCES:
                 if (
                     depth != 1
                     or self.writes[name] != 1

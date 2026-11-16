@@ -346,11 +346,12 @@ def cute_serial_axis(
     state: CodegenState, value: torch.Tensor, dim: int, what: str
 ) -> CuteSerialAxis:
     """The serial walk of dim ``dim`` of ``value`` in the current scope."""
-    from ...language.memory_ops import _cute_active_index_var
     from ..compile_environment import CompileEnvironment
     from ..tile_strategy import PerThreadFlattenedTileStrategy
     from .cute_reshape import _get_dim_local_coord
     from .cute_reshape import _resolve_dim_block_id
+    from .emitters.memory_access import _cute_active_index_var
+    from .iota_utils import cute_padded_range_length
     from .tile_ops import cute_masked_block_end
 
     env = CompileEnvironment.current()
@@ -408,14 +409,22 @@ def cute_serial_axis(
             )
         position = _get_dim_local_coord(state.codegen, value, dim)
         tile_base = f"({index_var}) - ({position})"
-    return CuteSerialAxis(
-        block_id,
-        extent,
-        position,
-        tile_base,
-        index_var,
-        cute_masked_block_end(state.codegen, block_id, what),
-    )
+    end = cute_masked_block_end(state.codegen, block_id, what)
+    # A padded ``hl.arange`` on the lanes of this reduction dim of its padded
+    # size (``cute_padded_range_reduction_block``) holds elements in its first
+    # ``length`` lanes only, and the dim has no mask that says so: a sort over
+    # ``hl.load(x, [i, hl.arange(5)])`` on 8 lanes must not rank the 3 past
+    # it.  The walked value's own inputs name the range; a full row sorted
+    # beside it walks all 8.
+    assert state.fx_node is not None
+    length = cute_padded_range_length(state.codegen, state.fx_node, block_id)
+    if length is not None:
+        if end is not None:
+            raise exc.BackendUnsupported(
+                "cute", f"{what} along a padded hl.arange on a masked dim"
+            )
+        end = str(length)
+    return CuteSerialAxis(block_id, extent, position, tile_base, index_var, end)
 
 
 def cute_reread_index(
@@ -436,9 +445,9 @@ def cute_reread_index(
     lane-validity bounds, but not for an ``extra_mask`` that varies along
     the walked dim: such a load is refused.
     """
-    from ...language.memory_ops import _cute_tensor_dim_size_expr
     from ..compile_environment import CompileEnvironment
     from .cute_reshape import _resolve_dim_block_id
+    from .emitters.memory_access import _cute_tensor_dim_size_expr
 
     pattern = re.compile(rf"\b{re.escape(axis.index_var)}\b")
     positions = [
@@ -598,9 +607,17 @@ def _cute_inline_combine_graph(
             rhs = operand(node.args[1])
             emit(node, f"({lhs}) if ({lhs}) > ({rhs}) else ({rhs})")
         elif target is torch.ops.prims.convert_element_type.default:
-            # Per-lane scalars are already in their storage dtype; treat the
-            # cast as a pass-through (matches the load/store scalar pipeline).
-            env_map[node] = operand(node.args[0])
+            # A cast the combine function writes, or type promotion adds:
+            # ``right.float() > left.float()`` of int64 operands compares
+            # their fp32 roundings, which values 1 apart above 2**24 share.
+            dtype = node.args[1]
+            assert isinstance(dtype, torch.dtype)
+            emit(
+                node,
+                env.backend.cast_expr(
+                    operand(node.args[0]), env.backend.dtype_str(dtype)
+                ),
+            )
         else:
             raise exc.BackendUnsupported(
                 "cute", f"associative_scan combine function: {target}"
@@ -680,6 +697,7 @@ def _cute_codegen_serial_scan(
     from ..ast_extension import expr_from_string
     from ..ast_extension import statement_from_string
     from ..compile_environment import CompileEnvironment
+    from ..device_ir import HelperFunctionGraphInfo
     from .indexing import CuteSortableLoad
 
     # Fake-tensor metadata lives on the per-stream input nodes (the scan node
@@ -753,6 +771,20 @@ def _cute_codegen_serial_scan(
     combine_lines, combine_exprs = _cute_inline_combine_graph(
         state, helper_graph_info, acc_vars, value_vars
     )
+    # A combine that returns another dtype than its stream's (`l.float() +
+    # r.float()` of fp16 values) casts back, as the parallel scan's merge
+    # does: the loop carries each stream in its own dtype.
+    assert isinstance(helper_graph_info, HelperFunctionGraphInfo)
+    output = next(n for n in helper_graph_info.graph.nodes if n.op == "output")
+    outputs = output.args[0]
+    if not isinstance(outputs, (tuple, list)):
+        outputs = [outputs]
+    combine_exprs = [
+        env.backend.cast_expr(expr, env.backend.dtype_str(val.dtype))
+        if isinstance(out, torch.fx.Node) and out.meta["val"].dtype != val.dtype
+        else expr
+        for expr, out, val in zip(combine_exprs, outputs, vals, strict=True)
+    ]
     # Fold: when this position is included and we already have a running prefix,
     # combine; on the first included element seed the accumulator with the
     # value.  Stage combined results so reads of the old accumulator inside the
@@ -1036,7 +1068,7 @@ def _cute_scan_inner_lanes(
     """
     from ..tile_strategy import DeviceGridState
     from ..tile_strategy import PerThreadNDTileStrategy
-    from ..tile_strategy import _static_lane_loop_extent
+    from .lane_loops.markers import _static_lane_loop_extent
 
     lanes: list[_CuteScanInnerLane] = []
     if isinstance(owner, DeviceGridState):
@@ -1069,11 +1101,11 @@ def _cute_scan_inner_lanes(
         extent = strategy._elements_per_thread_for_block(other)
         if extent <= 1:
             continue
-        vec_lane_var = strategy._cute_vec_lane_var_by_block.get(other)
+        vec_lane_var = strategy.lane_context(other).vec_lane_var
         if vec_lane_var is None:
             lanes.append(_CuteScanInnerLane(f"cutlass.Int32({var})", extent))
             continue
-        width = strategy._cute_lane_vec_width_by_block.get(other, 1)
+        width = strategy.lane_context(other).vec_width
         if extent % width:
             return None
         lanes.append(_cute_scan_lane_slot(var, vec_lane_var, extent, width))
@@ -1269,13 +1301,13 @@ def _cute_scan_prepare_lane_direction(
     """
     from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
     from ..tile_strategy import DeviceGridState
-    from ..tile_strategy import _lane_loop_reversible
-    from ..tile_strategy import _reverse_lane_loop_iter
+    from .lane_loops.markers import _lane_loop_reversible
+    from .lane_loops.markers import _reverse_lane_loop_iter
 
     lane_var = geometry.lane_var
     if lane_var is None or geometry.lane_steps * geometry.vec_width <= 1:
         return True
-    directions = state.device_function.cute_state.scan_lane_directions
+    directions = state.device_function.cute_state.lanes.scan_lane_directions
     previous = directions.get(lane_var)
     if previous is not None:
         return previous == reverse
@@ -1778,6 +1810,7 @@ def _cute_try_parallel_scan(
 
     from ..ast_extension import expr_from_string
     from .cute_reshape import _resolve_dim_block_id
+    from .iota_utils import cute_padded_range_length
 
     if not input_nodes or not all(isinstance(node, Node) for node in input_nodes):
         return "an input is not a traced tile"
@@ -1805,6 +1838,15 @@ def _cute_try_parallel_scan(
     block_id = _resolve_dim_block_id(state.codegen, first, dim)
     if block_id is None:
         return "the scan dim has no block"
+    if reverse and (
+        cute_padded_range_length(state.codegen, cast("Node", state.fx_node), block_id)
+        is not None
+    ):
+        # The lanes past a padded ``hl.arange`` on the dim's lanes hold the
+        # zeros its loads fill in, which a reverse scan would fold into every
+        # element, and the shuffles carry no flag for them; the serial walk
+        # ends at the range's length (``cute_serial_axis``).
+        return "a reverse scan reads the padding lanes of an hl.arange"
     geometry = _cute_scan_geometry(state, block_id)
     if geometry is None:
         return (

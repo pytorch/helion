@@ -12,6 +12,7 @@ from .ref_tile import RefTile
 
 if TYPE_CHECKING:
     import ast
+    from collections.abc import Sequence
 
     from .._compiler.inductor_lowering import CodegenState
 
@@ -19,7 +20,7 @@ __all__ = ["arange", "full", "zeros"]
 
 
 def zeros(
-    shape: list[object],
+    shape: Sequence[object],
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,
 ) -> torch.Tensor:
@@ -66,7 +67,7 @@ def zeros(
 
 @_decorators.api(tiles_as_sizes=True)
 def full(
-    shape: list[object],
+    shape: Sequence[object],
     value: float | torch.Tensor,
     dtype: torch.dtype = torch.float32,
     device: torch.device | None = None,

@@ -35,8 +35,9 @@ pattern:
 The cached and rescaled exponentials round each output differently, so
 that form needs the ``fast_math`` setting.  Without it the rewrite keeps
 every exponential exact: only sweep B moves into the frame of the CTA's own
-maximum (``_try_rewrite_pair_exact``), and sweep C recomputes its ``exp2``
-from the global maximum.
+maximum (``_try_rewrite_pair_exact``, which also takes the natural ``exp``
+that ``torch.exp`` lowers to without ``fast_math``), and sweep C recomputes
+its exponentials from the global maximum.
 
 Every rewrite condition fails closed: if any structural check does not
 match, the kernel keeps the two-exchange form.
@@ -45,17 +46,25 @@ match, the kernel keeps the two-exchange form.
 from __future__ import annotations
 
 import ast
-from collections import Counter
 import copy
 import dataclasses
 import math
 from typing import Callable
-from typing import TypeGuard
-from typing import cast
 
-_CLUSTER_REDUCE = "_cute_grouped_reduce_cluster"
-_BLOCK_REDUCE = "_cute_grouped_reduce_block"
-_PAIR_REDUCE = "_cute_grouped_reduce_cluster_online_pair"
+from ._ast_pass_utils import is_name_assign
+from ._ast_pass_utils import reparse_expr
+from .analysis.online_pair import _BLOCK_REDUCE
+from .analysis.online_pair import _PAIR_REDUCE
+from .analysis.online_pair import OnlinePairMatcher
+from .analysis.online_pair import _exponent
+from .analysis.online_pair import _Inliner
+from .analysis.online_pair import _is_exp2
+from .analysis.online_pair import _loads
+from .analysis.online_pair import _loop_chain
+from .analysis.online_pair import _reduced_values
+from .analysis.online_pair import _same_loop_ranges
+from .analysis.online_pair import _Site
+from .analysis.online_pair import _stmt
 
 # Module aliases / builtins that appear as Name loads in emitted code but
 # are not kernel-local values.
@@ -88,153 +97,26 @@ def _local_loads(node: ast.AST) -> list[str]:
     ]
 
 
-def _stmt(src: str) -> ast.stmt:
-    return ast.parse(src).body[0]
-
-
-def _reparse_expr(node: ast.expr) -> ast.expr:
-    """Plain-ast copy of an expression (``copy.deepcopy`` fails on the
-    ExtendedAST nodes the emitter produces)."""
-    return ast.parse(ast.unparse(node), mode="eval").body
-
-
-def _is_name_assign(stmt: ast.AST) -> TypeGuard[ast.Assign]:
-    return (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    )
-
-
-def _assigned_name(stmt: ast.Assign) -> str:
-    """Name of a target already proved by ``_is_name_assign``."""
-    return cast("ast.Name", stmt.targets[0]).id
-
-
-def _loads(node: ast.AST) -> list[str]:
-    return [
-        n.id
-        for n in ast.walk(node)
-        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
-    ]
-
-
-def _int_kw(call: ast.Call, name: str) -> int | None:
-    for kw in call.keywords:
-        if kw.arg == name and isinstance(kw.value, ast.Constant):
-            value = kw.value.value
-            if isinstance(value, int):
-                return value
-    return None
-
-
-class _Site:
-    def __init__(
-        self,
-        top_idx: int,
-        stmt_idx: int,
-        for_node: ast.For,
-        assign: ast.Assign,
-        call: ast.Call,
-    ) -> None:
-        self.top_idx = top_idx
-        self.stmt_idx = stmt_idx
-        self.for_node = for_node
-        self.assign = assign
-        self.call = call
-        self.target: str = assign.targets[0].id  # type: ignore[attr-defined]
-        self.op: str = call.args[1].value  # type: ignore[attr-defined]
-        self.buf_name: str = call.args[4].id  # type: ignore[attr-defined]
-        self.mbar_name: str = call.args[5].id  # type: ignore[attr-defined]
-        self.group_span = _int_kw(call, "group_span")
-        self.cluster_n = _int_kw(call, "cluster_n")
-
-
-def _find_sites(body: list[ast.stmt]) -> list[_Site] | None:
-    """All ``_cute_grouped_reduce_cluster`` sites, in order.  Returns None
-    when any site does not have the exact shape the rewrite understands
-    (a single-Name-target Assign directly inside a top-level For)."""
-    sites: list[_Site] = []
-    seen = 0
-    for i, top in enumerate(body):
-        for node in ast.walk(top):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == _CLUSTER_REDUCE
-            ):
-                seen += 1
-        if not isinstance(top, ast.For):
-            continue
-        for j, inner in enumerate(top.body):
-            if not (_is_name_assign(inner) and isinstance(inner.value, ast.Call)):
-                continue
-            call = inner.value
-            if not (
-                isinstance(call.func, ast.Name) and call.func.id == _CLUSTER_REDUCE
-            ):
-                continue
-            if (
-                len(call.args) != 6
-                or not isinstance(call.args[1], ast.Constant)
-                or not isinstance(call.args[4], ast.Name)
-                or not isinstance(call.args[5], ast.Name)
-            ):
-                return None
-            sites.append(_Site(i, j, top, inner, call))
-    if seen != len(sites):
-        return None
-    return sites
-
-
-class _Inliner(ast.NodeTransformer):
-    """Substitute vec-body local single-assignment names into an expression
-    (bounded depth, load context only)."""
-
-    def __init__(self, defs: dict[str, ast.expr], depth: int = 0) -> None:
-        self.defs = defs
-        self.depth = depth
-
-    def visit_Name(self, node: ast.Name) -> ast.AST:
-        if isinstance(node.ctx, ast.Load) and node.id in self.defs and self.depth < 10:
-            replacement = _reparse_expr(self.defs[node.id])
-            return _Inliner(self.defs, self.depth + 1).visit(replacement)
-        return node
-
-
 def _inline_locals(expr: ast.expr, block: list[ast.stmt], upto: ast.stmt) -> ast.expr:
     defs: dict[str, ast.expr] = {}
     for stmt in block:
         if stmt is upto:
             break
-        if _is_name_assign(stmt):
+        if is_name_assign(stmt):
             name = stmt.targets[0].id  # type: ignore[attr-defined]
             if name not in _loads(stmt.value):
                 defs[name] = stmt.value
-    inlined = _Inliner(defs).visit(_reparse_expr(expr))
+    inlined = _Inliner(defs).visit(reparse_expr(expr))
     ast.fix_missing_locations(inlined)
     return inlined
 
 
 def _canonical_src(expr: ast.expr, rename: dict[str, str]) -> str:
-    node = _reparse_expr(expr)
+    node = reparse_expr(expr)
     for sub in ast.walk(node):
         if isinstance(sub, ast.Name) and sub.id in rename:
             sub.id = rename[sub.id]
     return ast.unparse(node)
-
-
-def _is_exp2(call: ast.AST) -> TypeGuard[ast.Call]:
-    return (
-        isinstance(call, ast.Call)
-        and len(call.args) == 1
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "exp2"
-        and isinstance(call.func.value, ast.Attribute)
-        and call.func.value.attr == "math"
-        and isinstance(call.func.value.value, ast.Name)
-        and call.func.value.value.id == "cute"
-    )
 
 
 def _is_pure(expr: ast.AST) -> bool:
@@ -280,7 +162,7 @@ def _prune_dead_assigns(block: list[ast.stmt], external_readers: list[ast.AST]) 
         changed = False
         for idx in range(len(block) - 1, -1, -1):
             stmt = block[idx]
-            if not (_is_name_assign(stmt) and _is_pure(stmt.value)):
+            if not (is_name_assign(stmt) and _is_pure(stmt.value)):
                 continue
             name = stmt.targets[0].id  # type: ignore[attr-defined]
             read = False
@@ -375,26 +257,41 @@ def _is_fp32_cache_read(value: ast.expr, cache_names: set[str]) -> bool:
         isinstance(value, ast.Subscript)
         and isinstance(value.value, ast.Name)
         and value.value.id in cache_names
-        and all(
-            isinstance(
-                node,
-                (
-                    ast.Name,
-                    ast.Load,
-                    ast.Constant,
-                    ast.BinOp,
-                    ast.Add,
-                    ast.Sub,
-                    ast.Mult,
-                    ast.UnaryOp,
-                    ast.USub,
-                    ast.UAdd,
-                ),
-            )
-            and (not isinstance(node, ast.Constant) or type(node.value) is int)
-            for node in ast.walk(value.slice)
-        )
+        and _is_pure_index(value.slice)
     )
+
+
+def _is_pure_index(node: ast.expr) -> bool:
+    """A register-cache slot index built only from names, integer literals,
+    integer arithmetic, ``cutlass.Int32`` casts and the launch coordinates
+    (``cute.arch.block_idx()[k]`` / ``thread_idx()[k]``): the shape of both
+    the explicit two-pass slot and the rolled ``reduction_loops`` slot
+    (``((roffset - base) // chunk * lanes + lane) * vec + k``)."""
+    if isinstance(node, ast.Name):
+        return True
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int
+    if isinstance(node, ast.BinOp):
+        return isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod)
+        ) and (_is_pure_index(node.left) and _is_pure_index(node.right))
+    if isinstance(node, ast.UnaryOp):
+        return isinstance(node.op, (ast.USub, ast.UAdd)) and _is_pure_index(
+            node.operand
+        )
+    if isinstance(node, ast.Call) and not node.keywords:
+        func = ast.unparse(node.func)
+        if func == "cutlass.Int32" and len(node.args) == 1:
+            return _is_pure_index(node.args[0])
+        return func in ("cute.arch.block_idx", "cute.arch.thread_idx") and not node.args
+    if isinstance(node, ast.Subscript):
+        return (
+            isinstance(node.value, ast.Call)
+            and _is_pure_index(node.value)
+            and isinstance(node.slice, ast.Constant)
+            and type(node.slice.value) is int
+        )
+    return False
 
 
 def _find_vec_exp(
@@ -449,7 +346,13 @@ def _find_vec_exp(
                     and isinstance(s.value, ast.Name)
                     and s.value.id in cache_names
                 ]
-                if len(cache_slots) != 1:
+                # The pair caches each lane's exponential at the slot its
+                # exponent reads: a slot every lane shares (a single-slot
+                # value of fuse_two_pass_loads) would keep the last lane's.
+                if len(cache_slots) != 1 or not any(
+                    isinstance(name, ast.Name) and name.id == vec_var
+                    for name in ast.walk(cache_slots[0].slice)
+                ):
                     continue
                 canonical = _canonical_src(
                     inlined, {vec_var: "_V_", scaled_name: "_S_"}
@@ -479,7 +382,7 @@ def _find_vec_exp(
         ):
             return None
     for m in matches:
-        if _is_name_assign(m.exp_stmt) and m.exp_stmt.value is m.exp_call:
+        if is_name_assign(m.exp_stmt) and m.exp_stmt.value is m.exp_call:
             return m
     return first
 
@@ -495,14 +398,12 @@ def fuse_cluster_online_pair(
     def canon(name: str) -> str:
         return renames.get(name, name)
 
-    sites = _find_sites(body)
-    if not sites or len(sites) < 2:
-        return body
+    matcher = OnlinePairMatcher(body)
 
     # Top-level register-fragment caches (fuse_two_pass_loads output).
     caches: dict[str, tuple[int, int, str]] = {}
     for i, top in enumerate(body):
-        if not (_is_name_assign(top) and isinstance(top.value, ast.Call)):
+        if not (is_name_assign(top) and isinstance(top.value, ast.Call)):
             continue
         call = top.value
         if (
@@ -518,19 +419,8 @@ def fuse_cluster_online_pair(
                 ast.unparse(call.args[1]),
             )
 
-    for pair_idx in range(len(sites) - 1):
-        site_a, site_b = sites[pair_idx], sites[pair_idx + 1]
-        if (
-            site_a.op != "max"
-            or site_b.op != "sum"
-            or site_a.cluster_n is None
-            or site_a.cluster_n <= 1
-            or site_a.cluster_n != site_b.cluster_n
-            or site_a.group_span is None
-            or site_a.group_span != site_b.group_span
-            or site_a.top_idx >= site_b.top_idx
-        ):
-            continue
+    for candidate in matcher.candidates():
+        pair_idx, site_a, site_b = candidate.index, candidate.site_a, candidate.site_b
         if (
             fast_math
             and _try_rewrite_pair(
@@ -552,328 +442,6 @@ def fuse_cluster_online_pair(
     return body
 
 
-def _loop_chain(
-    node: ast.AST, parents: dict[int, ast.AST], root: ast.For
-) -> list[tuple[ast.For, ast.stmt]] | None:
-    """The ``for`` loops from ``root`` down to ``node`` (outermost first),
-    each with the statement of its body that holds ``node``; None if
-    ``node`` sits under other control flow or in a loop's ``else``."""
-    chain: list[tuple[ast.For, ast.stmt]] = []
-    child: ast.AST = node
-    while child is not root:
-        parent = parents.get(id(child))
-        if parent is None:
-            return None
-        if isinstance(child, ast.stmt):
-            if not (
-                isinstance(parent, ast.For) and any(s is child for s in parent.body)
-            ):
-                return None
-            chain.append((parent, child))
-        child = parent
-    chain.reverse()
-    return chain
-
-
-def _strip_fp32_casts(node: ast.expr) -> ast.expr:
-    """Drop ``cutlass.Float32(v)`` around a value that already is Float32."""
-
-    class Strip(ast.NodeTransformer):
-        def visit_Call(self, call: ast.Call) -> ast.AST:
-            self.generic_visit(call)
-            if not (
-                ast.unparse(call.func) == "cutlass.Float32"
-                and len(call.args) == 1
-                and not call.keywords
-                and isinstance(inner := call.args[0], ast.Call)
-            ):
-                return call
-            if ast.unparse(inner.func) == "cutlass.Float32" or (
-                isinstance(inner.func, ast.Attribute)
-                and inner.func.attr == "bitcast"
-                and [ast.unparse(arg) for arg in inner.args] == ["cutlass.Float32"]
-            ):
-                return inner
-            return call
-
-    result = Strip().visit(node)
-    assert isinstance(result, ast.expr)
-    return result
-
-
-def _stable_outer_definitions(body: list[ast.stmt], before: int) -> dict[str, ast.expr]:
-    """Pure scalar aliases whose dependencies have one unchanged SSA value.
-
-    Expand only definitions preceding the first reduction. Every candidate and
-    dependency is either never assigned in this body or was already proved as
-    a single-assignment scalar. A later write, including a loop-carried write,
-    therefore prevents substitution into a subsequent load site's address.
-    """
-    from ..tile_strategy import _is_proven_relocatable_assignment
-
-    module = ast.Module(body=body, type_ignores=[])
-    writes = Counter(
-        node.id
-        for node in ast.walk(module)
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-    )
-    stable = set(_loads(module)) - writes.keys()
-    definitions: dict[str, ast.expr] = {}
-    for statement in body[:before]:
-        if not _is_name_assign(statement):
-            continue
-        name = statement.targets[0].id
-        if (
-            writes[name] != 1
-            or not set(_loads(statement.value)) <= stable
-            or not _is_proven_relocatable_assignment(statement, allow_load=False)
-        ):
-            continue
-        # Canonicalize this acyclic prefix once, so an expression's nesting
-        # depth does not change how far its outer aliases are substituted.
-        definitions[name] = _Inliner(definitions).visit(_reparse_expr(statement.value))
-        stable.add(name)
-    return definitions
-
-
-class _ElementValues:
-    """Canonical per-element values of expressions inside ``for`` nests
-    whose innermost loop is ``range_constexpr(N)``: local definitions are
-    inlined, the innermost index becomes each constant ``0..N-1``, the
-    other loop indices become positional placeholders, and register-cache
-    reads become the values written into them."""
-
-    def __init__(self, outer_definitions: dict[str, ast.expr] | None = None) -> None:
-        # (cache name, canonical index) -> canonical stored value
-        self.cache_values: dict[tuple[str, str], ast.expr] = {}
-        self.outer_definitions = outer_definitions or {}
-
-    @staticmethod
-    def _definitions(
-        chain: list[tuple[ast.For, ast.stmt]],
-    ) -> dict[str, ast.expr] | None:
-        definitions: dict[str, ast.expr] = {}
-        for loop, holder in chain:
-            seen: set[str] = set()
-            for statement in loop.body:
-                if statement is holder:
-                    break
-                for node in ast.walk(statement):
-                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-                        if node.id in seen:
-                            return None  # rebound: inlining could skip a write
-                        seen.add(node.id)
-                if _is_name_assign(statement):
-                    name = statement.targets[0].id  # type: ignore[attr-defined]
-                    if name not in _loads(statement.value):  # type: ignore[attr-defined]
-                        definitions[name] = statement.value  # type: ignore[attr-defined]
-        return definitions
-
-    @staticmethod
-    def _rename(node: ast.expr, names: dict[str, ast.expr]) -> ast.expr:
-        class Rename(ast.NodeTransformer):
-            def visit_Name(self, name: ast.Name) -> ast.AST:
-                replacement = names.get(name.id)
-                if replacement is None or not isinstance(name.ctx, ast.Load):
-                    return name
-                return _reparse_expr(replacement)
-
-        result = Rename().visit(_reparse_expr(node))
-        assert isinstance(result, ast.expr)
-        return result
-
-    def _canonical(
-        self,
-        node: ast.expr,
-        chain: list[tuple[ast.For, ast.stmt]],
-        constant: dict[str, int],
-    ) -> ast.expr | None:
-        definitions = self._definitions(chain)
-        if definitions is None:
-            return None
-        expr = _Inliner(self.outer_definitions | definitions).visit(_reparse_expr(node))
-        names: dict[str, ast.expr] = {
-            loop.target.id: ast.Name(id=f"_loop{level}_", ctx=ast.Load())  # type: ignore[attr-defined]
-            for level, (loop, _) in enumerate(chain)
-            if isinstance(loop.target, ast.Name)
-        }
-        names.update(
-            {name: ast.Constant(value=value) for name, value in constant.items()}
-        )
-        return _strip_fp32_casts(self._rename(expr, names))
-
-    def record_cache_store(
-        self, store: ast.Assign, chain: list[tuple[ast.For, ast.stmt]]
-    ) -> bool:
-        target = store.targets[0]
-        assert isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
-        index = self._canonical(target.slice, chain, {})
-        value = self._canonical(store.value, chain, {})
-        if index is None or value is None:
-            return False
-        key = (target.value.id, ast.unparse(index))
-        if key in self.cache_values:
-            return False
-        self.cache_values[key] = value
-        return True
-
-    def values(
-        self,
-        node: ast.expr,
-        chain: list[tuple[ast.For, ast.stmt]],
-        caches: set[str],
-    ) -> list[str] | None:
-        """``node``'s canonical value at each innermost-loop position."""
-        if not chain:
-            return None
-        inner = chain[-1][0]
-        iterator = inner.iter
-        if not (
-            isinstance(inner.target, ast.Name)
-            and isinstance(iterator, ast.Call)
-            and isinstance(iterator.func, ast.Attribute)
-            and iterator.func.attr == "range_constexpr"
-            and len(iterator.args) == 1
-            and isinstance(iterator.args[0], ast.Constant)
-            and isinstance(iterator.args[0].value, int)
-        ):
-            return None
-        owner = self
-        results: list[str] = []
-        for position in range(iterator.args[0].value):
-            expr = self._canonical(node, chain, {inner.target.id: position})
-            if expr is None:
-                return None
-            missing = False
-
-            class ReadCache(ast.NodeTransformer):
-                def visit_Subscript(self, read: ast.Subscript) -> ast.AST:
-                    nonlocal missing
-                    self.generic_visit(read)
-                    if not (
-                        isinstance(read.value, ast.Name) and read.value.id in caches
-                    ):
-                        return read
-                    stored = owner.cache_values.get(
-                        (read.value.id, ast.unparse(read.slice))
-                    )
-                    if stored is None:
-                        missing = True
-                        return read
-                    return _reparse_expr(stored)
-
-            expr = ReadCache().visit(expr)
-            if missing:
-                return None
-            results.append(ast.unparse(_strip_fp32_casts(expr)))
-        return results
-
-
-def _same_loop_ranges(
-    first: list[tuple[ast.For, ast.stmt]], second: list[tuple[ast.For, ast.stmt]]
-) -> bool:
-    return len(first) == len(second) and all(
-        ast.unparse(a.iter) == ast.unparse(b.iter)
-        for (a, _), (b, _) in zip(first, second, strict=True)
-    )
-
-
-def _reduced_values(
-    body: list[ast.stmt],
-    site_a: _Site,
-    canon: Callable[[str], str],
-    caches: set[str],
-) -> tuple[_ElementValues, list[tuple[ast.For, ast.stmt]], list[str]] | None:
-    """The values site A max-reduces, per position of its fold's
-    ``range_constexpr`` loop, with the register caches written alongside."""
-    acc = site_a.call.args[0]
-    if not isinstance(acc, ast.Name):
-        return None
-    acc_name = canon(acc.id)
-    root = site_a.for_node
-    parents = {
-        id(child): node
-        for node in ast.walk(root)
-        for child in ast.iter_child_nodes(node)
-    }
-    folds: list[tuple[ast.Assign, ast.expr]] = []
-    for statement in root.body[: site_a.stmt_idx]:
-        for node in ast.walk(statement):
-            if isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-                return None
-            if not (
-                isinstance(node, ast.Assign)
-                and any(
-                    isinstance(t, ast.Name) and canon(t.id) == acc_name
-                    for t in node.targets
-                )
-            ):
-                continue
-            value = node.value
-            if not _is_name_assign(node):
-                return None
-            if ast.unparse(value) == "cutlass.Float32(float('-inf'))":
-                continue
-            if not (isinstance(value, ast.Call) and len(value.args) == 2):
-                return None
-            # NaN-propagating maxima only, as the packed exchange folds.
-            call = (
-                ast.unparse(value.func),
-                tuple((kw.arg, ast.unparse(kw.value)) for kw in value.keywords),
-            )
-            if call not in {
-                ("cute.arch.fmax", (("nan", "True"),)),
-                ("cute.math.max", (("propagate_nan", "True"),)),
-                ("_cute_nan_max", ()),
-            }:
-                return None
-            first, second = value.args
-            if isinstance(first, ast.Name) and canon(first.id) == acc_name:
-                element = second
-            elif isinstance(second, ast.Name) and canon(second.id) == acc_name:
-                element = first
-            else:
-                return None
-            if acc_name in {canon(name) for name in _loads(element)}:
-                return None
-            folds.append((node, element))
-    if len(folds) != 1:
-        return None
-    fold, element = folds[0]
-    chain = _loop_chain(fold, parents, root)
-    if chain is None:
-        return None
-    elements = _ElementValues(_stable_outer_definitions(body, site_a.top_idx))
-    # Register caches written beside the fold (same loops), and nowhere else.
-    for statement in body:
-        for node in ast.walk(statement):
-            if not (
-                isinstance(node, ast.Assign)
-                and len(node.targets) == 1
-                and isinstance(node.targets[0], ast.Subscript)
-                and isinstance(node.targets[0].value, ast.Name)
-                and node.targets[0].value.id in caches
-            ):
-                continue
-            store_chain = _loop_chain(node, parents, root)
-            if (
-                store_chain is None
-                or len(store_chain) >= len(chain)
-                or any(
-                    a is not b
-                    for (a, _), (b, _) in zip(
-                        store_chain, chain[: len(store_chain)], strict=True
-                    )
-                )
-                or not elements.record_cache_store(node, store_chain)
-            ):
-                return None
-    values = elements.values(element, chain, caches)
-    if values is None:
-        return None
-    return elements, chain, values
-
-
 def _try_rewrite_pair_exact(
     body: list[ast.stmt],
     site_a: _Site,
@@ -888,11 +456,12 @@ def _try_rewrite_pair_exact(
 
     ``_try_rewrite_pair`` caches sweep B's exponentials and rescales them in
     sweep C, which rounds each output differently; it needs fast_math.  This one
-    only moves sweep B's ``exp2((x - mi) * C)`` into the frame of the CTA's
-    own maximum: the packed exchange folds the CTA sums with ``sum +=
-    s_r * exp2((m_r - m) * C)``, the reassociation the kernel's online
-    recurrence already applies between tiles, and sweep C still computes
-    ``exp2((x - mi) * C)`` from the global maximum.
+    only moves sweep B's ``exp2((x - mi) * C)`` (or natural ``exp(x - mi)``,
+    see ``_exponent``) into the frame of the CTA's own maximum: the packed
+    exchange folds the CTA sums with ``sum += s_r * exp2((m_r - m) * C)``
+    (``exp(m_r - m)``), the reassociation the kernel's online recurrence
+    already applies between tiles, and sweep C still computes its
+    exponentials from the global maximum.
 
     Every read of ``mi`` (or a copy of it) between the sweeps must be the
     subtrahend of such an exponent, and site B must reduce exactly their
@@ -924,7 +493,7 @@ def _try_rewrite_pair_exact(
         for node in ast.walk(statement)
         if isinstance(node, ast.Assign)
     ]
-    if any(not _is_name_assign(node) for node in assigns):
+    if any(not is_name_assign(node) for node in assigns):
         return False
 
     def target(node: ast.Assign) -> str:
@@ -972,27 +541,21 @@ def _try_rewrite_pair_exact(
     ):
         return False
 
-    # ``exp2(Float32(shift) * C)`` with ``shift`` a frame subtraction.
-    exponents: dict[int, float] = {}
+    # ``exp2(Float32(shift) * C)`` or ``exp(Float32(shift))`` with ``shift``
+    # a frame subtraction.
+    exponents: dict[int, float | None] = {}
     allowed: set[int] = set()
     subtractions: list[ast.BinOp] = [
         value for value in shifted.values() if isinstance(value, ast.BinOp)
     ]
     for statement in region:
         for node in ast.walk(statement):
-            if not (_is_exp2(node) and not node.keywords):  # type: ignore[union-attr]
+            if not isinstance(node, ast.Call) or node.keywords:
                 continue
-            argument = node.args[0]  # type: ignore[union-attr]
-            if not (
-                isinstance(argument, ast.BinOp)
-                and isinstance(argument.op, ast.Mult)
-                and isinstance(argument.right, ast.Constant)
-                and type(argument.right.value) is float
-                and math.isfinite(argument.right.value)
-                and argument.right.value > 0
-            ):
+            exponent = _exponent(node)
+            if exponent is None:
                 continue
-            shift = argument.left
+            shift, scale = exponent
             if (
                 isinstance(shift, ast.Call)
                 and ast.unparse(shift.func) == "cutlass.Float32"
@@ -1007,7 +570,7 @@ def _try_rewrite_pair_exact(
                 subtractions.append(subtraction)
             else:
                 continue
-            exponents[id(node)] = argument.right.value
+            exponents[id(node)] = scale
     scales = set(exponents.values())
     if len(scales) != 1:
         return False
@@ -1122,9 +685,9 @@ def _try_rewrite_pair_exact(
     negative_inf = _unique_name(body, canon, f"_pair_negative_inf_{k}")
     frame = _unique_name(body, canon, f"_pair_frame_{k}")
     _localize_site_a(site_a)
-    # An all--inf CTA slice has the zero frame, so exp2((-inf - -inf) * C)
-    # does not poison its sum; the packed exchange keeps the true local
-    # maximum, so a globally all--inf row still produces NaN.
+    # An all--inf CTA slice has the zero frame, so its exponentials of
+    # -inf - -inf do not poison its sum; the packed exchange keeps the true
+    # local maximum, so a globally all--inf row still produces NaN.
     after_a = body.index(site_a.for_node) + 1
     body[after_a:after_a] = [
         _stmt(f"{negative_inf} = {mi_name} == cutlass.Float32(float('-inf'))"),
@@ -1165,7 +728,7 @@ def _max_variable(
     # --- max carrier chain: everything after site A in sweep A must be a
     # linear cast/accumulate chain ending at the max variable ``mi``.
     tail = site_a.for_node.body[site_a.stmt_idx + 1 :]
-    if not tail or not all(_is_name_assign(s) for s in tail):
+    if not tail or not all(is_name_assign(s) for s in tail):
         return None
     chain_targets = [s.targets[0].id for s in tail]  # type: ignore[attr-defined]
     mi_name = canon(chain_targets[-1])
@@ -1176,12 +739,23 @@ def _max_variable(
     intermediates = {site_a.target} | {t for t in chain_targets if canon(t) != mi_name}
 
     # ``mi`` must start at -inf (single trip => mi ends as a cast of the
-    # site-A result).
-    init_found = False
+    # site-A result), or have no definition at all before sweep A: the
+    # rolled ``reduction_loops`` form first defines the maximum as the cast
+    # of the finalized reduce, so the chain above is its only pre-exchange
+    # value.
+    init_found: bool | None = None
     for top in body[: site_a.top_idx]:
-        if _is_name_assign(top) and canon(top.targets[0].id) == mi_name:  # type: ignore[attr-defined]
+        if is_name_assign(top) and canon(top.targets[0].id) == mi_name:  # type: ignore[attr-defined]
             init_found = "-inf" in ast.unparse(top.value)
-    if not init_found:
+    if init_found is None and any(
+        isinstance(node, ast.Name)
+        and isinstance(node.ctx, ast.Store)
+        and canon(node.id) == mi_name
+        for top in body[: site_a.top_idx]
+        for node in ast.walk(top)
+    ):
+        return None
+    if init_found is False:
         return None
 
     # No escape of the local-valued intermediates past sweep A.
@@ -1215,7 +789,7 @@ def _localize_site_a(site_a: _Site) -> None:
 
 
 def _pair_site_b(
-    site_b: _Site, mi_name: str, scale: float, fast_math: bool, k: int
+    site_b: _Site, mi_name: str, scale: float | None, fast_math: bool, k: int
 ) -> None:
     """Site B exchanges the ``(local_max, local_sum)`` pair once and every
     later read of ``mi`` sees the global maximum."""
@@ -1275,7 +849,7 @@ def _try_rewrite_pair(
                 continue
             value = sub_stmt.value
             if (
-                _is_name_assign(sub_stmt)
+                is_name_assign(sub_stmt)
                 and isinstance(value, ast.BinOp)
                 and isinstance(value.op, ast.Mult)
                 and isinstance(value.left, ast.Name)
@@ -1286,7 +860,7 @@ def _try_rewrite_pair(
                 scaled_before[sub_stmt.targets[0].id] = value.right.value  # type: ignore[attr-defined]
                 continue
             # Dead alias copies (e.g. ``mi_copy = mi``) are harmless.
-            if _is_name_assign(sub_stmt) and not _read_anywhere(
+            if is_name_assign(sub_stmt) and not _read_anywhere(
                 sub_stmt.targets[0].id  # type: ignore[attr-defined]
             ):
                 continue
@@ -1322,21 +896,48 @@ def _try_rewrite_pair(
             return False
 
     # The accumulator update in the same vec body must add exactly this
-    # exp2 to the site-B input.
+    # exp2 to the site-B input: the exp2 call itself (the explicit two-pass
+    # emitter duplicates it into the update) or the name it was assigned
+    # to (the rolled ``reduction_loops`` emitter adds ``Float32(name)``).
     exp_src = ast.unparse(match_b.exp_call)
     acc_name = None
     if isinstance(site_b.call.args[0], ast.Name):
         acc_name = site_b.call.args[0].id
     if acc_name is None:
         return False
+    exp_names: set[str] = set()
+    if is_name_assign(match_b.exp_stmt) and match_b.exp_stmt.value is match_b.exp_call:
+        exp_names.add(canon(match_b.exp_stmt.targets[0].id))  # type: ignore[attr-defined]
+
+    def adds_exp_name(value: ast.expr) -> bool:
+        if not (
+            isinstance(value, ast.BinOp)
+            and isinstance(value.op, ast.Add)
+            and isinstance(value.left, ast.Name)
+            and canon(value.left.id) == canon(acc_name)
+        ):
+            return False
+        term = value.right
+        if (
+            isinstance(term, ast.Call)
+            and ast.unparse(term.func) == "cutlass.Float32"
+            and len(term.args) == 1
+            and not term.keywords
+        ):
+            term = term.args[0]
+        return isinstance(term, ast.Name) and canon(term.id) in exp_names
+
     acc_stmt = None
     for stmt in match_b.vec_for.body:
         if (
-            _is_name_assign(stmt)
+            is_name_assign(stmt)
             and canon(stmt.targets[0].id) == canon(acc_name)  # type: ignore[attr-defined]
-            and any(
-                _is_exp2(node) and ast.unparse(node) == exp_src
-                for node in ast.walk(stmt.value)
+            and (
+                any(
+                    _is_exp2(node) and ast.unparse(node) == exp_src
+                    for node in ast.walk(stmt.value)
+                )
+                or adds_exp_name(stmt.value)
             )
         ):
             acc_stmt = stmt
@@ -1350,7 +951,7 @@ def _try_rewrite_pair(
     for i in range(site_b.top_idx + 1, len(body)):
         top = body[i]
         if (
-            _is_name_assign(top)
+            is_name_assign(top)
             and isinstance(top.value, ast.BinOp)
             and isinstance(top.value.op, ast.Mult)
             and isinstance(top.value.left, ast.Name)
@@ -1386,7 +987,7 @@ def _try_rewrite_pair(
     # The sweep-C exp2 must be the whole RHS of a Name assignment so the
     # cached value can substitute for it.
     if not (
-        _is_name_assign(match_c.exp_stmt) and match_c.exp_stmt.value is match_c.exp_call
+        is_name_assign(match_c.exp_stmt) and match_c.exp_stmt.value is match_c.exp_call
     ):
         return False
 
@@ -1413,7 +1014,7 @@ def _try_rewrite_pair(
         node
         for statement, _in_sweep_b in region
         for node in ast.walk(statement)
-        if _is_name_assign(node) and node.targets[0].id == scaled0
+        if is_name_assign(node) and node.targets[0].id == scaled0
     ]
     if len(scale_assignments) != 1:
         return False
@@ -1439,7 +1040,7 @@ def _try_rewrite_pair(
         if stmt is acc_stmt:
             break
         if (
-            _is_name_assign(stmt)
+            is_name_assign(stmt)
             and _is_exp2(stmt.value)
             and ast.unparse(stmt.value) == exp_src
         ):
@@ -1480,7 +1081,7 @@ def _try_rewrite_pair(
     )
     if exp_reads == 1:
         for stmt in match_c.vec_for.body:
-            if not (_is_name_assign(stmt) and isinstance(stmt.value, ast.BinOp)):
+            if not (is_name_assign(stmt) and isinstance(stmt.value, ast.BinOp)):
                 continue
             value = stmt.value
             if not isinstance(value.op, ast.Mult):
@@ -1494,7 +1095,7 @@ def _try_rewrite_pair(
                     if j != sweep_c_top_idx
                 )
                 defined_before = any(
-                    _is_name_assign(top) and top.targets[0].id == other  # type: ignore[attr-defined]
+                    is_name_assign(top) and top.targets[0].id == other  # type: ignore[attr-defined]
                     for top in body[: scaled1_idx + 1]
                 )
                 if not read_elsewhere and defined_before:
@@ -1546,7 +1147,7 @@ def _rebuffer_pair(body: list[ast.stmt], site_a: _Site, site_b: _Site) -> None:
     """Site B's receive buffer becomes ``cluster_n`` Int64 pair slots, and
     site A's buffer/mbarrier (now unused) are removed."""
     for top in body:
-        if _is_name_assign(top) and top.targets[0].id == site_b.buf_name:  # type: ignore[attr-defined]
+        if is_name_assign(top) and top.targets[0].id == site_b.buf_name:  # type: ignore[attr-defined]
             top.value = _stmt(
                 f"_x = cute.arch.alloc_smem(cutlass.Int64, {site_b.cluster_n})"
             ).value
@@ -1554,7 +1155,7 @@ def _rebuffer_pair(body: list[ast.stmt], site_a: _Site, site_b: _Site) -> None:
     removable: list[int] = []
     for i, top in enumerate(body):
         if (
-            _is_name_assign(top)
+            is_name_assign(top)
             and top.targets[0].id
             in (  # type: ignore[attr-defined]
                 site_a.buf_name,

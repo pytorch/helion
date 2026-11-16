@@ -24,6 +24,8 @@ from helion.autotuner.logger import AutotuningLogger
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture
 def case(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:

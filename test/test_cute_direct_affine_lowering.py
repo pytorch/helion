@@ -15,23 +15,27 @@ from helion import exc
 from helion._compiler.ast_extension import ExtendedAST
 from helion._compiler.ast_extension import statement_from_string
 from helion._compiler.cute import direct_affine_lowering as lowering
-from helion._compiler.cute import direct_affine_replay as replay_impl
+from helion._compiler.cute import direct_affine_templates as templates_impl
 from helion._compiler.cute.direct_affine_plan import DirectAffineCoefficientLayout
 from helion._compiler.cute.direct_affine_plan import DirectAffineMma
 from helion._compiler.cute.direct_affine_plan import DirectAffinePhaseOrder
 from helion._compiler.cute.direct_affine_plan import DirectAffineStateAccessProof
 from helion._compiler.cute.direct_affine_plan import DirectAffineStateIngress
 from helion._compiler.cute.direct_affine_plan import resolve_direct_affine_plan
-from helion._compiler.cute.direct_affine_replay import DirectAffineCoordinates
-from helion._compiler.cute.direct_affine_replay import DirectAffineEffectReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineOrdinaryAxis
-from helion._compiler.cute.direct_affine_replay import DirectAffineReplayBindings
-from helion._compiler.cute.direct_affine_replay import DirectAffineResolvedTemplates
-from helion._compiler.cute.direct_affine_replay import DirectAffineStateStoreReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineStepReplay
-from helion._compiler.cute.direct_affine_replay import DirectAffineValueReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineCoordinates
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineEffectReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineOrdinaryAxis
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineReplayBindings
+from helion._compiler.cute.direct_affine_replay_core import (
+    DirectAffineResolvedTemplates,
+)
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineStateStoreReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineStepReplay
+from helion._compiler.cute.direct_affine_replay_core import DirectAffineValueReplay
+from helion._compiler.cute.state import CuteCodegenState
 from helion._compiler.device_function import TensorArg
 from helion._testing import DEVICE
+from helion._testing import skipUnlessCuteAvailable
 
 
 def _expression(source: str) -> ast.expr:
@@ -109,7 +113,9 @@ class _CoordinateCodegen:
             row: _expression("_BLOCK_SIZE_10"),
             feature: _expression("ordinary_feature"),
         }
-        self.cute_synthetic_arange_axis_sizes = {0: 32} if synthetic_feature else {}
+        self.backend_state = CuteCodegenState(
+            synthetic_arange_axis_sizes={0: 32} if synthetic_feature else {}
+        )
         if synthetic_feature:
             self.device_function = SimpleNamespace(
                 tile_strategy=SimpleNamespace(block_id_to_strategy=_BlockStrategies())
@@ -199,7 +205,9 @@ def _axis_source_case(*, free_feature: bool = False) -> tuple[Any, Any, Any, Any
         )
     codegen = SimpleNamespace(
         device_function=device_function,
-        cute_synthetic_arange_axis_sizes={0: 32} if free_feature else {},
+        backend_state=CuteCodegenState(
+            synthetic_arange_axis_sizes={0: 32} if free_feature else {}
+        ),
         codegen_result_for_node=lambda node: (
             True,
             _expression("ordinary_feature" if node is feature else "_BLOCK_SIZE_10"),
@@ -430,7 +438,7 @@ def test_output_ownership_is_discharged_but_semantic_guard_is_preserved() -> Non
         "    output(ordinary_row).store(logical_value)",
     )
 
-    normalized = replay_impl._validate_direct_affine_templates(
+    normalized = templates_impl._validate_direct_affine_templates(
         templates,
         cast("Any", replay),
         _plan(),
@@ -479,7 +487,7 @@ def test_output_ownership_rejects_missing_or_non_dominating_guard(
     coordinates = _coordinates()
     templates = _templates(output_source)
     assert (
-        replay_impl._validate_direct_affine_templates(
+        templates_impl._validate_direct_affine_templates(
             templates,
             cast("Any", replay),
             _plan(),
@@ -569,7 +577,7 @@ def _memory_case(
     )
     codegen = SimpleNamespace(device_function=device_function)
     env = SimpleNamespace(
-        compiler_fact_specialization_facts=frozenset(("input_tensor_metadata",)),
+        exact_input_metadata_holds=lambda: True,
         runtime_value_for_tensor=lambda tensor: tensor,
         tensor_input_source=lambda tensor: object(),
         config_spec=SimpleNamespace(target_device_capability=(9, 0)),
@@ -586,7 +594,7 @@ def test_memory_proof_covers_every_pair_involving_a_writer() -> None:
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             return_value=True,
         ) as disjoint,
     ):
@@ -648,7 +656,7 @@ def test_memory_proof_rejects_stride_tail_and_slot_failures(
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             return_value=True,
         ),
     ):
@@ -671,7 +679,7 @@ def test_memory_proof_rejects_unproved_alias() -> None:
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             side_effect=(True, False, True),
         ),
     ):
@@ -708,13 +716,14 @@ def _real_codegen_tensor_metadata(
     )
 
 
+@pytest.mark.cpu_only
 def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
-    from test.test_cute_affine_scan_heuristic import _fake_cute_context
-    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
-    from test.test_cute_fixed_token_rank1_recurrence import _inputs
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_cpu_target
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_inputs
 
     with (
-        _fake_cute_context(),
+        fixed_rank1_cpu_target(),
         patch.object(
             lowering,
             "_tensor_metadata",
@@ -725,12 +734,12 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
             return_value=True,
         ),
         patch(
-            "helion._compiler.cute.memory_ops.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.runtime_tensor_guards.runtime_tensors_are_proven_disjoint",
             return_value=True,
         ),
     ):
-        bound = _fixed_rank1._bind_isolated(
-            (*_inputs(3), 3, 1.0e-6, True, False, False, False)
+        bound = fixed_rank1._bind_isolated(
+            (*fixed_rank1_inputs(3), 3, 1.0e-6, True, False, False, False)
         )
         config = next(
             seed
@@ -738,7 +747,7 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
             if seed.config.get("cute_affine_scan_schedule") == "direct_m16n8_v1"
             and seed.config.get("block_sizes") == [64]
         )
-        source = bound.to_triton_code(config)
+        source = bound.to_code(config)
 
     assert (
         "import helion._compiler.cute.short_affine_scan_mma "
@@ -769,16 +778,17 @@ def test_fixed_rank1_t3_real_codegen_reaches_direct_async_emission() -> None:
         ),
     ],
 )
+@pytest.mark.cpu_only
 def test_direct_affine_rejects_conflicting_fragment_schedule(
     key: str, value: int | str, message: str
 ) -> None:
-    from test.test_cute_affine_scan_heuristic import _fake_cute_context
-    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
-    from test.test_cute_fixed_token_rank1_recurrence import _inputs
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_cpu_target
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1_inputs
 
-    with _fake_cute_context():
-        bound = _fixed_rank1._bind_isolated(
-            (*_inputs(3), 3, 1.0e-6, True, False, False, False)
+    with fixed_rank1_cpu_target():
+        bound = fixed_rank1._bind_isolated(
+            (*fixed_rank1_inputs(3), 3, 1.0e-6, True, False, False, False)
         )
         config = deepcopy(
             next(
@@ -926,6 +936,7 @@ def _reference_fixed_rank1(args: tuple[object, ...]) -> torch.Tensor:
     return result
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="direct affine MMA requires a Blackwell CUDA device",
@@ -942,14 +953,14 @@ def test_fixed_rank1_direct_runtime_matches_reference(
     schedule: str,
     row_tile: int,
 ) -> None:
-    from test.test_cute_fixed_token_rank1_recurrence import _fixed_rank1
+    from helion._testing.cute_fixed_token_rank1 import fixed_rank1
 
     args = _runtime_inputs(token_count)
     reference_args = tuple(
         value.clone() if isinstance(value, torch.Tensor) else value for value in args
     )
     expected = _reference_fixed_rank1(reference_args)
-    bound = _fixed_rank1._bind_isolated(args)
+    bound = fixed_rank1._bind_isolated(args)
     config = next(
         seed
         for seed in bound.config_spec.compiler_seed_configs

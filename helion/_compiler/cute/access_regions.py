@@ -3,7 +3,7 @@
 ``helion/language/memory_ops.py`` tags every load and store call it emits
 with the elements the tile program's access covers, per tensor dimension, as
 ``[begin, end)`` bounds over sympy symbols (``HELION_ACCESS_REGIONS_ATTR``);
-the barrier pass (``lane_loop_distribution.add_thread_barriers``) decides
+the barrier pass (``lane_loops.barriers.add_thread_barriers``) decides
 from them whether two accesses can meet.  Both sides build the symbols here,
 so they agree on what a symbol stands for, and both find the address of a
 load or store call the same way (``access_address``).
@@ -12,12 +12,10 @@ load or store call the same way (``access_address``).
 from __future__ import annotations
 
 import ast
-import itertools
 from typing import Protocol
 
 import sympy
 
-_instances = itertools.count()
 # The DSL's own load and store, whose address is their first argument.
 _ARCH_ACCESS_CALLS = ("cute.arch.load", "cute.arch.store")
 
@@ -37,11 +35,6 @@ def access_address(call: ast.Call) -> ast.AST | None:
     ):
         return call.func.value
     return call.args[0] if call.args else None
-
-
-def new_loop_instance() -> int:
-    """A serial for a loop state, unique for the process (``LoopInstance``)."""
-    return next(_instances)
 
 
 class LoopInstance(Protocol):

@@ -21,6 +21,8 @@ from helion._compiler.cute.tcgen05_flat_grouped_kernel import (
 )
 from helion._compiler.cute.tcgen05_flat_grouped_plan import flat_grouped_storage
 
+pytestmark = pytest.mark.cpu_only
+
 
 def check_emitted_storage(source, selected):
     """Run the emitted SDK layouts/assertions, then bound every emitted view."""

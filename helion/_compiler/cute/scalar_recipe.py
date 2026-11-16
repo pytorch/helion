@@ -15,6 +15,9 @@ from typing import TypeVar
 from typing import cast
 
 from ..ast_extension import ExtendedAST
+from ._ast_pass_utils import call_path
+from ._ast_pass_utils import cutlass_scalar_type
+from ._ast_pass_utils import names_read as _read_names
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -134,6 +137,7 @@ _BUILTINS = frozenset({"abs", "bool", "float", "int", "max", "min", "round"})
 # across lane-loop scopes.
 PURE_DECODE_HELPERS = frozenset(
     {
+        "_cute_float4_e2m1fn_x16_dot_float32",
         "_cute_float4_e2m1fn_x2_to_float32",
         "_cute_fp8e4m3fn_to_float32",
         "_cute_fp8e4m3fn_x2_to_float32",
@@ -148,8 +152,8 @@ PURE_HELPERS = PURE_DECODE_HELPERS | {
     "_cute_join_cast",
     "_cute_python_mod",
 }
-# ``_cute_inline_asm_elementwise`` enters a recipe only as the rounded FP32
-# product ``is_rounded_fp32_multiply`` recognizes (``_PureExpression.visit_Call``).
+# ``_cute_inline_asm_elementwise`` enters a recipe only as one of the explicitly
+# rounded products ``is_rounded_multiply`` recognizes (``_PureExpression.visit_Call``).
 _GLOBALS = (
     _BUILTINS
     | PURE_HELPERS
@@ -179,32 +183,23 @@ def _clone(node: _AstT) -> _AstT:
     return ast.copy_location(type(node)(**fields), node)
 
 
-def _path(node: ast.expr) -> tuple[str, ...] | None:
-    if isinstance(node, ast.Name):
-        return (node.id,)
-    if isinstance(node, ast.Attribute):
-        prefix = _path(node.value)
-        if prefix is not None:
-            return (*prefix, node.attr)
-    return None
-
-
-def _numeric_type(node: ast.expr) -> bool:
-    path = _path(node)
-    return (
-        path is not None
-        and len(path) == 2
-        and path[0] == "cutlass"
-        and path[1] in _NUMERIC_TYPES
-    )
-
-
 ROUNDED_FP32_MULTIPLY_ASM = "mul.rn.f32 $0, $1, $2;"
 ROUNDED_FP32_MULTIPLY_CONSTRAINTS = "=f,f,f"
+ROUNDED_HALF_MULTIPLY_CONSTRAINTS = "=h,h,h"
+# The explicitly rounded products ``scalar_recipe_rounding`` emits, by the
+# ``cutlass`` dtype of the result: ``(asm, constraints)``.  The FP32 form is
+# the rounding-preserving product; the 16-bit forms are the exact products
+# ``narrow_exact_products`` makes of two upcasts and a cast back.
+ROUNDED_MULTIPLY_FORMS: dict[str, tuple[str, str]] = {
+    "Float32": (ROUNDED_FP32_MULTIPLY_ASM, ROUNDED_FP32_MULTIPLY_CONSTRAINTS),
+    "Float16": ("mul.rn.f16 $0, $1, $2;", ROUNDED_HALF_MULTIPLY_CONSTRAINTS),
+    "BFloat16": ("mul.rn.bf16 $0, $1, $2;", ROUNDED_HALF_MULTIPLY_CONSTRAINTS),
+}
 
 
-def is_rounded_fp32_multiply(value: ast.expr) -> bool:
-    """Recognize the explicitly rounded FP32 product of ``scalar_recipe_rounding``."""
+def rounded_multiply_dtype(value: ast.expr) -> str | None:
+    """The ``cutlass`` dtype name of an explicitly rounded product of
+    ``scalar_recipe_rounding`` (a key of ``ROUNDED_MULTIPLY_FORMS``), else None."""
     if not (
         isinstance(value, ast.Call)
         and isinstance(value.func, ast.Name)
@@ -214,13 +209,34 @@ def is_rounded_fp32_multiply(value: ast.expr) -> bool:
         and len(value.args[0].elts) == 2
         and len(value.keywords) == 4
     ):
-        return False
-    return {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords} == {
-        "asm": repr(ROUNDED_FP32_MULTIPLY_ASM),
-        "constraints": repr(ROUNDED_FP32_MULTIPLY_CONSTRAINTS),
-        "dtype": "cutlass.Float32",
-        "is_pure": "True",
-    }
+        return None
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in value.keywords}
+    for dtype, (asm, constraints) in ROUNDED_MULTIPLY_FORMS.items():
+        if keywords == {
+            "asm": repr(asm),
+            "constraints": repr(constraints),
+            "dtype": f"cutlass.{dtype}",
+            "is_pure": "True",
+        }:
+            return dtype
+    return None
+
+
+def is_rounded_multiply(value: ast.expr) -> bool:
+    """Recognize any explicitly rounded product of ``scalar_recipe_rounding``
+    (FP32, or the 16-bit forms of ``narrow_exact_products``): two register
+    operands, one register result, no memory or other effect."""
+    return rounded_multiply_dtype(value) is not None
+
+
+def is_rounded_fp32_multiply(value: ast.expr) -> bool:
+    """Recognize the explicitly rounded FP32 product of ``scalar_recipe_rounding``.
+
+    Only this form has an FP32 result: the packed ``mul_packed_f32x2`` rewrite
+    and the typed FP32 proofs of the register chain must not accept the
+    16-bit forms.
+    """
+    return rounded_multiply_dtype(value) == "Float32"
 
 
 class _PureExpression(ast.NodeVisitor):
@@ -248,10 +264,10 @@ class _PureExpression(ast.NodeVisitor):
     def visit_Attribute(self, node: ast.Attribute) -> None:
         if not isinstance(node.ctx, ast.Load):
             raise _NotRecipe
-        if node.attr in _METADATA or _numeric_type(node):
+        if node.attr in _METADATA or cutlass_scalar_type(node) in _NUMERIC_TYPES:
             self.visit(node.value)
             return
-        if _path(node) in {("math", "inf"), ("math", "nan"), ("math", "pi")}:
+        if call_path(node) in {("math", "inf"), ("math", "nan"), ("math", "pi")}:
             self.visit(node.value)
             return
         raise _NotRecipe
@@ -261,7 +277,7 @@ class _PureExpression(ast.NodeVisitor):
             raise _NotRecipe
         # A named container may be a tensor, so conservatively classify it as
         # a read. Metadata and architecture index tuples are immutable.
-        path = _path(node.value.func) if isinstance(node.value, ast.Call) else None
+        path = call_path(node.value.func) if isinstance(node.value, ast.Call) else None
         immutable = (
             isinstance(node.value, ast.Tuple)
             or isinstance(node.value, ast.Attribute)
@@ -300,13 +316,14 @@ class _PureExpression(ast.NodeVisitor):
         self.visit(node.orelse)
 
     def visit_Call(self, node: ast.Call) -> None:
-        if is_rounded_fp32_multiply(node):
+        if is_rounded_multiply(node):
             # ``preserve_fp32_multiply_rounding``'s spelling of an FP32
             # product, already emitted for a product that
-            # ``mark_narrowed_fp32_multiplies`` flagged at device-IR time.
+            # ``mark_narrowed_fp32_multiplies`` flagged at device-IR time, or
+            # the 16-bit product ``narrow_exact_products`` made of one.
             self.visit(node.args[0])
             return
-        path = _path(node.func)
+        path = call_path(node.func)
         pure_global = path is not None and (
             len(path) == 1
             and path[0] in _BUILTINS | PURE_HELPERS
@@ -339,7 +356,7 @@ class _PureExpression(ast.NodeVisitor):
             path == ("cute", "arch", "load")
             and len(node.args) == 2
             and not node.keywords
-            and _numeric_type(node.args[1])
+            and cutlass_scalar_type(node.args[1]) in _NUMERIC_TYPES
         ):
             self.reads_memory = True
         elif pure_global or index_call:
@@ -353,7 +370,7 @@ class _PureExpression(ast.NodeVisitor):
                 node.func.attr in {"bitcast", "to"}
                 and len(node.args) == 1
                 and not node.keywords
-                and _numeric_type(node.args[0])
+                and cutlass_scalar_type(node.args[0]) in _NUMERIC_TYPES
             ):
                 self.visit(node.func.value)
             else:
@@ -372,14 +389,6 @@ def _memory_reads(value: ast.expr) -> bool:
     visitor = _PureExpression()
     visitor.visit(value)
     return visitor.reads_memory
-
-
-def _read_names(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-    }
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

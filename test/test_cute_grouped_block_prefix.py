@@ -22,10 +22,10 @@ from test.test_cute_tma_rn_two_stage import low_config
 from test.test_cute_tma_rn_two_stage import low_schedule
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute import tcgen05_flattened_prefix as prefix_module
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
-from helion._compiler.cute import tcgen05_flattened_prefix as prefix_module
 from helion._compiler.cute.tcgen05_flat_grouped_config import K_KEY
 from helion._compiler.cute.tcgen05_flat_grouped_config import PREFIX_SCAN_KEY
 from helion._compiler.cute.tcgen05_flat_grouped_config import RESIDENT_CTAS_KEY
@@ -50,6 +50,8 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _block_config(bound, ctas=2, wrapped=True):

@@ -10,9 +10,21 @@ from typing import TypeVar
 from typing import cast
 
 from ..ast_read_writes import ReadWrites
-from ..tile_strategy import _is_proven_relocatable_assignment
-from . import cluster_online_pair as pair
-from . import rolled_cluster_online_pair as rolled
+from ._ast_pass_utils import _is_proven_relocatable_assignment
+from ._ast_pass_utils import is_name_assign
+from ._ast_pass_utils import reparse_expr
+from .analysis.online_pair import _assigned_name
+from .analysis.online_pair import _domain
+from .analysis.online_pair import _exponent
+from .analysis.online_pair import _exponential_src
+from .analysis.online_pair import _float32
+from .analysis.online_pair import _Inliner
+from .analysis.online_pair import _literal
+from .analysis.online_pair import _loads
+from .analysis.online_pair import _stmt
+from .analysis.online_pair import _strip_fp32_casts
+from .analysis.online_pair import _under_domain
+from .reduce_call import CTA_REDUCES
 from .uniform_packet_mask import integer_alignment
 from .uniform_packet_mask import loop_alignment
 from .uniform_packet_mask import uniform_packet_mask
@@ -25,7 +37,7 @@ def _clone(node: _Statement) -> _Statement:
 
 
 def _call(statement: ast.stmt, name: str) -> ast.Call | None:
-    if not pair._is_name_assign(statement):
+    if not is_name_assign(statement):
         return None
     value = statement.value
     return (
@@ -55,40 +67,33 @@ def _definitions(statements: list[ast.stmt]) -> dict[str, ast.expr] | None:
     definitions = {}
     for statement in statements:
         if not (
-            pair._is_name_assign(statement)
+            is_name_assign(statement)
             and _is_proven_relocatable_assignment(statement, allow_load=True)
         ):
             return None
-        name = pair._assigned_name(statement)
-        if name in definitions or name in pair._loads(statement.value):
+        name = _assigned_name(statement)
+        if name in definitions or name in _loads(statement.value):
             return None
-        definitions[name] = pair._reparse_expr(statement.value)
+        definitions[name] = reparse_expr(statement.value)
     return definitions
 
 
 def _canonical(node: ast.expr, definitions: dict[str, ast.expr]) -> ast.expr:
-    return pair._strip_fp32_casts(
-        pair._Inliner(definitions).visit(pair._reparse_expr(node))
-    )
+    return _strip_fp32_casts(_Inliner(definitions).visit(reparse_expr(node)))
 
 
 def _reduce(statement: ast.stmt, op: str) -> ast.Call | None:
-    if not pair._is_name_assign(statement) or not isinstance(statement.value, ast.Call):
+    if not is_name_assign(statement) or not isinstance(statement.value, ast.Call):
         return None
     call = statement.value
     if (
-        ast.unparse(call.func)
-        not in (
-            "_cute_grouped_reduce_shared_two_stage",
-            "_cute_grouped_reduce_shared_tree",
-            "_cute_grouped_reduce_warp",
-        )
+        ast.unparse(call.func) not in CTA_REDUCES
         or len(call.args) < 4
         or not isinstance(call.args[0], ast.Name)
         or not isinstance(call.args[1], ast.Constant)
         or call.args[1].value != op
-        or not rolled._float32(call.args[2])
-        or rolled._literal(call.args[2]) != (-math.inf if op == "max" else 0.0)
+        or not _float32(call.args[2])
+        or _literal(call.args[2]) != (-math.inf if op == "max" else 0.0)
     ):
         return None
     return call
@@ -107,7 +112,7 @@ class _Proof:
     next_maximum: str
     maximum: str
     denominator: str
-    scale: float
+    scale: float | None
     safe_ftz: bool
 
 
@@ -162,18 +167,18 @@ def _prove(
     max_initializers = [
         statement
         for statement in before
-        if pair._is_name_assign(statement) and pair._assigned_name(statement) == max_acc
+        if is_name_assign(statement) and _assigned_name(statement) == max_acc
     ]
     if (
         len(max_initializers) != 1
-        or not rolled._float32(max_initializers[0].value)
-        or rolled._literal(max_initializers[0].value) != -math.inf
+        or not _float32(max_initializers[0].value)
+        or _literal(max_initializers[0].value) != -math.inf
     ):
         return None
     folds = [
         (index, statement)
         for index, statement in enumerate(first_loop.body)
-        if pair._is_name_assign(statement) and pair._assigned_name(statement) == max_acc
+        if is_name_assign(statement) and _assigned_name(statement) == max_acc
     ]
     if len(folds) != 1:
         return None
@@ -191,7 +196,7 @@ def _prove(
     ):
         return None
     caches = {
-        pair._assigned_name(cast("ast.Assign", statement))
+        _assigned_name(cast("ast.Assign", statement))
         for statement in before
         if _call(statement, "cute.make_rmem_tensor") is not None
     }
@@ -203,7 +208,7 @@ def _prove(
         or ast.unparse(statement.value.args[1]) != "cutlass.Float32"
         or statement.value.keywords
         for statement in before
-        if pair._is_name_assign(statement) and pair._assigned_name(statement) in caches
+        if is_name_assign(statement) and _assigned_name(statement) in caches
     ):
         return None
     cache_stores = [
@@ -233,8 +238,8 @@ def _prove(
             statement
             for statement in before[:-1]
             if not (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement) in caches | {max_acc}
+                is_name_assign(statement)
+                and _assigned_name(statement) in caches | {max_acc}
             )
         ]
     )
@@ -242,10 +247,8 @@ def _prove(
         return None
     definitions = prefix_definitions | first_definitions
     value = fold_call.args[1]
-    maximum_domain, maximum_value = rolled._domain(
-        _canonical(value, definitions), -math.inf
-    )
-    if not rolled._float32(maximum_value):
+    maximum_domain, maximum_value = _domain(_canonical(value, definitions), -math.inf)
+    if not _float32(maximum_value):
         return None
     region = loop.body[maximum_index + 1 : sum_index]
     second_loops = [statement for statement in region if isinstance(statement, ast.For)]
@@ -255,7 +258,7 @@ def _prove(
     assert isinstance(second_loop.target, ast.Name)
     if second_loop.target.id != first_loop.target.id:
         return None
-    max_result = pair._assigned_name(maximum_statement)
+    max_result = _assigned_name(maximum_statement)
     next_sites = [
         statement
         for statement in region
@@ -268,13 +271,13 @@ def _prove(
         return None
     next_statement = cast("ast.Assign", next_sites[0])
     next_call = cast("ast.Call", next_statement.value)
-    next_maximum = pair._assigned_name(next_statement)
+    next_maximum = _assigned_name(next_statement)
     region_prefix = region[: region.index(next_statement)]
     max_definitions = _definitions(region_prefix)
     if max_definitions is None:
         return None
     operands = [_canonical(operand, max_definitions) for operand in next_call.args]
-    if not all(rolled._float32(operand) for operand in operands):
+    if not all(_float32(operand) for operand in operands):
         return None
     names = [cast("ast.Call", operand).args[0] for operand in operands]
     if not all(isinstance(name, ast.Name) for name in names):
@@ -304,18 +307,18 @@ def _prove(
     sum_initializers = [
         statement
         for statement in region
-        if pair._is_name_assign(statement) and pair._assigned_name(statement) == sum_acc
+        if is_name_assign(statement) and _assigned_name(statement) == sum_acc
     ]
     if (
         len(sum_initializers) != 1
-        or not rolled._float32(sum_initializers[0].value)
-        or rolled._literal(sum_initializers[0].value) != 0.0
+        or not _float32(sum_initializers[0].value)
+        or _literal(sum_initializers[0].value) != 0.0
     ):
         return None
     sum_folds = [
         (index, statement)
         for index, statement in enumerate(second_loop.body)
-        if pair._is_name_assign(statement) and pair._assigned_name(statement) == sum_acc
+        if is_name_assign(statement) and _assigned_name(statement) == sum_acc
     ]
     if len(sum_folds) != 1 or sum_folds[0][1] is not second_loop.body[-1]:
         return None
@@ -344,40 +347,35 @@ def _prove(
                 and node.value.id == cache_name
                 and ast.unparse(node.slice) == cast("ast.Name", first_loop.target).id
             ):
-                return pair._reparse_expr(cached_value)
+                return reparse_expr(cached_value)
             return self.generic_visit(node)
 
     sum_term = Restore().visit(sum_term)
-    sum_term = pair._strip_fp32_casts(sum_term)
-    sum_domain, exponential = rolled._domain(sum_term, 0.0)
+    sum_term = _strip_fp32_casts(sum_term)
+    sum_domain, exponential = _domain(sum_term, 0.0)
     if (ast.unparse(maximum_domain) if maximum_domain is not None else None) != (
         ast.unparse(sum_domain) if sum_domain is not None else None
     ):
         return None
-    while rolled._float32(exponential):
+    while _float32(exponential):
         exponential = exponential.args[0]
-    if not pair._is_exp2(exponential) or exponential.keywords:
+    exponent = (
+        _exponent(exponential)
+        if isinstance(exponential, ast.Call) and not exponential.keywords
+        else None
+    )
+    if exponent is None:
         return None
-    argument = exponential.args[0]
-    if not (
-        isinstance(argument, ast.BinOp)
-        and isinstance(argument.op, ast.Mult)
-        and isinstance(argument.right, ast.Constant)
-        and type(argument.right.value) is float
-        and math.isfinite(argument.right.value)
-        and argument.right.value > 0
-    ):
-        return None
-    shift = argument.left
-    while rolled._float32(shift):
+    shift, scale = exponent
+    while _float32(shift):
         shift = shift.args[0]
     if not (
         isinstance(shift, ast.BinOp)
         and isinstance(shift.op, ast.Sub)
         and isinstance(shift.right, ast.Name)
         and shift.right.id == next_maximum
-        and rolled._under_domain(shift.left, maximum_domain)
-        == rolled._under_domain(maximum_value, maximum_domain)
+        and _under_domain(shift.left, maximum_domain)
+        == _under_domain(maximum_value, maximum_domain)
     ):
         return None
     # Match the two carried values and the rescaling update exactly.
@@ -393,17 +391,15 @@ def _prove(
         or len(update.args) != 3
         or update.keywords
         or not isinstance(update.args[0], ast.Name)
-        or update.args[0].id != pair._assigned_name(denominator_statement)
-        or not pair._is_name_assign(maximum_statement)
-        or pair._assigned_name(maximum_statement) != maximum
+        or update.args[0].id != _assigned_name(denominator_statement)
+        or not is_name_assign(maximum_statement)
+        or _assigned_name(maximum_statement) != maximum
         or ast.unparse(maximum_statement.value) != next_maximum
     ):
         return None
-    denominator = pair._assigned_name(denominator_statement)
-    before_reads = Counter(
-        name for statement in before for name in pair._loads(statement)
-    )
-    loop_reads = Counter(pair._loads(loop))
+    denominator = _assigned_name(denominator_statement)
+    before_reads = Counter(name for statement in before for name in _loads(statement))
+    loop_reads = Counter(_loads(loop))
     if (
         before_reads[maximum]
         or before_reads[denominator]
@@ -412,15 +408,18 @@ def _prove(
     ):
         return None
     alpha = _canonical(update.args[1], scalar_definitions)
+    alpha_exponent = (
+        _exponent(alpha) if isinstance(alpha, ast.Call) and not alpha.keywords else None
+    )
     total = _canonical(update.args[2], tail_definitions)
     if not (
-        pair._is_exp2(alpha)
-        and not alpha.keywords
-        and ast.unparse(alpha.args[0])
-        == f"cutlass.Float32({maximum} - {next_maximum}) * {argument.right.value!r}"
-        and rolled._float32(total)
+        alpha_exponent is not None
+        and alpha_exponent[1] == scale
+        and ast.unparse(alpha_exponent[0])
+        == f"cutlass.Float32({maximum} - {next_maximum})"
+        and _float32(total)
         and isinstance(total.args[0], ast.Name)
-        and total.args[0].id == pair._assigned_name(sum_statement)
+        and total.args[0].id == _assigned_name(sum_statement)
     ):
         return None
     writes = Counter(
@@ -437,9 +436,9 @@ def _prove(
     ):
         return None
     local_names = set(writes) - {maximum, denominator}
-    inside_reads = Counter(pair._loads(loop))
+    inside_reads = Counter(_loads(loop))
     if any(read_counts[name] > inside_reads[name] for name in local_names) or any(
-        set(pair._loads(statement)) & local_names for statement in outside
+        set(_loads(statement)) & local_names for statement in outside
     ):
         return None
     # Every load, assignment and scalar update is pure. Only the proved local
@@ -453,8 +452,7 @@ def _prove(
         *(
             id(statement)
             for statement in before
-            if pair._is_name_assign(statement)
-            and pair._assigned_name(statement) in caches
+            if is_name_assign(statement) and _assigned_name(statement) in caches
         ),
     }
     for statement in loop.body:
@@ -468,7 +466,7 @@ def _prove(
     # lane. The packet variable may occur only in the value-producing prefix.
     for coordinate in maximum_call.args[3:]:
         expanded = _canonical(coordinate, prefix_definitions)
-        if loop.target.id in pair._loads(expanded):
+        if loop.target.id in _loads(expanded):
             return None
     return _Proof(
         width,
@@ -482,7 +480,7 @@ def _prove(
         next_maximum,
         maximum,
         denominator,
-        argument.right.value,
+        scale,
         initial_values.get(maximum) == -math.inf
         and initial_values.get(denominator) == 0.0,
     )
@@ -534,10 +532,7 @@ def lower_online_chunk_reduction(
         cloned_first.body = [
             statement
             for statement in cloned_first.body
-            if not (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement) == max_acc
-            )
+            if not (is_name_assign(statement) and _assigned_name(statement) == max_acc)
             and not (
                 isinstance(statement, ast.Assign)
                 and len(statement.targets) == 1
@@ -547,7 +542,7 @@ def lower_online_chunk_reduction(
             )
         ]
         cloned_first.body.append(
-            pair._stmt(
+            _stmt(
                 f"{row}[{loop_index} * {proof.width} + "
                 f"{first_loop_index_name}] = {ast.unparse(proof.value)}"
             )
@@ -559,8 +554,8 @@ def lower_online_chunk_reduction(
             statement
             for statement in clone.body[: proof.maximum_call_index]
             if not (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement) in proof.caches | {max_acc}
+                is_name_assign(statement)
+                and _assigned_name(statement) in proof.caches | {max_acc}
             )
         ]
         packet_alignments = alignments | {loop_index: 1}
@@ -570,12 +565,12 @@ def lower_online_chunk_reduction(
         if masked is not None:
             clone.body[-1:] = masked
         result = [
-            pair._stmt(
+            _stmt(
                 f"{row} = cute.make_rmem_tensor({proof.width * proof.packets}, "
                 "cutlass.Float32)"
             ),
             clone,
-            pair._stmt(f"{values} = {row}.load()"),
+            _stmt(f"{values} = {row}.load()"),
         ]
         # Keep NaN propagation exact and balance the local max dependency tree.
         names = [f"{row}[{index}]" for index in range(proof.width * proof.packets)]
@@ -584,14 +579,14 @@ def lower_online_chunk_reduction(
             for index in range(0, len(names), 2):
                 name = fresh("tree")
                 result.append(
-                    pair._stmt(
+                    _stmt(
                         f"{name} = cute.arch.fmax({names[index]}, "
                         f"{names[index + 1]}, nan=True)"
                     )
                 )
                 next_names.append(name)
             names = next_names
-        result.append(pair._stmt(f"{maximum_local} = {names[0]}"))
+        result.append(_stmt(f"{maximum_local} = {names[0]}"))
         maximum_statement = _clone(maximum_call)
         cast("ast.Call", maximum_statement.value).args[0] = ast.Name(
             id=maximum_local, ctx=ast.Load()
@@ -601,8 +596,8 @@ def lower_online_chunk_reduction(
             if statement is proof.first_loop or isinstance(statement, ast.For):
                 continue
             if (
-                pair._is_name_assign(statement)
-                and pair._assigned_name(statement)
+                is_name_assign(statement)
+                and _assigned_name(statement)
                 == cast(
                     "ast.Name",
                     cast(
@@ -614,10 +609,13 @@ def lower_online_chunk_reduction(
                 continue
             result.append(_clone(statement))
         result.append(
-            pair._stmt(
-                f"{exponents} = cute.math.exp2(({values} - "
-                f"{proof.next_maximum}) * {proof.scale!r}, "
-                f"fastmath={proof.safe_ftz!r})"
+            _stmt(
+                f"{exponents} = "
+                + _exponential_src(
+                    f"{values} - {proof.next_maximum}",
+                    proof.scale,
+                    ftz=proof.safe_ftz,
+                )
             )
         )
         sum_statement = _clone(cast("ast.Assign", loop.body[proof.sum_call_index]))
@@ -668,18 +666,18 @@ def lower_online_chunk_reduction(
                 result.append(statement)
                 alignment = (
                     integer_alignment(statement.value, alignments)
-                    if pair._is_name_assign(statement)
+                    if is_name_assign(statement)
                     else None
                 )
                 for name in ReadWrites.from_ast(statement).writes:
                     known.pop(name, None)
                     alignments.pop(name, None)
-                if pair._is_name_assign(statement):
-                    value = rolled._literal(statement.value)
+                if is_name_assign(statement):
+                    value = _literal(statement.value)
                     if value is not None:
-                        known[pair._assigned_name(statement)] = value
+                        known[_assigned_name(statement)] = value
                     if alignment is not None:
-                        alignments[pair._assigned_name(statement)] = alignment
+                        alignments[_assigned_name(statement)] = alignment
         return result
 
     return visit(

@@ -204,12 +204,22 @@ def run_literal(
     elif mutation == "ascending_tree":
         text = text.replace("row_lanes >> level + 1", "1 << level")
     elif mutation == "missing_row_guard":
-        text = text.replace("row < rows and column < columns", "column < columns")
+        text = text.replace(
+            "chunk < chunks and row < rows and column < columns",
+            "chunk < chunks and column < columns",
+        )
     elif mutation == "missing_column_guard":
-        text = text.replace("row < rows and column < columns", "row < rows")
+        text = text.replace(
+            "chunk < chunks and row < rows and column < columns",
+            "chunk < chunks and row < rows",
+        )
     elif mutation == "cast_partial":
         text = text.replace(
-            "+ values_left[lane]", "+ cutlass.BFloat16(values_left[lane])"
+            "+ loaded[part * 4 + slot, lane]",
+            "+ cutlass.BFloat16(loaded[part * 4 + slot, lane])",
+        ).replace(
+            "+ loaded[0, part * 4 + slot, lane]",
+            "+ cutlass.BFloat16(loaded[0, part * 4 + slot, lane])",
         )
     elif mutation == "reuse_left_output":
         text = text.replace(

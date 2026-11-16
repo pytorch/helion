@@ -7,28 +7,27 @@ import inspect
 import itertools
 import linecache
 import operator
-from unittest.mock import patch
 
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_cuda_work
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
-from helion._compiler.autotuner_heuristics.cute_block_scaled import (
+from helion._compiler.compile_environment import FixedBlockSizeSource
+from helion._compiler.cute.autotune.heuristics.cute_block_scaled import (
     CuteBlockScaledMmaHeuristic,
 )
-from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._compiler.cute.registered_mxfp8 import int32_registered_domain
 from helion._compiler.cute.registered_mxfp8 import match_registered_mxfp8
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._testing import cpu_render_target
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_cuda_work
 from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language import memory_ops
 from helion.language import tile_ops
+
+pytestmark = pytest.mark.cpu_only
 
 
 @helion.kernel(
@@ -182,10 +181,10 @@ def _bound(m=7, n=33, k=160, **options):
     if options:
         option = next(iter(options))
         kernel = _host_variant(option)
-        return _cpu_bind(
+        return cpu_bind(
             kernel, args + ((options[option],) if option == "external_output" else ())
         )
-    return _cpu_bind(_generic_registered_contraction, args)
+    return cpu_bind(_generic_registered_contraction, args)
 
 
 def _match(bound):
@@ -198,11 +197,8 @@ def _match(bound):
 @pytest.fixture(autouse=True)
 def _cpu_only():
     with (
-        _forbid_cuda_work(),
-        _mock_cuda_unavailable(),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=228 * 1024
-        ),
+        cpu_render_target(smem_capacity_bytes=228 * 1024),
+        forbid_cuda_work(),
     ):
         yield
 

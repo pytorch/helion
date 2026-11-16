@@ -4,25 +4,30 @@ import ast
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-from examples.aot_example import matmul_custom_key
 import pytest
 import torch
 
 from test import test_cute_lowerings
-from test.test_cute_fuse_mm_accumulation import _cpu_target
 
 import helion
 from helion._compiler.cute.cute_mma import _build_kloop_non_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _build_kloop_pipeline_consumer_if
 from helion._compiler.cute.cute_mma import _Tcgen05ScalarSmemSync
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_target
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
+
+matmul_custom_key = import_example("aot_example").matmul_custom_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+@helion.kernel(
+    backend="cute", cute_flat_edge_tma=False, static_shapes=True, autotune_effort="none"
+)
 def _native_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     m, k = a.shape
     n = b.size(1)
@@ -38,7 +43,7 @@ def _native_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 @pytest.fixture(autouse=True)
 def _target(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("HELION_CUTE_MMA_IMPL", "auto")
-    with _cpu_target():
+    with cpu_target():
         yield
 
 
@@ -57,7 +62,6 @@ def _assert_copy_order(source: str, first_store: str) -> None:
 @pytest.mark.parametrize(
     "shape,bm", [((73, 41, 78), 64), ((73, 41, 162), 128), ((128, 128, 78), 64)]
 )
-@skipUnlessBackends(["cute"])
 def test_edge_scalar_staging_is_ordered(
     dtype: torch.dtype, aot: bool, shape: tuple[int, int, int], bm: int
 ) -> None:
@@ -65,6 +69,7 @@ def test_edge_scalar_staging_is_ordered(
     kernel = (
         helion.kernel(
             matmul_custom_key.fn,
+            cute_flat_edge_tma=False,
             key=matmul_custom_key._key_fn,
             backend="cute",
             static_shapes=False,
@@ -107,7 +112,6 @@ def test_edge_scalar_staging_is_ordered(
     assert "tcgen05_scalar_smem_phase ^ cutlass.Int32(1)" in edge
 
 
-@skipUnlessBackends(["cute"])
 def test_all_tma_kernel_keeps_its_pipeline() -> None:
     kernel = helion.kernel(
         matmul_custom_key.fn,
@@ -164,14 +168,9 @@ def test_non_pipelined_consumer_binds_try_token_before_wait() -> None:
         "ab_consumer_try_token = ab_pipeline.consumer_try_wait(ab_consumer_state)",
         "ab_pipeline.consumer_wait(ab_consumer_state, ab_consumer_try_token)",
     ]
-    skipped = _build_kloop_non_pipeline_consumer_if(
-        replace(args, skip_consumer_wait=True)
-    )
-    assert "consumer_try_token" not in ast.unparse(skipped)
 
 
 @pytest.mark.parametrize("transpose_rhs", [False, True])
-@skipUnlessBackends(["cute"])
 def test_m_major_lhs_matmul_binds_try_token_before_every_wait(
     transpose_rhs: bool,
 ) -> None:

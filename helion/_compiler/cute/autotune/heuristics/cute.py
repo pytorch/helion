@@ -1,0 +1,11173 @@
+"""The CuTe backend's general seed heuristics (the family-specific ones sit beside them).
+
+Role: heuristic.  Each ``Cute*Heuristic`` class proposes seed configs for one
+kernel shape of the SIMT lowering -- reduction tiles
+(``CuteReductionTileHeuristic``), explicit tile loops (``CuteTileVecHeuristic``),
+scans (``CuteScanTileHeuristic``), collective operand staging
+(``CuteCollectiveMatmulHeuristic``), resident and sibling rows, column
+reductions, the rank-1 and affine-scan recurrences -- from the device IR and
+the config spec.  ``autotune/heuristics/__init__.py`` ranks them by
+``priority`` into ``CUTE_HEURISTICS``; the family-specific heuristics
+(tcgen05 schedule, mma_dag, fragments, split-K, ...) are the sibling
+``cute_*.py`` modules of this package.
+"""
+
+from __future__ import annotations
+
+import collections
+import contextlib
+from copy import deepcopy
+import functools
+from functools import partial
+from itertools import zip_longest
+import logging
+import math
+import operator
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import ClassVar
+from typing import cast
+
+import sympy
+import torch
+from torch._inductor.runtime.runtime_utils import next_power_of_2
+from torch._inductor.runtime.triton_heuristics import (
+    get_max_y_grid,  # type: ignore[import-untyped]
+)
+from torch.fx import Node
+
+from ....._utils import prev_power_of_2
+from .....autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
+from .....autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
+from .....autotuner.config_spec import get_valid_eviction_policies
+from .....language._tracing_ops import _host_tensor
+from .....language.inline_asm_ops import inline_asm_elementwise
+from .....language.memory_ops import load as language_load
+from .....language.memory_ops import store as language_store
+from .....language.scan_ops import _associative_scan
+from .....runtime.config import Config
+from ....autotuner_heuristics.common import dedupe_configs
+from ....autotuner_heuristics.common import is_canonical_row_reduction
+from ....autotuner_heuristics.common import op_name_parts
+from ....autotuner_heuristics.registry import AutotunerHeuristic
+from ....compile_environment import ConfigValueExpression
+from ....compile_environment import FixedBlockSizeSource
+from ....compile_environment import _symint_sympy_expr
+from ....compile_environment import _to_sympy
+from ....loop_dependency_checker import _storage_ids
+from ....loop_dependency_checker import graph_memory_access_storage_ids
+from ....loop_dependency_checker import intra_loop_raw_reread_block_ids
+from ....utils import compute_slice_size
+from ....utils import normalize_slice
+from ... import jam_grid_lanes
+from ... import target_facts
+from ...cutedsl_compat import cp_async_supported
+from ...cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+from ...cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
+from ...emitters.lane_packets import _CUTE_VECTOR_MAX_BYTES
+from ...flat_gather_lane import _packet_layout_aligned
+from ...flat_gather_lane import _tile_index_block
+from ...flat_gather_lane import row_is_multiple_of
+from ...fuse_two_pass_loads import FORWARDED_DTYPES
+from ...grouped_full_coverage import FULL_COVERAGE_PIPELINES
+from ...grouped_full_coverage import full_coverage_index_domain
+from ...grouped_full_coverage import full_coverage_pipeline_supported
+from ...grouped_full_coverage import full_coverage_smem_upper_bound
+from ...grouped_panel_raster import GROUPED_PANEL_ALTERNATE_KEY
+from ...grouped_panel_raster import GROUPED_PANEL_RATIO_KEY
+from ...grouped_row_union import PAIRED_CLC
+from ...grouped_row_union import PAIRED_CLC_SCHEDULE
+from ...grouped_row_union import SCHEDULE_KEY as GROUPED_ROW_UNION_SCHEDULE_KEY
+from ...grouped_row_union import TRANSPOSED
+from ...grouped_row_union import TRANSPOSED_SCHEDULE
+from ...grouped_row_union import index_domain as row_union_index_domain
+from ...grouped_row_union import resident_ctas_supported
+from ...grouped_worklist_policy import GroupedBMajor
+from ...grouped_worklist_policy import GroupedWorklistHardwareIdentity
+from ...grouped_worklist_policy import get_grouped_worklist_target_policy
+from ...grouped_worklist_policy import grouped_worklist_target_identities
+from ...indexing import cute_lane_remainder_terms
+from ...indexing import match_cute_lane_remainder
+from ...loop_nesting import sibling_row_loop_blocks
+from ...loop_nesting import tile_loop_paths
+from ...matmul_utils import cute_matmul_root_placements
+from ...memory_ops import cute_vector_strides_aligned
+from ...mma_support import cute_fp32_dot_uses_tf32
+from ...packed_matmul import contraction_axis_for_fact
+from ...pdl_release import CUTE_PDL_SPREAD_KEY
+from ...reduction_lanes import WARP_THREADS
+from ...reduction_lanes import walks_live_lanes
+from ...register_tile_admission import register_tile_reduction_levels
+from ...strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
+from ...strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+from ...strategies import TCGEN05_STRATEGY_CONFIG_KEY
+from ...strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
+from ...strategies import Tcgen05PersistenceModel
+from ...strategies import Tcgen05Strategy
+from ...sweep_values import _TRANSCENDENTAL_COST
+from ...sweep_values import MIN_SAVED_COST
+from ...sweep_values import _pure_asm_instructions
+from ...tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+from ...tcgen05_config import facts
+from ...tcgen05_config import seeds
+from ...tcgen05_config import smem
+from ...tcgen05_constants import TCGEN05_CONSUMER_REGS_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_CONSUMER_REGS_DEFAULT
+from ...tcgen05_constants import TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+from ...tcgen05_constants import TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+from ...tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_MODE_DYNAMIC
+from ...tcgen05_constants import TCGEN05_GROUPED_MODE_STATIC
+from ...tcgen05_constants import TCGEN05_GROUPED_MODE_WORKLIST_NM
+from ...tcgen05_constants import TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
+from ...tcgen05_constants import TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS
+from ...tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT
+from ...tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
+from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
+from ...tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
+from ...tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from ...tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_L2_GROUPING
+from ...tcgen05_constants import TCGEN05_TWO_CTA_SEED_PID_TYPE
+from ...tcgen05_constants import TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY
+from ...tcgen05_constants import resolve_tcgen05_grouped_worklist_mma_profile
+from ...tcgen05_constants import tcgen05_grouped_worklist_epilogue_shape
+from ...tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from ...tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
+from ...thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+from ...thread_budget import MAX_THREADS_PER_BLOCK
+from ...unpadded_rows import unpadded_row_layout
+from ..config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
+from ..config_keys import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
+from ..config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
+from ..config_keys import CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY
+from ..config_keys import CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY
+from ..config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
+from ..config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
+from ..config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
+from ..config_keys import _cute_chunk_recurrence_config_is_safe
+from ..flash_surface import cute_flash_gated_seed_configs
+from ..flash_surface import cute_flash_seed_configs
+from ..flash_surface import pdl_searched
+from ..search_surface import cute_lone_row_reduction
+from ..search_surface import enable_cute_affine_scan_search
+from ..search_surface import enable_cute_async_load_pipeline
+from ..search_surface import enable_cute_bf16x2_recurrence
+from ..search_surface import enable_cute_chunk_prepare_schedule_search
+from ..search_surface import enable_cute_chunk_recurrence_search
+from ..search_surface import enable_cute_gdn_recurrence_search
+from ..search_surface import enable_cute_packet_prefetch
+from ..search_surface import enable_cute_proven_bounds
+from ..search_surface import enable_cute_topk_search
+
+log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from collections.abc import Collection
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+    from collections.abc import Sequence
+
+    from .....autotuner.config_fragment import BlockSizeFragment
+    from .....autotuner.config_spec import ConfigSpec
+    from .....autotuner.config_spec import MatmulFact
+    from .....autotuner.config_spec import MemoryOpFact
+    from .....autotuner.config_spec import PointwiseElementwiseFact
+    from .....autotuner.config_spec import ReductionLoopSpec
+    from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
+    from ....compile_environment import CompileEnvironment
+    from ....device_ir import DeviceIR
+    from ...cute_mma import Tcgen05GroupedWorklistAnalysis
+    from ...gdn_recurrence import GdnRecurrenceGeometry
+    from ...grouped_worklist_policy import GroupedWorklistTargetPolicy
+
+
+def _seq_config_list(
+    seq: Any,  # noqa: ANN401 - BlockIdSequence of any spec type
+    overrides: Mapping[int, object],
+) -> list[object]:
+    """Build a full-length config list for a BlockIdSequence, filling
+    non-overridden slots with each spec's default.  Seeds must match the
+    live spec length exactly (``_encode_flat_values`` asserts on it), and
+    slot order varies (e.g. ``num_threads`` registers tile slots first
+    while ``cute_vector_widths`` keeps the rdim slot at index 0), so build
+    by block id instead of by position."""
+    return [
+        overrides[item.block_id] if item.block_id in overrides else item._fill_missing()
+        for item in seq
+    ]
+
+
+def _has_async_state_load_candidate(env: CompileEnvironment) -> bool:
+    """Cheap device-IR gate for the stricter generated-AST matcher.
+
+    This intentionally admits an input-layout-independent superset: a 16-bit
+    tensor that is both read and written in one graph. The late AST pass proves
+    the exact vector width, row/thread coverage, address equality, and alias
+    facts from cache-specialized metadata.
+    """
+    by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
+    for fact in env.config_spec.memory_op_facts:
+        if (
+            fact.tensor_name is None
+            or fact.dtype not in (torch.float16, torch.bfloat16)
+            or fact.ndim < 2
+        ):
+            continue
+        by_tensor_graph.setdefault((fact.tensor_name, fact.graph_id), []).append(fact)
+    return any(
+        any(fact.kind == "load" for fact in tensor_facts)
+        and any(fact.kind == "store" for fact in tensor_facts)
+        for tensor_facts in by_tensor_graph.values()
+    )
+
+
+class CutePackedSingleTokenRank1Heuristic(AutotunerHeuristic):
+    """Seed packed one-warp single-token rank-1 recurrences.
+
+    This is deliberately a cheap structural superset of the fail-closed FX
+    matcher.  It never keys on a function or tensor name: the late matcher
+    remains responsible for proving the complete recurrence and its layouts.
+    """
+
+    name = "cute_packed_single_token_rank1"
+    backend = "cute"
+    priority = 12
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _value_block_id(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> int | None:
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        if (
+            spec.matmul_facts
+            or len(spec.block_sizes) != 1
+            or grid_fact is None
+            or len(grid_fact.roots) != 1
+        ):
+            return None
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3:
+            return None
+        value_spec = cast("Any", spec.block_sizes[0])
+        if value_spec.block_id != root.block_ids[-1] or not any(
+            value_spec.min_size <= tile <= value_spec.max_size for tile in (8, 16)
+        ):
+            return None
+
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return None
+        try:
+            reduction_size = int(reduction_blocks[0].numel)
+        except (TypeError, ValueError):
+            return None
+        if reduction_size != 128:
+            return None
+
+        facts = [fact for fact in spec.memory_op_facts if fact.tensor_name is not None]
+        root_index_loads = [
+            fact
+            for fact in facts
+            if fact.graph_id == root.root_graph_id
+            and fact.kind == "load"
+            and fact.ndim == 1
+            and fact.dtype in (torch.int32, torch.int64)
+        ]
+        if len(root_index_loads) != 1:
+            return None
+
+        by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
+        by_tensor: dict[str, list[MemoryOpFact]] = {}
+        for fact in facts:
+            assert fact.tensor_name is not None
+            by_tensor_graph.setdefault((fact.tensor_name, fact.graph_id), []).append(
+                fact
+            )
+            by_tensor.setdefault(fact.tensor_name, []).append(fact)
+        state_candidates = [
+            (name, graph_id)
+            for (name, graph_id), tensor_facts in by_tensor_graph.items()
+            if tensor_facts[0].dtype is torch.bfloat16
+            and tensor_facts[0].ndim == 4
+            and sum(fact.kind == "load" for fact in tensor_facts) == 1
+            and sum(fact.kind == "store" for fact in tensor_facts) == 1
+        ]
+        if len(state_candidates) != 1:
+            return None
+        _, recurrence_graph_id = state_candidates[0]
+        has_packed_input = any(
+            tensor_facts[0].dtype is torch.bfloat16
+            and tensor_facts[0].ndim == 2
+            and sum(
+                fact.kind == "load" and fact.graph_id == recurrence_graph_id
+                for fact in tensor_facts
+            )
+            >= 3
+            for tensor_facts in by_tensor.values()
+        )
+        has_branched_output = any(
+            tensor_facts[0].dtype is torch.bfloat16
+            and tensor_facts[0].ndim == 4
+            and all(fact.kind == "store" for fact in tensor_facts)
+            and any(fact.graph_id == recurrence_graph_id for fact in tensor_facts)
+            and any(fact.graph_id != recurrence_graph_id for fact in tensor_facts)
+            for tensor_facts in by_tensor.values()
+        )
+        return value_spec.block_id if has_packed_input and has_branched_output else None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._value_block_id(env, device_ir) is not None
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS
+            if cls._value_block_id(env, device_ir) is not None
+            else frozenset()
+        )
+
+    @classmethod
+    def _seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        value_block_id = cls._value_block_id(env, device_ir)
+        if value_block_id is None:
+            return []
+        spec = env.config_spec
+        value_spec = cast("Any", spec.block_sizes[0])
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return []
+        reduction_block_id = reduction_blocks[0].block_id
+        if not {value_block_id, reduction_block_id}.issubset(
+            spec.num_threads.valid_block_ids()
+        ):
+            return []
+
+        def make_seed(tile_rows: int, num_warps: int) -> Config:
+            num_threads = (
+                _seq_config_list(
+                    spec.num_threads,
+                    {
+                        value_block_id: 1,
+                        reduction_block_id: 32,
+                    },
+                )
+                if num_warps == 1
+                else _seq_config_list(spec.num_threads, {})
+            )
+            return Config(
+                block_sizes=cast(
+                    "list[int]",
+                    _seq_config_list(
+                        spec.block_sizes,
+                        {value_block_id: tile_rows},
+                    ),
+                ),
+                # CuTe SIMT autotuning represents launch topology with
+                # per-axis ``num_threads``.  Keep ``num_warps`` as the direct,
+                # pinned-config compatibility signal, but encode one value-row
+                # thread by 32 reduction threads so flatten/unflatten preserves
+                # the one-warp seed.
+                num_threads=cast("list[int]", num_threads),
+                loop_orders=[[2, 1, 0]],
+                num_warps=num_warps,
+                num_stages=1,
+                indexing="pointer",
+                pid_type="flat",
+            )
+
+        seeds = [
+            make_seed(tile_rows, 1)
+            for tile_rows in (16, 8)
+            if value_spec.min_size <= tile_rows <= value_spec.max_size
+        ]
+        if value_spec.min_size <= 16 <= value_spec.max_size:
+            # Preserve an explicit path to the existing 256-thread B1 body.
+            seeds.append(make_seed(16, 8))
+        return seeds
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls._seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        seeds = cls._seed_configs(env, device_ir)
+        return seeds or None
+
+
+class CuteFixedTokenRank1Heuristic(AutotunerHeuristic):
+    """Seed the grouped fixed-token rank-1 recurrence schedule.
+
+    The seed is intentionally selected from device-IR structure rather than a
+    function or benchmark name.  The late fixed-token matcher remains the
+    authority and fails closed unless it proves the complete recurrence.
+    """
+
+    name = "cute_fixed_token_rank1"
+    backend = "cute"
+    priority = 13
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _value_block_id(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> int | None:
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        if (
+            spec.matmul_facts
+            or len(spec.block_sizes) != 1
+            or grid_fact is None
+            or len(grid_fact.roots) != 1
+        ):
+            return None
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3:
+            return None
+        value_spec = cast("Any", spec.block_sizes[0])
+        if (
+            value_spec.block_id != root.block_ids[-1]
+            or not value_spec.min_size <= 32 <= value_spec.max_size
+        ):
+            return None
+
+        reduction_blocks = [block for block in env.block_sizes if block.reduction]
+        if len(reduction_blocks) != 1:
+            return None
+        try:
+            reduction_size = int(reduction_blocks[0].numel)
+        except (TypeError, ValueError):
+            return None
+        if reduction_size != 128:
+            return None
+
+        by_tensor_graph: dict[tuple[str, int], list[MemoryOpFact]] = {}
+        for fact in spec.memory_op_facts:
+            if (
+                fact.tensor_name is not None
+                and fact.graph_id == root.root_graph_id
+                and fact.dtype is torch.bfloat16
+            ):
+                by_tensor_graph.setdefault(
+                    (fact.tensor_name, fact.graph_id), []
+                ).append(fact)
+        state_store_counts = [
+            sum(fact.kind == "store" for fact in tensor_facts)
+            for tensor_facts in by_tensor_graph.values()
+            if tensor_facts[0].ndim == 4
+            and sum(fact.kind == "load" for fact in tensor_facts) == 1
+        ]
+        if (
+            len(state_store_counts) != 1
+            or not 2 <= state_store_counts[0] <= 6
+            or sum(
+                fact.kind == "store" and fact.ndim == 3
+                for fact in spec.memory_op_facts
+                if fact.graph_id == root.root_graph_id
+            )
+            != state_store_counts[0]
+        ):
+            return None
+        return value_spec.block_id
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._value_block_id(env, device_ir) is not None
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS
+            if cls._value_block_id(env, device_ir) is not None
+            else frozenset()
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        value_block_id = cls._value_block_id(env, device_ir)
+        if value_block_id is None:
+            return None
+        return Config(
+            block_sizes=cast(
+                "list[int]",
+                _seq_config_list(
+                    env.config_spec.block_sizes,
+                    {value_block_id: 32},
+                ),
+            ),
+            num_warps=4,
+            num_stages=1,
+            indexing="pointer",
+            pid_type="flat",
+        )
+
+
+def _affine_scan_search_context(
+    env: CompileEnvironment, *, require_supported_extent: bool
+) -> tuple[int, int, int, dict[tuple[str, int], list[MemoryOpFact]]] | None:
+    spec = env.config_spec
+    grid_fact = spec.kernel_grid_fact
+    if (
+        spec.matmul_facts
+        or len(spec.block_sizes) != 1
+        or grid_fact is None
+        or len(grid_fact.roots) != 1
+    ):
+        return None
+    (root,) = grid_fact.roots
+    row_spec = cast("Any", spec.block_sizes[0])
+    row_block_id = row_spec.block_id
+    if row_block_id not in root.block_ids:
+        return None
+
+    reduction_blocks = [block for block in env.block_sizes if block.reduction]
+    if len(reduction_blocks) != 1:
+        return None
+    reduction = reduction_blocks[0]
+    try:
+        feature_extent = int(reduction.numel)
+    except (TypeError, ValueError):
+        return None
+    if require_supported_extent and feature_extent != 128:
+        return None
+
+    by_tensor: dict[tuple[str, int], list[MemoryOpFact]] = {}
+    for fact in spec.memory_op_facts:
+        if fact.tensor_name is not None and fact.graph_id == root.root_graph_id:
+            by_tensor.setdefault((fact.tensor_name, fact.graph_id), []).append(fact)
+    return row_block_id, reduction.block_id, len(root.block_ids), by_tensor
+
+
+def _affine_scan_search_geometry(
+    env: CompileEnvironment,
+) -> tuple[int, int, int, int] | None:
+    """Infer an unambiguous seed from a possible affine-scan region.
+
+    This is deliberately a structural superset of the semantic matcher.  The
+    late lowering remains authoritative for the recurrence, accesses, aliases,
+    and generated thread coordinates.
+    """
+
+    context = _affine_scan_search_context(env, require_supported_extent=True)
+    if context is None:
+        return None
+    row_block_id, feature_block_id, root_rank, by_tensor = context
+    possible_step_counts: set[int] = set()
+    for state_key, tensor_facts in by_tensor.items():
+        if (
+            tensor_facts[0].dtype is not torch.bfloat16
+            or tensor_facts[0].ndim < 2
+            or not any(fact.kind == "load" for fact in tensor_facts)
+        ):
+            continue
+        step_count = sum(fact.kind == "store" for fact in tensor_facts)
+        if not 2 <= step_count <= 8:
+            continue
+        non_state_stores = sum(
+            fact.kind == "store" and fact.dtype is torch.bfloat16
+            for key, other_facts in by_tensor.items()
+            if key != state_key
+            for fact in other_facts
+        )
+        if non_state_stores >= step_count:
+            possible_step_counts.add(step_count)
+    if len(possible_step_counts) != 1:
+        return None
+    (step_count,) = possible_step_counts
+    return row_block_id, feature_block_id, step_count, root_rank
+
+
+def _may_have_affine_scan(
+    env: CompileEnvironment, *, require_supported_extent: bool
+) -> bool:
+    """Cheap superset used to expose direct choices without seed assumptions."""
+
+    context = _affine_scan_search_context(
+        env, require_supported_extent=require_supported_extent
+    )
+    if context is None:
+        return False
+    by_tensor = context[3]
+    return any(
+        tensor_facts[0].dtype is torch.bfloat16
+        and tensor_facts[0].ndim >= 2
+        and any(fact.kind == "load" for fact in tensor_facts)
+        and sum(fact.kind == "store" for fact in tensor_facts) >= 2
+        and sum(
+            fact.kind == "store" and fact.dtype is torch.bfloat16
+            for other_name, other_facts in by_tensor.items()
+            if other_name != name
+            for fact in other_facts
+        )
+        >= 2
+        for name, tensor_facts in by_tensor.items()
+    )
+
+
+class CuteAffineScanHeuristic(AutotunerHeuristic):
+    """Expose the generic direct-affine schedule behind a structural gate."""
+
+    name = "cute_affine_scan"
+    backend = "cute"
+    priority = 8
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        capability = env.config_spec.target_device_capability
+        if capability is None or capability < (8, 0) or not env.settings.fast_math:
+            return frozenset()
+        if not _may_have_affine_scan(env, require_supported_extent=False):
+            return frozenset()
+        if not _may_have_affine_scan(env, require_supported_extent=True):
+            return cls.CACHE_SPECIALIZATION_FACTS
+        geometry = _affine_scan_search_geometry(env)
+        enable_cute_affine_scan_search(
+            env.config_spec, step_count=None if geometry is None else geometry[2]
+        )
+        # The geometry predicate consumes runtime tensor extents.  Keep the
+        # negative binding specialized too, so a later dynamic-shape call that
+        # does match cannot reuse a ConfigSpec where the choices stayed hidden.
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_affine_scan_schedule is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        geometry = _affine_scan_search_geometry(env)
+        if geometry is None or env.config_spec.cute_affine_scan_schedule is None:
+            return None
+        row_block_id, feature_block_id, step_count, root_rank = geometry
+        from ...direct_affine_plan import DirectAffineMma
+        from ...direct_affine_plan import decode_direct_affine_schedule
+        from ...direct_affine_plan import select_direct_affine_schedule
+
+        schedule_name = select_direct_affine_schedule(step_count)
+        schedule = decode_direct_affine_schedule(schedule_name)
+        if schedule is None:
+            return None
+        row_extent = 64 if schedule.mma is DirectAffineMma.M16N8 else 128
+        row_spec = cast("Any", env.config_spec.block_sizes[0])
+        if not row_spec.min_size <= row_extent <= row_spec.max_size or not {
+            row_block_id,
+            feature_block_id,
+        }.issubset(env.config_spec.num_threads.valid_block_ids()):
+            return None
+        values = {
+            "block_sizes": cast(
+                "list[int]",
+                _seq_config_list(
+                    env.config_spec.block_sizes,
+                    {row_block_id: row_extent},
+                ),
+            ),
+            "num_threads": cast(
+                "list[int]",
+                _seq_config_list(
+                    env.config_spec.num_threads,
+                    {row_block_id: row_extent // 16, feature_block_id: 32},
+                ),
+            ),
+            "loop_orders": [list(reversed(range(root_rank)))],
+            "num_warps": row_extent // 16,
+            "num_stages": 1,
+            "indexing": "pointer",
+            "pid_type": "flat",
+            CUTE_AFFINE_SCAN_SCHEDULE_KEY: schedule_name,
+        }
+        return [Config.from_dict(values)]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
+    """Seed the proven shared-memory ring for in-place vector state updates.
+
+    Eligibility is deliberately broader than codegen matching so it can be
+    derived from stable device-IR facts. The AST pass is fail-closed and emits
+    no shared allocation unless one exact disjoint row/vector region matches.
+    """
+
+    name = "cute_async_state_load"
+    backend = "cute"
+    priority = 1
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        if cp_async_supported(
+            env.config_spec.target_device_capability
+        ) and _has_async_state_load_candidate(env):
+            enable_cute_async_load_pipeline(env.config_spec)
+            enable_cute_bf16x2_recurrence(env.config_spec)
+            enable_cute_proven_bounds(env.config_spec)
+            # Generated scheduling consumes exact tensor extents and strides.
+            # Make those values part of the bound-kernel cache key so a later
+            # dynamic-shape/layout call cannot reuse an incompatible ring.
+            return frozenset({"input_tensor_metadata"})
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            cp_async_supported(env.config_spec.target_device_capability)
+            and env.config_spec.cute_async_load_pipeline_enabled
+        )
+
+    @staticmethod
+    def _seed_overrides() -> dict[str, object]:
+        return {
+            "cute_async_load_stages": 5,
+            "cute_async_load_lookahead": 4,
+            "cute_async_load_group_rows": 2,
+            "cute_async_load_cache": "cg",
+            "cute_proven_bounds": False,
+        }
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+        values = dict(env.config_spec.autotune_reference_config().config)
+        values.update(cls._seed_overrides())
+        return Config.from_dict(values)
+
+
+def _cute_static_block_extent(env: CompileEnvironment, block_id: int) -> int | None:
+    size = env.block_sizes[block_id].size
+    if not isinstance(size, (int, torch.SymInt)):
+        return None
+    extent = env.specialize_expr(env.shape_env.replace(_to_sympy(size)))
+    return int(extent) if extent.is_Integer else None
+
+
+def _cute_seed_vec_width(
+    env: CompileEnvironment,
+    rl_spec: ReductionLoopSpec,
+    device_ir: DeviceIR,
+) -> int:
+    """Pick a default vector width for the cute_vector_widths seed.
+
+    Returns 1 (scalar) when the kernel has no plausible LDG.128 win, or
+    the dtype is not supported by the vector load helper. For supported
+    dtypes, prefer 4 (fp32) / 8 (fp16/bf16) when the reduction is wide
+    enough that a vec-load actually halves the number of inner-loop
+    iters.  For fp16/bf16 the V=8 seed is sampled even when the picked
+    tile doesn't exactly match the seed size_hint — the per-block
+    strategy at construction time validates ``EPT % V == 0`` and falls
+    back to V=1 if the chosen lattice can't fit V=8, so over-seeding is
+    safe and lets the hill-climber discover the V>1 lattices that lift
+    softmax-style reductions from scalar LDG to LDG.64/LDG.128.
+    """
+    spec = env.config_spec
+    if not spec.cute_vector_widths.valid_block_ids():
+        return 1
+    if rl_spec.size_hint < (spec.max_reduction_threads or 1024):
+        # Reduction extent barely fits in one wide chunk; vec wouldn't
+        # remove enough loop iters to matter.
+        return 1
+    return _cute_tile_seed_vec_width_for_dtype(
+        _cute_tile_inner_block_dtype(
+            env, device_ir, rl_spec.block_id, allow_symbolic=True
+        )
+    )
+
+
+def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
+    """A row reduction whose rows are indexed by several tile axes.
+
+    ``is_canonical_row_reduction`` admits one tile axis; a batched softmax
+    (``hl.tile([b, m])`` with the row as a full slice) has two.  Every tile
+    axis must accept block size 1 so the seeds spell one row per CTA; the
+    single reduction loop and the absence of matmul facts are as for the
+    canonical form.  CuTe-only: the Triton heuristics keep the shared gate.
+    """
+    spec = env.config_spec
+    if len(spec.block_sizes) < 2 or len(spec.reduction_loops) != 1:
+        return False
+    if spec.matmul_facts:
+        return False
+    # The loop must carry a reduction: a pointwise kernel's rollable full
+    # slice (rope's half dim) registers a reduction loop too, and one row
+    # per CTA is the wrong family for it.
+    fact = spec.reduction_kernel_fact
+    if fact is None or not any(
+        descriptor.category in SIZED_REDUCTION_CATEGORIES
+        for descriptor in fact.reductions
+    ):
+        return False
+    return all(
+        max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
+        for bs_spec in spec.block_sizes
+    )
+
+
+class CuteReductionTileHeuristic(AutotunerHeuristic):
+    """Seed config for canonical reduction kernels (RMS norm, softmax, etc.).
+
+    Seeds the "narrow chunk" config: bs=1, nt=1, reduction_loops=[None] for
+    N<=max_threads (single-pass persistent reduction) or
+    reduction_loops=[max_threads] for N>max_threads (one element per
+    thread per iter, no lane loop). This config keeps the M-axis at one
+    row per block so the reduction recruits all available threads, and
+    the two-pass load fusion (helion/_compiler/cute/fuse_two_pass_loads.py)
+    eliminates the redundant gmem reload of x in the post-reduction sweep.
+
+    A persistent row whose static extent is a power of two additionally
+    seeds the one-vector-per-thread layout: ``N / V`` threads (a multiple of
+    32) each own one 16-byte fragment and the per-thread V-folds are combined
+    once with the cross-warp two-stage shared reduce.  For a 1024-wide bf16
+    row that is a 128-thread CTA issuing one LDG.128 per thread (the Triton
+    kernel's shape) instead of 1024 threads loading one scalar each.
+
+    The row seeds (not the narrow chunk) also pin the reduction reload mode
+    to ``register_prefetch``: the per-thread slice is one or two packets, so
+    the consume sweeps of a softmax-style kernel re-read registers instead of
+    gmem.  Under the default ``auto`` mode the same geometries re-load the row
+    (batch_softmax: 3.06 vs 2.68 us at 8x256x1024 fp16, 30.8 vs 24.8 us at
+    16x512x4096, against quack's 2.68 / 24.9).
+    """
+
+    name = "cute_reduction_tile"
+    backend = "cute"
+    priority = 29
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return is_canonical_row_reduction(env) or _is_row_reduction_over_tiles(env)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        size_hint = rl_spec.size_hint
+        if size_hint <= max_threads:
+            # Persistent reduction (no roll). The normalize step will keep
+            # reduction_loops[0]=None when the M-axis allows it.
+            reduction_loops: list[int | None] = [None]
+        else:
+            reduction_loops = [max_threads]
+        seed: dict[str, Any] = {
+            "block_sizes": [1] * len(spec.block_sizes),
+            "num_threads": _seq_config_list(spec.num_threads, {}),
+            "reduction_loops": reduction_loops,
+        }
+        vec = 1
+        if (
+            reduction_loops[0] is not None
+            or _cute_static_block_extent(env, rl_spec.block_id) is not None
+        ):
+            vec = _cute_seed_vec_width(env, rl_spec, device_ir)
+        if vec > 1:
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rl_spec.block_id: vec}
+            )
+        return Config(**seed)
+
+    @classmethod
+    def multiwarp_vector_row_seed_config(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        *,
+        packet_bytes: int = 16,
+    ) -> Config | None:
+        """One ``packet_bytes`` vector per thread across a warp-aligned CTA.
+
+        ``PersistentReductionStrategy`` applies ``cute_vector_widths`` only when
+        V exactly covers each thread's slice, so the layout needs
+        ``num_threads = N / V`` on the reduction block.  Requires a persistent
+        (unrolled) static power-of-two extent -- a dynamic extent is masked and
+        never vectorized, whatever its size hint -- and at least one full warp
+        of threads.  ``packet_bytes=32`` seeds the SM100 32-byte packet (half
+        the threads, one LDG.256 per thread: batch_softmax's 1024-wide fp16
+        rows run at quack's speed with 64 threads x V16 where 128 x V8 is 5%
+        and the rolled forms 10-25% slower).
+        """
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        block_id = rl_spec.block_id
+        extent = _cute_static_block_extent(env, block_id)
+        if extent is None:
+            return None
+        if (
+            extent > max_threads
+            or extent & (extent - 1)
+            or block_id not in spec.num_threads.valid_block_ids()
+            or block_id not in spec.cute_vector_widths.valid_block_ids()
+        ):
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        vec = vec * packet_bytes // 16
+        choices = (
+            spec.cute_vector_widths.block_id_lookup(block_id)._fragment(spec).choices
+        )
+        if vec not in choices or extent % vec:
+            return None
+        threads = extent // vec
+        if threads < 32 or threads % 32:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": [1] * len(spec.block_sizes),
+            "num_threads": _seq_config_list(spec.num_threads, {block_id: threads}),
+            "reduction_loops": [None],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {block_id: vec}
+            ),
+            **cls._row_reload_entries(spec, block_id),
+        }
+        return Config(**seed)
+
+    ROLLED_ROW_PACKETS_PER_THREAD = 2
+
+    @classmethod
+    def two_packet_rolled_row_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        """Two 16-byte packets per thread per trip over the narrow chunk.
+
+        The rolled counterpart of the one-vector rows for rows wider than the
+        thread budget (and the two-packet form of rows that fit it): the chunk
+        is the narrow chunk's (the extent when it fits ``max_threads``, else
+        the budget) and ``chunk / (2 V)`` threads each load two packets per
+        trip.  Requires a static extent that is a whole number of chunks and
+        at least one full warp of threads.  batch_softmax's 4096-wide fp16
+        rows (64 threads x V8, four trips) run at quack's speed in this form
+        (24.8 vs 24.9 us) where the persistent one-vector layouts of that
+        width are 30-65% slower and the narrow chunk 20%.
+        """
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        block_id = rl_spec.block_id
+        extent = _cute_static_block_extent(env, block_id)
+        if extent is None:
+            return None
+        chunk = min(extent, max_threads)
+        if spec.max_reduction_loop is not None:
+            chunk = min(chunk, spec.max_reduction_loop)
+        if (
+            chunk < 2
+            or extent % chunk
+            or block_id not in spec.num_threads.valid_block_ids()
+            or block_id not in spec.cute_vector_widths.valid_block_ids()
+        ):
+            return None
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        choices = (
+            spec.cute_vector_widths.block_id_lookup(block_id)._fragment(spec).choices
+        )
+        per_thread = vec * cls.ROLLED_ROW_PACKETS_PER_THREAD
+        if vec not in choices or chunk % per_thread:
+            return None
+        threads = chunk // per_thread
+        if threads < 32 or threads % 32 or threads > max_threads:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": [1] * len(spec.block_sizes),
+            "num_threads": _seq_config_list(spec.num_threads, {block_id: threads}),
+            "reduction_loops": [chunk],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {block_id: vec}
+            ),
+            **cls._row_reload_entries(spec, block_id),
+        }
+        return Config(**seed)
+
+    @classmethod
+    def two_packet_persistent_row_seed_config(
+        cls, env: CompileEnvironment, rolled: Config
+    ) -> Config | None:
+        """The two-packet row of one warp held in registers.
+
+        When ``rolled``, the two-packet rolled row
+        (``two_packet_rolled_row_seed_config``), is one trip of a single warp,
+        the persistent row keeps its layout -- each thread holds two V-wide
+        packets ``32 * V`` elements apart (``PersistentReductionStrategy``'s
+        chunked lanes, which stay within one warp) -- and every sweep reads
+        registers.  The rolled trip re-reads, in each later sweep, the scalar
+        loads of a tensor whose rows are not packet aligned; the one-vector
+        row of 16 elements per thread spreads those scalar loads over the
+        whole row per warp instruction where the two packets span half of it.
+        XLNet's relative-shift softmax (bf16 rows of 512 beside a position row
+        shifted by one element per row) runs faster in this form, with the
+        native warp reductions (``get_seed_configs``), than in the one-vector
+        row.  It fires only where the rolled seed's block is that one warp, a
+        ``64 * V``-wide row (512 bf16 or f16 elements, 256 fp32): wider rows,
+        whose rolled seed takes more warps, get no one-warp row holding more
+        packets per thread, a layout not measured here.
+        """
+        spec = env.config_spec
+        block_id = cast("ReductionLoopSpec", spec.reduction_loops[0]).block_id
+        threads = spec.num_threads.config_get(
+            cast("list[int]", rolled.config["num_threads"]), block_id, 0
+        )
+        # The rolled row's chunk is the static extent when it fits the
+        # thread budget: one trip.
+        if threads != 32 or rolled.config["reduction_loops"] != [
+            _cute_static_block_extent(env, block_id)
+        ]:
+            return None
+        return Config.from_dict(deepcopy(rolled.config) | {"reduction_loops": [None]})
+
+    WARP_ROWS_PER_CTA = (2, 4)
+    WARP_ROWS_MAX_EXTENT = 4096
+
+    @classmethod
+    def warp_rows_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """One warp per row, several rows per CTA.
+
+        Short rows (up to ``WARP_ROWS_MAX_EXTENT`` elements) are latency and
+        launch bound; the one-row seeds spend a 32-thread CTA per row (2048
+        CTAs for 8 x 256 rows of 1024 fp16) where quack packs four rows into a
+        128-thread CTA.  Seeds the innermost tile axis at 2 and 4 rows with as
+        many threads on it, 32 threads on the row, 16-byte packets, the row as
+        one rolled trip, strided lanes and register-prefetch reloads: the form
+        measured at 2.24 us against quack's 2.28 on batch_softmax's 1024-wide
+        rows (B200), where the one-row winner reads 2.36.
+        """
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        block_id = rl_spec.block_id
+        extent = _cute_static_block_extent(env, block_id)
+        if extent is None or not spec.block_sizes:
+            return []
+        row_index = len(spec.block_sizes) - 1
+        row_block = spec.block_sizes[row_index].block_id
+        if (
+            extent > cls.WARP_ROWS_MAX_EXTENT
+            or block_id not in spec.num_threads.valid_block_ids()
+            or row_block not in spec.num_threads.valid_block_ids()
+            or block_id not in spec.cute_vector_widths.valid_block_ids()
+        ):
+            return []
+        dtype = _cute_tile_inner_block_dtype(env, device_ir, block_id)
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1 or extent % (32 * vec):
+            return []
+        choices = (
+            spec.cute_vector_widths.block_id_lookup(block_id)._fragment(spec).choices
+        )
+        if vec not in choices:
+            return []
+        max_loop = spec.max_reduction_loop
+        if max_loop is not None and extent > max_loop:
+            return []
+        seeds: list[Config] = []
+        for rows in cls.WARP_ROWS_PER_CTA:
+            if not _block_size_value_reachable(spec, row_index, rows):
+                continue
+            block_sizes = [1] * len(spec.block_sizes)
+            block_sizes[row_index] = rows
+            seed: dict[str, Any] = {
+                "block_sizes": block_sizes,
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {row_block: rows, block_id: 32}
+                ),
+                "reduction_loops": [extent],
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {block_id: vec}
+                ),
+                **cls._row_reload_entries(spec, block_id),
+            }
+            if block_id in spec.cute_lane_layouts.valid_block_ids():
+                seed["cute_lane_layouts"] = _seq_config_list(
+                    spec.cute_lane_layouts, {block_id: "strided"}
+                )
+            try:
+                seeds.append(Config(**seed))
+            except Exception:
+                continue
+        return seeds
+
+    @classmethod
+    def _row_reload_entries(cls, spec: ConfigSpec, block_id: int) -> dict[str, Any]:
+        """``register_prefetch`` reloads on the row's reduction block."""
+        if block_id not in spec.cute_reduction_reloads.valid_block_ids():
+            return {}
+        return {
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {block_id: "register_prefetch"}
+            )
+        }
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        seeds = [primary]
+        for packet_bytes in (16, 32):
+            if packet_bytes == 32 and not (
+                (env.config_spec.target_device_capability or (0, 0)) >= (10, 0)
+            ):
+                continue
+            alternate = cls.multiwarp_vector_row_seed_config(
+                env, device_ir, packet_bytes=packet_bytes
+            )
+            if alternate is not None and alternate not in seeds:
+                seeds.append(alternate)
+        rolled = cls.two_packet_rolled_row_seed_config(env, device_ir)
+        if rolled is not None and rolled not in seeds:
+            seeds.append(rolled)
+        persistent = (
+            None
+            if rolled is None
+            else cls.two_packet_persistent_row_seed_config(env, rolled)
+        )
+        if persistent is not None:
+            if env.config_spec.cute_native_redux_sites:
+                # The row's max, min or ``any`` takes one ``redux.sync`` per
+                # warp; the kernel's structure opens the knob at every shape
+                # (``cute_native_redux_sites``).
+                persistent = Config.from_dict(
+                    deepcopy(persistent.config) | {"cute_warp_fp32_redux": True}
+                )
+            if persistent not in seeds:
+                seeds.append(persistent)
+        for warp_rows in cls.warp_rows_seed_configs(env, device_ir):
+            if warp_rows not in seeds:
+                seeds.append(warp_rows)
+        return seeds
+
+
+def _access_spans_block(
+    env: CompileEnvironment, node: torch.fx.Node, block_id: int
+) -> bool:
+    """Whether a load / store indexes the whole extent of ``block_id`` on some
+    dimension: a slice of the block's size, or the block's tile symbol."""
+    tensor = node.args[0] if node.args else None
+    fake = tensor.meta.get("val") if isinstance(tensor, torch.fx.Node) else None
+    indices = node.args[1] if len(node.args) > 1 else None
+    block = env.block_sizes[block_id]
+    if (
+        not isinstance(fake, torch.Tensor)
+        or not isinstance(indices, (list, tuple))
+        or not isinstance(block.size, (int, torch.SymInt))
+    ):
+        return False
+    symbol = _symint_sympy_expr(block.var)
+    dim = 0
+    for item in indices:
+        if item is None:
+            continue
+        if isinstance(item, slice):
+            if dim < fake.ndim and env.known_equal(
+                compute_slice_size(item, fake.shape[dim]), block.size
+            ):
+                return True
+        else:
+            value = item.meta.get("val") if isinstance(item, torch.fx.Node) else item
+            if isinstance(value, torch.SymInt) and _symint_sympy_expr(value) == symbol:
+                return True
+        dim += 1
+    return False
+
+
+def _register_tile_lane_split_orders_memory(
+    env: CompileEnvironment, device_ir: DeviceIR, reduction_block_id: int
+) -> bool:
+    """Whether the body's memory accesses need an order across threads.
+
+    The register tile's lane split orders nothing: a thread barrier has no
+    place in a body a later pass rewrites (the lane-reduce placeholder), the
+    RAW barrier the IR marks cannot be predicated into an owner thread, and
+    no lane's load may move above another lane's store.  Two shapes need such
+    an order: a store the same loop region reads back (``out[tile] = ...;
+    other[tile] = out[tile] * 2``), and a tensor both loaded and stored
+    through an access that does not span the reduction block -- replicated
+    on every reduction thread, so one thread's store races another's load
+    (``out[tile] += x[:, tile].sum(0)``).  A read-modify-write whose every
+    access spans the reduction block keeps each element in one thread (the
+    in-place recurrent step) and needs none.
+    """
+    graphs = device_ir.graphs
+    if intra_loop_raw_reread_block_ids(
+        graphs, device_ir.root_ids, device_ir.grid_block_ids
+    ):
+        return True
+    shared: set[int] = set()
+    for root_id in device_ir.root_ids:
+        reads, writes = graph_memory_access_storage_ids(graphs, root_id)
+        shared |= reads & writes
+    if not shared:
+        return False
+    for info in graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                language_load,
+                language_store,
+            ):
+                continue
+            if _storage_ids(graphs, info.graph_id, node.args[0]) & shared and not (
+                _access_spans_block(env, node, reduction_block_id)
+            ):
+                return True
+    return False
+
+
+class CuteRegisterTileHeuristic(AutotunerHeuristic):
+    """Seed a per-thread register tile for a reduction over a vectorized tile.
+
+    Kernels that reduce a 2-D tile along its strided axis while the stride-1
+    axis stays a free tile (the fused linear-attention state update,
+    ``sum(q[:, None] * state, 0)``) get one 16-byte fragment of the stride-1
+    axis per thread and a trace-time reduction lane loop outside that vector
+    loop (``cute/register_tile_reductions.py``): eight vector threads cover a
+    128-byte row segment per warp row, every lane's packet load issues before
+    the first store, and each tile column is combined once with the
+    shared-memory column reduce.  The seed sizes the reduction thread count so
+    the unrolled register tile holds ``CUTE_REGISTER_TILE_MAX_ELEMENTS`` per
+    thread, divided by the number of chained reduction levels
+    (``register_tile_reduction_levels``): a body whose second reduction reads
+    the first one's result (the delta-rule recurrent step) stashes more of the
+    tile between its combines.
+
+    Disjoint from ``CuteColumnReductionHeuristic``, which seeds the reduction
+    over a serial device-loop axis of a kernel without reduction loops (for
+    ``cute_vloop_sink``): this seed needs exactly one reduction loop, so no
+    kernel is eligible for both and the seeds need no precedence.
+
+    The seed is also the autotune-off default: it is the SIMT reduction layout
+    read off the operand strides (the stride-1 axis on the vectorized lanes,
+    the reduction axis on the remaining threads), whereas the base default
+    walks the strided axis with the fastest thread index -- a warp reading
+    fp32 words 512 B apart, 8-13x slower on the fused linear-attention step
+    (124 us vs 14.5 us at [512, 128, 128]) and the same on every
+    ``x[i, :, tile].sum(0)``-shaped kernel. The lowering keeps it safe: a body
+    the two-pass schedule cannot place regenerates with the rolled lane
+    nesting (``RegisterTileUnsupported``), and a lane axis that is not the
+    tensor's stride-1 dim loads scalars.  A body whose memory accesses the
+    lane split would have to order across threads (a store the loop reads
+    back, or a tensor loaded and stored through an access replicated on the
+    reduction threads) gets no seed at all: no pass can place that order
+    next to the lane-reduce placeholder, so the seed would not compile as
+    the default either (``_register_tile_lane_split_orders_memory``).
+    """
+
+    name = "cute_register_tile"
+    backend = "cute"
+    priority = 30
+    promote_seed_to_default = True
+    VECTOR_THREADS = 8
+
+    @classmethod
+    def _geometry(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int, int, int] | None:
+        """``(tile_block_id, tile_block, tile_threads, reduction_block_id,
+        reduction_threads, vec)``, or ``None`` when the kernel lacks the shape."""
+        spec = env.config_spec
+        if spec.matmul_facts or len(spec.reduction_loops) != 1:
+            return None
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        if rl_spec.block_id not in spec.cute_register_tile_reduction_blocks:
+            return None
+        if _register_tile_lane_split_orders_memory(env, device_ir, rl_spec.block_id):
+            return None
+        max_threads = spec.max_reduction_threads
+        size_hint = rl_spec.size_hint
+        if max_threads is None or size_hint > max_threads or size_hint < 2:
+            return None
+        tile_block_ids = [
+            block_id
+            for block_id in spec.block_sizes.valid_block_ids()
+            if block_id in spec.cute_vector_widths.valid_block_ids()
+            and block_id in spec.num_threads.valid_block_ids()
+        ]
+        if len(tile_block_ids) != 1:
+            return None
+        (tile_block_id,) = tile_block_ids
+        if rl_spec.block_id not in spec.num_threads.valid_block_ids():
+            return None
+        numel = env.block_sizes[tile_block_id].numel
+        if not isinstance(numel, (int, sympy.Integer)):
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_tile_inner_block_dtype(env, device_ir, tile_block_id)
+        )
+        if vec <= 1:
+            return None
+        tile_block = min(int(numel), cls.VECTOR_THREADS * vec)
+        if tile_block % vec or (int(numel) % tile_block):
+            return None
+        tile_threads = tile_block // vec
+        # Every accumulate nest after the first keeps more of the tile stashed
+        # (the delta-rule step holds the decayed tile, two per-row products
+        # and the corrected tile across its two combines), so a chained body
+        # takes proportionally fewer lanes per thread to stay inside the
+        # live-value budget.
+        levels = register_tile_reduction_levels(device_ir.graphs)
+        lanes = max(1, CUTE_REGISTER_TILE_MAX_ELEMENTS // vec // levels)
+        reduction_threads = next_power_of_2(max(1, -(-size_hint // lanes)))
+        if size_hint % reduction_threads or tile_threads * reduction_threads > (
+            spec.max_reduction_threads or 1024
+        ):
+            return None
+        if size_hint // reduction_threads < 2:
+            # One row per thread needs no lane loop; the persistent
+            # one-vector layouts cover that shape.
+            return None
+        return (
+            tile_block_id,
+            tile_block,
+            tile_threads,
+            rl_spec.block_id,
+            reduction_threads,
+            vec,
+        )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._geometry(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        geometry = cls._geometry(env, device_ir)
+        if geometry is None:
+            return None
+        (
+            tile_block_id,
+            tile_block,
+            tile_threads,
+            reduction_block_id,
+            reduction_threads,
+            vec,
+        ) = geometry
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": [
+                tile_block if block_id == tile_block_id else 1
+                for block_id in spec.block_sizes.valid_block_ids()
+            ],
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {tile_block_id: tile_threads, reduction_block_id: reduction_threads},
+            ),
+            "reduction_loops": [None],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {tile_block_id: vec}
+            ),
+        }
+        return Config(**seed)
+
+    # The schedule knobs of ``RegisterTileOptions``: the warp fold of the
+    # multi-warp column reduce and the consume nest ahead of the combines.
+    SCHEDULE_KNOBS: ClassVar[dict[str, bool]] = {
+        "cute_register_tile_warp_fold": True,
+        "cute_register_tile_store_first": True,
+    }
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        """``[primary, primary + schedule knobs, finer tile + schedule knobs]``.
+
+        The primary stays the autotune-off default.  The alternates make the
+        schedule knobs searchable (``_flat_fields`` offers a knob only when a
+        compiler seed sets it) and point the search at the finer register
+        tile: half the lanes per thread on twice the reduction threads keeps
+        more CTAs per SM (fewer live registers each) and shorter CTAs, while
+        the column reduce then spans more warps, where the serial
+        ``pre > 1`` form reads ``group_span // pre`` partials per column and
+        the warp fold does not (fused linear-attention step at
+        [512, 128, 128] fp32, L2-warm: 8.4 us -> 8.2 us; the knob-free finer
+        tile was 10.0 us).  The cooperative fold, which reads fewer still,
+        is not seeded (``RegisterTileOptions``).
+        """
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        geometry = cls._geometry(env, device_ir)
+        assert geometry is not None
+        (
+            tile_block_id,
+            _tile_block,
+            tile_threads,
+            reduction_block_id,
+            reduction_threads,
+            _vec,
+        ) = geometry
+        spec = env.config_spec
+        alternates = [Config.from_dict(deepcopy(primary.config) | cls.SCHEDULE_KNOBS)]
+        size_hint = cast("ReductionLoopSpec", spec.reduction_loops[0]).size_hint
+        finer = reduction_threads * 2
+        if (
+            size_hint % finer == 0
+            and size_hint // finer >= 2
+            and tile_threads * finer <= (spec.max_reduction_threads or 1024)
+        ):
+            finer_seed = deepcopy(primary.config) | cls.SCHEDULE_KNOBS
+            finer_seed["num_threads"] = _seq_config_list(
+                spec.num_threads,
+                {tile_block_id: tile_threads, reduction_block_id: finer},
+            )
+            alternates.append(Config.from_dict(finer_seed))
+        return [primary, *alternates]
+
+
+def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
+    """V seed for ``PerThreadNDTileStrategy`` lane-loop vec on a given dtype.
+
+    Seeds a full 16-byte LDG.128 per thread per outer iter: V=4 for fp32,
+    V=8 for fp16/bf16 (a single ``cute.arch.load(..., V=8)``; the old 4+4
+    split workaround for the ``nvvm.load.ext`` ICE is gone as of cutlass
+    4.7).
+    """
+    if dtype is torch.float32:
+        return 4
+    if dtype in (torch.float16, torch.bfloat16):
+        return 8
+    return 1
+
+
+def _cute_reduction_dtype(
+    device_ir: DeviceIR, reduction_size: int
+) -> torch.dtype | None:
+    """The loaded dtype of a row ``reduction_size`` long that takes the
+    widest vector (``_cute_tile_seed_vec_width_for_dtype``), or None."""
+    # Ignore the integer FakeTensor produced by ``hl.arange`` itself and
+    # find a vector-loadable tensor value using that trailing dimension.
+    best_dtype: torch.dtype | None = None
+    best_width = 1
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            value = node.meta.get("val")
+            target_name = getattr(node.target, "__name__", "")
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 1
+                and isinstance(value.shape[-1], int)
+                and value.shape[-1] == reduction_size
+                and target_name in ("_host_tensor", "load")
+            ):
+                width = _cute_tile_seed_vec_width_for_dtype(value.dtype)
+                if width > best_width:
+                    best_dtype = value.dtype
+                    best_width = width
+    return best_dtype
+
+
+def _row_starts_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, dim: int, start: object, vec: int
+) -> bool:
+    """Whether every row of ``tensor`` walked along ``dim`` from ``start``
+    keeps a ``vec``-wide packet at a multiple of ``vec`` aligned, relative to
+    the tensor's base: ``start`` and the strides of the other dims (a static
+    size-1 dim aside, which never moves an address) are multiples of
+    ``vec``.  Decided by ``specialized_multiple``, which guards no shape."""
+    return env.specialized_multiple(start, vec) and all(
+        env.specialized_multiple(tensor.stride(other), vec)
+        for other in range(tensor.ndim)
+        if other != dim
+        and not (isinstance(tensor.shape[other], int) and tensor.shape[other] == 1)
+    )
+
+
+def _cute_tile_row_blocks(env: CompileEnvironment) -> tuple[int, int] | None:
+    """Find row/inner axes in loop order, independent of registration order."""
+    blocks = env.config_spec.block_sizes
+    if len(blocks) != 2:
+        return None
+    paths = env.config_spec.cute_tile_loop_paths
+    if len(paths) != 1 or not paths[0][0]:
+        return None
+    block_ids = blocks.valid_block_ids()
+    axes = tuple(bid for level in paths[0] for bid in level if bid in block_ids)
+    if len(axes) != 2 or set(axes) != set(block_ids):
+        return None
+    return axes[0], axes[1]
+
+
+def _cute_tile_inner_block_dtype(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    block_id: int,
+    *,
+    allow_symbolic: bool = False,
+) -> torch.dtype | None:
+    """Find ordinary vector-load payloads on the block's innermost axis.
+
+    Prefer floating memory payloads over masks and indices, then indexed loads
+    over raw host buffer sizes to identify the axis precisely. Derived values
+    remain a fallback for jagged axes. Within a source category choose a width
+    fitting every dtype. Conversions alone cannot establish a memory dtype.
+    Rolled reductions opt into unresolved extents; other callers stay static.
+    """
+    bs = env.block_sizes[block_id]
+    jagged = env.is_jagged_tile(block_id)
+    tile_extent = _to_sympy(bs.var)
+    extent = env.specialize_expr(
+        env.shape_env.replace(tile_extent if jagged else bs.numel)
+    )
+    if not jagged and not allow_symbolic and not extent.is_Integer:
+        return None
+    best_dtype = None
+    best_priority = (False, False, False, -1, 0)
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.target is language_load:
+                source_priority = 2
+            elif node.target is _host_tensor:
+                source_priority = 1
+            elif jagged:
+                source_priority = 0
+            else:
+                continue
+            val = node.meta.get("val")
+            if not isinstance(val, torch.Tensor) or val.ndim < 1:
+                continue
+            width = _cute_tile_seed_vec_width_for_dtype(val.dtype)
+            if source_priority == 0 and width <= 1:
+                continue
+            last = _to_sympy(val.shape[-1])
+            same_axis = last == tile_extent
+            # Memory > derived values; exact axis > coincidental buffer size;
+            # floating payload > mask/index; indexed load > raw buffer;
+            # FP32's V4 also fits FP16/BF16.
+            priority = (
+                source_priority > 0,
+                same_axis,
+                width > 1,
+                source_priority,
+                -width,
+            )
+            if priority <= best_priority:
+                continue
+            if (
+                not same_axis
+                and env.specialize_expr(env.shape_env.replace(last)) != extent
+            ):
+                continue
+            best_dtype, best_priority = val.dtype, priority
+    return best_dtype
+
+
+def _cute_tile_vector_axis(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    require_lane_layout: bool = False,
+) -> tuple[int, int, int, int | None] | None:
+    """Row/inner axes, vector width and static extent (absent for jagged)."""
+    spec = env.config_spec
+    if (
+        spec.matmul_facts
+        or len(spec.block_sizes) != 2
+        or spec.reduction_loops
+        or (spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1)
+    ):
+        return None
+    blocks = _cute_tile_row_blocks(env)
+    if blocks is None:
+        return None
+    outer_block_id, block_id = blocks
+    if block_id not in spec.cute_vector_widths.valid_block_ids() or (
+        require_lane_layout and block_id not in spec.cute_lane_layouts.valid_block_ids()
+    ):
+        return None
+    extent = _cute_static_block_extent(env, block_id)
+    if extent is None and not env.is_jagged_tile(block_id):
+        return None
+    vec = _cute_tile_seed_vec_width_for_dtype(
+        _cute_tile_inner_block_dtype(env, device_ir, block_id)
+    )
+    return (outer_block_id, block_id, vec, extent) if vec > 1 else None
+
+
+def _stride_one_accesses(
+    device_ir: DeviceIR,
+) -> Iterator[tuple[torch.Tensor, int, list[object]] | None]:
+    """Each load and store of ``device_ir`` as ``(tensor, its stride-1 dim,
+    the subscripts of its dims)``, ``None`` for one whose tensor or indices
+    are not plain.  An operand with no stride-1 dim (a broadcast, stride 0
+    everywhere) sets no lane axis and is skipped."""
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                language_load,
+                language_store,
+            ):
+                continue
+            tensor_node = node.args[0] if node.args else None
+            fake = (
+                tensor_node.meta.get("val")
+                if isinstance(tensor_node, torch.fx.Node)
+                else None
+            )
+            index_list = node.args[1] if len(node.args) >= 2 else None
+            if not isinstance(fake, torch.Tensor) or not isinstance(
+                index_list, (list, tuple)
+            ):
+                yield None
+                continue
+            stride1 = next(
+                (
+                    dim
+                    for dim in range(fake.ndim)
+                    if isinstance(fake.stride(dim), int) and fake.stride(dim) == 1
+                ),
+                None,
+            )
+            if stride1 is not None:
+                yield fake, stride1, [idx for idx in index_list if idx is not None]
+
+
+def _slice_reduction_blocks(
+    env: CompileEnvironment, fake: torch.Tensor, dim: int, subscript: object
+) -> tuple[object, list[int]] | None:
+    """``(extent, reduction blocks of that extent)`` of ``subscript``, a
+    unit-step slice of ``fake``'s ``dim``; ``None`` for any other subscript."""
+    if not isinstance(subscript, slice) or subscript.step not in (None, 1):
+        return None
+    size = compute_slice_size(subscript, fake.shape[dim])
+    return size, [
+        info.block_id
+        for info in env.block_sizes
+        if info.reduction
+        and isinstance(info.size, (int, torch.SymInt))
+        and env.known_equal(info.size, size)
+    ]
+
+
+def _cute_persistent_contiguous_block(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> tuple[int, torch.dtype, int] | None:
+    """The persistent block every load and store addresses at its tensor's
+    stride-1 dim through a unit-step slice, with the widest storage dtype
+    and the block's static extent.
+
+    ``None`` when some access addresses that dim with a tile, a gather or a
+    strided slice, when the slices resolve to different blocks, or when the
+    extent is not static.
+    """
+    block_id: int | None = None
+    dtype: torch.dtype | None = None
+    for access in _stride_one_accesses(device_ir):
+        if access is None:
+            return None
+        fake, stride1, subscripts = access
+        subscript = subscripts[stride1] if stride1 < len(subscripts) else None
+        sliced = _slice_reduction_blocks(env, fake, stride1, subscript)
+        if sliced is None:
+            return None
+        _, matches = sliced
+        if len(matches) != 1 or (block_id is not None and block_id != matches[0]):
+            return None
+        block_id = matches[0]
+        if dtype is None or fake.dtype.itemsize > dtype.itemsize:
+            dtype = fake.dtype
+    if block_id is None or dtype is None:
+        return None
+    numel = env.block_sizes[block_id].numel
+    if not isinstance(numel, (int, sympy.Integer)):
+        return None
+    return block_id, dtype, int(numel)
+
+
+def _wide_rows_outweigh_tile(
+    env: CompileEnvironment, device_ir: DeviceIR, tile_block: int, width: int
+) -> bool:
+    """Whether a load or store moves a row wider than ``width`` along its
+    tensor's stride-1 dim through a whole-dim slice (a 30522-wide row beside
+    its label in a folded cross-entropy backward) while no access that
+    ``tile_block`` tiles along its stride-1 dim spans such a row too (a
+    transpose's ``out[:, tile]`` stores its wide dim along the tile)."""
+
+    def wide(fake: torch.Tensor, dim: int, subscript: object) -> bool:
+        sliced = _slice_reduction_blocks(env, fake, dim, subscript)
+        if sliced is None:
+            return False
+        size, blocks = sliced
+        return (
+            bool(blocks)
+            and isinstance(size, (int, torch.SymInt))
+            and env.size_hint(size) > width
+        )
+
+    tile_var = _symint_sympy_expr(env.block_sizes[tile_block].var)
+    wide_row = False
+    for access in _stride_one_accesses(device_ir):
+        if access is None:
+            continue
+        fake, stride1, subscripts = access
+        if len(subscripts) != fake.ndim:
+            continue
+        subscript = subscripts[stride1]
+        tile = (
+            subscript.meta.get("val")
+            if isinstance(subscript, torch.fx.Node)
+            else subscript
+        )
+        if wide(fake, stride1, subscript):
+            wide_row = True
+        elif (
+            isinstance(tile, torch.SymInt)
+            and _symint_sympy_expr(tile) == tile_var
+            and any(
+                wide(fake, dim, other)
+                for dim, other in enumerate(subscripts)
+                if dim != stride1
+            )
+        ):
+            return False
+    return wide_row
+
+
+class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
+    """Seed a row-tiled, one-vector persistent reduction.
+
+    This targets the general shape of a small row tile sharing a short static
+    reduction: eight row threads, one 16-byte reduction fragment per thread,
+    and register reloads across repeated reduction sweeps.  It is deliberately
+    an autotuning seed only; no architecture has promoted it to the default.
+    """
+
+    name = "cute_persistent_subwarp_rows"
+    backend = "cute"
+    priority = 34
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    FULL_ROW_BLOCK_SIZE = 128
+    RECURRENT_STYLE_REDUCTION_SIZE = 128
+    RECURRENT_STYLE_REDUCTION_THREADS = 32
+    RECURRENT_STYLE_ROW_THREADS = 1
+    RECURRENT_STYLE_VECTOR_WIDTH = 4
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # The lane-splitting legality proof consumes exact runtime strides.
+        # Register this independently of seed generation so explicitly pinned
+        # configs and autotuner-disabled compilation remain cache-safe.
+        if cls._plan(env, device_ir) is None:
+            return frozenset()
+        # Exact thread dimensions and the static reduction extent suffice for
+        # the late integer interval proof; ``cute_proven_bounds`` stays an
+        # opt-in search knob (off by default).
+        enable_cute_proven_bounds(env.config_spec)
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int] | None:
+        spec = env.config_spec
+        blocks = cute_lone_row_reduction(
+            spec,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+            spec.cute_reduction_reloads,
+        )
+        if blocks is None:
+            return None
+        row_block_id, reduction_block_id = blocks
+        try:
+            reduction_size = int(env.block_sizes[reduction_block_id].numel)
+        except (TypeError, ValueError):
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_reduction_dtype(device_ir, reduction_size)
+        )
+        if vec <= 1 or not 32 <= reduction_size <= 256:
+            return None
+        if reduction_size % vec:
+            return None
+        reduction_threads = reduction_size // vec
+        if reduction_threads not in (4, 8, 16, 32):
+            return None
+        row_spec = cast("Any", spec.block_sizes[0])
+        if not row_spec.min_size <= 16 <= row_spec.max_size:
+            return None
+        return row_block_id, reduction_block_id, reduction_threads
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id, reduction_threads = plan
+        return cls._seed_config(
+            env,
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            row_block_size=16,
+        )
+
+    @classmethod
+    def _seed_config(
+        cls,
+        env: CompileEnvironment,
+        row_block_id: int,
+        reduction_block_id: int,
+        reduction_threads: int,
+        *,
+        row_block_size: int,
+        row_threads: int = 8,
+    ) -> Config:
+        reduction_size = int(env.block_sizes[reduction_block_id].numel)
+        vec = reduction_size // reduction_threads
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                env.config_spec.block_sizes, {row_block_id: row_block_size}
+            ),
+            "num_threads": _seq_config_list(
+                env.config_spec.num_threads,
+                {row_block_id: row_threads, reduction_block_id: reduction_threads},
+            ),
+            "cute_vector_widths": _seq_config_list(
+                env.config_spec.cute_vector_widths, {reduction_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                env.config_spec.cute_lane_layouts, {reduction_block_id: "blocked"}
+            ),
+            "cute_reduction_reloads": _seq_config_list(
+                env.config_spec.cute_reduction_reloads,
+                {reduction_block_id: "register"},
+            ),
+            "num_warps": max(1, row_threads * reduction_threads // 32),
+            "num_stages": 1,
+            "pid_type": "flat",
+        }
+        return Config(**seed)
+
+    @classmethod
+    def _recurrent_style_seed_config(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        row_block_id: int,
+        reduction_block_id: int,
+    ) -> Config | None:
+        reduction_size = int(env.block_sizes[reduction_block_id].numel)
+        if reduction_size != cls.RECURRENT_STYLE_REDUCTION_SIZE:
+            return None
+        dtype_vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_reduction_dtype(device_ir, reduction_size)
+        )
+        if dtype_vec < cls.RECURRENT_STYLE_VECTOR_WIDTH:
+            return None
+        if reduction_size % cls.RECURRENT_STYLE_VECTOR_WIDTH:
+            return None
+        reduction_threads = reduction_size // cls.RECURRENT_STYLE_VECTOR_WIDTH
+        if reduction_threads != cls.RECURRENT_STYLE_REDUCTION_THREADS:
+            return None
+        return cls._seed_config(
+            env,
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            row_block_size=16,
+            row_threads=cls.RECURRENT_STYLE_ROW_THREADS,
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        """Add recurrent-style, row-one, one-warp, and full-row schedules.
+
+        The recurrent-style sibling maps one row thread and 32 reduction
+        threads into a single-warp CTA with V=4 for K=128 updates.  The row-one
+        sibling maps all 16 rows onto independent 16-thread groups in an
+        eight-warp CTA.  This exposes enough resident warps to hide the
+        state-load latency of short recurrent updates.  A 128-row tile instead
+        maps eight groups across a short row loop, which amortizes invariant
+        setup, while a 32-row one-warp sibling targets latency-sensitive
+        workloads.  Reductions of at most 64 elements also get full 512-thread
+        CTAs at the planned group size and, on SM100+, at half of it (one
+        32-byte packet per thread), plus, where the fixed L2 store policy is
+        valid, 64- and 128-row CTAs that request read-only input packets
+        (``nc_l2_first``) and L2-retained output packets (``l2_evict_last``).
+        The existing 16-row seed stays rank zero and therefore preserves the
+        no-autotune/default behavior.
+        """
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id, reduction_threads = plan
+        primary = cls._seed_config(
+            env,
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            row_block_size=16,
+        )
+        row_spec = cast("Any", env.config_spec.block_sizes[0])
+        seeds = [primary]
+        recurrent_style = cls._recurrent_style_seed_config(
+            env,
+            device_ir,
+            row_block_id,
+            reduction_block_id,
+        )
+        if recurrent_style is not None:
+            seeds.append(recurrent_style)
+        if reduction_threads == 16:
+            seeds.append(
+                cls._seed_config(
+                    env,
+                    row_block_id,
+                    reduction_block_id,
+                    reduction_threads,
+                    row_block_size=16,
+                    row_threads=16,
+                )
+            )
+        one_warp_row_threads = max(1, 32 // reduction_threads)
+        if row_spec.max_size >= 32:
+            seeds.append(
+                cls._seed_config(
+                    env,
+                    row_block_id,
+                    reduction_block_id,
+                    reduction_threads,
+                    row_block_size=32,
+                    row_threads=one_warp_row_threads,
+                )
+            )
+        if row_spec.max_size >= cls.FULL_ROW_BLOCK_SIZE:
+            seeds.append(
+                cls._seed_config(
+                    env,
+                    row_block_id,
+                    reduction_block_id,
+                    reduction_threads,
+                    row_block_size=cls.FULL_ROW_BLOCK_SIZE,
+                )
+            )
+        if int(env.block_sizes[reduction_block_id].numel) <= 64:
+            # Short independent reductions can fit several groups in a warp.
+            # Cover full CTAs as well as the latency-oriented small row tiles.
+            # Halving the group threads doubles each fragment to one 32-byte
+            # packet, which only SM100+ loads and stores as one vector.
+            capability = env.config_spec.target_device_capability
+            wide_packets = capability is not None and capability >= (10, 0)
+            if env.config_spec.cute_l2_evict_last_store_policy_supported:
+                # Small CTAs can hide launch/tail latency.  Request read-only
+                # input packets and L2-retained output packets; the memory
+                # proofs keep ordinary accesses wherever they do not apply.
+                for row_block_size in (64, 128):
+                    if row_block_size > row_spec.max_size:
+                        continue
+                    cache_seed = cls._seed_config(
+                        env,
+                        row_block_id,
+                        reduction_block_id,
+                        reduction_threads // 2,
+                        row_block_size=row_block_size,
+                        row_threads=row_block_size,
+                    )
+                    cache_seed.config["load_eviction_policies"] = "nc_l2_first"
+                    cache_seed.config["cute_store_policy"] = "l2_evict_last"
+                    seeds.append(cache_seed)
+            group_sizes = (
+                (reduction_threads, reduction_threads // 2)
+                if wide_packets
+                else (reduction_threads,)
+            )
+            for group_threads in group_sizes:
+                row_threads = min(row_spec.max_size, 512 // group_threads)
+                seeds.append(
+                    cls._seed_config(
+                        env,
+                        row_block_id,
+                        reduction_block_id,
+                        group_threads,
+                        row_block_size=row_threads,
+                        row_threads=row_threads,
+                    )
+                )
+        return seeds
+
+
+class CuteAsyncPersistentSubwarpRowsHeuristic(AutotunerHeuristic):
+    """Compose the full-row reduction and async state-load schedules.
+
+    The component heuristics deliberately remain useful independently.  This
+    seed joins their measured settings only when the kernel has one 3-D root
+    whose innermost axis is the row tile.  No tensor names or model shapes are
+    part of the match.
+
+    ``xyz`` is included only when exact, metadata-specialized root extents prove
+    that every axis fits the CUDA y/z limit even at a one-element block.  That
+    stronger proof keeps every nearby block-size/loop-order candidate safe; the
+    global conservative ``allowed_pid_types`` restriction remains untouched.
+    """
+
+    name = "cute_async_persistent_subwarp_rows"
+    backend = "cute"
+    priority = 35
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int] | None:
+        if not CuteAsyncStateLoadHeuristic.is_eligible(env, device_ir):
+            return None
+        persistent_plan = CutePersistentSubwarpRowsHeuristic._plan(env, device_ir)
+        if persistent_plan is None:
+            return None
+        row_block_id, reduction_block_id, reduction_threads = persistent_plan
+        row_spec = cast("Any", env.config_spec.block_sizes[0])
+        full_row_size = CutePersistentSubwarpRowsHeuristic.FULL_ROW_BLOCK_SIZE
+        row_size = env.block_sizes[row_block_id].size
+        if (
+            row_spec.max_size < full_row_size
+            or not isinstance(row_size, (int, torch.SymInt))
+            or not isinstance(
+                row_extent := env.try_concretize_symint(row_size),
+                int,
+            )
+            or not 0 <= row_extent <= full_row_size
+        ):
+            return None
+
+        grid_fact = env.config_spec.kernel_grid_fact
+        if grid_fact is None or len(grid_fact.roots) != 1:
+            return None
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3 or root.block_ids[-1] != row_block_id:
+            return None
+        matching_loop_orders = [
+            spec
+            for spec in env.config_spec.loop_orders
+            if tuple(spec.block_ids) == root.block_ids
+        ]
+        if len(matching_loop_orders) != 1:
+            return None
+        return (
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            matching_loop_orders[0].block_id,
+        )
+
+    @staticmethod
+    def _metadata_specialized_xyz_is_safe(env: CompileEnvironment) -> bool:
+        """Prove every searchable 3-D launch stays within y/z limits.
+
+        Each program count is at most its full axis extent because every legal
+        block size is positive.  Requiring all three exact extents below the
+        y/z limit therefore remains valid if the tuner changes either the block
+        size or loop order around this seed.  ``try_concretize_symint`` accepts
+        backed input-shape symbols; ``CACHE_SPECIALIZATION_FACTS`` makes those
+        exact runtime shapes part of the bound-kernel cache key.
+        """
+
+        spec = env.config_spec
+        grid_fact = spec.kernel_grid_fact
+        if (
+            grid_fact is None
+            or len(grid_fact.roots) != 1
+            or "flat" not in spec.allowed_pid_types
+            or "input_tensor_metadata" not in env.compiler_fact_specialization_facts
+        ):
+            return False
+        (root,) = grid_fact.roots
+        if len(root.block_ids) != 3:
+            return False
+        if "xyz" not in spec.allowed_pid_types:
+            reason = spec.disallowed_pid_type_reasons.get("xyz", "")
+            if not reason.startswith("grid does not fit the y/z launch grid"):
+                return False
+
+        limit = get_max_y_grid()
+        for block_id in root.block_ids:
+            if not 0 <= block_id < len(env.block_sizes):
+                return False
+            block = env.block_sizes[block_id]
+            if block.reduction or not isinstance(block.size, (int, torch.SymInt)):
+                return False
+            extent = env.try_concretize_symint(block.size)
+            if not isinstance(extent, int) or not 0 <= extent < limit:
+                return False
+        return True
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # Async registration runs earlier in the CuTe registry.  Keep the exact
+        # input metadata in the cache key for both the async matcher and the
+        # optional backed-SymInt xyz proof.
+        return (
+            cls.CACHE_SPECIALIZATION_FACTS if cls._plan(env, device_ir) else frozenset()
+        )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        (
+            row_block_id,
+            reduction_block_id,
+            reduction_threads,
+            loop_order_block_id,
+        ) = plan
+        values = dict(
+            CutePersistentSubwarpRowsHeuristic._seed_config(
+                env,
+                row_block_id,
+                reduction_block_id,
+                reduction_threads,
+                row_block_size=CutePersistentSubwarpRowsHeuristic.FULL_ROW_BLOCK_SIZE,
+            ).config
+        )
+        values.update(
+            {
+                "loop_orders": _seq_config_list(
+                    env.config_spec.loop_orders,
+                    {loop_order_block_id: [1, 0, 2]},
+                ),
+            }
+        )
+        values.update(CuteAsyncStateLoadHeuristic._seed_overrides())
+        from ...cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+
+        values.update(
+            {
+                "cute_async_store_policy": (
+                    "l2_evict_last"
+                    if fixed_l2_evict_last_store_policy_supported(
+                        env.config_spec.target_device_capability,
+                        torch.version.cuda,
+                    )
+                    else "default"
+                ),
+                "cute_bf16x2_recurrence": True,
+            }
+        )
+        if cls._metadata_specialized_xyz_is_safe(env):
+            values["pid_type"] = "xyz"
+        return Config.from_dict(values)
+
+
+class CutePersistentLaneUnrollHeuristic(AutotunerHeuristic):
+    """Seed a masked persistent row whose lanes issue their loads first.
+
+    A persistent row whose length is not a power of two pads to the next one
+    and is masked, which keeps it off the vector-row and register-tile paths:
+    one warp walks it in rolled scalar lanes, each lane loading right before
+    its arithmetic, so a latency-bound row keeps one load in flight per
+    thread (better-benchmark's dual_dropout_residual_layernorm: two Philox
+    draws and a LayerNorm over 768 columns).
+    ``cute_lane_unroll`` issues the loads of that many lanes before any of
+    them computes.  The seed runs eight rows of one warp each, with register
+    reloads and eight lanes per load phase.  The knob's search choices open
+    on the kernel's structure (``cute_lone_row_reduction``), whatever its
+    extents, not on this seed.  It only seeds: a knob-on config may contract
+    a multiply-add the knob-off code keeps separate (see
+    ``cute_lane_unroll`` in ``Config``).
+    """
+
+    name = "cute_persistent_lane_unroll"
+    backend = "cute"
+    priority = 95
+    ROW_BLOCK_SIZE = 8
+    LANE_UNROLL = 8
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int] | None:
+        if not env.config_spec.supports_config_key("cute_lane_unroll"):
+            return None
+        row = _masked_persistent_row(env, cls.ROW_BLOCK_SIZE)
+        # The seed's one warp walks the row's live lanes; an odd count takes
+        # no unroll factor, so the knob would walk them rounded up to its
+        # multiple (``masked_row_lanes``), which the seed does not offer:
+        # whether those beat the rolled live lanes is the search's to find.
+        if row is None or not walks_live_lanes(
+            row[2], WARP_THREADS, proven_bounds=False, unroll=cls.LANE_UNROLL
+        ):
+            return None
+        return row[:2]
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id = plan
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {row_block_id: cls.ROW_BLOCK_SIZE}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {row_block_id: cls.ROW_BLOCK_SIZE, reduction_block_id: 32},
+            ),
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {reduction_block_id: "register"}
+            ),
+            "cute_lane_unroll": cls.LANE_UNROLL,
+        }
+        config = Config(**seed)
+        # Where normalization resets the knob, no lane loop of this layout
+        # takes it (``_cute_config_forms_lane_loop``), and the seed would be
+        # a plain layout.
+        if spec.normalized_config(config).config.get("cute_lane_unroll", 1) == 1:
+            return None
+        return config
+
+
+def _masked_persistent_row(
+    env: CompileEnvironment, row_block_size: int
+) -> tuple[int, int, int] | None:
+    """The row and reduction block ids and the row's length, for a kernel
+    whose one reduction runs persistent (no ``reduction_loops`` slot may roll
+    it, ``cute_lone_row_reduction``) over a static, masked row longer than a
+    warp, beside one tile axis whose block may be ``row_block_size``."""
+    spec = env.config_spec
+    blocks = cute_lone_row_reduction(spec, spec.cute_reduction_reloads)
+    if blocks is None:
+        return None
+    row_block_id, reduction_block_id = blocks
+    numel = env.specialize_expr(env.block_sizes[reduction_block_id].numel)
+    if not isinstance(numel, (int, sympy.Integer)):
+        return None
+    size = int(numel)
+    if size <= 32 or size & (size - 1) == 0:
+        return None
+    row_spec = cast("Any", spec.block_sizes[0])
+    if not row_spec.min_size <= row_block_size <= row_spec.max_size:
+        return None
+    return row_block_id, reduction_block_id, size
+
+
+class CutePersistentUnpaddedRowsHeuristic(AutotunerHeuristic):
+    """Seed a masked persistent row unpadded across several warps.
+
+    The row ``CutePersistentLaneUnrollHeuristic`` seeds walks its live lanes
+    on one warp.  ``cute_unpadded_rows`` instead runs it unpadded when
+    a whole number of warps, one vector per thread, covers it exactly: the
+    multi-warp vector row, whose packets load before the arithmetic and whose
+    sums combine across warps through shared memory, like Inductor's four
+    warps per 768-wide row.  The primary seed takes the widest vector the
+    row's narrowest loaded element allows (8 for bf16: 96 threads for 768
+    columns) that leaves whole warps, the alternate the next narrower one
+    (4: 192 threads); both run one row per CTA with register reloads.  Only
+    a row no ``reduction_loops`` slot may roll is seeded
+    (``_masked_persistent_row``), and no row an ``hl.reduce`` reduces, which
+    keeps its padding (``cute_user_reduce_block_ids``): a rollable row of the
+    same width (a plain softmax over 768 columns) takes the knob too, but no
+    seed offers it the whole-warp thread count, which the search's
+    power-of-two thread counts never reach.  The knob's search choices open
+    on the kernel's structure, not on these seeds.  They only seed: the
+    unpadded row sums in another order and contracts its multiply-adds
+    differently (see ``cute_unpadded_rows`` in ``Config``).
+    """
+
+    name = "cute_persistent_unpadded_rows"
+    backend = "cute"
+    priority = 96
+    ROW_BLOCK_SIZE = 1
+    # The primary layout and one alternate.
+    LAYOUTS = 2
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, list[tuple[int, int]]] | None:
+        """The row and reduction block ids and the exact ``(threads, vec)``
+        layouts, widest vector first."""
+        spec = env.config_spec
+        if not spec.supports_config_key("cute_unpadded_rows"):
+            return None
+        row = _masked_persistent_row(env, cls.ROW_BLOCK_SIZE)
+        if row is None:
+            return None
+        row_block_id, reduction_block_id, size = row
+        if (
+            reduction_block_id not in spec.cute_vector_widths.valid_block_ids()
+            or reduction_block_id in spec.cute_user_reduce_block_ids
+        ):
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_reduction_dtype(device_ir, size)
+        )
+        layouts: list[tuple[int, int]] = []
+        while vec > 1 and len(layouts) < cls.LAYOUTS:
+            threads = size // vec
+            if (
+                unpadded_row_layout(threads, vec, size)
+                and threads * cls.ROW_BLOCK_SIZE <= MAX_THREADS_PER_BLOCK
+            ):
+                layouts.append((threads, vec))
+            vec //= 2
+        if not layouts:
+            return None
+        return row_block_id, reduction_block_id, layouts
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id, layouts = plan
+        spec = env.config_spec
+        seeds: list[Config] = []
+        for threads, vec in layouts:
+            seed: dict[str, Any] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {row_block_id: cls.ROW_BLOCK_SIZE}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads,
+                    {row_block_id: cls.ROW_BLOCK_SIZE, reduction_block_id: threads},
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {reduction_block_id: vec}
+                ),
+                "cute_reduction_reloads": _seq_config_list(
+                    spec.cute_reduction_reloads, {reduction_block_id: "register"}
+                ),
+                "cute_unpadded_rows": True,
+            }
+            seeds.append(Config(**seed))
+        return seeds
+
+
+class CuteTileVecHeuristic(AutotunerHeuristic):
+    """Seed config for canonical tile kernels (softmax_two_pass etc.)
+    that drive their own explicit tile loop over the reduction axis.
+
+    Seeds the "wide reduction + per-thread vec" config: block_size=
+    [1, R] on the M and reduction axes (1 row per grid block), num_threads
+    sized so each thread owns one V-wide vector per trip (lane_extent = V),
+    cute_vector_widths=[1, V].  This lets the strategy hoist a single
+    LDG.64 / LDG.128 per outer-tile iter, lifting the kernel from scalar
+    LDG bandwidth.  Beside it, when the tile admits it and
+    ``cute_lane_layouts`` covers the tile, comes Helion-Triton's block:
+    2048 elements over 64 threads, so several vectors per thread, strided by
+    the thread count (``cute_lane_layouts`` ``strided``) so that a warp's
+    load reads adjacent vectors.  Blocked lanes would put a thread's own
+    vectors side by side and neighbouring threads a whole thread's span
+    apart (64 bytes for four 16-byte vectors), four times the L1 wavefronts
+    per load.
+
+    The heuristic fires when:
+    * The kernel has exactly 2 tile blocks (one outer row tile + one
+      inner reduction tile), no matmul facts, no rolled reductions.
+    * The inner tile has a stride-1 fp16/bf16/fp32 source tensor.
+    """
+
+    name = "cute_tile_vec"
+    backend = "cute"
+    priority = 40
+    # Helion-Triton's tile for these rows: two warps walk a 2048-element
+    # block, 32 elements per thread, which leaves the block's reductions a
+    # quarter as often as one vector per thread does.  Its lanes load each
+    # element once, since a later pass reuses the earlier one's loads
+    # (``cute/stash_lane_loads.py``).
+    WIDE_BLOCK = 2048
+    WIDE_THREADS = 64
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return _cute_tile_vector_axis(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return []
+        outer_block_id, inner_block_id, vec, _extent = axis
+        spec = env.config_spec
+        # Pick a reasonable inner block_size: prefer 1024 (matches
+        # SM100 warp + L2 hit cadence) when reachable, else cap at the
+        # inner tile's fragment.high.  ``num_threads`` is sized so the
+        # lane_extent equals V (one vec load per thread per outer iter).
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
+        block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
+        shapes = [(block_n, max(1, block_n // vec))]
+        if (
+            bn_high >= cls.WIDE_BLOCK
+            # Its lanes need the strided layout (see the class docstring).
+            and inner_block_id in spec.cute_lane_layouts.valid_block_ids()
+        ):
+            shapes.append((cls.WIDE_BLOCK, cls.WIDE_THREADS))
+        seeds: list[Config] = []
+        for block, threads in shapes:
+            seed: dict[str, Any] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {outer_block_id: 1, inner_block_id: block}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {inner_block_id: threads}
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {inner_block_id: vec}
+                ),
+            }
+            if block > threads * vec:
+                # Several V-wide chunks per thread: strided lanes give a
+                # warp's threads adjacent chunks.
+                seed["cute_lane_layouts"] = _seq_config_list(
+                    spec.cute_lane_layouts, {inner_block_id: "strided"}
+                )
+            seeds.append(Config(**seed))
+        return seeds
+
+
+class CuteScanTileHeuristic(AutotunerHeuristic):
+    """Seed for a 2-D grid tile scanned along one axis.
+
+    ``hl.associative_scan(fn, x[tile_rows, tile_cols], dim=0)`` (a segmented
+    reduction, a per-column prefix over a row tile) puts the scan on the
+    dependence-carrying axis and leaves the other axis embarrassingly
+    parallel.  The autotuner's natural winners split the scan axis over
+    threads, paying a shuffle scan per row and one scalar load per element.
+    Seed the layout that needs neither: one thread per V-wide strip of the
+    contiguous axis owning the whole scan axis (a carried in-register prefix,
+    no cross-thread traffic), 16-byte vector loads and, for atomic outputs,
+    16-byte vector atomics along the strip, and the scan lane loop unrolled
+    loads-first (``cute_lane_unroll``) so every row's loads are in flight
+    before the first row computes.  The unroll depth becomes a searchable
+    knob once seeded.  Seeds only layouts the vector protocol realises: the
+    strip is the innermost grid block and its extent is a multiple of the
+    vector width.
+    """
+
+    name = "cute_scan_tile"
+    backend = "cute"
+    priority = 39
+    SCAN_ROWS = 16
+    ALTERNATE_SCAN_ROWS = 32
+    # Column strips per CTA (one warp of 16-byte strips).
+    STRIP_THREADS = 32
+    # Shrink the row tile of a small problem until the grid holds at least
+    # this many CTAs per SM (a 2000-row input at 16 rows is 125 CTAs).
+    MIN_CTAS_PER_SM = 2
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.dtype] | None:
+        """``(scan_block_id, strip_block_id, dtype)`` when the kernel is a
+        single 2-D grid tile whose body scans a ``[scan, strip]``-shaped tile
+        along ``scan`` and loads such a tile from a 16/32-bit tensor
+        contiguous along ``strip``."""
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops:
+            return None
+        if len(spec.block_sizes) != 2 or any(
+            len(item.block_ids) != 1 for item in spec.block_sizes
+        ):
+            return None
+        if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
+            return None
+        block_ids = [item.block_ids[0] for item in spec.block_sizes]
+        if set(block_ids) != set(spec.grid_block_ids):
+            return None
+        for sequence in (
+            spec.num_threads,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+        ):
+            if not set(block_ids).issubset(sequence.valid_block_ids()):
+                return None
+        symbols = {
+            block_id: _symint_sympy_expr(env.block_sizes[block_id].var)
+            for block_id in block_ids
+        }
+
+        def block_of(size: object) -> int | None:
+            if not isinstance(size, torch.SymInt):
+                return None
+            expr = _symint_sympy_expr(size)
+            return next((b for b in block_ids if symbols[b] == expr), None)
+
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function" or node.target is not _associative_scan:
+                    continue
+                inputs = node.args[1]
+                dim = node.args[2]
+                first = (
+                    inputs[0]
+                    if isinstance(inputs, (tuple, list)) and inputs
+                    else inputs
+                )
+                value = (
+                    first.meta.get("val") if isinstance(first, torch.fx.Node) else None
+                )
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.ndim != 2
+                    or not isinstance(dim, int)
+                    or dim not in (-2, -1, 0, 1)
+                ):
+                    continue
+                dim %= 2
+                scan_block = block_of(value.shape[dim])
+                strip_block = block_of(value.shape[1 - dim])
+                if (
+                    scan_block is None
+                    or strip_block is None
+                    or scan_block == strip_block
+                ):
+                    continue
+                dtype = cls._strip_load_dtype(
+                    device_ir, scan_block, strip_block, symbols
+                )
+                if dtype is not None:
+                    return scan_block, strip_block, dtype
+        return None
+
+    @classmethod
+    def _strip_load_dtype(
+        cls,
+        device_ir: DeviceIR,
+        scan_block: int,
+        strip_block: int,
+        symbols: dict[int, sympy.Expr],
+    ) -> torch.dtype | None:
+        """dtype of a ``[scan, strip]`` (or transposed) tile load whose source
+        tensor is contiguous along the strip axis."""
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function" or node.target is not language_load:
+                    continue
+                loaded = node.meta.get("val")
+                tensor_node = node.args[0] if node.args else None
+                tensor = (
+                    tensor_node.meta.get("val")
+                    if isinstance(tensor_node, torch.fx.Node)
+                    else None
+                )
+                if (
+                    not isinstance(loaded, torch.Tensor)
+                    or loaded.ndim != 2
+                    or loaded.dtype
+                    not in (torch.float16, torch.bfloat16, torch.float32)
+                    or not isinstance(tensor, torch.Tensor)
+                    or tensor.ndim != 2
+                ):
+                    continue
+                shape = [
+                    _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else None
+                    for size in loaded.shape
+                ]
+                for strip_dim in (0, 1):
+                    if (
+                        shape[strip_dim] == symbols[strip_block]
+                        and shape[1 - strip_dim] == symbols[scan_block]
+                        and tensor.stride(strip_dim) == 1
+                    ):
+                        return loaded.dtype
+        return None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def _seed(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rows: int
+    ) -> Config | None:
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        scan_block, strip_block, dtype = match
+        spec = env.config_spec
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if vec <= 1:
+            return None
+        strip_spec = spec.block_sizes.block_id_lookup(strip_block)
+        scan_spec = spec.block_sizes.block_id_lookup(scan_block)
+        # The tile vector protocol (16-byte packets, the vector atomic flush)
+        # runs on the innermost grid block and needs the strip extent to be a
+        # multiple of the vector width; a strip elsewhere (a column-major
+        # input) or of another width (98 columns) would seed scalar code.
+        if strip_block != device_ir.grid_block_ids[0][-1] or strip_spec.size_hint % vec:
+            return None
+        strip = min(strip_spec.max_size, cls.STRIP_THREADS * vec)
+        rows = min(rows, scan_spec.max_size)
+        if strip % vec or strip < vec or rows < 2:
+            return None
+        ctas_wanted = cls.MIN_CTAS_PER_SM * max(spec.num_sm, 1)
+        strips = -(-max(strip_spec.size_hint, 1) // strip)
+        while (
+            rows > 2 and -(-max(scan_spec.size_hint, 1) // rows) * strips < ctas_wanted
+        ):
+            rows //= 2
+        unroll = max(
+            choice
+            for choice in _CUTE_LANE_UNROLL_CHOICES
+            if choice <= rows and rows % choice == 0
+        )
+        sizes = {scan_block: rows, strip_block: strip}
+        seed: dict[str, Any] = {
+            "block_sizes": [sizes[item.block_ids[0]] for item in spec.block_sizes],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {scan_block: 1, strip_block: strip // vec}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {strip_block: vec}
+            ),
+            "cute_lane_unroll": unroll,
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        return cls._seed(env, device_ir, cls.SCAN_ROWS)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        if primary is None:
+            return None
+        alternate = cls._seed(env, device_ir, cls.ALTERNATE_SCAN_ROWS)
+        if alternate is None or alternate.config == primary.config:
+            return [primary]
+        return [primary, alternate]
+
+
+class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
+    """Sibling seed for ``CuteTileVecHeuristic`` favouring a warp-sized
+    thread block over the wider 1024-thread lattice.
+
+    For tile kernels that reduce across the inner axis per outer-tile
+    iter (softmax_two_pass, RMS norm, etc.), the cross-thread combine
+    is the dominant cost. With ``num_threads <= 32`` the reduction
+    strategy lowers to ``cute.arch.warp_reduction`` (one warp-shuffle,
+    no shared memory, no CTA-wide barrier); with ``num_threads > 32``
+    it lowers to ``_cute_grouped_reduce_shared_two_stage`` which costs
+    two ``sync_threads`` per reduction. For wide reduction axes the
+    larger number of outer iters is more than offset by the per-iter
+    savings.
+
+    Seeds ``block_sizes=[1, V * 32]``, ``num_threads=[0, 32]``,
+    ``cute_vector_widths=[1, V]`` so each thread owns V contiguous
+    elements (one vec load per outer iter) and the cross-thread
+    reduction stays inside a single warp. Applies only when the
+    reduction extent is large enough to amortise the launch cost of
+    many CTAs (each row is a CTA) and the dtype admits a vec >= 2.
+    """
+
+    name = "cute_tile_vec_warp_reduce"
+    backend = "cute"
+    priority = 41
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return False
+        _, inner_block_id, vec, _extent = axis
+        spec = env.config_spec
+        # Only worth it when the reduction extent is wide enough that
+        # the warp-only reduction's many outer iters still amortise
+        # against the launch cost (and an autotuner-picked warp lattice
+        # can hold the row).  We use the inner block fragment's high
+        # bound as a proxy for the reduction extent.
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
+        return bn_high >= vec * 32
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return None
+        outer_block_id, inner_block_id, vec, _extent = axis
+        spec = env.config_spec
+        # Each thread owns V contiguous elements; one warp = 32 threads
+        # = 32 * V elements per outer-tile iter. Cap by the fragment's
+        # high bound so the seed is reachable for short reduction axes.
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
+        block_n = vec * 32
+        if bn_high < block_n:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: block_n}
+            ),
+            "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
+    """Seed collective operand staging for independent contractions."""
+
+    name = "cute_collective_matmul"
+    backend = "cute"
+    priority = 15
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # Copy legality needs guarded strides even when heuristic seeds are
+        # disabled and the caller explicitly selects a collective config.
+        if cls._axes(env, device_ir):
+            enable_cute_proven_bounds(env.config_spec)
+            return cls.CACHE_SPECIALIZATION_FACTS
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        # Eligibility is cheap; get_seed_configs performs the placement and
+        # lowering proofs once when the registry requests the candidates.
+        return bool(env.config_spec.matmul_facts)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @staticmethod
+    def _axes(
+        env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[tuple[int, int, int, int], ...]:
+        """The consistent (m, n, k, factor) geometry of the placed contractions.
+
+        This is the geometry alone: it registers the proven-bounds knob and
+        the stride facts an explicit collective config relies on, whether or
+        not any site passes the structural proofs that gate the seeds.
+        """
+        return CuteCollectiveMatmulHeuristic._placements(env, device_ir)[0]
+
+    @staticmethod
+    def _placements(
+        env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[
+        tuple[tuple[int, int, int, int], ...],
+        tuple[tuple[MatmulFact, tuple[int, ...], int, int], ...],
+    ]:
+        """Geometry axes with each placed fact's root, K block and packing."""
+        placements = cute_matmul_root_placements(env, device_ir)
+        if not placements:
+            return (), ()
+        axes = []
+        sites: list[tuple[MatmulFact, tuple[int, ...], int, int]] = []
+        occupied: dict[int, tuple[int, ...]] = {}
+        roots: dict[tuple[int, ...], tuple[int, int]] = {}
+        factors: dict[int, int] = {}
+        block_specs = {
+            block_id: item
+            for item in env.config_spec.block_sizes
+            for block_id in item.block_ids
+        }
+        for fact, root in placements:
+            m, n = fact.m_block_id, fact.n_block_id
+            axis = contraction_axis_for_fact(env, device_ir, fact)
+            k, factor = (None, 1) if axis is None else (axis.block_id, axis.factor)
+            if (
+                m is None
+                or n is None
+                or k is None
+                or len({m, n, k}) != 3
+                or fact.lhs_ndim not in (2, 3)
+                or fact.rhs_ndim != fact.lhs_ndim
+                or fact.lhs_dtype not in (torch.float16, torch.bfloat16, torch.float32)
+                or fact.rhs_dtype != fact.lhs_dtype
+                or fact.lhs_dtype == torch.float32
+                and (
+                    not cute_fp32_dot_uses_tf32()
+                    or env.config_spec.target_device_capability is None
+                    or env.config_spec.target_device_capability[0] < 8
+                )
+                or fact.lhs_ndim == 3
+                and not all(
+                    (item := block_specs.get(block_id)) is not None
+                    and item.max_size == 1
+                    for block_id in root
+                    if block_id not in (m, n)
+                )
+                or n not in root
+                or k in root
+                or root in roots
+                and roots[root] != (m, n)
+                or any(
+                    block_id in occupied and occupied[block_id] != root
+                    for block_id in (m, n, k)
+                )
+                or k in factors
+                and factors[k] != factor
+            ):
+                return (), ()
+            if (m, n, k, factor) not in axes:
+                axes.append((m, n, k, factor))
+            sites.append((fact, root, k, factor))
+            roots[root] = (m, n)
+            occupied.update(dict.fromkeys((m, n, k), root))
+            factors[k] = factor
+        return tuple(axes), tuple(sites)
+
+    @staticmethod
+    def _gathered_candidate(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """A cheap structural superset of the late gathered-row proof.
+
+        This only seeds direct rank-2 gathered A and rank-3 group-indexed B.
+        Complete effects, masks, alignment, zero seed and scatter equivalence
+        are proved by generated-AST admission before this schedule can run.
+        """
+        placements = cute_matmul_root_placements(env, device_ir)
+        if len(placements) != 1:
+            return False
+        fact, root = placements[0]
+        if fact.m_block_id in root or len(root) != 2:
+            return False
+        contractions = [
+            node
+            for graph in device_ir.graphs
+            for node in graph.graph.nodes
+            if node.op == "call_function"
+            and node.target is torch.ops.aten.addmm.default
+        ]
+        if len(contractions) != 1:
+            return False
+        node = contractions[0]
+        operands = node.args[1:3]
+        if any(
+            not isinstance(operand, torch.fx.Node)
+            or operand.target is not language_load
+            or not isinstance(operand.args[0], torch.fx.Node)
+            for operand in operands
+        ):
+            return False
+        lhs, rhs = cast("tuple[torch.fx.Node, torch.fx.Node]", operands)
+        lhs_base, rhs_base = lhs.args[0], rhs.args[0]
+        assert isinstance(lhs_base, torch.fx.Node) and isinstance(
+            rhs_base, torch.fx.Node
+        )
+        lhs_tensor, rhs_tensor = lhs_base.meta.get("val"), rhs_base.meta.get("val")
+        indices = lhs.args[1]
+        if (
+            not isinstance(lhs_tensor, torch.Tensor)
+            or not isinstance(rhs_tensor, torch.Tensor)
+            or (lhs_tensor.ndim, rhs_tensor.ndim) != (2, 3)
+            or not isinstance(indices, (tuple, list))
+            or len(indices) != 2
+            or not isinstance(indices[0], torch.fx.Node)
+        ):
+            return False
+        gathered_rows = indices[0].meta.get("val")
+        return (
+            isinstance(gathered_rows, torch.Tensor)
+            and gathered_rows.ndim == 1
+            and gathered_rows.dtype == torch.int32
+        )
+
+    @staticmethod
+    def _bounded_k_seeds(
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        axes: tuple[tuple[int, int, int, int], ...],
+        seeds: list[Config],
+    ) -> tuple[list[Config], tuple[str, ...]]:
+        """Explore config-owned outer chunks together with the MMA geometry.
+
+        A collective seed at the default outer chunk may launch only a few
+        CTAs. Mutating the chunk after the search has selected a scalar tile
+        does not recover the collective's coordinated M/N/thread settings.
+        Follow the compiler's config-expression provenance, independent of
+        user parameter names, to seed both choices together.
+        """
+
+        def keys(expression: ConfigValueExpression) -> set[str]:
+            result: set[str] = set()
+            for argument in expression.arguments:
+                if isinstance(argument, str):
+                    result.add(argument)
+                elif isinstance(argument, ConfigValueExpression):
+                    result.update(keys(argument))
+            return result
+
+        spec = env.config_spec
+        blocks = {
+            item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
+        }
+        root_ids = {block_id for root in device_ir.grid_block_ids for block_id in root}
+        default = spec._base_default_config()
+        result = []
+        parameters: list[str] = []
+        for _m, _n, k, _factor in axes:
+            if k not in blocks:
+                continue
+            bound_id = blocks[k].bounded_by_block_id
+            if bound_id is None or bound_id not in root_ids:
+                continue
+            source = env.block_sizes[bound_id].block_size_source
+            if not isinstance(source, FixedBlockSizeSource) or not isinstance(
+                source.value, torch.SymInt
+            ):
+                continue
+            expression = env.config_value_expressions.get(
+                _symint_sympy_expr(source.value)
+            )
+            if expression is None:
+                continue
+            parameter_keys = keys(expression)
+            if len(parameter_keys) != 1:
+                continue
+            parameter = next(iter(parameter_keys))
+            fragment = spec.user_defined_tunables[parameter]
+            values = fragment.search_values(limit=32)
+            if values is None:
+                continue
+            for seed in seeds:
+                if seed.get("cute_collective_copy") == "scalar":
+                    continue
+                inner = spec.block_sizes.config_get(seed.block_sizes, k)
+                assert isinstance(inner, int)
+                for value in values:
+                    if (
+                        type(value) is not int
+                        or value <= 0
+                        or value == default[parameter]
+                    ):
+                        continue
+                    candidate = Config.from_dict(
+                        default.config | seed.config | {parameter: value}
+                    )
+                    if expression.evaluate(candidate) >= inner:
+                        result.append(
+                            Config.from_dict(seed.config | {parameter: value})
+                        )
+                        if parameter not in parameters:
+                            parameters.append(parameter)
+        return result, tuple(parameters)
+
+    @staticmethod
+    def _interleave_bounded_k_seeds(
+        spec: ConfigSpec,
+        seeds: list[Config],
+        parameters: tuple[str, ...],
+    ) -> list[Config]:
+        """Expose compound schedules before the initial-population cutoff.
+
+        The seed generator nests geometries, pipelines, and then config-owned
+        K chunks. Taking its prefix can test every pipelined geometry only at
+        the default chunk, even though all the coupled choices exist later.
+        Register-produced A can additionally require native seed reuse,
+        vector recipes, cooperative epilogues, and proved bounds together.
+        FP32 native MMA can instead convert vector register loads directly,
+        avoiding an asynchronous copy's raw shared-memory staging. Rotate its
+        paired copy/recipe choices before repeating geometries. When the TMEM
+        storage alternative is present, rotate through complete
+        schedules as well as compute/copy/depth/chunk groups, retaining the
+        ranked geometry order within each. This only reorders existing seeds;
+        the first seed, default promotion, other heuristics, and search budget
+        stay unchanged. Unrelated user knobs never supply a grouping dimension.
+        """
+        tmem_operand_schedules = any(
+            seed.get("cute_collective_tmem_a", False) for seed in seeds
+        )
+        register_recipe_schedules = any(
+            seed.get("cute_collective_compute") == "tcgen05"
+            and seed.get("cute_collective_copy") == "scalar"
+            and seed.get("cute_collective_recipe") in ("vector", "vector_unrolled")
+            for seed in seeds
+        )
+        packet_schedules = any(
+            seed.get("cute_collective_operand_packets", False) for seed in seeds
+        )
+        if (
+            not parameters
+            and not tmem_operand_schedules
+            and not register_recipe_schedules
+            and not packet_schedules
+        ):
+            return seeds
+        default = spec._base_default_config()
+        groups: dict[tuple[object, ...], list[Config]] = {}
+        for seed in seeds:
+            key = (
+                seed.get("cute_collective_compute", "warp"),
+                seed.get("cute_collective_copy", "scalar"),
+                seed.get("cute_collective_stages", 1),
+                *(seed.get(parameter, default[parameter]) for parameter in parameters),
+            )
+            if tmem_operand_schedules:
+                key += (
+                    seed.get("cute_collective_native_seeded", False),
+                    seed.get("cute_collective_recipe", "scalar"),
+                    seed.get("cute_collective_epilogue", "scalar"),
+                    seed.get("cute_collective_tmem_seed", False),
+                    seed.get("cute_proven_bounds", False),
+                    seed.get("cute_collective_tmem_a", False),
+                )
+            elif register_recipe_schedules:
+                key += (seed.get("cute_collective_recipe", "scalar"),)
+            if packet_schedules:
+                key += (seed.get("cute_collective_operand_packets", False),)
+            groups.setdefault(key, []).append(seed)
+        return [
+            seed
+            for row in zip_longest(*groups.values())
+            for seed in row
+            if seed is not None
+        ]
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        # The collective proof imports DeviceIR, which imports the runtime
+        # kernel while this registry is being initialized.
+        from ...collective_matmul import fact_admits_collective_site
+        from ...collective_matmul import has_collective_native_seed_candidate
+        from ...collective_matmul import has_collective_tmem_operand_candidate
+
+        spec = env.config_spec
+        # Those search families do not carry collective controls. Their
+        # flatten/unflatten path would silently turn these into unrelated
+        # native-MMA seeds instead of measuring the requested collective.
+        if spec.tcgen05.search_enabled or spec.cute_flash_search_enabled:
+            return []
+        axes, sites = cls._placements(env, device_ir)
+        if not axes:
+            return []
+        # A consistent geometry does not make a seed useful: when no placed
+        # contraction passes the lowering's structural proofs (for example a
+        # full-slice K accumulating a serial loop's carry, or operands indexed
+        # by that loop), every seed would fail at code generation. Only the
+        # seeds are withheld; ``register_facts`` keeps the geometry's knob and
+        # cache facts for explicit configs.
+        if not any(
+            fact_admits_collective_site(
+                env, device_ir, fact, root=root, k_block_id=k, k_factor=factor
+            )
+            for fact, root, k, factor in sites
+        ):
+            return []
+        blocks = {
+            item.block_id: item for item in spec.block_sizes if len(item.block_ids) == 1
+        }
+        axis_ids = {block_id for m, n, k, _ in axes for block_id in (m, n, k)}
+        non_matmul_axes = blocks.keys() - axis_ids
+        matmul_roots = {root for _, root, _, _ in sites}
+        # A sibling reduction can claim an extra CUDA thread axis. Preserve
+        # existing epilogue admission within the matmul's own root.
+        reduction = spec.reduction_kernel_fact
+        grid = spec.kernel_grid_fact
+        if reduction is not None and grid is not None:
+            for item in reduction.reductions:
+                root = grid.group_for_graph(item.graph_id)
+                if root not in matmul_roots:
+                    log.debug(
+                        "Withholding collective seeds: reduction graph %s has %s",
+                        item.graph_id,
+                        f"sibling root {root}" if root else "no attributed root",
+                    )
+                    return []
+        # Only separate roots may retain ordinary tile defaults. A non-MMA
+        # axis nested under a matmul still shares its collective thread layout.
+        singleton_axes = {
+            block_id
+            for path in spec.cute_tile_loop_paths
+            if path[0] in matmul_roots
+            for level in path
+            for block_id in level
+            if block_id in non_matmul_axes
+        }
+        if any(blocks[block_id].max_size != 1 for block_id in singleton_axes):
+            return []
+        fp32_inputs = any(
+            fact.lhs_dtype == torch.float32 for fact, _root, _, _ in sites
+        )
+        fixed_k = axis_ids - set(blocks)
+        if any(
+            block_id not in {k for _, _, k, _ in axes}
+            or not env.block_sizes[block_id].reduction
+            or not env.block_sizes[block_id].numel.is_Integer
+            or not 1 < int(env.block_sizes[block_id].numel) <= 128
+            for block_id in fixed_k
+        ):
+            return []
+        fragments = {
+            block_id: item._fragment(spec) for block_id, item in blocks.items()
+        }
+        seeded_native = has_collective_native_seed_candidate(env, device_ir)
+        result = []
+        non_matmul_defaults = {
+            block_id: fragments[block_id].default() for block_id in non_matmul_axes
+        }
+        for bm, bn, bk in (
+            (64, 32, 64),
+            (64, 64, 64),
+            (32, 32, 64),
+            (32, 32, 32),
+            (128, 32, 64),
+            (64, 32, 32),
+            (128, 64, 128),
+            (64, 64, 128),
+            (32, 64, 32),
+            (32, 64, 64),
+        ):
+            if any(bk % factor for _, _, _, factor in axes):
+                continue
+            values = {
+                block_id: value
+                for m, n, k, factor in axes
+                for block_id, value in zip(
+                    (m, n, k), (bm, bn, bk // factor), strict=True
+                )
+                if block_id in blocks
+            }
+            threads = {
+                block_id: value
+                for m, n, k, _ in axes
+                for block_id, value in zip((m, n, k), (128 // bn, bn, 1), strict=True)
+            }
+            values.update(non_matmul_defaults)
+            if not all(
+                fragments[block_id].low <= value <= fragments[block_id].high
+                for block_id, value in values.items()
+            ):
+                continue
+            copy_modes = (
+                ("scalar",)
+                if any(factor > 1 for _, _, _, factor in axes)
+                else ("scalar", "async", "async_cached")
+            )
+            for copy in copy_modes:
+                seed = Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(spec.block_sizes, values),
+                        "num_threads": _seq_config_list(spec.num_threads, threads),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths,
+                            dict.fromkeys(axis_ids | singleton_axes, 1),
+                        ),
+                        "cute_lane_layouts": _seq_config_list(
+                            spec.cute_lane_layouts,
+                            dict.fromkeys(axis_ids | singleton_axes, "blocked"),
+                        ),
+                        "cute_collective_mma": True,
+                        "cute_collective_copy": copy,
+                    }
+                )
+                if (
+                    fp32_inputs
+                    and bm in (64, 128)
+                    and spec.target_device_capability is not None
+                    and spec.target_device_capability[0] == 10
+                ):
+                    # Retain the established native candidates and ordering;
+                    # the warp alternative also admits a smaller M32 tile.
+                    result.append(
+                        Config.from_dict(
+                            seed.config | {"cute_collective_compute": "tcgen05"}
+                        )
+                    )
+                result.append(seed)
+            if (
+                bm in (64, 128)
+                and spec.target_device_capability is not None
+                and spec.target_device_capability[0] == 10
+            ):
+                # Native MMA consumes the same generic shared recipes, including
+                # the scalar fallback for transformed or unaligned operands.
+                native_seed = Config.from_dict(
+                    result[-1].config | {"cute_collective_compute": "tcgen05"}
+                )
+                if not fp32_inputs:
+                    result.append(native_seed)
+                if seeded_native:
+                    result.append(
+                        Config.from_dict(
+                            native_seed.config | {"cute_collective_native_seeded": True}
+                        )
+                    )
+        if (
+            len(axes) == 1
+            and axes[0][3] == 1
+            and spec.target_device_capability is not None
+            and spec.target_device_capability[0] == 10
+            and cls._gathered_candidate(env, device_ir)
+        ):
+            m, n, k, _factor = axes[0]
+            base = next(
+                (
+                    seed
+                    for seed in result
+                    if spec.block_sizes.config_get(seed.block_sizes, m) == 128
+                    and spec.block_sizes.config_get(seed.block_sizes, n) == 32
+                    and spec.block_sizes.config_get(seed.block_sizes, k) == 64
+                ),
+                None,
+            )
+            if base is not None:
+                result.extend(
+                    Config.from_dict(
+                        base.config
+                        | {
+                            "cute_collective_compute": "tma_gather",
+                            "cute_gathered_mma_n": columns,
+                            "cute_gathered_mma_stages": stages,
+                        }
+                    )
+                    for columns in (128, 256, 512)
+                    for stages in (2, 3, 4)
+                    if columns != 512 or stages == 2
+                )
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_stages": stages})
+                for seed in result
+                if seed.get("cute_collective_compute", "warp") == "warp"
+                and seed.get("cute_collective_copy") == "async_cached"
+                for stages in (2, 4)
+            ]
+        )
+        bounded_seeds, bounded_parameters = cls._bounded_k_seeds(
+            env, device_ir, axes, result
+        )
+        result.extend(bounded_seeds)
+        # Keep register-vector recipe traversal paired with a complete MMA
+        # geometry. Unrolling is a separate search choice because its register
+        # pressure can outweigh the saved loop and address instructions.
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_recipe": recipe})
+                for seed in result
+                if (
+                    seed.get("cute_collective_copy") == "async_cached"
+                    or (
+                        fp32_inputs
+                        and seed.get("cute_collective_compute") == "tcgen05"
+                        and seed.get("cute_collective_copy") == "scalar"
+                    )
+                )
+                and seed.get("cute_collective_compute", "warp") != "tma_gather"
+                and seed.get("cute_collective_stages", 1) == 1
+                for recipe in ("vector", "vector_unrolled")
+            ]
+        )
+        # Pair cooperative epilogues with complete copy/compute geometries.
+        # Keep scalar epilogues available when repartitioning increases register
+        # pressure or the output's stride/mask proof cannot vectorize stores.
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_epilogue": epilogue})
+                for seed in result
+                if seed.get("cute_collective_recipe") == "vector_unrolled"
+                for epilogue in ("vector", "vector_unrolled")
+            ]
+        )
+        # A dependent native contraction can carry its FP32 seed directly
+        # through TMEM. Keep the shared route available as a search alternative.
+        result.extend(
+            [
+                Config.from_dict(seed.config | {"cute_collective_tmem_seed": True})
+                for seed in result
+                if seed.get("cute_collective_compute") == "tcgen05"
+                and seed.get("cute_collective_native_seeded", False)
+                and seed.get("cute_collective_recipe") == "vector_unrolled"
+                and seed.get("cute_collective_epilogue") == "vector_unrolled"
+            ]
+        )
+        if spec.cute_proven_bounds_enabled:
+            result.extend(
+                [
+                    Config.from_dict(seed.config | {"cute_proven_bounds": True})
+                    for seed in result
+                    if seed.get("cute_collective_recipe") == "vector_unrolled"
+                    and seed.get("cute_collective_epilogue") == "vector_unrolled"
+                ]
+            )
+        if (
+            not fp32_inputs
+            and all(factor == 1 for _m, _n, _k, factor in axes)
+            and has_collective_tmem_operand_candidate(device_ir.graphs)
+        ):
+            # TMEM A changes register ownership as well as storage. Couple it
+            # to complete native/vector geometries, retaining seed reuse and
+            # proven bounds when available, rather than waiting for unrelated
+            # coordinate mutations to discover the full schedule.
+            result.extend(
+                [
+                    Config.from_dict(seed.config | {"cute_collective_tmem_a": True})
+                    for seed in result
+                    if seed.get("cute_collective_compute") == "tcgen05"
+                    and seed.get("cute_collective_recipe") == "vector_unrolled"
+                    and seed.get("cute_collective_epilogue") == "vector_unrolled"
+                ]
+            )
+        if fp32_inputs:
+            # Store four already-rounded operand words together. This can save
+            # shared instructions/bank conflicts, but changes register lifetime;
+            # retain the scalar stores and both recipe loop schedules.
+            result.extend(
+                [
+                    Config.from_dict(
+                        deepcopy(seed.config)
+                        | {"cute_collective_operand_packets": True}
+                    )
+                    for seed in result
+                    if seed.get("cute_collective_recipe")
+                    in ("vector", "vector_unrolled")
+                    and seed.get("cute_collective_copy") == "scalar"
+                    and seed.get("cute_collective_stages", 1) == 1
+                    and seed.get("cute_collective_compute", "warp") != "tma_gather"
+                ]
+            )
+        if _half_atomic_output(device_ir):
+            # A half output written by atomic adds has no native scalar
+            # atomic on sm_100 (``atom.add.noftz.f16`` is a compare-and-swap
+            # loop there); only the vector epilogue's packed ``f16x2`` /
+            # ``bf16x2`` reductions run at speed, so every warp seed with a
+            # scalar epilogue also carries a vector twin.
+            result.extend(
+                [
+                    Config.from_dict(
+                        seed.config | {"cute_collective_epilogue": epilogue}
+                    )
+                    for seed in result
+                    if seed.get("cute_collective_epilogue", "scalar") == "scalar"
+                    and seed.get("cute_collective_compute", "warp") == "warp"
+                    for epilogue in ("vector_unrolled", "vector")
+                ]
+            )
+        return cls._interleave_bounded_k_seeds(
+            spec, dedupe_configs(result), bounded_parameters
+        )
+
+
+def _half_atomic_output(device_ir: DeviceIR) -> bool:
+    """Whether a device atomic add updates a float16 / bfloat16 tensor (one
+    the fp32 output promotion did not widen)."""
+    from .....language import atomic_add
+
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target is not atomic_add:
+                continue
+            target = node.args[0]
+            value = target.meta.get("val") if isinstance(target, Node) else None
+            if isinstance(value, torch.Tensor) and value.dtype in (
+                torch.float16,
+                torch.bfloat16,
+            ):
+                return True
+    return False
+
+
+def _cute_reread_cache_policies(
+    spec: ConfigSpec, inner_block_ids: tuple[int, ...]
+) -> list[str]:
+    # A repeated input benefits from retention on the earlier passes and
+    # eviction on the last. Seed this alongside ordinary cache policies;
+    # the compiler never infers a cache choice from a kernel name or size.
+    cache_policies = [""] * spec.load_eviction_policies.length
+    tensor_passes: dict[str, list[tuple[int, int]]] = {}
+    for fact in spec.memory_op_facts:
+        axes = set(fact.subscript_block_ids).intersection(inner_block_ids)
+        if (
+            fact.kind == "load"
+            and fact.eviction_index is not None
+            and fact.tensor_name is not None
+            and len(axes) == 1
+        ):
+            pass_index = inner_block_ids.index(next(iter(axes)))
+            tensor_passes.setdefault(fact.tensor_name, []).append(
+                (pass_index, fact.eviction_index)
+            )
+    for accesses in tensor_passes.values():
+        passes = {pass_index for pass_index, _ in accesses}
+        if len(passes) > 1:
+            last_pass = max(passes)
+            for pass_index, eviction_index in accesses:
+                cache_policies[eviction_index] = (
+                    "l1_l2_first" if pass_index == last_pass else "l1_l2_last"
+                )
+    return cache_policies
+
+
+def _cute_streaming_input_cache_policies(
+    spec: ConfigSpec,
+    device_ir: DeviceIR,
+    config: Config,
+    reduction_block_id: int,
+    tile_block_id: int,
+    row_elements: int,
+    line_bytes: int,
+) -> list[str]:
+    """``l1_l2_first`` on the load slots of ``config`` that stream an input
+    through once, "" on the others.  Such a load feeds the
+    ``reduction_block_id`` reduction once, addresses every grid axis with no
+    axis broadcast (a zero stride), and is the code's only load of its
+    tensor, so each CTA reads its own slice of the input, once; and the
+    CTA's rows of ``row_elements`` contiguous elements, the
+    ``tile_block_id`` tile along the tensor's stride-1 dim, own the L2 lines
+    (``line_bytes``) they read (``_rows_own_their_lines``), so no
+    neighboring CTA reads them.  A tile wider than that dim counts at its
+    full width, though its CTA reads rows of the dim's extent that can share
+    lines with the neighboring CTAs: the policy still ran the wide seeds of
+    a [64, 784, 4, 40] float32 grouped mean (64-column tiles, 160-byte rows
+    640 bytes apart) 4-5% faster on B200 with a cold L2.  (An input whose
+    stride-1 dim another axis indexes gets no policy: its CTA reads one
+    element per line, or the whole reduced extent, which the seed does not
+    size.)  The slots are numbered as the code for ``config`` lowers the
+    loads (``DeviceIR.config_memory_op_facts``): a reduction rolled in
+    several passes loads its input again in each, and
+    rolling lowers a per-channel weight, which every CTA of a channel tile
+    shares, ahead of the loop.  Two views keep the policy where neighbors
+    read lines marked evict-first again from DRAM: one whose CTAs read the
+    same elements (an ``as_strided`` batch stride below the rows inside it;
+    the strides are not checked for overlap), and one whose storage offset
+    starts its rows inside a line (the line check reads the strides, since
+    the binding does not key on the offset, and a check of the example's
+    offset could leave a stale hint).  The policy is a cache hint, so that
+    costs bandwidth, never a value.
+
+    Under a cold-L2 timer the flush leaves L2 full of dirty lines; a stream
+    whose lines are not evict-first evicts them, so their write-back runs
+    inside the kernel: 27.7 against 24.0 us for a channels-last spatial mean
+    over 127 MB of bf16 on B200, where the evict-first stream writes back
+    4-9 MB instead of 45-49 MB (ncu)."""
+    grid_block_ids = {item.block_id for item in spec.block_sizes}
+    facts = device_ir.config_memory_op_facts(spec.normalized_config(config))
+    loads = collections.Counter(
+        fact.tensor_name for fact in facts if fact.kind == "load"
+    )
+    policies = [""] * spec.load_eviction_policies.length
+    for fact in facts:
+        if (
+            fact.eviction_index is not None
+            and fact.tensor_name is not None
+            and loads[fact.tensor_name] == 1
+            and dict(fact.reductions_fed).get(reduction_block_id) == 1
+            and grid_block_ids <= set(fact.subscript_block_ids)
+            and 0 not in fact.subscript_strides
+            and _contiguous_block_id(fact) == tile_block_id
+            and _rows_own_their_lines(fact, row_elements, line_bytes)
+        ):
+            policies[fact.eviction_index] = "l1_l2_first"
+    return policies
+
+
+def _contiguous_block_id(fact: MemoryOpFact) -> int | None:
+    """The block of ``fact``'s subscript at its tensor's stride-1 dim, or None
+    without exactly one such dim."""
+    positions = [
+        position
+        for position, stride in enumerate(fact.subscript_strides)
+        if stride == 1
+    ]
+    if len(positions) != 1 or positions[0] >= len(fact.subscript_block_ids):
+        return None
+    return fact.subscript_block_ids[positions[0]]
+
+
+def _rows_own_their_lines(
+    fact: MemoryOpFact, row_elements: int, line_bytes: int
+) -> bool:
+    """Whether CTA rows of ``row_elements`` contiguous elements of ``fact``'s
+    tensor own the L2 lines (``line_bytes``) they read: rows of at least two
+    lines (only the lines at the ends may be shared), or whole lines that
+    start on line boundaries (the row and every stride but the contiguous
+    one a multiple of the line in bytes; a narrower row shares its lines with
+    the neighboring CTA, an unaligned one straddles two).  The tensor's
+    storage offset is taken as line-aligned."""
+    if fact.dtype is None:
+        return False
+    itemsize = fact.dtype.itemsize
+    row_bytes = row_elements * itemsize
+    if row_bytes >= 2 * line_bytes:
+        return True
+    return row_bytes % line_bytes == 0 and all(
+        stride == 1 or stride * itemsize % line_bytes == 0
+        for stride in fact.subscript_strides
+    )
+
+
+class CuteSiblingRowHeuristic(AutotunerHeuristic):
+    """Coherent vector/thread seeds for distinct sibling row-tile passes.
+
+    Independent tile IDs make it unlikely for an ordinary coordinate search
+    to discover a common layout for the reduction and consume passes. Seed
+    warp-sized chunks and whole-row tiles with the same configuration for
+    every pass, including a multi-row warp layout for short rows.
+    """
+
+    name = "cute_sibling_row"
+    backend = "cute"
+    priority = 47
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops:
+            return []
+        plan = sibling_row_loop_blocks(env, device_ir, device_ir.graphs)
+        jagged = False
+        if plan is None:
+            # Dynamic row lengths have no host-side bound to equate. Seeds
+            # may still configure sibling passes coherently; the compiler
+            # retains each pass's own bound and masks.
+            paths = tile_loop_paths(device_ir, device_ir.graphs)
+            if (
+                len(paths) >= 2
+                and all(
+                    len(path) == 2 and all(len(axis) == 1 for axis in path)
+                    for path in paths
+                )
+                and len({path[0][0] for path in paths}) == 1
+                and all(env.is_jagged_tile(path[1][0]) for path in paths)
+            ):
+                plan = (
+                    paths[0][0][0],
+                    tuple(dict.fromkeys(path[1][0] for path in paths)),
+                )
+                jagged = True
+        if plan is None or len(plan[1]) < 2:
+            return []
+        row_block_id, inner_block_ids = plan
+        block_ids = {row_block_id, *inner_block_ids}
+        if len(spec.block_sizes) != len(block_ids) or any(
+            len(item.block_ids) != 1 for item in spec.block_sizes
+        ):
+            return []
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        if set(block_specs) != block_ids:
+            return []
+        for sequence in (
+            spec.num_threads,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+        ):
+            if not set(inner_block_ids).issubset(sequence.valid_block_ids()):
+                return []
+        vec = min(
+            _cute_tile_seed_vec_width_for_dtype(
+                _cute_tile_inner_block_dtype(env, device_ir, block_id)
+            )
+            for block_id in inner_block_ids
+        )
+        if vec <= 1:
+            return []
+        row_fragment = block_specs[row_block_id]._fragment(spec)
+        inner_fragments = [
+            block_specs[block_id]._fragment(spec) for block_id in inner_block_ids
+        ]
+        low = max(fragment.low for fragment in inner_fragments)
+        high = min(fragment.high for fragment in inner_fragments)
+        row_extent = (
+            1 << (max(1, block_specs[inner_block_ids[0]].size_hint) - 1).bit_length()
+        )
+        candidates: list[tuple[int, int, int]] = []
+        if jagged:
+            # Size hints cannot describe device-resident row lengths. Offer
+            # several register footprints so a cold search can discover wide,
+            # vectorized sweeps without synchronizing many independent knobs.
+            candidates.extend(
+                (1, threads * elements_per_thread, threads)
+                for threads in (128, 256, 512)
+                for elements_per_thread in (32, 64)
+            )
+        for threads in (256, 128, 512):
+            if row_extent % (threads * vec) == 0 and row_extent // threads <= 64:
+                candidates.append((1, row_extent, threads))
+        if row_extent <= 2048 and row_extent % (32 * vec) == 0:
+            candidates.append((4, row_extent, 32))
+        wide_chunk = min(1024, high)
+        if wide_chunk >= vec:
+            candidates.append((1, wide_chunk, wide_chunk // vec))
+        candidates.extend(((1, 32 * vec, 32), (4, 32 * vec, 32)))
+
+        cache_policies = _cute_reread_cache_policies(spec, inner_block_ids)
+
+        seeds: list[Config] = []
+        for rows, columns, threads in candidates:
+            if not (
+                row_fragment.low <= rows <= row_fragment.high and low <= columns <= high
+            ):
+                continue
+            seeds.append(
+                Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(
+                            spec.block_sizes,
+                            {
+                                row_block_id: rows,
+                                **dict.fromkeys(inner_block_ids, columns),
+                            },
+                        ),
+                        "num_threads": _seq_config_list(
+                            spec.num_threads,
+                            {
+                                row_block_id: rows,
+                                **dict.fromkeys(inner_block_ids, threads),
+                            },
+                        ),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths, dict.fromkeys(inner_block_ids, vec)
+                        ),
+                        "cute_lane_layouts": _seq_config_list(
+                            spec.cute_lane_layouts,
+                            dict.fromkeys(inner_block_ids, "strided"),
+                        ),
+                    }
+                )
+            )
+            if any(cache_policies):
+                seeds.append(
+                    Config.from_dict(
+                        {**seeds[-1].config, "load_eviction_policies": cache_policies}
+                    )
+                )
+        packet_seeds: list[Config] = []
+        for seed in seeds:
+            block_sizes = seed.block_sizes
+            thread_counts = seed.num_threads
+            if block_sizes[
+                spec.block_sizes.block_id_to_index(row_block_id)
+            ] != 1 or not all(
+                block_sizes[spec.block_sizes.block_id_to_index(block_id)] == row_extent
+                for block_id in inner_block_ids
+            ):
+                continue
+            for packet_width in dict.fromkeys((vec, max(2, vec // 2))):
+                if not all(
+                    row_extent
+                    % (
+                        thread_counts[spec.num_threads.block_id_to_index(block_id)]
+                        * packet_width
+                    )
+                    == 0
+                    for block_id in inner_block_ids
+                ):
+                    continue
+                packet_seeds.append(
+                    Config.from_dict(
+                        deepcopy(seed.config)
+                        | {
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths,
+                                dict.fromkeys(inner_block_ids, packet_width),
+                            ),
+                            "cute_independent_reduction": True,
+                            "cute_replicated_reduction": True,
+                            "cute_vector_packet_unroll": True,
+                        }
+                    )
+                )
+        return dedupe_configs([*seeds, *packet_seeds])
+
+
+def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
+    """``cute_pdl`` (released at entry, spread to one wave's density) for the
+    nested-row seeds where ``griddepcontrol`` exists.
+
+    These kernels run a few microseconds per call in back-to-back streams;
+    launching each as a programmatic dependent of the previous kernel overlaps
+    its launch and prologue (offsets loads, lane index arithmetic) with that
+    kernel's tail: jagged_layer_norm on 16 rows x 32 features went from 2.17
+    to 2.05 us per call (Triton's default 2.05) with nothing else changed.
+    The kernel waits (``griddepcontrol.wait``) ahead of its first global
+    access, so the result is unchanged.  The kernel also releases its own
+    dependents (``cute_pdl_release``, left to its grid-aware default here:
+    right after the wait while the grid fits in one wave, from the last
+    wave's CTAs past it), which
+    is what lets the NEXT kernel of a sequence launch early too; a dependent
+    of a kernel that never releases starts later than a plain stream edge
+    would have launched it (mamba2_ssd s0 forward, 64-call graph: 9.92 us
+    per call unreleased, 9.50 without the knob, 9.37 released at entry).
+    ``cute_pdl_spread`` pads the kernel's shared memory to one wave's density
+    so its early launch never packs its CTAs onto the SMs its primary left
+    idle (vanilla linear attention forward: 7.45 us per call packed, 4.1
+    spread); a tie in isolation, it is searched and preferred among ties.
+    """
+    if pdl_searched(spec):
+        return {"cute_pdl": True, CUTE_PDL_SPREAD_KEY: True}
+    return {}
+
+
+class CuteNestedRowHeuristic(AutotunerHeuristic):
+    """Seed matching layouts for sibling passes over nested row tiles.
+
+    A coalesced outer feature axis can own the threads while an inner
+    jagged axis accumulates serially. Configuring each sibling independently
+    makes this layout difficult to discover through individual mutations.
+
+    The primary seed is also the autotune-off default. The generic default
+    threads only the root tile, so one thread walks every feature and jagged
+    element of its row serially: 7.4 ms against 0.059 ms for this seed on
+    256 rows of up to 256 x 128 fp32 elements (B200).
+
+    When the inner passes gather rows of a flattened tensor
+    (``x_flat[(start + tile_k.index) * M + tile_m.index]``: jagged softmax,
+    sum, layer norm) the feature axis is also vectorized: V contiguous
+    features per thread (one 16-byte packet), ``block_m / V`` threads along
+    the features and the rest of the block along the jagged axis, with
+    ``cute_vloop_sink`` so one vector load serves every lane of a row and
+    ``cute_lane_unroll`` so a thread's rows load before any is consumed.
+    These seeds lead the list (and so become the default) only when every
+    gather of the kernel is proven sinkable (``flat_gather_sink_vec_width``): an
+    unsunk V-loop wraps the whole body and multiplies the serial work by V.
+    0.0245 ms against 0.0428 ms for the threaded seed on the softmax above.
+    """
+
+    name = "cute_nested_row"
+    backend = "cute"
+    priority = 48
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    promote_seed_to_default = True
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        if spec.matmul_facts or spec.reduction_loops:
+            return []
+        from ...flat_gather_lane import flat_gather_row_width_hint
+
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        # One root tile over the rows; under it one or more feature tiles,
+        # each with one or more jagged passes (sibling passes may share a
+        # feature tile: softmax's two sweeps, or a single sum).
+        if not paths or any(
+            len(path) != 3 or any(len(axis) != 1 for axis in path) for path in paths
+        ):
+            return []
+        roots = {path[0][0] for path in paths}
+        outer = {path[1][0] for path in paths}
+        inner = {path[2][0] for path in paths}
+        if (
+            len(roots) != 1
+            or len(inner) != len(paths)
+            or roots & (outer | inner)
+            or outer & inner
+            or not all(env.is_jagged_tile(block_id) for block_id in inner)
+        ):
+            return []
+        # A jagged feature tile (``hl.jagged_tile(feature_counts)``) has no
+        # static extent to thread; only the vectorized family, whose chunks
+        # may straddle the extent, seeds it.
+        jagged_outer = any(env.is_jagged_tile(block_id) for block_id in outer)
+        axes = roots | outer | inner
+        if any(len(item.block_ids) != 1 for item in spec.block_sizes):
+            return []
+        blocks = {item.block_id: item for item in spec.block_sizes}
+        if set(blocks) != axes or any(
+            not axes.issubset(sequence.valid_block_ids())
+            for sequence in (
+                spec.num_threads,
+                spec.cute_vector_widths,
+                spec.cute_lane_layouts,
+            )
+        ):
+            return []
+        fragments = {bid: block._fragment(spec) for bid, block in blocks.items()}
+        if jagged_outer:
+            # Size the feature tile by the gathered rows' width (the hint
+            # of ``M`` in ``(start + k) * M + tile_m.index``).
+            width = flat_gather_row_width_hint(env, device_ir, outer, outer | inner)
+            columns = 1 << (max(1, width or 128) - 1).bit_length()
+            return cls._sunk_vector_seeds(
+                env, device_ir, spec, roots, outer, inner, None, columns, fragments
+            )
+        extents = {blocks[block_id].size_hint for block_id in outer}
+        if len(extents) != 1:
+            return []
+        (extent,) = extents
+        columns = 1 << (max(1, extent) - 1).bit_length()
+        sunk = cls._sunk_vector_seeds(
+            env, device_ir, spec, roots, outer, inner, extent, columns, fragments
+        )
+        seeds = list(sunk)
+        for column_tile in dict.fromkeys((columns, min(columns, 128))):
+            for reduction_tile in (32, 128, 256):
+                values = {
+                    **dict.fromkeys(roots, 1),
+                    **dict.fromkeys(outer, column_tile),
+                    **dict.fromkeys(inner, reduction_tile),
+                }
+                if not all(
+                    fragments[bid].low <= value <= fragments[bid].high
+                    for bid, value in values.items()
+                ):
+                    continue
+                threads = {
+                    **dict.fromkeys(roots | inner, 1),
+                    **dict.fromkeys(outer, min(column_tile, 256)),
+                }
+                seeds.append(
+                    Config.from_dict(
+                        {
+                            "block_sizes": _seq_config_list(spec.block_sizes, values),
+                            "num_threads": _seq_config_list(spec.num_threads, threads),
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths, dict.fromkeys(axes, 1)
+                            ),
+                            "cute_lane_layouts": _seq_config_list(
+                                spec.cute_lane_layouts, dict.fromkeys(axes, "strided")
+                            ),
+                            **_dependent_launch(spec),
+                        }
+                    )
+                )
+        return dedupe_configs(seeds)
+
+    @classmethod
+    def _sunk_vector_seeds(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+        spec: ConfigSpec,
+        roots: set[int],
+        outer: set[int],
+        inner: set[int],
+        extent: int | None,
+        columns: int,
+        fragments: dict[int, Any],
+    ) -> list[Config]:
+        """Seeds vectorizing the feature axis with the V-loop sunk (see class).
+
+        ``extent`` is the static feature extent, or None for a jagged feature
+        tile (its chunks may straddle the extent; the sink loads them under
+        the mask of their first lane)."""
+        from ...flat_gather_lane import flat_gather_rows_hint
+        from ...flat_gather_lane import flat_gather_sink_vec_width
+
+        if not all(
+            spec.supports_config_key(key)
+            for key in ("cute_vloop_sink", "cute_lane_unroll", "cute_min_blocks_per_mp")
+        ):
+            return []
+        vec = flat_gather_sink_vec_width(env, device_ir, outer, outer | inner)
+        # The chunk base is V-aligned from the zero origin and no chunk
+        # straddles the extent only when the extent is a multiple of V.
+        if (
+            vec is None
+            or vec <= 1
+            or (extent is not None and extent % vec)
+            or columns % vec
+        ):
+            return []
+        # Size the jagged thread count by the binding's average row count:
+        # a 512-thread block with 64 jagged threads over 16-row sequences
+        # spends its time in the cross-thread reduces (0.0036 vs 0.0028 ms
+        # per call against Triton on 16 rows of up to 32 x 32 fp32), while
+        # 256-row sequences want every thread the block can hold.
+        blocks = {item.block_id: item for item in spec.block_sizes}
+        rows_hint = flat_gather_rows_hint(
+            env,
+            device_ir,
+            outer,
+            outer | inner,
+            extent if extent is not None else columns,
+            max(1, min(blocks[block_id].size_hint for block_id in roots)),
+        )
+        seeds: list[Config] = []
+        for column_tile in dict.fromkeys((min(columns, 128), min(columns, 64))):
+            feature_threads = column_tile // vec
+            if feature_threads < 1:
+                continue
+            block_choices: list[int] = []
+            if rows_hint is not None:
+                # The largest power of two not above the average row count:
+                # more jagged threads than rows idle in the reduces.
+                preferred = feature_threads * max(
+                    2, min(32, 1 << (max(1, rows_hint).bit_length() - 1))
+                )
+                block_choices.append(max(128, min(512, preferred)))
+            block_choices.extend((512, 256))
+            for block_threads in dict.fromkeys(block_choices):
+                jagged_threads = block_threads // feature_threads
+                if jagged_threads < 1:
+                    continue
+                tile_choices: list[int] = []
+                if rows_hint is not None:
+                    # One row tile covers an average sequence twice over.
+                    tile_choices.append(
+                        max(
+                            32,
+                            min(256, 1 << ((2 * max(1, rows_hint)).bit_length() - 1)),
+                        )
+                    )
+                tile_choices.extend((128, 256))
+                for reduction_tile in dict.fromkeys(tile_choices):
+                    # At least two rows per thread per tile: one row per
+                    # thread leaves nothing to unroll and the sink declines
+                    # the degenerate lane loop.
+                    rows_per_thread = reduction_tile // jagged_threads
+                    if rows_per_thread < 2 or rows_per_thread > 32:
+                        continue
+                    values = {
+                        **dict.fromkeys(roots, 1),
+                        **dict.fromkeys(outer, column_tile),
+                        **dict.fromkeys(inner, reduction_tile),
+                    }
+                    if not all(
+                        fragments[bid].low <= value <= fragments[bid].high
+                        for bid, value in values.items()
+                    ):
+                        continue
+                    unroll = max(
+                        choice
+                        for choice in _CUTE_LANE_UNROLL_CHOICES
+                        if choice <= min(rows_per_thread, 8)
+                    )
+                    threads = {
+                        **dict.fromkeys(roots, 1),
+                        **dict.fromkeys(outer, feature_threads),
+                        **dict.fromkeys(inner, jagged_threads),
+                    }
+                    widths = {
+                        **dict.fromkeys(roots | inner, 1),
+                        **dict.fromkeys(outer, vec),
+                    }
+                    layouts = {
+                        **dict.fromkeys(roots | inner, "strided"),
+                        **dict.fromkeys(outer, "blocked"),
+                    }
+                    seeds.append(
+                        Config.from_dict(
+                            {
+                                "block_sizes": _seq_config_list(
+                                    spec.block_sizes, values
+                                ),
+                                "num_threads": _seq_config_list(
+                                    spec.num_threads, threads
+                                ),
+                                "cute_vector_widths": _seq_config_list(
+                                    spec.cute_vector_widths, widths
+                                ),
+                                "cute_lane_layouts": _seq_config_list(
+                                    spec.cute_lane_layouts, layouts
+                                ),
+                                "cute_vloop_sink": True,
+                                "cute_lane_unroll": unroll,
+                                # Let ptxas keep a thread's rows in flight
+                                # (the default register cap targets full
+                                # occupancy and serializes the loads).
+                                "cute_min_blocks_per_mp": 1,
+                                **_dependent_launch(spec),
+                            }
+                        )
+                    )
+        return seeds
+
+
+class CuteResidentRowHeuristic(AutotunerHeuristic):
+    """Register-resident whole-row seed for softmax-shaped tile kernels.
+
+    Seeds ``block_sizes=[1, N]`` (the whole reduction axis as one tile) with
+    a multi-warp thread block, V=8 vec loads/stores, and the strided
+    (coalesced) lane layout.  With the single-trip tile loop the cross-sweep
+    load fuser caches the row in a register fragment (one gmem read for the
+    whole kernel), the lane-reduce collapse runs ONE grouped reduction per
+    sweep, and the vec-store flush writes 128-bit stores.  Measured ~2x over
+    the warp-reduce family on (32768, 4096..16384) bf16 rows on B200.
+    """
+
+    name = "cute_resident_row"
+    backend = "cute"
+    priority = 49
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int] | None:
+        """Return ``(row_extent, num_threads, vec, cluster_n)`` or None."""
+        spec = env.config_spec
+        axis = _cute_tile_vector_axis(env, device_ir, require_lane_layout=True)
+        if axis is None:
+            return None
+        _, inner_block_id, vec, n = axis
+        if n is None:
+            return None
+        inner = spec.block_sizes.block_id_lookup(inner_block_id)
+        # The whole-row block must be a reachable block size (power of 2)
+        # and fit the per-thread register budget at some thread count.
+        if n & (n - 1) or n <= 0:
+            return None
+        bn_fragment = inner._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        if not isinstance(bn_high, int) or bn_high < n:
+            return None
+        # Prefer <=64 elements per thread (no spills) at 256 threads, using
+        # the smallest cluster that fits — a 256-thread CTA with a wider
+        # cluster measures well ahead of a 512-thread CTA at the same
+        # per-thread footprint (5090 vs 3374 GB/s on 32768x32768 bf16).
+        # Each cluster CTA owns a contiguous register-resident slice; one
+        # DSM cluster reduce per sweep.
+        for threads in (256, 512, 128):
+            for cluster_n in (1, 2, 4, 8, 16):
+                per_cta = n // cluster_n
+                if (
+                    per_cta > 0
+                    and per_cta % (threads * vec) == 0
+                    and per_cta // threads <= 64
+                ):
+                    return n, threads, vec, cluster_n
+        return None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        n, threads, vec, cluster_n = plan
+        spec = env.config_spec
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: n}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {inner_block_id: threads}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {inner_block_id: "strided"}
+            ),
+        }
+        if cluster_n > 1:
+            seed["cute_cluster_n"] = cluster_n
+        if cluster_n >= 4:
+            # Wide clusters need occupancy over registers (measured +9-27%
+            # at cluster 4-16 on B200).
+            seed["cute_min_blocks_per_mp"] = 3
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
+    """Wide-cluster occupancy-squeeze variant of ``CuteResidentRowHeuristic``.
+
+    With the cluster online-pair rewrite (one packed DSM exchange per row
+    instead of two) wide clusters of small CTAs win big rows.  The best
+    measured family keeps 64 elements per thread (the fused u16 x-cache +
+    f32 exp-cache footprint that fits ~80-95 registers) and squeezes
+    ptxas to ~24 warps/SM via ``min_blocks_per_mp = 768 // threads``: on
+    B200 the extra resident CTA outweighs ~10 spilled registers
+    (65536: T128/CL8/mb6 4861 vs mb2 4712 GB/s; 131072: T128/CL16/mb6
+    4821 vs quack 4614; 262144: T256/CL16/mb3 4304 vs quack 4284).
+    Rows that cannot hit 64/thread at any cluster width (e.g. odd-multiple
+    rows whose per-CTA slice divides 128 lanes but not 256) fall back to
+    the 128-elements/thread register-capped family at ``mb=3``; power-of-2
+    rows too big even for that leave the heuristic ineligible.
+    """
+
+    # minnctapersm target: ~24 warps/SM measured best for the
+    # 64-element/thread family on B200 (see class docstring).
+    _TARGET_THREADS_PER_SM = 768
+
+    name = "cute_resident_row_wide_cluster"
+    backend = "cute"
+    priority = 50
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, int, int, int] | None:
+        base = CuteResidentRowHeuristic._plan(env, device_ir)
+        if base is None:
+            return None
+        n, _threads, vec, _cluster_n = base
+        for max_per_thread, threads in ((64, 128), (64, 256), (128, 128)):
+            for cluster_n in (2, 4, 8, 16):
+                per_cta = n // cluster_n
+                if (
+                    per_cta % (threads * vec) == 0
+                    and per_cta // threads <= max_per_thread
+                ):
+                    return n, threads, vec, cluster_n, max_per_thread
+        return None
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        n, threads, vec, cluster_n, max_per_thread = plan
+        spec = env.config_spec
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 1, inner_block_id: n}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {inner_block_id: threads}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {inner_block_id: "strided"}
+            ),
+            "cute_cluster_n": cluster_n,
+        }
+        if max_per_thread > 64:
+            # 128 elements/thread: the exp/load caches alone need ~128
+            # registers, so cap the budget for 3 CTAs/SM.
+            seed["cute_min_blocks_per_mp"] = 3
+        else:
+            # 64/thread: squeeze to ~24 warps/SM (an 80-register cap at 128
+            # threads); a handful of spills costs less than the lost CTA.
+            seed["cute_min_blocks_per_mp"] = cls._TARGET_THREADS_PER_SM // threads
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
+    """Multi-row variant of ``CuteResidentRowHeuristic`` for short rows.
+
+    A short reduction axis (N <= 2048) leaves a whole-row CTA with too few
+    threads/CTAs doing too little work each; packing several rows per CTA
+    with one warp per row keeps the reduction a pure warp shuffle (no
+    shared memory) while restoring the CTA size.
+    """
+
+    name = "cute_resident_multi_row"
+    backend = "cute"
+    priority = 51
+
+    _ROWS_PER_CTA = 4
+    _THREADS_PER_ROW = 32
+    _MAX_ROW_EXTENT = 2048
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int] | None:
+        spec = env.config_spec
+        axis = _cute_tile_vector_axis(env, device_ir, require_lane_layout=True)
+        if axis is None:
+            return None
+        _, inner_block_id, vec, n = axis
+        if n is None:
+            return None
+        inner = spec.block_sizes.block_id_lookup(inner_block_id)
+        if n & (n - 1) or n <= 0 or n > cls._MAX_ROW_EXTENT:
+            return None
+        if n % (cls._THREADS_PER_ROW * vec) != 0:
+            return None
+        bn_fragment = inner._fragment(spec)
+        bn_high = getattr(bn_fragment, "high", None)
+        if not isinstance(bn_high, int) or bn_high < n:
+            return None
+        return n, vec
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        n, vec = plan
+        spec = env.config_spec
+        blocks = _cute_tile_row_blocks(env)
+        if blocks is None:
+            return None
+        outer_block_id, inner_block_id = blocks
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: cls._ROWS_PER_CTA, inner_block_id: n}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {
+                    outer_block_id: cls._ROWS_PER_CTA,
+                    inner_block_id: cls._THREADS_PER_ROW,
+                },
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {inner_block_id: "strided"}
+            ),
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
+    """P15: warp-per-row layout for softmax-shaped tile kernels.
+
+    Sibling seed for ``CuteTileVecWarpReduceHeuristic`` that puts MORE
+    than one row per CTA — each warp owns one row. The warp-per-row
+    plan in ``execution_plans.py`` swaps the thread-axis assignment
+    so:
+
+    * N (reduction axis) lands on ``thread_idx[0]`` (32 contiguous
+      threads = one warp per row)
+    * M (outer grid row axis) lands on ``thread_idx[1]`` (warp index =
+      row index)
+
+    The strided reduction dispatcher then picks the direct
+    ``cute.arch.warp_reduction_*`` path with ``threads_in_group=32``
+    (group_span == 32, one warp per group), avoiding the
+    cross-warp shared-memory two-stage reduce that would dominate when
+    rows are spread across threads.
+
+    Seeds ``block_sizes=[2, V * 32]``, ``num_threads=[0, 32]``,
+    ``cute_vector_widths=[1, V]`` so each row stays inside a single
+    warp and 2 rows fit in one CTA (giving 64 threads = 2 warps per
+    CTA -> higher occupancy on softmax-shaped reductions).
+
+    Eligible whenever ``CuteTileVecWarpReduceHeuristic`` is eligible
+    and the outer tile fragment admits M >= 2.
+    """
+
+    name = "cute_tile_vec_warp_per_row"
+    backend = "cute"
+    priority = 42
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return False
+        outer_block_id, inner_block_id, vec, _extent = axis
+        spec = env.config_spec
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
+        if bn_high < vec * 32:
+            return False
+        # Outer (M) fragment must admit M=2 (warp-per-row launches 2
+        # warps per CTA so each row is one warp).
+        bm_fragment = spec.block_sizes.block_id_lookup(outer_block_id)._fragment(spec)
+        return bm_fragment.low <= 2 <= bm_fragment.high
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        axis = _cute_tile_vector_axis(env, device_ir)
+        if axis is None:
+            return None
+        outer_block_id, inner_block_id, vec, _extent = axis
+        spec = env.config_spec
+        bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
+        block_n = vec * 32
+        if bn_high < block_n:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block_id: 2, inner_block_id: block_n}
+            ),
+            "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {inner_block_id: vec}
+            ),
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+# The reductions the column and de-linearized row heuristics seed.
+_REDUCTION_NAMES = ("sum", "amax", "amin", "prod", "mean")
+
+
+def _device_loop_reduction(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> tuple[tuple[int, ...], int, list[Node]] | None:
+    """``(grid_blocks, reduced_block_id, calls)`` when the kernel's single
+    grid loop, over ``grid_blocks``, holds a single device loop over one
+    block, ``reduced_block_id``, no matmul or reduction loop shapes the
+    tiles, and ``block_sizes`` has one entry per block of the two loops.
+    ``calls`` are the ``call_function`` nodes of the device loop."""
+    from ....device_ir import ForLoopGraphInfo
+
+    spec = env.config_spec
+    if spec.matmul_facts or spec.reduction_loops:
+        return None
+    paths = tile_loop_paths(device_ir, device_ir.graphs)
+    if len(paths) != 1 or len(paths[0]) != 2 or len(paths[0][1]) != 1:
+        return None
+    grid_blocks = paths[0][0]
+    (reduced_block_id,) = paths[0][1]
+    if len(spec.block_sizes) != len(grid_blocks) + 1 or any(
+        len(item.block_ids) != 1 for item in spec.block_sizes
+    ):
+        return None
+    calls = [
+        node
+        for graph_info in device_ir.graphs
+        if isinstance(graph_info, ForLoopGraphInfo)
+        and list(graph_info.block_ids) == [reduced_block_id]
+        for node in graph_info.graph.nodes
+        if node.op == "call_function"
+    ]
+    return grid_blocks, reduced_block_id, calls
+
+
+def _shape_exprs(value: object) -> list[object] | None:
+    """The sizes of the tensor ``value``, symbolic ones as sympy expressions
+    (None when ``value`` is no tensor)."""
+    if not isinstance(value, torch.Tensor):
+        return None
+    return [
+        _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else size
+        for size in value.shape
+    ]
+
+
+def _reduced_sizes(node: Node, reduced_symbol: sympy.Expr) -> list[object] | None:
+    """The sizes of the value ``node`` reduces, symbolic ones as sympy
+    expressions, when ``node`` is a ``_REDUCTION_NAMES`` reduction over one
+    dim of extent ``reduced_symbol``."""
+    if getattr(node.target, "__name__", "").split(".")[0] not in _REDUCTION_NAMES:
+        return None
+    dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    if isinstance(dims, int):
+        dims = [dims]
+    value = (
+        node.args[0].meta.get("val")
+        if node.args and isinstance(node.args[0], Node)
+        else None
+    )
+    if not (
+        isinstance(dims, (list, tuple))
+        and len(dims) == 1
+        and isinstance(dims[0], int)
+        and isinstance(value, torch.Tensor)
+        and -value.ndim <= dims[0] < value.ndim
+    ):
+        return None
+    sizes = _shape_exprs(value)
+    assert sizes is not None
+    return sizes if sizes[dims[0]] == reduced_symbol else None
+
+
+def _column_row_threads(row_threads: int, rows: int) -> int:
+    """``row_threads`` halved, down to one warp, until each thread takes at
+    least four of a chunk's ``rows``."""
+    while row_threads > 32 and rows // row_threads < 4:
+        row_threads //= 2
+    return row_threads
+
+
+def _load_operands(node: Node) -> tuple[torch.Tensor | None, object]:
+    """The tensor a load node reads (its first operand's value; None when
+    that is no tensor) and its subscript (the second operand, if any)."""
+    tensor_node = node.args[0] if node.args else None
+    tensor = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+    subscript = node.args[1] if len(node.args) > 1 else None
+    return (tensor if isinstance(tensor, torch.Tensor) else None), subscript
+
+
+class _CuteColumnSeedHeuristic(AutotunerHeuristic):
+    """What the column-sum seed heuristics share: ``_match`` finds
+    ``(column_block_id, reduced_block_id, source)`` when the kernel reduces
+    rows of a ``source`` whose last dim is the zero-origin column tile,
+    independently of the binding's extents and strides, and
+    ``get_seed_configs`` builds the seeds from ``_plan``."""
+
+    backend = "cute"
+    # Vector loads over a dynamic extent need the exact input metadata: the
+    # extent and the row strides must be proven multiples of the vector width.
+    # ``register_facts`` asks for it for every dynamic-shape binding that
+    # ``_match`` accepts, even where ``_plan`` then declines or autotuner
+    # heuristics are disabled, so such a ``static_shapes=False`` kernel binds,
+    # and may autotune, once per input shape and stride tuple.
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    # The input dtypes the seeds load as one 16-byte vector per thread.
+    SEED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        raise NotImplementedError
+
+    @staticmethod
+    def _lane_knobs(spec: ConfigSpec, block_ids: Sequence[int]) -> bool:
+        """Every block of ``block_ids`` has threads, a vector width and a lane
+        layout the seeds can set."""
+        return all(
+            set(block_ids).issubset(sequence.valid_block_ids())
+            for sequence in (
+                spec.num_threads,
+                spec.cute_vector_widths,
+                spec.cute_lane_layouts,
+            )
+        )
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """The match when sinking can fire for this binding: the column
+        tile's extent and the source's other strides are multiples of the
+        seed vector width (one aligned V-wide chunk per row)."""
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        column_block_id, _reduced_block_id, source = match
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        if not (
+            env.specialized_multiple(env.block_sizes[column_block_id].numel, vec)
+            and all(
+                env.specialized_multiple(source.stride(dim), vec)
+                for dim in range(source.ndim - 1)
+            )
+        ):
+            return None
+        return match
+
+    @staticmethod
+    def _seed(
+        spec: ConfigSpec,
+        column_block_id: int,
+        reduced_block_id: int,
+        vec: int,
+        block_sizes: dict[int, int],
+        num_threads: dict[int, int],
+        **knobs: object,
+    ) -> Config:
+        """A coalesced seed: ``block_sizes`` and ``num_threads`` by block id,
+        the vector width ``vec`` on the column block, a strided lane layout on
+        the reduced one, ``cute_vloop_sink`` and the row lane loop unrolled 8
+        deep, and the other ``knobs``."""
+        return Config.from_dict(
+            {
+                "block_sizes": _seq_config_list(spec.block_sizes, block_sizes),
+                "num_threads": _seq_config_list(spec.num_threads, num_threads),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {column_block_id: vec}
+                ),
+                "cute_lane_layouts": _seq_config_list(
+                    spec.cute_lane_layouts, {reduced_block_id: "strided"}
+                ),
+                "cute_vloop_sink": True,
+                "cute_lane_unroll": 8,
+                **knobs,
+            }
+        )
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        match = cls._match(env, device_ir)
+        if match is None:
+            # Nothing this binding's metadata could add would let a seed fire,
+            # so this hook adds no facts.  Other heuristics (the resident
+            # sequence and bounded loop cache seeds) may still key the same
+            # binding on its exact input metadata.
+            return frozenset()
+        column_block_id, _reduced_block_id, source = match
+        # Static extents and strides prove the vector layout by themselves;
+        # only dynamic ones need this binding's exact metadata.
+        if isinstance(env.block_sizes[column_block_id].size, torch.SymInt) or any(
+            isinstance(source.stride(dim), torch.SymInt) for dim in range(source.ndim)
+        ):
+            return cls.CACHE_SPECIALIZATION_FACTS
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteColumnReductionHeuristic(_CuteColumnSeedHeuristic):
+    """Coalesced seeds for a reduction over a serial tile axis whose other
+    axis is the grid (a column sum: ``acc += sum(x[tile_m, tile_n], dim=0)``).
+
+    The autotuner's natural winner for this shape puts the threads along the
+    reduced rows (uncoalesced 2-byte loads), and the coalesced layouts that
+    exist in the space (lanes and the vector along the contiguous grid axis)
+    only pay off together with ``cute_vloop_sink``, which interchanges the
+    grid axis' constexpr vector loop into the row loops so each thread issues
+    one 16-byte vector load per row.  Seed that layout: a few threads along
+    the contiguous grid axis owning one vector each (32-64 contiguous bytes
+    per row per CTA), the remaining threads along the reduced axis with a
+    strided lane layout, the whole reduced extent per CTA, sinking on and
+    the row lane loop unrolled.  Sinking and the unroll depth become
+    searchable knobs once seeded.
+    """
+
+    name = "cute_column_reduction"
+    priority = 46
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``(grid_block_id, reduced_block_id, source)`` when the kernel reduces
+        a ``[reduced, grid]`` tile loaded from the 2-D 16/32-bit input
+        ``source`` along its serial device-loop axis, the grid tile has a zero
+        origin, ``source`` is contiguous along the grid axis and the seed
+        vector fits one transaction: what sinking needs independently of this
+        binding's extents and strides (``_plan`` checks those)."""
+        spec = env.config_spec
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None or len(nest[0]) != 1:
+            return None
+        (grid_block_id,), reduced_block_id, calls = nest
+        if grid_block_id in device_ir.noncanonical_task_origin_block_ids:
+            # ``hl.tile(8, n)``: the chunks are not V-aligned and the column
+            # mask differs per element, so no load can be widened.
+            return None
+        if not cls._lane_knobs(spec, (grid_block_id, reduced_block_id)):
+            return None
+        grid_symbol = _symint_sympy_expr(env.block_sizes[grid_block_id].var)
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+        for node in calls:
+            # The sum over the ``[reduced, grid]`` tile's rows.
+            if _reduced_sizes(node, reduced_symbol) != [reduced_symbol, grid_symbol]:
+                continue
+            source = cast("Node", node.args[0])
+            while (
+                source.op == "call_function"
+                and getattr(source.target, "__name__", "").startswith(
+                    "convert_element_type"
+                )
+                and isinstance(source.args[0], torch.fx.Node)
+            ):
+                source = source.args[0]
+            loaded = source.meta.get("val")
+            tensor, _ = _load_operands(source)
+            if not (
+                source.target is language_load
+                and isinstance(loaded, torch.Tensor)
+                and loaded.dtype in cls.SEED_DTYPES
+                and tensor is not None
+                and tensor.ndim == 2
+            ):
+                continue
+            column_stride = tensor.stride(1)
+            if isinstance(column_stride, int) and column_stride == 1:
+                return grid_block_id, reduced_block_id, tensor
+        return None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return []
+        grid_block_id, reduced_block_id, source = plan
+        spec = env.config_spec
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        grid_fragment = block_specs[grid_block_id]._fragment(spec)
+        reduced_fragment = block_specs[reduced_block_id]._fragment(spec)
+        reduced_hint = max(1, block_specs[reduced_block_id].size_hint)
+        # The whole reduced extent per CTA (one serial trip), capped by the
+        # fragment so the seed stays reachable for very tall inputs.
+        rows = min(1 << (reduced_hint - 1).bit_length(), reduced_fragment.high)
+        seeds: list[Config] = []
+        # (threads along the grid axis, CTA threads, vector divisor): 2 x V
+        # elements per row per CTA is one 32-byte sector for a 16-byte
+        # vector.  The half-width vector (four grid threads owning 8-byte
+        # vectors, 128 row threads) keeps that sector with twice the rows in
+        # flight per CTA and was the measured best at 1024^2 and 4096^2.
+        for grid_threads, cta_threads, vec_divisor in (
+            (2, 512, 1),
+            (4, 512, 1),
+            (2, 256, 1),
+            (4, 512, 2),
+        ):
+            seed_vec = vec // vec_divisor
+            if seed_vec < 2:
+                continue
+            columns = grid_threads * seed_vec
+            row_threads = _column_row_threads(cta_threads // grid_threads, rows)
+            if not (
+                grid_fragment.low <= columns <= grid_fragment.high
+                and reduced_fragment.low <= rows <= reduced_fragment.high
+            ):
+                continue
+            seeds.append(
+                cls._seed(
+                    spec,
+                    grid_block_id,
+                    reduced_block_id,
+                    seed_vec,
+                    {reduced_block_id: rows, grid_block_id: columns},
+                    {reduced_block_id: row_threads, grid_block_id: grid_threads},
+                    # The launch overlaps the output's zero fill (and the
+                    # default release lets the next kernel launch early).
+                    cute_pdl=True,
+                    **{CUTE_PDL_SPREAD_KEY: True},
+                )
+            )
+        return dedupe_configs(seeds)
+
+
+class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
+    """Coalesced seeds for a split column reduction: a grid of split blocks
+    and a contiguous column tile whose serial device loop walks each split's
+    rows of a ``[rows, C]`` input (Inductor's looped split reductions, the
+    BatchNorm backward sums and Welford partials of channels-last
+    activations)::
+
+        for tile_s, tile_c in hl.tile([splits, C]):
+            for tile_r in hl.tile(rows_per_split):
+                row = tile_s.index[:, None] * rows_per_split + tile_r.index[None, :]
+                acc = acc + torch.sum(f(hl.load(x, [row, tile_c])), dim=1)
+
+    The column sum of ``CuteColumnReductionHeuristic`` (which takes only a
+    one-axis grid) with split axes beside the column tile.  Without a seed
+    the search starts from scalar layouts (a 2-byte load per element), and
+    the coalesced one needs the column tile's vector width, its threads on
+    the lowest lanes, the rest along the rows and ``cute_vloop_sink``
+    together.  Seed it with one split per CTA: warp-sized CTAs that walk the
+    split in chunks with a shuffle combine per chunk, and the column
+    heuristic's whole split per chunk (one cross-warp combine per CTA).  The
+    match takes any such loop nest, so batched column sums (``x[tile_b,
+    tile_r, tile_c]`` summed over the rows) and broadcast-sum contractions
+    (``torch.sum(a[tm, tk][:, :, None] * b[tk, tn][None, :, :], dim=1)``)
+    get these seeds too; seeds only add configs.
+    """
+
+    name = "cute_split_column_reduction"
+    priority = 99
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``(column_block_id, reduced_block_id, source)`` when the kernel's
+        single grid loop tiles two or more axes, its single device loop
+        reduces the rows of tiles that span every grid axis, and that loop
+        loads the 16/32-bit input ``source`` with the zero-origin column tile
+        as the last, stride-1 index."""
+        spec = env.config_spec
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None or len(nest[0]) < 2:
+            return None
+        grid_blocks, reduced_block_id, calls = nest
+        if not cls._lane_knobs(spec, (*grid_blocks, reduced_block_id)):
+            return None
+        grid_symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid_blocks
+        }
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+        reduces_rows = False
+        match: tuple[int, int, torch.Tensor] | None = None
+        for node in calls:
+            if node.target is language_load:
+                # The first such load sets the seeds' vector width and the
+                # strides ``_plan`` checks, whether or not it feeds the row
+                # reduction directly: the reduction may see the loaded rows
+                # through any ``f(...)`` (a mask, a convert, a product with
+                # another load).  A kernel that mixes load dtypes is seeded for
+                # the first; seeds only add configs.
+                if match is not None:
+                    continue
+                tensor, subscript = _load_operands(node)
+                loaded = _shape_exprs(node.meta.get("val"))
+                if not (
+                    tensor is not None
+                    and tensor.ndim >= 2
+                    and tensor.dtype in cls.SEED_DTYPES
+                    and isinstance(subscript, (list, tuple))
+                    and len(subscript) == tensor.ndim
+                    and isinstance(subscript[-1], torch.fx.Node)
+                    and loaded is not None
+                    and reduced_symbol in loaded
+                ):
+                    continue
+                column = subscript[-1].meta.get("val")
+                stride = tensor.stride(-1)
+                if not (
+                    isinstance(column, torch.SymInt)
+                    and isinstance(stride, int)
+                    and stride == 1
+                ):
+                    continue
+                column_block_id = grid_symbols.get(_symint_sympy_expr(column))
+                if (
+                    column_block_id is not None
+                    and column_block_id
+                    not in device_ir.noncanonical_task_origin_block_ids
+                ):
+                    match = (column_block_id, reduced_block_id, tensor)
+                continue
+            sizes = _reduced_sizes(node, reduced_symbol)
+            if (
+                sizes is not None
+                and len(sizes) == len(grid_blocks) + 1
+                and set(sizes) - {reduced_symbol} == set(grid_symbols)
+            ):
+                reduces_rows = True
+        return match if reduces_rows else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return []
+        column_block_id, reduced_block_id, source = plan
+        spec = env.config_spec
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        column_fragment = block_specs[column_block_id]._fragment(spec)
+        reduced_fragment = block_specs[reduced_block_id]._fragment(spec)
+        column_extent = next_power_of_2(max(1, block_specs[column_block_id].size_hint))
+        whole = next_power_of_2(max(1, block_specs[reduced_block_id].size_hint))
+        splits = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id not in (column_block_id, reduced_block_id)
+        }
+        # (column threads, row threads, rows per chunk), measured on B200 for
+        # the bf16 BatchNorm backward sums of 2384-row splits over 32 channels
+        # (sum_sum_643db2887a01) and the Welford partials of 680-row splits
+        # over 144 channels (var_mean_mean_e790938418f4).  A warp per CTA, two
+        # column threads over 16 row threads taking 8 rows each per chunk, was
+        # best on both (129 and 63 us, against 71 us for Helion-Triton on the
+        # second); the column heuristic's whole split per chunk with 4 x 128
+        # threads came second on the first (139 us) and 4 x 8 threads with 16
+        # rows each on the second (65 us).  ``None`` is that whole split per
+        # chunk, its 128 row threads halved (``_column_row_threads``) for the
+        # rows the chunk gets once clamped.
+        shapes: tuple[tuple[int, int | None, int | None], ...] = (
+            (2, 16, 128),
+            (4, None, None),
+            (4, 8, 128),
+        )
+        seeds: list[Config] = []
+        for column_threads, fixed_threads, chunk_rows in shapes:
+            columns = column_threads * vec
+            rows = min(chunk_rows or whole, whole, reduced_fragment.high)
+            row_threads = (
+                _column_row_threads(128, rows)
+                if fixed_threads is None
+                else fixed_threads
+            )
+            if not (
+                columns <= column_extent
+                and column_fragment.low <= columns <= column_fragment.high
+                and reduced_fragment.low <= rows
+                and rows >= row_threads
+            ):
+                continue
+            seeds.append(
+                cls._seed(
+                    spec,
+                    column_block_id,
+                    reduced_block_id,
+                    vec,
+                    {**splits, column_block_id: columns, reduced_block_id: rows},
+                    {
+                        **splits,
+                        column_block_id: column_threads,
+                        reduced_block_id: row_threads,
+                    },
+                )
+            )
+        return dedupe_configs(seeds)
+
+
+class CuteDelinearizedRowReductionHeuristic(AutotunerHeuristic):
+    """Seed a device-loop reduction whose loop walks contiguous rows through
+    a de-linearized index: the split Welford partials of an NCHW BatchNorm,
+    which read the input as ``[N, H*W, C]``::
+
+        for tile_s, tile_c in hl.tile([splits, C]):
+            for tile_r in hl.tile(rows_per_split):
+                r = tile_s.index[:, None] * rows_per_split + tile_r.index[None, :]
+                values = hl.load(x, [r // hw, r % hw, tile_c])
+                ... torch.sum(values, dim=1) ...
+
+    The loop's tile reaches the stride-1 ``H*W`` axis through ``r % hw``, so
+    the column heuristics (the column tile on the stride-1 axis) and the
+    row ones (a reduction dimension) do not take the kernel, and without a
+    seed the search neither leaves short chunks nor reaches
+    ``cute_lane_unroll``.  Seed one (split, channel) per CTA whose 128
+    threads walk the rows in chunks of two 32-byte vectors per thread, with
+    ``cute_uniform_lane_compares``: the masks of the chunk (its tile mask,
+    ``r < total``, the bounds of ``r // hw`` and ``r % hw``) then cost one
+    compare per vector instead of one per element.  Measured on B200 (cold
+    L2) for better-benchmark's bn_welford_partials
+    (var_mean_var_mean_5cc92f5d49c1: [32, 256, 56, 56] bf16, 4 splits of
+    25088 rows): 17.0 us, against 32.3 us for the autotuned config
+    (512-element chunks of 64 threads) and 22.5 us for Helion-Triton.
+    Other chunks with the knob measured slower: 2048 elements 18.5 us (128
+    threads, one vector each) and 22.2 us (64 threads, two), 4096 elements
+    19.3 us (64 threads, four) and 19.8 us (256 threads, one), 8192
+    elements 21.5 us (128 threads, four) and 19.8 us (256 threads, two),
+    and 16-byte vectors 20.5 us (2048 elements) and 23.9 us (4096).
+
+    A vector is one packet only where it stays in one row, ``hw`` and the
+    other terms of ``r`` (the split offsets) multiples of its width, where
+    the loop's extent is a multiple of it, and where it starts on a multiple
+    of its width in memory, the input's base address and other strides
+    multiples of it too (a static size-1 dim exempt): the seed halves the
+    vector until they provably are, down to one-element lanes (``hw = 49``;
+    a padded plane; a view one element into its storage; a dynamic shape,
+    whose extents nothing proves), and takes one-element lanes for a loop
+    that does not start at 0, whose lane bases are no multiples of a width.
+    Before SM100 a 32-byte vector is two 16-byte accesses, and the seed
+    starts from 16-byte vectors there (not measured).
+    """
+
+    name = "cute_delinearized_row_reduction"
+    backend = "cute"
+    priority = 102
+    THREADS = 128
+    UNROLL = 2
+    # The input dtypes the seed loads in packets of 32 bytes (16 before SM100).
+    SEED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, torch.Tensor, Node, int] | None:
+        """``(reduced_block_id, source, index, dim)`` when the kernel's single
+        grid loop holds a single device loop that reduces over its own tile
+        and loads the 16/32-bit float ``source`` with the remainder ``index``,
+        ``e % d``, on its stride-1 dim ``dim``, ``e`` adding the loop tile's
+        index."""
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None:
+            return None
+        _grid_blocks, reduced_block_id, calls = nest
+        spec = env.config_spec
+        # The seed sets the loop tile's threads and vector width (and one
+        # block and thread per grid tile, where those have slots).
+        if not all(
+            reduced_block_id in sequence.valid_block_ids()
+            for sequence in (spec.num_threads, spec.cute_vector_widths)
+        ):
+            return None
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+
+        def walks_rows(index: object) -> bool:
+            return any(
+                _tile_index_block(tile, env) == reduced_block_id
+                for tile in match_cute_lane_remainder(index) or ()
+            )
+
+        match: tuple[int, torch.Tensor, Node, int] | None = None
+        reduces = False
+        for node in calls:
+            if node.target is language_load:
+                tensor, subscript = _load_operands(node)
+                if not (
+                    match is None
+                    and tensor is not None
+                    and tensor.dtype in cls.SEED_DTYPES
+                    and isinstance(subscript, (list, tuple))
+                    and len(subscript) == tensor.ndim
+                ):
+                    continue
+                for dim, index in enumerate(subscript):
+                    stride = tensor.stride(dim)
+                    if (
+                        isinstance(stride, int)
+                        and stride == 1
+                        and isinstance(index, Node)
+                        and walks_rows(index)
+                    ):
+                        match = (reduced_block_id, tensor, index, dim)
+                        break
+                continue
+            if _reduced_sizes(node, reduced_symbol) is not None:
+                reduces = True
+        return match if reduces else None
+
+    @staticmethod
+    def _packet_width(
+        env: CompileEnvironment,
+        index: Node,
+        reduced_block_id: int,
+        widest: int,
+        source: torch.Tensor,
+        dim: int,
+    ) -> int:
+        """The widest power of two up to ``widest`` whose aligned packets the
+        remainder ``index``, ``e % d``, keeps in one row: ``e`` adds the loop
+        tile's index once, and ``d`` and the other terms of ``e`` are static
+        multiples of it, which is what the lowering proves on the generated
+        expression (``_cute_lane_contiguous``: a kernel argument's factors
+        are unknown there, even where ``input_tensor_metadata`` pins them),
+        as is the loop's extent (the lowering's ``known_multiple``), and
+        ``source``'s base address and the strides of its dims other than
+        ``dim`` are multiples of it (``cute_reduction_vector_layout_aligned``
+        in the lowering, read here from the example input's base residue,
+        ``_packet_layout_aligned``), so that each packet starts on a multiple
+        of its width in memory.  1 when no width is."""
+        parts = cute_lane_remainder_terms(index)
+        if parts is None:
+            return 1
+        divisor, terms = parts
+        lanes = [
+            position
+            for position, (term, sign) in enumerate(terms)
+            if sign > 0 and _tile_index_block(term, env) == reduced_block_id
+        ]
+        if len(lanes) != 1:
+            return 1
+        others = [
+            term for position, (term, _) in enumerate(terms) if position != lanes[0]
+        ]
+        vec = widest
+        while vec > 1 and not (
+            env.known_multiple(_to_sympy(divisor), vec)
+            and all(row_is_multiple_of(term, vec, env, static=True) for term in others)
+            and env.block_sizes[reduced_block_id].known_multiple(vec)
+            and _packet_layout_aligned(env, source, dim, vec)
+        ):
+            vec //= 2
+        return vec
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._match(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        reduced_block_id, source, index, dim = match
+        spec = env.config_spec
+        # A 32-byte vector is one load on SM100+, two 16-byte ones before.
+        capability = spec.target_device_capability
+        packet_bytes = _CUTE_VECTOR_MAX_BYTES * (
+            2 if capability is not None and capability >= (10, 0) else 1
+        )
+        # A loop that does not start at 0 (``hl.tile(3, rows)``) loads no
+        # aligned packet: the lowering needs the lane base a multiple of V.
+        vec = (
+            1
+            if reduced_block_id in device_ir.noncanonical_task_origin_block_ids
+            else cls._packet_width(
+                env,
+                index,
+                reduced_block_id,
+                max(1, packet_bytes // source.dtype.itemsize),
+                source,
+                dim,
+            )
+        )
+        # The chunk shrinks with a loop shorter than it, threads first and
+        # then the vector, but the seed keeps the lane unroll and the knob,
+        # one-element lanes included: whether they are searchable must not
+        # depend on the shape (``autotune_multi``).
+        fragment = spec.block_sizes.block_id_lookup(reduced_block_id)._fragment(spec)
+        chunk = max(fragment.low, min(cls.THREADS * vec * cls.UNROLL, fragment.high))
+        vec = max(1, min(vec, chunk // cls.UNROLL))
+        threads = max(1, min(cls.THREADS, chunk // (vec * cls.UNROLL)))
+        others = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id != reduced_block_id
+        }
+        return Config.from_dict(
+            {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {**others, reduced_block_id: chunk}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {**others, reduced_block_id: threads}
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {reduced_block_id: vec}
+                ),
+                "cute_lane_unroll": cls.UNROLL,
+                "cute_uniform_lane_compares": True,
+            }
+        )
+
+
+class CuteStridedReductionHeuristic(AutotunerHeuristic):
+    """Coalesced seeds for a reduction over a strided full slice beside a
+    contiguous grid tile (a channels-last spatial mean or BatchNorm-ReLU pool:
+    ``x[tile_n, :, tile_c]`` reduced over the middle dim).
+
+    The reduction threads take ``thread_idx[0]`` by default, so a warp's
+    lanes read rows ``C`` elements apart, one element each.  With
+    ``cute_vloop_sink`` the contiguous tile's vectors take the lowest thread
+    axes instead (``_plan_vloop_sink_reduction_execution``): each lane loads
+    one vector per row, a 16-byte chunk where the rows are 16-byte aligned
+    (else the widest aligned power of two, down to two elements: 4 bytes for
+    16-bit types), and the reduction combines across the interleaved tile
+    threads in shared memory.
+    The autotuner rarely draws that combination (the tile's vector width,
+    sinking and a deep lane unroll together), so seed it: 16 or 32 vector
+    threads along the contiguous tile (2 or 4 times as many for an 8- or
+    4-byte vector, the wider tile first), 8 or 16 reduction threads over 64-
+    to 128-row chunks with the row lane loop unrolled, and one element of
+    every other grid axis per CTA.  A reduction of at most
+    ``WHOLE_CHUNK_ROWS`` rows also gets a seed that covers it in one chunk,
+    and a seed whose chunk is longer than the reduction runs it in one pass
+    of a clamped chunk; a grid of too few CTAs gets a narrower tile with up
+    to 1024 threads per CTA (``_narrow_tile_shape``).
+
+    Disjoint from ``CuteColumnReductionHeuristic`` (a serial device-loop
+    reduction, no reduction loops) and from ``CuteRegisterTileHeuristic``:
+    this one seeds the rolled chunks of a reduction the register tile does
+    not take and leaves a reduction the register tile seeds to it (its
+    persistent layout beat these seeds 1.6-3.9x on B200 column sums of 128
+    to 1024 bf16 rows).  It registers no specialization: a binding whose
+    extent or strides are not already proven multiples of a two-element
+    vector (a dynamic shape) gets no seed rather than recompiling per input
+    shape.
+    """
+
+    name = "cute_strided_reduction"
+    backend = "cute"
+    priority = 92
+    # The narrow seed (``_narrow_tile_shape``) depends on the SM count.
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
+
+    # CTAs per SM the seeded grid keeps at least before the narrow seed
+    # (``_narrow_tile_shape``) joins the others.
+    NARROW_MIN_CTAS_PER_SM = 4
+    NARROW_CTA_THREADS = 128
+    NARROW_UNROLL = 8
+    # A reduction longer than the first seed's chunk and at most this many
+    # rows also gets a seed that covers it in one chunk with the deepest lane
+    # unroll.
+    WHOLE_CHUNK_ROWS = 256
+    WHOLE_CHUNK_UNROLL = 16
+    # An L2 line: an input whose CTA rows are narrower in its dtype, or one
+    # line wide off the line boundaries, shares its lines with the
+    # neighboring CTAs, so it keeps the default policy
+    # (``_rows_own_their_lines``).
+    STREAM_LINE_BYTES = 128
+
+    @classmethod
+    def _narrow_tile_shape(
+        cls,
+        env: CompileEnvironment,
+        tile_block_id: int,
+        vec: int,
+        tile_threads: int,
+        rows: int,
+    ) -> tuple[int, int, int, int] | None:
+        """A narrower contiguous tile when the seeds launch too few CTAs.
+
+        Every other grid axis keeps one element per CTA, so the grid is their
+        extents times the tiles of the contiguous axis.  A pool of 128 images
+        over 144 channels ([128, 3136, 144] bf16) gets 256 CTAs from
+        128-column tiles, each walking 3136 rows with 8 reduction threads:
+        637 us on B200, against 98 us for 16-column tiles (1152 CTAs) whose
+        64 reduction threads keep 128 threads per CTA.  The narrow tile is the
+        widest power of two that gives ``NARROW_MIN_CTAS_PER_SM`` CTAs per SM,
+        with ``NARROW_CTA_THREADS`` threads per CTA (more reduction threads
+        when even one vector per CTA cannot reach that many CTAs, as long as
+        a chunk stays shorter than the ``rows`` reduced);
+        ``(tile threads, reduction threads, rows per chunk, lane unroll)``.
+        """
+        from .....runtime import get_num_sm
+
+        try:
+            num_sm = get_num_sm(env.device)
+        except (AssertionError, NotImplementedError):
+            return None
+        spec = env.config_spec
+        extent = spec.block_sizes.block_id_lookup(tile_block_id).size_hint
+        other_ctas = math.prod(
+            item.size_hint
+            for item in spec.block_sizes
+            if item.block_id != tile_block_id
+        )
+        target = cls.NARROW_MIN_CTAS_PER_SM * num_sm
+        default_columns = tile_threads * vec
+        if num_sm <= 0 or other_ctas * -(-extent // default_columns) >= target:
+            return None
+        columns = max(vec, prev_power_of_2(extent * other_ctas // target))
+        if columns >= default_columns:
+            return None
+        narrow_threads = columns // vec
+        # One vector per CTA can still leave the grid short of the target
+        # (512 fp32 columns over a lone grid axis: 128 CTAs of 4 columns):
+        # each CTA then takes the reduction threads of the CTAs it lacks, up to
+        # a full CTA, so as many loads stay in flight from a cold L2 (that
+        # column sum: 66 us at 128 threads, 28 us at 512, B200), as long as
+        # their chunk (``NARROW_UNROLL`` rows a thread) stays shorter than
+        # the reduction: 2048 to 4096 rows keep 128 or 256 threads.  The
+        # ``NARROW_CTA_THREADS`` floor alone can make the chunk longer (1024
+        # rows for one vector per CTA), and the seed then runs the reduction
+        # in one pass of a clamped chunk.
+        ctas = other_ctas * -(-extent // columns)
+        reduction_threads = max(
+            cls.NARROW_CTA_THREADS // narrow_threads,
+            prev_power_of_2(
+                cls.NARROW_CTA_THREADS * target // (ctas * narrow_threads),
+                min(
+                    MAX_THREADS_PER_BLOCK // narrow_threads,
+                    (rows - 1) // cls.NARROW_UNROLL,
+                ),
+            ),
+        )
+        return (
+            narrow_threads,
+            reduction_threads,
+            reduction_threads * cls.NARROW_UNROLL,
+            cls.NARROW_UNROLL,
+        )
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``strided_reduction`` of a kernel whose reduction the register tile
+        does not take."""
+        match = cls.strided_reduction(env, device_ir)
+        if match is None or CuteRegisterTileHeuristic.is_eligible(env, device_ir):
+            return None
+        return match
+
+    @classmethod
+    def strided_reduction(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``(tile_block_id, reduction_block_id, source)`` when a load of the
+        16/32-bit input ``source`` addresses its stride-1 dim with a
+        zero-origin tile of the kernel's single grid loop and a strided dim
+        with the full slice the kernel's one reduction loop reduces.  The
+        kernel's structure decides, never its extents: ``cute_vloop_sink`` and
+        ``cute_lane_unroll`` open on it (``cute_strided_reduction_sites``), so
+        the search space is the same at every extent, though the seeds fit
+        only some."""
+        spec = env.config_spec
+        if spec.matmul_facts or len(spec.reduction_loops) != 1:
+            return None
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if len(paths) != 1 or len(paths[0]) != 1:
+            return None
+        grid_blocks = set(paths[0][0])
+        grid_symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid_blocks
+        }
+        reduction_extent = env.block_sizes[rl_spec.block_id].numel
+        for sequence in (spec.num_threads, spec.cute_vector_widths):
+            if not (grid_blocks | {rl_spec.block_id}) <= set(
+                sequence.valid_block_ids()
+            ):
+                return None
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function" or node.target is not language_load:
+                    continue
+                tensor, subscript = _load_operands(node)
+                if not (
+                    tensor is not None
+                    and isinstance(subscript, (list, tuple))
+                    and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                ):
+                    continue
+                vec = _cute_tile_seed_vec_width_for_dtype(tensor.dtype)
+                if vec < 2 or vec * tensor.dtype.itemsize > _CUTE_VECTOR_MAX_BYTES:
+                    continue
+                # Only static strides and structural extent matches: comparing
+                # a dynamic size or stride would guard (specialize) it.
+                contiguous: int | None = None
+                strided_slices = 0
+                dim = 0
+                for index in subscript:
+                    if isinstance(index, torch.fx.Node):
+                        index = index.meta.get("val")
+                    if index is None:
+                        continue
+                    if dim >= tensor.ndim:
+                        break
+                    stride = tensor.stride(dim)
+                    if isinstance(index, slice):
+                        if not (
+                            index == slice(None)
+                            and isinstance(stride, int)
+                            and stride != 1
+                        ):
+                            strided_slices = -1
+                            break
+                        size = tensor.size(dim)
+                        if (
+                            size if isinstance(size, int) else _symint_sympy_expr(size)
+                        ) == reduction_extent:
+                            strided_slices += 1
+                    elif (
+                        isinstance(index, torch.SymInt)
+                        and isinstance(stride, int)
+                        and stride == 1
+                    ):
+                        contiguous = grid_symbols.get(_symint_sympy_expr(index))
+                    dim += 1
+                if (
+                    strided_slices == 1
+                    and contiguous in grid_blocks
+                    and contiguous not in device_ir.noncanonical_task_origin_block_ids
+                ):
+                    return cast("int", contiguous), rl_spec.block_id, tensor
+        return None
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor, int, int] | None:
+        """The match, the seed vector width and the dtype's 16-byte vector
+        width when sinking can fire for this binding: the seed width is the
+        widest power of two up to the 16-byte vector that divides the
+        contiguous tile's extent and every other stride of ``source`` (rows
+        of 30522 bf16 elements are only 4-byte aligned: two elements)."""
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        tile_block_id, _reduction_block_id, source = match
+        full = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        vec = full
+        while vec >= 2 and not (
+            env.specialized_multiple(env.block_sizes[tile_block_id].numel, vec)
+            and all(
+                source.stride(dim) == 1
+                or env.specialized_multiple(source.stride(dim), vec)
+                for dim in range(source.ndim)
+            )
+        ):
+            vec //= 2
+        if vec < 2:
+            return None
+        return (*match, vec, full)
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return []
+        tile_block_id, reduction_block_id, source, vec, full = plan
+        spec = env.config_spec
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        tile_fragment = block_specs[tile_block_id]._fragment(spec)
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        chunk_fragment = rl_spec._flat_fragment(spec)
+        tile_extent = next_power_of_2(max(1, block_specs[tile_block_id].size_hint))
+        others = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id != tile_block_id
+        }
+        seeds: list[Config] = []
+        # A vector narrower than 16 bytes (rows only 4- or 8-byte aligned)
+        # takes as many more threads along the tile: each CTA row keeps the
+        # bytes, and each CTA the bytes in flight, of the measured shapes.
+        widen = full // vec
+        # (vector threads along the tile, reduction threads, rows per chunk,
+        # lane unroll): measured on B200 for bf16 [512, 784, 120] and
+        # [128, 324, 1536] (channels-last BatchNorm-ReLU pool and spatial
+        # mean), where 8 reduction threads with an 8-deep unroll keep the
+        # most 16-byte loads in flight per thread.
+        measured = [(16, 8, 128, 8), (32, 8, 64, 8), (16, 16, 128, 4)]
+        # The 128-row-chunk shape the one-chunk seed extends.
+        base_index = 0
+        if widen > 1:
+            # A narrow vector seeds the wider tile first: 256 columns per CTA
+            # beat 128 on the BERT vocabulary gradient ([16384, 30522] bf16,
+            # rows 4-byte aligned; 174.0 against 182.2 us, B200 with a cold
+            # L2, Helion-Triton 174.1 us).  8-byte rows take the same order
+            # without a measurement.
+            measured[0], measured[1] = measured[1], measured[0]
+            base_index = 1
+        shapes = [
+            (
+                max(
+                    1,
+                    min(
+                        tile_threads * widen,
+                        tile_extent // vec,
+                        MAX_THREADS_PER_BLOCK // reduction_threads,
+                    ),
+                ),
+                reduction_threads,
+                chunk,
+                unroll,
+            )
+            for tile_threads, reduction_threads, chunk, unroll in measured
+        ]
+        # The narrow seed joins when the first seed launches too few CTAs;
+        # the one-chunk seed extends the 128-row-chunk shape.
+        narrow = cls._narrow_tile_shape(
+            env, tile_block_id, vec, shapes[0][0], rl_spec.size_hint
+        )
+        if narrow is not None:
+            shapes.append(narrow)
+        base = shapes[base_index]
+        whole = next_power_of_2(max(1, rl_spec.size_hint))
+        # A reduction short enough for one chunk, past the base shape's
+        # 128-row chunks: each reduction thread walks its rows in one fully
+        # unrolled pass, every load in flight at once (bf16 [128, 196, 768]
+        # token sums: 25.4 us with 16 reduction threads, 26.4 with 8, against
+        # 30.9 us for the first seed's 128-row chunks, on B200 with a cold
+        # L2).  The unroll sets the thread count: 16 rows a thread.
+        if base[2] < whole <= cls.WHOLE_CHUNK_ROWS:
+            shapes.append(
+                (
+                    base[0],
+                    whole // cls.WHOLE_CHUNK_UNROLL,
+                    whole,
+                    cls.WHOLE_CHUNK_UNROLL,
+                )
+            )
+        hint_streams = spec.supports_config_key("load_eviction_policies")
+        for tile_threads, reduction_threads, chunk, unroll in shapes:
+            columns = tile_threads * vec
+            # A chunk that reaches the reduction's length (a measured shape's
+            # over at most 128 rows, the narrow seed's over up to 1024) is
+            # clamped to the reduction's power of two: the seed runs the
+            # reduction in one pass, where that pass stays a rolled loop
+            # (``_full_extent_chunk``: from 8 rows; a shorter reduction runs
+            # persistent and nothing sinks).  These seeds give short
+            # reductions the sunk, unrolled layouts, and better-benchmark's
+            # channels-last BatchNorm chain (var_mean_var_mean_mean_0efb69a14422:
+            # 128-row partials, a 49-row combine and spatial mean) ran in 25.3 us
+            # at the configs autotuned with them, against 32.3 us without
+            # (B200, L2 cleared before every call).
+            chunk = min(chunk, whole)
+            if not (
+                tile_fragment.low <= columns <= tile_fragment.high
+                and chunk_fragment.low <= chunk <= chunk_fragment.high
+                and (chunk < rl_spec.size_hint or chunk == rl_spec._full_extent_chunk())
+            ):
+                continue
+            # A clamped chunk can hold fewer rows than the shape's threads
+            # walk: the seed records what runs, at most one reduction thread
+            # a row and a lane unroll no deeper than each thread's rows.
+            reduction_threads = min(reduction_threads, chunk)
+            unroll = min(unroll, chunk // reduction_threads)
+            values: dict[str, object] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {**others, tile_block_id: columns}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads,
+                    {
+                        **others,
+                        tile_block_id: tile_threads,
+                        reduction_block_id: reduction_threads,
+                    },
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {tile_block_id: vec}
+                ),
+                "reduction_loops": [chunk],
+                "cute_vloop_sink": True,
+                "cute_lane_unroll": unroll,
+            }
+            if hint_streams:
+                # The strided input is streamed through once: its lines go
+                # evict-first so the seed keeps the L2 lines it does not own.
+                policies = _cute_streaming_input_cache_policies(
+                    spec,
+                    device_ir,
+                    Config.from_dict(values),
+                    reduction_block_id,
+                    tile_block_id,
+                    columns,
+                    cls.STREAM_LINE_BYTES,
+                )
+                if any(policies):
+                    values["load_eviction_policies"] = policies
+            seeds.append(Config.from_dict(values))
+        return dedupe_configs(seeds)
+
+
+def _reduction_chunk_size(size_hint: int, max_chunk: int | None) -> int:
+    return prev_power_of_2(size_hint // 2, max_chunk)
+
+
+class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
+    """Seed prev_power_of_2(min(size_hint // 2, max_reduction_loop)).
+
+    For large N this lattice (few outer iters, large lane_extent) tends to
+    schedule better than the narrow-chunk lattice (many outer iters,
+    lane_extent=1) on B200 — the SASS is dominated by per-iter scheduling
+    bubbles in the narrow case, while the wide case lets the compiler
+    overlap the load/compute/store traffic across the unrolled lane
+    iterations. Only applies when the rounded chunk exceeds max_threads.
+    """
+
+    name = "cute_reduction_wide_chunk"
+    backend = "cute"
+    priority = 31
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not is_canonical_row_reduction(env):
+            return False
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        max_threads = spec.max_reduction_threads or 1024
+        return (
+            _reduction_chunk_size(rl_spec.size_hint, spec.max_reduction_loop)
+            > max_threads
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        size_hint = rl_spec.size_hint
+        chunk = _reduction_chunk_size(size_hint, spec.max_reduction_loop)
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": _seq_config_list(spec.num_threads, {}),
+            "reduction_loops": [chunk],
+        }
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
+        if vec > 1:
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rl_spec.block_id: vec}
+            )
+        return Config(**seed)
+
+
+class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
+    """Quack-style ladder seed for rolled row reductions (layernorm /
+    rmsnorm family): moderate threads-per-row that grow with the row width,
+    128-bit vectorized strided lanes, and a wide loop chunk.
+
+    Measured on B200 bf16 rows (see benchmarks/cute/layernorm_plan.md):
+    threads-per-row 32 @ N<=2k, 128 @ <=8k, 256 @ <=32k, 512 @ <=64k, and
+    the chunk-derived maximum beyond; rows-per-CTA fills the CTA to >=128
+    threads for narrow rows.  The reload choice is left at "auto" (register
+    fragment up to 64 elements/thread, gmem/L2 reload beyond), which
+    matched the hand-tuned best at every measured width.
+    """
+
+    name = "cute_rolled_row_ladder"
+    backend = "cute"
+    priority = 36
+    MAX_CHUNK = 65536
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return is_canonical_row_reduction(env)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        size_hint = rl_spec.size_hint
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
+        if size_hint <= 2048:
+            threads_per_row = 32
+        elif size_hint <= 8192:
+            threads_per_row = 128
+        elif size_hint <= 32768:
+            threads_per_row = 256
+        elif size_hint <= 65536:
+            threads_per_row = 512
+        else:
+            threads_per_row = 0  # auto: chunk-derived (1024)
+        rows_per_cta = max(1, 128 // threads_per_row) if threads_per_row else 1
+        if rows_per_cta > 1 and not _block_size_value_reachable(spec, 0, rows_per_cta):
+            rows_per_cta = 1
+        max_chunk = cls.MAX_CHUNK
+        if spec.max_reduction_loop is not None:
+            max_chunk = min(max_chunk, spec.max_reduction_loop)
+        chunk = _reduction_chunk_size(size_hint, max_chunk)
+        chunk = max(chunk, max(threads_per_row, 1) * max(vec, 1))
+        if chunk < 2 or chunk >= size_hint or chunk > max_chunk:
+            return None
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        nt_overrides: dict[int, object] = {tile_id: rows_per_cta}
+        if threads_per_row:
+            nt_overrides[rdim_id] = threads_per_row
+        seed: dict[str, Any] = {
+            "block_sizes": [rows_per_cta],
+            "num_threads": _seq_config_list(spec.num_threads, nt_overrides),
+            "reduction_loops": [chunk],
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {rdim_id: "strided"}
+            ),
+        }
+        if vec > 1:
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            )
+        return Config(**seed)
+
+
+class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
+    """Seed Triton's rolled-row shape for row kernels that store a row.
+
+    A row-store sweep (a cross-entropy backward, softmax's normalize) is
+    bound by its loads in flight: 64 threads walk a 2048-element chunk, and
+    the loads-first lane unroll (``cute_lane_unroll``) issues 16 lanes' loads
+    before any store, Helion-Triton's 2-warp, 32-elements-per-thread block.
+    The lanes are as wide as every row the sweeps load or store along the
+    reduced dim is aligned for, at most two elements (``_lane_vector``): a
+    vector lane walks a row whose start the packet cannot reach
+    element by element at the vector's stride, 8x the L1 wavefronts at
+    16-byte packets.  Measured on B200 (cold L2): better-benchmark's BART
+    cross-entropy backward (``[8192, 50265]`` bf16 rows at odd offsets)
+    672 us with unvectorized lanes, 1206 us at 128 threads and 16-byte
+    packets (Helion-Triton 733); BERT's masked-LM backward (rows of 30522
+    elements, 4-byte aligned) 724 us with two-wide lanes (Helion-Triton 733).
+    """
+
+    name = "cute_rolled_row_loads_first"
+    backend = "cute"
+    priority = 94
+    CHUNK = 2048
+    THREADS = 64
+    UNROLL = 16
+    # Wider lanes have not measured better on these sweeps.
+    MAX_LANE_VECTOR = 2
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        # Structure only: the seed makes ``cute_lane_unroll`` searchable, and
+        # the search space must not change with the shape.  A row shorter
+        # than the chunk normalizes the seed to a persistent row, which keeps
+        # the lane vector, and the unroll only where normalization finds a
+        # lane loop that takes it (``_cute_config_forms_lane_loop``): one
+        # more candidate.  No reduction is required: a row-store sweep
+        # without one (a cross-entropy backward whose one-hot sum is folded
+        # away, ``out[tile, :] = f(x[tile, :])``) is the same loads-bound
+        # walk.
+        if not is_canonical_row_reduction(env):
+            return False
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        return rl_spec.block_id in spec.num_threads.valid_block_ids() and any(
+            "store" in ops for ops in _rolled_row_sweeps(device_ir)
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        chunk = cls.CHUNK
+        if spec.max_reduction_loop is not None:
+            chunk = min(chunk, spec.max_reduction_loop)
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {tile_id: 1, rdim_id: cls.THREADS}
+            ),
+            "reduction_loops": [chunk],
+            "cute_lane_unroll": cls.UNROLL,
+        }
+        vec = cls._lane_vector(env, device_ir, rdim_id)
+        if vec > 1 and rdim_id in spec.cute_vector_widths.valid_block_ids():
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            )
+        return Config(**seed)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """The seed, and when the chunk leaves a partial last one, the seed
+        under ``cute_proven_bounds``: its complete chunks then run apart and
+        lose their bounds predicates (``peel_partial_chunks``), 21.25 instead
+        of 24.6 instructions per element in BERT's folded cross-entropy
+        backward (30522 = 14 * 2048 + 1850)."""
+        seed = cls.get_seed_config(env, device_ir)
+        if seed is None:
+            return []
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        extent = env.specialize_expr(env.block_sizes[rl_spec.block_id].numel)
+        chunk = cast("list[int]", seed.config["reduction_loops"])[0]
+        if (
+            not spec.cute_proven_bounds_enabled
+            or not isinstance(extent, (int, sympy.Integer))
+            or int(extent) <= chunk
+            or int(extent) % chunk == 0
+        ):
+            return [seed]
+        return [seed, Config.from_dict({**seed.config, "cute_proven_bounds": True})]
+
+    @classmethod
+    def _lane_vector(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rdim_id: int
+    ) -> int:
+        """The seed's lane vector (see the class docstring): a row is a load
+        or store whose unit-stride dim is indexed by a slice spanning the
+        reduced extent, aligned for the vector when the slice's start and the
+        tensor's other strides are multiples of it (``_row_starts_aligned``).
+        A dynamic stride counts only when the bound kernel is keyed on exact
+        input metadata (``input_tensor_metadata``, which this seed does not
+        request; another heuristic may): otherwise the lanes stay
+        unvectorized.  The base pointer is not read: the bind records the
+        inputs' base residues only after the seeds, so a view whose rows
+        start off a packet boundary at a storage offset still gets the
+        vector, and its lanes then load element by element.  A performance
+        seed only: the generated code proves its own packets."""
+        from ....device_ir import ReductionLoopGraphInfo
+
+        extent = env.block_sizes[rdim_id].size
+        if not isinstance(extent, (int, torch.SymInt)):
+            return 1
+        rows: list[tuple[torch.Tensor, int, object]] = []
+        for graph_info in device_ir.graphs:
+            if not isinstance(graph_info, ReductionLoopGraphInfo):
+                continue
+            for node in graph_info.graph.nodes:
+                if (
+                    node.op != "call_function"
+                    or node.target not in (language_load, language_store)
+                    or len(node.args) < 2
+                    or not isinstance(node.args[0], torch.fx.Node)
+                    or not isinstance(node.args[1], (list, tuple))
+                ):
+                    continue
+                tensor = node.args[0].meta.get("val")
+                indices = [index for index in node.args[1] if index is not None]
+                if not isinstance(tensor, torch.Tensor) or len(indices) != tensor.ndim:
+                    continue
+                for dim, index in enumerate(indices):
+                    stride = tensor.stride(dim)
+                    if (
+                        isinstance(index, slice)
+                        and index.step in (None, 1)
+                        and isinstance(stride, int)
+                        and stride == 1
+                        and env.known_equal(
+                            compute_slice_size(index, tensor.shape[dim]), extent
+                        )
+                    ):
+                        start = normalize_slice(index, tensor.shape[dim]).start
+                        rows.append((tensor, dim, 0 if start is None else start))
+        if not rows:
+            return 1
+        vec = min(
+            cls.MAX_LANE_VECTOR,
+            *(
+                _cute_tile_seed_vec_width_for_dtype(tensor.dtype)
+                for tensor, _, _ in rows
+            ),
+        )
+        # Two elements at most: aligned for two, or unvectorized.
+        if vec > 1 and not all(
+            _row_starts_aligned(env, tensor, dim, start, vec)
+            for tensor, dim, start in rows
+        ):
+            vec = 1
+        return vec
+
+
+def _unit_dims(tensor: torch.Tensor) -> list[int]:
+    """The dimensions that may be ``tensor``'s stride-1 dimension at every
+    extent: its one dimension of stride 1 or, where a size-1 dimension has
+    stride 1 too, each such size-1 dimension, which PyTorch gives stride 1
+    only innermost (a ``[q, k, heads]`` view of one head has stride 1 on both
+    the heads and the keys).  Which of several size-1 dimensions is the
+    innermost at other extents depends on the layout (the keys of contiguous
+    ``[b, h, 1, 1]`` scores, the heads of a heads-innermost ``[b, 1, q, 1]``
+    bias view), so each is a candidate: a seed that picked one would find its
+    operands at some extents only (``autotune_multi`` needs one search
+    space)."""
+    units = [
+        dim
+        for dim in range(tensor.ndim)
+        if isinstance(stride := tensor.stride(dim), int) and stride == 1
+    ]
+    if len(units) > 1:
+        units = [
+            dim
+            for dim in units
+            if isinstance(size := tensor.shape[dim], int) and size == 1
+        ]
+    return units
+
+
+def _stride_one_loads(
+    graph: torch.fx.Graph, among: Collection[torch.fx.Node] | None = None
+) -> list[tuple[torch.Tensor, list[sympy.Expr | None], int]]:
+    """``(tensor, sizes, unit_dim)`` for each load in ``graph`` of a tensor
+    (each of ``among`` only, when given) and each dimension ``unit_dim``
+    that may be its stride-1 dimension (``_unit_dims``).  ``sizes`` are the
+    loaded value's sizes as sympy expressions per dimension of the tensor
+    (``None`` where static, or where a scalar index drops the dimension), so
+    a tile's symbol names the dimension it walks.  The subscripts align
+    them: a scalar index (``bias[0, ...]``) takes no dimension of the value,
+    a ``None`` axis one of the tensor."""
+    loads = []
+    for node in graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target is not language_load
+            or (among is not None and node not in among)
+            or len(node.args) < 2
+            or not isinstance(node.args[0], torch.fx.Node)
+            or not isinstance(node.args[1], (list, tuple))
+        ):
+            continue
+        tensor = node.args[0].meta.get("val")
+        value = node.meta.get("val")
+        if not (isinstance(tensor, torch.Tensor) and isinstance(value, torch.Tensor)):
+            continue
+        sizes: list[sympy.Expr | None] = []
+        position = 0
+        for index in node.args[1]:
+            if index is None:
+                position += 1
+                continue
+            val = index.meta.get("val") if isinstance(index, torch.fx.Node) else index
+            size = value.shape[position] if position < value.ndim else None
+            if isinstance(val, int) or (
+                isinstance(val, torch.SymInt)
+                and not (
+                    isinstance(size, torch.SymInt)
+                    and _symint_sympy_expr(size) == _symint_sympy_expr(val)
+                )
+            ):
+                # A scalar index, not a tile: the value has no such dimension.
+                sizes.append(None)
+                continue
+            if isinstance(val, torch.Tensor) and val.ndim != 1:
+                break
+            position += 1
+            sizes.append(
+                _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else None
+            )
+        else:
+            if position == value.ndim and len(sizes) == tensor.ndim:
+                loads.extend((tensor, sizes, unit) for unit in _unit_dims(tensor))
+    return loads
+
+
+def _packet_lanes(
+    env: CompileEnvironment, tensor: torch.Tensor, unit: int, lane_block: int
+) -> int | None:
+    """The lanes of one ``cute_grid_lane_jam`` packet of ``tensor``, tiled by
+    ``lane_block``: the elements of the widest vector load
+    (``_CUTE_VECTOR_MAX_BYTES``), halved until they divide the lane block's
+    extent (the jam's lane index is then unmasked) and ``tensor``'s stride-1
+    extent (the lanes' elements are then one packet: 12 bf16 heads take 4
+    lanes, not 8), and until its other strides are multiples of them, as the
+    jam checks (``cute_vector_strides_aligned``; the base pointer is the
+    bound kernel's, which the jam checks itself).  None when either extent is
+    symbolic: the jam proves the lanes unmasked on static values only and
+    leaves the lane loop of a dynamic shape rolled.  One lane (an odd head
+    count) still counts, so that the knob the seed makes searchable is
+    searchable at every static shape (``autotune_multi`` needs one search
+    space)."""
+    extents = [env.block_sizes[lane_block].numel, tensor.shape[unit]]
+    if not all(isinstance(extent, (int, sympy.Integer)) for extent in extents):
+        return None
+    lanes = max(1, _CUTE_VECTOR_MAX_BYTES // tensor.dtype.itemsize)
+    while lanes > 1 and (
+        any(int(extent) % lanes for extent in extents)
+        or not cute_vector_strides_aligned(env, tensor, unit, lanes)
+    ):
+        lanes //= 2
+    return lanes
+
+
+# The keys of a jammed tile, at most.
+_KEY_CHUNK = 1024
+
+
+def _key_chunk(keys: int, vec: int) -> int:
+    """The tile of an axis of ``keys`` elements that ``cute_grid_lane_jam``
+    reads in ``vec``-wide packets (a device loop's keys, or the privatized
+    scatter's grid tile, ``CutePrivatizeAtomicsHeuristic._jam_seed``): up to
+    ``_KEY_CHUNK``, the largest power of two that divides ``keys`` while it
+    still gives the tile a warp of packets (768 keys take 256), so that the
+    tile is unmasked, which the jam needs; else the next power of two, whose
+    masked tile the jam leaves rolled."""
+    chunk = min(_KEY_CHUNK, next_power_of_2(keys))
+    divisor = chunk
+    while keys % divisor:
+        divisor //= 2
+    return divisor if divisor == chunk or divisor >= 32 * vec else chunk
+
+
+class CuteGridLaneJamHeuristic(AutotunerHeuristic):
+    """Seed the rows of a row-innermost operand as one thread's jammed lanes.
+
+    T5's relative-position softmax adds a ``[batch, q, k, heads]`` bias, viewed
+    ``[batch, heads, q, k]``, to the scores in device loops over the keys.  A
+    head per thread gathers its head of each key two bytes at a 16-byte
+    stride, and the kernel is bound by L1 wavefronts.  This seed tiles as many
+    heads as one 16-byte packet of that operand holds per CTA, as one thread's
+    lane loop (``num_threads`` 1 on the head axis), puts the keys of each
+    device loop on threads of 16-byte packets and turns on
+    ``cute_grid_lane_jam``, which loads the heads of one key in a single
+    vector and reduces the heads together.
+    """
+
+    name = "cute_grid_lane_jam"
+    backend = "cute"
+    priority = 97
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, dict[int, int]] | None:
+        """``(grid_block_id, lanes, widths)``: a tensor some device loop
+        loads with its stride-1 dimension tiled by the root grid axis
+        ``grid_block_id`` (in ``lanes`` lanes of one packet,
+        ``_packet_lanes``), beside a load of a tensor whose stride-1
+        dimension that loop walks, and the vector width of each device loop
+        (``widths``): one packet of the tensors it walks, the scores rather
+        than the bias.  Every device loop must be a single tile directly in
+        the root that walks some tensor: the seed puts each loop's chunk on
+        threads of its own, which a nested loop would multiply, and a loop
+        over strided elements takes no packets.  A dynamic shape, whose
+        packet the jam cannot prove, gets no seed (``_packet_lanes``)."""
+        from ....device_ir import ForLoopGraphInfo
+        from ....device_ir import ReductionLoopGraphInfo
+
+        spec = env.config_spec
+        if (
+            spec.matmul_facts
+            or spec.reduction_loops
+            or len(device_ir.grid_block_ids) != 1
+        ):
+            return None
+        grid = device_ir.grid_block_ids[0]
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if not paths or any(len(path) != 2 or len(path[1]) != 1 for path in paths):
+            return None
+        symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid
+        }
+        operand: tuple[int, torch.Tensor, int] | None = None
+        walked: dict[int, list[tuple[torch.Tensor, int]]] = {}
+        for graph in device_ir.graphs:
+            if (
+                not isinstance(graph, ForLoopGraphInfo)
+                or isinstance(graph, ReductionLoopGraphInfo)
+                or len(graph.block_ids) != 1
+            ):
+                continue
+            loop_block = graph.block_ids[0]
+            loop_symbol = _symint_sympy_expr(env.block_sizes[loop_block].var)
+            lane_operands: list[tuple[int, torch.Tensor, int]] = []
+            for tensor, sizes, unit in _stride_one_loads(graph.graph):
+                symbol = sizes[unit]
+                if symbol == loop_symbol:
+                    walked.setdefault(loop_block, []).append((tensor, unit))
+                elif symbol is not None and symbol in symbols:
+                    lane_operands.append((symbols[symbol], tensor, unit))
+            if operand is None and loop_block in walked and lane_operands:
+                # A tensor the loop walks along another of its candidate
+                # dimensions (the scores at one query and one key) only when
+                # no other tensor is a lane operand.
+                walking = {id(tensor) for tensor, _ in walked[loop_block]}
+                operand = min(lane_operands, key=lambda lane: id(lane[1]) in walking)
+        loops = {item.block_id for item in spec.block_sizes} - set(grid)
+        if operand is None or not loops <= walked.keys():
+            return None
+        lane_block, tensor, unit = operand
+        lanes = _packet_lanes(env, tensor, unit, lane_block)
+        if lanes is None:
+            return None
+        widths = {
+            block_id: max(
+                1,
+                min(
+                    _CUTE_VECTOR_MAX_BYTES // walk.dtype.itemsize
+                    for walk, _ in walked[block_id]
+                ),
+            )
+            for block_id in loops
+        }
+        return lane_block, lanes, widths
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        return cls._plan(env, device_ir) is not None and all(
+            item.block_id in sequence.valid_block_ids()
+            for sequence in (spec.num_threads, spec.cute_vector_widths)
+            for item in spec.block_sizes
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        lane_block, lanes, vectors = plan
+        spec = env.config_spec
+        blocks: dict[int, int] = {}
+        threads: dict[int, int] = {}
+        widths: dict[int, int] = {}
+        for item in spec.block_sizes:
+            block_id = item.block_id
+            if block_id == lane_block:
+                blocks[block_id] = lanes
+                threads[block_id] = 1
+            elif block_id not in vectors:
+                blocks[block_id] = 1
+                threads[block_id] = 1
+            else:
+                vec = vectors[block_id]
+                chunk = _key_chunk(item.size_hint, vec)
+                blocks[block_id] = chunk
+                threads[block_id] = max(1, chunk // vec)
+                widths[block_id] = min(vec, chunk)
+        seed: dict[str, Any] = {
+            "block_sizes": [blocks[item.block_id] for item in spec.block_sizes],
+            "num_threads": _seq_config_list(spec.num_threads, threads),
+            "cute_vector_widths": _seq_config_list(spec.cute_vector_widths, widths),
+            "cute_grid_lane_jam": True,
+        }
+        return Config(**seed)
+
+
+# The operations whose results ``fuse_two_pass_loads`` carries from a looped
+# reduction's sweep to the later ones under ``register`` reloads, as aten ops
+# (``sweep_values.TRANSCENDENTALS``; sigmoid lowers through exp), besides pure
+# scalar inline asm (``_sweep_cost``).
+_SWEEP_CARRIED_OPS = frozenset(
+    (
+        torch.ops.aten.exp.default,
+        torch.ops.aten.exp2.default,
+        torch.ops.aten.log.default,
+        torch.ops.aten.log2.default,
+        torch.ops.aten.tanh.default,
+        torch.ops.aten.erf.default,
+        torch.ops.aten.sigmoid.default,
+    )
+)
+
+
+def _sweep_cost(node: torch.fx.Node) -> int:
+    """The instructions ``fuse_two_pass_loads`` counts for ``node`` when it
+    weighs carrying a value built from it to a later sweep
+    (``sweep_values.heavy_cost``): a transcendental's, or a pure scalar inline
+    asm's own count (the Philox chain of a word0 ``hl.rand`` draw), else 0."""
+    if node.target in _SWEEP_CARRIED_OPS:
+        return _TRANSCENDENTAL_COST
+    if node.target is inline_asm_elementwise and len(node.args) == 6:
+        asm, constraints, _, _, pure, pack = node.args
+        if (
+            pack == 1
+            and isinstance(asm, str)
+            and isinstance(constraints, str)
+            and isinstance(pure, bool)
+        ):
+            return _pure_asm_instructions(asm, constraints, pure) or 0
+    return 0
+
+
+def _sweep_value_key(
+    node: torch.fx.Node, memo: dict[torch.fx.Node, int], table: dict[object, int]
+) -> int:
+    """``node``'s value number in a sweep's graph, comparable across the
+    sweeps of one looped reduction that share ``table``: a load by its
+    tensor and subscript, an input by its name, any other node by its target
+    and its operands, nodes by their numbers also inside lists (a subscript,
+    an asm's operands).  Numbers rather than nested keys, so that comparing
+    two values costs one comparison per operand however many paths reach a
+    shared one.  Callers number a graph's nodes in order, so that each call
+    finds its operands numbered."""
+
+    def operand(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return _sweep_value_key(arg, memo, table)
+        if isinstance(arg, (list, tuple)):
+            return tuple(map(operand, arg))
+        return repr(arg)
+
+    if node not in memo:
+        key: object
+        if node.op == "placeholder":
+            key = ("input", node.name)
+        elif node.target is language_load and isinstance(node.args[0], torch.fx.Node):
+            key = ("load", id(node.args[0].meta.get("val")), operand(node.args[1]))
+        else:
+            key = (
+                str(node.target),
+                tuple(map(operand, node.args)),
+                repr(sorted(node.kwargs.items())),
+            )
+        memo[node] = table.setdefault(key, len(table))
+    return memo[node]
+
+
+class CuteReductionLaneJamHeuristic(AutotunerHeuristic):
+    """Seed the rows of a row-gathered operand as one thread's jammed lanes
+    around a looped row reduction.
+
+    T5's softmax-dropout backward reduces each ``(batch * head, query)`` row
+    over its keys and adds the head's bias row, ``bias[bh % heads, q, :]``,
+    a ``[heads, q, k]`` view of a ``[q, k, heads]`` fp32 tensor.  A row per
+    CTA gathers four bytes of each key at a 32-byte stride, and the kernel is
+    bound by L1 sectors.  This seed tiles as many rows as one 16-byte packet
+    of that operand holds per CTA, as one thread's lane loop (``num_threads``
+    1 on that axis), keeps each row's keys on 128 threads in a looped
+    reduction of at most 1024 keys a chunk whose first sweep caches its values
+    in registers (``cute_reduction_reloads`` ``register``), and turns on
+    ``cute_grid_lane_jam``: the rows' bias elements of one key are one packet,
+    each row keeps its own workspace row and register cache, and the rows'
+    reduces run together.  Measured on B200 (cold L2), better-benchmark's T5
+    backward at ``[64, 1024, 1024]``: the encoder's kernel runs in 210 us at
+    the seed (263 us at the best CuTe config the autotuner found, 321 us at
+    the seed without the jam; Helion-Triton 220 us), the decoder's causal
+    kernel in 241 us (292 us; Helion-Triton 188 us).
+
+    The best vector width along the reduced dimension differs per kernel
+    (packets of the keys against the registers each row keeps live): four
+    keys per thread won the causal kernel (224.8 us against 235.5 at one),
+    eight the encoder's (205.2 us against 209.8).  So the seed comes at one,
+    four and eight elements per thread (``get_seed_configs``; the primary is
+    the first), where the target loads every row's packets whole, and the
+    autotuner picks.
+    """
+
+    name = "cute_reduction_lane_jam"
+    backend = "cute"
+    priority = 100
+    REDUCTION_THREADS = 128
+    REDUCTION_CHUNK = 1024
+    # The seed's widths along the reduced dim beside the primary's one.
+    ALTERNATE_VECTOR_WIDTHS = (4, 8)
+
+    @classmethod
+    def _lane_operand(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, torch.Tensor, int, int] | None:
+        """``(grid_block_id, tensor, unit_dim, row_itemsize)``: a tensor the
+        tile body loads along the reduced dimension with its stride-1
+        dimension ``unit_dim`` tiled by a root grid axis (a gathered row),
+        beside loads whose stride-1 dimension is the reduced one (the rows),
+        the widest of which has elements of ``row_itemsize`` bytes (loads
+        only: a row only stored is not counted).  Per-row
+        scalars (a row's max, a query's position) do not span the reduced
+        dimension and are no lane operands.  Structure only (the seed makes
+        ``cute_grid_lane_jam`` searchable): the layout, not the extents."""
+        from ....device_ir import RootGraphInfo
+
+        spec = env.config_spec
+        if (
+            spec.matmul_facts
+            or len(spec.reduction_loops) != 1
+            or spec.reduction_loops[0].pinned
+            or len(device_ir.grid_block_ids) != 1
+        ):
+            return None
+        grid = device_ir.grid_block_ids[0]
+        symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid
+        }
+        reduced = _symint_sympy_expr(
+            env.block_sizes[spec.reduction_loops[0].block_id].var
+        )
+        lane_operands: list[tuple[int, torch.Tensor, int]] = []
+        row_itemsize = 0
+        for graph in device_ir.graphs:
+            if not isinstance(graph, RootGraphInfo):
+                continue
+            for tensor, sizes, unit in _stride_one_loads(graph.graph):
+                symbol = sizes[unit]
+                if symbol == reduced:
+                    row_itemsize = max(row_itemsize, tensor.dtype.itemsize)
+                elif symbol is not None and symbol in symbols and reduced in sizes:
+                    lane_operands.append((symbols[symbol], tensor, unit))
+        if row_itemsize and lane_operands:
+            return (*lane_operands[0], row_itemsize)
+        return None
+
+    @staticmethod
+    def _cached_values(device_ir: DeviceIR, block_id: int) -> int:
+        """The values each lane's sweeps of the looped reduction over
+        ``block_id`` cache for the later ones under ``register`` reloads
+        (``fuse_two_pass_loads``, where a sweep reads what any earlier sweep
+        cached).  A later sweep reads a value an earlier sweep computes from
+        the same operands from a cache instead of computing it again when the
+        transcendentals and pure scalar inline asm its computation includes
+        cost at least ``MIN_SAVED_COST`` instructions, as
+        ``sweep_values.SweepValues.cacheable`` weighs them (three exponentials
+        of one row are three caches: a softmax's output sweep reads the
+        exponentials of its sum sweep; ``e + 1``, ``e + 2`` and ``e + 3`` of
+        one ``e = exp(v)`` are three caches, as ``sweep_values.plan_cut``
+        cuts them; a one-instruction asm is computed again), and so every
+        load of an earlier sweep it still needs besides those: a load it reads
+        only to compute a cached value is not cached.  One cache may hold an
+        expression of several loads, so the count may err high.
+        """
+        from ....device_ir import ReductionLoopGraphInfo
+
+        sweeps = [
+            graph.graph
+            for graph in device_ir.graphs
+            if isinstance(graph, ReductionLoopGraphInfo)
+            and list(graph.block_ids) == [block_id]
+        ]
+        if not sweeps:
+            return 0
+        table: dict[object, int] = {}
+        memo: dict[torch.fx.Node, int] = {}
+        earlier = {_sweep_value_key(node, memo, table) for node in sweeps[0].nodes}
+        cached: set[int] = set()
+        for graph in sweeps[1:]:
+            memo = {}
+            keys = {node: _sweep_value_key(node, memo, table) for node in graph.nodes}
+            # The values the sweeps carry: those whose computation includes
+            # carried operations worth ``MIN_SAVED_COST`` instructions.
+            carried: dict[torch.fx.Node, frozenset[torch.fx.Node]] = {}
+            for node in graph.nodes:
+                own = frozenset((node,)) if _sweep_cost(node) else frozenset()
+                carried[node] = own.union(
+                    *(carried.get(arg, frozenset()) for arg in node.all_input_nodes)
+                )
+            heavy = {
+                node
+                for node, ops in carried.items()
+                if sum(map(_sweep_cost, ops)) >= MIN_SAVED_COST
+            }
+            # From the sweep's results and stores back to its inputs.
+            pending = [node for node in graph.nodes if not node.users]
+            seen: set[torch.fx.Node] = set()
+            while pending:
+                node = pending.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node.op == "call_function" and (
+                    node in heavy
+                    or (
+                        node.target is language_load
+                        and isinstance(node.args[0], torch.fx.Node)
+                    )
+                ):
+                    key = keys[node]
+                    if key in earlier:
+                        cached.add(key)
+                        if node in heavy:
+                            # Read from the cache: its operands are not needed.
+                            continue
+                pending.extend(node.all_input_nodes)
+            earlier |= set(keys.values())
+        return len(cached)
+
+    @classmethod
+    def _forwarded_caches(cls, env: CompileEnvironment, device_ir: DeviceIR) -> int:
+        """The caches the seed's ``cute_scratch_forwarding`` adds: a forwarded
+        store's values are cached like a load's.  None here."""
+        return 0
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """Also requires a packet the jam can prove (``_packet_lanes``: a
+        dynamic shape leaves the lane loop rolled, and the seed's knob would
+        change nothing), an N-D grid tile (the jam takes the lane index as
+        the tile offset plus the lane; a one-axis tile lays out flattened
+        unless the planner keeps it N-D, ``cute_nd_tile_loops``, and its
+        lanes index through an alias of the flattened offset, which the jam
+        keeps rolled), every block size to tile a root grid axis (the seed tiles
+        them by its lanes or by 1, which would leave a device loop's block
+        one element on one thread) and every block the seed sets to have its
+        slots: threads for all, a reload mode for the reduction.  Nor may a
+        value span the reduced dimension and another reduction dim
+        (``_spans_another_reduction``)."""
+        spec = env.config_spec
+        match = cls._lane_operand(env, device_ir)
+        if match is None:
+            return False
+        lane_block, tensor, unit, _ = match
+        if _packet_lanes(env, tensor, unit, lane_block) is None:
+            return False
+        level = tuple(device_ir.grid_block_ids[0])
+        if len(level) == 1 and level not in spec.cute_nd_tile_loops:
+            return False
+        grid = set(level)
+        blocks = [item.block_id for item in spec.block_sizes]
+        loop = spec.reduction_loops[0].block_id
+        threaded = spec.num_threads.valid_block_ids()
+        return (
+            all(block_id in grid for block_id in blocks)
+            and all(block_id in threaded for block_id in (*blocks, loop))
+            and loop in spec.cute_reduction_reloads.valid_block_ids()
+            and not cls._spans_another_reduction(env, device_ir)
+        )
+
+    @staticmethod
+    def _spans_another_reduction(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """Whether a value spans the looped reduction's dimension and another
+        reduction dim.  The seed runs every other reduction dim on one thread
+        (``get_seed_config``), which lowers for a narrow sum of its own beside
+        the looped one, but not for the heads of ``exp(x[tb, tm, :, :])``
+        summed over its keys and then over its heads: "reduction marker is
+        nested in a different lane owner"."""
+        spec = env.config_spec
+        loop = spec.reduction_loops[0].block_id
+        grid = set(device_ir.grid_block_ids[0])
+        others = {
+            _symint_sympy_expr(env.block_sizes[block_id].var)
+            for block_id in spec.num_threads.valid_block_ids()
+            if block_id not in grid and block_id != loop
+        }
+        if not others:
+            return False
+        looped = _symint_sympy_expr(env.block_sizes[loop].var)
+        for graph in device_ir.graphs:
+            for node in graph.graph.nodes:
+                value = node.meta.get("val")
+                if not isinstance(value, torch.Tensor):
+                    continue
+                dims = {
+                    _symint_sympy_expr(size)
+                    for size in value.shape
+                    if isinstance(size, torch.SymInt)
+                }
+                if looped in dims and not others.isdisjoint(dims):
+                    return True
+        return False
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        match = cls._lane_operand(env, device_ir)
+        if match is None:
+            return None
+        lane_block, tensor, unit, _ = match
+        spec = env.config_spec
+        lanes = _packet_lanes(env, tensor, unit, lane_block)
+        if lanes is None:
+            return None
+        blocks: dict[int, int] = {}
+        threads: dict[int, int] = {}
+        for item in spec.block_sizes:
+            blocks[item.block_id] = lanes if item.block_id == lane_block else 1
+            threads[item.block_id] = 1
+        # A second reduction dim (a row's narrow sum beside the looped one)
+        # runs on one thread: an automatic count gives it a thread axis that
+        # the rows' stores do not address but their values vary along, which
+        # does not lower.
+        for block_id in spec.num_threads.valid_block_ids():
+            threads.setdefault(block_id, 1)
+        loop = spec.reduction_loops[0]
+        chunk, threads[loop.block_id] = cls._reduction_chunk(loop.size_hint)
+        # Each lane caches its row's values of the reduction's first sweep
+        # for the later ones, and those of each later sweep for the sweeps
+        # after it: past the register budget the caches would spill, so the
+        # later sweeps reload from memory instead.  The lanes' copies of the
+        # caches share the jam's budget (one thread's under ``"auto"``), and
+        # so do those of the stores the seed forwards.
+        cached = max(
+            1,
+            cls._cached_values(device_ir, loop.block_id)
+            + cls._forwarded_caches(env, device_ir),
+        )
+        # A cache holds a thread's elements of every chunk, a masked last
+        # chunk's padding too: 600 keys in a 1024-key chunk on 128 threads
+        # take eight per value, not five.
+        trips = -(-loop.size_hint // chunk)
+        per_thread = lanes * cached * trips * (chunk // threads[loop.block_id])
+        reload = (
+            "register"
+            if per_thread <= jam_grid_lanes.MAX_PRIVATE_CACHE_ELEMENTS
+            else "gmem"
+        )
+        seed: dict[str, Any] = {
+            "block_sizes": [blocks[item.block_id] for item in spec.block_sizes],
+            "num_threads": _seq_config_list(spec.num_threads, threads),
+            "reduction_loops": [chunk],
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {loop.block_id: reload}
+            ),
+            "cute_grid_lane_jam": True,
+        }
+        return Config(**seed)
+
+    @classmethod
+    def _reduction_chunk(cls, size_hint: int) -> tuple[int, int]:
+        """The seed's reduction chunk for rows of ``size_hint`` elements and
+        the threads that share it: up to ``REDUCTION_CHUNK``, the largest
+        power of two that divides the row while it still gives each thread
+        two keys (768 keys take 256, 1536 take 512), so that no chunk is
+        masked, which would keep each lane's gathered loads scalar; else the
+        next power of two, masked (2176 keys, 17 chunks of 128 otherwise,
+        take 1024)."""
+        chunk = min(cls.REDUCTION_CHUNK, next_power_of_2(size_hint))
+        divisor = chunk
+        while size_hint % divisor:
+            divisor //= 2
+        if divisor >= 2 * cls.REDUCTION_THREADS:
+            chunk = divisor
+        return chunk, min(cls.REDUCTION_THREADS, chunk)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        match = cls._lane_operand(env, device_ir)
+        if primary is None or match is None:
+            return None
+        *_, row_itemsize = match
+        spec = env.config_spec
+        loop = spec.reduction_loops[0]
+        # The primary's chunk and its threads.
+        (chunk,) = cast("list[int]", primary.config["reduction_loops"])
+        threads = cast("list[int]", primary.config["num_threads"])[
+            [item.block_id for item in spec.num_threads].index(loop.block_id)
+        ]
+        # A width must divide the row, or its packets would not tile it (its
+        # loads would stay scalar, at a stride), and give every thread keys
+        # of a full chunk, or of the whole row when that is shorter (a longer
+        # row's last chunk may leave some threads idle).
+        keys = min(chunk, loop.size_hint)
+        # Nor may a packet of the widest row operand loaded (a workspace read
+        # back counts; a row only stored does not) be wider than a lane loads
+        # whole, twice
+        # ``_CUTE_VECTOR_MAX_BYTES`` from sm_100 on: its loads would stay
+        # scalar.
+        capability = spec.target_device_capability
+        packet_bytes = _CUTE_VECTOR_MAX_BYTES * (
+            2 if capability is not None and capability >= (10, 0) else 1
+        )
+        seeds = [primary]
+        for width in cls.ALTERNATE_VECTOR_WIDTHS:
+            if (
+                loop.size_hint % width
+                or threads * width > keys
+                or width * row_itemsize > packet_bytes
+            ):
+                continue
+            values: dict[str, Any] = {
+                **primary.config,
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {loop.block_id: width}
+                ),
+            }
+            seeds.append(Config(**values))
+        return seeds
+
+
+class CuteReductionLaneJamForwardingHeuristic(CuteReductionLaneJamHeuristic):
+    """``cute_reduction_lane_jam``'s seed with ``cute_scratch_forwarding``.
+
+    Those kernels keep each row in a kernel-local workspace between the
+    sweeps (T5's softmax-dropout backward stores its probabilities or
+    products, then reads them back).  Forwarding the stored values from
+    registers saves the workspace's reloads (and, once no load reads them,
+    its stores) but keeps the values live across the sweeps, in registers
+    that may cost occupancy.  The knob is searchable wherever this heuristic
+    is eligible (``ConfigSpec.cute_scratch_forwarding_sites``), whatever the
+    extent, and both seeds start the search, so the autotuner picks per
+    kernel.
+    """
+
+    name = "cute_reduction_lane_jam_forwarding"
+    priority = 101
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return super().is_eligible(env, device_ir) and _reloads_scratch(env, device_ir)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seed = super().get_seed_config(env, device_ir)
+        if seed is None:
+            return None
+        # Nothing is forwarded under gmem reloads (the forwarded stores'
+        # caches past the jam's budget too: ``_forwarded_caches``), nor when
+        # the chunk does not divide the row (its stores are masked): the twin
+        # would compile and time the jam seed's code again.
+        (chunk,) = cast("list[int]", seed.config["reduction_loops"])
+        if (
+            "gmem" in cast("list[str]", seed.config["cute_reduction_reloads"])
+            or env.config_spec.reduction_loops[0].size_hint % chunk
+        ):
+            return None
+        forwarding: dict[str, Any] = {**seed.config, "cute_scratch_forwarding": True}
+        return Config(**forwarding)
+
+    @classmethod
+    def _forwarded_caches(cls, env: CompileEnvironment, device_ir: DeviceIR) -> int:
+        """One for each workspace a later sweep reads back
+        (``_reloaded_scratch``)."""
+        return len(_reloaded_scratch(env, device_ir))
+
+
+def _reloads_scratch(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Whether the tile body loads a kernel-local scratch tensor after it
+    stores to it (``_reloaded_scratch``)."""
+    return bool(_reloaded_scratch(env, device_ir))
+
+
+def _reloaded_scratch(env: CompileEnvironment, device_ir: DeviceIR) -> set[int]:
+    """The storages of the kernel-local scratch tensors the tile body loads
+    after it stores to them (``scratch_tensors``): workspaces a later sweep
+    reads back, of a dtype the forwarding moves (``FORWARDED_DTYPES``: not
+    bytes, bools or unsigned integers).  A load before the only store
+    (``ws[t] += x``) reads nothing forwarded."""
+    from ....device_ir import RootGraphInfo
+    from ....scratch_tensors import kernel_local_scratch
+
+    if device_ir.host_function is None:
+        return set()
+    scratch = kernel_local_scratch(device_ir.host_function)
+    reloaded: set[int] = set()
+    for graph in device_ir.graphs:
+        if not isinstance(graph, RootGraphInfo):
+            continue
+        stored: set[int] = set()
+        for node in graph.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target not in (language_load, language_store)
+                or not node.args
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            tensor = node.args[0].meta.get("val")
+            if (
+                isinstance(tensor, torch.Tensor)
+                and scratch.holds(tensor)
+                and env.backend.dtype_str(tensor.dtype) in FORWARDED_DTYPES
+            ):
+                storage = id(tensor.untyped_storage())
+                if node.target is language_store:
+                    stored.add(storage)
+                elif storage in stored:
+                    reloaded.add(storage)
+    return reloaded
+
+
+class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
+    """Cluster row-split seed for very wide rolled row reductions: split
+    each row across a thread-block cluster so every CTA rolls a ~16k-element
+    slice (one DSM exchange combines the partials; every CTA gets the full
+    result and consumes only its slice).
+
+    Below the cluster the single-CTA rolled form must reload the whole row
+    for the consume sweep from gmem — at multi-hundred-KB rows that second
+    read misses L2 and costs ~1.5x DRAM traffic.  The 16k-element slice
+    target matches both the Quack rmsnorm heuristic (cluster_n =
+    N/16384 capped at 16) and the B200 hand-transplant measurements
+    (see benchmarks/cute/compare_rmsnorm_backends.py): 128 threads/CTA,
+    single roll trip over the slice.
+    """
+
+    name = "cute_rolled_cluster_ladder"
+    backend = "cute"
+    priority = 37
+
+    _SLICE_TARGET = 16384
+    _MAX_CLUSTER = 16
+    _THREADS_PER_ROW = 128
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        if not is_canonical_row_reduction(env):
+            return False
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        return rl_spec.size_hint >= 4 * cls._SLICE_TARGET
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        size_hint = rl_spec.size_hint
+        vec = _cute_seed_vec_width(env, rl_spec, device_ir)
+        # Power of two only: the cute_cluster_n EnumFragment enumerates
+        # {1,2,4,8,16}, and an off-surface value would one-hot encode as
+        # all zeros in the search surrogate.
+        cluster_n = 1 << (
+            min(cls._MAX_CLUSTER, size_hint // cls._SLICE_TARGET).bit_length() - 1
+        )
+        threads_per_row = cls._THREADS_PER_ROW
+        # The rolled cluster split requires every CTA to roll whole chunks
+        # of its own contiguous slice (see LoopedReductionStrategy).
+        while cluster_n > 1 and size_hint % (cluster_n * threads_per_row * max(vec, 1)):
+            cluster_n //= 2
+        if cluster_n <= 1:
+            return None
+        # A chunk a few trips smaller than the slice schedules better than
+        # one whole-slice trip (measured on B200 at N=262144: 4616 vs
+        # 4350 GB/s) — the shorter unrolled body overlaps its loads across
+        # roll iterations instead of one long dependency chain.
+        slice_len = size_hint // cluster_n
+        chunk = prev_power_of_2(min(4096, slice_len), spec.max_reduction_loop)
+        while slice_len % chunk:
+            chunk //= 2
+        if chunk < threads_per_row * max(vec, 1):
+            return None
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {tile_id: 1, rdim_id: threads_per_row}
+            ),
+            "reduction_loops": [chunk],
+            "cute_cluster_n": cluster_n,
+            "cute_lane_layouts": _seq_config_list(
+                spec.cute_lane_layouts, {rdim_id: "strided"}
+            ),
+        }
+        if vec > 1:
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            )
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+def _rolled_row_sweeps(device_ir: DeviceIR) -> list[frozenset[str]]:
+    """Op-name parts of every reduction-loop sweep over the row, in order.
+
+    A ``reduction_loops`` row kernel lowers to one sweep per reduction plus
+    one for a row-shaped consumer (softmax's normalize-and-store sweep), so
+    the sweep list is the kernel's structure as the rolled lowering passes
+    see it: which collectives exist and whether a row sweep follows them.
+    """
+    from ....device_ir import ReductionLoopGraphInfo
+
+    return [
+        frozenset().union(
+            *(
+                op_name_parts(node.target)
+                for node in graph_info.graph.nodes
+                if node.op == "call_function"
+            )
+        )
+        for graph_info in device_ir.graphs
+        if isinstance(graph_info, ReductionLoopGraphInfo)
+    ]
+
+
+def _rolled_scalar_row_output(sweeps: list[frozenset[str]]) -> bool:
+    """No sweep stores a row: every row output is a scalar epilogue value.
+
+    ``cute_scalar_epilogue`` (one owner for the scalar epilogue) and
+    ``cute_register_row`` (whose lowering declines when a later sweep reads
+    the register cache) only act on this shape; seeding them elsewhere only
+    duplicates configs.
+    """
+    return bool(sweeps) and not any("store" in ops for ops in sweeps)
+
+
+def _rolled_online_pair_seedable(
+    env: CompileEnvironment, sweeps: list[frozenset[str]]
+) -> bool:
+    """Whether ``cute_cluster_warp_online`` can pay off on this kernel.
+
+    The rolled pair needs a max sweep followed by a sweep summing the
+    exponential of ``x - max``.  Under exact numerics that sum sweep must
+    also be the last one: a later sweep recomputing ``exp2`` in the global
+    frame (softmax's normalize) shares sweep B's exponentials in the
+    two-exchange form (same expression, same frame), and the single
+    exchange would un-share them -- one extra ``MUFU.EX2`` per element for
+    one saved cluster round trip, measured at -26% on a 4096x32768 fp16
+    softmax (B200).  Under fast_math the pair caches sweep B's exponentials
+    and the later sweep reuses them, so every shape qualifies.
+    """
+    for index, ops in enumerate(sweeps):
+        if "amax" not in ops:
+            continue
+        for later in range(index + 1, len(sweeps)):
+            if "sum" in sweeps[later] and {"exp", "exp2"} & sweeps[later]:
+                return env.settings.fast_math or later == len(sweeps) - 1
+    return False
+
+
+class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
+    """Vectorized cluster seeds for static row reductions with a padded tail.
+
+    The rolled cluster lowering gives each CTA disjoint whole chunks and
+    retains the original row bound on its loads and reduction inputs. Seed
+    both one wide chunk and several short chunks at the same register
+    footprint so the search can compare load scheduling and occupancy.
+    """
+
+    name = "cute_masked_rolled_cluster"
+    backend = "cute"
+    priority = 38
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        if not is_canonical_row_reduction(env):
+            return []
+        spec = env.config_spec
+        reduction = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        if spec.target_device_capability is None or spec.target_device_capability < (
+            9,
+            0,
+        ):
+            return []
+        numel = env.specialize_expr(env.block_sizes[reduction.block_id].numel)
+        if not isinstance(numel, sympy.Integer):
+            return []
+        extent = int(numel)
+        if extent < 16384:
+            return []
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_tile_inner_block_dtype(env, device_ir, reduction.block_id)
+        )
+        if vec <= 1 or extent % vec:
+            return []
+        row_block = spec.block_sizes[0].block_id
+        sweeps = _rolled_row_sweeps(device_ir)
+        scalar_row = _rolled_scalar_row_output(sweeps)
+        online_pair = _rolled_online_pair_seedable(env, sweeps)
+        seeds: list[Config] = []
+        for threads in (256, 128, 512):
+            cluster = min(16, max(2, next_power_of_2(-(-extent // (threads * 64)))))
+            wide_chunk = next_power_of_2(extent) // cluster
+            for chunk in dict.fromkeys((wide_chunk, min(wide_chunk, 4096))):
+                if chunk < threads * vec or (
+                    spec.max_reduction_loop is not None
+                    and chunk > spec.max_reduction_loop
+                ):
+                    continue
+                slice_len = -(-extent // (cluster * chunk)) * chunk
+                elements = slice_len // threads
+                if elements > 128:
+                    continue
+                seeds.append(
+                    Config.from_dict(
+                        {
+                            "block_sizes": [1],
+                            "num_threads": _seq_config_list(
+                                spec.num_threads,
+                                {row_block: 1, reduction.block_id: threads},
+                            ),
+                            "reduction_loops": [chunk],
+                            "cute_vector_widths": _seq_config_list(
+                                spec.cute_vector_widths, {reduction.block_id: vec}
+                            ),
+                            "cute_lane_layouts": _seq_config_list(
+                                spec.cute_lane_layouts,
+                                {reduction.block_id: "strided"},
+                            ),
+                            "cute_reduction_reloads": ["register"],
+                            "cute_cluster_n": cluster,
+                            "cute_cluster_warp_online": online_pair,
+                            "cute_scalar_epilogue": scalar_row,
+                            "cute_min_blocks_per_mp": 3
+                            if elements > 64
+                            else max(1, 768 // threads),
+                        }
+                    )
+                )
+        independent = [
+            Config.from_dict(
+                deepcopy(seed.config) | {"cute_independent_reduction": True}
+            )
+            for seed in seeds
+        ]
+        # The register-row lowering (and the scalar epilogue's kept inputs)
+        # only act when no later sweep consumes the row; elsewhere these
+        # copies would render the very same kernel as their parents.
+        register_rows = (
+            [
+                Config.from_dict(deepcopy(seed.config) | {"cute_register_row": True})
+                for seed in seeds
+            ]
+            if scalar_row
+            else []
+        )
+        kept_inputs = [
+            Config.from_dict(
+                deepcopy(seed.config) | {"cute_scalar_epilogue_keep_inputs": True}
+            )
+            for seed in register_rows
+        ]
+        from ...native_warp_reduction import has_native_redux_reduction
+
+        # The cluster's grouped reduce helpers take only a max or a min
+        # natively under the knob (an ``any`` keeps their shuffle
+        # reduction); elsewhere these copies would render their parents.
+        native_redux = (
+            [
+                Config.from_dict(deepcopy(seed.config) | {"cute_warp_fp32_redux": True})
+                for seed in ([*register_rows, *kept_inputs] or seeds)
+            ]
+            if has_native_redux_reduction(
+                device_ir, spec.target_device_capability, with_any=False
+            )
+            else []
+        )
+        return dedupe_configs(
+            [*seeds, *independent, *register_rows, *kept_inputs, *native_redux]
+        )
+
+
+def _block_size_value_reachable(
+    spec: ConfigSpec,
+    block_index: int,
+    value: int,
+) -> bool:
+    if block_index < 0 or block_index >= len(spec.block_sizes):
+        return False
+    fragment = spec.block_sizes[block_index]._fragment(spec)
+    return fragment.low <= value <= fragment.high
+
+
+def _filter_reachable_block_size_configs(
+    spec: ConfigSpec,
+    configs: Sequence[Config],
+) -> list[Config]:
+    """Keep seeds whose block sizes are reachable in the live config spec."""
+    result: list[Config] = []
+    for config in configs:
+        block_sizes = config.config.get("block_sizes")
+        if not isinstance(block_sizes, list) or len(block_sizes) != len(
+            spec.block_sizes
+        ):
+            continue
+        if all(
+            type(value) is int and _block_size_value_reachable(spec, index, value)
+            for index, value in enumerate(block_sizes)
+        ):
+            result.append(config)
+    return result
+
+
+def _tcgen05_grouped_fact(env: CompileEnvironment) -> MatmulFact | None:
+    spec = env.config_spec
+    if (
+        not spec.tcgen05.search_enabled
+        or len(spec.matmul_facts) != 1
+        or len(spec.block_sizes) != 3
+    ):
+        return None
+    fact = _tcgen05_fact_with_static_provenance(spec, spec.matmul_facts[0])
+    if fact.lhs_dtype is not fact.rhs_dtype or fact.lhs_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+    if (
+        fact.m_block_id is None
+        or fact.n_block_id is None
+        or fact.k_block_id is None
+        or fact.static_m is None
+        or fact.static_n is None
+        or fact.static_k is None
+    ):
+        return None
+    try:
+        block_indices = (
+            spec.block_sizes.block_id_to_index(fact.m_block_id),
+            spec.block_sizes.block_id_to_index(fact.n_block_id),
+            spec.block_sizes.block_id_to_index(fact.k_block_id),
+        )
+    except KeyError:
+        return None
+    if block_indices != (0, 1, 2):
+        return None
+    if fact.static_m % 128 != 0 or fact.static_n % 64 != 0:
+        return None
+    return fact
+
+
+def _tcgen05_fact_with_static_provenance(
+    spec: ConfigSpec,
+    fact: MatmulFact,
+) -> MatmulFact:
+    static_extents = spec.tcgen05.matmul_compile_time_static_extents
+    if static_extents is None:
+        return fact
+    return fact._replace(
+        static_m=static_extents[0],
+        static_n=static_extents[1],
+        static_k=static_extents[2],
+    )
+
+
+def _tcgen05_grouped_worklist_structural_fact(
+    env: CompileEnvironment,
+) -> MatmulFact | None:
+    """Return structural grouped facts before dynamic shape hints are frozen."""
+    spec = env.config_spec
+    if len(spec.matmul_facts) != 1 or len(spec.block_sizes) != 3:
+        return None
+    fact = _tcgen05_fact_with_static_provenance(spec, spec.matmul_facts[0])
+    if (
+        fact.lhs_dtype not in (torch.float16, torch.bfloat16)
+        or fact.rhs_dtype != fact.lhs_dtype
+    ):
+        return None
+    if (
+        fact.m_block_id is None
+        or (fact.k_block_id is None and fact.static_k != 0)
+        or (fact.n_block_id is None and fact.static_n != 0)
+    ):
+        return None
+    if fact.k_block_id is None:
+        # A statically empty reduction erases the K block association from the
+        # matmul fact, but the registered third block axis remains its source.
+        # Recover it so the full grouped-worklist proof below can decide whether
+        # this kernel needs input-metadata specialization.
+        fact = fact._replace(k_block_id=spec.block_sizes[2].block_id)
+    try:
+        assert fact.m_block_id is not None
+        assert fact.k_block_id is not None
+        m_index = spec.block_sizes.block_id_to_index(fact.m_block_id)
+        k_index = spec.block_sizes.block_id_to_index(fact.k_block_id)
+        n_index = (
+            None
+            if fact.n_block_id is None
+            else spec.block_sizes.block_id_to_index(fact.n_block_id)
+        )
+    except KeyError:
+        return None
+    return fact if (m_index, n_index, k_index) in ((0, 1, 2), (0, None, 2)) else None
+
+
+def _tcgen05_grouped_worklist_fact(
+    env: CompileEnvironment,
+) -> MatmulFact | None:
+    if not env.config_spec.tcgen05.search_enabled:
+        return None
+    return _tcgen05_grouped_worklist_structural_fact(env)
+
+
+def _tcgen05_grouped_dynamic_bk64_fact(env: CompileEnvironment) -> MatmulFact | None:
+    fact = _tcgen05_grouped_fact(env)
+    if fact is None or cast("int", fact.static_k) % 64 != 0:
+        return None
+    spec = env.config_spec
+    if not (
+        _block_size_value_reachable(spec, 0, 128)
+        and _block_size_value_reachable(spec, 1, 64)
+        and _block_size_value_reachable(spec, 2, 64)
+    ):
+        return None
+    if not smem.grouped_dynamic_stages_fit_for_target(
+        spec.tcgen05,
+        dtype_bytes=fact.lhs_dtype.itemsize,
+        output_dtype_bytes=fact.lhs_dtype.itemsize,
+        device=env.device,
+        bm=128,
+        bn=64,
+        bk=64,
+        cluster_m=1,
+        ab_stages=TCGEN05_GROUPED_DYNAMIC_AB4_STAGE,
+        c_stages=2,
+    ):
+        return None
+    return fact
+
+
+def _tcgen05_grouped_seed_grid_is_valid(device_ir: DeviceIR, fact: MatmulFact) -> bool:
+    return (
+        len(device_ir.root_ids) == 1
+        and len(device_ir.grid_block_ids) == 1
+        and device_ir.grid_block_ids[0] == [fact.m_block_id, fact.n_block_id]
+    )
+
+
+def _tcgen05_grouped_static_common_k_block_k(static_k: int) -> int | None:
+    return next(
+        (bk for k, bk in TCGEN05_GROUPED_STATIC_COMMON_K_BLOCK_PAIRS if static_k == k),
+        None,
+    )
+
+
+def _tcgen05_grouped_static_common_k_fact(env: CompileEnvironment) -> MatmulFact | None:
+    fact = _tcgen05_grouped_fact(env)
+    if fact is None:
+        return None
+    bk = _tcgen05_grouped_static_common_k_block_k(cast("int", fact.static_k))
+    if bk is None:
+        return None
+    spec = env.config_spec
+    if not (
+        _block_size_value_reachable(spec, 0, 128)
+        and _block_size_value_reachable(spec, 1, 64)
+        and _block_size_value_reachable(spec, 2, bk)
+    ):
+        return None
+    return fact
+
+
+def _tcgen05_grouped_seed_config(bk: int) -> Config:
+    config = Config(
+        block_sizes=[128, 64, bk],
+        l2_groupings=[1],
+        loop_orders=[[0, 1]],
+        num_stages=2,
+        num_warps=8,
+        pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+        tcgen05_cluster_m=1,
+        tcgen05_cluster_n=1,
+        tcgen05_ab_stages=2,
+        tcgen05_acc_stages=2,
+        tcgen05_c_stages=2,
+        tcgen05_num_epi_warps=4,
+    )
+    config.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = TCGEN05_GROUPED_MODE_STATIC
+    config.config[TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY] = (
+        Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+    )
+    return config
+
+
+# These B200 values shape generic reservation seeds only. Their SM reservations
+# scale proportionally on other devices; exact measured policy overrides remain
+# restricted to the product and SM count recorded in their workload envelope.
+_TCGEN05_GROUPED_B200_REFERENCE_NUM_SMS = 148
+_TCGEN05_GROUPED_B200_LOW_RESERVED_SMS = 32
+_TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS = 52
+_TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS = 20
+# Grouped tcgen05 lowering is supported on both Blackwell compute capabilities;
+# target-specific seed ranking remains separate from this architecture gate.
+_TCGEN05_GROUPED_SUPPORTED_CAPABILITIES = frozenset({"sm100", "sm103"})
+# The bound-kernel key already carries device kind and capability. Registering
+# every policy identity as a named promotion target adds the exact product name,
+# so two products on the same architecture cannot reuse different ranked seeds.
+_TCGEN05_GROUPED_TARGET_IDENTITIES = grouped_worklist_target_identities()
+assert {
+    capability for _kind, _name, capability in _TCGEN05_GROUPED_TARGET_IDENTITIES
+} <= _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES
+
+
+def _tcgen05_grouped_worklist_config(
+    source_m_tile: int,
+    block_k: int,
+    ab_stages: int,
+    consumer_regs: int,
+    *,
+    runtime_direct: bool = True,
+    l2_swizzle_size: int | None = None,
+    reserved_sms: int | None = None,
+    clc: bool = False,
+) -> Config:
+    if clc and not runtime_direct:
+        raise ValueError("grouped worklist CLC requires runtime_direct=True")
+    cluster_m = (
+        1
+        if source_m_tile in TCGEN05_GROUPED_WORKLIST_ONE_CTA_SOURCE_M_TILE_CHOICES
+        else 2
+    )
+    values: dict[str, object] = {
+        "block_sizes": [256, 128, block_k],
+        "l2_groupings": [1],
+        "loop_orders": [[0, 1, 2]],
+        "num_stages": 7,
+        "num_warps": 8,
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": cluster_m,
+        "tcgen05_cluster_n": 1,
+        "tcgen05_ab_stages": ab_stages,
+        "tcgen05_acc_stages": 2,
+        "tcgen05_c_stages": 2,
+        "tcgen05_num_epi_warps": 4,
+        TCGEN05_CONSUMER_REGS_CONFIG_KEY: consumer_regs,
+        TCGEN05_GROUPED_MODE_CONFIG_KEY: TCGEN05_GROUPED_MODE_WORKLIST_NM,
+        TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY: source_m_tile,
+    }
+    if runtime_direct:
+        values[TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY] = True
+    if l2_swizzle_size is not None:
+        values[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = l2_swizzle_size
+    if reserved_sms is not None:
+        values[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = reserved_sms
+    if clc:
+        values.update(
+            {
+                TCGEN05_STRATEGY_CONFIG_KEY: (
+                    Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER.value
+                ),
+                TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY: 1,
+                TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                    Tcgen05PersistenceModel.CLC_PERSISTENT.value
+                ),
+            }
+        )
+    return Config.from_dict(values)
+
+
+def _tcgen05_grouped_worklist_target_seed(
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    source_m_tile: int,
+    source_tiles: int,
+    num_sm: int,
+    target_policy: GroupedWorklistTargetPolicy,
+    worklist_rows: tuple[tuple[int, int, int, int], ...] | None,
+) -> Config | None:
+    tuning = target_policy.tuning_for(
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        source_m_tile=source_m_tile,
+        source_tiles=source_tiles,
+        num_sm=num_sm,
+        worklist_rows=worklist_rows,
+    )
+    if tuning is None:
+        return None
+    return _tcgen05_grouped_worklist_config(
+        source_m_tile,
+        tuning.block_k,
+        tuning.ab_stages,
+        tuning.consumer_regs,
+        runtime_direct=tuning.runtime_direct,
+        l2_swizzle_size=tuning.l2_swizzle_size,
+        reserved_sms=tuning.reserved_sms,
+        clc=tuning.clc,
+    )
+
+
+def _tcgen05_grouped_scaled_reserved_sms(
+    num_sm: int,
+    b200_reserved_sms: int,
+) -> int:
+    value = round(num_sm * b200_reserved_sms / _TCGEN05_GROUPED_B200_REFERENCE_NUM_SMS)
+    # The reviewed B200 occupancy splits were selected on a two-SM reservation
+    # lattice.  Preserve that lattice after proportional scaling; an odd rounded
+    # value moves up so the seed never reserves less than the scaled reference.
+    value += value % 2
+    return min(
+        max(value, 0),
+        max(num_sm - 2, 0),
+        TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX,
+    )
+
+
+def _tcgen05_grouped_small_m_reserved_sms(
+    *,
+    groups: int,
+    work_clusters: int,
+    num_sm: int,
+) -> tuple[int, int]:
+    """Rank low/high reserved-SM seeds scaled from B200 occupancy splits."""
+    low = _tcgen05_grouped_scaled_reserved_sms(
+        num_sm,
+        _TCGEN05_GROUPED_B200_LOW_RESERVED_SMS,
+    )
+    high = _tcgen05_grouped_scaled_reserved_sms(
+        num_sm,
+        _TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS,
+    )
+    active_high = num_sm - high
+    high_first = (
+        groups <= 8
+        and work_clusters > num_sm
+        and active_high > 0
+        and work_clusters % active_high == 0
+    )
+    return (high, low) if high_first else (low, high)
+
+
+def _tcgen05_grouped_worklist_seed_family(
+    *,
+    groups: int,
+    packed_m: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    source_m_tile: int,
+    num_sm: int,
+    target_policy: GroupedWorklistTargetPolicy,
+    worklist_rows: tuple[tuple[int, int, int, int], ...] | None = None,
+) -> tuple[list[Config], Config | None]:
+    """Build one ranked family and return its exact target seed, if any."""
+    if any(
+        type(value) is not int or value <= 0
+        for value in (groups, packed_m, n, k, num_sm)
+    ):
+        raise ValueError("grouped seed dimensions and num_sm must be positive integers")
+    if b_major not in ("k", "n"):
+        raise ValueError(f"unsupported grouped B major {b_major!r}")
+    if source_m_tile not in TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CHOICES:
+        raise ValueError(f"unsupported grouped source M tile {source_m_tile!r}")
+    if packed_m % source_m_tile != 0:
+        raise ValueError("packed M extent must be divisible by source_m_tile")
+
+    source_tiles = packed_m // source_m_tile
+    logical_n_per_cluster = (
+        128 if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE else 256
+    )
+    work_clusters = source_tiles * (
+        (n + logical_n_per_cluster - 1) // logical_n_per_cluster
+    )
+    target_seed = _tcgen05_grouped_worklist_target_seed(
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        source_m_tile=source_m_tile,
+        source_tiles=source_tiles,
+        num_sm=num_sm,
+        target_policy=target_policy,
+        worklist_rows=worklist_rows,
+    )
+
+    if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+        preferred_reservation, alternate_reservation = (
+            _tcgen05_grouped_small_m_reserved_sms(
+                groups=groups,
+                work_clusters=work_clusters,
+                num_sm=num_sm,
+            )
+        )
+        high_reservation = _tcgen05_grouped_scaled_reserved_sms(
+            num_sm,
+            _TCGEN05_GROUPED_B200_HIGH_RESERVED_SMS,
+        )
+        panel_reservation = _tcgen05_grouped_scaled_reserved_sms(
+            num_sm,
+            _TCGEN05_GROUPED_B200_PANEL_RESERVED_SMS,
+        )
+        bk128 = {
+            "preferred_reserved": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                128,
+                5,
+                256,
+                reserved_sms=preferred_reservation,
+            ),
+            "alternate_reserved": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                128,
+                5,
+                256,
+                reserved_sms=alternate_reservation,
+            ),
+            "unreserved": _tcgen05_grouped_worklist_config(source_m_tile, 128, 5, 256),
+        }
+        bk64 = {
+            "high_reserved": _tcgen05_grouped_worklist_config(
+                source_m_tile, 64, 7, 240, reserved_sms=high_reservation
+            ),
+            "direct": _tcgen05_grouped_worklist_config(source_m_tile, 64, 7, 240),
+            "panel4": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                64,
+                7,
+                240,
+                l2_swizzle_size=4,
+                reserved_sms=panel_reservation,
+            ),
+            "panel8": _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                64,
+                7,
+                240,
+                l2_swizzle_size=8,
+                reserved_sms=panel_reservation,
+            ),
+            "mailbox": _tcgen05_grouped_worklist_config(
+                source_m_tile, 64, 7, 240, runtime_direct=False
+            ),
+        }
+        if groups >= 16:
+            if n > k:
+                generic_primary = bk64["panel8"]
+            elif n < k:
+                generic_primary = bk64["panel4"]
+            else:
+                generic_primary = bk64["direct"]
+        elif n >= 9 * k // 4:
+            generic_primary = bk128["alternate_reserved"]
+        elif n >= 2 * k:
+            generic_primary = bk64["high_reserved"]
+        elif k > n:
+            generic_primary = bk64["direct"]
+        else:
+            generic_primary = bk128["preferred_reserved"]
+        primary = generic_primary if target_seed is None else target_seed
+        return (
+            dedupe_configs([primary, generic_primary, *bk128.values(), *bk64.values()]),
+            target_seed,
+        )
+
+    if source_m_tile == TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT:
+        # Source-224 normally keeps the reviewed panel-8 direct config as its
+        # deterministic primary; target policy may replace it only for an
+        # exact measured workload.
+        panel8_direct = _tcgen05_grouped_worklist_config(
+            source_m_tile,
+            64,
+            7,
+            256,
+            l2_swizzle_size=8,
+        )
+        mailbox_by_ab_stages = {
+            ab_stages: _tcgen05_grouped_worklist_config(
+                source_m_tile, 64, ab_stages, 240, runtime_direct=False
+            )
+            for ab_stages in range(7, 3, -1)
+        }
+        bk128_direct = _tcgen05_grouped_worklist_config(source_m_tile, 128, 3, 240)
+        primary = panel8_direct if target_seed is None else target_seed
+        return (
+            dedupe_configs(
+                [
+                    primary,
+                    panel8_direct,
+                    *mailbox_by_ab_stages.values(),
+                    bk128_direct,
+                ]
+            ),
+            target_seed,
+        )
+
+    bk128 = {
+        "mailbox": _tcgen05_grouped_worklist_config(
+            source_m_tile, 128, 3, 240, runtime_direct=False
+        ),
+        "direct": _tcgen05_grouped_worklist_config(source_m_tile, 128, 3, 240),
+        "panel8": _tcgen05_grouped_worklist_config(
+            source_m_tile, 128, 3, 240, l2_swizzle_size=8
+        ),
+    }
+    bk64 = {
+        "mailbox_regs224": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 6, 224, runtime_direct=False
+        ),
+        "mailbox_regs240": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 6, 240, runtime_direct=False
+        ),
+        "direct_regs240": _tcgen05_grouped_worklist_config(source_m_tile, 64, 6, 240),
+        "panel16_regs224": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 6, 224, l2_swizzle_size=16
+        ),
+        "panel8_stage5_regs224": _tcgen05_grouped_worklist_config(
+            source_m_tile, 64, 5, 224, l2_swizzle_size=8
+        ),
+    }
+    # Runtime CLC uses fixed full-allocation TensorMaps.  In N,M orientation,
+    # logical N is the physical MMA-M dimension, so the immutable descriptor
+    # path requires a whole 256-row physical tile.  Keep tail-N shapes on the
+    # dynamic-TensorMap runtime-direct or mailbox families.
+    clc_by_consumer_regs = (
+        {
+            consumer_regs: _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                64,
+                6,
+                consumer_regs,
+                l2_swizzle_size=8,
+                clc=True,
+            )
+            for consumer_regs in (240, 256)
+        }
+        if (
+            n % logical_n_per_cluster == 0
+            and work_clusters <= TCGEN05_GROUPED_RUNTIME_DIRECT_CLC_MAX_CLUSTERS
+        )
+        else {}
+    )
+    clc_configs = list(clc_by_consumer_regs.values())
+    # Ranking-only splits fitted from the reviewed B200 source-256 cases:
+    # 16 groups marks high fan-out, N/K=2 and 9/4 are aspect buckets, and
+    # 8/24 tiles per group separate short, medium, and long expert waves.
+    tiles_per_group = source_tiles // groups
+    clc_ready = bool(clc_configs) and work_clusters >= num_sm
+    if groups >= 16:
+        if k > n or n >= 9 * k // 4:
+            generic_primary = bk128["mailbox"]
+        elif n >= 2 * k:
+            generic_primary = bk64["direct_regs240"]
+        else:
+            generic_primary = bk64["mailbox_regs224"]
+    elif tiles_per_group >= 8:
+        if k > n and clc_ready:
+            preferred_clc_consumer_regs = 256 if groups <= 4 else 240
+            generic_primary = clc_by_consumer_regs[preferred_clc_consumer_regs]
+        elif n >= 9 * k // 4:
+            generic_primary = (
+                bk64["panel16_regs224"] if b_major == "n" else bk128["panel8"]
+            )
+        elif n >= 2 * k:
+            generic_primary = (
+                clc_by_consumer_regs[240]
+                if b_major == "n" and clc_ready
+                else bk64["direct_regs240"]
+            )
+        elif n == k:
+            generic_primary = (
+                bk128["direct"]
+                if tiles_per_group >= 24
+                else bk64["panel8_stage5_regs224"]
+            )
+        else:
+            generic_primary = bk64["mailbox_regs240"]
+    elif b_major == "n" and n >= 2 * k:
+        generic_primary = bk64["direct_regs240"]
+    else:
+        generic_primary = bk64["mailbox_regs240"]
+    primary = generic_primary if target_seed is None else target_seed
+    return (
+        dedupe_configs(
+            [primary, generic_primary, *clc_configs, *bk64.values(), *bk128.values()]
+        ),
+        target_seed,
+    )
+
+
+def _tcgen05_grouped_worklist_source_analysis(
+    env: CompileEnvironment,
+    analysis: Tcgen05GroupedWorklistAnalysis,
+) -> tuple[
+    tuple[int, ...],
+    tuple[tuple[int, int, int, int], ...] | None,
+]:
+    """Return legal source-M families and any exact reviewed row signature."""
+    if analysis.input_kind == "device_split_sizes":
+        # Compact A has no physical source-tile constraint. Source-32 uses the
+        # one-CTA mailbox path with the same device-derived interval metadata.
+        return (
+            (
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+            ),
+            None,
+        )
+
+    facts = analysis.seed_facts
+    from ...grouped_worklist import has_tcgen05_grouped_worklist_runtime_specialization
+    from ...grouped_worklist import tcgen05_grouped_worklist_rows
+
+    reviewed_rows = _tcgen05_grouped_worklist_reviewed_rows(env)
+    if not has_tcgen05_grouped_worklist_runtime_specialization(
+        env, analysis.metadata_tensor
+    ):
+        return (), None
+    worklist = env.runtime_value_for_tensor(analysis.metadata_tensor)
+    if not isinstance(worklist, torch.Tensor):
+        return (), None
+    from ...grouped_worklist import tcgen05_grouped_worklist_compatible_source_m_tiles
+    from ...grouped_worklist import (
+        tcgen05_grouped_worklist_source_m_tiles_by_preference,
+    )
+
+    rows = tcgen05_grouped_worklist_rows(worklist)
+    if rows is None:
+        return (), None
+    compatible = tcgen05_grouped_worklist_compatible_source_m_tiles(
+        rows,
+        group_count=facts.groups_hint,
+        packed_m=facts.packed_m_hint,
+    )
+    return (
+        tcgen05_grouped_worklist_source_m_tiles_by_preference(compatible),
+        rows if rows in reviewed_rows else None,
+    )
+
+
+_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT = 8
+# Seed ranking leaves room for CuTe pipeline bookkeeping beyond the explicit
+# shared arena. Final codegen/resource validation still decides admissibility.
+_TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM = 1024
+
+
+def _bounded_grouped_worklist_seed_families(
+    families: Sequence[Sequence[Config]],
+    *,
+    preferred_config: Config | None = None,
+) -> list[Config]:
+    """Keep every legal family represented without expanding tuning startup."""
+    nonempty = [family for family in families if family]
+    if preferred_config is not None and not any(
+        preferred_config in family for family in nonempty
+    ):
+        raise ValueError("preferred_config must belong to a nonempty seed family")
+    if not nonempty:
+        return []
+    ranked = [] if preferred_config is None else [preferred_config]
+    ranked.extend(
+        family[index]
+        for index in range(max(map(len, nonempty)))
+        for family in nonempty
+        if index < len(family)
+    )
+    return dedupe_configs(ranked)[:_TCGEN05_GROUPED_WORKLIST_AUTOMATIC_SEED_LIMIT]
+
+
+def _tcgen05_grouped_output_ring_seeds(
+    seeds: Sequence[Config],
+    *,
+    group_count: int,
+    dtype_bytes: int,
+    capacity_bytes: int,
+    output_dtype_bytes: int | None = None,
+) -> list[Config]:
+    """Cover the alternate output ring for device-metadata mailbox schedules.
+
+    Grouped mode and its source-M tile are seed-only search coordinates. Their
+    existing seeds all use C2, so random configurations cannot sample a complete
+    C4 schedule. Add one C4/default-register witness per existing two-CTA
+    source-M/BK geometry, retaining the original seed prefix at the caller.
+    """
+    budget = capacity_bytes - _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    if group_count <= 0 or dtype_bytes != 2 or budget <= 0:
+        return []
+    seen: set[tuple[int, int]] = set()
+    result: list[Config] = []
+    for seed in seeds:
+        block_k = cast("list[int]", seed.config["block_sizes"])[2]
+        profile = resolve_tcgen05_grouped_worklist_mma_profile(
+            seed.config, block_k=block_k
+        )
+        if profile is None or profile.cluster_m != 2:
+            continue
+        key = (profile.source_m_tile, block_k)
+        if key in seen:
+            continue
+        seen.add(key)
+        # The existing grouped C4 envelope admits at most three AB stages.
+        # Select the deepest inherited stage count that fits the physical
+        # worklist tile, which differs from the logical [256, 128] config tile.
+        ab_stages = min(cast("int", seed.config["tcgen05_ab_stages"]), 3)
+        while ab_stages > 0:
+            required = tcgen05_grouped_worklist_smem_bytes(
+                group_count=group_count,
+                device_split_sizes=True,
+                sched_stage_count=cast(
+                    "int", seed.config.get(TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY, 1)
+                ),
+                bm=profile.mma_m,
+                bn=profile.mma_n,
+                bk=block_k,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                ab_stages=ab_stages,
+                acc_stages=cast("int", seed.config["tcgen05_acc_stages"]),
+                c_stages=4,
+                cluster_m=profile.cluster_m,
+            )
+            if required <= budget:
+                values = dict(seed.config)
+                values["tcgen05_ab_stages"] = ab_stages
+                values["tcgen05_c_stages"] = 4
+                values[TCGEN05_CONSUMER_REGS_CONFIG_KEY] = TCGEN05_CONSUMER_REGS_DEFAULT
+                values.pop(TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY, None)
+                result.append(Config.from_dict(values))
+                break
+            ab_stages -= 1
+    return dedupe_configs(result)
+
+
+def _tcgen05_grouped_device_tile_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+    source_m_tile: int,
+    physical_k: int | None = None,
+) -> list[Config]:
+    """Seed complete device pipelines using their physical allocation sizes.
+
+    Physical rows and the CTA group determine each ring's actual footprint.
+    Cover both a deep ring and an independent ONE ring that can occupy two
+    CTAs per SM; kernel names and routing-vector contents are irrelevant.
+    """
+    if (
+        min(groups, n, k, dtype_bytes, output_dtype_bytes) <= 0
+        or n % 32
+        or capacity_bytes <= _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    ):
+        return []
+    result: list[Config] = []
+    budget = capacity_bytes - _TCGEN05_GROUPED_OUTPUT_RING_SMEM_HEADROOM
+    logical_choices = (
+        (64,) if physical_k is not None else TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+    )
+    for block_k in logical_choices:
+        effective_k = physical_k if physical_k is not None else block_k
+        if k % effective_k or not _block_size_value_reachable(spec, 2, block_k):
+            continue
+        for cluster_m in (1, 2):
+            config = _tcgen05_grouped_worklist_config(
+                source_m_tile,
+                block_k,
+                1,
+                TCGEN05_CONSUMER_REGS_DEFAULT,
+                runtime_direct=False,
+            )
+            config.config["tcgen05_cluster_m"] = cluster_m
+            if physical_k is not None:
+                config.config[TCGEN05_GROUPED_AB_TILE_K_CONFIG_KEY] = physical_k
+            if cluster_m == 1:
+                config.config.pop(TCGEN05_CONSUMER_REGS_CONFIG_KEY)
+                config.config[TCGEN05_WARP_REGISTER_REALLOCATION_CONFIG_KEY] = False
+            profile = resolve_tcgen05_grouped_worklist_mma_profile(
+                config.config, block_k=effective_k
+            )
+            if profile is None:
+                continue
+
+            footprint = partial(
+                tcgen05_grouped_worklist_smem_bytes,
+                group_count=groups,
+                device_split_sizes=True,
+                sched_stage_count=1,
+                bm=profile.mma_m,
+                bn=profile.mma_n,
+                bk=effective_k,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                acc_stages=2,
+                c_stages=2,
+                cluster_m=cluster_m,
+            )
+
+            max_stages = min(7, k // effective_k)
+            while max_stages > 0 and footprint(ab_stages=max_stages) > budget:
+                max_stages -= 1
+            if max_stages == 0:
+                continue
+            config.config["tcgen05_ab_stages"] = max_stages
+            result.append(config)
+            immutable_supported = (
+                b_major == "k"
+                and n % profile.mma_m == 0
+                and groups * n * k <= (1 << 31) - 1
+            )
+            if immutable_supported:
+                immutable = deepcopy(config)
+                immutable.config[TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY] = True
+                result.append(immutable)
+            if cluster_m != 1:
+                continue
+            resident_stages = min(2, max_stages)
+            while (
+                resident_stages > 0
+                and 2 * footprint(ab_stages=resident_stages) > budget
+            ):
+                resident_stages -= 1
+            if resident_stages:
+                resident = deepcopy(config)
+                resident.config["tcgen05_ab_stages"] = resident_stages
+                resident.config["num_sm_multiplier"] = 2
+                result.append(resident)
+                if immutable_supported:
+                    resident_immutable = deepcopy(resident)
+                    resident_immutable.config[
+                        TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
+                    ] = True
+                    result.append(resident_immutable)
+    return _filter_reachable_block_size_configs(spec, dedupe_configs(result))
+
+
+def _tcgen05_grouped_mn_device_tile_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: str,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    """Seed resource-checked physical M,N tiles on typed device worklists.
+
+    These are additive proposals. Row geometry, output buffering, and optional
+    worker balancing remain choices measured by the autotuner.
+    """
+    if (
+        not spec._cute_tcgen05_config.grouped_device_worklist_supported
+        or not spec._cute_tcgen05_config.grouped_d_shift_supported
+        or not spec._cute_tcgen05_config.matmul_operands_tma_provable
+        or min(groups, n, k, capacity_bytes) <= 0
+        or dtype_bytes != 2
+        or output_dtype_bytes not in (2, 4)
+        or b_major != "k"
+        or n % 32
+        or k % 64
+        or groups * n > (1 << 31) - 1
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+
+    seeds: list[Config] = []
+    for row_tile in (128, 256):
+        for column_tile in (128, 192, 224, 256):
+            epi_m, epi_n = tcgen05_grouped_worklist_epilogue_shape(
+                bm=row_tile,
+                bn=column_tile,
+                cluster_m=2,
+                output_dtype_bytes=output_dtype_bytes,
+                orientation="mn",
+            )
+            subtiles = (row_tile // 2 // epi_m) * (column_tile // epi_n)
+            preferred_c_stages = max(
+                value for value in (2, 3, 4) if value == 2 or subtiles % value == 0
+            )
+            for cluster_n in (1, 2):
+                if cluster_n == 2 and n % (column_tile * cluster_n):
+                    continue
+                for c_stages in (2, 3, 4):
+                    if c_stages != 2 and subtiles % c_stages:
+                        continue
+                    ab_stages = 32
+                    while ab_stages >= 2:
+                        required = tcgen05_grouped_worklist_smem_bytes(
+                            group_count=groups,
+                            device_split_sizes=True,
+                            sched_stage_count=1,
+                            bm=row_tile,
+                            bn=column_tile,
+                            bk=64,
+                            dtype_bytes=dtype_bytes,
+                            output_dtype_bytes=output_dtype_bytes,
+                            ab_stages=ab_stages,
+                            acc_stages=2,
+                            c_stages=c_stages,
+                            cluster_m=2,
+                            orientation="mn",
+                            immutable_ab_tensormaps=True,
+                            immutable_d_tensormap=True,
+                        )
+                        if required <= capacity_bytes:
+                            break
+                        ab_stages -= 1
+                    if ab_stages < 2:
+                        continue
+                    candidate = _tcgen05_grouped_worklist_config(
+                        row_tile, 64, ab_stages, 256, runtime_direct=False
+                    )
+                    candidate.config.update(
+                        {
+                            "tcgen05_cluster_m": 2,
+                            "tcgen05_cluster_n": cluster_n,
+                            "tcgen05_c_stages": c_stages,
+                            "cute_min_blocks_per_mp": 1,
+                            "tcgen05_grouped_worklist_orientation": "mn",
+                            "tcgen05_grouped_worklist_mma_n": column_tile,
+                            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+                            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+                        }
+                    )
+                    variants = [candidate]
+                    if spec._cute_tcgen05_config.grouped_balanced_workers_supported:
+                        balanced = deepcopy(candidate)
+                        balanced.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = (
+                            True
+                        )
+                        variants.append(balanced)
+                    seeds.extend(variants)
+                    if (
+                        spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported
+                        and c_stages == preferred_c_stages
+                    ):
+                        for variant in variants:
+                            for swizzle in (4, 8):
+                                panel = deepcopy(variant)
+                                panel.config[TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY] = (
+                                    swizzle
+                                )
+                                seeds.append(panel)
+                            for alternate in (2, 4):
+                                adaptive = deepcopy(variant)
+                                adaptive.config.update(
+                                    {
+                                        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY: 8,
+                                        GROUPED_PANEL_ALTERNATE_KEY: alternate,
+                                        GROUPED_PANEL_RATIO_KEY: 1,
+                                    }
+                                )
+                                seeds.append(adaptive)
+    return dedupe_configs(seeds)
+
+
+def _tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec: ConfigSpec) -> list[Config]:
+    """Append both worker policies for one resource-derived paired recipe."""
+    model = spec._cute_tcgen05_config
+    profile = model.grouped_prefix_adaptive_n_profile
+    if (
+        not model.grouped_prefix_adaptive_n_search_enabled
+        or profile is None
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+    seed = _tcgen05_grouped_worklist_config(
+        profile.row_tile,
+        profile.block_k,
+        profile.primary.ab_stages,
+        TCGEN05_CONSUMER_REGS_DEFAULT,
+        runtime_direct=False,
+        l2_swizzle_size=8,
+    )
+    seed.config.update(
+        {
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": profile.primary.c_stages,
+            "tcgen05_num_epi_warps": 4,
+            "cute_min_blocks_per_mp": 1,
+            "tcgen05_grouped_worklist_orientation": "mn",
+            "tcgen05_grouped_worklist_mma_n": profile.primary.n,
+            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+            TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY: True,
+            TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY: True,
+        }
+    )
+    # Explicit native roles/rings replace the generic warp and stage aliases.
+    seed.config.pop("num_stages")
+    seed.config.pop("num_warps")
+    static = deepcopy(seed)
+    static.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = False
+    result = [seed, static]
+    cluster_size = cast("int", static["tcgen05_cluster_m"]) * cast(
+        "int", static["tcgen05_cluster_n"]
+    )
+    reserved_sms = round(spec.num_sm / (16 * cluster_size)) * cluster_size
+    if (
+        0 < reserved_sms < spec.num_sm
+        and reserved_sms <= TCGEN05_GROUPED_STATIC_RESERVED_SMS_MAX
+    ):
+        reserved = deepcopy(static)
+        reserved.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = reserved_sms
+        result.append(reserved)
+    return result
+
+
+def _tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec: ConfigSpec) -> list[Config]:
+    """Offer the native M256 pair after the existing compiler seed palette."""
+    model = spec._cute_tcgen05_config
+    profile = facts.get_grouped_prefix_adaptive_n_profile(
+        model, {"tcgen05_grouped_worklist_source_m_tile": 256}
+    )
+    if (
+        not model.grouped_prefix_adaptive_n_search_enabled
+        or profile is None
+        or not all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+    ):
+        return []
+    seed = _tcgen05_grouped_worklist_config(
+        profile.row_tile,
+        profile.block_k,
+        profile.primary.ab_stages,
+        TCGEN05_CONSUMER_REGS_DEFAULT,
+        runtime_direct=False,
+        l2_swizzle_size=8,
+    )
+    seed.config.update(
+        {
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": profile.primary.c_stages,
+            "tcgen05_num_epi_warps": 4,
+            "cute_min_blocks_per_mp": 1,
+            "tcgen05_grouped_worklist_orientation": "mn",
+            "tcgen05_grouped_worklist_mma_n": profile.primary.n,
+            TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
+            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
+            TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY: False,
+            TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY: 0,
+            TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY: True,
+            GROUPED_PANEL_ALTERNATE_KEY: 4,
+            GROUPED_PANEL_RATIO_KEY: 1,
+        }
+    )
+    seed.config.pop("num_stages")
+    seed.config.pop("num_warps")
+    balanced = deepcopy(seed)
+    balanced.config[TCGEN05_GROUPED_BALANCED_WORKERS_CONFIG_KEY] = True
+    return [seed, balanced]
+
+
+def _tcgen05_grouped_prefix_adaptive_n_seeds(spec: ConfigSpec) -> list[Config]:
+    """Preserve M128 recipes, then append the M256 worker policies."""
+    return [
+        *_tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec),
+        *_tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec),
+    ]
+
+
+def _tcgen05_grouped_source128_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    return _tcgen05_grouped_device_tile_seeds(
+        spec,
+        groups=groups,
+        n=n,
+        k=k,
+        b_major=b_major,
+        dtype_bytes=dtype_bytes,
+        output_dtype_bytes=output_dtype_bytes,
+        capacity_bytes=capacity_bytes,
+        source_m_tile=TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+    )
+
+
+def _tcgen05_grouped_physical_k_seeds(
+    spec: ConfigSpec,
+    *,
+    groups: int,
+    n: int,
+    k: int,
+    b_major: GroupedBMajor,
+    dtype_bytes: int,
+    output_dtype_bytes: int,
+    capacity_bytes: int,
+) -> list[Config]:
+    if not spec._cute_tcgen05_config.grouped_ab_k_fusion_supported:
+        return []
+    return dedupe_configs(
+        [
+            config
+            for source_m_tile in (
+                TCGEN05_GROUPED_WORKLIST_MEDIUM_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+                TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE,
+            )
+            for config in _tcgen05_grouped_device_tile_seeds(
+                spec,
+                groups=groups,
+                n=n,
+                k=k,
+                b_major=b_major,
+                dtype_bytes=dtype_bytes,
+                output_dtype_bytes=output_dtype_bytes,
+                capacity_bytes=capacity_bytes,
+                source_m_tile=source_m_tile,
+                physical_k=128,
+            )
+        ]
+    )
+
+
+def _tcgen05_grouped_worklist_hardware_identity(
+    env: CompileEnvironment,
+) -> GroupedWorklistHardwareIdentity | None:
+    """Resolve the exact policy identity, failing closed on inconsistent data."""
+    from ....._argument_device import _canonicalize_argument_device
+    from ....._hardware import get_hardware_info
+
+    try:
+        hardware = get_hardware_info(_canonicalize_argument_device(env.device))
+    except RuntimeError:
+        return None
+    capability = env.config_spec.target_device_capability
+    if (
+        capability is None
+        or hardware.compute_capability != f"sm{capability[0]}{capability[1]}"
+    ):
+        return None
+    return (
+        hardware.device_kind,
+        hardware.hardware_name,
+        hardware.compute_capability,
+    )
+
+
+def _tcgen05_grouped_worklist_reviewed_rows(
+    env: CompileEnvironment,
+) -> frozenset[tuple[tuple[int, int, int, int], ...]]:
+    """Return exact worklist signatures eligible for a target-specific override."""
+    if env.settings.disable_autotuner_heuristics:
+        return frozenset()
+    policy = get_grouped_worklist_target_policy(
+        _tcgen05_grouped_worklist_hardware_identity(env)
+    )
+    return policy.reviewed_worklist_rows()
+
+
+class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
+    """Rank grouped-worklist configs for validated Blackwell products.
+
+    B200 uses the generic structural ranking. GB300 prepends a target-specific
+    primary only for an exact measured worklist; other rows retain the generic
+    rank-0 while live autotuning receives the complete legal seed set.
+    """
+
+    name = "cute_tcgen05_grouped_worklist"
+    backend = "cute"
+    priority = 25
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_NAMED_TARGETS = _TCGEN05_GROUPED_TARGET_IDENTITIES
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        """Record grouped SMEM facts independently of seed generation.
+
+        Grouped semantics are discovered from DeviceIR rather than a user
+        annotation. Publish seed specialization even when an empty first
+        binding cannot emit seeds, and input specialization when heuristics are
+        disabled but correctness facts still depend on runtime metadata.
+        """
+        spec = env.config_spec
+        fact = _tcgen05_grouped_worklist_structural_fact(env)
+        if fact is None:
+            return frozenset()
+        from ...cute_mma import analyze_tcgen05_grouped_worklist
+
+        analysis = analyze_tcgen05_grouped_worklist(
+            env,
+            device_ir,
+            fact,
+        )
+        if analysis is None:
+            return frozenset()
+        # Explicit configs may compile outside the ordinary sampler's block
+        # domains. Keep their semantic/codegen support separate from whether
+        # this binding can declare an automatic coverage carrier.
+        spec._cute_tcgen05_config.grouped_full_coverage_supported = (
+            analysis.full_coverage_supported
+            and spec.target_device_capability == (10, 0)
+        )
+        spec._cute_tcgen05_config.grouped_row_union_supported = (
+            analysis.dense_row_union_supported
+            and spec.target_device_capability == (10, 0)
+        )
+        spec._cute_tcgen05_config.grouped_row_union_cluster4_supported = (
+            analysis.dense_row_union_cluster4_supported
+            and spec.target_device_capability == (10, 0)
+            and target_facts.per_cta_smem_capacity_bytes(env.device)
+            >= TRANSPOSED.shared_upper_bound
+        )
+        spec._cute_tcgen05_config.grouped_row_union_paired_clc_supported = (
+            analysis.dense_row_union_paired_clc_supported
+            and spec.target_device_capability == (10, 0)
+            and target_facts.per_cta_smem_capacity_bytes(env.device)
+            >= PAIRED_CLC.shared_upper_bound
+        )
+        spec._cute_tcgen05_config.grouped_row_union_multi_resident_supported = (
+            spec._cute_tcgen05_config.grouped_row_union_supported
+            and resident_ctas_supported(
+                2, target_facts.per_cta_smem_capacity_bytes(env.device)
+            )
+        )
+        seed_facts = analysis.seed_facts
+        # The register-MMA family on the dense row union (one CTA per tile of
+        # the packed rows, membership-predicated stores): admitted on the
+        # first binding's hints, specialized under guards at codegen.
+        facts.register_grouped_row_union_warp_mma(
+            spec._cute_tcgen05_config,
+            env,
+            groups=seed_facts.groups_hint,
+            m=seed_facts.packed_m_hint,
+            n=seed_facts.n_hint,
+            k=seed_facts.k_hint,
+            dtype=fact.lhs_dtype,
+            b_major="row" if seed_facts.b_major == "n" else "col",
+        )
+        spec._cute_tcgen05_config.grouped_device_worklist_supported = (
+            seed_facts.device_split_sizes
+        )
+        spec._cute_tcgen05_config.grouped_ab_k_fusion_supported = (
+            analysis.ab_k_fusion_supported
+        )
+        spec._cute_tcgen05_config.grouped_d_shift_supported = analysis.d_shift_supported
+        # The pure typed device-worklist palette can exceed the nominal search
+        # population as physical layouts/panel policies compose. Keep its legal
+        # normalized seeds after that unchanged prefix; no sampler budget grows.
+        spec.compiler_seed_overflow_requested = (
+            spec.compiler_seed_overflow_requested
+            or (
+                analysis.d_shift_supported
+                and seed_facts.device_split_sizes
+                and analysis.device_layout_kind == "offsets"
+                and seed_facts.b_major == "k"
+            )
+        )
+        # The same native K64 proof supplies closed work ownership, a fresh
+        # output, live compact metadata, and signed input/output allocations.
+        spec._cute_tcgen05_config.grouped_balanced_workers_supported = (
+            analysis.d_shift_supported
+        )
+        spec._cute_tcgen05_config.grouped_device_mn_swizzle_supported = (
+            analysis.d_shift_supported
+            and analysis.device_layout_kind == "offsets"
+            and seed_facts.device_split_sizes
+            and seed_facts.b_major == "k"
+        )
+        from ...grouped_prefix_adaptive_n import (
+            grouped_prefix_adaptive_n_analysis_eligible,
+        )
+        from ...grouped_prefix_adaptive_n import (
+            resolve_grouped_prefix_adaptive_n_profile,
+        )
+
+        model = spec._cute_tcgen05_config
+        prefix_profiles = {}
+        if model.search_enabled and facts._matmul_block_indices(model) is not None:
+            for source_m in (128, 256):
+                if not grouped_prefix_adaptive_n_analysis_eligible(
+                    analysis,
+                    matmul_operands_tma_provable=model.matmul_operands_tma_provable,
+                    source_m_tile=source_m,
+                ):
+                    continue
+                prefix_profile = resolve_grouped_prefix_adaptive_n_profile(
+                    int(analysis.grouped_tensor.shape[0]),
+                    analysis.packed_tensor.dtype.itemsize,
+                    (analysis.output_dtype or analysis.packed_tensor.dtype).itemsize,
+                    target_facts.per_cta_smem_capacity_bytes(env.device),
+                    source_m_tile=source_m,
+                )
+                if prefix_profile is not None:
+                    prefix_profiles[source_m] = prefix_profile
+        model.grouped_prefix_adaptive_n_profiles = prefix_profiles
+        model.grouped_prefix_adaptive_n_profile = prefix_profiles.get(128)
+        model.grouped_prefix_adaptive_n_supported = bool(prefix_profiles)
+        model.grouped_prefix_adaptive_n_search_enabled = bool(prefix_profiles) and all(
+            _block_size_value_reachable(spec, index, size)
+            for index, size in enumerate((256, 128, 64))
+        )
+        if analysis.input_kind == "external_worklist":
+            from ...grouped_worklist import (
+                register_tcgen05_grouped_worklist_runtime_specialization,
+            )
+
+            register_tcgen05_grouped_worklist_runtime_specialization(
+                env,
+                analysis.metadata_tensor,
+                grouped_tensor=analysis.grouped_tensor,
+                packed_tensor=analysis.packed_tensor,
+                reviewed_rows=_tcgen05_grouped_worklist_reviewed_rows(env),
+            )
+        if seed_facts.groups_hint > 0:
+            facts.register_grouped_worklist_smem_facts(
+                spec.tcgen05,
+                group_count=seed_facts.groups_hint,
+                device_split_sizes=seed_facts.device_split_sizes,
+                output_dtype_bytes=(analysis.output_dtype or fact.lhs_dtype).itemsize,
+            )
+        # A coordinate without any carrier would perturb the old random domain
+        # even when additive coverage has no declaration. Share the complete
+        # proposal predicate with the declaration builder, including live block
+        # domains. Final lowering independently checks guarded runtime metadata.
+        spec._cute_tcgen05_config.grouped_full_coverage_eligible = (
+            _grouped_full_coverage_carrier(env, device_ir) is not None
+            or _grouped_full_coverage_carrier(env, device_ir, block_k=128) is not None
+        )
+        spec._cute_tcgen05_config.grouped_row_union_eligible = (
+            grouped_row_union_carrier(env, device_ir) is not None
+        )
+        spec._cute_tcgen05_config.grouped_row_union_cluster4_eligible = (
+            grouped_row_union_cluster4_carrier(env, device_ir) is not None
+        )
+        spec._cute_tcgen05_config.grouped_row_union_paired_clc_eligible = (
+            grouped_row_union_paired_clc_carrier(env, device_ir) is not None
+        )
+        if env.settings.disable_autotuner_heuristics:
+            return frozenset({"input_tensor_metadata"})
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def _eligible_inputs(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+    ) -> tuple[MatmulFact, Tcgen05GroupedWorklistAnalysis] | None:
+        spec = env.config_spec
+        fact = _tcgen05_grouped_worklist_fact(env)
+        if (
+            fact is None
+            or (fact.static_n is not None and fact.static_n % 32 != 0)
+            or spec.target_device_capability is None
+            or f"sm{spec.target_device_capability[0]}{spec.target_device_capability[1]}"
+            not in _TCGEN05_GROUPED_SUPPORTED_CAPABILITIES
+            or not _block_size_value_reachable(spec, 0, 256)
+            or not _block_size_value_reachable(spec, 1, 128)
+            or not any(
+                _block_size_value_reachable(spec, 2, block_k)
+                for block_k in TCGEN05_GROUPED_WORKLIST_BLOCK_K_CHOICES
+            )
+        ):
+            return None
+        from ...cute_mma import analyze_tcgen05_grouped_worklist
+
+        analysis = analyze_tcgen05_grouped_worklist(env, device_ir, fact)
+        if (
+            analysis is None
+            or min(
+                analysis.seed_facts.groups_hint,
+                analysis.seed_facts.packed_m_hint,
+                analysis.seed_facts.n_hint,
+                analysis.seed_facts.k_hint,
+            )
+            <= 0
+            or analysis.seed_facts.n_hint % 32 != 0
+        ):
+            return None
+        if (
+            not tcgen05_runtime_n_ptx_compatible()
+            and not analysis.seed_facts.device_split_sizes
+        ):
+            warn_tcgen05_runtime_n_ptx_fallback()
+            return None
+        return fact, analysis
+
+    @classmethod
+    def _seed_configs(
+        cls,
+        env: CompileEnvironment,
+        device_ir: DeviceIR,
+    ) -> list[Config]:
+        eligible = cls._eligible_inputs(env, device_ir)
+        if eligible is None:
+            return _tcgen05_grouped_prefix_adaptive_n_seeds(env.config_spec)
+        fact, analysis = eligible
+        spec = env.config_spec
+        seed_facts = analysis.seed_facts
+        source_m_tiles, reviewed_rows = _tcgen05_grouped_worklist_source_analysis(
+            env, analysis
+        )
+        if not source_m_tiles:
+            return _tcgen05_grouped_prefix_adaptive_n_seeds(spec)
+        families: list[list[Config]] = []
+        target_policy = get_grouped_worklist_target_policy(
+            None
+            if seed_facts.device_split_sizes
+            else _tcgen05_grouped_worklist_hardware_identity(env)
+        )
+        preferred_target_seed: Config | None = None
+        for source_m_tile in source_m_tiles:
+            # ``packed_m_hint`` remains the exact compiler fact. Seed selection
+            # only needs a tile-wave estimate, so round this local ranking input
+            # upward. Runtime/codegen validation never consumes the rounded value.
+            ranking_quantum = (
+                seed_facts.groups_hint * source_m_tile
+                if seed_facts.device_split_sizes
+                else source_m_tile
+            )
+            ranking_packed_m = (
+                (seed_facts.packed_m_hint + ranking_quantum - 1) // ranking_quantum
+            ) * ranking_quantum
+            family, family_target_seed = _tcgen05_grouped_worklist_seed_family(
+                groups=seed_facts.groups_hint,
+                packed_m=ranking_packed_m,
+                n=seed_facts.n_hint,
+                k=seed_facts.k_hint,
+                b_major=seed_facts.b_major,
+                source_m_tile=source_m_tile,
+                num_sm=spec.num_sm,
+                target_policy=target_policy,
+                worklist_rows=reviewed_rows,
+            )
+            if seed_facts.device_split_sizes:
+                # Device split-size kernels derive group rows on device and are
+                # supported only by the scheduler-mailbox family. Convert direct
+                # seeds rather than dropping useful BK/reservation variants;
+                # panel swizzles and CLC have no mailbox equivalent.
+                mailbox_family: list[Config] = []
+                for config in family:
+                    values = dict(config.config)
+                    l2_swizzle_size = values.get(
+                        TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY,
+                        1,
+                    )
+                    if values.get(
+                        TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
+                    ) == Tcgen05PersistenceModel.CLC_PERSISTENT.value or (
+                        type(l2_swizzle_size) is int and l2_swizzle_size > 1
+                    ):
+                        continue
+                    values.pop(TCGEN05_GROUPED_RUNTIME_DIRECT_CONFIG_KEY, None)
+                    mailbox_family.append(Config.from_dict(values))
+                if source_m_tile == TCGEN05_GROUPED_WORKLIST_SMALL_SOURCE_M_TILE:
+                    # Consumer registers are seed-only. Keep the existing BK64
+                    # mailbox witness inside the bounded family interleave.
+                    mailbox_family.insert(
+                        0,
+                        _tcgen05_grouped_worklist_config(
+                            source_m_tile, 64, 7, 240, runtime_direct=False
+                        ),
+                    )
+                family = dedupe_configs(mailbox_family)
+            family = [
+                config
+                for config in family
+                if seed_facts.k_hint
+                % cast("list[int]", config.config["block_sizes"])[2]
+                == 0
+            ]
+            family = _filter_reachable_block_size_configs(spec, family)
+            if (
+                preferred_target_seed is None
+                and family_target_seed is not None
+                and family_target_seed in family
+            ):
+                preferred_target_seed = family_target_seed
+            families.append(family)
+        seeds = _bounded_grouped_worklist_seed_families(
+            families,
+            preferred_config=preferred_target_seed,
+        )
+        if seed_facts.device_split_sizes:
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_output_ring_seeds(
+                        [
+                            *seeds,
+                            *(config for family in families for config in family),
+                        ],
+                        group_count=seed_facts.groups_hint,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=target_facts.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+            source128_seeds = _tcgen05_grouped_source128_seeds(
+                spec,
+                groups=seed_facts.groups_hint,
+                n=seed_facts.n_hint,
+                k=seed_facts.k_hint,
+                b_major=seed_facts.b_major,
+                dtype_bytes=fact.lhs_dtype.itemsize,
+                output_dtype_bytes=(analysis.output_dtype or fact.lhs_dtype).itemsize,
+                capacity_bytes=target_facts.per_cta_smem_capacity_bytes(env.device),
+            )
+            spec._cute_tcgen05_config.grouped_source128_search_enabled = bool(
+                source128_seeds
+            )
+            seeds = dedupe_configs([*seeds, *source128_seeds])
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_physical_k_seeds(
+                        spec,
+                        groups=seed_facts.groups_hint,
+                        n=seed_facts.n_hint,
+                        k=seed_facts.k_hint,
+                        b_major=seed_facts.b_major,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=target_facts.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+            # Larger routed-row profiles need the same resource-checked
+            # device pipelines as source128, including immutable K-major
+            # weights. Append them after the established seed/default prefix.
+            for source_m_tile in (
+                TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_DEFAULT,
+                TCGEN05_GROUPED_WORKLIST_LARGE_SOURCE_M_TILE,
+            ):
+                seeds = dedupe_configs(
+                    [
+                        *seeds,
+                        *_tcgen05_grouped_device_tile_seeds(
+                            spec,
+                            groups=seed_facts.groups_hint,
+                            n=seed_facts.n_hint,
+                            k=seed_facts.k_hint,
+                            b_major=seed_facts.b_major,
+                            dtype_bytes=fact.lhs_dtype.itemsize,
+                            output_dtype_bytes=(
+                                analysis.output_dtype or fact.lhs_dtype
+                            ).itemsize,
+                            capacity_bytes=target_facts.per_cta_smem_capacity_bytes(
+                                env.device
+                            ),
+                            source_m_tile=source_m_tile,
+                        ),
+                    ]
+                )
+        if spec._cute_tcgen05_config.grouped_d_shift_supported:
+            shifted = []
+            for seed in seeds:
+                if seed.get(TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY) is True:
+                    candidate = deepcopy(seed)
+                    candidate.config[TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY] = True
+                    shifted.append(candidate)
+            seeds = dedupe_configs([*seeds, *shifted])
+        if seed_facts.device_split_sizes:
+            seeds = dedupe_configs(
+                [
+                    *seeds,
+                    *_tcgen05_grouped_mn_device_tile_seeds(
+                        spec,
+                        groups=seed_facts.groups_hint,
+                        n=seed_facts.n_hint,
+                        k=seed_facts.k_hint,
+                        b_major=seed_facts.b_major,
+                        dtype_bytes=fact.lhs_dtype.itemsize,
+                        output_dtype_bytes=(
+                            analysis.output_dtype or fact.lhs_dtype
+                        ).itemsize,
+                        capacity_bytes=target_facts.per_cta_smem_capacity_bytes(
+                            env.device
+                        ),
+                    ),
+                ]
+            )
+        return dedupe_configs([*seeds, *_tcgen05_grouped_prefix_adaptive_n_seeds(spec)])
+
+    @classmethod
+    def should_promote(cls, env: CompileEnvironment) -> bool:
+        fact = _tcgen05_grouped_worklist_fact(env)
+        return (
+            (
+                tcgen05_runtime_n_ptx_compatible()
+                or env.config_spec._cute_tcgen05_config.grouped_device_worklist_supported
+            )
+            and fact is not None
+            and fact.static_k is not None
+            and super().should_promote(env)
+        )
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            cls._eligible_inputs(env, device_ir) is not None
+            or env.config_spec._cute_tcgen05_config.grouped_prefix_adaptive_n_search_enabled
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        configs = cls._seed_configs(env, device_ir)
+        # The optional recipe adds live-search candidates, while the existing
+        # promotion/default path keeps its established source and first seed.
+        return next(
+            (
+                config
+                for config in configs
+                if config.get(TCGEN05_GROUPED_PREFIX_ADAPTIVE_N_CONFIG_KEY) is not True
+            ),
+            None,
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        return cls._seed_configs(env, device_ir)
+
+
+def grouped_row_union_carrier(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> Config | None:
+    """One ordinary dense carrier, without grouped scheduler requirements.
+
+    Input metadata only proposes the seed. Codegen repeats the complete
+    semantic, allocation, typed-index and layout proof under shape guards.
+    """
+    spec = env.config_spec
+    if not spec._cute_tcgen05_config.grouped_row_union_supported:
+        return None
+    fact = _tcgen05_grouped_worklist_structural_fact(env)
+    if fact is None:
+        return None
+    from ...cute_mma import analyze_tcgen05_grouped_worklist
+
+    analysis = analyze_tcgen05_grouped_worklist(env, device_ir, fact)
+    if analysis is None or not analysis.dense_row_union_supported:
+        return None
+    hints = analysis.seed_facts
+    if not row_union_index_domain(
+        hints.groups_hint, hints.packed_m_hint, hints.n_hint, hints.k_hint
+    ):
+        return None
+    blocks = facts._matmul_seed_block_sizes(spec.tcgen05, bm=128, bn=64, bk=128)
+    if blocks is None:
+        return None
+    # The existing per-CTA budget excludes pipeline/barrier overhead. Only the
+    # two ordinary BF16 A/B rings occupy bulk SMEM; output uses SIMT stores.
+    if target_facts.per_cta_smem_budget_bytes(env.device) < 2 * (128 + 64) * 128 * 2:
+        return None
+    carrier = Config.from_dict(
+        {
+            "block_sizes": blocks,
+            "loop_orders": _seq_config_list(spec.loop_orders, {}),
+            "l2_groupings": _seq_config_list(
+                spec.l2_groupings, {item.block_id: 1 for item in spec.l2_groupings}
+            ),
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_monolithic",
+            "tcgen05_persistence_model": "static_persistent",
+        }
+    )
+    return carrier if _filter_reachable_block_size_configs(spec, [carrier]) else None
+
+
+def grouped_row_union_cluster4_carrier(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> Config | None:
+    """A coherent physical schedule, appended after the existing carriers."""
+    return _grouped_row_union_physical_carrier(env, TRANSPOSED_SCHEDULE)
+
+
+def grouped_row_union_paired_clc_carrier(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> Config | None:
+    return _grouped_row_union_physical_carrier(env, PAIRED_CLC_SCHEDULE)
+
+
+def _grouped_row_union_physical_carrier(
+    env: CompileEnvironment, schedule: str
+) -> Config | None:
+    spec = env.config_spec
+    if not facts.row_union_profile_supported(spec._cute_tcgen05_config, schedule):
+        return None
+    blocks = facts._matmul_seed_block_sizes(spec.tcgen05, bm=128, bn=64, bk=128)
+    if blocks is None:
+        return None
+    carrier = Config.from_dict(
+        {
+            "block_sizes": blocks,
+            "loop_orders": _seq_config_list(spec.loop_orders, {}),
+            "l2_groupings": _seq_config_list(
+                spec.l2_groupings, {item.block_id: 1 for item in spec.l2_groupings}
+            ),
+            "pid_type": "persistent_interleaved",
+            "tcgen05_cluster_m": 1,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_ab_stages": 2,
+            "tcgen05_acc_stages": 2,
+            "tcgen05_c_stages": 2,
+            "tcgen05_num_epi_warps": 4,
+            "tcgen05_strategy": "role_local_monolithic",
+            "tcgen05_persistence_model": "static_persistent",
+            "tcgen05_grouped_dense_row_union": True,
+            GROUPED_ROW_UNION_SCHEDULE_KEY: schedule,
+        }
+    )
+    return carrier if _filter_reachable_block_size_configs(spec, [carrier]) else None
+
+
+def _grouped_full_coverage_carrier(
+    env: CompileEnvironment,
+    device_ir: DeviceIR,
+    *,
+    block_k: int = 64,
+    source_m_tile: int = 32,
+) -> Config | None:
+    """One shared predicate for the optional domain and its coverage carrier."""
+    spec = env.config_spec
+    profile = next(
+        (profile for profile in FULL_COVERAGE_PIPELINES if profile[0] == block_k), None
+    )
+    if profile is None:
+        return None
+    _, ab_stages, consumer_regs = profile
+    if not full_coverage_pipeline_supported(
+        block_k, ab_stages, consumer_regs, source_m_tile=source_m_tile
+    ):
+        return None
+    if spec.target_device_capability != (10, 0):
+        return None
+    eligible = CuteTcgen05GroupedWorklistHeuristic._eligible_inputs(env, device_ir)
+    if eligible is None:
+        return None
+    _fact, analysis = eligible
+    hints = analysis.seed_facts
+    if not analysis.full_coverage_supported or not full_coverage_index_domain(
+        hints.groups_hint,
+        hints.packed_m_hint,
+        hints.n_hint,
+        hints.k_hint,
+        source_m_tile,
+        128,
+        block_k,
+    ):
+        return None
+    if block_k == 128 and full_coverage_smem_upper_bound(
+        hints.groups_hint, block_k, ab_stages, source_m_tile=source_m_tile
+    ) > target_facts.per_cta_smem_capacity_bytes(env.device):
+        return None
+    carrier = _tcgen05_grouped_worklist_config(
+        source_m_tile,
+        block_k,
+        ab_stages,
+        consumer_regs,
+        runtime_direct=False,
+        l2_swizzle_size=1,
+    )
+    if block_k == 128:
+        # Reuse the ordinary general worklist reservation lattice. This is a
+        # coherent pipeline carrier, not a shape-specific scheduler selection.
+        carrier.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = (
+            _tcgen05_grouped_scaled_reserved_sms(spec.num_sm, 32)
+        )
+    if not _filter_reachable_block_size_configs(spec, [carrier]):
+        return None
+    # TCGen role and AB-stage fields fully specify this carrier. The generic
+    # warp/stage aliases are absent from its flat serializer; omit only those
+    # redundant aliases from this new declaration, leaving legacy seeds intact.
+    carrier.config.pop("num_stages")
+    carrier.config.pop("num_warps")
+    return carrier
+
+
+def grouped_full_coverage_configs(
+    env: CompileEnvironment, device_ir: DeviceIR, *, block_k: int = 64
+) -> list[Config]:
+    """Return independent carrier/witness configs for additive compiler coverage.
+
+    The generic coverage facility owns population assembly and explicit override
+    handling. These records never enter the capped legacy seed family. Hints
+    restrict proposal generation only; final lowering rechecks guarded metadata.
+    """
+    if not env.config_spec._cute_tcgen05_config.grouped_full_coverage_eligible:
+        return []
+    carrier = _grouped_full_coverage_carrier(env, device_ir, block_k=block_k)
+    if carrier is None:
+        return []
+    dense = Config.from_dict(
+        deepcopy(carrier.config)
+        | {
+            TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY: TCGEN05_GROUPED_FULL_COVERAGE_DENSE
+        }
+    )
+    return [carrier, dense]
+
+
+class CuteTcgen05GroupedSource64Heuristic(AutotunerHeuristic):
+    """Add one larger ONE tile without replacing existing grouped seeds."""
+
+    name = "cute_tcgen05_grouped_source64"
+    backend = "cute"
+    priority = 57
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        carrier = _grouped_full_coverage_carrier(
+            env, device_ir, block_k=128, source_m_tile=64
+        )
+        if carrier is not None:
+            carrier.config[TCGEN05_GROUPED_FULL_COVERAGE_CONFIG_KEY] = (
+                TCGEN05_GROUPED_FULL_COVERAGE_DENSE_LOCAL
+            )
+        return carrier
+
+
+class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):
+    """Seed grouped-static configs for common K tails without partial TMA."""
+
+    name = "cute_tcgen05_grouped_static_common_k"
+    backend = "cute"
+    priority = 26
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ...cute_mma import tcgen05_grouped_static_seed_has_common_k_proof
+
+        fact = _tcgen05_grouped_static_common_k_fact(env)
+        return (
+            fact is not None
+            and _tcgen05_grouped_seed_grid_is_valid(device_ir, fact)
+            and tcgen05_grouped_static_seed_has_common_k_proof(env, device_ir, fact)
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        fact = _tcgen05_grouped_static_common_k_fact(env)
+        if fact is None:
+            return None
+        static_k = cast("int", fact.static_k)
+        bk = _tcgen05_grouped_static_common_k_block_k(static_k)
+        if bk is None:
+            return None
+        config = _tcgen05_grouped_seed_config(bk)
+        if (
+            static_k >= 3 * bk
+            and static_k % bk == 0
+            and smem.ab_stages_three_fits(
+                env.config_spec.tcgen05,
+                bm=128,
+                bn=64,
+                bk=bk,
+                cluster_m=1,
+            )
+        ):
+            config.config["tcgen05_ab_stages"] = 3
+        return config
+
+
+class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
+    """Seed the proven BK64 dynamic TensorMap grouped-static config.
+
+    This is intentionally narrow: it only fires for one tcgen05 FP16/BF16
+    rank-3 RHS grouped-NT matmul whose graph proves the exact per-group
+    ``k_sizes[safe_group]`` mask on both A and grouped B operands. The dynamic
+    TensorMap flag stays seed-only and is not exposed as a broad random-search
+    knob.
+    """
+
+    name = "cute_tcgen05_grouped_dynamic_bk64"
+    backend = "cute"
+    priority = 27
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ...cute_mma import tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof
+
+        fact = _tcgen05_grouped_dynamic_bk64_fact(env)
+        return (
+            fact is not None
+            and _tcgen05_grouped_seed_grid_is_valid(device_ir, fact)
+            and tcgen05_grouped_dynamic_bk64_seed_has_exact_k_proof(
+                env,
+                device_ir,
+                fact,
+            )
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        fact = _tcgen05_grouped_dynamic_bk64_fact(env)
+        if fact is None:
+            return None
+        config = _tcgen05_grouped_seed_config(64)
+        config.config[TCGEN05_GROUPED_MODE_CONFIG_KEY] = TCGEN05_GROUPED_MODE_DYNAMIC
+        config.config[TCGEN05_GROUPED_STATIC_RESERVED_SMS_CONFIG_KEY] = 3
+        config.config["tcgen05_ab_stages"] = TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
+        return config
+
+
+class CuteChunkRecurrenceHeuristic(AutotunerHeuristic):
+    """Expose legal BT16 recurrence schedules and register caps."""
+
+    name = "cute_chunk_recurrence"
+    backend = "cute"
+    priority = 3
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ...chunk_recurrence import _select_sm100_dv_partitions
+        from ...chunk_recurrence import detect_chunk_recurrence_search_geometry
+
+        geometry = detect_chunk_recurrence_search_geometry(device_ir.graphs)
+        capability = env.config_spec.target_device_capability
+        if geometry is None or capability is None or capability[0] != 10:
+            return frozenset()
+        preferred = _select_sm100_dv_partitions(
+            total_chunks=geometry.total_chunks,
+            sequences=geometry.sequences,
+            heads=geometry.heads,
+            num_sm=env.config_spec.num_sm,
+        )
+        enable_cute_chunk_recurrence_search(
+            env.config_spec, preferred_partitions=preferred
+        )
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            env.config_spec.cute_chunk_recurrence_dv_partitions is not None
+            and env.config_spec.cute_chunk_recurrence_register_cap is not None
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_recurrence_dv_partitions
+        register_cap_fragment = env.config_spec.cute_chunk_recurrence_register_cap
+        if fragment is None or register_cap_fragment is None:
+            return None
+        register_caps = (
+            72,
+            *(
+                cap
+                for cap in register_cap_fragment.choices
+                if cap is not None and cap != 72
+            ),
+            *((None,) if None in register_cap_fragment.choices else ()),
+        )
+        return [
+            Config.from_dict(
+                {
+                    CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY: partitions,
+                    CUTE_CHUNK_RECURRENCE_REGISTER_CAP_KEY: register_cap,
+                }
+            )
+            for partitions in fragment.choices
+            for register_cap in register_caps
+            if _cute_chunk_recurrence_config_is_safe(partitions, register_cap)
+        ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
+    """Seed the tcgen05 schedule of the gated-delta-rule chunk recurrence.
+
+    The whole-root ``gdn_recurrence`` planner fires only for the dstate tiles
+    its geometry admits (a 128-row TMEM tile, replicated for narrower tiles),
+    so the seeds pin
+    ``block_sizes`` to the preferred tile and its half to make sure the
+    autotuner measures the tensor-core path.  The TMA ring depth and the
+    epilogue warp count are real trade-offs and stay searchable knobs: the
+    depth domain is the union over every tile the planner lowers, including
+    the wider tiles the ``block_sizes`` search reaches for a non-power-of-two
+    dstate, and ``normalize`` re-validates it per tile.  Every seed is legal
+    as written, and no searched config reaches codegen with a depth its tile
+    cannot hold.  The dstate tile's own floor is raised to the smallest
+    admitted tile: the SM100 dot minimum leaves it at one row, and no lowering
+    of this kernel compiles a narrower tile, so the autotuner must not sample
+    one.
+    """
+
+    name = "cute_gdn_recurrence"
+    backend = "cute"
+    priority = 4
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+
+    @classmethod
+    def _geometry(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> GdnRecurrenceGeometry | None:
+        from ...gdn_recurrence import detect_gdn_recurrence_search_geometry
+
+        host_function = device_ir.host_function
+        if host_function is None:
+            return None
+        with host_function:
+            return detect_gdn_recurrence_search_geometry(
+                device_ir.graphs, env.config_spec.target_device_capability
+            )
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ...gdn_recurrence import gdn_recurrence_mma_m_choices_by_tile
+        from ...gdn_recurrence import gdn_recurrence_stage_choices_by_tile
+        from ...gdn_recurrence import gdn_recurrence_token_group_choices_by_tile
+        from ...gdn_recurrence_geometry import GDN_ADMITTED_BLOCK_V
+        from ...gdn_recurrence_geometry import gdn_epilogue_warp_choices
+
+        geometry = cls._geometry(env, device_ir)
+        if geometry is None:
+            return frozenset()
+        # Both dots of this kernel need a 16-row dstate tile in every lowering
+        # (tensor-core or SIMT), but the SM100 dot minimum leaves the tile's
+        # spec at one row: raise the hard floor so no sampled config can fail.
+        env.config_spec.block_sizes.block_id_lookup(geometry.value_block_id).update_min(
+            GDN_ADMITTED_BLOCK_V[-1]
+        )
+        enable_cute_gdn_recurrence_search(
+            env.config_spec,
+            value_block_id=geometry.value_block_id,
+            stage_choices_by_tile=gdn_recurrence_stage_choices_by_tile(geometry),
+            epilogue_warp_choices=gdn_epilogue_warp_choices(
+                geometry.chunk, geometry.dhead
+            ),
+            mma_m_choices_by_tile=gdn_recurrence_mma_m_choices_by_tile(geometry),
+            token_group_choices_by_tile=gdn_recurrence_token_group_choices_by_tile(
+                geometry
+            ),
+        )
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return (
+            env.config_spec.cute_gdn_recurrence_stages is not None
+            and env.config_spec.cute_gdn_recurrence_epilogue_warps is not None
+            and env.config_spec.cute_gdn_recurrence_token_groups is not None
+            and env.config_spec.cute_gdn_recurrence_mma_m is not None
+        )
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        from ...gdn_recurrence import gdn_recurrence_warp_choices
+        from ...gdn_recurrence import gdn_seed_block_sizes
+        from ...gdn_recurrence_geometry import gdn_mma_m_choices
+        from ...gdn_recurrence_geometry import gdn_stage_choices
+        from ...gdn_recurrence_geometry import gdn_token_group_choices
+
+        spec = env.config_spec
+        if (
+            spec.cute_gdn_recurrence_stages is None
+            or spec.cute_gdn_recurrence_epilogue_warps is None
+            or spec.cute_gdn_recurrence_token_groups is None
+            or spec.cute_gdn_recurrence_mma_m is None
+        ):
+            return None
+        geometry = cls._geometry(env, device_ir)
+        if geometry is None:
+            return None
+        # The seed pins the whole block_sizes list, so it is only sound when
+        # the dstate tile is the sole tunable tile of the kernel.
+        if spec.block_sizes.valid_block_ids() != [geometry.value_block_id]:
+            return None
+        seeds: list[Config] = []
+        # Seed the preferred dstate tile and its half; the remaining admitted
+        # tiles stay reachable through the ordinary block_sizes search.  Each
+        # seed carries the preferred tcgen05 M of its tile and warps (M = 64
+        # for tiles of at most 64 rows) and that M's preferred depths.
+        for block_v in gdn_seed_block_sizes(geometry):
+            for warps in gdn_recurrence_warp_choices(geometry, block_v):
+                mma_m = gdn_mma_m_choices(
+                    geometry.chunk, geometry.dhead, block_v, warps
+                )[0]
+                stage_choices = gdn_stage_choices(
+                    geometry.chunk, geometry.dhead, block_v, mma_m
+                )
+                for stages in stage_choices[:2]:
+                    seeds.append(
+                        Config.from_dict(
+                            {
+                                "block_sizes": [block_v],
+                                CUTE_GDN_RECURRENCE_STAGES_KEY: stages,
+                                CUTE_GDN_RECURRENCE_EPILOGUE_WARPS_KEY: warps,
+                                CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY: (
+                                    gdn_token_group_choices(
+                                        geometry.chunk, block_v, warps, mma_m
+                                    )[0]
+                                ),
+                                CUTE_GDN_RECURRENCE_MMA_M_KEY: mma_m,
+                            }
+                        )
+                    )
+        return seeds or None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteTopKHeuristic(AutotunerHeuristic):
+    """Seed subgroup geometry from bounded per-lane selection fragments."""
+
+    name = "cute_topk"
+    backend = "cute"
+    priority = 9
+
+    @staticmethod
+    def _supports_float32_bit_keys(dtype: torch.dtype, n: int) -> bool:
+        if dtype not in (torch.float16, torch.bfloat16):
+            return False
+        index_bits = (n - 1).bit_length()
+        index_mask = (1 << index_bits) - 1
+        min_key = -(32767 << index_bits)
+        max_key = (32767 << index_bits) | index_mask
+        # Match the emitter's biased-key proof: real keys are positive normal
+        # finite Float32 values, leaving zero below every real key for padding.
+        return 0x40000000 + min_key >= 0x00800000 and 0x40000000 + max_key <= 0x7F7FFFFF
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ....runtime_tensor_guards import register_tensor_alias_specializations
+        from ...selection.topk import match_topk_root
+        from ...selection.topk import topk_tensors_are_proven_disjoint
+
+        host_function = device_ir.host_function
+        if host_function is None or len(device_ir.root_ids) != 1:
+            return frozenset()
+        with host_function:
+            plan = match_topk_root(
+                device_ir.graphs,
+                noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+            )
+            # The structural match precedes real-argument availability. Wait
+            # until binding can prove disjoint storage before freezing generic
+            # tiling; the registered alias classifier guards bound-cache reuse.
+            if plan is not None:
+                # Singleton top-k has no reduction dimension, so the reduction
+                # registration pass may not have installed its alias facts.
+                register_tensor_alias_specializations(env)
+                if topk_tensors_are_proven_disjoint(plan, env, allow_unbound=True):
+                    enable_cute_topk_search(env.config_spec, plan.selection_dtype)
+                    env.config_spec.cute_topk_coarse_keys_available = (
+                        plan.selection_dtype == torch.float32
+                        and 1 < plan.n <= (1 << 23)
+                        and (1 << (plan.k - 1).bit_length()) <= plan.n
+                    )
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_topk_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        from ...selection.topk import match_topk_root
+        from ...selection.topk import topk_tensors_are_proven_disjoint
+
+        host_function = device_ir.host_function
+        if host_function is None or len(device_ir.root_ids) != 1:
+            return None
+        with host_function:
+            plan = match_topk_root(
+                device_ir.graphs,
+                noncanonical_block_ids=device_ir.noncanonical_task_origin_block_ids,
+            )
+            # A structural candidate can still fail the final runtime alias
+            # proof. Do not seed its specialized schedule without that proof.
+            if plan is None or not topk_tensors_are_proven_disjoint(plan, env):
+                return None
+        full_precision = plan.selection_dtype == torch.float32
+        integer_key = "int64" if full_precision else "int32"
+        padded_k = 1 << (plan.k - 1).bit_length()
+        seeds = []
+        small_row_seed = None
+        per_warp_lane = (plan.n + 31) // 32
+        if (
+            env.block_sizes[plan.row_block_id].size_hint() <= 8
+            and plan.n >= 32
+            and per_warp_lane <= 32
+        ):
+            # A warp per row exposes parallelism when only a few rows exist.
+            # Bound the per-lane register footprint and append this hint after
+            # every existing family; ordinary defaults and their order stay put.
+            small_row_seed = env.config_spec.default_config()
+            small_row_seed.config.update(
+                cute_topk_lanes_per_row=32,
+                cute_topk_rows_per_block=1,
+                cute_topk_vector_width=min(4, 1 << (per_warp_lane.bit_length() - 1)),
+                cute_topk_output_vector_width=1,
+                cute_topk_value_mode="decode",
+                cute_topk_key_dtype=integer_key,
+                cute_topk_rank_mode="ordinal",
+                cute_topk_selection_layout="distributed",
+                cute_topk_sort_network="compact_pruned",
+                cute_topk_merge_schedule="balanced",
+            )
+        # Retain the original register-pressure and occupancy candidates. All
+        # seeds are search hints, not promoted defaults.
+        for target, threads, value_mode, rank_mode, layout in (
+            (32, 128, "decode", "ordinal", "replicated"),
+            (64, 128, "decode", "signed", "replicated"),
+            (128, 64, "gather", "signed", "replicated"),
+            (32, 64, "decode", "ordinal", "distributed"),
+        ):
+            elements_per_lane = max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
+            config = env.config_spec.default_config()
+            config.config.update(
+                cute_topk_lanes_per_row=lanes,
+                cute_topk_rows_per_block=threads // lanes,
+                cute_topk_vector_width=8,
+                cute_topk_output_vector_width=4,
+                cute_topk_value_mode=value_mode,
+                cute_topk_key_dtype=integer_key,
+                cute_topk_rank_mode=rank_mode,
+                cute_topk_selection_layout=layout,
+            )
+            seeds.append(config)
+
+        # Growing distributed fragments need not contain K keys in every lane.
+        # Native floating-point comparisons provide a complementary replicated
+        # schedule; their precision guard can fall back to integer keys.
+        for target, layout, key_dtype in (
+            (8, "distributed", "int32"),
+            (16, "distributed", "int32"),
+            (32, "replicated", "float32_native"),
+            (64, "replicated", "float32_native"),
+        ):
+            distributed = layout == "distributed"
+            elements_per_lane = target if distributed else max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(
+                32,
+                32 if distributed else padded_k,
+                1 << (required_lanes - 1).bit_length(),
+            )
+            per_lane = (plan.n + lanes - 1) // lanes
+            input_vector = min(8, 1 << (per_lane.bit_length() - 1))
+            config = env.config_spec.default_config()
+            config.config.update(
+                cute_topk_lanes_per_row=lanes,
+                cute_topk_rows_per_block=128 // lanes,
+                cute_topk_vector_width=input_vector,
+                cute_topk_output_vector_width=4,
+                cute_topk_value_mode="decode",
+                cute_topk_key_dtype=integer_key if full_precision else key_dtype,
+                cute_topk_rank_mode="ordinal",
+                cute_topk_selection_layout=layout,
+                cute_topk_sort_network="compact_pruned",
+            )
+            seeds.append(config)
+        if full_precision:
+            # Couple exact coarse-key recovery with value gathering at two bounded
+            # register budgets. The existing full-precision seeds stay first.
+            if env.config_spec.cute_topk_coarse_keys_available:
+                for register_target in (16, 32):
+                    required_lanes = (plan.n + register_target - 1) // register_target
+                    lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                    per_lane = (plan.n + lanes - 1) // lanes
+                    rows = 64 // lanes
+                    if per_lane > register_target or (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=min(8, 1 << (per_lane.bit_length() - 1)),
+                        cute_topk_output_vector_width=1,
+                        cute_topk_value_mode="gather",
+                        cute_topk_key_dtype="int64",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="compact_pruned",
+                        cute_topk_key_encoder="dsl",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="sequential",
+                        cute_topk_coarse_keys=True,
+                        cute_topk_key_recovery="packed",
+                    )
+                    seeds.append(config)
+            if small_row_seed is not None:
+                seeds.append(small_row_seed)
+            return dedupe_configs(seeds)
+        # Replicated ordinal decoding can avoid irregular value gathers. Add
+        # all encoder implementations at two bounded register-fragment sizes;
+        # these remain unpromoted search hints with the ordinary merge default.
+        for target in (32, 64):
+            elements_per_lane = max(padded_k, target)
+            required_lanes = (plan.n + elements_per_lane - 1) // elements_per_lane
+            lanes = min(32, padded_k, 1 << (required_lanes - 1).bit_length())
+            for encoder in ("dsl", "asm", "paired"):
+                config = env.config_spec.default_config()
+                config.config.update(
+                    cute_topk_lanes_per_row=lanes,
+                    cute_topk_rows_per_block=128 // lanes,
+                    cute_topk_vector_width=8,
+                    cute_topk_output_vector_width=4,
+                    cute_topk_value_mode="decode",
+                    cute_topk_key_dtype=integer_key,
+                    cute_topk_rank_mode="ordinal",
+                    cute_topk_selection_layout="replicated",
+                    cute_topk_sort_network="compact_pruned",
+                    cute_topk_key_encoder=encoder,
+                    cute_topk_defer_value_gathers=True,
+                )
+                seeds.append(config)
+        # Complement the existing integer/replicated hints with a bounded
+        # distributed floating-key family at two occupancy budgets. Keep the
+        # original seed order and promoted/default configuration unchanged.
+        if cls._supports_float32_bit_keys(plan.selection_dtype, plan.n):
+            for register_target in (32, 64):
+                required_lanes = (plan.n + register_target - 1) // register_target
+                lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                per_lane = (plan.n + lanes - 1) // lanes
+                if per_lane > register_target:
+                    continue
+                input_vector = min(4, 1 << (per_lane.bit_length() - 1))
+                output_vector = min(4, max(1, padded_k // lanes))
+                for threads in (128, 256):
+                    rows = threads // lanes
+                    if (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=input_vector,
+                        cute_topk_output_vector_width=output_vector,
+                        cute_topk_value_mode="decode",
+                        cute_topk_key_dtype="float32_bits",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="batcher",
+                        cute_topk_key_encoder="paired",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="sequential",
+                    )
+                    seeds.append(config)
+        # Keep scalar single-warp hints before paired-store two-warp hints.
+        if plan.selection_dtype in (torch.float16, torch.bfloat16):
+            for threads, output_width in ((32, 1), (64, 2)):
+                for register_target in (32, 64):
+                    required_lanes = (plan.n + register_target - 1) // register_target
+                    lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                    per_lane = (plan.n + lanes - 1) // lanes
+                    if per_lane > register_target:
+                        continue
+                    rows = threads // lanes
+                    if (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=min(8, 1 << (per_lane.bit_length() - 1)),
+                        cute_topk_output_vector_width=min(
+                            output_width, max(1, padded_k // lanes)
+                        ),
+                        cute_topk_value_mode="decode",
+                        cute_topk_key_dtype="int32",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="compact_pruned",
+                        cute_topk_key_encoder="paired",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="balanced",
+                    )
+                    seeds.append(config)
+            # Scalar stores complement the vector-output hints at the existing
+            # register budgets and multi-warp occupancies. Keep these integer
+            # schedules after the original seeds; they do not change defaults.
+            for register_target in (32, 64):
+                required_lanes = (plan.n + register_target - 1) // register_target
+                lanes = min(32, 1 << (required_lanes - 1).bit_length())
+                per_lane = (plan.n + lanes - 1) // lanes
+                if per_lane > register_target:
+                    continue
+                for threads in (128, 256):
+                    rows = threads // lanes
+                    if (
+                        rows
+                        not in env.config_spec.cute_topk_choices[
+                            "cute_topk_rows_per_block"
+                        ]
+                    ):
+                        continue
+                    config = env.config_spec.default_config()
+                    config.config.update(
+                        cute_topk_lanes_per_row=lanes,
+                        cute_topk_rows_per_block=rows,
+                        cute_topk_vector_width=min(4, 1 << (per_lane.bit_length() - 1)),
+                        cute_topk_output_vector_width=1,
+                        cute_topk_value_mode="decode",
+                        cute_topk_key_dtype="int32",
+                        cute_topk_rank_mode="ordinal",
+                        cute_topk_selection_layout="distributed",
+                        cute_topk_sort_network="batcher",
+                        cute_topk_key_encoder="paired",
+                        cute_topk_defer_value_gathers=False,
+                        cute_topk_merge_schedule="sequential",
+                    )
+                    seeds.append(config)
+            # Couple a larger distributed fragment with scalar output and the
+            # compact balanced network. Keep all earlier search hints first.
+            register_target = 128
+            required_lanes = (plan.n + register_target - 1) // register_target
+            lanes = min(32, 1 << (required_lanes - 1).bit_length())
+            per_lane = (plan.n + lanes - 1) // lanes
+            rows = 128 // lanes
+            if 64 < per_lane <= register_target and (
+                rows in env.config_spec.cute_topk_choices["cute_topk_rows_per_block"]
+            ):
+                config = env.config_spec.default_config()
+                config.config.update(
+                    cute_topk_lanes_per_row=lanes,
+                    cute_topk_rows_per_block=rows,
+                    cute_topk_vector_width=8,
+                    cute_topk_output_vector_width=1,
+                    cute_topk_value_mode="decode",
+                    cute_topk_key_dtype="int32",
+                    cute_topk_rank_mode="ordinal",
+                    cute_topk_selection_layout="distributed",
+                    cute_topk_sort_network="compact_pruned",
+                    cute_topk_key_encoder="paired",
+                    cute_topk_defer_value_gathers=False,
+                    cute_topk_merge_schedule="balanced",
+                )
+                seeds.append(config)
+        if small_row_seed is not None:
+            seeds.append(small_row_seed)
+        return dedupe_configs(seeds)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteChunkPrepareHeuristic(AutotunerHeuristic):
+    """Expose exact BT16 prepare schedules with a geometry-derived seed."""
+
+    name = "cute_chunk_prepare"
+    backend = "cute"
+    priority = 7
+    promote_seed_to_default = True
+    PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        from ...chunk_prepare import preferred_chunk_prepare_schedule
+
+        capability = env.config_spec.target_device_capability
+        host_function = device_ir.host_function
+        if capability is None or capability[0] != 10 or host_function is None:
+            return frozenset()
+        with host_function:
+            preferred_schedule = preferred_chunk_prepare_schedule(
+                device_ir.graphs,
+                env=env,
+                num_sm=env.config_spec.num_sm,
+            )
+        if preferred_schedule is None:
+            return frozenset()
+        enable_cute_chunk_prepare_schedule_search(
+            env.config_spec, preferred_schedule=preferred_schedule
+        )
+        return cls.CACHE_SPECIALIZATION_FACTS
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_chunk_prepare_schedule is not None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        fragment = env.config_spec.cute_chunk_prepare_schedule
+        if fragment is None:
+            return None
+        return [
+            Config.from_dict({CUTE_CHUNK_PREPARE_SCHEDULE_KEY: schedule})
+            for schedule in fragment.choices
+        ]
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteFlashAttentionHeuristic(AutotunerHeuristic):
+    """Seed ``block_sizes=[1, 128, 128]`` for detected flash attention.
+
+    When ``HELION_CUTE_FLASH`` is on (the default), a dense online-softmax
+    attention kernel at [tile_b=1, tile_m=128, tile_n=128], FP16/BF16, head_dim
+    in {64, 128} lowers to the fused tcgen05 flash path
+    (``cute_flash.codegen_attention_flash``) -- orders of magnitude faster than
+    the scalar fallback. The flash detector fires at EXACTLY 128x128 tiles, so
+    unless that config is in the autotuner population the fast path is never
+    measured. This seed puts it in generation 0; the search still owns every
+    other knob and benchmarks the seed against the rest, dropping it if the
+    accuracy/compile check ever fails.
+    """
+
+    name = "cute_flash_attention"
+    backend = "cute"
+    priority = 10
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_flash_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        spec = env.config_spec
+        if not spec.cute_flash_search_enabled:
+            return None
+        # The spec owns the one seed builder; this ranked list must equal the
+        # flash part of ``spec.autotune_seed_configs()`` fact for fact.
+        seeds = cute_flash_seed_configs(spec)
+        if seeds:
+            # Slow but valid flash seeds can exceed the normal subprocess
+            # timing window. Retry once with three measured launches so a
+            # transient timeout does not remove a structural family.
+            spec.compiler_seed_timeout_retry_repetitions = 3
+        return seeds
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteFlashGatedAttentionHeuristic(AutotunerHeuristic):
+    """Seed the fused tile shape for detected gated (softmax-free) attention.
+
+    The gated tcgen05 body (``cute_flash_gated``) fires only at 128x128 tiles,
+    which ``enable_cute_flash_gated_search`` pins; the seeds put every legal
+    K/V TMA ring depth into generation zero so the fused family is measured
+    against the rest of the search.
+    """
+
+    name = "cute_flash_gated_attention"
+    backend = "cute"
+    priority = 11
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return env.config_spec.cute_flash_gated_search_enabled
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        seeds = cute_flash_gated_seed_configs(env.config_spec)
+        return seeds or None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
+    """Seed the one-CTA tile used by tcgen05 thread-local epilogues.
+
+    The structural region analysis only decides whether this seed is useful.
+    The exhaustive, per-config ownership proof remains authoritative for
+    codegen, so planting the seed does not widen the accepted kernel surface.
+    """
+
+    name = "cute_tcgen05_thread_local_epilogue"
+    backend = "cute"
+    priority = 28
+    promote_seed_to_default = True
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        seed = cls.get_seed_config(env, device_ir)
+        if seed is None:
+            return []
+        return [seed]
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        from ...cute_mma import tcgen05_fragment_epilogue_has_unique_anchor
+        from ...cute_mma import tcgen05_fragment_epilogue_present
+
+        spec = env.config_spec
+        return (
+            spec.tcgen05.search_enabled
+            and TCGEN05_TWO_CTA_SEED_PID_TYPE in spec.allowed_pid_types
+            and tcgen05_fragment_epilogue_present(device_ir.graphs)
+            and tcgen05_fragment_epilogue_has_unique_anchor(
+                device_ir.graphs,
+                device_ir=device_ir,
+            )
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        fragments = facts._matmul_block_fragments(spec.tcgen05)
+        if fragments is None:
+            return None
+        bm_fragment, bn_fragment, bk_fragment = fragments
+
+        def select(fragment: BlockSizeFragment, choices: tuple[int, ...]) -> int | None:
+            return next(
+                (value for value in choices if fragment.low <= value <= fragment.high),
+                None,
+            )
+
+        bm = select(bm_fragment, (128,))
+        bn = select(bn_fragment, (128, 64))
+        bk = select(bk_fragment, (128, 64, 32, 16))
+        if bm is None or bn is None or bk is None:
+            return None
+        block_sizes = facts._matmul_seed_block_sizes(
+            spec.tcgen05,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+        )
+        if block_sizes is None:
+            return None
+        return Config(
+            block_sizes=block_sizes,
+            num_stages=2,
+            num_warps=8,
+            pid_type=TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            tcgen05_cluster_m=1,
+            tcgen05_cluster_n=1,
+            tcgen05_ab_stages=2,
+            tcgen05_acc_stages=2,
+            tcgen05_c_stages=2,
+            tcgen05_num_epi_warps=4,
+        )
+
+
+class CuteTcgen05ClusterM2Heuristic(AutotunerHeuristic):
+    name = "cute_tcgen05_cluster_m2"
+    backend = "cute"
+    priority = 23
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        constraints = spec.tcgen05.cluster_m2_search_constraints
+        if constraints is None or constraints.one_wave_only:
+            # One-wave-only shapes seed their narrow tiles from the config
+            # spec; the 256x256 two-CTA seed would idle most SMs there.
+            return False
+        if TCGEN05_TWO_CTA_SEED_PID_TYPE not in spec.allowed_pid_types:
+            return False
+        fragments = facts._matmul_block_fragments(spec.tcgen05)
+        if fragments is None:
+            return False
+        bm_fragment, bn_fragment, _ = fragments
+        edge_k_tail_family = constraints.allow_edge_k_tail_family
+        m_tile_reachable = (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            # The edge+K-tail surface keeps the flat M search capped below 256,
+            # then normalization projects cluster_m=2 candidates to 256.
+            or (edge_k_tail_family and bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M)
+        )
+        n_tile_reachable = (
+            bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+            or (edge_k_tail_family and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N)
+        )
+        full_tile_reachable = m_tile_reachable and n_tile_reachable
+        # The fp8 small-grid family seeds the bm=128/bn=128 tile, which is
+        # reachable on shapes (small M/N) where the bm=256 full tile is not.
+        small_grid_reachable = (
+            constraints.allow_fp8_small_grid
+            and not edge_k_tail_family
+            and cls._small_grid_tile_reachable(spec)
+        )
+        return (full_tile_reachable or small_grid_reachable) and cls._select_bk(
+            env
+        ) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        bk = cls._select_bk(env)
+        if bk is None:
+            raise AssertionError(f"{cls.name} get_seed_config called while ineligible")
+        return cls._seed_config_for_bk(env, bk)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        return [
+            seed
+            for bk in seeds.cluster_m2_seed_bk_choices(
+                env.config_spec._cute_tcgen05_config
+            )
+            if (seed := cls._seed_config_for_bk(env, bk)) is not None
+        ]
+
+    @classmethod
+    def _seed_config_for_bk(cls, env: CompileEnvironment, bk: int) -> Config | None:
+        spec = env.config_spec
+
+        constraints = spec.tcgen05.cluster_m2_search_constraints
+        edge_k_tail_family = (
+            constraints is not None and constraints.allow_edge_k_tail_family
+        )
+        fp8_small_grid_family = (
+            constraints is not None
+            and constraints.allow_fp8_small_grid
+            and not edge_k_tail_family
+            and cls._small_grid_tile_reachable(spec)
+        )
+        if fp8_small_grid_family:
+            # Seed the bm=128 small-grid tile only while it is the right tile
+            # for the shape: it wins on B200 cold-L2 while its 128x128 cluster
+            # grid fits in ~one wave (1.00-1.17x at <=72 clusters / <=0.97
+            # waves) but loses from 80 clusters / 1.08 waves up (0.84-0.94x),
+            # where the larger bm=256 full tile is the better seed. Above the
+            # one-wave ceiling fall through to the full-tile seed -- but only
+            # when that tile is actually reachable; otherwise (e.g. M not a
+            # multiple of 256) keep the small-grid seed, which is still the only
+            # validated cluster_m=2 starting point. The bm=128 search candidates
+            # stay reachable regardless (the search-admission gate is unchanged);
+            # this only chooses the heuristic's starting point.
+            if cls._small_grid_within_one_wave(env) or not cls._full_tile_reachable(
+                spec
+            ):
+                return cls._fp8_small_grid_seed_config(env, bk)
+        # Generalized known-good CtaGroup.TWO template (the DEFAULT-layout,
+        # non-FFI config family that the hand-pinned per-shape seeds shared).
+        # Pinning the full perf-critical knob set — not just the tile + cluster
+        # — gives the autotuner a strong, complete starting point for ANY
+        # 2-CTA-eligible matmul shape instead of relying on the search to
+        # rediscover num_warps/num_stages/staging from a partial seed.
+        # ``tcgen05_strategy`` (ROLE_LOCAL_MONOLITHIC) is the default, so it is
+        # left implicit; the search still owns every one of these knobs.
+        block_sizes = facts._matmul_seed_block_sizes(
+            spec.tcgen05,
+            bm=TCGEN05_TWO_CTA_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_BLOCK_N,
+            bk=bk,
+        )
+        if block_sizes is None:
+            return None
+        seed: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "num_warps": 8,
+            "num_stages": 4,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 2,
+            # Matches the validated tcgen05 search restriction.
+            "tcgen05_num_epi_warps": 4,
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+        }
+        if edge_k_tail_family:
+            seed.update(tcgen05_two_cta_edge_k_tail_seed_overrides())
+        else:
+            seed["l2_groupings"] = [TCGEN05_TWO_CTA_SEED_L2_GROUPING]
+            seed["tcgen05_c_stages"] = 2
+            # When the SMEM-budget gate admits ``ab=3`` for this seed tile
+            # shape, seed the canonical fast config family directly so it
+            # reaches the autotuner's initial population without depending on a
+            # search-stage mutation.
+            if smem.ab_stages_three_fits(
+                spec.tcgen05,
+                bm=TCGEN05_TWO_CTA_BLOCK_M,
+                bn=TCGEN05_TWO_CTA_BLOCK_N,
+                bk=bk,
+                cluster_m=2,
+            ):
+                seed["tcgen05_ab_stages"] = 3
+        if spec.indexing.length == 3:
+            # Pure matmul has exactly the A/B/C indexing slots. Fused epilogues
+            # add more memory ops, so leave those seeds to the spec default
+            # rather than constructing a partial list.
+            seed["indexing"] = [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ]
+        elif edge_k_tail_family:
+            seed["indexing"] = ["tensor_descriptor"] * spec.indexing.length
+        return Config(**seed)
+
+    @staticmethod
+    def _select_bk(env: CompileEnvironment) -> int | None:
+        choices = seeds.cluster_m2_seed_bk_choices(env.config_spec._cute_tcgen05_config)
+        return choices[0] if choices else None
+
+    @staticmethod
+    def _small_grid_tile_reachable(spec: ConfigSpec) -> bool:
+        """True when the fp8 small-grid 2-CTA tile (bm=128/bn=128) is in range."""
+        fragments = facts._matmul_block_fragments(spec.tcgen05)
+        if fragments is None:
+            return False
+        bm_fragment, bn_fragment, _ = fragments
+        return (
+            bm_fragment.low
+            <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+            <= bm_fragment.high
+            and bn_fragment.low
+            <= TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+            <= bn_fragment.high
+        )
+
+    @staticmethod
+    def _full_tile_reachable(spec: ConfigSpec) -> bool:
+        """True when the bm=256/bn=256 full-tile cluster_m=2 tile is in range."""
+        fragments = facts._matmul_block_fragments(spec.tcgen05)
+        if fragments is None:
+            return False
+        bm_fragment, bn_fragment, _ = fragments
+        return (
+            bm_fragment.low <= TCGEN05_TWO_CTA_BLOCK_M <= bm_fragment.high
+            and bn_fragment.low <= TCGEN05_TWO_CTA_BLOCK_N <= bn_fragment.high
+        )
+
+    @staticmethod
+    def _small_grid_within_one_wave(env: CompileEnvironment) -> bool:
+        """True when the bm=128 small-grid cluster grid fits in ~one wave.
+
+        Each 128x128 cluster spans 2 CTAs, so the grid fills the device once at
+        ``clusters * 2 == num_sms``; the small-grid tile is the right *seed*
+        only at or below that point (B200 cold-L2: 1.00-1.17x at <=72 clusters,
+        0.84-0.94x from 80 clusters up). Mirrors the ``num_sms // 2`` ceiling
+        rationale; uses static M/N from the single matmul fact. A non-CUDA /
+        unknown SM count (0) keeps the small-grid seed (search still owns the
+        final choice), matching the wave-quantization gate's mocked-host policy.
+        """
+        facts = env.config_spec.matmul_facts
+        if len(facts) != 1:
+            return True
+        fact = facts[0]
+        if fact.static_m is None or fact.static_n is None:
+            return True
+        from .....runtime import get_num_sm
+
+        try:
+            num_sm = get_num_sm(env.device)
+        except (AssertionError, NotImplementedError):
+            return True
+        if num_sm <= 0:
+            return True
+        clusters = (fact.static_m // TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M) * (
+            fact.static_n // TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N
+        )
+        return clusters <= num_sm // 2
+
+    @classmethod
+    def _fp8_small_grid_seed_config(cls, env: CompileEnvironment, bk: int) -> Config:
+        """Seed the fp8 small-grid 2-CTA family (per-CTA 64xbn, bm=128/bn=128).
+
+        Pins the small-grid tile plus the deep-prefetch pipeline the cold-L2
+        sweeps found optimal on the small/wave-limited fp8 serving GEMMs:
+        ``ab_stages=12`` (max A/B prefetch to hide the cold DRAM read),
+        ``acc_stages=1`` and ``c_stages=2`` (lean accumulator + C ring),
+        ``l2_groupings=1`` (no scheduler swizzle). Measured cold-L2 vs
+        torch._scaled_mm on B200: 512x2048x4096 1.14x and 512x2048x2048 1.01x,
+        both ahead of the shallower ab=8/acc=2/c=4/l2=4 seed (1.02x / 0.88x).
+        The bm=256 full-tile seed underfills this regime (16 clusters), so this
+        small-grid seed is the strong starting point the autotuner needs.
+
+        ``ab_stages=12`` is the validator max and sits near the B200 SMEM optin
+        budget; on a lower-SMEM Blackwell SKU it is dropped gracefully by the
+        seed transfer (``seed_flat_config_pairs`` catches ``InvalidConfig``) and
+        the search falls back to shallower samples, so seeding the max is safe.
+        """
+        spec = env.config_spec
+        block_sizes = facts._matmul_seed_block_sizes(
+            spec.tcgen05,
+            bm=TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M,
+            bn=TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_N,
+            bk=bk,
+        )
+        if block_sizes is None:
+            raise AssertionError("fp8 small-grid seed requested without matmul axes")
+        seed: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "num_warps": 8,
+            "num_stages": 4,
+            "pid_type": TCGEN05_TWO_CTA_SEED_PID_TYPE,
+            "tcgen05_cluster_m": 2,
+            "tcgen05_cluster_n": 1,
+            "tcgen05_acc_stages": 1,
+            "tcgen05_c_stages": 2,
+            "tcgen05_ab_stages": 12,
+            "tcgen05_num_epi_warps": 4,
+            "l2_groupings": [1],
+            TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY: (
+                Tcgen05PersistenceModel.STATIC_PERSISTENT.value
+            ),
+        }
+        if spec.indexing.length == 3:
+            seed["indexing"] = [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+            ]
+        return Config(**seed)
+
+
+# L2 capacity when the device cannot be queried (CPU code generation,
+# mocked devices): a conservative value below every current data-center part.
+_FALLBACK_L2_BYTES = 64 << 20
+
+
+def _device_l2_bytes(env: CompileEnvironment) -> int:
+    device = env.device
+    if device is not None and device.type == "cuda" and torch.cuda.is_available():
+        return _cuda_l2_bytes(device.index if device.index is not None else -1)
+    return _FALLBACK_L2_BYTES
+
+
+@functools.cache
+def _cuda_l2_bytes(index: int) -> int:
+    # Queried once per device: seed generation runs inside budgeted searches
+    # whose wall clock must not pay a driver round trip per search.
+    with contextlib.suppress(Exception):
+        return int(
+            torch.cuda.get_device_properties(
+                torch.device("cuda", index) if index >= 0 else "cuda"
+            ).L2_cache_size
+        )
+    return _FALLBACK_L2_BYTES
+
+
+def _resident_input_eviction_policies(env: CompileEnvironment) -> list[str] | None:
+    """``l2_last`` on the loads of inputs that fit in L2, default on the big streams.
+
+    Back-to-back calls of a bandwidth-bound kernel re-read the same inputs; an
+    input whose distinct bytes (``accessed_numel`` x itemsize) fit in a quarter
+    of L2 stays resident across calls when its loads carry L2::evict_last while
+    the large streams keep the default policy (rope backward s2: the 17 MB
+    key-gradient and the 2 MB cos/sin tables resident, the 67 MB query
+    gradient streaming, 29.5 -> 28.0 us per call; evict_last on every load
+    reads 29.8). Resident inputs are admitted smallest first up to half of L2.
+    ``None`` when no load qualifies or the policy is unavailable.
+    """
+    spec = env.config_spec
+    if not spec.supports_config_key("load_eviction_policies"):
+        return None
+    if "l2_last" not in get_valid_eviction_policies(env.backend):
+        return None
+    length = spec.load_eviction_policies.length
+    if length <= 0:
+        return None
+    l2_bytes = _device_l2_bytes(env)
+    by_tensor: dict[str, tuple[int, list[int]]] = {}
+    for fact in spec.memory_op_facts:
+        if (
+            fact.kind != "load"
+            or fact.eviction_index is None
+            or not 0 <= fact.eviction_index < length
+            or fact.dtype is None
+            or fact.accessed_numel <= 0
+        ):
+            continue
+        key = fact.tensor_name or f"#{fact.eviction_index}"
+        size, slots = by_tensor.setdefault(
+            key, (fact.accessed_numel * fact.dtype.itemsize, [])
+        )
+        slots.append(fact.eviction_index)
+    resident: list[int] = []
+    budget = l2_bytes // 2
+    for size, slots in sorted(by_tensor.values(), key=operator.itemgetter(0)):
+        if size > l2_bytes // 4 or size > budget:
+            break
+        budget -= size
+        resident.extend(slots)
+    if not resident or len(resident) == sum(len(s) for _, s in by_tensor.values()):
+        # Nothing to keep, or nothing streams past it: the all-``l2_last``
+        # and plain seeds already cover those programs.
+        return None
+    policies = [""] * length
+    for slot in resident:
+        policies[slot] = "l2_last"
+    return policies
+
+
+def _reversed_root_loop_orders(env: CompileEnvironment) -> list[object] | None:
+    """The last grid axis as the fastest CTA axis, for every multi-axis root.
+
+    Row-major tiles make the last tile axis the one with the smallest stride;
+    walking it fastest keeps consecutive CTAs on nearby DRAM pages (rope
+    backward s2: 29.5 -> 29.0 us per call).
+    """
+    spec = env.config_spec
+    if not spec.supports_config_key("loop_orders"):
+        return None
+    overrides = {
+        item.block_id: list(reversed(range(len(item.block_ids))))
+        for item in spec.loop_orders
+        if len(item.block_ids) > 1
+    }
+    if not overrides:
+        return None
+    return _seq_config_list(spec.loop_orders, overrides)
+
+
+class CutePointwiseVecHeuristic(AutotunerHeuristic):
+    """Seed config for PURE pointwise kernels (add, gelu, cast, ...).
+
+    The cute default maps one thread per element with scalar loads (~5% of
+    HBM on B200). Seed ``NT * V * UNROLL`` elements across ``NT`` threads,
+    with ``V`` sized to a 16-byte load (8 for 16-bit dtypes, 4 for fp32).
+    A stride-one axis too small for ``NT * V`` elements shares the tile
+    and threads with its flatten group, distributed from the innermost
+    axis outward. Odd inner extents also flatten when the total extent is
+    vector-divisible. Both flattened and N-D grids use the tile_unroll
+    vec-hoist protocol.
+
+    Fires on the presence of ``PointwiseElementwiseFact`` (built only in
+    the absence of reduction/matmul/accumulator facts, so it never claws a
+    reducing kernel into this track).
+
+    When no tiled axis is contiguous because the stride-1 dim is a full or
+    bounded slice held by a persistent block (rope's ``q[tile_b, :, tile_t,
+    :half]``), ``_persistent_seed_configs`` seeds the one-vector persistent
+    lane with ``cute_vloop_sink`` instead of the tile hoist.
+    """
+
+    name = "cute_pointwise_vec"
+    backend = "cute"
+    priority = 52
+
+    NT = 256  # threads per CTA
+    UNROLL = 2  # vectors per thread (outer lane iters)
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        if env.config_spec.pointwise_facts:
+            # Admission uses the actual launch's tensor metadata behind a
+            # guard; no example size or new binding specialization is needed.
+            enable_cute_proven_bounds(env.config_spec)
+            enable_cute_packet_prefetch(env.config_spec)
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(env.config_spec.pointwise_facts)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
+        if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
+            return cls._multi_root_seed_configs(env)
+        if not spec.pointwise_facts:
+            return []
+        fact = spec.pointwise_facts[0]
+        if not spec.block_sizes:
+            return []
+        if not fact.contig_block_ids:
+            # No tiled axis is contiguous: the stride-1 dim is a full or
+            # bounded slice (rope's ``q[tile_b, :, tile_t, :half]``) held by
+            # a persistent block, which vectorizes through the one-vector
+            # persistent lane and the sunk V-loop instead of the tile hoist.
+            persistent = _cute_persistent_contiguous_block(env, device_ir)
+            if persistent is not None:
+                return cls._persistent_seed_configs(env, *persistent)
+        candidates = [s.block_id for s in spec.block_sizes]
+        vec_block = next(
+            (
+                bid
+                for bid in reversed(candidates)
+                if bid in fact.contig_block_ids
+                and spec.block_sizes.block_id_lookup(bid).size_hint > 1
+            ),
+            candidates[-1],
+        )
+        if vec_block not in spec.cute_vector_widths.valid_block_ids():
+            return []
+        if vec_block not in spec.num_threads.valid_block_ids():
+            return []
+        extent = spec.block_sizes.block_id_lookup(vec_block).size_hint
+        choices = (
+            spec.cute_vector_widths.block_id_lookup(vec_block)._fragment(spec).choices
+        )
+        full_vec = max(
+            cast("int", value)
+            for value in choices
+            if cast("int", value) <= 16 // max(1, fact.storage_itemsize)
+        )
+        # Where a one-hot sum folded away, a row wider than a CTA of packets
+        # carries the traffic along its stride-1 dim (a 30522-wide row beside
+        # its label in a cross-entropy backward): tile vectors would run
+        # across the rows, one CTA per 1024 rows with every thread walking
+        # whole rows.  Other kernels keep the tile seeds, untimed there.
+        if device_ir.folded_one_hot_sums and _wide_rows_outweigh_tile(
+            env, device_ir, vec_block, cls.NT * full_vec
+        ):
+            return []
+        # Power-of-two vector widths must divide the actual extent.
+        vec = math.gcd(full_vec, extent)
+        flatten_group = next(
+            (
+                f
+                for f in spec.flatten_loops
+                if f.block_ids[-1] == vec_block and not f.pinned
+            ),
+            None,
+        )
+        fragments = {s.block_id: s._fragment(spec) for s in spec.block_sizes}
+        # Flatten when one axis cannot supply a full CTA of vector packets.
+        narrow = fragments[vec_block].high < cls.NT * full_vec
+        flatten = vec <= 1 or (flatten_group is not None and narrow)
+        tile_ids = [vec_block]
+        if flatten:
+            if flatten_group is None:
+                return []
+            extent = math.prod(
+                spec.block_sizes.block_id_lookup(bid).size_hint
+                for bid in flatten_group.block_ids
+            )
+            vec = math.gcd(full_vec, extent)
+            if vec <= 1:
+                return []
+            if narrow:
+                tile_ids = list(flatten_group.block_ids)
+        bs_low = math.prod(fragments[bid].low for bid in tile_ids)
+        bs_high = math.prod(fragments[bid].high for bid in tile_ids)
+        nt, unroll = cls.NT, cls.UNROLL
+        while nt * vec * unroll > bs_high and unroll > 1:
+            unroll //= 2
+        while nt * vec * unroll > bs_high and nt > 1:
+            nt //= 2
+        block = nt * vec * unroll
+        if block > bs_high or nt <= 1:
+            return []
+
+        def tile_config(block: int, nt: int) -> dict[str, Any] | None:
+            if not bs_low <= block <= bs_high:
+                return None
+            blocks = dict.fromkeys(candidates, 1)
+            threads = {}
+            outer_min = bs_low
+            for block_id in reversed(tile_ids):
+                fragment = fragments[block_id]
+                outer_min //= fragment.low
+                # Reserve each outer axis's minimum before filling this axis.
+                size = min(block // outer_min, fragment.high)
+                blocks[block_id] = size
+                threads[block_id] = min(nt, size)
+                block //= size
+                nt //= threads[block_id]
+            return {
+                "block_sizes": _seq_config_list(spec.block_sizes, blocks),
+                "num_threads": _seq_config_list(spec.num_threads, threads),
+            }
+
+        seed = tile_config(block, nt)
+        if seed is None:
+            return []
+        seed["cute_vector_widths"] = _seq_config_list(
+            spec.cute_vector_widths, {vec_block: vec}
+        )
+        if flatten:
+            seed["flatten_loops"] = [
+                group is flatten_group for group in spec.flatten_loops
+            ]
+        # Streamed-once pointwise inputs benefit from L2::evict_last on the
+        # hoisted vec loads (triton's pointwise winners routinely carry
+        # evict_last; measured +1.7% on fp32 mul under do_bench's flush).
+        # Seed-only: this heuristic never promotes to the autotune-off
+        # default, and a plain-policy alternate is planted alongside.
+        # Sized from the live spec, not memory_op_facts: loads carrying an
+        # explicit ``hl.load(..., eviction_policy=...)`` get no config slot,
+        # so the fact count can exceed the list the search space expects.
+        n_evict = (
+            spec.load_eviction_policies.length
+            if spec.supports_config_key("load_eviction_policies")
+            else 0
+        )
+        if n_evict and "l2_last" in get_valid_eviction_policies(env.backend):
+            seed["load_eviction_policies"] = ["l2_last"] * n_evict
+        try:
+            primary = Config(**seed)
+        except Exception:
+            return []
+        seeds = [primary]
+        base_variants: list[dict[str, Any]] = [primary.config]
+        if not flatten and len(spec.block_sizes) > 1 and flatten_group is not None:
+            flat_seed: dict[str, Any] = deepcopy(primary.config)
+            flat_seed["flatten_loops"] = [
+                group is flatten_group for group in spec.flatten_loops
+            ]
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**flat_seed))
+                base_variants.append(flat_seed)
+        # Plain-eviction alternate of the primary (which seeds l2_last on
+        # every load): keeps a no-hint starting point in the population for
+        # regimes where the L2 policy is a wash.
+        if primary.config.get("load_eviction_policies"):
+            plain_seed: dict[str, Any] = deepcopy(primary.config)
+            plain_seed.pop("load_eviction_policies", None)
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**plain_seed))
+        # Streaming-store alternate: a pointwise output is written once, so
+        # evict-first packet stores (``cute_store_policy="streaming"``,
+        # ``st.global.cs``) keep a fresh output from displacing the inputs a
+        # back-to-back call re-reads (4096x4096 bf16 add with a new output
+        # per call: 16.5 -> 14.9 us on B200; the default store reads the
+        # same with one reused buffer).  Seed-only alternate.
+        if spec.supports_config_key("cute_store_policy"):
+            streaming_seed: dict[str, Any] = deepcopy(primary.config)
+            streaming_seed["cute_store_policy"] = "streaming"
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**streaming_seed))
+        # Resident-input alternate: l2_last only on the inputs that fit in L2
+        # (a quarter each, half in total), default on the large streams.
+        resident = _resident_input_eviction_policies(env)
+        if resident is not None and resident != primary.config.get(
+            "load_eviction_policies"
+        ):
+            resident_seed: dict[str, Any] = deepcopy(primary.config)
+            resident_seed["load_eviction_policies"] = list(resident)
+            with contextlib.suppress(Exception):
+                seeds.append(Config(**resident_seed))
+        # Wide-thread sibling (NT*2, one vector per thread): kernels whose
+        # per-element pipeline is ALU-heavier (e.g. a broadcast gather's
+        # per-element div/mod) prefer more threads over per-thread unroll
+        # (bias_add 4096x50257: 3.0 -> 4.9 TB/s on B200).
+        nt2 = nt * 2
+        if nt2 <= 1024 and block % (nt2 * vec) == 0:
+            wide_tile = tile_config(block, nt2)
+            if wide_tile is not None:
+                for base in base_variants:
+                    seeds.append(Config.from_dict(deepcopy(base | wide_tile)))
+        # Independent scalar chains can use one small packet per thread:
+        # vector loads precede the packet's arithmetic and stores follow
+        # it. Only 1-D tiles split FP32 width eight into two 128-bit transfers.
+        # Keep wide/unrolled seeds as alternatives for bandwidth work.
+        for threads in (128, 256):
+            for packet_width in (4, 8):
+                if extent % packet_width or (
+                    len(candidates) > 1 and packet_width > full_vec
+                ):
+                    continue
+                packet_tile = tile_config(threads * packet_width, threads)
+                if packet_tile is None:
+                    continue
+                packet = deepcopy(primary.config) | packet_tile
+                packet["cute_vector_widths"] = _seq_config_list(
+                    spec.cute_vector_widths, {vec_block: packet_width}
+                )
+                seeds.append(Config.from_dict(packet))
+        seeds.extend(cls._wide_row_packet_seeds(env, fact, candidates, vec_block))
+        seeds.extend(cls._broadcast_hoist_seeds(env, fact, candidates, vec_block))
+        if flatten and narrow:
+            seeds.extend(cls._row_tile_seeds(env, fact, candidates, vec_block, primary))
+        if spec.cute_proven_bounds_enabled:
+            # Keep the complete existing family and its order. Add independent
+            # true counterparts so ordinary cold search can compare the proof
+            # with its original fallback, without changing the default config.
+            seeds.extend(
+                Config.from_dict(deepcopy(seed.config) | {"cute_proven_bounds": True})
+                for seed in list(seeds)
+                if not seed.config.get("cute_proven_bounds", False)
+            )
+        if (
+            spec.cute_packet_prefetch_enabled
+            and fact.storage_itemsize in (2, 4)
+            and vec_block in spec.cute_lane_layouts.valid_block_ids()
+        ):
+            # Preserve the complete existing prefix, including its paired
+            # bounds variants. Only add strided off/on siblings of existing
+            # multi-packet tiles; do not invent new geometries or defaults.
+            vector_pos = spec.cute_vector_widths.block_id_to_index(vec_block)
+            for base in list(seeds):
+                # A sunk vector loop's prefetch twin renders the same source
+                # as its proven-bounds seed: it would only time a duplicate.
+                if base.config.get("cute_proven_bounds") is not True or (
+                    base.config.get("cute_vloop_sink")
+                ):
+                    continue
+                block = math.prod(base.block_sizes)
+                threads = math.prod(max(1, n) for n in base.num_threads)
+                widths = base.config["cute_vector_widths"]
+                assert isinstance(widths, list)
+                width = widths[vector_pos]
+                packet = threads * width
+                if (
+                    width not in (2, 4, 8)
+                    or packet <= 0
+                    or block < 2 * packet
+                    or block % (2 * packet)
+                ):
+                    continue
+                control = deepcopy(base.config)
+                control["cute_lane_layouts"] = _seq_config_list(
+                    spec.cute_lane_layouts, {vec_block: "strided"}
+                )
+                for values in (
+                    control,
+                    deepcopy(control) | {"cute_packet_prefetch": 2},
+                ):
+                    if all(values != previous.config for previous in seeds):
+                        seeds.append(Config.from_dict(values))
+        if spec.cute_rng_packet_enabled:
+            # Keep the complete existing family in order. Explicit-uniform RNG
+            # may reuse one Philox invocation across a vector packet; seed that
+            # choice alongside the scalar path without changing stream policy
+            # or relying on a later Boolean mutation to discover it.
+            seeds.extend(
+                Config.from_dict(deepcopy(seed.config) | {"cute_rng_packet": True})
+                for seed in list(seeds)
+                if not seed.config.get("cute_rng_packet", False)
+            )
+        return seeds
+
+    # Row-tile seed: the bytes of a lane's packet, the fewest lanes a row
+    # spans, the most of the row's tile that may be masked off, and the
+    # threads per CTA.
+    ROW_TILE_PACKET_BYTES = 16
+    ROW_TILE_MIN_LANES = 32
+    ROW_TILE_MASKED_FRACTION = 1 / 8
+    ROW_TILE_THREADS = 128
+
+    @classmethod
+    def _row_tile_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+        primary: Config,
+    ) -> list[Config]:
+        """One tile per row of a contiguous axis too narrow for the CTA.
+
+        The primary flattens the tile axes into one when the contiguous axis
+        cannot supply a CTA of packets.  Each element of a flattened tile
+        then takes its indices from a division and a remainder of its offset
+        by the row length, a multiply-high sequence for a length that is no
+        power of two, and loads an operand broadcast over an outer axis as
+        one scalar per lane, which also keeps ``cute_pair_lane_math`` from
+        pairing the lanes.  Here a tile holds a whole row instead (its length
+        rounded up to a power of two, with at most
+        ``ROW_TILE_MASKED_FRACTION`` of the tile masked off), one packet per
+        thread across it, and the rest of the CTA's ``ROW_TILE_THREADS``
+        threads take one row each of the innermost outer axis long enough
+        for them, the other axes a tile of one: the indices are the
+        threads', operands indexed by the rows load once per row and the
+        broadcast ones as packets, and the seed pairs the lanes' fp32 math.
+        gpt-oss's sink-softmax normalize over ``[64, 1000, 1000]`` bf16
+        (better-benchmark's max_amax_sum_66e6dc6d2131), timed interleaved
+        on B200: 70 us at this seed (a row per 128-thread CTA; 72 at two rows
+        per 256-thread CTA, 78 of them without the pairing), 94-138 at the
+        flattened seeds and 94 at the run6 sweep's config.  These tiles lie
+        below the floor that ``raise_grid_block_minimums`` puts under the
+        search's block sizes (its CTAs exceed the grid budget), so the
+        search reaches them only through this seed; its tiles of 16 rows
+        ran 100-123 us.
+        """
+        spec = env.config_spec
+        layout = cls._packet_layout(
+            env, fact, candidates, vec_block, cls.ROW_TILE_PACKET_BYTES, cls.NT
+        )
+        if layout is None or len(candidates) < 2:
+            return []
+        vec, inner, _, fragments = layout
+        row_tile = next_power_of_2(inner)
+        lanes = row_tile // vec
+        if (
+            # A power-of-two row splits a flat offset with shifts and masks.
+            row_tile == inner
+            or row_tile - inner > row_tile * cls.ROW_TILE_MASKED_FRACTION
+            or lanes < cls.ROW_TILE_MIN_LANES
+            or not fragments[vec_block].low <= row_tile <= fragments[vec_block].high
+        ):
+            return []
+        # A row narrower than the primary's CTA of packets spans fewer than
+        # ``NT`` lanes, a power of two: at most ``ROW_TILE_THREADS``.
+        rows = cls.ROW_TILE_THREADS // lanes
+        outer = next(
+            (
+                axis
+                for axis in reversed(candidates[:-1])
+                if rows <= fragments[axis].high
+            ),
+            None,
+        )
+        if outer is None:
+            return []
+        tiles = dict.fromkeys(candidates, 1)
+        values: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {**tiles, outer: rows, vec_block: row_tile}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {**tiles, outer: rows, vec_block: lanes}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+        }
+        evictions = primary.config.get("load_eviction_policies")
+        if evictions:
+            # The seed owns its list (seeds must not alias each other).
+            values["load_eviction_policies"] = deepcopy(evictions)
+        if spec.cute_pair_lane_math_sites:
+            values["cute_pair_lane_math"] = True
+        return [Config(**values)]
+
+    # Wide row packets: bytes per lane load, lanes across the contiguous axis,
+    # packet loads hoisted per thread, and the CTA's thread budget.
+    WIDE_PACKET_BYTES = 32
+    WIDE_PACKET_LANES = 8
+    WIDE_PACKET_LOADS = 4
+    WIDE_PACKET_THREADS = 256
+
+    @classmethod
+    def _wide_row_packet_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+    ) -> list[Config]:
+        """Rows of 32-byte packets with the register budget to keep them in flight.
+
+        A two-axis pointwise kernel whose rows are gathered or streamed
+        (embedding: ``weight[idx, tile_e]``) is bandwidth-bound on the row
+        reads. Eight lanes of 32-byte packets cover a 256-byte row segment
+        per load, four such loads are hoisted per thread, and the rest of the
+        CTA's 256 threads take rows, one each (32 rows per CTA at eight
+        lanes). The seed carries ``cute_min_blocks_per_mp=1`` so ptxas keeps
+        the four packets in registers instead of capping them for occupancy
+        (embedding s1 on B200: 4.44 us with the hint, 5.51 without), and a
+        ``cute_pdl`` twin (another 0.2 us back to back). Every cold search of
+        embedding s1 that reached parity with Triton found this class; the
+        16-byte packet seeds start 30-80% away from it.
+        """
+        spec = env.config_spec
+        if len(candidates) != 2:
+            return []
+        layout = cls._packet_layout(
+            env,
+            fact,
+            candidates,
+            vec_block,
+            cls.WIDE_PACKET_BYTES,
+            cls.WIDE_PACKET_LANES,
+        )
+        if layout is None or not spec.supports_config_key("cute_min_blocks_per_mp"):
+            return []
+        outer_block = candidates[0]
+        vec, inner, lanes, fragments = layout
+        # Block sizes and thread counts must be powers of two. Rounding down
+        # keeps the caps (no more lanes than the row has packets, no tile wider
+        # than the row), so only a row's last tile is ragged; the search times
+        # this seed beside the others, and the doubled tile is one neighbor
+        # step from it.
+        inner_tile = prev_power_of_2(inner, lanes * vec * cls.WIDE_PACKET_LOADS)
+        rows = cls.WIDE_PACKET_THREADS // lanes
+        rows = max(fragments[outer_block].low, min(rows, fragments[outer_block].high))
+        if not fragments[vec_block].low <= inner_tile <= fragments[vec_block].high:
+            return []
+        base: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {outer_block: rows, vec_block: inner_tile}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {outer_block: rows, vec_block: lanes}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+            "cute_min_blocks_per_mp": 1,
+        }
+        if vec_block in spec.cute_lane_layouts.valid_block_ids():
+            base["cute_lane_layouts"] = _seq_config_list(
+                spec.cute_lane_layouts, {vec_block: "strided"}
+            )
+        # Rows in memory order: the contiguous axis is the fastest CTA axis
+        # (embedding s1: 5.7 us with the default order, 4.5 reversed).
+        reversed_orders = _reversed_root_loop_orders(env)
+        if reversed_orders is not None:
+            base["loop_orders"] = reversed_orders
+        variants = [base]
+        dependent = _dependent_launch(spec)
+        if dependent:
+            # The twin owns its lists (seeds must not alias each other).
+            variants.append(deepcopy(base) | dependent)
+        return [Config(**values) for values in variants]
+
+    @classmethod
+    def _packet_layout(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+        packet_bytes: int,
+        lanes_cap: int,
+    ) -> tuple[int, int, int, dict[int, BlockSizeFragment]] | None:
+        """The packet layout along the contiguous axis: the vector width of
+        a ``packet_bytes`` packet, the axis's extent, the lanes across it (a
+        power of two, at most ``lanes_cap`` and the packets a row holds) and
+        every axis's block-size fragment; None unless the contiguous axis is
+        the inner of the threaded axes and its extent takes whole packets."""
+        spec = env.config_spec
+        if (
+            vec_block != candidates[-1]
+            or fact.storage_itemsize <= 0
+            or vec_block not in spec.cute_vector_widths.valid_block_ids()
+            or not set(spec.num_threads.valid_block_ids()).issuperset(candidates)
+        ):
+            return None
+        vec = packet_bytes // fact.storage_itemsize
+        choices = {
+            cast("int", value)
+            for value in spec.cute_vector_widths.block_id_lookup(vec_block)
+            ._fragment(spec)
+            .choices
+        }
+        inner = spec.block_sizes.block_id_lookup(vec_block).size_hint
+        if vec not in choices or inner % vec:
+            return None
+        fragments = {
+            bid: spec.block_sizes.block_id_lookup(bid)._fragment(spec)
+            for bid in candidates
+        }
+        lanes = prev_power_of_2(inner // vec, lanes_cap)
+        return vec, inner, lanes, fragments
+
+    # Broadcast-hoist seed: rows per thread, the CTAs-per-SM hint, the
+    # lane-unroll block the rows load in, bytes per lane load, lanes across the
+    # contiguous axis and threads per CTA.
+    HOIST_ROWS_PER_THREAD = 8
+    HOIST_CTAS_PER_SM = 3
+    HOIST_LANE_UNROLL = HOIST_ROWS_PER_THREAD
+    HOIST_PACKET_BYTES = 16
+    HOIST_LANES = 16
+    HOIST_THREADS = 128
+
+    @classmethod
+    def _broadcast_hoist_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+    ) -> list[Config]:
+        """Several rows per thread, so operands that do not vary over the rows
+        load once per thread.
+
+        A pointwise kernel that reads operands indexed by the contiguous axis
+        but not by its rows (a BatchNorm epilogue's ``mean[tile_c]``,
+        ``weight[tile_c]``, ...) reloads them for every row under the
+        one-row-per-thread seeds above. Here each thread owns one 16-byte
+        packet column over several rows: ``cute_vloop_sink`` hoists those
+        loads and their arithmetic out of the row loop into fragments, and
+        ``cute_lane_unroll`` issues the rows' loads before any is consumed.
+        The rows are the outer axis the fewest loads index (the innermost on
+        a tie); another outer axis takes its smallest tile, a thread per
+        element: ConvNeXt-V2's GELU + GRN apply over ``[n, hw, c]`` reads
+        ``gx[tile_n, tile_c] / denom[tile_n]``, ``beta[tile_c]`` and
+        ``gamma[tile_c]``, none of them per spatial row, so the rows are
+        ``hw`` and ``n`` takes its smallest tile.  That smallest tile grows
+        with the grid (16 images of a 512-image batch), so where the other
+        axes leave the rows no thread, or the rows do not fit their axis,
+        the next outer axis in that order takes the rows instead.  Where none
+        fits there is no seed: a thread walking the other axes' smallest
+        tiles instead holds 1024 elements (16 query rows of gpt-oss's sink
+        softmax under 8 heads), and that softmax's normalize ran 5.7x slower
+        than its autotuned config.  The seed is the layout and CTAs-per-SM
+        hint that cold full autotunes of repvgg's BatchNorm epilogue
+        converged on.
+        """
+        spec = env.config_spec
+        # One axis leaves no outer axis to hold the rows: no layout to search.
+        # An axis an inner device loop tiles leaves the sinking pass, which
+        # sinks the vector loop of a grid tile, nothing to sink.
+        if (
+            len(candidates) < 2
+            or not set(candidates) <= set(spec.grid_block_ids)
+            or not spec.supports_config_key("cute_vloop_sink")
+            or not spec.supports_config_key("cute_lane_unroll")
+        ):
+            return []
+        layout = cls._packet_layout(
+            env, fact, candidates, vec_block, cls.HOIST_PACKET_BYTES, cls.HOIST_LANES
+        )
+        if layout is None:
+            return []
+        vec, _, lanes, fragments = layout
+        if lanes < 2:
+            # A row of one packet leaves the sinking pass no vector loop to
+            # sink, and the seed would run the knob-off scalar code.
+            return []
+        if not fragments[vec_block].low <= lanes * vec <= fragments[vec_block].high:
+            return []
+        outer = candidates[:-1]
+        loads = [
+            set(op.subscript_block_ids)
+            for op in spec.memory_op_facts
+            if op.kind == "load"
+        ]
+        # The fewest loads first, the innermost axis first on a tie.
+        order = sorted(
+            outer,
+            key=lambda bid: (sum(bid in ids for ids in loads), -outer.index(bid)),
+        )
+        for row in order:
+            # A load along the vector axis that does not vary over the rows
+            # and indexes no gathered position (``weight[idx[tile_b], tile_e]``
+            # is ``(None, vec_block)``): the sinking pass leaves a gather
+            # unsunk.
+            if not any(
+                vec_block in ids and row not in ids and None not in ids for ids in loads
+            ):
+                continue
+            # A thread per element of the other axes' smallest tiles.
+            others = {bid: fragments[bid].low for bid in outer if bid != row}
+            row_threads = cls.HOIST_THREADS // (lanes * math.prod(others.values()))
+            rows = row_threads * cls.HOIST_ROWS_PER_THREAD
+            # A CTA has three thread axes: a fourth axis of several threads
+            # would run as a serial lane loop, which the lane unroll takes.
+            threaded = sum(t > 1 for t in (*others.values(), row_threads, lanes))
+            if (
+                row_threads >= 1
+                and fragments[row].low <= rows <= fragments[row].high
+                and threaded <= 3
+            ):
+                break
+        else:
+            return []
+        layouts = {
+            bid: kind
+            for bid, kind in ((row, "blocked"), (vec_block, "strided"))
+            if bid in spec.cute_lane_layouts.valid_block_ids()
+        }
+        values: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {**others, row: rows, vec_block: lanes * vec}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {**others, row: row_threads, vec_block: lanes}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+            "cute_vloop_sink": True,
+            "cute_lane_unroll": cls.HOIST_LANE_UNROLL,
+        }
+        if spec.supports_config_key("cute_min_blocks_per_mp"):
+            values["cute_min_blocks_per_mp"] = cls.HOIST_CTAS_PER_SM
+        if layouts:
+            values["cute_lane_layouts"] = _seq_config_list(
+                spec.cute_lane_layouts, layouts
+            )
+        loop_orders = _reversed_root_loop_orders(env)
+        if loop_orders is not None:
+            values["loop_orders"] = loop_orders
+        return [Config(**values)]
+
+    # Per-CTA thread budgets and thread counts on the widest other full-slice
+    # axis the persistent family seeds (``_persistent_seed_configs``), and the
+    # CTAs per SM a seeded grid keeps at least (a small problem would
+    # otherwise fill 32 CTAs of 1024 threads and leave the GPU mostly idle).
+    PERSISTENT_THREAD_BUDGETS = (1024, 512, 256)
+    PERSISTENT_SLICE_THREADS = (1, 2, 4, 8)
+    PERSISTENT_MIN_CTAS_PER_SM = 2
+    # A seeded CTA keeps at least four warps: the grid cap above would
+    # otherwise shrink a small problem's tile to one or two rows and leave
+    # 32-thread CTAs (rope s1: 3.7 us against 2.7 us with four rows per CTA).
+    PERSISTENT_MIN_THREADS = 128
+
+    @classmethod
+    def _persistent_seed_configs(
+        cls,
+        env: CompileEnvironment,
+        vec_block: int,
+        dtype: torch.dtype,
+        extent: int,
+    ) -> list[Config]:
+        """Seed one 16-byte packet per thread on a persistent stride-1 block.
+
+        A pointwise kernel whose stride-1 dim is a full or bounded slice (the
+        two halves of rope's head dim) addresses it with a persistent
+        reduction block, not a tile.  ``PersistentReductionStrategy`` keeps
+        one V-wide fragment per thread only when ``num_threads = extent / V``
+        on that block; its other full-slice axes (the heads) become per-thread
+        lane loops, and ``cute_vloop_sink`` interchanges the V-loop into them
+        so every load and store inside is one packet.  The innermost tiled
+        axis takes the remaining threads of the CTA budget, one element per
+        thread; the widest other slice axis takes ``PERSISTENT_SLICE_THREADS``
+        threads so the search starts from several per-thread work splits.
+        """
+        spec = env.config_spec
+        vec = _cute_tile_seed_vec_width_for_dtype(dtype)
+        if (
+            vec <= 1
+            or extent % vec
+            or vec_block not in spec.num_threads.valid_block_ids()
+            or vec_block not in spec.cute_vector_widths.valid_block_ids()
+            or not spec.supports_config_key("cute_vloop_sink")
+        ):
+            return []
+        vec_threads = extent // vec
+        others = sorted(
+            (
+                (item.block_id, item.size_hint)
+                for item in spec.num_threads
+                if item.block_id != vec_block
+                and env.block_sizes[item.block_id].reduction
+            ),
+            key=lambda pair: -pair[1],
+        )
+        tiled = [item.block_id for item in spec.block_sizes]
+        fragments = {item.block_id: item._fragment(spec) for item in spec.block_sizes}
+        inner = tiled[-1]
+        # The grid holds ``prod(extents) / tile`` CTAs: cap the inner tile so
+        # at least ``PERSISTENT_MIN_CTAS_PER_SM`` CTAs per SM remain.
+        grid_elements = math.prod(item.size_hint for item in spec.block_sizes)
+        ctas_wanted = cls.PERSISTENT_MIN_CTAS_PER_SM * max(spec.num_sm, 1)
+        tile_cap = max(1, 1 << max(0, (grid_elements // ctas_wanted).bit_length() - 1))
+        reduction_loops = (
+            _seq_config_list(spec.reduction_loops, {vec_block: None})
+            if vec_block in {item.block_id for item in spec.reduction_loops}
+            else None
+        )
+        # Siblings of every geometry: the inputs that fit in L2 kept resident
+        # with l2_last, and that plus the last grid axis as the fastest CTA
+        # axis. Back-to-back calls re-read the small inputs from L2 and the
+        # large streams walk DRAM in memory order (rope backward s2: 29.5 ->
+        # 27.1 us per call against 28.3 for the Triton winner).
+        resident = _resident_input_eviction_policies(env)
+        reversed_orders = _reversed_root_loop_orders(env)
+        seeds: list[Config] = []
+        for budget in cls.PERSISTENT_THREAD_BUDGETS:
+            for slice_threads in cls.PERSISTENT_SLICE_THREADS:
+                if others:
+                    wide_extent = others[0][1]
+                    if slice_threads > wide_extent or wide_extent % slice_threads:
+                        continue
+                elif slice_threads != 1:
+                    continue
+                tile = budget // (vec_threads * slice_threads)
+                if tile < 1:
+                    continue
+                min_tile = -(
+                    -cls.PERSISTENT_MIN_THREADS // (vec_threads * slice_threads)
+                )
+                tile = max(
+                    min(tile, fragments[inner].high, max(tile_cap, min_tile)),
+                    fragments[inner].low,
+                )
+                if tile > fragments[inner].high:
+                    continue
+                blocks = dict.fromkeys(tiled, 1)
+                blocks[inner] = tile
+                # Every other slice axis the count divides shares one thread
+                # axis (``CutePersistentReductionEmitter.plan_axis_partner``);
+                # the rest walk their whole extent per thread.
+                threads: dict[int, int] = {vec_block: vec_threads}
+                for block_id, size in others:
+                    threads[block_id] = (
+                        slice_threads
+                        if slice_threads <= size and size % slice_threads == 0
+                        else 1
+                    )
+                seed: dict[str, Any] = {
+                    "block_sizes": _seq_config_list(spec.block_sizes, blocks),
+                    "num_threads": _seq_config_list(spec.num_threads, threads),
+                    "cute_vector_widths": _seq_config_list(
+                        spec.cute_vector_widths, {vec_block: vec}
+                    ),
+                    "cute_vloop_sink": True,
+                }
+                if reduction_loops is not None:
+                    seed["reduction_loops"] = reduction_loops
+                # Every sibling owns its lists: the search mutates configs in
+                # place, so seeds must not alias each other's values.
+                variants: list[dict[str, Any]] = [seed]
+                if resident is not None:
+                    with_resident = deepcopy(seed)
+                    with_resident["load_eviction_policies"] = list(resident)
+                    variants.append(with_resident)
+                    if reversed_orders is not None:
+                        variants.append(
+                            deepcopy(with_resident)
+                            | {"loop_orders": deepcopy(reversed_orders)}
+                        )
+                for values in variants:
+                    try:
+                        config = Config(**values)
+                    except Exception:
+                        continue
+                    if config not in seeds:
+                        seeds.append(config)
+        return seeds
+
+    @classmethod
+    def _multi_root_seed_configs(cls, env: CompileEnvironment) -> list[Config]:
+        """Seed each independent pointwise grid from its own storage accesses.
+
+        Whole-kernel pointwise facts multiply extents across roots, so they
+        cannot size individual roots' vector traffic. Use direct stride-one
+        memory facts here, with scalar siblings for gather-heavy grids. This
+        only seeds a bounded family; codegen remains the vector-eligibility and
+        combined physical-thread-budget authority.
+        """
+        spec = env.config_spec
+        topology = spec.kernel_grid_fact
+        assert topology is not None
+        axes: list[tuple[int, int]] = []
+        for root in topology.roots:
+            candidates = [
+                item.block_id
+                for item in spec.block_sizes
+                if item.block_id in root.block_ids
+                and item.block_id in spec.num_threads.valid_block_ids()
+                and item.block_id in spec.cute_vector_widths.valid_block_ids()
+            ]
+            if not candidates:
+                return []
+            widths: dict[int, int] = {}
+            for block_id in candidates:
+                dtypes = [
+                    fact.dtype
+                    for fact in spec.memory_op_facts
+                    if fact.dtype is not None
+                    and any(
+                        bid == block_id and stride == 1
+                        for bid, stride in zip(
+                            fact.subscript_block_ids,
+                            fact.subscript_strides,
+                            strict=True,
+                        )
+                    )
+                ]
+                if dtypes:
+                    width = min(
+                        _cute_tile_seed_vec_width_for_dtype(dtype) for dtype in dtypes
+                    )
+                    choices = (
+                        spec.cute_vector_widths.block_id_lookup(block_id)
+                        ._fragment(spec)
+                        .choices
+                    )
+                    widths[block_id] = max(
+                        cast("int", value)
+                        for value in choices
+                        if cast("int", value) <= width
+                    )
+            axis = next(
+                (bid for bid in reversed(candidates) if bid in widths), candidates[-1]
+            )
+            axes.append((axis, widths.get(axis, 1)))
+        # Limit family growth independently of a kernel's number of roots.
+        scalar_choices = [set(), {axis for axis, _ in axes}]
+        scalar_choices.extend({axis} for axis, width in axes[:4] if width > 1)
+        seeds: list[Config] = []
+        for threads in (128, cls.NT):
+            for unroll in (1, cls.UNROLL):
+                for scalar_axes in scalar_choices:
+                    blocks: dict[int, object] = {
+                        item.block_id: item.min_size for item in spec.block_sizes
+                    }
+                    thread_values: dict[int, object] = {}
+                    vector_values: dict[int, object] = {}
+                    for axis, width in axes:
+                        width = 1 if axis in scalar_axes else width
+                        fragment = spec.block_sizes.block_id_lookup(axis)._fragment(
+                            spec
+                        )
+                        block = min(threads * width * unroll, fragment.high)
+                        if block < fragment.low or block < width:
+                            break
+                        blocks[axis] = block
+                        thread_values[axis] = min(threads, block // width)
+                        vector_values[axis] = width
+                    else:
+                        seeds.append(
+                            Config(
+                                block_sizes=cast(
+                                    "list[int]",
+                                    _seq_config_list(spec.block_sizes, blocks),
+                                ),
+                                num_threads=cast(
+                                    "list[int]",
+                                    _seq_config_list(spec.num_threads, thread_values),
+                                ),
+                                cute_vector_widths=cast(
+                                    "list[int]",
+                                    _seq_config_list(
+                                        spec.cute_vector_widths, vector_values
+                                    ),
+                                ),
+                                cute_lane_layouts=cast(
+                                    "list[str]",
+                                    _seq_config_list(spec.cute_lane_layouts, {}),
+                                ),
+                            )
+                        )
+        return list(dict.fromkeys(seeds))
+
+
+class CuteFp8GemmSkinnyMHeuristic(AutotunerHeuristic):
+    """Seed config for skinny-M FP8 GEMM kernels.
+
+    For small M (1-16), seed a small outer tile and a wide inner tile.
+    With M untiled, this means one N column per grid block with a 256-element
+    K tile, 32 K threads, and wide FP8 vector loads.
+    Seeding this anchors the autotuner in the valid small-tile region instead
+    of letting the random population burn its budget on configs like
+    ``block_sizes=[4096, 2048]`` or
+    1024-thread launches that are structurally wrong for a 1-row problem (and
+    frequently overflow shared memory).
+
+    A/B benchmark (helion benchmarks/run.py, fp8_gemm, CuTe, 120s budget):
+    on M=1 shapes the search locks onto this seed and produces a 1.8-2.0x
+    faster kernel than with heuristics disabled, with ~25% fewer wasted
+    compile failures.
+
+    Of the two tunable axes in M/N/K order, the first gets block size 1,
+    automatic threads (0), and vector width 4; the second gets block size
+    256, 32 threads, and vector width 8. This is the autotune-winning N/K
+    config for M=1, K=4096, N=4096.
+    """
+
+    name = "cute_fp8_gemm_skinny_m"
+    backend = "cute"
+    priority = 2
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        # Needs to be a matmul with FP8 inputs
+        if not spec.matmul_facts or len(spec.matmul_facts) != 1:
+            return False
+        fact = spec.matmul_facts[0]
+        # Check for FP8 dtypes
+        is_fp8 = fact.lhs_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ) and fact.rhs_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        )
+        if not is_fp8:
+            return False
+        block_ids = spec.block_sizes.valid_block_ids()
+        axes = tuple(
+            block_id
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if block_id in block_ids
+        )
+        # Check for skinny M (small batch / decode scenario):
+        # M <= 16 is the skinny-M case.
+        return (
+            fact.static_m is not None
+            and fact.static_m <= 16
+            and len(axes) == 2
+            and set(axes) == set(block_ids)
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        if not cls.is_eligible(env, device_ir):
+            return None
+        spec = env.config_spec
+        fact = spec.matmul_facts[0]
+        block_ids = spec.block_sizes.valid_block_ids()
+        first, second = (
+            block_id
+            for block_id in (fact.m_block_id, fact.n_block_id, fact.k_block_id)
+            if block_id in block_ids
+        )
+        assert first is not None and second is not None
+        # Best config from autotune benchmarks for M=1, K=4096, N=4096
+        # (1.5x speedup over baseline; the M=1 search reliably converges here).
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(spec.block_sizes, {first: 1, second: 256}),
+            "num_threads": _seq_config_list(spec.num_threads, {first: 0, second: 32}),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {first: 4, second: 8}
+            ),
+        }
+        try:
+            return Config(**seed)
+        except Exception:
+            return None
+
+
+class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
+    """Generalized TVM-FFI seed for full-tile CtaGroup.TWO 16-bit GEMMs.
+
+    The generic ``--enable-tvm-ffi`` launcher builds its A/B/D TMA descriptors
+    from the runtime tensor shapes, so the fast launch path is shape-GENERAL:
+    the only real constraints are structural (256x256 CTA tile, cluster_m=2, a
+    bk in the direct-entry stage-tuple table, bf16/fp16 operands, the 128x32
+    explicit epilogue subtile). This heuristic emits that full
+    ``explicit_epi_tile`` + flat-role + ``tvm_ffi_launch`` config for ANY
+    eligible shape, replacing the bank of hand-pinned per-shape seeds.
+
+    The DEFAULT-layout sibling (``CuteTcgen05ClusterM2Heuristic``) still seeds
+    the non-FFI config, so the autotuner benchmarks both and keeps whichever
+    wins: full-autotune A/B measured the FFI direct entry ~7-21% faster on
+    smaller / square GEMMs (1024x4096x1024, 2048^3) where launch + epilogue
+    overhead dominates, and tied on large compute-bound shapes
+    (8192x1024x1024, 8192x2048x2048). An FFI config that fails to compile or
+    the accuracy check for a given shape is dropped by the autotuner,
+    degrading gracefully to the DEFAULT seed.
+    """
+
+    name = "cute_tcgen05_cluster_m2_ffi"
+    backend = "cute"
+    priority = 21
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        # The flat-role / FFI direct-entry seed hard-requires the TMA A/B
+        # pipeline and the TMA store epilogue, which codegen enables only when
+        # both matmul operands and the output destination pass the TensorMap
+        # alignment proof; an unaligned input keeps the scalar SMEM producers,
+        # an under-aligned or N-major output takes the SIMT store body, and
+        # either way the seed config fails to compile. Decide that here,
+        # before any seed or the search surface consults
+        # ``full_tile_direct_entry_seed_eligible``, and even when heuristic
+        # seeds are disabled, because the default projection reads it too.
+        host_function = device_ir.host_function
+        if host_function is None or not env.config_spec.tcgen05.search_enabled:
+            return frozenset()
+        from ...cute_mma import host_function_cp_async_a_provable
+        from ...cute_mma import host_function_exact_aux_tma_provable
+        from ...cute_mma import host_function_matmul_operands_tma_provable
+        from ...cute_mma import host_function_matmul_output_matches_extents
+
+        # Codegen proves a pointer-preserving host view operand through its
+        # input's exact metadata (``input_view_copy_facts``), which this hook
+        # therefore requests (the static-shapes bind key already carries it);
+        # evaluate the proof under that registration so the bind-time and
+        # codegen answers agree.
+        facts: frozenset[CompilerHeuristicSpecializationFact] = (
+            frozenset({"input_tensor_metadata"})
+            if env.settings.static_shapes
+            else frozenset()
+        )
+        saved = env.compiler_fact_specialization_facts
+        env.compiler_fact_specialization_facts = saved | facts
+        try:
+            provable = host_function_matmul_operands_tma_provable(env, host_function)
+            inputs_provable = provable or host_function_matmul_operands_tma_provable(
+                env, host_function, outputs=False
+            )
+            output_matches = host_function_matmul_output_matches_extents(
+                env, host_function
+            )
+            # The staged aux modes (``tma`` / ``epi_tma``) bulk-load every
+            # exact-shape auxiliary operand through a row-major TensorMap;
+            # the same proof over those operands keeps both modes off the
+            # search surface, the seeds and the normalizer for an offset,
+            # strided or column-major residual / gate view (codegen refuses
+            # them with ``TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON``).
+            aux_provable = host_function_exact_aux_tma_provable(env, host_function)
+            cp_async_a = not provable and host_function_cp_async_a_provable(
+                env, host_function
+            )
+        finally:
+            env.compiler_fact_specialization_facts = saved
+        env.config_spec.tcgen05.matmul_operands_tma_provable = provable
+        env.config_spec.tcgen05.matmul_inputs_tma_provable = inputs_provable
+        env.config_spec.tcgen05.cp_async_a_provable = cp_async_a
+        env.config_spec.tcgen05.exact_aux_tma_provable = aux_provable
+        env.config_spec.tcgen05.matmul_output_matches_extents = output_matches
+        return facts
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return seeds.full_tile_direct_entry_seed_eligible(env.config_spec.tcgen05)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        # Single source of truth lives on the ConfigSpec/CuteTcgen05Config so the
+        # search-projection (``_fix_target1_tvm_ffi_search_config``) and this
+        # population seed emit the identical FFI envelope.
+        return seeds.full_tile_direct_entry_seed_config(env.config_spec.tcgen05)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        # The direct-entry family owns its exact K/stage tuple separately from
+        # the ordinary multi-seed family above.
+        return None

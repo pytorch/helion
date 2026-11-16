@@ -46,7 +46,12 @@ python benchmarks/cute/compare_example_backends.py report \
 
 Omit `--modules` for the complete catalogue. `--shapes 0,1,2` is the default;
 each module has small, medium and large presets appropriate to its operation.
-`--cases 01_backward,...` restricts a run to the named cases of each module.
+`--cases 01_backward,...` restricts a run to the named cases of each module;
+`--providers cute,triton,baselines` and `--impls helion,aten,...` restrict it to
+the named providers and implementation names (all recorded in `results.json`).
+An `--impls` list that leaves a requested provider without an implementation
+makes every variant `incomplete` in the report unless `--providers` is
+narrowed too.
 The run refuses an existing output directory and checks for other GPU processes
 before each worker. Use a GPU you have reserved; the prelaunch check is not a
 scheduler or protection against another user starting work during a measurement.

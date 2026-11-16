@@ -10,10 +10,14 @@ persistent (synthetic lane) and the rolled (``reduction_loops``) index forms
 are covered.
 
 A single-thread reduction also claims no thread axis of its own
-(``ReductionStrategy._claims_thread_axis``): an attention kernel whose value
-head dim differs from the q/k head dim holds four reduction dims (the two head
-dims plus the two tile-sized dims its causal mask's ``tile.index[...]`` slices
-allocate), and handing each a private axis ran past the three hardware axes.
+(``ReductionStrategy._claims_thread_axis``), so a kernel never runs out of the
+three hardware axes on reductions left with one live thread
+(``test_cute_launch_thread_coverage.py`` renders four full slices, three of
+them on one thread each).  The attention kernels
+(``helion._testing.cute_attention_kernels``) guard the launch of their two
+head-dim reductions and the per-thread K fold of a second matmul: their
+generated source is checked on the CPU in
+``test_cute_single_thread_reduction_codegen.py``, their results here.
 
 The launch layout (``TileStrategyDispatch.thread_axis_for_strategy``, which
 sizes the launch block) must not count an axis for it either:
@@ -31,11 +35,7 @@ import os
 import re
 from unittest.mock import patch
 
-import pytest
 import torch
-
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 
 import helion
 from helion import exc
@@ -49,7 +49,9 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_attention_kernels import attention_inputs
+from helion._testing.cute_attention_kernels import attention_mla
+from helion._testing.cute_attention_kernels import attention_rope
 import helion.language as hl
 
 
@@ -162,9 +164,13 @@ def _root_launch_threads(code: str) -> tuple[int, int]:
 _plan_thread_axis = TileStrategyDispatch.thread_axis_for_strategy
 
 
-def _shift_tile_axes(self: TileStrategyDispatch, target: TileStrategy) -> int | None:
+def _shift_tile_axes(
+    self: TileStrategyDispatch,
+    target: TileStrategy,
+    root_grid: TileStrategy | None = None,
+) -> int | None:
     """A launch layout one axis too high for every tile."""
-    axis = _plan_thread_axis(self, target)
+    axis = _plan_thread_axis(self, target, root_grid)
     if axis is not None and not isinstance(target, ReductionStrategy):
         return axis + 1
     return axis
@@ -193,162 +199,8 @@ def _rolled_lane_index_lines(code: str) -> list[str]:
     ]
 
 
-@helion.kernel(backend="cute", static_shapes=True)
-def _attention_mla(
-    q_in: torch.Tensor, k_in: torch.Tensor, v_in: torch.Tensor
-) -> torch.Tensor:
-    """Causal attention whose value head dim differs from the q/k head dim."""
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    head_dim = hl.specialize(q_in.size(-1))
-    v_dim = hl.specialize(v_in.size(-1))
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim])
-    v_view = v_in.reshape([-1, n_dim, v_dim])
-    out = torch.empty(
-        [q_view.size(0), m_dim, v_dim], dtype=q_in.dtype, device=q_in.device
-    )
-    qk_scale = (1.0 / math.sqrt(head_dim)) * 1.44269504
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-        m_i = hl.full([tile_b, tile_m], -1e30, dtype=torch.float32)
-        l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_b, tile_m, v_dim], dtype=torch.float32)
-        qt = q_view[tile_b, tile_m, :]
-        for tile_n in hl.tile(n_dim):
-            kt = k_view[tile_b, tile_n, :]
-            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
-            # The ``tile.index`` slices allocate reduction dims sized by the
-            # tile symbols, each left with a single live thread.
-            qk = torch.where(
-                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
-                qk,
-                float("-inf"),
-            )
-            m_ij_keepdim = torch.maximum(
-                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
-            )
-            p = torch.exp2(qk - m_ij_keepdim)
-            m_ij = m_ij_keepdim.squeeze(-1)
-            alpha = torch.exp2(m_i - m_ij)
-            l_i = l_i * alpha + torch.sum(p, -1)
-            vt = v_view[tile_b, tile_n, :]
-            acc = torch.baddbmm(acc * alpha[:, :, None], p.to(vt.dtype), vt)
-            m_i = m_ij
-        out[tile_b, tile_m, :] = (acc / l_i[:, :, None]).to(out.dtype)
-    return out.view([q_in.size(0), q_in.size(1), m_dim, v_dim])
-
-
-@helion.kernel(backend="cute", static_shapes=True)
-def _attention_rope(
-    q_in: torch.Tensor,
-    k_in: torch.Tensor,
-    v_in: torch.Tensor,
-    qr_in: torch.Tensor,
-    kr_in: torch.Tensor,
-) -> torch.Tensor:
-    """Causal attention whose scores add a second matmul over a shorter
-    (RoPE) head dim."""
-    m_dim = q_in.size(-2)
-    n_dim = k_in.size(-2)
-    head_dim = hl.specialize(q_in.size(-1))
-    rope_dim = hl.specialize(qr_in.size(-1))
-    v_dim = hl.specialize(v_in.size(-1))
-    q_view = q_in.reshape([-1, m_dim, head_dim])
-    k_view = k_in.reshape([-1, n_dim, head_dim])
-    qr_view = qr_in.reshape([-1, m_dim, rope_dim])
-    kr_view = kr_in.reshape([-1, n_dim, rope_dim])
-    v_view = v_in.reshape([-1, n_dim, v_dim])
-    out = torch.empty(
-        [q_view.size(0), m_dim, v_dim], dtype=q_in.dtype, device=q_in.device
-    )
-    qk_scale = (1.0 / math.sqrt(head_dim + rope_dim)) * 1.44269504
-    for tile_b, tile_m in hl.tile([q_view.size(0), m_dim]):
-        m_i = hl.full([tile_b, tile_m], -1e30, dtype=torch.float32)
-        l_i = torch.full_like(m_i, 1.0)
-        acc = hl.zeros([tile_b, tile_m, v_dim], dtype=torch.float32)
-        qt = q_view[tile_b, tile_m, :]
-        qr = qr_view[tile_b, tile_m, :]
-        for tile_n in hl.tile(n_dim):
-            kt = k_view[tile_b, tile_n, :]
-            kr = kr_view[tile_b, tile_n, :]
-            qk = torch.bmm(qt * qk_scale, kt.transpose(1, 2), torch.float32)
-            qk = qk + torch.bmm(qr * qk_scale, kr.transpose(1, 2), torch.float32)
-            # The ``tile.index`` slices allocate reduction dims sized by the
-            # tile symbols, each left with a single live thread.
-            qk = torch.where(
-                tile_m.index[None, :, None] >= tile_n.index[None, None, :],
-                qk,
-                float("-inf"),
-            )
-            m_ij_keepdim = torch.maximum(
-                m_i[:, :, None], torch.amax(qk, -1, keepdim=True)
-            )
-            p = torch.exp2(qk - m_ij_keepdim)
-            m_ij = m_ij_keepdim.squeeze(-1)
-            alpha = torch.exp2(m_i - m_ij)
-            l_i = l_i * alpha + torch.sum(p, -1)
-            vt = v_view[tile_b, tile_n, :]
-            acc = torch.baddbmm(acc * alpha[:, :, None], p.to(vt.dtype), vt)
-            m_i = m_ij
-        out[tile_b, tile_m, :] = (acc / l_i[:, :, None]).to(out.dtype)
-    return out.view([q_in.size(0), q_in.size(1), m_dim, v_dim])
-
-
-def _attention_inputs(
-    device: torch.device | str, *dims: int
-) -> tuple[torch.Tensor, ...]:
-    generator = torch.Generator().manual_seed(0)
-    return tuple(
-        torch.randn(1, 2, 256, dim, generator=generator, dtype=torch.bfloat16).to(
-            device
-        )
-        for dim in dims
-    )
-
-
-def _cpu_render(
-    kernel: helion.Kernel, args: tuple[object, ...], **overrides: object
-) -> str:
-    """Render a kernel without a GPU, from the default config plus ``overrides``."""
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
-        bound = _cpu_bind(kernel, args)
-        settings = dict(bound.config_spec.default_config().config)
-        settings.update(overrides)
-        return bound.to_code(helion.Config.from_dict(settings))
-
-
-@skipUnlessBackends(["cute"])
-def test_single_thread_reductions_claim_no_thread_axis() -> None:
-    """The q/k head dim (192, 256 threads) and the value head dim (128, 4
-    threads once the first reduction took the budget) own axes 0 and 1; the
-    two tile-sized dims of the causal mask are left with one live thread
-    each and claim no axis, so the launch is ``(256, 4, 1)`` and no
-    coordinate reads a fourth axis.  ``torch.bmm(..., torch.float32)`` folds
-    its transposed operand like ``bmm.default`` (no shared-memory shuffle)."""
-    q, k, v = _attention_inputs("cpu", 192, 192, 128)
-    code = _cpu_render(_attention_mla, (q, k, v), block_sizes=[1, 128, 128])
-    assert "block=(256, 4, 1)" in code
-    assert "thread_idx()[3]" not in code
-    assert "permute_smem" not in code
-
-
-@skipUnlessBackends(["cute"])
-def test_second_matmul_contraction_reaches_the_lane_scheduler() -> None:
-    """A RoPE side matmul adds a fifth reduction dim (64); with the single
-    thread dims out of the way the four axes are not exhausted any more and
-    codegen reaches the lane-split scheduler, which declines the side
-    matmul's serial K fold (a loop, not a straight-line assignment) inside the
-    key lane loop.  Pins where the limitation now lies."""
-    q, k, v, qr, kr = _attention_inputs("cpu", 128, 128, 128, 64, 64)
-    with pytest.raises(helion.exc.BackendUnsupported, match="staged lane schedule"):
-        _cpu_render(_attention_rope, (q, k, v, qr, kr), block_sizes=[1, 128, 128])
+_attention_mla = helion.kernel(attention_mla, backend="cute", static_shapes=True)
+_attention_rope = helion.kernel(attention_rope, backend="cute", static_shapes=True)
 
 
 @onlyBackends(["cute"])
@@ -375,6 +227,21 @@ class TestCuteSingleThreadReduction(TestCase):
     def test_slice_store_single_thread_reduction_matches_cat(self) -> None:
         self._check(256, 128, 256)
 
+    def test_rope_side_matmul_lane_fold_matches_reference(self) -> None:
+        q, k, v, qr, kr = attention_inputs(DEVICE, 128, 128, 128, 64, 64)
+        _code, out = code_and_output(
+            _attention_rope, (q, k, v, qr, kr), block_sizes=[1, 128, 128]
+        )
+        scale = 1.0 / math.sqrt(q.size(-1) + qr.size(-1))
+        scores = (q.float() @ k.float().transpose(-1, -2)) * scale
+        scores = scores + (qr.float() @ kr.float().transpose(-1, -2)) * scale
+        causal = torch.ones(
+            q.size(-2), k.size(-2), dtype=torch.bool, device=q.device
+        ).tril()
+        scores = scores.masked_fill(~causal, float("-inf"))
+        expected = torch.softmax(scores, dim=-1) @ v.float()
+        torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
     def test_slice_store_single_thread_reduction_ragged(self) -> None:
         self._check(64, 33, 257)
 
@@ -397,9 +264,9 @@ class TestCuteSingleThreadReduction(TestCase):
     def test_attention_with_narrower_value_head_dim_matches_sdpa(self) -> None:
         """The (192, 128) head-dim pair runs on the fused flash path by default
         and on the generic SIMT path with the fused lowering switched off
-        (``HELION_CUTE_FLASH=0``); both match SDPA, and the generic path keeps
-        its two single-thread mask dims off the launch axes."""
-        q, k, v = _attention_inputs(DEVICE, 192, 192, 128)
+        (``HELION_CUTE_FLASH=0``); both match SDPA, and the generic path
+        launches the two head-dim reductions' ``(256, 4, 1)``."""
+        q, k, v = attention_inputs(DEVICE, 192, 192, 128)
         expected = torch.nn.functional.scaled_dot_product_attention(
             q.float(), k.float(), v.float(), is_causal=True
         )
@@ -427,7 +294,16 @@ class TestCuteSingleThreadReduction(TestCase):
             x = torch.randn(m, k, device=DEVICE)
             w = torch.randn(k, n, device=DEVICE)
             with self.subTest(m=m, k=k, n=n):
-                code, out = code_and_output(_full_slice_matmul, (x, w))
+                # The loop-less mma-dag owner claims this body where its tiles
+                # fit (an fp32 ``@`` on tf32 MMAs under the default
+                # ``dot_precision``); the launch pin is about the SIMT lane
+                # scheduler's default, so the owner is withheld here.
+                _full_slice_matmul.reset()
+                with patch(
+                    "helion._compiler.cute.cute_mma_dag.match_mma_dag",
+                    return_value=None,
+                ):
+                    code, out = code_and_output(_full_slice_matmul, (x, w))
                 torch.testing.assert_close(out, x @ w, rtol=1e-4, atol=1e-4)
                 launched, rows = _root_launch_threads(code)
                 self.assertEqual(launched, rows, code)

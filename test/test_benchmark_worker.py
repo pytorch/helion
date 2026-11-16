@@ -6,11 +6,13 @@ import dataclasses
 import linecache
 import math
 import multiprocessing as mp
+from multiprocessing import connection as mp_connection
 from multiprocessing.connection import Connection
 import os
 from pathlib import Path
 import pickle
 import random
+import select
 import signal
 import statistics
 import subprocess
@@ -27,8 +29,10 @@ import unittest
 from unittest.mock import Mock
 from unittest.mock import patch
 
+import pytest
 import torch
 
+import helion
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
@@ -38,6 +42,7 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import PatternSearch
+from helion.autotuner import benchmark_worker as benchmark_worker_module
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_job import AccuracyCheckJob
@@ -48,6 +53,7 @@ from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmark_worker import _DEFAULT_START_TIMEOUT_SECONDS
 from helion.autotuner.benchmark_worker import _REAP_TIMEOUT_SECONDS
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
@@ -58,6 +64,7 @@ from helion.autotuner.benchmarking import _estimate_runtime_and_warmup
 from helion.autotuner.benchmarking import do_bench
 from helion.autotuner.benchmarking import do_bench_generic
 from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.logger import match_device_out_of_memory
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
 from helion.autotuner.precompile_future import _load_compiled_fn
@@ -68,16 +75,62 @@ from helion.autotuner.process_utils import signal_process_tree
 from helion.autotuner.process_utils import start_isolated_process_group
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
-from helion.runtime import _create_cute_wrapper
+import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.cute.launcher import _create_cute_wrapper
 from helion.runtime.settings import Settings
 
 if TYPE_CHECKING:
+    import contextlib
+
     from helion.runtime.kernel import CompiledConfig
 
 
 # Job callables: must be at module level so multiprocessing.spawn can
 # re-import them in the child.
+
+
+def _precompile_after_ready(
+    ready: Connection,
+    fn_spec: SerializedCompiledFunction,
+    args_path: str,
+    result_path: str,
+) -> None:
+    # spawn has now imported this module and its runtime dependencies. The
+    # serialization checks below exercise Python callables and need no device.
+    ready.send("ready")
+    ready.close()
+    _run_kernel_in_subprocess_spawn(fn_spec, args_path, result_path, "@test")
+
+
+def _run_spawned_precompile(
+    fn_spec: SerializedCompiledFunction, args_path: Path, result_path: Path
+) -> int | None:
+    context = mp.get_context("spawn")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_precompile_after_ready,
+        args=(send, fn_spec, str(args_path), str(result_path)),
+    )
+    try:
+        process.start()
+        send.close()
+        # Interpreter/import startup is separate from execution, as it is in
+        # BenchmarkWorker. Keep the original 30-second execution deadline.
+        assert receive.poll(_DEFAULT_START_TIMEOUT_SECONDS), (
+            "spawn did not become ready"
+        )
+        assert receive.recv() == "ready"
+        process.join(timeout=30)
+        assert not process.is_alive(), "precompile execution exceeded 30 seconds"
+        return process.exitcode
+    finally:
+        receive.close()
+        send.close()
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+        assert not process.is_alive(), "precompile child was not reaped"
 
 
 @dataclasses.dataclass
@@ -114,6 +167,49 @@ class _Crash:
 
 
 @dataclasses.dataclass
+class _ReturnPid:
+    def __call__(self) -> int:
+        return os.getpid()
+
+
+@dataclasses.dataclass
+class _OutOfMemory:
+    """Runs out of device memory, naming the worker process it ran in."""
+
+    def __call__(self) -> object:
+        raise RuntimeError(f"CUDA out of memory in pid {os.getpid()}")
+
+
+@dataclasses.dataclass
+class _OutOfMemoryInProcess:
+    """Runs out of device memory, as a Triton module load does on a full
+    device, in worker process ``pid``; returns the pid of any other."""
+
+    pid: int
+
+    def __call__(self) -> int:
+        if os.getpid() == self.pid:
+            raise RuntimeError("Triton Error [CUDA]: out of memory")
+        return os.getpid()
+
+
+@dataclasses.dataclass
+class _OutOfMemoryWhileAlive:
+    """Runs out of device memory while process ``pid`` exists, as beside a
+    killed worker whose CUDA teardown holds the device; returns its own pid
+    once ``pid`` is gone."""
+
+    pid: int
+
+    def __call__(self) -> int:
+        try:
+            os.kill(self.pid, 0)
+        except ProcessLookupError:
+            return os.getpid()
+        raise RuntimeError("CUDA out of memory")
+
+
+@dataclasses.dataclass
 class _SpawnChildAndSleep:
     pid_path: str
 
@@ -123,11 +219,78 @@ class _SpawnChildAndSleep:
         time.sleep(60)
 
 
+def _close_descriptors_and_sleep(
+    connection: Connection, seconds: float, release: int | None
+) -> None:
+    """A benchmark worker partway through an exit that its CUDA teardown
+    holds up: its descriptors are closed, so the parent's sentinel reads EOF,
+    but the process remains for ``seconds``, or until the parent closes the
+    write end of the ``release`` pipe. The job pipe stays open, so
+    ``shutdown``'s stop message still goes through."""
+    start_isolated_process_group()
+    kept = [connection.fileno()] if release is None else [connection.fileno(), release]
+    low = 3
+    for fd in sorted(kept):
+        os.closerange(low, fd)
+        low = fd + 1
+    os.closerange(low, os.sysconf("SC_OPEN_MAX"))
+    if release is None:
+        time.sleep(seconds)
+    else:
+        select.select([release], [], [], seconds)
+
+
+def _exit_leaving_the_sentinel_open(release: int, release_writer: int) -> None:
+    """Exit once a descendant has left the process group (which a worker's
+    kill then misses), holding the sentinel's write end until the parent
+    closes ``release_writer``, the write end of the ``release`` pipe."""
+    os.close(release_writer)
+    start_isolated_process_group()
+    ready, ready_writer = os.pipe()
+    if os.fork() == 0:
+        os.close(ready)
+        os.setsid()
+        os.close(ready_writer)
+        select.select([release], [], [], 600.0)
+        os._exit(0)
+    os.close(ready_writer)
+    # EOF once the descendant has its own session: a kill of this process
+    # group before that would take the descendant along, and the sentinel
+    # with it.
+    os.read(ready, 1)
+    os.close(ready)
+
+
+def _sleep_leaving_the_sentinel_open(
+    connection: Connection, release: int, release_writer: int
+) -> None:
+    """``_exit_leaving_the_sentinel_open``'s descendant, then report it and
+    sleep until killed."""
+    _exit_leaving_the_sentinel_open(release, release_writer)
+    connection.send("forked")
+    time.sleep(600.0)
+
+
+@dataclasses.dataclass
+class _AddInPlace:
+    """``b += a`` returning the baseline's output regardless of ``extra``."""
+
+    extra: float = 0.0
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        output = a + b
+        b.add_(a).add_(self.extra)
+        return output
+
+
 @dataclasses.dataclass
 class _ReturnValue:
+    """Compiled-function stand-in: the job calls it once on the kernel's
+    arguments before the (mocked) timers."""
+
     value: object
 
-    def __call__(self) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> object:
         return self.value
 
 
@@ -142,6 +305,7 @@ class _FakeTimingEvent:
         return self.elapsed_times.pop(0)
 
 
+@pytest.mark.cpu_only
 class TestAutotuneDataclassCompatibility(unittest.TestCase):
     def test_benchmark_job_preserves_fixed_repetitions_position(self) -> None:
         job = BenchmarkJob(
@@ -190,6 +354,10 @@ class TestAutotuneDataclassCompatibility(unittest.TestCase):
     "HELION_INTERPRET=1 bypasses, and it flakes (crashing the xdist worker "
     "with no traceback) on the single-GPU A10G ref-eager runner."
 )
+# These jobs exercise serialization, process control and simulated failures on
+# Python values/CPU tensors. Do not initialize CUDA in every spawned child while
+# the native lane is also compiling and benchmarking kernels on the same GPU.
+@pytest.mark.cpu_only
 class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_precompile_worker_starts_isolated_process_group(self) -> None:
         with patch("helion.autotuner.process_utils.os.setsid") as setsid:
@@ -319,6 +487,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         modules_after = {name for name in sys.modules if name.startswith(module_prefix)}
         self.assertEqual(modules_after, modules_before)
 
+    @pytest.mark.slow
     def test_benchmark_job_classifies_wrapper_load_failure(self) -> None:
         fn_spec = SerializedCompiledFunction(
             function_name="call",
@@ -431,6 +600,43 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertIsNone(wall_clock_bench.call_args.kwargs["fixed_repetitions"])
         self.assertIs(wall_clock_bench.call_args.kwargs["probe_long_kernel"], False)
 
+    def test_benchmark_job_warms_the_arguments_device(self) -> None:
+        # The worker warms the current device before every job; a kernel
+        # whose arguments live on another device gets that one warmed too.
+        fn = _ReturnValue(torch.empty(()))
+        args = (3, torch.empty(1, device=torch.device("meta")), torch.ones(1))
+        with (
+            patch("helion.autotuner.benchmark_job._load_compiled_fn", return_value=fn),
+            patch(
+                "helion.autotuner.benchmark_job.load_trusted_kernel_args",
+                return_value=args,
+            ),
+            patch("helion.autotuner.benchmark_job.do_bench_generic", return_value=1.0),
+            patch("helion.autotuner.benchmark_job.steady_graph_dispatch") as warmup,
+        ):
+            BenchmarkJob(
+                fn_spec=cast("SerializedCompiledFunction", object()),
+                args_path="/tmp/args.pt",
+                use_wall_clock=True,
+            )()
+        # No CUDA tensor among the arguments: the current device.
+        warmup.assert_called_once_with(device=None)
+        from helion.autotuner.benchmark_job import _cuda_device_of
+
+        self.assertEqual(
+            _cuda_device_of(
+                (3, torch.empty(1, device=torch.device("meta")), [{"k": "cpu"}])
+            ),
+            None,
+        )
+        cuda_like = Mock(spec=torch.Tensor)
+        cuda_like.device = torch.device("cuda", 1)
+        with patch(
+            "helion.autotuner.benchmark_job.tree_flatten",
+            return_value=([3, cuda_like], None),
+        ):
+            self.assertEqual(_cuda_device_of(()), torch.device("cuda", 1))
+
     def test_wall_clock_fixed_repetitions_run_setup_and_measurements(self) -> None:
         invocation_count = 0
 
@@ -510,6 +716,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         wall_bench.assert_not_called()
         self.assertIs(event_bench.call_args.kwargs["probe_long_kernel"], True)
 
+    @pytest.mark.cuda
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_event_timed_long_kernel_skips_redundant_estimates(self) -> None:
         # A kernel longer than both timing windows needs only a setup launch and
@@ -867,6 +1074,8 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             autotune_compile_timeout=3,
             autotune_benchmark_timeout=17,
         )
+        provider.mutated_arg_indices = []
+        provider._precompile_baseline_post_args_path = None
         provider._precompile_args_path = "/tmp/args.pt"
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
@@ -888,11 +1097,14 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         _, kwargs = provider._benchmark_worker.run.call_args
         self.assertEqual(kwargs["timeout"], 17.0)
 
+    @pytest.mark.cpu_only
     def test_accuracy_wrapper_load_failure_falls_back_and_disables_worker(
         self,
     ) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
+        provider._precompile_baseline_post_args_path = None
         provider._precompile_args_path = "/tmp/args.pt"
         provider._precompile_baseline_path = "/tmp/baseline.pt"
         provider._effective_atol = 0.0
@@ -1214,6 +1426,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
         run_job.assert_called_once()
 
+    @pytest.mark.cpu_only
     def test_wrapper_load_failure_falls_back_and_disables_worker(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.config_spec = SimpleNamespace(
@@ -1221,6 +1434,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             backend=SimpleNamespace(
                 name="cute",
                 get_do_bench=lambda: None,
+                prefers_wall_clock_bench=lambda: True,
                 probe_long_autotune_kernels=lambda _config_spec: False,
             ),
             cute_flash_search_enabled=False,
@@ -1261,6 +1475,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_fixed_repetition_job_uses_existing_benchmark_timeout(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
         provider.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
         provider._precompile_args_path = "/tmp/args.pt"
         provider._benchmark_worker = Mock()
@@ -1309,13 +1524,163 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         )
         self.assertTrue(provider._probe_long_kernel())
 
-    def test_subprocess_accuracy_check_skips_mutated_args(self) -> None:
+    def test_subprocess_paths_take_mutated_arg_kernels(self) -> None:
+        # A kernel that writes into an input is timed and checked in the
+        # killable worker like any other (the jobs clone its mutated
+        # arguments per candidate); only a custom accuracy callback keeps the
+        # check in-process. In-process, a candidate's device-side fault
+        # poisons the autotuning process's CUDA context and ends the search
+        # (the kda WY transform's k_state_out made it an in-process kernel).
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
         provider.settings = Settings()
-        provider.mutated_arg_indices = [0]
-        provider._subprocess_benchmark_enabled = lambda: True
+        provider.mutated_arg_indices = [5]
+        provider._args_unpicklable = False
+        provider._subprocess_wrapper_unloadable = False
+        provider.kernel = SimpleNamespace(
+            env=SimpleNamespace(device=torch.device("cpu")),
+            supports_subprocess_benchmark=lambda: True,
+        )
+        provider.config_spec = SimpleNamespace(backend=None)
 
+        self.assertTrue(provider._subprocess_benchmark_enabled())
+        self.assertTrue(provider._subprocess_accuracy_check_enabled())
+        provider.settings.autotune_baseline_accuracy_check_fn = lambda out, ref: None
         self.assertFalse(provider._subprocess_accuracy_check_enabled())
+        self.assertIn(
+            "autotune_baseline_accuracy_check_fn",
+            provider._in_process_benchmark_reason(),
+        )
+        provider.settings.autotune_benchmark_subprocess = False
+        self.assertFalse(provider._subprocess_benchmark_enabled())
+        self.assertIn(
+            "HELION_AUTOTUNE_BENCHMARK_SUBPROCESS=0",
+            provider._in_process_benchmark_reason(),
+        )
+
+    def test_subprocess_accuracy_job_carries_mutated_arg_baseline(self) -> None:
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = [1]
+        provider._subprocess_accuracy_check_enabled = lambda: True
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._precompile_baseline_path = "/tmp/baseline.pt"
+        provider._effective_atol = 0.0
+        provider._effective_rtol = 0.0
+        provider._scale_atol = False
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = AccuracyCheckResult(ok=True)
+
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            # Without the baseline's post-call arguments the worker cannot
+            # check the mutation: fall back to the in-process check.
+            provider._precompile_baseline_post_args_path = None
+            self.assertIsNone(
+                provider._run_subprocess_accuracy_check_job(
+                    cast("CompiledConfig", object())
+                )
+            )
+            provider._benchmark_worker.run.assert_not_called()
+
+            provider._precompile_baseline_post_args_path = "/tmp/post_args.pt"
+            result = provider._run_subprocess_accuracy_check_job(
+                cast("CompiledConfig", object())
+            )
+
+        assert result is not None
+        self.assertTrue(result.ok)
+        job = provider._benchmark_worker.run.call_args.args[0]
+        self.assertEqual(job.mutated_arg_indices, (1,))
+        self.assertEqual(job.baseline_post_args_path, "/tmp/post_args.pt")
+        self.assertTrue(job.check_input_accuracy)
+
+    def _run_mutating_accuracy_job(
+        self,
+        fn: object,
+        *,
+        baseline_b: float,
+        check_input_accuracy: bool = True,
+    ) -> tuple[AccuracyCheckResult, torch.Tensor]:
+        """Run ``fn(a, b)`` as a mutated-``b`` accuracy job; return the result
+        and the worker's cached ``b`` (which the job must leave untouched)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            baseline_path = Path(tmpdir) / "baseline.pt"
+            post_args_path = Path(tmpdir) / "baseline_post_args.pt"
+            torch.save((torch.tensor([1.0]), torch.tensor([1.0])), args_path)
+            torch.save(torch.tensor([2.0]), baseline_path)
+            torch.save(
+                (torch.tensor([1.0]), torch.tensor([baseline_b])), post_args_path
+            )
+            load_trusted_kernel_args.cache_clear()
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=fn,
+            ):
+                result = AccuracyCheckJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    baseline_path=str(baseline_path),
+                    atol=0.0,
+                    rtol=0.0,
+                    mutated_arg_indices=(1,),
+                    baseline_post_args_path=str(post_args_path),
+                    check_input_accuracy=check_input_accuracy,
+                )()
+            cached_b = cast("torch.Tensor", load_trusted_kernel_args(str(args_path))[1])
+            load_trusted_kernel_args.cache_clear()
+        return result, cached_b
+
+    def test_accuracy_check_job_clones_and_checks_mutated_args(self) -> None:
+        result, cached_b = self._run_mutating_accuracy_job(
+            _AddInPlace(), baseline_b=2.0
+        )
+        self.assertTrue(result.ok, result.message)
+        # The kernel ran on a clone: the worker's shared arguments still hold
+        # the original values for the next candidate.
+        torch.testing.assert_close(cached_b, torch.tensor([1.0]))
+
+    def test_accuracy_check_job_rejects_wrong_mutation(self) -> None:
+        # Right output, wrong in-place result: only the post-call argument
+        # comparison can catch this config.
+        result, _ = self._run_mutating_accuracy_job(
+            _AddInPlace(extra=1.0), baseline_b=2.0
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Tensor-likes are not equal", result.message)
+
+        result, _ = self._run_mutating_accuracy_job(
+            _AddInPlace(extra=1.0), baseline_b=2.0, check_input_accuracy=False
+        )
+        self.assertTrue(result.ok, result.message)
+
+    @pytest.mark.cpu_only
+    def test_benchmark_job_times_mutated_args_on_a_clone(self) -> None:
+        # Timing repeats the kernel many times; the worker's cached arguments
+        # must still hold the original values for the accuracy job that
+        # follows (and for every later config). These arguments live on CPU.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args_path = Path(tmpdir) / "args.pt"
+            torch.save((torch.tensor([1.0]), torch.tensor([1.0])), args_path)
+            load_trusted_kernel_args.cache_clear()
+            with patch(
+                "helion.autotuner.benchmark_job._load_compiled_fn",
+                return_value=_AddInPlace(),
+            ):
+                BenchmarkJob(
+                    fn_spec=cast("SerializedCompiledFunction", object()),
+                    args_path=str(args_path),
+                    warmup=1,
+                    rep=1,
+                    fixed_repetitions=3,
+                    mutated_arg_indices=(1,),
+                    use_wall_clock=True,
+                )()
+            cached_b = cast("torch.Tensor", load_trusted_kernel_args(str(args_path))[1])
+            load_trusted_kernel_args.cache_clear()
+        torch.testing.assert_close(cached_b, torch.tensor([1.0]))
 
     def test_load_trusted_kernel_args_accepts_python_objects(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1328,6 +1693,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertIsInstance(loaded[0], _ReturnValue)
         self.assertEqual(loaded[0].value, 3)
 
+    @pytest.mark.slow
     @skipIfPallasTpu("spawned workers cannot acquire an initialized TPU device")
     def test_spawn_precompile_loads_trusted_python_args(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1342,26 +1708,14 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 module_name=None,
             )
 
-            process = mp.get_context("spawn").Process(
-                target=_run_kernel_in_subprocess_spawn,
-                args=(fn_spec, str(args_path), str(result_path), "@test"),
+            self.assertEqual(
+                _run_spawned_precompile(fn_spec, args_path, result_path), 0
             )
-            process.start()
-            try:
-                process.join(timeout=30)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=5)
+            with result_path.open("rb") as f:
+                result = pickle.load(f)
+            self.assertEqual(result, {"status": "ok"})
 
-                self.assertEqual(process.exitcode, 0)
-                with result_path.open("rb") as f:
-                    result = pickle.load(f)
-                self.assertEqual(result, {"status": "ok"})
-            finally:
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=5)
-
+    @pytest.mark.slow
     @skipIfPallasTpu("spawned workers cannot acquire an initialized TPU device")
     def test_spawn_loads_source_module_from_file(self) -> None:
         # Regression: a kernel loaded by path / notebook / exec lives under a
@@ -1395,28 +1749,22 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 module_name=None,
                 source_modules=[(origin_name, str(origin_file))],
             )
-            process = mp.get_context("spawn").Process(
-                target=_run_kernel_in_subprocess_spawn,
-                args=(fn_spec, str(args_path), str(result_path), "@test"),
+            self.assertEqual(
+                _run_spawned_precompile(fn_spec, args_path, result_path), 0
             )
-            process.start()
-            try:
-                process.join(timeout=30)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=5)
-                self.assertEqual(process.exitcode, 0)
-                with result_path.open("rb") as f:
-                    result = pickle.load(f)
-                self.assertEqual(result, {"status": "ok"})
-            finally:
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=5)
+            with result_path.open("rb") as f:
+                result = pickle.load(f)
+            self.assertEqual(result, {"status": "ok"})
 
+    # The one real worker spawn outside the slow tier: the smoke test of the
+    # killable worker (its timeout, kill and respawn). The other spawning
+    # tests below carry @pytest.mark.slow.
     def test_timeout_kills_worker(self) -> None:
         worker = BenchmarkWorker()
         try:
+            # Warm the worker: its start precedes the job's deadline and
+            # takes seconds, which the promptness bound below is not about.
+            self.assertEqual(worker.run(_ReturnValue(0), timeout=60.0), 0)
             t0 = time.time()
             with self.assertRaises(BenchmarkTimeout):
                 worker.run(_Sleep(60), timeout=0.5)
@@ -1427,35 +1775,49 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.cpu_only
     def test_timeout_with_unkillable_worker_prevents_respawn(self) -> None:
         worker = BenchmarkWorker()
         process = Mock(pid=123)
         process.is_alive.return_value = True
         connection = Mock()
-        kill_started = threading.Event()
-
-        def poll_until_watchdog_runs(timeout: float) -> bool:
-            self.assertTrue(kill_started.wait(timeout=1.0))
-            return False
-
-        connection.poll.side_effect = poll_until_watchdog_runs
         worker._process = process
         worker._parent_connection = connection
 
         with (
+            patch("helion.autotuner.benchmark_worker.threading.Timer") as timer,
+            patch("helion.autotuner.benchmark_worker.time.monotonic", return_value=0.0),
             patch(
-                "helion.autotuner.benchmark_worker.signal_process_tree",
-                side_effect=lambda *_args: kill_started.set(),
+                "helion.autotuner.benchmark_worker.signal_process_tree"
             ) as signal_tree,
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=False
+            ) as wait_for_exit,
             self.assertRaisesRegex(
                 BenchmarkWorkerUnkillable,
                 "refusing to launch another worker",
             ),
         ):
+            # Fire the real watchdog callback before the mocked reply. This
+            # checks fatal-state handling without a thread-scheduling deadline.
+            def poll_after_watchdog(_timeout: float) -> bool:
+                # The ordinary poll-timeout path also kills. Check before that
+                # path runs so a missing or ineffective watchdog cannot pass.
+                signal_tree.assert_called_once_with(process, signal.SIGKILL)
+                self.assertIsNotNone(worker._fatal_error)
+                return False
+
+            connection.send.side_effect = lambda _job: timer.call_args.args[1]()
+            connection.poll.side_effect = poll_after_watchdog
             worker.run(_ReturnValue(7), timeout=0.01)
 
+        connection.poll.assert_called_once_with(0.01)
+        timer.assert_called_once()
+        self.assertEqual(timer.call_args.args[0], 0.01)
+        timer.return_value.start.assert_called_once_with()
+        timer.return_value.cancel.assert_called_once_with()
         signal_tree.assert_called_once_with(process, signal.SIGKILL)
-        process.join.assert_called_once_with(timeout=_REAP_TIMEOUT_SECONDS)
+        wait_for_exit.assert_called_once_with(process, _REAP_TIMEOUT_SECONDS)
         connection.close.assert_called_once_with()
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)
@@ -1470,7 +1832,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_watchdog_claim_cannot_race_successful_completion(self) -> None:
         worker = BenchmarkWorker()
         process = Mock(pid=123)
-        process.is_alive.side_effect = (True, False)
+        process.is_alive.side_effect = (True,)
         connection = Mock()
         event_type = threading.Event
         watchdog_checked_done = event_type()
@@ -1531,6 +1893,9 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 side_effect=event_factory,
             ),
             patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=True
+            ),
         ):
             runner.start()
             self.assertTrue(watchdog_checked_done.wait(timeout=2.0))
@@ -1546,13 +1911,16 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
     def test_shutdown_surfaces_unkillable_worker(self) -> None:
         worker = BenchmarkWorker()
         process = Mock(pid=123)
-        process.is_alive.side_effect = (True, True)
+        process.is_alive.return_value = True
         connection = Mock()
         worker._process = process
         worker._parent_connection = connection
 
         with (
             patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch(
+                "helion.autotuner.benchmark_worker._wait_for_exit", return_value=False
+            ),
             self.assertRaisesRegex(
                 BenchmarkWorkerUnkillable,
                 "refusing to launch another worker",
@@ -1562,6 +1930,300 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
         self.assertIs(worker._process, process)
         self.assertIs(worker._parent_connection, connection)
+
+    def _exiting_worker(
+        self, release: int | None = None
+    ) -> tuple[BenchmarkWorker, mp.process.BaseProcess]:
+        """A worker whose process has closed its descriptors and sleeps on
+        (``_close_descriptors_and_sleep``), once its sentinel reads EOF."""
+        context = mp.get_context("fork")
+        connection, child_connection = context.Pipe(duplex=True)
+        # Ten minutes outlast the slow tests' worker starts on a loaded host;
+        # the cleanups below end it.
+        process = context.Process(
+            target=_close_descriptors_and_sleep,
+            args=(child_connection, 600.0, release),
+            daemon=True,
+        )
+        process.start()
+        child_connection.close()
+        self.addCleanup(self._forget_exiting, process)
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        self.assertTrue(mp_connection.wait([process.sentinel], 30))
+        self.assertTrue(process.is_alive())
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection = connection
+        return worker, process
+
+    @staticmethod
+    def _forget_exiting(process: mp.process.BaseProcess) -> None:
+        """Take ``process`` out of the module's exiting workers, which every
+        ``BenchmarkWorker`` of the test process shares."""
+        with benchmark_worker_module._exiting_lock:
+            if process in benchmark_worker_module._exiting:
+                benchmark_worker_module._exiting.remove(process)
+
+    def test_shutdown_is_bounded_while_the_worker_finishes_exiting(self) -> None:
+        # process.join(timeout) waits for the sentinel only, then reaps with a
+        # blocking waitpid: here it would wait out the minute-long sleep, as
+        # it waited out a CUDA teardown on a loaded GPU.
+        worker, process = self._exiting_worker()
+        started = time.monotonic()
+        with patch("helion.autotuner.benchmark_worker._SHUTDOWN_TIMEOUT_SECONDS", 0.5):
+            worker.shutdown()
+        self.assertLess(time.monotonic() - started, 30.0)
+        self.assertEqual(process.exitcode, -signal.SIGKILL)
+        self.assertIsNone(worker._process)
+
+    def test_a_worker_past_closing_its_descriptors_is_not_unkillable(self) -> None:
+        # SIGKILL cannot cut a CUDA teardown short (modeled by a SIGKILL that
+        # does not arrive). A worker whose sentinel closed runs no more code
+        # and the next one may start, as when join() eventually reaped it.
+        worker, process = self._exiting_worker()
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 0.5),
+        ):
+            worker._kill()
+        self.assertTrue(process.is_alive())
+        self.assertIsNone(worker._fatal_error)
+        self.assertIsNone(worker._process)
+        self.assertIn(process, benchmark_worker_module._exiting)
+
+    def test_a_reaped_worker_is_not_waited_for(self) -> None:
+        # Its sentinel can stay open past the exit, here held by a descendant
+        # outside the killed process group: shutdown must not wait on it.
+        release, release_writer = os.pipe()
+        context = mp.get_context("fork")
+        process = context.Process(
+            target=_exit_leaving_the_sentinel_open,
+            args=(release, release_writer),
+            daemon=True,
+        )
+        process.start()
+        os.close(release)
+        self.addCleanup(os.close, release_writer)
+        benchmark_worker_module._poll_until_reaped(process, time.monotonic() + 30.0)
+        self.assertEqual(process.exitcode, 0)
+        self.assertFalse(mp_connection.wait([process.sentinel], 0))
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection, child_connection = context.Pipe(duplex=True)
+        child_connection.close()
+        started = time.monotonic()
+        with patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 30.0):
+            worker.shutdown()
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertIsNone(worker._process)
+
+    def test_a_killed_worker_is_not_waited_for_once_reaped(self) -> None:
+        # Alive when killed, its sentinel held open by a descendant outside
+        # its process group: it is reaped as soon as it dies, so the kill
+        # does not wait the deadline out on the sentinel.
+        release, release_writer = os.pipe()
+        context = mp.get_context("fork")
+        connection, child_connection = context.Pipe(duplex=True)
+        process = context.Process(
+            target=_sleep_leaving_the_sentinel_open,
+            args=(child_connection, release, release_writer),
+            daemon=True,
+        )
+        process.start()
+        os.close(release)
+        child_connection.close()
+        self.addCleanup(os.close, release_writer)
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        self.assertTrue(connection.poll(30))
+        self.assertEqual(connection.recv(), "forked")
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection = connection
+        started = time.monotonic()
+        with patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 30.0):
+            worker._kill()
+        self.assertLess(time.monotonic() - started, 10.0)
+        self.assertEqual(process.exitcode, -signal.SIGKILL)
+        self.assertIsNone(worker._process)
+
+    def test_a_worker_that_has_not_begun_to_exit_is_unkillable(self) -> None:
+        # Past the deadline with its sentinel still open (a SIGKILL that does
+        # not arrive, here) the worker may still run code: it is reported
+        # unkillable, kept and not remembered as exiting.
+        context = mp.get_context("fork")
+        connection, child_connection = context.Pipe(duplex=True)
+        process = context.Process(target=time.sleep, args=(60,), daemon=True)
+        process.start()
+        child_connection.close()
+        self.addCleanup(process.join, 5)
+        self.addCleanup(process.kill)
+        worker = BenchmarkWorker()
+        worker._process = process
+        worker._parent_connection = connection
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 0.5),
+        ):
+            worker._kill()
+        self.assertTrue(process.is_alive())
+        self.assertIs(worker._process, process)
+        self.assertNotIn(process, benchmark_worker_module._exiting)
+        with self.assertRaisesRegex(
+            BenchmarkWorkerUnkillable, "refusing to launch another worker"
+        ):
+            worker._raise_if_unusable()
+
+    def _brief_reap_of(
+        self, process: mp.process.BaseProcess
+    ) -> contextlib.AbstractContextManager[object]:
+        """Cut to 2 s a worker start's wait for the killed workers while
+        ``process`` is one of them (``_reap_exiting``); a real worker's kill,
+        and a start's wait for that worker alone, keep their deadline, which
+        its CUDA teardown may need on a loaded host."""
+        reap_exiting = benchmark_worker_module._reap_exiting
+
+        def reap() -> bool:
+            if process not in benchmark_worker_module._exiting:
+                return reap_exiting()
+            with patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 2.0):
+                return reap_exiting()
+
+        return patch(
+            "helion.autotuner.benchmark_worker._reap_exiting", side_effect=reap
+        )
+
+    def _killed_while_exiting(
+        self, release: int | None = None
+    ) -> mp.process.BaseProcess:
+        """The process of an ``_exiting_worker``, killed by a SIGKILL that
+        does not arrive (as a CUDA teardown outlasts it) and remembered as
+        exiting."""
+        worker, process = self._exiting_worker(release)
+        with (
+            patch("helion.autotuner.benchmark_worker.signal_process_tree"),
+            patch("helion.autotuner.benchmark_worker._REAP_TIMEOUT_SECONDS", 0.5),
+        ):
+            worker._kill()
+        self.assertIn(process, benchmark_worker_module._exiting)
+        return process
+
+    @pytest.mark.slow
+    def test_a_new_worker_starts_once_a_killed_one_has_been_reaped(self) -> None:
+        # A killed worker counts as exited once its descriptors close, though
+        # its CUDA teardown may still run the kernel it was killed in: a
+        # worker timing candidates beside it would measure them slow.  The
+        # next worker, also in a new BenchmarkWorker as the provider makes
+        # one after a shutdown, starts once the killed one is reaped: its
+        # first job finds it gone and runs out of no memory.
+        release, release_writer = os.pipe()
+        process = self._killed_while_exiting(release)
+        os.close(release)
+        writers = [release_writer]
+        reap_exiting = benchmark_worker_module._reap_exiting
+
+        def finish_exit_while_waited_for() -> bool:
+            # The teardown ends while the parent waits for it.
+            if writers:
+                os.close(writers.pop())
+            return reap_exiting()
+
+        self.addCleanup(finish_exit_while_waited_for)
+        warnings: list[str] = []
+        fresh = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            with patch(
+                "helion.autotuner.benchmark_worker._reap_exiting",
+                side_effect=finish_exit_while_waited_for,
+            ):
+                pid = fresh.run(_OutOfMemoryWhileAlive(process.pid), timeout=30.0)
+            self.assertNotEqual(pid, process.pid)
+            self.assertIsNotNone(process.exitcode)
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(warnings, [])
+        finally:
+            fresh.shutdown()
+
+    @pytest.mark.slow
+    def test_out_of_memory_beside_a_worker_still_exiting_is_retried(self) -> None:
+        # A worker that completed a job runs out of memory while a killed
+        # one, here of another BenchmarkWorker, is still exiting and may hold
+        # that memory: the job reruns once the killed one has been reaped,
+        # whatever the worker's back-off, which the rerun leaves alone.
+        warnings: list[str] = []
+        writers: list[int] = []
+
+        def finish_exit(message: str | None = None) -> None:
+            if message is not None:
+                warnings.append(message)
+            if writers:
+                os.close(writers.pop())
+
+        self.addCleanup(finish_exit)
+        fresh = BenchmarkWorker(log_warning=finish_exit)
+        # back-off from jobs that ran out of memory on their own
+        fresh._retry_after_jobs = 4
+        try:
+            first = fresh.run(_ReturnPid(), timeout=30.0)
+            release, release_writer = os.pipe()
+            writers.append(release_writer)
+            process = self._killed_while_exiting(release)
+            os.close(release)
+            pid = fresh.run(_OutOfMemoryWhileAlive(process.pid), timeout=30.0)
+            self.assertNotIn(pid, (first, process.pid))
+            self.assertIsNotNone(process.exitcode)
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("while a killed worker was still exiting", warnings[0])
+            self.assertEqual(fresh._retry_after_jobs, 4)
+        finally:
+            fresh.shutdown()
+
+    @pytest.mark.slow
+    def test_a_worker_exiting_past_the_reap_deadline_is_forgotten(self) -> None:
+        # The next worker's start waits for the killed worker only up to the
+        # deadline, says so, and forgets it: the job's out-of-memory error is
+        # raised without a rerun, and the worker started to replace it waits
+        # for the killed one no more.  The back-off stays as it was.
+        process = self._killed_while_exiting()
+        warnings: list[str] = []
+        fresh = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            with (
+                self._brief_reap_of(process),
+                self.assertRaisesRegex(RuntimeError, "CUDA out of memory"),
+            ):
+                fresh.run(_OutOfMemoryWhileAlive(process.pid), timeout=30.0)
+            self.assertTrue(process.is_alive())
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(fresh._retry_after_jobs, 1)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("may measure slow", warnings[0])
+        finally:
+            fresh.shutdown()
+
+    @pytest.mark.slow
+    def test_a_rerun_beside_a_worker_exiting_past_the_reap_deadline_says_so(
+        self,
+    ) -> None:
+        # A job runs out of memory beside a killed worker that is still
+        # exiting: the rerun's worker starts once the wait for it runs out,
+        # forgets it and says the candidates it times may measure slow.
+        warnings: list[str] = []
+        fresh = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            first = fresh.run(_ReturnPid(), timeout=30.0)
+            process = self._killed_while_exiting()
+            with self._brief_reap_of(process):
+                pid = fresh.run(_OutOfMemoryInProcess(first), timeout=30.0)
+            self.assertNotEqual(pid, first)
+            self.assertNotIn(process, benchmark_worker_module._exiting)
+            self.assertEqual(len(warnings), 2)
+            self.assertIn("while a killed worker was still exiting", warnings[0])
+            self.assertIn("may measure slow", warnings[1])
+        finally:
+            fresh.shutdown()
 
     def test_provider_cleanup_retains_unkillable_worker(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
@@ -1595,6 +2257,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertEqual(provider._anchor_fns_by_materialized_key, {})
         self.assertEqual(provider._effective_source_repairs, {})
 
+    @pytest.mark.slow
     def test_timeout_kills_worker_process_group(self) -> None:
         worker = BenchmarkWorker()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1608,7 +2271,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
                 while time.monotonic() < deadline:
                     try:
                         state = Path(f"/proc/{child_pid}/stat").read_text().split()[2]
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         state = "gone"
                     if state in {"gone", "Z"}:
                         break
@@ -1617,6 +2280,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             finally:
                 worker.shutdown()
 
+    @pytest.mark.slow
     def test_watchdog_kills_worker_when_poll_timeout_is_ignored(self) -> None:
         original_poll = Connection.poll
 
@@ -1628,6 +2292,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
 
         worker = BenchmarkWorker()
         try:
+            self.assertEqual(worker.run(_ReturnValue(0), timeout=60.0), 0)
             t0 = time.time()
             with (
                 patch.object(Connection, "poll", poll_until_ready),
@@ -1640,6 +2305,54 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    def test_watchdog_keeps_connection_open_until_poll_returns(self) -> None:
+        worker = BenchmarkWorker()
+        connection, child_connection = mp.Pipe()
+        process = Mock(pid=123)
+        process.is_alive.side_effect = (True,)
+        worker._process = process
+        worker._parent_connection = connection
+        watchdog_finished = threading.Event()
+        original_kill = worker._kill_if_current
+        original_poll = connection.poll
+
+        def kill_then_notify(*args: Any, **kwargs: Any) -> None:
+            try:
+                original_kill(*args, **kwargs)
+            finally:
+                watchdog_finished.set()
+
+        def poll_after_watchdog(timeout: float | None = None) -> bool:
+            # Force the watchdog to finish before the waiting thread handles
+            # EOF. Closing this descriptor from the watchdog can lose the
+            # poll wakeup on macOS and hang the caller indefinitely.
+            self.assertTrue(watchdog_finished.wait(timeout=5))
+            self.assertFalse(connection.closed)
+            return original_poll(1.0)
+
+        try:
+            with (
+                patch(
+                    "helion.autotuner.benchmark_worker.signal_process_tree",
+                    side_effect=lambda *_args: child_connection.close(),
+                ),
+                patch(
+                    "helion.autotuner.benchmark_worker._wait_for_exit",
+                    return_value=True,
+                ),
+                patch.object(worker, "_kill_if_current", kill_then_notify),
+                patch.object(connection, "poll", poll_after_watchdog),
+                self.assertRaises(BenchmarkTimeout),
+            ):
+                worker.run(_ReturnValue(7), timeout=0.1)
+            self.assertTrue(connection.closed)
+            self.assertFalse(worker.alive())
+        finally:
+            connection.close()
+            child_connection.close()
+            worker.shutdown()
+
+    @pytest.mark.slow
     def test_sticky_error_kills_worker(self) -> None:
         # Errors matching _UNRECOVERABLE_RUNTIME_ERROR_RE force the worker
         # to be killed so the next call spawns a fresh CUDA context.
@@ -1653,6 +2366,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_worker_crash_raises_died(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -1662,6 +2376,7 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
     def test_unpickleable_worker_exception_is_serialized(self) -> None:
         worker = BenchmarkWorker()
         try:
@@ -1673,7 +2388,99 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         finally:
             worker.shutdown()
 
+    @pytest.mark.slow
+    def test_out_of_memory_after_successful_jobs_retries_on_a_fresh_worker(
+        self,
+    ) -> None:
+        # A worker that has run jobs can hold the memory a job needs itself
+        # (free blocks of its caching allocator, which a driver allocation
+        # cannot use; the modules it loaded): every later job would fail the
+        # same way while it lives, so the job reruns on a fresh worker.
+        warnings: list[str] = []
+        worker = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            first_pid = worker.run(_ReturnPid(), timeout=30.0)
+            retried_pid = worker.run(_OutOfMemoryInProcess(first_pid), timeout=30.0)
+            self.assertNotEqual(retried_pid, first_pid)
+            self.assertTrue(worker.alive())
+            self.assertEqual(len(warnings), 1)
+            self.assertIn(
+                "ran out of device memory after 1 successful job(s)", warnings[0]
+            )
+            self.assertIn("Triton Error [CUDA]: out of memory", warnings[0])
+        finally:
+            worker.shutdown()
 
+    def _run_out_of_memory(self, worker: BenchmarkWorker) -> int:
+        """Run a job that runs out of memory wherever it runs; the pid of the
+        worker that raised (the retry's, when retried)."""
+        with self.assertRaisesRegex(RuntimeError, "out of memory") as ctx:
+            worker.run(_OutOfMemory(), timeout=30.0)
+        return int(str(ctx.exception).rsplit(" ", 1)[1])
+
+    @pytest.mark.slow
+    def test_out_of_memory_replaces_the_worker_and_backs_off_retries(self) -> None:
+        # Every out-of-memory error replaces the worker that raised it, the
+        # retry's included: the failing kernel can itself raise the
+        # local-memory high-water mark the process keeps. A fresh worker's
+        # error is the job's own and is not retried; one that recurs on the
+        # retry doubles the successful jobs required before the next retry.
+        warnings: list[str] = []
+        worker = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            failed = self._run_out_of_memory(worker)
+            self.assertEqual(warnings, [])
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), failed)
+            failed = self._run_out_of_memory(worker)  # retried, runs out again
+            self.assertEqual(len(warnings), 2)
+            self.assertIn("in a fresh benchmark worker too", warnings[1])
+            self.assertIn("the next retry needs 2 successful job(s)", warnings[1])
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), failed)
+            failed = self._run_out_of_memory(worker)  # 1 of 2 jobs: not retried
+            self.assertEqual(len(warnings), 2)
+            self.assertNotEqual(worker.run(_ReturnPid(), timeout=30.0), failed)
+        finally:
+            worker.shutdown()
+
+    @pytest.mark.slow
+    def test_out_of_memory_retry_that_succeeds_resets_the_back_off(self) -> None:
+        warnings: list[str] = []
+        worker = BenchmarkWorker(log_warning=warnings.append)
+        try:
+            worker.run(_ReturnPid(), timeout=30.0)
+            self._run_out_of_memory(worker)  # retried in vain: 2 jobs from now on
+            worker.run(_ReturnPid(), timeout=30.0)
+            pid = worker.run(_ReturnPid(), timeout=30.0)
+            retried = worker.run(_OutOfMemoryInProcess(pid), timeout=30.0)
+            self.assertNotEqual(retried, pid)
+            # 1 job (the retry) in the new worker suffices again
+            self.assertNotEqual(
+                worker.run(_OutOfMemoryInProcess(retried), timeout=30.0), retried
+            )
+            self.assertEqual(len(warnings), 4)
+        finally:
+            worker.shutdown()
+
+    def test_device_out_of_memory_matches_allocator_runtime_and_driver(self) -> None:
+        for message in (
+            "CUDA out of memory. Tried to allocate 384.00 MiB.",
+            "HIP out of memory. Tried to allocate 2.00 MiB.",
+            "CUDA error: out of memory",
+            "CUDA driver error: out of memory",
+            "Triton Error [CUDA]: out of memory",
+            "Triton Error [HIP]:  Code: 2, Message: out of memory",
+        ):
+            self.assertTrue(match_device_out_of_memory(RuntimeError(message)), message)
+        self.assertTrue(match_device_out_of_memory(torch.OutOfMemoryError()))
+        for message in (
+            "out of resource: shared memory, Required: 262184",
+            "Triton Error [CUDA]: invalid argument",
+            "CUDA error: an illegal memory access was encountered",
+        ):
+            self.assertFalse(match_device_out_of_memory(RuntimeError(message)), message)
+
+
+@pytest.mark.cpu_only
 class TestSuspiciousRebenchmark(unittest.TestCase):
     def test_isolated_unkillable_worker_is_fatal(self) -> None:
         provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
@@ -2018,7 +2825,9 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(provider.rep, 200)
         self.assertEqual(provider.desc, "verify")
         self.assertEqual(members[0].perfs, [1.00, 0.50])
-        self.assertEqual(members[1].perfs, [0.80, 0.80])
+        # An unavailable reading preserves the old observation without
+        # manufacturing a second sample from it.
+        self.assertEqual(members[1].perfs, [0.80])
         self.assertEqual(search.best_perf_so_far, 0.50)
 
     def test_cute_flash_isolated_timeout_invalidates_source_aliases(self) -> None:
@@ -2198,7 +3007,8 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
 
         search.rebenchmark([retained, measured], desc="verify")
 
-        self.assertEqual(retained.perfs, [1.0, 1.0])
+        self.assertEqual(retained.perfs, [1.0])
+        self.assertEqual(retained.perf, 1.0)
         self.assertEqual(retained.status, "ok")
         self.assertEqual(measured.perfs, [0.8, 0.75])
 
@@ -2247,36 +3057,39 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(measured.perfs, [0.8, 0.75])
 
 
+def _inplace_add_kernel(*block_sizes: int) -> helion.Kernel:
+    """A small kernel timed and checked in the benchmark worker, searched over
+    one config per block size (a fresh kernel, so each test autotunes)."""
+
+    def inplace_add(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        for tile in hl.tile(out.size()):
+            out[tile] += a[tile]
+        return out
+
+    return helion.kernel(
+        inplace_add,
+        configs=[
+            helion.Config(block_sizes=[size], num_warps=4) for size in block_sizes
+        ],
+        autotune_log_level=0,
+        autotune_benchmark_subprocess=True,
+    )
+
+
 @onlyBackends(["triton", "cute"])
 class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase):
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
-    def test_autotune_with_subprocess_bench(self) -> None:
-        if not torch.cuda.is_available():
-            self.skipTest("requires CUDA")
+    """Real searches through the benchmark worker. The slow tier holds every
+    test but test_autotune_runs_mutated_arg_kernels_in_the_worker, the smoke
+    test of a small kernel timed and checked in the worker."""
 
-        examples_dir = Path(__file__).parent.parent / "examples"
-        matmul = import_path(examples_dir / "matmul.py").matmul
-
-        args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
-        )
-        bound_kernel = matmul.bind(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-        # The autotuner reseeds `random` from this setting, so pinning it (not
-        # random.seed) is what makes the config sequence reproducible.
-        bound_kernel.settings.autotune_random_seed = 123
-
-        random.seed(123)
-        RandomSearch(bound_kernel, args, 10).autotune()
-
+    @pytest.mark.slow
     @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
     def test_autotune_continues_when_subprocess_reports_inf(self) -> None:
         # Patches _benchmark_function_subprocess to return inf for a
         # fraction of configs, simulating BenchmarkTimeout / worker death;
-        # autotune must still pick a best config from the rest.
+        # autotune must still pick a best config from the rest. The other two
+        # thirds of the configs run the real worker path, so this is also the
+        # happy-path search through the worker.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -2304,18 +3117,23 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
             torch.randn([512, 512], device=DEVICE),
         )
         bound_kernel = matmul.bind(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-        # The autotuner reseeds `random` from this setting, so pinning it (not
-        # random.seed) is what makes the config sequence reproducible.
-        bound_kernel.settings.autotune_random_seed = 123
+        settings = bound_kernel.settings
 
         random.seed(123)
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_benchmark_function_subprocess",
-            maybe_fail,
+        # The settings belong to the matmul example's kernel, which other tests
+        # share: restore them afterwards.  The autotuner reseeds `random` from
+        # autotune_random_seed, so pinning it (not random.seed) is what makes
+        # the config sequence reproducible.
+        with (
+            patch.object(settings, "autotune_benchmark_subprocess", True),
+            patch.object(settings, "autotune_benchmark_timeout", 60),
+            patch.object(settings, "autotune_precompile", None),
+            patch.object(settings, "autotune_random_seed", 123),
+            patch.object(
+                LocalBenchmarkProvider,
+                "_benchmark_function_subprocess",
+                maybe_fail,
+            ),
         ):
             search = RandomSearch(bound_kernel, args, 10)
             search.autotune()
@@ -2324,12 +3142,15 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
         self.assertGreaterEqual(call_count[1], 2)
         self.assertEqual(search._autotune_metrics.num_worker_failures, call_count[1])
 
-    @skipIfXPU("matmul config space includes maxnreg, unsupported on XPU")
+    @pytest.mark.slow
     def test_autotune_continues_when_accuracy_check_crashes(self) -> None:
         # A config can pass the timed run and then crash in the accuracy
         # check. Patches the accuracy job to raise a sticky CUDA error for one
         # config; the worker dies and respawns, and autotune must still pick a
-        # best config from the rest instead of aborting.
+        # best config from the rest instead of aborting. The crash hook does
+        # not depend on the kernel: a small in-place add with three configs
+        # (one checked before the crash, the crash, one after) replaces the
+        # matmul search this test used to run.
         if not torch.cuda.is_available():
             self.skipTest("requires CUDA")
 
@@ -2357,39 +3178,126 @@ class TestSubprocessBenchmarkIntegration(RefEagerTestDisabled, unittest.TestCase
                 )
             return original(self, fn)
 
-        examples_dir = Path(__file__).parent.parent / "examples"
-        matmul = import_path(examples_dir / "matmul.py").matmul
+        inplace_add = _inplace_add_kernel(32, 64, 128)
 
-        args = (
-            torch.randn([512, 512], device=DEVICE),
-            torch.randn([512, 512], device=DEVICE),
-        )
-        # Bind outside the shared cache: an earlier test in this process can
-        # leave compiled configs on the cached BoundKernel whose generated
-        # module files were deleted with that test's fresh inductor cache. Those
-        # cannot be serialized into the benchmark worker, so they silently
-        # fall back in-process and are not counted below.
-        bound_kernel = matmul._bind_isolated(args)
-        bound_kernel.settings.autotune_benchmark_subprocess = True
-        bound_kernel.settings.autotune_benchmark_timeout = 60
-        bound_kernel.settings.autotune_precompile = None
-        # The autotuner reseeds `random` from this setting, so pinning it (not
-        # random.seed) is what makes the config sequence reproducible.
-        bound_kernel.settings.autotune_random_seed = 123
-
-        random.seed(123)
+        a = torch.full([256], 2.0, device=DEVICE)
+        out = torch.zeros([256], device=DEVICE)
         with patch.object(
             LocalBenchmarkProvider,
             "_run_subprocess_accuracy_check_job",
             maybe_crash,
         ):
-            best = RandomSearch(bound_kernel, args, 8).autotune()
+            result = inplace_add(a, out)
 
-        self.assertIsNotNone(best)
-        # The second accuracy-check attempt crashes. A third proves the search
-        # continued; random configs can fail compilation before reaching this hook.
+        # The second accuracy check crashes; the third proves the search
+        # continued past it and the crashed worker's replacement served it.
         self.assertGreaterEqual(call_count[0], 3)
         self.assertEqual(call_count[1], 1)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
+
+    @pytest.mark.slow
+    def test_autotune_runs_mutated_arg_kernels_in_the_worker(self) -> None:
+        # A kernel that writes into an input (``out[tile] += ...``) is timed
+        # and checked in the killable worker on fresh copies of that input:
+        # every candidate reads the same ``out`` and the accuracy check
+        # compares the mutated copy against the baseline run's arguments.
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+        inplace_add = _inplace_add_kernel(32, 64)
+
+        a = torch.full([256], 2.0, device=DEVICE)
+        out = torch.zeros([256], device=DEVICE)
+        bench_jobs: list[tuple[int, ...]] = []
+        check_jobs: list[tuple[tuple[int, ...], str | None]] = []
+        original_bench = LocalBenchmarkProvider._run_subprocess_benchmark_job
+        original_check = LocalBenchmarkProvider._run_subprocess_accuracy_check_job
+
+        def spy_bench(
+            self: LocalBenchmarkProvider, fn: CompiledConfig, **kwargs: object
+        ) -> float | None:
+            bench_jobs.append(tuple(self.mutated_arg_indices))
+            result = original_bench(self, fn, **kwargs)  # pyrefly: ignore[bad-argument-type]
+            assert result is not None, "the candidate fell back in-process"
+            return result
+
+        def spy_check(
+            self: LocalBenchmarkProvider, fn: CompiledConfig
+        ) -> AccuracyCheckResult | None:
+            check_jobs.append(
+                (
+                    tuple(self.mutated_arg_indices),
+                    self._precompile_baseline_post_args_path,
+                )
+            )
+            result = original_check(self, fn)
+            assert result is not None, "the accuracy check fell back in-process"
+            return result
+
+        with (
+            patch.object(
+                LocalBenchmarkProvider, "_run_subprocess_benchmark_job", spy_bench
+            ),
+            patch.object(
+                LocalBenchmarkProvider, "_run_subprocess_accuracy_check_job", spy_check
+            ),
+        ):
+            result = inplace_add(a, out)
+
+        # Both configs were timed and checked in the worker (``out`` is the
+        # flat argument 1); the final selection may time them again.
+        self.assertGreaterEqual(len(bench_jobs), 2)
+        self.assertEqual(set(bench_jobs), {(1,)})
+        self.assertGreaterEqual(len(check_jobs), 2)
+        self.assertEqual({indices for indices, _ in check_jobs}, {(1,)})
+        self.assertTrue(all(path is not None for _, path in check_jobs))
+        # The autotuning runs mutated copies: the real ``out`` saw one call.
+        torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
+
+    @pytest.mark.slow
+    def test_autotune_survives_a_device_fault_in_a_mutated_arg_candidate(
+        self,
+    ) -> None:
+        # The kda forward's cold autotune died when a candidate executed an
+        # illegal instruction: its kernel writes into an input, which kept it
+        # on the in-process path, where the sticky error poisoned the
+        # process's CUDA context. In the worker the fault kills only the
+        # worker: the candidate is dropped, the search continues and the
+        # parent's context is intact.
+        if not torch.cuda.is_available():
+            self.skipTest("requires CUDA")
+
+        inplace_add = _inplace_add_kernel(32, 64, 128)
+
+        a = torch.full([256], 2.0, device=DEVICE)
+        out = torch.zeros([256], device=DEVICE)
+        original = LocalBenchmarkProvider._run_subprocess_benchmark_job
+        calls = [0]
+
+        def fault_once(
+            self: LocalBenchmarkProvider, fn: CompiledConfig, **kwargs: object
+        ) -> float | None:
+            calls[0] += 1
+            if calls[0] == 2:
+                if self._benchmark_worker is None:
+                    self._benchmark_worker = BenchmarkWorker(device=None)
+                # A sticky error raised inside the worker: the worker is
+                # killed and the error propagates as a device fault would.
+                self._benchmark_worker.run(
+                    _RaiseRuntimeError("an illegal instruction was encountered"),
+                    timeout=float(self.settings.autotune_benchmark_timeout),
+                )
+            return original(self, fn, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        with patch.object(
+            LocalBenchmarkProvider, "_run_subprocess_benchmark_job", fault_once
+        ):
+            result = inplace_add(a, out)
+
+        self.assertGreaterEqual(calls[0], 3)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, torch.full([256], 2.0, device=DEVICE))
 
 
 if __name__ == "__main__":

@@ -23,8 +23,13 @@ from helion._compiler.cute.attention_plan import FLASH_ASYMMETRIC_HEAD_DIM_PAIRS
 from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import flash_head_dims_supported
 from helion._compiler.cute.attention_plan import flash_pair_head_dims_supported
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
 from helion._testing import patch_cute_mma_support
+from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from helion.autotuner.config_fragment import ConfigSpecFragment
@@ -185,14 +190,17 @@ def test_score_plan_value_head_dim() -> None:
     ).asymmetric_head_dims
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_detector_admits_the_mla_pair_on_cpu() -> None:
     assert _cpu_surface(192, 128, 512) == (True, 192, 128)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_detector_keeps_the_symmetric_surface_unchanged() -> None:
     assert _cpu_surface(128, 128, 512) == (True, 128, None)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize(
     ("head_dim", "head_dim_v", "seq"),
     (
@@ -204,6 +212,7 @@ def test_detector_rejects_other_pairs(head_dim: int, head_dim_v: int, seq: int) 
     assert _cpu_surface(head_dim, head_dim_v, seq) == (False, None, None)
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 def test_detector_admits_symmetric_192_on_the_single_tile_body() -> None:
     """Two 192-wide accumulators do not fit the pair body's TMEM; the width
     is hosted by the single-query-tile body instead (one score buffer per
@@ -1000,7 +1009,7 @@ def test_resident_packet_gate_follows_the_hd128_causal_one() -> None:
 
 
 def _config_spec(num_kv: int = 32, *, is_causal: bool = True):
-    from helion._compiler.backend import CuteBackend
+    from helion._compiler.cute.backend import CuteBackend
     from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
@@ -1008,7 +1017,8 @@ def _config_spec(num_kv: int = 32, *, is_causal: bool = True):
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
     spec.target_device_capability = (10, 0)
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=HEAD_DIM,
         head_dim_v=HEAD_DIM_V,
         num_kv=num_kv,
@@ -1045,12 +1055,12 @@ def test_structural_coverage_design_is_complete(is_causal: bool) -> None:
     spec = _config_spec(is_causal=is_causal)
     with patch.dict(os.environ, {}, clear=True):
         generation = ConfigGeneration(spec)
-        generation.validate_flash_structural_coverage()
-        configs = generation.flash_deterministic_population_configs()
+        generation.extension.validate_flash_structural_coverage()
+        configs = generation.extension.deterministic_population_configs()
         assert configs
         staged = 0
         for config in configs:
-            resolved = spec._resolve_cute_flash_config(config.config)
+            resolved = _resolve_cute_flash_config(spec, config.config)
             assert resolved.pipeline_family == "fa4"
             # The plain two-slot ring, or FA4's uneven three-slot ring.
             assert resolved.kv_stage == (3 if resolved.uneven_kv_ring else 2)

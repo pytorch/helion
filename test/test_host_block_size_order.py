@@ -12,8 +12,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from test._cute_binding import _mock_cuda_unavailable
-from test._cute_binding import _require_cute_codegen
 from test.test_cute_materialized_fission import _HostModules
 from test.test_cute_materialized_fission import _sources
 
@@ -22,6 +20,9 @@ from helion import _compat
 from helion import _hardware
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import require_cute_codegen
 import helion.language as hl
 
 triton = pytest.importorskip("triton")
@@ -105,8 +106,8 @@ def _host_result(code: str, name: str, x: torch.Tensor) -> torch.Tensor:
         ("triton", "single"),
         ("triton", "multi"),
         ("triton", "gather"),
-        ("cute", "single"),
-        ("cute", "multi"),
+        pytest.param("cute", "single", marks=skipUnlessBackends(["cute"])),
+        pytest.param("cute", "multi", marks=skipUnlessBackends(["cute"])),
     ],
 )
 @pytest.mark.parametrize("blocks", [[16, 32], [32, 16], [1, 16]])
@@ -115,7 +116,7 @@ def test_later_root_reduction_host_dependencies(
     backend: str, blocks: list[int], static_shapes: bool, kind: str
 ) -> None:
     if backend == "cute":
-        _require_cute_codegen()
+        require_cute_codegen()
     function = {
         "single": _single_root_reduction,
         "multi": _multi_root_reduction,
@@ -146,7 +147,7 @@ def test_later_root_reduction_host_dependencies(
     cache_info_before = [function.cache_info() for function in cached_capabilities]
     with ExitStack() as stack:
         stack.enter_context(patch("torch.cuda.current_device", return_value=0))
-        stack.enter_context(_mock_cuda_unavailable())
+        stack.enter_context(mock_cuda_unavailable())
         stack.enter_context(
             patch(
                 "torch.cuda._lazy_init", side_effect=AssertionError("unexpected CUDA")
@@ -203,7 +204,7 @@ def test_later_root_reduction_host_dependencies(
 @pytest.mark.parametrize("backend", ["triton", "cute"])
 def test_multi_root_reduction_native(backend: str) -> None:
     if backend == "cute":
-        _require_cute_codegen()
+        require_cute_codegen()
     kernel = helion.kernel(backend=backend, static_shapes=True, autotune_effort="none")(
         _multi_root_reduction
     )

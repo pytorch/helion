@@ -12,10 +12,7 @@ from .test_cute_grid_launch_extents import _config
 from .test_cute_grid_launch_extents import _grid_argreduce
 import helion
 from helion._testing import DEVICE
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 def _bounds_code(rows: int, columns: int, largest: bool) -> str:

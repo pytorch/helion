@@ -337,7 +337,7 @@ def capture_block_scaled_provenance(
     for side, row_axis in zip(("lhs", "rhs"), row_axes, strict=True):
         terms = [pair.lhs if side == "lhs" else pair.rhs for pair in pairs]
         scales = [pair.lhs_scale if side == "lhs" else pair.rhs_scale for pair in pairs]
-        if any(scale is not scales[0] for scale in scales[1:]):
+        if scales[0] is None or any(scale is not scales[0] for scale in scales[1:]):
             return None
         scale = _plain_load(scales[0].args[0], torch.float8_e4m3fn)
         loads = [_packed_pair(pair) for pair in terms]

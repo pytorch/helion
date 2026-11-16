@@ -31,15 +31,21 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from helion._compiler.autotuner_heuristics.cute import CuteFlashAttentionHeuristic
-from helion._compiler.backend import CuteBackend
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._compiler.cute.autotune.flash_surface import _resolve_cute_flash_config
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_bwd_search
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.autotune.heuristics.cute import CuteFlashAttentionHeuristic
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.device_ir import DeviceIR
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     import helion
@@ -53,10 +59,15 @@ PLANS = {
     "s4096": (4096, 4096, 4, 16),
     "s131072": (131072, 131072, 1, 8),
 }
-# The score plan's two surfaces: a mask-only plan (any ``mask_mod``, the
-# BlockMask tables walked) and a plan with a score region (a ``score_mod``
-# other than the identity: softcap / ALiBi run the hook on every tile).
-WALKS = ("mask", "score")
+# The score plan's four surfaces: a mask-only plan (any ``mask_mod``, the
+# BlockMask tables walked), a plan with a score region (a ``score_mod``
+# other than the identity: softcap / ALiBi run the hook on every tile),
+# torch's empty BlockMask under a mask region (the trivial walk: one KV
+# block over the whole sequence, no list walk, the flex body), and torch's
+# empty BlockMask with the identity ``score_mod`` (the dense flex plan,
+# ``AttentionScorePlan.flex_dense``: the dense attention surface over the
+# flex kernel's two tiles, ``_flex_dense_search_surface``).
+WALKS = ("mask", "score", "trivial", "dense")
 
 
 def flex_forward_spec(
@@ -78,7 +89,10 @@ def flex_forward_spec(
     for block_id in (0, 1):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=128))
     score_region = walk == "score"
-    spec.enable_cute_flash_search(
+    trivial_walk = walk == "trivial"
+    dense = walk == "dense"
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         head_dim_v=None,
         num_kv=kv_seq // 128,
@@ -97,16 +111,16 @@ def flex_forward_spec(
         output_requires_tma=False,
         supports_tensor_4d_tma=False,
         has_row_epilogue=False,
-        plain_row_body=False,
+        plain_row_body=dense,
         has_score_modifiers=score_region,
-        score_modifier_kinds=("flex",),
+        score_modifier_kinds=("dense",) if dense else ("flex",),
         device_sm_count=device_sm_count,
         kv_group=kv_group,
         fast_math=True,
-        has_list_walk=True,
+        has_list_walk=not (trivial_walk or dense),
         flex_has_score_region=score_region,
-        flex_has_mask_region=True,
-        flex_trivial_walk=False,
+        flex_has_mask_region=not dense,
+        flex_trivial_walk=trivial_walk,
         q_seq=q_seq,
         kv_seq=kv_seq,
         flex_aux_smem_candidates=(),
@@ -126,7 +140,8 @@ def attention_spec(
     spec = ConfigSpec(backend=CuteBackend(), target_device_capability=(10, 0))
     for block_id, target in enumerate((1, 128, 128)):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-    spec.enable_cute_flash_search(
+    enable_cute_flash_search(
+        spec,
         head_dim=head_dim,
         num_kv=num_kv,
         num_bh=64,
@@ -150,7 +165,8 @@ def flex_backward_spec(head_dim: int) -> ConfigSpec:
     for block_id in (0, 1):
         spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=128))
     two_cta = head_dim == 128
-    spec.enable_cute_flash_bwd_search(
+    enable_cute_flash_bwd_search(
+        spec,
         block_size_targets={0: 128, 1: 128},
         two_cta_allowed=two_cta,
         two_cta_table_steps=160 if two_cta else 0,
@@ -196,6 +212,12 @@ SURFACES = {
     "flex_d64_s4096": (
         lambda: flex_forward_spec(
             64, q_seq=4096, kv_seq=4096, num_bh=64, heads=16, kv_group=1
+        ),
+        [128, 128],
+    ),
+    "flex_dense_s4096": (
+        lambda: flex_forward_spec(
+            128, q_seq=4096, kv_seq=4096, num_bh=64, heads=16, kv_group=1, walk="dense"
         ),
         [128, 128],
     ),
@@ -257,9 +279,12 @@ def test_flex_forward_coverage_design_is_complete(
     )
     with patch.dict(os.environ, {}, clear=True):
         generation = ConfigGeneration(spec)
-        generation.validate_flash_structural_coverage()
-        assert generation.flash_structural_coverage_uncovered_values() == []
-        assert generation.flash_structural_coverage_uncovered_interactions() == []
+        generation.extension.validate_flash_structural_coverage()
+        assert generation.extension.flash_structural_coverage_uncovered_values() == []
+        assert (
+            generation.extension.flash_structural_coverage_uncovered_interactions()
+            == []
+        )
 
 
 @pytest.mark.parametrize("head_dim", HEAD_DIMS)
@@ -285,7 +310,7 @@ def test_tail_split_offers_only_the_splits_a_correction_tile_realizes(
         head_dim, q_seq=4096, kv_seq=4096, num_bh=64, heads=16, kv_group=1
     )
     with patch.dict(os.environ, {}, clear=True):
-        fragments = spec._cute_flash_autotune_fragments()
+        fragments = _cute_flash_autotune_fragments(spec)
     fragment = fragments[cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY]
     assert isinstance(fragment, EnumFragment)
     assert tuple(fragment.search_choices or fragment.choices) == expected
@@ -295,14 +320,15 @@ def test_tail_split_offers_only_the_splits_a_correction_tile_realizes(
             continue
         size = next(s for s in corr_tiles if (head_dim // s) % splits == 0)
         with patch.dict(os.environ, {}, clear=True):
-            resolved = spec._resolve_cute_flash_config(
+            resolved = _resolve_cute_flash_config(
+                spec,
                 {
                     **spec.default_config().config,
                     cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY: splits,
                     cute_flash.FLASH_CORR_TILE_SIZE_KEY: size,
                     cute_flash.FLASH_PERSISTENT_KEY: False,
                     cute_flash.FLASH_KV_SPLIT_KEY: 1,
-                }
+                },
             )
         assert (resolved.flex_tail_split, resolved.corr_tile_size) == (splits, size)
 
@@ -328,6 +354,39 @@ def test_seed_block_sizes_accept_the_flex_kernels_two_tiles(
     assert cute_flash._flash_seed_block_sizes(targets) == expected
 
 
+def test_dense_flex_surface_seeds_the_dense_families() -> None:
+    """The dense flex plan's surface (``walk="dense"``) seeds the dense
+    attention kernel's families instead of the list-walk bodies: on the
+    campaign's small (1, 4, 256, 64) grid the row programs and the
+    persistent fa4 / ws_overlap bodies, and no seed resolves to a list
+    walk (``has_list_walk``) or carries the hook knobs' searched values."""
+    spec = flex_forward_spec(
+        64, q_seq=256, kv_seq=256, num_bh=4, heads=4, kv_group=1, walk="dense"
+    )
+    with patch.dict(os.environ, {}, clear=True):
+        seeds = recorded_compiler_seeds(spec)
+        assert seeds
+        resolved = [_resolve_cute_flash_config(spec, seed.config) for seed in seeds]
+        fragments = _cute_flash_autotune_fragments(spec)
+        messages: list[str] = []
+        pairs = ConfigGeneration(spec).seed_flat_config_pairs(messages.append)
+    assert not messages
+    # (Two of the dense surface's 21 seeds fold into one flat config on this
+    # small grid, on the attention example's own surface as well.)
+    assert len(pairs) >= len(seeds) - 1
+    families = {(cfg.pipeline_family, cfg.persistent) for cfg in resolved}
+    assert ("row_mma", False) in families
+    assert ("fa4", True) in families
+    assert ("ws_overlap", True) in families
+    assert all(not cfg.flex_early_qk and cfg.flex_tail_split == 0 for cfg in resolved)
+    family = fragments[cute_flash.FLASH_PIPELINE_FAMILY_KEY]
+    assert isinstance(family, EnumFragment)
+    assert "row_mma" in (family.search_choices or family.choices)
+    tail = fragments[cute_flash.FLASH_FLEX_TAIL_SPLIT_KEY]
+    assert isinstance(tail, EnumFragment)
+    assert tuple(tail.search_choices or tail.choices) == (0,)
+
+
 @pytest.mark.parametrize("plan", sorted(PLANS))
 def test_flex_forward_surface_seeds_the_measured_list_walk_bodies(
     plan: str,
@@ -349,7 +408,7 @@ def test_flex_forward_surface_seeds_the_measured_list_walk_bodies(
         seeds = recorded_compiler_seeds(spec)
         assert seeds
         assert all(seed.config["block_sizes"] == [128, 128] for seed in seeds)
-        resolved = [spec._resolve_cute_flash_config(seed.config) for seed in seeds]
+        resolved = [_resolve_cute_flash_config(spec, seed.config) for seed in seeds]
     mid = [
         cfg
         for cfg in resolved

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+import functools
 import inspect
 import math
 import os
@@ -13,7 +14,10 @@ from unittest.mock import Mock
 from unittest.mock import call
 from unittest.mock import patch
 
+import pytest
 import torch
+from torch.testing._internal.common_utils import instantiate_parametrized_tests
+from torch.testing._internal.common_utils import parametrize
 
 from test._autotuner_test_utils import AutotunerTestCase
 from test._autotuner_test_utils import _assert_phase_config_manifest
@@ -23,13 +27,20 @@ from test._autotuner_test_utils import _stub_flash_conditional_proposals
 
 import helion
 from helion import exc
-from helion._compiler.backend import CuteBackend
 from helion._compiler.cute import cute_flash
+from helion._compiler.cute import flash_knobs
 from helion._compiler.cute.attention_plan import CAUSAL_MASK_KIND
 from helion._compiler.cute.attention_plan import ROW_KV_BEGIN_MASK_KIND
 from helion._compiler.cute.attention_plan import SLIDING_WINDOW_MASK_KIND
 from helion._compiler.cute.attention_plan import AttentionScoreModifier
 from helion._compiler.cute.attention_plan import AttentionScorePlan
+from helion._compiler.cute.autotune.config_generation_ext import (
+    CuteConfigGenerationExtension,
+)
+from helion._compiler.cute.autotune.flash_search import FlashCoverageDesign
+from helion._compiler.cute.autotune.flash_search import _flash_log_maximin_refinements
+from helion._compiler.cute.autotune.flash_surface import enable_cute_flash_search
+from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_flash import _flash_clc_heads_per_batch_candidates
 from helion._compiler.cute.cute_flash import (
     _flash_clc_heads_per_batch_coverage_candidates,
@@ -41,6 +52,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner import AccuracyCheck
 from helion.autotuner import DESurrogateHybrid
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import LFBOPatternSearch
@@ -59,18 +71,17 @@ from helion.autotuner.benchmarking import MirroredBenchmarkTrace
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.config_generation import CoordinateNeighborProjection
-from helion.autotuner.config_generation import _flash_log_maximin_refinements
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.local_cache import LocalAutotuneCache
 from helion.autotuner.local_cache import StrictLocalAutotuneCache
-from helion.autotuner.local_cache import _cute_flash_search_policy_hash
+from helion.autotuner.local_cache import _search_policy_hash
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.random_search import RandomSearch
 from helion.autotuner.search_space_logger import canonical_config_id
-from helion.autotuner.surrogate_pattern_search import _FLASH_EXACT_SPACE_RAW_FLOOR
+from helion.autotuner.surrogate_pattern_search import FLASH_EXACT_SPACE_RAW_FLOOR
 from helion.autotuner.surrogate_pattern_search import (
     flash_terminal_measurement_is_valid,
 )
@@ -85,9 +96,14 @@ _CACHE_POLICY_BASELINE_SCALE = 1
 _CACHE_POLICY_DYNAMIC_HELPER: object = None
 
 
-@onlyBackends(["triton", "cute"])
+@instantiate_parametrized_tests
+@onlyBackends(["cute"])
 class TestAutotunerCuteFlash(AutotunerTestCase):
-    def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(self):
+    @pytest.mark.cpu_only
+    @parametrize("missing_phase", [None, "rounds", "all", "confirmation", "reference"])
+    def test_lfbo_flash_terminal_coordinate_refinement_runs_two_rounds(
+        self, missing_phase
+    ):
         def make_fn(source_id: int):
             def fn():
                 return None
@@ -126,6 +142,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         outcome="candidate",
                         flat_values=[target],
                         config=projected,
+                        requested_flat_values=[target],
                     )
                 )
             return result
@@ -188,6 +205,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
 
         initial_perfs = {1: 9.9, 2: 10.2}
+        if missing_phase == "rounds":
+            # The missing candidate's old observation would win every round.
+            initial_perfs[2] = 0.1
 
         def benchmark_population(members, *, desc):
             self.assertIn("Terminal coordinate refinement", desc)
@@ -215,12 +235,30 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         def mirrored_rebenchmark(members, *, desc, target_ms):
             values = timing_rounds[mirrored_rebenchmark.calls]
             mirrored_rebenchmark.calls += 1
-            timings = [
-                values[member.config.config[cute_flash.FLASH_WAIT_HINT_KEY]]
+            statuses = [
+                "incomplete"
+                if missing_phase == "all"
+                or (
+                    missing_phase == "rounds"
+                    and member.config.config[cute_flash.FLASH_WAIT_HINT_KEY] == 2
+                )
+                or (missing_phase == "confirmation" and "confirming" in desc)
+                or (
+                    missing_phase == "reference"
+                    and member.config.config[cute_flash.FLASH_WAIT_HINT_KEY] == 0
+                )
+                else "ok"
                 for member in members
             ]
-            for member, timing in zip(members, timings, strict=True):
-                member.perfs.append(timing)
+            timings = [
+                values[member.config.config[cute_flash.FLASH_WAIT_HINT_KEY]]
+                if status == "ok"
+                else math.inf
+                for member, status in zip(members, statuses, strict=True)
+            ]
+            for member, timing, status in zip(members, timings, statuses, strict=True):
+                if status == "ok":
+                    member.perfs.append(timing)
             order = list(range(len(members)))
             return MirroredBenchmarkTrace(
                 orders=[order, list(reversed(order))],
@@ -229,12 +267,44 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 sweep_count=2,
                 calls_per_sample=1,
                 total_calls=2,
+                statuses=statuses if missing_phase is not None else None,
             )
 
         mirrored_rebenchmark.calls = 0
         search.mirrored_rebenchmark = Mock(side_effect=mirrored_rebenchmark)
 
         selected = search.run_terminal_refinement(best)
+
+        if missing_phase is not None:
+            transcript = search._autotune_metrics.search_phase_metrics[
+                "terminal_coordinate_refinement"
+            ]
+            self.assertEqual(
+                selected.config.config[cute_flash.FLASH_WAIT_HINT_KEY],
+                1 if missing_phase == "rounds" else 0,
+            )
+            if missing_phase == "rounds":
+                self.assertNotIn(
+                    canonical_config_id(make_member(2, 0.1).config),
+                    transcript["accepted_config_ids"],
+                )
+            elif missing_phase in ("all", "reference"):
+                self.assertFalse(transcript["accepted_config_ids"])
+                self.assertEqual(best.perfs, [10.0])
+            else:
+                self.assertFalse(transcript["confirmation"]["accepted"])
+            measurements = [row["measurement"] for row in transcript["rounds"]] + [
+                transcript["confirmation"]["measurement"]
+            ]
+            self.assertTrue(
+                any(
+                    measurement is not None and "incomplete" in measurement["statuses"]
+                    for measurement in measurements
+                )
+            )
+            self.assertEqual(search._autotune_metrics.num_generations, 20)
+            self.assertTrue(transcript["completed"])
+            return
 
         self.assertEqual(
             selected.config.config[cute_flash.FLASH_WAIT_HINT_KEY],
@@ -455,6 +525,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.benchmark_population.assert_not_called()
         search.mirrored_rebenchmark.assert_not_called()
 
+    @pytest.mark.cpu_only
     def test_lfbo_flash_terminal_coordinate_refinement_crosses_beam_valley(self):
         def member(
             e2e_offset: int,
@@ -492,6 +563,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         [5, 12.0],
                         intermediate_config,
+                        [5, 12.0],
                     )
                 ]
             if flat == [5, 12.0]:
@@ -505,6 +577,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         [5, 4.0],
                         endpoint_config,
+                        [5, 4.0],
                     )
                 ]
             return []
@@ -651,7 +724,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 8
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=None)
@@ -812,7 +889,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=1)
@@ -867,7 +948,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 3
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -907,8 +992,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             search.args = args
             search.copies = copies
             search.config_gen = SimpleNamespace(
-                flash_structural_starting_path_limit=lambda **_kwargs: 17,
-                flash_structural_family_probe_path_limit=lambda _cap, _generations: 18,
+                extension=SimpleNamespace(
+                    flash_structural_starting_path_limit=lambda **_kwargs: 17,
+                    flash_structural_family_probe_path_limit=lambda _cap, _generations: (
+                        18
+                    ),
+                ),
             )
 
         flash_kernel = SimpleNamespace(
@@ -995,7 +1084,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 6
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=4)
@@ -1076,7 +1169,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 5
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=4)
@@ -1123,7 +1220,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -1187,7 +1288,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -1239,7 +1344,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -1282,7 +1391,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 5
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -1355,10 +1468,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
+        generation.extension = CuteConfigGenerationExtension(generation)
         with patch.object(
-            generation, "flash_structural_leaf_catalog", return_value=catalog
+            generation.extension, "flash_structural_leaf_catalog", return_value=catalog
         ):
-            capacity = generation.flash_structural_starting_path_limit(
+            capacity = generation.extension.flash_structural_starting_path_limit(
                 minimum=1,
                 retained_families=policy.retained_families,
                 retained_candidates_per_leaf=policy.retained_candidates_per_leaf,
@@ -1367,7 +1481,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = capacity
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = policy
         search._autotune_metrics = SimpleNamespace(search_phase_metrics={})
         search.population = population
@@ -1426,7 +1544,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 5
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=4)
@@ -1488,7 +1610,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 3
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -1543,7 +1669,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.copies = 4
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         search.flash_structural_search = get_effort_profile(
             "full"
         ).flash_structural_search
@@ -1652,7 +1782,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         assert global_leaf is not None
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=4)
@@ -1781,7 +1915,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         assert ordinary_leaf is not None
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.config_spec = _cute_flash_test_config_spec()
-        search.config_gen = SimpleNamespace(flash_pipeline_lane_catalog=dict)
+        search.config_gen = SimpleNamespace(
+            extension=SimpleNamespace(
+                flash_pipeline_lane_catalog=dict,
+            ),
+        )
         policy = get_effort_profile("full").flash_structural_search
         assert policy is not None
         search.flash_structural_search = replace(policy, retained_families=4)
@@ -1925,17 +2063,19 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
             flatten=lambda config: [config.config["cute_flash_softmax_disc"]],
-            flash_structural_leaf_catalog=lambda: leaves,
-            flash_low_confound_schedule_anchor_configs=lambda: [
-                anchor.config,
-                initial.config,
-            ],
-            flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                initial.config,
-                anchor.config,
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: leaves,
+                flash_low_confound_schedule_anchor_configs=lambda: [
+                    anchor.config,
+                    initial.config,
+                ],
+                flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: [
+                    initial.config,
+                    anchor.config,
+                ],
+            ),
         )
         search.copies = 2
         search.num_neighbors = 200
@@ -2049,15 +2189,17 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
             flatten=lambda config: [config.config["cute_flash_wait_hint"]],
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=lambda: [
-                item.config for item in generated
-            ],
-            flash_pipeline_lane_catalog=lambda: {leaf: ()},
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                item.config for item in generated
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=lambda: [
+                    item.config for item in generated
+                ],
+                flash_pipeline_lane_catalog=lambda: {leaf: ()},
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: [
+                    item.config for item in generated
+                ],
+            ),
         )
         search.copies = 2
         search.num_neighbors = 200
@@ -2132,10 +2274,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -2227,12 +2371,14 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                item.config for item in initial
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: [
+                    item.config for item in initial
+                ],
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -2310,10 +2456,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -2374,6 +2522,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         assert leaf is not None
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
+        generation.extension = CuteConfigGenerationExtension(generation)
         generation.flat_spec = [EnumFragment(tuple(range(7)))]
         generation.compiler_coverage_enabled = True
         generation._override_values = {}
@@ -2381,18 +2530,20 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         # enumeration runs as one global product.
         generation._key_to_flat_indices = {}
         generation.unflatten = lambda _flat: initial.config
-        self.assertIsNone(generation.flash_exact_effective_search_space_configs(1))
+        self.assertIsNone(generation.extension.exact_effective_search_space_configs(1))
         self.assertEqual(
-            generation.flash_exact_effective_search_space_configs(7),
+            generation.extension.exact_effective_search_space_configs(7),
             [initial.config],
         )
-        exact_space = Mock(wraps=generation.flash_exact_effective_search_space_configs)
-        generation.flash_exact_effective_search_space_configs = exact_space
+        exact_space = Mock(
+            wraps=generation.extension.exact_effective_search_space_configs
+        )
+        generation.extension.exact_effective_search_space_configs = exact_space
         generation.encode_config = lambda flat: flat
-        generation.flash_structural_leaf_catalog = lambda: [leaf]
-        generation.flash_low_confound_schedule_anchor_configs = list
-        generation.flash_pipeline_lane_catalog = lambda: {leaf: ()}
-        generation.flash_clc_lane_catalog = dict
+        generation.extension.flash_structural_leaf_catalog = lambda: [leaf]
+        generation.extension.flash_low_confound_schedule_anchor_configs = list
+        generation.extension.flash_pipeline_lane_catalog = lambda: {leaf: ()}
+        generation.extension.flash_clc_lane_catalog = dict
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = generation
@@ -2431,9 +2582,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         # (The enumeration budget floors at the raw-product floor: a space this
         # small is enumerated whatever the initial population size.)
         self.assertEqual(
-            metrics["exact_space_raw_budget"], max(_FLASH_EXACT_SPACE_RAW_FLOOR, 7)
+            metrics["exact_space_raw_budget"], max(FLASH_EXACT_SPACE_RAW_FLOOR, 7)
         )
-        exact_space.assert_called_once_with(max(_FLASH_EXACT_SPACE_RAW_FLOOR, 7))
+        exact_space.assert_called_once_with(max(FLASH_EXACT_SPACE_RAW_FLOOR, 7))
         self.assertEqual(metrics["qualification_passes_planned"], 0)
         leaf_metric = metrics["leaf_results"][0]
         self.assertTrue(leaf_metric["space_exhausted"])
@@ -2473,11 +2624,13 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: leaves,
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: exact_space,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: leaves,
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: exact_space,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 200
@@ -2598,7 +2751,8 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                     spec.block_sizes.append(
                         BlockSizeSpec(block_id=block_id, size_hint=target)
                     )
-                spec.enable_cute_flash_search(
+                enable_cute_flash_search(
+                    spec,
                     head_dim=64,
                     num_kv=512,
                     num_bh=num_bh,
@@ -2622,7 +2776,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 overrides[cute_flash.FLASH_PIPELINE_FAMILY_KEY] = "fa4_clc"
                 generation = spec.create_config_generation(overrides=overrides)
 
-                catalogs = generation.flash_clc_lane_catalog()
+                catalogs = generation.extension.flash_clc_lane_catalog()
                 self.assertEqual(len(catalogs), 1)
                 leaf, catalog = next(iter(catalogs.items()))
                 legal = _flash_clc_heads_per_batch_candidates(num_bh)
@@ -2635,7 +2789,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 )
                 self.assertEqual(set(catalog["attempted_values"]), set(legal))
 
-                witnesses = generation.flash_clc_lane_witnesses()
+                witnesses = generation.extension.flash_clc_lane_witnesses()
                 self.assertEqual(
                     {
                         value
@@ -2671,27 +2825,38 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                     fixed.config[cute_flash.FLASH_CLC_HEADS_PER_BATCH_KEY],
                     refinement,
                 )
-                self.assertEqual(fixed_generation.flash_clc_lane_catalog(), {})
+                self.assertEqual(
+                    fixed_generation.extension.flash_clc_lane_catalog(), {}
+                )
 
     def test_lfbo_flash_structural_transfers_preserve_pipeline_depths(self):
-        with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
-            spec = ConfigSpec(
-                backend=CuteBackend(),
-                target_device_capability=(10, 0),
-                num_sm=148,
+        def make_spec():
+            # The flash knob channel is captured when the surface is enabled,
+            # so a spec built under a patched environment carries it.
+            with patch("helion.autotuner.config_spec.get_num_xcd", return_value=1):
+                spec = ConfigSpec(
+                    backend=CuteBackend(),
+                    target_device_capability=(10, 0),
+                    num_sm=148,
+                )
+            for block_id, target in enumerate((1, 128, 128)):
+                spec.block_sizes.append(
+                    BlockSizeSpec(block_id=block_id, size_hint=target)
+                )
+            enable_cute_flash_search(
+                spec,
+                head_dim=64,
+                num_kv=512,
+                num_bh=96,
+                dtype=torch.float16,
+                block_size_targets={0: 1, 1: 128, 2: 128},
+                standard_dense_output=True,
+                # The compound variants below exist on the fast_math surface only.
+                fast_math=True,
             )
-        for block_id, target in enumerate((1, 128, 128)):
-            spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
-            head_dim=64,
-            num_kv=512,
-            num_bh=96,
-            dtype=torch.float16,
-            block_size_targets={0: 1, 1: 128, 2: 128},
-            standard_dense_output=True,
-            # The compound variants below exist on the fast_math surface only.
-            fast_math=True,
-        )
+            return spec
+
+        spec = make_spec()
 
         def make_search(generation):
             search = LFBOPatternSearch.__new__(LFBOPatternSearch)
@@ -2802,7 +2967,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 self.assertFalse(combined.config.config[cute_flash.FLASH_EPI_TMA_KEY])
 
         with patch.dict(os.environ, {"HELION_CUTE_FLASH_MMA_PTX": "0"}):
-            compound_generation = spec.create_config_generation(
+            compound_generation = make_spec().create_config_generation(
                 overrides={cute_flash.FLASH_PIPELINE_FAMILY_KEY: "fa4_2cta"}
             )
             compound_search = make_search(compound_generation)
@@ -2885,7 +3050,8 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             )
         for block_id, target in enumerate((1, 128, 128)):
             spec.block_sizes.append(BlockSizeSpec(block_id=block_id, size_hint=target))
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=512,
             num_bh=64,
@@ -2931,10 +3097,14 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             }
         )
 
-        rows = generation.flash_deterministic_population_configs()
-        leaves = generation.flash_structural_leaf_catalog()
-        parent_count = generation.flash_structural_parent_coverage_prefix_count()
-        qualification_count = generation.flash_structural_qualification_prefix_count()
+        rows = generation.extension.deterministic_population_configs()
+        leaves = generation.extension.flash_structural_leaf_catalog()
+        parent_count = (
+            generation.extension.flash_structural_parent_coverage_prefix_count()
+        )
+        qualification_count = (
+            generation.extension.structural_qualification_prefix_count()
+        )
         ordinary_leaves = [leaf for leaf in leaves if leaf.compound_exp2_packet is None]
         compound_leaves = [
             leaf for leaf in leaves if leaf.compound_exp2_packet is not None
@@ -2954,7 +3124,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertTrue(all(parent_counts[leaf] == 1 for leaf in leaves))
         # A leaf with a single reachable normalized config under these
         # overrides is complete after its one parent row.
-        singleton_leaves = set(generation.flash_structural_singleton_leaves())
+        singleton_leaves = set(generation.extension.flash_structural_singleton_leaves())
         self.assertEqual(singleton_leaves, set())
         self.assertTrue(
             all(qualification_counts[leaf] == 2 for leaf in ordinary_leaves)
@@ -2963,18 +3133,18 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             all(qualification_counts[leaf] == 1 for leaf in compound_leaves)
         )
         self.assertEqual(
-            generation.flash_structural_coverage_underqualified_values(), []
+            generation.extension.flash_structural_coverage_underqualified_values(), []
         )
         self.assertEqual(
             qualification_count,
             parent_count + len(ordinary_leaves),
         )
         self.assertEqual(
-            generation.flash_structural_population_budget(parent_count),
+            generation.extension.structural_population_budget(parent_count),
             parent_count,
         )
         self.assertEqual(
-            generation.flash_structural_population_budget(2 * qualification_count),
+            generation.extension.structural_population_budget(2 * qualification_count),
             qualification_count,
         )
 
@@ -2998,7 +3168,8 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             "dtype": torch.float16,
             "standard_dense_output": True,
         }
-        spec.enable_cute_flash_search(
+        enable_cute_flash_search(
+            spec,
             head_dim=64,
             num_kv=4,
             block_size_targets={0: 1, 1: 128, 2: 128},
@@ -3030,9 +3201,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 if key not in live_prefix_keys
             }
         )
-        rows = generation.flash_deterministic_population_configs()
-        leaves = generation.flash_structural_leaf_catalog()
-        singleton_leaves = generation.flash_structural_singleton_leaves()
+        rows = generation.extension.deterministic_population_configs()
+        leaves = generation.extension.flash_structural_leaf_catalog()
+        singleton_leaves = generation.extension.flash_structural_singleton_leaves()
         self.assertEqual(
             [leaf.pipeline_family for leaf in singleton_leaves], ["row_mma"]
         )
@@ -3042,8 +3213,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             if leaf.compound_exp2_packet is None and leaf not in singleton_leaves
         ]
         self.assertTrue(ordinary_leaves)
-        parent_count = generation.flash_structural_parent_coverage_prefix_count()
-        qualification_count = generation.flash_structural_qualification_prefix_count()
+        parent_count = (
+            generation.extension.flash_structural_parent_coverage_prefix_count()
+        )
+        qualification_count = (
+            generation.extension.structural_qualification_prefix_count()
+        )
 
         def prefix_leaf_counts(limit: int) -> dict[object, int]:
             counts = dict.fromkeys(leaves, 0)
@@ -3064,24 +3239,24 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
         self.assertEqual(qualification_count, parent_count + len(ordinary_leaves))
         self.assertEqual(
-            generation.flash_structural_coverage_underqualified_leaves(), []
+            generation.extension.flash_structural_coverage_underqualified_leaves(), []
         )
         # The family value keeps reporting its single witness: the report
         # stays honest about the collapsed surface while the leaf catalog
         # carries the singleton exemption.
         self.assertEqual(
-            generation.flash_structural_coverage_underqualified_values(),
+            generation.extension.flash_structural_coverage_underqualified_values(),
             [(cute_flash.FLASH_PIPELINE_FAMILY_KEY, "row_mma", 1)],
         )
         # The row_mma leaf is a singleton only because its knobs are
         # overridden: the live surface gives it two witnesses.
         live = spec.create_config_generation()
-        self.assertEqual(live.flash_structural_singleton_leaves(), [])
+        self.assertEqual(live.extension.flash_structural_singleton_leaves(), [])
         self.assertGreaterEqual(
             sum(
                 config.config[cute_flash.FLASH_PIPELINE_FAMILY_KEY] == "row_mma"
-                for config in live.flash_deterministic_population_configs()[
-                    : live.flash_structural_qualification_prefix_count()
+                for config in live.extension.deterministic_population_configs()[
+                    : live.extension.structural_qualification_prefix_count()
                 ]
             ),
             2,
@@ -3107,9 +3282,11 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
         search = LFBOPatternSearch.__new__(LFBOPatternSearch)
         search.config_gen = SimpleNamespace(
-            flash_pipeline_lane_witnesses=lambda: {(leaf, stage_key, 3): config},
             flatten=Mock(return_value=flat),
             canonicalize_flat=Mock(return_value=(flat, config)),
+            extension=SimpleNamespace(
+                flash_pipeline_lane_witnesses=lambda: {(leaf, stage_key, 3): config},
+            ),
         )
         search.make_unbenchmarked = Mock(return_value=expected)
 
@@ -3193,11 +3370,13 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_pipeline_lane_catalog=lambda: {leaf: ()},
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_pipeline_lane_catalog=lambda: {leaf: ()},
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.set_generation = Mock()
         search._budgeted_range = lambda *args: range(*args)
@@ -3364,11 +3543,13 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             typed_leaves.append(leaf)
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: typed_leaves,
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_pipeline_lane_catalog=lambda: dict.fromkeys(typed_leaves, ()),
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: typed_leaves,
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_pipeline_lane_catalog=lambda: dict.fromkeys(typed_leaves, ()),
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.set_generation = Mock()
         search._budgeted_range = lambda *args: range(*args)
@@ -3516,11 +3697,13 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: leaves,
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: leaves,
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_pipeline_lane_catalog=lambda: dict.fromkeys(leaves, ()),
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.set_generation = Mock()
         search._budgeted_range = lambda *args: range(*args)
@@ -3591,11 +3774,13 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_pipeline_lane_catalog=lambda: {leaf: ()},
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_pipeline_lane_catalog=lambda: {leaf: ()},
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search._autotune_budget_exceeded_across_ranks = Mock(side_effect=(False, True))
         search.set_generation = Mock()
@@ -3667,11 +3852,13 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_pipeline_lane_catalog=lambda: {leaf: ()},
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_pipeline_lane_catalog=lambda: {leaf: ()},
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -3764,10 +3951,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search._autotune_metrics = SimpleNamespace(search_phase_metrics=None)
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search._flash_pipeline_lanes = lambda _leaf: (
             (stage_key, 2),
@@ -3899,10 +4088,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -4005,10 +4196,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -4146,10 +4339,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -4281,10 +4476,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             search.config_spec = _cute_flash_test_config_spec()
             search.config_gen = SimpleNamespace(
                 encode_config=lambda flat: flat,
-                flash_structural_leaf_catalog=lambda: [leaf],
-                flash_low_confound_schedule_anchor_configs=list,
-                flash_clc_lane_catalog=dict,
-                flash_exact_effective_search_space_configs=lambda _limit: None,
+                extension=SimpleNamespace(
+                    flash_structural_leaf_catalog=lambda: [leaf],
+                    flash_low_confound_schedule_anchor_configs=list,
+                    flash_clc_lane_catalog=dict,
+                    exact_effective_search_space_configs=lambda _limit: None,
+                ),
             )
             search.copies = 5
             search.num_neighbors = 300
@@ -4406,10 +4603,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -4554,18 +4753,20 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=lambda: {
-                leaf: {
-                    "legal_values": (2,),
-                    "search_values": (2,),
-                    "anchor_values": (2,),
-                    "refinement_values": (),
-                    "attempted_values": (2,),
-                }
-            },
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=lambda: {
+                    leaf: {
+                        "legal_values": (2,),
+                        "search_values": (2,),
+                        "anchor_values": (2,),
+                        "refinement_values": (),
+                        "attempted_values": (2,),
+                    }
+                },
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -4707,18 +4908,20 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             search.config_spec = _cute_flash_test_config_spec()
             search.config_gen = SimpleNamespace(
                 encode_config=lambda flat: flat,
-                flash_structural_leaf_catalog=lambda: [leaf],
-                flash_low_confound_schedule_anchor_configs=list,
-                flash_clc_lane_catalog=lambda: {
-                    leaf: {
-                        "legal_values": (2,),
-                        "search_values": (2,),
-                        "anchor_values": (2,),
-                        "refinement_values": (),
-                        "attempted_values": (2,),
-                    }
-                },
-                flash_exact_effective_search_space_configs=lambda _limit: None,
+                extension=SimpleNamespace(
+                    flash_structural_leaf_catalog=lambda: [leaf],
+                    flash_low_confound_schedule_anchor_configs=list,
+                    flash_clc_lane_catalog=lambda: {
+                        leaf: {
+                            "legal_values": (2,),
+                            "search_values": (2,),
+                            "anchor_values": (2,),
+                            "refinement_values": (),
+                            "attempted_values": (2,),
+                        }
+                    },
+                    exact_effective_search_space_configs=lambda _limit: None,
+                ),
             )
             search.copies = 5
             search.num_neighbors = 300
@@ -4872,20 +5075,22 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=lambda: {
-                leaf: {
-                    "legal_values": values,
-                    "search_values": values,
-                    "anchor_values": values,
-                    "refinement_values": (),
-                    "attempted_values": values,
-                }
-            },
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                witness.config for witness in failed_witnesses.values()
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=lambda: {
+                    leaf: {
+                        "legal_values": values,
+                        "search_values": values,
+                        "anchor_values": values,
+                        "refinement_values": (),
+                        "attempted_values": values,
+                    }
+                },
+                exact_effective_search_space_configs=lambda _limit: [
+                    witness.config for witness in failed_witnesses.values()
+                ],
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -5070,6 +5275,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                     )
                 )
 
+    @pytest.mark.cpu_only
     def test_lfbo_flash_qualification_reserves_lanes_before_surrogate_pruning(
         self,
     ):
@@ -5110,10 +5316,12 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 softmax_key: ([3], False),
             },
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 200
@@ -5183,6 +5391,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                         "candidate",
                         child_flat,
                         by_flat[tuple(child_flat)].config,
+                        child_flat,
                     )
                     for child_flat in generate(parent, _leaf, constraints, limit)
                 ]
@@ -5191,7 +5400,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
                 flatten=search.config_gen.flatten,
                 canonicalize_flat=search.config_gen.canonicalize_flat,
                 coordinate_neighbor_projections=projections,
-                flash_owned_coordinate_indices=lambda config: [],
+                extension=SimpleNamespace(
+                    flash_owned_coordinate_indices=lambda config: [],
+                ),
             )
 
         search._flash_leaf_config_generation = leaf_generation
@@ -5269,14 +5480,16 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [ordinary_leaf, orphan_leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: [initial.config],
-            flash_pipeline_lane_catalog=lambda: {
-                ordinary_leaf: (),
-                orphan_leaf: (),
-            },
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [ordinary_leaf, orphan_leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: [initial.config],
+                flash_pipeline_lane_catalog=lambda: {
+                    ordinary_leaf: (),
+                    orphan_leaf: (),
+                },
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -5382,14 +5595,16 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [ordinary_leaf, compound_leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=dict,
-            flash_exact_effective_search_space_configs=lambda _limit: None,
-            flash_pipeline_lane_catalog=lambda: {
-                ordinary_leaf: ((stage_key, 2),),
-                compound_leaf: (),
-            },
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [ordinary_leaf, compound_leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=dict,
+                exact_effective_search_space_configs=lambda _limit: None,
+                flash_pipeline_lane_catalog=lambda: {
+                    ordinary_leaf: ((stage_key, 2),),
+                    compound_leaf: (),
+                },
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -5643,7 +5858,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         untransferred = member(0.1, packet="deg1_8x2_corr10", wait_hint=99)
         search.population.append(untransferred)
         search._flash_pipeline_lanes = lambda leaf: (
-            search.config_gen.flash_pipeline_lane_catalog()[leaf]
+            search.config_gen.extension.flash_pipeline_lane_catalog()[leaf]
         )
         selected = {member.config for member, _ in search._select_starting_paths()}
         self.assertNotIn(untransferred.config, selected)
@@ -5677,20 +5892,22 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=lambda: {
-                leaf: {
-                    "legal_values": (1, 2),
-                    "search_values": (1, 2),
-                    "anchor_values": (1, 2),
-                    "refinement_values": (),
-                    "attempted_values": (1, 2),
-                }
-            },
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                item.config for item in initial
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=lambda: {
+                    leaf: {
+                        "legal_values": (1, 2),
+                        "search_values": (1, 2),
+                        "anchor_values": (1, 2),
+                        "refinement_values": (),
+                        "attempted_values": (1, 2),
+                    }
+                },
+                exact_effective_search_space_configs=lambda _limit: [
+                    item.config for item in initial
+                ],
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -5785,20 +6002,22 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=lambda: {
-                leaf: {
-                    "legal_values": (1, 2, 4, 8, 16, 32),
-                    "search_values": (1, 2, 4, 8, 16, 32),
-                    "anchor_values": (1, 2),
-                    "refinement_values": (4, 8, 16, 32),
-                    "attempted_values": (1, 2, 4, 8, 16, 32),
-                }
-            },
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                item.config for item in anchors
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=lambda: {
+                    leaf: {
+                        "legal_values": (1, 2, 4, 8, 16, 32),
+                        "search_values": (1, 2, 4, 8, 16, 32),
+                        "anchor_values": (1, 2),
+                        "refinement_values": (4, 8, 16, 32),
+                        "attempted_values": (1, 2, 4, 8, 16, 32),
+                    }
+                },
+                exact_effective_search_space_configs=lambda _limit: [
+                    item.config for item in anchors
+                ],
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -5967,18 +6186,20 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=lambda: {
-                leaf: {
-                    "legal_values": (1, 2, 4, 8),
-                    "search_values": (1, 2, 4, 8),
-                    "anchor_values": (1, 8),
-                    "refinement_values": (2, 4),
-                    "attempted_values": (1, 8, 2, 4),
-                }
-            },
-            flash_exact_effective_search_space_configs=lambda _limit: None,
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=lambda: {
+                    leaf: {
+                        "legal_values": (1, 2, 4, 8),
+                        "search_values": (1, 2, 4, 8),
+                        "anchor_values": (1, 8),
+                        "refinement_values": (2, 4),
+                        "attempted_values": (1, 8, 2, 4),
+                    }
+                },
+                exact_effective_search_space_configs=lambda _limit: None,
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -6269,25 +6490,24 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.config_gen = SimpleNamespace(
             encode_config=lambda flat: flat,
-            flash_structural_leaf_catalog=lambda: [leaf],
-            flash_low_confound_schedule_anchor_configs=list,
-            flash_clc_lane_catalog=lambda: {
-                leaf: {
-                    "legal_values": (2, 4),
-                    "search_values": (2, 4),
-                    "anchor_values": (2, 4),
-                    "refinement_values": (),
-                    "attempted_values": (2, 4),
-                }
-            },
-            # Value-specific spaces are measured, avoiding unrelated CLC
-            # conditional searches. The extra config keeps the full leaf
-            # non-exhaustive so the depth/divisor projection is still required.
-            flash_exact_effective_search_space_configs=lambda _limit: [
-                depth_2.config,
-                depth_3.config,
-                unmeasured,
-            ],
+            extension=SimpleNamespace(
+                flash_structural_leaf_catalog=lambda: [leaf],
+                flash_low_confound_schedule_anchor_configs=list,
+                flash_clc_lane_catalog=lambda: {
+                    leaf: {
+                        "legal_values": (2, 4),
+                        "search_values": (2, 4),
+                        "anchor_values": (2, 4),
+                        "refinement_values": (),
+                        "attempted_values": (2, 4),
+                    }
+                },
+                exact_effective_search_space_configs=lambda _limit: [
+                    depth_2.config,
+                    depth_3.config,
+                    unmeasured,
+                ],
+            ),
         )
         search.copies = 5
         search.num_neighbors = 300
@@ -6426,7 +6646,9 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         search.config_spec = _cute_flash_test_config_spec()
         search.flash_structural_search = None
         self.assertEqual(search._run_flash_structural_qualification(set()), 0)
-        self.assertFalse(search.config_gen.flash_structural_leaf_catalog.called)
+        self.assertFalse(
+            search.config_gen.extension.flash_structural_leaf_catalog.called
+        )
 
     def test_lfbo_non_flash_does_not_require_json_serializable_configs(self):
         config = helion.Config(
@@ -6691,14 +6913,16 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
 
         config_gen = SimpleNamespace(
             config_spec=_cute_flash_test_config_spec(),
-            flash_deterministic_population_configs=lambda: [configs[1], configs[2]],
-            flash_exact_effective_search_space_configs=lambda _limit: None,
-            flash_structural_parent_coverage_prefix_count=lambda: 2,
-            flash_structural_population_budget=lambda _target: 2,
-            flash_structural_qualification_prefix_count=lambda: 2,
             flatten=lambda config: [config.config["block_sizes"][0] - 1],
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=([-1], [4])),
+            extension=SimpleNamespace(
+                deterministic_population_configs=lambda: [configs[1], configs[2]],
+                exact_effective_search_space_configs=lambda _limit: None,
+                flash_structural_parent_coverage_prefix_count=lambda: 2,
+                structural_population_budget=lambda _target: 2,
+                structural_qualification_prefix_count=lambda: 2,
+            ),
         )
         search = PatternSearch.__new__(PatternSearch)
         search.config_spec = config_gen.config_spec
@@ -6721,7 +6945,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertEqual(padded, [[1], [2], [0], [3], [4]])
         self.assertEqual(config_gen.random_flat.call_count, 2)
 
-        config_gen.flash_structural_parent_coverage_prefix_count = lambda: 0
+        config_gen.extension.flash_structural_parent_coverage_prefix_count = lambda: 0
         search.initial_population = 0
         zero = search._generate_initial_population_flat()
         self.assertEqual(zero, [[0], [3]])
@@ -6735,13 +6959,15 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
 
         config_gen = SimpleNamespace(
             config_spec=_cute_flash_test_config_spec(),
-            flash_deterministic_population_configs=lambda: [configs[1], configs[2]],
-            flash_exact_effective_search_space_configs=lambda _limit: None,
-            flash_structural_population_budget=lambda _target: 2,
-            flash_structural_qualification_prefix_count=lambda: 2,
             flatten=lambda config: [config.config["block_sizes"][0] - 1],
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=AssertionError("quick search must not pad")),
+            extension=SimpleNamespace(
+                deterministic_population_configs=lambda: [configs[1], configs[2]],
+                exact_effective_search_space_configs=lambda _limit: None,
+                structural_population_budget=lambda _target: 2,
+                structural_qualification_prefix_count=lambda: 2,
+            ),
         )
         search = PatternSearch.__new__(PatternSearch)
         search.config_gen = config_gen
@@ -6776,14 +7002,15 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         exact_space = Mock(return_value=exact_configs)
         config_gen = ConfigGeneration.__new__(ConfigGeneration)
         config_gen.config_spec = _cute_flash_test_config_spec()
+        config_gen.extension = CuteConfigGenerationExtension(config_gen)
         config_gen._config_value_priors = {}
         config_gen.default_flat = lambda: [0]
-        config_gen.validate_flash_structural_coverage = Mock()
-        config_gen._flash_deterministic_coverage_flats = lambda: [[0]]
-        config_gen.flash_deterministic_population_configs = lambda: [configs[0]]
-        config_gen.flash_structural_qualification_prefix_count = lambda: 1
-        config_gen.flash_structural_population_budget = lambda _target: 1
-        config_gen.flash_exact_effective_search_space_configs = exact_space
+        config_gen.extension.validate_flash_structural_coverage = Mock()
+        config_gen.extension._flash_deterministic_coverage_flats = lambda: [[0]]
+        config_gen.extension.deterministic_population_configs = lambda: [configs[0]]
+        config_gen.extension.structural_qualification_prefix_count = lambda: 1
+        config_gen.extension.structural_population_budget = lambda _target: 1
+        config_gen.extension.exact_effective_search_space_configs = exact_space
         config_gen.unflatten = unflatten
         config_gen.flatten = lambda config: [config.config["block_sizes"][0] - 1]
         config_gen.canonicalize_flat = lambda flat: (
@@ -6849,15 +7076,17 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
 
         config_gen = SimpleNamespace(
             config_spec=_cute_flash_test_config_spec(),
-            flash_deterministic_population_configs=lambda: [configs[1]],
-            flash_exact_effective_search_space_configs=Mock(
-                return_value=[configs[1], configs[2]]
-            ),
-            flash_structural_population_budget=lambda _target: 1,
-            flash_structural_qualification_prefix_count=lambda: 1,
             flatten=lambda config: [config.config["block_sizes"][0] - 1],
             canonicalize_flat=canonicalize_flat,
             random_flat=Mock(side_effect=AssertionError("population is complete")),
+            extension=SimpleNamespace(
+                deterministic_population_configs=lambda: [configs[1]],
+                exact_effective_search_space_configs=Mock(
+                    return_value=[configs[1], configs[2]]
+                ),
+                structural_population_budget=lambda _target: 1,
+                structural_qualification_prefix_count=lambda: 1,
+            ),
         )
         search = PatternSearch.__new__(PatternSearch)
         search.config_gen = config_gen
@@ -6881,20 +7110,27 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
 
         self.assertEqual(population, [[1], [3], [2]])
         self.assertEqual(len(population), len({tuple(flat) for flat in population}))
-        config_gen.flash_exact_effective_search_space_configs.assert_called_once_with(2)
+        config_gen.extension.exact_effective_search_space_configs.assert_called_once_with(
+            2
+        )
         config_gen.random_flat.assert_not_called()
 
     def test_cute_flash_population_bounds_compiler_seeds(self):
         configs = {value: helion.Config(block_sizes=[value + 1]) for value in range(6)}
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
+        generation.extension = CuteConfigGenerationExtension(generation)
         generation._config_value_priors = {}
         generation.default_flat = lambda: [0]
-        generation.validate_flash_structural_coverage = Mock()
-        generation._flash_deterministic_coverage_flats = lambda: [[0], [1], [2]]
-        generation.flash_structural_qualification_prefix_count = lambda: 2
-        generation.flash_structural_population_budget = lambda _target: 3
-        generation.flash_exact_effective_search_space_configs = lambda _limit: None
+        generation.extension.validate_flash_structural_coverage = Mock()
+        generation.extension._flash_deterministic_coverage_flats = lambda: [
+            [0],
+            [1],
+            [2],
+        ]
+        generation.extension.structural_qualification_prefix_count = lambda: 2
+        generation.extension.structural_population_budget = lambda _target: 3
+        generation.extension.exact_effective_search_space_configs = lambda _limit: None
         generation.unflatten = lambda flat: configs[flat[0]]
         generation.flatten = lambda config: [config.config["block_sizes"][0] - 1]
         generation.user_seed_flat_config_pairs = lambda _configs, _log: [
@@ -6916,7 +7152,7 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertEqual(len(normalized), 6)
         self.assertLessEqual({configs[0], configs[1], configs[2]}, set(normalized))
         self.assertLessEqual({configs[3], configs[4]}, set(normalized))
-        generation.validate_flash_structural_coverage.assert_called_once_with()
+        generation.extension.validate_flash_structural_coverage.assert_called_once_with()
 
         # A target smaller than the mandatory set may grow for explicit user
         # seeds, but compiler hints stay within the requested population size.
@@ -6926,19 +7162,22 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         )
         self.assertEqual(small, [[0], [1], [3]])
         generation.random_flat.assert_not_called()
-        self.assertEqual(generation.validate_flash_structural_coverage.call_count, 2)
+        self.assertEqual(
+            generation.extension.validate_flash_structural_coverage.call_count, 2
+        )
 
     def test_cute_flash_exact_space_survives_oversized_mandatory_population(self):
         configs = {value: helion.Config(block_sizes=[value + 1]) for value in range(4)}
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
+        generation.extension = CuteConfigGenerationExtension(generation)
         generation._config_value_priors = {}
         generation.default_flat = lambda: [0]
-        generation.validate_flash_structural_coverage = Mock()
-        generation._flash_deterministic_coverage_flats = lambda: [[0]]
-        generation.flash_structural_qualification_prefix_count = lambda: 1
-        generation.flash_structural_population_budget = lambda _target: 1
-        generation.flash_exact_effective_search_space_configs = lambda _limit: [
+        generation.extension.validate_flash_structural_coverage = Mock()
+        generation.extension._flash_deterministic_coverage_flats = lambda: [[0]]
+        generation.extension.structural_qualification_prefix_count = lambda: 1
+        generation.extension.structural_population_budget = lambda _target: 1
+        generation.extension.exact_effective_search_space_configs = lambda _limit: [
             configs[0],
             configs[1],
         ]
@@ -6962,20 +7201,21 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
     def test_incomplete_cute_flash_structural_design_is_rejected(self):
         generation = ConfigGeneration.__new__(ConfigGeneration)
         generation.config_spec = _cute_flash_test_config_spec()
+        generation.extension = CuteConfigGenerationExtension(generation)
         generation._override_values = {}
-        generation._flash_deterministic_coverage_flats = Mock(return_value=[])
-        generation._flash_coverage_uncovered_cache = [("family", "missing")]
-        generation._flash_coverage_underqualified_cache = [("packet", "thin", 1)]
-        generation._flash_coverage_uncovered_interactions_cache = [
-            (("family", "packet"), ("missing", "thin"))
-        ]
+        design = FlashCoverageDesign(
+            uncovered_values=[("family", "missing")],
+            underqualified_values=[("packet", "thin", 1)],
+            uncovered_interactions=[(("family", "packet"), ("missing", "thin"))],
+        )
+        generation.extension._flash_coverage_design = Mock(return_value=design)
 
         with self.assertRaisesRegex(
             exc.AutotuneError,
             "incomplete CuTe flash structural coverage design.*uncovered values.*"
             "uncovered interactions",
         ):
-            generation.flash_deterministic_population_configs()
+            generation.extension.deterministic_population_configs()
 
         # An unrelated override must not hide a broken flash covering design.
         generation._override_values = {"num_warps": 4}
@@ -6983,32 +7223,35 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
             exc.AutotuneError,
             "incomplete CuTe flash structural coverage design",
         ):
-            generation.flash_deterministic_population_configs()
+            generation.extension.deterministic_population_configs()
         generation._override_values = {"cute_flash_wait_hint": 0}
         with self.assertRaisesRegex(
             exc.AutotuneError,
             "incomplete CuTe flash structural coverage design",
         ):
-            generation.flash_deterministic_population_configs()
+            generation.extension.deterministic_population_configs()
         generation._override_values = {"cute_flash_exp2_packet": "1x1"}
         with self.assertRaisesRegex(
             exc.AutotuneError,
             "incomplete CuTe flash structural coverage design",
         ):
-            generation.flash_deterministic_population_configs()
+            generation.extension.deterministic_population_configs()
 
         # A family may legitimately normalize to one effective config. Keep the
         # two-witness shortfall as telemetry for the strict harness, not a fatal
         # invariant for ordinary tuning.
-        generation._flash_coverage_uncovered_cache = []
-        generation._flash_coverage_uncovered_interactions_cache = []
-        self.assertEqual(generation.flash_deterministic_population_configs(), [])
+        generation.extension._flash_coverage_design = Mock(
+            return_value=replace(design, uncovered_values=[], uncovered_interactions=[])
+        )
+        self.assertEqual(generation.extension.deterministic_population_configs(), [])
 
         # Explicit overrides intentionally narrow the advertised search surface;
         # its unpruned diagnostics must not reject that constrained search.
         generation._override_values = {"cute_flash_pipeline_family": "fa4"}
-        generation._flash_coverage_uncovered_cache = [("family", "missing")]
-        self.assertEqual(generation.flash_deterministic_population_configs(), [])
+        generation.extension._flash_coverage_design = Mock(
+            return_value=replace(design, uncovered_interactions=[])
+        )
+        self.assertEqual(generation.extension.deterministic_population_configs(), [])
 
     def test_lfbo_flash_path_constraint_filters_before_visited(self):
         packet_key = "cute_flash_exp2_packet"
@@ -7187,6 +7430,8 @@ class TestAutotunerCuteFlash(AutotunerTestCase):
         self.assertIn(ordinary.config, visited)
 
 
+@onlyBackends(["cute"])
+@pytest.mark.cpu_only
 class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
     @staticmethod
     def _search(
@@ -7202,8 +7447,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         best_available_max_configs: int = 20,
         config_filter: object = None,
         baseline_fn: object = None,
+        accuracy_check_fn: object = None,
         baseline_atol: float | None = None,
         baseline_rtol: float | None = None,
+        fp8_accuracy: str = "ulp",
         best_of_k: int = 1,
         precompile_jobs: int | None = None,
         with_torch_compile_fusion: bool = False,
@@ -7219,8 +7466,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             autotune_best_available_max_configs=best_available_max_configs,
             autotune_config_filter=config_filter,  # type: ignore[arg-type]
             autotune_baseline_fn=baseline_fn,  # type: ignore[arg-type]
+            autotune_baseline_accuracy_check_fn=accuracy_check_fn,  # type: ignore[arg-type]
             autotune_baseline_atol=baseline_atol,
             autotune_baseline_rtol=baseline_rtol,
+            autotune_fp8_accuracy=fp8_accuracy,  # type: ignore[arg-type]
             autotune_best_of_k=best_of_k,
             autotune_precompile_jobs=precompile_jobs,
             autotune_with_torch_compile_fusion=with_torch_compile_fusion,
@@ -7231,6 +7480,8 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         assert pattern is not None
         search = object.__new__(LFBOTreeSearch)
         search.settings = settings
+        search._benchmark_provider_cls = LocalBenchmarkProvider
+        search.final_selection = search._final_selection_from_settings(settings)
         search.config_spec = SimpleNamespace(  # type: ignore[assignment]
             compiler_seed_configs=[],
             compiler_coverage_groups=(),
@@ -7240,8 +7491,10 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
             backend=SimpleNamespace(
                 config_value_priors_version=1,
                 # Like the CuTe backend: no precompile pool, so the cache
-                # policy reports no precompile mode.
+                # policy reports no precompile mode, and the trace kernel
+                # timer for its final selection.
                 supports_precompile=lambda: False,
+                default_final_selection_regime=lambda: "kernel",
             ),
             backend_name="cute",
             cute_flash_search_enabled=True,
@@ -7277,16 +7530,20 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         return search
 
     def _hash(self, search: BaseSearch, *, enabled: bool = True) -> str:
-        return _cute_flash_search_policy_hash(
+        return _search_policy_hash(
             search,
             cute_flash_search_enabled=enabled,
         )
 
-    def test_non_flash_preserves_legacy_empty_policy(self) -> None:
+    def test_non_flash_preserves_policy_equivalence_with_clone_version(self) -> None:
         full = self._search()
         quick = self._search(effort="quick", max_generations=5)
-        self.assertEqual(self._hash(full, enabled=False), "")
-        self.assertEqual(self._hash(quick, enabled=False), "")
+        # Clone semantics version even default one-bank cache keys; disabled
+        # flash search still leaves full and quick search policies equivalent.
+        full_key = self._hash(full, enabled=False)
+        self.assertNotEqual(full_key, "")
+        self.assertEqual(full_key, self._hash(full, enabled=False))
+        self.assertEqual(full_key, self._hash(quick, enabled=False))
 
     def test_config_generation_policy_version_covers_flash_searches(self) -> None:
         def random_search(*, cute_flash: bool) -> RandomSearch:
@@ -7513,6 +7770,67 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         self.assertNotEqual(self._hash(identity), self._hash(atol))
         self.assertNotEqual(self._hash(identity), self._hash(rtol))
 
+    def test_fp8_accuracy_mode_changes_policy(self) -> None:
+        # The fp8 mode changes which configs the default check accepts.
+        ulp = self._search(fp8_accuracy="ulp")
+        bitwise = self._search(fp8_accuracy="bitwise")
+        self.assertNotEqual(self._hash(ulp), self._hash(bitwise))
+        # Explicit zero tolerances select bitwise whatever the setting says.
+        self.assertEqual(
+            self._search(
+                fp8_accuracy="ulp", baseline_atol=0.0, baseline_rtol=0.0
+            ).cache_policy()["settings"]["autotune_fp8_accuracy"],
+            "bitwise",
+        )
+        # An accuracy check carries its own fp8 mode.
+        check = AccuracyCheck(atol=0.02, rtol=0.0)
+        self.assertEqual(
+            self._hash(self._search(fp8_accuracy="ulp", accuracy_check_fn=check)),
+            self._hash(self._search(fp8_accuracy="bitwise", accuracy_check_fn=check)),
+        )
+
+    def test_accuracy_check_is_keyed_by_its_fields(self) -> None:
+        # Helion's own check keys the cache by plain data and replaces the
+        # tolerance settings; without a check the policy is unchanged. (Other
+        # kernels' keys: TestAccuracyCheck in test_autotuner_accuracy.py.)
+        def search(atol: float = 0.02):
+            return self._search(
+                accuracy_check_fn=AccuracyCheck(atol=atol, rtol=0.0, atol_scale="peak")
+            )
+
+        plain = self._search().cache_policy()["settings"]
+        self.assertNotIn("autotune_baseline_accuracy_check_fn", plain)
+        self.assertIn("autotune_baseline_atol", plain)
+        keyed = search().cache_policy()["settings"]
+        self.assertEqual(
+            keyed["autotune_baseline_accuracy_check_fn"],
+            search().settings.autotune_baseline_accuracy_check_fn.cache_policy(),
+        )
+        self.assertNotIn("autotune_baseline_atol", keyed)
+        self.assertNotIn("autotune_baseline_rtol", keyed)
+        self.assertNotIn("autotune_fp8_accuracy", keyed)
+        self.assertEqual(self._hash(search()), self._hash(search()))
+        self.assertNotEqual(self._hash(search()), self._hash(search(0.05)))
+        self.assertNotEqual(self._hash(search()), self._hash(self._search()))
+        cacheable = search()
+        self._hash(cacheable)
+        self.assertTrue(getattr(cacheable, "_search_policy_cacheable", True))
+
+    def test_other_accuracy_checks_are_one_shot(self) -> None:
+        # An arbitrary callback (or a subclass, which may override __call__)
+        # cannot be keyed.
+        class Subclass(AccuracyCheck):
+            pass
+
+        for custom in (
+            lambda actual, expected: None,
+            functools.partial(torch.testing.assert_close, atol=0.0, rtol=0.0),
+            Subclass(atol=0.02, rtol=0.0),
+        ):
+            one_shot = self._search(accuracy_check_fn=custom)
+            self._hash(one_shot)
+            self.assertIs(one_shot._search_policy_cacheable, False)
+
     def test_baseline_function_runtime_globals_change_policy(self) -> None:
         global _CACHE_POLICY_BASELINE_SCALE
 
@@ -7625,7 +7943,7 @@ class TestCuteFlashSearchPolicyCacheKey(unittest.TestCase):
         search = object.__new__(RandomSearch)
         search.count = 100
         search._benchmark_provider_cls = object
-        self.assertIsNone(search._algorithm_cache_policy())
+        self.assertIsNone(search.cache_policy())
 
         search._benchmark_provider_cls = LocalBenchmarkProvider
         self.assertEqual(
@@ -7832,12 +8150,20 @@ class TestCuteAutotuner(TestCase):
         # elimination. The set still excludes Triton-style knobs that
         # the CuTe path does not consume.
         # Resident packet controls are explicit CuTe config fields; unseeded
-        # configs retain their false-only search domains.
+        # configs retain their false-only search domains.  On sm_100 the
+        # fp32 adds can pair into packed instructions.
+        pair_lane_math = (
+            {"cute_pair_lane_math"}
+            if gen.config_spec.cute_pair_lane_math_sites
+            else set()
+        )
         self.assertEqual(
             flat_keys,
-            {
+            pair_lane_math
+            | {
                 "block_sizes",
                 "num_threads",
+                "cute_compiler_pipeline",
                 "flatten_loops",
                 "loop_orders",
                 "cute_vector_widths",
@@ -7854,11 +8180,20 @@ class TestCuteAutotuner(TestCase):
                 "cute_scalar_epilogue_keep_inputs",
                 "cute_scalar_epilogue_owner_fold",
                 "cute_warp_fp32_redux",
+                "cute_register_tile_warp_fold",
+                "cute_register_tile_cooperative_fold",
+                "cute_register_tile_store_first",
                 "cute_replicated_reduction",
                 "cute_vector_packet_unroll",
                 "cute_vloop_sink",
                 "cute_lane_unroll",
+                "cute_unpadded_rows",
+                "cute_grid_lane_jam",
+                "cute_scratch_forwarding",
+                "cute_uniform_lane_compares",
                 "cute_pdl",
+                "cute_pdl_release",
+                "cute_pdl_spread",
                 "cute_store_policy",
                 "load_eviction_policies",
             },
@@ -7873,36 +8208,7 @@ class TestCuteAutotuner(TestCase):
         configs = [gen.random_config() for _ in range(20)]
         self.assertTrue(any(config.num_threads for config in configs))
         for config in configs:
-            self.assertLessEqual(
-                set(config.config),
-                {
-                    "block_sizes",
-                    "num_threads",
-                    "flatten_loops",
-                    "loop_orders",
-                    "cute_vector_widths",
-                    "cute_lane_layouts",
-                    "cute_cluster_n",
-                    "cute_min_blocks_per_mp",
-                    "cute_proven_bounds",
-                    "cute_packet_prefetch",
-                    "cute_independent_reduction",
-                    "cute_cluster_warp_online",
-                    "cute_register_row",
-                    "cute_register_row_tensor_copy",
-                    "cute_scalar_epilogue",
-                    "cute_scalar_epilogue_keep_inputs",
-                    "cute_scalar_epilogue_owner_fold",
-                    "cute_warp_fp32_redux",
-                    "cute_replicated_reduction",
-                    "cute_vector_packet_unroll",
-                    "cute_vloop_sink",
-                    "cute_lane_unroll",
-                    "cute_pdl",
-                    "cute_store_policy",
-                    "load_eviction_policies",
-                },
-            )
+            self.assertLessEqual(set(config.config), flat_keys)
             self.assertNotIn("persistent", config.pid_type)
             explicit_threads = [nt for nt in config.num_threads if nt > 0]
             if explicit_threads:
@@ -7943,7 +8249,7 @@ class TestCuteAutotuner(TestCase):
         )
         bound = _get_examples_matmul().bind(args)
         # Confirm we are on the tcgen05 search branch.
-        self.assertTrue(bound.config_spec.cute_tcgen05_search_enabled)
+        self.assertTrue(bound.config_spec.tcgen05.search_enabled)
         flat_keys = {
             key for key, _count, _is_sequence in bound.config_spec.flat_key_layout()
         }
@@ -8108,10 +8414,10 @@ class TestCuteAutotuner(TestCase):
             for key, _count, _is_sequence in attn_bound.config_spec.flat_key_layout()
         }
         self.assertLessEqual(
-            set(cute_flash.FLASH_AUTOTUNE_CONFIG_KEYS),
+            set(flash_knobs.FLASH_AUTOTUNE_CONFIG_KEYS),
             attn_keys,
         )
-        self.assertTrue(set(cute_flash.FLASH_LEGACY_CONFIG_KEYS).isdisjoint(attn_keys))
+        self.assertTrue(set(flash_knobs.FLASH_LEGACY_CONFIG_KEYS).isdisjoint(attn_keys))
         self.assertNotIn(cute_flash.FLASH_Q_TILE_COUNT_KEY, attn_keys)
         for generic_key in ("num_threads", "loop_orders", "cute_vector_widths"):
             self.assertNotIn(generic_key, attn_keys)
@@ -8672,7 +8978,7 @@ class TestCuteAutotuner(TestCase):
         ):
             flat = generation.flatten(config)
             generation.encode_config(flat)
-            expected = dict(config.config)
+            expected = dict(config.config, cute_compiler_pipeline="default")
             expected.pop("cute_vector_widths", None)
             expected.pop("cute_lane_layouts", None)
             self.assertEqual(generation.unflatten(flat).config, expected)
@@ -8697,7 +9003,7 @@ class TestCuteAutotuner(TestCase):
             )
             for key, value in effective.items():
                 self.assertEqual(values[key], value, key)
-            for legacy_key in cute_flash.FLASH_LEGACY_CONFIG_KEYS:
+            for legacy_key in flash_knobs.FLASH_LEGACY_CONFIG_KEYS:
                 self.assertNotIn(legacy_key, values)
 
         q_odd, k_odd, v_odd = (

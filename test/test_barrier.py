@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import cast
 from unittest.mock import patch
 
 import torch
@@ -9,11 +8,11 @@ import torch
 import helion
 from helion._compiler.device_ir import DeviceIR
 from helion._compiler.device_ir import RolledReductionInfo
-from helion._compiler.device_ir import RootGraphInfo
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
@@ -161,68 +160,6 @@ class TestBarrier(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "DeviceIR mutation test does not execute a kernel in ref eager mode"
     )
-    def test_apply_rolling_preserves_root_phase_metadata(self) -> None:
-        class _FakeReductionLoopSpecs(list[object]):
-            def config_get(
-                self, values: list[int | None], block_id: int, default: object
-            ) -> object:
-                for idx, spec in enumerate(self):
-                    spec_obj = cast("SimpleNamespace", spec)
-                    if spec_obj.block_id == block_id:
-                        return values[idx]
-                return default
-
-        class _FakeReductionRoller:
-            def __init__(self, *args: object, **kwargs: object) -> None:
-                pass
-
-            def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
-                return graph
-
-        device_ir = DeviceIR()
-        graph0 = torch.fx.Graph()
-        graph0.output(())
-        graph1 = torch.fx.Graph()
-        graph1.output(())
-        device_ir.add_root_graph(graph0)
-        device_ir.add_root_graph(graph1)
-
-        root0 = cast("RootGraphInfo", device_ir.graphs[device_ir.root_ids[0]])
-        root1 = cast("RootGraphInfo", device_ir.graphs[device_ir.root_ids[1]])
-        root0.phase_index = 0
-        root1.phase_index = 1
-
-        block_id = 7
-        device_ir.rolled_reductions = [
-            RolledReductionInfo(
-                rolled_block_ids=[block_id],
-                original_graph_id=1,
-                used_rdim=True,
-                can_be_rolled_by_caller=True,
-            )
-        ]
-
-        reduction_specs = _FakeReductionLoopSpecs([SimpleNamespace(block_id=block_id)])
-        fake_env = SimpleNamespace(
-            block_sizes=[SimpleNamespace(block_id=block_id, reduction=True)],
-            config_spec=SimpleNamespace(reduction_loops=reduction_specs),
-        )
-
-        with (
-            patch(
-                "helion._compiler.device_ir.CompileEnvironment.current",
-                return_value=fake_env,
-            ),
-            patch("helion._compiler.device_ir.ReductionRoller", _FakeReductionRoller),
-        ):
-            device_ir._apply_rolling(helion.Config(reduction_loops=[16]))
-
-        rolled_root1 = cast("RootGraphInfo", device_ir.graphs[device_ir.root_ids[1]])
-        self.assertEqual(rolled_root1.phase_index, 1)
-
-    @skipIfRefEager(
-        "DeviceIR mutation test does not execute a kernel in ref eager mode"
-    )
     def test_register_rollable_reductions_does_not_mutate_graphs(self) -> None:
         class _FakeRDim:
             block_id = 7
@@ -240,25 +177,24 @@ class TestBarrier(RefEagerTestBase, TestCase):
                 device_ir: DeviceIR,
                 rdim: _FakeRDim,
                 graph_id_to_info: dict[int, RolledReductionInfo],
+                *,
+                allow_unbound_alias_facts: bool = False,
             ) -> None:
                 self.device_ir = device_ir
                 self.rdim = rdim
                 self.graphs_added: list[int] = []
                 self.outer_count = 0
 
-            def has_matmul_with_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_gather_along_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_stack_tensor_with_rdim(self, graph: torch.fx.Graph) -> bool:
-                return False
-
-            def has_unrollable_reduction(self, graph: torch.fx.Graph) -> bool:
+            def cannot_roll_graph(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def has_pinned_rdim(self) -> bool:
+                return False
+
+            def tied_rdims(self) -> list[int]:
+                return []
+
+            def reads_padded_range(self, graph: torch.fx.Graph) -> bool:
                 return False
 
             def process(self, graph: torch.fx.Graph) -> torch.fx.Graph:
@@ -279,7 +215,10 @@ class TestBarrier(RefEagerTestBase, TestCase):
         original_graph_count = len(device_ir.graphs)
 
         fake_backend = SimpleNamespace(
-            register_reduction_loop_config_slots=lambda *_: None
+            register_reduction_loop_config_slots=lambda *_: None,
+            rewrite_device_ir=lambda *_: None,
+            reduction_loops_allow_non_power_of_two=False,
+            reduction_loops_allow_full_extent=False,
         )
         fake_env = SimpleNamespace(
             block_sizes=[_FakeRDim()],
@@ -289,6 +228,7 @@ class TestBarrier(RefEagerTestBase, TestCase):
             ),
             backend_name="triton",
             backend=fake_backend,
+            subscript_extent_reductions={},
         )
 
         # The fake roller adds an empty subgraph (only an output node), so the
@@ -450,7 +390,7 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
     def test_split_k_matmul_default_config(self) -> None:
         """The example's default config (no explicit config) must launch a
         persistent kernel whose two phases agree on the thread layout."""
-        from examples.split_k_barrier import split_k_matmul
+        split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
         torch.manual_seed(0)
         a = torch.randn(16, 4096, device=DEVICE)
@@ -468,7 +408,7 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         lanes per axis-0 thread instead of shuffling consecutive lanes, and the
         launch must match the axes the body indexes (previously block=(16, 8, 1)
         was launched for a body indexing axes 1 and 2)."""
-        from examples.split_k_barrier import split_k_matmul
+        split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
         torch.manual_seed(0)
         a = torch.randn(16, 4096, device=DEVICE)
@@ -530,8 +470,9 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
     @skipIfRefEager("launch-layout checks only run in compiled mode")
     def test_rejects_tile_reduction_narrower_than_phase_launch(self) -> None:
         """A reduction over a 128-thread tile axis in phase 1 shares thread axis
-        0 with phase 2's 512-thread tile, so the launch runs more lanes on that
-        axis than the reduction spans."""
+        1 with phase 2's 512-thread tile (phase 2's row sum takes axis 0 with
+        the two threads the launch leaves it), so the launch runs more lanes on
+        that axis than the reduction spans."""
 
         @helion.kernel(autotune_effort="none")
         def two_phase_tile_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -549,8 +490,8 @@ class TestCuteBarrier(RefEagerTestBase, TestCase):
         y = torch.randn([64, 1024], device=DEVICE)
         with self.assertRaisesRegex(
             exc.BackendUnsupported,
-            r"reduction over tile block 1 spans 128 lanes on thread axis 0 but "
-            r"the hl\.barrier\(\) launch \(512, 1, 1\) runs 512 there",
+            r"reduction over tile block 1 spans 128 lanes on thread axis 1 but "
+            r"the hl\.barrier\(\) launch \(2, 512, 1\) runs 512 there",
         ):
             code_and_output(
                 two_phase_tile_sums,

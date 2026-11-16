@@ -183,7 +183,7 @@ def lower_register_chain(
 ) -> list[ast.stmt]:
     from ..device_function import TensorArg
 
-    sites = df.cute_state.collective_mma_sites
+    sites = df.cute_state.lanes.collective_mma_sites
     if len(sites) < 2:
         _reject("requires an admitted chain of contractions")
     first = sites[0]
@@ -474,7 +474,7 @@ def lower_register_chain(
         plan, prefix=df.new_var("register_chain"), tid=tid, fresh_name=df.new_var
     )
     working[row_index : row_index + 1] = emitted
-    df.cute_state.collective_register_chain_lowered = True
+    df.cute_state.lanes.collective_register_chain_lowered = True
     if flat_threads:
-        df.cute_state.collective_register_chain_block_dims = (64, 1, 1)
+        df.cute_state.lanes.collective_register_chain_block_dims = (64, 1, 1)
     return working

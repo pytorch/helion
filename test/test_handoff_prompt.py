@@ -9,6 +9,8 @@ import pytest
 from helion.autotuner.handoff_prompt import _evaluation_summary
 from helion.autotuner.handoff_prompt import build_handoff_prompt
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _evaluation(perf: float = 1.15) -> dict[str, Any]:
     return {

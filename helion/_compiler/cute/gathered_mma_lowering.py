@@ -20,6 +20,7 @@ from .gathered_mma import analyze_gathered_mma_region
 from .gathered_mma_codegen import emit_gathered_mma_region
 from .memory_ops import tensor_has_specialized_base_alignment
 from .promote_output_axis import _fresh_tensors
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from ..device_function import DeviceFunction
@@ -36,7 +37,7 @@ def gathered_tensor_facts(
     Dynamic scalar arguments and device metadata contents are never constants.
     """
     env = CompileEnvironment.current()
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return None
     tensor_args = [arg for arg in df.arguments if isinstance(arg, TensorArg)]
     guarded: dict[sympy.Expr, sympy.Integer] = {}
@@ -52,8 +53,9 @@ def gathered_tensor_facts(
         if env.tensor_input_source(arg.fake_value) is None:
             continue
         for value in (*arg.fake_value.shape, *arg.fake_value.stride()):
-            key = expression(value)
-            guarded[key] = sympy.Integer(env.size_hint(value))
+            hint = env.keyed_hint(value)
+            if hint is not None:
+                guarded[expression(value)] = sympy.Integer(hint)
 
     def exact(value: int | torch.SymInt | sympy.Expr) -> int | None:
         key = value if isinstance(value, sympy.Expr) else expression(value)
@@ -110,7 +112,7 @@ def lower_gathered_matmul(
 ) -> list[ast.stmt]:
     """Lower only an explicitly selected and fully proved pipeline region."""
     env = CompileEnvironment.current()
-    sites = df.cute_state.collective_mma_sites
+    sites = df.cute_state.lanes.collective_mma_sites
     facts = gathered_tensor_facts(df)
     thread_dims = _exact_thread_block_dims(df.tile_strategy)
     if (
@@ -119,9 +121,9 @@ def lower_gathered_matmul(
         or len(sites) != 1
         or facts is None
         or thread_dims is None
-        or df.codegen.cute_wrapper_plans
-        or df.cute_state.matmul_plan is not None
-        or df.cute_state.matmul_fx_nodes
+        or cute_codegen_state(df.codegen).wrapper_plans
+        or df.cute_state.tcgen05.matmul_plan is not None
+        or df.cute_state.tcgen05.matmul_fx_nodes
         or df.cute_state.has_tcgen05_fragment_epilogue_plan
     ):
         raise exc.BackendUnsupported(

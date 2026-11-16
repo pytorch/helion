@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 # Sigmoid uses the default pointwise lowering's EX2.APPROX + RCP.APPROX
 # contract, independently of fast_math. Its FP32 argument rounding already
 # dominates the reciprocal error. NaNs, infinities, and saturation retain
@@ -42,3 +44,14 @@ def argreduce_candidate_expr(
         f"({index}) if ((({value}) == ({reduced})) | "
         f"(({value}) != ({value}))) else ({max_index})"
     )
+
+
+def float_literal(value: float) -> str:
+    """Python source for a float constant: ``repr`` for a finite value;
+    ``inf``, ``-inf`` and ``nan`` repr to bare names (undefined in the
+    generated module), so they are spelled as ``float(...)`` calls."""
+    if math.isinf(value):
+        return "float('inf')" if value > 0 else "float('-inf')"
+    if math.isnan(value):
+        return "float('nan')"
+    return repr(value)

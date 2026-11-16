@@ -14,11 +14,15 @@ from typing import TYPE_CHECKING
 from typing import Literal
 
 from .. import exc
+from ..runtime.config_cache import ConfigCache
+from ..runtime.config_cache import ConfigSet
+from ..runtime.config_cache import _stored_config
 from helion._dist_utils import all_gather_object
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import MutableMapping
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -78,7 +82,7 @@ class HandoffProgress:
 
 @dataclasses.dataclass(frozen=True)
 class HandoffMeasurement:
-    """A detached observation, including failures and confirmation samples."""
+    """An observation with snapshotted config containers and opaque leaf identity."""
 
     phase: Literal["search", "confirmation"]
     algorithm: str
@@ -155,7 +159,7 @@ class _HandoffSession:
         self.trials = 0
         self.sources: set[str] = set()
         self.measurements: list[HandoffMeasurement] = []
-        self.candidates: dict[Config, HandoffMeasurement] = {}
+        self.candidates: MutableMapping[Config, HandoffMeasurement] = ConfigCache()
         self.reason: str | None = None
         self.callback_error: str | None = None
 
@@ -210,7 +214,7 @@ class _HandoffSession:
         measurement = HandoffMeasurement(
             phase,
             type(search).__name__,
-            copy.deepcopy(result.config),
+            _stored_config(result.config.config),
             result.perf if valid else None,
             result.status,
             source_hash,
@@ -295,22 +299,32 @@ class _HandoffSession:
             key=lambda m: m.perf if m.perf is not None else math.inf,
         )
         configs: list[Config] = []
-        seen: set[str | Config] = set()
+        seen_sources: set[str] = set()
+        seen_configs = ConfigSet()
         for measurement in ranked:
-            key = measurement.source_hash or measurement.config
-            if key not in seen:
-                seen.add(key)
+            key = measurement.source_hash
+            if (
+                key not in seen_sources
+                if key is not None
+                else measurement.config not in seen_configs
+            ):
+                if key is not None:
+                    seen_sources.add(key)
+                seen_configs.add(measurement.config)
                 configs.append(measurement.config)
             if len(configs) == self.policy.finalists:
                 break
         # Include the returned config even if its search timing did not place
         # it in the top K.
-        if extra is not None and extra not in configs:
-            configs.append(copy.deepcopy(extra))
+        if extra is not None and extra not in seen_configs:
+            configs.append(_stored_config(extra.config))
         configs = sync_object(configs, search.kernel.env.process_group_name)
         if not configs:
+            self.candidates.clear()
             return ()
-        samples: dict[Config, list[HandoffMeasurement]] = {c: [] for c in configs}
+        samples: MutableMapping[Config, list[HandoffMeasurement]] = ConfigCache(
+            (c, []) for c in configs
+        )
         settings = copy.copy(search.settings)
         settings.autotune_accuracy_check = True
         confirmation_log = copy.copy(search.log)
@@ -347,41 +361,49 @@ class _HandoffSession:
                     samples[result.config].append(measurement)
             finally:
                 provider.cleanup()
-        confirmed = []
-        for config, measurements in samples.items():
+        confirmed: dict[int, HandoffCandidate] = {}
+        invalid_indices: set[int] = set()
+        for index, config in enumerate(configs):
+            measurements = samples[config]
             values = tuple(m.perf for m in measurements if m.perf is not None)
             if len(values) != self.policy.repetitions:
-                self.candidates.pop(config, None)
+                invalid_indices.add(index)
                 continue
             perf = statistics.median(values)
             candidate = HandoffCandidate(
-                copy.deepcopy(config),
+                _stored_config(config.config),
                 measurements[-1].source_hash,
                 values,
                 perf,
                 statistics.median(abs(value - perf) for value in values),
             )
-            confirmed.append(candidate)
-            self.candidates[candidate.config] = dataclasses.replace(
-                measurements[-1], perf=perf
-            )
+            confirmed[index] = candidate
         # A finalist must succeed on every rank. Share one ranking so every
         # rank selects the same kernel, even with noisy timers.
-        invalid_configs = set(configs) - {c.config for c in confirmed}
+        # Configs were broadcast before benchmarking. Their stable positions,
+        # unlike opaque object identities inside them, survive rank transport.
         group = search.kernel.env.process_group_name
-        for invalid in all_gather_object(invalid_configs, group):
-            invalid_configs = invalid_configs | invalid
-        for config in invalid_configs:
-            self.candidates.pop(config, None)
-        return sync_object(
+        for invalid in all_gather_object(invalid_indices, group):
+            invalid_indices.update(invalid)
+        order = sync_object(
             tuple(
                 sorted(
-                    (c for c in confirmed if c.config not in invalid_configs),
-                    key=lambda candidate: candidate.perf,
+                    (index for index in confirmed if index not in invalid_indices),
+                    key=lambda index: confirmed[index].perf,
                 )
             ),
             group,
         )
+        # Confirmation is terminal for find_handoff. Replace the search pool
+        # rather than keep stale opaque identities from before the broadcast;
+        # the original observations remain in self.measurements.
+        self.candidates.clear()
+        for index in order:
+            candidate = confirmed[index]
+            self.candidates[candidate.config] = dataclasses.replace(
+                samples[configs[index]][-1], perf=candidate.perf
+            )
+        return tuple(confirmed[index] for index in order)
 
 
 def find_handoff(
@@ -423,7 +445,7 @@ def find_handoff(
             best = finalists[0]
             point = HandoffPoint(
                 reason,
-                copy.deepcopy(best.config),
+                _stored_config(best.config.config),
                 search.kernel.compile_config(best.config, allow_print=False),
                 session.progress(),
                 finalists,

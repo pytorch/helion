@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 import helion._compile_time as compile_time
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_enable_after_import_activates_measurement(monkeypatch) -> None:

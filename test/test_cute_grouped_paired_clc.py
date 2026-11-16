@@ -9,16 +9,19 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import torch
 
+from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_grouped_coverage_search import _search
 from test.test_cute_grouped_k128_full_coverage import _bound
-from test.test_cute_grouped_row_union_cluster4 import cpu_only as cpu_only
 from test.test_cute_grouped_row_union_cluster4 import wrapper
 from test.test_cute_shared_rhs_grouped import _plans
 
-from helion._compiler.autotuner_heuristics.cute import (
+import helion
+from helion._compiler.cute.autotune.heuristics.cute import (
     grouped_row_union_paired_clc_carrier,
 )
+from helion._compiler.cute.grouped_row_union import AB_STAGES_KEY
 from helion._compiler.cute.grouped_row_union import CONFIG_KEY
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC
 from helion._compiler.cute.grouped_row_union import PAIRED_CLC_SCHEDULE
@@ -26,23 +29,44 @@ from helion._compiler.cute.grouped_row_union import SCHEDULE_KEY
 from helion._compiler.cute.grouped_row_union import STARTUP_PREFILL_KEY
 from helion._compiler.cute.grouped_row_union import TRANSPOSED
 from helion._compiler.cute.grouped_row_union import GroupedRowUnionPlan
+from helion._compiler.cute.tcgen05.scheduler_pids import Tcgen05PersistentProgramIDs
+from helion._compiler.cute.tcgen05_constants import TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
 from helion._compiler.program_id import ProgramIDs
-from helion._compiler.program_id import Tcgen05PersistentProgramIDs
-from helion._testing import skipUnlessBackends
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
+
+grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
+
+# The B200 model with tcgen05 MMA support (the ``cpu_only`` model of
+# ``test_cute_grouped_row_union_cluster4``); the module-scoped ``case`` below
+# is set up ahead of the per-test marker and renders under the same model.
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.cpu_render(mma_support=tcgen05_mma_support()),
+]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _single_thread():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    yield
+    torch.set_num_threads(previous)
 
 
 @pytest.fixture(scope="module")
 def case():
-    bound, args = _bound(10240, 1024, 1024, 16)
-    with bound.env:
-        config = grouped_row_union_paired_clc_carrier(
-            bound.env, bound.host_function.device_ir
-        )
-    assert config is not None
-    config.config[STARTUP_PREFILL_KEY] = True
-    source = bound.to_code(config)
+    with cpu_render_target(mma_support=tcgen05_mma_support()):
+        bound, args = _bound(10240, 1024, 1024, 16)
+        with bound.env:
+            config = grouped_row_union_paired_clc_carrier(
+                bound.env, bound.host_function.device_ir
+            )
+        assert config is not None
+        config.config[STARTUP_PREFILL_KEY] = True
+        source = bound.to_code(config)
     return bound, args, config, source
 
 
@@ -54,7 +78,6 @@ def device(source):
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_original_ordinary_caller_profile_and_queues(case):
     bound, _, config, source = case
     before = deepcopy(config)
@@ -97,7 +120,6 @@ def test_original_ordinary_caller_profile_and_queues(case):
     assert source.count("tcgen05_c_pipeline.producer_tail()") == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_startup_is_private_before_publication_and_resume_is_once(case):
     fn = device(case[3])
     prefix = next(
@@ -105,14 +127,34 @@ def test_startup_is_private_before_publication_and_resume_is_once(case):
         for n in fn.body
         if isinstance(n, ast.If) and "tcgen05_prefill_state =" in ast.unparse(n)
     )
+    # The prologue publication is a named barrier the TMA-load warp skips
+    # (the startup prefill above runs ahead of it on that warp anyway).
     publish = next(
         n
         for n in fn.body
-        if isinstance(n, ast.Expr) and ast.unparse(n) == "cute.arch.sync_threads()"
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "not tcgen05_tma_warp"
+        and "tcgen05_row_union_publication_barrier.arrive_and_wait()"
+        in ast.unparse(n.body[0])
+    )
+    assert not any(
+        isinstance(n, ast.Expr) and ast.unparse(n) == "cute.arch.sync_threads()"
+        for n in fn.body
     )
     assert fn.body.index(prefix) < fn.body.index(publish)
-    assert "griddepcontrol_wait" in ast.unparse(prefix.body[0])
-    assert ast.unparse(prefix.body[1]).endswith("tcgen05_ab_producer_state.clone()")
+    body = list(prefix.body)
+    assert "griddepcontrol_wait" in ast.unparse(body[0])
+    # The ``entry`` release placement follows the lowering's own wait; the
+    # startup prefill is otherwise unchanged by it.
+    assert ast.unparse(body[1]) == "cute.arch.griddepcontrol_launch_dependents()"
+    del body[1]
+    # The throttled CLC scheduler's credit for the prefilled first tile follows
+    # the dependent-launch wait; the private prefill state comes after it.
+    assert ast.unparse(body[1]) == (
+        "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):"
+        "\n    tcgen05_clc_throttle_barrier.arrive()"
+    )
+    assert ast.unparse(body[2]).endswith("tcgen05_ab_producer_state.clone()")
     writes = {
         n.id
         for n in ast.walk(prefix)
@@ -134,12 +176,18 @@ def test_startup_is_private_before_publication_and_resume_is_once(case):
     resumed = next(n for n in producer.body if isinstance(n, ast.For))
     assert "range(7, unroll_full=True)" in ast.unparse(resumed.iter)
     work = next(n for n in producer.body if isinstance(n, ast.While))
-    first = next(
+    gated = [
         n
         for n in work.body
         if isinstance(n, ast.If)
         and ast.unparse(n.test) == "not tcgen05_prefilled_first_record"
+    ]
+    # The throttled scheduler's per-tile credit, then the resumed prefetch.
+    assert len(gated) == 2
+    assert ast.unparse(gated[0].body[0]).endswith(
+        "tcgen05_clc_throttle_barrier.arrive()"
     )
+    first = gated[1]
     assert len(first.body) == 1 and isinstance(first.body[0], ast.For)
     latch = work.body[work.body.index(first) + 1]
     assert (
@@ -158,7 +206,6 @@ def test_startup_is_private_before_publication_and_resume_is_once(case):
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_prefill_false_and_absent_are_byte_identical(case):
     bound, _, config, _ = case
     off = deepcopy(config)
@@ -171,7 +218,6 @@ def test_prefill_false_and_absent_are_byte_identical(case):
     assert "range(7, unroll=1)" in absent
 
 
-@skipUnlessBackends(["cute"])
 def test_steady_producer_has_only_remaining_packets(case):
     source = case[3]
     steady = next(
@@ -206,12 +252,15 @@ def test_linear_records_preserve_all_semantic_pid_orders(order):
             SimpleNamespace(
                 block_id=b,
                 pid_var=f"pid_{b}",
+                pack=1,
+                pack_axis=0,
                 num_pids_expr=lambda *, is_device, value=extents[b]: str(value),
             )
             for b in order
         ],
         _tcgen05_plan=lambda: plan,
         _tcgen05_logical_m_coord_expr=lambda value: f"({value}) // 2",
+        pid_division_exprs=lambda state: None,
     )
     expression = (
         Tcgen05PersistentProgramIDs._tcgen05_linear_virtual_pid_from_coords_expr(
@@ -254,7 +303,6 @@ def test_linear_records_preserve_all_semantic_pid_orders(order):
 @pytest.mark.parametrize(
     "m,n,k,g", [(640, 512, 512, 1), (1280, 768, 1024, 31), (768, 256, 512, 2)]
 )
-@skipUnlessBackends(["cute"])
 def test_non_original_domains_emit(m, n, k, g):
     assert PAIRED_CLC.index_domain(g, m, n, k)
     bound, _ = _bound(m, n, k, g)
@@ -306,7 +354,6 @@ def test_legacy_cluster4_whole_tile_domain_stays_separate():
         {"block_sizes": [128, 64, 64]},
     ],
 )
-@skipUnlessBackends(["cute"])
 def test_invalid_explicit_startup_or_profile_rejects(case, updates):
     config = deepcopy(case[2])
     config.config.update(updates)
@@ -314,7 +361,6 @@ def test_invalid_explicit_startup_or_profile_rejects(case, updates):
         case[0].to_code(config)
 
 
-@skipUnlessBackends(["cute"])
 def test_full_population_keeps_both_profile_siblings(case):
     bound, args, _, _ = case
     seeds = deepcopy(bound.config_spec.compiler_seed_configs)
@@ -339,3 +385,152 @@ def test_full_population_keeps_both_profile_siblings(case):
     assert outcomes[0].effective in configs
     assert outcomes[0].effective[STARTUP_PREFILL_KEY] is True
     assert bound.config_spec.compiler_seed_configs == seeds
+
+
+def _clc_throttle_markers(source: str) -> tuple[int, int, int]:
+    """(barrier objects, TMA-load credits, scheduler waits) in ``source``."""
+    return (
+        source.count(
+            "tcgen05_clc_throttle_barrier = cutlass.pipeline.NamedBarrier("
+            "barrier_id=5, num_threads=64)"
+        ),
+        source.count("tcgen05_clc_throttle_barrier.arrive()"),
+        source.count("tcgen05_clc_throttle_barrier.arrive_and_wait()"),
+    )
+
+
+def test_clc_query_pacing_throttles_the_scheduler_to_tile_starts(case):
+    bound, _, config, source = case
+    # Default pacing ("tile"): one barrier, the leader TMA-load warp's credit
+    # for the prefilled first tile and one per later tile, the scheduler's
+    # wait right before its single query.
+    assert _clc_throttle_markers(source) == (1, 2, 1)
+    fn = device(source)
+    credit = (
+        "if cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) == cutlass.Int32(0):"
+        "\n    tcgen05_clc_throttle_barrier.arrive()"
+    )
+    per_tile = [
+        n
+        for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and ast.unparse(n.test) == "not tcgen05_prefilled_first_record"
+        and ast.unparse(n.body[0]) == credit
+    ]
+    assert len(per_tile) == 1
+    # The per-tile credit leads the tile's AB prefetch (so the next tile's
+    # query overlaps these loads) and the wait leads the query.
+    rendered = ast.unparse(fn)
+    prologue_credit = rendered.index("tcgen05_clc_throttle_barrier.arrive()")
+    assert prologue_credit < rendered.index("tcgen05_prefill_state =")
+    assert rendered.index(
+        "tcgen05_clc_throttle_barrier.arrive()", prologue_credit + 1
+    ) < rendered.index("tcgen05_initial_k in cutlass.range(")
+    wait = rendered.index("tcgen05_clc_throttle_barrier.arrive_and_wait()")
+    assert wait < rendered.index("_cute_issue_clc_query_nomulticast(")
+    assert rendered.rindex("cute.arch.sync_warp()", 0, wait) > rendered.rindex(
+        "tcgen05_sched_pipeline_producer_state.advance()", 0, wait
+    )
+    # The default pacing is implied: normalization never carries it, so a
+    # config spelling it out and one leaving it implicit read alike.
+    normalized = bound.config_spec.normalized_config(config)
+    assert TCGEN05_CLC_QUERY_PACING_CONFIG_KEY not in normalized
+    spelled = deepcopy(config)
+    spelled.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "tile"
+    assert bound.config_spec.normalized_config(spelled) == normalized
+    assert bound.to_code(spelled) == source
+    # Eager pacing: no barrier, no credits, no wait; the knob survives.
+    eager = deepcopy(config)
+    eager.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "eager"
+    eager_source = bound.to_code(eager)
+    assert _clc_throttle_markers(eager_source) == (0, 0, 0)
+    assert eager_source.count("_cute_issue_clc_query_nomulticast(") == 1
+    assert (
+        bound.config_spec.normalized_config(eager)[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY]
+        == "eager"
+    )
+
+
+def test_clc_query_pacing_needs_a_clc_scheduler(case):
+    bound, _, config, _ = case
+    # The transposed profile has no scheduler warp: the inert default pacing
+    # leaves the config silently, a requested non-default pacing is rejected
+    # strictly and repaired by the search normalization.
+    other = deepcopy(config)
+    other.config[SCHEDULE_KEY] = TRANSPOSED.name
+    other.config.pop(STARTUP_PREFILL_KEY)
+    other.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "tile"
+    assert (
+        TCGEN05_CLC_QUERY_PACING_CONFIG_KEY
+        not in bound.config_spec.normalized_config(other)
+    )
+    other.config[TCGEN05_CLC_QUERY_PACING_CONFIG_KEY] = "eager"
+    with pytest.raises(InvalidConfig, match="tcgen05_clc_query_pacing"):
+        bound.config_spec.normalized_config(other)
+    repaired = deepcopy(other)
+    bound.config_spec.normalize(repaired, _fix_invalid=True)
+    assert TCGEN05_CLC_QUERY_PACING_CONFIG_KEY not in repaired.config
+    assert "tcgen05_clc_throttle_barrier" not in bound.to_code(repaired)
+
+
+# GPU numerics of the paired CLC grouped profile (sm_100).
+
+
+CUDA_DEVICE = "cuda"
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("ab_stages", [None, 4], ids=["own_ring", "ab4"])
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("partial", [False, True], ids=["full", "partial_g31"])
+def test_ordinary_paired_profile_cuda(
+    startup: bool, partial: bool, ab_stages: int | None
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("paired tcgen05 profile requires an SM100 CUDA device")
+    m, n, k = (640 if partial else 768), 256, 512
+    offsets = [17, 17, 49, 113, 113] + [617] * 27 if partial else [0, m]
+    generator = torch.Generator(device=CUDA_DEVICE).manual_seed(73453)
+    a = torch.randn(
+        (m, k), dtype=torch.bfloat16, device=CUDA_DEVICE, generator=generator
+    )
+    b = torch.randn(
+        (k, n), dtype=torch.bfloat16, device=CUDA_DEVICE, generator=generator
+    )
+    groups = torch.tensor(offsets, dtype=torch.int32, device=CUDA_DEVICE)
+    args = (a, b, groups)
+    kernel = helion.kernel(
+        grouped_gemm_jagged.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+        cute_segmented_matmul_tiling=True,
+    )
+    bound = kernel.bind(args)
+    with bound.env:
+        config = grouped_row_union_paired_clc_carrier(
+            bound.env, bound.host_function.device_ir
+        )
+    assert config is not None
+    config.config[STARTUP_PREFILL_KEY] = startup
+    if ab_stages is not None:
+        # A searched ring depth below the profile's own seven stages.
+        config.config[AB_STAGES_KEY] = ab_stages
+        with bound.env:
+            assert bound.config_spec.normalized_config(config)[AB_STAGES_KEY] == 4
+        assert "make_tma_umma_pipeline(num_stages=4," in bound.to_code(config)
+    bound.set_config(config)
+    # The public function allocates output on every invocation. The partial case
+    # covers [17,617), with empty groups and uncovered prefix/suffix rows; its
+    # final 192-row physical tile contains only 64 allocated rows. Unselected
+    # rows remain unspecified, so compare only the original intervals' union.
+    expected = a.float() @ b.float()
+    for _ in range(2):
+        result = bound(*args)
+        assert result.shape == (m, n) and result.dtype == torch.bfloat16
+        torch.testing.assert_close(
+            result[offsets[0] : offsets[-1]].float(),
+            expected[offsets[0] : offsets[-1]],
+            atol=0.01,
+            rtol=0.05,
+        )

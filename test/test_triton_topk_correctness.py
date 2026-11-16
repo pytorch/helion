@@ -9,13 +9,14 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from .test_triton_scalar_codegen import cpu_codegen as cpu_codegen
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.roll_reduction import ReductionRoller
 from helion._testing import DEVICE
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
+from helion._testing.triton_codegen import cpu_codegen as cpu_codegen
+from helion._testing.triton_codegen import interpret_triton_selection
 from helion._utils import triton_is_available
 import helion.language as hl
 from helion.runtime.settings import _get_backend
@@ -248,62 +249,19 @@ def test_selection_guard_checks_the_consumed_dimension(operation, dim):
         roller.should_go_in_inner_graph(node)
 
 
-def _interpret_triton_selection(source, inputs, path, monkeypatch, selected_ops=None):
-    """Execute the exact generated body through Triton's CPU interpreter."""
-    import importlib.util
-    import sys
-
-    from triton.runtime.interpreter import InterpretedFunction
-    from triton.runtime.interpreter import _patch_lang
-    from triton.runtime.jit import JITFunction
-
-    path.write_text(source)
-    spec = importlib.util.spec_from_file_location("selection_interpreter_fixture", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, spec.name, module)
-    spec.loader.exec_module(module)
-
-    def launch(kernel, grid, *args, **kwargs):
-        # The standard library was imported before interpreter mode. Dispatch
-        # its existing JIT helpers through the same interpreter, without
-        # replacing top-k/sort arithmetic with a reference implementation.
-        def device_call(function, *values, **options):
-            if selected_ops is not None and function.fn.__name__ in ("sort", "topk"):
-                selected_ops.add(function.fn.__name__)
-            interpreted = InterpretedFunction(function.fn)
-            # InterpretedFunction.__call__ patches each helper's language
-            # namespace without restoring it. Helpers may import tl.core,
-            # which the outer grid's tl patch does not cover.
-            scope = _patch_lang(function.fn)
-            try:
-                return interpreted.rewrite()(*values, **options)
-            finally:
-                scope.restore()
-
-        with patch.object(JITFunction, "__call__", device_call):
-            return InterpretedFunction(kernel.fn)[grid](*args, **kwargs)
-
-    function = next(
-        node.name
-        for node in reversed(ast.parse(source).body)
-        if isinstance(node, ast.FunctionDef)
-    )
-    return vars(module)[function](*inputs, _launcher=launch)
-
-
-@pytest.mark.parametrize("largest", [False, True])
+# The automatic dispatch sorts only one block row of four warps at k >= 32
+# over the 769-wide input; the rows sit on each side of those boundaries,
+# with each direction seen at every k.
 @pytest.mark.parametrize(
-    ("k", "warps", "rows_per_program"),
+    ("k", "warps", "rows_per_program", "largest"),
     [
-        (16, 4, 1),
-        (16, 8, 1),
-        (32, 4, 1),
-        (32, 8, 1),
-        (64, 4, 1),
-        (64, 8, 1),
-        (64, 4, 2),
-        (64, 4, 4),
+        (16, 4, 1, False),  # k below the sort threshold
+        (16, 8, 1, True),
+        (32, 4, 1, False),  # the smallest sorted k
+        (32, 8, 1, True),  # eight warps keep top-k
+        (64, 4, 1, True),  # the largest k
+        (64, 8, 1, False),
+        (64, 4, 4, True),  # several rows per program keep top-k
     ],
 )
 @skipIfRefEager("executes generated automatic dispatch through the CPU interpreter")
@@ -327,7 +285,7 @@ def test_float_topk_auto_dispatch_dynamic_widths(
         if largest:
             x = -x
         selected_ops = set()
-        values, indices = _interpret_triton_selection(
+        values, indices = interpret_triton_selection(
             code,
             (x, k, largest),
             tmp_path / "automatic_topk.py",
@@ -350,7 +308,7 @@ def test_float_topk_auto_dispatch_dynamic_widths(
 def test_float_topk_auto_other_targets(cpu_codegen, capability, hip, monkeypatch):
     bound = _row_topk._bind_isolated((torch.ones(3, 1024), 64, False))
     monkeypatch.setattr(bound.env.config_spec, "target_device_capability", capability)
-    monkeypatch.setattr("helion._compiler.triton.aten_lowering.is_hip", lambda: hip)
+    monkeypatch.setattr("helion._compat._is_hip", lambda: hip)
     config = bound.config_spec.default_config()
     config.config.update(block_sizes=[1], num_warps=4)
     code = bound.to_code(config)
@@ -358,10 +316,15 @@ def test_float_topk_auto_other_targets(cpu_codegen, capability, hip, monkeypatch
     assert "tl.topk(" in code
 
 
-@pytest.mark.parametrize("largest", [False, True])
+@skipUnlessBackends(["triton"])
+@pytest.mark.parametrize(
+    ("largest", "flatten"),
+    # flatten_loops makes the two tile dims one dimension of the value.
+    [(False, False), (True, False), (True, True)],
+)
 @skipIfRefEager("executes generated sort with two leading tile dimensions")
 def test_float_topk_sort_multiple_leading_dimensions(
-    cpu_codegen, largest, tmp_path, monkeypatch
+    cpu_codegen, largest, flatten, tmp_path, monkeypatch
 ):
     def batched_topk(x: torch.Tensor, k: hl.constexpr, largest: hl.constexpr):
         values = torch.empty((x.size(0), x.size(1), k), dtype=x.dtype, device=x.device)
@@ -381,10 +344,10 @@ def test_float_topk_sort_multiple_leading_dimensions(
     bound = kernel._bind_isolated((x, 17, largest))
     monkeypatch.setattr(bound.env.config_spec, "target_device_capability", (10, 3))
     config = bound.config_spec.default_config()
-    config.config.update(block_sizes=[1, 1], num_warps=4)
+    config.config.update(block_sizes=[1, 1], num_warps=4, flatten_loops=[flatten])
     code = bound.to_code(config)
     selected_ops = set()
-    values, indices = _interpret_triton_selection(
+    values, indices = interpret_triton_selection(
         code, (x, 17, largest), tmp_path / "batched_topk.py", monkeypatch, selected_ops
     )
     _assert_topk(x, 17, largest, values, indices)
@@ -419,11 +382,11 @@ def wrapper(x, out, *, _launcher):
     with patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")):
         if fail:
             with pytest.raises(InterpreterError, match="expected interpreter failure"):
-                _interpret_triton_selection(
+                interpret_triton_selection(
                     source, (x, out), tmp_path / "generated.py", monkeypatch
                 )
         else:
-            actual = _interpret_triton_selection(
+            actual = interpret_triton_selection(
                 source, (x, out), tmp_path / "generated.py", monkeypatch
             )
             torch.testing.assert_close(actual, x.topk(2).values, rtol=0, atol=0)
@@ -450,7 +413,7 @@ def test_tileir_topk_payload_selection(
         bound = kernel._bind_isolated((x, 4, largest))
         code = bound.to_code(bound.config_spec.default_config())
         assert "tl.gather" not in code
-        values, indices = _interpret_triton_selection(
+        values, indices = interpret_triton_selection(
             code, (x, 4, largest), tmp_path / "tileir_topk.py", monkeypatch
         )
     _assert_topk(x, 4, largest, values, indices)
@@ -479,7 +442,7 @@ def test_tileir_topk_after_promoted_division(cpu_codegen, dtype, tmp_path, monke
         )
         bound = kernel._bind_isolated((x, divisor))
         code = bound.to_code(bound.config_spec.default_config())
-        values, indices = _interpret_triton_selection(
+        values, indices = interpret_triton_selection(
             code, (x, divisor), tmp_path / "tileir_promoted_topk.py", monkeypatch
         )
     expected = torch.topk(x.float() / divisor.float(), 3, dim=-1)

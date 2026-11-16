@@ -5,6 +5,9 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
+from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import loop_extent
+
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
@@ -17,32 +20,8 @@ _MIN_SAVED_WORK = 8
 _LIVE_SCALAR_COST = 4
 
 
-def _call_path(node: ast.expr) -> str | None:
-    parts: list[str] = []
-    current: ast.expr = node
-    while isinstance(current, ast.Attribute):
-        parts.append(current.attr)
-        current = current.value
-    if not isinstance(current, ast.Name):
-        return None
-    parts.append(current.id)
-    return ".".join(reversed(parts))
-
-
 def _constexpr_extent(loop: ast.For) -> int | None:
-    call = loop.iter
-    if (
-        not isinstance(call, ast.Call)
-        or _call_path(call.func) not in {"range", "cutlass.range_constexpr"}
-        or len(call.args) != 1
-        or call.keywords
-        or not isinstance(call.args[0], ast.Constant)
-        or not isinstance(call.args[0].value, int)
-        or isinstance(call.args[0].value, bool)
-        or call.args[0].value <= 0
-    ):
-        return None
-    return call.args[0].value
+    return loop_extent(loop, minimum=1)
 
 
 def _expression_work(expression: ast.AST) -> int:
@@ -50,7 +29,7 @@ def _expression_work(expression: ast.AST) -> int:
     work = 0
     for node in ast.walk(expression):
         if isinstance(node, ast.Call):
-            path = _call_path(node.func)
+            path = call_path_str(node.func)
             # A warp reduction expands to multiple shuffle/combine operations.
             # Transcendentals and memory operations also deserve more weight
             # than a scalar cast or ordinary helper call.

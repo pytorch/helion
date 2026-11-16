@@ -43,20 +43,30 @@ from typing import TYPE_CHECKING
 import torch
 
 from ..device_function import TensorArg
-from .cute_flash_bwd_flex import _lines
-from .cute_flash_bwd_flex import _merge_blocks
-from .cute_flash_bwd_flex import _reg_split
+from ..emitter_protocols import source_adapter
+from .cute_flash_bwd_common import FbwdPSpec
+from .cute_flash_bwd_common import fbwd_dq_reduce_partitions
+from .cute_flash_bwd_common import fbwd_p_passes
+from .cute_flash_bwd_common import fbwd_p_sub_loop
+from .cute_flash_bwd_common import fbwd_tmem_warp
+from .cute_flash_bwd_common import indent_lines
+from .cute_flash_bwd_common import merge_blocks
+from .cute_flash_bwd_common import reg_split_counts
+from .cute_flash_bwd_common import setmaxreg
 from .cute_flash_bwd_flex import _render_hooks
-from .cute_flash_bwd_flex import _setmaxreg
 from .cute_flash_bwd_flex import _step_table_fill
 from .cute_flash_bwd_flex import _step_table_loop
 from .cute_flash_bwd_flex import _tile_decode
 from .cute_flash_bwd_flex import additive_bias_region
+from .cute_flash_bwd_flex import flex_bwd_bindings
+from .cute_flash_bwd_flex import flex_bwd_exp2_emu
 from .cute_flash_bwd_flex import flex_bwd_hook_plan
 from .cute_flash_bwd_flex import flex_bwd_pair_split_p
 from .cute_flash_bwd_flex import flex_bwd_pair_table_steps
+from .cute_flash_bwd_flex import flex_bwd_wrapper_plan
 from .flash_score_mod import render_flex_hook
 from .flex_bwd_match import flex_bwd_tmem_plan
+from .state import cute_codegen_state
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -314,8 +324,8 @@ def _pair_compute_block(
     pre_scaled = has_score or has_grad
     p_scale = "fbwd_log2c" if pre_scaled else "fbwd_scale2"
     hooks = [hook for hook in (plain, masked, jac) if hook is not None]
-    item_block = _merge_blocks(*(hook.item_prelude for hook in hooks))
-    tile_block = _merge_blocks(*(hook.tile_prologue for hook in hooks))
+    item_block = merge_blocks(*(hook.item_prelude for hook in hooks))
+    tile_block = merge_blocks(*(hook.tile_prologue for hook in hooks))
     # The hooks' item-level values run per step when the group has several
     # Q heads (the dK/dV clusters' steps change the Q head).
     per_step_item = plan.group > 1 and not dq_role
@@ -343,14 +353,14 @@ def _pair_compute_block(
             )
         return "\n".join(lines) + "\n"
 
-    def bias_lines(ind: str) -> str:
-        if not bias_fold or plain is None:
-            return ""
-        return (
-            f"{ind}fbwd_gfrag = cute.make_rmem_tensor(cute.make_layout({hook_cols}), cutlass.Float32)\n"
-            + _lines(plain.chunk_body, len(ind))
-            + f"{ind}_helion_flash_rt.fbwd_lse_fold(fbwd_lse_sub, fbwd_gfrag, fbwd_neg_log2c)\n"
-        )
+    p_spec = FbwdPSpec(
+        hook_cols=hook_cols,
+        p_scale=p_scale,
+        exp2_f32=exp2_f32,
+        exp2_emu=exp2_emu,
+        chunk_prefix=chunk_prefix,
+        fold_body=plain.chunk_body if bias_fold and plain is not None else None,
+    )
 
     # The LSE term: per Q column (staged per step, dK/dV clusters) or the
     # thread's row (dQ clusters: the resident fragment of the tile setup).
@@ -368,26 +378,11 @@ def _pair_compute_block(
     )
 
     def p_pass(hook: FlexHookCode | None, ind: str) -> str:
-        return (
-            lse_load.format(ind=ind)
-            + f"{ind}for fbwd_sub in cutlass.range_constexpr({subs}):\n"
-            + chunk_prefix(ind + "    ")
-            + f"{ind}    fbwd_lse_sub = cute.make_tensor(fbwd_lse_frg.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
-            + bias_lines(ind + "    ")
-            + (_lines(hook.chunk_body, len(ind) + 4) if hook is not None else "")
-            + f"{ind}    _helion_flash_rt.fbwd_p_pairs_packed(tLDrS, fbwd_lse_sub, fbwd_off, {hook_cols}, {p_scale}, None, fbwd_off, exp2_f32={exp2_f32}, emu_res={exp2_emu})\n"
-        )
+        return lse_load.format(ind=ind) + fbwd_p_sub_loop(ind, hook, p_spec)
 
-    unmasked_hook = None if bias_fold else plain
-    if masked is not None:
-        p_passes = (
-            "            if fbwd_masked != 0:\n"
-            + p_pass(masked, " " * 16)
-            + "            else:\n"
-            + p_pass(unmasked_hook, " " * 16)
-        )
-    else:
-        p_passes = p_pass(unmasked_hook, " " * 12)
+    p_passes = fbwd_p_passes(
+        p_pass, masked=masked, unmasked=None if bias_fold else plain
+    )
     jac_lines = ""
     if jac is not None:
         jac_lines = (
@@ -395,7 +390,7 @@ def _pair_compute_block(
             f"                fbwd_ch2 = fbwd_c0 // {hook_cols} + fbwd_sub\n"
             f"                fbwd_spre_chunk = cute.make_tensor(fbwd_spre.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
             f"                fbwd_cchunk = cute.logical_divide(tLDcS_h, {hook_cols})[None, fbwd_sub]\n"
-            + _lines(jac.chunk_body, 16)
+            + indent_lines(jac.chunk_body, 16)
             + f"                fbwd_ds_sub = cute.make_tensor(tLDrdP.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
             f"                _helion_flash_rt.fbwd_mul_pairs_packed(fbwd_ds_sub, fbwd_spre, fbwd_sub * {hook_cols}, {hook_cols})\n"
         )
@@ -409,8 +404,8 @@ def _pair_compute_block(
         if hook_pin
         else "fbwd_m_tile_h = fbwd_m_tile"
     )
-    item_lines = _lines(item_block, 12 if per_step_item else 8)
-    tile_lines = _lines(tile_block, 12)
+    item_lines = indent_lines(item_block, 12 if per_step_item else 8)
+    tile_lines = indent_lines(tile_block, 12)
     item_once = "" if per_step_item else item_lines
     item_each = item_lines if per_step_item else ""
     # The dQ clusters' item-level hook lines read the tile's Q tile (pinned
@@ -1143,14 +1138,7 @@ def _dq_role(
             fbwd_dkv_shape = fbwd_pvt.partition_shape_C((128, 256))
             tDKV_frag = fbwd_pvt.make_fragment_C(fbwd_dkv_shape)
             tDQ_t = cute.make_tensor(fbwd_tmem_ptr + {tmem_dq}, tDKV_frag.layout)
-            cDQ = cute.make_identity_tensor((128, 256))
-            tDQcDQ = fbwd_pvt.partition_C(cDQ)
-            fbwd_dq_ld_atom = cute.make_copy_atom(cute_tcgen05_flash.Ld32x32bOp(cute_tcgen05_flash.Repetition(32)), cutlass.Float32)
-            fbwd_tiled_dq_ld = cute_tcgen05_flash.make_tmem_copy(fbwd_dq_ld_atom, tDQ_t)
-            fbwd_thr_dq_ld = fbwd_tiled_dq_ld.get_slice(fbwd_local_tidx)
-            tRDtDQ = fbwd_thr_dq_ld.partition_S(tDQ_t)
-            tRDcDQ = fbwd_thr_dq_ld.partition_D(tDQcDQ)
-            fbwd_my_m = cutlass.Int32(tRDcDQ[0][0])
+{fbwd_dq_reduce_partitions("            ", d=256, thr_mma="fbwd_pvt")}            fbwd_my_m = cutlass.Int32(tRDcDQ[0][0])
             fbwd_my_row = fbwd_my_m % 32
             fbwd_my_c0 = cutlass.Int32(tRDcDQ[0][1]) // 16
             fbwd_slot0 = (warp_idx % 2) * 8
@@ -1218,7 +1206,7 @@ def emit_flash_bwd_flex_pair_device_body(
         mask_form=mask_form,
         hook_cols=hook_cols,
     )
-    regs_reduce, regs_compute, regs_other = _reg_split(reg_split)
+    regs_reduce, regs_compute, regs_other = reg_split_counts(reg_split)
     binding_lines = "".join(f"    {line}\n" for line in bindings)
     max_steps = flex_bwd_pair_table_steps(plan)
     # P gets its own staging buffer when the storage still fits (the step
@@ -1310,7 +1298,7 @@ def emit_flash_bwd_flex_pair_device_body(
 
     compute_blocks = "".join(
         f"""    if (warp_idx >= {lo}) & (warp_idx < {lo + 4}):
-        {_setmaxreg(regs_compute)}
+        {setmaxreg(regs_compute)}
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
         fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
 """
@@ -1544,22 +1532,18 @@ def emit_flash_bwd_flex_pair_device_body(
                 cute.copy(_fbwd_tma_v, tVgV_kdl[None, None, 0, fbwd_bhk][None, fbwd_n_tile], tVsV[None, fbwd_ve.index], tma_bar_ptr=fbwd_ve.barrier)
     cute.arch.sync_threads()
     if (warp_idx >= 12) & (warp_idx < 16):
-        {_setmaxreg(regs_other)}
+        {setmaxreg(regs_other)}
     if warp_idx == 13:
-{role_branch(dq.tma, dkdv.tma)}    if warp_idx == 12:
-        fbwd_tmem.allocate(512)
-        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
-        fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
-{role_branch(dq.mma, dkdv.mma)}        fbwd_tmem.relinquish_alloc_permit()
-        _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
-        fbwd_tmem.free(fbwd_tmem_ptr)
-    if warp_idx < 4:
-        {_setmaxreg(regs_reduce)}
+{role_branch(dq.tma, dkdv.tma)}{fbwd_tmem_warp(role_branch(dq.mma, dkdv.mma))}    if warp_idx < 4:
+        {setmaxreg(regs_reduce)}
         _helion_flash_rt.named_barrier_wait_unaligned(2, 13 * 32)
         fbwd_tmem_ptr = fbwd_tmem.retrieve_ptr(cutlass.Float32)
 {role_branch(dq.reduce, dkdv.reduce)}        _helion_flash_rt.named_barrier_arrive_unaligned(2, 13 * 32)
 {compute_blocks}"""
     return body  # noqa: RET504
+
+
+emit_flash_bwd_flex_pair_body = source_adapter(emit_flash_bwd_flex_pair_device_body)
 
 
 def codegen_flex_bwd_pair(
@@ -1580,7 +1564,6 @@ def codegen_flex_bwd_pair(
 ) -> bool:
     """Emit the pair kernel (the arguments were validated by
     :func:`cute_flash_bwd_flex.codegen_attention_flash_bwd_flex`)."""
-    import ast as ast_module
 
     from ..compile_environment import CompileEnvironment
     from .cute_flash import emit_flash_module_statements
@@ -1589,23 +1572,10 @@ def codegen_flex_bwd_pair(
     plan = match.plan
     env = CompileEnvironment.current()
     batch, heads, kv_heads = plan.batch, plan.heads, plan.kv_heads
-    exp2_emu_cfg = df.config.config.get("cute_flash_bwd_exp2_emu", 0)
-    exp2_emu = (
-        exp2_emu_cfg if isinstance(exp2_emu_cfg, int) and env.settings.fast_math else 0
-    )
+    exp2_emu = flex_bwd_exp2_emu(df, env)
     walk = plan.walk
     emit_flash_module_statements(cg)
-    bindings = [
-        f"_flash_heads = {heads}",
-        f"_fbwd_part_cnt = {args[walk.part_cnt_name].name}",
-        f"_fbwd_part_idx = {args[walk.part_idx_name].name}",
-        f"_fbwd_full_cnt = {args[walk.full_cnt_name].name}",
-        f"_fbwd_full_idx = {args[walk.full_idx_name].name}",
-    ]
-    for index, buffer in enumerate(plan.aux_buffers):
-        bindings.append(f"_flash_aux{index} = {args[buffer.name].name}")
-    for index, expr in enumerate(scalar_exprs):
-        bindings.append(f"_flash_hs{index} = {expr}")
+    bindings = flex_bwd_bindings(plan, args, scalar_exprs)
     # The dQ clusters' KV-side lists, derived on the host from the Q-side
     # tables (``flex_bwd_kv_tables``).
     q_blocks = -(-plan.q_seq // walk.q_block)
@@ -1633,42 +1603,22 @@ def codegen_flex_bwd_pair(
     n_dkdv = batch * kv_heads * plan.num_kv_tiles
     n_dq = batch * heads * q_tiles
     grid_multiplier = 2 * (-(-(n_dkdv + n_dq) // n_dkdv))
-    wrapper_plan: dict[str, object] = {
-        "kind": "helion_flash_bwd",
-        "flex_pair": True,
-        "q_name": args[match.q_name].name,
-        "k_name": args[match.k_name].name,
-        "v_name": args[match.v_name].name,
-        "do_name": args[match.do_name].name,
-        "lse_name": args[match.lse_name].name,
-        "delta_name": args[match.delta_name].name,
-        "dq_name": args[match.dq_name].name,
-        "dk_name": args[match.dk_name].name,
-        "dv_name": args[match.dv_name].name,
-        "head_dim": plan.head_dim,
-        "dtype": io_dtype_str,
-        "total_q_rows": plan.num_bh * plan.q_seq,
-        "total_kv_rows": batch * kv_heads * plan.kv_seq,
-        "q_stage": 1,
-        "do_stage": 1,
-        "kv_stage": 1,
-        "two_cta": False,
-        "persistent": False,
-        "total_tiles": batch * kv_heads * plan.num_kv_tiles,
-        "topology": "fa4",
-        "flex_seq_q": plan.q_seq,
-        "flex_bh_q": plan.num_bh,
-        "flex_seq_k": plan.kv_seq,
-        "flex_bh_k": batch * kv_heads,
-    }
-    cg.cute_wrapper_plans.append(wrapper_plan)  # type: ignore[attr-defined]
+    wrapper_plan = flex_bwd_wrapper_plan(
+        match,
+        args,
+        io_dtype_str,
+        total_tiles=batch * kv_heads * plan.num_kv_tiles,
+        family="flex_pair",
+    )
+    codegen_state = cute_codegen_state(cg)
+    codegen_state.wrapper_plans.append(wrapper_plan)
     df.wrapper_only_params.extend(_FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS)
     df.placeholder_args.update(a.name for a in args.values())
-    cg.cute_uses_matmul = True  # type: ignore[attr-defined]
-    df.cute_state.attention_flash_threads = 512
-    df.cute_state.cluster_shape = (2, 1, 1)
-    df.cute_state.launch_grid_multiplier = grid_multiplier
-    body_src = emit_flash_bwd_flex_pair_device_body(
+    codegen_state.declare_matmul()
+    df.cute_state.flash.threads = 512
+    df.cute_state.tcgen05.cluster_shape = (2, 1, 1)
+    df.cute_state.lanes.launch_grid_multiplier = grid_multiplier
+    emitted = emit_flash_bwd_flex_pair_body(
         plan=plan,
         io_dtype=io_dtype_str,
         scale_expr=scale_expr,
@@ -1688,8 +1638,6 @@ def codegen_flex_bwd_pair(
         q_blocks=q_blocks,
         kv_blocks=kv_blocks,
     )
-    wrapped = ast_module.parse("if True:\n" + body_src)
-    assert isinstance(wrapped.body[0], ast_module.If)
-    df.body = list(wrapped.body[0].body)
+    df.body = emitted.statements
     df.preamble = []
     return True

@@ -13,6 +13,7 @@ GPU-free codegen checks for three lowerings and their seed, plus GPU numerics:
 
 from __future__ import annotations
 
+import ast
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -22,18 +23,23 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.cute.unroll_lane_loads import _LevelPlan
 from helion._testing import DEVICE
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import patch_cute_mma_support
 from helion._testing import skipIfNotCUDA
-from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import kernel_body
 import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
 
-pytestmark = skipUnlessBackends(["cute"])
+# The CPU lane runs the codegen checks; the GPU lane runs the numerics,
+# marked ``cuda``.
+pytestmark = pytest.mark.cpu_only
+
 CPU = torch.device("cpu")
 
 VECTOR_ATOMIC = "_cute_red_add_f32_vec("
@@ -41,42 +47,8 @@ SCALAR_ATOMIC = "cute.arch.atomic_add("
 LOAD_LIST = "_lane_unroll_loads_"
 
 
-def _combine(
-    left_values: torch.Tensor,
-    left_indices: torch.Tensor,
-    right_values: torch.Tensor,
-    right_indices: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.where(
-            left_indices == right_indices, left_values + right_values, right_values
-        ),
-        right_indices,
-    )
-
-
-def _segmented_reduction(
-    indices: torch.Tensor, input_data: torch.Tensor, num_nodes: int
-) -> torch.Tensor:
-    """``examples/segment_reduction.py::segmented_reduction_helion``."""
-    num_elements, num_features = input_data.shape
-    output = torch.zeros(
-        (num_nodes, num_features), dtype=input_data.dtype, device=input_data.device
-    )
-    for tile_e, tile_f in hl.tile([num_elements, num_features]):
-        vals = input_data[tile_e, tile_f]
-        idxs = indices[tile_e]
-        idxs_next = hl.load(
-            indices, [tile_e.index + 1], extra_mask=tile_e.index < num_elements - 1
-        )
-        tuple_in = (vals, idxs.float().unsqueeze(1).expand_as(vals))
-        out_vals, _ = hl.associative_scan(_combine, tuple_in, dim=0)
-        mask = (idxs != idxs_next) | (
-            tile_e.index % tile_e.block_size == tile_e.block_size - 1
-        )
-        segment_vals = torch.where(mask.unsqueeze(1), out_vals, 0.0)
-        hl.atomic_add(output, [idxs, tile_f], segment_vals)
-    return output
+# The example's kernel function, which the tests bind for the CuTe backend.
+_segmented_reduction = import_example("segment_reduction").segmented_reduction_helion.fn
 
 
 def _scatter_where(
@@ -301,6 +273,21 @@ def _column_scan(input_t: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def _registered_scan(
+    x: torch.Tensor, reverse: hl.constexpr, dim: hl.constexpr
+) -> torch.Tensor:
+    if reverse:
+        columns = hl.register_block_size(x.size(1))
+        rows = hl.register_block_size(x.size(0))
+    else:
+        rows = hl.register_block_size(x.size(0))
+        columns = hl.register_block_size(x.size(1))
+    output = torch.empty_like(x)
+    for row, col in hl.tile(x.shape, block_size=[rows, columns]):
+        output[row, col] = hl.associative_scan(_add, x[row, col], dim=dim)
+    return output
+
+
 def _pointwise_2d(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile_e, tile_f in hl.tile(x.shape):
@@ -308,16 +295,11 @@ def _pointwise_2d(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-# GPU numerics tests; everything else runs with CUDA forbidden.
-_GPU_TESTS = {
-    "test_segmented_reduction_matches_index_add",
-    "test_elided_scatter_matches_the_unelided_sum",
-}
-
-
 @pytest.fixture(autouse=True)
 def _cpu_only(request: pytest.FixtureRequest) -> Iterator[None]:
-    if request.node.originalname in _GPU_TESTS:
+    """Every test but the ``cuda``-marked GPU numerics runs with CUDA
+    forbidden."""
+    if request.node.get_closest_marker("cuda") is not None:
         yield
         return
     with (
@@ -351,18 +333,7 @@ def _codegen(
     config = bound.config_spec.default_config()
     if overrides:
         config = helion.Config(**{**config.config, **overrides})
-    return _kernel_body(bound.to_code(config))
-
-
-def _kernel_body(code: str) -> str:
-    start = code.index("@cute.kernel")
-    kernel_def = code.index("\ndef ", start)
-    end = code.find("\ndef ", kernel_def + 1)
-    if end < 0:
-        end = len(code)
-    return "\n".join(
-        line for line in code[start:end].splitlines() if "# src[" not in line
-    )
+    return kernel_body(bound.to_code(config))
 
 
 def _segment_args(
@@ -648,6 +619,54 @@ def test_partial_lane_unroll_rolls_the_remaining_trips() -> None:
     assert re.search(r"= _lane_unroll_loads_\d+\[lane_0_u\]", code)
 
 
+@pytest.mark.parametrize(
+    ("columns", "unroll", "unrolled"),
+    [
+        # Four column packets per row: 8 rows would hold 32 packets live,
+        # twice ``_MAX_LIVE_PACKETS``, so the knob unrolls 4 rows.
+        (512, 8, 4),
+        # Sixteen per row: two rows already hold 32, so the knob declines
+        # and the knob-off kernel is regenerated.
+        (2048, 4, 1),
+    ],
+)
+def test_lane_unroll_counts_every_packet_of_a_nested_lane_loop(
+    columns: int, unroll: int, unrolled: int
+) -> None:
+    # The load phase appends a packet on every trip of the nested column lane
+    # loop; the budget counted one trip of it, so these unrolled 8 and 4 rows
+    # holding 32 and 64 packets.
+    x = torch.zeros(64, columns, dtype=torch.bfloat16, device=CPU)
+    config = {
+        "block_sizes": [8, columns],
+        "num_threads": [1, 32],
+        "cute_vector_widths": [1, 4],
+    }
+    code = _codegen(_pointwise_2d, (x,), **config, cute_lane_unroll=unroll)
+    if unrolled == 1:
+        assert code == _codegen(_pointwise_2d, (x,), **config)
+        assert LOAD_LIST not in code
+    else:
+        assert "for lane_0_blk in range(2):" in code
+        assert code.count(f"for lane_0_u in cutlass.range_constexpr({unrolled}):") == 2
+
+
+def test_lane_unroll_copy_budget_adds_sibling_nested_levels() -> None:
+    # Nested levels that run one after another in a lane body add their
+    # trace-time copies, as packet_count adds their packets; a level nested in
+    # another multiplies.  (The planner stops hoisting at a lane body's first
+    # nested loop, so no kernel builds sibling levels yet.)
+    def level(extent: int, *nested: _LevelPlan) -> _LevelPlan:
+        loop = ast.parse("for lane in range(1):\n    pass").body[0]
+        assert isinstance(loop, ast.For)
+        return _LevelPlan(loop, extent, list(nested))
+
+    assert level(8).nested_product() == 1
+    assert level(8, level(4)).nested_product() == 4
+    assert level(8, level(4), level(4)).nested_product() == 8
+    assert level(8, level(4, level(2)), level(4)).nested_product() == 12
+
+
 def test_lane_unroll_without_a_lane_loop_or_a_movable_load_changes_nothing() -> None:
     # No lane loop: every row of the tile has its own thread.
     args = _segment_args()
@@ -675,25 +694,33 @@ def test_lane_unroll_without_a_lane_loop_or_a_movable_load_changes_nothing() -> 
     assert "for lane_0 in range(16):" in unrolled
 
 
-def test_lane_unroll_declines_bodies_with_scalar_cache_policy_loads() -> None:
-    # The scalar streaming helper is not eligible for lane-load unrolling.
-    # Keep the policy and regenerate the ordinary loop unchanged.
+# The next-row index read with a streaming hint (an 8-byte scalar, which
+# ``lower_scalar_policy_loads`` spells as exact-policy PTX).
+_STREAMING_NEXT_INDEX = ["", "", "streaming"]
+
+
+def test_lane_unroll_moves_lowered_scalar_cache_policy_loads() -> None:
+    # The hinted 8-byte scalar load lowers to the exact-policy PTX helper, so
+    # the unroll takes its body: the load moves to the load phase with its
+    # hint.
     args = _segment_args()
-    policies = ["", "", "streaming"]
     plain = _codegen(
-        _segmented_reduction, args, **STRIP, load_eviction_policies=policies
+        _segmented_reduction,
+        args,
+        **STRIP,
+        load_eviction_policies=_STREAMING_NEXT_INDEX,
     )
     unrolled = _codegen(
         _segmented_reduction,
         args,
         **STRIP,
-        load_eviction_policies=policies,
+        load_eviction_policies=_STREAMING_NEXT_INDEX,
         cute_lane_unroll=16,
     )
     assert "_cute_scalar_policy_load(" in plain
-    assert "cutlass.Int64, 'streaming'" in plain
-    assert plain == unrolled
-    assert LOAD_LIST not in unrolled
+    assert LOAD_LIST not in plain
+    assert LOAD_LIST in unrolled
+    assert "cutlass.Int64, 'streaming'" in unrolled
 
 
 def test_lane_unroll_normalizes_to_one_without_a_grid_lane_loop() -> None:
@@ -767,6 +794,28 @@ def test_scan_tile_seed_skips_kernels_without_a_scan() -> None:
     assert not _unroll_seeds(bound)
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("transposed", [False, True])
+def test_scan_tile_seed_follows_grid_order(reverse: bool, transposed: bool) -> None:
+    x = torch.zeros(4096, 128, device=CPU)
+    if transposed:
+        x = x.t()
+    bound = _bind(_registered_scan, (x, reverse, int(transposed)))
+    seeds = _unroll_seeds(bound)
+    if transposed:
+        assert not seeds
+        return
+    assert seeds
+    row, col = (1, 0) if reverse else (0, 1)
+    spec = bound.config_spec
+    for seed in seeds:
+        assert spec.block_sizes.config_get(seed["block_sizes"], col) == 128
+        assert spec.num_threads.config_get(seed["num_threads"], row) == 1
+        assert spec.num_threads.config_get(seed["num_threads"], col) == 32
+        assert spec.cute_vector_widths.config_get(seed["cute_vector_widths"], col) == 4
+        assert LOAD_LIST in bound.to_code(helion.Config(**seed))
+
+
 def test_scan_tile_seed_skips_layouts_the_vector_protocol_cannot_realise() -> None:
     # 98 columns: no 16-byte packet covers the strip.
     assert not _unroll_seeds(
@@ -790,24 +839,20 @@ def _reference(indices: torch.Tensor, x: torch.Tensor, num_nodes: int) -> torch.
 
 
 def _index_patterns(num_elements: int, num_nodes: int) -> dict[str, torch.Tensor]:
-    """Sorted segment ids whose last row never belongs to node 0.
-
-    The example masks the next-row index of the last row with 0, so a
-    partial last tile whose last row is node 0 does not flag it as a
-    segment end (the Triton backend drops that sum too); the study inputs
-    (sorted random ids) never end on node 0 either.
+    """Sorted segment ids, one of them a single segment on node 0: the
+    kernel masks the next-row id of the last row with 0, so that row also
+    ends its segment explicitly, which a partial last tile on node 0 needs.
     """
     generator = torch.Generator().manual_seed(1)
     sorted_random = torch.randint(
         0, num_nodes, (num_elements,), generator=generator
     ).sort()[0]
-    sorted_random[-1] = num_nodes - 1
     # Segments of 33 rows straddle every 16- and 32-row tile boundary; the
     # last node ids stay empty.
     spans = torch.arange(num_elements) // 33
     return {
         "sorted_random": sorted_random,
-        "single_segment": torch.ones(num_elements, dtype=torch.int64),
+        "single_segment": torch.zeros(num_elements, dtype=torch.int64),
         "one_row_segments": torch.arange(num_elements) % num_nodes,
         "tile_spanning": spans.clamp(max=num_nodes - 1),
     }
@@ -844,7 +889,14 @@ _GPU_CONFIGS: dict[str, dict[str, Any]] = {
 }
 
 
+@pytest.mark.cuda
 @skipIfNotCUDA()
+# 36 cases, the full product: the six configs are distinct lowerings (lane
+# unrolls of 16, 8 and 4, 2-wide vectors, strided vector and scalar lanes);
+# the shapes end their row tiles evenly (4096) or not (2000 in 32-row tiles,
+# 1000 in 16- and 32-row tiles), the last with a partial vector of columns
+# (98); fast_math switches every lowering's zero-add elision, which must
+# keep each flush, a partial last tile's last row included.
 @pytest.mark.parametrize("fast_math", [False, True])
 @pytest.mark.parametrize("name", sorted(_GPU_CONFIGS))
 @pytest.mark.parametrize(
@@ -864,7 +916,13 @@ def test_segmented_reduction_matches_index_add(
             kernel, (indices, x, num_nodes), **_GPU_CONFIGS[name]
         )
         expected = _reference(indices, x, num_nodes)
-        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3), pattern
+        torch.testing.assert_close(
+            out,
+            expected,
+            rtol=1e-4,
+            atol=1e-3,
+            msg=lambda m, pattern=pattern: f"{pattern}: {m}",
+        )
         if name.startswith("strip") and num_features % 4 == 0:
             assert VECTOR_ATOMIC in code
         # A partial column tile keeps every load inside the per-element
@@ -876,10 +934,38 @@ def test_segmented_reduction_matches_index_add(
         y = torch.randn_like(x)
         _, out = code_and_output(kernel, (indices, y, num_nodes), **_GPU_CONFIGS[name])
         torch.testing.assert_close(
-            out, _reference(indices, y, num_nodes), rtol=1e-4, atol=1e-3
+            out,
+            _reference(indices, y, num_nodes),
+            rtol=1e-4,
+            atol=1e-3,
+            msg=lambda m, pattern=pattern: f"{pattern}: {m}",
         )
 
 
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_lane_unroll_over_a_streaming_scalar_load_matches_index_add() -> None:
+    """The unrolled body holding the hinted next-row index load compiles and
+    computes the segment sums (the CuTe DSL aborts on this form when the
+    hint reaches NVVM as an extended load, which
+    ``lower_scalar_policy_loads`` rules out)."""
+    kernel = helion.kernel(_segmented_reduction, backend="cute", static_shapes=True)
+    x = torch.randn(4096, 128, device=DEVICE)
+    indices = _index_patterns(4096, 64)["sorted_random"].to(DEVICE)
+    code, out = code_and_output(
+        kernel,
+        (indices, x, 64),
+        **STRIP,
+        load_eviction_policies=_STREAMING_NEXT_INDEX,
+        cute_lane_unroll=16,
+    )
+    # The unrolled form, with the hinted load lowered to exact-policy PTX.
+    assert LOAD_LIST in code
+    assert "cutlass.Int64, 'streaming'" in code
+    torch.testing.assert_close(out, _reference(indices, x, 64), rtol=1e-4, atol=1e-3)
+
+
+@pytest.mark.cuda
 @skipIfNotCUDA()
 def test_elided_scatter_matches_the_unelided_sum() -> None:
     """``fast_math`` elision vs every add issued, on +0.0, -0.0, NaN, inf and
@@ -919,3 +1005,25 @@ def test_elided_scatter_matches_the_unelided_sum() -> None:
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-4, equal_nan=True)
     assert torch.equal(torch.isnan(out), torch.isnan(expected))
     assert torch.isnan(out).any() and torch.isinf(out).any()
+
+
+@pytest.mark.parametrize(
+    "dtype,helper",
+    [
+        (torch.float16, "_cute_red_add_f16_vec("),
+        (torch.bfloat16, "_cute_red_add_bf16_vec("),
+    ],
+)
+def test_half_output_vector_lanes_flush_packed_reductions(
+    dtype: torch.dtype, helper: str
+) -> None:
+    """A half output kept in its dtype (no fp32 promotion) takes the same
+    V-loop flush as fp32: four lanes become one ``red.global.add.noftz.v2.f16x2``
+    / ``bf16x2`` instead of four scalar atomics (compare-and-swap loops on
+    sm_100)."""
+    indices, values, num_nodes = _segment_args()
+    args = (indices, values.to(dtype), num_nodes)
+    code = _codegen(_segmented_reduction, args, **STRIP)
+    assert helper in code, code
+    assert "_tile_atomic_vals_1_0.append(cutlass." in code
+    assert VECTOR_ATOMIC not in code

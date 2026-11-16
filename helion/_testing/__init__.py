@@ -1,0 +1,2468 @@
+from __future__ import annotations
+
+import collections
+import contextlib
+import functools
+import importlib
+import importlib.machinery
+import importlib.metadata
+import importlib.util
+import inspect
+import io
+import logging
+import math
+import operator
+import os
+from pathlib import Path
+import re
+import sys
+import tempfile
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from typing import Callable
+from typing import Generator
+from typing import NamedTuple
+from typing import ParamSpec
+from typing import Sequence
+from typing import TypeVar
+from typing import cast
+import unittest
+from unittest.mock import patch
+
+import filelock
+import pytest
+import torch
+import torch.distributed as dist
+import torch.nn.functional
+from torch.utils._pytree import tree_map
+
+from .._compat import get_mtia_tunable_fragments
+from .._compat import get_tensor_descriptor_fn_name
+from .._compat import requires_torch_version
+from .._compat import supports_amd_cdna_tunables
+from .._compat import supports_block_ptr
+from .._compat import supports_host_tensor_descriptor
+from .._compat import supports_tensor_descriptor
+from .._compat import target_device_capability
+from .._dist_utils import is_master_rank
+from .._dist_utils import sync_object as sync_object
+from .._utils import counters
+from ..autotuner.benchmarking import synchronize_device
+from ..runtime.settings import _get_backend
+from ..runtime.settings import is_pallas_interpret
+from helion.autotuner.benchmark_provider import _clone_args
+
+if _get_backend() == "pallas":
+    from ..autotuner.benchmarking import compute_repeat_generic as compute_repeat
+    from ..autotuner.benchmarking import do_bench_generic as do_bench
+    from ..autotuner.benchmarking import interleaved_bench_generic as interleaved_bench
+else:
+    from ..autotuner.benchmarking import compute_repeat
+    from ..autotuner.benchmarking import do_bench as do_bench
+    from ..autotuner.benchmarking import interleaved_bench
+
+import typing
+
+from ..runtime.config import Config
+from ..runtime.ref_mode import is_ref_mode_enabled
+from ..runtime.settings import RefMode
+
+if TYPE_CHECKING:
+    import types
+
+    from .._compiler.cute.target_facts import TargetFacts
+    from .._hardware import HardwareInfo
+    from ..runtime.kernel import BoundKernel
+    from ..runtime.kernel import Kernel
+
+_R = TypeVar("_R")
+_P = ParamSpec("_P")
+
+
+class CosSimilarity(NamedTuple):
+    dim: int
+    min_similarity: float
+
+
+def _strip_launcher_args(value: str) -> str:
+    strip_pairs = []
+    if supports_amd_cdna_tunables():
+        strip_pairs += [
+            (r", waves_per_eu=\d+", ""),
+            (r", matrix_instr_nonkdim=\d+", ""),
+            (r", xcd_remap=(?:True|False)", ""),
+        ]
+    if _get_backend() == "tileir":
+        strip_pairs += [(r", num_ctas=\d+", ""), (r", occupancy=\d+", "")]
+    for tunable in get_mtia_tunable_fragments():
+        # Match tunable=value patterns:
+        # - Quoted strings: 'value' or "value"
+        # - Unquoted values (bools, numbers): stops at comma or closing paren
+        strip_pairs.append((rf", {tunable}=(?:'[^']*'|\"[^\"]*\"|[^,)]+)", ""))
+    for pattern, replacement in strip_pairs:
+        value = re.sub(pattern, replacement, value)
+    return value
+
+
+def _get_triton_backend() -> str | None:
+    try:
+        import triton
+
+        # pyrefly: ignore [missing-attribute]
+        return triton.runtime.driver.active.get_current_target().backend
+    except Exception:
+        return None
+
+
+def skipIfFn(
+    cond_fn: Callable[[], bool], reason: str
+) -> Callable[[Callable], Callable]:
+    """Decorator that evaluates skip condition at test execution time.
+
+    Unlike unittest.skipIf which evaluates at decoration time, this defers
+    evaluation to e.g. avoid CUDA init during pytest-xdist collection.
+
+    Works on both test methods and test classes. When applied to a class,
+    wraps setUp to check the skip condition before each test runs.
+    """
+
+    if not isinstance(reason, str):
+        raise TypeError(
+            f"Decorator using skipIfFn requires a reason string argument, got {type(reason).__name__}. "
+            "Make sure to call the decorator with parentheses, e.g. @decorator('reason') or @decorator()"
+        )
+
+    def decorator(test_item: Callable) -> Callable:
+        if isinstance(test_item, type):
+            # For classes: wrap setUp to check skip condition at test execution time
+            original_setUp = test_item.setUp  # pyrefly: ignore [missing-attribute]
+
+            @functools.wraps(original_setUp)
+            def new_setUp(self: object, *args: object, **kwargs: object) -> object:
+                if cond_fn():
+                    assert isinstance(self, unittest.TestCase)
+                    self.skipTest(reason)
+                return original_setUp(self, *args, **kwargs)
+
+            test_item.setUp = new_setUp  # type: ignore[attr-defined]
+            return test_item
+        # For functions/methods
+
+        @functools.wraps(test_item)
+        def wrapper(*args: object, **kwargs: object) -> object:
+            if cond_fn():
+                # Use self.skipTest() when called on a TestCase method so that
+                # RefEagerTestBase's patched skipTest counter is incremented.
+                if args and isinstance(args[0], unittest.TestCase):
+                    args[0].skipTest(reason)
+                else:
+                    raise unittest.SkipTest(reason)
+            return test_item(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def xfailIfFn(
+    cond_fn: Callable[[], bool], reason: str
+) -> Callable[[Callable], Callable]:
+    """Decorator that marks tests expected-failure when condition is true."""
+
+    def decorator(test_item: Callable) -> Callable:
+        if not cond_fn():
+            return test_item
+
+        if isinstance(test_item, type):
+            for name, value in vars(test_item).items():
+                if name.startswith("test") and callable(value):
+                    setattr(test_item, name, unittest.expectedFailure(value))
+            return test_item
+
+        decorated = unittest.expectedFailure(test_item)
+        decorated.__doc__ = (
+            f"{decorated.__doc__ or ''}\n[xfailIfFn reason] {reason}".rstrip()
+        )
+        return decorated
+
+    return decorator
+
+
+def is_mtia() -> bool:
+    """Return True if running on MTIA."""
+    return _get_triton_backend() == "mtia"
+
+
+def skipIfMTIA(reason: str) -> Callable[[Callable], Callable]:
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(is_mtia, reason)
+
+
+class _LogCapture(logging.Handler):
+    """Simple logging handler to capture log records."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.records.append(record)
+
+    def clear(self) -> None:
+        self.records.clear()
+
+
+class _OutputCapture:
+    """Simple output capture class for stdout/stderr."""
+
+    def __init__(self) -> None:
+        self.stdout = io.StringIO()
+        self.stderr = io.StringIO()
+
+    def readouterr(self) -> tuple[str, str]:
+        """Read and clear captured output, returning (stdout, stderr) tuple."""
+        stdout_val = self.stdout.getvalue()
+        stderr_val = self.stderr.getvalue()
+        # Clear the buffers
+        self.stdout.seek(0)
+        self.stdout.truncate()
+        self.stderr.seek(0)
+        self.stderr.truncate()
+        return (stdout_val, stderr_val)
+
+
+def is_cuda() -> bool:
+    """Return True if running on CUDA (NVIDIA GPU)."""
+    if _get_backend() == "pallas":
+        return False
+    return _get_triton_backend() == "cuda" and torch.cuda.is_available()
+
+
+def is_xpu() -> bool:
+    """Return True if running on Intel XPU."""
+    return _get_triton_backend() == "xpu" and torch.xpu.is_available()
+
+
+PROJECT_ROOT: Path = Path(__file__).parent.parent.parent
+EXAMPLES_DIR: Path = PROJECT_ROOT / "examples"
+
+# ``examples/`` holds standalone scripts and is deliberately not a package:
+# a bare ``import examples`` resolves to whichever ``examples`` directory is
+# first on sys.path.  Expose the directory under this unique dotted name
+# instead, so ``import_example("matmul")`` is an ordinary import of
+# ``helion._testing.examples.matmul``: the module gets a real spec and file,
+# is cached in ``sys.modules``, can be re-imported by name in a benchmark
+# worker process (``PortableFunction``), and can be traced by torch.compile.
+EXAMPLES_PACKAGE = f"{__name__}.examples"
+if EXAMPLES_PACKAGE not in sys.modules:
+    _examples_spec = importlib.machinery.ModuleSpec(
+        EXAMPLES_PACKAGE, None, is_package=True
+    )
+    _examples_spec.submodule_search_locations = [str(EXAMPLES_DIR)]
+    sys.modules[EXAMPLES_PACKAGE] = importlib.util.module_from_spec(_examples_spec)
+PRETUNED_KERNELS_DIR: Path = PROJECT_ROOT / "pretuned_kernels"
+
+# The skip reason of ``skipUnlessBackends`` / ``onlyBackends``, followed by the
+# backend name.
+BACKEND_SKIP_REASON = "disabled for HELION_BACKEND="
+DEVICE = None
+
+
+def _has_mtia_runtime() -> bool:
+    try:
+        # is_mtia() calls _get_triton_backend() which triggers CUDA init on CUDA devices,
+        # so we first try importing MTIA lib to make sure we are in MTIA-available environment.
+        import mtia.host_runtime.torch_mtia.dynamic_library  # noqa: F401  # pyrefly: ignore[missing-import]
+
+        return is_mtia()
+    except ImportError:
+        return False
+
+
+# Determine DEVICE without calling functions that initialize CUDA.
+if _get_backend() == "pallas" and is_pallas_interpret():
+    DEVICE = torch.device("cpu")
+elif _get_backend() == "pallas":
+    DEVICE = torch.device("tpu")
+elif torch.xpu.is_available():
+    DEVICE = torch.device("xpu")
+elif _has_mtia_runtime():
+    DEVICE = torch.device("mtia")
+elif _get_backend() == "metal" and torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cuda")
+
+# Half-precision dtype: bfloat16 on TPU (float16 not supported), float16 elsewhere
+if _get_backend() == "pallas" and not is_pallas_interpret():
+    HALF_DTYPE = torch.bfloat16
+else:
+    HALF_DTYPE = torch.float16
+
+# Long integer dtype: int32 on TPU (64-bit types not supported), int64 elsewhere
+if _get_backend() == "pallas":
+    LONG_INT_TYPE = torch.int32
+else:
+    LONG_INT_TYPE = torch.int64
+
+
+def get_nvidia_gpu_model() -> str:
+    """
+    Retrieves the model of the NVIDIA GPU being used.
+    Will return the name of the current device.
+    Returns:
+        str: The model of the NVIDIA GPU or empty str if not found.
+    """
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        return getattr(props, "name", "")
+    return ""
+
+
+def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running in ref eager mode (HELION_INTERPRET=1)."""
+    return unittest.skipIf(os.environ.get("HELION_INTERPRET") == "1", reason)
+
+
+def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running in normal mode (i.e. if HELION_INTERPRET=1 is not set)."""
+    return unittest.skipIf(os.environ.get("HELION_INTERPRET") != "1", reason)
+
+
+def skipIfRocm(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with rocm"""
+    return unittest.skipIf(torch.version.hip is not None, reason)
+
+
+@functools.cache
+def _has_fbtriton() -> bool:
+    # Meta's fbtriton distribution owns the triton package. Looked up by name:
+    # packages_distributions() reads every distribution's file list, which
+    # raises in a fbcode par.
+    try:
+        importlib.metadata.distribution("fbtriton")
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return True
+
+
+def skipIfFbTriton(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if the Triton backend runs on Meta's fbtriton build."""
+    # Deferred to test time like skipIfTileIR: no CUDA init at collection.
+    return skipIfFn(lambda: _get_backend() == "triton" and _has_fbtriton(), reason)
+
+
+def skipIfTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with tileir"""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: _get_backend() == "tileir", reason)
+
+
+def skipIfMetal(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with metal"""
+    return skipIfFn(lambda: _get_backend() == "metal", reason)
+
+
+def skipIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with pallas"""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def skipIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test only on real Pallas TPU (not in interpret mode)."""
+    return skipIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
+def xfailIfPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure if running with pallas (TPU or interpret mode)"""
+    return xfailIfFn(lambda: _get_backend() == "pallas", reason)
+
+
+def xfailIfPallasTpu(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure only on real Pallas TPU (passes in interpret mode)."""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and not is_pallas_interpret(), reason
+    )
+
+
+def xfailIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test as expected failure only in Pallas interpret mode (passes on real TPU)."""
+    return xfailIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
+
+
+def skipIfPallasInterpret(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test in Pallas interpret mode (e.g. tests of TPU-only behavior)."""
+    return skipIfFn(
+        lambda: _get_backend() == "pallas" and is_pallas_interpret(), reason
+    )
+
+
+def skipUnlessAMDCDNA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on AMD CDNA architecture."""
+    from helion._compat import supports_amd_cdna_tunables
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not supports_amd_cdna_tunables(), reason)
+
+
+def skipUnlessMultiXCD(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on a multi-XCD AMD CDNA GPU.
+
+    Single-XCD parts and CPX-partitioned devices (which expose one XCD) are
+    skipped, since xcd_remap is a no-op there.
+    """
+    from helion._compat import supports_amd_cdna_tunables
+    from helion.runtime.triton.launcher import get_num_xcd
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not (supports_amd_cdna_tunables() and get_num_xcd() > 1), reason
+    )
+
+
+def skipUnlessMTIA(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on MTIA hardware."""
+    from .._compat import supports_mtia_tunables
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: not supports_mtia_tunables(), reason)
+
+
+def skipUnlessTileIR(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless running on tileir"""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: _get_backend() != "tileir", reason)
+
+
+@functools.cache
+def _has_cute_dsl() -> bool:
+    from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
+
+    return _cute_backend_requirement_error() is None
+
+
+def skipUnlessCuteAvailable(reason: str) -> Callable[[Callable], Callable]:
+    """Skip unless every validated CuTe backend requirement is available."""
+    return skipIfFn(lambda: not _has_cute_dsl(), reason)
+
+
+def _tcgen05_runtime_n_ptx_compatible() -> bool:
+    from .._compiler.cute.cutedsl_compat import tcgen05_runtime_n_ptx_compatible
+
+    return tcgen05_runtime_n_ptx_compatible()
+
+
+# Runtime UMMA-N raw PTX (grouped worklist codegen and its seeds) is enabled only
+# for the exact CuTe DSL release it was validated on; other releases fall back to
+# static-width MMA.
+skipUnlessTcgen05RuntimeNPtx = skipIfFn(
+    lambda: not _tcgen05_runtime_n_ptx_compatible(),
+    "runtime UMMA-N PTX is enabled only for the validated nvidia-cutlass-dsl release",
+)
+
+
+def xfailIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Mark test xfail when CUTLASS CuTe backend is selected."""
+    return xfailIfFn(lambda: _get_backend() == "cute", reason)
+
+
+def skipIfCute(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when CUTLASS CuTe backend is selected."""
+    return skipIfFn(lambda: _get_backend() == "cute", reason)
+
+
+# The torch.chunk / torch.unbind device lowering (view_ops._check_split_backend).
+skipUnlessChunkLowering = skipIfFn(
+    lambda: _get_backend() not in ("triton", "cute"),
+    "torch.chunk/torch.unbind device lowering exists on Triton and CuTe only",
+)
+
+
+def matchesBackends(backends: Sequence[str]) -> bool:
+    """Return whether `_get_backend() in backends`, matching onlyBackends."""
+    backend = _get_backend()
+    return backend in backends or (backend == "tileir" and "triton" in backends)
+
+
+def _axis_pair(i: int, a: int, j: int, b: int) -> tuple[int, int, int, int]:
+    return (i, a, j, b) if i < j else (j, b, i, a)
+
+
+def pairwise(**axes: Sequence[object]) -> list[tuple[object, ...]]:
+    """Return an all-pairs covering array over ``axes``, in axis order.
+
+    Every value of every axis appears together with every value of every other
+    axis in at least one row, which catches the interactions a full product
+    would while growing with the two largest axes instead of their product
+    (eight boolean flags need 9 rows, not 256). The greedy construction is
+    deterministic, so pytest ids are stable. Use the result as the parameter
+    list of ``pytest.mark.parametrize``.
+    """
+    names = list(axes)
+    values = [list(axes[name]) for name in names]
+    for name, options in zip(names, values, strict=True):
+        if not options:
+            raise ValueError(f"pairwise axis {name!r} has no values")
+    if len(names) == 1:
+        return [(value,) for value in values[0]]
+    uncovered = {
+        (i, a, j, b)
+        for i in range(len(names))
+        for j in range(i + 1, len(names))
+        for a in range(len(values[i]))
+        for b in range(len(values[j]))
+    }
+    rows: list[tuple[int, ...]] = []
+    while uncovered:
+        # Seed the row with the first uncovered pair, then give every other
+        # axis the value that covers the most pairs with the values chosen so
+        # far (lowest index on ties).
+        i, a, j, b = min(uncovered)
+        row = {i: a, j: b}
+        for axis in range(len(names)):
+            if axis in row:
+                continue
+
+            def gain(value: int, axis: int = axis, chosen: dict[int, int] = row) -> int:
+                return sum(
+                    _axis_pair(axis, value, other, index) in uncovered
+                    for other, index in chosen.items()
+                )
+
+            row[axis] = max(range(len(values[axis])), key=lambda v: (gain(v), -v))
+        choice = tuple(row[axis] for axis in range(len(names)))
+        rows.append(choice)
+        for i in range(len(names)):
+            uncovered.difference_update(
+                (i, choice[i], j, choice[j]) for j in range(i + 1, len(names))
+            )
+    return [
+        tuple(values[axis][index] for axis, index in enumerate(row)) for row in rows
+    ]
+
+
+def skipUnlessBackends(backends: Sequence[str]) -> pytest.MarkDecorator:
+    """Return a pytest mark that skips unless `_get_backend() in backends`."""
+    backend = _get_backend()
+    return pytest.mark.skipif(
+        not matchesBackends(backends),
+        reason=f"{BACKEND_SKIP_REASON}{backend}",
+    )
+
+
+def default_cute_mma_support(
+    *,
+    supported_impls: tuple[str, ...] = ("universal", "warp", "tcgen05"),
+    warp_f16bf16: bool = True,
+    tcgen05_f16bf16: bool = True,
+    tcgen05_f8: bool = True,
+) -> SimpleNamespace:
+    """Return a ``get_cute_mma_support()`` mock with tcgen05-on defaults."""
+    return SimpleNamespace(
+        supported_impls=supported_impls,
+        warp_f16bf16=warp_f16bf16,
+        tcgen05_f16bf16=tcgen05_f16bf16,
+        tcgen05_f8=tcgen05_f8,
+    )
+
+
+@contextlib.contextmanager
+def patch_cute_mma_support(
+    support: SimpleNamespace | None = None,
+) -> Generator[SimpleNamespace, None, None]:
+    """Patch the support function and its compiler-module bindings.
+
+    Import consumers before patching so first use cannot leave a mock bound
+    in a newly imported module after this context exits.
+    """
+    from .._compiler.cute import mma_support
+
+    if support is None:
+        support = default_cute_mma_support()
+    mma_support.clear_cute_mma_support_cache()
+    try:
+        with (
+            patch(
+                "helion._compiler.cute.cute_mma.get_cute_mma_support",
+                return_value=support,
+            ),
+            patch(
+                "helion._compiler.cute.mma_support.get_cute_mma_support",
+                return_value=support,
+            ),
+        ):
+            yield support
+    finally:
+        mma_support.clear_cute_mma_support_cache()
+
+
+class _Unset:
+    """Default of a ``patch_target_facts`` keyword that leaves its seam alone."""
+
+
+_UNSET = _Unset()
+_TARGET_FACTS = "helion._compiler.cute.target_facts"
+
+
+def _constant_probe(value: object) -> Callable[..., object]:
+    """A plain function returning ``value`` for one device-probe seam.
+
+    A ``MagicMock`` answers every attribute, so a kernel body that calls
+    ``helion.runtime.get_num_sm(x.device)`` on the host (the persistent
+    examples) would type-propagate the patched probe as a device-only API
+    function and fail to bind; a function has no such attributes.
+    """
+
+    def probe(*args: object, **kwargs: object) -> object:
+        return value
+
+    return probe
+
+
+@contextlib.contextmanager
+def patch_target_facts(
+    facts: TargetFacts | None = None,
+    *,
+    capability: tuple[int, int] | _Unset | None = _UNSET,
+    num_sm: int | _Unset = _UNSET,
+    matmul_num_sm: int | _Unset = _UNSET,
+    smem_capacity_bytes: int | _Unset = _UNSET,
+    smem_budget_bytes: int | _Unset = _UNSET,
+    reduction_smem_budget_bytes: int | _Unset = _UNSET,
+    hardware: HardwareInfo | Callable[..., HardwareInfo] | _Unset = _UNSET,
+    is_hip: bool | _Unset = _UNSET,
+) -> Generator[None, None, None]:
+    """Install one device model at every probe seam the CuTe compiler reads.
+
+    ``facts`` supplies the modelled fields (its ``None`` fields are left
+    unpatched); the keyword arguments override or add to it, ``capability``
+    included (``None`` there models an unknown target, what
+    ``target_device_capability`` reports without CUDA).  Each seam is the
+    dotted path fixtures patched by hand before this helper existed, so the
+    values a fixture pins are unchanged:
+
+    * ``capability`` -> ``helion._compat.target_device_capability`` and its
+      by-name bindings ``helion.runtime.kernel.target_device_capability`` and
+      ``helion._compiler.compile_environment.target_device_capability``
+    * ``num_sm`` -> ``helion.runtime.get_num_sm``
+    * ``matmul_num_sm`` -> ``helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero``
+    * ``smem_capacity_bytes`` / ``smem_budget_bytes`` ->
+      ``helion._compiler.cute.target_facts.per_cta_smem_capacity_bytes`` /
+      ``per_cta_smem_budget_bytes`` (``per_cta_ab_smem_budget_bytes`` derives
+      from the patched capacity)
+    * ``reduction_smem_budget_bytes`` ->
+      ``helion._compiler.cute.thread_budget.shared_memory_budget_bytes``
+    * ``hardware`` -> ``helion._hardware.get_hardware_info`` (a ``HardwareInfo``
+      is returned as is, a callable replaces the probe); ``facts`` with a
+      ``hardware_name`` contributes ``facts.hardware_info()``. A concrete CUDA/ROCm
+      record and explicit ``is_hip`` also model the matching ``torch.version``
+      runtime and clear the other runtime, independently of the installed wheel.
+      Inconsistent CUDA/ROCm records and ``is_hip`` values are rejected.
+    * ``is_hip`` -> ``helion._compat._is_hip``
+    """
+    from .._hardware import HardwareInfo
+
+    def pick(value: object, modelled: object) -> object:
+        if not isinstance(value, _Unset):
+            return value
+        return _UNSET if modelled is None else modelled
+
+    modelled_hardware = (
+        facts.hardware_info()
+        if facts is not None
+        and facts.hardware_name is not None
+        and facts.capability is not None
+        else None
+    )
+    values = {
+        "capability": pick(capability, None if facts is None else facts.capability),
+        "num_sm": pick(num_sm, None if facts is None else facts.num_sm),
+        "matmul_num_sm": pick(
+            matmul_num_sm, None if facts is None else facts.matmul_num_sm
+        ),
+        "smem_capacity_bytes": pick(
+            smem_capacity_bytes, None if facts is None else facts.smem_capacity_bytes
+        ),
+        "smem_budget_bytes": pick(
+            smem_budget_bytes, None if facts is None else facts.smem_budget_bytes
+        ),
+        "reduction_smem_budget_bytes": pick(
+            reduction_smem_budget_bytes,
+            None if facts is None else facts.reduction_smem_budget_bytes,
+        ),
+        "hardware": pick(hardware, modelled_hardware),
+        "is_hip": pick(is_hip, None if facts is None else facts.is_hip),
+    }
+    seams: dict[str, tuple[str, ...]] = {
+        "capability": (
+            "helion._compat.target_device_capability",
+            "helion.runtime.kernel.target_device_capability",
+            "helion._compiler.compile_environment.target_device_capability",
+        ),
+        "num_sm": ("helion.runtime.get_num_sm",),
+        "matmul_num_sm": (
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+        ),
+        "smem_capacity_bytes": (f"{_TARGET_FACTS}.per_cta_smem_capacity_bytes",),
+        "smem_budget_bytes": (f"{_TARGET_FACTS}.per_cta_smem_budget_bytes",),
+        "reduction_smem_budget_bytes": (
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
+        ),
+        "is_hip": ("helion._compat._is_hip",),
+    }
+    with contextlib.ExitStack() as stack:
+        for name, targets in seams.items():
+            value = values[name]
+            if isinstance(value, _Unset):
+                continue
+            for target in targets:
+                stack.enter_context(patch(target, new=_constant_probe(value)))
+        probe = values["hardware"]
+        if isinstance(probe, HardwareInfo):
+            stack.enter_context(
+                patch("helion._hardware.get_hardware_info", new=_constant_probe(probe))
+            )
+            hip = values["is_hip"]
+            if probe.device_kind in ("cuda", "rocm") and isinstance(hip, bool):
+                assert hip == (probe.device_kind == "rocm"), (
+                    "is_hip must match hardware.device_kind"
+                )
+                stack.enter_context(
+                    patch("torch.version.cuda", None if hip else probe.runtime_version)
+                )
+                stack.enter_context(
+                    patch("torch.version.hip", probe.runtime_version if hip else None)
+                )
+        elif not isinstance(probe, _Unset):
+            stack.enter_context(patch("helion._hardware.get_hardware_info", new=probe))
+        yield
+
+
+@contextlib.contextmanager
+def cpu_render_target(
+    facts: TargetFacts | None = None,
+    *,
+    mma_support: SimpleNamespace | None = None,
+    forbid_native: bool = True,
+    forbid_cuda_init: str | None = "GPU forbidden",
+    mock_cuda: bool = True,
+    fake_device_sm_count: int | None = None,
+    capability: tuple[int, int] | _Unset | None = _UNSET,
+    num_sm: int | _Unset = _UNSET,
+    matmul_num_sm: int | _Unset = _UNSET,
+    smem_capacity_bytes: int | _Unset = _UNSET,
+    smem_budget_bytes: int | _Unset = _UNSET,
+    reduction_smem_budget_bytes: int | _Unset = _UNSET,
+    hardware: HardwareInfo | Callable[..., HardwareInfo] | _Unset = _UNSET,
+    is_hip: bool | _Unset = _UNSET,
+) -> Generator[None, None, None]:
+    """CPU CuTe source generation against a modelled device (a B200 by default).
+
+    The suite's fixture stacks composed in one place: ``mock_cuda_unavailable``
+    (``mock_cuda``), ``patch_target_facts`` over ``facts`` (defaulting to the
+    :data:`~helion._compiler.cute.target_facts.B200` model) and the per-fact
+    keywords it accepts, which override the model,
+    ``patch_cute_mma_support(mma_support)`` when a support record is given,
+    ``forbid_native_compile`` (``forbid_native``) and a ``torch.cuda._lazy_init``
+    guard raising ``AssertionError(forbid_cuda_init)`` (``None`` leaves CUDA
+    initialization alone).  ``fake_device_sm_count`` additionally traces the
+    CPU inputs as ``cuda:0`` tensors (``cute_codegen.cuda_fake``; ``torch.cuda``'s
+    current device 0 with the modelled capability, the kernel's argument
+    device ``cuda:0``, inductor's ``DeviceProperties`` with that SM count),
+    which the tcgen05 planners need to see a CUDA target.
+    """
+    from .._compiler.cute.target_facts import B200
+    from .cute_codegen import cuda_fake
+    from .cute_codegen import forbid_native_compile
+    from .cute_codegen import mock_cuda_unavailable
+
+    model = B200 if facts is None else facts
+    with contextlib.ExitStack() as stack:
+        if mma_support is not None:
+            stack.enter_context(patch_cute_mma_support(mma_support))
+        if mock_cuda:
+            stack.enter_context(mock_cuda_unavailable())
+        if forbid_cuda_init is not None:
+            stack.enter_context(
+                patch(
+                    "torch.cuda._lazy_init",
+                    side_effect=AssertionError(forbid_cuda_init),
+                )
+            )
+        stack.enter_context(
+            patch_target_facts(
+                model,
+                capability=capability,
+                num_sm=num_sm,
+                matmul_num_sm=matmul_num_sm,
+                smem_capacity_bytes=smem_capacity_bytes,
+                smem_budget_bytes=smem_budget_bytes,
+                reduction_smem_budget_bytes=reduction_smem_budget_bytes,
+                hardware=hardware,
+                is_hip=is_hip,
+            )
+        )
+        if forbid_native:
+            stack.enter_context(forbid_native_compile())
+        if fake_device_sm_count is not None:
+            traced = model.capability if isinstance(capability, _Unset) else capability
+            assert traced is not None, "a fake CUDA device needs a capability"
+            major, minor = traced
+            stack.enter_context(patch("torch.cuda.current_device", return_value=0))
+            stack.enter_context(
+                patch("torch.cuda.get_device_capability", return_value=traced)
+            )
+            stack.enter_context(
+                patch(
+                    "helion.runtime.kernel._find_device",
+                    return_value=torch.device("cuda:0"),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "helion._compiler.cute.backend.CuteBackend"
+                    ".normalize_input_fake_tensor",
+                    new=cuda_fake,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "torch._inductor.runtime.hints.DeviceProperties.create",
+                    return_value=SimpleNamespace(
+                        type="cuda",
+                        index=0,
+                        cc=major * 10 + minor,
+                        warp_size=32,
+                        multi_processor_count=fake_device_sm_count,
+                    ),
+                )
+            )
+        yield
+
+
+@contextlib.contextmanager
+def float32_matmul_precision(precision: str) -> Generator[None, None, None]:
+    """Context manager to temporarily set the float32 matrix multiplication precision.
+
+    The original `torch.float32_matmul_precision` setting is restored upon exiting the context.
+
+    Args:
+        precision: The precision level to set ("highest", "high", or "medium").
+    """
+    original_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision(precision)
+    try:
+        yield
+    finally:
+        torch.set_float32_matmul_precision(original_precision)
+
+
+def get_test_float32_matmul_precision() -> str:
+    """Return the PyTorch fp32 matmul precision used for test references."""
+    if _get_backend() == "pallas" and not is_pallas_interpret():
+        return "medium"
+    return "high"
+
+
+def skipIfNotTriton(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test when backend is not Triton (e.g. cute, pallas)."""
+    return skipIfFn(lambda: _get_backend() != "triton", reason)
+
+
+def slowIfBackends(backends: Sequence[str]) -> Callable[[Callable], Callable]:
+    """Mark a test ``slow`` only under one of ``backends``.
+
+    For tests whose cost comes from one backend (a CuTe cold compile of
+    every candidate) while the others run them as cheap correctness checks
+    that pull requests should keep.
+    """
+    if matchesBackends(backends):
+        return pytest.mark.slow
+    return lambda test_item: test_item
+
+
+def onlyBackends(
+    backends: Sequence[str],
+) -> Callable[[type[unittest.TestCase]], type[unittest.TestCase]]:
+    """Skip an entire test class unless `_get_backend() in backends`"""
+
+    def wrapper(cls: type[unittest.TestCase]) -> type[unittest.TestCase]:
+        backend = _get_backend()
+        if matchesBackends(backends):
+            return cls
+        return unittest.skip(f"{BACKEND_SKIP_REASON}{backend}")(cls)
+
+    return wrapper
+
+
+def skipUnlessTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless tensor descriptors are supported."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not (is_cuda() or is_xpu()) or not supports_tensor_descriptor(), reason
+    )
+
+
+def skipUnlessBlockPtr(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless the installed Triton still supports block pointers.
+
+    Triton >= 3.9 removed ``tl.make_block_ptr`` (triton-lang/triton#10833);
+    tests that pin ``indexing="block_ptr"`` and check the generated code have
+    nothing to check there.  Other backends keep running them as numerics
+    checks.
+    """
+    return skipIfFn(
+        lambda: matchesBackends(["triton"]) and not supports_block_ptr(), reason
+    )
+
+
+def skipUnlessHostTensorDescriptor(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless Triton's host tensor descriptor API is supported."""
+    return skipIfFn(
+        lambda: (
+            not is_cuda()
+            or not supports_host_tensor_descriptor()
+            or (target_device_capability() or (0, 0)) < (9, 0)
+        ),
+        reason,
+    )
+
+
+def skipUnlessTf32Supported(
+    reason: str = "TF32 not supported on this GPU",
+) -> Callable[[Callable], Callable]:
+    """Skip test unless TF32 precision is supported (NVIDIA or AMD CDNA3 gfx942)."""
+    from helion._compat import is_hip
+    from helion._compat import supports_tf32_precision_on_amd
+
+    # TF32 is supported on NVIDIA or on AMD GPUs that support it (gfx908-gfx942)
+    tf32_supported = not is_hip() or supports_tf32_precision_on_amd()
+    return unittest.skipUnless(tf32_supported, reason)
+
+
+def get_test_dot_precision() -> str:
+    """Get the appropriate dot precision for tests based on platform support.
+
+    Returns 'tf32' if supported (NVIDIA or AMD gfx908-gfx942), otherwise 'ieee'.
+    """
+    from helion._compat import is_hip
+    from helion._compat import supports_tf32_precision_on_amd
+
+    if not is_hip():
+        # NVIDIA - always supports tf32
+        return "tf32"
+    if supports_tf32_precision_on_amd():
+        # AMD CDNA with TF32 support (gfx908-gfx942)
+        return "tf32"
+    # AMD without TF32 support (gfx950+)
+    return "ieee"
+
+
+def skipIfXPU(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running with Intel XPU"""
+    return unittest.skipIf(torch.xpu.is_available(), reason)
+
+
+def skipUnlessPallas(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test unless JAX Pallas TPU backend or interpret mode is available."""
+
+    def _has_tpu_pallas() -> bool:
+        if is_pallas_interpret():
+            try:
+                from jax.experimental import pallas
+
+                return True
+            except Exception:
+                return False
+        try:
+            from jax.experimental import pallas  # noqa: F401
+
+            return hasattr(torch, "tpu") and torch.accelerator.is_available()
+        except Exception:
+            return False
+
+    return skipIfFn(lambda: not _has_tpu_pallas(), reason)
+
+
+def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
+    """Skip test if running on A10G GPU."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(lambda: "A10G" in get_nvidia_gpu_model(), reason=reason)
+
+
+def skipIfNotCUDA() -> Callable[[Callable], Callable]:
+    """Skip test if not running on CUDA (NVIDIA GPU)."""
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        lambda: not is_cuda(),
+        reason="Test skipped: CUDA (NVIDIA GPU) is not available.",
+    )
+
+
+def skipIfCudaCapabilityLessThan(
+    min_capability: tuple[int, int], *, reason: str | None = None
+) -> Callable[[Callable], Callable]:
+    """Skip test if running on CUDA with capability less than min_capability.
+
+    Pass-through on non-CUDA backends. Combine with `skipIfNotCUDA()` (or
+    `skipIfPallas`/`skipIfXPU`/etc.) at the call site if the test also
+    requires a specific platform.
+    """
+
+    def cond() -> bool:
+        if not is_cuda():
+            return False
+        return torch.cuda.get_device_capability() < min_capability
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires CUDA capability >= {min_capability[0]}.{min_capability[1]}",
+    )
+
+
+def skipIfSharedMemoryLessThan(
+    required_memory_for_config: int,
+    *,
+    reason: str | None = None,
+) -> Callable[[Callable], Callable]:
+    """Skip test if GPU shared memory per block is below required_memory_for_config.
+
+    Works on both NVIDIA (CUDA) and AMD (ROCm) GPUs.
+    """
+
+    def cond() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        default_shared = cast("int", props.shared_memory_per_block)
+        optin_shared = cast(
+            "int | None", getattr(props, "shared_memory_per_block_optin", None)
+        )
+        max_shared = default_shared if optin_shared is None else optin_shared
+        return max_shared < required_memory_for_config
+
+    return skipIfFn(
+        cond,
+        reason=reason
+        or f"Requires shared memory per block >= {required_memory_for_config} bytes",
+    )
+
+
+def skipIfLowVRAM(
+    reason: str = "Test requires high VRAM",
+    *,
+    required_bytes: int | None = None,
+) -> Callable[[Callable], Callable]:
+    """Skip test on systems with low GPU VRAM.
+
+    When called with only a reason, returns a decorator that skips tests on GPUs
+    with less than ~30 GiB total VRAM. When provided with required_bytes, uses
+    that value as the threshold.
+
+    The pytest-xdist workers of a run share one GPU, so these tests take turns:
+    otherwise two of them could both pass the free-memory check and then
+    allocate together.  Each releases its cached memory for the other workers.
+    """
+
+    threshold_bytes = (
+        int(30.0 * (1024**3)) if required_bytes is None else required_bytes
+    )
+
+    def is_low_vram() -> bool:
+        try:
+            if torch.cuda.is_available():
+                device = torch.cuda.current_device()
+                props = torch.cuda.get_device_properties(device)
+                total_memory = int(getattr(props, "total_memory", 0))
+                if total_memory < threshold_bytes:
+                    return True
+                # Also check free memory for shared GPU environments
+                free_memory, _ = torch.cuda.mem_get_info(device)
+                if free_memory < threshold_bytes:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # Defers check to test execution time to avoid CUDA init during pytest-xdist collection.
+    skip_if_low_vram = skipIfFn(is_low_vram, reason=reason)
+
+    def decorator(test_fn: Callable) -> Callable:
+        checked_fn = skip_if_low_vram(test_fn)
+
+        @functools.wraps(test_fn)
+        def wrapper(*args: object, **kwargs: object) -> object:
+            with _vram_test_lock():
+                try:
+                    return checked_fn(*args, **kwargs)
+                finally:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+        return wrapper
+
+    return decorator
+
+
+@contextlib.contextmanager
+def _vram_test_lock() -> Generator[None, None, None]:
+    """Hold the skipIfLowVRAM lock shared by the xdist workers of this run."""
+    run_id = os.environ.get("PYTEST_XDIST_TESTRUNUID")
+    if run_id is None:
+        yield
+        return
+    path = os.path.join(tempfile.gettempdir(), f"helion-vram-{run_id}.lock")
+    with filelock.FileLock(path):
+        yield
+
+
+def skipIfPyTorchBaseVerLessThan(min_version: str) -> Callable[[Callable], Callable]:
+    """Skip test if PyTorch base version is less than the specified version.
+
+    Uses the base version for comparison, which ignores pre-release/dev/post suffixes.
+    This allows development versions like "2.10.0.dev20251104" to pass when checking >= "2.10".
+
+    Args:
+        min_version: Minimum required PyTorch version (e.g., "2.10")
+
+    Returns:
+        Decorator that skips the test if PyTorch base version is below min_version
+    """
+    return unittest.skipIf(
+        not requires_torch_version(min_version),
+        f"PyTorch version {min_version} or higher required",
+    )
+
+
+@contextlib.contextmanager
+def track_run_ref_calls() -> Generator[list[int], None, None]:
+    """Context manager that tracks BoundKernel.run_ref calls.
+
+    Yields:
+        A list that will contain the count of run_ref calls.
+    """
+    from ..runtime.kernel import BoundKernel
+
+    original_run_ref = BoundKernel.run_ref
+    run_ref_count = [0]
+
+    def tracked_run_ref(self: BoundKernel, *args: object) -> object:
+        run_ref_count[0] += 1
+        return original_run_ref(self, *args)
+
+    # pyrefly: ignore [bad-assignment]
+    BoundKernel.run_ref = tracked_run_ref
+
+    try:
+        yield run_ref_count
+    finally:
+        BoundKernel.run_ref = original_run_ref
+
+
+@contextlib.contextmanager
+def assert_helion_ref_mode(
+    ref_mode: RefMode = RefMode.OFF,
+) -> Generator[None, None, None]:
+    """Context manager that asserts Helion compilation behavior based on RefMode.
+
+    - RefMode.OFF: expects compilation (run_ref should not be called)
+    - RefMode.EAGER: expects no compilation (run_ref should be called)
+    """
+    with track_run_ref_calls() as run_ref_count:
+        yield
+
+        if ref_mode == RefMode.OFF:
+            # In normal mode (RefMode.OFF), run_ref should not be called
+            assert run_ref_count[0] == 0, (
+                f"Expected run_ref to not be called in normal mode (RefMode.OFF), but got: run_ref={run_ref_count[0]}"
+            )
+        elif ref_mode == RefMode.EAGER:
+            # In ref eager mode (RefMode.EAGER), run_ref should be called
+            assert run_ref_count[0] > 0, (
+                f"Expected run_ref to be called in ref eager mode (RefMode.EAGER), but got: run_ref={run_ref_count[0]}"
+            )
+        else:
+            raise ValueError(f"Unknown RefMode: {ref_mode}")
+
+
+assert_helion_compilation = functools.partial(
+    assert_helion_ref_mode, ref_mode=RefMode.OFF
+)
+
+assert_ref_eager_mode = functools.partial(
+    assert_helion_ref_mode, ref_mode=RefMode.EAGER
+)
+
+
+class RefEagerTestBase:
+    """Base class for all ref eager mode test shards of normal Helion unit test files."""
+
+    # Class-level tracking for assert_close counting
+    _assert_close_count = 0
+    _original_assert_close_func = None
+    # Class-level tracking for assertRaises counting
+    _assert_raises_count = 0
+    _original_assert_raises_func = None
+    # Class-level tracking for skipTest counting
+    _skip_test_count = 0
+    _original_skip_test_func = None
+    # Class-level tracking for pytest.raises patching
+    _original_pytest_raises = None
+    # Class-level tracking for assertTrue/assertFalse/assertGreater
+    _assert_true_count = 0
+    _original_assert_true_func = None
+    _assert_false_count = 0
+    _original_assert_false_func = None
+    _assert_greater_count = 0
+    _original_assert_greater_func = None
+
+    def setUp(self) -> None:
+        """Common setup for all ref eager tests."""
+        super().setUp()  # type: ignore[misc]
+
+        # Check if HELION_INTERPRET is already set
+        self._in_ref_eager_mode = os.environ.get("HELION_INTERPRET") == "1"
+
+        # If not in ref eager mode, skip the setup
+        if not self._in_ref_eager_mode:
+            return
+
+        # Reset assert_close counter for this test
+        RefEagerTestBase._assert_close_count = 0
+        # Reset assertRaises counter for this test
+        RefEagerTestBase._assert_raises_count = 0
+        # Reset skipTest counter for this test
+        RefEagerTestBase._skip_test_count = 0
+        # Reset assertTrue/assertFalse/assertGreater counters
+        RefEagerTestBase._assert_true_count = 0
+        RefEagerTestBase._assert_false_count = 0
+        RefEagerTestBase._assert_greater_count = 0
+
+        # Patch torch.testing.assert_close to count calls
+        if RefEagerTestBase._original_assert_close_func is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_assert_close_func = torch.testing.assert_close
+
+        def counting_assert_close(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_close_count += 1
+            return RefEagerTestBase._original_assert_close_func(*args, **kwargs)  # type: ignore[misc]
+
+        torch.testing.assert_close = counting_assert_close
+
+        # Patch self.assertRaises to count calls
+        if RefEagerTestBase._original_assert_raises_func is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_assert_raises_func = self.assertRaises
+
+        def counting_assert_raises(*args: object, **kwargs: object) -> object:
+            RefEagerTestBase._assert_raises_count += 1
+            return RefEagerTestBase._original_assert_raises_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertRaises = counting_assert_raises
+
+        # Patch self.skipTest to count calls
+        if RefEagerTestBase._original_skip_test_func is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_skip_test_func = self.skipTest
+
+        def counting_skip_test(*args: object, **kwargs: object) -> object:
+            RefEagerTestBase._skip_test_count += 1
+            return RefEagerTestBase._original_skip_test_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.skipTest = counting_skip_test
+
+        # Store the tracking context manager instance so we can check counts in tearDown
+        self._run_ref_tracker = track_run_ref_calls()
+        self._run_ref_count = self._run_ref_tracker.__enter__()
+
+        # Patch pytest.raises to count calls
+        if RefEagerTestBase._original_pytest_raises is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_pytest_raises = pytest.raises
+
+        def counting_pytest_raises(*args: object, **kwargs: object) -> object:
+            """Wrapper for pytest.raises that counts calls but still runs the original logic."""
+            RefEagerTestBase._assert_raises_count += 1
+            assert RefEagerTestBase._original_pytest_raises is not None
+            return RefEagerTestBase._original_pytest_raises(*args, **kwargs)
+
+        pytest.raises = counting_pytest_raises  # type: ignore[assignment]
+
+        # Patch self.assertTrue to count calls
+        if RefEagerTestBase._original_assert_true_func is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_assert_true_func = self.assertTrue
+
+        def counting_assert_true(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_true_count += 1
+            return RefEagerTestBase._original_assert_true_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertTrue = counting_assert_true  # type: ignore[assignment]
+
+        # Patch self.assertFalse to count calls
+        if RefEagerTestBase._original_assert_false_func is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_assert_false_func = self.assertFalse
+
+        def counting_assert_false(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_false_count += 1
+            return RefEagerTestBase._original_assert_false_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertFalse = counting_assert_false  # type: ignore[assignment]
+
+        # Patch self.assertGreater to count calls
+        if RefEagerTestBase._original_assert_greater_func is None:
+            # pyrefly: ignore [bad-assignment]
+            RefEagerTestBase._original_assert_greater_func = self.assertGreater
+
+        def counting_assert_greater(*args: object, **kwargs: object) -> None:
+            RefEagerTestBase._assert_greater_count += 1
+            return RefEagerTestBase._original_assert_greater_func(*args, **kwargs)  # type: ignore[misc]
+
+        self.assertGreater = counting_assert_greater  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        """Common teardown with assertion counting check."""
+        # If not in ref eager mode, skip the teardown logic
+        if not self._in_ref_eager_mode:
+            super().tearDown()  # type: ignore[misc]
+            return
+
+        try:
+            # Exit the run_ref tracker
+            self._run_ref_tracker.__exit__(None, None, None)
+
+            # Check if the test was skipped
+            test_method = getattr(self, self._testMethodName, None)  # type: ignore[attr-defined]
+            is_skipped = (
+                test_method is not None
+                and hasattr(test_method, "__unittest_skip__")
+                and test_method.__unittest_skip__
+            ) or RefEagerTestBase._skip_test_count > 0
+
+            # Assert that either run_ref was called or the test was skipped
+            if not is_skipped and self._run_ref_count[0] == 0:
+                self.fail(  # type: ignore[attr-defined]
+                    # pyrefly: ignore [missing-attribute]
+                    f"Test {self._testMethodName} did not call run_ref and was not skipped"
+                )
+
+            if not is_skipped:
+                # Check that either assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater was called
+                total_assertions = (
+                    RefEagerTestBase._assert_close_count
+                    + RefEagerTestBase._assert_raises_count
+                    + RefEagerTestBase._skip_test_count
+                    + RefEagerTestBase._assert_true_count
+                    + RefEagerTestBase._assert_false_count
+                    + RefEagerTestBase._assert_greater_count
+                )
+                # Need to use the original assertGreater to avoid recursion
+                if RefEagerTestBase._original_assert_greater_func is not None:
+                    RefEagerTestBase._original_assert_greater_func(  # type: ignore[misc]
+                        total_assertions,
+                        0,
+                        f"Test {self._testMethodName} did not call torch.testing.assert_close, assertRaises, skipTest, assertTrue, assertFalse, or assertGreater",  # type: ignore[attr-defined]
+                    )
+                else:
+                    # Fallback if original not available
+                    assert total_assertions > 0, (
+                        f"Test {self._testMethodName} did not call any assertion methods"  # type: ignore[attr-defined]
+                    )
+        finally:
+            # Restore the original assert_close function
+            if RefEagerTestBase._original_assert_close_func is not None:
+                torch.testing.assert_close = (
+                    RefEagerTestBase._original_assert_close_func
+                )
+
+            # Restore the original assertRaises function
+            if RefEagerTestBase._original_assert_raises_func is not None:
+                self.assertRaises = RefEagerTestBase._original_assert_raises_func
+
+            # Restore the original skipTest function
+            if RefEagerTestBase._original_skip_test_func is not None:
+                self.skipTest = RefEagerTestBase._original_skip_test_func
+
+            # Restore the original pytest.raises function
+            if RefEagerTestBase._original_pytest_raises is not None:
+                pytest.raises = RefEagerTestBase._original_pytest_raises
+
+            # Restore the original assertTrue function
+            if RefEagerTestBase._original_assert_true_func is not None:
+                self.assertTrue = RefEagerTestBase._original_assert_true_func
+
+            # Restore the original assertFalse function
+            if RefEagerTestBase._original_assert_false_func is not None:
+                self.assertFalse = RefEagerTestBase._original_assert_false_func
+
+            # Restore the original assertGreater function
+            if RefEagerTestBase._original_assert_greater_func is not None:
+                self.assertGreater = RefEagerTestBase._original_assert_greater_func
+
+            super().tearDown()  # type: ignore[misc]
+
+    # NOTE: We no-op these methods because they commonly check behaviors that are not relevant in ref eager mode.
+    # Instead, we solely rely on the unit test's `torch.testing.assert_close` and `assertRaises` checks to ensure ref eager mode's correctness.
+    def assertExpectedJournal(self, value: str) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertExpectedJournal(value)  # type: ignore[misc]
+
+    def assertIn(
+        self, member: object, container: object, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIn(member, container, msg)  # type: ignore[misc]
+
+    def assertNotIn(
+        self, member: object, container: object, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertNotIn(member, container, msg)  # type: ignore[misc]
+
+    def assertIs(self, expr1: object, expr2: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIs(expr1, expr2, msg)  # type: ignore[misc]
+
+    def assertIsNot(self, expr1: object, expr2: object, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIsNot(expr1, expr2, msg)  # type: ignore[misc]
+
+    def assertTrueIfInNormalMode(self, condition: bool, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            self.assertTrue(condition, msg)  # type: ignore[attr-defined]
+
+    def assertEqualCode(self, first: str, second: str, msg: str | None = None) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertEqual(first, second, msg)  # type: ignore[misc]
+
+    def assertNotEqualCode(
+        self, first: str, second: str, msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertNotEqual(first, second, msg)  # type: ignore[misc]
+
+    def getUserDefinedTunable(
+        self, user_defined_tunables: dict[str, object], key: str
+    ) -> object | None:
+        """Look up a specific value via key from user defined tunables. Returns None in ref mode."""
+        if self._in_ref_eager_mode:
+            return None
+        return user_defined_tunables.get(key)
+
+    def assertIsInstance(
+        self, obj: object, cls: type | tuple[type, ...], msg: str | None = None
+    ) -> None:
+        if not self._in_ref_eager_mode:
+            super().assertIsInstance(obj, cls, msg)  # type: ignore[misc]
+
+
+def import_example(name: str) -> types.ModuleType:
+    """Import ``examples/<name>.py`` as ``helion._testing.examples.<name>``.
+
+    ``name`` may be dotted for a subdirectory (``"linear.example_kda"``).
+    Every caller shares one instance of each example and its kernels.
+    """
+    return importlib.import_module(f"{EXAMPLES_PACKAGE}.{name}")
+
+
+def import_path(filename: Path) -> types.ModuleType:
+    filename = filename.resolve()
+    examples_dir = EXAMPLES_DIR.resolve()
+    if filename.is_relative_to(examples_dir):
+        # One module per example everywhere; see ``import_example``.
+        relative = filename.relative_to(examples_dir).with_suffix("")
+        return import_example(".".join(relative.parts))
+    module_name = f"{__name__}.{filename.stem}"
+    if module_name not in sys.modules:
+        # pyrefly: ignore [implicit-import]
+        spec = importlib.util.spec_from_file_location(module_name, filename)
+        assert spec is not None
+        # pyrefly: ignore [implicit-import]
+        module = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
+    return sys.modules[module_name]
+
+
+def _bound_test_config(bound: BoundKernel, **kwargs: object) -> Config:
+    if kwargs:
+        config = Config(
+            # pyrefly: ignore [bad-argument-type]
+            **kwargs
+        )
+    elif len(bound.kernel.configs) == 1:
+        config = bound.kernel.configs[0]
+    else:
+        config = bound.config_spec.default_config()
+    # Strip config keys not supported by the current backend so that
+    # tests with Triton-specific keys (num_warps, num_stages, indexing, etc.)
+    # can run on other backends like Pallas/TPU.
+    config_spec = bound.config_spec
+    for key in config_spec.unsupported_config_keys(config.config):
+        config.config.pop(key, None)
+    return config
+
+
+def _run_bound_kernel(
+    bound: BoundKernel,
+    args: tuple[object, ...],
+    config: Config,
+    *,
+    emit_code: bool,
+) -> tuple[str | None, object]:
+    has_device_tensor = any(
+        isinstance(value, torch.Tensor) and value.device.type != "cpu" for value in args
+    )
+    code = bound.to_triton_code(config) if emit_code else None
+    compiled_kernel = bound.compile_config(config)
+    try:
+        result = compiled_kernel(*args)
+        if has_device_tensor or (
+            isinstance(result, torch.Tensor) and result.device.type != "cpu"
+        ):
+            synchronize_device()
+    except Exception as exc:
+        if code is None:
+            try:
+                code = bound.to_triton_code(config)
+            except Exception:
+                code = None
+        if code is not None:
+            sys.stderr.write(f"Failed to run kernel:\n{code}\n")
+        else:
+            sys.stderr.write("Failed to run kernel.\n")
+        if has_device_tensor:
+            try:
+                synchronize_device()
+            except Exception as sync_error:
+                raise exc from sync_error
+        raise
+    return code, result
+
+
+def code_and_output(
+    fn: Kernel[_R],
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> tuple[str, _R]:
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
+            # pyrefly: ignore [bad-argument-type]
+            config = Config(**kwargs)
+            bound._config = config
+        result = fn(*args)
+        # Return the original kernel source code
+        code = inspect.getsource(fn.fn)
+        return code, result
+
+    config = _bound_test_config(bound, **kwargs)
+    code, result = _run_bound_kernel(bound, args, config, emit_code=True)
+    assert code is not None
+    return code, cast("_R", result)
+
+
+def output_only(
+    fn: Kernel[_R],
+    args: tuple[object, ...],
+    **kwargs: object,
+) -> _R:
+    """Run a kernel for correctness checks without eagerly materializing code text."""
+    bound = fn.bind(args)
+    if is_ref_mode_enabled(bound.kernel.settings):
+        if kwargs:
+            # pyrefly: ignore [bad-argument-type]
+            config = Config(**kwargs)
+            bound._config = config
+        return fn(*args)
+
+    config = _bound_test_config(bound, **kwargs)
+    _code, result = _run_bound_kernel(bound, args, config, emit_code=False)
+    return cast("_R", result)
+
+
+def _as_tensors(result: object) -> list[torch.Tensor]:
+    """Normalize a single tensor or tuple of tensors to a flat list."""
+    if isinstance(result, tuple):
+        return [t.clone() for t in result]
+    assert isinstance(result, torch.Tensor)
+    return [result.clone()]
+
+
+def _with_tf32_precision(fn: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Run a test helper with backend-aligned fp32 matmul precision."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        orig_cudnn_fp32_precision: str | None = None
+        orig_float32_matmul_precision = torch.get_float32_matmul_precision()
+        torch.set_float32_matmul_precision(get_test_float32_matmul_precision())
+        try:
+            cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+            orig_cudnn_fp32_precision = cast("str", cudnn_conv.fp32_precision)
+            cudnn_conv.fp32_precision = "tf32"
+        except AttributeError:  # No cudnn available
+            pass
+
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            torch.set_float32_matmul_precision(orig_float32_matmul_precision)
+            if orig_cudnn_fp32_precision is not None:
+                cudnn_conv = torch.backends.cudnn.conv  # pyrefly: ignore[missing-attribute]
+                cudnn_conv.fp32_precision = orig_cudnn_fp32_precision
+
+    return wrapper
+
+
+@_with_tf32_precision
+def run_example(
+    kernel_fn: Callable[..., torch.Tensor] | Kernel | dict[str, Kernel],
+    baseline_fn: Callable[..., torch.Tensor] | dict[str, Callable[..., torch.Tensor]],
+    args: tuple[object, ...],
+    kernel_name: str = "helion",
+    baseline_name: str = "torch",
+    rtol: float = 1e-2,
+    atol: float = 1e-1,
+    max_mismatch_pct: float | None = None,
+    max_mismatched_abs_diff: float | None = None,
+    bwd: bool = False,
+    bwd_relative_l2: float | None = None,
+    trace_path: str | None = None,
+    process_group_name: str | None = None,
+    interleaved: bool = True,
+) -> dict[str, float]:
+    """Run complete example: correctness check + benchmark.
+
+    Returns:
+        Dictionary mapping implementation names to their benchmark times in ms.
+
+    Args:
+        kernel_fn: Single kernel function, or dict of {name: function} for multiple kernel variants
+        baseline_fn: Single baseline function or dict of {name: function} for multiple baselines
+        args: Arguments to pass to all functions
+        kernel_name: Name for single kernel in output (default: "helion")
+        baseline_name: Name for single baseline in output (default: "torch")
+        rtol: Relative tolerance for correctness check (default: 1e-2)
+        atol: Absolute tolerance for correctness check (default: 1e-1)
+        max_mismatch_pct: If set, use assert_close_with_mismatch_tolerance with this mismatch
+            fraction tolerance instead of strict assert_close (default: None)
+        max_mismatched_abs_diff: If set with max_mismatch_pct, bound the largest
+            absolute difference among mismatched elements.
+        bwd: Whether to also test backward pass (default: False)
+        bwd_relative_l2: If set, judge each gradient by relative L2 error
+            (see :func:`assert_relative_l2_close`) instead of the elementwise
+            ``rtol``/``atol`` check. Use this for backward passes of chained
+            half-precision matmuls, where a forward intermediate rounded to
+            half precision after an fp32 accumulation differs from the
+            reference by one ulp in a few elements and a full-row reduction
+            spreads each such flip across a whole gradient row.
+        trace_path: if not None, do profiling and save trace to this path
+    """
+
+    if dist.is_initialized() and process_group_name is None:
+        assert dist.group.WORLD is not None
+        process_group_name = dist.group.WORLD.group_name
+
+    # Normalize to dict format
+    kernels = kernel_fn if isinstance(kernel_fn, dict) else {kernel_name: kernel_fn}
+    baselines = (
+        baseline_fn if isinstance(baseline_fn, dict) else {baseline_name: baseline_fn}
+    )
+
+    # Check correctness against first baseline
+    first_baseline_name, first_baseline_func = next(iter(baselines.items()))
+    expected = _as_tensors(first_baseline_func(*args))
+
+    for name, func in {**kernels, **baselines}.items():
+        if name != first_baseline_name:
+            print(f"Testing {name} correctness...", file=sys.stderr)
+            # Clone args to avoid buffer donation issues (e.g., Pallas/TPU)
+            cloned_args = _clone_args(args, process_group_name=process_group_name)
+            result = _as_tensors(func(*cloned_args))
+            assert len(result) == len(expected)
+            for r, e in zip(result, expected, strict=True):
+                if max_mismatch_pct is not None:
+                    assert_close_with_mismatch_tolerance(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        atol=atol,
+                        rtol=rtol,
+                        max_mismatch_pct=max_mismatch_pct,
+                        max_mismatched_abs_diff=max_mismatched_abs_diff,
+                    )
+                else:
+                    torch.testing.assert_close(
+                        r.to(torch.float32),
+                        e.to(torch.float32),
+                        rtol=rtol,
+                        atol=atol,
+                    )
+
+    # Test backward pass
+    if bwd:
+        # Find tensors that require gradients in args
+        grad_tensors = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor) and arg.requires_grad:
+                grad_tensors.append(arg)
+
+        # Ensure we have tensors to check
+        assert len(grad_tensors) > 0, (
+            "BWD: No tensors with requires_grad=True found. "
+            "Check that input tensors have requires_grad set."
+        )
+
+        # Run baseline backward pass
+        baseline_out = first_baseline_func(*args)
+        grad_output = torch.randn_like(baseline_out)
+
+        # Save original gradients
+        baseline_out.backward(grad_output, retain_graph=True)
+        baseline_grads = [
+            t.grad.clone() if t.grad is not None else None for t in grad_tensors
+        ]
+
+        # Ensure at least one gradient was computed
+        has_gradient = any(g is not None for g in baseline_grads)
+        assert has_gradient, (
+            "BWD: No gradients were computed. All tensors have grad=None. "
+            "Check that backward was called and tensors require gradients."
+        )
+
+        # Clear gradients
+        for t in grad_tensors:
+            t.grad = None
+
+        # Test each implementation
+        for name, func in {**kernels, **baselines}.items():
+            if name != first_baseline_name:
+                # Run backward
+                out = func(*args)
+                out.backward(grad_output, retain_graph=True)
+
+                # Collect implementation gradients
+                impl_grads = [t.grad for t in grad_tensors]
+
+                # Ensure same number of grad tensors
+                assert len(impl_grads) == len(baseline_grads), (
+                    f"BWD: Mismatch in number of grad tensors for {name}: "
+                    f"{len(impl_grads)} vs {len(baseline_grads)}"
+                )
+
+                # Compare each tensor's gradient
+                for i, (tensor, baseline_grad) in enumerate(
+                    zip(grad_tensors, baseline_grads, strict=False)
+                ):
+                    # Check gradient existence
+                    assert (baseline_grad is None) == (tensor.grad is None), (
+                        f"BWD: Gradient existence mismatch for tensor {i} in {name}: "
+                        f"baseline has grad={baseline_grad is not None}, "
+                        f"impl has grad={tensor.grad is not None}"
+                    )
+
+                    if baseline_grad is not None:
+                        assert tensor.grad is not None
+                        msg = f"BWD: Gradient mismatch for tensor {i} with shape {tensor.shape} in {name}"
+                        if bwd_relative_l2 is not None:
+                            assert_relative_l2_close(
+                                tensor.grad, baseline_grad, bwd_relative_l2, msg=msg
+                            )
+                        else:
+                            torch.testing.assert_close(
+                                tensor.grad.to(torch.float32),
+                                baseline_grad.to(torch.float32),
+                                rtol=rtol,
+                                atol=atol,
+                                msg=msg,
+                            )
+
+                # Clear gradients for next test
+                for t in grad_tensors:
+                    t.grad = None
+
+    # Benchmark all functions — clone args to avoid buffer donation issues
+    cloned_args = _clone_args(args, process_group_name=process_group_name)
+    all_benchmarks = {**kernels, **baselines}
+    benchmark_functions = [
+        functools.partial(fn, *cloned_args) for fn in all_benchmarks.values()
+    ]
+    repeat = compute_repeat(benchmark_functions[0], default_cudagraph=True)
+
+    # For distributed workload, different rank may have slightly different
+    # benchmarking result causing diverging `repeat` value.
+    # Running different number of times on different ranks may cause
+    # stuck processes.
+    if dist.is_initialized():
+        repeat = sync_object(repeat, process_group_name=process_group_name)
+
+    # pyrefly: ignore [bad-argument-type]
+    profile_context = contextlib.nullcontext()
+    if trace_path is not None and is_master_rank():
+        profile_context = torch.profiler.profile()
+
+    with profile_context:
+        if interleaved:
+            timings = interleaved_bench(
+                # pyrefly: ignore[bad-argument-type]
+                benchmark_functions,
+                repeat=repeat,
+                desc="Benchmarking",
+                default_cudagraph=True,
+            )
+        else:
+            timings = typing.cast(
+                "list[float]",
+                [
+                    do_bench(
+                        benchmark_function,
+                        process_group_name=process_group_name,
+                        default_cudagraph=True,
+                    )
+                    for benchmark_function in benchmark_functions
+                ],
+            )
+
+    if trace_path is not None and is_master_rank():
+        print(f"Write profile to {trace_path}")
+        # pyrefly: ignore[missing-attribute]
+        profile_context.export_chrome_trace(trace_path)
+
+    all_times = dict(zip(all_benchmarks.keys(), timings, strict=True))
+    best_baseline_time = min(all_times[name] for name in baselines)
+
+    if is_master_rank():
+        # Print results (on rank 0)
+        print(f"\n{'=' * 65}\nBenchmark Results\n{'=' * 65}", file=sys.stderr)
+        print(
+            f"{'Implementation':<20} {'Time (ms)':<12} {'Speedup':<15}\n{'-' * 65}",
+            file=sys.stderr,
+        )
+
+        for name, time in all_times.items():
+            is_best_baseline = name in baselines and time == best_baseline_time
+            speedup_str = (
+                "1.00x (ref)"
+                if is_best_baseline
+                else f"{best_baseline_time / time:.2f}x"
+            )
+            print(f"{name:<20} {time:<12.4f} {speedup_str:<15}", file=sys.stderr)
+
+        print(f"{'=' * 65}\n", file=sys.stderr)
+
+    return all_times
+
+
+def _assert_example_result_close(
+    result: object,
+    expected: object,
+    *,
+    skip_accuracy: bool,
+    atol: float,
+    rtol: float,
+    max_mismatch_pct: float | None = None,
+    max_mismatched_abs_diff: float | None = None,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
+) -> None:
+    if skip_accuracy:
+        return
+
+    # Use tree_map to apply assert_close to all tensor pairs
+    def assert_close_fn(got: object, exp: object) -> None:
+        # Skip if expected is None (i.e. we don't care what the actual value is)
+        if exp is None:
+            return
+        # Both None is OK
+        if got is None and exp is None:
+            return
+        assert isinstance(got, torch.Tensor) and isinstance(exp, torch.Tensor), (
+            f"Type mismatch: got {type(got)}, expected {type(exp)}"
+        )
+        got_f32 = got.to(torch.float32)
+        exp_f32 = exp.to(torch.float32)
+
+        if cos_sim is not None:
+            dim, min_sim = cos_sim
+            sim = torch.nn.functional.cosine_similarity(got_f32, exp_f32, dim=dim)
+            assert sim.mean().item() >= min_sim, (
+                f"Cosine similarity {sim.mean().item()} is less than {min_sim}"
+            )
+
+        if max_mismatch_pct is not None:
+            assert_close_with_mismatch_tolerance(
+                got_f32,
+                exp_f32,
+                atol=atol,
+                rtol=rtol,
+                max_mismatch_pct=max_mismatch_pct,
+                max_mismatched_abs_diff=max_mismatched_abs_diff,
+            )
+        else:
+            torch.testing.assert_close(
+                got_f32,
+                exp_f32,
+                atol=atol,
+                rtol=rtol,
+            )
+
+    tree_map(assert_close_fn, result, expected)
+
+
+def _example_kernel(
+    name: str,
+    fn_name: str | None = None,
+    static_shapes: bool | None = None,
+) -> Kernel:
+    kernel_fn = getattr(import_example(name), fn_name or name)
+    if static_shapes is not None:
+        assert static_shapes in (True, False)
+        kernel_fn.settings.static_shapes = static_shapes
+    return kernel_fn
+
+
+def check_example(
+    name: str,
+    args: tuple[torch.Tensor, ...],
+    expected: object,
+    fn_name: str | None = None,
+    skip_accuracy: bool = False,
+    static_shapes: bool | None = None,
+    atol: float = 1e-1,
+    rtol: float = 1e-2,
+    max_mismatch_pct: float | None = None,
+    max_mismatched_abs_diff: float | None = None,
+    emit_code: bool = True,
+    cos_sim: CosSimilarity | tuple[int, float] | None = None,
+    **kwargs: object,
+) -> str:
+    """Helper used in unit tests to run a single example kernel and check its output."""
+    kernel_fn = _example_kernel(name, fn_name=fn_name, static_shapes=static_shapes)
+
+    if emit_code:
+        code, result = code_and_output(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    else:
+        code = ""
+        result = output_only(
+            kernel_fn,
+            args,
+            **kwargs,
+        )
+    _assert_example_result_close(
+        result,
+        expected,
+        skip_accuracy=skip_accuracy,
+        atol=atol,
+        rtol=rtol,
+        max_mismatch_pct=max_mismatch_pct,
+        max_mismatched_abs_diff=max_mismatched_abs_diff,
+        cos_sim=cos_sim,
+    )
+    return code
+
+
+class AssertExpectedJournal:
+    """
+    Manages a <testfile>.expected file that contains expected output for TestCase.assertExpectedJournal() calls.
+
+    This replaces the previous `expecttest` assertExpectedInline approach by storing expected output
+    in external .expected files rather than inline strings in test files. This provides better
+    organization and avoids cluttering test files with large code blocks.
+
+    The .expected file format uses sections like:
+    --- assertExpectedJournal(TestClass.test_method)
+    expected output here
+
+    --- assertExpectedJournal(TestClass.test_method)
+    second expected output for same test
+
+    Environment variable EXPECTTEST_ACCEPT=1 can be used to update expected outputs.
+    """
+
+    def expected_filename(self, basename: Path) -> Path:
+        backend = _get_backend()
+        if backend == "triton":
+            return basename
+        return Path(f"{basename}_{backend}")
+
+    def __init__(self, cls: type[TestCase]) -> None:
+        pyfile = os.path.abspath(inspect.getfile(cls))
+        assert "/test/" in pyfile
+        assert pyfile.endswith(".py")
+        self._base_filename = basename = Path(pyfile[:-3] + ".expected")
+        self.filename: Path = self.expected_filename(basename).resolve()
+        self._cache: dict[str, list[str]] | None = None
+        self._current_id: str | None = None
+        self._current_index: int = 0
+
+    @property
+    def cache(self) -> dict[str, list[str]]:
+        if self._cache is None:
+            return self.reload()
+        return self._cache
+
+    def reload(self) -> dict[str, list[str]]:
+        if self.filename.exists():
+            data = self.filename.read_text()
+        elif self.filename != self._base_filename and self._base_filename.exists():
+            # use default expected file if specific one doesn't exist
+            data = self._base_filename.read_text()
+        else:
+            data = ""
+        result = collections.defaultdict(list)
+        for name, expected in re.findall(
+            r"--- assertExpectedJournal\(([^)]*)\)\n(.*?)(?=^--- assertExpectedJournal\(|\Z)",
+            data,
+            re.MULTILINE | re.DOTALL,
+        ):
+            result[name].append(expected.strip())
+        self._cache = result
+        return result
+
+    def save(self) -> None:
+        tmp = f"{self.filename}.tmp{os.getpid()}"
+        with open(tmp, "w") as f:
+            f.write(
+                f"This file is automatically generated by assertExpectedJournal calls in {self.filename.stem}.py.\n"
+                "Update expected outputs by running tests with the EXPECTTEST_ACCEPT=1 environment variable set.\n\n"
+            )
+            for name, expected_values in sorted(
+                self.cache.items(), key=operator.itemgetter(0)
+            ):
+                f.writelines(
+                    f"--- assertExpectedJournal({name})\n{expected}\n\n"
+                    for expected in expected_values
+                )
+            # Remove the last newline to play nicer with some people's editors
+            f.truncate(f.tell() - 1)
+        os.rename(tmp, self.filename)
+
+    @staticmethod
+    def normalize_id(test_id: str) -> str:
+        match = re.search(r"\b([^.]+\.[^.]+)$", test_id)
+        assert match, f"Test ID '{test_id}' does not match expected format"
+        return match.group(1)
+
+    @staticmethod
+    def normalize_tensor_descriptors(code: str) -> str:
+        return code.replace(
+            get_tensor_descriptor_fn_name(), "tl.make_tensor_descriptor"
+        )
+
+    @staticmethod
+    def normalize_device_name(code: str) -> str:
+        """
+        convert device='cuda:0' or device(type='cuda', index=0) etc to device=DEVICE
+        """
+        # device='cuda:0'
+        reg_pattern_for_device_str = r"device\s*=\s*['\"][^'\"]+['\"]"
+        normalized_code = re.sub(reg_pattern_for_device_str, "device=DEVICE", code)
+        # device(type='cuda', index=0)
+        reg_pattern_for_torch_device = (
+            r"device\s*\(type\s*=\s*['\"][^'\"]+['\"][^'\"\)]*\)"
+        )
+        return re.sub(reg_pattern_for_torch_device, "device=DEVICE", normalized_code)
+
+    @staticmethod
+    def normalize_codegen_variants(code: str) -> str:
+        # TODO(oulgen): Remove when PyTorch 2.10 becomes stable
+
+        # Remove libdevice import line if present
+        code = re.sub(
+            r"^\s*from torch\._inductor\.runtime\.triton_compat import libdevice\s*\n?",
+            "",
+            code,
+            flags=re.MULTILINE,
+        )
+
+        # Normalize sqrt variants
+        # libdevice.sqrt( -> tl.sqrt_rn(
+        code = re.sub(r"\blibdevice\.sqrt\s*\(", "tl.sqrt_rn(", code)
+        # tl.sqrt( -> tl.sqrt_rn(
+        code = re.sub(r"\btl\.sqrt\s*\(", "tl.sqrt_rn(", code)
+
+        # Normalize rsqrt variants
+        # libdevice.rsqrt( -> tl.rsqrt(
+        code = re.sub(r"\blibdevice\.rsqrt\s*\(", "tl.rsqrt(", code)
+
+        total_num_triton_helpers_replacements = 0
+
+        # Normalize maximum variants
+        # tl.maximum(a, b, tl.PropagateNan.ALL) -> triton_helpers.maximum(a, b)
+        code, num_replacements = re.subn(
+            r"\btl\.maximum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
+            r"triton_helpers.maximum(\1, \2)",
+            code,
+        )
+        total_num_triton_helpers_replacements += num_replacements
+
+        # Normalize minimum variants
+        # tl.minimum(a, b, tl.PropagateNan.ALL) -> triton_helpers.minimum(a, b)
+        code, num_replacements = re.subn(
+            r"\btl\.minimum\s*\(([^,]+),\s*([^,]+),\s*tl\.PropagateNan\.ALL\s*\)",
+            r"triton_helpers.minimum(\1, \2)",
+            code,
+        )
+        total_num_triton_helpers_replacements += num_replacements
+
+        # Normalize tl.full scalar constants
+        # tl.full([], VALUE, tl.float32) -> VALUE
+        # tl.full([], VALUE, tl.float64) -> VALUE
+        # tl.full([], VALUE, tl.int32) -> VALUE
+        # etc.
+        code = re.sub(
+            r"\btl\.full\s*\(\s*\[\s*\]\s*,\s*([^,]+)\s*,\s*tl\.\w+\s*\)",
+            r"\1",
+            code,
+        )
+
+        triton_helpers_import = "from torch._inductor.runtime import triton_helpers"
+        if (
+            total_num_triton_helpers_replacements > 0
+            and triton_helpers_import not in code
+        ):
+            # Insert right after `import triton.language as tl`
+            code = re.sub(
+                r"(^import triton\.language as tl$)",
+                rf"\1\n{triton_helpers_import}",
+                code,
+                count=1,
+                flags=re.MULTILINE,
+            )
+
+        return code
+
+    @staticmethod
+    def normalize_source_comment_structure(code: str) -> str:
+        pattern = re.compile(
+            r"^(?P<indent>\s*)# src\[(?P<prefix>[^:\]]+:)(?P<start>\d+|N)(?:-(?P<end>\d+|N))?]: (?P<text>.*?)(?P<newline>\r?\n|$)",
+            flags=re.MULTILINE,
+        )
+
+        def replacer(match: re.Match[str]) -> str:
+            text = match.group("text").rstrip()
+            if not text.strip():
+                return ""
+            indent = match.group("indent")
+            prefix = match.group("prefix")
+            suffix = "N-N" if match.group("end") is not None else "N"
+            newline = match.group("newline")
+            return f"{indent}# src[{prefix}{suffix}]: {text}{newline}"
+
+        # Normalize structured src comments
+        code = pattern.sub(replacer, code)
+
+        # Normalize file line refs: foo.py:123 -> foo.py:N
+        return re.sub(r"(\b[^:\s]+\.py):(\d+)\b", r"\1:N", code)
+
+    @classmethod
+    def normalize_code(cls, code: str) -> str:
+        code = cls.normalize_source_comment_structure(code)
+        code = cls.normalize_tensor_descriptors(code)
+        code = cls.normalize_device_name(code)
+        code = cls.normalize_codegen_variants(code)
+        return code.strip()
+
+    def lookup(self, test_id: str, value: str) -> tuple[str, str]:
+        test_id = self.normalize_id(test_id)
+        if self._current_id != test_id:
+            self._current_id = test_id
+            self._current_index = 0
+
+        expected_values = self.cache[test_id]
+        if self._current_index < len(expected_values):
+            expected = expected_values[self._current_index]
+        else:
+            assert self._current_index == len(expected_values)
+            expected_values.append("")
+            expected = ""
+
+        # Normalize both actual and expected for robust comparisons
+        value = self.normalize_code(value)
+        expected = self.normalize_code(expected)
+
+        if value != expected and os.environ.get("EXPECTTEST_ACCEPT", "0") not in {
+            "0",
+            "false",
+            "False",
+            "",
+        }:
+            expected_values[self._current_index] = value
+            # Reload to play nicer with other processes
+            self.reload()[test_id][:] = expected_values
+            self.save()
+            expected = value
+            print(
+                f"Expected output for {test_id} updated: {len(expected)} => {len(value)} bytes",
+                file=sys.stderr,
+            )
+        self._current_index += 1
+        return value, expected
+
+
+class RefEagerTestDisabled:
+    """Base class for test classes that should be skipped when ref eager mode is enabled."""
+
+    def setUp(self) -> None:
+        """Skip test if ref eager mode is enabled."""
+        if os.environ.get("HELION_INTERPRET") == "1":
+            self.skipTest("Test class disabled in ref eager mode")  # type: ignore[attr-defined]
+        super().setUp()  # type: ignore[misc]
+
+
+class TestCase(unittest.TestCase):
+    maxDiff = 16384
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._expected_journal = AssertExpectedJournal(cls)
+
+        if is_mtia():
+            # pyrefly: ignore [missing-import]
+            import mtia.host_runtime.torch_mtia.dynamic_library  # noqa: F401
+
+            # pyrefly: ignore [missing-import]
+            from mtia.re.re_unittest_lib import MTIAUnittest
+
+            # pyrefly: ignore [missing-import]
+            from triton_mtia.python.mtia.eager import mtia_triton_launcher
+
+            # Call MTIAUnittest.setUpClass for MTIA initialization
+            MTIAUnittest.setUpClass.__func__(cls)
+            # Initialize MTIA properly
+            mtia_triton_launcher.init()
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        super().tearDownClass()
+        del cls._expected_journal
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._test_stack = contextlib.ExitStack()
+        # unittest does not call tearDown if setUp raises, including SkipTest.
+        # Close contexts even when a subclass skips after calling super().setUp().
+        self.addCleanup(self._test_stack.close)
+
+        from torch._inductor.utils import fresh_cache
+
+        self._test_stack.enter_context(
+            fresh_cache(
+                delete=os.getenv("HELION_DELETE_CACHE_AFTER_TEST", "1") == "1",
+            )
+        )
+
+        counters.clear()
+
+    def tearDown(self) -> None:
+        try:
+            super().tearDown()
+        finally:
+            self._test_stack.close()
+
+    def assertExpectedJournal(self, value: str) -> None:
+        """
+        Assert that the given value matches the expected output stored in <testfile>.expected.
+
+        This method replaces assertExpectedInline for code generation tests. Instead of storing
+        expected output as inline strings in test files, it uses external .expected files for
+        better organization.
+
+        Args:
+            value: The actual output to compare (usually generated Triton code)
+
+        Raises:
+            AssertionError: If value doesn't match expected output
+
+        Note:
+            Use EXPECTTEST_ACCEPT=1 environment variable to update expected outputs.
+        """
+        value = _strip_launcher_args(value)
+        value, expected = self._expected_journal.lookup(self.id(), value)
+        expected = _strip_launcher_args(expected)
+        # Normalize input_precision for consistent test comparisons across GPUs
+        value = re.sub(
+            r"input_precision='(tf32|ieee)'", "input_precision='ieee'", value
+        )
+        expected = re.sub(
+            r"input_precision='(tf32|ieee)'", "input_precision='ieee'", expected
+        )
+        self.assertMultiLineEqual(
+            value,
+            expected,
+            msg="To accept the new output, re-run test with env EXPECTTEST_ACCEPT=1",
+        )
+
+    @contextlib.contextmanager
+    def capture_logs(self) -> Generator[_LogCapture, None, None]:
+        """Context manager to capture logs."""
+        handler = _LogCapture()
+        handler.setLevel(logging.DEBUG)
+        logger = logging.getLogger()
+        logger.addHandler(handler)
+        try:
+            yield handler
+        finally:
+            logger.removeHandler(handler)
+
+    @contextlib.contextmanager
+    def capture_output(self) -> Generator[_OutputCapture, None, None]:
+        """Context manager to capture stdout/stderr."""
+        capture = _OutputCapture()
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = capture.stdout, capture.stderr
+        try:
+            yield capture
+        finally:
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+
+
+def assert_relative_l2_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    max_relative_l2: float,
+    *,
+    msg: str = "",
+) -> None:
+    """Assert ``||actual - expected|| / ||expected|| <= max_relative_l2``.
+
+    Unlike an elementwise check this tolerates a handful of large per-element
+    deviations as long as they are small relative to the whole tensor, which is
+    the signature of accumulation-order noise amplified by a reduction (e.g. a
+    one-ulp flip in a forward intermediate shifting an entire gradient row).
+    """
+    assert actual.shape == expected.shape, (actual.shape, expected.shape)
+    expected_f32 = expected.to(torch.float32)
+    diff = (actual.to(torch.float32) - expected_f32).norm().item()
+    relative_l2 = diff / max(expected_f32.norm().item(), 1e-8)
+    # ``<=`` rather than ``not >`` so a NaN error also fails.
+    assert relative_l2 <= max_relative_l2, (
+        f"{msg or 'Tensors are not close'}: relative L2 error {relative_l2:.3e} "
+        f"exceeds {max_relative_l2:.3e}"
+    )
+
+
+def assert_close_with_mismatch_tolerance(
+    actual: object,
+    expected: object,
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+    max_mismatch_pct: float = 0.01,
+    max_mismatched_abs_diff: float | None = None,
+    max_abs_diff: float | None = None,
+    max_rel_diff: float | None = None,
+) -> None:
+    """Check that actual and expected are close, tolerating a small fraction of mismatches.
+
+    First tries ``torch.testing.assert_close`` with the given *atol*/*rtol*.
+    If that fails **and** both arguments are tensors, falls back to a relaxed
+    check using the same mismatch definition as ``torch.testing.assert_close``
+    (``|actual - expected| > atol + rtol * |expected|``):
+
+    - *max_mismatch_pct*: maximum allowed fraction of mismatched elements
+      (default 1%).  Always checked.
+    - *max_mismatched_abs_diff*: if not None, the greatest absolute
+      difference among mismatched elements must not exceed this value.
+    - *max_abs_diff*: if not None, the greatest absolute difference across
+      all elements must not exceed this value.
+    - *max_rel_diff*: if not None, the greatest relative difference
+      (``|actual - expected| / |expected|``) must not exceed this value.
+
+    This is useful for kernels where most elements match but a tiny
+    fraction have large relative differences.  Pass this function directly as
+    ``autotune_baseline_accuracy_check_fn`` for the default thresholds, or use
+    ``functools.partial`` to customize them::
+
+        from functools import partial
+        from helion._testing import assert_close_with_mismatch_tolerance
+
+        @helion.kernel(
+            autotune_baseline_accuracy_check_fn=partial(
+                assert_close_with_mismatch_tolerance,
+                max_mismatch_pct=0.05,
+                max_mismatched_abs_diff=1.0,
+                max_abs_diff=10.0,
+                max_rel_diff=15.0,
+            ),
+        )
+        def my_kernel(...): ...
+    """
+    try:
+        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        return
+    except AssertionError:
+        if not (
+            isinstance(actual, torch.Tensor) and isinstance(expected, torch.Tensor)
+        ):
+            raise
+
+    # torch.isclose requires matching dtypes; compare in the promoted one so a
+    # dtype mismatch is still judged numerically rather than raising a
+    # RuntimeError, which the autotuner's accuracy check would not catch.
+    dtype = torch.promote_types(actual.dtype, expected.dtype)
+    actual, expected = actual.to(dtype), expected.to(dtype)
+    abs_diff = (actual - expected).abs()
+    total = actual.numel()
+
+    # Same elementwise contract as torch.testing.assert_close: mismatched when
+    # |actual - expected| > atol + rtol * |expected|, and infinities match only
+    # when equal (so e.g. -inf padding agrees exactly on both sides). NaNs are
+    # tolerated only when both sides are NaN.
+    mismatch_mask = ~torch.isclose(
+        actual, expected, rtol=rtol, atol=atol, equal_nan=True
+    )
+    # A NaN difference comes from inf - inf or a NaN operand. Where isclose
+    # accepted the pair (matching infinities or NaNs) it contributes nothing,
+    # so it cannot poison the max() in the bounds below; where it did not (a
+    # one-sided NaN or inf) it is an infinite miss that those bounds reject.
+    nan_diff = torch.where(mismatch_mask, math.inf, 0.0)
+    abs_diff = torch.where(abs_diff.isnan(), nan_diff, abs_diff)
+    mismatched = mismatch_mask.sum().item()
+    mismatch_pct = mismatched / total if total > 0 else 0.0
+
+    if mismatch_pct > max_mismatch_pct:
+        raise AssertionError(
+            f"Too many mismatches: {mismatch_pct:.4%} > {max_mismatch_pct:.4%}"
+        )
+
+    if max_mismatched_abs_diff is not None and mismatched:
+        worst_mismatched_abs = abs_diff[mismatch_mask].max().item()
+        if worst_mismatched_abs > max_mismatched_abs_diff:
+            raise AssertionError(
+                "Mismatched absolute diff too large: "
+                f"{worst_mismatched_abs} > {max_mismatched_abs_diff}"
+            )
+
+    if max_abs_diff is not None:
+        worst_abs = abs_diff.max().item()
+        if worst_abs > max_abs_diff:
+            raise AssertionError(
+                f"Absolute diff too large: {worst_abs} > {max_abs_diff}"
+            )
+
+    if max_rel_diff is not None:
+        rel_diff = abs_diff / expected.abs().clamp(min=1e-6)
+        rel_diff = torch.where(rel_diff.isnan(), nan_diff, rel_diff)
+        worst_rel = rel_diff.max().item()
+        if worst_rel > max_rel_diff:
+            raise AssertionError(
+                f"Relative diff too large: {worst_rel:.2f} > {max_rel_diff}"
+            )

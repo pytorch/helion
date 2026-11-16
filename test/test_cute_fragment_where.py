@@ -17,14 +17,11 @@ pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
 import helion
+from helion._compiler.cute import target_facts
 from helion._compiler.cute.fragment_epilogue import _is_literal_scalar
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
 from helion._testing import DEVICE
 from helion._testing import patch_cute_mma_support
-from helion._testing import skipUnlessBackends
 import helion.language as hl
-
-pytestmark = skipUnlessBackends(["cute"])
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -92,12 +89,10 @@ def _code(args: tuple[torch.Tensor, ...], mode: str, n: int) -> str:
             return_value=(10, 3),
         ),
         patch("helion.runtime.get_num_sm", return_value=148),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
-        ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         bound = _fragment_where._bind_isolated((*args, mode))
-        assert bound.config_spec.cute_tcgen05_search_enabled
+        assert bound.config_spec.tcgen05.search_enabled
         return bound.to_code(_config(n))
 
 

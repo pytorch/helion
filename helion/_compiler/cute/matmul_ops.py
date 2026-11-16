@@ -38,16 +38,13 @@ from .matmul_utils import cute_outer_accumulator_out_dtype
 from .matmul_utils import cute_resolve_active_block_id
 from .matmul_utils import cute_resolve_active_matmul_k_block_id
 from .matmul_utils import cute_static_k_invariant_extent
+from .matmul_utils import cute_synthetic_lane_k_extent
 from .matmul_utils import emit_cute_serial_mm_from_load_views
-from .strategies import is_pure_matmul_role_lifecycle_config
+from .matmul_utils import emit_cute_synthetic_lane_fold_mm
 from .tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
-
-
-def _requested_pure_matmul_role_lifecycle(state: CodegenState) -> bool:
-    return is_pure_matmul_role_lifecycle_config(state.device_function.config)
 
 
 def _requested_tcgen05_flat_role_coordinates(state: CodegenState) -> bool:
@@ -184,12 +181,6 @@ def _(state: CodegenState) -> object:
                 "cute",
                 "CuTe scalar matmul fallback requires an active K tile or a K-invariant static shortcut",
             )
-    if _requested_pure_matmul_role_lifecycle(state):
-        raise exc.BackendUnsupported(
-            "cute",
-            "tcgen05_strategy='pure_matmul_role_lifecycle' requires hl.dot "
-            "to lower through the tcgen05 K-loop path",
-        )
     if _requested_tcgen05_flat_role_coordinates(state):
         raise exc.BackendUnsupported(
             "cute",
@@ -198,16 +189,6 @@ def _(state: CodegenState) -> object:
         )
     if serial_result is not None:
         return serial_result
-    if cute_has_synthetic_lane_k(state.codegen, k_block_id):
-        # The wrapping lane loop also repeats accumulator initialization and
-        # users of this dot. A reduction over live threads would therefore
-        # expose a partial dot on every iteration, not the complete K sum.
-        # Native/collective lowering above owns the whole K axis; the scalar
-        # fallback is only valid when that axis is fully mapped to threads.
-        raise exc.BackendUnsupported(
-            "cute",
-            "CuTe hl.dot scalar fallback cannot reduce a K axis split across synthetic lanes",
-        )
     dot_lhs_node = (
         state.fx_node.args[0]
         if state.fx_node is not None and len(state.fx_node.args) > 0
@@ -223,6 +204,39 @@ def _(state: CodegenState) -> object:
         if state.fx_node is not None and len(state.fx_node.args) > 2
         else None
     )
+    if cute_has_synthetic_lane_k(state.codegen, k_block_id):
+        # The wrapping lane loop also repeats accumulator initialization and
+        # users of this dot. A reduction over live threads would therefore
+        # expose a partial dot on every iteration, not the complete K sum.
+        # Native/collective lowering above owns the whole K axis.  As for
+        # ``aten.mm``, operands that are direct loads fold the full K extent
+        # per thread instead (``emit_cute_synthetic_lane_fold_mm``); anything
+        # else keeps the refusal.
+        lane_fold_k = cute_synthetic_lane_k_extent(state.codegen, k_block_id)
+        if (
+            lane_fold_k is not None
+            and k_block_id is not None
+            and isinstance(dot_lhs_node, torch.fx.Node)
+            and isinstance(dot_rhs_node, torch.fx.Node)
+        ):
+            fold_result = emit_cute_synthetic_lane_fold_mm(
+                state.codegen,
+                dot_lhs_node,
+                dot_rhs_node,
+                k_block_id=k_block_id,
+                k_extent=lane_fold_k,
+                acc=None if is_acc_none else acc_ast,
+                out_dtype=effective_out_dtype,
+                acc_dtype=acc_dtype,
+                lhs_dtype=lhs_proxy.dtype,
+                rhs_dtype=rhs_proxy.dtype,
+            )
+            if fold_result is not None:
+                return fold_result
+        raise exc.BackendUnsupported(
+            "cute",
+            "CuTe hl.dot scalar fallback cannot reduce a K axis split across synthetic lanes",
+        )
     return _emit_cute_matmul(
         state.codegen,
         lhs_ast,

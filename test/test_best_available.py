@@ -13,8 +13,8 @@ from unittest.mock import patch
 
 import torch
 
-from helion._compiler.backend import TileIRBackend
-from helion._compiler.backend import TritonBackend
+from helion._compiler.triton.backend import TileIRBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion.autotuner.base_cache import LooseAutotuneCacheKey
 from helion.autotuner.base_search import PopulationBasedSearch

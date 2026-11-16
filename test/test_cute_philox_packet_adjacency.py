@@ -18,6 +18,8 @@ from helion._compiler.cute.philox_packets import lower_philox_packets
 from helion._compiler.cute.philox_stream import SCALAR_ASM
 from helion._compiler.cute.philox_stream import SCALAR_CONSTRAINTS
 
+pytestmark = pytest.mark.cpu_only
+
 CORE = "cutlass.Int64(base + cutlass.Int32(lane))"
 PROVED = (
     CORE,
@@ -181,14 +183,14 @@ def _lower(expression, width):
     tree = ast.parse(
         f"""for lane in cutlass.range_constexpr({width}):
     offset = {expression}
-    random = _cute_inline_asm_elementwise((seed[0], offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
+    random = _cute_inline_asm_elementwise((cutlass.Int64(seed), offset), asm={SCALAR_ASM!r}, constraints={SCALAR_CONSTRAINTS!r}, dtype=cutlass.Float32, is_pure=True)
     result = random
 """
     )
     names = itertools.count()
     lowered = lower_philox_packets(
         tree.body,
-        seed_names={"seed"},
+        seed_exprs={"cutlass.Int64(seed)"},
         integer_names={"base"},
         new_name=lambda prefix: f"{prefix}_{next(names)}",
     )

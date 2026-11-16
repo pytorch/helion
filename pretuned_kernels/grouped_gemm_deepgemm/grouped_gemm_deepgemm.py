@@ -145,7 +145,7 @@ def _deepgemm_aot_autotuner(
     **kwargs: object,
 ) -> AOTAutotuneCache:
     """Search only the validated worklist-NM schedule family."""
-    bound_kernel.env.config_spec.cute_tcgen05_search_enabled = True
+    bound_kernel.env.config_spec.tcgen05.search_enabled = True
     provider = partial(_ColdCudagraphBenchmarkProvider, repetitions=50)
 
     def make_search() -> FiniteSearch:
@@ -301,7 +301,7 @@ def _captured_calls(
     )
     kernel_args = (a, b, worklist)
     bound = grouped_gemm_deepgemm.bind(kernel_args)
-    bound.env.config_spec.cute_tcgen05_search_enabled = True
+    bound.env.config_spec.tcgen05.search_enabled = True
 
     def helion_call() -> torch.Tensor:
         return bound(*kernel_args)
@@ -403,7 +403,7 @@ def _run_aot_training(verbose: bool) -> dict[str, object]:
         )
         kernel_args = (a, b, worklist)
         bound = grouped_gemm_deepgemm.bind(kernel_args)
-        bound.env.config_spec.cute_tcgen05_search_enabled = True
+        bound.env.config_spec.tcgen05.search_enabled = True
         output = bound(*kernel_args)
         torch.cuda.synchronize()
         _check_output(

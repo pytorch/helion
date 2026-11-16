@@ -3,7 +3,7 @@
 ``load_eviction_policies="nc_l2_first"`` emits the noncoherent L2 evict-first
 helper only for a full 16/32-byte packet of a source that no store or atomic
 in the kernel can alias, on SM100+ with CUDA 13+; every other site keeps its
-ordinary load.  See test_cute_readonly_packet_loads_cuda.py for GPU numerics.
+ordinary load.  The GPU numerics are at the end of the module.
 """
 
 from __future__ import annotations
@@ -13,14 +13,22 @@ from typing import Any
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _forbid_native_compile
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
+from helion import exc
 from helion._compiler.cute.cache_policy_loads import _CUTE_NC_L2_FIRST_HELPERS
+from helion._compiler.cute.cutedsl_compat import (
+    fixed_l2_evict_last_store_policy_supported,
+)
 from helion._compiler.cute.cutedsl_compat import readonly_packet_load_supported
+from helion._testing import DEVICE
+from helion._testing import skipIfCudaCapabilityLessThan
+from helion._testing import skipIfNotCUDA
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
 
 _NC_16B = _CUTE_NC_L2_FIRST_HELPERS[16]
 _NC_32B = _CUTE_NC_L2_FIRST_HELPERS[32]
@@ -66,6 +74,24 @@ def _rows_through_asm(
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _pointwise_through_asm(
+    x: torch.Tensor, output: torch.Tensor, is_pure: hl.constexpr
+) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        data = x[tile].to(torch.float32)
+        copied = hl.inline_asm_elementwise(
+            "mov.b32 $0, $1;",
+            "=r,r",
+            [data.view(torch.int32)],
+            dtype=torch.int32,
+            is_pure=is_pure,
+            pack=1,
+        )
+        output[tile] = copied.view(torch.float32).to(output.dtype)
+    return output
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _scaled_rows(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for row in hl.tile(x.size(0)):
@@ -104,8 +130,8 @@ def _generate(
     config: helion.Config,
     capability: tuple[int, int] | None = None,
 ) -> str:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(kernel, args)
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(kernel, args)
         if capability is not None:
             bound.config_spec.target_device_capability = capability
         return bound.to_code(config)
@@ -132,8 +158,35 @@ def test_only_scalar_pure_inline_asm_keeps_the_readonly_load(is_pure: bool) -> N
     # Assembly the scalar-arithmetic proof cannot read might store anywhere.
     x = torch.empty((128, 32), dtype=torch.bfloat16)
     output = torch.empty((128, 32), dtype=torch.float8_e4m3fn)
+    if not is_pure:
+        # Per-column effect count is not a proof that an opaque epilogue leaves
+        # another column's reloaded input unchanged. No snapshot schedule has
+        # been proved for this epilogue; the pointwise test below still checks
+        # opaque assembly's read-only-load refusal in a supported schedule.
+        with pytest.raises(exc.BackendUnsupported, match="inline assembly"):
+            _generate(_rows_through_asm, (x, output, is_pure), _row_config(16))
+        return
     code = _generate(_rows_through_asm, (x, output, is_pure), _row_config(16))
     assert (f"{_NC_32B}(x.iterator" in code) is is_pure, code
+    assert f"is_pure={is_pure}" in code, code
+
+
+@pytest.mark.parametrize("is_pure", [True, False])
+def test_only_pure_pointwise_assembly_keeps_the_readonly_load(is_pure: bool) -> None:
+    x = torch.empty(512, dtype=torch.bfloat16)
+    output = torch.empty_like(x)
+    config = helion.Config(
+        block_sizes=[256],
+        num_threads=[32],
+        cute_vector_widths=[8],
+        load_eviction_policies="nc_l2_first",
+    )
+    code = _generate(_pointwise_through_asm, (x, output, is_pure), config)
+    assert (f"{_NC_16B}(x.iterator" in code) is is_pure, code
+    if not is_pure:
+        assert _NC_16B not in code and _NC_32B not in code, code
+        assert "cute.arch.load(x.iterator" in code, code
+    assert f"is_pure={is_pure}" in code, code
 
 
 def test_misaligned_input_view_keeps_the_ordinary_32_byte_load() -> None:
@@ -148,8 +201,8 @@ def test_scalar_word_load_drops_the_readonly_hint() -> None:
     # The policy applies to every load site; only packets have the helper.
     x = torch.empty((37, 64), dtype=torch.bfloat16)
     scale = torch.empty((37,), dtype=torch.float32)
-    with _mock_cuda_unavailable(), _forbid_native_compile():
-        bound = _cpu_bind(_scaled_rows, (x, scale))
+    with mock_cuda_unavailable(), forbid_native_compile():
+        bound = cpu_bind(_scaled_rows, (x, scale))
         (reduction,) = [
             block.block_id for block in bound.env.block_sizes if block.reduction
         ]
@@ -259,3 +312,89 @@ def test_runtime_helper_ir_reinterprets_every_loaded_bit(
     assert "v8.b32" in code if packet_bytes == 32 else "v4.b32" in code
     assert ("createpolicy" in code) is (packet_bytes == 16)
     assert "arith.truncf" not in code and "arith.extf" not in code
+
+
+# GPU numerics for read-only noncoherent packet loads and L2 evict-last
+# packet stores (test_cute_store_policy.py has the store policy's CPU codegen).
+#
+# A cache policy changes only the opcode of a proven packet: every hinted
+# render must match the reference bit for bit.
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scale_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size()):
+        out[tile] = (x[tile] * 2).to(out.dtype)
+    return out
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((10, 0), reason="ld.global.nc.v8 needs SM100+")
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize(
+    "dtype,width",
+    [
+        (torch.bfloat16, 8),
+        (torch.bfloat16, 16),
+        (torch.float32, 4),
+        (torch.float32, 8),
+    ],
+)
+def test_readonly_packets_load_every_bit(
+    dtype: torch.dtype, width: int, pdl: bool
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(64, 1024, device=DEVICE).to(dtype)
+    out = torch.empty_like(x)
+    # Isolated bindings keep each pinned configuration independent.
+    bound = _scale_into._bind_isolated((x, out))
+    config = helion.Config(
+        block_sizes=[4, 256],
+        num_threads=[1, 256 // width],
+        cute_vector_widths=[1, width],
+        load_eviction_policies=["nc_l2_first"],
+        cute_pdl=pdl,
+    )
+    helper = _CUTE_NC_L2_FIRST_HELPERS[width * dtype.itemsize]
+    assert f"{helper}(x.iterator" in bound.to_code(config)
+    fn = bound.compile_config(config)
+    for _ in range(2):
+        # A producer rewrites every source element ahead of each launch: the
+        # read-only packets must observe it after the ``cute_pdl`` wait.
+        x.add_(1)
+        fn(x, out)
+    torch.testing.assert_close(out, x * 2, atol=0, rtol=0)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    "out_dtype,width",
+    [(torch.bfloat16, 8), (torch.float32, 4), (torch.float8_e4m3fn, 16)],
+)
+def test_l2_evict_last_packets_store_every_bit(
+    out_dtype: torch.dtype, width: int
+) -> None:
+    if not fixed_l2_evict_last_store_policy_supported(
+        torch.cuda.get_device_capability(), torch.version.cuda
+    ):
+        pytest.skip("the fixed L2 store descriptor is validated for SM103/CUDA13")
+    torch.manual_seed(0)
+    x = torch.randn(128, 32, device=DEVICE, dtype=torch.bfloat16)
+    out = torch.empty(128, 32, device=DEVICE, dtype=out_dtype)
+    bound = _rows_into._bind_isolated((x, out))
+    config = helion.Config(
+        block_sizes=[64],
+        num_threads=[32, 32 // width],
+        cute_vector_widths=[width, 1],
+        cute_lane_layouts=["blocked", "blocked"],
+        cute_reduction_reloads=["register"],
+        load_eviction_policies="nc_l2_first",
+        cute_store_policy="l2_evict_last",
+    )
+    assert "_l2_evict_last(output.iterator" in bound.to_code(config)
+    bound.compile_config(config)(x, out)
+    data = x.float()
+    reference = (data / (data.abs().amax(-1, keepdim=True) + 1)).to(out_dtype)
+    assert torch.equal(out.view(torch.uint8), reference.view(torch.uint8))

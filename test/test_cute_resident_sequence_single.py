@@ -9,13 +9,10 @@ from typing import Any
 from typing import cast
 from unittest.mock import patch
 
-from examples.softmax import softmax_bwd
 import numpy as np
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test.test_cute_resident_sequence import _indent
 from test.test_cute_resident_sequence import _Tensor
 from test.test_cute_resident_sequence import _YieldCollectives
@@ -23,16 +20,23 @@ from test.test_cute_resident_sequence import _YieldCollectives
 import helion
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
-from helion._compiler.autotuner_heuristics.cute_resident_sequence import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_sequence import (
     CuteResidentSequenceHeuristic,
 )
+from helion._compiler.cute.lane_loops.markers import _lane_reduce_marker_expr
 from helion._compiler.cute.merge_sibling_v_loops import merge_sibling_v_loops
+from helion._compiler.cute.resident_reductions import ResidentPassContext
 from helion._compiler.cute.resident_sequence import _MARKER
 from helion._compiler.cute.resident_sequence import SequenceRegion
 from helion._compiler.cute.resident_sequence import materialize_resident_sequences
-from helion._compiler.tile_strategy import _lane_reduce_marker_expr
-from helion._testing import skipUnlessBackends
+from helion._testing import import_example
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
+
+softmax_bwd = import_example("softmax").softmax_bwd
 
 
 def _source(threads: int, slots: int, vector: int) -> str:
@@ -91,18 +95,20 @@ def _rewrite(
     result = materialize_resident_sequences(
         list(body),
         regions={id(loop): region},
-        tensor_dtypes={
-            "x": "cutlass.Float16",
-            "y": "cutlass.Float16",
-            "out": "cutlass.Float32",
-        },
-        rename_groups={"new_carry": "carry"},
-        disjoint_pairs={frozenset(("x", "out")), frozenset(("y", "out"))}
-        if disjoint
-        else set(),
-        boundary_names={"x", "y", "out", "width", "rows", "initial"},
+        context=ResidentPassContext(
+            tensor_dtypes={
+                "x": "cutlass.Float16",
+                "y": "cutlass.Float16",
+                "out": "cutlass.Float32",
+            },
+            rename_groups={"new_carry": "carry"},
+            disjoint_pairs={frozenset(("x", "out")), frozenset(("y", "out"))}
+            if disjoint
+            else set(),
+            uniform_names={"x", "y", "out", "width", "rows", "initial"},
+            new_var=lambda hint: f"{hint}_{next(counter)}",
+        ),
         resident=resident,
-        new_var=lambda hint: f"{hint}_{next(counter)}",
     )
 
     class Rename(ast.NodeTransformer):
@@ -346,7 +352,6 @@ def test_single_sequence_requires_disjoint_outputs() -> None:
 
 @pytest.mark.parametrize("static", [False, True])
 @pytest.mark.parametrize("columns", [128, 513, 2048])
-@skipUnlessBackends(["cute"])
 def test_original_backward_single_reduction_seeds_roundtrip(
     static: bool, columns: int
 ) -> None:
@@ -357,14 +362,14 @@ def test_original_backward_single_reduction_seeds_roundtrip(
     with (
         # Binding specializes hardware facts even for CPU tensors. The imported
         # helper's target mocks must not fall through to the visible CUDA device.
-        _mock_cuda_unavailable(),
+        mock_cuda_unavailable(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
         patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
+            "helion._compiler.cute.thread_budget.shared_memory_budget_bytes",
             return_value=232448,
         ),
     ):
-        bound = _cpu_bind(kernel, inputs)
+        bound = cpu_bind(kernel, inputs)
         host = bound.host_function
         assert host is not None
         with bound.env:

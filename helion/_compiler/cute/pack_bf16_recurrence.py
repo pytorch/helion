@@ -18,6 +18,12 @@ from dataclasses import dataclass
 from dataclasses import replace
 
 from ..ast_extension import ExtendedAST
+from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import call_path
+from ._ast_pass_utils import loop_extent
+from ._ast_pass_utils import names_read
+from ._ast_pass_utils import names_stored_or_deleted
+from ._ast_pass_utils import same_expr
 
 _ABI_VERSION = 1
 _PACK = "_cute_rank1_pack_bf16x2"
@@ -51,49 +57,12 @@ def _clone_expression(value: ast.expr) -> ast.expr:
     return result
 
 
-def _call_path(node: ast.AST) -> tuple[str, ...] | None:
-    path: list[str] = []
-    while isinstance(node, ast.Attribute):
-        path.append(node.attr)
-        node = node.value
-    if not isinstance(node, ast.Name):
-        return None
-    path.append(node.id)
-    return tuple(reversed(path))
-
-
 def _calls(node: ast.AST, path: tuple[str, ...]) -> list[ast.Call]:
     return [
         child
         for child in ast.walk(node)
-        if isinstance(child, ast.Call) and _call_path(child.func) == path
+        if isinstance(child, ast.Call) and call_path(child.func) == path
     ]
-
-
-def _name_target(stmt: ast.stmt) -> str | None:
-    if (
-        isinstance(stmt, ast.Assign)
-        and len(stmt.targets) == 1
-        and isinstance(stmt.targets[0], ast.Name)
-    ):
-        return stmt.targets[0].id
-    return None
-
-
-def _assigned_names(node: ast.AST) -> set[str]:
-    result: set[str] = set()
-    for child in ast.walk(node):
-        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
-            result.add(child.id)
-    return result
-
-
-def _loaded_names(node: ast.AST) -> set[str]:
-    return {
-        child.id
-        for child in ast.walk(node)
-        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
-    }
 
 
 def _name_loads(node: ast.AST, name: str) -> set[int]:
@@ -117,14 +86,14 @@ def _loaded_before_redefinition(
 
     def statement_access(statement: ast.stmt) -> tuple[bool, bool]:
         if isinstance(statement, ast.Assign):
-            if name in _loaded_names(statement.value):
+            if name in names_read(statement.value):
                 return True, False
-            return False, name in _assigned_names(statement)
+            return False, name in names_stored_or_deleted(statement)
         if (
             isinstance(statement, ast.For)
             and (_constexpr_trip_count(statement) or 0) > 0
         ):
-            if name in _loaded_names(statement.iter):
+            if name in names_read(statement.iter):
                 return True, False
             if isinstance(statement.target, ast.Name) and statement.target.id == name:
                 return False, True
@@ -133,7 +102,7 @@ def _loaded_before_redefinition(
                 if read or written:
                     return read, written
             return False, False
-        return name in _loaded_names(statement), name in _assigned_names(statement)
+        return name in names_read(statement), name in names_stored_or_deleted(statement)
 
     for statement in statements[start:]:
         read, written = statement_access(statement)
@@ -154,7 +123,7 @@ def _assignment_rhs_is_pure(statement: ast.Assign) -> bool:
 def _expression_is_pure(node: ast.expr) -> bool:
     """Accept only side-effect-free calls used by generated scalar arithmetic."""
     for call in (child for child in ast.walk(node) if isinstance(child, ast.Call)):
-        path = _call_path(call.func)
+        path = call_path(call.func)
         if path is not None and (
             path[0] == "operator"
             or path[:2] == ("cute", "math")
@@ -251,7 +220,7 @@ def _cache_expansion_loop_is_pure(loop: ast.For, cache_names: set[str]) -> bool:
 
 def _packed_cache_expression_is_pure(node: ast.expr) -> bool:
     for call in (child for child in ast.walk(node) if isinstance(child, ast.Call)):
-        path = _call_path(call.func)
+        path = call_path(call.func)
         if path == ("cutlass", "Float16"):
             return False
         if path is not None and path[0] == "cutlass":
@@ -263,17 +232,7 @@ def _packed_cache_expression_is_pure(node: ast.expr) -> bool:
 
 
 def _constexpr_trip_count(loop: ast.For) -> int | None:
-    if not (
-        isinstance(loop.target, ast.Name)
-        and isinstance(loop.iter, ast.Call)
-        and _call_path(loop.iter.func) == ("cutlass", "range_constexpr")
-        and len(loop.iter.args) == 1
-        and not loop.iter.keywords
-        and isinstance(loop.iter.args[0], ast.Constant)
-        and type(loop.iter.args[0].value) is int
-    ):
-        return None
-    return loop.iter.args[0].value
+    return loop_extent(loop, kinds=("constexpr",), minimum=None)
 
 
 def _unwrap_value_casts(node: ast.expr) -> ast.expr:
@@ -281,7 +240,7 @@ def _unwrap_value_casts(node: ast.expr) -> ast.expr:
     while True:
         if (
             isinstance(node, ast.Call)
-            and _call_path(node.func)
+            and call_path(node.func)
             in {
                 ("cutlass", "BFloat16"),
                 ("cutlass", "Float16"),
@@ -368,7 +327,7 @@ def _pair_cache(
         if common_factors is None:
             common_factors = other_factors
         elif len(common_factors) != len(other_factors) or any(
-            not _same_expression(left, right)
+            not same_expr(left, right)
             for left, right in zip(common_factors, other_factors, strict=True)
         ):
             return None
@@ -396,7 +355,7 @@ def _same_pair_expression(
     right_definitions: dict[str, ast.expr],
     right_loop_var: str,
 ) -> bool:
-    return _same_expression(
+    return same_expr(
         _normalized_pair_expression(
             left,
             loop_var=left_loop_var,
@@ -437,10 +396,10 @@ def _zero_initialized_before(
     """Prove that the last top-level write to each accumulator is exact zero."""
     remaining = set(names)
     for statement in reversed(statements[:end]):
-        written = remaining & _assigned_names(statement)
+        written = remaining & names_stored_or_deleted(statement)
         if not written:
             continue
-        target = _name_target(statement)
+        target = assigned_name(statement)
         if (
             target is None
             or target not in written
@@ -465,7 +424,7 @@ def _state_element_subscript(node: ast.expr) -> ast.Subscript | None:
             continue
         if not isinstance(node, ast.Call):
             break
-        path = _call_path(node.func)
+        path = call_path(node.func)
         if (
             path
             in {
@@ -484,7 +443,7 @@ def _state_element_subscript(node: ast.expr) -> ast.Subscript | None:
             and node.func.attr == "bitcast"
             and len(node.args) == 1
             and not node.keywords
-            and _call_path(node.args[0]) == ("cutlass", "BFloat16")
+            and call_path(node.args[0]) == ("cutlass", "BFloat16")
             and not saw_bf16_bitcast
             and isinstance(node.func.value, ast.expr)
         ):
@@ -538,7 +497,7 @@ def _tuple_target_names(call: ast.Call, loop: ast.For) -> tuple[str, str] | None
 def _scalar_name(node: ast.expr) -> str | None:
     while isinstance(node, ast.Call):
         if (
-            _call_path(node.func)
+            call_path(node.func)
             in {
                 ("cutlass", "BFloat16"),
                 ("cutlass", "Float16"),
@@ -573,16 +532,10 @@ def _name_pair(node: ast.expr) -> tuple[str, str] | None:
     return names[0], names[1]  # type: ignore[return-value]
 
 
-def _same_expression(left: ast.AST, right: ast.AST) -> bool:
-    return ast.dump(left, include_attributes=False) == ast.dump(
-        right, include_attributes=False
-    )
-
-
 def _canonical_index(node: ast.expr) -> object | None:
     while (
         isinstance(node, ast.Call)
-        and _call_path(node.func)
+        and call_path(node.func)
         in {
             ("cutlass", "Int32"),
             ("cutlass", "Int64"),
@@ -600,7 +553,7 @@ def _canonical_index(node: ast.expr) -> object | None:
     if (
         isinstance(node, ast.Subscript)
         and isinstance(node.value, ast.Call)
-        and _call_path(node.value.func) == ("cute", "arch", "thread_idx")
+        and call_path(node.value.func) == ("cute", "arch", "thread_idx")
         and not node.value.args
         and not node.value.keywords
         and isinstance(node.slice, ast.Constant)
@@ -636,13 +589,13 @@ def _warp_reduction_target(
     matches: list[str] = []
     for index in range(start, end):
         statement = statements[index]
-        target = _name_target(statement)
+        target = assigned_name(statement)
         if target is None or not isinstance(statement, ast.Assign):
             continue
         value = statement.value
         if not (
             isinstance(value, ast.Call)
-            and _call_path(value.func) == ("cutlass", "Float32")
+            and call_path(value.func) == ("cutlass", "Float32")
             and len(value.args) == 1
             and not value.keywords
             and isinstance(value.args[0], ast.Call)
@@ -650,7 +603,7 @@ def _warp_reduction_target(
             continue
         reduction = value.args[0]
         if not (
-            _call_path(reduction.func) == ("cute", "arch", "warp_reduction_sum")
+            call_path(reduction.func) == ("cute", "arch", "warp_reduction_sum")
             and len(reduction.args) == 1
             and isinstance(reduction.args[0], ast.Name)
             and len(reduction.keywords) == 1
@@ -663,7 +616,7 @@ def _warp_reduction_target(
         lane_definitions = [
             previous
             for previous in statements[start:index]
-            if _name_target(previous) == lane_name and isinstance(previous, ast.Assign)
+            if assigned_name(previous) == lane_name and isinstance(previous, ast.Assign)
         ]
         if len(lane_definitions) != 1:
             continue
@@ -695,7 +648,7 @@ def _resolve_value_aliases(
             continue
         if (
             isinstance(result, ast.Call)
-            and _call_path(result.func)
+            and call_path(result.func)
             in {
                 ("cutlass", "BFloat16"),
                 ("cutlass", "Float16"),
@@ -724,7 +677,7 @@ def _is_original_output(
     expression = _resolve_value_aliases(expression, definitions)
     if (
         isinstance(expression, ast.Call)
-        and _call_path(expression.func) == ("cute", "math", "fma")
+        and call_path(expression.func) == ("cute", "math", "fma")
         and len(expression.args) == 3
         and not expression.keywords
     ):
@@ -760,12 +713,12 @@ def _is_bf16_output(expression: ast.expr, definitions: dict[str, ast.expr]) -> b
         expression = definitions[expression.id]
     return (
         isinstance(expression, ast.Call)
-        and _call_path(expression.func) == ("cutlass", "BFloat16")
+        and call_path(expression.func) == ("cutlass", "BFloat16")
         and len(expression.args) == 1
         and not expression.keywords
         and not any(
             isinstance(node, ast.Call)
-            and _call_path(node.func) == ("cutlass", "Float16")
+            and call_path(node.func) == ("cutlass", "Float16")
             for node in ast.walk(expression.args[0])
         )
     )
@@ -782,14 +735,14 @@ def _stored_bf16_name(
         and expression.func.attr == "bitcast"
         and len(expression.args) == 1
         and not expression.keywords
-        and _call_path(expression.args[0]) == ("cutlass", "Uint16")
+        and call_path(expression.args[0]) == ("cutlass", "Uint16")
     ):
         return None
     value = expression.func.value
     saw_bf16_cast = False
     while (
         isinstance(value, ast.Call)
-        and _call_path(value.func) == ("cutlass", "BFloat16")
+        and call_path(value.func) == ("cutlass", "BFloat16")
         and len(value.args) == 1
         and not value.keywords
     ):
@@ -908,7 +861,7 @@ class _ReplaceShuffle(ast.NodeTransformer):
     def visit_Call(self, node: ast.Call) -> ast.AST:
         visited = self.generic_visit(node)
         assert isinstance(visited, ast.Call)
-        if _call_path(visited.func) == ("cute", "arch", "shuffle_sync"):
+        if call_path(visited.func) == ("cute", "arch", "shuffle_sync"):
             if len(visited.args) != 2 or visited.keywords:
                 return visited
             self.count += 1
@@ -942,8 +895,8 @@ def _uniform_names_before(
         # A write hidden under control flow is not a straight-line definition
         # that this local proof can model.  Invalidate every such name before
         # considering the one direct assignment form below.
-        uniform.difference_update(_assigned_names(statement))
-        target = _name_target(statement)
+        uniform.difference_update(names_stored_or_deleted(statement))
+        target = assigned_name(statement)
         if target is None or not isinstance(statement, ast.Assign):
             continue
         if not _expression_is_pure(statement.value):
@@ -973,7 +926,7 @@ def _uniform_names_before(
             )
         ):
             continue
-        if _loaded_names(statement.value) <= uniform:
+        if names_read(statement.value) <= uniform:
             uniform.add(target)
     return uniform
 
@@ -993,8 +946,8 @@ def _packed_source_is_safe(
         shuffles[0].args[0],
         {loop_var: ast.Name(id=replacement_name, ctx=ast.Load())},
     )
-    source_names = _loaded_names(source)
-    moved_names = _loaded_names(packed) - source_names - _UNIFORM_GLOBALS
+    source_names = names_read(source)
+    moved_names = names_read(packed) - source_names - _UNIFORM_GLOBALS
     return (
         moved_names <= uniform_names
         and not _calls(original, ("cutlass", "Float16"))
@@ -1037,15 +990,13 @@ def _hoist_common_scale(
     high_factors = _multiplication_factors(high)
     if len(low_factors) != len(high_factors):
         return None
-    low_source = [factor for factor in low_factors if low_name in _loaded_names(factor)]
-    high_source = [
-        factor for factor in high_factors if high_name in _loaded_names(factor)
-    ]
+    low_source = [factor for factor in low_factors if low_name in names_read(factor)]
+    high_source = [factor for factor in high_factors if high_name in names_read(factor)]
     low_uniform = [
-        factor for factor in low_factors if low_name not in _loaded_names(factor)
+        factor for factor in low_factors if low_name not in names_read(factor)
     ]
     high_uniform = [
-        factor for factor in high_factors if high_name not in _loaded_names(factor)
+        factor for factor in high_factors if high_name not in names_read(factor)
     ]
     if (
         len(low_source) != 1
@@ -1053,7 +1004,7 @@ def _hoist_common_scale(
         or len(low_uniform) < 2
         or len(low_uniform) != len(high_uniform)
         or any(
-            not _same_expression(left, right)
+            not same_expr(left, right)
             for left, right in zip(low_uniform, high_uniform, strict=True)
         )
     ):
@@ -1108,14 +1059,14 @@ def _backward_slice(
     required = {required_name}
     selected: list[ast.stmt] = []
     for statement in reversed(statements):
-        written = _assigned_names(statement)
+        written = names_stored_or_deleted(statement)
         if not (required & written):
             continue
         cloned = _clone_ast(statement)
         assert isinstance(cloned, ast.stmt)
         selected.append(cloned)
         required.difference_update(written)
-        required.update(_loaded_names(statement))
+        required.update(names_read(statement))
     # The new packed reduction supplies this value.  Everything else in the
     # slice must be defined within the selected statements or outside the row.
     required.discard(defined_name)
@@ -1126,7 +1077,7 @@ def _backward_slice(
 
 
 def _is_uint16_vector_type(call: ast.Call, width: int) -> bool:
-    if _call_path(call.func) != ("ir", "VectorType", "get") or len(call.args) != 2:
+    if call_path(call.func) != ("ir", "VectorType", "get") or len(call.args) != 2:
         return False
     shape, dtype = call.args
     return (
@@ -1134,7 +1085,7 @@ def _is_uint16_vector_type(call: ast.Call, width: int) -> bool:
         and len(shape.elts) == 1
         and isinstance(shape.elts[0], ast.Constant)
         and shape.elts[0].value == width
-        and _call_path(dtype) == ("cutlass", "Uint16", "mlir_type")
+        and call_path(dtype) == ("cutlass", "Uint16", "mlir_type")
     )
 
 
@@ -1228,14 +1179,14 @@ def _match(body: list[ast.stmt]) -> _Match | None:
     update_loop_var = update_loop.target.id
     first_definitions: dict[str, ast.expr] = {}
     for statement in first_loop.body:
-        target = _name_target(statement)
+        target = assigned_name(statement)
         if target is not None and isinstance(statement, ast.Assign):
             first_definitions[target] = _inline_names(
                 statement.value, first_definitions
             )
     update_definitions: dict[str, ast.expr] = {}
     for statement in update_loop.body:
-        target = _name_target(statement)
+        target = assigned_name(statement)
         if target is not None and isinstance(statement, ast.Assign):
             update_definitions[target] = _inline_names(
                 statement.value, update_definitions
@@ -1282,7 +1233,7 @@ def _match(body: list[ast.stmt]) -> _Match | None:
     query_cache = query_candidates[0]
     key_fma = first_fmas[fma_caches.index(key_cache)]
     query_fma = first_fmas[fma_caches.index(query_cache)]
-    if not _same_expression(key_fma.args[0], query_fma.args[0]):
+    if not same_expr(key_fma.args[0], query_fma.args[0]):
         return None
     decayed_pair = _tuple_target_names(first_mul, first_loop)
     prediction_acc = _tuple_target_names(key_fma, first_loop)
@@ -1338,13 +1289,13 @@ def _match(body: list[ast.stmt]) -> _Match | None:
         for name, writes in cache_writes.items()
         if len(writes) == 2
         and all(
-            index == expected_index and _same_expression(value, expected_value)
+            index == expected_index and same_expr(value, expected_value)
             for (index, value), (expected_index, expected_value) in zip(
                 writes, expected_state_writes, strict=True
             )
         )
     }
-    update_reads = _loaded_names(update_loop)
+    update_reads = names_read(update_loop)
     decayed_candidates = written_caches & update_reads
     if len(decayed_candidates) != 1:
         return None
@@ -1401,7 +1352,7 @@ def _match(body: list[ast.stmt]) -> _Match | None:
             continue
         definitions: dict[str, ast.expr] = {}
         for child in statement.body:
-            target = _name_target(child)
+            target = assigned_name(child)
             if target is not None and isinstance(child, ast.Assign):
                 definitions[target] = _inline_names(child.value, definitions)
         pair_caches = [
@@ -1504,7 +1455,7 @@ def _match(body: list[ast.stmt]) -> _Match | None:
         return None
     output_definitions: dict[str, ast.expr] = {}
     for statement in row.body[first_index + 1 : output_index]:
-        target = _name_target(statement)
+        target = assigned_name(statement)
         if target is not None and isinstance(statement, ast.Assign):
             output_definitions[target] = statement.value
     if not _is_bf16_output(output_call.args[0], output_definitions) or not (
@@ -1538,9 +1489,9 @@ def _match(body: list[ast.stmt]) -> _Match | None:
         for assignment in (
             node for node in ast.walk(body_module) if isinstance(node, ast.Assign)
         )
-        if _name_target(assignment) == pipe_vector
+        if assigned_name(assignment) == pipe_vector
         and isinstance(assignment.value, ast.Call)
-        and _call_path(assignment.value.func) == ("cute", "arch", "load")
+        and call_path(assignment.value.func) == ("cute", "arch", "load")
         and len(assignment.value.args) == 2
         and isinstance(assignment.value.args[1], ast.Call)
         and _is_uint16_vector_type(assignment.value.args[1], 8)
@@ -1549,7 +1500,7 @@ def _match(body: list[ast.stmt]) -> _Match | None:
         statement
         for statement in row.body[:first_index]
         if isinstance(statement, ast.Assign)
-        and _name_target(statement) == state_vector
+        and assigned_name(statement) == state_vector
         and isinstance(statement.value, ast.Name)
         and statement.value.id == pipe_vector
     ]
@@ -1624,11 +1575,11 @@ def _find_allocations(
                 expected_dtypes = frozenset((expected_dtypes,))
             if not (
                 isinstance(value, ast.Call)
-                and _call_path(value.func) == ("cute", "make_rmem_tensor")
+                and call_path(value.func) == ("cute", "make_rmem_tensor")
                 and len(value.args) == 2
                 and isinstance(value.args[0], ast.Constant)
                 and value.args[0].value == width
-                and _call_path(value.args[1])
+                and call_path(value.args[1])
                 in {("cutlass", dtype) for dtype in expected_dtypes}
             ):
                 return None
@@ -1684,7 +1635,7 @@ def _pack_expansion(
         element_name: str | None = None
         lane_expression: ast.expr | None = None
         for child in statement.body:
-            target = _name_target(child)
+            target = assigned_name(child)
             if target is not None and isinstance(child, ast.Assign):
                 definitions[target] = _inline_names(child.value, definitions)
                 if (
@@ -1861,7 +1812,7 @@ def _pack_expansion(
         for cache in cache_names
     ) or any(
         not _loads_only_within(body_module, name, loop)
-        for name in _assigned_names(loop) - cache_names
+        for name in names_stored_or_deleted(loop) - cache_names
     ):
         return False
     expected_dtypes: dict[str, str | frozenset[str]] = {
@@ -1924,7 +1875,7 @@ def _producer_loop_is_pure(loop: ast.For, cache_name: str) -> bool:
         for call in (
             node for node in ast.walk(statement.value) if isinstance(node, ast.Call)
         ):
-            path = _call_path(call.func)
+            path = call_path(call.func)
             if path is not None and (
                 path[0] in {"cutlass", "operator"} or path[:2] == ("cute", "math")
             ):
@@ -1952,11 +1903,11 @@ def _reaching_definitions_before(
     definitions: dict[str, ast.expr] = {}
     written: set[str] = set()
     for statement in statements[:end]:
-        assigned = _assigned_names(statement)
+        assigned = names_stored_or_deleted(statement)
         written.update(assigned)
         for name in assigned:
             definitions.pop(name, None)
-        target = _name_target(statement)
+        target = assigned_name(statement)
         if target is not None and isinstance(statement, ast.Assign):
             definitions[target] = statement.value
     return definitions, frozenset(written)
@@ -1972,10 +1923,10 @@ def _source_address_is_half_warp_uniform(
     """Prove an address is CTA-uniform apart from the canonical x-lane base."""
     without_base = _substitute_names(node, {base_name: ast.Constant(value=0)})
     expanded = _inline_names(without_base, definitions)
-    if _loaded_names(expanded) & written_names:
+    if names_read(expanded) & written_names:
         return False
     return not any(
-        _call_path(call.func)
+        call_path(call.func)
         in {
             ("cute", "arch", "lane_idx"),
             ("cute", "arch", "thread_idx"),
@@ -2004,7 +1955,7 @@ def _vector_high_bound_literal(
             or not isinstance(comparison.ops[0], ast.Lt)
             or len(comparison.comparators) != 1
             or _canonical_index(comparison.left) != expected_left
-            or base_name in _loaded_names(comparison.comparators[0])
+            or base_name in names_read(comparison.comparators[0])
         ):
             continue
         literals = [
@@ -2060,9 +2011,9 @@ def _find_cache_producer(match: _Match, cache_name: str) -> _Producer | None:
 
     base_names = {
         name
-        for name in _loaded_names(loop)
+        for name in names_read(loop)
         if any(
-            _name_target(statement) == name
+            assigned_name(statement) == name
             and isinstance(statement, ast.Assign)
             and _canonical_index(statement.value)
             == ("multiply", ("constant", 8), ("thread", 0))
@@ -2076,8 +2027,8 @@ def _find_cache_producer(match: _Match, cache_name: str) -> _Producer | None:
     for index, statement in enumerate(match.owner[:loop_index]):
         if not isinstance(statement, ast.Assign):
             continue
-        target = _name_target(statement)
-        if target is None or target not in _loaded_names(loop):
+        target = assigned_name(statement)
+        if target is None or target not in names_read(loop):
             continue
         calls = _calls(statement.value, ("cute", "arch", "load"))
         if (
@@ -2085,13 +2036,13 @@ def _find_cache_producer(match: _Match, cache_name: str) -> _Producer | None:
             and len(calls[0].args) == 2
             and isinstance(calls[0].args[1], ast.Call)
             and _is_uint16_vector_type(calls[0].args[1], 8)
-            and base_name in _loaded_names(statement.value)
+            and base_name in names_read(statement.value)
         ):
             vector_candidates.append((index, statement))
     if len(vector_candidates) != 1:
         return None
     vector_index, vector_load = vector_candidates[0]
-    vector_name = _name_target(vector_load)
+    vector_name = assigned_name(vector_load)
     assert vector_name is not None
     load_call = _calls(vector_load.value, ("cute", "arch", "load"))[0]
     lexical_prefix = _lexical_statements_before(match.root_body, vector_load)
@@ -2101,7 +2052,7 @@ def _find_cache_producer(match: _Match, cache_name: str) -> _Producer | None:
         lexical_prefix, len(lexical_prefix)
     )
     written_names |= frozenset(
-        _assigned_names(ast.Module(body=match.root_body, type_ignores=[]))
+        names_stored_or_deleted(ast.Module(body=match.root_body, type_ignores=[]))
     )
     base_definition = definitions.get(base_name)
     high_bound_literal = _vector_high_bound_literal(load_call.args[0], base_name, 8)
@@ -2124,9 +2075,9 @@ def _find_cache_producer(match: _Match, cache_name: str) -> _Producer | None:
     self_updates = [
         target
         for statement in loop.body
-        if (target := _name_target(statement)) is not None
+        if (target := assigned_name(statement)) is not None
         and isinstance(statement, ast.Assign)
-        and target in _loaded_names(statement.value)
+        and target in names_read(statement.value)
     ]
     expected_reductions = 0 if cache_name == match.decay_cache else 1
     if len(self_updates) != expected_reductions:
@@ -2159,7 +2110,9 @@ def _find_cache_producer(match: _Match, cache_name: str) -> _Producer | None:
     allowed_external_names = {cache_name}
     if accumulator is not None:
         allowed_external_names.add(accumulator)
-    assigned_temporaries = _assigned_names(loop) - allowed_external_names - {loop_var}
+    assigned_temporaries = (
+        names_stored_or_deleted(loop) - allowed_external_names - {loop_var}
+    )
     root = ast.Module(body=match.root_body, type_ignores=[])
     owner_module = ast.Module(body=match.owner, type_ignores=[])
     cache_region = ast.Module(
@@ -2335,7 +2288,7 @@ def _pack_separate_caches(
     }
     for expression in pair_expressions.values():
         moved_names = (
-            _loaded_names(expression)
+            names_read(expression)
             - original_caches
             - {match.pair_loop_var}
             - _UNIFORM_GLOBALS
@@ -2497,7 +2450,7 @@ def _remove_qdot(match: _Match) -> int | None:
             continue
         definitions: dict[str, ast.expr] = {}
         for child in statement.body:
-            target = _name_target(child)
+            target = assigned_name(child)
             if target is not None and isinstance(child, ast.Assign):
                 definitions[target] = _inline_names(child.value, definitions)
         caches = {
@@ -2521,7 +2474,7 @@ def _remove_qdot(match: _Match) -> int | None:
     ):
         return None
     start = index
-    while start > 0 and _name_target(match.owner[start - 1]) in targets:
+    while start > 0 and assigned_name(match.owner[start - 1]) in targets:
         start -= 1
     if start != index - 2:
         return None
@@ -2529,9 +2482,9 @@ def _remove_qdot(match: _Match) -> int | None:
     reduced_names: set[str] = set(targets)
     while end < match.row_index and end < index + 4:
         statement = match.owner[end]
-        if not (_loaded_names(statement) & reduced_names):
+        if not (names_read(statement) & reduced_names):
             break
-        reduced_names.update(_assigned_names(statement))
+        reduced_names.update(names_stored_or_deleted(statement))
         end += 1
     if end != index + 3 or not _calls(
         match.owner[end - 1], ("cute", "arch", "warp_reduction_sum")
@@ -2546,7 +2499,7 @@ def _remove_qdot(match: _Match) -> int | None:
     root_module = ast.Module(body=match.root_body, type_ignores=[])
     if any(
         not _loads_only_within(root_module, name, removed_module)
-        for name in _assigned_names(removed_module) - {match.qdot_name}
+        for name in names_stored_or_deleted(removed_module) - {match.qdot_name}
     ):
         return None
     del match.owner[start:end]
@@ -2578,7 +2531,7 @@ def _rewrite_row(match: _Match, prefix: str) -> bool:
     row = match.row
     prediction_stmt_index: int | None = None
     for index in range(match.first_index + 1, match.update_index):
-        if _name_target(row.body[index]) == match.prediction_name:
+        if assigned_name(row.body[index]) == match.prediction_name:
             prediction_stmt_index = index
             break
     if prediction_stmt_index is None:
@@ -2687,7 +2640,7 @@ for {prefix}reduce_step in cutlass.range_constexpr(4):
         targets = _tuple_target_names(call, match.first_loop)
         if targets is not None:
             accumulator_names.update(targets)
-    while start > 0 and _name_target(row.body[start - 1]) in accumulator_names:
+    while start > 0 and assigned_name(row.body[start - 1]) in accumulator_names:
         start -= 1
     removed = row.body[start : match.store_index + 1]
     explicitly_replaced = {
@@ -2708,7 +2661,7 @@ for {prefix}reduce_step in cutlass.range_constexpr(4):
     root_module = ast.Module(body=match.root_body, type_ignores=[])
     if any(
         not _loads_only_within(root_module, name, removed_module)
-        for name in _assigned_names(removed_module)
+        for name in names_stored_or_deleted(removed_module)
     ):
         return False
     row.body[start : match.store_index + 1] = replacement

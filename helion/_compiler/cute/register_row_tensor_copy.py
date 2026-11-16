@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from . import cluster_online_pair as pair
+from ._ast_pass_utils import is_name_assign
+from .analysis.online_pair import _assigned_name
+from .analysis.online_pair import _domain
+from .analysis.online_pair import _literal
+from .analysis.online_pair import _under_domain
 from .pipeline_state_loads import _indices_by_stride
 from .pipeline_state_loads import _pointer_info
 from .pipeline_state_loads import _vector_type_info
-from .rolled_cluster_online_pair import _domain
-from .rolled_cluster_online_pair import _literal
-from .rolled_cluster_online_pair import _under_domain
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -40,7 +42,8 @@ class TensorCopyInput:
 @dataclass(frozen=True)
 class TensorCopyContext:
     inputs: Mapping[str, TensorCopyInput]
-    threads: tuple[int, int, int]
+    # The proven launch shape; ``None`` when unproven (no site matches).
+    threads: tuple[int, int, int] | None
 
 
 @dataclass(frozen=True)
@@ -64,13 +67,15 @@ class TensorCopyPlan:
 
 def context_from_device_function(
     fn: DeviceFunction,
-    threads: tuple[int, int, int],
+    threads: tuple[int, int, int] | None,
     dtypes: Mapping[str, str],
 ) -> TensorCopyContext:
+    """The copy facts of ``fn``'s inputs; ``threads`` is the proven launch
+    shape, ``None`` (unproven) matches no row copy site."""
     from ..compile_environment import CompileEnvironment
     from ..device_function import TensorArg
     from ..device_function import TensorDescriptorArg
-    from .memory_ops import runtime_tensor_has_specialized_alignment
+    from .memory_ops import tensor_has_specialized_base_alignment
 
     env = CompileEnvironment.current()
     strides = fn.proven_tensor_stride_values()
@@ -91,12 +96,16 @@ def context_from_device_function(
                 (
                     size
                     for size in (32, 16, 8, 4, 2)
-                    if runtime_tensor_has_specialized_alignment(
-                        env, arg.fake_value, size
-                    )
+                    if tensor_has_specialized_base_alignment(env, arg.fake_value, size)
                 ),
                 0,
             )
+
+            # The launcher declares a tensor pointer at most 16-byte aligned
+            # (``helion.runtime.cute.arg_signature.pointer_alignment``), and
+            # the DSL verifies a copy atom against that declaration, so no
+            # copy may rely on more, however aligned the input is.
+            alignment = min(alignment, 16)
             inputs[arg.name] = TensorCopyInput(
                 dtype,
                 (shape[0], shape[1]),
@@ -250,11 +259,11 @@ def prove_tensor_copy(
     context: TensorCopyContext,
 ) -> TensorCopyPlan | None:
     """Admit original Half widening or FP32 identity loads over a complete slice."""
-    from ..tile_strategy import _is_proven_relocatable_assignment
+    from ._ast_pass_utils import _is_proven_relocatable_assignment
     from .fuse_two_pass_loads import _range_bounds
 
     threads = site.group_span
-    if threads is None or context.threads != (threads, 1, 1):
+    if threads is None or context.threads is None or context.threads != (threads, 1, 1):
         return None
     if len(trips) != len(chain) - 1 or not values:
         return None
@@ -271,8 +280,7 @@ def prove_tensor_copy(
     initial = [
         statement.value
         for statement in body[: site.top_idx]
-        if pair._is_name_assign(statement)
-        and pair._assigned_name(statement) == maximum_acc.id
+        if is_name_assign(statement) and _assigned_name(statement) == maximum_acc.id
     ]
     if (
         writes[maximum_acc.id] != 2
@@ -296,11 +304,11 @@ def prove_tensor_copy(
     }
     for statement in body[: site.top_idx]:
         if (
-            pair._is_name_assign(statement)
-            and writes[pair._assigned_name(statement)] == 1
+            is_name_assign(statement)
+            and writes[_assigned_name(statement)] == 1
             and _is_proven_relocatable_assignment(statement, allow_load=False)
         ):
-            definitions[pair._assigned_name(statement)] = statement.value
+            definitions[_assigned_name(statement)] = statement.value
     for level, (loop, _) in enumerate(chain):
         if not isinstance(loop.target, ast.Name) or loop.orelse:
             return None
@@ -425,9 +433,9 @@ def prove_tensor_copy(
     if elements % vector_width or column_form.get("thread0") != vector_width:
         return None
     allocations = {
-        pair._assigned_name(statement): statement.value
+        _assigned_name(statement): statement.value
         for statement in body
-        if pair._is_name_assign(statement) and pair._assigned_name(statement) in caches
+        if is_name_assign(statement) and _assigned_name(statement) in caches
     }
     if set(allocations) != caches:
         return None
@@ -477,7 +485,7 @@ def prove_tensor_copy(
                 isinstance(node, ast.Assign)
                 and node is not fold
                 and not (
-                    pair._is_name_assign(node)
+                    is_name_assign(node)
                     and _is_proven_relocatable_assignment(node, allow_load=True)
                 )
             ):

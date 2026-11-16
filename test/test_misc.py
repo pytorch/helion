@@ -4,7 +4,6 @@ import ast
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-import math
 import os
 from pathlib import Path
 import subprocess
@@ -25,15 +24,12 @@ from torch.testing._internal.common_utils import parametrize
 from torch.utils._sympy.functions import PowByNatural
 from torch.utils._sympy.value_ranges import ValueRanges
 
-from ._cute_binding import _codegen_skip_reason
-from ._cute_binding import _cpu_bind
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .cute_population_contracts import _target
 import helion
 from helion import _compat
 from helion import exc
 from helion._compat import supports_block_ptr
+from helion._compiler.backend_registry import get_backend_class
 from helion._compiler.cute.printer import cute_texpr
 from helion._compiler.integer_power import lower_integer_powers
 from helion._testing import DEVICE
@@ -46,6 +42,7 @@ from helion._testing import get_test_dot_precision
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfCute
+from helion._testing import skipIfFbTriton
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPyTorchBaseVerLessThan
 from helion._testing import skipIfRefEager
@@ -55,8 +52,14 @@ from helion._testing import skipIfXPU
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing.cute_codegen import codegen_skip_reason
+from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import forbid_native_compile
+from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.runtime.settings import _get_backend
+
+_CUTE_BACKEND = get_backend_class("cute")()
 
 
 @onlyBackends(["triton", "cute"])
@@ -635,6 +638,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                     x[:4] = torch.tensor([-1.5, 1.5, -2.0, 0.0])
                     y[:4] = torch.tensor([0.5, -0.5, 0.25, -1.0])
                     x, y = x.to(dtype), y.to(dtype)
+                    # About one float16 subtest in 2000 draws a divisor that
+                    # rounds to zero, whose NaNs the exact comparison below
+                    # counts as a mismatch.
+                    y[y == 0] = 1.0
                     _, result = code_and_output(modulus, (x, y, s))
                     expected = torch.stack(
                         [
@@ -654,6 +661,10 @@ class TestMisc(RefEagerTestBase, TestCase):
                     )
 
     @skipIfXPU("one wrapped 8-bit result differs from XPU eager by 256")
+    @skipIfFbTriton(
+        "fbtriton crashes the test worker on 8- and 16-bit integer math "
+        "(every fbtriton-h100 CI run, Nov 2026)"
+    )
     def test_narrow_integer_math_wraps_like_eager(self):
         # Eager wraps every 8- and 16-bit integer result, and converts a
         # Python number operand to the tensor's dtype first (x_uint8 % -7
@@ -1181,6 +1192,8 @@ class TestMisc(RefEagerTestBase, TestCase):
             self.assertNotIn("b_size_1", code)
             self.assertIn("b_size_0", code)
 
+    # Each repro test runs its script in a fresh interpreter; this one is the
+    # smoke test, the custom-argument variants below are the slow tier.
     @skipIfRefEager("no code execution")
     def test_triton_repro_add(self):
         mod = import_path(EXAMPLES_DIR / "add.py")
@@ -1204,6 +1217,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=f"stderr:\n{result.stderr}")
 
+    @pytest.mark.slow
     @skipIfRefEager("no code execution")
     @parametrize("static_shapes", (True, False))
     def test_triton_repro_custom(self, static_shapes):
@@ -1408,6 +1422,12 @@ class TestMisc(RefEagerTestBase, TestCase):
         if _get_backend() == "triton":
             self.assertIn("tl.sort", code)
 
+    @skipIfXPU(
+        "Intel's Triton compiler fails an assertion in its "
+        "TritonIntelGPURemoveLayoutConversions pass for a scan of a sort's output "
+        "when one constant is used before and after the sort, as the sort keys' "
+        "encoding and decoding do"
+    )
     def test_torch_sort_then_cumsum(self):
         """Test that torch.sort result can be used as input to torch.cumsum.
 
@@ -1445,7 +1465,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         When only values from torch.sort() are used, the compiler should
         skip generating the rank-based argsort code (which creates
         O(N^2) intermediate tensors and would exceed Triton's 1M element limit
-        for large N).
+        for large N). On Triton, 32-bit values never rank: their indices come
+        from sorting packed value/index keys. 64-bit values rank only for used
+        indices (test_triton_selection.py).
         """
 
         @helion.kernel()
@@ -1467,7 +1489,7 @@ class TestMisc(RefEagerTestBase, TestCase):
             # Argsort rank computation should NOT be present
             self.assertNotIn("tl.sum(tl.where(", code)
 
-        # Contrast: when indices ARE used, argsort code must be generated
+        # Contrast: the indices are used
         @helion.kernel()
         def sort_with_indices_kernel(
             x: torch.Tensor,
@@ -1486,8 +1508,9 @@ class TestMisc(RefEagerTestBase, TestCase):
         torch.testing.assert_close(vals2, ref_vals2)
         torch.testing.assert_close(idx2, ref_idx2)
         if _get_backend() == "triton":
-            # Argsort rank computation SHOULD be present when indices are used
-            self.assertIn("tl.sum(tl.where(", code2)
+            # Sorted value/index keys give the indices, without ranks
+            self.assertIn("tl.sort", code2)
+            self.assertNotIn("tl.sum(tl.where(", code2)
 
     def test_cumsum_does_not_alias_input(self):
         """Regression test: torch.cumsum output must not alias its input.
@@ -1704,10 +1727,21 @@ class TestMisc(RefEagerTestBase, TestCase):
             f"{TRITON_MAX_TENSOR_NUMEL}. "
             f"This will cause Triton JIT compilation to hang.",
         )
-        # The heuristic in BlockSizeSpec._fragment() should pick default=4
-        # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
-        # (safe for 64KB shared memory with bf16).
-        self.assertEqual(block_sizes, [4, 4, 4])
+        promoted = config_spec.compiler_default_config
+        if promoted is None:
+            # The heuristic in BlockSizeSpec._fragment() should pick default=4
+            # for 3 tiled dims + reduction_numel=128, giving 4^3*128 = 8K
+            # (safe for 64KB shared memory with bf16).
+            self.assertEqual(block_sizes, [4, 4, 4])
+        else:
+            # A kernel that only streams a full head_dim slab per element is
+            # pointwise; on the arches where the Triton pointwise seed is
+            # promoted (TritonPointwiseSeedHeuristic.PROMOTE_TARGETS) that seed
+            # is the default. Its byte budget over the 128-wide bf16 slab gives
+            # one row per CTA on the batch and head axes and 16 rows along the
+            # sequence.
+            self.assertIn("triton_pointwise", config_spec.autotuner_heuristics)
+            self.assertEqual(block_sizes, [1, 1, 16])
 
         # Also verify it actually runs successfully
         code, result = code_and_output(helion_merge_attention_fwd, (a, lse_a, b, lse_b))
@@ -1905,14 +1939,14 @@ class TestHelionCutePrinter(TestCase):
         backends = [
             backend
             for backend in ("cute", "triton")
-            if _codegen_skip_reason(backend) is None
+            if codegen_skip_reason(backend) is None
         ]
         if not backends:
             raise unittest.SkipTest("no backend can generate device source")
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
-            _forbid_native_compile(),
+            forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
             for backend in backends:
@@ -1921,7 +1955,7 @@ class TestHelionCutePrinter(TestCase):
                 )
                 for bits in (5, 31, 62):
                     with self.subTest(backend=backend, bits=bits):
-                        bound = _cpu_bind(
+                        bound = cpu_bind(
                             kernel, (torch.ones(3, dtype=torch.int64), bits)
                         )
                         code = bound.to_code(bound.config_spec.default_config())
@@ -1964,7 +1998,7 @@ class TestHelionCutePrinter(TestCase):
         for base, last in ((2, 62), (4, 31), (8, 20), (16, 15)):
             expression = cast("sympy.Expr", PowByNatural(sympy.Integer(base), exponent))
             lowered = lower_integer_powers(
-                expression, {exponent: ValueRanges(0, last)}, backend="cute"
+                expression, {exponent: ValueRanges(0, last)}, backend=_CUTE_BACKEND
             )
             rendered = cute_texpr(lowered)
             for value in range(last + 1):
@@ -1996,7 +2030,9 @@ class TestHelionCutePrinter(TestCase):
                     ),
                 )
                 with self.assertRaises(exc.BackendUnsupported):
-                    lower_integer_powers(expression, {exponent: bounds}, backend="cute")
+                    lower_integer_powers(
+                        expression, {exponent: bounds}, backend=_CUTE_BACKEND
+                    )
         # Unprepared powers must not fall through to Triton's floating printer.
         with self.assertRaises(exc.BackendUnsupported):
             cute_texpr(cast("sympy.Expr", PowByNatural(2, exponent)))
@@ -2015,7 +2051,7 @@ class TestHelionCutePrinter(TestCase):
         ):
             expression = cast("sympy.Expr", expression)
             rendered = cute_texpr(
-                lower_integer_powers(expression, {index: bounds}, backend="cute")
+                lower_integer_powers(expression, {index: bounds}, backend=_CUTE_BACKEND)
             )
             for value in (3, 17, 30):
                 actual = eval(
@@ -2025,7 +2061,9 @@ class TestHelionCutePrinter(TestCase):
                 )
                 self.assertEqual(actual, expression.subs(index, value))
         unchanged = sympy.Add(sympy.Mul(3, index), 4)
-        self.assertIs(lower_integer_powers(unchanged, {}, backend="cute"), unchanged)
+        self.assertIs(
+            lower_integer_powers(unchanged, {}, backend=_CUTE_BACKEND), unchanged
+        )
 
     @skipIfRefEager("inspects generated device code")
     def test_scalar_loop_integer_power_range_proof(self) -> None:
@@ -2043,14 +2081,14 @@ class TestHelionCutePrinter(TestCase):
             return result
 
         with (
-            _mock_cuda_unavailable(),
+            mock_cuda_unavailable(),
             _target(),
-            _forbid_native_compile(),
+            forbid_native_compile(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
             for begin, end, step in ((0, 63, 1), (3, 63, 2), (62, -1, -1)):
                 with self.subTest(begin=begin, end=end, step=step):
-                    bound = _cpu_bind(
+                    bound = cpu_bind(
                         powers, (torch.ones(5, dtype=torch.int64), begin, end, step)
                     )
                     code = bound.to_code(bound.config_spec.default_config())
@@ -2085,7 +2123,7 @@ class TestHelionCutePrinter(TestCase):
                                 },
                             )
                             self.assertEqual(actual, 1 << value)
-            bound = _cpu_bind(powers, (torch.ones(5, dtype=torch.int64), 0, 64, 1))
+            bound = cpu_bind(powers, (torch.ones(5, dtype=torch.int64), 0, 64, 1))
             with self.assertRaisesRegex(exc.BackendUnsupported, "proved exponent"):
                 bound.to_code(bound.config_spec.default_config())
 
@@ -2160,84 +2198,6 @@ class TestHelionCutePrinter(TestCase):
                     ),
                     int(expression.subs(x, value)),
                 )
-
-
-@onlyBackends(["triton"])
-class TestHelionTritonPrinter(TestCase):
-    """Tests for the HelionTritonPrinter class."""
-
-    def test_print_ToFloat(self):
-        """Test that ToFloat expressions are printed correctly."""
-        import sympy
-        from torch.utils._sympy.functions import ToFloat
-
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # Symbolic variable: should print "x + 0.0", not "ToFloat(x) + 0.0"
-        x = sympy.Symbol("x", integer=True)
-        self.assertEqual(printer.doprint(ToFloat(x)), "x + 0.0")
-
-        # Complex expression
-        y = sympy.Symbol("y", integer=True)
-        result = printer.doprint(ToFloat(x + y))
-        self.assertNotIn("ToFloat", result)
-        self.assertIn("0.0", result)
-
-        # Concrete integer: ToFloat(5) simplifies to 5.0
-        result = printer.doprint(ToFloat(sympy.Integer(5)))
-        self.assertNotIn("ToFloat", result)
-        self.assertEqual(float(result), 5.0)
-
-    def test_print_Float(self):
-        """Test that Float expressions are printed as raw literals."""
-        import sympy
-
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # Non-symbolic floats should print as raw numeric literals (not tl.full)
-        for val in [math.pi, 0.0, -2.5]:
-            result = printer.doprint(sympy.Float(val))
-            self.assertNotIn("tl.full", result)
-            self.assertAlmostEqual(float(result), val)
-
-    def test_print_FloorDiv_constexpr(self):
-        """Test that FloorDiv with constexpr LHS prints as // operator.
-
-        This is required for TMA tensor descriptors which need compile-time
-        constant block shapes. When the LHS is a constexpr argument (like a
-        block size), we must emit `lhs // rhs` instead of
-        `triton_helpers.div_floor_integer(lhs, rhs)` so Triton can evaluate
-        the expression at compile time.
-        """
-        from unittest.mock import Mock
-
-        import sympy
-        from torch.utils._sympy.functions import FloorDiv
-
-        from helion._compiler.device_function import DeviceFunction
-        from helion._compiler.triton.printer import HelionTritonPrinter
-
-        printer = HelionTritonPrinter()
-
-        # LHS is constexpr -> use //
-        mock_df = Mock(_constexpr_args={"_BLOCK_SIZE_0": None})
-        with patch.object(DeviceFunction, "current", return_value=mock_df):
-            block_size = sympy.Symbol("_BLOCK_SIZE_0", integer=True)
-            expr = FloorDiv(block_size, 2)
-            result = printer.doprint(expr)
-            self.assertEqual(result, "_BLOCK_SIZE_0 // 2")
-
-        # LHS is NOT constexpr -> fallback to triton_helpers
-        mock_df = Mock(_constexpr_args={})
-        with patch.object(DeviceFunction, "current", return_value=mock_df):
-            x = sympy.Symbol("x", integer=True)
-            expr = FloorDiv(x, 2)
-            result = printer.doprint(expr)
-            self.assertIn("div_floor_integer", result)
 
 
 @onlyBackends(["triton", "cute"])
@@ -2539,13 +2499,14 @@ def _run_narrow_shift_generated(code, x, shifts):
     return tuple(outputs)
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", (torch.int8, torch.uint8, torch.int16))
 @pytest.mark.parametrize("count_kind", ("scalar", "narrow", "wide"))
 def test_cute_narrow_integer_shifts_generated(dtype, count_kind):
     args = _narrow_shift_inputs(dtype, count_kind)
     snapshots = [a.clone() for a in args[:2]]
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_narrow_integer_shift_chain, args)
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_narrow_integer_shift_chain, args)
         for block_size in (32, 128):
             code = bound.to_code(
                 helion.Config(block_sizes=[block_size], num_threads=[32])
@@ -2582,6 +2543,7 @@ class TestNarrowIntegerShifts(TestCase):
                             torch.testing.assert_close(arg, original, rtol=0, atol=0)
 
 
+@skipUnlessBackends(["cute"])
 @skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_sdk_type(dtype):
@@ -2589,7 +2551,7 @@ def test_cute_unsigned_scalar_load_sdk_type(dtype):
     cute = pytest.importorskip("cutlass.cute")
     ir = pytest.importorskip("cutlass._mlir.ir")
     from helion._compiler.cute.backend import CuteBackend
-    from helion.language.memory_ops import _cute_scalar_load_expr
+    from helion._compiler.cute.emitters.memory_access import _cute_scalar_load_expr
 
     logical = cutlass.Uint8 if dtype == torch.uint8 else cutlass.Uint32
     environment = SimpleNamespace(
@@ -2620,10 +2582,11 @@ def test_cute_unsigned_scalar_load_sdk_type(dtype):
         assert "arith.extsi" not in assembly
 
 
+@skipUnlessBackends(["cute"])
 def test_cute_scalar_load_non_unsigned_paths_unchanged():
     from helion._compiler.cute.backend import CuteBackend
-    from helion.language.memory_ops import _cute_scalar_load_expr
-    from helion.language.memory_ops import _cute_scalar_pointer_expr
+    from helion._compiler.cute.emitters.memory_access import _cute_scalar_load_expr
+    from helion._compiler.cute.emitters.memory_access import _cute_scalar_pointer_expr
 
     environment = SimpleNamespace(
         backend=CuteBackend(), index_type=lambda: "cutlass.Int32"
@@ -2668,11 +2631,12 @@ def _unsigned_load_input(dtype, device):
     return values[1:515:2]
 
 
+@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("dtype", (torch.uint8, torch.uint32))
 def test_cute_unsigned_scalar_load_codegen(dtype):
     x = _unsigned_load_input(dtype, "cpu")
-    with _mock_cuda_unavailable(), _target(), _forbid_native_compile():
-        bound = _cpu_bind(_unsigned_scalar_widen, (x,))
+    with mock_cuda_unavailable(), _target(), forbid_native_compile():
+        bound = cpu_bind(_unsigned_scalar_widen, (x,))
         for size in (32, 128):
             code = bound.to_code(helion.Config(block_sizes=[size], num_threads=[32]))
             branches = [

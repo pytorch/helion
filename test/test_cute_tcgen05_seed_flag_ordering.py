@@ -9,8 +9,11 @@ from unittest.mock import patch
 import torch
 
 import helion
-from helion._compiler.autotuner_heuristics.cute import CuteTcgen05ClusterM2FfiHeuristic
-from helion._compiler.cute.tcgen05_config import CuteTcgen05Config
+from helion._compiler.cute import target_facts
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteTcgen05ClusterM2FfiHeuristic,
+)
+from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY,
 )
@@ -29,10 +32,10 @@ if TYPE_CHECKING:
 # Compiler seeds (``compiler_seed_configs``) consult them, so they must be
 # final before the seeds are computed.
 _HOST_FUNCTION_FACT_FLAGS = (
-    "cute_tcgen05_aux_kernel_detected",
-    "cute_tcgen05_exact_shape_aux_kernel_detected",
-    "cute_tcgen05_matmul_has_non_tcgen05_operand",
-    "cute_tcgen05_rowvec_aux_facts",
+    "aux_kernel_detected",
+    "exact_shape_aux_kernel_detected",
+    "matmul_has_non_tcgen05_operand",
+    "rowvec_aux_facts",
 )
 
 
@@ -92,10 +95,11 @@ def _bf16xint16_gemm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 def _blackwell_bind_patches() -> Iterator[None]:
     with (
         patch_cute_mma_support(),
-        patch("helion.language.matmul_ops._cuda_num_sms_or_zero", return_value=132),
-        patch.object(
-            CuteTcgen05Config, "per_cta_smem_capacity_bytes", return_value=232448
+        patch(
+            "helion._compiler.cute.tcgen05.search_plan._cuda_num_sms_or_zero",
+            return_value=132,
         ),
+        patch.object(target_facts, "per_cta_smem_capacity_bytes", return_value=232448),
     ):
         yield
 
@@ -131,7 +135,7 @@ class TestCuteTcgen05SeedFlagOrdering(TestCase):
             assert not seed_time_flags
             spec = env.config_spec  # pyrefly: ignore[missing-attribute]
             for flag in _HOST_FUNCTION_FACT_FLAGS:
-                seed_time_flags[flag] = getattr(spec, flag)
+                seed_time_flags[flag] = getattr(spec.tcgen05, flag)
             return real_compiler_seed_configs(env, device_ir)
 
         with (
@@ -151,7 +155,8 @@ class TestCuteTcgen05SeedFlagOrdering(TestCase):
     ) -> helion.runtime.kernel.BoundKernel:
         bound, seed_time_flags = self._bind_recording_seed_time_flags(kernel, args)
         final_flags = {
-            flag: getattr(bound.config_spec, flag) for flag in _HOST_FUNCTION_FACT_FLAGS
+            flag: getattr(bound.config_spec.tcgen05, flag)
+            for flag in _HOST_FUNCTION_FACT_FLAGS
         }
         self.assertEqual(seed_time_flags, final_flags)
         return bound
@@ -170,9 +175,9 @@ class TestCuteTcgen05SeedFlagOrdering(TestCase):
         )
         bound = self._assert_flags_final_at_seed_time(_residual_gemm, args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_aux_kernel_detected)
-        self.assertTrue(spec.cute_tcgen05_exact_shape_aux_kernel_detected)
-        self.assertIsNotNone(spec.cute_tcgen05_rowvec_aux_facts)
+        self.assertTrue(spec.tcgen05.aux_kernel_detected)
+        self.assertTrue(spec.tcgen05.exact_shape_aux_kernel_detected)
+        self.assertIsNotNone(spec.tcgen05.rowvec_aux_facts)
 
     def test_non_tcgen05_operand_flag_final_before_compiler_seeds(self) -> None:
         """The bf16 x int16 GEMM's cast operand is known when seeds are computed.
@@ -186,7 +191,7 @@ class TestCuteTcgen05SeedFlagOrdering(TestCase):
             torch.empty([1024, 4096], device=DEVICE, dtype=torch.int16),
         )
         bound = self._assert_flags_final_at_seed_time(_bf16xint16_gemm, args)
-        self.assertTrue(bound.config_spec.cute_tcgen05_matmul_has_non_tcgen05_operand)
+        self.assertTrue(bound.config_spec.tcgen05.matmul_has_non_tcgen05_operand)
         self.assertEqual(_direct_entry_seeds(bound), [])
 
     def test_non_tcgen05_operand_keeps_direct_entry_seed_out_of_compiler_seeds(
@@ -207,7 +212,7 @@ class TestCuteTcgen05SeedFlagOrdering(TestCase):
         with _blackwell_bind_patches():
             eligible = _make_plain_gemm().bind(args)
         self.assertTrue(
-            eligible.config_spec._tcgen05_full_tile_direct_entry_seed_eligible()
+            seeds.full_tile_direct_entry_seed_eligible(eligible.config_spec.tcgen05)
         )
         self.assertIn(
             CuteTcgen05ClusterM2FfiHeuristic.name,
@@ -218,14 +223,14 @@ class TestCuteTcgen05SeedFlagOrdering(TestCase):
         with (
             _blackwell_bind_patches(),
             patch(
-                "helion.runtime.kernel.host_function_matmul_has_non_tcgen05_operand",
+                "helion._compiler.cute.runtime_hooks.host_function_matmul_has_non_tcgen05_operand",
                 return_value=True,
             ),
         ):
             bound = _make_plain_gemm().bind(args)
         spec = bound.config_spec
-        self.assertTrue(spec.cute_tcgen05_matmul_has_non_tcgen05_operand)
-        self.assertFalse(spec._tcgen05_full_tile_direct_entry_seed_eligible())
+        self.assertTrue(spec.tcgen05.matmul_has_non_tcgen05_operand)
+        self.assertFalse(seeds.full_tile_direct_entry_seed_eligible(spec.tcgen05))
         self.assertNotIn(
             CuteTcgen05ClusterM2FfiHeuristic.name, spec.autotuner_heuristics
         )

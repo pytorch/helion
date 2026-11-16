@@ -1,26 +1,25 @@
 from __future__ import annotations
 
 import ast
+from contextlib import ExitStack
 from copy import deepcopy
 import random
 import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
-from examples.layer_norm import layer_norm_bwd
-from examples.rms_norm import rms_norm_bwd
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
-
 import helion
 from helion._compiler.autotuner_heuristics import compiler_seed_configs
-from helion._compiler.autotuner_heuristics.cute_resident_reductions import (
+from helion._compiler.cute.autotune.heuristics.cute_resident_reductions import (
     CuteResidentReductionHeuristic,
 )
+from helion._testing import cpu_render_target
+from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner import LFBOTreeSearch
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.autotuner.local_cache import LocalAutotuneCache
@@ -28,7 +27,10 @@ from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
 from helion.runtime.settings import default_autotuner_fn
 
-pytestmark = skipUnlessBackends(["cute"])
+layer_norm_bwd = import_example("layer_norm").layer_norm_bwd
+rms_norm_bwd = import_example("rms_norm").rms_norm_bwd
+
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -39,6 +41,37 @@ if TYPE_CHECKING:
 
 
 KEY = "cute_host_paired_sum"
+
+# The computed-fragment lowering's coverage groups a layer-norm backward
+# kernel also carries (the resident family is its promoted route; the
+# fragment route is a search alternative whose witnesses append after the
+# whole legacy population).  The historical-prefix tests build their "old"
+# population without these registrations, as test_cute_fragment_scan_config's
+# fixture does: a new fragment knob extends this list, never the prefix.
+_FRAGMENT_COVERAGE_REGISTRATIONS = (
+    "register_fragment_reduction_coverage",
+    "register_fragment_threads_coverage",
+    "register_fragment_padded_rows_coverage",
+    "register_fragment_unrolled_loops_coverage",
+    "register_fragment_vector_io_coverage",
+    "register_fragment_batched_loads_coverage",
+    "register_fragment_split_k_coverage",
+    "register_fragment_slab_loads_coverage",
+    "register_fragment_packet_loads_coverage",
+)
+_FRAGMENT_COVERAGE_MECHANISMS = frozenset(
+    {
+        "cute.computed_fragment_reduction",
+        "cute.computed_fragment_threads",
+        "cute.fragment_padded_rows",
+        "cute.fragment_unrolled_loops",
+        "cute.fragment_vector_io",
+        "cute.fragment_batched_loads",
+        "cute.fragment_split_k",
+        "cute.fragment_slab_loads",
+        "cute.fragment_packet_loads",
+    }
+)
 
 
 @pytest.fixture(autouse=True)
@@ -55,14 +88,7 @@ def _cpu_only(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         "HELION_CUTE_MATERIALIZE_TRANSFORMED_OPERANDS",
     ):
         monkeypatch.delenv(name, raising=False)
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 
@@ -104,7 +130,7 @@ def _bind(
         ignore_warnings=[helion.exc.TensorOperationInWrapper],
         **settings,
     )
-    return _cpu_bind(kernel, args), args
+    return cpu_bind(kernel, args), args
 
 
 def _family(bound: BoundKernel) -> list[helion.Config]:
@@ -162,26 +188,26 @@ def _initial_population_with_legacy_prefix(
     # population. Check the actual benchmark boundary, exact order and RNG.
     spec = bound.config_spec
     groups = spec.compiler_coverage_groups
-    with (
-        patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_reduction_coverage"
-        ),
-        patch(
-            "helion._compiler.autotuner_heuristics.register_fragment_threads_coverage"
-        ),
-    ):
-        old_bound = _cpu_bind(bound.kernel, args)
-    _old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
+    with ExitStack() as stack:
+        for registration in _FRAGMENT_COVERAGE_REGISTRATIONS:
+            stack.enter_context(
+                patch("helion._compiler.cute.autotune.heuristics." + registration)
+            )
+        old_bound = cpu_bind(bound.kernel, args)
+    old_search, old, old_rng = _capture_initial_population(old_bound, args, seed)
     search, delivered, rng = _capture_initial_population(bound, args, seed)
-    assert len(old) == 100
+    # The packed V-lane knob's witnesses, registered before the fragment
+    # groups, follow the 100 rows in both populations.
+    assert len(old) == 100 + sum(
+        outcome.outcome == "added" for outcome in old_search.compiler_coverage_outcomes
+    )
     assert delivered[: len(old)] == old
     assert rng == old_rng
     additions = delivered[len(old) :]
     assert all(config not in old for config in additions)
     assert all(
         any(
-            group.mechanism
-            in ("cute.computed_fragment_reduction", "cute.computed_fragment_threads")
+            group.mechanism in _FRAGMENT_COVERAGE_MECHANISMS
             and config.config.get(group.key, group.legacy) != group.legacy
             for group in groups
         )
@@ -245,9 +271,10 @@ def test_entire_old_seed_prefix_and_default_are_preserved(
     assert [
         group.mechanism
         for group in spec.compiler_coverage_groups
-        if group.mechanism
-        not in ("cute.computed_fragment_reduction", "cute.computed_fragment_threads")
+        if group.mechanism not in _FRAGMENT_COVERAGE_MECHANISMS
     ] == [
+        "cute.pair_lane_math",
+        "cute.uniform_lane_compares",
         "cute.resident_row_consumption",
         "cute.resident_terminal_product",
     ]
@@ -416,7 +443,7 @@ def _unreturned_feature_partial(x: torch.Tensor) -> torch.Tensor:
 
 
 def test_structural_family_without_host_sum_has_only_ordinary_producer() -> None:
-    bound = _cpu_bind(
+    bound = cpu_bind(
         _unreturned_feature_partial, (torch.empty((17, 128), dtype=torch.float16),)
     )
     assert not bound.config_spec.cute_host_paired_sum_available

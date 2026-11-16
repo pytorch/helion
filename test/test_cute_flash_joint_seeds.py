@@ -6,14 +6,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from ._cute_binding import _forbid_native_compile
-from ._cute_binding import _mock_cuda_unavailable
 from .test_cute_flash_stateful_choice import _resolve
 from .test_cute_flash_stateful_choice import _spec
 import helion
 from helion._compiler.cute import cute_flash as flash
+from helion._compiler.cute.autotune.flash_surface import _cute_flash_autotune_fragments
+from helion._testing import cpu_render_target
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -21,7 +23,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _cpu_only() -> Iterator[None]:
-    with _mock_cuda_unavailable(), _forbid_native_compile():
+    with cpu_render_target():
         yield
 
 
@@ -57,6 +59,8 @@ def test_complete_seed_prefix_and_joint_surface(head_dim, dtype, heads) -> None:
     assert {c.config[flash.FLASH_SOFTMAX_REGS_KEY] for c in added} == {200, 152}
     for parent in parents:
         expected = dict(spec.normalized_config(parent).config)
+        # Flattening materializes this implicit default; legacy seeds stay sparse.
+        expected["cute_compiler_pipeline"] = "default"
         for registers in (200, 152):
             candidate = helion.Config.from_dict(
                 {
@@ -88,7 +92,7 @@ def test_active_domains_and_parent_storage_cap(
 ) -> None:
     spec = _spec(head_dim, 32, torch.float16)
     old = _old_seeds(spec)
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
     fragments[flash.FLASH_KV_STAGE_KEY] = EnumFragment(depths, depths)
     fragments[flash.FLASH_SOFTMAX_REGS_KEY] = EnumFragment(registers, registers)
     added = flash._flash_stateful_joint_seed_configs(
@@ -111,7 +115,7 @@ def test_weighted_budget_rejection_and_canonical_duplicate_parents() -> None:
         if c.config.get(flash.FLASH_SOFTMAX_LOWERING_KEY) == "resident_stateful"
         and c.config.get(flash.FLASH_ROWMAX_KEY) == "tmem"
     )
-    fragments = spec._cute_flash_autotune_fragments()
+    fragments = _cute_flash_autotune_fragments(spec)
 
     def supplement(parents):
         return flash._flash_stateful_joint_seed_configs(

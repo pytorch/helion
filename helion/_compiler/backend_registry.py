@@ -11,14 +11,15 @@ import threading
 import types
 from typing import TYPE_CHECKING
 
-from .backend import CuteBackend
-from .backend import MetalBackend
-from .backend import PallasBackend
-from .backend import TileIRBackend
-from .backend import TritonBackend
+from .cute.backend import CuteBackend
 from .flydsl.backend import FlyDSLBackend
+from .metal.backend import MetalBackend
+from .pallas.backend import PallasBackend
+from .triton.backend import TileIRBackend
+from .triton.backend import TritonBackend
 
 if TYPE_CHECKING:
+    from ..autotuner.search_surface import BackendSearchSurface
     from .backend import Backend
 
 _BUILTIN_BACKENDS: list[type[Backend]] = [
@@ -31,6 +32,11 @@ _BUILTIN_BACKENDS: list[type[Backend]] = [
 ]
 
 _REGISTRY: dict[str, type[Backend]] = {}
+# Bumped by every registration and unregistration: the tables derived from
+# the registry (``config_spec``'s key tables, ``autotuner_heuristics``'s
+# heuristics by backend) key their caches on it, so a backend registered
+# after those modules imported is seen on the next lookup.
+_GENERATION = 0
 _CODEGEN_REPAIR_LOCK = threading.RLock()
 _REPAIRED_CODEGEN_NAMES: frozenset[str] = frozenset()
 
@@ -44,13 +50,33 @@ def register_compiler_backend(backend_class: type[Backend]) -> None:
     Args:
         backend_class: A :class:`Backend` subclass.
     """
-    global _REPAIRED_CODEGEN_NAMES
+    global _GENERATION, _REPAIRED_CODEGEN_NAMES
 
     backend = backend_class()
     with _CODEGEN_REPAIR_LOCK:
         _REGISTRY[backend.name] = backend_class
+        _GENERATION += 1
         codegen_names, _ = _codegen_repair_scope(backend.codegen_name)
         _REPAIRED_CODEGEN_NAMES = _REPAIRED_CODEGEN_NAMES.difference(codegen_names)
+
+
+def unregister_compiler_backend(name: str) -> None:
+    """Remove the backend registered as ``name`` (a no-op for unknown names).
+
+    For tests that register a throwaway backend: the derived tables forget
+    it on their next lookup.
+    """
+    global _GENERATION
+
+    with _CODEGEN_REPAIR_LOCK:
+        if _REGISTRY.pop(name, None) is not None:
+            _GENERATION += 1
+
+
+def registry_generation() -> int:
+    """A counter bumped by every (un)registration, for caches derived from
+    the registry."""
+    return _GENERATION
 
 
 def get_backend_class(name: str) -> type[Backend]:
@@ -60,6 +86,17 @@ def get_backend_class(name: str) -> type[Backend]:
             f"Unknown backend: {name!r}. Available backends: {list_backends()}"
         )
     return _REGISTRY[name]
+
+
+def get_backend(name: str) -> Backend:
+    """A fresh instance of the backend registered as ``name``.
+
+    Callers that only read a hook (a capability predicate, the heuristics
+    tuple, the structural policy type) get their own instance: backends are
+    cheap to construct and several (Metal, Pallas, FlyDSL) keep per-compile
+    state on the instance, so instances are never shared.
+    """
+    return get_backend_class(name)()
 
 
 def list_backends() -> list[str]:
@@ -78,6 +115,21 @@ def all_reserved_launch_param_names() -> frozenset[str]:
     for backend_cls in _REGISTRY.values():
         result.update(backend_cls.reserved_launch_param_names())
     return frozenset(result)
+
+
+def all_search_surfaces() -> list[BackendSearchSurface]:
+    """The distinct search surfaces of the registered backends.
+
+    ``helion.autotuner.config_spec`` derives ``BACKEND_SPECIFIC_KEYS`` /
+    ``VALID_KEYS`` / ``DEBUG_KEYS`` from them; backends that share one surface
+    object (the no-op default) contribute it once.
+    """
+    surfaces: list[BackendSearchSurface] = []
+    for backend_cls in _REGISTRY.values():
+        surface = backend_cls().config_spec_extension()
+        if not any(surface is seen for seen in surfaces):
+            surfaces.append(surface)
+    return surfaces
 
 
 def import_backend_codegen() -> None:

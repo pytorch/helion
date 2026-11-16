@@ -150,3 +150,10 @@ class PallasMatmulF32NoTilingSeedHeuristic(_PallasNoTilingSeedHeuristic):
     name = "pallas_matmul_f32_no_tiling_seed"
     _allowed_dtypes = _F32_DTYPES
     _dims = _PALLAS_F32_NO_TILING_DIMS
+
+
+# Ranked registry (``PallasBackend.autotuner_heuristics``).
+PALLAS_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
+    PallasMatmulNoTilingSeedHeuristic,
+    PallasMatmulF32NoTilingSeedHeuristic,
+)

@@ -25,7 +25,7 @@ def aligned_shared_bytes(count: int, dtype: torch.dtype) -> int:
 
 
 def metadata_guarded(env: CompileEnvironment, expr: sympy.Expr) -> bool:
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return False
     # The exact metadata guard covers sizes and strides, not runtime scalar
     # arguments, device values, or storage offsets.
@@ -66,14 +66,14 @@ def configured_fragment_expr(
                 )
             block = env.block_sizes[info.origin.block_id]
             replacement = (
-                block.numel if block.reduction else resolve_block_size(block.block_id)
+                block.numel if not block.is_tile else resolve_block_size(block.block_id)
             )
             if replacement is None:
                 continue
             if isinstance(replacement, torch.SymInt):
                 replacement = replacement._sympy_()
             resolved = resolve(sympy.sympify(replacement), visiting | {symbol})
-            if block.reduction:
+            if not block.is_tile:
                 logical = env.specialize_expr(sympy.sympify(resolved))
                 if logical.free_symbols and metadata_guarded(env, logical):
                     # Storage has a static capacity; masks and scans still

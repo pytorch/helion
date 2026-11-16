@@ -28,11 +28,11 @@ from helion._testing import _get_backend
 from helion._testing import check_example
 from helion._testing import float32_matmul_precision
 from helion._testing import get_test_float32_matmul_precision
+from helion._testing import import_example
 from helion._testing import import_path
 from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
-from helion._testing import skipIfCute
 from helion._testing import skipIfFn
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
@@ -50,11 +50,6 @@ from helion.runtime.ref_mode import is_ref_mode_enabled
 
 _orig_cudnn_fp32_precision: str = "none"
 _orig_float32_matmul_precision: str = "none"
-
-_CUTE_LINEAR_ATTN_SKIP = (
-    "[C, C] intra-chunk tiles (causal mask, q @ k^T, hl.zeros([t, C, C])) bind "
-    "one block id to two axes; cute's SIMT lowering has one lane per block id"
-)
 
 
 def _compile_only(
@@ -251,7 +246,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         The bug manifests after multiple kernel executions - errors accumulate
         due to improper handling of the tmp tensor across invocations.
         """
-        from examples.split_k_barrier import split_k_matmul
+        split_k_matmul = import_example("split_k_barrier").split_k_matmul
 
         m, k, n = 64, 33, 64
         config = helion.Config(
@@ -374,6 +369,31 @@ class TestExamples(RefEagerTestBase, TestCase):
                 bias=args[3],
             ),
             block_sizes=[16, 16],
+            static_shapes=True,
+        )
+
+    @xfailIfPallasTpu(
+        "Mosaic cannot lower the fp16 row-block load: 'Invalid vector type for "
+        "load' on a (16,128)-tiled f16 VMEM ref"
+    )
+    def test_layernorm_rows(self):
+        # The second launch of ``matmul_layernorm_unfused``.
+        args = (
+            torch.randn([64, 256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256], device=DEVICE, dtype=torch.float16),
+            torch.randn([256], device=DEVICE, dtype=torch.float16),
+        )
+        check_example(
+            "matmul_layernorm",
+            args,
+            torch.nn.functional.layer_norm(
+                args[0].float(),
+                normalized_shape=(256,),
+                weight=args[1].float(),
+                bias=args[2].float(),
+            ).to(torch.float16),
+            fn_name="layernorm_rows",
+            block_sizes=[16],
             static_shapes=True,
         )
 
@@ -706,8 +726,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         "Test configs require tensor descriptor support",
     )
     def test_welford_bfloat16_accuracy(self, reduction_block_size):
-        from examples.welford import eager_layer_norm
-        from examples.welford import welford
+        _examples_welford = import_example("welford")
+        eager_layer_norm = _examples_welford.eager_layer_norm
+        welford = _examples_welford.welford
 
         if _get_backend() == "cute":
             # The Triton config below pins Triton-only knobs (indexing,
@@ -746,8 +767,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
     def test_low_mem_dropout(self):
-        from examples.low_mem_dropout import low_mem_dropout
-        from examples.low_mem_dropout import low_mem_dropout_bwd
+        _examples_low_mem_dropout = import_example("low_mem_dropout")
+        low_mem_dropout = _examples_low_mem_dropout.low_mem_dropout
+        low_mem_dropout_bwd = _examples_low_mem_dropout.low_mem_dropout_bwd
 
         p = 0.25
         size = 1024
@@ -797,7 +819,9 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("precision differences with bf16xint16 operations on rocm")
     @skipIfXPU("precision differences with bf16xint16 operations on xpu")
     def test_bf16xint16(self):
-        from examples.bf16xint16_gemm import reference_bf16xint16_pytorch
+        reference_bf16xint16_pytorch = import_example(
+            "bf16xint16_gemm"
+        ).reference_bf16xint16_pytorch
 
         m, k, n = 2048, 1024, 1280
 
@@ -943,7 +967,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         eps = 1e-5
 
         # Compute forward pass to get rms
-        from examples.rms_norm import rms_norm_fwd
+        rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
         # Create configured kernel with explicit config
         config = helion.Config(block_size=32, num_warps=4, num_stages=3)
@@ -1061,6 +1085,25 @@ class TestExamples(RefEagerTestBase, TestCase):
             indexing="pointer",
         )
 
+    @skipIfRefEager("checks the example's reference, not a kernel")
+    @skipIfFn(
+        lambda: DEVICE.type == "tpu",
+        "the reference does not run on TPU (_baseline_unless_tpu)",
+    )
+    def test_attention_baseline_keeps_no_autograd_graph(self):
+        # The autotuner keeps the baseline output for the whole search, and
+        # benchmark harnesses (tritonbench) pass inputs that require grad: a
+        # graph behind the output pinned every score block of the reference's
+        # LSE loop, ~50 GiB at (4, 48, 8192, 128).
+        mod = import_path(EXAMPLES_DIR / "attention.py")
+        args = [
+            torch.randn(1, 2, 128, 64, device=DEVICE, requires_grad=True)
+            for _ in range(3)
+        ]
+        for baseline in (mod._attention_baseline, mod._causal_attention_baseline):
+            for output in baseline(*args):
+                self.assertFalse(output.requires_grad)
+
     def test_attention_output(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -1110,6 +1153,75 @@ class TestExamples(RefEagerTestBase, TestCase):
             atol=5e-2,
             rtol=2e-2,
         )
+
+    # Only the CuTe path lowers the fused flash body and the mul.f32x2 idiom
+    # this test exercises.
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="the fused flash body and mul.f32x2 require Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_blackwell_attention(self):
+        # The forward is the flattened-rows attention form (one root axis
+        # over B*H*M rows, a runtime softmax scale, a packed ``mul.f32x2``
+        # rescale): on cute it takes the fused flash body, as the backward
+        # takes the fused flash backward.  The forward has no pinned config
+        # on cute, so pin its default config (the flash default, restored on
+        # teardown) instead of autotuning.
+        mod = self._check_blackwell_attention()
+        # The fused body takes the row max of the raw scores and scales it,
+        # so the generated host function asserts the runtime scale positive
+        # before the launch (the SIMT twin computes the kernel as written).
+        q, k, v = (
+            torch.randn((1, 4, 256, 64), dtype=torch.bfloat16, device=DEVICE)
+            for _ in range(3)
+        )
+        with self.assertRaisesRegex(AssertionError, "softmax scale must be positive"):
+            mod.blackwell_attention_kernel(q, k, v, -0.125)
+
+    @onlyBackends(["cute"])
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan(
+        (10, 0), reason="the example's raw mul.f32x2 requires Blackwell"
+    )
+    @skipIfRefEager("inline asm codegen is not available in ref eager mode")
+    def test_blackwell_attention_simt(self):
+        # The same forward with the fused flash body gated off: the split /
+        # join round trip over the accumulator is elided and the packed pure
+        # asm relocates through the staged lane schedule.
+        with patch.dict("os.environ", {"HELION_CUTE_FLASH": "0"}):
+            self._check_blackwell_attention()
+
+    def _check_blackwell_attention(self):
+        mod = import_path(EXAMPLES_DIR / "blackwell_attention.py")
+        kernel = mod.blackwell_attention_kernel
+        kernel.reset()
+        self.addCleanup(kernel.reset)
+        self.addCleanup(setattr, kernel, "configs", kernel.configs)
+        shape = (1, 4, 256, 64)
+        q, k, v = (
+            torch.randn(shape, dtype=torch.bfloat16, device=DEVICE, requires_grad=True)
+            for _ in range(3)
+        )
+        qk_scale = math.sqrt(1.0 / shape[-1])
+        kernel.configs = [kernel.bind((q, k, v, qk_scale)).config_spec.default_config()]
+        q_ref, k_ref, v_ref = (
+            t.detach().clone().requires_grad_(True) for t in (q, k, v)
+        )
+        expected = F.scaled_dot_product_attention(q_ref, k_ref, v_ref)
+        grad_out = torch.randn_like(expected)
+        expected.backward(grad_out)
+        result = mod.blackwell_attention_fwd_bwd(q, k, v)
+        result.backward(grad_out)
+        torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-1)
+        for got, ref in (
+            (q.grad, q_ref.grad),
+            (k.grad, k_ref.grad),
+            (v.grad, v_ref.grad),
+        ):
+            torch.testing.assert_close(got, ref, atol=1e-1, rtol=1e-1)
+        return mod
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
     @skipIfXPU("failure on XPU")
@@ -1412,17 +1524,36 @@ class TestExamples(RefEagerTestBase, TestCase):
         indices = torch.randint(0, num_nodes, (num_edges,), device=DEVICE).sort()[0]
         input_data = torch.randn(num_edges, num_features, device=DEVICE, dtype=dtype)
 
-        args = (indices, input_data, num_nodes)
-
         # Import and use the reference implementation
         mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
-        expected = mod.segmented_reduction_pytorch(*args)
 
-        check_example(
-            "segment_reduction",
-            args,
-            expected,
-            fn_name="segmented_reduction_helion",
+        # Random segments, then one segment on node 0, whose last row only the
+        # last-row flush ends: its masked next index (0) equals its own.
+        for segment_ids in (indices, torch.zeros_like(indices)):
+            args = (segment_ids, input_data, num_nodes)
+            check_example(
+                "segment_reduction",
+                args,
+                mod.segmented_reduction_pytorch(*args),
+                fn_name="segmented_reduction_helion",
+            )
+
+    @onlyBackends(["triton"])
+    @skipIfRefEager("checks the example's Triton reference, not a kernel")
+    def test_segment_reduction_triton_reference(self):
+        """The example's Triton reference ends the last segment at the last
+        element too: one segment on node 0 over 1001 rows, which leaves the
+        last block partial at every block size it autotunes over."""
+        mod = import_path(EXAMPLES_DIR / "segment_reduction.py")
+        indices = torch.zeros(1001, dtype=torch.int64, device=DEVICE)
+        # Small integers: the atomic adds sum them exactly in any order.
+        input_data = torch.randint(-4, 5, (1001, 32), device=DEVICE).float()
+        args = (indices, input_data, 4)
+        torch.testing.assert_close(
+            mod.segmented_reduction_triton(*args),
+            mod.segmented_reduction_pytorch(*args),
+            rtol=0,
+            atol=0,
         )
 
     @patch.object(_compat, "_supports_tensor_descriptor", lambda: False)
@@ -1618,7 +1749,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
         grad_out = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
 
-        from examples.softmax import softmax_two_pass
+        softmax_two_pass = import_example("softmax").softmax_two_pass
 
         config = helion.Config(block_size=[128, 128], num_warps=4, num_stages=3)
         configured_kernel = helion.kernel(softmax_two_pass.fn, config=config)
@@ -1881,6 +2012,36 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             expected,
             fn_name="grouped_gemm_jagged",
+        )
+
+    @xfailIfPallasInterpret(
+        "the partial last M tile makes emit_pipeline's writeback a dynamic-size "
+        "DMA slice (pl.ds with a traced size) that JAX interpret mode cannot "
+        "discharge"
+    )
+    def test_grouped_gemm_shared_weight(self):
+        # The shared-weight formulation: one tile space over the packed rows,
+        # with ragged groups whose packed total (100 rows) ends in a partial
+        # tile.
+        torch.manual_seed(0)
+        K, N = 64, 64
+        dtype = torch.bfloat16
+        group_A = [
+            torch.randn(rows, K, device=DEVICE, dtype=dtype).contiguous()
+            for rows in (17, 50, 33)
+        ]
+        B_shared = torch.randn(K, N, device=DEVICE, dtype=dtype).contiguous()
+        starts = [0]
+        for a in group_A:
+            starts.append(starts[-1] + int(a.size(0)))
+        group_offsets = torch.tensor(starts, device=DEVICE, dtype=torch.int32)
+        A_packed = torch.cat(group_A, dim=0).contiguous()
+        expected = torch.cat([a @ B_shared for a in group_A], dim=0)
+        check_example(
+            "grouped_gemm",
+            (A_packed, B_shared, group_offsets),
+            expected,
+            fn_name="grouped_gemm_shared_weight",
         )
 
     @xfailIfPallas("Pallas scatter: multiple indirect dims are not supported")
@@ -2261,6 +2422,38 @@ class TestExamples(RefEagerTestBase, TestCase):
 
     @skipIfXPU("Timeout on XPU")
     def test_fused_linear_jsd(self):
+        args, expected = self._fused_linear_jsd_case()
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            block_sizes=[64],
+        )
+
+    @skipIfXPU("Timeout on XPU")
+    # Pallas has no reduction_loops: it would rerun the persistent config.
+    @onlyBackends(["triton", "cute"])
+    def test_fused_linear_jsd_rolled(self):
+        """Both softmaxes rolled: reduction_loops=[64] splits the max, sum and
+        consumer passes over each 256-wide row into sweeps of 64 columns."""
+        args, expected = self._fused_linear_jsd_case()
+        check_example(
+            "fused_linear_jsd",
+            args,
+            expected,
+            fn_name="fused_linear_jsd_kernel",
+            emit_code=False,
+            block_sizes=[64],
+            reduction_loops=[64],
+        )
+
+    @staticmethod
+    def _fused_linear_jsd_case() -> tuple[
+        tuple[float, int, float, torch.Tensor, torch.Tensor], torch.Tensor
+    ]:
+        """fused_linear_jsd_kernel's arguments for 64 rows of 256 logits, and
+        the loss of the PyTorch reference."""
         beta = 0.5
         ignore_index = -100
         temperature = 1.0
@@ -2294,13 +2487,45 @@ class TestExamples(RefEagerTestBase, TestCase):
             student_input,
             teacher_input,
         )
+        return args, expected
 
+    def test_fused_linear_jsd_flushed_probabilities(self):
+        """Rows whose softmax probabilities are fp32 subnormals.
+
+        fast_math's approximate exp and division flush them to zero; both JSD
+        kernels clamp the mixture before its log, otherwise the loss is
+        p * (log p - log 0) = NaN.  student == teacher, so the JSD and the
+        gradient are zero.
+        """
+        beta = 0.5
+        ignore_index = -100
+        temperature = 1.0
+        student_logits = torch.full([16, 1024], -100.0, device=DEVICE)
+        student_logits[:, 0] = 0.0
+        teacher_logits = student_logits.clone()
+        args = (beta, ignore_index, temperature, student_logits, teacher_logits)
+
+        # One row per CTA covers the subnormal regression without the slow
+        # fbtriton lowering of sixteen 1024-element rows in a single CTA.
         check_example(
             "fused_linear_jsd",
             args,
-            expected,
+            torch.zeros((), device=DEVICE),
             fn_name="fused_linear_jsd_kernel",
-            block_sizes=[64],
+            emit_code=False,
+            block_sizes=[1],
+            atol=1e-6,
+            rtol=0,
+        )
+        check_example(
+            "fused_linear_jsd",
+            args,
+            (torch.zeros(16, device=DEVICE), torch.zeros_like(student_logits)),
+            fn_name="jsd_kernel",
+            emit_code=False,
+            block_sizes=[1],
+            atol=1e-6,
+            rtol=0,
         )
 
     def test_fused_linear_jsd_fwd(self):
@@ -2309,13 +2534,24 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         This is the user-facing API; the existing `test_fused_linear_jsd`
         only covers the simpler `fused_linear_jsd_kernel` JSD-only path.
-        Shape picked so chunk_size > 1 (chunked path actually runs).
+        The default budget makes this shape a single chunk; four chunks of
+        32 rows of fp32 [chunk, k] logits exercise the multi-chunk loop.
         """
+        self._check_fused_linear_jsd_fwd(m=128, n=512, k=1024, chunk_rows=32)
+
+    def test_fused_linear_jsd_fwd_ragged_chunks(self):
+        """Chunking whose last chunk is partial (48 rows in chunks of 32 and
+        16): the forward writes grad_input row slices and the weight
+        gradient without zero fills, so every row must be covered exactly
+        once and the first chunk must initialize the accumulators.
+        """
+        self._check_fused_linear_jsd_fwd(m=48, n=256, k=512, chunk_rows=32)
+
+    def _check_fused_linear_jsd_fwd(self, m: int, n: int, k: int, chunk_rows: int):
         beta = 0.5
         ignore_index = -100
         # Use temperature = sqrt(hidden_dim) so logits/temperature has std ~1
         # and softmax stays in fp32 range.
-        m, n, k = 128, 512, 1024
         temperature = float(n) ** 0.5
 
         student_input = torch.randn([m, n], device=DEVICE, dtype=torch.float32)
@@ -2336,26 +2572,44 @@ class TestExamples(RefEagerTestBase, TestCase):
             setattr, mod.jsd_kernel.settings, "static_shapes", original_static_shapes
         )
         mod.jsd_kernel.settings.static_shapes = True
-        mod.jsd_kernel.configs = [helion.Config(block_sizes=[16])]
-        result = mod.fused_linear_jsd_fwd(
-            beta,
-            ignore_index,
-            temperature,
-            student_weight,
-            teacher_weight,
-            student_input,
-            teacher_input,
-        )
-        expected = mod.fused_linear_jsd_pytorch(
-            beta,
-            ignore_index,
-            temperature,
-            student_weight,
-            teacher_weight,
-            student_input,
-            teacher_input,
+        mod.jsd_kernel.configs = [helion.Config(block_sizes=[16], num_warps=16)]
+        # Shrink the logits byte budget to chunk_rows rows of fp32 [chunk, k].
+        original_budget = mod.LOGITS_CHUNK_BYTES
+        self.addCleanup(setattr, mod, "LOGITS_CHUNK_BYTES", original_budget)
+        mod.LOGITS_CHUNK_BYTES = chunk_rows * k * 4
+
+        def loss_and_grads(
+            fn: typing.Callable[..., torch.Tensor],
+        ) -> tuple[torch.Tensor, ...]:
+            # The forward precomputes the gradients of the mean loss w.r.t.
+            # the student input and weight; compare them with autograd of
+            # the reference, not only the loss.
+            x = student_input.detach().clone().requires_grad_(True)
+            w = student_weight.detach().clone().requires_grad_(True)
+            with torch.enable_grad():
+                loss = fn(
+                    beta,
+                    ignore_index,
+                    temperature,
+                    w,
+                    teacher_weight,
+                    x,
+                    teacher_input,
+                )
+                grad_x, grad_w = torch.autograd.grad(loss, (x, w))
+            return loss.detach(), grad_x, grad_w
+
+        result, grad_input, grad_weight = loss_and_grads(mod.fused_linear_jsd_fwd)
+        expected, expected_grad_input, expected_grad_weight = loss_and_grads(
+            mod.fused_linear_jsd_pytorch
         )
         torch.testing.assert_close(result, expected, atol=1e-1, rtol=1e-2)
+        torch.testing.assert_close(
+            grad_input, expected_grad_input, atol=1e-6, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            grad_weight, expected_grad_weight, atol=1e-6, rtol=2e-2
+        )
 
     @xfailIfPallas("JAX tracer error")
     @skipIfRefEager("hl.jagged_tile does not support ref mode yet")
@@ -2506,23 +2760,26 @@ class TestExamples(RefEagerTestBase, TestCase):
                 **config,
             )
 
-    @xfailIfPallas("conflicting tiling patterns")
-    @skipIfA10G("failure on a10g")
-    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
-    @skipIfTileIR("accuracy failure")
-    def test_squeeze_and_excitation_net_bwd_dx(self):
+    def _squeeze_and_excitation_net_bwd_inputs(self):
+        """Forward intermediates from the configured Helion forward, a random
+        grad_out, the torch autograd gradients of x, a and b, and the shared
+        backward intermediates (grad_cb, grad_c) computed with torch in fp32
+        and rounded to the input dtype as the dc kernel stores them."""
+        torch.manual_seed(0)
         m, n, k = 256, 256, 256
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
         a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
         b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
 
-        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
+        squeeze_and_excitation_net_fwd = import_example(
+            "squeeze_and_excitation_net"
+        ).squeeze_and_excitation_net_fwd
 
         config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
         configured_kernel = helion.kernel(
             squeeze_and_excitation_net_fwd.fn, config=config
         )
-        out, c, d = configured_kernel(x, a, b)
+        _out, c, d = configured_kernel(x, a, b)
 
         # Create gradient for backward pass
         grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
@@ -2536,61 +2793,80 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         out_torch.backward(grad_out)
 
-        args = (grad_out, x, a, b, c, d)
-        expected = x_torch.grad
+        grad_cb = grad_out.float() * x.float() * d.float() * (1.0 - d.float())
+        grad_cb = grad_cb.to(HALF_DTYPE)
+        grad_c = (grad_cb.float() @ b.float().T) * (c > 0)
+        grad_c = grad_c.to(HALF_DTYPE)
+        tensors = {"x": x, "a": a, "b": b, "c": c, "d": d, "grad_out": grad_out}
+        grads = {"x": x_torch.grad, "a": a_torch.grad, "b": b_torch.grad}
+        return tensors, grads, grad_cb, grad_c
 
+    @xfailIfPallas("conflicting tiling patterns")
+    @skipIfA10G("failure on a10g")
+    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @skipIfTileIR("accuracy failure")
+    def test_squeeze_and_excitation_net_bwd_dc(self):
+        t, _grads, _grad_cb, _grad_c = self._squeeze_and_excitation_net_bwd_inputs()
+
+        # The shared intermediates are the autograd gradients of the forward's
+        # pre-activation intermediates: grad_cb of c @ b (before the sigmoid)
+        # and grad_c of x @ a (before the relu, so the relu mask is applied).
+        x_torch = t["x"].detach().clone().requires_grad_(True)
+        xa_torch = x_torch @ t["a"]
+        cb_torch = torch.relu(xa_torch) @ t["b"]
+        out_torch = torch.mul(x_torch, torch.sigmoid(cb_torch))
+        grad_cb_torch, grad_c_torch = torch.autograd.grad(
+            out_torch, (cb_torch, xa_torch), t["grad_out"]
+        )
+
+        args = (t["grad_out"], t["x"], t["b"], t["c"], t["d"])
         check_example(
             "squeeze_and_excitation_net",
             args,
-            expected,
-            fn_name="squeeze_and_excitation_net_bwd_dx",
-            block_sizes=[16] * 8,
+            (grad_cb_torch, grad_c_torch),
+            fn_name="squeeze_and_excitation_net_bwd_dc",
+            block_sizes=[16] * 5,
             pid_type="persistent_blocked",
             num_warps=4,
             num_stages=2,
             atol=0.3,
         )
 
-    @xfailIfPallas("tensor accessed with conflicting tiling patterns")
+    @skipIfA10G("failure on a10g")
+    @skipIfXPU("Squeeze-and-excitation network not supported on XPU")
+    @skipIfTileIR("accuracy failure")
+    def test_squeeze_and_excitation_net_bwd_dx(self):
+        t, grads, _grad_cb, grad_c = self._squeeze_and_excitation_net_bwd_inputs()
+
+        args = (t["grad_out"], t["a"], t["d"], grad_c)
+        check_example(
+            "squeeze_and_excitation_net",
+            args,
+            grads["x"],
+            fn_name="squeeze_and_excitation_net_bwd_dx",
+            block_sizes=[16] * 3,
+            num_warps=4,
+            num_stages=2,
+            atol=0.3,
+            # grad_c carries the forward's half-precision c through the relu
+            # mask (c > 0); a flip at |c| ~ 0 shifts a whole row of grad_x by
+            # one grad_c element (0.1 % of the elements on the Pallas TPU row).
+            max_mismatch_pct=0.5,
+        )
+
     @skipIfA10G("failure on a10g")
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_da(self):
-        m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        t, grads, _grad_cb, grad_c = self._squeeze_and_excitation_net_bwd_inputs()
 
-        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
-
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(
-            squeeze_and_excitation_net_fwd.fn, config=config
-        )
-        out, c, d = configured_kernel(x, a, b)
-
-        # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-
-        # Compute expected gradients with PyTorch autograd
-        x_torch = x.detach().clone().requires_grad_(True)
-        a_torch = a.detach().clone().requires_grad_(True)
-        b_torch = b.detach().clone().requires_grad_(True)
-        out_torch = torch.mul(
-            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
-        )
-        out_torch.backward(grad_out)
-
-        args = (grad_out, x, b, c, d)
-        expected = a_torch.grad
-
+        args = (t["x"], grad_c)
         check_example(
             "squeeze_and_excitation_net",
             args,
-            expected,
+            grads["a"],
             fn_name="squeeze_and_excitation_net_bwd_da",
-            block_sizes=[16] * 8,
-            pid_type="persistent_blocked",
+            block_sizes=[16] * 3,
             num_warps=4,
             num_stages=2,
             atol=0.3,
@@ -2600,42 +2876,15 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfTileIR("accuracy failure")
     @skipIfXPU("ocloc compilation failure with 256-GRF kernel on XPU backend")
     def test_squeeze_and_excitation_net_bwd_db(self):
-        torch.manual_seed(0)
-        m, n, k = 256, 256, 256
-        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-        a = torch.randn([n, k], device=DEVICE, dtype=HALF_DTYPE)
-        b = torch.randn([k, n], device=DEVICE, dtype=HALF_DTYPE)
+        t, grads, grad_cb, _grad_c = self._squeeze_and_excitation_net_bwd_inputs()
 
-        # Create configured kernel with explicit config
-        from examples.squeeze_and_excitation_net import squeeze_and_excitation_net_fwd
-
-        config = helion.Config(block_size=[16, 16, 16, 16], num_warps=4, num_stages=3)
-        configured_kernel = helion.kernel(
-            squeeze_and_excitation_net_fwd.fn, config=config
-        )
-        out, c, d = configured_kernel(x, a, b)
-
-        # Create gradient for backward pass
-        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
-
-        # Compute expected gradients with PyTorch autograd
-        x_torch = x.detach().clone().requires_grad_(True)
-        a_torch = a.detach().clone().requires_grad_(True)
-        b_torch = b.detach().clone().requires_grad_(True)
-        out_torch = torch.mul(
-            x_torch, torch.sigmoid(torch.relu(x_torch @ a_torch) @ b_torch)
-        )
-        out_torch.backward(grad_out)
-
-        args = (grad_out, x, d, c)
-        expected = b_torch.grad
-
+        args = (t["c"], grad_cb)
         check_example(
             "squeeze_and_excitation_net",
             args,
-            expected,
+            grads["b"],
             fn_name="squeeze_and_excitation_net_bwd_db",
-            block_sizes=[16, 16, 16],
+            block_sizes=[16] * 3,
             num_warps=4,
             num_stages=2,
             atol=2.0,
@@ -2658,13 +2907,12 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        from examples.grpo_loss import extract_selected_logits_pytorch
+        _examples_grpo_loss = import_example("grpo_loss")
+        eager_selected_logits = _examples_grpo_loss.eager_selected_logits
+        torch_grpo_loss = _examples_grpo_loss.torch_grpo_loss
 
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
-
-        from examples.grpo_loss import torch_grpo_loss
+        # None on the GPU backends (the kernel gathers), eager on Pallas.
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         expected_loss, expected_kl, expected_clipped = torch_grpo_loss(
             logits.float(),
@@ -2681,6 +2929,7 @@ class TestExamples(RefEagerTestBase, TestCase):
 
         args = (
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -2725,18 +2974,18 @@ class TestExamples(RefEagerTestBase, TestCase):
         advantages = torch.randn(B, device=DEVICE, dtype=torch.float32)
         completion_mask = torch.ones(B, L, device=DEVICE, dtype=torch.float32)
 
-        # Pre-compute selected logits and run forward pass to get lse
-        from examples.grpo_loss import extract_selected_logits_pytorch
-        from examples.grpo_loss import grpo_loss_forward
+        # Run the forward pass to get lse
+        _examples_grpo_loss = import_example("grpo_loss")
+        eager_selected_logits = _examples_grpo_loss.eager_selected_logits
+        grpo_loss_forward = _examples_grpo_loss.grpo_loss_forward
 
         from helion._testing import code_and_output
 
-        selected_logits = extract_selected_logits_pytorch(
-            logits[:, :-1, :], completion_ids, temperature
-        )
+        selected_logits = eager_selected_logits(logits, completion_ids)
 
         forward_args = (
             logits,
+            completion_ids,
             selected_logits,
             old_logp,
             ref_logp,
@@ -2757,7 +3006,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         grad_output = torch.randn(B, L, device=DEVICE, dtype=torch.float32)
 
         logits_torch = logits.detach().clone().float().requires_grad_(True)
-        from examples.grpo_loss import torch_grpo_loss
+        torch_grpo_loss = import_example("grpo_loss").torch_grpo_loss
 
         loss_torch, _, _ = torch_grpo_loss(
             logits_torch,
@@ -2777,8 +3026,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         args = (
             grad_output,
             logits,
-            selected_logits,
             completion_ids,
+            selected_logits,
             old_logp,
             ref_logp,
             advantages,
@@ -3107,8 +3356,22 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_se_block_fwd(self):
-        m, n = 128, 128
+        self._check_se_block_fwd(128, 128)
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
+    def test_se_block_fwd_wide_rows(self):
+        # w is 512 KB at n = 512: the forward tiles the output columns and
+        # the reduction, so no config needs a whole row of w on chip (the
+        # earlier whole-row ``x_tile @ w[:, :]`` ran out of shared memory
+        # under every block size from this width on).
+        self._check_se_block_fwd(256, 512)
+
+    def _check_se_block_fwd(self, m: int, n: int) -> None:
         x = torch.randn([m, n], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn([n, n], device=DEVICE, dtype=torch.bfloat16)
 
@@ -3122,7 +3385,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             (expected, None),  # (output, sigmoid)
             fn_name="se_block_fwd",
-            block_sizes=[32],
+            block_sizes=[32, 32, 32],
             num_warps=4,
             num_stages=3,
         )
@@ -3130,7 +3393,6 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRocm("failure on rocm")
     @skipIfA10G("failure on a10g")
     @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
-    @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
     def test_se_block_bwd_dx(self):
         m, n = 128, 128
         x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE, requires_grad=True)
@@ -3143,10 +3405,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
         out_torch.backward(grad_out)
 
-        # Compute sigmoid values using PyTorch reference
+        # Compute sigmoid values using PyTorch reference, and the shared
+        # matmul operand the example's producer kernel writes
         s = torch.sigmoid(x @ w)
+        g = (2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())).to(
+            x.dtype
+        )
 
-        args = (grad_out, x, w, s)
+        args = (grad_out, g, w, s)
 
         check_example(
             "se_block",
@@ -3154,6 +3420,29 @@ class TestExamples(RefEagerTestBase, TestCase):
             x_torch.grad,
             fn_name="se_block_bwd_dx",
             block_sizes=[32, 32, 32],
+            num_warps=4,
+            num_stages=3,
+        )
+
+    @skipIfRocm("failure on rocm")
+    @skipIfA10G("failure on a10g")
+    @skipIfCudaCapabilityLessThan((9, 0), reason="se_block CUDA path requires H100+")
+    def test_se_block_bwd_grad_to_w(self):
+        m, n = 128, 128
+        x = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        w = torch.randn([n, n], device=DEVICE, dtype=HALF_DTYPE)
+        grad_out = torch.randn([m, n], device=DEVICE, dtype=HALF_DTYPE)
+        s = torch.sigmoid(x @ w)
+        expected = (
+            2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())
+        ).to(x.dtype)
+
+        check_example(
+            "se_block",
+            (grad_out, x, s),
+            expected,
+            fn_name="se_block_bwd_grad_to_w",
+            block_sizes=[32, 32],
             num_warps=4,
             num_stages=3,
         )
@@ -3173,10 +3462,14 @@ class TestExamples(RefEagerTestBase, TestCase):
         out_torch = 2 * x_torch * torch.sigmoid(x_torch @ w_torch)
         out_torch.backward(grad_out)
 
-        # Compute sigmoid values using PyTorch reference
+        # Compute sigmoid values using PyTorch reference, and the shared
+        # matmul operand the example's producer kernel writes
         s = torch.sigmoid(x @ w)
+        g = (2.0 * grad_out.float() * x.float() * s.float() * (1.0 - s.float())).to(
+            x.dtype
+        )
 
-        args = (grad_out, x, s)
+        args = (x, g)
 
         check_example(
             "se_block",
@@ -3196,7 +3489,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     def _skip_linear_engine_autotune(self) -> None:
         # These tests only assert correctness. Pin a fixed default config;
         # restored after the test.
-        from examples.linear import linear_attention_engine as engine
+        from helion.experimental import linear_attention as engine
 
         # Free cached GPU memory after each test so xdist workers
         # sharing one GPU don't OOM.
@@ -3222,10 +3515,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             kernel.reset()
 
     def _run_linear_example(self, name: str, method: str = "test") -> None:
-        import importlib
 
         self._skip_linear_engine_autotune()
-        mod = importlib.import_module(f"examples.linear.{name}")
+        mod = import_example(f"linear.{name}")
         harness = getattr(mod, "HARNESS", None)
         if harness is not None:
             getattr(harness, method)()
@@ -3235,72 +3527,120 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_simple_gla(self):
         self._run_linear_example("example_simple_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_full_gla(self):
         self._run_linear_example("example_full_gla")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_vanilla_linear_attn(self):
         self._run_linear_example("example_vanilla_linear_attn")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_retention(self):
         self._run_linear_example("example_retention")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_mamba2_ssd(self):
         self._run_linear_example("example_mamba2_ssd")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_delta_rule(self):
         self._run_linear_example("example_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_gated_delta_rule(self):
         self._run_linear_example("example_gated_delta_rule")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda(self):
         self._run_linear_example("example_kda")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_fused_preamble(self):
         self._run_linear_example("example_kda", method="test_fused_preamble")
 
     @pytest.mark.timeout(600)
     @skipIfRefEager("linear examples assert against their own reference")
     @skipIfNotCUDA()
-    @skipIfCute(_CUTE_LINEAR_ATTN_SKIP)
     def test_linear_kda_varlen(self):
         self._run_linear_example("example_kda", method="test_varlen")
+
+    @pytest.mark.timeout(600)
+    @skipIfRefEager("linear examples assert against their own reference")
+    @skipIfNotCUDA()
+    def test_linear_kda_varlen_cuda_graph(self):
+        # The varlen forward reads cu_seqlens on the host only when it first sees
+        # the tensor (its validation and chunk tables are built together, cached
+        # by identity), so a warmed-up forward holds no device-to-host sync and a
+        # CUDA graph captures it; a fresh, malformed vector still raises.
+        import dataclasses
+
+        from helion._testing import linear_attention_harness as harness_mod
+
+        HARNESS = import_example("linear.example_kda").HARNESS
+
+        self._skip_linear_engine_autotune()
+        torch.manual_seed(42)
+        B, H, T, D, DV = harness_mod.VARLEN_TEST_SHAPE
+        inputs = HARNESS.make_inputs(
+            B,
+            H,
+            T,
+            D,
+            DV,
+            dtype=harness_mod.DTYPE,
+            device=DEVICE,
+            varlen=True,
+            varlen_lengths=harness_mod.VARLEN_TEST_LENGTHS,
+        )
+        C = harness_mod.TEST_C
+        eager = HARNESS.helion_fwd(inputs, C).clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            HARNESS.helion_fwd(inputs, C)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = HARNESS.helion_fwd(inputs, C)
+        captured.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+        cu_seqlens = inputs.preamble["cu_seqlens"]
+
+        def with_cu_seqlens(vector: torch.Tensor) -> torch.Tensor:
+            preamble = {**inputs.preamble, "cu_seqlens": vector}
+            return HARNESS.helion_fwd(dataclasses.replace(inputs, preamble=preamble), C)
+
+        short = cu_seqlens.clone()
+        short[-1] -= 1
+        with pytest.raises(ValueError, match="must end at"):
+            with_cu_seqlens(short)
+        flat = cu_seqlens.clone()
+        flat[1] = flat[2]
+        with pytest.raises(ValueError, match="strictly increase"):
+            with_cu_seqlens(flat)
 
     # ── Monkey-patch tests: plug our engine into FLA layers ──
 
@@ -3314,8 +3654,8 @@ class TestExamples(RefEagerTestBase, TestCase):
         preprocess=None,
         dtype=torch.bfloat16,
     ):
-        from examples.linear.linear_attention_engine import get_helion_fwd_kernel
-        from examples.linear.linear_attention_utils import head_to_time_first as _tf
+        from helion._testing.linear_attention_utils import head_to_time_first as _tf
+        from helion.experimental.linear_attention import get_helion_fwd_kernel
 
         self._skip_linear_engine_autotune()
         helion_fwd = get_helion_fwd_kernel(variant)
@@ -3377,7 +3717,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_gla(self):
         """Monkey-patch FLA's GatedLinearAttention to use our engine, verify fwd+bwd."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.gla as _fla_gla_mod
@@ -3405,7 +3745,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_delta_rule(self):
         """Monkey-patch FLA's DeltaNet to use our engine, verify fwd+bwd."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.delta_net as _fla_dn_mod
@@ -3439,7 +3779,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_gated_delta_rule(self):
         """Monkey-patch FLA's GatedDeltaNet to use our engine, verify fwd+bwd."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.gated_deltanet as _fla_gdn_mod
@@ -3488,7 +3828,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @pytest.mark.timeout(600)
     def test_linear_monkeypatch_simple_gla(self):
         """Monkey-patch FLA's SimpleGatedLinearAttention to use our engine."""
-        from examples.linear.linear_attention_engine import LinearAttentionVariant
+        from helion.experimental.linear_attention import LinearAttentionVariant
 
         try:
             import fla.layers.simple_gla as _fla_sgla_mod

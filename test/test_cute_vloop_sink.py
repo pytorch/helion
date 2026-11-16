@@ -9,7 +9,7 @@ with the loops: one V-wide vector load per row, V register accumulators, one
 fragment grouped combine per row tile, strength-reduced row addressing and an
 optional load-first unroll of the row lane loop (``cute_lane_unroll``).
 
-CPU code generation only; ``test_cute_vloop_sink_cuda.py`` runs the kernels.
+CPU code generation first; the GPU tests at the end run the kernels.
 """
 
 from __future__ import annotations
@@ -17,64 +17,94 @@ from __future__ import annotations
 import ast
 import builtins
 from contextlib import ExitStack
+from contextlib import contextmanager
+import functools
+import json
+import re
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import Callable
+from typing import cast
 from unittest.mock import patch
 
-from examples.rms_norm import rms_norm_fwd
-from examples.softmax import softmax
 import pytest
 import torch
 
-from test._cute_binding import _cpu_bind
-from test._cute_binding import _mock_cuda_unavailable
 from test._cute_vloop_sink_kernels import FRAGMENT_REDUCE
 from test._cute_vloop_sink_kernels import TWO_STAGE_REDUCE
 from test._cute_vloop_sink_kernels import _sink_config
+from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_atomic_then_load_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_from8_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_from8_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_gather_then_atomic_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_lower_triangle_static
+from test._cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_pair_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_const_static
+from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_dynamic
 from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_static
 from test._cute_vloop_sink_kernels import col_reduce_sum_static
+from test._cute_vloop_sink_kernels import col_reduce_sum_with_policy_dynamic
+from test._cute_vloop_sink_kernels import col_weighted_mean_dynamic
 from test._cute_vloop_sink_kernels import col_weighted_mean_static
 
 import helion
-from helion._compiler import generate_ast
 from helion._compiler.ast_read_writes import ReadWrites
-from helion._compiler.autotuner_heuristics.cute import CuteColumnReductionHeuristic
+from helion._compiler.cute import device_state
+from helion._compiler.cute import kernel_generators
 from helion._compiler.cute import sink_vector_loops
-from helion._testing import skipUnlessBackends
+from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
+from helion._compiler.cute.autotune.heuristics.cute import (
+    CuteSplitColumnReductionHeuristic,
+)
+from helion._compiler.cute.autotune.search_surface import CUTE_EVICTION_POLICIES
+from helion._compiler.cute.cache_hint_forms import L1_PRIORITY_QUALIFIERS
+from helion._compiler.cute.cache_policy_loads import CachePolicy
+from helion._compiler.cute.cutedsl_compat import readonly_packet_load_supported
+from helion._compiler.cute.fuse_fma import fuse_fma
+from helion._compiler.cute.lane_loops import root_passes
+from helion._compiler.cute.sink_vector_loops import VloopSinkNotApplied
+from helion._compiler.cute.state import cute_env_state
+from helion._compiler.reduction_strategy import LoopedReductionStrategy
+from helion._testing import DEVICE
+from helion._testing import TestCase
+from helion._testing import code_and_output
+from helion._testing import cpu_render_target
+from helion._testing import import_example
+from helion._testing import onlyBackends
+from helion._testing import patch_target_facts
+from helion._testing import skipIfNotCUDA
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
+
+pytestmark = pytest.mark.cpu_only
+
+rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
+softmax = import_example("softmax").softmax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from helion._compiler.generate_ast import GenerateAST
+    from helion.autotuner.config_spec import ConfigSpec
+    from helion.runtime.kernel import BoundKernel
 
 cutlass = pytest.importorskip("cutlass")
 
 
 @pytest.fixture
 def cpu_only() -> Iterator[None]:
-    with (
-        _mock_cuda_unavailable(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU-only test")),
-        patch(
-            "helion._compiler.reduction_strategy._cute_shared_memory_budget_bytes",
-            return_value=232448,
-        ),
-    ):
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
         yield
 
 
 def _cpu_code(
     kernel: helion.Kernel, args: tuple[torch.Tensor, ...], **config: object
 ) -> str:
-    bound = _cpu_bind(kernel, args)
+    bound = cpu_bind(kernel, args)
     return bound.to_code(
         bound.config_spec.normalized_config(helion.Config.from_dict(dict(config)))
     )
@@ -94,11 +124,16 @@ def _loop(code: str, target: str) -> ast.For:
 
 
 def _vector_loads(body: list[ast.stmt]) -> list[ast.stmt]:
+    """The packet loads of ``body``: plain ``cute.arch.load`` or, under a
+    guard, the predicated ``_cute_load_v*b_if`` helpers."""
     return [
         stmt
         for stmt in body
         if isinstance(stmt, ast.Assign)
-        and "cute.arch.load(" in ast.unparse(stmt)
+        and (
+            "cute.arch.load(" in ast.unparse(stmt)
+            or "_cute_load_v" in ast.unparse(stmt)
+        )
         and "ir.VectorType.get(" in ast.unparse(stmt)
     ]
 
@@ -179,7 +214,6 @@ def _both(
     return on
 
 
-@skipUnlessBackends(["cute"])
 def test_column_sum_sinks_the_vector_loop_into_the_row_loops(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -231,7 +265,167 @@ def test_column_sum_sinks_the_vector_loop_into_the_row_loops(cpu_only: None) -> 
     assert "_cute_store_u16_vec(out.iterator" in code
 
 
-@skipUnlessBackends(["cute"])
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _column_sum(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([x.size(1)], dtype=torch.float32, device=x.device)
+    for tile_c in hl.tile(x.size(1)):
+        out[tile_c] = torch.sum(x[:, tile_c].float(), 0)
+    return out
+
+
+_ONE_TILE_COLUMN_SUM = {
+    "block_sizes": [4],
+    "num_threads": [1, 128],
+    "cute_vector_widths": [1, 4],
+    "reduction_loops": [1024],
+    "cute_lane_unroll": 8,
+}
+
+
+def test_one_block_column_sum_sinks_its_vector_loop(cpu_only: None) -> None:
+    """A column sum over a lone ``hl.tile(cols)`` takes the flattened tile
+    strategy, whose V-loop the sink never saw: every thread walked its rows
+    V times with scalar loads (better-benchmark's RMSNorm weight gradient
+    over ``[36000, 512]`` fp32 partials). One packet per row now."""
+    x = torch.empty(36000, 512, dtype=torch.float32)
+    code = _cpu_code(_column_sum, (x,), **_ONE_TILE_COLUMN_SUM, cute_vloop_sink=True)
+    rows = _loop(code, "roffset_1")
+    loads = [
+        stmt
+        for stmt in ast.walk(rows)
+        if isinstance(stmt, ast.Assign) and "_cute_load_v16b_if(" in ast.unparse(stmt)
+    ]
+    assert len(loads) == 8
+    assert ".load()" not in code
+    assert code.count("cute.make_rmem_tensor(4, cutlass.Float32)") == 2
+    assert code.count(FRAGMENT_REDUCE) == 1
+    # Resized for the launched block like the knob-off reduce: one group of
+    # four warps, which combines in the serial form's order.
+    assert "count=4, pre=1, group_span=128, group_count=1)" in code
+    assert TWO_STAGE_REDUCE not in code
+    assert "_cute_store_u32_vec(out.iterator" in code
+    # Without the knob the per-element index keeps its ``offsets`` spelling
+    # and the V-loop stays outside the row loop.
+    off = _cpu_code(_column_sum, (x,), **_ONE_TILE_COLUMN_SUM, cute_vloop_sink=False)
+    assert "indices_0 = offsets_0" in off
+    assert "_vsink" not in off
+
+
+@pytest.mark.parametrize(
+    ("columns", "block", "threads"),
+    [(520, 16, [1, 128]), (516, 8, [1, 128]), (516, 32, [8, 128])],
+)
+def test_a_masked_one_block_tile_sinks_its_vector_loop(
+    cpu_only: None, columns: int, block: int, threads: list[int]
+) -> None:
+    """The last tile is partial, but its width is a multiple of V, so every
+    chunk lies wholly inside or outside the columns: the tile's mask, spelled
+    on the element index under the sink, is evaluated once per chunk."""
+    x = torch.empty(3000, columns, dtype=torch.float32)
+    config = {**_ONE_TILE_COLUMN_SUM, "block_sizes": [block], "num_threads": threads}
+    code = _cpu_code(_column_sum, (x,), **config, cute_vloop_sink=True)
+    assert f"mask_0 = lane_base_0 < {columns}" in code
+    loads = [
+        stmt
+        for stmt in ast.walk(_loop(code, "roffset_1"))
+        if isinstance(stmt, ast.Assign) and "_cute_load_v16b_if(" in ast.unparse(stmt)
+    ]
+    assert len(loads) == 8
+    assert ".load()" not in code
+    assert code.count(FRAGMENT_REDUCE) == 1
+
+
+def test_a_one_block_tile_that_sinks_nothing_keeps_the_knob_off_code(
+    cpu_only: None,
+) -> None:
+    """518 columns are not a multiple of V: a chunk can straddle the last
+    column, nothing sinks, and the index the knob respelled for the sink is
+    regenerated with the knob off."""
+    x = torch.empty(3000, 518, dtype=torch.float32)
+    code = _both(_column_sum, (x,), **{**_ONE_TILE_COLUMN_SUM, "block_sizes": [8]})
+    assert "indices_0 = offsets_0" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _doubled(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * 2.0
+    return out
+
+
+def test_a_one_block_tile_without_a_loop_keeps_its_lane_unroll(
+    cpu_only: None,
+) -> None:
+    """A pointwise tile has no loop to sink into: the knob-on code is the
+    code of the knob-off config with the lane unroll it asks for, whose
+    loads-first unroll of the grid lane loop stays (the knob-off retry used
+    to drop the unroll as well)."""
+    x = torch.empty(1 << 20, dtype=torch.float32)
+    code = _both(
+        _doubled,
+        (x,),
+        block_sizes=[2048],
+        num_threads=[128],
+        cute_vector_widths=[4],
+        cute_lane_unroll=4,
+    )
+    assert "_lane_unroll_loads" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scaled_atomic_add(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        hl.atomic_add(out, [tile], x[tile] * 2.0)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _column_sum_and_count(x: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
+    """``_column_sum`` that also bumps a per-column counter."""
+    out = torch.empty([x.size(1)], dtype=torch.float32, device=x.device)
+    for tile_c in hl.tile(x.size(1)):
+        out[tile_c] = torch.sum(x[:, tile_c].float(), 0)
+        hl.atomic_add(count, [tile_c], hl.full([tile_c], 1.0, dtype=torch.float32))
+    return out
+
+
+def test_a_one_block_atomic_flushes_as_a_vector_only_beside_a_sink(
+    cpu_only: None,
+) -> None:
+    """The wrapper the knob records for the sink also lets a one-block
+    tile's atomic flush its V lanes as one vector atomic, as an N-D tile's
+    always may.  Without a reduction to sink the knob-on code is the
+    knob-off code, scalar atomics included; beside a sunk column sum the
+    counter's atomic becomes a vector atomic."""
+    with patch_target_facts(capability=(10, 0)):
+        x = torch.empty(4096, dtype=torch.float32)
+        code = _both(
+            _scaled_atomic_add,
+            (x, torch.empty_like(x)),
+            block_sizes=[512],
+            num_threads=[128],
+            cute_vector_widths=[4],
+        )
+        assert "_cute_red_add_f32_vec(" not in code
+        columns = (torch.empty(3000, 512, dtype=torch.float32), torch.empty(512))
+        code = _cpu_code(
+            _column_sum_and_count,
+            columns,
+            **_ONE_TILE_COLUMN_SUM,
+            cute_vloop_sink=True,
+        )
+        assert "_vsink_vec" in code
+        assert "_cute_red_add_f32_vec((count.iterator" in code
+        off = _cpu_code(
+            _column_sum_and_count,
+            columns,
+            **_ONE_TILE_COLUMN_SUM,
+            cute_vloop_sink=False,
+        )
+        assert "_cute_red_add_f32_vec(" not in off
+
+
 def test_lane_unroll_one_keeps_the_rolled_lane_loop(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -251,7 +445,6 @@ def test_lane_unroll_one_keeps_the_rolled_lane_loop(cpu_only: None) -> None:
     assert "block=(2, 256, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_sunk_loads_keep_the_cache_policy(cpu_only: None) -> None:
     """A load's eviction policy applies to the vector form the sinking pass
     emits (the L2 policy helpers exist for 16-byte packets)."""
@@ -269,7 +462,90 @@ def test_sunk_loads_keep_the_cache_policy(cpu_only: None) -> None:
     assert "cute.arch.load(" not in code
 
 
-@skipUnlessBackends(["cute"])
+def test_every_searched_policy_renders_its_own_masked_packets(
+    cpu_only: None,
+) -> None:
+    """No ``load_eviction_policies`` value the search offers is a dead point
+    of the sink's predicated packets: each renders loads no other value does,
+    with the site's hint as the packet's priority (an L2 family keeps its
+    policy, the helper carrying its ``createpolicy`` descriptor, see
+    ``test_masked_packet_loads_carry_the_l2_policy``).  ``nc_l2_first`` on this
+    source nothing writes reaches the 8-byte predicated packets too, as
+    ``.nc`` loads, which the unpredicated 8-byte packets have no helper
+    for."""
+    x = torch.empty(4000, 4000, dtype=torch.bfloat16)
+    bound = cpu_bind(col_reduce_sum_dynamic, (x,))
+    values = bound.config_spec.load_eviction_policies.inner.search_values()
+    # Every searched value, nc_l2_first only where its read-only gate opens.
+    assert values is not None, values
+    assert (
+        set(CUTE_EVICTION_POLICIES) - {"nc_l2_first"}
+        <= set(values)
+        <= set(CUTE_EVICTION_POLICIES)
+    ), values
+    loads: dict[str, str] = {}
+    for value in values:
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=2
+        )
+        code = bound.to_code(
+            bound.config_spec.normalized_config(
+                helion.Config.from_dict({**config, "load_eviction_policies": [value]})
+            )
+        )
+        packets = _vector_loads(_loop(code, "lane_0").body)
+        priority = CachePolicy.tunable(value).masked_priority
+        tail = f", {priority!r})" if priority else "cutlass.Uint16.mlir_type))"
+        assert packets and all(
+            "_cute_load_v8b_if(_vsink_ptr + " in ast.unparse(load)
+            and ast.unparse(load).endswith(tail)
+            for load in packets
+        ), (value, [ast.unparse(load) for load in packets])
+        loads[value] = "\n".join(ast.unparse(load) for load in packets)
+    assert len(set(loads.values())) == len(values), loads
+
+
+def test_explicit_eviction_policies_reach_the_masked_packets(cpu_only: None) -> None:
+    """Every ``hl.load(..., eviction_policy=...)`` spelling reaches the
+    sink's predicated packets as their priority (each has a PTX form there,
+    see ``test_every_explicit_eviction_policy_has_a_masked_load_form``)."""
+    x = torch.empty(4000, 4000, dtype=torch.bfloat16)
+    config = _sink_config(
+        block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=2
+    )
+    for spelling in L1_PRIORITY_QUALIFIERS:
+        bound = cpu_bind(col_reduce_sum_with_policy_dynamic, (x, spelling))
+        code = bound.to_code(
+            bound.config_spec.normalized_config(helion.Config.from_dict(config))
+        )
+        packets = [
+            ast.unparse(load) for load in _vector_loads(_loop(code, "lane_0").body)
+        ]
+        assert packets and all(
+            "_cute_load_v8b_if(_vsink_ptr + " in load
+            and load.endswith(f", {spelling!r})")
+            for load in packets
+        ), (spelling, packets)
+
+
+def test_an_explicit_l2_family_spelling_is_refused(cpu_only: None) -> None:
+    """An ``hl.load(..., eviction_policy=...)`` spelling that is not an L1
+    priority is refused: the predicated packets read an L2 policy family's
+    name in the same argument, so ``nc_l2_first`` loaded noncoherently from
+    a tensor the kernel may write, past the read-only check the tunable
+    makes."""
+    x = torch.empty(4000, 4000, dtype=torch.bfloat16)
+    config = _sink_config(
+        block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=2
+    )
+    for spelling in ("nc_l2_first", "l2_last", "first"):
+        bound = cpu_bind(col_reduce_sum_with_policy_dynamic, (x, spelling))
+        with pytest.raises(helion.exc.BackendUnsupported, match="L1 eviction priority"):
+            bound.to_code(
+                bound.config_spec.normalized_config(helion.Config.from_dict(config))
+            )
+
+
 def test_rows_above_columns_uses_the_interleaved_fragment_reduce(
     cpu_only: None,
 ) -> None:
@@ -293,13 +569,12 @@ def test_rows_above_columns_uses_the_interleaved_fragment_reduce(
     assert len(_vector_loads(_loop(code, "lane_0").body)) == 4
 
 
-@skipUnlessBackends(["cute"])
 def test_dynamic_shapes_guard_whole_vectors_with_a_uniform_mask(
     cpu_only: None,
 ) -> None:
     """With ``n % V == 0`` the column mask is the same for all V lanes: it is
-    evaluated once at the chunk base, guards the vector transaction (masked
-    threads read the tensor's first chunk) and still gates every value."""
+    evaluated once at the chunk base, guards the predicated vector transaction
+    (masked threads load nothing and see zeros) and still gates every value."""
     x = torch.empty(4000, 4000, dtype=torch.bfloat16)
     code = _cpu_code(
         col_reduce_sum_dynamic,
@@ -316,21 +591,24 @@ def test_dynamic_shapes_guard_whole_vectors_with_a_uniform_mask(
     lane_loop = _loop(code, "lane_0")
     loads = _vector_loads(lane_loop.body)
     assert len(loads) == 2
-    assert (
-        "if mask_0_u0 and mask_1 else x.iterator + cutlass.Int32(0), ir.VectorType"
-        in ast.unparse(loads[0])
-    )
+    # Four bf16 lanes: an 8-byte predicated packet at the strength-reduced
+    # row pointer, guarded by the row mask and the chunk-base column mask.
+    assert "_cute_load_v8b_if(_vsink_ptr + " in ast.unparse(loads[0])
+    assert ", mask_0_u0 and mask_1, ir.VectorType" in ast.unparse(loads[0])
     assert "mask_0_u1 = indices_0_u1 < m" in ast.unparse(lane_loop)
-    assert (
-        ".bitcast(cutlass.BFloat16) if mask_0_u1 and mask_1 else cutlass.BFloat16(0)"
-        in ast.unparse(lane_loop)
+    # The predicated load left zeros in the masked lanes; the value needs no
+    # select of its own.
+    assert "_vsink_vec_u1[vec_lane_1]).bitcast(cutlass.BFloat16)" in ast.unparse(
+        lane_loop
+    )
+    assert "if mask_0_u1 and mask_1 else cutlass.BFloat16(0)" not in ast.unparse(
+        lane_loop
     )
     # The finished columns are stored under the same uniform mask.
     assert "if mask_1:" in code
     assert code.count(FRAGMENT_REDUCE) == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_extent_not_a_multiple_of_the_vector_width_stays_scalar(
     cpu_only: None,
 ) -> None:
@@ -351,7 +629,6 @@ def test_extent_not_a_multiple_of_the_vector_width_stays_scalar(
     assert "block=(128, 4, 1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_nonzero_grid_origin_keeps_per_element_masks_and_scalar_loads(
     cpu_only: None,
 ) -> None:
@@ -385,7 +662,6 @@ def _strided_view(view: str) -> torch.Tensor:
     return torch.empty(4096, 4100, dtype=torch.bfloat16)[:, :4096]
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("view", ["offset_2", "row_stride_4098"])
 def test_misaligned_input_views_stay_scalar_with_the_knob_on(
     cpu_only: None, view: str
@@ -408,7 +684,6 @@ def test_misaligned_input_views_stay_scalar_with_the_knob_on(
     assert code.count(TWO_STAGE_REDUCE) == 1
 
 
-@skipUnlessBackends(["cute"])
 def test_an_aligned_row_stride_still_sinks(cpu_only: None) -> None:
     code = _cpu_code(
         col_reduce_sum_static,
@@ -421,7 +696,6 @@ def test_an_aligned_row_stride_still_sinks(cpu_only: None) -> None:
     assert ".load()" not in code
 
 
-@skipUnlessBackends(["cute"])
 def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
     """A load under a condition that differs per V lane (an ``extra_mask``
     over both axes) has no whole-chunk transaction: the pass raises
@@ -452,7 +726,6 @@ def test_per_element_load_conditions_are_unsupported(cpu_only: None) -> None:
     assert "operator.ge(indices_0, indices_1)" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_row_only_loads_and_accumulators_become_per_lane(cpu_only: None) -> None:
     """``acc += sum(x * w[:, None]); wsum += sum(w)``: the row weight is
     loaded once per row before the V-loop (with its convert), and the
@@ -485,7 +758,6 @@ def test_row_only_loads_and_accumulators_become_per_lane(cpu_only: None) -> None
     assert "v_5 = acc_frag[vec_lane_1] / wsum_frag[vec_lane_1]" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_sibling_row_loops_sink_independently(cpu_only: None) -> None:
     """Two row loops over the same rows block define the same row index and
     mask names; each loop hoists its own definitions ahead of its vector
@@ -507,20 +779,23 @@ def test_sibling_row_loops_sink_independently(cpu_only: None) -> None:
     assert len(lane_loops) == 2
     for loop, tensor in zip(lane_loops, ("x", "y"), strict=True):
         statements = [ast.unparse(stmt) for stmt in loop.body]
-        (load,) = [text for text in statements if "cute.arch.load(" in text]
-        assert f"else {tensor}.iterator + cutlass.Int32(0)" in load
+        (load,) = [text for text in statements if "_cute_load_v8b_if(" in text]
+        # The strength-reduced row pointer of this loop's loads starts at
+        # this loop's tensor.
+        (base,) = re.findall(r"_cute_load_v8b_if\((\w+) \+ ", load)
+        assert f"{base} = {tensor}.iterator + " in code
         # The row index and the row mask of this loop come first, in the
         # same lane iteration, ahead of the vector transaction they address
         # and guard.
         (row_index,) = [text for text in statements if text.startswith("indices_")]
         (row_mask,) = [text for text in statements if text.startswith("mask_")]
+        assert f", {row_mask.split(' = ')[0]}, ir.VectorType" in load
         assert statements.index(row_index) < statements.index(row_mask)
         assert statements.index(row_mask) < statements.index(load)
     assert code.count(FRAGMENT_REDUCE) == 2
     assert ".load()" not in code
 
 
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     ("kernel", "extra_args", "definition"),
     [
@@ -582,7 +857,6 @@ def test_a_lane_invariant_scalar_redefined_inside_the_segment_stays_per_lane(
     assert "v_3 = 0" in code
 
 
-@skipUnlessBackends(["cute"])
 def test_a_load_after_a_bound_atomic_rejects_the_config(cpu_only: None) -> None:
     """``old = hl.atomic_add(count, [tile_n], 1); first = count[tile.id * B]``:
     threads 1-3 read the element thread 0's atomic bumps, a race no barrier
@@ -600,7 +874,6 @@ def test_a_load_after_a_bound_atomic_rejects_the_config(cpu_only: None) -> None:
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> None:
     """``before = gather(count[tile_n], tile_n.index)`` then
     ``hl.atomic_add(count, [tile_n], 1)``: the gather lowers to
@@ -677,7 +950,6 @@ def test_a_gathered_value_is_not_recomputed_after_the_atomic(cpu_only: None) -> 
     assert ast.unparse(off_gather).startswith("before = count[")
 
 
-@skipUnlessBackends(["cute"])
 def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
     cpu_only: None,
 ) -> None:
@@ -714,7 +986,7 @@ def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
             cute_full_slice_matmul_tiling=False,
         )
         bound = kernel._bind_isolated((torch.empty(64, 256, dtype=torch.bfloat16),))
-        assert bound.env.cute_fission_plan is not None
+        assert cute_env_state(bound.env).fission_plan is not None
         spec = bound.config_spec
         base = spec.default_config().config
 
@@ -733,19 +1005,52 @@ def test_fission_stages_regenerate_the_knob_off_code_when_nothing_sinks(
         # with the knob off.
         restarts: list[bool] = []
 
-        def not_applied(self: generate_ast.GenerateAST) -> None:
+        def not_applied(codegen: GenerateAST) -> None:
             restarts.append(True)
-            raise generate_ast.VloopSinkNotApplied
+            raise VloopSinkNotApplied
 
-        with patch.object(
-            generate_ast.GenerateAST, "_sink_grid_vector_loops", not_applied
-        ):
+        with patch.object(root_passes, "sink_root_vector_loops", not_applied):
             retried = code(True)
         assert restarts == [True, True]
         assert retried == off
 
 
-@skipUnlessBackends(["cute"])
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _scale_columns(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile(x.size()):
+        out[tile_r, tile_c] = (
+            x[tile_r, tile_c].to(torch.float32) * w[tile_c].to(torch.float32)
+        ).to(x.dtype)
+    return out
+
+
+def test_a_guarded_row_store_lets_the_row_loads_sink(cpu_only: None) -> None:
+    """500 rows end the 32-row tiles ragged, so each row's store is guarded
+    by its row mask.  A plain ``if mask: ptr.store(v)`` is a store into
+    ``out`` (``_segment_stored_tensors``), so the vector loop sinks: each
+    row's ``x`` loads as one predicated packet.  The guarded store used to be
+    a statement substituted for a template line, wrapped in a second
+    ``Expr``: an effect the pass could not name, which kept the knob-off code
+    (a 2-byte load per element of each row)."""
+    args = (
+        torch.empty(500, 384, dtype=torch.bfloat16),
+        torch.empty(384, dtype=torch.bfloat16),
+    )
+    code = _cpu_code(
+        _scale_columns,
+        args,
+        block_sizes=[32, 32],
+        num_threads=[8, 4],
+        loop_orders=[[1, 0]],
+        cute_vector_widths=[1, 8],
+        cute_lane_layouts=["blocked", "strided"],
+        cute_vloop_sink=True,
+    )
+    rows = _loop(code, "lane_0")
+    assert len(_vector_loads(rows.body)) == 1, code
+
+
 def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -761,7 +1066,1799 @@ def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     assert FRAGMENT_REDUCE not in code
 
 
-@skipUnlessBackends(["cute"])
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_mean(x: torch.Tensor) -> torch.Tensor:
+    """The squeeze-excite pool of a channels-last activation, as its
+    ``[N, H*W, C]`` view: each output reduces a column ``C`` elements apart."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=x.dtype, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        out[tile_n, tile_c] = torch.mean(
+            x[tile_n, :, tile_c].to(torch.float32), dim=1
+        ).to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _relu_and_spatial_mean(
+    x: torch.Tensor, shift: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A BatchNorm-ReLU epilogue's shape: every element is stored inside the
+    rolled reduction that pools it."""
+    batch, rows, channels = x.shape
+    act = torch.empty_like(x)
+    pooled = torch.empty([batch, channels], dtype=x.dtype, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        y = torch.relu(
+            x[tile_n, :, tile_c].to(torch.float32) - shift[tile_c][None, None, :]
+        )
+        act[tile_n, :, tile_c] = y.to(act.dtype)
+        pooled[tile_n, tile_c] = torch.mean(y, dim=1).to(pooled.dtype)
+    return act, pooled
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _relu_then_zero_even_channels(
+    x: torch.Tensor, shift: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_relu_and_spatial_mean`` with a later masked store of the same
+    elements: the even channels of ``act`` end up zero."""
+    batch, rows, channels = x.shape
+    act = torch.empty_like(x)
+    pooled = torch.empty([batch, channels], dtype=x.dtype, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        y = torch.relu(
+            x[tile_n, :, tile_c].to(torch.float32) - shift[tile_c][None, None, :]
+        )
+        act[tile_n, :, tile_c] = y.to(act.dtype)
+        even = tile_c.index % 2 == 0
+        hl.store(
+            act,
+            [tile_n, slice(None), tile_c],
+            torch.zeros_like(y).to(act.dtype),
+            extra_mask=even[None, None, :],
+        )
+        pooled[tile_n, tile_c] = torch.mean(y, dim=1).to(pooled.dtype)
+    return act, pooled
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_argmax(x: torch.Tensor) -> torch.Tensor:
+    """``_spatial_mean`` as an argmax: the rolled argreduce's finalize folds
+    consecutive lanes, so it cannot combine across interleaved threads."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=torch.int64, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        out[tile_n, tile_c] = torch.argmax(x[tile_n, :, tile_c], dim=1)
+    return out
+
+
+def _strided_reduction_config(
+    bound: BoundKernel,
+    *,
+    sink: bool,
+    block_sizes: tuple[int, int] = (1, 64),
+    grid_threads: tuple[int, int] = (1, 8),
+    reduction_threads: int = 16,
+    rows: int | None = 32,
+    loop_orders: list[list[int]] | None = None,
+) -> helion.Config:
+    """By default a ``[1, 64]`` tile of rows: eight vectors of eight channels
+    on one axis and sixteen reduction threads over 32-row chunks (``rows``
+    None: the persistent reduction)."""
+    spec = bound.config_spec
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+    widths = {reduction: 1, 0: 1, 1: 8}
+    threads = {0: grid_threads[0], 1: grid_threads[1], reduction: reduction_threads}
+    config = helion.Config(
+        block_sizes=list(block_sizes),
+        num_threads=[threads[b] for b in spec.num_threads.valid_block_ids()],
+        cute_vector_widths=[
+            widths[b] for b in spec.cute_vector_widths.valid_block_ids()
+        ],
+        reduction_loops=[rows],
+        cute_vloop_sink=sink,
+    )
+    if loop_orders is not None:
+        config.config["loop_orders"] = loop_orders
+    return spec.normalized_config(config)
+
+
+def _thread_axis_of(code: str, name: str) -> int | None:
+    match = re.search(rf"{name} = .*?thread_idx\(\)\[(\d)\]", code)
+    return None if match is None else int(match.group(1))
+
+
+def test_strided_reduction_lays_the_vectorized_tile_on_thread_x(
+    cpu_only: None,
+) -> None:
+    """Sinking the channel vector into the rolled spatial reduction puts the
+    channel vectors on ``thread_idx[0]``, so a warp's lanes load adjacent
+    16-byte chunks of one row instead of 16 rows ``C`` elements apart; the
+    reduction threads move to ``thread_idx[1]`` and combine across the
+    interleaved channel threads in shared memory, all eight channels of a
+    vector in one fragment combine (one pair of barriers, not eight)."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_mean, (x,))
+    code = bound.to_code(_strided_reduction_config(bound, sink=True))
+    assert _thread_axis_of(code, "lane_base_1") == 0, code
+    assert _thread_axis_of(code, r"rindex_\d") == 1, code
+    assert "_cute_load_v16b_if(" in code
+    assert code.count(FRAGMENT_REDUCE) == 1, code
+    assert TWO_STAGE_REDUCE not in code
+    assert "block=(8, 16, 1)" in code
+
+
+def test_strided_reduction_keeps_its_layout_with_the_knob_off(cpu_only: None) -> None:
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_mean, (x,))
+    code = bound.to_code(_strided_reduction_config(bound, sink=False))
+    assert _thread_axis_of(code, r"rindex_\d") == 0, code
+    assert "_vsink" not in code
+
+
+@pytest.mark.parametrize(
+    ("loop_orders", "launch", "vector_axis"),
+    [
+        # ``tile_n`` first: its two threads would sit below the channel
+        # vectors, so the default layout stays.
+        (None, "block=(16, 2, 8)", 2),
+        # ``tile_c`` first: the vectors take thread_idx[0].
+        ([[1, 0]], "block=(8, 2, 16)", 0),
+    ],
+)
+def test_threads_on_both_grid_dims_lay_the_vectors_first_only_in_loop_order(
+    cpu_only: None,
+    loop_orders: list[list[int]] | None,
+    launch: str,
+    vector_axis: int,
+) -> None:
+    """The plan orders whole strategies, and the grid strategy numbers its
+    own threaded blocks in loop order, so with threads on both grid dims the
+    channel vectors come first only when the loop order reaches ``tile_c``
+    first; otherwise the default layout stays.  The V-loop sinks either way,
+    and no layout is regenerated."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_mean, (x,))
+    config = _strided_reduction_config(
+        bound,
+        sink=True,
+        block_sizes=(2, 64),
+        grid_threads=(2, 8),
+        loop_orders=loop_orders,
+    )
+    with _regenerations() as signals:
+        code = bound.to_code(config)
+    assert signals == []
+    assert launch in code, code
+    assert _thread_axis_of(code, "lane_base_1") == vector_axis, code
+    assert "_vsink_vec" in code, code
+
+
+def test_a_persistent_strided_reduction_keeps_the_default_layout(
+    cpu_only: None,
+) -> None:
+    """Only a rolled reduction takes the tile-first layout: a persistent one
+    (64 rows on 16 threads) keeps its threads on thread_idx[0] and its warp
+    shuffles rather than a shared-memory combine across the channel
+    threads."""
+    x = torch.empty(8, 64, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_mean, (x,))
+    code = bound.to_code(_strided_reduction_config(bound, sink=True, rows=None))
+    assert "block=(16, 8, 1)" in code, code
+    assert _thread_axis_of(code, "lane_base_1") == 1, code
+    assert TWO_STAGE_REDUCE not in code
+    assert FRAGMENT_REDUCE not in code
+
+
+def test_a_tile_store_inside_the_sunk_reduction_flushes_as_one_packet(
+    cpu_only: None,
+) -> None:
+    """The ReLU output of each row is stored inside the reduction loop; its
+    eight lanes leave as one 16-byte store after the sunk V-loop instead of
+    eight 2-byte stores."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    shift = torch.empty(120, dtype=torch.float32)
+    bound = cpu_bind(_relu_and_spatial_mean, (x, shift))
+    code = bound.to_code(_strided_reduction_config(bound, sink=True))
+    assert "_cute_store_u16_vec(act.iterator" in code, code
+    assert not re.search(r"\(act\.iterator[^\n]*\)\.store\(", code), code
+
+
+def test_a_later_masked_store_of_the_same_elements_keeps_both_stores_in_order(
+    cpu_only: None,
+) -> None:
+    """The even channels are zeroed by a masked store after the ReLU store.
+    Its per-lane mask cannot predicate a packet, and flushing the ReLU store
+    as one after the V-loop would overwrite the zeros the masked store wrote
+    inside it: both stay per lane, in order."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    shift = torch.empty(120, dtype=torch.float32)
+    bound = cpu_bind(_relu_then_zero_even_channels, (x, shift))
+    code = bound.to_code(_strided_reduction_config(bound, sink=True))
+    assert "_vsink_vec" in code, code
+    assert "_cute_store_u16_vec(act.iterator" not in code, code
+    assert len(re.findall(r"\(act\.iterator[^\n]*\)\.store\(", code)) == 2, code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _store_repeating_the_vector_index(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``out[c, r, c]`` addresses dim 0 with the vectorized channel index too,
+    beside a channel sum over the rows."""
+    rows, channels = x.shape
+    out = torch.empty([channels, rows, channels], dtype=x.dtype, device=x.device)
+    pooled = torch.empty([channels], dtype=x.dtype, device=x.device)
+    for c in hl.tile(channels):
+        acc = hl.full([c], 0, dtype=torch.float32)
+        for r in hl.tile(rows):
+            y = x[r, c]
+            out[c, r, c] = y[None, :, :]
+            acc += y.float().sum(0)
+        pooled[c] = acc.to(x.dtype)
+    return out, pooled
+
+
+def test_a_store_addressing_another_dim_by_the_vector_index_stays_per_lane(
+    cpu_only: None,
+) -> None:
+    """Consecutive lanes of ``out[c, r, c]`` lie ``out.stride(0) + 1`` elements
+    apart: under the sink the store keeps its per-lane form, as with the knob
+    off, rather than one packet along the last dim.  ``check_repeated_block_ids``
+    refuses the store first (per lane it reaches only the tile's diagonal), so
+    the test turns that refusal off to reach the sink's own check."""
+    x = torch.empty(784, 64, dtype=torch.bfloat16)
+    with patch(
+        "helion._compiler.cute.repeated_block_ids.check_repeated_block_ids",
+        return_value=None,
+    ):
+        code = _cpu_code(
+            _store_repeating_the_vector_index,
+            (x,),
+            block_sizes=[64, 32],
+            num_threads=[8, 16],
+            cute_vector_widths=[8, 1],
+            cute_vloop_sink=True,
+        )
+    assert "_vsink" in code, code
+    assert "_cute_store_u16_vec(out.iterator" not in code, code
+    assert re.search(r"\(out\.iterator[^\n]*\)\.store\(", code), code
+
+
+@contextmanager
+def _regenerations() -> Iterator[list[str]]:
+    """The signals ``CuteRegeneration`` repairs while the block runs."""
+    signals: list[str] = []
+    repair = kernel_generators.CuteRegeneration.repair
+
+    def recording(
+        self: kernel_generators.CuteRegeneration,
+        signal: BaseException,
+        config: helion.Config,
+        *,
+        caller_graphs: bool,
+    ) -> helion.Config | None:
+        signals.append(type(signal).__name__)
+        return repair(self, signal, config, caller_graphs=caller_graphs)
+
+    with patch.object(kernel_generators.CuteRegeneration, "repair", recording):
+        yield signals
+
+
+def test_a_strided_argmax_regenerates_with_the_default_layout(cpu_only: None) -> None:
+    """The rolled argmax refuses the tile-first layout, so the kernel is
+    generated again with the default one, where nothing sinks: the knob-on
+    code is the knob-off code."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_argmax, (x,))
+    with _regenerations() as signals:
+        code = bound.to_code(_strided_reduction_config(bound, sink=True))
+    assert signals == ["VloopSinkLayoutRefused"]
+    assert code == bound.to_code(_strided_reduction_config(bound, sink=False))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_argmax_then_copy(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_spatial_argmax``, then an ``hl.barrier()`` and a copy: ordered
+    phases, generated as materialized fission stages."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=torch.int64, device=x.device)
+    copy = torch.empty_like(y)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        out[tile_n, tile_c] = torch.argmax(x[tile_n, :, tile_c], dim=1)
+    hl.barrier()
+    for tile in hl.tile(y.size(0)):
+        copy[tile] = y[tile]
+    return out, copy
+
+
+def test_an_ordered_phase_argmax_regenerates_with_the_default_layout(
+    cpu_only: None,
+) -> None:
+    """Each phase is a stage generated from graphs materialized fission
+    supplies, which carry the layout plan: the stage's refusal of the
+    tile-first layout reaches the fission driver, which rebuilds the stage's
+    graphs with the default layout."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    y = torch.empty(1024, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_argmax_then_copy, (x, y))
+    spec = bound.config_spec
+
+    def config(sink: bool) -> helion.Config:
+        (reduction,) = spec.reduction_loops.valid_block_ids()
+        threads = {0: 1, 1: 8, reduction: 16}
+        widths = {1: 8}
+        return spec.normalized_config(
+            helion.Config(
+                block_sizes=[1, 64, 256],
+                num_threads=[
+                    threads.get(b, 0) for b in spec.num_threads.valid_block_ids()
+                ],
+                cute_vector_widths=[
+                    widths.get(b, 1) for b in spec.cute_vector_widths.valid_block_ids()
+                ],
+                reduction_loops=[32],
+                pid_type="flat",
+                cute_vloop_sink=sink,
+            )
+        )
+
+    with _regenerations() as signals:
+        code = bound.to_code(config(True))
+    assert signals == ["VloopSinkLayoutRefused"]
+    assert code == bound.to_code(config(False))
+
+
+def test_a_refused_sibling_lane_combine_regenerates_with_the_default_layout(
+    cpu_only: None,
+) -> None:
+    """Under the tile-first layout the rolled sum combines its lanes across
+    the vector tile's interleaved threads and refuses where their group is
+    not provable under the launch (one wider on x than the tile, as other
+    sections sharing it make).  The refusal regenerates the kernel with the
+    default layout, like the argmax's, instead of failing it; the planned
+    launch is widened on x here to stand in for such sections."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_mean, (x,))
+    planned = LoopedReductionStrategy._planned_thread_dims
+
+    def wider_on_x(self: LoopedReductionStrategy) -> tuple[int, int, int]:
+        dims = planned(self)
+        return (dims[0] * 2, dims[1], dims[2])
+
+    with (
+        patch.object(LoopedReductionStrategy, "_planned_thread_dims", wider_on_x),
+        _regenerations() as signals,
+    ):
+        code = bound.to_code(_strided_reduction_config(bound, sink=True))
+    assert signals == ["VloopSinkLayoutRefused"]
+    # The default layout: sixteen reduction threads on x, the vectors on y.
+    assert "block=(16, 8, 1)" in code, code
+    assert "_vsink_vec" in code, code
+
+
+def test_a_capacity_decline_passes_the_layout_refusal_through(cpu_only: None) -> None:
+    """Once the computed-fragment owner declines a root for its shared
+    memory, a refusal of the generic lowering becomes the config's
+    InvalidConfig, but the planned layout's refusal is a regeneration signal
+    and passes through: the kernel is generated again with the default
+    layout."""
+    bound = cpu_bind(_spatial_mean, (torch.empty(8, 784, 120, dtype=torch.bfloat16),))
+    root_plans = SimpleNamespace(fragment_capacity_decline=(300000, 232448))
+    codegen = cast(
+        "GenerateAST",
+        SimpleNamespace(
+            device_function=SimpleNamespace(
+                cute_state=SimpleNamespace(root_plans=root_plans)
+            )
+        ),
+    )
+    explain = bound.env.backend.explain_root_failure
+    refusal = kernel_generators.VloopSinkLayoutRefused("cute", "rolled argmax")
+    assert explain(codegen, refusal) is refusal
+    other = helion.exc.BackendUnsupported("cute", "a lane restore")
+    assert isinstance(explain(codegen, other), helion.exc.InvalidConfig)
+
+
+def test_a_strided_reduction_past_the_z_launch_limit_keeps_the_default_layout(
+    cpu_only: None,
+) -> None:
+    """Two threads on each grid axis and 128 reduction threads: the
+    tile-first order would launch ``(2, 2, 128)``, past the 64 threads the z
+    axis allows, so the default ``(128, 2, 2)`` stays and the V-loop still
+    sinks."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    bound = cpu_bind(_spatial_mean, (x,))
+    config = _strided_reduction_config(
+        bound,
+        sink=True,
+        block_sizes=(2, 16),
+        grid_threads=(2, 2),
+        reduction_threads=128,
+        rows=256,
+    )
+    with _regenerations() as signals:
+        code = bound.to_code(config)
+    assert signals == []
+    assert "block=(128, 2, 2)" in code, code
+    assert _thread_axis_of(code, r"rindex_\d") == 0, code
+    assert "_vsink_vec" in code, code
+
+
+@pytest.mark.parametrize(
+    ("unroll", "retries"),
+    [
+        (1, ["VloopSinkNotApplied"]),
+        # The knob-off retry keeps the unroll, which no lane loop of the
+        # default layout takes either: that retry turns it off.
+        (8, ["VloopSinkNotApplied", "LaneUnrollNotApplied"]),
+    ],
+)
+def test_a_strided_reduction_that_sinks_nothing_regenerates_the_knob_off_code(
+    cpu_only: None, unroll: int, retries: list[str]
+) -> None:
+    """248-byte rows put every other row's chunks off the 16-byte packet
+    alignment: no load fact is recorded and nothing sinks, so the layout the
+    knob shaped goes with the knob and the knob-on code is the knob-off
+    code at the same ``cute_lane_unroll``."""
+    x = torch.empty(8, 784, 124, dtype=torch.bfloat16)[..., :120]
+    bound = cpu_bind(_spatial_mean, (x,))
+
+    def config(sink: bool) -> helion.Config:
+        config = _strided_reduction_config(bound, sink=sink)
+        config.config["cute_lane_unroll"] = unroll
+        return bound.config_spec.normalized_config(config)
+
+    with _regenerations() as signals:
+        code = bound.to_code(config(True))
+    assert signals == retries
+    assert code == bound.to_code(config(False))
+
+
+_OUT_POINTER = (
+    "out.iterator + cutlass.Int32(indices_1) * cutlass.Int32(out.layout.stride[0])"
+)
+
+
+def _packs_the_store(segment: list[str], *, disjoint: bool = True) -> bool:
+    """Whether the sink flushes the per-lane store into ``out`` that ends a
+    V-loop segment (one statement per string) as one packet; ``x`` is proven
+    disjoint from ``out`` or not."""
+    sinker = sink_vector_loops._Sinker(
+        cast("ast.For", ast.parse("for vec_lane_1 in range(4):\n    pass").body[0]),
+        device_state.CuteVloopWrapperFact(
+            block_id=1,
+            vec_width=4,
+            lane_var="lane_1",
+            vec_lane_var="vec_lane_1",
+            base_index_var="lane_base_1",
+            index_var="indices_1",
+            mask_var=None,
+            uniform_vector_mask=True,
+        ),
+        loads={},
+        rename_groups={},
+        new_var=lambda name, **_: name,
+        lane_unroll=1,
+        tensor_dtypes={"out": torch.float32, "x": torch.float32},
+        proven_disjoint_tensor_pairs=[frozenset(("out", "x"))] if disjoint else [],
+        stores={
+            _OUT_POINTER: device_state.CuteVloopStoreFact(
+                "vec_lane_1", "out", 4, torch.float32
+            )
+        },
+    )
+    sinker.analysis = sink_vector_loops._Analysis(
+        varying=set(),
+        expanded={},
+        fragment_dtypes={},
+        rematerialized={},
+        definition_counts={},
+    )
+    statements = [
+        ast.parse(text).body[0]
+        for text in [*segment, f"({_OUT_POINTER}).store(cutlass.Float32(v))"]
+    ]
+    return bool(sinker._packable_store_statements(statements, frozenset({"out"}), True))
+
+
+def test_a_store_read_back_through_a_gather_stays_per_lane() -> None:
+    """A gather lowers to a bare subscript (``t[i] if mask else 0``) with no
+    load call.  Reading the stored tensor that way in the store's segment
+    keeps the store per lane: a later lane must see the earlier lanes'
+    stores, which the packet flush would only write after the V-loop.  A
+    tensor proven disjoint from it may be gathered."""
+    load = "v = (x.iterator + cutlass.Int32(indices_1)).load()"
+    assert _packs_the_store([load])
+    assert not _packs_the_store([load], disjoint=False)
+    assert not _packs_the_store([load, "back = out[indices_1]"])
+    assert _packs_the_store(["v = x[indices_1]"])
+    assert not _packs_the_store(["v = x[indices_1]"], disjoint=False)
+
+
+@pytest.mark.parametrize(
+    "load",
+    [
+        # A predicated packet of the sink itself and an L2-policy helper.
+        "v = _cute_load_v16b_if(x.iterator + cutlass.Int32(indices_1), mask_1)",
+        "v = _cute_load_l1_l2_evict_first(x.iterator + cutlass.Int32(indices_1))",
+    ],
+    ids=["packet", "policy_helper"],
+)
+def test_a_store_beside_an_unresolved_load_stays_per_lane(load: str) -> None:
+    """The segment analysis does not resolve the tensor of a packet or
+    helper load, so a segment holding one packs no store."""
+    assert not _packs_the_store([load])
+
+
+def test_strided_reduction_heuristic_seeds_the_tile_first_layout(
+    cpu_only: None,
+) -> None:
+    """The reduction over the strided middle dim gets coalesced seeds: the
+    120 channels on 16 vector threads (128 columns), 8 reduction threads over
+    128-row chunks and an 8-deep lane unroll, and the seeded layout sinks."""
+    x = torch.empty(8, 784, 120, dtype=torch.bfloat16)
+    shift = torch.empty(120, dtype=torch.float32)
+    bound = cpu_bind(_relu_and_spatial_mean, (x, shift))
+    spec = bound.config_spec
+    assert "cute_strided_reduction" in spec.autotuner_heuristics
+    seeds = [
+        seed.config
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+    assert seeds
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+    threads = dict(
+        zip(spec.num_threads.valid_block_ids(), seeds[0]["num_threads"], strict=True)
+    )
+    widths = dict(
+        zip(
+            spec.cute_vector_widths.valid_block_ids(),
+            seeds[0]["cute_vector_widths"],
+            strict=True,
+        )
+    )
+    assert seeds[0]["block_sizes"] == [1, 128]
+    assert threads == {0: 1, 1: 16, reduction: 8}
+    assert widths[1] == 8
+    assert seeds[0]["reduction_loops"] == [128]
+    assert seeds[0]["cute_lane_unroll"] == 8
+    code = bound.to_code(spec.normalized_config(helion.Config(**seeds[0])))
+    assert _thread_axis_of(code, "lane_base_1") == 0, code
+    assert "_cute_store_u16_vec(act.iterator" in code
+    assert re.search(r"_vsink_store_vals\w*\.append\(", code)
+
+
+def _bind_with_sink_seeds(
+    kernel: helion.Kernel, args: tuple[torch.Tensor, ...]
+) -> tuple[BoundKernel, list[dict[str, object]]]:
+    """``kernel`` bound on CPU, with the strided heuristic's (vloop-sink)
+    seed configs, of which there must be some."""
+    bound = cpu_bind(kernel, args)
+    seeds = [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+    assert seeds
+    return bound, seeds
+
+
+def _seed_spans_a_line(seed: dict[str, object], itemsize: int) -> bool:
+    """Whether the seed's CTA rows cover at least one 128-byte L2 line."""
+    block_sizes = seed["block_sizes"]
+    assert isinstance(block_sizes, list)
+    return max(block_sizes) * itemsize >= 128
+
+
+def test_strided_reduction_seeds_stream_their_input_evict_first(
+    cpu_only: None,
+) -> None:
+    """A column sum streams its input through once (each CTA reads its own
+    columns, once): the strided seeds give its load slot the evict-first L2
+    policy, which the sink's predicated packets carry (1000 columns leave a
+    partial tile).  The narrow seed's CTA rows, under one 128-byte line,
+    share their lines with the neighboring CTAs and keep the default."""
+    bound, seeds = _bind_with_sink_seeds(
+        _column_sum, (torch.empty(2048, 1000, dtype=torch.bfloat16),)
+    )
+    wide = [seed for seed in seeds if _seed_spans_a_line(seed, 2)]
+    assert wide and len(wide) < len(seeds), seeds
+    for seed in seeds:
+        policies = seed.get("load_eviction_policies") or [""]
+        assert isinstance(policies, list)
+        assert policies[0] == ("l1_l2_first" if seed in wide else ""), seed
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**wide[0])))
+    assert re.search(r"_cute_load_v16b_if\(_vsink_ptr \+ .*'l1_l2_first'\)", code), code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_mean_of_sum(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The mean of each ``[N, H*W, C]`` column of ``x + y``."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=torch.float32, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        out[tile_n, tile_c] = torch.mean(
+            x[tile_n, :, tile_c] + y[tile_n, :, tile_c].to(torch.float32), dim=1
+        )
+    return out
+
+
+def test_strided_reduction_seeds_check_each_inputs_lines(cpu_only: None) -> None:
+    """Each streamed input's CTA rows must cover a line in its own dtype:
+    the narrow seed's 32 columns span 128 bytes of the float32 ``x`` but 64
+    of the bfloat16 ``y``, which keeps the default policy there."""
+    _, seeds = _bind_with_sink_seeds(
+        _spatial_mean_of_sum,
+        (
+            torch.empty(256, 784, 128),
+            torch.empty(256, 784, 128, dtype=torch.bfloat16),
+        ),
+    )
+    spans = [
+        (_seed_spans_a_line(seed, 4), _seed_spans_a_line(seed, 2)) for seed in seeds
+    ]
+    assert (True, False) in spans and (True, True) in spans, seeds
+    for seed, (x_spans, y_spans) in zip(seeds, spans, strict=True):
+        policies = seed.get("load_eviction_policies") or ["", ""]
+        assert isinstance(policies, list)
+        assert policies[:2] == [
+            "l1_l2_first" if x_spans else "",
+            "l1_l2_first" if y_spans else "",
+        ], seed
+
+
+def test_strided_reduction_seeds_need_the_tile_on_each_inputs_stride_1_dim(
+    cpu_only: None,
+) -> None:
+    """An input whose stride-1 dim the batch indexes, not the channel tile,
+    has each CTA read its tile's elements one per line (a ``y`` permuted to
+    strides (1, 256, 200704)): it keeps the default policy, where ``x`` takes
+    evict-first as before."""
+    x = torch.empty(256, 784, 128)
+    y = torch.empty(128, 784, 256).permute(2, 1, 0)
+    _, seeds = _bind_with_sink_seeds(_spatial_mean_of_sum, (x, y))
+    hinted = [seed for seed in seeds if seed.get("load_eviction_policies")]
+    assert hinted, seeds
+    for seed in seeds:
+        policies = seed.get("load_eviction_policies") or ["", ""]
+        assert isinstance(policies, list)
+        assert policies[1] == "", seed
+    for seed in hinted:
+        policies = seed["load_eviction_policies"]
+        assert isinstance(policies, list)
+        assert policies[0] == "l1_l2_first", seed
+
+
+def test_strided_reduction_seeds_keep_the_lines_of_unaligned_rows(
+    cpu_only: None,
+) -> None:
+    """A CTA row of one 128-byte line owns it only if it starts on a line
+    boundary: the narrow seed's 32 float32 columns of 120-channel rows (480
+    bytes apart) straddle lines they share with the neighboring channel
+    tile and keep the default policy, those of 128-channel rows (512 bytes
+    apart) take evict-first.  Rows of two lines or more keep it either way."""
+    for channels, aligned in ((120, False), (128, True)):
+        _, seeds = _bind_with_sink_seeds(
+            _spatial_mean, (torch.empty(256, 784, channels),)
+        )
+        widths = []
+        for seed in seeds:
+            block_sizes = seed["block_sizes"]
+            assert isinstance(block_sizes, list)
+            widths.append(max(block_sizes))
+            policies = seed.get("load_eviction_policies") or [""]
+            assert isinstance(policies, list)
+            hinted = aligned or max(block_sizes) * 4 >= 256
+            assert policies[0] == ("l1_l2_first" if hinted else ""), (channels, seed)
+        assert 32 in widths, seeds
+
+
+def test_strided_reduction_search_space_is_the_same_at_every_extent(
+    cpu_only: None,
+) -> None:
+    """The strided seeds that sink a spatial mean fit some reduction extents
+    only (none over 4 rows), but its strided full slice opens
+    ``cute_vloop_sink`` and ``cute_lane_unroll`` at every extent:
+    ``autotune_multi`` needs one search space (``structural_fingerprint``)
+    across shapes."""
+    fingerprints = []
+    sinking = []
+    for rows in (4, 16, 784):
+        spec = cpu_bind(
+            _spatial_mean, (torch.empty(256, rows, 128, dtype=torch.bfloat16),)
+        ).config_spec
+        fingerprints.append(spec.structural_fingerprint())
+        sinking.append(
+            any(
+                seed.config.get("cute_vloop_sink")
+                for seed in spec.compiler_seed_configs
+            )
+        )
+    assert sinking == [False, True, True], sinking
+    assert fingerprints[0] == fingerprints[1] == fingerprints[2]
+
+
+def test_strided_reduction_seeds_record_what_runs(cpu_only: None) -> None:
+    """A chunk clamped to a short reduction keeps its seed only where the
+    single pass stays a rolled loop: from 8 rows, so a 7-row spatial mean,
+    which runs persistent, gets no sinking seed.  A kept seed records the
+    threads and lane unroll its code runs: at most one reduction thread a row
+    and an unroll no deeper than each thread's rows (the narrow seed of a
+    49-row spatial mean over 4 images: 64 threads, no unroll, the block its
+    code launches)."""
+    spec = cpu_bind(
+        _spatial_mean, (torch.empty(128, 7, 256, dtype=torch.bfloat16),)
+    ).config_spec
+    assert not any(
+        seed.config.get("cute_vloop_sink") for seed in spec.compiler_seed_configs
+    )
+    bound, seeds = _bind_with_sink_seeds(
+        _spatial_mean, (torch.empty(4, 49, 256, dtype=torch.bfloat16),)
+    )
+    (reduction,) = bound.config_spec.reduction_loops.valid_block_ids()
+    slot = list(bound.config_spec.num_threads.valid_block_ids()).index(reduction)
+    rows = []
+    for seed in seeds:
+        threads = seed["num_threads"]
+        chunks = seed["reduction_loops"]
+        assert isinstance(threads, list) and isinstance(chunks, list)
+        unroll = seed.get("cute_lane_unroll", 1)
+        assert isinstance(unroll, int)
+        assert threads[slot] * unroll <= chunks[0], seed
+        rows.append(threads[slot])
+    assert 64 in rows, seeds
+
+
+def test_strided_reduction_seeds_take_a_views_offset_as_line_aligned(
+    cpu_only: None,
+) -> None:
+    """The line check reads the strides: the channel slice ``[..., 4:124]`` of
+    a float32 [256, 784, 128] activation keeps 512-byte rows, so the narrow
+    seed's 32 columns take evict-first though the slice starts each row 16
+    bytes into a line.  The binding does not key on the storage offset, so a
+    check of the example's offset could leave a stale hint; the policy costs
+    bandwidth, never a value."""
+    _, seeds = _bind_with_sink_seeds(
+        _spatial_mean, (torch.empty(256, 784, 128)[..., 4:124],)
+    )
+    narrow = []
+    for seed in seeds:
+        block_sizes = seed["block_sizes"]
+        assert isinstance(block_sizes, list)
+        if max(block_sizes) == 32:
+            narrow.append(seed)
+    assert narrow, seeds
+    for seed in narrow:
+        policies = seed.get("load_eviction_policies") or [""]
+        assert isinstance(policies, list)
+        assert policies[0] == "l1_l2_first", seed
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _spatial_variance(x: torch.Tensor) -> torch.Tensor:
+    """The variance of each ``[N, H*W, C]`` column, its mean first: a
+    reduction that reads its input twice."""
+    batch, _, channels = x.shape
+    out = torch.empty([batch, channels], dtype=torch.float32, device=x.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        xt = x[tile_n, :, tile_c].to(torch.float32)
+        mean = torch.mean(xt, dim=1, keepdim=True)
+        out[tile_n, tile_c] = torch.mean((xt - mean) * (xt - mean), dim=1)
+    return out
+
+
+def test_strided_reduction_seeds_keep_the_lines_of_inputs_read_again(
+    cpu_only: None,
+) -> None:
+    """No evict-first for an input other CTAs or later passes read again: a
+    per-channel shift every CTA of a channel tile shares (the seeds' rolled
+    reduction lowers it ahead of its loop, into the first slot, while the
+    streamed ``x`` keeps the policy), an input broadcast over the batch
+    (every batch CTA reads the same lines), and the input of a mean then a
+    variance, which the rolled reduction reads in two passes."""
+    bound, seeds = _bind_with_sink_seeds(
+        _relu_and_spatial_mean,
+        (
+            torch.empty(8, 784, 120, dtype=torch.bfloat16),
+            torch.empty(120, dtype=torch.float32),
+        ),
+    )
+    wide = [seed for seed in seeds if _seed_spans_a_line(seed, 2)]
+    assert wide
+    for seed in wide:
+        policies = seed["load_eviction_policies"]
+        assert isinstance(policies, list)
+        assert policies[:2] == ["", "l1_l2_first"], seed
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**wide[0])))
+    shift_loads = [line for line in code.splitlines() if "shift.iterator" in line]
+    assert shift_loads, code
+    assert not any("first" in line for line in shift_loads), shift_loads
+    for kernel, x in (
+        (
+            _spatial_mean,
+            torch.empty(1, 784, 120, dtype=torch.bfloat16).expand(128, 784, 120),
+        ),
+        (_spatial_variance, torch.empty(8, 3136, 256, dtype=torch.bfloat16)),
+    ):
+        _, seeds = _bind_with_sink_seeds(kernel, (x,))
+        for seed in seeds:
+            policies = seed.get("load_eviction_policies") or ()
+            assert isinstance(policies, (list, tuple))
+            assert not any(policies), (kernel.name, seed)
+
+
+def test_strided_reduction_heuristic_leaves_short_reductions_to_the_register_tile(
+    cpu_only: None,
+) -> None:
+    """512 rows fit the register tile's persistent layout, whose seeds beat
+    the strided ones on such column sums; 2048 rows do not."""
+    for rows, seeded, skipped in (
+        (512, "cute_register_tile", "cute_strided_reduction"),
+        (2048, "cute_strided_reduction", "cute_register_tile"),
+    ):
+        x = torch.empty(rows, 1024, dtype=torch.bfloat16)
+        heuristics = cpu_bind(_column_sum, (x,)).config_spec.autotuner_heuristics
+        assert seeded in heuristics and skipped not in heuristics, (rows, heuristics)
+
+
+def _sunk_seeds(spec: ConfigSpec, *fields: str) -> list[tuple[Any, ...]]:
+    """``fields`` of each compiler seed of ``spec`` that sinks its V-loop
+    (the strided-reduction seeds), ``reduction_threads`` naming the
+    ``num_threads`` entry of the rolled reduction."""
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+
+    def value(seed: helion.Config, field: str) -> object:
+        if field == "reduction_threads":
+            return spec.num_threads.config_get(seed.config["num_threads"], reduction)
+        return seed.config[field]
+
+    return [
+        tuple(value(seed, field) for field in fields)
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+
+
+def test_strided_reduction_heuristic_seeds_narrow_tiles_for_a_small_grid(
+    cpu_only: None,
+) -> None:
+    """128 images of 144 channels: the 128-column seeds launch 256 CTAs that
+    each walk 3136 rows, so a 16-column seed (1152 CTAs) with 64 reduction
+    threads joins them."""
+    x = torch.empty(128, 3136, 144, dtype=torch.bfloat16)
+    shift = torch.empty(144, dtype=torch.float32)
+    bound = cpu_bind(_relu_and_spatial_mean, (x, shift))
+    spec = bound.config_spec
+    seeds = _sunk_seeds(spec, "block_sizes", "reduction_threads", "reduction_loops")
+    assert ([1, 16], 64, [512]) in seeds, seeds
+    assert ([1, 128], 8, [128]) in seeds, seeds
+
+
+@pytest.mark.parametrize(
+    ("rows", "threads", "chunk"),
+    [
+        (200, 128, 256),
+        (300, 128, 512),
+        (1000, 128, 1024),
+        (2048, 128, 1024),
+        (3000, 256, 2048),
+        (4096, 256, 2048),
+        (36000, 512, 4096),
+    ],
+)
+def test_strided_reduction_heuristic_widens_the_narrow_seed_on_a_tiny_grid(
+    cpu_only: None, rows: int, threads: int, chunk: int
+) -> None:
+    """512 fp32 columns over a lone grid axis: even one 4-wide vector per CTA
+    launches only 128 CTAs, so the narrow seed takes up to 512 reduction
+    threads (the thread count of the 4 CTAs per SM it cannot launch), as many
+    as keep its chunk of 8 rows a thread shorter than the reduction.  Up to
+    1024 rows, the chunk of its 128 threads alone reaches the reduction's
+    length, and the seed runs the reduction in one pass of a chunk clamped
+    to the next power of two."""
+    x = torch.empty(rows, 512, dtype=torch.float32)
+    bound = cpu_bind(_column_sum, (x,))
+    spec = bound.config_spec
+    seeds = _sunk_seeds(spec, "block_sizes", "reduction_threads", "reduction_loops")
+    assert ([4], threads, [chunk]) in seeds, seeds
+
+
+def test_strided_reduction_heuristic_seeds_a_short_reduction_in_one_chunk(
+    cpu_only: None,
+) -> None:
+    """129 to 256 rows fit one 256-row chunk: beside the 128-row chunks, a
+    seed gives each of 16 reduction threads 16 rows in one pass with the
+    deepest lane unroll.  Up to 256 rows, a seed whose chunk would be longer
+    than the rows runs them in one pass of a chunk clamped to the next power
+    of two (40 and 64 rows get 64-row chunks, 100 and 128 rows 128-row chunks
+    beside the 64-row ones); 3136 rows get no one-chunk seed."""
+    for rows in (40, 64, 100, 128, 196, 256, 3136):
+        expected = 128 < rows <= 256
+        x = torch.empty(8, rows, 120, dtype=torch.bfloat16)
+        shift = torch.empty(120, dtype=torch.float32)
+        spec = cpu_bind(_relu_and_spatial_mean, (x, shift)).config_spec
+        seeds = _sunk_seeds(
+            spec, "reduction_loops", "cute_lane_unroll", "reduction_threads"
+        )
+        one_pass = 1 << (rows - 1).bit_length()
+        assert all(
+            seed[0][0] < rows or (seed[0][0] == one_pass and rows <= 256)
+            for seed in seeds
+        ), (rows, seeds)
+        # The narrow seed's threads walk one row each of a clamped chunk, so
+        # it records no unroll.
+        if rows <= 64:
+            assert [seed[:2] for seed in seeds] == [([64], 8), ([64], 4), ([64], 1)]
+        elif rows <= 128:
+            assert [seed[:2] for seed in seeds] == [
+                ([128], 8),
+                ([64], 8),
+                ([128], 4),
+                ([128], 1),
+            ], (rows, seeds)
+        assert (([256], 16, 16) in seeds) is expected, (rows, seeds)
+
+
+# better-benchmark's channels-last BatchNorm training chain
+# (var_mean_var_mean_mean_0efb69a14422): Welford partials over 49 blocks of
+# 128 rows, their combine over the 49 blocks, and a spatial mean over 49
+# positions.
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bn_welford_partials(
+    x_rows: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    splits, rows, channels = x_rows.shape
+    mean_p = torch.empty([splits, channels], dtype=torch.float32, device=x_rows.device)
+    m2_p = torch.empty([splits, channels], dtype=torch.float32, device=x_rows.device)
+    weight_p = torch.empty(
+        [splits, channels], dtype=torch.float32, device=x_rows.device
+    )
+    for tile_s, tile_c in hl.tile([splits, channels]):
+        values = x_rows[tile_s, :, tile_c].to(torch.float32)
+        block_mean = torch.mean(values, dim=1)
+        centered = values - block_mean[:, None, :]
+        mean_p[tile_s, tile_c] = block_mean
+        m2_p[tile_s, tile_c] = torch.sum(centered * centered, dim=1)
+        weight_p[tile_s, tile_c] = hl.full([tile_s, tile_c], rows, torch.float32)
+    return mean_p, m2_p, weight_p
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bn_welford_combine(
+    mean_p: torch.Tensor, m2_p: torch.Tensor, weight_p: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    splits, channels = mean_p.shape
+    mean_out = torch.empty([channels], dtype=torch.float32, device=mean_p.device)
+    rstd_out = torch.empty([channels], dtype=torch.float32, device=mean_p.device)
+    for tile_c in hl.tile(channels):
+        means = mean_p[:, tile_c]
+        weights = weight_p[:, tile_c]
+        total = torch.sum(weights, dim=0)
+        mean = torch.sum(means * weights, dim=0) / total
+        delta = means - mean[None, :]
+        m2 = torch.sum(m2_p[:, tile_c] + weights * delta * delta, dim=0)
+        rstd_out[tile_c] = torch.rsqrt(m2 / total + 1e-05)
+        mean_out[tile_c] = mean
+    return mean_out, rstd_out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bn_relu_spatial_mean(
+    x_rows: torch.Tensor, mean: torch.Tensor, rstd: torch.Tensor
+) -> torch.Tensor:
+    batch, hw, channels = x_rows.shape
+    pooled = torch.empty([batch, channels], dtype=x_rows.dtype, device=x_rows.device)
+    for tile_n, tile_c in hl.tile([batch, channels]):
+        y = (
+            x_rows[tile_n, :, tile_c].to(torch.float32) - mean[tile_c][None, None, :]
+        ) * rstd[tile_c][None, None, :]
+        pooled[tile_n, tile_c] = torch.mean(torch.relu(y), dim=1).to(pooled.dtype)
+    return pooled
+
+
+def test_strided_reduction_heuristic_seeds_every_kernel_of_a_batchnorm_chain(
+    cpu_only: None,
+) -> None:
+    """The 128-row partials keep their 128-row chunks clamped to one pass
+    beside the 64-row ones, and the 49-row combine and spatial mean get
+    64-row single-pass seeds: 4, 4 and 3, with ``cute_vloop_sink`` and
+    ``cute_lane_unroll`` open to the search.  The configs a cold autotune
+    found from these seeds ran the chain in 25.3 us, against 32.3 us for
+    those found without them (B200)."""
+    partials = torch.empty(49, 1408, dtype=torch.float32)
+    channels = torch.empty(1408, dtype=torch.float32)
+    for kernel, args, count in (
+        (_bn_welford_partials, (torch.empty(49, 128, 1408, dtype=torch.bfloat16),), 4),
+        (_bn_welford_combine, (partials, partials, partials), 4),
+        (
+            _bn_relu_spatial_mean,
+            (torch.empty(128, 49, 1408, dtype=torch.bfloat16), channels, channels),
+            3,
+        ),
+    ):
+        spec = cpu_bind(kernel, args).config_spec
+        seeds = _sunk_seeds(spec, "reduction_loops")
+        assert len(seeds) == count, (kernel.name, seeds)
+        fields = spec._flat_fields()
+        assert set(fields["cute_vloop_sink"].search_choices) == {False, True}
+        assert set(fields["cute_lane_unroll"].search_choices) == {1, 2, 4, 8, 16}
+
+
+@pytest.mark.parametrize(
+    ("width", "vec", "columns", "tile_threads", "packet_load"),
+    (
+        # Rows of 1026 bf16 elements are only 4-byte aligned (the BERT
+        # vocabulary gradient's 30522 too): 2-element vectors, four times
+        # the tile threads of a 16-byte vector, the wider tile first.
+        (1026, 2, 256, 128, "_cute_load_v4b_if("),
+        # 8-byte aligned rows of 1028: 4-element vectors, twice the tile
+        # threads of a 16-byte vector, the wider tile first.
+        (1028, 4, 256, 64, "_cute_load_v8b_if("),
+        # 16-byte aligned rows: the measured shape.
+        (1032, 8, 128, 16, "_cute_load_v16b_if("),
+    ),
+)
+def test_strided_reduction_heuristic_seeds_the_widest_aligned_vector(
+    cpu_only: None,
+    width: int,
+    vec: int,
+    columns: int,
+    tile_threads: int,
+    packet_load: str,
+) -> None:
+    """A column sum over a lone grid axis: the first seed's tile leaves a
+    jagged last tile, whose bounds mask on the vector fact's index the sink
+    evaluates at the vector's base, and the seeded config sinks predicated
+    packets with the vector threads on ``thread_idx[0]``."""
+    x = torch.empty(2048, width, dtype=torch.bfloat16)
+    bound = cpu_bind(_column_sum, (x,))
+    spec = bound.config_spec
+    seeds = [
+        seed.config
+        for seed in spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+    assert seeds
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+    (tile,) = spec.block_sizes.valid_block_ids()
+    threads = dict(
+        zip(spec.num_threads.valid_block_ids(), seeds[0]["num_threads"], strict=True)
+    )
+    widths = dict(
+        zip(
+            spec.cute_vector_widths.valid_block_ids(),
+            seeds[0]["cute_vector_widths"],
+            strict=True,
+        )
+    )
+    assert seeds[0]["block_sizes"] == [columns]
+    assert threads == {tile: tile_threads, reduction: 8}
+    assert widths[tile] == vec
+    code = bound.to_code(spec.normalized_config(helion.Config(**seeds[0])))
+    assert code.count(packet_load) == 8, code
+    assert _thread_axis_of(code, "offsets_base_0") == 0, code
+    assert _thread_axis_of(code, "_vsink_ptr") == 1, code
+
+
+def test_strided_reduction_heuristic_skips_rows_without_a_vector(
+    cpu_only: None,
+) -> None:
+    """Rows of an odd number of bf16 elements align no 2-element vector."""
+    bound = cpu_bind(_column_sum, (torch.empty(2048, 1025, dtype=torch.bfloat16),))
+    assert "cute_strided_reduction" not in bound.config_spec.autotuner_heuristics
+
+
+def test_strided_reduction_heuristic_skips_a_contiguous_row(cpu_only: None) -> None:
+    """A row reduction over the stride-1 dim is already coalesced on the
+    reduction threads: no strided-reduction seed."""
+    bound = cpu_bind(
+        rms_norm_fwd,
+        (
+            torch.empty(256, 4096, dtype=torch.bfloat16),
+            torch.empty(4096, dtype=torch.bfloat16),
+        ),
+    )
+    assert "cute_strided_reduction" not in bound.config_spec.autotuner_heuristics
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channel_affine_relu(
+    x: torch.Tensor,
+    mean: torch.Tensor,
+    var: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """A BatchNorm-inference epilogue on a channels-last ``[rows, C]`` view:
+    every element reads its channel's statistics and affine parameters."""
+    out = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile(x.size()):
+        y = x[tile_r, tile_c].to(torch.float32) - mean[tile_c].to(torch.float32)
+        y = y * torch.rsqrt(var[tile_c].to(torch.float32) + 1e-05)
+        y = y * weight[tile_c].to(torch.float32) + bias[tile_c].to(torch.float32)
+        out[tile_r, tile_c] = torch.relu(y).to(out.dtype)
+    return out
+
+
+def _channel_affine_args(
+    device: str = "cpu", rows: int = 512
+) -> tuple[torch.Tensor, ...]:
+    x = torch.randn(rows, 384, dtype=torch.bfloat16, device=device)
+    mean, weight, bias = (
+        torch.randn(384, dtype=torch.bfloat16, device=device) for _ in range(3)
+    )
+    var = torch.rand(384, dtype=torch.bfloat16, device=device) + 0.5
+    return x, mean, var, weight, bias
+
+
+def _channel_affine_config(*, sink: bool, vector: int = 8) -> helion.Config:
+    """Four rows per thread on 8 row threads, one ``vector``-channel vector
+    per thread on 4 channel threads."""
+    return helion.Config(
+        block_sizes=[32, 32],
+        num_threads=[8, 4],
+        loop_orders=[[1, 0]],
+        flatten_loops=[False],
+        cute_vector_widths=[1, vector],
+        cute_lane_layouts=["blocked", "strided"],
+        cute_vloop_sink=sink,
+    )
+
+
+@functools.cache
+def _channel_affine_bound(rows: int) -> BoundKernel:
+    return cpu_bind(_channel_affine_relu, _channel_affine_args(rows=rows))
+
+
+@functools.cache
+def _channel_affine_render(rows: int, config: str) -> str:
+    bound = _channel_affine_bound(rows)
+    return bound.to_code(
+        bound.config_spec.normalized_config(helion.Config(**json.loads(config)))
+    )
+
+
+def _channel_affine_code(rows: int, config: dict[str, Any]) -> str:
+    """``_channel_affine_relu``'s code for ``config`` on ``rows`` rows,
+    rendered once per module: several tests read the same configs' code."""
+    return _channel_affine_render(rows, json.dumps(config, sort_keys=True))
+
+
+def _value_statements(code: str) -> set[str]:
+    """The kernel's ``v_N = ...`` statements, each element of a sunk fragment
+    read as the per-lane value it holds and unrolled copies merged: two
+    renders with equal sets do the same arithmetic, contractions included."""
+    statements = set()
+    for node in ast.walk(ast.parse(code)):
+        if isinstance(node, ast.Assign):
+            text = re.sub(r"_frag\[vec_lane_\d+\]", "", ast.unparse(node))
+            text = re.sub(r"\b(\w+?)_u\d+\b", r"\1", text)
+            if re.match(r"v_\d+ = ", text):
+                statements.add(text)
+    return statements
+
+
+def test_channel_parameters_load_once_per_thread_beside_the_row_loop(
+    cpu_only: None,
+) -> None:
+    """Sinking the channel vector into the rows' lane loop computes each
+    channel's statistics (and its ``rsqrt``) once per thread into register
+    fragments; each of the thread's four rows then loads one 16-byte chunk of
+    ``x`` and stores one 16-byte packet."""
+    code = _channel_affine_code(512, dict(_channel_affine_config(sink=True).config))
+    rows = _loop(code, "lane_0")
+    assert "rsqrt" not in ast.unparse(rows), code
+    assert code.count("cute.math.rsqrt(") == 1
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 5
+    assert "_cute_store_u16_vec(out.iterator" in ast.unparse(rows)
+    assert ".load()" not in code
+
+
+def test_channel_parameters_keep_the_per_element_form_with_the_knob_off(
+    cpu_only: None,
+) -> None:
+    code = _channel_affine_code(512, dict(_channel_affine_config(sink=False).config))
+    assert "_vsink" not in code
+    assert "rsqrt" in ast.unparse(_loop(code, "vec_lane_1"))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_rows(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile(x.size()):
+        out[tile_r, tile_c] = x[tile_r, tile_c] + y[tile_r, tile_c]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _gather_rows(idx: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Embedding: each output row gathers one ``weight`` row."""
+    out = torch.empty(
+        [idx.size(0), weight.size(1)], dtype=weight.dtype, device=weight.device
+    )
+    for tile_b, tile_e in hl.tile(out.size()):
+        out[tile_b, tile_e] = weight[idx[tile_b], tile_e]
+    return out
+
+
+def _hoist_seeds(bound: Any) -> list[dict[str, Any]]:
+    return [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+        and not seed.config.get("cute_proven_bounds")
+    ]
+
+
+def test_pointwise_heuristic_seeds_rows_per_thread_for_channel_operands(
+    cpu_only: None,
+) -> None:
+    """Per-channel operands get a seed giving each of 128 threads 8 rows of
+    one 8-channel vector at three CTAs per SM, with the vector loop sunk and
+    eight rows' loads issued together, plus its proven-bounds copy (a packet
+    prefetch twin would render the same); the seeded config computes the
+    channel terms once per thread and issues all of a thread's row loads at
+    once."""
+    bound = _channel_affine_bound(4096)
+    seeds = _hoist_seeds(bound)
+    assert [
+        (seed["block_sizes"], seed["num_threads"], seed.get("cute_min_blocks_per_mp"))
+        for seed in seeds
+    ] == [([64, 128], [8, 16], 3)]
+    (seed,) = seeds
+    assert seed["cute_vector_widths"] == [1, 8]
+    assert seed["cute_lane_layouts"] == ["blocked", "strided"]
+    assert seed["loop_orders"] == [[1, 0]]
+    assert seed["cute_lane_unroll"] == 8
+    sunk = [
+        seed.config
+        for seed in bound.config_spec.compiler_seed_configs
+        if seed.config.get("cute_vloop_sink")
+    ]
+    assert len(sunk) == 2
+    assert not any(config.get("cute_packet_prefetch") for config in sunk)
+    code = _channel_affine_code(4096, seeds[0])
+    rows = _loop(code, "lane_0")
+    assert code.count("cute.math.rsqrt(") == 1
+    assert "rsqrt" not in ast.unparse(rows)
+    # One rolled trip: the thread's eight rows load before any is consumed.
+    assert ast.unparse(rows.iter) == "range(1)", code
+    assert re.search(r"_vsink_vec_\d+_u7", ast.unparse(rows)), code
+
+
+def test_pointwise_heuristic_skips_the_hoist_without_channel_operands(
+    cpu_only: None,
+) -> None:
+    rows = torch.empty(4096, 384, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_rows, (rows, rows))) == []
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _bias_add(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile(x.size()):
+        out[tile_r, tile_c] = x[tile_r, tile_c] + bias[tile_c]
+    return out
+
+
+def test_pointwise_heuristic_skips_the_hoist_for_one_packet_rows(
+    cpu_only: None,
+) -> None:
+    """Eight bf16 channels are one 16-byte packet: a thread's row has no
+    vector loop to sink, so no seed; sixteen channels are two packets."""
+    for channels, expected in ((8, 0), (16, 1)):
+        x = torch.empty(4096, channels, dtype=torch.bfloat16)
+        bias = torch.empty(channels, dtype=torch.bfloat16)
+        assert len(_hoist_seeds(cpu_bind(_bias_add, (x, bias)))) == expected
+
+
+def test_pointwise_heuristic_skips_the_hoist_for_a_gathered_row(
+    cpu_only: None,
+) -> None:
+    """``weight[idx[tile_b], tile_e]`` is indexed by the contiguous axis and a
+    gather, not by the contiguous axis alone: the sinking pass leaves such a
+    nest unsunk, so the seeds would only cost search time."""
+    idx = torch.zeros(4096, dtype=torch.int32)
+    weight = torch.empty(4096, 384, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_gather_rows, (idx, weight))) == []
+
+
+def test_hoist_seed_with_a_ragged_row_tile_masks_each_rows_packets(
+    cpu_only: None,
+) -> None:
+    """500 rows end the seed's 64-row tiles ragged: the channel operands still
+    load as one 16-byte packet each per thread before the row loop, and each
+    of the thread's eight rows loads ``x`` and stores ``out`` as one 16-byte
+    packet under that row's mask, its loads issued with the others'.  (The
+    sinking pass packs a row's masked store, ``if mask: store``, as it packs
+    an unmasked one.)"""
+    seed = _hoist_seeds(_channel_affine_bound(500))[0]
+    assert seed["block_sizes"] == [64, 128]
+    code = _channel_affine_code(500, seed)
+    rows = _loop(code, "lane_0")
+    packet = "ir.VectorType.get([8], cutlass.Uint16.mlir_type)"
+    assert ast.unparse(rows.iter) == "range(1)", code
+    assert code.count(packet) == 12
+    assert ast.unparse(rows).count(packet) == 8
+    assert "rsqrt" not in ast.unparse(rows)
+    stores = [
+        node
+        for node in ast.walk(rows)
+        if isinstance(node, ast.If)
+        and any("_cute_store_u16_vec(" in ast.unparse(stmt) for stmt in node.body)
+    ]
+    assert [ast.unparse(store.test) for store in stores] == [
+        f"mask_0_u{row}" for row in range(8)
+    ], code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channel_scale_shift(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile(x.size()):
+        out[tile_r, tile_c] = (
+            torch.sqrt(x[tile_r, tile_c]) * weight[tile_c] + bias[tile_c]
+        )
+    return out
+
+
+def test_sunk_float32_channel_operands_contract_like_the_unsunk_kernel(
+    cpu_only: None,
+) -> None:
+    """With float32 operands neither form contracts ``sqrt(x) * weight +
+    bias``: a plain fp32 load is not proven fp32, whether a per-lane
+    ``.load()`` (knob off) or the packet lane that fills a fragment (knob
+    on), so the knob cannot change the rounding here either."""
+    args = (torch.empty(512, 384), torch.empty(384), torch.empty(384))
+    bound = cpu_bind(_channel_scale_shift, args)
+    sunk, unsunk = (
+        bound.to_code(
+            bound.config_spec.normalized_config(
+                _channel_affine_config(sink=sink, vector=4)
+            )
+        )
+        for sink in (True, False)
+    )
+    assert "_vsink_vec" in sunk
+    assert "_vsink" not in unsunk
+    assert "cute.math.fma(" not in sunk, sunk
+    assert _value_statements(sunk) == _value_statements(unsunk)
+
+
+@pytest.mark.parametrize(
+    ("rows", "config"),
+    [(512, "test"), (4096, "seed"), (500, "seed")],
+    ids=["test_config", "seed_unrolled_rows", "seed_ragged_rows"],
+)
+def test_sunk_channel_operands_contract_like_the_unsunk_kernel(
+    cpu_only: None, rows: int, config: str
+) -> None:
+    """``y * weight + bias`` contracts into one FMA whether ``weight`` and
+    ``bias`` are per-lane names (knob off) or elements of the fragments the
+    sinking pass fills before the row loop (knob on), so the knob cannot
+    change the rounding: the 32x32 test config, and the first broadcast-hoist
+    seed with its eight rows unrolled and with a ragged row tile."""
+    values = (
+        dict(_channel_affine_config(sink=True).config)
+        if config == "test"
+        else _hoist_seeds(_channel_affine_bound(rows))[0]
+    )
+    sunk, unsunk = (
+        _channel_affine_code(rows, values | {"cute_vloop_sink": sink})
+        for sink in (True, False)
+    )
+    assert "_vsink_vec" in sunk
+    assert "_vsink" not in unsunk
+    assert "cute.math.fma(" in ast.unparse(_loop(sunk, "lane_0")), sunk
+    assert _value_statements(sunk) == _value_statements(unsunk)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _grn_apply(
+    x: torch.Tensor,
+    beta: torch.Tensor,
+    gamma: torch.Tensor,
+    gx: torch.Tensor,
+    denom: torch.Tensor,
+) -> torch.Tensor:
+    """ConvNeXt-V2's GRN apply on a channels-last ``[n, hw, c]`` view: each
+    element reads its channel's ``beta`` and ``gamma``, its image's channel
+    of ``gx`` and its image's ``denom``, none of them per spatial row."""
+    out = torch.empty_like(x)
+    for tile_n, tile_hw, tile_c in hl.tile(x.size()):
+        v = x[tile_n, tile_hw, tile_c].to(torch.float32)
+        nx = gx[tile_n, tile_c] / denom[tile_n][:, None]
+        y = torch.addcmul(beta[tile_c], gamma[tile_c], v * nx[:, None, :])
+        out[tile_n, tile_hw, tile_c] = (v + y).to(out.dtype)
+    return out
+
+
+def _grn_args(
+    device: str = "cpu", images: int = 8, rows: int = 196, channels: int = 256
+) -> tuple[torch.Tensor, ...]:
+    # 196 spatial rows end the seed's 64-row tiles ragged.
+    x = torch.randn(images, rows, channels, dtype=torch.bfloat16, device=device)
+    beta, gamma = (torch.randn(channels, device=device) for _ in range(2))
+    gx = torch.rand(images, channels, device=device)
+    denom = torch.rand(images, device=device) + 0.5
+    return x, beta, gamma, gx, denom
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_channel_bias(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n, tile_hw, tile_c in hl.tile(x.size()):
+        out[tile_n, tile_hw, tile_c] = x[tile_n, tile_hw, tile_c] + bias[tile_c]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_volumes(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n, tile_hw, tile_c in hl.tile(x.size()):
+        out[tile_n, tile_hw, tile_c] = (
+            x[tile_n, tile_hw, tile_c] + y[tile_n, tile_hw, tile_c]
+        )
+    return out
+
+
+def test_pointwise_heuristic_seeds_spatial_rows_beside_image_and_channel_operands(
+    cpu_only: None,
+) -> None:
+    """Three tile axes: the spatial rows, which only ``x`` indexes, take the
+    seed's rows, and the image axis its smallest tile with a thread per
+    image.  ``gx / denom``, ``beta`` and ``gamma`` load (and divide) once
+    per thread before the rows; each of the thread's eight rows loads and
+    stores one 16-byte packet under its mask."""
+    bound = cpu_bind(_grn_apply, _grn_args())
+    seeds = _hoist_seeds(bound)
+    assert [
+        (seed["block_sizes"], seed["num_threads"], seed.get("cute_min_blocks_per_mp"))
+        for seed in seeds
+    ] == [([1, 64, 128], [1, 8, 16], 3)]
+    (seed,) = seeds
+    assert seed["cute_vector_widths"] == [1, 1, 8]
+    assert seed["cute_lane_layouts"] == ["blocked", "blocked", "strided"]
+    assert seed["loop_orders"] == [[2, 1, 0]]
+    assert seed["cute_lane_unroll"] == 8
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+    rows = ast.unparse(_loop(code, "lane_1"))
+    assert ast.unparse(_loop(code, "lane_1").iter) == "range(1)", code
+    assert " / " in code
+    assert " / " not in rows
+    for operand in ("gx", "beta", "gamma", "denom"):
+        assert f"{operand}.iterator" not in rows
+    assert rows.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 8
+    assert rows.count("_cute_store_u16_vec(") == 8
+
+
+def test_pointwise_heuristic_hoists_image_operands_with_images_on_threads(
+    cpu_only: None,
+) -> None:
+    """At GRN's batch of 128 images the seed puts four images on threads
+    beside the spatial rows: ``gx / denom``, which vary over the images,
+    still load and divide once per thread, before its rows."""
+    bound = cpu_bind(_grn_apply, _grn_args(images=128))
+    (seed,) = _hoist_seeds(bound)
+    assert (seed["block_sizes"], seed["num_threads"]) == ([4, 16, 128], [4, 2, 16])
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+    assert "_vsink_vec" in code
+    rows = ast.unparse(_loop(code, "lane_1"))
+    assert " / " not in rows
+    for operand in ("gx", "beta", "gamma", "denom"):
+        assert f"{operand}.iterator" not in rows
+
+
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "num_threads"),
+    [
+        # A 512-image batch's smallest image tile, 16 images on a thread each,
+        # leaves the spatial rows no thread: the images take the rows, the
+        # spatial axis its smallest tile of 2.
+        ((512, 64, 256), [32, 2, 128], [4, 2, 16]),
+        # One spatial row cannot hold 16 rows: the images take them.
+        ((512, 1, 256), [64, 1, 128], [8, 1, 16]),
+    ],
+)
+def test_pointwise_heuristic_moves_the_hoist_rows_where_the_smallest_tiles_fit(
+    cpu_only: None,
+    shape: tuple[int, int, int],
+    block_sizes: list[int],
+    num_threads: list[int],
+) -> None:
+    """The occupancy floor of a large grid raises the smallest tile of the
+    axes beside the rows; the seed moves its rows to the next outer axis
+    where they fit."""
+    x = torch.empty(shape, dtype=torch.bfloat16)
+    bias = torch.empty(shape[-1], dtype=torch.bfloat16)
+    bound = cpu_bind(_add_channel_bias, (x, bias))
+    (seed,) = _hoist_seeds(bound)
+    assert (seed["block_sizes"], seed["num_threads"]) == (block_sizes, num_threads)
+    code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+    assert "_vsink_vec" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _shift_rows_exp(
+    scores: torch.Tensor, mask: torch.Tensor, row_max: torch.Tensor
+) -> torch.Tensor:
+    """The shape of gpt-oss's sink softmax normalize: ``mask`` does not vary
+    over the heads, ``row_max`` not over the columns."""
+    out = torch.empty_like(scores)
+    for tile_h, tile_q, tile_k in hl.tile(scores.size()):
+        x = scores[tile_h, tile_q, tile_k] + mask[tile_q, tile_k][None, :, :]
+        out[tile_h, tile_q, tile_k] = torch.exp(x - row_max[tile_h, tile_q][:, :, None])
+    return out
+
+
+def test_pointwise_heuristic_skips_the_hoist_where_no_rows_fit(
+    cpu_only: None,
+) -> None:
+    """Neither outer axis fits the seed's rows beside the other axis's
+    smallest tile: 16 images beside the spatial rows (and 8 spatial rows
+    under the images' 16), 16 query rows beside the heads (and no operand
+    along the columns that the query rows leave out).  A thread walking
+    those tiles would hold 1024 elements, so there is no seed."""
+    grn = (
+        torch.empty(512, 196, 256, dtype=torch.bfloat16),
+        torch.empty(256),
+        torch.empty(256),
+        torch.empty(512, 256),
+        torch.empty(512),
+    )
+    assert _hoist_seeds(cpu_bind(_grn_apply, grn)) == []
+    scores = torch.empty(64, 1000, 1000, dtype=torch.bfloat16)
+    mask = torch.empty(1000, 1000, dtype=torch.bfloat16)
+    row_max = torch.empty(64, 1000, dtype=torch.float32)
+    assert _hoist_seeds(cpu_bind(_shift_rows_exp, (scores, mask, row_max))) == []
+
+
+def test_pointwise_heuristic_skips_the_hoist_when_every_operand_varies_by_row(
+    cpu_only: None,
+) -> None:
+    x = torch.empty(8, 196, 256, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_volumes, (x, x))) == []
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_channel_bias_in_a_loop(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n, tile_hw in hl.tile([x.size(0), x.size(1)]):
+        for tile_c in hl.tile(x.size(2)):
+            out[tile_n, tile_hw, tile_c] = x[tile_n, tile_hw, tile_c] + bias[tile_c]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_row_bias_in_a_loop(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_n in hl.tile(x.size(0)):
+        for tile_c in hl.tile(x.size(1)):
+            out[tile_n, tile_c] = x[tile_n, tile_c] + bias[tile_c]
+    return out
+
+
+def test_pointwise_heuristic_skips_the_hoist_for_an_inner_device_loop(
+    cpu_only: None,
+) -> None:
+    """The channels an inner device loop tiles are no grid axis, whose
+    vector loop the sinking pass sinks: a hoist seed would run the knob-off
+    code."""
+    x = torch.empty(8, 196, 256, dtype=torch.bfloat16)
+    bias = torch.empty(256, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_channel_bias_in_a_loop, (x, bias))) == []
+    rows = torch.empty(4096, 256, dtype=torch.bfloat16)
+    assert _hoist_seeds(cpu_bind(_add_row_bias_in_a_loop, (rows, bias))) == []
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_bias_4d(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b, tile_c, tile_d in hl.tile(x.size()):
+        out[tile_a, tile_b, tile_c, tile_d] = (
+            x[tile_a, tile_b, tile_c, tile_d] + bias[tile_d]
+        )
+    return out
+
+
+def test_pointwise_heuristic_keeps_the_hoist_within_three_thread_axes(
+    cpu_only: None,
+) -> None:
+    """Over four axes every fit threads the rows, the columns and both other
+    outer axes (their smallest tiles are 2 here): a CTA has three thread
+    axes, and the fourth would run as a serial lane loop that the lane unroll
+    takes, so there is no seed."""
+    x = torch.empty(32, 32, 32, 256, dtype=torch.bfloat16)
+    bound = cpu_bind(_add_bias_4d, (x, torch.empty(256)))
+    assert [
+        bound.config_spec.block_sizes.block_id_lookup(block_id)
+        ._fragment(bound.config_spec)
+        .low
+        for block_id in range(3)
+    ] == [2, 2, 2]
+    assert _hoist_seeds(bound) == []
+
+
+_FILLED_FRAGMENTS = """
+w_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+b_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+for vec_lane in cutlass.range_constexpr(8):
+    w_frag[vec_lane] = cutlass.Float32(w)
+    b_frag[vec_lane] = cutlass.Float32(b)
+"""
+
+
+@pytest.mark.parametrize(
+    ("source", "contracted"),
+    [
+        (
+            _FILLED_FRAGMENTS
+            + """
+for row in range(4):
+    for vec_lane in cutlass.range_constexpr(8):
+        y = cutlass.Float32(x)
+        t = y * w_frag[vec_lane]
+        out = t + b_frag[vec_lane]
+""",
+            "out = cute.math.fma(y, w_frag[vec_lane], b_frag[vec_lane])",
+        ),
+        (
+            """
+shift_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+for vec_lane in cutlass.range_constexpr(8):
+    m = cutlass.Float32(mean)
+    s = cutlass.Float32(scale)
+    b = cutlass.Float32(bias)
+    t = m * s
+    shift_frag[vec_lane] = b - t
+""",
+            "shift_frag[vec_lane] = cute.math.fma(-m, s, b)",
+        ),
+        (
+            """
+acc_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+for vec_lane in cutlass.range_constexpr(8):
+    acc_frag[vec_lane] = 0.0
+for row in range(4):
+    for vec_lane in cutlass.range_constexpr(8):
+        y = cutlass.Float32(x)
+        t = y * y
+        acc_frag[vec_lane] = acc_frag[vec_lane] + t
+""",
+            None,
+        ),
+        (
+            """
+w_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+for vec_lane in cutlass.range_constexpr(8):
+    y = cutlass.Float32(x)
+    t = y * w_frag[vec_lane]
+    w_frag[vec_lane] = cutlass.Float32(w)
+    out = t + 1.0
+""",
+            None,
+        ),
+        (
+            _FILLED_FRAGMENTS
+            + """
+for i in range(4):
+    y = cutlass.Float32(x)
+    t = y * w_frag[i]
+    for i in range(2):
+        pass
+    out = t + b_frag[i]
+""",
+            None,
+        ),
+        (
+            """
+w_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+w_frag.fill(2.0)
+for vec_lane in cutlass.range_constexpr(8):
+    y = cutlass.Float32(x)
+    t = y * w_frag[vec_lane]
+    out = t + 1.0
+""",
+            None,
+        ),
+        (
+            _FILLED_FRAGMENTS
+            + """
+for vec_lane in cutlass.range_constexpr(8):
+    y = cutlass.Float32(x)
+    t = y * w_frag[vec_lane]
+    cute.autovec_copy(src, w_frag[None])
+    out = t + 1.0
+""",
+            None,
+        ),
+        (
+            _FILLED_FRAGMENTS
+            + """
+view_index = None
+for vec_lane in cutlass.range_constexpr(8):
+    y = cutlass.Float32(x)
+    t = y * w_frag[vec_lane]
+    cute.autovec_copy(src, w_frag[view_index])
+    out = t + 1.0
+""",
+            None,
+        ),
+        (
+            """
+w_frag = cute.make_rmem_tensor(8, cutlass.BFloat16)
+for vec_lane in cutlass.range_constexpr(8):
+    w_frag[vec_lane] = cutlass.BFloat16(w)
+for vec_lane in cutlass.range_constexpr(8):
+    y = cutlass.Float32(x)
+    t = y * w_frag[vec_lane]
+    out = t + 1.0
+""",
+            None,
+        ),
+        (
+            """
+w_frag = cute.make_rmem_tensor(8, cutlass.Float32)
+w_vec = cute.arch.load(w_ptr, ir.VectorType.get([8], cutlass.Uint32.mlir_type))
+for vec_lane in cutlass.range_constexpr(8):
+    w_frag[vec_lane] = cutlass.Uint32(w_vec[vec_lane]).bitcast(cutlass.Float32)
+for vec_lane in cutlass.range_constexpr(8):
+    y = cutlass.Float32(x)
+    t = y * w_frag[vec_lane]
+    out = t + 1.0
+""",
+            None,
+        ),
+    ],
+    ids=[
+        "filled_before_the_row_loop",
+        "fragment_element_consumer",
+        "accumulator",
+        "stored_before_the_consumer",
+        "index_rebound_before_the_consumer",
+        "escaped",
+        "escaped_through_a_view",
+        "escaped_through_a_named_index",
+        "bf16_fragment",
+        "filled_with_a_value_not_proven_fp32",
+    ],
+)
+def test_fma_contraction_reads_single_store_fragments_like_names(
+    source: str, contracted: str | None
+) -> None:
+    """An element of an fp32 fragment that one statement fills with a value
+    proven fp32, used only through element subscripts (an int literal or a
+    ``range`` loop's variable), contracts like the single-assignment name the
+    sinking pass moved into it; an accumulator, a store or index change
+    between the product and its consumer, a fragment that escapes (also
+    through a view, ``f[None]``, or an index that may hold one), a non-fp32
+    one or one filled with a packet lane's bitcast (a plain load is not
+    proven fp32 either) do not.  Generated loops do not always mark their
+    target as a store, so every case also runs with each loop target a
+    load."""
+    for load_targets in (False, True):
+        body = ast.parse(source).body
+        if load_targets:
+            for node in ast.walk(ast.Module(body=body, type_ignores=[])):
+                if isinstance(node, ast.For):
+                    node.target.ctx = ast.Load()
+        text = ast.unparse(ast.Module(body=fuse_fma(body), type_ignores=[]))
+        if contracted is None:
+            assert "cute.math.fma" not in text, text
+        else:
+            assert contracted in text, text
+            assert text.count("cute.math.fma") == 1
+
+
 def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> None:
     def example(fn: Callable[..., Any]) -> helion.Kernel:
         return helion.kernel(
@@ -785,7 +2882,7 @@ def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> 
     ) -> dict[str, object]:
         """One 1024-wide row per CTA on 128 threads with V=8 (the persistent
         one-vector-per-thread layout of a row reduction)."""
-        bound = _cpu_bind(kernel, args)
+        bound = cpu_bind(kernel, args)
         spec = bound.config_spec
         (reduction,) = [
             block.block_id for block in bound.env.block_sizes if block.reduction
@@ -829,15 +2926,14 @@ def test_kernels_without_the_pattern_generate_identical_code(cpu_only: None) -> 
     )
 
 
-@skipUnlessBackends(["cute"])
 def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_static, (x,))
+    bound = cpu_bind(col_reduce_sum_static, (x,))
 
-    def normalized_unroll(num_threads: list[int]) -> int:
+    def normalized_unroll(block_sizes: list[int], num_threads: list[int]) -> int:
         config = bound.config_spec.normalized_config(
             helion.Config(
-                block_sizes=[4096, 16],
+                block_sizes=block_sizes,
                 num_threads=num_threads,
                 cute_vector_widths=[1, 4],
                 cute_vloop_sink=False,
@@ -847,10 +2943,13 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
         return config.config["cute_lane_unroll"]
 
     # Without sinking the unroll belongs to the loads-first lane unroll
-    # (``cute/unroll_lane_loads.py``), which needs a grid lane loop: four
-    # threads over 16 columns form one, sixteen do not.
-    assert normalized_unroll([128, 4]) == 8
-    assert normalized_unroll([128, 16]) == 1
+    # (``cute/unroll_lane_loads.py``), which needs a lane loop on some tile
+    # axis, of the grid or of a device loop: four threads over 16 columns
+    # form one, as do 128 threads over 4096 rows; one thread per element on
+    # every axis does not.
+    assert normalized_unroll([4096, 16], [128, 4]) == 8
+    assert normalized_unroll([4096, 16], [128, 16]) == 8
+    assert normalized_unroll([128, 16], [128, 16]) == 1
     with pytest.raises(helion.exc.InvalidConfig):
         bound.config_spec.normalize(
             helion.Config(
@@ -863,12 +2962,11 @@ def test_lane_unroll_requires_sinking_or_a_grid_lane_loop(cpu_only: None) -> Non
         )
 
 
-@skipUnlessBackends(["cute"])
 def test_column_reduction_heuristic_seeds_the_coalesced_layout(
     cpu_only: None,
 ) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
-    bound = _cpu_bind(col_reduce_sum_dynamic, (x,))
+    bound = cpu_bind(col_reduce_sum_dynamic, (x,))
     spec = bound.config_spec
     assert "cute_column_reduction" in spec.autotuner_heuristics
     seeds = [
@@ -909,7 +3007,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
     assert CuteColumnReductionHeuristic.register_facts(
         bound.env, bound.host_function.device_ir
     ) == {"input_tensor_metadata"}
-    static_bound = _cpu_bind(col_reduce_sum_static, (x,))
+    static_bound = cpu_bind(col_reduce_sum_static, (x,))
     assert "cute_column_reduction" in static_bound.config_spec.autotuner_heuristics
     assert (
         CuteColumnReductionHeuristic.register_facts(
@@ -924,7 +3022,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         (col_reduce_sum_from8_static, (1000, 1008)),
         (col_reduce_sum_from8_dynamic, (1000, 1008)),
     ):
-        declined = _cpu_bind(kernel, (torch.empty(*shape, dtype=torch.bfloat16),))
+        declined = cpu_bind(kernel, (torch.empty(*shape, dtype=torch.bfloat16),))
         assert "cute_column_reduction" not in declined.config_spec.autotuner_heuristics
         assert not any(
             seed.config.get("cute_vloop_sink")
@@ -937,7 +3035,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         (col_reduce_sum_from8_dynamic, torch.empty(1000, 1008, dtype=torch.bfloat16)),
         (col_reduce_sum_dynamic, torch.empty(4096, 4096, dtype=torch.bfloat16).t()),
     ):
-        declined = _cpu_bind(kernel, (x,))
+        declined = cpu_bind(kernel, (x,))
         assert (
             CuteColumnReductionHeuristic.register_facts(
                 declined.env, declined.host_function.device_ir
@@ -945,7 +3043,7 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
             == frozenset()
         )
     # Row reductions are not column reductions.
-    rows_bound = _cpu_bind(
+    rows_bound = cpu_bind(
         helion.kernel(
             rms_norm_fwd.fn,
             backend="cute",
@@ -959,3 +3057,853 @@ def test_column_reduction_heuristic_seeds_the_coalesced_layout(
         ),
     )
     assert "cute_column_reduction" not in rows_bound.config_spec.autotuner_heuristics
+
+
+def _split_column_sum_fn(x: torch.Tensor, rows_per_split: hl.constexpr) -> torch.Tensor:
+    """Column sums of ``x``'s blocks of ``rows_per_split`` rows, the last one
+    partial: the serial loop walks a split's rows with an explicit tile and
+    masked loads, as Inductor's looped split reductions do."""
+    rows, n = x.size()
+    splits = (rows + rows_per_split - 1) // rows_per_split
+    out = torch.empty([splits, n], dtype=torch.float32, device=x.device)
+    for tile_s, tile_n in hl.tile([splits, n]):
+        acc = hl.zeros([tile_s, tile_n], dtype=torch.float32)
+        for tile_r in hl.tile(rows_per_split):
+            row = tile_s.index[:, None] * rows_per_split + tile_r.index[None, :]
+            valid = (row < rows) & (tile_r.index[None, :] < rows_per_split)
+            vals = hl.load(x, [row, tile_n], extra_mask=valid[:, :, None])
+            acc = acc + torch.sum(vals.to(torch.float32), dim=1)
+        out[tile_s, tile_n] = acc
+    return out
+
+
+split_column_sum_static = helion.kernel(
+    _split_column_sum_fn, backend="cute", static_shapes=True, autotune_effort="none"
+)
+split_column_sum_dynamic = helion.kernel(
+    _split_column_sum_fn, backend="cute", static_shapes=False, autotune_effort="none"
+)
+
+
+# Eight columns of each split on one thread (``num_threads`` 1 along the column
+# tile, 32 threads along the rows).
+_ONE_THREAD_COLUMNS = {
+    "block_sizes": [1, 8, 256],
+    "num_threads": [1, 1, 32],
+    "cute_vector_widths": [1, 8, 1],
+    "cute_lane_layouts": ["blocked", "blocked", "strided"],
+    "cute_vloop_sink": True,
+    "cute_lane_unroll": 8,
+}
+
+
+def test_a_one_thread_column_tile_sinks_its_vector_loop(cpu_only: None) -> None:
+    """A column tile on one thread walks its block as V-wide vector lanes,
+    as a thread's blocked span does: the row loop loads one 8-column packet
+    per row instead of eight 2-byte scalars."""
+    x = torch.empty(4700, 64, dtype=torch.bfloat16)
+    code = _cpu_code(split_column_sum_static, (x, 600), **_ONE_THREAD_COLUMNS)
+    _assert_defined_before_use(code)
+    assert "_vsink_vec" in code
+    lane_loop = _loop(code, "lane_2")
+    loads = _vector_loads(lane_loop.body)
+    assert len(loads) == 8
+    assert all(
+        "ir.VectorType.get([8], cutlass.Uint16.mlir_type)" in ast.unparse(stmt)
+        for stmt in loads
+    )
+    assert ".load()" not in ast.unparse(lane_loop)
+    assert "block=(32, 1, 1)" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _add_4d(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_a, tile_b, tile_c, tile_d in hl.tile(x.size()):
+        out[tile_a, tile_b, tile_c, tile_d] = (
+            x[tile_a, tile_b, tile_c, tile_d] + y[tile_a, tile_b, tile_c, tile_d]
+        )
+    return out
+
+
+# Threads on all four axes: the first three take the launch's x/y/z axes, and
+# the fourth is demoted to one thread whose lane loop walks its 64 elements.
+_DEMOTED_FOURTH_AXIS = {
+    "block_sizes": [2, 2, 2, 64],
+    "num_threads": [2, 2, 2, 8],
+    "cute_vector_widths": [1, 1, 1, 8],
+}
+
+
+def test_a_block_demoted_past_the_third_thread_axis_loads_packets(
+    cpu_only: None,
+) -> None:
+    """A block that loses its thread axis to the launch's three walks its
+    block as V-wide lanes, as a configured one-thread axis does: one 8-wide
+    packet per operand instead of scalar loads."""
+    x = torch.empty(4, 4, 4, 128, dtype=torch.bfloat16)
+    code = _cpu_code(_add_4d, (x, x), **_DEMOTED_FOURTH_AXIS)
+    assert "block=(2, 2, 2)" in code
+    assert code.count("ir.VectorType.get([8], cutlass.Uint16.mlir_type)") == 2
+    assert ".load()" not in code
+
+
+@helion.kernel(backend="cute", static_shapes=False, autotune_effort="none")
+def _col_reduce_sum_dim_minus_2(x: torch.Tensor) -> torch.Tensor:
+    """``col_reduce_sum_dynamic`` with the rows summed as ``dim=-2``."""
+    m, n = x.size()
+    out = torch.zeros(n, dtype=x.dtype, device=x.device)
+    block_m = hl.register_block_size(m)
+    block_n = hl.register_block_size(n)
+    for tile_n in hl.tile(n, block_size=block_n):
+        col_acc = hl.zeros([tile_n], dtype=torch.float32)
+        for tile_m in hl.tile(m, block_size=block_m):
+            col_acc += torch.sum(x[tile_m, tile_n].to(torch.float32), dim=-2)
+        out[tile_n] = col_acc.to(out.dtype)
+    return out
+
+
+def test_column_reduction_heuristic_takes_the_rows_summed_as_dim_minus_2(
+    cpu_only: None,
+) -> None:
+    """``dim=-2`` names the rows of the ``[tile_m, tile_n]`` tile as ``dim=0``
+    does: the column heuristic seeds that sum the same coalesced layouts."""
+    x = torch.empty(4096, 4096, dtype=torch.bfloat16)
+    seeds = [
+        [
+            seed.config
+            for seed in cpu_bind(kernel, (x,)).config_spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        ]
+        for kernel in (col_reduce_sum_dynamic, _col_reduce_sum_dim_minus_2)
+    ]
+    assert seeds[0] and seeds[1] == seeds[0]
+
+
+def test_split_column_reduction_heuristic_seeds_the_coalesced_layout(
+    cpu_only: None,
+) -> None:
+    """Splits of 600 rows of 64 contiguous bf16 columns, walked by an explicit
+    row loop: warp-sized CTAs with a shuffle combine per chunk, and
+    whole-split chunks with one cross-warp combine, both sinking the column
+    vector."""
+    x = torch.empty(4700, 64, dtype=torch.bfloat16)
+    bound = cpu_bind(split_column_sum_static, (x, 600))
+    spec = bound.config_spec
+    assert "cute_split_column_reduction" in spec.autotuner_heuristics
+    seeds = [seed.config for seed in spec.compiler_seed_configs]
+    assert [(seed["block_sizes"], seed["num_threads"]) for seed in seeds] == [
+        ([1, 16, 128], [1, 2, 16]),
+        ([1, 32, 1024], [1, 4, 128]),
+        ([1, 32, 128], [1, 4, 8]),
+    ]
+    for seed in seeds:
+        assert seed["cute_vector_widths"] == [1, 8, 1]
+        assert seed["cute_lane_layouts"] == ["blocked", "blocked", "strided"]
+        assert seed["cute_vloop_sink"] is True
+        assert seed["cute_lane_unroll"] == 8
+    # One seed of each family sinks: the per-chunk shuffle combine and the
+    # cross-warp fragment combine.
+    chunked = bound.to_code(spec.normalized_config(spec.compiler_seed_configs[0]))
+    assert "_vsink_vec" in chunked
+    assert "_cute_grouped_reduce_warp(" in chunked
+    assert FRAGMENT_REDUCE not in chunked
+    whole = bound.to_code(spec.normalized_config(spec.compiler_seed_configs[1]))
+    assert "_vsink_vec" in whole
+    assert FRAGMENT_REDUCE in whole
+    # Static extents and strides need no specialization; dynamic ones are
+    # proven through the exact input metadata.
+    heuristic = CuteSplitColumnReductionHeuristic
+    assert (
+        heuristic.register_facts(bound.env, bound.host_function.device_ir)
+        == frozenset()
+    )
+    dynamic = cpu_bind(split_column_sum_dynamic, (x, 600))
+    assert "cute_split_column_reduction" in dynamic.config_spec.autotuner_heuristics
+    assert heuristic.register_facts(dynamic.env, dynamic.host_function.device_ir) == {
+        "input_tensor_metadata"
+    }
+    # A column dim that is not contiguous, or a column extent that is not a
+    # multiple of the vector width (60 of 64 contiguous columns), gets no
+    # seed; a one-axis grid is the column heuristic's.
+    for kernel, args in (
+        (
+            split_column_sum_static,
+            (torch.empty(64, 4700, dtype=torch.bfloat16).t(), 600),
+        ),
+        (
+            split_column_sum_static,
+            (torch.empty(4700, 64, dtype=torch.bfloat16)[:, :60], 600),
+        ),
+        (col_reduce_sum_static, (torch.empty(4096, 4096, dtype=torch.bfloat16),)),
+    ):
+        declined = cpu_bind(kernel, args)
+        assert (
+            "cute_split_column_reduction"
+            not in declined.config_spec.autotuner_heuristics
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _batched_column_sum(x: torch.Tensor) -> torch.Tensor:
+    """Column sums of each of ``x``'s ``[rows, C]`` planes."""
+    batches, rows, n = x.size()
+    out = torch.empty([batches, n], dtype=torch.float32, device=x.device)
+    for tile_b, tile_c in hl.tile([batches, n]):
+        acc = hl.zeros([tile_b, tile_c], dtype=torch.float32)
+        for tile_r in hl.tile(rows):
+            acc = acc + torch.sum(x[tile_b, tile_r, tile_c].to(torch.float32), dim=1)
+        out[tile_b, tile_c] = acc
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _broadcast_sum_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ b`` as a broadcast product summed over ``k``."""
+    m, k = a.size()
+    n = b.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + torch.sum(
+                a[tile_m, tile_k][:, :, None].to(torch.float32)
+                * b[tile_k, tile_n][None, :, :].to(torch.float32),
+                dim=1,
+            )
+        out[tile_m, tile_n] = acc
+    return out
+
+
+def test_split_column_reduction_heuristic_takes_batched_and_broadcast_sums(
+    cpu_only: None,
+) -> None:
+    """The match takes any grid of two or more axes whose row loop reduces
+    the column tile's rows: a batched column sum and a broadcast-sum
+    contraction get the three seeds too, and a seed sinks the column
+    vector."""
+    a = torch.empty(64, 256, dtype=torch.bfloat16)
+    b = torch.empty(256, 64, dtype=torch.bfloat16)
+    for kernel, args in (
+        (_batched_column_sum, (torch.empty(8, 600, 64, dtype=torch.bfloat16),)),
+        (_broadcast_sum_matmul, (a, b)),
+    ):
+        bound = cpu_bind(kernel, args)
+        spec = bound.config_spec
+        assert "cute_split_column_reduction" in spec.autotuner_heuristics
+        sunk = [
+            seed
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        ]
+        assert len(sunk) == 3
+        assert "_vsink_vec" in bound.to_code(spec.normalized_config(sunk[0]))
+
+
+# GPU numerics for grid vector-loop sinking (``cute_vloop_sink``).
+#
+# Partial tiles on both axes, the interleaved (rows above columns) thread
+# layout, static shapes with several unroll depths, a max reduction and an
+# fp32 input; see ``test_cute_vloop_sink.py`` for the code-shape assertions.
+
+
+def _col_sum(t: torch.Tensor) -> torch.Tensor:
+    return t.float().sum(0).to(t.dtype)
+
+
+def _col_max(t: torch.Tensor) -> torch.Tensor:
+    return t.float().amax(0).to(t.dtype)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@onlyBackends(["cute"])
+class TestCuteVloopSink(TestCase):
+    def _check(
+        self,
+        kernel: helion.Kernel,
+        ref: Callable[[torch.Tensor], torch.Tensor],
+        x: torch.Tensor,
+        **config: object,
+    ) -> str:
+        code, out = code_and_output(kernel, (x,), **config)  # pyrefly: ignore
+        torch.testing.assert_close(out, ref(x), atol=2e-2, rtol=2e-2)
+        # A second, different input must produce a different (correct) output.
+        y = torch.randn_like(x) * 3
+        _, out_y = code_and_output(kernel, (y,), **config)  # pyrefly: ignore
+        torch.testing.assert_close(out_y, ref(y), atol=5e-2, rtol=2e-2)
+        self.assertFalse(torch.allclose(out.float(), out_y.float()))
+        self.assertIn("_vsink_vec", code)
+        self.assertIn(FRAGMENT_REDUCE, code)
+        return code
+
+    def test_one_block_column_sum_matches_the_knob_off_bits(self) -> None:
+        """The sunk one-block column sum adds each column's rows, and then the
+        threads' sums, in the knob-off form's order; 3000 rows leave a partial
+        row chunk, and 520 columns in 16-column blocks a partial tile."""
+        for columns, block in ((512, 4), (520, 16)):
+            with self.subTest(columns=columns):
+                x = torch.randn(3000, columns, device=DEVICE, dtype=torch.float32)
+                config = {**_ONE_TILE_COLUMN_SUM, "block_sizes": [block]}
+                code, sunk = code_and_output(
+                    _column_sum, (x,), **config, cute_vloop_sink=True
+                )
+                self.assertIn("_vsink_vec", code)
+                _, plain = code_and_output(
+                    _column_sum, (x,), **config, cute_vloop_sink=False
+                )
+                torch.testing.assert_close(sunk, x.sum(0), atol=1e-3, rtol=1e-4)
+                self.assertTrue(torch.equal(sunk, plain))
+
+    def test_a_vector_atomic_beside_a_sunk_column_sum(self) -> None:
+        """Each column's counter is bumped once per call, from sm_90 on by the
+        vector atomic that flushes the one-block tile's V lanes."""
+        x = torch.randn(3000, 512, device=DEVICE, dtype=torch.float32)
+        count = torch.zeros(512, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            _column_sum_and_count,
+            (x, count),
+            **_ONE_TILE_COLUMN_SUM,
+            cute_vloop_sink=True,
+        )
+        self.assertIn("_vsink_vec", code)
+        if torch.cuda.get_device_capability() >= (9, 0):
+            self.assertIn("_cute_red_add_f32_vec(", code)
+        torch.testing.assert_close(out, x.sum(0), atol=1e-3, rtol=1e-4)
+        torch.testing.assert_close(count, torch.ones_like(count))
+
+    def test_split_column_sum_seeds(self) -> None:
+        """A chunked seed and a whole-split one over 4700 rows in splits of
+        600: the last split and the last chunk of each split are partial."""
+        x = torch.randn(4700, 64, device=DEVICE, dtype=torch.bfloat16)
+        expected = torch.stack(
+            [x[row : row + 600].float().sum(0) for row in range(0, 4700, 600)]
+        )
+        bound = split_column_sum_static.bind((x, 600))
+        # This heuristic's chunked seed and its whole-split one, picked by
+        # shape: other heuristics may seed this kernel on a real device too.
+        wanted = [([1, 16, 128], [1, 2, 16]), ([1, 32, 1024], [1, 4, 128])]
+        seeds = [
+            seed
+            for seed in bound.config_spec.compiler_seed_configs
+            if (seed.config["block_sizes"], seed.config["num_threads"]) in wanted
+        ]
+        self.assertEqual(len(seeds), 2)
+        for seed in seeds:
+            with self.subTest(block_sizes=seed.config["block_sizes"]):
+                out = bound.compile_config(seed)(x, 600)
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+
+    def test_explicit_eviction_policies_load_the_unhinted_bits(self) -> None:
+        """The spellings a predicated packet had no PTX form for (a KeyError
+        as the kernel traced) assemble, and their packets load the same
+        values as without a hint: ``hl.load(..., eviction_policy=...)``
+        through the sink's 8-byte packets over partial tiles."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        )
+        _, plain = code_and_output(
+            col_reduce_sum_with_policy_dynamic, (x, ""), **config
+        )
+        torch.testing.assert_close(plain, _col_sum(x), atol=2e-2, rtol=2e-2)
+        for spelling in ("evict_normal", "evict_unchanged", "evict_no_allocate"):
+            with self.subTest(spelling=spelling):
+                code, hinted = code_and_output(
+                    col_reduce_sum_with_policy_dynamic, (x, spelling), **config
+                )
+                self.assertIn(f", {spelling!r})", code)
+                self.assertTrue(torch.equal(hinted, plain))
+
+    def test_masked_l2_policy_loads_match_the_unhinted_bits(self) -> None:
+        """A masked row strip's predicated packets under an L2 policy family
+        (the ``createpolicy`` + ``.L2::cache_hint`` form) load the same values
+        as without a hint: the partial tiles leave masked lanes zero.  8-byte
+        packets (V=4) and 16-byte packets (V=8), each family at least once."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        readonly = readonly_packet_load_supported(
+            torch.cuda.get_device_capability(), torch.version.cuda
+        )
+        for config, policies in (
+            (
+                _sink_config(
+                    block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+                ),
+                ["l1_l2_first", "l2_last"],
+            ),
+            (
+                _sink_config(
+                    block_sizes=[4096, 16], num_threads=[256, 2], vec=[1, 8], unroll=4
+                ),
+                # The noncoherent form of a source nothing writes.
+                ["l1_l2_first", "l1_l2_last", *(["nc_l2_first"] if readonly else [])],
+            ),
+        ):
+            _, plain = code_and_output(
+                col_reduce_sum_dynamic, (x,), **config, load_eviction_policies=[""]
+            )
+            for policy in policies:
+                with self.subTest(policy=policy, vec=config["cute_vector_widths"]):
+                    code, hinted = code_and_output(
+                        col_reduce_sum_dynamic,
+                        (x,),
+                        **config,
+                        load_eviction_policies=[policy],
+                    )
+                    self.assertIn(f", {policy!r})", code)
+                    self.assertTrue(torch.equal(hinted, plain))
+            torch.testing.assert_close(plain, _col_sum(x), atol=2e-2, rtol=2e-2)
+
+    def test_one_thread_column_tile_matches_the_scalar_bits(self) -> None:
+        """Eight columns per thread as one vector lane against the same
+        layout without the vector: the column sums add the same rows in the
+        same order.  60 columns leave a partial last column tile."""
+        for columns in (64, 60):
+            with self.subTest(columns=columns):
+                x = torch.randn(4700, columns, device=DEVICE, dtype=torch.bfloat16)
+                bound = split_column_sum_static.bind((x, 600))
+                vector = bound.compile_config(helion.Config(**_ONE_THREAD_COLUMNS))(
+                    x, 600
+                )
+                scalar = bound.compile_config(
+                    helion.Config(
+                        **{**_ONE_THREAD_COLUMNS, "cute_vector_widths": [1, 1, 1]}
+                    )
+                )(x, 600)
+                self.assertTrue(torch.equal(vector, scalar))
+                expected = torch.stack(
+                    [x[row : row + 600].float().sum(0) for row in range(0, 4700, 600)]
+                )
+                torch.testing.assert_close(vector, expected, rtol=1e-4, atol=1e-3)
+
+    def test_demoted_fourth_axis_packets_match_torch(self) -> None:
+        """The demoted block's 8-wide packets add the same elements as
+        torch, with a partial last block on the demoted axis: 100 of 128
+        elements of 256-byte rows, so the packets stay aligned."""
+        x = torch.randn(4, 4, 4, 128, device=DEVICE, dtype=torch.bfloat16)[..., :100]
+        y = torch.randn(4, 4, 4, 128, device=DEVICE, dtype=torch.bfloat16)[..., :100]
+        code, out = code_and_output(_add_4d, (x, y), **_DEMOTED_FOURTH_AXIS)
+        self.assertIn("ir.VectorType.get([8], cutlass.Uint16.mlir_type)", code)
+        self.assertTrue(torch.equal(out, x + y))
+
+    def test_partial_tiles_on_both_axes(self) -> None:
+        """1000 rows against a 4096-row block and 1000 columns against
+        16-column blocks: row and column masks, V=4 and V=8."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[256, 2], vec=[1, 8], unroll=4
+            ),
+        )
+
+    def test_rows_above_columns_partial_tiles(self) -> None:
+        x = torch.randn(1000, 56, device=DEVICE, dtype=torch.bfloat16)
+        code = self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[2048, 16],
+                num_threads=[16, 8],
+                vec=[1, 2],
+                layouts=["blocked", "blocked"],
+                unroll=4,
+            ),
+        )
+        self.assertIn("pre=8, group_span=128", code)
+
+    def test_interleaved_fragment_combine_matches_the_knob_off_bits(self) -> None:
+        """The fragment combine of eight interleaved column threads over four
+        warps adds the threads' fp32 sums in the order of the per-lane reduces
+        it replaces."""
+        x = torch.randn(1000, 56, device=DEVICE, dtype=torch.float32)
+        layout = {
+            "block_sizes": [2048, 16],
+            "num_threads": [16, 8],
+            "vec": [1, 2],
+            "layouts": ["blocked", "blocked"],
+        }
+        code, sunk = code_and_output(
+            col_reduce_sum_dynamic, (x,), **_sink_config(**layout, unroll=4)
+        )
+        self.assertIn("count=2, pre=8, group_span=128", code)
+        _, plain = code_and_output(
+            col_reduce_sum_dynamic, (x,), **_sink_config(**layout, sink=False)
+        )
+        self.assertTrue(torch.equal(sunk, plain))
+
+    def test_static_shapes_and_unroll_depths(self) -> None:
+        x = torch.randn(2048, 512, device=DEVICE, dtype=torch.bfloat16)
+        for unroll in (1, 2, 16):
+            self._check(
+                col_reduce_sum_static,
+                _col_sum,
+                x,
+                **_sink_config(
+                    block_sizes=[2048, 16],
+                    num_threads=[128, 2],
+                    vec=[1, 8],
+                    unroll=unroll,
+                ),
+            )
+
+    def test_max_reduction(self) -> None:
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        code = self._check(
+            col_reduce_max_dynamic,
+            _col_max,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        self.assertIn("'max', cutlass.Float32(float('-inf'))", code)
+        # The sunk per-lane combine keeps torch.amax's NaN propagation.
+        x[17, 5] = float("nan")
+        x[900, 640] = float("nan")
+        _, out = code_and_output(
+            col_reduce_max_dynamic,
+            (x,),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        torch.testing.assert_close(out, _col_max(x), equal_nan=True)
+
+    def test_float32_input(self) -> None:
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.float32)
+        code = self._check(
+            col_reduce_sum_dynamic,
+            _col_sum,
+            x,
+            **_sink_config(
+                block_sizes=[4096, 8], num_threads=[128, 2], vec=[1, 4], unroll=4
+            ),
+        )
+        self.assertIn("ir.VectorType.get([4], cutlass.Uint32.mlir_type)", code)
+
+    def test_a_guarded_row_store_sinks_bitwise(self) -> None:
+        """``test_a_guarded_row_store_lets_the_row_loads_sink``'s ragged row
+        tiles: the sunk kernel's output is bitwise the knob-off kernel's."""
+        x = torch.randn(500, 384, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(384, device=DEVICE, dtype=torch.bfloat16)
+        outputs = {}
+        for sink in (True, False):
+            code, outputs[sink] = code_and_output(
+                _scale_columns,
+                (x, w),
+                block_sizes=[32, 32],
+                num_threads=[8, 4],
+                loop_orders=[[1, 0]],
+                cute_vector_widths=[1, 8],
+                cute_lane_layouts=["blocked", "strided"],
+                cute_vloop_sink=sink,
+            )
+            self.assertEqual("_vsink" in code, sink)
+        torch.testing.assert_close(outputs[True], outputs[False], atol=0, rtol=0)
+        expected = (x.float() * w.float()).to(x.dtype)
+        torch.testing.assert_close(outputs[True], expected, atol=0, rtol=0)
+
+    def test_nonzero_grid_origin_declines_and_stays_correct(self) -> None:
+        """``hl.tile(8, n)`` keeps per-element column masks: the pass declines
+        (no out-of-bounds vector transaction) and the knob-off code runs."""
+        x = torch.randn(1000, 1008, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            col_reduce_sum_from8_dynamic,
+            (x,),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        expected = torch.zeros_like(out)
+        expected[8:] = _col_sum(x[:, 8:])
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+        self.assertNotIn("_vsink", code)
+        self.assertNotIn(FRAGMENT_REDUCE, code)
+
+    def test_a_misaligned_input_view_declines_and_stays_correct(self) -> None:
+        """A view whose base is four bytes into its allocation cannot take the
+        8-byte sunk packet: the pass declines (it shares the tile hoist's base
+        proof) and the knob-off code runs instead of faulting on a misaligned
+        address."""
+        x = torch.randn(4096, 4112, device=DEVICE, dtype=torch.bfloat16)[:, 2:4098]
+        self.assertEqual(x.data_ptr() % 8, 4)
+        config = _sink_config(
+            block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+        )
+        code, out = code_and_output(col_reduce_sum_static, (x,), **config)
+        code_off, out_off = code_and_output(
+            col_reduce_sum_static, (x,), **{**config, "cute_vloop_sink": False}
+        )
+        torch.testing.assert_close(out, _col_sum(x), atol=2e-2, rtol=2e-2)
+        self.assertEqual(code, code_off)
+        self.assertTrue(torch.equal(out, out_off))
+        self.assertNotIn("_vsink", code)
+
+    def test_row_weighted_mean(self) -> None:
+        """A row-only weight load and a row-only sum next to the column sum:
+        both become per-lane state; partial tiles on both axes."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.rand(1000, device=DEVICE, dtype=torch.bfloat16) + 0.5
+        code, out = code_and_output(
+            col_weighted_mean_dynamic,
+            (x, w),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        expected = (x.float() * w.float()[:, None]).sum(0) / w.float().sum()
+        torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+        self.assertIn("_vsink_vec", code)
+        self.assertEqual(code.count(FRAGMENT_REDUCE), 2)
+        self.assertIn("wsum_frag", code)
+
+    def test_lane_invariant_scalar_redefined_by_an_if(self) -> None:
+        """``s = scale[0]`` feeds one store, an ``if flag[0]`` doubles ``s``
+        and a second store uses it: with the flag set, every column of both
+        outputs must see one ``scale`` (not a value compounded over the V
+        lanes), and with it clear the second output equals the first."""
+        x = torch.randn(1000, 1000, device=DEVICE, dtype=torch.bfloat16)
+        scale = torch.full((1,), 1.5, device=DEVICE, dtype=torch.float32)
+        column_sum = x.float().sum(0)
+        for flag_value, factor in ((1, 2.0), (0, 1.0)):
+            flag = torch.full((1,), flag_value, device=DEVICE, dtype=torch.int32)
+            code, (out1, out2) = code_and_output(
+                col_reduce_sum_rescaled_dynamic,
+                (x, scale, flag),
+                **_sink_config(
+                    block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+                ),
+            )
+            torch.testing.assert_close(out1, column_sum * 1.5, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(
+                out2, column_sum * (1.5 * factor), atol=2e-2, rtol=2e-2
+            )
+            self.assertIn("_vsink_vec", code)
+            self.assertIn(FRAGMENT_REDUCE, code)
+
+    def test_a_gathered_value_is_read_before_the_atomic(self) -> None:
+        """Each lane gathers its own element of ``count`` and then bumps it,
+        unguarded (static shapes, one thread along the rows), so one thread
+        alone touches that element: the gathered value is the initial 2.0,
+        never the 3.0 the atomic leaves behind, with the knob on as with it
+        off.  Recomputing the gather after the row loop read 3.0."""
+        x = torch.randn(1024, 1024, device=DEVICE, dtype=torch.bfloat16)
+        outputs: dict[bool, torch.Tensor] = {}
+        for sink in (False, True):
+            count = torch.full((1024,), 2.0, device=DEVICE, dtype=torch.float32)
+            code, out = code_and_output(
+                col_reduce_sum_gather_then_atomic_static,
+                (x, count),
+                **_sink_config(
+                    block_sizes=[1024, 16],
+                    num_threads=[1, 4],
+                    vec=[1, 4],
+                    unroll=8,
+                    sink=sink,
+                ),
+            )
+            self.assertEqual("_vsink_vec" in code, sink)
+            torch.testing.assert_close(count, torch.full_like(count, 3.0))
+            before = out - x.float().sum(0)
+            torch.testing.assert_close(
+                before, torch.full_like(before, 2.0), atol=5e-2, rtol=0
+            )
+            outputs[sink] = out
+        torch.testing.assert_close(outputs[True], outputs[False])
+
+    def test_sibling_row_loops(self) -> None:
+        x = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(1000, 1024, device=DEVICE, dtype=torch.bfloat16) * 2
+        code, out = code_and_output(
+            col_reduce_sum_pair_dynamic,
+            (x, y),
+            **_sink_config(
+                block_sizes=[4096, 16], num_threads=[128, 4], vec=[1, 4], unroll=8
+            ),
+        )
+        expected = (x.float().sum(0) + y.float().sum(0)).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, atol=5e-2, rtol=2e-2)
+        # Each row loop strength-reduces and vectorizes its own tensor.
+        self.assertIn("_vsink_ptr = x.iterator", code)
+        self.assertIn("_vsink_ptr_1 = y.iterator", code)
+        self.assertEqual(code.count(FRAGMENT_REDUCE), 2)
+
+    def test_a_later_masked_store_of_the_same_elements_lands_last(self) -> None:
+        """The even channels the masked store zeroes after the ReLU store
+        stay zero: the ReLU store is not flushed after the V-loop."""
+        x = torch.randn(4, 784, 120, device=DEVICE, dtype=torch.bfloat16)
+        shift = torch.randn(120, device=DEVICE, dtype=torch.float32)
+        bound = _relu_then_zero_even_channels.bind((x, shift))
+        config = _strided_reduction_config(bound, sink=True)
+        bound.set_config(config)
+        self.assertIn("_vsink_vec", bound.to_code(config))
+        act, pooled = cast("tuple[torch.Tensor, torch.Tensor]", bound(x, shift))
+        y = torch.relu(x.float() - shift)
+        torch.testing.assert_close(pooled, y.mean(1).to(x.dtype), atol=1e-2, rtol=1e-2)
+        y[..., ::2] = 0
+        torch.testing.assert_close(act, y.to(x.dtype), atol=0, rtol=0)
+
+    def test_a_strided_reduction_past_the_z_launch_limit_sinks_in_place(
+        self,
+    ) -> None:
+        """Two threads on each grid axis and 128 reduction threads keep the
+        default ``(128, 2, 2)`` layout, where the V-loop still sinks."""
+        x = torch.randn(8, 784, 120, device=DEVICE, dtype=torch.bfloat16)
+        bound = _spatial_mean.bind((x,))
+        config = _strided_reduction_config(
+            bound,
+            sink=True,
+            block_sizes=(2, 16),
+            grid_threads=(2, 2),
+            reduction_threads=128,
+            rows=256,
+        )
+        bound.set_config(config)
+        code = bound.to_code(config)
+        self.assertIn("_vsink_vec", code)
+        self.assertIn("block=(128, 2, 2)", code)
+        torch.testing.assert_close(
+            bound(x), x.float().mean(1).to(x.dtype), atol=1e-2, rtol=1e-2
+        )
+
+    def test_strided_reductions_with_threads_on_both_grid_dims(self) -> None:
+        """Threads on both grid dims in both loop orders (the default layout
+        with ``tile_n`` first, the tile-first one with ``tile_c`` first),
+        then a persistent reduction, against eager."""
+        for rows, loop_orders in ((784, None), (784, [[1, 0]]), (64, None)):
+            x = torch.randn(8, rows, 120, device=DEVICE, dtype=torch.bfloat16)
+            bound = _spatial_mean.bind((x,))
+            config = (
+                _strided_reduction_config(
+                    bound,
+                    sink=True,
+                    block_sizes=(2, 64),
+                    grid_threads=(2, 8),
+                    loop_orders=loop_orders,
+                )
+                if rows == 784
+                else _strided_reduction_config(bound, sink=True, rows=None)
+            )
+            bound.set_config(config)
+            torch.testing.assert_close(
+                bound(x), x.float().mean(1).to(x.dtype), atol=1e-2, rtol=1e-2
+            )
+
+    def test_strided_reductions_with_the_tile_on_thread_x(self) -> None:
+        """Partial channel vectors (120 of a 64-wide tile's second block) and
+        a partial last row chunk (784 rows in 32-row chunks of 16 threads),
+        with the ReLU output stored inside the reduction as packets; then the
+        heuristic's first seed and its 64-row seed (16 vector threads, 8
+        reduction threads over 128- and 64-row chunks, the row loop unrolled
+        8 deep with a packet flush per copy)."""
+        x = torch.randn(4, 784, 120, device=DEVICE, dtype=torch.bfloat16)
+        shift = torch.randn(120, device=DEVICE, dtype=torch.float32)
+        spec = _relu_and_spatial_mean.bind((x, shift)).config_spec
+        seeds = [
+            spec.normalized_config(helion.Config(**seed.config))
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        ]
+        (rows64,) = [seed for seed in seeds if seed.reduction_loops == [64]]
+        for kernel, args, seed in (
+            (_spatial_mean, (x,), None),
+            (_relu_and_spatial_mean, (x, shift), None),
+            (_relu_and_spatial_mean, (x, shift), seeds[0]),
+            (_relu_and_spatial_mean, (x, shift), rows64),
+        ):
+            bound = kernel.bind(args)
+            config = (
+                _strided_reduction_config(bound, sink=True) if seed is None else seed
+            )
+            bound.set_config(config)
+            self.assertIn("_vsink_vec", bound.to_code(config))
+            result = bound(*args)
+            if kernel is _spatial_mean:
+                expected = x.float().mean(1).to(x.dtype)
+                torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-2)
+                continue
+            act, pooled = cast("tuple[torch.Tensor, torch.Tensor]", result)
+            y = torch.relu(x.float() - shift)
+            torch.testing.assert_close(act, y.to(x.dtype), atol=0, rtol=0)
+            torch.testing.assert_close(
+                pooled, y.mean(1).to(x.dtype), atol=1e-2, rtol=1e-2
+            )
+
+    def test_a_column_sum_over_4_byte_aligned_rows(self) -> None:
+        """The heuristic's first seed for rows of 1026 bf16 elements: 2-element
+        packets on 128 vector threads, the last 256-column tile jagged."""
+        x = torch.randn(2048, 1026, device=DEVICE, dtype=torch.bfloat16)
+        bound = _column_sum.bind((x,))
+        spec = bound.config_spec
+        seed = next(
+            spec.normalized_config(helion.Config(**seed.config))
+            for seed in spec.compiler_seed_configs
+            if seed.config.get("cute_vloop_sink")
+        )
+        bound.set_config(seed)
+        self.assertIn("_cute_load_v4b_if(", bound.to_code(seed))
+        torch.testing.assert_close(bound(x), x.float().sum(0), atol=1e-2, rtol=1e-3)
+
+    def _check_hoist(
+        self,
+        kernel: helion.Kernel,
+        args: tuple[torch.Tensor, ...],
+        config: dict[str, Any],
+        expected: torch.Tensor,
+    ) -> None:
+        """``config`` matches ``expected``, and its output with the operands
+        hoisted out of the row loop (``cute_vloop_sink``) is bitwise the
+        knob-off kernel's."""
+        outputs = []
+        for sink in (True, False):
+            code, out = code_and_output(
+                kernel, args, **(config | {"cute_vloop_sink": sink})
+            )
+            self.assertEqual("_vsink_vec" in code, sink)
+            outputs.append(out)
+        sunk, unsunk = outputs
+        torch.testing.assert_close(sunk, unsunk, atol=0, rtol=0)
+        torch.testing.assert_close(
+            sunk, expected.to(torch.bfloat16), atol=1e-2, rtol=1e-2
+        )
+
+    def _check_channel_affine(self, rows: int, config: dict[str, Any]) -> None:
+        args = _channel_affine_args(DEVICE, rows=rows)
+        x, mean, var, weight, bias = (t.float() for t in args)
+        expected = torch.relu((x - mean) * torch.rsqrt(var + 1e-05) * weight + bias)
+        self._check_hoist(_channel_affine_relu, args, config, expected)
+
+    def test_channel_affine_with_parameters_hoisted_out_of_the_row_loop(self) -> None:
+        self._check_channel_affine(512, dict(_channel_affine_config(sink=True).config))
+
+    def test_channel_affine_hoist_seed(self) -> None:
+        """The first broadcast-hoist seed (64x128 tiles, eight unrolled rows
+        per thread, three CTAs per SM), on whole and on ragged row tiles."""
+        for rows in (4096, 500):
+            bound = _channel_affine_relu.bind(_channel_affine_args(DEVICE, rows=rows))
+            self._check_channel_affine(rows, _hoist_seeds(bound)[0])
+
+    def test_grn_apply_hoist_seed(self) -> None:
+        """The three-axis seeds match eager, and their output is bitwise the
+        knob-off kernel's: on ragged spatial rows, with four images on
+        threads beside them (128 images), and with the rows moved to the
+        images (512 images of 64 rows)."""
+        for images, rows, channels in ((8, 196, 256), (128, 196, 256), (512, 64, 512)):
+            args = _grn_args(DEVICE, images=images, rows=rows, channels=channels)
+            seed = _hoist_seeds(_grn_apply.bind(args))[0]
+            x, beta, gamma, gx, denom = (t.float() for t in args)
+            nx = (gx / denom[:, None])[:, None, :]
+            expected = x + torch.addcmul(beta, gamma, x * nx)
+            self._check_hoist(_grn_apply, args, seed, expected)

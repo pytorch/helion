@@ -20,6 +20,8 @@ the device topology and the cluster size, so it is cached per process.
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 
 from ..triton.launcher import get_num_sm
@@ -69,3 +71,38 @@ def get_max_active_clusters(
             clusters, get_num_sm(device, reserved_sms=reserved_sms) // cluster_size
         )
     return max(1, clusters)
+
+
+def persistent_cluster_ctas(
+    device: torch.device | None, cluster_size: int, num_sm: int
+) -> int:
+    """CTAs of a persistent one-CTA-per-SM cluster grid the device co-schedules.
+
+    The driver's co-resident cluster count (``get_max_active_clusters``, a
+    CUDA context query) where the device is known; ``num_sm // cluster_size``
+    clusters otherwise (CPU renders, tests without a device).
+    """
+    if device is None or device.type != "cuda":
+        return (num_sm // cluster_size) * cluster_size
+    return get_max_active_clusters(device, cluster_size) * cluster_size
+
+
+def resident_clusters(cluster_shape: object, device: torch.device | None) -> int | None:
+    """The co-resident cluster count a wrapper of ``cluster_shape`` bakes in.
+
+    Clusters above two CTAs take their persistent grid from the driver's
+    count (:func:`persistent_cluster_ctas`), which varies with the GPC
+    floorsweeping of same-SM-count devices, so the compiled-launcher keys
+    carry it; ``None`` for the single CTA, the pair and CPU builds (their
+    keys are unchanged).
+    """
+    if device is None or device.type != "cuda":
+        return None
+    if not isinstance(cluster_shape, (tuple, list)):
+        return None
+    cluster_size = 1
+    for extent in cluster_shape:
+        cluster_size *= int(cast("int", extent))
+    if cluster_size <= 2:
+        return None
+    return get_max_active_clusters(device, cluster_size)

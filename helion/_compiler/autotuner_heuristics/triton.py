@@ -25,7 +25,6 @@ from ...autotuner.config_spec import LoopAxisFact
 from ...autotuner.config_spec import ReductionCategory
 from ...exc import InvalidConfig
 from ...runtime.config import Config
-from ..compile_environment import _symint_sympy_expr
 from .common import clamp_block_size_targets
 from .common import dedupe_configs
 from .common import matches_hardware
@@ -927,9 +926,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             info = env.block_sizes[bid]
             value = info.block_size_source.from_config(candidate, info)
             if isinstance(value, torch.SymInt):
-                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
-                if expression is not None:
-                    value = expression.evaluate(candidate)
+                configured = env.config_value(value, candidate)
+                if configured is not None:
+                    value = configured
             assert isinstance(value, (int, torch.SymInt))
             out[bid] = max(1, env.size_hint(value))
         return out
@@ -4056,12 +4055,18 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
     CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     # Fires arch-agnostically (is_eligible keys only on the pointwise fact), but
     # its byte/register constants were hill-climbed and validated on H100 (sm90).
-    # Promote to the autotune-off default ONLY on the arches the correctness hunt
-    # has cleared — sm90 (H100) and sm100 (B200) — so a non-validated arch keeps
-    # the conservative base default while still getting the seed as a search
-    # candidate. The seed keeps firing everywhere; only PROMOTION is gated.
+    # Promote to the autotune-off default ONLY on the arches below, so an
+    # unchecked arch keeps the conservative base default while still getting
+    # the seed as a search candidate. The seed keeps firing everywhere; only
+    # PROMOTION is gated.
+    # - sm90 (H100) and sm100 (B200): cleared by the correctness hunt (#3053).
+    # - sm120: every sm120 part (RTX 50-series, RTX PRO Blackwell), not one
+    #   product. Checked on an RTX 5080 only, with the Triton test lane and
+    #   targeted pointwise checks with autotuning off. sm120 is not in
+    #   TUNED_TARGETS, so the seed uses the sm90 constants and sizes its grid
+    #   from the device SM count.
     promote_seed_to_default = True
-    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"))
+    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"), ("cuda", "sm120"))
 
     # Arches whose pointwise constants have been measured. An allow-list, not a
     # ``>= sm100`` compare: an unmeasured arch (including a same-generation consumer
@@ -4519,9 +4524,9 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             info = env.block_sizes[block_id]
             value = info.block_size_source.from_config(default, info)
             if isinstance(value, torch.SymInt):
-                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
-                if expression is not None:
-                    value = expression.evaluate(default)
+                configured = env.config_value(value, default)
+                if configured is not None:
+                    value = configured
             if isinstance(value, (int, torch.SymInt)) and env.size_hint(value) > 1:
                 return True
         return False
@@ -4547,15 +4552,31 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     @staticmethod
     def _reread_eviction_policies(
         env: CompileEnvironment,
+        device_ir: DeviceIR,
+        seed: dict[str, Any],
         reread_slot: int | None,
     ) -> list[str] | None:
-        """Keep one re-read input in L2 and evict the other load slots first."""
+        """Keep one re-read input in L2 and evict the other load slots first.
+
+        ``reread_slot`` is the input's slot in ``memory_op_facts``, the order
+        of the configs that roll no reduction.  A seed that rolls the
+        reduction lowers the input in each loop that reads it, in an order of
+        its own (``DeviceIR.config_memory_op_fact_pairs``, which pairs each
+        copy with the input's slot): its first read keeps the lines, and the
+        later reads evict them like the other loads.
+        """
         n = env.config_spec.load_eviction_policies.length
         if reread_slot is None or not 0 <= reread_slot < n:
             return None
-        policy = ["first"] * n
-        policy[reread_slot] = "last"
-        return policy
+        pairs = device_ir.config_memory_op_fact_pairs(Config.from_dict(seed))
+        for persistent, fact in pairs:
+            # The seed's first copy of the input.
+            if persistent.eviction_index == reread_slot:
+                assert fact.eviction_index is not None
+                policy = ["first"] * n
+                policy[fact.eviction_index] = "last"
+                return policy
+        return None
 
     # ======================= candidate-resolved liveness allocator ====================== #
     @classmethod
@@ -4848,9 +4869,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                 descriptors_by_block.setdefault(descriptor.block_id, []).append(
                     descriptor
                 )
-        rolled_ids = {
-            reduction_loop.block_ids[0] for reduction_loop in spec.reduction_loops
-        }
+        rolled_ids = spec.rollable_reduction_block_ids()
         raw_reduction_extents = {
             block_id: max(descriptor.size_hint for descriptor in descriptors)
             for block_id, descriptors in descriptors_by_block.items()
@@ -5206,34 +5225,33 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         if _is_standard_reduction(pd):
             # Compiler-rolled reductions have no block_sizes slot. Full width is encoded as
             # ``None``; a materialized full reduction has no reduction_loops knob at all.
-            if pd.block_id not in spec.reduction_loops.valid_block_ids():
-                reduction_loops: list[int | None] = []
-            elif len(spec.reduction_loops) <= 1:
-                reduction_loops = [
-                    None
-                    if alloc.primary_r_block >= pd.size_hint
-                    else alloc.primary_r_block
-                ]
-            else:
-                reduction_loops = []
-                for rl_spec in spec.reduction_loops:
-                    block_id = rl_spec.block_ids[0]
-                    width = (
-                        alloc.primary_r_block
-                        if block_id == pd.block_id
-                        else alloc.rolled_loop_sizes[block_id]
-                    )
-                    reduction_loops.append(
-                        None if width >= rl_spec.size_hint else width
-                    )
+            rollable_ids = spec.rollable_reduction_block_ids()
+            reduction_loops: list[int | None] = []
+            for rl_spec in spec.reduction_loops:
+                block_id = rl_spec.block_id
+                if block_id not in rollable_ids:
+                    # Preserve the saved-config slot without proposing a chunk
+                    # that normalization would repair with a warning.
+                    reduction_loops.append(None)
+                    continue
+                width = (
+                    alloc.primary_r_block
+                    if block_id == pd.block_id
+                    else alloc.rolled_loop_sizes[block_id]
+                )
+                reduction_loops.append(None if width >= rl_spec.size_hint else width)
             seed["reduction_loops"] = reduction_loops
             if pd.row_reread and cls._has_floor_batched_nonresident_grid(env):
-                evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+                evict = cls._reread_eviction_policies(
+                    env, device_ir, seed, pd.reread_eviction_index
+                )
                 if evict is not None:
                     seed["load_eviction_policies"] = evict
         elif kf.non_reduction_loop_block_ids or pd.row_reread:
             # A user-written reduction already emits its mutable width through block_sizes.
-            evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+            evict = cls._reread_eviction_policies(
+                env, device_ir, seed, pd.reread_eviction_index
+            )
             if evict is not None:
                 seed["load_eviction_policies"] = evict
 
@@ -5411,3 +5429,21 @@ class TritonMatmulReductionEpilogueHeuristic(AutotunerHeuristic):
             "num_stages": num_stages,
         }
         return Config(**seed)
+
+
+# Ranked registry (``TritonBackend.autotuner_heuristics``).
+TRITON_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
+    # The two sm90 front ends are disjoint and share the B200 decision flow,
+    # with WGMMA/register-resident resource policy.
+    TritonH100FormulaMatmulHeuristic,
+    TritonH100MultiMatmulHeuristic,
+    TritonSkinnyGemmHeuristic,
+    # The two sm100 front ends are disjoint and both provide fast
+    # autotune-off defaults as well as autotuner seeds.
+    TritonB200FormulaMatmulHeuristic,
+    TritonB200MultiMatmulHeuristic,
+    TritonMatmulReductionEpilogueHeuristic,
+    TritonReductionHeuristic,
+    TritonNarrowReductionHeuristic,
+    TritonPointwiseSeedHeuristic,
+)

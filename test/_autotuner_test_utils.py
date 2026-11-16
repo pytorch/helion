@@ -45,6 +45,7 @@ _FINAL_REBENCHMARK_ENV_KEYS = (
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_TARGET_MS",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED",
     "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE",
+    "HELION_AUTOTUNE_FINAL_REBENCHMARK_MAX_SPREAD",
 )
 # Pin the architecture and SM count for config-space golden tests. The matmul-seed
 # heuristics are hardware-gated and use the SM count for wave sizing, so which
@@ -184,33 +185,25 @@ def _get_examples_matmul():
 
 
 def _pin_sm90(fn):
-    """Run ``fn`` with the hardware identity and SM count pinned to H100, and
-    evict the shared ``examples/matmul`` bound-kernel cache on entry and exit.
+    """Run ``fn`` with the hardware identity and SM count pinned to H100.
 
     The ``Kernel`` bind cache keys on the real device capability instead
-    (``_device_specialization_key``). Without the eviction, a config computed under
-    this pin (the sm90 budget-formula seed, e.g. ``block_sizes=[64, 64, 64],
-    num_stages=6``) is cached against the real-GPU key and then reused by a later
-    *un-pinned* test that actually compiles/executes it, which OOMs on a smaller GPU
-    (A10G's 99KB shared memory). Clearing on entry gives this test a clean compute;
-    clearing on exit guarantees no sm90-simulated config leaks into a test that runs
-    on the true hardware.
+    (``_device_specialization_key``), so a config computed under this pin (the
+    sm90 budget-formula seed, e.g. ``block_sizes=[64, 64, 64], num_stages=6``)
+    must not reach a later un-pinned test that compiles it, which OOMs on a
+    smaller GPU (A10G's 99KB shared memory): ``AutotunerTestCase`` drops the
+    shared kernels' binds around every test.
     """
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        matmul = _get_examples_matmul()
         with (
             patch.object(
                 _hardware, "get_hardware_info", lambda device=None: _SM90_HARDWARE
             ),
             patch("helion.runtime.get_num_sm", return_value=_SM90_NUM_SM),
         ):
-            matmul._bound_kernels.clear()
-            try:
-                return fn(*args, **kwargs)
-            finally:
-                matmul._bound_kernels.clear()
+            return fn(*args, **kwargs)
 
     return wrapper
 
@@ -245,6 +238,15 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
     def setUp(self):
         super().setUp()
         random.seed(112)
+        # Tests patch facts a config spec reads when a kernel binds (the
+        # hardware identity picks random_population's compiler seeds), but the
+        # bind cache keys on the arguments and the real device, so a bind made
+        # under one test's patches would reach the next test binding the same
+        # arguments.  Drop the shared kernels' binds before and after each
+        # test (only the binds: settings changed on a shared kernel stay).
+        for kernel in (basic_kernels.add, _get_examples_matmul()):
+            kernel.reset()
+            self.addCleanup(kernel.reset)
 
     @staticmethod
     def _scalar_override() -> tuple[str, int, int]:
@@ -406,3 +408,61 @@ class AutotunerTestCase(RefEagerTestDisabled, TestCase):
         )
         search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
         return search, args, reference_block, promoted
+
+    @staticmethod
+    def _promoted_baseline_search(
+        promoted_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None,
+        attempted: list[int],
+        reference_error: Exception | None = None,
+    ) -> tuple[FiniteSearch, tuple[torch.Tensor, torch.Tensor], int, int]:
+        """A search whose kernel has a promoted execution default: a compiler
+        default config at another block size than the autotuning reference
+        config's.  The baseline runs the default and then the reference and
+        compares the two (``_compute_reference_baseline``).
+
+        ``promoted_fn`` stands in for the default's compiled kernel (None:
+        the real one); ``reference_error`` makes every compile of the
+        reference config and its shrinks fail.  Returns the search, the
+        arguments, the reference block size and the promoted block size.
+        """
+
+        @helion.kernel(autotune_log_level=0, autotune_benchmark_subprocess=False)
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        args = (
+            torch.randn([1024], device=DEVICE),
+            torch.randn([1024], device=DEVICE),
+        )
+        bound = add.bind(args)
+        spec = bound.config_spec
+        reference_block = spec.autotune_reference_config()["block_sizes"][0]
+        promoted_block = reference_block * 2 if reference_block < 512 else 64
+        spec.compiler_default_config = helion.Config(block_sizes=[promoted_block])
+        assert spec.default_config()["block_sizes"][0] == promoted_block
+        assert promoted_block != reference_block
+        original = bound.compile_config
+
+        def compile_config(config: helion.Config, **kwargs: object) -> object:
+            block = config["block_sizes"][0]
+            attempted.append(block)
+            if block == promoted_block:
+                if promoted_fn is not None:
+                    return promoted_fn
+            elif reference_error is not None:
+                raise reference_error
+            return original(config, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+        search = FiniteSearch(
+            bound,
+            args,
+            configs=[
+                helion.Config(block_sizes=[16], num_warps=4),
+                helion.Config(block_sizes=[32], num_warps=4),
+            ],
+        )
+        search.kernel.compile_config = compile_config  # pyrefly: ignore[bad-assignment]
+        return search, args, reference_block, promoted_block

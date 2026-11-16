@@ -20,7 +20,7 @@ from helion.language import creation_ops
 from helion.language import matmul_ops
 from helion.language import memory_ops
 
-pytestmark = skipUnlessBackends(["cute"])
+pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

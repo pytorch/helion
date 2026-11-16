@@ -129,8 +129,8 @@ def build_dma_access_spec(
     access: MemoryAccess,
 ) -> DmaAccessSpec | None:
     """Build config-independent TensorCore DMA eligibility for one access."""
-    from ..backend import PallasBackend
     from ..compile_environment import CompileEnvironment
+    from .backend import PallasBackend
 
     if access.kind not in (MemoryAccessKind.LOAD, MemoryAccessKind.STORE):
         return None

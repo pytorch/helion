@@ -20,6 +20,8 @@ from helion._compiler.device_ir import RootGraphInfo
 from helion.language import memory_ops
 from helion.language import view_ops
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 

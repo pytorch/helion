@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import gc
 import math
 import os
 import re
@@ -9,9 +10,8 @@ from typing import Any
 from typing import Callable
 from typing import cast
 import unittest
+import weakref
 
-from examples.geglu import _geglu_pallas as _geglu_pallas_example
-from examples.swiglu import _swiglu_fwd_pallas as _swiglu_fwd_pallas_example
 import torch
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
@@ -22,6 +22,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import _bound_test_config
 from helion._testing import code_and_output
+from helion._testing import import_example
 from helion._testing import onlyBackends
 from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
@@ -33,6 +34,9 @@ from helion.autotuner.accuracy import _chunked_assert_close
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 import helion.language as hl
+
+_geglu_pallas_example = import_example("geglu")._geglu_pallas
+_swiglu_fwd_pallas_example = import_example("swiglu")._swiglu_fwd_pallas
 
 if TYPE_CHECKING:
     from helion.autotuner.base_search import PopulationBasedSearch
@@ -287,7 +291,7 @@ def pallas_sum_reduce_multiple(x: torch.Tensor) -> torch.Tensor:
     b, _n, _m = x.size()
     out = torch.empty([b], dtype=x.dtype, device=x.device)
     for tile_b in hl.tile(b):
-        out[tile_b] = x[tile_b, :, :].sum([0, 1])
+        out[tile_b] = x[tile_b, :, :].sum([1, 2])
     return out
 
 
@@ -986,6 +990,8 @@ def kernel_output_index_remapping(
 
     Iterates over the combined batch*heads dimension and the seq_len dimension.
     """
+    batch = hl.specialize(batch)
+    heads = hl.specialize(heads)
     batch_heads, seq_len, head_dim = x.size()
     out = torch.empty([batch, heads, seq_len, head_dim], dtype=x.dtype, device=x.device)
     for bh in hl.grid(batch_heads):
@@ -1121,7 +1127,7 @@ class TestPallas(TestCase):
             atol=1e-5,
             rtol=1e-5,
             chunk_size=1024,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
 
         incorrect = expected.clone()
@@ -1480,6 +1486,75 @@ class TestPallas(TestCase):
         )
         self.assertEqual(estimated, 8 * 128 * 4 * 2)
 
+    def test_estimate_pallas_vmem_bytes_counts_vmem_scratch(self) -> None:
+        """VMEM scratch (fori_loop / DMA buffers) counts; DMA semaphores do not."""
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _estimate_pallas_vmem_bytes
+
+        estimated = _estimate_pallas_vmem_bytes(
+            pl,
+            pltpu,
+            None,
+            None,
+            [
+                pltpu.VMEM((4096, 2048), jnp.float32),
+                pltpu.VMEM((2, 4096, 2048), jnp.float32),
+                pltpu.SemaphoreType.DMA((2,)),
+            ],
+            (),
+            [],
+            [],
+            None,
+        )
+        self.assertEqual(estimated, 3 * 4096 * 2048 * 4)
+
+    def test_vmem_check_counts_fori_loop_dma_buffers(self) -> None:
+        """fori_loop inputs stay in HBM; their VMEM DMA buffers must still count."""
+        # Two inputs, two 2048x2048 fp32 DMA buffers each = 128MB of scratch.
+        args = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[2048, 2048],
+                pallas_loop_type="fori_loop",
+                pallas_load_buffer_count=[2, 2],
+            )
+
+    def test_vmem_check_counts_emit_pipeline_buffers(self) -> None:
+        """emit_pipeline allocates its block buffers in-kernel; they must count."""
+        # x, y and out each get two 2048x2048 fp32 pipeline buffers = 96MB.
+        args = (
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+            torch.randn(2048, 4096, device=DEVICE, dtype=torch.float32),
+        )
+        code, _ = code_and_output(
+            pallas_inner_loop_add,
+            args,
+            block_sizes=[256, 256],
+            pallas_loop_type="emit_pipeline",
+        )
+        self.assertIn(f"_pipeline_vmem_bytes={3 * 2 * 256 * 256 * 4}", code)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"Ran out of memory in memory space vmem.*Estimated [0-9.]+MB exceeds",
+        ):
+            code_and_output(
+                pallas_inner_loop_add,
+                args,
+                block_sizes=[2048, 2048],
+                pallas_loop_type="emit_pipeline",
+            )
+
     @xfailIfPallasInterpret(
         "torch.float8_e4m3fn has no JAX dtype mapping in interpret mode; "
         "conversion errors before the VMEM check fires"
@@ -1525,7 +1600,7 @@ class TestPallas(TestCase):
         with self.subTest(name="shrunken_blockspec"):
             self.assertIn(
                 "pl.BlockSpec((1, 1, _BLOCK_SIZE_1, 128), "
-                "lambda _j: (offset_0 // heads, offset_0 % heads, _j, 0)",
+                f"lambda _j: (offset_0 // {heads}, offset_0 % {heads}, _j, 0)",
                 code,
             )
 
@@ -3222,8 +3297,8 @@ class TestPallas(TestCase):
 
     def test_sum_reduce_multiple(self) -> None:
         x = torch.randn(4, 32, 64, device=DEVICE, dtype=torch.float32)
-        with self.assertRaises(NotImplementedError):
-            code_and_output(pallas_sum_reduce_multiple, (x,), block_size=2)
+        _, result = code_and_output(pallas_sum_reduce_multiple, (x,), block_sizes=[2])
+        torch.testing.assert_close(result, x.sum((1, 2)))
 
     def test_max_reduction(self) -> None:
         x = torch.randn(32, 64, device=DEVICE, dtype=torch.float32)
@@ -3575,6 +3650,30 @@ class TestPallas(TestCase):
             f"{(reference.float() - baseline_result.float()).abs().max().item()}).",
         )
 
+    def test_pallas_launcher_cache_does_not_leak_arguments(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scale_rows(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+            m, _ = x.shape
+            out = torch.empty_like(x)
+            for _g in hl.grid(1):
+                for outer in hl.tile(4, m, block_size=8):
+                    for inner in hl.tile(outer.begin, outer.end):
+                        out[inner, :] = x[inner, :] + bias[:, :]
+            return out
+
+        x = torch.randn(64, 128, device=DEVICE, dtype=torch.float32)
+        bias = torch.randn(1, 128, device=DEVICE, dtype=torch.float32)
+        fn = scale_rows.bind((x, bias)).compile_config(
+            helion.Config(block_sizes=[8], pallas_loop_type="fori_loop")
+        )
+        x_ref = weakref.ref(x)
+        bias_ref = weakref.ref(bias)
+        torch.testing.assert_close(fn(x, bias)[4:], (x + bias)[4:])
+        del x, bias
+        gc.collect()
+        self.assertIsNone(x_ref())
+        self.assertIsNone(bias_ref())
+
     def test_pallas_autotuner_final_pick_picks_true_best_on_noisy_initial_rank(
         self,
     ) -> None:
@@ -3897,6 +3996,77 @@ class TestPallas(TestCase):
         )
 
     @skipIfPallasInterpret(
+        "device-µs ranking needs a real TPU; CPU-interpret has no /device:TPU events"
+    )
+    def test_pallas_device_micros_waits_for_torch_launched_kernel(self) -> None:
+        from helion.autotuner.benchmarking import _pallas_device_micros_for_fn
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[256, 1024]),
+        )
+        def add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + y[tile]
+            return out
+
+        x = torch.randn(32768, 4096, device=DEVICE)  # 512 MiB per operand
+        y = torch.randn(32768, 4096, device=DEVICE)
+        micros = _pallas_device_micros_for_fn(
+            lambda: add(x, y), n_calls=100, n_warmup=5
+        )
+        self.assertTrue(
+            math.isfinite(micros) and micros > 0,
+            f"device µs must be finite for a torch-launched kernel; got {micros!r}",
+        )
+
+    def test_wall_clock_benches_time_failed_executions_as_inf(self) -> None:
+        from unittest.mock import patch
+
+        from helion.autotuner import benchmarking
+
+        with patch.object(benchmarking, "_execution_failed", return_value=True):
+            for probe_long_kernel in (False, True):
+                self.assertEqual(
+                    benchmarking.do_bench_generic(
+                        lambda: None,
+                        return_mode="median",
+                        fixed_repetitions=None if probe_long_kernel else 3,
+                        probe_long_kernel=probe_long_kernel,
+                    ),
+                    math.inf,
+                )
+
+        ok_calls = 0
+        failing_calls = 0
+
+        def ok() -> str:
+            nonlocal ok_calls
+            ok_calls += 1
+            return "ok"
+
+        def failing() -> str:
+            nonlocal failing_calls
+            failing_calls += 1
+            return "failed"
+
+        with patch.object(
+            benchmarking,
+            "_execution_failed",
+            side_effect=lambda output: output == "failed",
+        ):
+            timings = benchmarking.interleaved_bench_generic([ok, failing], repeat=5)
+        self.assertTrue(math.isfinite(timings[0]), timings)
+        # Only the candidate whose output fails on the device is scored as inf.
+        self.assertEqual(timings[1], math.inf)
+        # 1 warm-up + 5 timed repeats for ok; 1 warm-up + 1 failed timed run
+        # for failing (not re-run after failing).
+        self.assertEqual(ok_calls, 6)
+        self.assertEqual(failing_calls, 2)
+
+    @skipIfPallasInterpret(
         "device-sync semantics need a real TPU; CPU-interpret executes synchronously"
     )
     def test_device_sync_waits_for_compiled_output(self) -> None:
@@ -3939,8 +4109,8 @@ class TestPallas(TestCase):
                 best = min(best, (time.perf_counter() - start) * 1000)
             return best
 
-        from torch_tpu._internal.sync import (  # pyrefly: ignore[missing-import]
-            synchronize as tpu_sync,
+        from torch_tpu._internal.sync import (
+            synchronize as tpu_sync,  # pyrefly: ignore[missing-import]
         )
 
         device_sync_ms = best_ms(lambda out: synchronize_device())
@@ -4030,6 +4200,80 @@ class TestPallas(TestCase):
             5e-2,
             f"dot_general output diverged from pallas_call by {max_abs_diff}",
         )
+
+    def test_pallas_matmul_dot_general_lowering_needs_a_pure_matmul_body(
+        self,
+    ) -> None:
+        """The no-tiling ``lax.dot_general`` shortcut replaces the whole
+        kernel, so it only fires on exactly ``out = x @ y``: a transposed
+        operand (``x.T @ g``) or an epilogue (``relu``) keeps the
+        ``pl.pallas_call`` path and the result stays correct; an argument
+        order that differs from the operand order still takes the shortcut
+        with the operands oriented by the matmul, not by position.
+        """
+        from unittest.mock import patch
+
+        from helion.runtime.config import Config
+        from helion.runtime.pallas import launcher as pallas_launcher
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _transposed_lhs(x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty([n, n], device=x.device, dtype=x.dtype)
+            for tile_n1, tile_n2 in hl.tile([n, n]):
+                acc = hl.zeros([tile_n1, tile_n2], dtype=torch.float32)
+                for tile_m in hl.tile(m):
+                    acc = torch.addmm(acc, x[tile_m, tile_n1].T, g[tile_m, tile_n2])
+                out[tile_n1, tile_n2] = acc.to(x.dtype)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _relu_epilogue(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = torch.relu(acc).to(x.dtype)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def _operands_swapped(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            m, k = x.size()
+            _, n = y.size()
+            out = torch.empty([m, n], device=x.device, dtype=x.dtype)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+                out[tile_m, tile_n] = acc.to(x.dtype)
+            return out
+
+        torch.manual_seed(0)
+        x = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        y = torch.randn(128, 128, device=DEVICE, dtype=torch.bfloat16)
+        no_tiling_cfg = Config(block_sizes=[128, 128, 128])
+        cases = [
+            (_transposed_lhs, (x, y), x.float().T @ y.float(), 0),
+            (_relu_epilogue, (x, y), torch.relu(x.float() @ y.float()), 0),
+            (_operands_swapped, (y, x), x.float() @ y.float(), 1),
+        ]
+        for kernel, args, expected, builds in cases:
+            with (
+                self.subTest(kernel=kernel.name),
+                patch.object(
+                    pallas_launcher,
+                    "_build_matmul_dot_general_jit_fn",
+                    wraps=pallas_launcher._build_matmul_dot_general_jit_fn,
+                ) as build_spy,
+            ):
+                result = kernel.bind(args).compile_config(no_tiling_cfg)(*args)
+                self.assertEqual(build_spy.call_count, builds)
+                torch.testing.assert_close(
+                    result.float(), expected, atol=5e-2, rtol=5e-2
+                )
 
     def test_pallas_matmul_dot_general_lowering_pins_default_precision(self) -> None:
         """The no-tiling dot-general shortcut must not inherit JAX global precision."""
@@ -4231,6 +4475,38 @@ class TestPallas(TestCase):
             pallas_loop_type=loop_type,
         )
         torch.testing.assert_close(out, a @ b, rtol=1e-2, atol=1e-2)
+
+    @parametrize("loop_type", ("fori_loop", "unroll", "emit_pipeline"))
+    def test_two_loops_tiling_same_dim_pad_to_both_blocks(self, loop_type: str) -> None:
+        """Two inner loops tile N with different block sizes; pad covers both.
+
+        N = 1536 is a multiple of 256 but not of 1024.  Padding x only for
+        the second loop's 256 block lets the first loop's last 1024 tile read
+        past the end of x.
+        """
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def row_center(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            out = torch.empty_like(x)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_n in hl.tile(n):
+                    acc = acc + torch.sum(x[tile_m, tile_n], dim=-1)
+                mean = acc / n
+                for tile_n in hl.tile(n):
+                    out[tile_m, tile_n] = x[tile_m, tile_n] - mean[:, None]
+            return out
+
+        x = torch.randn(16, 1536, device=DEVICE, dtype=torch.float32)
+        code, out = code_and_output(
+            row_center,
+            (x,),
+            block_sizes=[8, 1024, 256],
+            pallas_loop_type=loop_type,
+        )
+        self.assertIn("(0, 1, 1024, 0), (0, 1, 256, 0)", code)
+        torch.testing.assert_close(out, x - x.mean(dim=-1, keepdim=True))
 
     @xfailIfPallas("Non-zero begin K reduction: DMA offset not tile-aligned")
     def test_bmm_nonzero_k_begin(self) -> None:
@@ -5733,6 +6009,65 @@ class TestPallas(TestCase):
         self.assertIn("device='meta'", code)
         # Launcher return captured into output variable.
         self.assertIn("out = _launcher(", code)
+
+    def test_output_first_scalar_device_uses_input(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def stride_from_container(values):
+            out = torch.empty_like(values[0])
+            for row, column in hl.tile(out.shape):
+                out[row, column] = values[0][row, column] + values[0].stride(0)
+            return out
+
+        x = torch.arange(12, device=DEVICE, dtype=torch.float32).reshape(3, 4)
+        code, result = code_and_output(
+            stride_from_container, ([x],), block_sizes=[4, 4]
+        )
+        torch.testing.assert_close(result, x + x.stride(0))
+        self.assertIn("_output_indices=[0]", code)
+        self.assertIn("device='meta'", code)
+        self.assertIn("device=values[0].device", code)
+
+    @parametrize("size", [8, 5])
+    def test_scalar_store_broadcast(self, size: int) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def filled_output(value: float, size: hl.constexpr, device: torch.device):
+            out = torch.empty((size,), device=device)
+            for tile in hl.tile(out.shape):
+                out[tile] = value
+            return out
+
+        _, result = code_and_output(
+            filled_output, (2.5, size, torch.device(DEVICE)), block_sizes=[8]
+        )
+        torch.testing.assert_close(result, torch.full((size,), 2.5, device=DEVICE))
+
+    def test_singleton_store_broadcast(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def repeat_rows(x: torch.Tensor):
+            out = torch.empty((3, x.numel()), device=x.device, dtype=x.dtype)
+            for rows, columns in hl.tile(out.shape):
+                out[rows, columns] = x[None, columns]
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(repeat_rows, (x,), block_sizes=[4, 8])
+        torch.testing.assert_close(result, x.expand(3, 8))
+
+    def test_output_only_scalar_device_uses_backend_default(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def filled_output(value: float, device: torch.device):
+            out = torch.empty((8,), device=device)
+            for tile in hl.tile(out.numel()):
+                out[tile] = hl.full((tile,), value)
+            return out
+
+        code, result = code_and_output(
+            filled_output, (2.5, torch.device(DEVICE)), block_sizes=[8]
+        )
+        torch.testing.assert_close(result, torch.full((8,), 2.5, device=DEVICE))
+        self.assertIn("_output_indices=[0]", code)
+        self.assertIn("device='meta'", code)
+        self.assertNotIn("device=out.device", code)
 
     def test_new_empty_output_only(self) -> None:
         """new_empty allocations should also be recognized as output-only."""
@@ -7345,6 +7680,55 @@ class TestPallas(TestCase):
         s, e = 0, 10
         ref = torch.bmm(y[:, s:e, :].transpose(0, 1), y[:, s:e, :].permute(1, 2, 0))
         torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
+
+    def test_loop_carry_update_from_partial_tile_loads(self) -> None:
+        """A carry with a dim on its loop's own block keeps its value in the
+        padded lanes of a partial tile, which would each add exp(0), also in
+        the branch of a runtime ``if`` that adds exp(x): the other branch's
+        constant reaches them."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def exp_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n])
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def exp_or_one(x: torch.Tensor, beta: float) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    if beta > 0:
+                        acc = acc + torch.exp(x[tile_m, tile_n])
+                    else:
+                        acc = acc + 1.0
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        # 200 columns end in a tile of 72 of 128.
+        x = -torch.randint(2, 10, [16, 200], device=DEVICE).float()
+        code, result = code_and_output(exp_sum, (x,), block_sizes=[128, 8])
+        self.assertRegex(
+            code,
+            r"_mask_select\w* = jnp\.where\(.*, jnp\.full\(\[\], 0, jnp\.float32\)\)",
+        )
+        torch.testing.assert_close(
+            result, torch.exp(x).sum(dim=1), rtol=1e-5, atol=1e-5
+        )
+        for beta, expected in ((1.0, torch.exp(x).sum(dim=1)), (-1.0, 256.0)):
+            _, result = code_and_output(exp_or_one, (x, beta), block_sizes=[128, 8])
+            torch.testing.assert_close(
+                result, torch.zeros_like(result) + expected, rtol=1e-5, atol=1e-5
+            )
 
     def test_if_branch_intermediate_outputs(self) -> None:
         """Branch intermediates must survive in _if output list."""

@@ -4,8 +4,6 @@ import pytest
 import sympy
 import torch
 
-from test._cute_binding import _cpu_bind
-
 import helion
 from helion._compiler.cute import cute_epilogue
 from helion._compiler.cute.epilogue_fanout import _chain_key
@@ -13,6 +11,7 @@ from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 from helion.language._tracing_ops import _get_symnode
 
@@ -58,7 +57,7 @@ def test_scalar_provenance_distinguishes_runtime_arguments_from_device_indices()
     None
 ):
     x = torch.empty((128, 128), dtype=torch.bfloat16)
-    bound = _cpu_bind(_scaled_matmul, (x, x.clone(), x.clone(), 1.25, -0.5, False))
+    bound = cpu_bind(_scaled_matmul, (x, x.clone(), x.clone(), 1.25, -0.5, False))
     assert bound.host_function is not None
     scalars = [
         node
@@ -70,7 +69,7 @@ def test_scalar_provenance_distinguishes_runtime_arguments_from_device_indices()
     assert len(scalars) == 2
     assert all(cute_epilogue._runtime_scalar(node) is not None for node in scalars)
 
-    bound = _cpu_bind(_device_scaled_matmul, (x, x.clone()))
+    bound = cpu_bind(_device_scaled_matmul, (x, x.clone()))
     assert bound.host_function is not None
     indices = [
         node

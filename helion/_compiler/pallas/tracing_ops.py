@@ -29,6 +29,7 @@ from ...language._tracing_ops import _for_loop
 from ...language._tracing_ops import _for_loop_step
 from ...language._tracing_ops import _host_tensor
 from ...language._tracing_ops import _if
+from ...language._tracing_ops import _mask_select
 from ...language._tracing_ops import _mask_to
 from ...language._tracing_ops import _new_var
 from ...language._tracing_ops import _not
@@ -64,6 +65,7 @@ _PALLAS_LOOP_LOAD_COUNT_META = "_helion_pallas_loop_load_count"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Collection
     from collections.abc import Iterator
     from collections.abc import Sequence
 
@@ -175,10 +177,8 @@ def _dependent_tile_end_expr(state: CodegenState, loop_dim_index: int) -> str | 
     source_end = next(arg for arg in expr.args if arg != tile_end_symbol)
     if not isinstance(source_end, sympy.Expr):
         return None
-    for symbol in source_end.free_symbols:
-        origin_info = HostFunction.current().expr_to_origin.get(symbol)
-        if origin_info is None or not origin_info.origin.is_host():
-            return None
+    if not HostFunction.current().is_host_scalar_expr(source_end):
+        return None
     return CompileEnvironment.current().backend.minimum_expr(
         state.sympy_expr(source_end), tile_end_expr
     )
@@ -1048,7 +1048,7 @@ def _descendant_memory_accesses(
     visited once, depth-first; the order does not matter because every access is
     collected.
     """
-    from .plan_tiling import control_flow_child_graph_ids
+    from ..device_ir import control_flow_child_graph_ids
 
     accesses: LoopAccesses = []
     seen: set[int] = set()
@@ -1956,6 +1956,40 @@ def _is_static_int(expr: str) -> bool:
     return True
 
 
+_STATIC_DIM_BINOPS: dict[type[ast.operator], Callable[[int, int], int]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.FloorDiv: operator.floordiv,
+}
+
+
+def _static_block_dim(state: CodegenState, expr: ast.expr) -> int | None:
+    """Value of a generated BlockSpec dim expression, if it is a static int.
+
+    Dims combine integer literals and block-size constexprs with ``+ - * //``
+    (e.g. ``(_BLOCK_SIZE_1) * 2``); ``pl.BoundedSlice(n)`` holds ``n`` rows.
+    """
+    if isinstance(expr, ast.Constant) and type(expr.value) is int:
+        return expr.value
+    if isinstance(expr, ast.Name):
+        return state.device_function.resolved_int_constexpr(expr.id)
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "BoundedSlice"
+        and len(expr.args) == 1
+    ):
+        return _static_block_dim(state, expr.args[0])
+    if isinstance(expr, ast.BinOp) and type(expr.op) in _STATIC_DIM_BINOPS:
+        lhs = _static_block_dim(state, expr.left)
+        rhs = _static_block_dim(state, expr.right)
+        if lhs is None or rhs is None:
+            return None
+        return _STATIC_DIM_BINOPS[type(expr.op)](lhs, rhs)
+    return None
+
+
 def _compute_grid_and_block_sizes(
     state: CodegenState,
     block_ids: list[int],
@@ -2768,6 +2802,48 @@ def _rewrite_scratch_init_for_pre_broadcast(
     stmts.append(replacement)
 
 
+def _tile_pre_broadcast_inputs(
+    graph: torch.fx.Graph,
+    consumer: torch.fx.Node,
+    is_pre_broadcast: Callable[[torch.fx.Node], bool],
+    new_nodes: list[torch.fx.Node],
+) -> None:
+    """Adapt each selected source once per consumer, preserving repeated inputs."""
+    if consumer.op != "call_function" or is_pre_broadcast(consumer):
+        return
+    value = consumer.meta.get("val")
+    if not isinstance(value, torch.Tensor) or len(value.shape) < 2:
+        return
+    width = value.shape[-1]
+    if not isinstance(width, torch.SymInt) and int(width) == PRE_BROADCAST_SIZE:
+        return
+    args = list(consumer.args)
+    tiled_inputs: dict[torch.fx.Node, torch.fx.Node] = {}
+    for index, arg in enumerate(args):
+        if not isinstance(arg, torch.fx.Node) or not is_pre_broadcast(arg):
+            continue
+        arg_value = arg.meta.get("val")
+        if not isinstance(arg_value, torch.Tensor):
+            continue
+        if not (
+            isinstance(arg_value.shape[-1], int)
+            and arg_value.shape[-1] == PRE_BROADCAST_SIZE
+        ):
+            continue
+        if arg not in tiled_inputs:
+            with graph.inserting_before(consumer):
+                tiled = graph.call_function(_pre_broadcast_tile, args=(arg, width))
+            tiled.meta = {
+                **arg.meta,
+                "val": arg_value.new_empty([*arg_value.shape[:-1], width]),
+            }
+            new_nodes.append(tiled)
+            tiled_inputs[arg] = tiled
+        args[index] = tiled_inputs[arg]
+    if tiled_inputs:
+        consumer.args = tuple(args)
+
+
 def _rewrite_outer_subscripts_for_pre_broadcast(
     for_loop_node: torch.fx.Node | None,
     candidates: dict[int, torch.fx.Node],
@@ -2890,44 +2966,12 @@ def _rewrite_outer_subscripts_for_pre_broadcast(
 
     new_nodes: list[torch.fx.Node] = []
     for node in list(outer_graph.nodes):
-        if node.op != "call_function" or node.name in all_pre_broadcast_outer:
-            continue
-        node_val = node.meta.get("val", None)
-        if not isinstance(node_val, torch.Tensor) or len(node_val.shape) < 2:
-            continue
-        last_dim = node_val.shape[-1]
-        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
-            continue
-        args_list = list(node.args)
-        changed = False
-        for ai, arg in enumerate(args_list):
-            if not isinstance(arg, torch.fx.Node):
-                continue
-            if arg.name not in all_pre_broadcast_outer:
-                continue
-            arg_val = arg.meta.get("val", None)
-            if not isinstance(arg_val, torch.Tensor):
-                continue
-            if not (
-                isinstance(arg_val.shape[-1], int)
-                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
-            ):
-                continue
-            with outer_graph.inserting_before(node):
-                tiled = outer_graph.call_function(
-                    _pre_broadcast_tile,
-                    args=(arg, last_dim),
-                )
-            tiled.meta = {
-                **arg.meta,
-                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
-            }
-            new_nodes.append(tiled)
-            args_list[ai] = tiled
-            changed = True
-        if changed:
-            node.args = tuple(args_list)
+        _tile_pre_broadcast_inputs(
+            outer_graph,
+            node,
+            lambda arg: arg.name in all_pre_broadcast_outer,
+            new_nodes,
+        )
 
     # Re-prepare lowerings for modified outer nodes
     all_to_prepare = reshaped + new_nodes
@@ -3008,44 +3052,9 @@ def _annotate_pre_broadcast(
 
     # --- Step 3: insert _pre_broadcast_tile where pre-broadcast values feed wider-dim ops ---
     for node in list(graph.nodes):
-        if node.op != "call_function" or node.name in pre_broadcast_nodes:
-            continue
-        node_val = _node_val(node)
-        if node_val is None or len(node_val.shape) < 2:
-            continue
-        last_dim = node_val.shape[-1]
-        last_dim_is_sym = isinstance(last_dim, torch.SymInt)
-        if not last_dim_is_sym and int(last_dim) == PRE_BROADCAST_SIZE:
-            continue
-        args_list = list(node.args)
-        changed = False
-        for ai, arg in enumerate(args_list):
-            if not isinstance(arg, torch.fx.Node):
-                continue
-            if arg.name not in pre_broadcast_nodes:
-                continue
-            arg_val = _node_val(arg)
-            if arg_val is None:
-                continue
-            if not (
-                isinstance(arg_val.shape[-1], int)
-                and arg_val.shape[-1] == PRE_BROADCAST_SIZE
-            ):
-                continue
-            with graph.inserting_before(node):
-                tiled = graph.call_function(
-                    _pre_broadcast_tile,
-                    args=(arg, last_dim),
-                )
-            tiled.meta = {
-                **arg.meta,
-                "val": arg_val.new_empty([*arg_val.shape[:-1], last_dim]),
-            }
-            new_nodes.append(tiled)
-            args_list[ai] = tiled
-            changed = True
-        if changed:
-            node.args = tuple(args_list)
+        _tile_pre_broadcast_inputs(
+            graph, node, lambda arg: arg.name in pre_broadcast_nodes, new_nodes
+        )
 
     # --- Step 4: insert unsqueeze for lower-rank non-pre-broadcast values ---
     # Reductions produce rank R-1. Pre-broadcast nodes now have rank R+1
@@ -3461,6 +3470,9 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
             )
             _bid_to_pid_var[pid.block_id] = pid_var
 
+    # VMEM bytes of this pipeline's double-buffered blocks (static dims only).
+    pipeline_block_bytes: list[int] = []
+
     def _make_block_spec(
         fake: torch.Tensor, subscript_meta: Sequence[object], is_store: bool = False
     ) -> str:
@@ -3685,6 +3697,15 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
                     block_shape_parts.append(str(int(shape[dim_idx])))
                     lambda_parts.append("0")
 
+        numel = 1
+        for part in block_shape_parts:
+            dim = _static_block_dim(state, ast.parse(part, mode="eval").body)
+            if dim is None:
+                break
+            numel *= dim
+        else:
+            pipeline_block_bytes.append(2 * numel * fake.dtype.itemsize)
+
         block_shape_str = ", ".join(block_shape_parts)
         lambda_body = ", ".join(lambda_parts)
         lambda_param_str = ", ".join(lambda_params)
@@ -3807,6 +3828,12 @@ def _codegen_emit_pipeline(state: CodegenState) -> object:
         out_specs.append(_make_store_block_spec(fake, sub_meta))
         body_params.append(vmem_name)
         pipeline_out_args.append(_make_hbm_slice(fake, hbm_name, sub_meta))
+
+    # Each emit_pipeline scopes its buffers to its own call, so sequential
+    # pipelines never hold them at the same time.
+    state.device_function.pallas_pipeline_vmem_bytes = max(
+        state.device_function.pallas_pipeline_vmem_bytes, sum(pipeline_block_bytes)
+    )
 
     # Build the body function
     body_fn_name = state.device_function.new_var("_pipeline_body")
@@ -4803,7 +4830,7 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
     schedule while using Python ``range`` so JAX traces a straight-line program.
     """
     from ..device_ir import ForLoopGraphInfo
-    from ..device_ir import LiftTensorArgs
+    from ..device_ir import LiftGraphArgs
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import codegen_call_with_graph
     from ..tile_strategy import ForiLoopState
@@ -4950,10 +4977,14 @@ def _codegen_fori_loop(state: CodegenState, *, static_unroll: bool = False) -> o
         "unroll",
     )
 
-    input_tensors = cast(
-        "list[torch.Tensor]",
-        LiftTensorArgs(dict(HostFunction.current().params.arguments)).get_tensor_args(),
-    )
+    # Buffer-count slots index tensor inputs, not lifted runtime scalar inputs.
+    input_tensors = [
+        arg
+        for arg in LiftGraphArgs(
+            dict(HostFunction.current().params.arguments)
+        ).get_graph_args()
+        if isinstance(arg, torch.Tensor)
+    ]
     input_slots_by_id: dict[int, list[int]] = {}
     input_slots_by_storage: dict[int, list[int]] = {}
     for input_slot, input_tensor in enumerate(input_tensors):
@@ -5868,19 +5899,23 @@ def _pipeline_physical_mask_bounds(
     return ()
 
 
-@_decorators.codegen(_mask_to, "pallas")
-def _(state: CodegenState) -> ast.AST:
-    tensor = state.proxy_arg(0)
-    assert isinstance(tensor, torch.Tensor)
-    other = state.proxy_arg(1)
-    assert isinstance(other, (int, float, bool))
+def _tile_mask_expr(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    block_ids: Collection[int] | None = None,
+) -> str | None:
+    """The mask of the active tiles over ``tensor``'s dims (of the canonical
+    ``block_ids`` only, if given) as a float tensor broadcast to its shape,
+    or None when no such dim has a masked tile."""
     mask_exprs: list[str] = []
     input_sizes = [*tensor.size()]
     env = CompileEnvironment.current()
     backend = env.backend
     for dim, size in enumerate(input_sizes):
         index = env.resolve_block_id(size)
-        if index is None:
+        if index is None or (
+            block_ids is not None and env.canonical_block_id(index) not in block_ids
+        ):
             continue
         mask_var = state.codegen.mask_var(index)
         physical_bounds = _pipeline_physical_mask_bounds(state, index)
@@ -5903,13 +5938,26 @@ def _(state: CodegenState) -> ast.AST:
         if expr not in mask_exprs:
             mask_exprs.append(expr)
     if not mask_exprs:
-        return state.ast_arg(0)
+        return None
     # Combine float masks via multiplication (equivalent to bool AND).
     mask_expr = " * ".join(mask_exprs)
     if len(mask_exprs) < len(input_sizes):
         mask_expr = backend.broadcast_to_expr(
             mask_expr, state.tile_strategy.shape_str(input_sizes)
         )
+    return mask_expr
+
+
+@_decorators.codegen(_mask_to, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    other = state.proxy_arg(1)
+    assert isinstance(other, (int, float, bool))
+    mask_expr = _tile_mask_expr(state, tensor)
+    if mask_expr is None:
+        return state.ast_arg(0)
+    backend = CompileEnvironment.current().backend
     # Ensure the masked value literal matches the tensor dtype
     input_dtype = tensor.dtype
     other_typed = expr_from_string(
@@ -5919,4 +5967,26 @@ def _(state: CodegenState) -> ast.AST:
         backend.where_expr(mask_expr, "{expr}", "{other}"),
         expr=state.ast_arg(0),
         other=other_typed,
+    )
+
+
+@_decorators.codegen(_mask_select, "pallas")
+def _(state: CodegenState) -> ast.AST:
+    tensor = state.proxy_arg(0)
+    assert isinstance(tensor, torch.Tensor)
+    block_ids = state.proxy_arg(2)
+    assert isinstance(block_ids, tuple)
+    mask_expr = _tile_mask_expr(state, tensor, block_ids)
+    if mask_expr is None:
+        return state.ast_arg(0)
+    backend = CompileEnvironment.current().backend
+    other = state.proxy_arg(1)
+    return expr_from_string(
+        backend.where_expr(mask_expr, "{expr}", "{other}"),
+        expr=state.ast_arg(0),
+        other=expr_from_string(
+            backend.full_expr([], constant_repr(other), tensor.dtype)
+        )
+        if isinstance(other, (int, float, bool))
+        else state.ast_arg(1),
     )

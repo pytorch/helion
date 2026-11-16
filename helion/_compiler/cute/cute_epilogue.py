@@ -12,7 +12,7 @@ register. The reachability check
 *reachability* — that the value depends on a tcgen05-registered matmul
 fx_node — and is the loud-failure backstop. This module owns the
 *narrower* whitelist-based classifier that produces a renderable inline
-expression for two cases:
+expression for these cases:
 
 - Unary chains: ``matmul -> [whitelisted unary op]* ->
   [convert_element_type] -> store``, where the terminal cast is omitted for
@@ -36,11 +36,21 @@ expression for two cases:
 - Tile-uniform scalars: a host scalar lifted into the kernel
   (``alpha * acc`` with a captured Python float) or a rank-0 aux load
   (``acc * scale[()]``) is a :class:`_RuntimeScalarExpr` leaf rendered
-  inline as one ``cutlass.Float32`` value.
-  Forms outside these two — 3-D underlying tensors with a static
-  collapse, mismatched indices, leading-axis rank-1
-  (``bias[tile_m]``), kwargs — are rejected to the loud-failure
-  backstop.
+  inline as one ``cutlass.Float32`` value. A 0-d constant (Inductor's FP32
+  ``hl.full([], c)``, or a traced ``aten.scalar_tensor`` at a select's 16-bit
+  or FP32 dtype) is the literal it holds, and a boolean mask converts to its
+  exact 0/1 promotion.
+- Selects: ``where(cond, literal, carrier)`` (either branch order) on an
+  auxiliary boolean condition, rendered as ``cute.where``; inside an
+  expression, ``where(cond, a, b)`` over expression or literal branches.
+- Steps that read the carrier more than once (GELU backward
+  ``acc * f(x) + acc * g(x)``, SELU backward ``where(c, acc * k1 * exp(x),
+  acc * k2)``): the expression down to the carrier paths' join is one step
+  (``_classify_carrier_dag``).
+
+Forms outside these — 3-D underlying tensors with a static collapse,
+mismatched indices, leading-axis rank-1 (``bias[tile_m]``), kwargs — are
+rejected to the loud-failure backstop.
 
 Any op outside the whitelist (reductions, shape changes,
 auxiliary-tensor loads with unsupported indexing, etc.) bails to
@@ -58,27 +68,41 @@ inline.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 import operator
 from typing import TYPE_CHECKING
+from typing import TypeVar
+from typing import cast
 
 import sympy
 import torch
 
 from ...language import _tracing_ops
+from ...language import memory_ops
 from ...language._gelu_tanh_approx import _gelu_erf
 from ...language._gelu_tanh_approx import _gelu_tanh_approx
 from ...language._gelu_tanh_approx import epilogue_unary_step_template
 from ...language._gelu_tanh_approx import gelu_erf_epilogue_unary_step_template
 from ...language._tracing_ops import _get_symnode
+from ...language.creation_ops import full as helion_full
+from ..compile_environment import CompileEnvironment
 from .cute_fx_walk import aux_tensor_load_kind
 from .cute_fx_walk import build_inner_outputs_index
 from .cute_fx_walk import build_inner_outputs_index_from_graphs
 from .cute_fx_walk import walk_carrier_to_tcgen05_matmul
+from .dtypes import narrow_common_dtype
+from .dtypes import round_scalar
+from .gelu_tanh_approx import FAST_MATH_UNARY_OPS
+from .gelu_tanh_approx import fast_math_unary_template
 from .math_templates import SIGMOID_TEMPLATE
+from .math_templates import float_literal
+from .tcgen05_constants import Tcgen05RowvecAuxRow
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from ..device_ir import GraphInfo
     from ..inductor_lowering import CodegenState
@@ -101,11 +125,15 @@ class _UnaryOp:
     more ``{inner}`` placeholders and is the Python source the splice
     substitutes for the prior carrier local. The renderer keeps carriers
     bound at every step, so multi-reference templates can reuse the existing
-    local directly without a second alias.
+    local directly without a second alias. ``transcendental`` marks an op a
+    math library call (or a polynomial) renders: per element it costs tens of
+    instructions, where an add or a cast costs one
+    (``Tcgen05UnaryEpilogueChain.transcendental_op_count``).
     """
 
     op_name: str
     template: str
+    transcendental: bool = False
 
 
 _FLOAT_CAST_TYPES = {
@@ -121,6 +149,23 @@ def _round_epilogue_expression(template: str, dtype: torch.dtype | None) -> str:
         return template
     assert dtype is not None
     return f"({template}).to({_FLOAT_CAST_TYPES[dtype]}).to(cutlass.Float32)"
+
+
+def _unary_step_for(target: object) -> _UnaryOp | None:
+    """The accepted zero-arg unary step for ``target``, in the current
+    settings' math regime: under ``fast_math`` the DSL math calls and the
+    exact-GELU helper take ``fastmath=True`` (as the pointwise lowering of
+    the same ops does)."""
+    step = _ZERO_ARG_TARGETS.get(target)
+    if (
+        step is not None
+        and step.op_name in FAST_MATH_UNARY_OPS
+        and CompileEnvironment.current().settings.fast_math
+    ):
+        return dataclasses.replace(
+            step, template=fast_math_unary_template(step.template)
+        )
+    return step
 
 
 def _round_unary_step(step: _UnaryOp, node: torch.fx.Node) -> _UnaryOp:
@@ -195,12 +240,25 @@ class _AuxiliaryTensorLoadExpr:
     template: str
 
 
+# Splice-side bindings of chain leaves to pre-bound locals: every auxiliary
+# load leaf (its per-subtile ``aux_loaded`` value) and, optionally, the
+# rank-0 device scalars (bound once per output tile ahead of the accumulator
+# wait; see ``Tcgen05UnaryEpilogueChain.render_runtime_scalar_bindings``).
+_LeafBindings = dict[_AuxiliaryTensorLoadExpr | _RuntimeScalarExpr, str]
+
+
 @dataclasses.dataclass(frozen=True)
 class _UnaryTensorExpr:
     """A whitelisted elementwise unary operation over an auxiliary expression."""
 
     step: _UnaryOp
     operand: _TensorExpr
+
+    @functools.cached_property
+    def contains_current(self) -> bool:
+        """Whether the expression reads the carrier; computed once, so a
+        subtree several uses share is visited once."""
+        return _tensor_expr_contains_current(self.operand)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -212,14 +270,59 @@ class _BinaryTensorExpr:
     lhs: _TensorExpr
     rhs: _TensorExpr
 
+    @functools.cached_property
+    def contains_current(self) -> bool:
+        """Whether the expression reads the carrier (``_UnaryTensorExpr``)."""
+        return _tensor_expr_contains_current(self.lhs) or (
+            self.rhs is not self.lhs and _tensor_expr_contains_current(self.rhs)
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _SelectTensorExpr:
+    """``where(condition, on_true, on_false)``, rendered as ``cute.where``.
+
+    A branch is an expression or a literal already rounded to the select's
+    result type (a ``float``, spelled inline)."""
+
+    condition: _TensorExpr
+    on_true: _TensorExpr | float
+    on_false: _TensorExpr | float
+
+    @property
+    def branch_exprs(self) -> tuple[_TensorExpr, ...]:
+        return tuple(
+            branch
+            for branch in (self.on_true, self.on_false)
+            if not isinstance(branch, float)
+        )
+
+    @functools.cached_property
+    def contains_current(self) -> bool:
+        """Whether the expression reads the carrier (``_UnaryTensorExpr``)."""
+        return any(
+            _tensor_expr_contains_current(child)
+            for child in (self.condition, *self.branch_exprs)
+        )
+
 
 _TensorExpr = (
     _CurrentTensorExpr
     | _AuxiliaryTensorLoadExpr
     | _UnaryTensorExpr
     | _BinaryTensorExpr
+    | _SelectTensorExpr
     | _RuntimeScalarExpr
 )
+
+
+# The aux-leaf template of an FP32 conversion of the loaded value
+# (``aux.to(torch.float32)``; ``_canonical_aux_load_operand``).
+_F32_CAST_AUX_TEMPLATE = "({aux}).to(cutlass.Float32)"
+# Leaf templates whose 16-bit operand reaches the FP32 root unrounded: the
+# bare load, which the DSL promotes, and Inductor's explicit FP32 conversion
+# (``bias.to(torch.float32) + acc``).
+_F32_PROMOTED_LEAF_TEMPLATES = ("{aux}", _F32_CAST_AUX_TEMPLATE)
 
 
 def aux_leaf_promoted_by_f32_root(
@@ -228,18 +331,32 @@ def aux_leaf_promoted_by_f32_root(
     """Whether ``leaf`` is consumed only by the FP32 root ``acc <op> aux`` step.
 
     True when the chain is that single step, the leaf carries no cast wrapper
-    and the step's result dtype is FP32 (``_round_epilogue_expression`` left
-    the template unrounded), i.e. the DSL promotes the loaded operand to FP32
-    before the op. A 16-bit leaf may then be staged already converted: the
-    fp16/bf16 -> fp32 conversion is exact, so the result is bit-identical.
+    other than an explicit FP32 conversion and the step's result dtype is FP32
+    (``_round_epilogue_expression`` left the template unrounded), i.e. the
+    loaded operand reaches the op as FP32. A 16-bit leaf may then be staged
+    already converted: the fp16/bf16 -> fp32 conversion is exact, so the
+    result is bit-identical (the conversion of the staged FP32 value is the
+    identity).
     """
-    if leaf.template != "{aux}" or len(chain.steps) != 1:
+    if leaf.template not in _F32_PROMOTED_LEAF_TEMPLATES or len(chain.steps) != 1:
         return False
     root = chain.steps[0].expr
     if not isinstance(root, _BinaryTensorExpr) or ".to(" in root.op_template:
         return False
     return (isinstance(root.lhs, _CurrentTensorExpr) and root.rhs is leaf) or (
         isinstance(root.rhs, _CurrentTensorExpr) and root.lhs is leaf
+    )
+
+
+def tcgen05_rowvec_aux_row(
+    chain: Tcgen05UnaryEpilogueChain, leaf: _AuxiliaryTensorLoadExpr, itemsize: int
+) -> Tcgen05RowvecAuxRow:
+    """The row stage an N-broadcast (``bias[tile_n]``) aux leaf of
+    ``itemsize`` bytes takes: staged converted to FP32 when it is a 16-bit
+    leaf only the FP32 root reads (``aux_leaf_promoted_by_f32_root``)."""
+    return Tcgen05RowvecAuxRow(
+        itemsize=itemsize,
+        promoted=itemsize == 2 and aux_leaf_promoted_by_f32_root(chain, leaf),
     )
 
 
@@ -299,6 +416,99 @@ def aux_leaf_takes_promoted_f32_stage(
     )
 
 
+def rowvec_aux_stage_copy_elems(
+    aux_dtype_bits: int,
+    block_n: int,
+    aux_extent: int | None,
+    *,
+    copy_bits: int = 128,
+) -> int | None:
+    """Return the vector width when a row-vector aux can be staged safely."""
+    if aux_extent is None or aux_dtype_bits <= 0:
+        return None
+    if copy_bits % aux_dtype_bits != 0:
+        return None
+    copy_elems = copy_bits // aux_dtype_bits
+    if copy_elems <= 0:
+        return None
+    if block_n % copy_elems != 0 or aux_extent % copy_elems != 0:
+        return None
+    return copy_elems
+
+
+def rowvec_aux_takes_per_warp_f32_stage(
+    *,
+    aux_dtype_bits: int,
+    broadcast_axis: int | None,
+    epi_warp_count: int,
+    bn: int,
+    aux_extent: int | None,
+) -> bool:
+    """Whether a row-vector leaf takes the warp-private FP32 SMEM stage.
+
+    The shape half of the store lowering's ``pre_acc_wait`` decision (its
+    site conditions -- full-tile TMA-store epilogue into a row-major output,
+    an epilogue tile of at least 128 rows, no whole-fragment register hoist
+    -- are the caller's): a 32-bit N-broadcast row whose width splits into
+    whole 32-lane copies (``bn % (32 * copy_elems) == 0``), on the B200
+    sweep's profitable widths (``bn >= 64``, a stage of at most 4 KiB).
+    """
+    if aux_dtype_bits != 32 or broadcast_axis != 1:
+        return False
+    copy_elems = rowvec_aux_stage_copy_elems(aux_dtype_bits, bn, aux_extent)
+    if copy_elems is None or bn % (32 * copy_elems) != 0:
+        return False
+    return bn >= 64 and epi_warp_count * bn * (aux_dtype_bits // 8) <= 4 * 1024
+
+
+def fanout_pre_wait_stages_rowvec_aux(
+    chains: Sequence[Tcgen05UnaryEpilogueChain],
+    *,
+    bm: int,
+    bn: int,
+    epi_warp_count: int,
+) -> bool:
+    """Whether ``pre_acc_wait`` would SMEM-stage a row-vector leaf of a shared
+    two-output epilogue.
+
+    The fan-out traversal concatenates both stores' per-tile setups and does
+    not compose a per-store stage and barrier, so the splice declines such
+    kernels; this is the same decision at config level.  The fan-out's own
+    schedule fixes the site conditions: a full-tile TMA-store epilogue into
+    row-major outputs (``prove_paired_fanout``), the default epilogue tile of
+    ``bm`` rows (the 128-row staging gate is ``bm >= 128``) and no two-CTA
+    m128 register hoist (the paired fan-out needs ``bm == 256``).
+    """
+    if bm < 128:
+        return False
+    for chain in chains:
+        for leaf in chain.auxiliary_tensor_loads:
+            if leaf.broadcast_axis != 1:
+                continue
+            tensor_node = leaf.load_node.args[0]
+            assert isinstance(tensor_node, torch.fx.Node)
+            tensor = tensor_node.meta["val"]
+            assert isinstance(tensor, torch.Tensor)
+            bits = tensor.dtype.itemsize * 8
+            extent = tensor.shape[0] if isinstance(tensor.shape[0], int) else None
+            if rowvec_aux_takes_per_warp_f32_stage(
+                aux_dtype_bits=bits,
+                broadcast_axis=1,
+                epi_warp_count=epi_warp_count,
+                bn=bn,
+                aux_extent=extent,
+            ) or aux_leaf_takes_promoted_f32_stage(
+                chain,
+                leaf,
+                aux_dtype_bits=bits,
+                epi_warp_count=epi_warp_count,
+                bn=bn,
+                aux_extent=extent,
+            ):
+                return True
+    return False
+
+
 @dataclasses.dataclass(frozen=True)
 class _AuxiliaryTensorExprStep:
     """One expression over the current carrier, scalars, and auxiliary loads."""
@@ -311,28 +521,44 @@ class _AuxiliaryTensorExprStep:
 
     @property
     def hoistable_aux_expr(self) -> _TensorExpr | None:
-        """Return a nontrivial aux-only side of the root carrier binary op."""
+        """Return a nontrivial aux-only side of the root carrier binary op
+        (not a side that reads the carrier too: ``acc * sigmoid(acc)``), or
+        the computed condition of a select between the carrier and a literal
+        (ReLU backward's ``x <= 0``)."""
+        if isinstance(self.expr, _SelectTensorExpr):
+            branches = (self.expr.on_true, self.expr.on_false)
+            if (
+                all(
+                    isinstance(branch, (float, _CurrentTensorExpr))
+                    for branch in branches
+                )
+                and not isinstance(self.expr.condition, _AuxiliaryTensorLoadExpr)
+                and not _tensor_expr_contains_current(self.expr.condition)
+            ):
+                return self.expr.condition
+            return None
         if not isinstance(self.expr, _BinaryTensorExpr):
             return None
-        if isinstance(self.expr.lhs, _CurrentTensorExpr) and not isinstance(
-            self.expr.rhs, _AuxiliaryTensorLoadExpr
+        for carrier, other in (
+            (self.expr.lhs, self.expr.rhs),
+            (self.expr.rhs, self.expr.lhs),
         ):
-            return self.expr.rhs
-        if isinstance(self.expr.rhs, _CurrentTensorExpr) and not isinstance(
-            self.expr.lhs, _AuxiliaryTensorLoadExpr
-        ):
-            return self.expr.lhs
+            if (
+                isinstance(carrier, _CurrentTensorExpr)
+                and not isinstance(other, _AuxiliaryTensorLoadExpr)
+                and not _tensor_expr_contains_current(other)
+            ):
+                return other
         return None
 
     def render_hoistable_aux_prelude_and_expr(
         self,
-        aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str],
+        aux_locals_by_expr: _LeafBindings,
         local_name_factory: object,
         prelude_indent: str,
     ) -> tuple[str, str]:
         aux_expr = self.hoistable_aux_expr
         assert aux_expr is not None
-        assert len(aux_locals_by_expr) == len(self.operands)
         assert all(operand in aux_locals_by_expr for operand in self.operands)
         return _render_auxiliary_tensor_expr(
             aux_expr,
@@ -343,6 +569,12 @@ class _AuxiliaryTensorExprStep:
         )
 
     def render_with_hoisted_aux(self, carrier_name: str, aux_name: str) -> str:
+        if isinstance(self.expr, _SelectTensorExpr):
+            on_true, on_false = (
+                float_literal(branch) if isinstance(branch, float) else carrier_name
+                for branch in (self.expr.on_true, self.expr.on_false)
+            )
+            return f"cute.where({aux_name}, {on_true}, {on_false})"
         assert isinstance(self.expr, _BinaryTensorExpr)
         if isinstance(self.expr.lhs, _CurrentTensorExpr):
             lhs, rhs = carrier_name, aux_name
@@ -354,7 +586,7 @@ class _AuxiliaryTensorExprStep:
     def render_prelude_and_expr(
         self,
         carrier_name: str,
-        aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str],
+        aux_locals_by_expr: _LeafBindings,
         local_name_factory: object,
         prelude_indent: str,
     ) -> tuple[str, str]:
@@ -399,16 +631,17 @@ _ERF_TEMPLATE = "cute.math.erf({inner})"
 # The chain renderer retains each result's dtype rounding separately.
 _SIGMOID_TEMPLATE = SIGMOID_TEMPLATE.format(x="{inner}")
 
-# SiLU also accepts an explicit division-based decomposition. Keep its
-# existing arithmetic form separate from the standalone sigmoid contract.
-_LOG2_E = 1.4426950408889634
-# ``silu(x) = x * sigmoid(x)``. The chain renderer always binds
-# ``{inner}`` to a fresh local before formatting, so the two
-# references to ``{inner}`` here resolve to a single SSA name (no
-# source-size blowup).
-_SILU_TEMPLATE = (
-    f"(({{inner}}) * (1.0 / (1.0 + cute.math.exp2(-({{inner}}) * {_LOG2_E!r}))))"
-)
+# The two silu decompositions ``_classify_silu`` folds compute what the
+# pointwise lowering computes for them, so a fused epilogue and an unfused
+# one agree bit for bit (``_silu_step``).  The chain renderer always binds
+# ``{inner}`` to a fresh local before formatting, so the repeated ``{inner}``
+# resolves to a single SSA name (no source-size blowup).
+# ``x * sigmoid(x)``: the sigmoid contract, with or without ``fast_math``.
+_SILU_SIGMOID_TEMPLATE = f"(({{inner}}) * {_SIGMOID_TEMPLATE})"
+# ``x / (1 + exp(-x))`` without ``fast_math``: the quotient of the exactly
+# reduced ``cute.math.exp`` as the launch divides (no
+# reciprocal-then-multiply, which rounds twice).
+_SILU_DIVISION_TEMPLATE = "(({inner}) / (1.0 + cute.math.exp(-({inner}))))"
 
 
 def _add_const_template(scalar: float) -> str:
@@ -485,11 +718,21 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     ),
     torch.ops.aten.abs.default: _UnaryOp(op_name="abs", template=_ABS_TEMPLATE),
     torch.ops.aten.neg.default: _UnaryOp(op_name="neg", template=_NEG_TEMPLATE),
-    torch.ops.aten.tanh.default: _UnaryOp(op_name="tanh", template=_TANH_TEMPLATE),
-    torch.ops.aten.exp.default: _UnaryOp(op_name="exp", template=_EXP_TEMPLATE),
-    torch.ops.aten.log.default: _UnaryOp(op_name="log", template=_LOG_TEMPLATE),
-    torch.ops.aten.sqrt.default: _UnaryOp(op_name="sqrt", template=_SQRT_TEMPLATE),
-    torch.ops.aten.erf.default: _UnaryOp(op_name="erf", template=_ERF_TEMPLATE),
+    torch.ops.aten.tanh.default: _UnaryOp(
+        op_name="tanh", template=_TANH_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.exp.default: _UnaryOp(
+        op_name="exp", template=_EXP_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.log.default: _UnaryOp(
+        op_name="log", template=_LOG_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.sqrt.default: _UnaryOp(
+        op_name="sqrt", template=_SQRT_TEMPLATE, transcendental=True
+    ),
+    torch.ops.aten.erf.default: _UnaryOp(
+        op_name="erf", template=_ERF_TEMPLATE, transcendental=True
+    ),
     # ``aten.sigmoid.default`` is accepted as a standalone unary step so
     # ``out[tile] = sigmoid(acc).to(...)`` fuses end-to-end. Its FP32
     # expression matches the default pointwise sigmoid lowering;
@@ -497,10 +740,12 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     torch.ops.aten.sigmoid.default: _UnaryOp(
         op_name="sigmoid",
         template=_SIGMOID_TEMPLATE,
+        transcendental=True,
     ),
     _gelu_erf: _UnaryOp(
         op_name="gelu_erf",
         template=gelu_erf_epilogue_unary_step_template(),
+        transcendental=True,
     ),
     # ``F.gelu(x, approximate="tanh")`` (mapped to ``_gelu_tanh_approx``
     # by the device_ir decomp) — single FX node folding the polynomial
@@ -509,6 +754,7 @@ _ZERO_ARG_TARGETS: dict[object, _UnaryOp] = {
     _gelu_tanh_approx: _UnaryOp(
         op_name="gelu_tanh_approx",
         template=epilogue_unary_step_template(),
+        transcendental=True,
     ),
     # Conversions require their dtype argument and are handled separately by
     # _floating_cast_step so intermediate rounding is retained explicitly.
@@ -550,6 +796,188 @@ _BINARY_OP_NAMES: dict[object, str] = {
     torch.ops.aten.sub.Tensor: "sub",
     torch.ops.aten.div.Tensor: "div",
 }
+
+# Elementwise comparisons over auxiliary expressions (``acc * (c[tile] > 0)``,
+# the relu-backward mask).  Both overloads trace with the scalar second; the
+# TensorSSA operators lower to the ordered ``cmpf`` predicates (``UNE`` for
+# ``ne``), which is exactly torch's NaN behaviour for every one of these.
+_COMPARE_TARGETS: dict[object, tuple[str, str]] = {
+    torch.ops.aten.gt.Tensor: ("gt", "({lhs}) > ({rhs})"),
+    torch.ops.aten.gt.Scalar: ("gt", "({lhs}) > ({rhs})"),
+    torch.ops.aten.ge.Tensor: ("ge", "({lhs}) >= ({rhs})"),
+    torch.ops.aten.ge.Scalar: ("ge", "({lhs}) >= ({rhs})"),
+    torch.ops.aten.lt.Tensor: ("lt", "({lhs}) < ({rhs})"),
+    torch.ops.aten.lt.Scalar: ("lt", "({lhs}) < ({rhs})"),
+    torch.ops.aten.le.Tensor: ("le", "({lhs}) <= ({rhs})"),
+    torch.ops.aten.le.Scalar: ("le", "({lhs}) <= ({rhs})"),
+    torch.ops.aten.eq.Tensor: ("eq", "({lhs}) == ({rhs})"),
+    torch.ops.aten.eq.Scalar: ("eq", "({lhs}) == ({rhs})"),
+    torch.ops.aten.ne.Tensor: ("ne", "({lhs}) != ({rhs})"),
+    torch.ops.aten.ne.Scalar: ("ne", "({lhs}) != ({rhs})"),
+}
+
+# torch promotes a boolean operand of floating arithmetic to the floating
+# dtype (``True -> 1.0``); a Boolean TensorSSA converts the same way (Boolean
+# is an Integer subtype, ``itofp``).  The promoted value is exact in every
+# floating dtype, so one FP32 step models the promotion to any of them.
+_BOOL_TO_FLOAT_STEP = _UnaryOp(op_name="mask", template="({inner}).to(cutlass.Float32)")
+_TO_FLOAT32_STEP = _UnaryOp(
+    op_name="to_float32", template="({inner}).to(cutlass.Float32)"
+)
+
+
+def _promote_bool_operand(
+    expr: _TensorExpr, node: torch.fx.Node, result_dtype: torch.dtype | None
+) -> _TensorExpr | None:
+    """Return ``expr`` as the floating operand torch makes of ``node``.
+
+    A boolean operand of a floating-point result is promoted; a boolean
+    operand anywhere else (a boolean result, or no dtype) is not modelled.
+    """
+    if _node_tensor_dtype(node) != torch.bool:
+        return expr
+    if result_dtype is None or not result_dtype.is_floating_point:
+        return None
+    return _UnaryTensorExpr(step=_BOOL_TO_FLOAT_STEP, operand=expr)
+
+
+def _common_dtype_operand(
+    expr: _TensorExpr, node: torch.fx.Node, other: torch.fx.Node
+) -> _TensorExpr:
+    """``expr``, the tensor operand ``node`` of a binary op beside ``other``,
+    converted as torch converts it: rounded to a 16-bit common dtype it does
+    not carry (``acc.to(torch.bfloat16) * scale[()]`` rounds the 0-d fp32
+    scale to bf16 before the product).  A host scalar is no tensor and keeps
+    its value."""
+    val = node.meta.get("val")
+    if not isinstance(val, torch.Tensor) or not isinstance(
+        other.meta.get("val"), torch.Tensor
+    ):
+        return expr
+    common = narrow_common_dtype(node, other)
+    if common is None or val.dtype in (common, torch.bool):
+        return expr
+    return _UnaryTensorExpr(
+        step=_UnaryOp(
+            op_name=f"to_{common}",
+            template=_round_epilogue_expression("{inner}", common),
+        ),
+        operand=expr,
+    )
+
+
+def _operand_dtype_matches(
+    expr: _TensorExpr, node: torch.fx.Node, result_dtype: torch.dtype
+) -> bool:
+    """Whether an aux operand already carries the binary op's result dtype.
+
+    A host scalar is weakly typed: torch promotes it to the tensor operand's
+    dtype like a literal.  A promoted boolean operand was just converted.
+    A rank-0 load is a tensor operand and must already carry the result dtype.
+    """
+    if _is_host_scalar_expr(expr):
+        return True
+    if _node_tensor_dtype(node) == torch.bool:
+        return True
+    return _node_tensor_dtype(node) == result_dtype
+
+
+def _round_literal(
+    value: float, dtype: torch.dtype, *, finite: bool = True
+) -> float | None:
+    """``value`` rounded to ``dtype``; ``None`` when ``finite`` and it rounds
+    to a non-finite value (the arithmetic templates splice ``repr(value)``,
+    and ``repr(inf)`` is ``inf``; see ``_extract_scalar``). The chain is
+    analyzed while lowering, under the tracing mode, which ``round_scalar``
+    steps out of."""
+    rounded = round_scalar(value, dtype)
+    return rounded if math.isfinite(rounded) or not finite else None
+
+
+def _fold_scalar_literal(arg: object) -> object:
+    """A 0-d constant as the literal it holds; any other argument unchanged.
+
+    Inductor lowers a constant operand of a pointwise op to a 0-d FP32
+    ``hl.full`` (``x * 0.5`` -> ``x * hl.full([], 0.5, dtype=torch.float32)``),
+    and a Python number where torch needs a tensor (``torch.where(m, acc,
+    0.0)``) traces to ``aten.scalar_tensor``; the chain treats both like the
+    number.
+    """
+    if not isinstance(arg, torch.fx.Node) or arg.op != "call_function":
+        return arg
+    val = arg.meta.get("val")
+    if (
+        arg.target is helion_full
+        and not arg.kwargs
+        and len(arg.args) >= 2
+        and isinstance(val, torch.Tensor)
+        and val.ndim == 0
+        and val.dtype is torch.float32
+    ):
+        value = arg.args[1]
+    elif (
+        arg.target is torch.ops.aten.scalar_tensor.default
+        and len(arg.args) == 1
+        and arg.kwargs.get("dtype") in _FLOAT_CAST_TYPES
+    ):
+        # The 0-d tensor holds the value rounded to its dtype (Helion traces
+        # a select's literal at the select's result dtype).
+        value = arg.args[0]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = _round_literal(value, arg.kwargs["dtype"], finite=False)
+    else:
+        return arg
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value
+    return arg
+
+
+def _binary_operands(node: torch.fx.Node) -> tuple[object, object]:
+    """The two operands of the binary ``node`` (the lowering's
+    ``strip_unused_inputs`` keeps a repeated operand, so ``x * x`` reaches the
+    chain as ``mul(x, x)``; a ``None`` is a pruned input and declines) with
+    0-d ``hl.full`` constants as their literals (``_fold_scalar_literal``).
+
+    Unlike a Python number, a 0-d tensor operand converts to a 16-bit result
+    type first: ``bf16_x * hl.full([], 0.1)`` multiplies by
+    ``bf16(0.1) = 0.10009765625``, so its literal is rounded to that type (a
+    literal that rounds to infinity stays the node, which no template takes).
+    """
+    args = node.args
+    if len(args) < 2 or args[0] is None or args[1] is None:
+        return None, None
+    result_dtype = _node_tensor_dtype(node)
+
+    def fold(arg: object) -> object:
+        value = _fold_scalar_literal(arg)
+        if (
+            value is arg
+            or result_dtype is None
+            or result_dtype not in (torch.float16, torch.bfloat16)
+        ):
+            return value
+        assert isinstance(value, (int, float))
+        rounded = _round_literal(value, result_dtype)
+        return arg if rounded is None else rounded
+
+    return fold(args[0]), fold(args[1])
+
+
+def _boolean_mask_cast(node: torch.fx.Node) -> torch.fx.Node | None:
+    """The boolean operand of ``node`` when it converts a boolean mask to
+    ``torch.bool`` (an identity) or to a floating type (the exact 0/1
+    promotion), else ``None``."""
+    if (
+        node.op == "call_function"
+        and node.target is torch.ops.prims.convert_element_type.default
+        and not node.kwargs
+        and len(node.args) == 2
+        and isinstance(node.args[0], torch.fx.Node)
+        and _node_tensor_dtype(node.args[0]) is torch.bool
+        and (node.args[1] is torch.bool or node.args[1] in _FLOAT_CAST_TYPES)
+    ):
+        return node.args[0]
+    return None
 
 
 def _extract_scalar(arg: object) -> float | None:
@@ -658,7 +1086,7 @@ def _canonical_aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str
     ):
         inner = node.args[0]
         if _is_helion_load_node(inner):
-            return inner, "({aux}).to(cutlass.Float32)"
+            return inner, _F32_CAST_AUX_TEMPLATE
     return node, "{aux}"
 
 
@@ -678,8 +1106,7 @@ def _aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
         return node, "{aux}"
     if node.kwargs or len(node.args) < 2:
         return node, "{aux}"
-    lhs = node.args[0]
-    rhs = node.args[1]
+    lhs, rhs = _binary_operands(node)
     if isinstance(lhs, torch.fx.Node):
         scalar = _extract_scalar(rhs)
         inner = lhs
@@ -692,6 +1119,10 @@ def _aux_load_operand(node: torch.fx.Node) -> tuple[torch.fx.Node, str]:
         return node, "{aux}"
     load_node, inner_template = _canonical_aux_load_operand(inner)
     if load_node is inner and not _is_helion_load_node(load_node):
+        return node, "{aux}"
+    if len(inner.users) > 1 or len(load_node.users) > 1:
+        # The load's other uses (GELU backward reads ``x`` bare and as
+        # ``x * 0.5``) read the same leaf: one load, the scale a separate step.
         return node, "{aux}"
     load_dtype = _node_tensor_dtype(load_node)
     if load_dtype is None or not load_dtype.is_floating_point:
@@ -730,10 +1161,12 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
         return True
     if node.op != "call_function" or node.kwargs:
         return False
+    if (mask := _boolean_mask_cast(node)) is not None:
+        return _is_auxiliary_tensor_expr_node(mask, depth + 1)
     cast_step = _floating_cast_step(node)
     if cast_step is not None:
         return _is_auxiliary_tensor_expr_node(cast_step[1], depth + 1)
-    unary_step = _ZERO_ARG_TARGETS.get(node.target)
+    unary_step = _unary_step_for(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
         if len(node.args) != 1 or not isinstance(node.args[0], torch.fx.Node):
@@ -745,14 +1178,35 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
             _, unary_operand = silu
     if unary_operand is not None:
         return _is_auxiliary_tensor_expr_node(unary_operand, depth + 1)
-    if node.target not in _SCALAR_BINARY_TARGETS or len(node.args) != 2:
+    if node.target is torch.ops.aten.where.self and len(node.args) == 3:
+        # ``_classify_select``: a condition and expression or literal branches
+        cond, *branches = node.args
+        if not isinstance(cond, torch.fx.Node) or not _is_auxiliary_tensor_expr_node(
+            cond, depth + 1
+        ):
+            return False
+        for branch in branches:
+            branch = _fold_scalar_literal(branch)
+            if isinstance(branch, torch.fx.Node):
+                if not _is_auxiliary_tensor_expr_node(branch, depth + 1):
+                    return False
+            elif not isinstance(branch, (int, float)) or isinstance(branch, bool):
+                return False
+        return True
+    if (
+        node.target not in _SCALAR_BINARY_TARGETS
+        and node.target not in _COMPARE_TARGETS
+    ) or len(node.args) != 2:
         return False
-    lhs, rhs = node.args
+    lhs, rhs = _binary_operands(node)
     lhs_is_expr = isinstance(lhs, torch.fx.Node) and _is_auxiliary_tensor_expr_node(
         lhs, depth + 1
     )
-    rhs_is_expr = isinstance(rhs, torch.fx.Node) and _is_auxiliary_tensor_expr_node(
-        rhs, depth + 1
+    rhs_is_expr = (
+        lhs_is_expr  # a repeated operand is checked once
+        if rhs is lhs
+        else isinstance(rhs, torch.fx.Node)
+        and _is_auxiliary_tensor_expr_node(rhs, depth + 1)
     )
     if lhs_is_expr and rhs_is_expr:
         return True
@@ -763,38 +1217,59 @@ def _is_auxiliary_tensor_expr_node(node: torch.fx.Node, depth: int = 0) -> bool:
     return False
 
 
+_LeafExpr = TypeVar("_LeafExpr", _AuxiliaryTensorLoadExpr, _RuntimeScalarExpr)
+
+
+def _tensor_expr_children(expr: _TensorExpr) -> tuple[_TensorExpr, ...]:
+    if isinstance(
+        expr, (_CurrentTensorExpr, _AuxiliaryTensorLoadExpr, _RuntimeScalarExpr)
+    ):
+        return ()
+    if isinstance(expr, _UnaryTensorExpr):
+        return (expr.operand,)
+    if isinstance(expr, _BinaryTensorExpr):
+        return (expr.lhs, expr.rhs)
+    if isinstance(expr, _SelectTensorExpr):
+        return (expr.condition, *expr.branch_exprs)
+    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
+
+
+def _distinct_tensor_expr_nodes(
+    exprs: Sequence[_TensorExpr],
+) -> Iterator[_TensorExpr]:
+    """Every node under ``exprs`` once, in visit order, by identity: a subtree
+    several uses share (a repeated operand, ``y * (1 - y)``) is visited once,
+    and nodes are never hashed (the frozen expression nodes compare by value,
+    so hashing one rehashes its whole subtree)."""
+    seen: set[int] = set()
+    pending = list(reversed(exprs))
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        pending.extend(reversed(_tensor_expr_children(current)))
+
+
+def _tensor_expr_leaves(
+    expr: _TensorExpr, kind: type[_LeafExpr]
+) -> tuple[_LeafExpr, ...]:
+    """The ``kind`` leaves under ``expr``, in visit order: one load per leaf,
+    one binding, and one visit (``_distinct_tensor_expr_nodes``)."""
+    return tuple(
+        dict.fromkeys(
+            node
+            for node in _distinct_tensor_expr_nodes((expr,))
+            if isinstance(node, kind)
+        )
+    )
+
+
 def _auxiliary_tensor_expr_operands(
     expr: _TensorExpr,
 ) -> tuple[_AuxiliaryTensorLoadExpr, ...]:
-    if isinstance(expr, (_CurrentTensorExpr, _RuntimeScalarExpr)):
-        return ()
-    if isinstance(expr, _AuxiliaryTensorLoadExpr):
-        return (expr,)
-    if isinstance(expr, _UnaryTensorExpr):
-        return _auxiliary_tensor_expr_operands(expr.operand)
-    if isinstance(expr, _BinaryTensorExpr):
-        return (
-            *_auxiliary_tensor_expr_operands(expr.lhs),
-            *_auxiliary_tensor_expr_operands(expr.rhs),
-        )
-    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
-
-
-def _runtime_scalar_operands(
-    expr: _TensorExpr,
-) -> tuple[_RuntimeScalarExpr, ...]:
-    if isinstance(expr, (_CurrentTensorExpr, _AuxiliaryTensorLoadExpr)):
-        return ()
-    if isinstance(expr, _RuntimeScalarExpr):
-        return (expr,)
-    if isinstance(expr, _UnaryTensorExpr):
-        return _runtime_scalar_operands(expr.operand)
-    if isinstance(expr, _BinaryTensorExpr):
-        return (
-            *_runtime_scalar_operands(expr.lhs),
-            *_runtime_scalar_operands(expr.rhs),
-        )
-    raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
+    return _tensor_expr_leaves(expr, _AuxiliaryTensorLoadExpr)
 
 
 def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
@@ -802,12 +1277,8 @@ def _tensor_expr_contains_current(expr: _TensorExpr) -> bool:
         return True
     if isinstance(expr, (_AuxiliaryTensorLoadExpr, _RuntimeScalarExpr)):
         return False
-    if isinstance(expr, _UnaryTensorExpr):
-        return _tensor_expr_contains_current(expr.operand)
-    if isinstance(expr, _BinaryTensorExpr):
-        return _tensor_expr_contains_current(expr.lhs) or _tensor_expr_contains_current(
-            expr.rhs
-        )
+    if isinstance(expr, (_UnaryTensorExpr, _BinaryTensorExpr, _SelectTensorExpr)):
+        return expr.contains_current
     raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
 
 
@@ -817,7 +1288,7 @@ def _render_runtime_scalar(expr: _RuntimeScalarExpr) -> str:
 
     df = DeviceFunction.current()
     if isinstance(expr.source, torch.fx.Node):
-        from ...language.memory_ops import _cute_scalar_load_expr
+        from .emitters.memory_access import _cute_scalar_load_expr
 
         tensor_node = expr.source.args[0]
         assert isinstance(tensor_node, torch.fx.Node)
@@ -836,13 +1307,46 @@ def _render_runtime_scalar(expr: _RuntimeScalarExpr) -> str:
 def _render_auxiliary_tensor_expr(
     expr: _TensorExpr,
     carrier_name: str,
-    aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str],
+    aux_locals_by_expr: _LeafBindings,
     local_name_factory: object,
     prelude_indent: str,
+    bound_locals: dict[int, str] | None = None,
 ) -> tuple[str, str]:
-    """Render an expression tree into bound TensorSSA locals."""
+    """Render an expression tree into bound TensorSSA locals.
+
+    A subtree shared by several uses (a repeated operand, ``y * (1 - y)``)
+    binds one local: ``bound_locals`` maps each rendered node to its local.
+    """
+    if bound_locals is None:
+        bound_locals = {}
+    if id(expr) in bound_locals:
+        return "", bound_locals[id(expr)]
+    prelude, local = _render_auxiliary_tensor_expr_node(
+        expr,
+        carrier_name,
+        aux_locals_by_expr,
+        local_name_factory,
+        prelude_indent,
+        bound_locals,
+    )
+    bound_locals[id(expr)] = local
+    return prelude, local
+
+
+def _render_auxiliary_tensor_expr_node(
+    expr: _TensorExpr,
+    carrier_name: str,
+    aux_locals_by_expr: _LeafBindings,
+    local_name_factory: object,
+    prelude_indent: str,
+    bound_locals: dict[int, str],
+) -> tuple[str, str]:
     if isinstance(expr, _RuntimeScalarExpr):
-        return "", _render_runtime_scalar(expr)
+        # A splice site that bound the scalar once per output tile (ahead of
+        # the accumulator wait) names the local; otherwise the leaf renders
+        # inline at every use.
+        bound = aux_locals_by_expr.get(expr)
+        return "", bound if bound is not None else _render_runtime_scalar(expr)
     if isinstance(expr, _CurrentTensorExpr):
         return "", carrier_name
     if isinstance(expr, _AuxiliaryTensorLoadExpr):
@@ -861,6 +1365,7 @@ def _render_auxiliary_tensor_expr(
             aux_locals_by_expr,
             local_name_factory,
             prelude_indent,
+            bound_locals,
         )
         local_prefix = (
             "tcgen05_chain_step"
@@ -878,6 +1383,7 @@ def _render_auxiliary_tensor_expr(
             aux_locals_by_expr,
             local_name_factory,
             prelude_indent,
+            bound_locals,
         )
         rhs_prelude, rhs = _render_auxiliary_tensor_expr(
             expr.rhs,
@@ -885,6 +1391,7 @@ def _render_auxiliary_tensor_expr(
             aux_locals_by_expr,
             local_name_factory,
             prelude_indent,
+            bound_locals,
         )
         if _tensor_expr_contains_current(expr):
             local_prefix = "tcgen05_chain_step"
@@ -897,6 +1404,35 @@ def _render_auxiliary_tensor_expr(
         rendered = expr.op_template.format(lhs=lhs, rhs=rhs)
         return (
             lhs_prelude + rhs_prelude + f"{prelude_indent}{local} = {rendered}\n",
+            local,
+        )
+    if isinstance(expr, _SelectTensorExpr):
+        prelude = ""
+        operands = []
+        for child in (expr.condition, expr.on_true, expr.on_false):
+            if isinstance(child, float):
+                operands.append(float_literal(child))
+                continue
+            child_prelude, name = _render_auxiliary_tensor_expr(
+                child,
+                carrier_name,
+                aux_locals_by_expr,
+                local_name_factory,
+                prelude_indent,
+                bound_locals,
+            )
+            prelude += child_prelude
+            operands.append(name)
+        local = local_name_factory(  # type: ignore[operator]
+            "tcgen05_chain_step"
+            if _tensor_expr_contains_current(expr)
+            else "tcgen05_aux_expr"
+        )
+        assert isinstance(local, str)
+        condition, on_true, on_false = operands
+        return (
+            prelude + f"{prelude_indent}{local} = cute.where({condition}, {on_true}, "
+            f"{on_false})\n",
             local,
         )
     raise AssertionError(f"unexpected tensor expression: {type(expr).__name__}")
@@ -939,15 +1475,40 @@ class Tcgen05UnaryEpilogueChain:
     steps: tuple[_AuxiliaryTensorExprStep, ...]
 
     @property
+    def reads_accumulator(self) -> bool:
+        """Whether the stored value reads the accumulator: the identity chain
+        stores it and every matmul chain's first step reads it; the one-step
+        chain of an aux-only store (``analyze_tcgen05_aux_only_store_chain``)
+        computes its value from epilogue input loads alone."""
+        return not self.steps or any(
+            _tensor_expr_contains_current(step.expr) for step in self.steps
+        )
+
+    @property
     def auxiliary_tensor_loads(self) -> tuple[_AuxiliaryTensorLoadExpr, ...]:
         """All auxiliary-tensor steps in application order.
 
         Used by the splice site to request per-step ``aux_local``
         locals before calling :meth:`render_prelude_and_expr` so the
         per-thread aux load setup runs once per output tile (outside
-        the per-subtile chain rendering).
+        the per-subtile chain rendering). A leaf two steps read (one input,
+        ``_chain_of``) is listed once.
         """
-        return tuple(operand for step in self.steps for operand in step.operands)
+        return tuple(
+            dict.fromkeys(operand for step in self.steps for operand in step.operands)
+        )
+
+    @property
+    def transcendental_op_count(self) -> int:
+        """The distinct transcendental unary ops the chain applies per
+        element (``exp``, ``erf``, ``tanh``, ...; ``_UnaryOp.transcendental``:
+        GELU backward's ``erf`` and ``exp`` two, a sigmoid or a ``tanh`` one),
+        each shared subtree counted once (``_distinct_tensor_expr_nodes``)."""
+        return sum(
+            1
+            for node in _distinct_tensor_expr_nodes([step.expr for step in self.steps])
+            if isinstance(node, _UnaryTensorExpr) and node.step.transcendental
+        )
 
     @property
     def runtime_scalars(self) -> tuple[_RuntimeScalarExpr, ...]:
@@ -960,15 +1521,43 @@ class Tcgen05UnaryEpilogueChain:
         :attr:`auxiliary_tensor_loads`, which never includes these leaves.
         """
         return tuple(
-            leaf for step in self.steps for leaf in _runtime_scalar_operands(step.expr)
+            leaf
+            for step in self.steps
+            for leaf in _tensor_expr_leaves(step.expr, _RuntimeScalarExpr)
         )
+
+    def render_runtime_scalar_bindings(
+        self, local_name_factory: object, prelude_indent: str
+    ) -> tuple[str, _LeafBindings]:
+        """Bind every rank-0 device-scalar leaf to a local, once.
+
+        Returns ``(prelude, bindings)``: one ``<local> = cutlass.Float32(<load>)``
+        line per distinct ``scale[()]`` leaf and the map the chain renderers
+        consult. The splice site emits the prelude once per output tile,
+        ahead of the accumulator wait, so the scalar's global read is issued
+        while the MMA drains instead of inside every subtile iteration after
+        the TMEM load (where the ``fence`` / named-barrier sequence keeps the
+        compiler from hoisting it and its latency lands on the critical path:
+        a 2x scalar epilogue cost 7% of a 1024^3 fp8 GEMM). Host scalars are
+        kernel arguments and stay inline.
+        """
+        bindings: _LeafBindings = {}
+        lines: list[str] = []
+        for leaf in self.runtime_scalars:
+            if leaf.is_host_scalar or leaf in bindings:
+                continue
+            local = local_name_factory("tcgen05_scalar")  # type: ignore[operator]
+            assert isinstance(local, str)
+            lines.append(f"{prelude_indent}{local} = {_render_runtime_scalar(leaf)}\n")
+            bindings[leaf] = local
+        return "".join(lines), bindings
 
     def render_prelude_and_expr(
         self,
         carrier_name: str,
         local_name_factory: object,
         prelude_indent: str,
-        aux_locals_by_expr: dict[_AuxiliaryTensorLoadExpr, str] | None = None,
+        aux_locals_by_expr: _LeafBindings | None = None,
     ) -> tuple[str, str]:
         """Return ``(prelude, final_expr)``.
 
@@ -997,20 +1586,20 @@ class Tcgen05UnaryEpilogueChain:
             "splice site (the ast.Name fast path handles them)"
         )
         aux_steps = self.auxiliary_tensor_loads
+        local_bindings: _LeafBindings = aux_locals_by_expr or {}
+        aux_bindings = [
+            key for key in local_bindings if isinstance(key, _AuxiliaryTensorLoadExpr)
+        ]
         if aux_steps:
-            assert aux_locals_by_expr is not None and len(aux_locals_by_expr) == len(
-                aux_steps
-            ), (
+            assert len(aux_bindings) == len(aux_steps), (
                 "auxiliary-tensor chains require one local binding per load leaf; "
-                f"got {len(aux_locals_by_expr) if aux_locals_by_expr is not None else None} "
-                f"bindings for {len(aux_steps)} leaves"
+                f"got {len(aux_bindings)} bindings for {len(aux_steps)} leaves"
             )
-            assert all(step in aux_locals_by_expr for step in aux_steps)
+            assert all(step in local_bindings for step in aux_steps)
         else:
-            assert aux_locals_by_expr is None or not aux_locals_by_expr, (
+            assert not aux_bindings, (
                 "non-auxiliary chains must not be passed aux_locals_by_expr"
             )
-        local_bindings = aux_locals_by_expr or {}
         prelude_lines: list[str] = []
         cur_expr = carrier_name
         local = carrier_name
@@ -1104,6 +1693,26 @@ def _is_one_plus_exp_neg_of(node: object, carrier: torch.fx.Node) -> bool:
     )
 
 
+def _silu_step(*, division: bool) -> _UnaryOp:
+    """The silu chain step, rendered as the pointwise lowering computes the
+    matched form (``x / (1 + exp(-x))`` when ``division``, else
+    ``x * sigmoid(x)``) in the current settings.
+
+    Under ``fast_math`` the pointwise quotient is ``div.approx.ftz``, which
+    multiplies by ``rcp.approx.ftz``, of ``exp2(-x * log2(e))`` on
+    ``ex2.approx.ftz``: the sigmoid form.  The scalar-only ``div.approx``
+    intrinsic cannot take the chain's TensorSSA; the two differ only where
+    the quotient flushes a denormal product (``|x|`` below ``2**-125``).
+    """
+    if division and not CompileEnvironment.current().settings.fast_math:
+        return _UnaryOp(
+            op_name="silu", template=_SILU_DIVISION_TEMPLATE, transcendental=True
+        )
+    return _UnaryOp(
+        op_name="silu", template=_SILU_SIGMOID_TEMPLATE, transcendental=True
+    )
+
+
 def _classify_silu(
     cur: torch.fx.Node,
 ) -> tuple[_UnaryOp, torch.fx.Node] | None:
@@ -1128,9 +1737,11 @@ def _classify_silu(
       inductor lowering tables in ``helion._compiler.device_ir``).
       This is the shape T13 / T17 / T26 hit in practice.
 
-    The same ``_SILU_TEMPLATE`` (``x * (1 / (1 + exp2(-x * log2_e)))``)
-    renders both forms. The pattern only matches when the inner
-    references point at the *same* carrier FX node — divergent
+    Each form renders the pointwise lowering's math for it
+    (``_silu_step``): the mul form ``x * sigmoid(x)`` with the sigmoid
+    contract, the div form the quotient of the exact ``exp`` (the
+    sigmoid form under ``fast_math``). The pattern only matches when the
+    inner references point at the *same* carrier FX node — divergent
     operands fall through to the generic binary classifier.
 
     Returns ``None`` if ``cur`` is not a silu shape so the caller can
@@ -1149,16 +1760,16 @@ def _classify_silu(
         if not (isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)):
             return None
         if _is_sigmoid_of(rhs, lhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), lhs
+            return _silu_step(division=False), lhs
         if _is_sigmoid_of(lhs, rhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), rhs
+            return _silu_step(division=False), rhs
         return None
     # ``div(carrier, add(exp(neg(carrier)), 1))`` form — inductor decomp.
     if target is torch.ops.aten.div.Tensor:
         if not isinstance(lhs, torch.fx.Node):
             return None
         if _is_one_plus_exp_neg_of(rhs, lhs):
-            return _UnaryOp(op_name="silu", template=_SILU_TEMPLATE), lhs
+            return _silu_step(division=True), lhs
         return None
     return None
 
@@ -1195,8 +1806,7 @@ def _classify_binary(
     if len(cur.args) < 2:
         return None
     target = cur.target
-    lhs = cur.args[0]
-    rhs = cur.args[1]
+    lhs, rhs = _binary_operands(cur)
     # Determine which arg is the chain carrier. The carrier is the
     # FX node that walks back to the matmul anchor; the other is
     # either a Python scalar literal or a recognized aux load FX
@@ -1219,19 +1829,24 @@ def _classify_binary(
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
         )
-        aux_expr: _TensorExpr
+        aux_expr: _TensorExpr | None
         carrier: torch.fx.Node
         forward_form: bool
         if lhs_expr is not None and rhs_expr is None:
-            aux_expr = lhs_expr
+            aux_expr = _promote_bool_operand(lhs_expr, lhs, _node_tensor_dtype(cur))
             carrier = rhs
             forward_form = False  # carrier is the right operand
         elif rhs_expr is not None and lhs_expr is None:
-            aux_expr = rhs_expr
+            aux_expr = _promote_bool_operand(rhs_expr, rhs, _node_tensor_dtype(cur))
             carrier = lhs
             forward_form = True  # carrier is the left operand
         else:
             return None
+        if aux_expr is None:
+            return None
+        aux_expr = _common_dtype_operand(
+            aux_expr, rhs if forward_form else lhs, carrier
+        )
         op_name = _BINARY_OP_NAMES[target]
         current_expr = _CurrentTensorExpr()
         return (
@@ -1291,6 +1906,211 @@ def _classify_binary(
     )
 
 
+def _has_tensor_leaf(expr: _TensorExpr) -> bool:
+    """Whether the auxiliary ``expr`` renders as a tensor: a tile-uniform
+    scalar or a per-row value read once per thread (``scale[()]``, a column
+    broadcast on one M row) renders as a scalar, so it needs an exact-shape
+    or row-broadcast leaf."""
+    return any(
+        leaf.broadcast_axis in (None, 0, 1)
+        for leaf in _auxiliary_tensor_expr_operands(expr)
+    )
+
+
+def _is_tensor_condition(expr: _TensorExpr) -> bool:
+    """Whether ``expr`` is a condition ``cute.where`` can select on: it takes
+    a tensor condition and broadcasts only its values (``_has_tensor_leaf``).
+    A condition on the carrier (``where(acc >= 0, acc, 0)``) is the fragment
+    epilogue's (``tcgen05_epi_where``)."""
+    return not _tensor_expr_contains_current(expr) and _has_tensor_leaf(expr)
+
+
+def _classify_select(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    depth: int,
+    memo: dict[torch.fx.Node, _TensorExpr | None],
+) -> _TensorExpr | None:
+    """``where(cond, a, b)`` inside an expression: ``cond`` a boolean tensor
+    condition (``_is_tensor_condition``), each branch an expression of the
+    select's floating result type or a literal, rounded to that type and
+    spelled inline (``float_literal``: a select does no arithmetic on it)."""
+    if len(node.args) != 3:
+        return None
+    cond = node.args[0]
+    result_dtype = _node_tensor_dtype(node)
+    if (
+        not isinstance(cond, torch.fx.Node)
+        or _node_tensor_dtype(cond) is not torch.bool
+        or result_dtype is None
+        or not result_dtype.is_floating_point
+    ):
+        return None
+
+    def classify(arg: torch.fx.Node) -> _TensorExpr | None:
+        return _classify_auxiliary_tensor_expr_impl(
+            arg,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+            depth=depth + 1,
+            memo=memo,
+        )
+
+    cond_expr = classify(cond)
+    if cond_expr is None or not _is_tensor_condition(cond_expr):
+        return None
+    branches: list[_TensorExpr | float] = []
+    for arg in node.args[1:]:
+        arg = _fold_scalar_literal(arg)
+        if isinstance(arg, torch.fx.Node):
+            expr = classify(arg)
+            if (
+                expr is None
+                or _node_tensor_dtype(arg) is torch.bool
+                or not _operand_dtype_matches(expr, arg, result_dtype)
+            ):
+                return None
+            if (
+                isinstance(expr, _AuxiliaryTensorLoadExpr)
+                and expr.template == "{aux}"
+                and _node_tensor_dtype(arg) in (torch.float16, torch.bfloat16)
+            ):
+                # ``cute.where`` takes branches of one type, and every other
+                # value renders as FP32: the exact widening of a bare 16-bit
+                # load (a select does no arithmetic on it).
+                expr = _UnaryTensorExpr(step=_TO_FLOAT32_STEP, operand=expr)
+            branches.append(expr)
+        elif isinstance(arg, (int, float)) and not isinstance(arg, bool):
+            literal = _round_literal(arg, result_dtype, finite=False)
+            assert literal is not None
+            branches.append(literal)
+        else:
+            return None
+    if not any(
+        not isinstance(branch, float)
+        and (_tensor_expr_contains_current(branch) or _has_tensor_leaf(branch))
+        for branch in branches
+    ):
+        # ``cute.where`` takes at least one tensor branch (``acc * where(m,
+        # 1.25, 0.0)`` would select between two numbers)
+        return None
+    on_true, on_false = branches
+    return _SelectTensorExpr(condition=cond_expr, on_true=on_true, on_false=on_false)
+
+
+def _carrier_join(
+    node: torch.fx.Node,
+    target_fx_nodes: set[torch.fx.Node],
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
+) -> torch.fx.Node | None:
+    """The nearest node every path from ``node`` to the carrier passes through.
+
+    The operands of ``node`` that depend on the matmul result form a DAG
+    ending at the carrier (the accumulator, reached by
+    ``walk_carrier_to_tcgen05_matmul``); its nearest dominator below
+    ``node`` is the value the step's expression reads as the current
+    carrier: GELU backward ``acc * a + acc * b`` joins at ``acc``, Hardswish
+    backward ``where(c, g * k, g)`` at ``g``. ``None`` when ``node`` does not
+    depend on the carrier or no node lies on all of its carrier paths (a join
+    above two carriers, ``t = acc1 + acc2``, is refused by the walk from it)."""
+    depends: dict[torch.fx.Node, bool] = {}
+    roots: set[torch.fx.Node] = set()
+
+    def carrier_dependent(current: torch.fx.Node) -> bool:
+        if current in depends:
+            return depends[current]
+        depends[current] = False
+        if (
+            walk_carrier_to_tcgen05_matmul(
+                current, target_fx_nodes, inner_outputs_by_graph_id
+            )
+            is not None
+        ):
+            roots.add(current)
+            depends[current] = True
+        elif current.op == "call_function":
+            # a list, not a generator: the edges below read every input's entry
+            depends[current] = any(
+                [carrier_dependent(arg) for arg in current.all_input_nodes]
+            )
+        return depends[current]
+
+    if not carrier_dependent(node) or node in roots:
+        return None
+    edges: dict[torch.fx.Node, tuple[torch.fx.Node, ...]] = {}
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if current in edges:
+            continue
+        edges[current] = (
+            ()
+            if current in roots
+            else tuple(arg for arg in current.all_input_nodes if depends[arg])
+        )
+        pending.extend(edges[current])
+
+    def reachable(
+        start: torch.fx.Node, blocked: torch.fx.Node | None
+    ) -> set[torch.fx.Node]:
+        seen = {start}
+        pending = [start]
+        while pending:
+            for arg in edges[pending.pop()]:
+                if arg is not blocked and arg not in seen:
+                    seen.add(arg)
+                    pending.append(arg)
+        return seen
+
+    dominators = [
+        candidate
+        for candidate in edges
+        if candidate is not node and not (reachable(node, candidate) & roots)
+    ]
+    if not dominators:
+        return None
+    # The dominators lie on every path, one below the other: the nearest one
+    # reaches all the others.
+    return max(dominators, key=lambda candidate: len(reachable(candidate, None)))
+
+
+def _classify_carrier_dag(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    target_fx_nodes: set[torch.fx.Node],
+    inner_outputs_by_graph_id: dict[int, tuple[torch.fx.Node | None, ...]],
+) -> tuple[_AuxiliaryTensorExprStep, torch.fx.Node] | None:
+    """One chain step whose expression reads the carrier more than once.
+
+    GELU (tanh) backward stores ``acc * f(x) + acc * g(x)``, SELU backward
+    ``where(x <= 0, acc * k1 * exp(x), acc * k2)``: both operands depend on
+    the carrier, so no single one continues the chain. The expression from
+    ``node`` down to the carriers' join (``_carrier_join``) is one step over
+    the join, which the walk continues from; the renderer reads the carrier
+    at each use."""
+    join = _carrier_join(node, target_fx_nodes, inner_outputs_by_graph_id)
+    if join is None:
+        return None
+    expr = _classify_auxiliary_tensor_expr_impl(
+        node,
+        carrier_tile_shape=carrier_tile_shape,
+        carrier_tile_index_nodes=carrier_tile_index_nodes,
+        carrier_global_shape=carrier_global_shape,
+        depth=0,
+        memo={join: _CurrentTensorExpr()},
+    )
+    if expr is None or not _tensor_expr_contains_current(expr):
+        return None
+    return _AuxiliaryTensorExprStep(expr=expr), join
+
+
 def _classify_auxiliary_tensor_expr(
     node: torch.fx.Node,
     *,
@@ -1320,6 +2140,33 @@ def _classify_auxiliary_tensor_expr_impl(
     carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
     carrier_global_shape: tuple[object, ...] | None,
     depth: int,
+    memo: dict[torch.fx.Node, _TensorExpr | None] | None = None,
+) -> _TensorExpr | None:
+    """``_classify_auxiliary_tensor_expr_node`` once per FX node: every use of
+    a node within one expression (``y * y``, ``y * (1 - y)``) is the same
+    subtree, so its loads are one leaf each and the renderer binds it once."""
+    if memo is None:
+        memo = {}
+    if node not in memo:
+        memo[node] = _classify_auxiliary_tensor_expr_node(
+            node,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+            depth=depth,
+            memo=memo,
+        )
+    return memo[node]
+
+
+def _classify_auxiliary_tensor_expr_node(
+    node: torch.fx.Node,
+    *,
+    carrier_tile_shape: tuple[object, ...] | None,
+    carrier_tile_index_nodes: tuple[torch.fx.Node, ...] | None,
+    carrier_global_shape: tuple[object, ...] | None,
+    depth: int,
+    memo: dict[torch.fx.Node, _TensorExpr | None],
 ) -> _TensorExpr | None:
     if depth >= 32:
         return None
@@ -1350,6 +2197,20 @@ def _classify_auxiliary_tensor_expr_impl(
 
     if node.op != "call_function" or node.kwargs:
         return None
+    if (mask := _boolean_mask_cast(node)) is not None:
+        # A boolean mask (dropout): ``mask.to(torch.bool)`` is the mask, and
+        # its floating conversion the exact 0/1 promotion.
+        operand_expr = _classify_auxiliary_tensor_expr_impl(
+            mask,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+            depth=depth + 1,
+            memo=memo,
+        )
+        if operand_expr is None or node.args[1] is torch.bool:
+            return operand_expr
+        return _UnaryTensorExpr(step=_BOOL_TO_FLOAT_STEP, operand=operand_expr)
     cast_step = _floating_cast_step(node)
     if cast_step is not None:
         unary_step, unary_operand = cast_step
@@ -1359,11 +2220,12 @@ def _classify_auxiliary_tensor_expr_impl(
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
             depth=depth + 1,
+            memo=memo,
         )
         if operand_expr is None:
             return None
         return _UnaryTensorExpr(step=unary_step, operand=operand_expr)
-    unary_step = _ZERO_ARG_TARGETS.get(node.target)
+    unary_step = _unary_step_for(node.target)
     unary_operand: torch.fx.Node | None = None
     if unary_step is not None:
         if len(node.args) != 1 or not isinstance(node.args[0], torch.fx.Node):
@@ -1387,6 +2249,7 @@ def _classify_auxiliary_tensor_expr_impl(
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
             depth=depth + 1,
+            memo=memo,
         )
         if operand_expr is None:
             return None
@@ -1394,10 +2257,21 @@ def _classify_auxiliary_tensor_expr_impl(
             step=_round_unary_step(unary_step, node), operand=operand_expr
         )
 
-    if node.target not in _SCALAR_BINARY_TARGETS or len(node.args) != 2:
+    if node.target is torch.ops.aten.where.self:
+        return _classify_select(
+            node,
+            carrier_tile_shape=carrier_tile_shape,
+            carrier_tile_index_nodes=carrier_tile_index_nodes,
+            carrier_global_shape=carrier_global_shape,
+            depth=depth,
+            memo=memo,
+        )
+    if (
+        node.target not in _SCALAR_BINARY_TARGETS
+        and node.target not in _COMPARE_TARGETS
+    ) or len(node.args) != 2:
         return None
-    lhs = node.args[0]
-    rhs = node.args[1]
+    lhs, rhs = _binary_operands(node)
     lhs_expr = (
         _classify_auxiliary_tensor_expr_impl(
             lhs,
@@ -1405,37 +2279,42 @@ def _classify_auxiliary_tensor_expr_impl(
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
             depth=depth + 1,
+            memo=memo,
         )
         if isinstance(lhs, torch.fx.Node)
         else None
     )
     rhs_expr = (
-        _classify_auxiliary_tensor_expr_impl(
+        lhs_expr  # a repeated operand shares its leaves
+        if rhs is lhs
+        else _classify_auxiliary_tensor_expr_impl(
             rhs,
             carrier_tile_shape=carrier_tile_shape,
             carrier_tile_index_nodes=carrier_tile_index_nodes,
             carrier_global_shape=carrier_global_shape,
             depth=depth + 1,
+            memo=memo,
         )
         if isinstance(rhs, torch.fx.Node)
         else None
     )
+    compare = _COMPARE_TARGETS.get(node.target)
+    if compare is not None:
+        return _classify_comparison(
+            node, compare, lhs, rhs, lhs_expr=lhs_expr, rhs_expr=rhs_expr
+        )
     if lhs_expr is not None and rhs_expr is not None:
         assert isinstance(lhs, torch.fx.Node) and isinstance(rhs, torch.fx.Node)
         result_dtype = _node_tensor_dtype(node)
-        # A host scalar is weakly typed: torch promotes it to the tensor
-        # operand's dtype like a literal. A rank-0 load is a tensor operand
-        # and must already carry the result dtype.
+        if result_dtype is None:
+            return None
+        lhs_expr = _promote_bool_operand(lhs_expr, lhs, result_dtype)
+        rhs_expr = _promote_bool_operand(rhs_expr, rhs, result_dtype)
         if (
-            result_dtype is None
-            or (
-                not _is_host_scalar_expr(lhs_expr)
-                and _node_tensor_dtype(lhs) != result_dtype
-            )
-            or (
-                not _is_host_scalar_expr(rhs_expr)
-                and _node_tensor_dtype(rhs) != result_dtype
-            )
+            lhs_expr is None
+            or rhs_expr is None
+            or not _operand_dtype_matches(lhs_expr, lhs, result_dtype)
+            or not _operand_dtype_matches(rhs_expr, rhs, result_dtype)
         ):
             return None
         return _BinaryTensorExpr(
@@ -1449,12 +2328,14 @@ def _classify_auxiliary_tensor_expr_impl(
     if lhs_expr is not None:
         assert isinstance(lhs, torch.fx.Node)
         scalar = _extract_scalar(rhs)
-        lhs_dtype = _node_tensor_dtype(lhs)
+        result_dtype = _node_tensor_dtype(node)
+        lhs_expr = _promote_bool_operand(lhs_expr, lhs, result_dtype)
         if (
             scalar is None
-            or lhs_dtype is None
-            or not lhs_dtype.is_floating_point
-            or _node_tensor_dtype(node) != lhs_dtype
+            or lhs_expr is None
+            or result_dtype is None
+            or not result_dtype.is_floating_point
+            or not _operand_dtype_matches(lhs_expr, lhs, result_dtype)
         ):
             return None
         template = _scalar_binary_template(node.target, scalar, forward_form=True)
@@ -1462,19 +2343,21 @@ def _classify_auxiliary_tensor_expr_impl(
         return _UnaryTensorExpr(
             step=_UnaryOp(
                 op_name=_BINARY_OP_NAMES[node.target],
-                template=_round_epilogue_expression(template, lhs_dtype),
+                template=_round_epilogue_expression(template, result_dtype),
             ),
             operand=lhs_expr,
         )
     if rhs_expr is not None:
         assert isinstance(rhs, torch.fx.Node)
         scalar = _extract_scalar(lhs)
-        rhs_dtype = _node_tensor_dtype(rhs)
+        result_dtype = _node_tensor_dtype(node)
+        rhs_expr = _promote_bool_operand(rhs_expr, rhs, result_dtype)
         if (
             scalar is None
-            or rhs_dtype is None
-            or not rhs_dtype.is_floating_point
-            or _node_tensor_dtype(node) != rhs_dtype
+            or rhs_expr is None
+            or result_dtype is None
+            or not result_dtype.is_floating_point
+            or not _operand_dtype_matches(rhs_expr, rhs, result_dtype)
         ):
             return None
         template = _scalar_binary_template(node.target, scalar, forward_form=False)
@@ -1482,7 +2365,88 @@ def _classify_auxiliary_tensor_expr_impl(
         return _UnaryTensorExpr(
             step=_UnaryOp(
                 op_name=_BINARY_OP_NAMES[node.target],
-                template=_round_epilogue_expression(template, rhs_dtype),
+                template=_round_epilogue_expression(template, result_dtype),
+            ),
+            operand=rhs_expr,
+        )
+    return None
+
+
+def _classify_comparison(
+    node: torch.fx.Node,
+    compare: tuple[str, str],
+    lhs: object,
+    rhs: object,
+    *,
+    lhs_expr: _TensorExpr | None,
+    rhs_expr: _TensorExpr | None,
+) -> _TensorExpr | None:
+    """Classify an elementwise comparison of floating auxiliary expressions.
+
+    The result is boolean; the consumer's promotion (``_promote_bool_operand``)
+    turns it back into a floating mask.  Boolean operands of a comparison and
+    comparisons of non-floating operands are not modelled.
+
+    A Python scalar operand is compared the way torch compares it: in the
+    tensor operand's dtype.  ``fp16_tensor > 0.3`` tests against
+    ``fp16(0.3) = 0.300048828125`` (the SIMT and Triton lowerings agree), so
+    the literal is rounded to that dtype before it is rendered; the rounded
+    value is exact in any wider type the TensorSSA comparison evaluates in.
+    A scalar the dtype cannot hold (``fp16_tensor > 1e5`` rounds to ``inf``)
+    is not modelled.
+    """
+    op_name, template = compare
+    if _node_tensor_dtype(node) != torch.bool:
+        return None
+
+    def floating(operand: object) -> bool:
+        return (
+            isinstance(operand, torch.fx.Node)
+            and (dtype := _node_tensor_dtype(operand)) is not None
+            and dtype.is_floating_point
+        )
+
+    def rounded(scalar: float, operand: torch.fx.Node) -> float | None:
+        dtype = _node_tensor_dtype(operand)
+        assert dtype is not None
+        return _round_literal(scalar, dtype)
+
+    if lhs_expr is not None and rhs_expr is not None:
+        if not (
+            isinstance(lhs, torch.fx.Node)
+            and isinstance(rhs, torch.fx.Node)
+            and floating(lhs)
+            and _node_tensor_dtype(lhs) == _node_tensor_dtype(rhs)
+        ):
+            return None
+        return _BinaryTensorExpr(
+            op_name=op_name, op_template=template, lhs=lhs_expr, rhs=rhs_expr
+        )
+    if lhs_expr is not None:
+        scalar = _extract_scalar(rhs)
+        if scalar is None or not floating(lhs):
+            return None
+        assert isinstance(lhs, torch.fx.Node)
+        scalar = rounded(scalar, lhs)
+        if scalar is None:
+            return None
+        return _UnaryTensorExpr(
+            step=_UnaryOp(
+                op_name=op_name, template=template.format(lhs="{inner}", rhs=scalar)
+            ),
+            operand=lhs_expr,
+        )
+    if rhs_expr is not None:
+        scalar = _extract_scalar(lhs)
+        if scalar is None or not floating(rhs):
+            return None
+        assert isinstance(rhs, torch.fx.Node)
+        scalar = rounded(scalar, rhs)
+        if scalar is None:
+            return None
+        return _UnaryTensorExpr(
+            step=_UnaryOp(
+                op_name=op_name, template=template.format(lhs=scalar, rhs="{inner}")
             ),
             operand=rhs_expr,
         )
@@ -1492,14 +2456,14 @@ def _classify_auxiliary_tensor_expr_impl(
 def _carrier_tile_shape(node: torch.fx.Node) -> tuple[object, ...] | None:
     """Extract the carrier's tile shape from ``meta['val'].shape``.
 
-    Returns ``None`` when the meta is missing. The classifier uses
-    this shape to decide whether an auxiliary-tensor load matches
-    the carrier's rank/extents — only exact-shape aux loads are
-    accepted; broadcast / rank mismatches drop to the loud-failure
+    Returns ``None`` for missing or non-tensor metadata, including scalar
+    SSA values. The classifier uses this shape to decide whether an
+    auxiliary-tensor load matches the carrier's rank/extents — only exact-shape
+    aux loads are accepted; broadcast / rank mismatches drop to the loud-failure
     backstop.
     """
     val = node.meta.get("val")
-    if val is None:
+    if not isinstance(val, torch.Tensor):
         return None
     return tuple(val.shape)
 
@@ -1567,7 +2531,10 @@ def _carrier_tile_index_nodes(
         # aux tensor and never find ``hl.zeros``.
         chosen: torch.fx.Node | None = None
         for inp in cur.all_input_nodes:
-            if _is_auxiliary_tensor_expr_node(inp):
+            if _is_auxiliary_tensor_expr_node(inp) or not isinstance(
+                _fold_scalar_literal(inp), torch.fx.Node
+            ):
+                # an aux operand, or a 0-d constant (``hl.full([], c)``)
                 continue
             chosen = inp
             break
@@ -1575,6 +2542,53 @@ def _carrier_tile_index_nodes(
             return None
         cur = chosen
     return None
+
+
+def _chain_of(steps: list[_AuxiliaryTensorExprStep]) -> Tcgen05UnaryEpilogueChain:
+    """The chain of ``steps`` (walked from the store down), carrier first.
+
+    Each step classifies its own operands, so two steps reading one input
+    (Hardswish backward tests ``x`` in both selects) build separate leaves for
+    it; they become one leaf, and the input one load."""
+    leaves: dict[tuple[object, ...], _AuxiliaryTensorLoadExpr] = {}
+    rebuilt: dict[int, _TensorExpr] = {}
+
+    def canonical(expr: _TensorExpr) -> _TensorExpr:
+        if id(expr) in rebuilt:
+            return rebuilt[id(expr)]
+        result: _TensorExpr
+        if isinstance(expr, _AuxiliaryTensorLoadExpr):
+            result = leaves.setdefault(
+                (expr.load_node, expr.broadcast_axis, expr.template), expr
+            )
+        elif isinstance(expr, _UnaryTensorExpr):
+            result = dataclasses.replace(expr, operand=canonical(expr.operand))
+        elif isinstance(expr, _BinaryTensorExpr):
+            result = dataclasses.replace(
+                expr, lhs=canonical(expr.lhs), rhs=canonical(expr.rhs)
+            )
+        elif isinstance(expr, _SelectTensorExpr):
+            result = dataclasses.replace(
+                expr,
+                condition=canonical(expr.condition),
+                on_true=expr.on_true
+                if isinstance(expr.on_true, float)
+                else canonical(expr.on_true),
+                on_false=expr.on_false
+                if isinstance(expr.on_false, float)
+                else canonical(expr.on_false),
+            )
+        else:
+            result = expr
+        rebuilt[id(expr)] = result
+        return result
+
+    return Tcgen05UnaryEpilogueChain(
+        steps=tuple(
+            _AuxiliaryTensorExprStep(expr=canonical(step.expr))
+            for step in reversed(steps)
+        )
+    )
 
 
 def analyze_tcgen05_unary_epilogue_chain(
@@ -1602,10 +2616,13 @@ def analyze_tcgen05_unary_epilogue_chain(
     Whitelisted ops are zero-arg unary (``relu`` / ``tanh`` / ``exp``
     / ``log`` / ``sqrt`` / ``abs`` / ``neg``), scalar binary
     (``add`` / ``sub`` / ``mul`` / ``div`` against a compile-time
-    Python literal), and carrier binary ops whose other operand is
-    a whitelisted elementwise expression over auxiliary loads and
-    tile-uniform scalars (lifted ``SymFloat`` / ``SymInt`` kernel
-    arguments and rank-0 ``scale[()]`` loads). The
+    Python literal or 0-d FP32 constant), carrier binary ops whose other
+    operand is a whitelisted elementwise expression over auxiliary loads
+    and tile-uniform scalars (lifted ``SymFloat`` / ``SymInt`` kernel
+    arguments and rank-0 ``scale[()]`` loads), ``where`` selects
+    between the carrier and a literal on an auxiliary boolean
+    condition, and steps whose expression reads the carrier more than
+    once (``_classify_carrier_dag``). The
     auxiliary leaves accept exact-shape
     (``residual[tile_m, tile_n]``, rank-2 matching the carrier tile)
     and rank-1 trailing-axis (rowvec) broadcast forms
@@ -1648,7 +2665,7 @@ def analyze_tcgen05_unary_epilogue_chain(
         if state is None:
             return None
         df = state.device_function
-        target_fx_nodes = df.cute_state.matmul_fx_nodes
+        target_fx_nodes = df.cute_state.tcgen05.matmul_fx_nodes
     if not target_fx_nodes:
         return None
 
@@ -1709,12 +2726,12 @@ def analyze_tcgen05_unary_epilogue_chain(
                 arg, target_fx_nodes, inner_outputs_by_graph_id
             )
             if anchor is not None:
-                steps.reverse()
-                return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
+                return _chain_of(steps), anchor
             cur = arg
             continue
         # Zero-arg unary ops.
-        if target in _ZERO_ARG_TARGETS:
+        zero_arg_step = _unary_step_for(target)
+        if zero_arg_step is not None:
             if cur.kwargs:
                 return None  # Reject unexpected kwargs.
             arg = cur.args[0] if cur.args else None
@@ -1723,7 +2740,7 @@ def analyze_tcgen05_unary_epilogue_chain(
             steps.append(
                 _AuxiliaryTensorExprStep(
                     expr=_UnaryTensorExpr(
-                        step=_round_unary_step(_ZERO_ARG_TARGETS[target], cur),
+                        step=_round_unary_step(zero_arg_step, cur),
                         operand=_CurrentTensorExpr(),
                     )
                 )
@@ -1732,8 +2749,7 @@ def analyze_tcgen05_unary_epilogue_chain(
                 arg, target_fx_nodes, inner_outputs_by_graph_id
             )
             if anchor is not None:
-                steps.reverse()
-                return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
+                return _chain_of(steps), anchor
             cur = arg
             continue
         # Decomposed silu — collapse multi-node silu shapes
@@ -1759,20 +2775,31 @@ def analyze_tcgen05_unary_epilogue_chain(
                 carrier, target_fx_nodes, inner_outputs_by_graph_id
             )
             if anchor is not None:
-                steps.reverse()
-                return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
+                return _chain_of(steps), anchor
             cur = carrier
             continue
         # Binary ops (scalar literal *or* aux-tensor load on the
-        # other side). The classifier rejects multi-tensor cases
-        # where neither operand is a recognized aux load and any
-        # kwarg-bearing form (``alpha=k``, etc.).
-        if target in _SCALAR_BINARY_TARGETS:
-            classified = _classify_binary(
+        # other side; no kwarg-bearing form such as ``alpha=k``) and selects
+        # (Inductor's ReLU / threshold backward ``where(x <= 0, 0, grad)``).
+        # An op whose operands all read the carrier, and every select, is one
+        # step down to the carrier paths' join (``_classify_carrier_dag``).
+        if target in _SCALAR_BINARY_TARGETS or target is torch.ops.aten.where.self:
+            classified = (
+                _classify_binary(
+                    cur,
+                    carrier_tile_shape=carrier_tile_shape,
+                    carrier_tile_index_nodes=carrier_tile_index_nodes,
+                    carrier_global_shape=output_global_shape,
+                )
+                if target in _SCALAR_BINARY_TARGETS
+                else None
+            ) or _classify_carrier_dag(
                 cur,
                 carrier_tile_shape=carrier_tile_shape,
                 carrier_tile_index_nodes=carrier_tile_index_nodes,
                 carrier_global_shape=output_global_shape,
+                target_fx_nodes=target_fx_nodes,
+                inner_outputs_by_graph_id=inner_outputs_by_graph_id,
             )
             if classified is None:
                 return None
@@ -1782,8 +2809,7 @@ def analyze_tcgen05_unary_epilogue_chain(
                 carrier, target_fx_nodes, inner_outputs_by_graph_id
             )
             if anchor is not None:
-                steps.reverse()
-                return Tcgen05UnaryEpilogueChain(steps=tuple(steps)), anchor
+                return _chain_of(steps), anchor
             cur = carrier
             continue
         # Op not on the whitelist. Surfacing None lets the
@@ -1791,6 +2817,86 @@ def analyze_tcgen05_unary_epilogue_chain(
         # actionable message.
         return None
     return None
+
+
+def store_tile_index_nodes(
+    store_node: torch.fx.Node,
+) -> tuple[torch.fx.Node, ...] | None:
+    """The index nodes of a store's subscript, when every index is a node:
+    the stores of one output tile share them."""
+    subscripts = store_node.args[1] if len(store_node.args) > 1 else None
+    if not isinstance(subscripts, (list, tuple)) or not all(
+        isinstance(index, torch.fx.Node) for index in subscripts
+    ):
+        return None
+    return tuple(cast("list[torch.fx.Node]", subscripts))
+
+
+def analyze_tcgen05_aux_only_store_chain(
+    store_node: torch.fx.Node,
+) -> Tcgen05UnaryEpilogueChain | None:
+    """The one-step chain of a store whose value never reads the accumulator.
+
+    ``out1[tile] = in2[tile].to(torch.float32)`` beside the stores of a
+    collective matmul's accumulator stores an epilogue input itself. The
+    collective matmul runs the rest of the tile body once per thread, so the
+    load has no per-element coordinates outside the matmul's epilogue
+    (``memory_ops._cute_load_has_placeholder_value``); the epilogue reads it
+    per subtile through the accumulator's partition like any auxiliary leaf.
+    The value must classify as an auxiliary expression
+    (``_classify_auxiliary_tensor_expr``: loads at the store's own tile
+    coordinates, scalars and whitelisted elementwise ops) whose loads are all
+    exact-shape: a broadcast row would take a shared-memory row stage the
+    SMEM model prices only for the accumulator's chains. A trailing
+    conversion to the output dtype is the splice site's ``.to(target_dtype)``,
+    as for every chain. The single step holds no ``_CurrentTensorExpr``, so
+    each subtile renders ::
+
+        tcgen05_aux_loaded = tcgen05_aux_rmem.load()
+        tcgen05_acc_vec = tcgen05_aux_loaded.to(cutlass.Float32)
+
+    Which matmul's epilogue stores it is
+    ``aux_tensor.tcgen05_aux_only_epilogue_stores``'s decision.
+    """
+    if (
+        store_node.op != "call_function"
+        or store_node.target is not memory_ops.store
+        or store_node.kwargs
+        or len(store_node.args) != 4
+        or store_node.args[3] is not None
+    ):
+        return None
+    tensor_node, _subscripts, value = store_node.args[:3]
+    output = (
+        tensor_node.meta.get("val") if isinstance(tensor_node, torch.fx.Node) else None
+    )
+    index_nodes = store_tile_index_nodes(store_node)
+    if (
+        not isinstance(output, torch.Tensor)
+        or not isinstance(value, torch.fx.Node)
+        or index_nodes is None
+    ):
+        return None
+    chain_input = value
+    converted = _convert_input_and_dtype(value)
+    if converted is not None and converted[1] == output.dtype:
+        # the store conversion itself, which the splice site renders
+        chain_input = converted[0]
+    tile_shape = _carrier_tile_shape(chain_input)
+    if tile_shape is None or len(tile_shape) != len(index_nodes):
+        return None
+    expr = _classify_auxiliary_tensor_expr(
+        chain_input,
+        carrier_tile_shape=tile_shape,
+        carrier_tile_index_nodes=index_nodes,
+        carrier_global_shape=tuple(output.shape),
+    )
+    if expr is None:
+        return None
+    leaves = _tensor_expr_leaves(expr, _AuxiliaryTensorLoadExpr)
+    if not leaves or any(leaf.broadcast_axis is not None for leaf in leaves):
+        return None
+    return _chain_of([_AuxiliaryTensorExprStep(expr=expr)])
 
 
 def _convert_input_and_dtype(

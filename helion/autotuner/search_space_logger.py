@@ -400,8 +400,8 @@ def analyze_search_space(
     Returns:
         A SearchSpaceReport describing the valid search space
     """
-    from ..autotuner.config_spec import VALID_KEYS
     from ..autotuner.config_spec import VALID_PID_TYPES
+    from ..autotuner.config_spec import valid_keys
 
     overrides = dict(config_overrides or {})
     dimensions: list[DimensionStats] = []
@@ -426,7 +426,7 @@ def analyze_search_space(
             _apply_override(acf_dim, overrides["advanced_controls_file"])
         dimensions.append(acf_dim)
 
-    for key in sorted(VALID_KEYS):
+    for key in sorted(valid_keys()):
         if key in flat_fields:
             continue
         if config_spec.supports_config_key(key):
@@ -592,9 +592,12 @@ def _get_disable_reason(config_spec: ConfigSpec, key: str) -> str:
         if key == "num_threads":
             return "Triton backend (uses num_warps)"
 
-    elif backend_name == "cute":
-        if key == "num_threads" and not config_spec.target_device_capability:
-            return "CuTe requires CUDA target"
+    else:
+        reason = config_spec.backend.config_spec_extension().explain_unavailable_key(
+            key, config_spec
+        )
+        if reason is not None:
+            return reason
 
     if key == "epilogue_subtile":
         if not config_spec.epilogue_subtile_candidate_enabled:

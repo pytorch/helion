@@ -8,8 +8,8 @@ chunk_retention computes its own internal decay, so we do NOT pass g to FLA.
 
 from __future__ import annotations
 
-from .linear_attention_engine import LinearAttentionVariant
-from .linear_attention_harness import LinearAttentionExampleHarness
+from helion._testing.linear_attention_harness import LinearAttentionExampleHarness
+from helion.experimental.linear_attention import LinearAttentionVariant
 
 HARNESS = LinearAttentionExampleHarness(variant=LinearAttentionVariant.RETENTION)
 

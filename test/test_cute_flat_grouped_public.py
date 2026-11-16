@@ -18,10 +18,10 @@ from test.test_cute_flat_grouped_ir import _host
 from test.test_cute_flat_grouped_ir import cuda_binding
 
 import helion
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     CuteGroupedRnaHeuristic,
 )
-from helion._compiler.autotuner_heuristics.cute_grouped_rna import (
+from helion._compiler.cute.autotune.heuristics.cute_grouped_rna import (
     interleave_grouped_rna_seeds,
 )
 from helion._compiler.cute.backend import CuteBackend
@@ -40,6 +40,8 @@ from helion.autotuner.pattern_search import InitialPopulationStrategy
 from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 from helion.exc import InvalidConfig
+
+pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -509,3 +511,29 @@ def test_native_seeds_own_their_nested_mutable_configuration(
         assert [seed.config for seed in fresh] == fresh_snapshots
         assert [seed.config for seed in ordinary] == ordinary_snapshots
         assert base.config == base_snapshot
+
+
+def test_native_grouped_launch_preserves_compile_options():
+    with cuda_binding(
+        static=True, original=True, groups=4, rows=256, k=128, n=128
+    ) as bound:
+        config = _config(bound)
+        control = _source(bound, config)
+        config.config["advanced_controls_file"] = "compile-controls.txt"
+        source = _source(bound, config)
+    assert _native_source(source) == _native_source(control)
+    launches = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_launcher"
+    ]
+    assert len(launches) == 1
+    assert ast.unparse(launches[0].args[0]).endswith("._helion_native_grouped_rna")
+    options = [
+        ast.literal_eval(keyword.value)
+        for keyword in launches[0].keywords
+        if keyword.arg == "cute_compile_options"
+    ]
+    assert options == ["--ptxas-options='--apply-controls compile-controls.txt'"]

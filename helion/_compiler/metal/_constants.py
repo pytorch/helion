@@ -13,15 +13,14 @@ SIMD_WIDTH = 32
 
 #: Maximum threads in a Metal threadgroup.
 #:
-#: Numerically equal to ``cute.thread_budget.MAX_THREADS_PER_BLOCK``: one
-#: Apple hardware limit under two names.  The MPP budget in ``backend.py``
-#: uses the CuTe name; everything else on this backend uses this one.
+#: Numerically equal to ``per_thread_planning.MAX_THREADS_PER_BLOCK``, the cap
+#: the shared per-thread tile planner (``plan_per_thread_loop_strategy``)
+#: enforces; everything on this backend uses this name.
 MAX_THREADS_PER_THREADGROUP = 1024
 
-#: Maximum number of SIMD groups in a threadgroup, hence the slot count of
-#: every ``threadgroup`` scratch buffer (one slot per SIMD group; see
-#: ``reduction.alloc_threadgroup_buffer``).
-MAX_SIMD_GROUPS = MAX_THREADS_PER_THREADGROUP // SIMD_WIDTH
+#: Threadgroup memory available to one threadgroup
+#: (``maxThreadgroupMemoryLength`` on Apple-silicon GPUs).
+MAX_THREADGROUP_MEMORY_BYTES = 32768
 
 #: A Metal threadgroup is three-dimensional:
 #: ``thread_position_in_threadgroup`` is a ``uint3``.  A kernel needing a

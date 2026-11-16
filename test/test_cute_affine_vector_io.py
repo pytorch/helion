@@ -7,9 +7,17 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 
+from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.affine_vector_io import _Vectorizer
+from helion._compiler.cute.affine_vector_io import vectorize_affine_tile_lanes
+from helion._compiler.cute.pure_lane_packets import _PacketVectorizer
 from helion._compiler.cute.scalar_integer import _integer_expression
+from helion._compiler.device_function import Argument
+from helion._compiler.device_function import TensorArg
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _Float32(float):
@@ -90,25 +98,36 @@ def _rewrite(
     aligned: bool = True,
     disjoint: bool = True,
     integer_tensors: frozenset[str] = frozenset(),
+    strides: dict[tuple[str, int], int] | None = None,
+    builtin_abs: bool = True,
 ):
     tree = ast.parse(source)
     function = tree.body[0]
     assert isinstance(function, ast.FunctionDef)
     rewriter = _Vectorizer(
         function.body,
-        strides={("src", 0): 1, ("out", 0): 1},
+        strides=strides if strides is not None else {("src", 0): 1, ("out", 0): 1},
         alignments={"src": 16 if aligned else 1, "out": 16},
         dtypes={"src": "cutlass.Float32", "out": "cutlass.Float32"},
         disjoint={frozenset(("src", "out"))} if disjoint else set(),
         constexpr={},
         integer_tensors=integer_tensors,
+        unshadowed_abs=builtin_abs
+        and all(arg.arg != "abs" for arg in function.args.args),
     )
     function.body = rewriter.body(function.body)
     return ast.fix_missing_locations(tree), rewriter.changed
 
 
 def _execute(
-    tree: ast.Module, start: int, length: int, *, int32=int, int64=int, extra_args=()
+    tree: ast.Module,
+    start: int,
+    length: int,
+    *,
+    int32=int,
+    int64=int,
+    extra_args=(),
+    out_stride: tuple[int, ...] = (1,),
 ):
     stats = dict.fromkeys(
         ("scalar_loads", "scalar_stores", "vector_loads", "vector_stores"), 0
@@ -116,7 +135,9 @@ def _execute(
     data = [float(value) for value in range(80)]
     output = [-123.0] * 80
     src = _Tensor(iterator=_Pointer(data, stats), layout=SimpleNamespace(stride=(1,)))
-    out = _Tensor(iterator=_Pointer(output, stats), layout=SimpleNamespace(stride=(1,)))
+    out = _Tensor(
+        iterator=_Pointer(output, stats), layout=SimpleNamespace(stride=out_stride)
+    )
     namespace = {
         "cutlass": SimpleNamespace(
             Int32=int32,
@@ -152,6 +173,204 @@ def test_vector_path_and_scalar_tails_preserve_memory_values(
     expected_vectors = length // 4 if start % 4 == 0 else 0
     assert after["vector_loads"] == after["vector_stores"] == expected_vectors
     assert after["scalar_loads"] == length - expected_vectors * 4
+
+
+def _computed_row_source() -> str:
+    source = _SOURCE.replace("vec_lane_1", "synthetic_lane_1").replace(
+        "cutlass.Int32(tile_offset_1) + cutlass.Int32(lane_1) * 4",
+        "cutlass.Int32(tile_offset_1 // 16) * 16 + cutlass.Int32(lane_1) * 4",
+    )
+    # This value DAG exceeds the address proof's expansion budget. Its values
+    # are consumed, but neither the addresses nor their masks depend on it.
+    values = ["fp_0 = value - 40.0"] + [
+        f"fp_{i} = fp_{i - 1} * 0.5 + fp_{i - 1} * 0.5" for i in range(1, 15)
+    ]
+    return source.replace(
+        "result = value * 1.25 + 2",
+        "\n                ".join([*values, "result = abs(fp_14)"]),
+    )
+
+
+@pytest.mark.parametrize("start,length", [(0, 32), (1, 17), (4, 5), (0, 0)])
+def test_implicit_computed_rows_keep_large_value_recipes_and_scalar_tails(
+    start: int, length: int
+) -> None:
+    source = _computed_row_source()
+    transformed, changed = _rewrite(source)
+    assert changed == 1
+    expected, before = _execute(ast.parse(source), start, length)
+    actual, after = _execute(transformed, start, length)
+    assert actual == expected
+    assert before["scalar_loads"] == length
+    vectors = length // 4 if start % 4 == 0 else 0
+    assert after["vector_loads"] == after["vector_stores"] == vectors
+    assert after["scalar_loads"] == length - vectors * 4
+
+
+@pytest.mark.parametrize("failure", ["alignment", "alias", "effect", "address"])
+def test_implicit_rows_keep_memory_and_effect_refusals(failure: str) -> None:
+    source = _computed_row_source()
+    if failure == "effect":
+        source = source.replace("result = abs(fp_14)", "result = opaque(fp_14)")
+    elif failure == "address":
+        # Every lane points at the same element. Dropping the oversized
+        # address dependency would falsely prove consecutive addresses.
+        terms = ["term_0 = cutlass.Int32(synthetic_lane_1)"] + [
+            f"term_{i} = term_{i - 1} + term_{i - 1}" for i in range(1, 14)
+        ]
+        source = source.replace(
+            "address = cutlass.Int32(start) + indices_1",
+            "\n                ".join(
+                [
+                    *terms,
+                    "hidden = (term_13 - term_13) - cutlass.Int32(synthetic_lane_1)",
+                    "address = cutlass.Int32(start) + indices_1 + hidden",
+                ]
+            ),
+        )
+    transformed, changed = _rewrite(
+        source, aligned=failure != "alignment", disjoint=failure != "alias"
+    )
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+@pytest.mark.parametrize(
+    "call", ["abs()", "abs(value, value)", "abs(value=value)", "abs(*value)"]
+)
+def test_scalar_abs_requires_exact_builtin_signature(call: str) -> None:
+    source = _SOURCE.replace("result = value * 1.25 + 2", f"result = {call}")
+    transformed, changed = _rewrite(source)
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+@pytest.mark.parametrize("binding", ["argument", "assignment", "function", "global"])
+def test_shadowed_abs_does_not_authorize_memory_motion(binding: str) -> None:
+    source = _SOURCE.replace("result = value * 1.25 + 2", "result = abs(value)")
+    if binding == "argument":
+        source = source.replace("start, length):", "start, length, abs):")
+    elif binding == "assignment":
+        source += "    abs = replacement\n"
+    elif binding == "function":
+        source += "    def abs(value):\n        return value\n"
+    elif binding == "global":
+        source = source.replace(
+            "    for tile_offset_1", "    global abs\n    for tile_offset_1", 1
+        )
+    transformed, changed = _rewrite(source)
+    assert changed == 0
+    assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+def _generated_function(*, binding: str = "none"):
+    arguments = [TensorArg(name, torch.empty(80), None) for name in ("src", "out")]
+    if binding == "argument":
+        arguments.append(Argument("abs"))
+    return SimpleNamespace(
+        arguments=arguments,
+        proven_tensor_stride_values=lambda: {("src", 0): 1, ("out", 0): 1},
+        proven_disjoint_tensor_pairs=lambda: {frozenset(("src", "out"))},
+        _variable_renames={},
+        _expr_args={},
+        codegen=SimpleNamespace(
+            module_statements=ast.parse(
+                "abs = replacement" if binding == "module" else ""
+            ).body
+        ),
+    )
+
+
+@pytest.mark.parametrize("binding", ["none", "argument", "module"])
+def test_generated_caller_checks_abs_argument_and_module_bindings(binding: str) -> None:
+    source = _SOURCE.replace("result = value * 1.25 + 2", "result = abs(value)")
+    module = ast.parse(source)
+    function = module.body[0]
+    env = SimpleNamespace(
+        input_sources=(),
+        backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
+        config_spec=SimpleNamespace(pointwise_facts=False),
+    )
+    with patch.object(CompileEnvironment, "current", return_value=env):
+        function.body = vectorize_affine_tile_lanes(
+            function.body, _generated_function(binding=binding), {}
+        )
+    if binding == "none":
+        expected, _ = _execute(ast.parse(source), 0, 17)
+        actual, stats = _execute(module, 0, 17)
+        assert actual == expected
+        assert stats["vector_loads"] == stats["vector_stores"] == 4
+    else:
+        assert ast.dump(module) == ast.dump(ast.parse(source))
+
+
+@pytest.mark.parametrize("start", [0, 1])
+def test_pointwise_packet_pass_handles_synthetic_lanes_and_scalar_tails(
+    start: int,
+) -> None:
+    # The packet pass requires a proved integer offset before speculating its
+    # alignment check. An arbitrary runtime scalar cast keeps its old refusal.
+    source = _SOURCE.replace("vec_lane_1", "synthetic_lane_1").replace(
+        "cutlass.Int32(start)", f"cutlass.Int32({start})"
+    )
+    module = ast.parse(source)
+    function = module.body[0]
+    env = SimpleNamespace(
+        input_sources=(),
+        backend=SimpleNamespace(dtype_str=lambda dtype: "cutlass.Float32"),
+        config_spec=SimpleNamespace(pointwise_facts=True),
+    )
+    packet_body = _PacketVectorizer.body
+    changed = []
+
+    def track_packet_body(packetizer, *args, **kwargs):
+        result = packet_body(packetizer, *args, **kwargs)
+        changed.append(packetizer.changed)
+        return result
+
+    with (
+        patch.object(CompileEnvironment, "current", return_value=env),
+        patch.object(_PacketVectorizer, "body", track_packet_body),
+    ):
+        function.body = vectorize_affine_tile_lanes(
+            function.body, _generated_function(), {}
+        )
+    assert max(changed) == 1
+    expected, _ = _execute(ast.parse(source), start, 17)
+    actual, stats = _execute(module, start, 17)
+    assert actual == expected
+    assert stats["vector_loads"] == stats["vector_stores"] == (4 if start == 0 else 0)
+
+
+# A sixteen-lane loop of a 4-byte dtype: four sixteen-byte packets per access
+# site (``cute_vector_widths`` 16 on fp32, or 16 bf16 lanes as two packets).
+_WIDE_SOURCE = (
+    _SOURCE.replace(
+        "range(0, cutlass.Int32(length), 16)", "range(0, cutlass.Int32(length), 64)"
+    )
+    .replace("cutlass.Int32(lane_1) * 4", "cutlass.Int32(lane_1) * 16")
+    .replace("range_constexpr(4)", "range_constexpr(16)")
+)
+
+
+@pytest.mark.parametrize("length", [0, 1, 15, 16, 17, 32, 64])
+@pytest.mark.parametrize("start", [0, 4, 16])
+def test_wide_lane_loop_splits_into_sixteen_byte_packets(
+    length: int, start: int
+) -> None:
+    transformed, changed = _rewrite(_WIDE_SOURCE)
+    assert changed == 1
+    text = ast.unparse(transformed)
+    assert text.count("ir.VectorType.get([4]") == 4
+    assert "ir.VectorType.get([16]" not in text
+    assert "+ 12, ir.VectorType" in text and "_helion_affine_store[12:16]" in text
+    expected, before = _execute(ast.parse(_WIDE_SOURCE), start, length)
+    actual, after = _execute(transformed, start, length)
+    assert actual == expected
+    assert before["scalar_loads"] == length
+    fragments = length // 16 if start % 16 == 0 else 0
+    assert after["vector_loads"] == after["vector_stores"] == 4 * fragments
+    assert after["scalar_loads"] == length - fragments * 16
 
 
 @pytest.mark.parametrize(
@@ -260,6 +479,22 @@ def test_nonaffine_effectful_or_mixed_width_loops_are_unchanged(
     tree, changed = _rewrite(_SOURCE.replace(before, after))
     assert changed == 0
     assert "_helion_affine_load" not in ast.unparse(tree)
+
+
+def test_fast_math_call_forms_still_vectorize() -> None:
+    # The fast_math setting rewrites exp and division into
+    # ``exp2(fma(x, log2e, -m), fastmath=True)`` and
+    # ``div(a, b, approx=True, ftz=True)``; both are pure elementwise calls,
+    # so the loads and stores around them vectorize as before (the aot
+    # row_softmax read 3x slower on B200 when they did not).
+    source = _SOURCE.replace(
+        "result = value * 1.25 + 2",
+        "result = cute.math.div(cute.math.exp2(cute.math.fma(value, 1.25, -2.0), "
+        "fastmath=True), 3.0, approx=True, ftz=True)",
+    )
+    tree, changed = _rewrite(source)
+    assert changed == 1
+    assert "_helion_affine_load" in ast.unparse(tree)
 
 
 @pytest.mark.parametrize("length", [0, 1, 3, 4, 8])
@@ -703,7 +938,7 @@ for vec_lane_1 in cutlass.range_constexpr(4):
     [
         "value = argument + 1",
         "if condition:\n    value = argument + 1",
-        "for vec_lane_0 in cutlass.range_constexpr(16):\n    value = argument + 1",
+        "for vec_lane_0 in cutlass.range_constexpr(32):\n    value = argument + 1",
         "for scalar_lane in cutlass.range_constexpr(4):\n    value = argument + 1",
         "for vec_lane_0 in range(4):\n    value = argument + 1",
         "for vec_lane_0 in cutlass.range_constexpr(1):\n    value = argument + 1",
@@ -761,3 +996,71 @@ def test_snapshot_gate_preserves_nested_masks_and_alias_rejection(
     if not disjoint:
         assert changed == 0
         assert ast.dump(transformed) == ast.dump(ast.parse(source))
+
+
+# Two stores into one output from a lane loop: an interleaved operand writes
+# rows ``2k`` and ``2k + 1`` (``out`` is (rows, 16), row stride 16).
+_TWO_ROW_SOURCE = """
+def kernel(src, out, start, length):
+    for tile_offset_1 in range(0, cutlass.Int32(length), 16):
+        row = cutlass.Int32(start)
+        row_lo = row * 2 + 0
+        row_hi = row * 2 + __HI_OFFSET__
+        for lane_1 in range(4):
+            lane_base_1 = cutlass.Int32(tile_offset_1) + cutlass.Int32(lane_1) * 4
+            for vec_lane_1 in cutlass.range_constexpr(4):
+                indices_1 = lane_base_1 + cutlass.Int32(vec_lane_1)
+                mask_1 = indices_1 < cutlass.Int32(length)
+                value = (src.iterator + cutlass.Int32(indices_1) * cutlass.Int32(src.layout.stride[0])).load() if mask_1 else cutlass.Float32(0)
+                if mask_1:
+                    (out.iterator + cutlass.Int32(row_lo) * cutlass.Int32(out.layout.stride[0]) + cutlass.Int32(indices_1) * cutlass.Int32(out.layout.stride[1])).store(cutlass.Float32(value * 2))
+                if mask_1:
+                    (out.iterator + cutlass.Int32(row_hi) * cutlass.Int32(out.layout.stride[0]) + cutlass.Int32(indices_1 + __COLUMN_SHIFT__) * cutlass.Int32(out.layout.stride[1])).store(cutlass.Float32(value + 1))
+"""
+_TWO_ROW_STRIDES = {("src", 0): 1, ("out", 0): 16, ("out", 1): 1}
+
+
+def _two_row_source(hi_offset: int, column_shift: int = 0) -> str:
+    return _TWO_ROW_SOURCE.replace("__HI_OFFSET__", str(hi_offset)).replace(
+        "__COLUMN_SHIFT__", str(column_shift)
+    )
+
+
+@pytest.mark.parametrize("length", [0, 3, 4, 12, 16])
+@pytest.mark.parametrize("start", [0, 1])
+def test_two_provably_disjoint_stores_of_one_tensor_both_vectorize(
+    length: int, start: int
+) -> None:
+    source = _two_row_source(1)
+    transformed, changed = _rewrite(source, strides=_TWO_ROW_STRIDES)
+    assert changed == 1
+    expected, _ = _execute(ast.parse(source), start, length, out_stride=(16, 1))
+    actual, after = _execute(transformed, start, length, out_stride=(16, 1))
+    assert actual == expected
+    # Rows 2k and 2k + 1 are 16 elements apart (>= the 4 lanes), so both
+    # stores flush as packets after the lane loop.
+    assert after["vector_stores"] == 2 * (length // 4)
+    assert after["scalar_stores"] == 2 * (length - 4 * (length // 4))
+
+
+@pytest.mark.parametrize(
+    "hi_offset,column_shift",
+    [
+        (0, 0),  # the same row: lane l of both stores
+        (0, 1),  # the same row, shifted by one lane: lane l against lane l - 1
+        (0, 3),  # still inside the 4-lane packet
+    ],
+)
+def test_two_stores_that_may_alias_keep_the_scalar_loop(
+    hi_offset: int, column_shift: int
+) -> None:
+    source = _two_row_source(hi_offset, column_shift)
+    transformed, changed = _rewrite(source, strides=_TWO_ROW_STRIDES)
+    assert changed == 0
+    assert ast.unparse(transformed) == ast.unparse(ast.parse(source))
+
+
+def test_two_stores_need_proven_strides_to_separate_their_rows() -> None:
+    # Without the proven row stride the constant distance is unknown.
+    _, changed = _rewrite(_two_row_source(1), strides={("src", 0): 1, ("out", 1): 1})
+    assert changed == 0

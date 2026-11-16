@@ -60,6 +60,33 @@ def _(state: CodegenState) -> ast.AST:
     return _render(state, epilogue_unary_step_template(), "gelu_tanh_approx_in")
 
 
+# Unary math steps whose DSL form takes ``fastmath=True``: the pointwise
+# lowering (``HelionCuteDSLOpOverrides._unary_math``) passes it under the
+# ``fast_math`` setting, and the fused epilogue forms of the same ops follow
+# it so a kernel's fused and unfused forms compute the same thing.
+FAST_MATH_UNARY_OPS = frozenset({"tanh", "exp", "log", "sqrt", "erf", "gelu_erf"})
+_FAST_MATH_SUFFIX = "({inner}, fastmath=True)"
+
+
+def fast_math_unary_template(template: str) -> str:
+    """``template`` with the DSL's ``fastmath=True`` flag on its single call.
+
+    The accepted templates end in ``({inner})`` (``cute.math.erf({inner})``,
+    ``_cute_gelu_erf_exact_f32x2({inner})``); anything else is returned as is.
+    """
+    if template.endswith("({inner})"):
+        return template[: -len("({inner})")] + _FAST_MATH_SUFFIX
+    return template
+
+
+def gelu_erf_cute_template() -> str:
+    """The exact-GELU template, approximate erf under ``fast_math``."""
+    template = gelu_erf_epilogue_unary_step_template()
+    if CompileEnvironment.current().settings.fast_math:
+        return fast_math_unary_template(template)
+    return template
+
+
 @_decorators.codegen(_gelu_erf, "cute")
 def _(state: CodegenState) -> ast.AST:
-    return _render(state, gelu_erf_epilogue_unary_step_template(), "gelu_erf_in")
+    return _render(state, gelu_erf_cute_template(), "gelu_erf_in")

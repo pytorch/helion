@@ -8,6 +8,7 @@ from cutlass import Float16
 from cutlass import Float32
 from cutlass import Int8
 from cutlass import Int16
+from cutlass import Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
@@ -160,6 +161,82 @@ def float4_e2m1fn_x2_to_float32(
         Float32(llvm.extractvalue(Float32.mlir_type, result, [0], loc=loc, ip=ip)),
         Float32(llvm.extractvalue(Float32.mlir_type, result, [1], loc=loc, ip=ip)),
     )
+
+
+def _as_i64_bytes(
+    value: object,
+    *,
+    loc: ir.Location | None,
+    ip: ir.InsertionPoint | None,
+) -> ir.Value:
+    """A packed 64-bit group given as an i64 or as an 8-byte vector load."""
+    raw_value = getattr(value, "value", None)
+    if hasattr(raw_value, "type"):
+        ir_value = cast("Any", raw_value)
+    elif hasattr(value, "ir_value"):
+        ir_value = cast("Any", value).ir_value(loc=loc, ip=ip)
+    else:
+        ir_value = cast("Any", value)
+    ir_type = str(ir_value.type)
+    if ir_type == "i64":
+        return ir_value
+    if ir_type == "vector<8xi8>":
+        return llvm.bitcast(Int64.mlir_type, ir_value, loc=loc, ip=ip)
+    raise TypeError(f"expected a packed 64-bit group, got {ir_type}")
+
+
+@dsl_user_op
+def float4_e2m1fn_x16_dot_float32(
+    lhs: object,
+    rhs: object,
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> Float32:
+    """The exact f32 dot product of two packed 64-bit E2M1 groups.
+
+    Every product of two E2M1 values is a multiple of 0.25 of magnitude at
+    most 36, so the two interleaved f16 sums of eight products each that the
+    ``fma.rn.f16x2`` chain keeps (magnitude at most 288; f16 resolves quarters
+    up to 512) round nothing, nor do the two final f32 conversions and the
+    add: the result equals the sixteen-term f32 sum bit for bit.
+    """
+    lhs_i64 = _as_i64_bytes(lhs, loc=loc, ip=ip)
+    rhs_i64 = _as_i64_bytes(rhs, loc=loc, ip=ip)
+    steps = []
+    for i in range(8):
+        op = "mul.rn.f16x2 acc, hw, hx;" if i == 0 else "fma.rn.f16x2 acc, hw, hx, acc;"
+        steps.append(
+            f"cvt.rn.f16x2.e2m1x2 hw, w{i}; cvt.rn.f16x2.e2m1x2 hx, x{i}; {op}"
+        )
+    body = "\n          ".join(steps)
+    result = llvm.inline_asm(
+        Float32.mlir_type,
+        [lhs_i64, rhs_i64],
+        f"""
+        {{
+          .reg .b32 wlo, whi, xlo, xhi, hw, hx, acc;
+          .reg .b8 w0, w1, w2, w3, w4, w5, w6, w7, x0, x1, x2, x3, x4, x5, x6, x7;
+          .reg .b16 s_lo, s_hi;
+          .reg .f32 f_lo, f_hi;
+          mov.b64 {{wlo, whi}}, $1;
+          mov.b64 {{xlo, xhi}}, $2;
+          mov.b32 {{w0, w1, w2, w3}}, wlo; mov.b32 {{w4, w5, w6, w7}}, whi;
+          mov.b32 {{x0, x1, x2, x3}}, xlo; mov.b32 {{x4, x5, x6, x7}}, xhi;
+          {body}
+          mov.b32 {{s_lo, s_hi}}, acc;
+          cvt.f32.f16 f_lo, s_lo; cvt.f32.f16 f_hi, s_hi;
+          add.f32 $0, f_lo, f_hi;
+        }}
+        """,
+        "=f,l,l",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return Float32(result)
 
 
 @dsl_user_op

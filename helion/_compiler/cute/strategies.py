@@ -58,16 +58,10 @@ class Tcgen05Strategy(str, enum.Enum):
       sched_pipeline ``cluster_size`` argument to the full
       ``cluster_m * cluster_n`` envelope so the deferred-init
       protocol participates in the cluster-wide barrier-init.
-    - ``PURE_MATMUL_ROLE_LIFECYCLE``. Experimental non-persistent,
-      static-full pure-matmul path. It emits separate TMA-producer,
-      MMA-exec, and epilogue/TMEM-free ownership while deleting the original
-      K-loop body only through exact tcgen05 statement ownership. It is
-      explicit-config only and not sampled by autotune.
     """
 
     ROLE_LOCAL_MONOLITHIC = "role_local_monolithic"
     ROLE_LOCAL_WITH_SCHEDULER = "role_local_with_scheduler"
-    PURE_MATMUL_ROLE_LIFECYCLE = "pure_matmul_role_lifecycle"
 
 
 class Tcgen05PersistenceModel(str, enum.Enum):
@@ -87,16 +81,11 @@ class Tcgen05PersistenceModel(str, enum.Enum):
       this through ``ROLE_LOCAL_WITH_SCHEDULER`` so the existing
       sched-warp role becomes the CLC issuer. Validator requires
       ``arch >= 100`` AND ``ROLE_LOCAL_WITH_SCHEDULER``.
-    - ``DYNAMIC_PERSISTENT``: atomic-counter / ``tile_count_semaphore``
-      driven dynamic persistent. Quack's fallback when CLC is
-      unavailable. Helion has no codegen for this today; validator
-      rejects it until a strategy consumes it.
     """
 
     NON_PERSISTENT = "non_persistent"
     STATIC_PERSISTENT = "static_persistent"
     CLC_PERSISTENT = "clc_persistent"
-    DYNAMIC_PERSISTENT = "dynamic_persistent"
 
 
 class Tcgen05LayoutStrategy(str, enum.Enum):
@@ -199,7 +188,7 @@ class Tcgen05WarpSpec:
       the C-input warp remains inert in cycle 34 (a no-op slot);
       the productive TMA-prefetch body is deferred. The autotune
       surface stays narrowed to ``0`` in
-      ``_tcgen05_strategy_autotune_fragments`` until the productive
+      ``tcgen05_config.surface.strategy_autotune_fragments`` until the productive
       body lands and perf is characterized; only the user-config
       validation surface accepts ``{0, 1}``.
     - ``store_warps``: dedicated epilogue store/drain warp count.
@@ -216,7 +205,7 @@ class Tcgen05WarpSpec:
     - ``register_split``: ``(decrease, increase)`` ``setmaxregister``
       counts. The current 6-warp shape uses ``(120, 256)``. Each
       entry's range is enforced by its per-field fragment in
-      ``ConfigSpec._tcgen05_strategy_autotune_fragments``; the
+      ``tcgen05_config.surface.strategy_autotune_fragments``; the
       surface stays narrowed to the implemented strategy's values
       until a strategy consumes the field. No cross-fragment
       invariant applies.
@@ -457,13 +446,6 @@ def tcgen05_smem_layout_expr(
 TCGEN05_STRATEGY_CONFIG_KEY = "tcgen05_strategy"
 
 
-def is_pure_matmul_role_lifecycle_config(config: Mapping[str, object]) -> bool:
-    return (
-        config.get(TCGEN05_STRATEGY_CONFIG_KEY)
-        == Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE.value
-    )
-
-
 # Persistence model. The default is *derived from* ``pid_type`` so
 # serialized configs cannot encode contradictions like
 # ``pid_type=flat`` paired with ``static_persistent``.
@@ -502,7 +484,7 @@ TCGEN05_WARP_SPEC_REGISTER_INCREASE_KEY = "tcgen05_warp_spec_register_increase"
 
 # Source of truth for ``epi_warps`` lives in the existing
 # ``tcgen05_num_epi_warps`` field, narrowed to ``(4,)`` at validation
-# time by ``narrow_tcgen05_autotune_to_validated_configs``.
+# time by ``tcgen05_config.surface.narrow_autotune_to_validated_configs``.
 TCGEN05_NUM_EPI_WARPS_CONFIG_KEY = "tcgen05_num_epi_warps"
 
 # L2 tile-scheduler swizzle size (Quack ``max_swizzle_size`` equivalent).
@@ -536,6 +518,37 @@ TCGEN05_BATCH_RASTER_CHOICES: tuple[str, ...] = (
     TCGEN05_BATCH_RASTER_SLOWEST,
 )
 TCGEN05_BATCH_RASTER_DEFAULT = TCGEN05_BATCH_RASTER_FASTEST
+
+
+# How a static-persistent clustered tcgen05 launch caps its grid when the
+# problem holds more clusters than the device co-schedules.  ``sm_pairs``
+# (the historical cap) grants one SM pair per CTA pair regardless of
+# ``cluster_n``, so a ``cluster_n=2`` grid may launch twice the resident
+# cluster count: the surplus clusters become a second hardware wave whose
+# CTAs each run one tile with a cold prologue and an exposed epilogue.
+# ``resident_clusters`` caps the launch at the device's co-resident
+# whole-cluster count (``helion.runtime.get_max_active_clusters``), so the
+# persistent CTAs recycle their pipelines across tiles and the epilogue of
+# one tile overlaps the mainloop of the next.  Batched clustered grids
+# already use the resident-cluster cap; the knob is inert there and on
+# ``cluster_n=1`` grids (both caps agree).
+TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY = "tcgen05_persistent_grid_cap"
+TCGEN05_PERSISTENT_GRID_CAP_SM_PAIRS = "sm_pairs"
+TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS = "resident_clusters"
+TCGEN05_PERSISTENT_GRID_CAP_CHOICES: tuple[str, ...] = (
+    TCGEN05_PERSISTENT_GRID_CAP_SM_PAIRS,
+    TCGEN05_PERSISTENT_GRID_CAP_RESIDENT_CLUSTERS,
+)
+TCGEN05_PERSISTENT_GRID_CAP_DEFAULT = TCGEN05_PERSISTENT_GRID_CAP_SM_PAIRS
+
+
+def persistent_grid_cap_from_config(config: Mapping[str, object]) -> str:
+    """Decode ``tcgen05_persistent_grid_cap`` (default ``sm_pairs``)."""
+    value = config.get(
+        TCGEN05_PERSISTENT_GRID_CAP_CONFIG_KEY, TCGEN05_PERSISTENT_GRID_CAP_DEFAULT
+    )
+    assert value in TCGEN05_PERSISTENT_GRID_CAP_CHOICES, value
+    return str(value)
 
 
 def batch_raster_from_config(config: Mapping[str, object]) -> str:
@@ -739,6 +752,18 @@ def tcgen05_explicit_epilogue_tile_supported(
     )
 
 
+def tcgen05_epilogue_subtile_m(*, bm: int, is_two_cta: bool) -> int:
+    """Per-CTA M of a configured epilogue subtile (``tcgen05_epi_subtile_n``).
+
+    The CtaGroup.TWO pair's epilogue owns the 128-row half of the 256-row pair
+    tile; one CTA walks whole 128-lane TMEM datapath tiles of its M tile (a
+    64-row tile is one 64-row subtile).
+    """
+    if is_two_cta:
+        return 128
+    return min(bm, 128)
+
+
 def tcgen05_explicit_epilogue_tile_expr(tile_m: int, tile_n: int) -> str:
     """Return the CuTe expression for a validated explicit epilogue tile."""
 
@@ -870,12 +895,10 @@ def derive_persistence_model_from_pid_type(
     Used during ``ConfigSpec.normalize`` when the user did not supply
     an explicit ``tcgen05_persistence_model``. The mapping is
     intentionally conservative: only the existing knob values are
-    recognized, and ``DYNAMIC_PERSISTENT`` / ``CLC_PERSISTENT`` never
-    fall out of this function — they are reachable only via an
-    explicit user opt-in. Helion has no codegen for dynamic
-    persistence today, and CLC requires explicit user opt-in so the
-    benchmarking surface stays under explicit control until perf is
-    characterized.
+    recognized, and ``CLC_PERSISTENT`` never falls out of this
+    function — it is reachable only via an explicit user opt-in so
+    the benchmarking surface stays under explicit control until perf
+    is characterized.
 
     ``pid_type`` is validated upstream by ``ConfigSpec.normalize``
     against ``VALID_PID_TYPES`` so this helper never sees an unknown
@@ -923,9 +946,6 @@ _STRATEGY_SUPPORTED_PERSISTENCE: dict[
             Tcgen05PersistenceModel.CLC_PERSISTENT,
         }
     ),
-    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset(
-        {Tcgen05PersistenceModel.NON_PERSISTENT}
-    ),
 }
 
 # Minimum CUDA compute capability (major version) for each persistence
@@ -943,7 +963,6 @@ _PERSISTENCE_MIN_ARCH_MAJOR: dict[Tcgen05PersistenceModel, int] = {
 _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: 0,
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: 1,
-    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: 0,
 }
 
 # Strategy-conditional ``c_input_warps`` accept set. Per ``cute_plan.md``
@@ -967,13 +986,12 @@ _STRATEGY_REQUIRED_SCHEDULER_WARPS: dict[Tcgen05Strategy, int] = {
 # 1 sched + 1 c_input, exactly matching the warpgroup-aligned launch
 # envelope). Producer-side TMA prefetch body is deferred to a
 # follow-up cycle. The autotune surface stays narrowed to ``(0,)``
-# in ``_tcgen05_strategy_autotune_fragments`` until the productive
+# in ``tcgen05_config.surface.strategy_autotune_fragments`` until the productive
 # body lands and perf is characterized; only the user-config
 # validation surface accepts ``(0, 1)``.
 _STRATEGY_SUPPORTED_C_INPUT_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0, 1}),
-    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({0}),
 }
 
 # Strategy-conditional ``store_warps`` accept set. Workstream A Stage 3
@@ -990,13 +1008,12 @@ _STRATEGY_SUPPORTED_C_INPUT_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
 _STRATEGY_SUPPORTED_STORE_WARPS: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({0}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({0, 1}),
-    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({0}),
 }
 
 # When the strategy demands warpgroup-aligned splits (every 4 warps
 # == one warpgroup, ``setmaxregister`` is warpgroup-uniform), the
-# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC`` and
-# ``PURE_MATMUL_ROLE_LIFECYCLE`` (1+1+4 = 6 role warps) and
+# total warp count must be a multiple of 4. ``ROLE_LOCAL_MONOLITHIC``
+# (1+1+4 = 6 role warps) and
 # ``ROLE_LOCAL_WITH_SCHEDULER`` (1+1+4+1 = 7 role warps) rely on
 # launched-warp padding in
 # ``CuteTcgen05MatmulPlan.launched_warp_count`` to round to a
@@ -1024,7 +1041,6 @@ _STRATEGY_REQUIRES_WARPGROUP_ALIGNED_TOTAL: frozenset[Tcgen05Strategy] = frozens
 _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
-    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
 
 # Strategy-conditional cluster_n capability. cluster_n=2 is now validated
@@ -1042,7 +1058,6 @@ _STRATEGY_SUPPORTED_CLUSTER_M: dict[Tcgen05Strategy, frozenset[int]] = {
 _STRATEGY_SUPPORTED_CLUSTER_N: dict[Tcgen05Strategy, frozenset[int]] = {
     Tcgen05Strategy.ROLE_LOCAL_MONOLITHIC: frozenset({1, 2}),
     Tcgen05Strategy.ROLE_LOCAL_WITH_SCHEDULER: frozenset({1, 2}),
-    Tcgen05Strategy.PURE_MATMUL_ROLE_LIFECYCLE: frozenset({1}),
 }
 
 # (strategy, persistence_model)-conditional cluster_n accept set. Used to
@@ -1092,7 +1107,7 @@ def validate_tcgen05_strategy_invariants(
     ``ConfigSpec._tcgen05_strategy_scalar_fragments``. ``epi_warps``
     is *also* not checked here — it is owned by the existing
     ``tcgen05_num_epi_warps`` validation
-    (``restrict_tcgen05_num_epi_warps_validation``); duplicating the
+    (``tcgen05_config.surface.restrict_num_epi_warps_validation``); duplicating the
     rule across two layers makes the lifting story confusing.
 
     The invariants here are the *cross-fragment* ones the strategy
@@ -1123,7 +1138,7 @@ def validate_tcgen05_strategy_invariants(
     first compile.
 
     Mirrors the pattern of
-    ``narrow_tcgen05_autotune_to_validated_configs`` — call from
+    ``tcgen05_config.surface.narrow_autotune_to_validated_configs`` — call from
     ``ConfigSpec.normalize`` after every fragment has been resolved.
     """
     errors: list[str] = []
@@ -1144,8 +1159,6 @@ def validate_tcgen05_strategy_invariants(
     # ``CLC_PERSISTENT`` when the user explicitly opts in — CLC
     # overlays the same persistent-grid launch with a runtime CLC
     # query, so it is compatible with the STATIC-derived pid_type).
-    # ``DYNAMIC_PERSISTENT`` has no codegen path so it never agrees
-    # with any current ``pid_type`` value.
     derived = derive_persistence_model_from_pid_type(pid_type)
     if persistence_model != derived and not (
         persistence_model is Tcgen05PersistenceModel.CLC_PERSISTENT
@@ -1231,7 +1244,7 @@ def validate_tcgen05_strategy_invariants(
 
     # ``epi_warps`` is intentionally NOT checked here — its accept-
     # set is owned by ``tcgen05_num_epi_warps`` validation
-    # (``restrict_tcgen05_num_epi_warps_validation``) so there is one
+    # (``tcgen05_config.surface.restrict_num_epi_warps_validation``) so there is one
     # place to lift the gate when G2 fixes the multi-warp store.
 
     # Total warp count must form clean warpgroups when the strategy

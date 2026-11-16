@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import math
 import operator
@@ -8,18 +9,23 @@ import os
 import re
 import tempfile
 from typing import Any
+from typing import Callable
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
+from torch import Tensor
 from torch._inductor import config as inductor_config
 from torch._inductor.codecache import FxGraphCache
 from torch._inductor.codecache import PyCodeCache
 from torch._inductor.compile_fx import compile_fx
 from torch._inductor.exc import InductorError
 from torch._inductor.ir import MutationOutput
+from torch._inductor.lowering import lowerings
 from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 from torch.utils._ordered_set import OrderedSet
@@ -530,9 +536,80 @@ def k_default_dtype_output(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(autotune_effort="none")
+def k_apply_callable(fn: Callable, x: torch.Tensor) -> torch.Tensor:
+    """Apply a callable (traced into the device code) elementwise."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = fn(x[tile])
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def k_host_applies_callable(fn: Callable, x: torch.Tensor) -> torch.Tensor:
+    """Apply a callable in host code, then copy the result on device."""
+    y = fn(x)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = y[tile]
+    return out
+
+
+def sin_plus_one(x: torch.Tensor) -> torch.Tensor:
+    return torch.sin(x) + 1.0
+
+
+@torch.library.custom_op("helion_test::sin_plus_one", mutates_args=())
+def sin_plus_one_op(x: torch.Tensor) -> torch.Tensor:
+    return sin_plus_one(x)
+
+
+# Not named ``_``: kernels in this module assign ``_`` inside device loops, and
+# a module-level ``_`` would make that an assignment to a host variable.
+@sin_plus_one_op.register_fake
+def _sin_plus_one_fake(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+def lower_through_callable_kernel(kernel: object) -> Callable[[object], object]:
+    """An Inductor lowering of ``helion_test::sin_plus_one`` as a call of
+    ``kernel(sin_plus_one, x)``, the way a lowering hands a Helion kernel a
+    traced callable (FlexAttention's score_mod subgraph, for one)."""
+    from helion._compiler._dynamo.higher_order_ops import helion_kernel_side_table
+    from helion._compiler._dynamo.variables import infer_output_spec
+    from helion._compiler._inductor.template_buffer import lower_helion_kernel
+
+    def lower(x: object) -> object:
+        with V.fake_mode:
+            fake_x = torch.empty_strided(
+                [int(s) for s in x.get_size()],  # pyrefly: ignore[missing-attribute]
+                [int(s) for s in x.get_stride()],  # pyrefly: ignore[missing-attribute]
+                dtype=x.get_dtype(),  # pyrefly: ignore[missing-attribute]
+                device=x.get_device(),  # pyrefly: ignore[missing-attribute]
+            )
+        (out,) = lower_helion_kernel(
+            kernel_idx=helion_kernel_side_table.add_kernel(kernel),
+            constant_args={"fn": sin_plus_one},
+            tensor_args={"x": x},
+            output_spec=infer_output_spec(kernel, (sin_plus_one, fake_x)),
+        )
+        return out
+
+    return lower
+
+
 # =============================================================================
 # Test Class
 # =============================================================================
+
+
+# Tests that assert nothing on their unfused leg (they pass
+# expected_num_kernels=None when allow_torch_compile_fusion is False and use
+# the flag nowhere else) only re-check the opaque lowering that the other
+# parametrized tests cover, so they run the fused leg alone; three such tests
+# keep both legs as representatives (test_transpose_then_view_to_3d_epilogue,
+# test_epilogue_broadcast_bias, test_prologue_flip_plus_bias_not_fused).
+_FUSED_ONLY = (True,)
 
 
 @onlyBackends(["triton", "cute"])
@@ -753,7 +830,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         ):
             torch.compile(f, fullgraph=True, backend="inductor")(x, y)
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_add_kernel(self, allow_torch_compile_fusion):
         """Test: basic addition kernel with prologue/epilogue ops."""
@@ -779,15 +856,32 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
     @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_fusion_survives_a_codegen_retry(self):
-        """The CuTe register-tile fallback throws a first codegen pass away
-        and generates the kernel again through the same memory transforms.
-        The prologue transform's record of emitted fused-input placeholders
-        belongs to the pass; a stale record would make the retried kernel
-        skip the placeholder and read an undefined variable."""
+        """A backend's retry policy (the CuTe register-tile fallback) throws a
+        first codegen pass away and generates the kernel again through the
+        same memory transforms.  The prologue transform's record of emitted
+        fused-input placeholders belongs to the pass; a stale record would
+        make the retried kernel skip the placeholder and read an undefined
+        variable."""
         from helion._compiler import generate_ast as generate_ast_module
+        from helion._compiler.backend import Backend
         from helion._compiler.cute.register_tile_admission import (
             RegisterTileUnsupported,
         )
+        from helion._compiler.emitter_protocols import RetryPolicy
+
+        repairs: list[BaseException] = []
+
+        @dataclasses.dataclass(frozen=True)
+        class RetryOnce(RetryPolicy):
+            signals: tuple[type[BaseException], ...] = (RegisterTileUnsupported,)
+
+            def repair(self, signal, config, *, caller_graphs):
+                # One repair only: a second signal propagates and fails the
+                # test instead of regenerating forever.
+                if repairs:
+                    return None
+                repairs.append(signal)
+                return config
 
         generate = generate_ast_module._generate_ast
         fused_passes: list[object] = []
@@ -808,7 +902,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
         x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
         y = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
-        with patch.object(generate_ast_module, "_generate_ast", generate_failing_once):
+        with (
+            patch.object(generate_ast_module, "_generate_ast", generate_failing_once),
+            patch.object(Backend, "retry_policy", return_value=RetryOnce()),
+        ):
             self._run_compile_test(
                 f,
                 (x, y),
@@ -881,7 +978,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_multiple_outputs(self, allow_torch_compile_fusion):
         """Test: kernel with multiple differently-shaped outputs."""
@@ -1019,7 +1116,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_constant_scalar_args(self, allow_torch_compile_fusion):
         """Test: scalar constants in prologue/epilogue operations."""
@@ -1275,7 +1372,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=2,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     @skipIfCute("hl.inline_triton embeds Triton source; CuTe cannot lower it")
     def test_inline_triton_mutation(self, allow_torch_compile_fusion):
@@ -1501,7 +1598,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_detached_input(self, allow_torch_compile_fusion):
         """Test: input is detached from grad-tracking tensor."""
@@ -2172,7 +2269,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_no_mutation(self, allow_torch_compile_fusion):
         """Test: pure function kernel with no input mutations."""
@@ -2196,7 +2293,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_basic_prologue_epilogue_tuple(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with tuple (tensor, scalar) output."""
@@ -2225,7 +2322,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_basic_prologue_epilogue_single(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with single tensor output."""
@@ -2253,7 +2350,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_epilogue_chained_ops(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with chained ops on both sides."""
@@ -2286,7 +2383,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_rms_norm_prologue_epilogue(self, allow_torch_compile_fusion):
         """Test: prologue/epilogue with multi-output RMS norm kernel."""
@@ -2350,7 +2447,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_fp16_prologue_epilogue_dtype_promotion_simple(
         self, allow_torch_compile_fusion
@@ -2385,7 +2482,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_fp16_prologue_epilogue_dtype_promotion_chained(
         self, allow_torch_compile_fusion
@@ -2420,7 +2517,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_original_twice_in_output(
         self, allow_torch_compile_fusion
@@ -2454,7 +2551,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_clone_then_mutate_view_of_original_as_output(
         self, allow_torch_compile_fusion
@@ -3288,6 +3385,78 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_annotated_with_unimported_name(self, allow_torch_compile_fusion):
+        """Test: kernel annotated with a name Inductor's output does not import.
+
+        The host function lands in Inductor's output module, which imports only
+        the libraries the generated code reads; ``Tensor`` (``from torch import
+        Tensor``) is not one of them, so its annotations are dropped.
+        """
+
+        @helion.kernel(autotune_effort="none")
+        def k_add_one_annotated(x: Tensor) -> Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        def f(x: torch.Tensor, *, _kernels=(k_add_one_annotated,)) -> torch.Tensor:
+            return torch.relu(_kernels[0](x * 2.0)) + 1.0
+
+        x = torch.randn(4, 8, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x,),
+            kernels=[k_add_one_annotated],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+        )
+
+    @skipIfFn(
+        lambda: not supports_torch_compile_template_lowering(),
+        "needs Helion's Inductor template lowering",
+    )
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_lowering_passes_none_for_traced_callable(self):
+        """Test: an Inductor lowering lowers a kernel call with a callable arg.
+
+        The kernel traces the callable into its device code, so the host
+        function never reads it and the generated call passes None.
+        """
+        x = torch.randn(1024, device=DEVICE)
+        op = torch.ops.helion_test.sin_plus_one.default
+        torch._dynamo.reset()
+        with (
+            patch.dict(
+                lowerings, {op: lower_through_callable_kernel(k_apply_callable)}
+            ),
+            fresh_cache(),
+        ):
+            actual, (code,) = run_and_get_code(
+                torch.compile(lambda x: op(x) * 2.0, fullgraph=True), x
+            )
+        torch.testing.assert_close(actual, sin_plus_one(x) * 2.0)
+        self.assertIn("_helion_k_apply_callable", code)
+
+    @skipIfFn(
+        lambda: not supports_torch_compile_template_lowering(),
+        "needs Helion's Inductor template lowering",
+    )
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_lowering_rejects_callable_read_in_host_code(self):
+        """Test: a callable arg the host code calls cannot be lowered."""
+        x = torch.randn(1024, device=DEVICE)
+        op = torch.ops.helion_test.sin_plus_one.default
+        torch._dynamo.reset()
+        lower = lower_through_callable_kernel(k_host_applies_callable)
+        with (
+            patch.dict(lowerings, {op: lower}),
+            fresh_cache(),
+            self.assertRaisesRegex(InductorError, "reads its callable argument 'fn'"),
+        ):
+            torch.compile(lambda x: op(x) * 2.0, fullgraph=True)(x)
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_same_kernel_different_shapes(self, allow_torch_compile_fusion):
         """Test: same kernel called twice with different input shapes.
 
@@ -3332,7 +3501,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=2,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_captured_global_variable(self, allow_torch_compile_fusion):
         """Test: kernel using captured global variable from module scope.
@@ -4109,7 +4278,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_single_element_tuple_return(self, allow_torch_compile_fusion):
         """Test: kernel returning (out,) works with fusion."""
@@ -5020,7 +5189,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_full_reduction_not_fused(self, allow_torch_compile_fusion):
         """Full reduction (scalar output): out.sum().
@@ -5075,7 +5244,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_self_read(self, allow_torch_compile_fusion):
         """Epilogue with same-index self-read: relu(out) + out.
@@ -5102,7 +5271,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_matmul_with_transposed_self(self, allow_torch_compile_fusion):
         """Epilogue that computes out @ out.T on a non-square tensor.
@@ -5130,7 +5299,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_transposed_contiguous(self, allow_torch_compile_fusion):
         """Epilogue that reads kernel output at transposed indices: out.T.contiguous().
@@ -5157,7 +5326,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_gather_not_fused(self, allow_torch_compile_fusion):
         """Epilogue that gathers from kernel output at non-trivial indices.
@@ -5185,7 +5354,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_flip_fused(self, allow_torch_compile_fusion):
         """Prologue that flips the input tensor is correctly inlined.
@@ -5212,7 +5381,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_epilogue_triu_fused(self, allow_torch_compile_fusion):
         """Epilogue using triu (index_expr) is fused via _Handler.index_expr."""
@@ -5263,7 +5432,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             expected_num_kernels_ref=1,
         )
 
-    @parametrize("allow_torch_compile_fusion", (True, False))
+    @parametrize("allow_torch_compile_fusion", _FUSED_ONLY)
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_prologue_bias_not_fused_when_multi_read(self, allow_torch_compile_fusion):
         """Multi-read prologue (y + bias) is not inlined when one input is flipped.
@@ -5307,6 +5476,10 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             ],
             torch_compile_fusion=True,
             autotune_with_torch_compile_fusion=autotune_with_torch_compile_fusion,
+            # The fused and unfused config stores are under test, not the
+            # benchmark worker: a standalone call's two-config search in the
+            # worker costs several seconds of spawn per test.
+            autotune_benchmark_subprocess=False,
         )
         def k_add_autotune(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)
@@ -5833,6 +6006,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         result_direct = kernel(x.clone(), y.clone())
         torch.testing.assert_close(result_direct, x + y, rtol=1e-4, atol=1e-4)
 
+    # Two real autotunes (unfused, then fused) with a wall-clock budget each
+    # plus two torch.compile passes; the slow tier, with a generous per-test
+    # timeout for a shared or slower runner (XPU).
+    @pytest.mark.slow
+    @pytest.mark.timeout(300)
     @skipUnlessBackendFuses
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_autotune_no_configs_uses_fusion_context(self):
@@ -5860,10 +6038,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             autotune_with_torch_compile_fusion=True,
             autotune_max_generations=1,
             autotune_effort="quick",
-            # The search only has to reach the fused benchmark path; cap its
-            # wall clock so a shared-GPU runner cannot stretch it past the
-            # per-test timeout.
-            autotune_budget_seconds=30,
+            # The search only has to reach the fused benchmark path (one
+            # bench_compile_config call is asserted below); a few seconds of
+            # wall clock cover the first candidates and keep a shared-GPU
+            # runner from stretching the search.
+            autotune_budget_seconds=5,
         )
         def k_add_no_configs(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             out = torch.empty_like(x)

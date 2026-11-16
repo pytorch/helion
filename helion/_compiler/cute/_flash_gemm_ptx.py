@@ -84,9 +84,9 @@ def to_UMMA_format(cutlass_type) -> int:
         return F16F32Format.BF16
     if cutlass_type is cutlass.TFloat32:
         return F16F32Format.TF32
-    if cutlass_type is cutlass.FloatE4M3FN:
+    if cutlass_type is cutlass.Float8E4M3FN:
         return MXF8F6F4Format.E4M3
-    if cutlass_type is cutlass.FloatE5M2:
+    if cutlass_type is cutlass.Float8E5M2:
         return MXF8F6F4Format.E5M2
     raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
 
@@ -170,6 +170,32 @@ def _mma_cta_group_qualifier(cta_group: cute.nvgpu.tcgen05.CtaGroup | int) -> st
     if value == 2:
         return "cta_group::2"
     raise ValueError(f"Unsupported tcgen05 MMA CTA group: {cta_group!r}")
+
+
+def mma_kind_for_dtype(cutlass_type) -> str:
+    """The ``tcgen05.mma`` kind of an A/B operand type: ``f16`` (fp16 / bf16),
+    ``tf32`` or ``f8f6f4`` (fp8). The instruction's K extent follows the kind
+    (16 / 8 / 32 elements: 32 bytes of a K-major operand either way), and the
+    emitters below take their per-K-tile descriptor offsets from the MMA
+    partition layouts, so the kind qualifier is the only per-dtype text."""
+    if cutlass_type is cutlass.Float16 or cutlass_type is cutlass.BFloat16:
+        return "f16"
+    if cutlass_type is cutlass.TFloat32:
+        return "tf32"
+    if cutlass_type is cutlass.Float8E4M3FN or cutlass_type is cutlass.Float8E5M2:
+        return "f8f6f4"
+    raise TypeError(
+        f"Unsupported CUTLASS scalar type for tcgen05.mma: {cutlass_type!r}"
+    )
+
+
+MMA_KINDS = ("f16", "tf32", "f8f6f4")
+
+
+def _mma_kind_qualifier(mma_kind: str) -> str:
+    if mma_kind not in MMA_KINDS:
+        raise ValueError(f"unsupported tcgen05.mma kind: {mma_kind!r}")
+    return f"kind::{mma_kind}"
 
 
 class LayoutType(IntEnum):
@@ -315,7 +341,11 @@ def declare_ptx_smem_desc(
     smem_desc_base_a: int | None,
     tCrA_layout: cute.Layout,
     var_name_prefix: str = "smem_desc",
+    a_width: int = 16,
 ) -> None:
+    """``a_width`` is the A element width in bits for a TMEM-sourced A
+    (``smem_desc_base_a is None``): the per-K-tile column offsets come from
+    the partition layout recast from 32-bit TMEM columns to A elements."""
     is_ts = const_expr(smem_desc_base_a is None)
     num_k_tile = cute.size(tCrA_layout.shape[2])
     smem_desc_base_a_lo, smem_desc_a_hi = None, None
@@ -324,7 +354,7 @@ def declare_ptx_smem_desc(
     tCrA_layout = (
         tCrA_layout
         if const_expr(not is_ts)
-        else cute.recast_layout(32, 16, tCrA_layout)
+        else cute.recast_layout(32, a_width, tCrA_layout)
     )
     offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_tile)]
     if const_expr(not is_ts):
@@ -348,32 +378,6 @@ def declare_ptx_smem_desc(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
-
-
-@cute.jit
-def declare_ptx_smem_desc_from_tensor(
-    op: cute.nvgpu.tcgen05.mma.MmaOp,
-    sA: cute.Tensor,
-    tCrA: cute.Tensor,
-    stage: int,
-    var_name_prefix: str,
-) -> None:
-    sA_swizzle = parse_swizzle_from_pointer(sA.iterator)
-    smem_desc_base_a: int = const_expr(
-        make_smem_desc_base(
-            cute.recast_layout(128, op.a_dtype.width, sA.layout[0]),
-            sA_swizzle,
-            Major.K
-            if const_expr(op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K)
-            else Major.MN,
-        )
-    )
-    declare_ptx_smem_desc(
-        make_smem_desc_start_addr(sA[None, None, None, stage].iterator),
-        smem_desc_base_a,
-        tCrA.layout,
-        var_name_prefix,
-    )
 
 
 @cute.jit
@@ -405,6 +409,7 @@ def gemm_ptx_precomputed_qk(
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
     issue: Int32 | None = None,
+    mma_kind: str = "f16",
 ) -> None:
     """``issue`` (a warp-uniform Int32, nonzero = issue; the caller hoists the
     uniformity shuffle off the issue chain) skips the MMA instructions only:
@@ -417,6 +422,7 @@ def gemm_ptx_precomputed_qk(
     zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
     pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
+    mma_kind_qualifier = const_expr(_mma_kind_qualifier(mma_kind))
     input_args = [
         Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
         Int32(_not_zero_init(zero_init)).ir_value(),
@@ -458,12 +464,12 @@ def gemm_ptx_precomputed_qk(
         )
         + "setp.ne.b32 p, $1, 0;\n\t"
         + _issue_skip_open("", bool(issue_str))
-        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
         f"[tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, "
         f"{idesc_var_name}, {pred_str};\n\t"
         + "".join(
             (
-                f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+                f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
                 f"[tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, "
                 f"{idesc_var_name}, 1;\n\t"
             )
@@ -516,105 +522,6 @@ def shift_ptx_smem_desc(
 
 
 @cute.jit
-def declare_ptx_smem_desc_base(
-    smem_desc_start_a: Int32,
-    smem_desc_base_a: int,
-    var_name_prefix: str = "smem_desc",
-) -> None:
-    """Declare only the k=0 low descriptor word ``{prefix}_lo`` as a PTX register.
-
-    ``declare_ptx_smem_desc`` materializes all ``num_k_tile`` 64-bit operand
-    descriptors as named registers; four operand sets (K, V, dS x2) then pin
-    64 registers in the MMA warp for the whole kernel and spill. FA4 instead
-    keeps one base word per operand and forms each k-tile descriptor at
-    issue time with a uniform add (``gemm_ptx_desc_base_qk``).
-    """
-    smem_desc_base_a_lo, _ = i64_to_i32x2(smem_desc_base_a)
-    smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
-    llvm.inline_asm(
-        None,
-        [Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value()],
-        f".reg .b32 {var_name_prefix}_lo;\n\tmov.b32 {var_name_prefix}_lo, $0;\n\t",
-        "r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
-def gemm_ptx_desc_base_qk(
-    acc_tmem_addr: Int32,
-    smem_desc_start_b: Int32,
-    smem_desc_base_b: int,
-    tCrB_layout: cute.Layout,
-    smem_var_name_prefix: str,
-    idesc_var_name: str,
-    *,
-    a_layout: cute.Layout,
-    a_base: int,
-    zero_init: bool | Boolean = False,
-    cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
-) -> None:
-    """SS gemm forming both operand descriptors per k-tile from base words.
-
-    A comes from the ``{prefix}_lo`` register declared by
-    ``declare_ptx_smem_desc_base``; B from ``smem_desc_start_b`` (dynamic
-    stage). Each k-tile descriptor is ``{base_lo + k_offset, hi}`` with the
-    hi word an immediate, so no per-k descriptor registers stay live.
-    """
-    _, smem_desc_a_hi = i64_to_i32x2(a_base)
-    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
-    num_k_tile = cute.size(tCrB_layout.shape[2])
-    offset_a = [cute.crd2idx((0, 0, k), a_layout) for k in range(num_k_tile)]
-    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
-    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
-    zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
-    pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
-    cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
-    mma = f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
-    llvm.inline_asm(
-        None,
-        [
-            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(_not_zero_init(zero_init)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-        ],
-        "{\n\t"
-        ".reg .pred leader_thread;\n\t"
-        ".reg .pred p;\n\t"
-        ".reg .b32 tmem_acc;\n\t"
-        ".reg .b32 smem_desc_b_lo_start;\n\t"
-        ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
-        ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
-        "elect.sync _|leader_thread, -1;\n\t"
-        "mov.b32 tmem_acc, $2;\n\t"
-        "mov.b32 smem_desc_b_lo_start, $0;\n\t"
-        "setp.ne.b32 p, $1, 0;\n\t"
-        f"mov.b64 smem_desc_a, {{{smem_var_name_prefix}_lo, {hex(smem_desc_a_hi)}}};\n\t"
-        f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, {hex(smem_desc_b_hi)}}};\n\t"
-        + mma
-        + f"[tmem_acc], smem_desc_a, smem_desc_b, {idesc_var_name}, {pred_str};\n\t"
-        + "".join(
-            (
-                f"add.s32 smem_desc_a_lo, {smem_var_name_prefix}_lo, {hex(offset_a[k])};\n\t"
-                f"mov.b64 smem_desc_a, {{smem_desc_a_lo, {hex(smem_desc_a_hi)}}};\n\t"
-                f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
-                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, {hex(smem_desc_b_hi)}}};\n\t"
-                + mma
-                + f"[tmem_acc], smem_desc_a, smem_desc_b, {idesc_var_name}, 1;\n\t"
-            )
-            for k in range(1, num_k_tile)
-        )
-        + "}\n",
-        "r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
-@cute.jit
 def gemm_ptx_dyn_qk(
     acc_tmem_addr: Int32,
     smem_desc_start_a: Int32,
@@ -628,11 +535,14 @@ def gemm_ptx_dyn_qk(
     zero_init: bool | Boolean = False,
     cta_group: cute.nvgpu.tcgen05.CtaGroup | int = 1,
     k_tiles: int | None = None,
+    mma_kind: str = "f16",
 ) -> None:
     """SS gemm with BOTH operand start addresses as runtime inputs.
 
-    Like ``gemm_ptx_desc_base_qk`` but without the ``{prefix}_lo`` PTX
-    register: the callers pass starts re-read per iteration (see
+    Both operand descriptors are formed per k-tile from base words, with no
+    per-k descriptor registers kept live (``declare_ptx_smem_desc`` instead
+    materializes every k-tile descriptor as a named register): the callers
+    pass starts re-read per iteration (see
     ``_flash_runtime.ld_volatile_shared_u32``) so ptxas forms the per-k
     descriptors with uniform adds inside the loop instead of hoisting them.
 
@@ -652,7 +562,8 @@ def gemm_ptx_dyn_qk(
     zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
     pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
-    mma = f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+    mma_kind_qualifier = const_expr(_mma_kind_qualifier(mma_kind))
+    mma = f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
     llvm.inline_asm(
         None,
         [
@@ -735,6 +646,7 @@ def gemm_ptx_precomputed_qk_static(
     pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
     mma_cta_group = op.cta_group if const_expr(cta_group is None) else cta_group
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(mma_cta_group))
+    mma_kind_qualifier = const_expr(_mma_kind_qualifier(mma_kind_for_dtype(op.a_dtype)))
     input_args = [
         Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
         Int32(_not_zero_init(zero_init)).ir_value(),
@@ -766,12 +678,12 @@ def gemm_ptx_precomputed_qk_static(
         )
         + "setp.ne.b32 p, $1, 0;\n\t"
         + _issue_skip_open("", bool(issue_str))
-        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
         f"[tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, "
         f"{idesc_var_name}, {pred_str};\n\t"
         + "".join(
             (
-                f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+                f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
                 f"[tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, "
                 f"{idesc_var_name}, 1;\n\t"
             )
@@ -841,8 +753,15 @@ def gemm_ptx_precomputed_pv_ts(
     a_offsets: tuple[int, ...] | None = None,
     mbar_mid_ptrs: tuple[cutlass.Pointer, cutlass.Pointer] | None = None,
     issue: Int32 | None = None,
+    mma_kind: str = "f16",
+    a_width: int = 16,
 ) -> None:
     """Issue the PV MMA K-chunks as one inline-asm stream.
+
+    ``mma_kind`` / ``a_width`` are the operands' ``tcgen05.mma`` kind and the
+    TMEM-resident A element width in bits (``f16`` / 16 for fp16 and bf16 P;
+    ``f8f6f4`` / 8 for fp8 P): the TMEM column offsets of the K-chunks are
+    recast from 32-bit columns to A elements.
 
     ``issue`` (a warp-uniform Int32, nonzero = issue) skips the MMA
     instructions only; the folded barrier waits still run, so a skipped PV
@@ -856,7 +775,7 @@ def gemm_ptx_precomputed_pv_ts(
     ``mbar_ptr``; all waits share ``mbar_phase``.
     """
     smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
-    tCrA_layout = cute.recast_layout(32, 16, tCrA_layout)
+    tCrA_layout = cute.recast_layout(32, a_width, tCrA_layout)
     num_k_tile = cute.size(tCrA_layout.shape[2])
     if const_expr(a_offsets is not None):
         # Explicit per-k TMEM column offsets (32-bit words) for a non-contiguous
@@ -872,6 +791,7 @@ def gemm_ptx_precomputed_pv_ts(
     zero_init_dynamic = const_expr(isinstance(zero_init, Boolean))
     pred_str = "p" if zero_init_dynamic else "0" if zero_init else "1"
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(cta_group))
+    mma_kind_qualifier = const_expr(_mma_kind_qualifier(mma_kind))
 
     input_args = [
         Int32(cute.arch.make_warp_uniform(tmem_a_addr)).ir_value(),
@@ -917,7 +837,7 @@ def gemm_ptx_precomputed_pv_ts(
             )
             + f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
             + "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-            + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+            + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
             f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
             f"smem_desc_b, {idesc_var_name}, 1;\n\t"
             for k in range(1, num_k_tile)
@@ -949,7 +869,7 @@ def gemm_ptx_precomputed_pv_ts(
         "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
         "setp.ne.b32 p, $2, 0;\n\t"
         + _issue_skip_open("A", skip)
-        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+        + f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
         f"[tmem_acc], [tmem_a], smem_desc_b, {idesc_var_name}, {pred_str};\n\t"
         + (
             chunked_stream
@@ -958,7 +878,7 @@ def gemm_ptx_precomputed_pv_ts(
                 (
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                    f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+                    f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
                     f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
                     f"smem_desc_b, {idesc_var_name}, 1;\n\t"
                 )
@@ -976,7 +896,7 @@ def gemm_ptx_precomputed_pv_ts(
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, "
                         f"{hex(offset_b_diff[k - 1])};\n\t"
                         "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 "
+                        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} "
                         f"[tmem_acc], [tmem_a + {hex(offset_a[k])}], "
                         f"smem_desc_b, {idesc_var_name}, 1;\n\t"
                     )
@@ -1018,6 +938,7 @@ def gemm_ptx_partial(
     idesc: int = const_expr(mma_op_to_idesc(op))
     mma_cta_group = op.cta_group if const_expr(cta_group is None) else cta_group
     cta_group_qualifier = const_expr(_mma_cta_group_qualifier(mma_cta_group))
+    mma_kind_qualifier = const_expr(_mma_kind_qualifier(mma_kind_for_dtype(op.a_dtype)))
     if const_expr(not is_ts):
         sA_swizzle = parse_swizzle_from_pointer(sA.iterator)
         smem_desc_base_a: int = const_expr(
@@ -1105,14 +1026,14 @@ def gemm_ptx_partial(
             "mov.b64 smem_desc_a, {smem_desc_a_lo_start, smem_desc_a_hi};\n\t"
             "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     "mov.b64 smem_desc_a, {smem_desc_a_lo, smem_desc_a_hi};\n\t"
                     "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                    f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(1, cute.size(tCrA.shape[2]))
             )
@@ -1170,12 +1091,12 @@ def gemm_ptx_partial(
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                    f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(
                     1,
@@ -1190,7 +1111,7 @@ def gemm_ptx_partial(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                         "mov.b64 smem_desc_b, {smem_desc_b_lo, smem_desc_b_hi};\n\t"
-                        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                        f"@leader_thread tcgen05.mma.{cta_group_qualifier}.{mma_kind_qualifier} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
                     for k in range(
                         cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2])

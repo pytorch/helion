@@ -9,6 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
+from helion._testing import skipUnlessCuteAvailable
+
 pytest.importorskip("cutlass")
 pytest.importorskip("cutlass.cute")
 
@@ -144,6 +146,7 @@ def sizes(plan: FlatGroupedProviderPlan) -> tuple[int, ...]:
     )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("bits", [32, 64])
 @pytest.mark.parametrize(
     ("a", "output"),
@@ -217,6 +220,7 @@ def test_actual_host_jit_matches_all_original_touched_elements(
                 )
 
 
+@skipUnlessCuteAvailable("requires the supported CuTe DSL")
 @pytest.mark.parametrize("bits", [32, 64])
 def test_prefix_preserves_holes_overlap_empty_and_wrapped_element_bases(
     bits: Literal[32, 64],

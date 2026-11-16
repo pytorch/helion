@@ -49,6 +49,8 @@ from helion._testing import TestCase
 from helion._testing import skipUnlessCuteAvailable
 import helion.language as hl
 
+pytestmark = pytest.mark.cpu_only
+
 if TYPE_CHECKING:
     import ast
     from collections.abc import Iterator
@@ -473,7 +475,7 @@ def _emulate_tiles(
 
     def stream_fill(ns: dict[str, object], tile: int) -> None:
         """The emitter's stream fill: chunks ``0 .. slots - 1`` of ``tile``."""
-        ns["flash_flex_pkv"] = tile
+        ns["flash_flex_ikv"] = tile
         for slot in range(slots):
             ns["flash_flex_pc"] = slot
             ns["flash_flex_ps"] = slot
@@ -516,6 +518,8 @@ def _emulate_tiles(
             ns["flash_kv_peek"] = next_tile
             exec(prologue, ns)
             if index not in absent:
+                # Bound once ahead of the chunk loop, as the emitter does:
+                # the stream's issues below must not move it.
                 ns["flash_flex_pkv"] = kv_tile
                 result = results[index]
                 for ci in range(chunks):
@@ -526,7 +530,6 @@ def _emulate_tiles(
                         ns["flash_flex_pc"] = (ci + depth) % chunks
                         ns["flash_flex_ps"] = (ci + depth) % (depth + 1)
                         ns["flash_flex_pf_init"] = False
-                        ns["flash_flex_pkv"] = kv_tile
                         exec(prefetch, ns)
                     ns["flash_ci"] = ci
                     if slots:
@@ -536,7 +539,7 @@ def _emulate_tiles(
                         exec(consume, ns)
                         ns["flash_flex_pc"] = (ci + slots) % chunks
                         ns["flash_flex_ps"] = ci % slots
-                        ns["flash_flex_pkv"] = (
+                        ns["flash_flex_ikv"] = (
                             kv_tile if ci + slots < chunks else next_tile
                         )
                         exec(issue, ns)
@@ -1571,7 +1574,7 @@ class TestCuteFlexScoreMod(TestCase):
         each run's copy row base (the owner's leading offsets plus the
         lane's row delta times the row step: 1024 / 3072 elements per query
         row); the issue block copies 1 / 3 pieces of 128 bytes per row of
-        chunk ``flash_flex_pc`` of tile ``flash_flex_pkv`` into slot
+        chunk ``flash_flex_pc`` of tile ``flash_flex_ikv`` into slot
         ``flash_flex_ps`` and commits; the consume block waits for the
         chunk's group, reads the whole-chunk runs from slot ``flash_ci %
         2`` between warp syncs; the element block indexes the chunk run;
@@ -1631,7 +1634,7 @@ class TestCuteFlexScoreMod(TestCase):
         )
         issue = code.chunk_issue
         self.assertIn(
-            "flash_flex1_ikvbase = cutlass.Int32(flash_flex_pkv) * cutlass.Int32(128)",
+            "flash_flex1_ikvbase = cutlass.Int32(flash_flex_ikv) * cutlass.Int32(128)",
             issue,
         )
         self.assertIn(
@@ -1890,10 +1893,10 @@ class TestCuteFlexScoreMod(TestCase):
         fake_cute = types.SimpleNamespace(
             arch=types.SimpleNamespace(
                 load=fake_load,
-                cp_async_shared_global=fake_copy,
                 sync_warp=lambda: barrier.wait(),
             )
         )
+        fake_prims = types.SimpleNamespace(cp_async_shared_global=fake_copy)
         fake_ir = types.SimpleNamespace(
             VectorType=types.SimpleNamespace(get=lambda shape, t: (shape[0], t))
         )
@@ -1934,6 +1937,7 @@ class TestCuteFlexScoreMod(TestCase):
 
         with (
             patch.object(flex_score_mod_runtime, "cute", fake_cute),
+            patch.object(flex_score_mod_runtime, "prims", fake_prims),
             patch.object(flex_score_mod_runtime, "ir", fake_ir),
             patch.object(flex_score_mod_runtime, "cutlass", fake_cutlass),
         ):
@@ -2624,6 +2628,44 @@ class TestCuteFlexScoreMod(TestCase):
         code, _plan_, _tables, _values = _render_case(case, with_tail=False)
         self.assertIn("cutlass.Float32(_flash_scale)", code.chunk_body)
         self.assertIn("cutlass.Float32(_flash_hs0)", code.chunk_body)
+
+    def test_host_example_scalars_preserve_result_bindings(self) -> None:
+        def dynamic_result(score, b, h, q_idx, kv_idx, prefix):
+            return torch.nonzero(score > prefix)
+
+        # Stop after the real make_fx trace: nonzero is outside the supported
+        # score-hook operations, but its data-dependent result must still bind
+        # a fresh symbol before region lowering checks that operation.
+        class Traced(Exception):
+            pass
+
+        graphs: list[torch.fx.Graph] = []
+
+        def capture(graph: torch.fx.Graph) -> None:
+            graphs.append(graph)
+            raise Traced
+
+        with (
+            _environment(),
+            patch(
+                "helion._compiler.cute.flash_score_mod._ensure_lowerings",
+                side_effect=capture,
+            ),
+            self.assertRaises(Traced),
+        ):
+            build_flex_region(dynamic_result, host_scalar_specs=(("prefix", int),))
+        self.assertEqual(len(graphs), 1)
+        graph = graphs[0]
+        result = next(
+            node
+            for node in graph.nodes
+            if node.target is torch.ops.aten.nonzero.default
+        )
+        symbol = result.meta["val"].shape[0]._sympy_()
+        self.assertIn(symbol, result.meta["unbacked_bindings"])
+        prefix = list(graph.find_nodes(op="placeholder"))[-1]
+        self.assertIsInstance(prefix.meta["val"], torch.SymInt)
+        self.assertNotIn("unbacked_bindings", prefix.meta)
 
     def test_matcher_copied_load_sources(self) -> None:
         """A region may keep the ``_host_tensor`` source node of a copied load

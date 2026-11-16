@@ -24,6 +24,9 @@ class AutotunerHeuristic:
 
     name: ClassVar[str]
     backend: ClassVar[str]
+    # Position in the backend's ranked registry (lower runs first). The cute
+    # registry sorts by it; a backend that orders its tuple by hand leaves 0.
+    priority: ClassVar[int] = 0
     promote_seed_to_default: ClassVar[bool] = False
     # Arches on which the promoted seed may become the autotune-off DEFAULT.
     # None = promote wherever the heuristic fires (back-compat; e.g. an
