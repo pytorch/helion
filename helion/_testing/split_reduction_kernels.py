@@ -1,8 +1,9 @@
 """A kernel, its config and a generated-code check shared by the
-``cute_defer_tile_reduce`` test modules: per-split column sums walked by an
-explicit row loop with masked loads (better-benchmark's BatchNorm backward
-partial sums, at test sizes), and the count of the cross-thread combines its
-device loops hold."""
+``cute_defer_tile_reduce`` test modules and the ``cute_tail_peel`` tests of
+sunk reduction nests: per-split column sums walked by an explicit row loop
+with masked loads (better-benchmark's BatchNorm backward partial sums, at
+test sizes), and the count of the cross-thread combines its device loops
+hold."""
 
 from __future__ import annotations
 

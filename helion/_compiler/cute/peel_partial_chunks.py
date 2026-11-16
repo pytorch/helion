@@ -116,17 +116,12 @@ def _compares_end(body: list[ast.stmt], end: int) -> bool:
     )
 
 
-def peelable(
-    loop: ast.For,
-    constexpr_values: Mapping[str, int],
-    *,
-    warp_reduces_keep_whole: bool = True,
-    needs: Callable[[list[ast.stmt], int], bool] = _compares_end,
-) -> _Split | None:
-    """Where to split ``loop``, or ``None``: a static ``range`` whose step
-    does not divide it, with no early exit and no call that keeps the loop
-    whole (``_keeps_loop_whole``), whose body ``needs`` the split given its
-    end."""
+def static_range(
+    loop: ast.For, constexpr_values: Mapping[str, int]
+) -> tuple[int, int, int] | None:
+    """``(start, end, step)`` of ``loop`` when it runs a plain name over
+    ``range(start, end, step)`` without an ``else``, its start and its
+    positive step static and its end a literal, or ``None``."""
     call = loop.iter
     if (
         loop.orelse
@@ -140,22 +135,43 @@ def peelable(
     start, step = (static_int(call.args[i], constexpr_values) for i in (0, 2))
     # The body compares against a literal end (a name for it never matches).
     end = static_int(call.args[1], {})
-    if (
-        start is None
-        or end is None
-        or step is None
-        or step <= 0
-        or end - start <= step
-        or (end - start) % step == 0
-    ):
+    if start is None or end is None or step is None or step <= 0:
         return None
-    for node in ast.walk(ast.Module(body=loop.body, type_ignores=[])):
-        if isinstance(node, (ast.Break, ast.Continue, ast.Return)):
-            return None
-        if isinstance(node, ast.Call) and _keeps_loop_whole(
-            node, warp_reduces_keep_whole=warp_reduces_keep_whole
-        ):
-            return None
+    return start, end, step
+
+
+def stays_whole(body: list[ast.stmt], *, warp_reduces_keep_whole: bool = True) -> bool:
+    """Whether a loop with ``body`` cannot run as two copies: it holds an
+    early exit or a call that keeps it whole (``_keeps_loop_whole``)."""
+    return any(
+        isinstance(node, (ast.Break, ast.Continue, ast.Return))
+        or (
+            isinstance(node, ast.Call)
+            and _keeps_loop_whole(node, warp_reduces_keep_whole=warp_reduces_keep_whole)
+        )
+        for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+    )
+
+
+def peelable(
+    loop: ast.For,
+    constexpr_values: Mapping[str, int],
+    *,
+    warp_reduces_keep_whole: bool = True,
+    needs: Callable[[list[ast.stmt], int], bool] = _compares_end,
+) -> _Split | None:
+    """Where to split ``loop``, or ``None``: a static ``range``
+    (``static_range``) whose step does not divide it, with no early exit and
+    no call that keeps the loop whole (``stays_whole``), whose body ``needs``
+    the split given its end."""
+    bounds = static_range(loop, constexpr_values)
+    if bounds is None:
+        return None
+    start, end, step = bounds
+    if end - start <= step or (end - start) % step == 0:
+        return None
+    if stays_whole(loop.body, warp_reduces_keep_whole=warp_reduces_keep_whole):
+        return None
     if not needs(loop.body, end):
         return None
     return _Split(start, end, end - (end - start) % step, step)

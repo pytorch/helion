@@ -3914,10 +3914,11 @@ def cute_flat_fields(
             fields["cute_bool_byte_packets"] = BooleanFragment()
         if config_spec.cute_tail_peel_blocks:
             # A device loop's complete tiles apart from its partial last tile,
-            # their lanes loaded in packets; bitwise identical but for FMA
-            # contraction.  Where the shape or the config leaves nothing to
-            # split (no partial tile, no aligned packet, a shared-memory
-            # reduce in the loop) the loop stays whole (``peel_vector_tails``).
+            # their lanes loaded in packets (a sunk nest's predicated packets
+            # unpredicated); bitwise identical but for FMA contraction.  Where
+            # the shape or the config leaves nothing to gain (no aligned
+            # packet and no proven predicate, a shared-memory reduce in a loop
+            # with a partial tile) the loop stays whole (``peel_vector_tails``).
             fields["cute_tail_peel"] = BooleanFragment()
         if config_spec.cute_carried_tile_sum_blocks:
             # A carried tile sum's threads combined once after the device

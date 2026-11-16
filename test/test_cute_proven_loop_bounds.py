@@ -333,3 +333,107 @@ def test_a_host_wrapper_launch_proves_no_xyz_grid(planned: bool) -> None:
     ):
         bound.to_code(config)
     assert grids == [(None, None, None) if planned else (16, 8, 1)]
+
+
+_MASKS = """
+for k in range(cutlass.Int32(0), cutlass.Int32(512), cutlass.Int32(BLOCK)):
+    row = k + cutlass.Int32(cute.arch.thread_idx()[2])
+    in_rows = operator.lt(row, 512)
+    in_tile = operator.ge(BLOCK, cute.arch.thread_idx()[2])
+    valid = in_rows & in_tile
+    value = load(row, valid and row < 512) if valid else 0
+    record(value if in_rows else 0)
+"""
+
+
+def _propagated(source: str, *, propagate_truths: bool = True) -> str:
+    return ast.unparse(
+        ast.Module(
+            body=simplify_proven_loop_bounds(
+                ast.parse(source).body,
+                enabled=True,
+                thread_block_dims=(1, 2, 64),
+                constexpr_values={"BLOCK": 64},
+                propagate_truths=propagate_truths,
+            ),
+            type_ignores=[],
+        )
+    )
+
+
+def test_proven_masks_follow_the_names_they_are_bound_to() -> None:
+    # 64-row tiles of 512 rows on 64 threads: every row is in range, which
+    # the kernel's ``operator.lt`` mask states, and the masks' ``&`` and
+    # every read of it are true with it.
+    assert _propagated(_MASKS) == (
+        "_cute_proven_loop_bounds_0_abi_version = 1\n"
+        "for k in range(cutlass.Int32(0), cutlass.Int32(512), cutlass.Int32(BLOCK)):\n"
+        "    row = k + cutlass.Int32(cute.arch.thread_idx()[2])\n"
+        "    in_rows = True\n"
+        "    in_tile = True\n"
+        "    valid = True\n"
+        "    value = load(row, True)\n"
+        "    record(value)"
+    )
+    # Without the option the proof reads ``<`` comparisons only.
+    plain = _propagated(_MASKS, propagate_truths=False)
+    assert "in_rows = operator.lt(row, 512)" in plain
+    assert "value = load(row, valid and True) if valid else 0" in plain
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "kept"),
+    [
+        ("operator.lt(row, 512)", "operator.lt(row, 500)", "if in_rows else 0"),
+        ("operator.lt(row, 512)", "operator.ne(row, 512)", "if in_rows else 0"),
+        ("in_rows & in_tile", "in_rows & other", "if valid else 0"),
+        ("in_rows & in_tile", "in_rows | in_tile", "if valid else 0"),
+        (
+            "    value = load",
+            "    if row:\n        valid = other\n    value = load",
+            "if valid else 0",
+        ),
+        (
+            "    value = load",
+            "    for valid in range(2):\n        pass\n    value = load",
+            "if valid else 0",
+        ),
+        (
+            "    value = load",
+            "    valid, extra = pair()\n    value = load",
+            "if valid else 0",
+        ),
+    ],
+    ids=[
+        "unproven_comparison",
+        "another_operator",
+        "and_of_an_unknown",
+        "or_of_masks",
+        "bound_again_in_a_branch",
+        "bound_again_by_a_loop",
+        "bound_again_in_a_tuple",
+    ],
+)
+def test_an_unproven_or_rebound_mask_keeps_its_reads(
+    old: str, new: str, kept: str
+) -> None:
+    assert old in _MASKS
+    assert kept in _propagated(_MASKS.replace(old, new))
+
+
+def test_a_mask_proven_in_one_branch_is_not_true_in_the_other() -> None:
+    source = """
+for k in range(cutlass.Int32(0), cutlass.Int32(512), cutlass.Int32(BLOCK)):
+    row = k + cutlass.Int32(cute.arch.thread_idx()[2])
+    valid = other
+    if row:
+        valid = operator.lt(row, 512)
+        record(1 if valid else 0)
+    else:
+        record(2 if valid else 0)
+    record(3 if valid else 0)
+"""
+    proven = _propagated(source)
+    assert "record(1)" in proven
+    assert "record(2 if valid else 0)" in proven
+    assert "record(3 if valid else 0)" in proven
