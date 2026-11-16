@@ -5449,7 +5449,9 @@ def emit_cross_loop_schedule(
         # statements make none of is placed in each task like its covered
         # readiness waits; a worker with no task (guarded extent) waits once
         # before its skipped-task arrivals and publications, which follow the
-        # wait as they did at the root's entry.
+        # wait as they did at the root's entry.  The root's own barrier
+        # publication follows it too: after the task loop, or riding the last
+        # task's arrivals, both after the first task's top-level wait.
         incoming_roots = root_barrier_incoming.get(root, ())
         every_worker = active_worker_count == launch_worker_count
         # None: a hoisted load reads through a name that is no tensor argument.
@@ -5469,13 +5471,12 @@ def emit_cross_loop_schedule(
         # Producers whose barrier a worker with no task here still waits for.
         no_task_producers: list[int] = []
         for producer in incoming_roots:
-            covered, publication = barrier_covers(root, producer)
+            covered, _publication = barrier_covers(root, producer)
             if (
                 claimed
                 or root in ws_roots
                 or guarded_kernel_scope_root(root)
                 or covered is None
-                or publication
                 or hoisted_reads is None
                 or covered & hoisted_reads
             ):
@@ -5612,7 +5613,8 @@ def emit_cross_loop_schedule(
             )
         waits = peer_waits(root)
         publications = peer_publications(root)
-        # Only its skipped-task arrivals and publications rely on the barrier.
+        # Its skipped-task arrivals, peer publications and own barrier publication
+        # rely on the barrier.
         no_task_waits = [
             create(
                 ast.If,
@@ -5626,7 +5628,7 @@ def emit_cross_loop_schedule(
                 orelse=[],
             )
             for producer in no_task_producers
-            if skipped_dispatch or publications
+            if skipped_dispatch or publications or root in root_barrier_indices
             for wait in [root_barrier_wait(root, producer, False)]
         ]
         task_dispatch: list[ast.stmt] = [
