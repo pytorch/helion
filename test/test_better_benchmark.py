@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import hashlib
 import itertools
 import json
 import math
 import operator
 import os
+import pathlib
 import re
 import secrets
 import signal
@@ -34,6 +36,9 @@ from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import helion
+from helion._testing import DEVICE
+from helion._testing import skipIfNotCUDA
+from helion.autotuner import benchmarking
 import helion.runtime
 
 if TYPE_CHECKING:
@@ -990,6 +995,12 @@ def test_time_impls_averages_the_two_round_orders(
     def interleaved_bench(
         order: list[Callable[[], object]], **kwargs: object
     ) -> list[float]:
+        # The rounds whose sample count rot_us takes over (rotating_samples).
+        assert kwargs == {
+            "repeat": bench.COLD_REPEAT,
+            "default_cudagraph": True,
+            "l2_flush_mode": "call",
+        }
         forward = names[id(order[0])] == "first"
         return [cold[names[id(fn)]] + (0.001 if forward else 0.0) for fn in order]
 
@@ -1009,6 +1020,590 @@ def test_time_impls_averages_the_two_round_orders(
     assert first["bb_us"] == pytest.approx(11.0)
     assert out["second"]["cold_us"] == pytest.approx(7.5)
     assert out["second"]["bb_us"] == pytest.approx(20.5)
+
+
+def test_bench_takes_two_or_more_rotating_input_sets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # One set would be cold_us again under another name.
+    base = ["bench.py", "r", "--configs-dir", "c", "--output", "o"]
+    for flags, message in (
+        (["--rotate-inputs", "1"], "at least 2 input sets are needed"),
+        (["--rotate-inputs", "-8"], "at least 2 input sets are needed"),
+        (["--rotate-inputs", "8", "--rotate-max-l2", "0"], "a positive factor"),
+    ):
+        monkeypatch.setattr(sys, "argv", [*base, *flags])
+        with pytest.raises(SystemExit):
+            bench.main()
+        assert message in capsys.readouterr().err
+
+
+def test_bench_rotates_inputs_only_on_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Without the option the record and the summary are what they were;
+    # with it the summary shows rot_us, or why a port has none.
+    timed = {"status": "ok", "bb_us": 12.0, "cold_us": 9.5}
+    seen: list[tuple[int, float]] = []
+
+    def run(args: object) -> dict[str, object]:
+        count = args.rotate_inputs  # pyrefly: ignore[missing-attribute]
+        seen.append((count, args.rotate_max_l2))  # pyrefly: ignore[missing-attribute]
+        record: dict[str, object] = {
+            "status": "ok",
+            "shape": "s1",
+            "impls": {"inductor": dict(timed), "oracle": {"status": "error"}},
+        }
+        if count == 8:
+            record["impls"]["inductor"]["rot_us"] = 10.75  # pyrefly: ignore[bad-index]
+            record["rotate_inputs"] = {"status": "ok"}
+        elif count:
+            record["rotate_inputs"] = {"status": "skipped", "skipped": "too large"}
+        return record
+
+    monkeypatch.setattr(bench, "run", run)
+    monkeypatch.setenv("BB_FOREIGN_ACTIVITY", "0")
+    out = tmp_path / "record.json"
+    argv = ["bench.py", "r", "--configs-dir", "c", "--output", str(out)]
+    summary = "ok r[s1] {'inductor': '12.00/9.50us', 'oracle': 'error'}\n"
+    monkeypatch.setattr(sys, "argv", argv)
+    bench.main()
+    assert capsys.readouterr().out == summary
+    assert json.loads(out.read_text()) == {
+        "status": "ok",
+        "shape": "s1",
+        "impls": {"inductor": timed, "oracle": {"status": "error"}},
+        "foreign_gpu_activity": None,
+    }
+    monkeypatch.setattr(sys, "argv", [*argv, "--rotate-inputs", "8"])
+    bench.main()
+    assert capsys.readouterr().out == summary.replace("9.50us", "9.50/10.75us")
+    monkeypatch.setattr(
+        sys, "argv", [*argv, "--rotate-inputs", "4", "--rotate-max-l2", "1"]
+    )
+    bench.main()
+    assert capsys.readouterr().out == summary + "rot_us skipped: too large\n"
+    assert seen == [(0, bench.ROTATE_MAX_L2_MULTIPLE), (8, 2.0), (4, 1.0)]
+
+
+# A B200: ``torch.cuda.get_device_properties(0).L2_cache_size`` and its
+# free memory with nothing else on it.
+_B200_L2 = 132_644_864
+_B200_FREE = 189_000_000_000
+
+
+def test_rotation_takes_the_small_ports_that_cold_us_times_in_batches() -> None:
+    def reason(input_bytes: int, **given: object) -> str:
+        # 8 sets for each of 6 implementations, the fastest one at 10 us.
+        fields: dict[str, object] = {
+            "fastest_impl": "memcopy",
+            "fastest_us": 10.0,
+            "l2_bytes": _B200_L2,
+            "free_bytes": _B200_FREE,
+        }
+        fields.update(given)
+        found = bench.rotation_skip_reason(
+            input_bytes,
+            48 * input_bytes,
+            **fields,  # pyrefly: ignore[bad-argument-type]
+        )
+        return found or "applies"
+
+    # The selection's points around the cut-off, twice the L2: 7291 (7 MB),
+    # 0dd15 (105 MB), c9e1 (127 MB), e232 (201 MB) and 979a (268 MB).
+    assert [reason(mb * 1_000_000) == "applies" for mb in (7, 105, 127, 201, 268)] == [
+        True,
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert reason(2 * _B200_L2) == "applies"
+    assert reason(2 * _B200_L2 + 1) == (
+        "inputs of 265.3 MB exceed 2 x the 132.6 MB L2 (265.3 MB), the limit for "
+        "private input sets (--rotate-max-l2)"
+    )
+    assert reason(201_000_000, max_l2_multiple=1.0).startswith(
+        "inputs of 201.0 MB exceed 1 x the 132.6 MB L2 (132.6 MB)"
+    )
+    # cold_us times single replays from 64 us for the fastest implementation
+    # (e232's memcopy takes 65.5 us): batches would not be its cross-check.
+    assert reason(128_000_000, fastest_us=41.0) == "applies"
+    assert reason(201_000_000, fastest_us=63.9) == "applies"
+    assert reason(201_000_000, fastest_us=65.5) == (
+        "the fastest implementation, memcopy, takes 65.5 us a call: from 64 us "
+        "cold_us times single replays, not the batches of flushed calls that "
+        "rot_us would time"
+    )
+    # Without the memcopy the fastest port decides (bbcd's takes 86 us).
+    assert reason(128_000_000, fastest_impl="oracle", fastest_us=86.4).startswith(
+        "the fastest implementation, oracle, takes 86.4 us a call"
+    )
+    assert reason(7_000_000, fastest_us=bench.ROTATE_BELOW_US) != "applies"
+    # The sets must also fit a quarter of what the device has free.
+    assert reason(105_000_000, free_bytes=4 * 48 * 105_000_000) == "applies"
+    assert reason(105_000_000, free_bytes=20_000_000_000) == (
+        "the private input sets need 5.04 GB, over 25% of the 20.00 GB of free "
+        "device memory"
+    )
+    # A device that reports no L2 takes no port: the first rule leaves it out.
+    assert reason(7_000_000, l2_bytes=0).startswith(
+        "inputs of 7.0 MB exceed 2 x the 0.0 MB L2 (0.0 MB)"
+    )
+
+
+def test_input_bytes_count_each_storage_once() -> None:
+    table = torch.zeros(100, 8, dtype=torch.float32)
+    ids = torch.zeros(5, dtype=torch.int64)
+    # Two views of one buffer, an expanded scalar, a shape and a scalar.
+    inputs = [table[:10], table[50:, ::2], ids, torch.zeros(1).expand(1000), [3, 4], 2]
+    assert common.input_bytes(inputs) == 3200 + 40 + 4
+    assert common.input_bytes([]) == 0
+
+
+class _FakeClock:
+    """CUDA events without a device: ``Event.record`` reads a clock that the
+    test's replays advance, in milliseconds."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        clock = self
+
+        class Event:
+            def __init__(self, enable_timing: bool = False) -> None:
+                assert enable_timing
+                self.at: float | None = None
+
+            def record(self) -> None:
+                self.at = clock.now
+
+            def elapsed_time(self, end: Event) -> float:
+                assert self.at is not None and end.at is not None
+                return end.at - self.at
+
+        self.Event = Event
+
+
+def test_rotating_bench_subtracts_the_flush_graph_sample_by_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr(torch.cuda, "Event", clock.Event)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    # Per sample: what the 4 flushes take, and each function's 4 calls on
+    # top of them. The first flush sample is an outlier, and so is the last
+    # sample of the first function.
+    flushes = [0.400, 0.010, 0.010]
+    kernels = {"first": [0.032, 0.032, 0.320], "second": [0.060, 0.064, 0.068]}
+    sample = {"first": 0, "second": 0, "flush": 0}
+    captured: list[tuple[list[str], str, int]] = []
+
+    def replay_of(name: str) -> Callable[[], None]:
+        def replay() -> None:
+            k = sample[name]
+            sample[name] += 1
+            clock.now += flushes[k] + (0.0 if name == "flush" else kernels[name][k])
+
+        return replay
+
+    def batched(
+        fns: list[Callable[[], str]], clear_cache: Callable[[], str], calls: int
+    ) -> tuple[list[Callable[[], None]], Callable[[], None]]:
+        captured.append(([fn() for fn in fns], clear_cache(), calls))
+        return [replay_of(fn()) for fn in fns], replay_of("flush")
+
+    monkeypatch.setattr(bench, "_batched_flushed_replays", batched)
+    fns = [lambda: "second", lambda: "first"]
+    timings = bench.rotating_bench(fns, lambda: "flush", calls=4, repeat=3)
+    assert captured == [(["second", "first"], "flush", 4)]
+    # In the order given, per call: the median of each sample's own
+    # difference (unpaired medians would read 0.080 - 0.010 for the first).
+    assert timings == pytest.approx([0.016, 0.008])
+    # A capture that fails fails the round: nothing else would be the timer.
+    monkeypatch.setattr(bench, "_batched_flushed_replays", lambda *args: None)
+    with pytest.raises(RuntimeError, match="graphs of 4 flushed calls"):
+        bench.rotating_bench(fns, lambda: "flush", calls=4, repeat=3)
+
+
+def test_time_rotating_reads_each_private_set_once_a_batch_in_both_orders(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(bench, "_make_l2_cache_clearer", lambda: "the flush")
+    read: dict[str, list[str]] = {"first": [], "second": []}
+    calls = {
+        name: (lambda inputs, name=name: read[name].append(inputs[0])) for name in read
+    }
+    sets = {name: [[f"{name}{i}"] for i in range(4)] for name in read}
+    cold = {"first": 0.005, "second": 0.007}
+    batches: list[dict[str, list[str]]] = []
+    # A clock that reads 0.2 s more each time: two untimed rounds pass
+    # before the GPU has run these batches for half a second.
+    clock = itertools.count()
+    monkeypatch.setattr(bench.time, "perf_counter", lambda: 0.2 * next(clock))
+
+    def rotating_bench(
+        fns: list[Callable[[], object]],
+        clear_cache: object,
+        *,
+        calls: int,
+        repeat: int,
+    ) -> list[float]:
+        # Every set was read once, eagerly, before the first round.
+        if not batches:
+            assert read == {name: [s[0] for s in sets[name]] for name in read}
+        assert clear_cache == "the flush" and (calls, repeat) == (4, 25)
+        order = []
+        batch = {}
+        for fn in fns:
+            before = {name: len(seen) for name, seen in read.items()}
+            # As the capture runs it: once on a side stream, then the batch.
+            fn()
+            (name,) = [n for n, seen in read.items() if len(seen) > before[n]]
+            for _ in range(calls):
+                fn()
+            batch[name] = read[name][-calls:]
+            order.append(name)
+        batches.append(batch)
+        # The untimed rounds read 9 us more; in the timed ones each
+        # implementation reads 1 us more in the forward order.
+        forward = order[0] == "first"
+        slower = 0.009 if len(batches) <= 2 else 0.001 if forward else 0.0
+        return [cold[name] + slower for name in order]
+
+    monkeypatch.setattr(bench, "rotating_bench", rotating_bench)
+    out = bench.time_rotating(calls, sets, rounds=4)
+    # Every batch reads each of the implementation's own sets exactly once.
+    assert len(batches) == 2 + 4
+    for batch in batches:
+        for name, seen in batch.items():
+            assert sorted(seen) == [s[0] for s in sets[name]]
+    first = out["first"]
+    assert first["rot_runs_us"] == pytest.approx([6.0, 5.0, 6.0, 5.0])
+    assert first["rot_order_medians_us"] == pytest.approx([6.0, 5.0])
+    assert first["rot_us"] == pytest.approx(5.5)
+    assert first["rot_sets"] == 4
+    assert out["second"]["rot_us"] == pytest.approx(7.5)
+    # A round's samples for batches of 2 to 16 calls: cold_us's 100 over the
+    # batch size, and at least 20.
+    assert [bench.rotating_samples(calls) for calls in (2, 3, 4, 5, 8, 16)] == [
+        50,
+        34,
+        25,
+        20,
+        20,
+        20,
+    ]
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_each_captured_call_of_a_rotating_batch_reads_a_set_of_its_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # On the device, what the fakes above assume of the capture: in the
+    # graphs a round replays, every call of an implementation reads another
+    # of its private sets, and none reads another implementation's.
+    monkeypatch.setattr(bench, "SETTLE_S", 0.0)
+    names = ("first", "second")
+    sets = {
+        name: [[torch.zeros(1024, device=DEVICE)] for _ in range(3)] for name in names
+    }
+    outputs: dict[str, list[torch.Tensor]] = {name: [] for name in names}
+    calls = {
+        name: (lambda inputs, name=name: outputs[name].append(inputs[0] + 1))
+        for name in names
+    }
+    rounds = []
+    capture = bench._batched_flushed_replays
+
+    def recording(
+        fns: list[Callable[[], object]], clear_cache: Callable[[], None], count: int
+    ) -> object:
+        rounds.append(capture(fns, clear_cache, count))
+        return rounds[-1]
+
+    monkeypatch.setattr(bench, "_batched_flushed_replays", recording)
+    with common.gc_paused():
+        out = bench.time_rotating(calls, sets, rounds=2)
+    assert [out[name]["rot_sets"] for name in names] == [3, 3]
+    assert all(out[name]["rot_us"] > 0 for name in names)
+    # The last round's graphs, replayed on sets that each hold a value of
+    # their own: an implementation's three captured calls (its last three)
+    # give its three sets' values plus one.
+    assert len(rounds) == 2 and rounds[-1] is not None
+    replays, flush_replay = rounds[-1]
+    value = {name: [100.0 * i + k for k in range(3)] for i, name in enumerate(names)}
+    for name in names:
+        for inputs, filled in zip(sets[name], value[name], strict=True):
+            inputs[0].fill_(filled)
+    for replay in (*replays, flush_replay):
+        replay()
+    torch.cuda.synchronize()
+    for name in names:
+        assert len(outputs[name]) == (3 + 2 * (1 + 3))
+        read = sorted(float(result[0]) for result in outputs[name][-3:])
+        assert read == [filled + 1 for filled in value[name]]
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_a_rotating_round_takes_the_samples_of_a_cold_round_on_such_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # rot_us is to average as many executions as cold_us. interleaved_bench
+    # decides its sample count inside, by the batch it sizes, so bench.py
+    # restates that rule (rotating_samples): here against the samples a cold
+    # round takes on the device, counted as replays of its flush-only graph.
+    source = torch.zeros(1024, device=DEVICE)
+    out = torch.empty_like(source)
+    capture = benchmarking._make_batched_cudagraph_replay
+    batches: list[int] = []
+    samples = 0
+
+    def counted(
+        fn: Callable[[], object] | None,
+        clear_cache: Callable[[], None],
+        calls: int,
+        keep_outputs: bool = False,
+    ) -> Callable[[], None]:
+        replay = capture(fn, clear_cache, calls, keep_outputs=keep_outputs)
+        if fn is not None:
+            batches.append(calls)
+            return replay
+
+        def flush_replay() -> None:
+            nonlocal samples
+            samples += 1
+            replay()
+
+        return flush_replay
+
+    monkeypatch.setattr(benchmarking, "_make_batched_cudagraph_replay", counted)
+    for calls in (2, 4, 8, 16):
+        # A single replay estimated at 64 / calls us: batches of that many.
+        monkeypatch.setattr(
+            benchmarking,
+            "_single_replay_estimate_us",
+            lambda *args, calls=calls, **kwargs: 64.0 / calls,
+        )
+        batches.clear()
+        samples = 0
+        with common.gc_paused():
+            (ms,) = bench.cold_round([lambda: torch.add(source, 1.0, out=out)])
+        assert ms > 0 and batches == [calls]
+        assert samples == bench.rotating_samples(calls)
+
+
+def test_a_ports_bench_entry_names_its_autotune_record_before_the_port_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configs = tmp_path / "configs"
+    _toy_tuned(tmp_path, "sum_000000000001", "s1", "cute")
+    path = configs / "sum_000000000001__s1__cute.json"
+    tuned = json.loads(path.read_text())
+    loads: list[object] = []
+
+    def load_port(repro: str, backend: str, pinned: dict[str, str]) -> object:
+        loads.append((repro, backend, pinned))
+        if len(loads) == 1:
+            raise helion.exc.InvalidConfig(_TOY_INVALID)
+        return "port"
+
+    monkeypatch.setattr(common, "load_port", load_port)
+    # A pick that this tree cannot load: the entry still says what the port
+    # was pinned to, so the campaign takes the bench for one on that record.
+    named = {
+        "autotune_record": str(path),
+        "decorators": {"k": "@helion.kernel(version=1)"},
+        "autotune_code_sha256": {"k": "cute-1"},
+        "autotune_provisional": False,
+        "autotune_reused_from": None,
+    }
+    info: dict[str, object] = {"status": "error"}
+    with pytest.raises(helion.exc.InvalidConfig):
+        bench.pinned_port(info, configs, "sum_000000000001", "s1", "cute")
+    assert info == {"status": "error", **named}
+    assert loads == [("sum_000000000001", "cute", named["decorators"])]
+    assert common.timed_on_record(info, tuned)
+    info = {}
+    assert bench.pinned_port(info, configs, "sum_000000000001", "s1", "cute") == (
+        "port",
+        tuned,
+    )
+    assert info == named
+    # Without an ok record the entry names none: its path only.
+    for backend, error in (("triton", FileNotFoundError), ("cute", RuntimeError)):
+        path.write_text(json.dumps({"status": "error"}))
+        info = {}
+        with pytest.raises(error):
+            bench.pinned_port(info, configs, "sum_000000000001", "s1", backend)
+        assert list(info) == ["autotune_record"] and len(loads) == 2
+        assert common.timed_on_record(info, None)
+        assert not common.timed_on_record(info, tuned)
+
+
+def test_a_bench_entry_is_of_the_record_whose_kernels_it_names() -> None:
+    tuned = {"status": "ok", "kernels": _toy_kernels("cute")}
+    again = {"status": "ok", "kernels": _toy_kernels("cute", 2)}
+    info = common.timed_record_fields(tuned)
+    assert common.timed_on_record(info, tuned)
+    assert common.timed_on_record(info, {**tuned, "autotune_s": 9.0})
+    assert not common.timed_on_record(info, again)
+    assert not common.timed_on_record(info, None)
+    # A provisional record that an autotune replaces holds a result the
+    # bench has not timed, whatever kernels the autotune picks.
+    provisional = {**tuned, "provisional": True, "reused_from": "run5"}
+    stood_in = common.timed_record_fields(provisional)
+    assert common.timed_on_record(stood_in, provisional)
+    assert not common.timed_on_record(stood_in, tuned)
+    assert not common.timed_on_record(info, provisional)
+    # An entry of a port that found no ok record names none.
+    assert common.timed_on_record({"status": "error"}, None)
+    assert not common.timed_on_record({"status": "error"}, tuned)
+    # Records made before the code digests name the decorators, and do not
+    # say whether their record was provisional: the kernels tell.
+    before = {"decorators": {"k": "@helion.kernel(version=1)"}}
+    assert common.timed_on_record(before, tuned)
+    assert common.timed_on_record(before, provisional)
+    assert not common.timed_on_record(before, again)
+    assert not common.timed_on_record(before, None)
+
+
+def _rotation_args(count: int = 8) -> object:
+    return types.SimpleNamespace(
+        rotate_inputs=count,
+        rotate_max_l2=bench.ROTATE_MAX_L2_MULTIPLE,
+        cold_rounds=6,
+    )
+
+
+def test_the_rotating_pass_records_rot_us_beside_the_other_timings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    properties = types.SimpleNamespace(L2_cache_size=_B200_L2)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: properties)
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda: (_B200_FREE, 2 * _B200_FREE)
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    made: dict[str, int] = {"port": 0, "memcopy": 0}
+
+    def fresh(name: str) -> Callable[[], list[object]]:
+        def make() -> list[object]:
+            made[name] += 1
+            return [f"{name}{made[name]}"]
+
+        return make
+
+    rotating = {
+        "helion_cute": bench.Rotating(lambda inputs: None, fresh("port")),
+        "inductor": bench.Rotating(lambda inputs: None, fresh("port")),
+        "memcopy": bench.Rotating(lambda inputs: None, fresh("memcopy"), 3_000_000),
+    }
+    timed: list[tuple[dict[str, list[list[object]]], int]] = []
+
+    def time_rotating(
+        calls: dict[str, object], sets: dict[str, list[list[object]]], *, rounds: int
+    ) -> dict[str, dict[str, object]]:
+        assert list(calls) == list(rotating)
+        timed.append((sets, rounds))
+        return {name: {"rot_us": 4.0, "rot_sets": len(sets[name])} for name in calls}
+
+    monkeypatch.setattr(bench, "time_rotating", time_rotating)
+
+    def record() -> dict[str, object]:
+        return {
+            "total_bytes": 8_000_000,
+            "impls": {name: {"cold_us": 5.0} for name in rotating},
+        }
+
+    # A port of 7 MB: 8 private sets per implementation, timed, recorded.
+    found = record()
+    bench.rotate_inputs(_rotation_args(), found, rotating, 7_000_000)
+    assert found["rotate_inputs"] == {
+        "sets": 8,
+        "rounds": 6,
+        "input_bytes": 7_000_000,
+        "fastest_impl": "helion_cute",
+        "fastest_cold_us": 5.0,
+        "sets_bytes": 8 * (7_000_000 + 7_000_000 + 3_000_000),
+        "l2_cache_bytes": _B200_L2,
+        "max_l2_multiple": 2.0,
+        "free_bytes": _B200_FREE,
+        "status": "ok",
+    }
+    [(sets, rounds)] = timed
+    assert rounds == 6 and made == {"port": 16, "memcopy": 8}
+    private = [s[0] for group in sets.values() for s in group]
+    assert len(private) == len(set(private)) == 24
+    assert found["impls"] == {
+        name: {"cold_us": 5.0, "rot_us": 4.0, "rot_sets": 8, "rot_gbps": 2000.0}
+        for name in rotating
+    }
+    # A port of 4.3 GB: no set is made, the record says why, and its
+    # implementations keep the fields they had.
+    found = record()
+    bench.rotate_inputs(_rotation_args(), found, rotating, 4_295_000_000)
+    decision = cast("dict[str, str]", found["rotate_inputs"])
+    assert decision["status"] == "skipped"
+    assert decision["skipped"] == (
+        "inputs of 4295.0 MB exceed 2 x the 132.6 MB L2 (265.3 MB), the limit for "
+        "private input sets (--rotate-max-l2)"
+    )
+    assert made == {"port": 16, "memcopy": 8} and len(timed) == 1
+    assert found["impls"] == record()["impls"]
+    # Nor does a port that cold_us timed call by call: its fastest
+    # implementation takes 64 us or more.
+    found = record()
+    slow = cast("dict[str, dict[str, float]]", found["impls"])
+    for name, us in zip(rotating, (90.0, 150.0, 65.5), strict=True):
+        slow[name]["cold_us"] = us
+    bench.rotate_inputs(_rotation_args(), found, rotating, 7_000_000)
+    decision = cast("dict[str, object]", found["rotate_inputs"])
+    assert (decision["status"], decision["fastest_cold_us"]) == ("skipped", 65.5)
+    assert decision["fastest_impl"] == "memcopy"
+    assert str(decision["skipped"]).startswith(
+        "the fastest implementation, memcopy, takes 65.5 us a call"
+    )
+    assert len(timed) == 1 and "rot_us" not in json.dumps(found["impls"])
+    # Nor is there anything to rotate when no implementation was timed.
+    found = record()
+    bench.rotate_inputs(_rotation_args(), found, {}, 7_000_000)
+    decision = cast("dict[str, str]", found["rotate_inputs"])
+    assert (decision["status"], decision["skipped"], decision["fastest_impl"]) == (
+        "skipped",
+        "no implementation was timed",
+        None,
+    )
+
+    # A pass that fails is recorded; the other timings stand.
+    def failing(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("could not capture graphs of 8 flushed calls")
+
+    monkeypatch.setattr(bench, "time_rotating", failing)
+    found = record()
+    bench.rotate_inputs(_rotation_args(), found, rotating, 7_000_000)
+    decision = cast("dict[str, str]", found["rotate_inputs"])
+    assert decision["status"] == "error"
+    assert "could not capture graphs of 8 flushed calls" in decision["error"]
+    assert found["impls"] == record()["impls"]
+
+    # So is a device query that fails before any set is made: the record is
+    # not lost to it either.
+    def lost(*args: object) -> None:
+        raise RuntimeError("CUDA error: unspecified launch failure")
+
+    for query in ("get_device_properties", "mem_get_info"):
+        monkeypatch.setattr(torch.cuda, query, lost)
+        found = record()
+        bench.rotate_inputs(_rotation_args(), found, rotating, 7_000_000)
+        decision = cast("dict[str, str]", found["rotate_inputs"])
+        assert (decision["status"], decision["sets"]) == ("error", 8)
+        assert "unspecified launch failure" in decision["error"]
+        assert found["impls"] == record()["impls"]
 
 
 def test_report_takes_only_finite_positive_timings() -> None:
@@ -1143,6 +1738,32 @@ if sm < 0:
     record["foreign_gpu_activity"].update(unknown_samples=9, processes={})
 if "--backend" in args:
     record["backend"] = args[args.index("--backend") + 1]
+if "--configs-dir" in args:
+    # A bench: an entry for every implementation it is given, a port's
+    # naming the autotune record it is pinned to, as bench.py's do.
+    configs = Path(args[args.index("--configs-dir") + 1])
+    impls = os.environ["BB_STUB_IMPLS"]
+    if "--impls" in args:
+        impls = args[args.index("--impls") + 1]
+    for impl in impls.split(","):
+        entry = {"status": "ok"}
+        if impl.startswith("helion_"):
+            name = f"{args[0]}__{record['shape']}__{impl.removeprefix('helion_')}.json"
+            tuned = {}
+            if (configs / name).exists():
+                tuned = json.loads((configs / name).read_text())
+            if tuned.get("status") == "ok":
+                entry["autotune_code_sha256"] = {
+                    kernel: fields["code_sha256"]
+                    for kernel, fields in tuned.get("kernels", {}).items()
+                }
+                entry["autotune_provisional"] = bool(tuned.get("provisional"))
+            else:
+                entry["status"] = "error"
+        record["impls"][impl] = entry
+if "--rotate-inputs" in args:
+    sets = int(args[args.index("--rotate-inputs") + 1])
+    record["rotate_inputs"] = {"sets": sets, "status": "ok"}
 out.write_text(json.dumps(record))
 if "BB_STUB_LEAVE" in os.environ:
     if os.fork() == 0:
@@ -1180,6 +1801,7 @@ def _stub_campaign(
     selection.write_text(json.dumps({"kernels": kernels}))
     monkeypatch.setenv("BB_STUB_PLAN", json.dumps(plan))
     monkeypatch.setenv("BB_STUB_DIR", str(tmp_path))
+    monkeypatch.setenv("BB_STUB_IMPLS", ",".join(common.ALL_IMPLS))
     monkeypatch.setattr(campaign, "PACKAGE_DIR", jobs)
     monkeypatch.setattr(campaign, "POLL_S", 0.01)
     monkeypatch.setattr(campaign, "gpu_uuid", gpu_uuid or (lambda gpu: f"GPU-{gpu}"))
@@ -1642,6 +2264,677 @@ def test_a_campaign_on_a_written_plan_runs_exactly_its_jobs(
     assert "already holds records" in capsys.readouterr().err
 
 
+def test_a_campaign_on_another_runs_picks_only_benches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Checked before any job starts or any record is copied.
+    picks = tmp_path / "before" / "configs"
+    picks.mkdir(parents=True)
+    bench_only = ("--phases", "bench")
+    for flags, message in (
+        (["--configs-from", str(picks)], "--phases bench"),
+        (
+            ["--configs-from", str(picks), "--phases", "autotune,bench"],
+            "--phases bench",
+        ),
+        (["--configs-from", str(tmp_path / "none"), "--phases", "bench"], "no such"),
+        (
+            ["--configs-from", str(tmp_path / "run" / "configs"), "--phases", "bench"],
+            "no such",
+        ),
+        (["--rotate-inputs", "1"], "at least 2 input sets"),
+    ):
+        with pytest.raises(SystemExit):
+            _stub_campaign(tmp_path, monkeypatch, {}, *flags)
+        assert message in capsys.readouterr().err
+    assert not (tmp_path / "run").exists() and not list(picks.iterdir())
+    # Nor is a directory that holds none of the selected picks another run's
+    # configs: the run itself given for its configs, say.
+    _toy_tuned(tmp_path / "before", "sum_000000000002", "s2", "triton")
+    for given in (picks, picks.parent):
+        with pytest.raises(SystemExit):
+            _stub_campaign(
+                tmp_path, monkeypatch, {}, "--configs-from", str(given), *bench_only
+            )
+        error = capsys.readouterr().err
+        assert f"{given} holds none of the 1 selected autotune records" in error
+        assert "sum_000000000001__s1__triton.json" in error and "RUN/configs" in error
+    assert not (tmp_path / "run").exists()
+    (tmp_path / "run" / "configs").mkdir(parents=True)
+    with pytest.raises(SystemExit):
+        _stub_campaign(
+            tmp_path,
+            monkeypatch,
+            {},
+            "--configs-from",
+            str(tmp_path / "run" / "configs"),
+            "--phases",
+            "bench",
+        )
+    assert "this run's own configs" in capsys.readouterr().err
+
+
+@pytest.mark.slow
+@_requires_proc
+def test_a_campaign_adds_rotating_timings_to_another_runs_picks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The earlier run: a Triton pick for each of two points, a bench record
+    # of the first, and a CuTe pick that --backends leaves out.
+    before = tmp_path / "before"
+    kernels = [
+        {"repro": "sum_000000000001", "shape": "s1"},
+        {"repro": "sum_000000000002", "shape": "s2"},
+    ]
+    for k in kernels:
+        _toy_tuned(before, k["repro"], k["shape"], "triton")
+    _toy_tuned(before, "sum_000000000001", "s1", "cute")
+    _toy_bench(before, "sum_000000000001", "s1", {"inductor": 2.0})
+    old = time.time() - 3600
+    kept = {}
+    for path in sorted(before.rglob("*.json")):
+        os.utime(path, (old, old))
+        kept[path] = (path.read_bytes(), path.stat().st_mtime_ns)
+    flags = ("--configs-from", str(before / "configs"), "--phases", "bench")
+    run, events = _stub_campaign(
+        tmp_path, monkeypatch, {}, *flags, "--rotate-inputs", "8", kernels=kernels
+    )
+    names = [f"{k['repro']}__{k['shape']}" for k in kernels]
+    # Only benches ran, on copies of the picks as they are, with the option.
+    starts = [e["job"] for e in events if e["kind"] == "job_start"]
+    assert sorted(starts) == [f"bench:{name}" for name in names]
+    copies = [f"{name}__triton.json" for name in names]
+    assert events[0]["kind"] == "configs_copied" and events[0]["records"] == copies
+    assert events[0]["missing"] == events[0]["removed"] == []
+    assert sorted(path.name for path in (run / "configs").iterdir()) == copies
+    assert events[0]["replaced"] == []
+    for name in copies:
+        source, copy = before / "configs" / name, run / "configs" / name
+        assert copy.read_bytes() == source.read_bytes()
+        # A record that is new to this run, whenever the other run made it.
+        assert copy.stat().st_mtime > old + 1800
+    for name in names:
+        assert (
+            json.loads((run / "bench" / f"{name}.json").read_text())["status"] == "ok"
+        )
+        command = (run / "logs" / "bench" / f"{name}.log").read_text().splitlines()[0]
+        assert f"--configs-dir {run / 'configs'} " in command
+        # Of the Helion ports, the selected backend's only.
+        assert command.endswith(
+            "--impls inductor,inductor_cd,oracle,helion_triton,memcopy "
+            "--rotate-inputs 8"
+        )
+    # The earlier run is as it was.
+    assert {
+        path: (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in sorted(before.rglob("*"))
+        if path.is_file()
+    } == kept
+    # Started again, it has nothing to copy or run; a pick that changed in
+    # the earlier run since is copied and its point benched again.
+    _, events = _stub_campaign(
+        tmp_path, monkeypatch, {}, *flags, "--rotate-inputs", "8", kernels=kernels
+    )
+    assert [e["kind"] for e in events] == [
+        "configs_copied",
+        "campaign_start",
+        "campaign_end",
+    ]
+    assert events[0]["records"] == []
+    first_copy = (run / "configs" / copies[1]).read_bytes()
+    _toy_tuned(before, "sum_000000000002", "s2", "triton", version=2)
+    _, events = _stub_campaign(
+        tmp_path, monkeypatch, {}, *flags, "--rotate-inputs", "8", kernels=kernels
+    )
+    assert events[0]["records"] == events[0]["replaced"] == [copies[1]]
+    starts = [e["job"] for e in events if e["kind"] == "job_start"]
+    assert starts == [f"bench:{names[1]}"]
+    # A finished bench does not run again for another count of sets: the
+    # campaign names the records that keep 8 sets.
+    _, events = _stub_campaign(
+        tmp_path, monkeypatch, {}, *flags, "--rotate-inputs", "4", kernels=kernels
+    )
+    assert [e["kind"] for e in events] == [
+        "configs_copied",
+        "rotate_inputs_not_added",
+        "campaign_start",
+        "campaign_end",
+    ]
+    assert events[0]["records"] == []
+    assert (events[1]["sets"], events[1]["records"]) == (
+        4,
+        [f"{name}.json" for name in names],
+    )
+    assert "--rebench" in str(events[1]["reason"])
+    # With the CuTe picks as well: the first point's is new to this run, so
+    # the point is benched again, on 4 sets; the second point's, which the
+    # earlier run lacks, is named, and its bench keeps what it has.
+    _, events = _stub_campaign(
+        tmp_path,
+        monkeypatch,
+        {},
+        *flags,
+        "--rotate-inputs",
+        "4",
+        kernels=kernels,
+        backends="cute,triton",
+    )
+    assert events[0]["records"] == [f"{names[0]}__cute.json"]
+    assert events[0]["replaced"] == []
+    assert events[0]["missing"] == [f"{names[1]}__cute.json"]
+    assert events[1]["kind"] == "rotate_inputs_not_added"
+    assert events[1]["records"] == [f"{names[1]}.json"]
+    starts = [e["job"] for e in events if e["kind"] == "job_start"]
+    assert starts == [f"bench:{names[0]}"]
+    command = (run / "logs" / "bench" / f"{names[0]}.log").read_text().splitlines()[0]
+    assert f"--impls {','.join(common.ALL_IMPLS)} --rotate-inputs 4" in command
+    for name, sets in zip(names, (4, 8), strict=True):
+        record = json.loads((run / "bench" / f"{name}.json").read_text())
+        assert record["rotate_inputs"] == {"sets": sets, "status": "ok"}
+    # What the option copied, by the digest of each copy, and the copy that
+    # the second point's replaced.
+    manifest = json.loads((run / campaign.COPIED_CONFIGS).read_text())
+    assert manifest.pop(copies[1])["replaces"] == hashlib.sha256(first_copy).hexdigest()
+    assert manifest == {
+        name: {
+            "source": str(before / "configs" / name),
+            "sha256": hashlib.sha256((run / "configs" / name).read_bytes()).hexdigest(),
+        }
+        for name in (copies[0], f"{names[0]}__cute.json")
+    }
+
+
+def _stopped() -> set[str] | None:
+    """In place of ``campaign.busy_uuids``: the campaign is told to stop as
+    it looks for a GPU for its first job."""
+    raise campaign.Interrupted(signal.SIGTERM)
+
+
+def _stopped_campaign(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kernels: list[dict[str, str]],
+    backends: str,
+    *flags: str,
+) -> list[dict[str, object]]:
+    """Start a campaign in ``tmp_path / "run"`` with ``flags`` that is
+    stopped before a job starts: its events, the last two of them its
+    ``campaign_start`` (with the number of jobs it queued) and its end."""
+    log = tmp_path / "run" / "campaign.jsonl"
+    before = len(log.read_text().splitlines()) if log.exists() else 0
+    with contextlib.suppress(campaign.Interrupted):
+        _stub_campaign(
+            tmp_path,
+            monkeypatch,
+            {},
+            *flags,
+            kernels=kernels,
+            backends=backends,
+            busy_uuids=_stopped,
+        )
+    events = [json.loads(line) for line in log.read_text().splitlines()[before:]]
+    assert [event["kind"] for event in events[-2:]] == [
+        "campaign_start",
+        "campaign_end",
+    ]
+    return events
+
+
+def _copied_and_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    kernels: list[dict[str, str]],
+    backends: str = "triton",
+    *more: str,
+) -> tuple[dict[str, object], object]:
+    """Start a campaign in ``tmp_path / "run"`` on the picks of ``source``
+    (another run's configs), with ``more`` flags, stopped before a job
+    starts: its ``configs_copied`` event and the number of jobs it queued."""
+    flags = ("--configs-from", str(source), "--phases", "bench", *more)
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, backends, *flags)
+    assert events[0]["kind"] == "configs_copied"
+    return events[0], events[-2]["jobs"]
+
+
+def _timed_on(backend: str, version: int) -> dict[str, object]:
+    """What a bench entry of a port says it was pinned to: that version of
+    ``_toy_kernels``."""
+    return common.timed_record_fields({"kernels": _toy_kernels(backend, version)})
+
+
+def test_a_point_is_benched_again_on_picks_its_bench_was_not_timed_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Earlier runs with a pick of the point each, all made an hour ago.
+    kernels = [{"repro": "sum_000000000001", "shape": "s1"}]
+    name = "sum_000000000001__s1__triton.json"
+    run = tmp_path / "run"
+    bench_record = run / "bench" / "sum_000000000001__s1.json"
+    old = time.time() - 3600
+
+    def pick(version: int) -> Path:
+        source = tmp_path / f"picks{version}"
+        _toy_tuned(
+            source,
+            "sum_000000000001",
+            "s1",
+            "triton",
+            kernels=_toy_kernels("triton", version),
+        )
+        os.utime(source / "configs" / name, (old, old))
+        return source / "configs"
+
+    def queued(source: Path) -> tuple[object, object]:
+        copied, jobs = _copied_and_queued(tmp_path, monkeypatch, source, kernels)
+        assert (run / "configs" / name).read_bytes() == (source / name).read_bytes()
+        return copied["records"], jobs
+
+    def benched(version: int, when: float, attempt: int = 0) -> str:
+        """The point's bench record, timed on that version of the pick and
+        dated ``when``; with ``attempt``, a contaminated attempt at it."""
+        _toy_bench(
+            run,
+            "sum_000000000001",
+            "s1",
+            {"inductor": 2.0, "helion_triton": 1.0},
+            max_sm=83 if attempt else 0,
+            helion_triton=_timed_on("triton", version),
+        )
+        os.utime(bench_record, (when, when))
+        if attempt:
+            kept = bench_record.with_name(f"{bench_record.name}.attempt{attempt}")
+            bench_record.replace(kept)
+            return str(kept)
+        return str(bench_record)
+
+    assert queued(pick(1)) == ([name], 1)
+    # The bench finishes; a campaign started again has nothing to do.
+    benched(1, time.time())
+    assert queued(pick(1)) == ([], 0)
+    # Another run's pick was made before that bench: it replaces the first
+    # copy all the same, and the point is benched again on it.
+    assert queued(pick(2)) == ([name], 1)
+    # That campaign stopped before the bench started, and the bench record of
+    # the pick before is dated after the copy (a clock that stepped back,
+    # say). The campaigns after it copy nothing and still bench the point:
+    # the record says which kernels it timed.
+    benched(1, time.time() + 3600)
+    assert queued(pick(2)) == ([], 1)
+    assert queued(pick(2)) == ([], 1)
+    benched(2, time.time() + 3600)
+    assert queued(pick(2)) == ([], 0)
+    # A campaign on that pick was contaminated at every attempt and stopped
+    # before it kept the cleanest. Then a third pick is copied: the attempts
+    # are no attempts at a bench on it, and neither that campaign nor, once
+    # it has stopped too, the next one lets one of them stand for it.
+    bench_record.unlink()
+    stale = [benched(2, time.time(), attempt) for attempt in (1, 2, 3)]
+    assert queued(pick(3)) == ([name], 1)
+    assert queued(pick(3)) == ([], 1)
+    assert not bench_record.exists()
+    # The attempts on the pick the point has now do count: with the retries
+    # spent, the cleanest of them is kept.
+    spent = [benched(3, time.time(), attempt) for attempt in (4, 5, 6)]
+    assert queued(pick(3)) == ([], 0)
+    kept = json.loads(bench_record.read_text())
+    assert kept["contaminated"] is True and kept["contaminated_attempts"] == spent
+    assert kept["impls"]["helion_triton"]["autotune_code_sha256"] == {"k": "triton-3"}
+    assert all(os.path.exists(path) for path in stale)
+
+
+def test_configs_from_benches_only_the_ports_whose_picks_it_takes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A run with a CuTe and a Triton pick of the point, and a second run
+    # with another Triton pick of it.
+    kernels = [{"repro": "sum_000000000001", "shape": "s1"}]
+    cute, triton = (f"sum_000000000001__s1__{b}.json" for b in ("cute", "triton"))
+    first, second, run = (tmp_path / d for d in ("first", "second", "run"))
+    for backend in ("cute", "triton"):
+        _toy_tuned(first, "sum_000000000001", "s1", backend)
+    _toy_tuned(
+        second, "sum_000000000001", "s1", "triton", kernels=_toy_kernels("triton", 2)
+    )
+
+    def start(source: Path, backends: str, *more: str) -> tuple[object, ...]:
+        copied, jobs = _copied_and_queued(
+            tmp_path, monkeypatch, source / "configs", kernels, backends, *more
+        )
+        return copied["records"], ",".join(copied["bench_impls"]), jobs
+
+    # Both backends: every implementation, in bench.py's order.
+    every = "inductor,inductor_cd,oracle,helion_triton,helion_cute,memcopy"
+    assert every == ",".join(common.ALL_IMPLS)
+    assert start(first, "cute,triton") == ([cute, triton], every, 1)
+    times = {"inductor": 2.0, "helion_cute": 1.0, "helion_triton": 1.5}
+    _toy_bench(run, "sum_000000000001", "s1", times)
+    assert start(first, "cute,triton")[2] == 0
+    # The second run's Triton pick replaces the copy of the first run's, and
+    # the copy of the first run's CuTe pick stays, since CuTe is not
+    # selected: the bench that the point gets leaves the CuTe port out, so it
+    # does not time the first run's pick beside the second run's.
+    without_cute = every.replace("helion_cute,", "")
+    assert start(second, "triton") == ([triton], without_cute, 1)
+    held = {path.name: path.read_bytes() for path in (run / "configs").iterdir()}
+    assert held == {
+        cute: (first / "configs" / cute).read_bytes(),
+        triton: (second / "configs" / triton).read_bytes(),
+    }
+    # --bench-impls narrows the list and may not widen it to a port whose
+    # pick the option does not take.
+    narrowed = "inductor,helion_triton"
+    assert start(second, "triton", "--bench-impls", narrowed) == ([], narrowed, 1)
+    kept = {path: path.read_bytes() for path in run.rglob("*") if path.is_file()}
+    with pytest.raises(SystemExit):
+        start(second, "triton", "--bench-impls", "inductor,helion_cute,helion_triton")
+    error = capsys.readouterr().err
+    assert "--bench-impls names helion_cute, and --backends triton takes no" in error
+    assert kept == {
+        path: path.read_bytes() for path in run.rglob("*") if path.is_file()
+    }
+    # That bench finishes, on the second run's Triton pick alone and dated an
+    # hour from now, so no date makes it stale.
+    bench_record = run / "bench" / "sum_000000000001__s1.json"
+
+    def benched(**ports: dict[str, object]) -> None:
+        times = {"inductor": 2.0, **dict.fromkeys(ports, 1.5)}
+        _toy_bench(run, "sum_000000000001", "s1", times, **ports)
+        os.utime(bench_record, (time.time() + 3600,) * 2)
+
+    benched(helion_triton=_timed_on("triton", 2))
+    assert start(second, "triton") == ([], without_cute, 0)
+    # It left the CuTe port out. That is nothing to bench the point again
+    # for while the port has no pick: on the second run's picks of both
+    # backends the copy of the first run's CuTe pick goes.
+    assert start(second, "cute,triton") == ([], every, 0)
+    assert not (run / "configs" / cute).exists()
+    # On the first run's CuTe pick the point is benched again, by the start
+    # that copies the pick and by one after it, which copies nothing: the
+    # bench record has no timing of the port. The record stands for a start
+    # whose benches leave the port out as well.
+    without_triton = every.replace("helion_triton,", "")
+    assert start(first, "cute") == ([cute], without_triton, 1)
+    assert start(first, "cute") == ([], without_triton, 1)
+    assert start(first, "cute", "--bench-impls", "inductor") == ([], "inductor", 0)
+    benched(helion_cute=_timed_on("cute", 1))
+    assert start(first, "cute") == ([], without_triton, 0)
+    # So it is without --configs-from: a bench with fewer --bench-impls is
+    # no bench of the ports that a restart without them times.
+    plain = ("--phases", "bench")
+    stopped = _stopped_campaign(tmp_path, monkeypatch, kernels, "cute,triton", *plain)
+    assert stopped[-2]["jobs"] == 1
+    stopped = _stopped_campaign(
+        tmp_path, monkeypatch, kernels, "cute,triton", *plain, "--bench-impls", "oracle"
+    )
+    assert stopped[-2]["jobs"] == 0
+    stopped = _stopped_campaign(tmp_path, monkeypatch, kernels, "cute", *plain)
+    assert stopped[-2]["jobs"] == 0
+
+
+def test_a_campaign_names_the_finished_benches_without_the_rotating_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Five finished benches: a pass on 8 sets that timed the port, one that
+    # left it out by rule, one that failed, a pass on 4 sets, and no pass.
+    run = tmp_path / "run"
+    passes: list[dict[str, object] | None] = [
+        {"sets": 8, "status": "ok"},
+        {"sets": 8, "status": "skipped", "skipped": "inputs of 268.4 MB exceed"},
+        {"sets": 8, "status": "error", "error": "could not capture graphs"},
+        {"sets": 4, "status": "ok"},
+        None,
+    ]
+    kernels = [
+        {"repro": f"sum_00000000000{index}", "shape": "s1"}
+        for index in range(1, len(passes) + 1)
+    ]
+    for k, decision in zip(kernels, passes, strict=True):
+        _toy_tuned(run, k["repro"], k["shape"], "triton")
+        _toy_bench(run, k["repro"], k["shape"], {"inductor": 2.0, "helion_triton": 1.0})
+        if decision is not None:
+            _add_fields(run, k["repro"], k["shape"], rotate_inputs=decision)
+    kept = {path: path.read_bytes() for path in (run / "bench").iterdir()}
+    flags = ("--phases", "bench", "--rotate-inputs", "8")
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, "triton", *flags)
+    # None of them runs again; the three that lack the timing are named.
+    assert [event["kind"] for event in events[:-2]] == ["rotate_inputs_not_added"]
+    assert events[0]["sets"] == 8 and events[-2]["jobs"] == 0
+    assert events[0]["records"] == [
+        f"{k['repro']}__{k['shape']}.json" for k in kernels[2:]
+    ]
+    assert kept == {path: path.read_bytes() for path in (run / "bench").iterdir()}
+    # Without the option there is nothing to name.
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, "triton", *flags[:2])
+    assert len(events) == 2 and events[0]["jobs"] == 0
+
+
+def test_configs_from_replaces_only_the_records_it_copied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The run autotuned the first point itself, and the other run's pick of
+    # it differs: nothing is copied, the second point's pick neither, and
+    # the run is as it was.
+    kernels = [
+        {"repro": "sum_000000000001", "shape": "s1"},
+        {"repro": "sum_000000000002", "shape": "s2"},
+    ]
+    before, run = tmp_path / "before", tmp_path / "run"
+    for k in kernels:
+        _toy_tuned(
+            before, k["repro"], k["shape"], "triton", kernels=_toy_kernels("triton", 2)
+        )
+    _toy_tuned(run, "sum_000000000001", "s1", "triton")
+    own = run / "configs" / "sum_000000000001__s1__triton.json"
+
+    def files() -> dict[Path, bytes]:
+        return {path: path.read_bytes() for path in run.rglob("*") if path.is_file()}
+
+    def refused(backends: str = "triton") -> str:
+        kept = files()
+        flags = ("--configs-from", str(before / "configs"), "--phases", "bench")
+        with pytest.raises(SystemExit):
+            _stub_campaign(
+                tmp_path, monkeypatch, {}, *flags, kernels=kernels, backends=backends
+            )
+        assert files() == kept
+        return capsys.readouterr().err
+
+    error = refused()
+    assert f"1 autotune record of this run that it did not copy ({own.name})" in error
+    assert "--run-dir" in error
+    # With the record out of the way the picks are copied. A copy that an
+    # autotune of this run then replaces is the run's own record too.
+    own.unlink()
+    copied, jobs = _copied_and_queued(
+        tmp_path, monkeypatch, before / "configs", kernels
+    )
+    assert copied["records"] == [own.name, "sum_000000000002__s2__triton.json"]
+    assert jobs == 2
+    _toy_tuned(run, "sum_000000000001", "s1", "triton", kernels=_toy_kernels("own"))
+    _toy_tuned(
+        before, "sum_000000000001", "s1", "triton", kernels=_toy_kernels("triton", 3)
+    )
+    assert f"did not copy ({own.name})" in refused()
+    # So is a record of the run's own that the other run has no pick for: a
+    # bench would time it beside the other run's picks. The copies stay.
+    own.write_bytes((before / "configs" / own.name).read_bytes())
+    _toy_tuned(run, "sum_000000000002", "s2", "cute")
+    error = refused("cute,triton")
+    assert "did not copy (sum_000000000002__s2__cute.json) is not" in error
+    # The run's record of the first point is the other run's now, byte for
+    # byte, and still no copy of the option's: the entry of the copy that it
+    # replaced goes, and the record stays when the other run's pick changes.
+    (run / "configs" / "sum_000000000002__s2__cute.json").unlink()
+    copied, _ = _copied_and_queued(tmp_path, monkeypatch, before / "configs", kernels)
+    assert copied["records"] == []
+    assert list(json.loads((run / campaign.COPIED_CONFIGS).read_text())) == [
+        "sum_000000000002__s2__triton.json"
+    ]
+    _toy_tuned(
+        before, "sum_000000000001", "s1", "triton", kernels=_toy_kernels("triton", 4)
+    )
+    assert f"did not copy ({own.name})" in refused()
+
+
+def test_a_copy_goes_when_its_source_has_no_such_pick(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # One run with a CuTe and a Triton pick of the point; another with that
+    # Triton pick, byte for byte, and no CuTe pick.
+    kernels = [{"repro": "sum_000000000001", "shape": "s1"}]
+    cute, triton = (f"sum_000000000001__s1__{b}.json" for b in ("cute", "triton"))
+    both, one, run = (tmp_path / d for d in ("both", "one", "run"))
+    for backend in ("cute", "triton"):
+        _toy_tuned(both, "sum_000000000001", "s1", backend)
+    _toy_tuned(one, "sum_000000000001", "s1", "triton")
+    bench_record = run / "bench" / "sum_000000000001__s1.json"
+
+    def start(source: Path) -> tuple[object, object, object, object]:
+        copied, jobs = _copied_and_queued(
+            tmp_path, monkeypatch, source / "configs", kernels, "cute,triton"
+        )
+        return copied["records"], copied["removed"], copied["missing"], jobs
+
+    def benched(**ports: dict[str, object]) -> None:
+        """The point's bench record, dated an hour from now: no date makes
+        it stale."""
+        times = {"inductor": 2.0, "helion_cute": 1.0, "helion_triton": 1.5}
+        _toy_bench(run, "sum_000000000001", "s1", times, **ports)
+        os.utime(bench_record, (time.time() + 3600,) * 2)
+
+    assert start(both) == ([cute, triton], [], [], 1)
+    benched()
+    assert start(both) == ([], [], [], 0)
+    # On the other run's picks, this run's copy of the first run's CuTe pick
+    # goes (a bench would time it beside the other run's Triton pick), and
+    # the point is benched again: its record has a timing of that pick.
+    assert start(one) == ([], [cute], [cute], 1)
+    assert sorted(path.name for path in (run / "configs").iterdir()) == [triton]
+    assert list(json.loads((run / campaign.COPIED_CONFIGS).read_text())) == [triton]
+    assert start(one) == ([], [], [cute], 1)
+    # That bench has an error for the CuTe port, which names no record.
+    no_record = dict.fromkeys(_timed_on("cute", 1))
+    benched(helion_cute={"status": "error", "cold_us": None, **no_record})
+    assert start(one) == ([], [], [cute], 0)
+    # Back on the first run's picks its CuTe pick is copied again, and the
+    # point benched again for it, also by a campaign after the one that
+    # copied it.
+    assert start(both) == ([cute], [], [], 1)
+    assert start(both) == ([], [], [], 1)
+    # A directory without any of the picks (the run, not its configs) is
+    # refused before the copies would go.
+    kept = {path: path.read_bytes() for path in run.rglob("*") if path.is_file()}
+    with pytest.raises(SystemExit):
+        _copied_and_queued(tmp_path, monkeypatch, one, kernels, "cute,triton")
+    assert "holds none of the 2 selected autotune records" in capsys.readouterr().err
+    assert kept == {
+        path: path.read_bytes() for path in run.rglob("*") if path.is_file()
+    }
+
+
+class _Died(BaseException):
+    """The campaign's process is gone (SIGKILL, a power cut)."""
+
+
+def test_configs_from_knows_its_copies_wherever_a_copy_died(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernels = [
+        {"repro": "sum_000000000001", "shape": "s1"},
+        {"repro": "sum_000000000002", "shape": "s2"},
+    ]
+
+    def picks(root: str, version: int, points: int = 2) -> Path:
+        for k in kernels[:points]:
+            _toy_tuned(
+                tmp_path / root,
+                k["repro"],
+                k["shape"],
+                "triton",
+                kernels=_toy_kernels("triton", version),
+            )
+        return tmp_path / root / "configs"
+
+    def start(root: Path, source: Path, die_at: int = 0) -> int:
+        """A campaign in ``root / "run"`` on the picks of ``source`` that
+        dies before its ``die_at``-th change to the run's files, each a file
+        put in place or removed (0: it lives, stopped before a job starts);
+        the changes it made."""
+        root.mkdir(exist_ok=True)
+        changes = 0
+
+        def counted(change: Callable[..., object]) -> Callable[..., object]:
+            def step(*args: object) -> object:
+                nonlocal changes
+                if changes + 1 == die_at:
+                    raise _Died
+                changes += 1
+                return change(*args)
+
+            return step
+
+        with monkeypatch.context() as patched:
+            for change in ("replace", "unlink"):
+                patched.setattr(
+                    pathlib.Path, change, counted(getattr(pathlib.Path, change))
+                )
+            if die_at:
+                flags = ("--configs-from", str(source), "--phases", "bench")
+                with pytest.raises(_Died):
+                    _stub_campaign(root, patched, {}, *flags, kernels=kernels)
+            else:
+                _copied_and_queued(root, patched, source, kernels)
+        return changes
+
+    # The run holds one run's picks. A campaign on other picks dies before
+    # its first, second, ... change: to its record of the copies, or to a
+    # copy. The next campaign, on those picks, a third run's or the first
+    # one's again, knows every record the run then holds as a copy and
+    # finishes the job: the records and their entries are those of its
+    # picks, and no entry is left of a copy that was not made or is gone.
+    first, second, third = picks("first", 1), picks("second", 2), picks("third", 3)
+    lacking = picks("lacking", 2, 1)
+    for held_first, dying, expected in (
+        # Both picks replaced; one replaced and the copy of the other, which
+        # the dying campaign's run lacks, removed; one replaced and one new.
+        (first, second, 3),
+        (first, lacking, 4),
+        (lacking, first, 3),
+    ):
+        case = f"{held_first.parent.name}-{dying.parent.name}"
+        start(tmp_path / f"{case}-whole", held_first)
+        steps = start(tmp_path / f"{case}-whole", dying)
+        assert steps == expected
+        for die_at in range(1, steps + 1):
+            for after in (dying, third, held_first):
+                root = tmp_path / f"{case}-{die_at}-{after.parent.name}"
+                start(root, held_first)
+                assert start(root, dying, die_at) == die_at - 1
+                start(root, after)
+                held = sorted(
+                    path.name for path in (root / "run" / "configs").iterdir()
+                )
+                assert held == sorted(path.name for path in after.iterdir())
+                manifest = json.loads(
+                    (root / "run" / campaign.COPIED_CONFIGS).read_text()
+                )
+                assert sorted(manifest) == held
+                for name in held:
+                    copy = (root / "run" / "configs" / name).read_bytes()
+                    assert copy == (after / name).read_bytes()
+                    assert manifest[name]["source"] == str(after / name)
+                    assert manifest[name]["sha256"] == hashlib.sha256(copy).hexdigest()
+
+
 def _toy_kernels(backend: str, version: int = 1) -> dict[str, dict[str, str]]:
     """The kernels of a toy autotune record."""
     return {
@@ -1852,6 +3145,153 @@ def test_the_final_tables_count_only_clean_sampled_records(
     found = json.loads((run / "report.json").read_text())
     every = found["aggregates"]["cold_us"]["all kernels"]
     assert every["kernels"] == 4 and every["triton_vs_inductor_kernels"] == 5
+
+
+def _add_fields(run: Path, repro: str, shape: str, **fields: object) -> None:
+    """Record-level fields for a toy bench record."""
+    path = run / "bench" / f"{repro}__{shape}.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), **fields}))
+
+
+def test_the_report_adds_rot_us_beside_cold_us_and_changes_nothing_else(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = tmp_path / "run"
+    skipped = "inputs of 4295.0 MB exceed 2 x the 132.6 MB L2"
+
+    def bench_records(rotated: bool) -> None:
+        """Five kernels; with ``rotated``, as ``bench.py --rotate-inputs 8``
+        records them: three timed, one too large, and one bench that a
+        foreign process contaminated."""
+
+        def rot(**times: float) -> dict[str, dict[str, object]]:
+            return (
+                {impl: {"rot_us": us} for impl, us in times.items()} if rotated else {}
+            )
+
+        def decided(repro: str, shape: str, **decision: object) -> None:
+            if rotated:
+                _add_fields(run, repro, shape, rotate_inputs={"sets": 8, **decision})
+
+        times = {"inductor": 12.0, "inductor_cd": 10.0, "helion_cute": 8.0}
+        # Inductor's hinted loads read 2 us warm in cold_us, CuTe's 1 us.
+        fields = rot(inductor=13.5, inductor_cd=12.0, helion_cute=9.0, memcopy=5.0)
+        _toy_bench(run, "mean_000000000001", "s1", {**times, "memcopy": 5.0}, **fields)
+        decided("mean_000000000001", "s1", status="ok")
+        # CuTe's hints are the ones that kept its inputs resident here.
+        fields = rot(inductor=20.5, helion_cute=25.0)
+        _toy_bench(
+            run,
+            "var_000000000002",
+            "s2",
+            {"inductor": 20.0, "helion_cute": 16.0},
+            **fields,
+        )
+        decided("var_000000000002", "s2", status="ok")
+        _toy_bench(
+            run, "sum_000000000003", "s3", {"inductor": 900.0, "helion_cute": 600.0}
+        )
+        decided("sum_000000000003", "s3", status="skipped", skipped=skipped)
+        fields = rot(inductor=30.0, helion_cute=10.0)
+        _toy_bench(
+            run,
+            "sum_000000000004",
+            "s4",
+            {"inductor": 30.0, "helion_cute": 15.0},
+            70,
+            **fields,
+        )
+        decided("sum_000000000004", "s4", status="ok")
+        # Its rotating pass failed: the other timings stand.
+        _toy_bench(
+            run, "amax_000000000005", "s5", {"inductor": 40.0, "helion_cute": 50.0}
+        )
+        decided(
+            "amax_000000000005",
+            "s5",
+            status="error",
+            error="Traceback\nRuntimeError: x\n",
+        )
+
+    for index in range(1, 6):
+        repro = ["mean", "var", "sum", "sum", "amax"][
+            index - 1
+        ] + f"_00000000000{index}"
+        _toy_tuned(run, repro, f"s{index}", "cute")
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run)])
+    bench_records(rotated=False)
+    report.main()
+    plain = json.loads((run / "report.json").read_text())
+    plain_text = (run / "report.md").read_text()
+    assert "rot" not in plain_text and "rot_us" not in json.dumps(plain)
+    bench_records(rotated=True)
+    report.main()
+    found = json.loads((run / "report.json").read_text())
+    text = (run / "report.md").read_text()
+    # s1 1.25x by cold_us and 12/9 by rot_us, s2 1.25x and 0.82x; the
+    # contaminated s4 counts in neither, s3 and s5 have no rot_us.
+    check = found["aggregates"]["cold_us"]["all kernels"].pop("rot_us")
+    assert check == {
+        "kernels": 2,
+        "cute_vs_inductor": pytest.approx((12 / 9 * 20.5 / 25) ** 0.5),
+        "same_kernels_by_this_timer": pytest.approx(1.25),
+    }
+    assert found["families"]["cold_us"]["mean"].pop("rot_us")["kernels"] == 1
+    for family in ("var", "sum", "amax"):
+        kernels = found["families"]["cold_us"][family].pop("rot_us")["kernels"]
+        assert kernels == (family == "var")
+    rot_rows = {row["repro"]: row for row in found["rows"].pop("rot_us")}
+    assert sorted(rot_rows) == [
+        "mean_000000000001",
+        "sum_000000000004",
+        "var_000000000002",
+    ]
+    assert rot_rows["mean_000000000001"]["inductor"] == 12.0
+    assert rot_rows["sum_000000000004"]["counted"] == []
+    assert found.pop("rotate_inputs") == {
+        "mean_000000000001__s1": {"sets": 8, "status": "ok"},
+        "var_000000000002__s2": {"sets": 8, "status": "ok"},
+        "sum_000000000003__s3": {"sets": 8, "status": "skipped", "skipped": skipped},
+        "sum_000000000004__s4": {"sets": 8, "status": "ok"},
+        "amax_000000000005__s5": {
+            "sets": 8,
+            "status": "error",
+            "error": "Traceback\nRuntimeError: x\n",
+        },
+    }
+    # Every other number is the one of the report without rot_us.
+    assert found == plain
+    assert (
+        "| Helion+CuTe vs Inductor by rot_us, private inputs, geomean (kernels) "
+        "| 1.046x (2) |\n"
+        "| the same kernels by cold_us, geomean | 1.250x |\n"
+    ) in text
+    assert "| mean_000000000001 | s1 | 0.0 | 10.00 | 8.00 | 1.250 | 1.333 | - |" in text
+    assert "| sum_000000000004 | s4 | 0.0 | 30.00 | 15.00 | 2.000 | 3.000 | - |" in text
+    assert "| sum_000000000003 | s3 | 0.0 | 900.00 | 600.00 | 1.500 | - | - |" in text
+    assert (
+        "## Rotating inputs (rot_us)\n\n"
+        "`bench.py --rotate-inputs` timed 3 of 5 records on private input sets "
+        "(8 per implementation), one per call of a flushed batch; not timed:\n\n"
+        "- amax_000000000005__s5: failed: RuntimeError: x\n"
+        f"- sum_000000000003__s3: {skipped}\n"
+        f"\n{report.ROTATION_CAVEAT}\n"
+    ) in text
+    assert "bracket the hint-free one only where the CuTe config has no such hints" in (
+        report.ROTATION_CAVEAT
+    )
+    # Without the rot_us rows, column and section it reads as before.
+    start = text.index("## Rotating inputs")
+    kept = []
+    for line in text[:start].splitlines():
+        cells = line.split(" | ")
+        if "rot_us" in line or "the same kernels by cold_us" in line:
+            continue
+        if line.startswith("| ") and len(cells) == 15:
+            del cells[6]
+        kept.append(" | ".join(cells))
+    kept = "\n".join(kept).replace(f"|{'---|' * 15}", f"|{'---|' * 14}", 1) + "\n"
+    assert kept == plain_text
 
 
 def test_the_goal_file_takes_only_the_ratios_the_aggregates_count(

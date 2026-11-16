@@ -41,7 +41,7 @@ and the scripts warn when the checkout is at another commit.
   CUDA graph replay, the way it is timed.
 - `campaign.py`: run autotune and bench jobs for a selection across GPUs;
   a job during which another process computed on its GPU runs again
-  (`--retry-contaminated`).
+  (`--retry-contaminated`). `--configs-from` benches another run's picks.
 - `plan_run.py`: plan a campaign from earlier runs' records: every CuTe
   autotune, the Triton autotunes whose earlier records cannot be reused
   (contaminated, unsampled, or no longer generating the code they were
@@ -60,7 +60,8 @@ and the scripts warn when the checkout is at another commit.
 
 ## Timers
 
-`bench.py` records two latencies per implementation, both cold-L2:
+`bench.py` records two latencies per implementation, both cold-L2 (and a
+third on request, below):
 
 - `bb_us`: better-benchmark's own methodology (single-call CUDA graph replay,
   `do_bench` minimum); includes one graph launch.
@@ -79,6 +80,112 @@ an even number of rounds (6 by default). Records made before that took the
 median of 5 cold rounds, a forward-order reading, and the minimum over all
 bb rounds: `report.py --rebalance` recomputes their timings from the
 recorded rounds.
+
+`bench.py --rotate-inputs N` adds a third, opt-in timing, `rot_us`, as a
+cross-check of `cold_us` on small kernels. `cold_us` replays every call on
+the same input tensors, and lines loaded with an `L2::evict_last` hint stay
+in L2 through the 256 MB flush (Triton's `eviction_policy="evict_last"`,
+which Inductor emits on the operands it expects to read again; CuTe's
+`l2_last` load policies, which a search can pick), so an implementation that
+hints its loads reads part of its inputs warm and the comparison depends on
+who hints what. For `rot_us` every implementation gets N private copies of
+the inputs (another implementation's hinted lines cannot serve its reads)
+and is timed as a graph of N x [flush; call on the next copy] minus the N
+flushes, in the same order-balanced rounds. On a B200 with N = 8, a CuTe
+config of var_mean_var_mean_0dd15b92dc70 reads 11.7 us in `cold_us` with
+`l2_last` on its loads and 14.1 us without, and 14.6 and 14.4 us in `rot_us`;
+kernels of 9 to 24 us without such hints and the memcopy read within 0.5 us
+of their `cold_us`. Its limits:
+
+- It is not a proof of coldness. Hinted lines are not kept forever, nothing
+  shows that N other sets displace all of them, and readings rise with N
+  without a plateau that would mark a cold time, a hinted kernel's most: over
+  its `cold_us`, Inductor on that port reads 1.1, 1.5 and 1.9 us more at
+  N = 4, 8 and 16 and the CuTe config without hints -0.1, 0.4 and 0.5 us, so
+  the ratio moves too (1.08, 1.09, 1.11). Compare readings taken with one N;
+  8 is the count the study used.
+- It leans against hinted kernels as `cold_us` leans towards them. A kernel
+  that hints its loads reads worse than the same kernel without the hints:
+  Inductor on mean_mean_7291b09200a4 reads 9.4 us in `cold_us` and 10.8 us in
+  `rot_us`, and 9.8-10.2 us by either when compiled with its hints stripped
+  (which coordinate descent then tunes differently). Part of that is time
+  outside the kernels: `rot_us` is timed between CUDA events like `cold_us`,
+  and under the same rotation Inductor on 0dd15 reads 15.5 us where the span
+  of its kernels in the CUDA activity trace is 14.3 us (three other
+  readings: 0.0 to 0.3 us over the span). Hinted lines also cost what is
+  timed beside them a few tenths of a microsecond (the memcopy of that 0dd15
+  port reads 10.8 us beside the config with `l2_last`, 10.4 us beside the
+  one without).
+- The two timers bracket a ratio only when one side hints. A CuTe config of
+  7291 without hints (9.0 us by both timers) is 1.05x faster than Inductor
+  by `cold_us` and 1.21x by `rot_us`, either side of the 1.09-1.14x it is
+  against Inductor compiled without hints. With `l2_last` on the same
+  config's loads (7.9 and 9.3 us) the timers agree, at 1.21x and 1.19x, and
+  both are high (1.06-1.14x against that compile): in `cold_us` CuTe's lines
+  are worth more warm than Inductor's, in `rot_us` Inductor's kernel loses
+  more to its hints than CuTe's. Inductor always hints, so agreement between
+  the timers settles nothing where the CuTe config hints too: look for
+  `l2_last` in the `load_eviction_policies` of the record's `decorators`
+  before reading a ratio.
+- A reading also moves with which tensors a kernel replays, with nothing
+  rotating, so not all of `rot_us - cold_us` is lines that rotation
+  displaced. With a single set in place of the N, default Inductor on 7291
+  read 1.1 to 1.7 us above its `cold_us` on a fresh set and 0.3 us above on
+  the set `cold_us` had replayed, on one GPU of four (four processes and
+  two); the other implementations and GPUs stayed within 0.6 us.
+- Compare ratios within a timer, not `rot_us` with `cold_us`: the rounds of
+  the two run at different times, and a power-capped GPU's clock moves with
+  the load (the Inductor and CuTe kernels of max_amax_sum_bbcd2529e855 read
+  about 5% higher in `rot_us`, its memcopy the same).
+- The Inductor side of a ratio is one sample per bench, in either timer. A
+  campaign's bench has a cache directory of its own, so coordinate descent
+  tunes again in each, and its pick moves a reading by more than the timers
+  differ: over eight benches of the same 7291 configs Inductor's tuned
+  compile read 9.3 to 11.6 us in `cold_us` and 10.2 to 13.4 us in `rot_us`
+  (its default compile 10.9 to 11.1 us and 13.1 to 13.3 us, the CuTe port
+  7.7 to 7.9 us and 9.0 to 9.1 us).
+- It covers small ports only, and a record's `rotate_inputs` field says why
+  a port was left out: inputs that total more than twice the device's L2
+  (`--rotate-max-l2`; the L2 is 126.5 MiB on a B200, and none of the seven
+  ports measured with 127 MB of inputs or more showed an effect of hints); a
+  fastest implementation of 64 us or more, which `cold_us` times as single
+  replays, so that a batch would not be its cross-check; or N sets for every
+  implementation that do not fit a quarter of the free device memory. By
+  input size and run time, 24 of the 51 selected points take it while the
+  memcopy is among the timed implementations, as it is by default: it is the
+  fastest on the larger ports (`rotate_inputs` names the fastest), and
+  without it five of the 24, whose fastest port takes 74 to 132 us, are
+  left out.
+
+To add it to the picks of a finished run `RUN` without autotuning again or
+touching its records, bench them into a run directory of their own, which
+`report.py` reports like any run, with the `rot_us` speedup beside the
+`cold_us` one:
+
+```bash
+S=benchmarks/cute/better_benchmark
+python $S/campaign.py --selection $S/selection.json --run-dir RUN-rot \
+    --configs-from RUN/configs --phases bench --rotate-inputs 8 --board-gpus 2
+python $S/report.py RUN-rot
+```
+
+A bench that has finished does not run again for the option (in `RUN`
+itself, or in `RUN-rot` with another N): the campaign names such records in
+a `rotate_inputs_not_added` event, and `--rebench` runs them again. Started
+again, the campaign makes `RUN-rot`'s copies those of the picks it is given
+then: it copies the picks that `RUN` has autotuned again since (or another
+run's, given that run's `configs`) and removes its copies of picks that are
+not there. Its benches time the Helion ports of `--backends` only, so a
+bench pins no record but the picks it is given, whatever else the run
+directory holds. A point is benched again when its bench record was timed on
+other picks than `RUN-rot` then holds; the bench record names the kernels
+each port was pinned to, so this does not depend on file dates or on which
+start of the campaign made the copy. `--configs-from` replaces and removes
+only the copies it made (`RUN-rot/configs_copied.json` lists them): it
+stops, before changing anything, on a run directory with autotune records
+of its own that are not among the picks it is given, so it cannot replace
+the records of the run it is pointed at by mistake, and on a directory that
+holds none of the selected picks (`RUN` for `RUN/configs`).
 
 Throughput is reported against better-benchmark's effective byte count
 (`byte_accounting.count_bytes_effective`: unique inputs read plus outputs

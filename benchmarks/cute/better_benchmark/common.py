@@ -110,6 +110,19 @@ def bench_record_path(bench_dir: Path, repro_id: str, shape: str) -> Path:
     return bench_dir / f"{repro_id}__{shape}.json"
 
 
+# The implementations ``bench.py`` times, in the order of a forward round (its
+# ``--impls``). ``helion_<backend>`` is the Helion port pinned to that
+# backend's autotune record.
+ALL_IMPLS = (
+    "inductor",
+    "inductor_cd",
+    "oracle",
+    "helion_triton",
+    "helion_cute",
+    "memcopy",
+)
+
+
 def repro_dir(repro_id: str) -> Path:
     path = bb_path() / "repros" / "canonical" / repro_id
     if not (path / "repro.py").exists():
@@ -173,6 +186,20 @@ def make_inputs(repro_id: str, shape: str, seed: int = 0) -> list[Any]:
         raise KeyError(f"{repro_id} has no shape point {shape}; have {list(configs)}")
     seed_everything(seed)
     return repro_harness.make_inputs_from_config(configs[shape])
+
+
+def input_bytes(inputs: Sequence[Any]) -> int:
+    """The device memory behind one input set: the bytes of the distinct
+    storages of its tensors (views of one buffer count it once, whatever
+    part of it they show)."""
+    import torch
+
+    storages = {}
+    for value in inputs:
+        if isinstance(value, torch.Tensor):
+            storage = value.untyped_storage()
+            storages[storage.data_ptr()] = storage.nbytes()
+    return sum(storages.values())
 
 
 def compile_policy(repro_id: str, shape: str) -> dict[str, Any]:
@@ -306,17 +333,33 @@ def load_port(
     return module
 
 
-def load_autotuned_port(
+def autotune_record(
     configs_dir: Path, repro_id: str, shape: str, backend: str
-) -> tuple[types.ModuleType, dict[str, Any]]:
-    """The port with every kernel pinned to the decorator its autotune
-    record (``autotune.py``'s, which must be ok) holds, and the record."""
+) -> dict[str, Any]:
+    """The record of one port's autotune (``autotune.py``'s), which must be
+    ok: what a bench pins the port to."""
     path = config_record_path(configs_dir, repro_id, shape, backend)
     record = json.loads(path.read_text())
     if record.get("status") != "ok":
         raise RuntimeError(f"autotune record {path} is not ok")
-    pinned = {name: kernel["decorator"] for name, kernel in record["kernels"].items()}
+    return record
+
+
+def load_autotuned_port(
+    configs_dir: Path, repro_id: str, shape: str, backend: str
+) -> tuple[types.ModuleType, dict[str, Any]]:
+    """The port with every kernel pinned to the decorator its autotune
+    record (``autotune_record``) holds, and the record."""
+    record = autotune_record(configs_dir, repro_id, shape, backend)
+    pinned = per_kernel(record["kernels"], "decorator")
     return load_port(repro_id, backend, pinned=pinned), record
+
+
+def per_kernel(kernels: dict[str, dict[str, Any]], field: str) -> dict[str, Any]:
+    """``field`` of each kernel of an autotune record (its ``kernels``), by
+    the kernel's name: ``decorator``, what the kernel is pinned to, or
+    ``code_sha256``, the digest of the code it then generates."""
+    return {name: kernel[field] for name, kernel in kernels.items()}
 
 
 def timed_record_fields(tuned: dict[str, Any]) -> dict[str, Any]:
@@ -326,12 +369,39 @@ def timed_record_fields(tuned: dict[str, Any]) -> dict[str, Any]:
     bench replaces the record, and ``report.py`` counts the timing only while
     the record holds the same kernels."""
     return {
-        "autotune_code_sha256": {
-            name: kernel["code_sha256"] for name, kernel in tuned["kernels"].items()
-        },
+        "autotune_code_sha256": per_kernel(tuned["kernels"], "code_sha256"),
         "autotune_provisional": bool(tuned.get("provisional")),
         "autotune_reused_from": tuned.get("reused_from"),
     }
+
+
+def timed_kernels_held(info: dict[str, Any], tuned: dict[str, Any] | None) -> bool:
+    """Whether the autotune record ``tuned`` (None: the point has no ok one)
+    holds the kernels that a port's entry in a bench record, ``info``, was
+    timed on: by their code digests (``timed_record_fields``), or, for an
+    entry made before ``bench.py`` recorded those, by their decorators."""
+    kernels = (tuned or {}).get("kernels", {})
+    if "autotune_code_sha256" in info:
+        return info["autotune_code_sha256"] == per_kernel(kernels, "code_sha256")
+    return info.get("decorators") == per_kernel(kernels, "decorator")
+
+
+def timed_on_record(info: dict[str, Any], tuned: dict[str, Any] | None) -> bool:
+    """Whether a port's entry in a bench record, ``info``, is of the autotune
+    record ``tuned`` (None: the point has no ok one), so that a bench of the
+    point now would pin what that one pinned: the same kernels
+    (``timed_kernels_held``), provisional or not as ``tuned`` is (an entry
+    made before ``bench.py`` recorded that is told by its kernels alone).
+    ``bench.py`` names the record before it loads the port, so an entry that
+    names none found no ok record, and is of ``tuned`` only when there is
+    still none."""
+    named = "autotune_code_sha256" in info or "decorators" in info
+    if tuned is None or not named:
+        return tuned is None and not named
+    return timed_kernels_held(info, tuned) and (
+        "autotune_provisional" not in info
+        or info["autotune_provisional"] == bool(tuned.get("provisional"))
+    )
 
 
 def port_kernels(module: types.ModuleType) -> dict[str, Any]:
