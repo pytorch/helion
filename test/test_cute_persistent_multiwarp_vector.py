@@ -692,8 +692,8 @@ def test_reduction_tile_heuristic_seeds_multiwarp_vector_row(
     spec = bound.config_spec
     assert CuteReductionTileHeuristic in get_heuristics("cute")
     seeds = CuteReductionTileHeuristic.get_seed_configs(bound.env, host.device_ir)
-    # The narrow chunk, the 16-byte one-vector row, the 32-byte row on SM100
-    # and the two-packet rolled row.
+    # The narrow chunk, the 16-byte one-vector row, the 32-byte row on SM100,
+    # the two-packet rolled row and its one-packet form.
     assert seeds is not None and len(seeds) >= 3
     primary, alternate = seeds[:2]
     assert primary == CuteReductionTileHeuristic.get_seed_config(
@@ -720,14 +720,17 @@ def test_reduction_tile_heuristic_seeds_multiwarp_vector_row(
             == "register_prefetch"
         )
     # The warp-per-row, rows-per-CTA seeds (``warp_rows_seed_configs``) close
-    # the list; the two-packet rolled row precedes them.
+    # the list; the two-packet rolled row and its one-packet form precede them.
     warp_rows = CuteReductionTileHeuristic.warp_rows_seed_configs(
         bound.env, host.device_ir
     )
     assert seeds[len(seeds) - len(warp_rows) :] == warp_rows
-    rolled = seeds[len(seeds) - len(warp_rows) - 1]
+    rolled, one_packet = seeds[len(seeds) - len(warp_rows) - 2 :][:2]
     assert rolled == CuteReductionTileHeuristic.two_packet_rolled_row_seed_config(
         bound.env, host.device_ir
+    )
+    assert one_packet == CuteReductionTileHeuristic.one_packet_rolled_row_seed_config(
+        bound.env, rolled
     )
     assert rolled.reduction_loops == [1024]
     assert rolled.num_threads[threads_index] == 1024 // (2 * vec)
@@ -777,6 +780,11 @@ def test_reduction_tile_heuristic_skips_rows_without_the_layout(width: int) -> N
         assert rolled.reduction_loops == [1024]
         assert rolled.num_threads[threads_index] == 64
         expected.append(rolled)
+        one_packet = CuteReductionTileHeuristic.one_packet_rolled_row_seed_config(
+            bound.env, rolled
+        )
+        assert one_packet is not None
+        expected.append(one_packet)
     else:
         # 1000 is not a whole number of 16-element thread slices; 128 gives
         # 8 threads.
@@ -785,6 +793,55 @@ def test_reduction_tile_heuristic_skips_rows_without_the_layout(width: int) -> N
         CuteReductionTileHeuristic.warp_rows_seed_configs(bound.env, host.device_ir)
     )
     assert seeds == expected
+
+
+def test_reduction_tile_heuristic_seeds_the_rolled_row_as_one_packet() -> None:
+    # Rows of 768 fp32 elements (not a power of two, so no persistent vector
+    # row): the two-packet rolled row is 96 threads loading two 16-byte
+    # packets each, 384 elements apart, and its one-packet form has each
+    # thread load one 32-byte packet (V8) of a single run over the row, with
+    # the threads, chunk and register reloads unchanged.
+    arguments = (torch.empty((256, 768)), torch.empty(768))
+    kernel = _example_kernel(rms_norm_fwd.fn)
+    bound = cpu_bind(kernel, arguments)
+    host = bound.host_function
+    assert host is not None
+    spec = bound.config_spec
+    seeds = CuteReductionTileHeuristic.get_seed_configs(bound.env, host.device_ir)
+    assert seeds is not None
+    rolled = CuteReductionTileHeuristic.two_packet_rolled_row_seed_config(
+        bound.env, host.device_ir
+    )
+    assert rolled is not None
+    one_packet = seeds[seeds.index(rolled) + 1]
+    reduction = _reduction_block_id(bound)
+    vec_index = spec.cute_vector_widths.valid_block_ids().index(reduction)
+    widths = list(cast("list[int]", rolled.config["cute_vector_widths"]))
+    assert widths[vec_index] == 4
+    widths[vec_index] = 8
+    assert one_packet.config == rolled.config | {"cute_vector_widths": widths}
+    assert rolled.num_threads[spec.num_threads.valid_block_ids().index(reduction)] == 96
+    assert one_packet in spec.compiler_seed_configs
+    generation = ConfigGeneration(spec)
+    assert generation.canonicalize_flat(generation.flatten(one_packet))[1] in [
+        config for _flat, config in generation.seed_flat_config_pairs()
+    ]
+    wide = "ir.VectorType.get([8], cutlass.Uint32.mlir_type)"
+    narrow = "ir.VectorType.get([4], cutlass.Uint32.mlir_type)"
+    code = bound.to_code(spec.normalized_config(one_packet))
+    assert "block=(96, 1, 1)" in code
+    assert wide in code and narrow not in code, code
+    two_packets = bound.to_code(spec.normalized_config(rolled))
+    assert narrow in two_packets and wide not in two_packets, two_packets
+    # sm_90 loads no 32-byte packet: the rolled row keeps its two packets.
+    older = cpu_bind(kernel, arguments, capability=(9, 0))
+    older_host = older.host_function
+    assert older_host is not None
+    older_seeds = CuteReductionTileHeuristic.get_seed_configs(
+        older.env, older_host.device_ir
+    )
+    assert older_seeds is not None
+    assert rolled in older_seeds and one_packet not in older_seeds
 
 
 def test_reduction_tile_heuristic_requires_static_extent() -> None:

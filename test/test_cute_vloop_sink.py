@@ -2007,6 +2007,158 @@ def test_strided_reduction_heuristic_seeds_a_short_reduction_in_one_chunk(
         assert (([256], 16, 16) in seeds) is expected, (rows, seeds)
 
 
+def _line_warp_twins(
+    kernel: helion.Kernel, args: tuple[torch.Tensor, ...]
+) -> tuple[BoundKernel, list[dict[str, object]], list[dict[str, object]]]:
+    """``kernel`` bound on CPU, with its strided seeds split into the other
+    shapes and the line-per-warp twins: a warp of tile threads whose CTA row
+    is one 128-byte line of ``args[0]``."""
+    bound, seeds = _bind_with_sink_seeds(kernel, args)
+    spec = bound.config_spec
+    (tile,) = (
+        block
+        for block in spec.block_sizes.valid_block_ids()
+        if any(
+            spec.cute_vector_widths.config_get(seed["cute_vector_widths"], block, 1) > 1
+            for seed in seeds
+        )
+    )
+    line_columns = 128 // args[0].dtype.itemsize
+
+    def is_twin(seed: dict[str, object]) -> bool:
+        return (
+            spec.num_threads.config_get(seed["num_threads"], tile) == 32
+            and spec.block_sizes.config_get(seed["block_sizes"], tile) == line_columns
+        )
+
+    twins = [seed for seed in seeds if is_twin(seed)]
+    # The twins close the list: the seeds before them are the ones without.
+    assert seeds[len(seeds) - len(twins) :] == twins, seeds
+    return bound, seeds[: len(seeds) - len(twins)], twins
+
+
+def test_strided_reduction_heuristic_seeds_line_per_warp_twins(
+    cpu_only: None,
+) -> None:
+    """Token sums over 196 rows of 768 bf16 channels (rows 1536 bytes apart,
+    on line boundaries): beside the 16-byte seeds, two twins put a warp along
+    the tile with one 4-byte packet a thread, so the block is the warp's 64
+    columns, one 128-byte line of a row.  Their rows are the 16-thread
+    shapes': the measured 128-row chunks at a 4-deep unroll and the one-chunk
+    seed's 256 rows at 16.  Both streamed inputs go evict-first, and the twin
+    sinks predicated 4-byte packets with the tile on ``thread_idx[0]``."""
+    x = torch.empty(8, 196, 768, dtype=torch.bfloat16)
+    y = torch.empty(8, 196, 768, dtype=torch.bfloat16)
+    bound, wide, twins = _line_warp_twins(_spatial_mean_of_sum, (x, y))
+    spec = bound.config_spec
+    (reduction,) = spec.reduction_loops.valid_block_ids()
+    assert all(max(seed["cute_vector_widths"]) == 8 for seed in wide), wide
+    assert [
+        (
+            seed["block_sizes"],
+            max(seed["cute_vector_widths"]),
+            spec.num_threads.config_get(seed["num_threads"], reduction),
+            seed["reduction_loops"],
+            seed["cute_lane_unroll"],
+        )
+        for seed in twins
+    ] == [([1, 64], 2, 16, [128], 4), ([1, 64], 2, 16, [256], 16)]
+    for seed in (wide[0], *twins):
+        policies = seed["load_eviction_policies"]
+        assert isinstance(policies, list)
+        assert policies[:2] == ["l1_l2_first", "l1_l2_first"], seed
+    code = bound.to_code(spec.normalized_config(helion.Config(**twins[0])))
+    assert "block=(32, 16, 1)" in code, code
+    assert code.count("_cute_load_v4b_if(") == 2 * 4, code
+    assert _thread_axis_of(code, "lane_base_1") == 0, code
+    # A reduction past the one-chunk seed's 256 rows keeps the rolled twin.
+    long_rows = torch.empty(8, 324, 768, dtype=torch.bfloat16)
+    _, _, twins = _line_warp_twins(_spatial_mean_of_sum, (long_rows, long_rows))
+    assert [seed["reduction_loops"] for seed in twins] == [[128]], twins
+
+
+def test_line_per_warp_twins_take_their_hints_at_their_own_width(
+    cpu_only: None,
+) -> None:
+    """A second streamed input whose rows start inside a line (769 elements
+    apart).  CTA rows of two lines or more own all but their end lines, so
+    the 16-byte seeds' 128 columns hint it; the twins' one-line rows share
+    both of the lines they straddle, and the twins hint the first input
+    alone."""
+    x = torch.empty(8, 196, 768, dtype=torch.bfloat16)
+    inside = torch.empty(8, 196, 769, dtype=torch.bfloat16)[:, :, :768]
+    _, wide, twins = _line_warp_twins(_spatial_mean_of_sum, (x, inside))
+
+    def hints(seed: dict[str, object]) -> list[str]:
+        policies = seed["load_eviction_policies"]
+        assert isinstance(policies, list)
+        return policies[:2]
+
+    assert hints(wide[0]) == ["l1_l2_first", "l1_l2_first"], wide[0]
+    assert [hints(seed) for seed in twins] == [["l1_l2_first", ""]] * 2, twins
+
+
+def test_line_per_warp_twins_follow_the_first_load(cpu_only: None) -> None:
+    """The twins' line rule reads the input of the first load the reduction
+    matches, as the seeds' packet width does.  Rows 776 elements apart are
+    16-byte aligned and start inside a line: as the second input they leave
+    the kernel its twins, as the first they leave it the 16-byte seeds
+    alone."""
+    x = torch.empty(8, 196, 768, dtype=torch.bfloat16)
+    inside = torch.empty(8, 196, 776, dtype=torch.bfloat16)[:, :, :768]
+    _, wide, twins = _line_warp_twins(_spatial_mean_of_sum, (x, inside))
+    assert len(twins) == 2, twins
+    _, swapped, no_twins = _line_warp_twins(_spatial_mean_of_sum, (inside, x))
+    assert no_twins == [], no_twins
+    assert len(swapped) == len(wide), swapped
+    assert all(max(seed["cute_vector_widths"]) == 8 for seed in swapped), swapped
+
+
+@pytest.mark.parametrize(
+    ("args", "twins"),
+    [
+        # fp32: the line's share of a thread is one element, which nothing
+        # sinks.
+        pytest.param((torch.empty(8, 196, 768),), 0, id="fp32"),
+        # Rows 240 bytes apart start inside a line: a warp's packets would
+        # straddle two lines, shared with the neighboring CTA.
+        pytest.param(
+            (torch.empty(8, 196, 120, dtype=torch.bfloat16),),
+            0,
+            id="rows_inside_a_line",
+        ),
+        # A channel slice of rows on line boundaries: 66 columns align only
+        # two-element vectors, the packet every seed already has.
+        pytest.param(
+            (torch.empty(8, 196, 128, dtype=torch.bfloat16)[:, :, :66],),
+            0,
+            id="two_element_rows",
+        ),
+        # 32 columns of rows on line boundaries: no 64-column block.
+        pytest.param(
+            (torch.empty(8, 196, 64, dtype=torch.bfloat16)[:, :, :32],),
+            0,
+            id="tile_under_a_line",
+        ),
+        # 32 rows leave the twin's 16 threads two rows each, under its 4-deep
+        # unroll; from 33 rows (one clamped 64-row chunk) the twin fits.
+        pytest.param(
+            (torch.empty(8, 32, 768, dtype=torch.bfloat16),), 0, id="short_reduction"
+        ),
+        pytest.param(
+            (torch.empty(8, 33, 768, dtype=torch.bfloat16),), 1, id="one_clamped_chunk"
+        ),
+    ],
+)
+def test_strided_reduction_heuristic_declines_line_per_warp_twins(
+    cpu_only: None, args: tuple[torch.Tensor, ...], twins: int
+) -> None:
+    """Each condition of a line-per-warp twin, at a shape that fails it
+    alone: the other strided seeds stay."""
+    _, wide, found = _line_warp_twins(_spatial_mean, args)
+    assert wide and len(found) == twins, (wide, found)
+
+
 # better-benchmark's channels-last BatchNorm training chain
 # (var_mean_var_mean_mean_0efb69a14422): Welford partials over 49 blocks of
 # 128 rows, their combine over the 49 blocks, and a spatial mean over 49
@@ -2074,16 +2226,17 @@ def test_strided_reduction_heuristic_seeds_every_kernel_of_a_batchnorm_chain(
     64-row single-pass seeds: 4, 4 and 3, with ``cute_vloop_sink`` and
     ``cute_lane_unroll`` open to the search.  The configs a cold autotune
     found from these seeds ran the chain in 25.3 us, against 32.3 us for
-    those found without them (B200)."""
+    those found without them (B200).  The two kernels over bf16 rows (1408
+    channels, on line boundaries) each add one line-per-warp twin."""
     partials = torch.empty(49, 1408, dtype=torch.float32)
     channels = torch.empty(1408, dtype=torch.float32)
     for kernel, args, count in (
-        (_bn_welford_partials, (torch.empty(49, 128, 1408, dtype=torch.bfloat16),), 4),
+        (_bn_welford_partials, (torch.empty(49, 128, 1408, dtype=torch.bfloat16),), 5),
         (_bn_welford_combine, (partials, partials, partials), 4),
         (
             _bn_relu_spatial_mean,
             (torch.empty(128, 49, 1408, dtype=torch.bfloat16), channels, channels),
-            3,
+            4,
         ),
     ):
         spec = cpu_bind(kernel, args).config_spec
