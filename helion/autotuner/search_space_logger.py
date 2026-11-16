@@ -140,6 +140,10 @@ class SearchSpaceReport:
     configs_tested: int = 0
     explored_valid: int = 0
     explored_invalid: int = 0
+    # "ok", "failed" (no config selected), or "handoff" (stopped early for
+    # source optimization); ``error_type`` names the failure's exception.
+    outcome: str = "ok"
+    error_type: str | None = None
 
     @property
     def enabled_features(self) -> list[str]:
@@ -182,6 +186,8 @@ class SearchSpaceReport:
                 else "unknown"
             ),
             "search_algorithm": self.search_algorithm,
+            "outcome": self.outcome,
+            "error_type": self.error_type,
             "elapsed_seconds": self.elapsed_seconds,
             "configs_tested": self.configs_tested,
             "explored_valid": self.explored_valid,
@@ -255,6 +261,13 @@ class SearchSpaceReport:
 
         # Exploration outcome.
         logger.log(level, f"  Search algorithm: {self.search_algorithm}")
+        if self.outcome != "ok":
+            detail = f" ({self.error_type})" if self.error_type else ""
+            logger.log(
+                level,
+                f"  Outcome: {self.outcome}{detail}; no config was selected, "
+                "coverage reflects the search up to this point",
+            )
         logger.log(
             level,
             f"  Time: {self.elapsed_seconds:.1f}s, "
@@ -342,11 +355,18 @@ class SearchSpaceTracker:
             self.invalid_config_count += count
 
     def finish(
-        self, search_algorithm: str, elapsed_seconds: float
+        self,
+        search_algorithm: str,
+        elapsed_seconds: float,
+        *,
+        outcome: str = "ok",
+        error_type: str | None = None,
     ) -> SearchSpaceReport:
         """Populate the report's exploration outcome and return it."""
         self.report.search_algorithm = search_algorithm
         self.report.elapsed_seconds = elapsed_seconds
+        self.report.outcome = outcome
+        self.report.error_type = error_type
         # configs_tested = distinct configs (coverage denominator);
         # explored_valid/invalid = raw attempt counts (validity breakdown).
         self.report.configs_tested = len(self._seen_keys)
