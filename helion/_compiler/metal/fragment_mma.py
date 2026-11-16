@@ -19,8 +19,9 @@ The planner, the accumulator's storage and the element loops are
   transposed))``) is ``rows * cols`` float fragments, and an element loop
   visits the elements a lane holds of them (:func:`fragment_elements`);
 - the op (``_helion_mpp_run(..., fragment=[...])``, :func:`codegen_fragment_run`)
-  carries each operand as a device view (masked loads at the element) or as
-  the name of its value, cast to the operand's dtype as staging would; and
+  carries each operand as a device view (loads at the element, masked or
+  clamped at the view's extents: :func:`_dim_mode`) or as the name of its
+  value, cast to the operand's dtype as staging would; and
 - :func:`fragment_run` (``elementize``) replaces the op with its loops: an
   operand element of a computed operand re-runs the Scalar statements that
   compute it, with the thread and lanes that hold it in the Scalar layout
@@ -61,7 +62,9 @@ from ...language.creation_ops import full
 from ...language.matmul_ops import dot
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
+from ..ast_read_writes import ast_rename
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import _to_sympy
 from ..inductor_lowering import ReductionLowering
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from ._constants import SIMD_WIDTH
@@ -87,6 +90,7 @@ from .mpp_matmul import MppGroup
 from .mpp_matmul import MppPlan
 from .mpp_matmul import Recomputable
 from .mpp_matmul import View
+from .mpp_matmul import assign_target
 from .mpp_matmul import assigned_names
 from .mpp_matmul import block_id_of
 from .mpp_matmul import call_name
@@ -390,7 +394,7 @@ def _tiles_in_range(cg: GenerateAST, block: int, op: int, extent: int | None) ->
 
 
 #: How a view's element load treats a dim (:func:`_dim_mode`).
-_UNMASKED, _MASKED, _BROADCAST = 0, 1, 2
+_UNMASKED, _MASKED, _BROADCAST, _CLAMPED = 0, 1, 2, 3
 
 
 def _dim_mode(
@@ -400,7 +404,10 @@ def _dim_mode(
     view's origin): a tile over a dim of size 1 broadcasts it (index 0, K
     masked at the loop's end only); otherwise the dim's extent masks it
     unless a tile dim's positions stay inside it at every tile, or a ``:``
-    dim's inside its size."""
+    dim's inside its size.  An M or N tile whose loop's end is the dim's
+    size clamps it instead of masking it (:func:`_view_element`): a
+    position past the size is past the loop's end, where the element loops
+    store nothing."""
     size = static_extent(view.tensor.size(view.positions[d]))
     if dim.full:
         return _MASKED if size is None or op > size else _UNMASKED
@@ -412,7 +419,30 @@ def _dim_mode(
         # The view's K extent is the loop's end (view_args).
         states = cg.active_device_loops[k_block]
         size = _static_int(states[-1].block_id_to_info[k_block].end_expr)
-    return _UNMASKED if _tiles_in_range(cg, dim.block_id, op, size) else _MASKED
+    if _tiles_in_range(cg, dim.block_id, op, size):
+        return _UNMASKED
+    if dim.block_id != k_block:
+        info = cg.active_device_loops[dim.block_id][-1].block_id_to_info.get(
+            dim.block_id
+        )
+        end = None if info is None else info.end_expr
+        extent = _to_sympy(view.tensor.size(view.positions[d]))
+        # The same size, not two sizes equal at these inputs only: keying the
+        # bound kernel on their equality (is_end_matching_keyed) would rebind
+        # it for inputs where they differ, to save a select.
+        if end is not None and _specialized(end) == _specialized(extent):
+            return _CLAMPED
+    return _MASKED
+
+
+def _tile_mask(cg: GenerateAST, block: int) -> tuple[str, str, str] | None:
+    """The mask, index and offset names of the tile over ``block``, a
+    fragment group operand's M or N, when codegen masks the tile; None when
+    each of its positions lies inside its loop's range."""
+    mask = cg.mask_var(block)
+    if mask is None:
+        return None
+    return mask, cg.index_var(block), cg.offset_var(block)
 
 
 def codegen_fragment_run(
@@ -421,10 +451,13 @@ def codegen_fragment_run(
     """``_helion_mpp_run(acc, gid, lhs..., rhs..., ..., fragment=[lhs, rhs])``
     of a fragment group: each operand as a view's nine run arguments
     (``view_args``) or the name of its value cast to the operand's dtype,
-    and per operand ``(computed, view dims masked, bindings, wide)``, where
-    the bindings make a lane act as the thread holding the element at
-    ``(_e_m or _e_n, _e_k)`` of a computed operand and ``wide`` marks a view
-    whose indices may pass 2**31.  ``steps`` is the K tile's MMA steps,
+    and per operand ``(computed, view dims masked, bindings, wide, past)``,
+    where the bindings make a lane act as the thread holding the element at
+    ``(_e_m or _e_n, _e_k)`` of a computed operand, ``wide`` marks a view
+    whose indices may pass 2**31 and ``past`` names a computed operand's M
+    or N tile's mask, index and offset when the mask is live
+    (:func:`_tile_mask`), for its loads past the tile's loop end
+    (:func:`_clamp_past_end`).  ``steps`` is the K tile's MMA steps,
     ``k_live`` its live length, which masks a computed operand's K tail
     (None when every tile is whole), ``facts`` the tile offsets' ``(offset,
     multiple, least)`` (:func:`_offset_fact`), over which the run folds its
@@ -455,6 +488,7 @@ def codegen_fragment_run(
                 cg, ((blocks[1 - k_pos], e), (group.k_block, "_e_k"))
             )
             outer = ""
+            past = _tile_mask(cg, blocks[1 - k_pos])
         else:
             op_parts, op_anchors, _, view_outer = view_args(
                 cg, view, group.k_block, value
@@ -468,9 +502,12 @@ def codegen_fragment_run(
             wide = int(reach is None or reach >= 2**31)
             binds = []
             outer = "".join(f"({x}, {s}, {st}, {a}), " for x, s, st, a in view_outer)
+            past = None
         parts += op_parts
         outers.append(f"[{outer}]")
-        sides.append(f"({int(operand.staged)}, {masks}, [{', '.join(binds)}], {wide})")
+        sides.append(
+            f"({int(operand.staged)}, {masks}, [{', '.join(binds)}], {wide}, {past!r})"
+        )
     info = cg.active_device_loops[group.k_block][-1].block_id_to_info[group.k_block]
     k_live = "None"
     if (group.lhs.staged or group.rhs.staged) and not _tiles_in_range(
@@ -614,8 +651,9 @@ def _view_element(
     """A view's element at ``index`` (the op's two positions from its
     origin) as a float: a load, masked to 0 past each masked dim's extent
     and where an outer index lies outside its dim; a broadcast dim reads
-    index 0 (:func:`_dim_mode`).  A ``wide`` view, one that may hold 2**31
-    elements or more, computes its offset in ``long``."""
+    index 0, and a clamped dim its origin past its extent
+    (:func:`_dim_mode`).  A ``wide`` view, one that may hold 2**31 elements
+    or more, computes its offset in ``long``."""
     tensor, *dims = args
     offset: list[str] = []
     terms: list[str] = []
@@ -628,6 +666,11 @@ def _view_element(
             if i == "_e_k":
                 terms.append(f"{at} < {_src(e)}")
             continue
+        if masks[d] == _CLAMPED:
+            # A row or column past the extent, the tile's loop end, is never
+            # stored, so its value is free: it reads the tile's first, which
+            # lies inside the extent at every tile the loop runs.
+            at = f"({at} if {at} < {_src(e)} else {_src(o)})"
         offset.append(f"{f'static_cast(long, {at})' if wide else at} * {_src(stride)}")
         if masks[d] == _MASKED:
             terms.append(f"{at} < {_src(e)}")
@@ -646,6 +689,140 @@ def _view_element(
     )
 
 
+def _mask_terms(mask: ast.expr) -> list[ast.expr]:
+    """The terms of a load mask's ``&`` (or ``and``) chain."""
+    if isinstance(mask, ast.BinOp) and isinstance(mask.op, ast.BitAnd):
+        return [*_mask_terms(mask.left), *_mask_terms(mask.right)]
+    if isinstance(mask, ast.BoolOp) and isinstance(mask.op, ast.And):
+        return [t for v in mask.values for t in _mask_terms(v)]
+    return [mask]
+
+
+def _position_reads(
+    binds: Mapping[str, ast.expr], position: str
+) -> tuple[set[str], set[int]]:
+    """The names among an element loop's ``binds`` that hold the element's
+    ``position`` (``_e_m`` or ``_e_n``): its block's lane variables, and the
+    components of ``tid`` along its block's axis."""
+    lanes = {n for n, e in binds.items() if n != "tid" and position in names_read(e)}
+    axes: set[int] = set()
+    tid = binds.get("tid")
+    if isinstance(tid, ast.Call):
+        axes = {j for j, a in enumerate(tid.args) if position in names_read(a)}
+    return lanes, axes
+
+
+def _reads_any(node: ast.AST, names: set[str], axes: set[int]) -> bool:
+    """Whether ``node`` reads one of ``names`` or a ``tid`` component in
+    ``axes`` (any component, when it reads ``tid`` other than by one)."""
+    tids = picked = 0
+    for n in ast.walk(node):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+            if n.id in names:
+                return True
+            tids += n.id == "tid"
+        elif (
+            isinstance(n, ast.Subscript)
+            and isinstance(n.value, ast.Name)
+            and n.value.id == "tid"
+            and isinstance(n.slice, ast.Constant)
+        ):
+            picked += 1
+            if n.slice.value in axes:
+                return True
+    return bool(axes) and tids > picked
+
+
+def _clamp_past_end(
+    stmts: list[ast.stmt],
+    mask: str,
+    index: str,
+    offset: str,
+    binds: Mapping[str, ast.expr],
+    position: str,
+) -> list[ast.stmt]:
+    """A computed operand's element statements ``stmts`` with each load
+    that its M or N tile's ``mask`` guards reading, where the mask is off,
+    at the tile's first position ``offset`` instead of 0: such an element
+    reaches only accumulator rows or columns past the tile's loop end (or
+    past the tile, in a fragment wider than it), which the element loops
+    never store, since they re-run the store's ``mask``.  Its value is
+    free, so only its address must lie inside the tensor.  The load keeps
+    its other mask terms: a K tail still reads 0.
+
+    Wherever its other terms admit it, the clamped load reads the address
+    the kernel reads at the tile's first position, which lies inside the
+    loop's range at every tile the loop runs.  That holds only while the
+    element's ``position`` reaches the address through ``index`` alone,
+    read clamped, and reaches none of the other terms, which are evaluated
+    at the element.  So a load keeps its mask when its address or another
+    term reads a name computed from the position: from ``index`` or
+    ``mask``, or from the block's lane or ``tid`` component in ``binds``.
+    Such an address (``tile.index // 2``) would be left neither masked nor
+    clamped, and such a term (``tile.index < x.size(0)``) can admit an
+    element past the end while it excludes the tile's first position,
+    whose address the kernel then never reads."""
+    assigned = {assign_target(s) for s in stmts}
+    if mask not in assigned or index not in assigned:
+        # A mask this thread holds as it stands, not the element's.
+        return stmts
+    lanes, axes = _position_reads(binds, position)
+    derived = {*lanes, index, mask}
+    for s in stmts:
+        t = assign_target(s)
+        if t is None or t in (index, mask):
+            continue
+        assert isinstance(s, ast.Assign)
+        if _reads_any(s.value, derived, axes):
+            derived.add(t)
+    clamped = f"_clamped_{index}"
+    hits = 0
+
+    class Clamp(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            nonlocal hits
+            self.generic_visit(node)
+            load = tl_load(node)
+            masked = None if load is None else load_mask_other(load)
+            if masked is None or _reads_any(node.args[0], derived - {index}, axes):
+                return node
+            terms = _mask_terms(masked[0])
+            kept = [t for t in terms if not (isinstance(t, ast.Name) and t.id == mask)]
+            if len(kept) == len(terms) or any(
+                _reads_any(t, derived, axes) for t in kept
+            ):
+                return node
+            hits += 1
+            ptr = ast_rename(node.args[0], {index: clamped})
+            if not kept:
+                return ast.Call(node.func, [ptr, ast.Constant(None)], [])
+            rest = kept[0]
+            for term in kept[1:]:
+                rest = ast.BinOp(rest, ast.BitAnd(), term)
+            return ast.Call(node.func, [ptr, rest, *node.args[2:]], node.keywords)
+
+    body = [Clamp().visit(s) for s in stmts]
+    if not hits:
+        return stmts
+    out: list[ast.stmt] = []
+    for s in body:
+        out.append(s)
+        if assign_target(s) == mask:
+            out.append(
+                ast.Assign(
+                    [ast.Name(clamped, ast.Store())],
+                    ast.IfExp(
+                        ast.Name(mask, ast.Load()),
+                        ast.Name(index, ast.Load()),
+                        ast.Name(offset, ast.Load()),
+                    ),
+                )
+            )
+    for s in out:
+        ast.fix_missing_locations(s)
+    return out
+
+
 def fragment_run(
     call: ast.Call,
     acc_call: ast.Call,
@@ -658,8 +835,10 @@ def fragment_run(
     writing the operand's value at the element (``_helion_mpp_put``).  A
     computed operand's element is its value's name with the Scalar
     statements it reads re-run by ``rerun(binds, reads, checked)``, under
-    its bindings, and is 0 past the K tile's live length; a view's is a
-    masked load (:func:`_view_element`)."""
+    its bindings, their loads past the M or N tile's loop end read at the
+    tile's first position (:func:`_clamp_past_end`), and is 0 past the K
+    tile's live length; a view's is a load masked or clamped at the view's
+    extents (:func:`_view_element`)."""
     grid = _keyword(acc_call, "fragment")
     steps, k_live, facts, tables, k_step, split, sides = (
         _keyword(call, name)
@@ -684,7 +863,9 @@ def fragment_run(
         zip(sides.elts, fragment_run_binds(call), strict=True)
     ):
         assert isinstance(side, ast.Tuple)
-        staged, masks, wide = (ast.literal_eval(side.elts[j]) for j in (0, 1, 3))
+        staged, masks, wide, past = (
+            ast.literal_eval(side.elts[j]) for j in (0, 1, 3, 4)
+        )
         index = ("_e_m", "_e_k") if i == 0 else ("_e_k", "_e_n")
         if staged:
             value = _parse(f"static_cast(float, {_src(call.args[pos])})")
@@ -702,7 +883,12 @@ def fragment_run(
         for b in binds_list:
             name, expr = b.elts
             binds[cast("str", ast.literal_eval(name))] = expr
-        loops.append([*rerun(binds, names_read(put), [value]), put])
+        stmts = rerun(binds, names_read(put), [value])
+        if past is not None:
+            mask, tile_index, offset = past
+            position = index[0] if i == 0 else index[1]
+            stmts = _clamp_past_end(stmts, mask, tile_index, offset, binds, position)
+        loops.append([*stmts, put])
     assert pos == len(call.args)
     a_side = 1 if flipped else 0
     body: list[ast.stmt] = [
