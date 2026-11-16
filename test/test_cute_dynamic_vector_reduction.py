@@ -1202,6 +1202,52 @@ class TestCuteDynamicVectorReduction(TestCase):
 
     @pytest.mark.cuda
     @skipIfNotCUDA()
+    def test_exact_chunk_narrower_than_its_threads_rolls_by_the_threads(self) -> None:
+        # An exact chunk that is not a power of two takes the next power of
+        # two of threads when its thread count is left automatic (768
+        # elements on 1024 threads, 384 on 512), one element each.  Rolled
+        # by the chunk, the threads past it would read and write past a
+        # one-trip row and take the next trip's elements a second time in a
+        # longer one; the roll steps by the threads.  The rows are views of
+        # wider buffers, NaN beside the input and zero beside the output:
+        # static rows of one masked trip, of a whole and a partial trip and
+        # of three whole trips, then a dynamic binding compiled once, so
+        # that the kernel bound at 1536 also runs a shorter and a longer row
+        # (through the bound kernel, those two runs pass even when the roll
+        # steps by the chunk).
+        def buffers(width: int) -> tuple[torch.Tensor, torch.Tensor]:
+            x = torch.full((5, width + 256), float("nan"), device=DEVICE)
+            x[:, :width].normal_()
+            return x, torch.zeros(5, width + 256, device=DEVICE)
+
+        for static_shapes, width, chunk, other_widths in (
+            (True, 768, 768, ()),
+            (True, 1536, 768, ()),
+            (True, 1536, 384, ()),
+            (False, 1536, 768, (1000, 2304)),
+        ):
+            threads = 1 << (chunk - 1).bit_length()
+            config = helion.Config(block_sizes=[1], reduction_loops=[chunk])
+            x, out = buffers(width)
+            bound = _kernel(_rms_norm_into, static_shapes=static_shapes).bind(
+                (x[:, :width], out[:, :width])
+            )
+            code = bound.to_code(config)
+            self.assertIn(f"block=({threads}, 1, 1)", code)
+            self.assertIn(f"_REDUCTION_BLOCK_1 = {threads}", code)
+            compiled = bound.compile_config(config)
+            for run_width in (width, *other_widths):
+                x, out = buffers(run_width)
+                torch.testing.assert_close(
+                    compiled(x[:, :run_width], out[:, :run_width]),
+                    _reference(x[:, :run_width]),
+                    atol=1e-4,
+                    rtol=1e-4,
+                )
+                self.assertEqual(out[:, run_width:].abs().sum().item(), 0.0)
+
+    @pytest.mark.cuda
+    @skipIfNotCUDA()
     def test_fragment_cap_falls_back_to_reloads_for_long_rows(self) -> None:
         # Bound at n=4096 (two trips) the register cache holds TRIPS * 32
         # elements under a trace-time budget of the 64-element size-hint

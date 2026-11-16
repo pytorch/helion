@@ -351,6 +351,63 @@ def test_full_loop_codegen_keeps_packet_cache_and_two_reduction_path(
     )
 
 
+class _DropThreadBarriers(ast.NodeTransformer):
+    def visit_Expr(self, node: ast.Expr) -> ast.Expr | None:
+        return None if ast.unparse(node) == "cute.arch.sync_threads()" else node
+
+
+@pytest.mark.parametrize(
+    ("width", "chunk", "static", "mask"),
+    [
+        # One trip: the 256 threads past the row are masked.
+        (768, 768, True, "rindex_1 < 768"),
+        # Two trips of 1024 threads, the second one partial.
+        (1536, 768, True, "rindex_1 < 1536"),
+        # Three whole trips of 512 threads: nothing to mask.
+        (1536, 384, True, None),
+        # A dynamic extent: the last trip is masked whatever their number.
+        (768, 768, False, "rindex_1 < n"),
+    ],
+)
+def test_exact_chunk_on_automatic_threads_rolls_by_its_threads(
+    width: int, chunk: int, static: bool, mask: str | None
+) -> None:
+    # An exact chunk that is not a power of two launches the next power of
+    # two of threads when its thread count is left automatic (768 elements on
+    # 1024 threads), one element each.  Rolled by the chunk, the threads past
+    # it would run past the row, or take the next trip's elements a second
+    # time.  The roll steps by the threads instead: the code of the chunk of
+    # that many elements, apart from the thread barrier the nest check adds
+    # between trips, which reads the configured chunk.
+    threads = 1 << (chunk - 1).bit_length()
+    kernel = helion.kernel(rms_norm, backend="cute", static_shapes=static)
+    bound = kernel._bind_isolated((torch.empty(4, width), torch.empty(width), 1e-6))
+    spec = bound.config_spec
+    with bound.env:
+        exact, padded = (
+            ConfigGeneration(spec).strict_config_pair(
+                helion.Config(block_sizes=[1], reduction_loops=[size])
+            )[1]
+            for size in (chunk, threads)
+        )
+    assert exact.config["reduction_loops"] == [chunk]
+    assert padded.config["reduction_loops"] == [threads]
+    source = bound.to_code(exact)
+    assert f"block=({threads}, 1, 1)" in source
+    assert f"_REDUCTION_BLOCK_1 = {threads}" in source
+    tree = ast.parse(source)
+    masks = [
+        ast.unparse(node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "mask_1"
+    ]
+    # The reduce sweep and the consume sweep.
+    assert masks == ([] if mask is None else [mask, mask]), source
+    assert ast.unparse(_DropThreadBarriers().visit(tree)) == ast.unparse(
+        _DropThreadBarriers().visit(ast.parse(bound.to_code(padded)))
+    )
+
+
 @pytest.mark.parametrize("width", [9, 129, 4097, 7168])
 def test_padded_full_chunk_is_reachable_from_persistent_search_neighbor(
     width: int,
