@@ -9,6 +9,7 @@ from helion._testing import cpu_render_target
 from helion._testing.cute_optional_lse import optional_lse_config
 from helion._testing.cute_paged_reference import reference_attention_bound
 from helion._testing.cute_paged_v_lag import paired_v_lag_bound
+from helion._testing.cute_paged_v_lag import without_paired_head
 from helion._testing.cute_paged_v_lag import without_retirement_seeds
 
 pytestmark = pytest.mark.cpu_only
@@ -85,19 +86,33 @@ def test_probability_schedule_invalid_values_and_repair(value):
         assert again == repaired
 
 
-def test_probability_seeds_share_admission_and_keep_serial_default():
+def test_probability_seeds_share_admission_behind_the_early_paired_head():
     bound, _ = reference_attention_bound("per_key", 5)
-    assert bound.host_function is not None
+    facts = bound.config_spec.cute_mma_dag_facts
+    assert facts is not None and bound.host_function is not None
     with bound.env, bound.host_function:
         seeds = CuteMmaDagHeuristic.get_seed_configs(
             bound.env, bound.host_function.device_ir
         )
         assert seeds is not None
-        assert all(not seed.get("cute_pdl_capture_overlap", False) for seed in seeds)
+        # Exactly the paired seeds carry the guarded capture default.
         assert all(
-            seed.get("cute_pdl_release", "auto") != "loader_tail" for seed in seeds
+            (
+                seed.get("cute_pdl", False),
+                seed.get("cute_pdl_capture_overlap", False),
+                seed.get("cute_pdl_release", "auto"),
+            )
+            == (
+                (True, True, "loader_tail")
+                if seed.get("cute_mma_dag_pass_warps") == "attention_paired"
+                else (False, False, "auto")
+            )
+            for seed in seeds
         )
-        seeds = without_retirement_seeds(seeds)
+        # The rank-0 paired seed takes the early schedule; the seeds behind
+        # it keep their order, the serial schedule first.
+        assert seeds[0].get(KEY) == "early"
+        seeds = without_paired_head(without_retirement_seeds(seeds), facts)
         assert seeds[0].get(KEY, "serial") == "serial"
         probed = [seed for seed in seeds if seed.get(KEY, "serial") != "serial"]
         assert sorted(

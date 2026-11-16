@@ -19,6 +19,7 @@ from helion._compiler.cute.paged_attention_transport import (
 from helion._compiler.cute.paged_attention_transport import (
     plan_paged_attention_transport,
 )
+from helion._compiler.cute.pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_optional_lse import optional_lse_config
@@ -27,6 +28,7 @@ from helion._testing.cute_paged_attention_pair import paired_bounds_attention
 from helion._testing.cute_paged_attention_schedule import paged_attention_args
 from helion._testing.cute_paged_base2 import base2_attention_fixture
 from helion._testing.cute_paged_reference import reference_attention_fixture
+from helion._testing.cute_paged_v_lag import without_paired_head
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
@@ -78,6 +80,56 @@ def test_paired_range_proof(heads, index, dtype, accepted):
                 # phase of a multi-root launch with sibling work.
                 bound.config_spec.cute_mma_dag_phase_index = 0
                 assert paired_attention_item_axis(bound.env, transport) is None
+
+
+@pytest.mark.parametrize("heads,per_key", [(2, True), (1, True), (2, False)])
+def test_no_config_default_is_the_paired_family_under_the_pair_proof(heads, per_key):
+    args = (*paged_attention_args(rows=40 if per_key else 32, heads=heads), None)
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(paged_online_attention, (*args, per_key))
+        spec = bound.config_spec
+        facts = spec.cute_mma_dag_facts
+        assert facts is not None and facts.attention is not None
+        proved = heads == 2 and per_key
+        assert facts.attention.paired_items is proved
+        seeds = spec.compiler_seed_configs
+        promoted = spec.compiler_default_config
+        assert promoted is not None and promoted == seeds[0]
+        assert bound.host_function is not None
+        with bound.env, bound.host_function:
+            default = spec.default_config()
+        source = bound.to_code(default)
+        if not proved:
+            # One KV head, or a reduced denominator: no paired schedule, and
+            # the default stays the first seed of the ordinary ranking.
+            assert all(
+                seed.get("cute_mma_dag_pass_warps") != "attention_paired"
+                for seed in seeds
+            )
+            assert default.get("cute_mma_dag") == "warp"
+            assert "_body(" not in source
+            return
+        assert without_paired_head(seeds, facts) == seeds[1:]
+        # The schedule's own defaults, none of the base config's pins.
+        assert default.get("cute_mma_dag_pass_warps") == "attention_paired"
+        assert default.get("cute_mma_dag_v_lag") == 2
+        assert default.get("cute_mma_dag_query_tma") is True
+        assert default.get("cute_mma_dag_early_tmem_retirement") is True
+        assert {key: default.get(key) for key in CUTE_PDL_CAPTURE_DEFAULT} == dict(
+            CUTE_PDL_CAPTURE_DEFAULT
+        )
+        # The kernel without a config is the seed's own render: two requests
+        # fit one wave, so the loader's tail releases the dependents.
+        assert source == bound.to_code(helion.Config.from_dict(dict(promoted.config)))
+        for text in (
+            "paged_attention_paired_body(",
+            "v_lag=2",
+            "early_tmem_retirement=True",
+            "capture_release_tail=True",
+            "tma_load_hints=('evict_first', 'evict_first', 'evict_first', 'evict_first')",
+            "query_map=",
+        ):
+            assert text in source
 
 
 @pytest.mark.parametrize(

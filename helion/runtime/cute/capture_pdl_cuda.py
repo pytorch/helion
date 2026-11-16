@@ -7,9 +7,12 @@ captured kernel's default EARLY mode untouched.
 
 The before/after whole-graph snapshots establish which node this launch added,
 including concurrent submissions on other streams. Their aggregate capture-time
-cost is quadratic in graph size, bounded by MAX_GRAPH_NODES. This cost is
-paid only for opted-in capture launches, never during graph replay or eager
-execution; avoiding it requires another equally strong node-identity proof.
+cost is quadratic in graph size, bounded by MAX_GRAPH_NODES: a graph that holds
+more nodes is not snapshotted, and a launch captured into it keeps EARLY. The
+cost is paid by every capturing launch of a kernel with the capture contract,
+which a proved paired attention kernel has by default and not only by opting
+in, and never during graph replay or eager execution; avoiding it requires
+another equally strong node-identity proof.
 """
 
 from __future__ import annotations

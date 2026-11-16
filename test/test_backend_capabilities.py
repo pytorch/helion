@@ -455,15 +455,16 @@ class TestSpecWithoutBackendState(unittest.TestCase):
                 self.assertFalse(spec.search_surface.pins_thread_knobs(spec, 0))
                 self.assertEqual(spec.default_config().block_sizes, [32])
 
-    def test_every_spec_compiles_an_unsearched_config_as_it_is(self) -> None:
+    def test_every_non_cute_spec_compiles_an_unsearched_config_as_it_is(self) -> None:
         # ``autotune_config_overrides`` act on a search. A config the kernel
         # selects without one (a cache hit, the default of a kernel that
-        # does not autotune) is compiled as it is unless its backend holds
-        # such a config to some of them, and none does
-        # (``BackendSearchSurface.overrides_without_search``).
+        # does not autotune) is compiled as it is: only CuTe holds such a
+        # config to any override (``BackendSearchSurface.overrides_without_search``).
         default = BackendSearchSurface.overrides_without_search
         held = BackendSearchSurface.overrides_held_without_search
         for name, backend in _backends().items():
+            if name == "cute":
+                continue
             with self.subTest(backend=name):
                 spec = self._spec(backend)
                 surface = type(spec.search_surface)

@@ -22,13 +22,14 @@ import torch
 
 from test.cute_population_contracts import tcgen05_mma_support
 from test.test_cute_tcgen05_fixed_chain import CPU_DEVICE
-from test.test_cute_tcgen05_fixed_chain import _bind_gemm
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
-from test.test_cute_tcgen05_fixed_chain import _source
 
 import helion
 from helion._compiler.cute.tcgen05_config import seeds
 from helion._compiler.cute.tcgen05_config import surface
+from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
+from helion._testing.cute_mma_dag import normalized_source as _source
+from helion._testing.cute_mma_dag import persistent_gemm_config as _persistent_config
 import helion.language as hl
 
 # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
@@ -135,17 +136,6 @@ def _flat_config(**overrides: object) -> helion.Config:
         "pid_type": "flat",
         "indexing": ["pointer"] * 3,
         "tcgen05_ab_stages": 2,
-    }
-    values.update(overrides)
-    return helion.Config(**values)
-
-
-def _persistent_config(**overrides: object) -> helion.Config:
-    values: dict[str, object] = {
-        "block_sizes": [128, 128, 64],
-        "pid_type": "persistent_blocked",
-        "indexing": ["tensor_descriptor"] * 3,
-        "tcgen05_ab_stages": 4,
     }
     values.update(overrides)
     return helion.Config(**values)

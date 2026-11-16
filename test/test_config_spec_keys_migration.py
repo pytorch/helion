@@ -120,7 +120,7 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_probability_schedule
-    cute_mma_dag_early_tmem_retirement cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_early_tmem_retirement cute_mma_dag_key_clip cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
     cute_mma_dag_value_metadata_skip
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
@@ -298,7 +298,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_probability_schedule
-    cute_mma_dag_early_tmem_retirement cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_early_tmem_retirement cute_mma_dag_key_clip cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
     cute_mma_dag_value_metadata_skip
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
@@ -536,7 +536,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_epilogue cute_mma_dag_exchange cute_mma_dag_loads
     cute_mma_dag_lookahead cute_mma_dag_pass_warps cute_mma_dag_persistent
     cute_mma_dag_probability_schedule
-    cute_mma_dag_early_tmem_retirement cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
+    cute_mma_dag_early_tmem_retirement cute_mma_dag_key_clip cute_mma_dag_query_tma cute_mma_dag_sleep_waits cute_mma_dag_split cute_mma_dag_stages
     cute_mma_dag_value_metadata_skip
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag

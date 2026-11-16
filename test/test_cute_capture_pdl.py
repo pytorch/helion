@@ -368,25 +368,69 @@ def test_native_mode_patch_copies_argument_values_and_changes_only_the_mode(
         assert updated == [(*original[:-1], b"\1\0\0\0")]
 
 
-@pytest.mark.parametrize("grid", [(0,), (1, 0, 1), (-1,), (), (1, 1, 1, 1)])
-def test_empty_or_unproved_grid_never_enters_capture_tracking(grid):
-    from helion.runtime.cute.capture_pdl_launch import prepare_capture_launch
+class _CudaTensor(torch.Tensor):
+    """A host tensor that reports a CUDA device, so the launch gates can run
+    without one. Reading its storage means a gate let the launch through."""
 
-    kernel = SimpleNamespace(
+    device = property(lambda self: torch.device("cuda", 0))
+    is_cuda = property(lambda self: True)
+
+    def get_device(self):
+        return 0
+
+    def untyped_storage(self):
+        raise AssertionError("the storage walk was reached")
+
+
+def _contract_kernel(suffix: object = (128, 128, 128, 128, 4)) -> SimpleNamespace:
+    return SimpleNamespace(
         _helion_cute_wrapper_plans=(
             {
                 "kind": "helion_paged_attention",
                 "capture_pdl_contract": "paired-output-stores-v1",
-                "capture_pdl_parameter_sizes": (128, 128, 128, 128, 4),
+                "capture_pdl_parameter_sizes": suffix,
             },
-            {"kind": "helion_mma_dag_alias"},
+            {
+                "kind": "helion_mma_dag_alias",
+                "tensor_idx": [0],
+                "stored": [True],
+                "capture_loaded": [True],
+            },
         ),
         _helion_cute_use_pdl=True,
         _helion_cute_last_launch_cache=object(),
     )
-    # No argument/storage/driver access is needed: there will be no tracked
-    # enqueue even if a concurrent thread adds one compatible graph node.
-    assert prepare_capture_launch(kernel, (), grid) is None
+
+
+def _contract_args() -> tuple[object, ...]:
+    return (torch.empty(1).as_subclass(_CudaTensor),)
+
+
+@pytest.fixture
+def capturing(monkeypatch):
+    """Report every stream as capturing and count the launches that asked."""
+    asked = []
+
+    def stream_capturing(tensor):
+        asked.append(tensor.get_device())
+        return True
+
+    monkeypatch.setattr(
+        capture_pdl_launch, "_launch_stream_capturing", stream_capturing
+    )
+    return asked
+
+
+@pytest.mark.parametrize("grid", [(0,), (1, 0, 1), (-1,), (), (1, 1, 1, 1)])
+def test_empty_or_unproved_grid_never_enters_capture_tracking(grid, capturing):
+    # No storage/driver access is needed: there will be no tracked enqueue
+    # even if a concurrent thread adds one compatible graph node.
+    kernel = _contract_kernel()
+    assert (
+        capture_pdl_launch.prepare_capture_launch(kernel, _contract_args(), grid)
+        is None
+    )
+    assert capturing == [0]
 
 
 def test_capture_suffix_follows_final_wrapper_signature_and_rejects_unknown_abi():
@@ -421,23 +465,101 @@ def test_capture_suffix_follows_final_wrapper_signature_and_rejects_unknown_abi(
 @pytest.mark.parametrize(
     "suffix", [None, (), (4,), (128, 8), (128, 4, 128), (128.0, 4)]
 )
-def test_missing_or_inconsistent_wrapper_suffix_stays_early(suffix):
-    from helion.runtime.cute.capture_pdl_launch import prepare_capture_launch
-
-    kernel = SimpleNamespace(
-        _helion_cute_wrapper_plans=(
-            {
-                "kind": "helion_paged_attention",
-                "capture_pdl_contract": "paired-output-stores-v1",
-                "capture_pdl_parameter_sizes": suffix,
-            },
-            {"kind": "helion_mma_dag_alias"},
-        ),
-        _helion_cute_use_pdl=True,
-        _helion_cute_last_launch_cache=object(),
+def test_missing_or_inconsistent_wrapper_suffix_stays_early(suffix, capturing):
+    # Decline before inspecting storages or graph state.
+    kernel = _contract_kernel(suffix)
+    assert (
+        capture_pdl_launch.prepare_capture_launch(kernel, _contract_args(), (1,))
+        is None
     )
-    # Decline before inspecting arguments, storages, devices, or graph state.
-    assert prepare_capture_launch(kernel, (), (1,)) is None
+    assert capturing == [0]
+
+
+def test_capturing_launch_with_a_proved_grid_and_suffix_reaches_the_storage_walk(
+    capturing,
+):
+    # The control for the two tests above: their fixtures decline at the
+    # grid or suffix gate, not earlier.
+    with pytest.raises(AssertionError, match="storage walk was reached"):
+        capture_pdl_launch.prepare_capture_launch(
+            _contract_kernel(), _contract_args(), (1,)
+        )
+
+
+def test_eager_launch_leaves_before_the_remaining_validation(monkeypatch):
+    # Every eager launch of a kernel with the contract pays for this path,
+    # so it ends at the capture test: neither the launch cache, the grid, the
+    # wrapper suffix nor a storage is examined (a cold kernel, an empty grid
+    # or an invalid suffix would otherwise decline first, and a proved launch
+    # would reach the storage walk).
+    asked = []
+
+    def stream_capturing(tensor):
+        asked.append(tensor.get_device())
+        return False
+
+    monkeypatch.setattr(
+        capture_pdl_launch, "_launch_stream_capturing", stream_capturing
+    )
+    cold = _contract_kernel()
+    cold._helion_cute_last_launch_cache = None
+    for kernel, grid in (
+        (_contract_kernel(), (1,)),
+        (_contract_kernel(suffix=None), (1,)),
+        (_contract_kernel(), (0,)),
+        (cold, (1,)),
+    ):
+        assert (
+            capture_pdl_launch.prepare_capture_launch(kernel, _contract_args(), grid)
+            is None
+        )
+    assert asked == [0] * 4
+    # A kernel without the contract and a host tensor never ask.
+    plain = SimpleNamespace(_helion_cute_wrapper_plans=())
+    for kernel, args in (
+        (plain, _contract_args()),
+        (_contract_kernel(), (torch.empty(1),)),
+    ):
+        assert capture_pdl_launch.prepare_capture_launch(kernel, args, (1,)) is None
+    assert len(asked) == 4
+
+
+def test_cold_or_plain_launch_kernel_declines_while_capturing(capturing):
+    cold = _contract_kernel()
+    cold._helion_cute_last_launch_cache = None
+    plain_launch = _contract_kernel()
+    plain_launch._helion_cute_use_pdl = False
+    for kernel in (cold, plain_launch):
+        assert (
+            capture_pdl_launch.prepare_capture_launch(kernel, _contract_args(), (1,))
+            is None
+        )
+    assert capturing == [0, 0]
+
+
+@pytest.mark.parametrize("capturing_stream", [False, True])
+def test_capture_test_switches_device_only_for_a_non_current_one(
+    monkeypatch, capturing_stream
+):
+    entered = []
+
+    @contextmanager
+    def device_context(device):
+        entered.append(device)
+        yield
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing_stream
+    )
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    current = torch.empty(1).as_subclass(_CudaTensor)
+    other = torch.empty(1).as_subclass(_CudaTensor)
+    monkeypatch.setattr(other, "get_device", lambda: 1, raising=False)
+    assert capture_pdl_launch._launch_stream_capturing(current) is capturing_stream
+    assert entered == []
+    assert capture_pdl_launch._launch_stream_capturing(other) is capturing_stream
+    assert entered == [1]
 
 
 def test_pending_launch_restores_its_device_for_snapshot_and_mode_update(monkeypatch):

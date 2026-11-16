@@ -373,12 +373,14 @@ def test_written_metadata_and_early_probability_have_joint_cache_anchors():
                 )
                 actual.add(axes)
                 assert seed.get("cute_mma_dag_query_tma") is True
-                assert not seed.get("cute_pdl_capture_overlap", False)
+                # Paired seeds carry the guarded capture default.
+                assert seed.get("cute_pdl_capture_overlap") is True
                 assert not seed.get(OVERLAP, False)
                 normalized = spec.normalized_config(seed)
                 normalized_configs.add(normalized)
                 assert normalized.get(KEY) is True
-                assert normalized.get("cute_pdl_capture_overlap", False) is False
+                assert normalized.get("cute_pdl_capture_overlap") is True
+                assert normalized.get("cute_pdl_release") == "loader_tail"
                 assert bound.env.backend.autotune_config_is_viable(spec, normalized)
                 if axes == ("early_tmem", 3, "streaming"):
                     selected = normalized

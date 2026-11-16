@@ -18,6 +18,7 @@ import cutlass.experimental.primitives as prims
 
 from ._flash_row_mma_runtime import pack_bf16x2
 from ._paged_attention_compute import logical_attention_mask
+from ._paged_attention_compute import shifted_attention_key
 from .device.ptx import sts_v4_b32
 
 
@@ -209,6 +210,7 @@ def online_softmax_per_key(
     query_columns: cutlass.Constexpr = 40,
     base2_scores: cutlass.Constexpr = False,
     coefficients_capped: cutlass.Constexpr = False,
+    key_clip: cutlass.Constexpr = "off",
 ) -> cutlass.Boolean:
     """Four full warps consume S[key,query] and produce P[query,key].
 
@@ -224,6 +226,9 @@ def online_softmax_per_key(
     issuer to overwrite S. The returned vote is uniform across all 128 compute
     threads: when false, alpha is one and the owner must skip its accumulator
     rescale and associated barrier. The owner retains P's lifetime.
+    A key_clip other than ``off`` requires the loader to issue this tile at
+    the same shift: this lane's row then holds another key of the page, or
+    zero fill that no row may see (shifted_attention_key).
     """
     assert cutlass.const_expr(query_columns % 8 == 0)
     warp = thread // 32
@@ -237,10 +242,22 @@ def online_softmax_per_key(
         prims.mbarrier_arrive(score_free)
     values = cute.make_rmem_tensor((query_columns,), cutlass.Float32)
     needs_update = cutlass.Boolean(False)
+    key_offset, key_loaded = shifted_attention_key(
+        thread,
+        logical_key_base,
+        128,
+        length,
+        query_columns,
+        query_length,
+        group_size,
+        window,
+        coordinate_dtype,
+        key_clip,
+    )
     for query in cutlass.range_constexpr(query_columns):
         visible = logical_attention_mask(
             logical_key_base,
-            thread,
+            key_offset,
             length,
             query,
             query_length,
@@ -248,6 +265,8 @@ def online_softmax_per_key(
             window,
             coordinate_dtype,
         )
+        if cutlass.const_expr(key_clip != "off"):
+            visible = visible & key_loaded
         score = scores[query] * score_scale
         if not visible:
             score = cutlass.Float32(float("-inf"))

@@ -191,10 +191,14 @@ def folded_paged_attention(
 
 
 def folded_attention_args(
-    query_len: int, *, device: torch.device | str = "cpu"
+    query_len: int,
+    *,
+    device: torch.device | str = "cpu",
+    pages: int = 7,
+    table_pages: int = 3,
 ) -> tuple[object, ...]:
     """Padded Q/O with pointer offsets, byte pages, and noncontiguous scales."""
-    batch, heads, dim, pages = 2, 16, 128, 7
+    batch, heads, dim = 2, 16, 128
     q_strides = (query_len * 4608 + 256, 4608, 128, 1)
     out_strides = (query_len * 2176 + 256, 2176, 128, 1)
     q = torch.empty(batch * q_strides[0] + 8, dtype=torch.bfloat16, device=device)
@@ -215,7 +219,7 @@ def folded_attention_args(
         v,
         ks,
         vs,
-        torch.empty((batch, 3), dtype=torch.int32, device=device),
+        torch.empty((batch, table_pages), dtype=torch.int32, device=device),
         torch.empty(batch, dtype=torch.int32, device=device),
         31,
         128,

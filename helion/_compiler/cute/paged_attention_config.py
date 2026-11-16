@@ -21,6 +21,7 @@ from .cute_mma_dag import MMA_DAG_EPILOGUE_ROW
 from .cute_mma_dag import MMA_DAG_EXCHANGE_AUTO
 from .cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from .cute_mma_dag import MMA_DAG_KEY
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
 from .cute_mma_dag import MMA_DAG_L2_CANONICAL
 from .cute_mma_dag import MMA_DAG_LOADS_KEY
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
@@ -44,6 +45,7 @@ from .cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import MMA_DAG_WARPS_KEY
 from .cute_mma_dag import paged_attention_early_retirement_default
+from .cute_mma_dag import paged_attention_key_clip_choices
 from .cute_mma_dag import paged_attention_pass_warps_reason
 from .cute_mma_dag import paged_attention_probability_choices
 from .cute_mma_dag import paged_attention_v_lag_choices
@@ -136,6 +138,12 @@ def paged_attention_config_reason(
     read_overlap = config.get(MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False)
     if type(read_overlap) is not bool or (read_overlap and not value_metadata_skip):
         return f"{MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY} requires a bool and enabled value metadata"
+    key_clips = paged_attention_key_clip_choices(
+        attention, pass_warps, value_metadata_skip
+    )
+    key_clip = config.get(MMA_DAG_KEY_CLIP_KEY, key_clips[0])
+    if type(key_clip) is not str or key_clip not in key_clips:
+        return f"{MMA_DAG_KEY_CLIP_KEY} must be one of {key_clips!r} for {pass_warps}"
     for key, expected in paged_attention_required_knobs(facts).items():
         actual = config.get(key, expected)
         if type(actual) is not type(expected) or actual != expected:

@@ -77,6 +77,7 @@ from .math_templates import argreduce_candidate_expr
 from .math_templates import nan_extremum_expr
 from .packet_flush_names import streaming_store_rendered
 from .pdl_release import generic_release_rendered
+from .pdl_release import loader_tail_release_rendered
 from .pdl_release import spread_rendered
 from .reduction_lanes import fit_reduction_threads
 from .reduction_lanes import synthetic_reduction_lanes
@@ -1515,7 +1516,11 @@ class CuteBackend(Backend):
         config ranks alike: their back-to-back timing sees the knob, and a
         ranking by the release there would break ties between unrelated
         knobs (matmul backward s2: a clc-persistent finalist 0.5% behind in
-        the autotuner's regime, 7% behind in the catalogue's).  A config
+        the autotuner's regime, 7% behind in the catalogue's).  The proved
+        paired attention kernel waits at entry like the generic path; where
+        its body owns the release (the loader's tail on a one-wave launch,
+        ``loader_tail_release_rendered``) it ranks with the generic early
+        release, which the same config renders past one wave.  A config
         without the knob ranks 2, and is rendered only for the store policy
         below.
 
@@ -1547,8 +1552,11 @@ class CuteBackend(Backend):
             return 2
         rendered = source()
         rank = 2
-        if releasing and generic_release_rendered(rendered):
-            rank = 0 if spread_rendered(rendered) else 1
+        if releasing:
+            if generic_release_rendered(rendered):
+                rank = 0 if spread_rendered(rendered) else 1
+            elif loader_tail_release_rendered(rendered):
+                rank = 1
         if streaming and streaming_store_rendered(rendered):
             rank += 3
         return rank

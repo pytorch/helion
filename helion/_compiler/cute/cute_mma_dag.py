@@ -193,6 +193,18 @@ MMA_DAG_PROBABILITY_SCHEDULE_CHOICES: tuple[str, ...] = (
     MMA_DAG_PROBABILITY_SCHEDULE_EARLY,
     MMA_DAG_PROBABILITY_SCHEDULE_EARLY_TMEM,
 )
+# Paired fast-math loads may shift a boundary tile's TMA boxes past keys that
+# no row of the tile sees, so the hardware fills them with zeros instead of
+# fetching them from their own addresses: ``leading`` those before every
+# row's window, ``trailing`` those after every row's causal bound, ``both``
+# the larger of the two on each tile. Measured on the SDG eval kernel
+# (B200), the leading clip made every sliding-window case faster and the
+# trailing clip alone gained nothing.
+MMA_DAG_KEY_CLIP_KEY = "cute_mma_dag_key_clip"
+MMA_DAG_KEY_CLIP_OFF = "off"
+MMA_DAG_KEY_CLIP_LEADING = "leading"
+MMA_DAG_KEY_CLIP_TRAILING = "trailing"
+MMA_DAG_KEY_CLIP_BOTH = "both"
 MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
@@ -281,6 +293,45 @@ def paged_attention_probability_choices(
     ):
         return MMA_DAG_PROBABILITY_SCHEDULE_CHOICES
     return (MMA_DAG_PROBABILITY_SCHEDULE_SERIAL,)
+
+
+def paged_attention_paired_facts(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+) -> PagedAttentionScheduleFacts | None:
+    """The bind's attention facts where a config runs the proved paired
+    schedule without the value-metadata transport, else None: the kernel
+    has the pair proof, the config names ``attention_paired`` and does not
+    skip the value metadata. The knobs of that body's own loader ask here,
+    each ahead of its own conditions.
+    """
+    if (
+        attention is None
+        or not attention.paired_items
+        or pass_warps != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+        or value_metadata_skip is True
+    ):
+        return None
+    return attention
+
+
+def paged_attention_key_clip_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+) -> tuple[str, ...]:
+    """Key clips the paired loader implements for this kernel, default first.
+
+    The value-metadata actor copies unshifted scale words, so it keeps whole
+    tiles; other schedules have no shifted loader. Normalization, a flattened
+    config's default, the config contract, the planner and the seeds all take
+    the choices, and with them the default, from here.
+    """
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if paired is not None:
+        return paired.key_clip_choices
+    return (MMA_DAG_KEY_CLIP_OFF,)
 
 
 def paged_attention_pass_warps_reason(
@@ -467,6 +518,7 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_VALUE_METADATA_SKIP_KEY,
     MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY,
     MMA_DAG_PROBABILITY_SCHEDULE_KEY,
+    MMA_DAG_KEY_CLIP_KEY,
     MMA_DAG_LOADS_KEY,
     MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,

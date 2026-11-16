@@ -11,13 +11,36 @@ as the last wave starts and never hold slots the earlier waves need; a grid
 that fits in one wave releases at plain entry), and ``auto`` (the default)
 picks ``entry`` while the launch grid is known to fit in one wave of
 resident CTAs and ``last_wave`` past it or when the host sizes the grid at
-runtime (``passes.pdl._implicit_pdl_release``).  The placement follows
-the grid, so the search leaves it at ``auto``; the explicit values serve
-pins, seeds and users. Proved paired capture overlap can explicitly request
-``loader_tail``: the audited loader releases four logical pages before its
-end, with an unconditional release after the loop for short/empty ranges.
-Ordinary search keeps release at ``auto`` and capture overlap disabled.
-Its dependency waits and capture-storage proof are unchanged.
+runtime (``passes.pdl._implicit_pdl_release``); a paired attention launch
+of one unit per CTA on a static grid keeps ``entry`` past one wave, where
+each CTA holds an SM for its whole life and the last wave's guard would
+only wait for the first CTAs in particular
+(``passes.pdl._entry_release_past_one_wave``).  The placement follows
+the grid, so the search leaves it at ``auto`` (the proved paired kernel
+aside, below); the explicit values serve
+pins, seeds and users. Proved paired capture overlap can request
+``loader_tail``: while the launch is known to fit in one wave the audited
+loader releases four logical pages before its end, with an unconditional
+release after the loop for short/empty ranges; past one wave, or when the
+host sizes the grid at runtime, a tail release would only hold the
+dependents back until the last wave's loaders finish, and the placement is
+the automatic one: the entry of every CTA for that kernel's one unit per
+CTA on a static grid, the last wave's guard on a grid the host sizes at
+runtime (``passes.pdl.loader_tail_release_applies``).
+Its dependency waits and capture-storage proof are unchanged. A proved
+single-root paired kernel whose config names none of the dependent-launch
+options gets that guarded overlap with the ``loader_tail`` release
+(``CUTE_PDL_CAPTURE_DEFAULT``), and the compiler's paired seeds carry it
+too. An ``autotune_config_overrides`` entry that contradicts the policy
+declines it for a seed as for a config, and an entry for one of the policy's
+own options likewise for a config the kernel selects without a search (a
+cached result, the default of a kernel that does not autotune).
+A search that times eager launches cannot observe the overlap and samples
+neither it nor a non-``auto`` release.
+A search whose benchmark times back-to-back captured launches (rotating
+input banks, ``search_surface.pdl_fields``) samples the overlap and both
+releases. In every other search each paired config carries the default
+policy, whatever a user seed or a cached config names.
 The tcgen05 GEMM kernels, whose lowering waits in
 its warp roles and releases after the MMA warp's last MMA, take the same
 placements: ``entry`` and ``last_wave`` add the (guarded) release right
@@ -51,10 +74,15 @@ slack each CTA keeps covers small ones.
 from __future__ import annotations
 
 import ast
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from ..zero_fill_kernels import ZERO_FILL_KERNEL_PREFIX
 from ..zero_fill_kernels import zero_fill_kernel_names
 from .target_facts import DEFAULT_MAX_SMEM_PER_BLOCK
+
+if TYPE_CHECKING:
+    from ...autotuner.config_spec import ConfigSpec
 
 CUTE_PDL_RELEASE_CHOICES: tuple[str, ...] = (
     "auto",
@@ -65,11 +93,48 @@ CUTE_PDL_RELEASE_CHOICES: tuple[str, ...] = (
     "loader_tail",
 )
 CUTE_PDL_RELEASE_DEFAULT = CUTE_PDL_RELEASE_CHOICES[0]
+# The releases a launch with the capture contract can use.  ``last_wave`` is
+# among them as the explicit name of the last wave's guard.  Past one wave
+# ``auto`` and the ``loader_tail`` fallback resolve to ``entry`` for the
+# paired schedule's one unit per CTA on a static grid, so only a config
+# that names ``last_wave`` gets the guard there, and nothing samples it.
 CUTE_PDL_CAPTURE_RELEASE_CHOICES: tuple[str, ...] = (
     CUTE_PDL_RELEASE_DEFAULT,
     "entry",
     "loader_tail",
+    "last_wave",
 )
+CUTE_PDL_CAPTURE_OVERLAP_KEY = "cute_pdl_capture_overlap"
+# The dependent-launch policy of a proved single-root paired attention kernel
+# whose config names none of ``cute_pdl``, capture overlap, the release and
+# spread padding: launched as a dependent, reading inputs ahead of a
+# predecessor the capture guard proved harmless (an unproved or eager launch
+# keeps the entry wait), and releasing its own dependents when its loader has
+# four pages left on a one-wave launch, from every CTA's entry past it.
+CUTE_PDL_CAPTURE_DEFAULT = MappingProxyType(
+    {
+        "cute_pdl": True,
+        CUTE_PDL_CAPTURE_OVERLAP_KEY: True,
+        "cute_pdl_release": "loader_tail",
+    }
+)
+
+
+def capture_policy_available(config_spec: ConfigSpec) -> bool:
+    """Whether the kernel's paired schedule takes that policy: the kernel has
+    the capture-time dependency proof (a single native paired-attention
+    root) and no explicit dependent-launch markers, which would own the
+    wait and the release.
+
+    The one statement of that condition: every rule about the policy asks
+    it, so normalization, the paired seeds and the search cannot drift
+    apart."""
+    return (
+        config_spec.cute_pdl_capture_overlap_available
+        and not config_spec.has_explicit_pdl
+    )
+
+
 # The hardware limits every target with ``griddepcontrol`` (sm_90 and up)
 # shares: resident CTAs per SM and, when the device cannot be queried, the
 # resident threads per SM (H100, B200).
@@ -255,6 +320,85 @@ def device_kernels(module: ast.Module) -> list[ast.FunctionDef]:
     ]
 
 
+def _capture_wait_params(module: ast.Module) -> dict[str, str] | None:
+    """The wait-mode parameter of every kernel of ``module`` whose wrapper
+    plan carries the audited paired capture contract, by kernel name; ``None``
+    when a plan launches with ``use_pdl`` (a family that owns its dependent
+    launch)."""
+    capture_waits: dict[str, str] = {}
+    for node in module.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Attribute)
+            and node.targets[0].attr == "_helion_cute_wrapper_plans"
+        ):
+            if "'use_pdl': True" in ast.unparse(node.value):
+                return None
+            if not isinstance(node.targets[0].value, ast.Name):
+                continue
+            try:
+                plans = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(plans, list):
+                continue
+            for plan in plans:
+                if (
+                    isinstance(plan, dict)
+                    and plan.get("kind") == "helion_paged_attention"
+                    and plan.get("capture_pdl_contract") == "paired-output-stores-v1"
+                    and isinstance(mode := plan.get("capture_pdl_mode_param"), str)
+                ):
+                    capture_waits[node.targets[0].value.id] = mode
+    return capture_waits
+
+
+def loader_tail_release_rendered(source: str) -> bool:
+    """Whether the generated module ``source`` renders the paired attention
+    body's own early release (``cute_pdl_release: loader_tail`` on a launch
+    known to fit one wave): the audited capture kernel, whose entry wait is
+    the contract's conditional one, calls its body with
+    ``capture_release_tail=True`` and the contract's wait-mode parameter.
+
+    That body releases the kernel's dependents when its loader has four
+    pages left, later than the generic entry release and well before the
+    grid completes; like the generic release it is invisible to the
+    kernel's isolated eager timing (``CuteBackend.finalist_preference``).
+    Past one wave the same config renders the generic release instead
+    (``generic_release_rendered``): at the entry of every CTA for this
+    kernel's one unit per CTA on a static grid, under the last wave's guard
+    on a grid the host sizes at runtime
+    (``passes.pdl._implicit_pdl_release``)."""
+    try:
+        module = ast.parse(source)
+    except SyntaxError:
+        return False
+    capture_waits = _capture_wait_params(module)
+    if not capture_waits:
+        return False
+    for kernel in device_kernels(module):
+        mode = capture_waits.get(kernel.name)
+        if mode is None or not any(
+            _is_capture_wait(statement, mode) for statement in kernel.body
+        ):
+            continue
+        for node in ast.walk(kernel):
+            if not isinstance(node, ast.Call):
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            tail = keywords.get("capture_release_tail")
+            wait_mode = keywords.get("capture_pdl_wait_mode")
+            if (
+                isinstance(tail, ast.Constant)
+                and tail.value is True
+                and isinstance(wait_mode, ast.Name)
+                and wait_mode.id == mode
+            ):
+                return True
+    return False
+
+
 def generic_release_rendered(source: str) -> bool:
     """Whether the generated module ``source`` renders the generic early
     release of ``cute_pdl_release`` (``entry``, or ``last_wave``'s guard).
@@ -280,32 +424,9 @@ def generic_release_rendered(source: str) -> bool:
         module = ast.parse(source)
     except SyntaxError:
         return False
-    capture_waits: dict[str, str] = {}
-    for node in module.body:
-        if (
-            isinstance(node, ast.Assign)
-            and len(node.targets) == 1
-            and isinstance(node.targets[0], ast.Attribute)
-            and node.targets[0].attr == "_helion_cute_wrapper_plans"
-        ):
-            if "'use_pdl': True" in ast.unparse(node.value):
-                return False
-            if not isinstance(node.targets[0].value, ast.Name):
-                continue
-            try:
-                plans = ast.literal_eval(node.value)
-            except (ValueError, TypeError):
-                continue
-            if not isinstance(plans, list):
-                continue
-            for plan in plans:
-                if (
-                    isinstance(plan, dict)
-                    and plan.get("kind") == "helion_paged_attention"
-                    and plan.get("capture_pdl_contract") == "paired-output-stores-v1"
-                    and isinstance(mode := plan.get("capture_pdl_mode_param"), str)
-                ):
-                    capture_waits[node.targets[0].value.id] = mode
+    capture_waits = _capture_wait_params(module)
+    if capture_waits is None:
+        return False
     for kernel in device_kernels(module):
         waits = [
             i

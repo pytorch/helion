@@ -88,9 +88,12 @@ def run(
     """Execute one supported SDG layout with the caller's output allocation.
 
     The cache and E8M0 scales share their original backing storage. Query,
-    output, key-cache and value-cache allocations must be distinct. The stored
-    configs may enable PDL capture overlap; captured topology and pointer
-    parameters must remain fixed, as documented by that CuTe config option.
+    output, key-cache and value-cache allocations must be distinct. A stored
+    config that selects the paired schedule and names no dependent-launch
+    option runs with guarded PDL capture overlap, as does one that enables it:
+    captured topology and pointer parameters must then remain fixed, as
+    documented by that CuTe config option. ``cute_pdl=False`` or
+    ``cute_pdl_capture_overlap=False`` in the profile's config opts out.
     """
     tensors = (q, k, v, k_scale, v_scale, page_table, lengths, out)
     if any(tensor.device != q.device for tensor in tensors):

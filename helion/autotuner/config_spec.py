@@ -1509,6 +1509,11 @@ class ConfigSpec:
         # Set only for a single native paired-attention root. The selected
         # emitter also proves complete load/store effects before adding its ABI.
         self.cute_pdl_capture_overlap_available: bool = False
+        # Whether the search samples that kernel's dependent-launch policy:
+        # only where candidates are timed as back-to-back launches of one
+        # captured graph (``autotune_benchmark_input_banks`` above one), the
+        # regime that observes it. Elsewhere searched configs keep the default.
+        self.cute_pdl_capture_overlap_searched: bool = False
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -1557,6 +1562,7 @@ class ConfigSpec:
         self.cute_mma_dag_value_metadata_skip: EnumFragment | None = None
         self.cute_mma_dag_value_metadata_read_overlap: EnumFragment | None = None
         self.cute_mma_dag_probability_schedule: EnumFragment | None = None
+        self.cute_mma_dag_key_clip: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
         # How a dot operand that is a pointwise chain over loaded tiles
@@ -3481,12 +3487,16 @@ class ConfigSpec:
         self.search_surface.prepare_override_normalization(self, config, overrides)
 
     def search_proposal(
-        self, config: helion.Config
+        self,
+        config: helion.Config,
+        overrides: Mapping[str, object] | StructuralConfig | None = None,
     ) -> tuple[helion.Config, tuple[str, ...]]:
         """``config``, a proposal that reaches a search from outside its
         flat search space, as the search admits it, and the options the
         backend returned to what the search proposes on its own
-        (``BackendSearchSurface.repair_search_proposal``).
+        (``BackendSearchSurface.repair_search_proposal``). ``overrides``
+        are the search's ``autotune_config_overrides``: what its candidates
+        hold can depend on them.
 
         A search draws its candidates from its flat fields. A proposal from
         elsewhere, the configs of an LLM's reply, can name any option
@@ -3505,7 +3515,9 @@ class ConfigSpec:
         options = {
             key: _copy_config_structure(value) for key, value in config.config.items()
         }
-        returned = self.search_surface.repair_search_proposal(self, options)
+        returned = self.search_surface.repair_search_proposal(
+            self, options, _override_entries(overrides) or {}
+        )
         if not returned:
             return config, ()
         self.normalize(options, _fix_invalid=True)

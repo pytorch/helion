@@ -8,6 +8,7 @@ against those facts.  Called from ``search_surface.CuteSearchSurface`` at the
 
 from __future__ import annotations
 
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -38,6 +39,8 @@ from ..cute_mma_dag import MMA_DAG_EPILOGUE_STREAMED
 from ..cute_mma_dag import MMA_DAG_EXCHANGE_CHOICES
 from ..cute_mma_dag import MMA_DAG_EXCHANGE_KEY
 from ..cute_mma_dag import MMA_DAG_KEY
+from ..cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
+from ..cute_mma_dag import MMA_DAG_KEY_CLIP_OFF
 from ..cute_mma_dag import MMA_DAG_L2_CANONICAL
 from ..cute_mma_dag import MMA_DAG_L2_HINTS
 from ..cute_mma_dag import MMA_DAG_LOADS_CHOICES
@@ -91,6 +94,7 @@ from ..cute_mma_dag import mma_dag_persistent_reason
 from ..cute_mma_dag import mma_dag_ragged_ceilings
 from ..cute_mma_dag import mma_dag_seed_configs
 from ..cute_mma_dag import paged_attention_early_retirement_default
+from ..cute_mma_dag import paged_attention_key_clip_choices
 from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_register_subblocks import COLSIDE_CHOICES as RSB_COLSIDE_CHOICES
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
@@ -112,6 +116,12 @@ from ..cute_register_subblocks import RegisterSubblockFacts
 from ..cute_register_subblocks import register_subblocks_config_reason
 from ..cute_register_subblocks import register_subblocks_repair
 from ..cutedsl_compat import hinted_cp_async_available
+from ..pdl_release import CUTE_PDL_CAPTURE_DEFAULT
+from ..pdl_release import CUTE_PDL_CAPTURE_OVERLAP_KEY
+from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
+from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from ..pdl_release import CUTE_PDL_SPREAD_KEY
+from ..pdl_release import capture_policy_available
 from ..phase_load_policies import project_load_policies
 from ..phase_load_policies import scatter_load_policies
 
@@ -325,7 +335,12 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     config_spec.cute_mma_dag_probability_schedule = None
     config_spec.cute_mma_dag_value_metadata_skip = None
     config_spec.cute_mma_dag_value_metadata_read_overlap = None
+    config_spec.cute_mma_dag_key_clip = None
     if facts.attention is not None and facts.attention.paired_items:
+        if len(facts.attention.key_clip_choices) > 1:
+            config_spec.cute_mma_dag_key_clip = EnumFragment(
+                choices=facts.attention.key_clip_choices
+            )
         config_spec.cute_mma_dag_v_lag = EnumFragment(choices=MMA_DAG_V_LAG_CHOICES)
         config_spec.cute_mma_dag_sleep_waits = EnumFragment(choices=(False, True))
         config_spec.cute_mma_dag_early_tmem_retirement = EnumFragment(
@@ -561,6 +576,7 @@ _PAIRED_KNOB_PINS: tuple[tuple[str, object], ...] = (
     (MMA_DAG_VALUE_METADATA_SKIP_KEY, False),
     (MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY, False),
     (MMA_DAG_PROBABILITY_SCHEDULE_KEY, MMA_DAG_PROBABILITY_SCHEDULE_SERIAL),
+    (MMA_DAG_KEY_CLIP_KEY, MMA_DAG_KEY_CLIP_OFF),
 )
 
 
@@ -587,6 +603,267 @@ def drop_paired_knob_pins(
         return
     for key, _pin in _PAIRED_KNOB_PINS:
         base.pop(key, None)
+
+
+# The options that select the paired schedule, and the dependent-launch
+# policy a proved kernel runs it under by default, spread padding included.
+# Every rule about that policy reads these tables: what a config must hold to
+# keep it (``CAPTURE_POLICY_REQUIREMENTS``), which schedule a kernel is on
+# (``paired_capture_schedule``) and what a search that does not sample the
+# policy keeps (``kept_capture_policy``).
+PAIRED_CAPTURE_SCHEDULE = MappingProxyType(
+    {
+        MMA_DAG_KEY: MMA_DAG_TCGEN05,
+        MMA_DAG_PASS_WARPS_KEY: MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
+    }
+)
+CAPTURE_POLICY = MappingProxyType(
+    {**CUTE_PDL_CAPTURE_DEFAULT, CUTE_PDL_SPREAD_KEY: False}
+)
+# What the guarded capture policy needs of a config: its own options and the
+# options ``capture_overlap_eligible`` reads.
+CAPTURE_POLICY_REQUIREMENTS = MappingProxyType(
+    {**CAPTURE_POLICY, **PAIRED_CAPTURE_SCHEDULE}
+)
+
+
+def paired_capture_schedule(available: bool, config: Mapping[str, object]) -> bool:
+    """Whether ``config`` selects the proved paired schedule of a kernel
+    whose capture-time dependency proof exists (a single paired root without
+    explicit dependent-launch markers).
+
+    ``available`` is the kernel's side of the rule,
+    ``capture_policy_available`` of a binding; the rest reads ``config``
+    alone. Every rule about the guarded policy takes that one fact as an
+    argument: the rules are also asked what a config does on a kernel that
+    has the proof, whatever binding is at hand
+    (``search_surface._held_capture_overrides``)."""
+    return available and all(
+        config.get(key) == value for key, value in PAIRED_CAPTURE_SCHEDULE.items()
+    )
+
+
+def capture_overlap_eligible(available: bool, config: Mapping[str, object]) -> bool:
+    """Whether the rest of ``config`` permits capture overlap on a kernel
+    whose ``capture_policy_available`` is ``available``: the proved paired
+    schedule under ``cute_pdl``, without spread padding, releasing where a
+    capture launch can.
+
+    The one statement of that rule: normalization asks it, and so do code
+    generation and every hook that acts on the guarded policy, such as the
+    one that declines the policy under a contradicting override (in a
+    search candidate and in a config no search produced), through
+    ``carries_capture_overlap``."""
+    return (
+        paired_capture_schedule(available, config)
+        and config.get("cute_pdl") is True
+        and not config.get(CUTE_PDL_SPREAD_KEY)
+        and config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
+        in CUTE_PDL_CAPTURE_RELEASE_CHOICES
+    )
+
+
+def carries_capture_overlap(available: bool, config: Mapping[str, object]) -> bool:
+    """Whether ``config``, normalized or a candidate under its overrides,
+    launches with the guarded capture overlap on a kernel whose
+    ``capture_policy_available`` is ``available``: it asks for the overlap
+    and the rest of it permits that (``capture_overlap_eligible``)."""
+    overlap = config.get(CUTE_PDL_CAPTURE_OVERLAP_KEY) is True
+    return overlap and capture_overlap_eligible(available, config)
+
+
+def carried_capture_policies() -> tuple[dict[str, object], ...]:
+    """The options ``carries_capture_overlap`` reads, as every normalized
+    config that launches with the guarded overlap can state them: the paired
+    schedule under ``cute_pdl`` with the overlap, on each release a capture
+    launch can use or none named (the automatic one), spread padding off or
+    not named."""
+    carried = {
+        **PAIRED_CAPTURE_SCHEDULE,
+        "cute_pdl": True,
+        CUTE_PDL_CAPTURE_OVERLAP_KEY: True,
+    }
+    policies: list[dict[str, object]] = []
+    for release in (None, *CUTE_PDL_CAPTURE_RELEASE_CHOICES):
+        for spread in (None, False):
+            policy: dict[str, object] = dict(carried)
+            if release is not None:
+                policy["cute_pdl_release"] = release
+            if spread is not None:
+                policy[CUTE_PDL_SPREAD_KEY] = spread
+            policies.append(policy)
+    return tuple(policies)
+
+
+def kept_capture_policy(
+    config_spec: ConfigSpec, overrides: Mapping[str, object]
+) -> dict[str, object] | None:
+    """The dependent-launch options of every candidate on the proved paired
+    schedule in a search that does not sample them: the default policy with
+    the options ``overrides`` name as they state them. ``None`` where
+    nothing is kept: the search owns the policy, the kernel has no capture
+    contract, or the overrides decline the policy or select another
+    schedule.
+
+    Eager timing cannot rank the capture policy: the guard grants its
+    overlap only inside a captured graph, so the knob reads as a tie, or as
+    a loss by the capture test's host time on a host-bound kernel, and a
+    search that steps to ``cute_pdl=False`` returns a config without the
+    overlap the default has. The policy is searched only where the
+    benchmark observes it
+    (``ConfigSpec.cute_pdl_capture_overlap_searched``).
+
+    A fixed override states the option it names and nothing else. While the
+    overridden options still form a guarded policy (``cute_pdl`` and the
+    overlap on, no spread padding, a release a capture launch can use), the
+    options the overrides leave out keep their default: under
+    ``cute_pdl_release="auto"`` a search cannot step off the overlap any
+    more than without the override. An override the policy cannot keep
+    declines it instead (``_decline_overridden_capture_policy``), and
+    nothing is kept. Which overrides those are is decided by the rule
+    normalization and the decline hook apply (``capture_overlap_eligible``),
+    so no policy is kept that they reject.
+
+    Three repairs apply the answer. A flat config is repaired wherever it is
+    made or decoded (``CuteConfigGenerationExtension.repair_flat_config``).
+    The overrides are layered over the decoded config afterwards, so a
+    candidate that an override puts on the paired schedule is repaired once
+    more there (``_keep_overridden_capture_policy``). A proposal from
+    outside the flat fields, which is never decoded from a flat config, is
+    repaired where its search admits it
+    (``_hold_proposed_capture_policy``)."""
+    if config_spec.cute_pdl_capture_overlap_searched:
+        return None
+    # The paired schedule and its policy as the overrides state them: kept
+    # while that is still a guarded policy.
+    stated = {
+        key: overrides.get(key, value)
+        for key, value in CAPTURE_POLICY_REQUIREMENTS.items()
+    }
+    if not carries_capture_overlap(capture_policy_available(config_spec), stated):
+        return None
+    return {key: stated[key] for key in CAPTURE_POLICY}
+
+
+def key_clip_choices(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> tuple[str, ...]:
+    """The key clips the schedule and value transport ``config`` selects can
+    run, its default first."""
+    facts = config_spec.cute_mma_dag_facts
+    assert facts is not None
+    return paged_attention_key_clip_choices(
+        facts.attention,
+        config.get(MMA_DAG_PASS_WARPS_KEY),
+        config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY),
+    )
+
+
+# What a shifted key clip needs of a config: the options
+# ``paged_attention_key_clip_choices`` reads.
+_KEY_CLIP_REQUIREMENTS = MappingProxyType(
+    {
+        MMA_DAG_PASS_WARPS_KEY: MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
+        MMA_DAG_VALUE_METADATA_SKIP_KEY: False,
+    }
+)
+
+
+def _paired_by_override_alone(
+    config: Mapping[str, object], overrides: Mapping[str, object]
+) -> bool:
+    """Whether ``overrides``, already layered over ``config``, are what put
+    it on the paired schedule, as far as the candidate still shows.
+
+    A candidate is decoded before the overrides are layered over it, and a
+    row on another body has every paired knob pinned by then
+    (``_pin_paired_knobs``). So an override that names the schedule, over a
+    candidate whose paired knobs all hold their pins where the overrides
+    leave them alone, marks a candidate that body pinned. A paired row that
+    chose every pin itself reads the same; any other paired row differs in
+    a knob."""
+    return any(key in overrides for key in PAIRED_CAPTURE_SCHEDULE) and all(
+        config.get(name, pin) == pin
+        for name, pin in _PAIRED_KNOB_PINS
+        if name not in overrides
+    )
+
+
+def rederive_overridden_key_clip(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Drop the key clip of a candidate where ``overrides``, already layered
+    over it, select options that cannot run it, or put the candidate on the
+    paired schedule with the clip another body pinned.
+
+    The clips a config may name follow its other options: only the paired
+    loader shifts a tile, and value-metadata transport keeps whole tiles.
+    Strict normalization treats the two differently. A clip named together
+    with value metadata is rejected, like a clip the kernel offers under no
+    schedule. A clip on another body is not an error: that body pins it to
+    ``off``, as it pins every paired knob (``_pin_paired_knobs``).
+
+    A complete candidate carries a clip that fits its own options; for a
+    windowed kernel that is usually ``leading``, the default no compiler
+    seed spells out. An override that turns value metadata on without
+    naming a clip would leave that clip behind to be rejected: under
+    ``cute_mma_dag_value_metadata_skip=True`` seed transfer dropped every
+    paired seed of a windowed fast_math kernel, also where the same entry
+    selects another schedule, because the transport check precedes the pin.
+    An override of the schedule alone needs no help here: the pin gives the
+    same config with the clip or without it.
+
+    The clip that no longer fits is dropped, so normalization derives the
+    default of the overridden config, as for a config that names the
+    override and no clip. A clip the overridden config still admits stays,
+    also where it was the default of the options the override replaced
+    (whole tiles under an override that turns value metadata off), and an
+    overridden clip is never dropped. A candidate that never admitted its
+    clip is left for validation to reject where the options at fault are
+    its own, those the overrides do not name. Where an override names the
+    option at fault, the candidate's own value is gone by the time this
+    hook runs, and the option is read as the value a shifted clip needs: a
+    config that names a clip of both sides beside value metadata, an error
+    on its own, loses the clip under the override
+    ``cute_mma_dag_value_metadata_skip=True`` like a seed whose clip the
+    override displaced.
+
+    The other direction is an override that selects the paired schedule
+    over a candidate of another body: a compiler seed of the plain attention
+    schedule, a random row whose own schedule slot holds another value. That
+    body pinned the clip to whole tiles, which the paired schedule admits,
+    so nothing is rejected, but the pin would read as the candidate's
+    choice, and every seed the override moves would start without the clip
+    a windowed kernel defaults to. Where the candidate shows that the
+    override alone put it there (``_paired_by_override_alone``), the pinned
+    clip is dropped as well and the paired default is derived. A paired
+    candidate that names another paired knob keeps the whole tiles it
+    chose."""
+    fragment = config_spec.cute_mma_dag_key_clip
+    if fragment is None or MMA_DAG_KEY_CLIP_KEY in overrides:
+        return
+    clip = config.get(MMA_DAG_KEY_CLIP_KEY)
+    if clip is None:
+        return
+    choices = key_clip_choices(config_spec, config)
+    if clip in choices:
+        if clip != choices[0] and _paired_by_override_alone(config, overrides):
+            del config[MMA_DAG_KEY_CLIP_KEY]
+        return
+    # The candidate as it was where an override now sits: it carried the
+    # clip only if its own options satisfy what a shifted clip needs.
+    carried = {
+        **config,
+        **{
+            name: value
+            for name, value in _KEY_CLIP_REQUIREMENTS.items()
+            if name in overrides
+        },
+    }
+    if clip in key_clip_choices(config_spec, carried):
+        del config[MMA_DAG_KEY_CLIP_KEY]
 
 
 def _normalize_cute_mma_dag(
@@ -655,6 +932,27 @@ def _normalize_cute_mma_dag(
                 config[key] = default
             if fragment is None:
                 config.pop(key, None)
+    clip_fragment = config_spec.cute_mma_dag_key_clip
+    if clip_fragment is not None or MMA_DAG_KEY_CLIP_KEY in config:
+        # A named clip must be one the paired loader runs with this config's
+        # value transport (the value-metadata actor copies unshifted scale
+        # words: whole tiles by default, and a named clip is rejected). A
+        # body other than the paired one then pins it to off, like every
+        # paired knob (``_pin_paired_knobs``).
+        clips = paged_attention_key_clip_choices(
+            facts.attention,
+            MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
+            config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY),
+        )
+        clip = config.setdefault(MMA_DAG_KEY_CLIP_KEY, clips[0])
+        if type(clip) is not str or clip not in clips:
+            if not fix_invalid:
+                raise InvalidConfig(
+                    f"{MMA_DAG_KEY_CLIP_KEY} must be one of {clips!r}, got {clip!r}"
+                )
+            config[MMA_DAG_KEY_CLIP_KEY] = clips[0]
+        if clip_fragment is None:
+            config.pop(MMA_DAG_KEY_CLIP_KEY, None)
     # The paired schedule retires its allocation early unless the config says
     # otherwise; every other body has no such phase.
     retires_early = paged_attention_early_retirement_default(

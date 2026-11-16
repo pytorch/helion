@@ -59,6 +59,51 @@ def logical_attention_mask(
 
 
 @cute.jit
+def _ordered_tile_ranges(
+    logical_key_base: cutlass.Int64,
+    key_count: cutlass.Constexpr,
+    length: cutlass.Int32,
+    query_columns: cutlass.Constexpr,
+    query_length: cutlass.Constexpr,
+    group_size: cutlass.Constexpr,
+    coordinate_dtype: cutlass.Constexpr,
+) -> tuple[
+    cutlass.Integer, cutlass.Integer, cutlass.Integer, cutlass.Integer, cutlass.Boolean
+]:
+    """First and last key of a tile, the positions of its first and last query
+    rows, and whether both ranges are ordered.
+
+    Ordered ranges exclude signed wrap, so their ends bound every key and
+    every row of the tile. Length subtraction retains INT32 semantics before
+    coordinate promotion, just as in logical_attention_mask. The interior
+    test and the key clip both start here, so they cannot disagree about
+    which tiles are ordered or where their keys and rows lie.
+    """
+    key_begin = coordinate_dtype(logical_key_base)
+    key_end = key_begin + coordinate_dtype(key_count - 1)
+    query_begin = coordinate_dtype(cutlass.Int32(length - query_length))
+    query_end = query_begin + coordinate_dtype((query_columns - 1) // group_size)
+    ordered = (key_end >= key_begin) & (query_end >= query_begin)
+    return key_begin, key_end, query_begin, query_end, ordered
+
+
+@cute.jit
+def _ordered_window_bounds(
+    query_begin: cutlass.Integer, query_end: cutlass.Integer, window: cutlass.Constexpr
+) -> tuple[cutlass.Integer, cutlass.Integer, cutlass.Boolean]:
+    """Lower window bounds of a tile's first and last query rows, and whether
+    they are ordered.
+
+    A window can wrap for only the earlier query rows. Their lower bound must
+    remain ordered before the first row's is used as the loosest and the last
+    row's as the strictest.
+    """
+    lower_begin = query_begin - window
+    lower_end = query_end - window
+    return lower_begin, lower_end, lower_end >= lower_begin
+
+
+@cute.jit
 def logical_attention_tile_is_interior(
     logical_key_base: cutlass.Int64,
     key_count: cutlass.Constexpr,
@@ -71,25 +116,144 @@ def logical_attention_tile_is_interior(
 ) -> cutlass.Boolean:
     """Prove that every key is visible to every row of a nonempty tile.
 
-    Ordered key and query ranges exclude signed wrap before using their extrema.
-    Length subtraction retains INT32 semantics before coordinate promotion,
-    just as in logical_attention_mask. Other tiles keep the per-element mask.
+    Ordered key and query ranges exclude signed wrap before using their extrema
+    (_ordered_tile_ranges, _ordered_window_bounds). Other tiles keep the
+    per-element mask.
     """
     assert cutlass.const_expr(key_count > 0 and query_columns > 0 and group_size > 0)
-    key_begin = coordinate_dtype(logical_key_base)
-    key_end = key_begin + coordinate_dtype(key_count - 1)
-    query_begin = coordinate_dtype(cutlass.Int32(length - query_length))
-    query_end = query_begin + coordinate_dtype((query_columns - 1) // group_size)
-    interior = (
-        (key_end >= key_begin) & (query_end >= query_begin) & (key_end <= query_begin)
+    key_begin, key_end, query_begin, query_end, ordered = _ordered_tile_ranges(
+        logical_key_base,
+        key_count,
+        length,
+        query_columns,
+        query_length,
+        group_size,
+        coordinate_dtype,
     )
+    interior = ordered & (key_end <= query_begin)
     if cutlass.const_expr(window is not None):
-        lower_begin = query_begin - window
-        lower_end = query_end - window
-        # A window can wrap for only the earlier query rows. Their lower bound
-        # must remain ordered before using the last row as the strictest one.
-        interior = interior & (lower_end >= lower_begin) & (key_begin >= lower_end)
+        _lower_begin, lower_end, lower_ordered = _ordered_window_bounds(
+            query_begin, query_end, window
+        )
+        interior = interior & lower_ordered & (key_begin >= lower_end)
     return interior
+
+
+@cute.jit
+def logical_attention_key_shift(
+    logical_key_base: cutlass.Int64,
+    key_count: cutlass.Constexpr,
+    length: cutlass.Int32,
+    query_columns: cutlass.Constexpr,
+    query_length: cutlass.Constexpr,
+    group_size: cutlass.Constexpr,
+    window: cutlass.Constexpr,
+    coordinate_dtype: cutlass.Constexpr,
+    key_clip: cutlass.Constexpr,
+) -> cutlass.Int32:
+    """Offset of a tile's key box that leaves out keys no row can see.
+
+    Row r of a shifted tile holds key ``shift + r`` of its page. Rows whose
+    key lies outside [0, key_count) are outside the descriptor's key extent:
+    the TMA unit fills them with zeros instead of fetching them from their
+    own addresses, and shifted_attention_key masks them. ``leading`` clips
+    drop keys before every row's window with a positive shift, ``trailing``
+    clips drop keys after every row's causal bound with a negative shift,
+    and ``both`` keeps the larger saving of a tile that has the two. ``off``
+    is a whole tile: shift zero, without an operation.
+
+    The loader issues a tile's boxes at this shift and the softmax helpers
+    map their lanes with it (shifted_attention_key), all from this function
+    and the same arguments, so the two sides cannot disagree about a key.
+
+    The ranges and ordering checks are those of
+    logical_attention_tile_is_interior, from the same two helpers: with
+    ordered keys, positions and window bounds, a key below the first row's
+    lower bound or above the last row's position fails logical_attention_mask
+    for every row in the mask's own wrapping arithmetic. Any other tile keeps
+    shift zero, as does every interior tile. Differences are taken only between
+    values inside one ordered tile, so they fit the key count.
+
+    Shifts are multiples of four keys, which keeps the packed scale box (one
+    INT32 word per key, key innermost) 16-byte aligned, and at most
+    key_count - 4, so some row always remains inside the descriptor.
+    """
+    assert cutlass.const_expr(key_clip in ("off", "leading", "trailing", "both"))
+    if cutlass.const_expr(key_clip == "off"):
+        return cutlass.Int32(0)
+    assert cutlass.const_expr(key_clip == "trailing" or window is not None)
+    assert cutlass.const_expr(key_count >= 8 and key_count % 4 == 0)
+    assert cutlass.const_expr(query_columns > 0 and group_size > 0)
+    key_begin, key_end, query_begin, query_end, ordered = _ordered_tile_ranges(
+        logical_key_base,
+        key_count,
+        length,
+        query_columns,
+        query_length,
+        group_size,
+        coordinate_dtype,
+    )
+    trailing = cutlass.Int32(0)
+    if cutlass.const_expr(key_clip != "leading"):
+        if query_end < key_end:
+            trailing = cutlass.Int32(key_count)
+            if query_end >= key_begin:
+                trailing = cutlass.Int32(key_end - query_end)
+        trailing = cutlass.Int32(cutlass.min(trailing & -4, key_count - 4))
+    leading = cutlass.Int32(0)
+    if cutlass.const_expr(key_clip != "trailing"):
+        lower_begin, _lower_end, lower_ordered = _ordered_window_bounds(
+            query_begin, query_end, window
+        )
+        ordered = ordered & lower_ordered
+        if lower_begin > key_begin:
+            leading = cutlass.Int32(key_count)
+            if lower_begin <= key_end:
+                leading = cutlass.Int32(lower_begin - key_begin)
+        leading = cutlass.Int32(cutlass.min(leading & -4, key_count - 4))
+    shift = cutlass.Int32(0)
+    if ordered:
+        shift = leading
+        if trailing > leading:
+            shift = cutlass.Int32(-trailing)
+    return shift
+
+
+@cute.jit
+def shifted_attention_key(
+    thread: cutlass.Int32,
+    logical_key_base: cutlass.Int64,
+    key_count: cutlass.Constexpr,
+    length: cutlass.Int32,
+    query_columns: cutlass.Constexpr,
+    query_length: cutlass.Constexpr,
+    group_size: cutlass.Constexpr,
+    window: cutlass.Constexpr,
+    coordinate_dtype: cutlass.Constexpr,
+    key_clip: cutlass.Constexpr,
+) -> tuple[cutlass.Int32, cutlass.Boolean]:
+    """The page key that softmax lane ``thread`` holds in its row of a tile,
+    and whether that row is a key of the page rather than zero fill.
+
+    The loader issued the tile at logical_attention_key_shift of the same
+    arguments, so the lane's row holds key ``thread + shift``; a key outside
+    [0, key_count) is zero fill, which no row may see. A whole tile
+    (``off``) keeps the lane's own key and every row, without an operation.
+    """
+    if cutlass.const_expr(key_clip == "off"):
+        return thread, cutlass.Boolean(True)
+    key_offset = thread + logical_attention_key_shift(
+        logical_key_base,
+        key_count,
+        length,
+        query_columns,
+        query_length,
+        group_size,
+        window,
+        coordinate_dtype,
+        key_clip,
+    )
+    return key_offset, cutlass.Uint32(key_offset) < cutlass.Uint32(key_count)
 
 
 @cute.jit

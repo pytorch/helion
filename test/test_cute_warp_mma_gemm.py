@@ -17,7 +17,6 @@ import torch
 
 from test.test_cute_tcgen05_fixed_chain import _bind_two_output_gemm
 from test.test_cute_tcgen05_fixed_chain import _kernel_body
-from test.test_cute_tcgen05_fixed_chain import _source
 from test.test_cute_tcgen05_fixed_chain import _two_output_gemm
 from test.test_cute_tcgen05_fixed_cost import _bind_row_bias_gemm
 from test.test_cute_tcgen05_fixed_cost import _closure_bias_epilogue
@@ -40,6 +39,7 @@ from helion._testing.cute_mma_dag import CPU_DEVICE
 from helion._testing.cute_mma_dag import _ordinary_gemm
 from helion._testing.cute_mma_dag import bind_cpu_gemm as _bind_gemm
 from helion._testing.cute_mma_dag import normalize_config as _normalize
+from helion._testing.cute_mma_dag import normalized_source as _source
 from helion._testing.cute_mma_dag import repaired_config as _repaired
 
 if TYPE_CHECKING:

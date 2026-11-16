@@ -4,25 +4,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 from typing import cast
-from unittest.mock import patch
 
 import torch
 
 from .cuda_graph import cuda_graph_for_replay
+from .cute_capture_replay import capture_launches
+from .cute_capture_replay import fill_nan
 from .cute_folded_attention import folded_attention_args
 from .cute_folded_attention import folded_attention_reference
 from .cute_folded_attention import folded_paged_attention
 from .cute_paged_attention import paged_online_attention
 from .cute_paged_attention_schedule import paged_attention_args
 import helion
-from helion.runtime.cute import capture_pdl_launch
-from helion.runtime.cute.capture_pdl import WaitMode
 
 if TYPE_CHECKING:
-    from helion.runtime.cute.capture_pdl import CaptureGuard
-    from helion.runtime.cute.capture_pdl import LaunchEffects
-    from helion.runtime.cute.capture_pdl_cuda import CaptureDriver
-    from helion.runtime.cute.capture_pdl_cuda import CaptureSnapshot
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
 
@@ -344,32 +339,15 @@ def check_paged_attention_length_replay(
     compiled = bound.compile_config(config)
     initialize_paged_attention_inputs(args)
     lengths = cast("torch.Tensor", args[6])
+    # A config that names no dependent-launch option takes the paired default.
+    with bound.env:
+        normalized = bound.config_spec.normalized_config(config)
+    capture_overlap = normalized.get("cute_pdl_capture_overlap") is True
     with cuda_graph_for_replay() as graph:
-        capture_overlap = config.config.get("cute_pdl_capture_overlap", False)
-        modes: list[WaitMode] = []
-        finish = capture_pdl_launch.finish_capture_launch
-
-        def observed(
-            driver: CaptureDriver,
-            guard: CaptureGuard,
-            before: CaptureSnapshot,
-            effects: LaunchEffects,
-            parameter_sizes: tuple[int, ...],
-        ) -> WaitMode:
-            mode = finish(driver, guard, before, effects, parameter_sizes)
-            modes.append(mode)
-            return mode
-
-        with (
-            patch.object(capture_pdl_launch, "finish_capture_launch", observed),
-            torch.cuda.graph(graph),
-        ):
-            captured = [compiled(*args)]
-            if capture_overlap:
-                # Keep both outputs alive so the graph pool cannot reuse their storage.
-                captured.append(compiled(*args))
-        if capture_overlap:
-            assert modes == [WaitMode.EARLY, WaitMode.BEFORE_WRITES], modes
+        # A second launch reads its inputs before the first finishes.
+        captured = capture_launches(
+            graph, compiled, args, 2 if capture_overlap else 1, overlap=capture_overlap
+        )
         for counts in ((0, 0), (1, 128), (129, 256), (513, 640), (2049, 2175)):
             lengths.copy_(lengths.new_tensor(counts))
             expected = optional_lse_reference(
@@ -385,10 +363,7 @@ def check_paged_attention_length_replay(
                 value_positive_zero=value_positive_zero,
             )
             # Poison and check both launches independently, including empty intervals.
-            for output in captured:
-                for value in output:
-                    if value is not None:
-                        value.fill_(float("nan"))
+            fill_nan(captured)
             graph.replay()
             for output in captured:
                 _assert_attention_outputs(output, expected, return_lse)

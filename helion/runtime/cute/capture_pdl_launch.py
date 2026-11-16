@@ -47,6 +47,21 @@ class PendingCaptureLaunch:
             )
 
 
+def _launch_stream_capturing(tensor: torch.Tensor) -> bool:
+    """Whether the current stream of ``tensor``'s device is capturing a CUDA
+    graph.
+
+    Query the actual stream rather than a Python capture flag: raw
+    torch.cuda.graph scopes are supported, including on a non-current device.
+    Only that case pays for switching the device.
+    """
+    index = tensor.get_device()
+    if index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    with torch.cuda.device(index):
+        return torch.cuda.is_current_stream_capturing()
+
+
 def prepare_capture_launch(
     kernel: object, args: tuple[object, ...], grid: tuple[int, ...]
 ) -> PendingCaptureLaunch | None:
@@ -57,7 +72,23 @@ def prepare_capture_launch(
         or plans[0].get("kind") != "helion_paged_attention"
         or plans[0].get("capture_pdl_contract") != "paired-output-stores-v1"
         or plans[1].get("kind") != "helion_mma_dag_alias"
-        or getattr(cast("Any", kernel), "_helion_cute_use_pdl", False) is not True
+    ):
+        return None
+    indices = plans[1]["tensor_idx"]
+    if not indices:
+        return None
+    first = args[indices[0]]
+    if not isinstance(first, torch.Tensor) or not first.is_cuda:
+        return None
+    # Eager relaunches leave here. The complete proof is capture-only and an
+    # ordinary launch retains its early wait, but every launch of a kernel
+    # with the contract comes through this function, so the capture test
+    # precedes the remaining validation, the storage walk and the graph
+    # inspection.
+    if not _launch_stream_capturing(first):
+        return None
+    if (
+        getattr(cast("Any", kernel), "_helion_cute_use_pdl", False) is not True
         or getattr(cast("Any", kernel), LAST_LAUNCH_CACHE_ATTRIBUTE, None) is None
     ):
         return None
@@ -77,23 +108,10 @@ def prepare_capture_launch(
         or any(size != 128 for size in suffix[:-1])
     ):
         return None
-    indices = plans[1]["tensor_idx"]
     stored = plans[1]["stored"]
     loaded = plans[1]["capture_loaded"]
     if len(indices) != len(stored) or len(indices) != len(loaded):
         return None
-    if not indices:
-        return None
-    first = args[indices[0]]
-    if not isinstance(first, torch.Tensor) or first.device.type != "cuda":
-        return None
-    # Eager relaunches should not walk storages or inspect graph nodes. The
-    # complete proof is capture-only; ordinary launches retain their early wait.
-    # Query the actual stream rather than a Python capture flag: raw
-    # torch.cuda.graph scopes are supported, including on a non-current device.
-    with torch.cuda.device(first.device):
-        if not torch.cuda.is_current_stream_capturing():
-            return None
     reads: list[StorageRange] = []
     writes: list[StorageRange] = []
     device: torch.device | None = None

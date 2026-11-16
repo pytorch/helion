@@ -28,8 +28,9 @@ def test_paged_attention_waits_for_delayed_lengths(per_key, paired):
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("the paged pipeline uses SM100 tensor memory")
     rows = 8 if per_key else 64
-    # A paired launch has 300 logical items but only 150 physical CTAs:
-    # on a 148-SM target its last-wave release starts at CTA 2, not 152.
+    # A paired launch has 300 logical items but only 150 physical CTAs, two
+    # more than a 148-SM target holds: past one wave the paired schedule
+    # releases at entry in every CTA.
     requests = 150 if paired else 2
     args = list(paged_attention_args(device=DEVICE, rows=rows, requests=requests))
     args[-1] = -1

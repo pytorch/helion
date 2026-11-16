@@ -210,7 +210,13 @@ def test_real_paired_surface_crosses_retirement_and_v_lag_only_on_paired_parents
     assert keys == (KEY, retirement, v_lag)
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
-        parent = paired_v_lag_config(0)
+        # A parent as the search hands it over: a searched paired config
+        # carries the kernel's default dependent-launch policy, whatever the
+        # config it was transferred from named.
+        _, parent = generation.canonicalize_flat(
+            generation.flatten(paired_v_lag_config(0))
+        )
+        assert parent.get("cute_pdl_capture_overlap") is True
         candidates = compiler_refinement_candidates(generation, [parent], keys)
         assert {
             (
@@ -232,8 +238,9 @@ def test_real_paired_surface_crosses_retirement_and_v_lag_only_on_paired_parents
             and candidate.config[retirement]
             and candidate.config[v_lag] == 2
         )
-        parent.config["cute_mma_dag_pass_warps"] = "attention"
-        candidates = compiler_refinement_candidates(generation, [parent], keys)
+        unpaired = paired_v_lag_config(0)
+        unpaired.config["cute_mma_dag_pass_warps"] = "attention"
+        candidates = compiler_refinement_candidates(generation, [unpaired], keys)
         assert len(candidates) == 1
         assert candidates[0].config.config[KEY] == "opt2"
         assert candidates[0].config.config[retirement] is False

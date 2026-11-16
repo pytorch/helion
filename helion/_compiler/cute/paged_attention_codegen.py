@@ -11,6 +11,8 @@ import torch
 from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
+from .autotune.mma_dag_surface import carries_capture_overlap
+from .cute_mma_dag import MMA_DAG_KEY_CLIP_OFF
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
 from .cute_mma_dag_codegen import emit_mma_dag_module_statements
 from .cute_mma_dag_codegen import mma_dag_alias_plan
@@ -20,8 +22,8 @@ from .fx_matcher import _is_call
 from .paged_attention_transport import paged_attention_launch_warps
 from .paged_attention_transport import paged_attention_tma_accesses
 from .passes.pdl import exit_release_applies
-from .pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
-from .pdl_release import CUTE_PDL_RELEASE_DEFAULT
+from .passes.pdl import loader_tail_release_applies
+from .pdl_release import capture_policy_available
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
@@ -143,14 +145,18 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             "cutlass.GridConstant[_helion_mma_dag_tc.cuda.TensorMap]"
         )
         query_arg = f", query_map={query_param}"
+    # The occupancy this body launches with; the dependent-launch release
+    # rule sizes the grid's waves from it (``passes.pdl``).
+    df.cute_state.tcgen05.min_blocks_per_mp = schedule.min_blocks_per_mp
+    # The config asks for the overlap and the rest of it permits that
+    # (``carries_capture_overlap``, by the rule normalization applies); the
+    # checks below are this emitter's own: one root, and the effect proof.
+    available = capture_policy_available(CompileEnvironment.current().config_spec)
     guarded_pdl = (
-        schedule.paired_items
-        and df.config.config.get("cute_pdl_capture_overlap") is True
-        and df.config.config.get("cute_pdl") is True
-        and df.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
-        in CUTE_PDL_CAPTURE_RELEASE_CHOICES
+        carries_capture_overlap(available, df.config.config)
         and len(HostFunction.current().device_ir.root_ids) == 1
     )
+    assert not guarded_pdl or schedule.paired_items
     if guarded_pdl:
         expected_stores = {
             semantic.output.node,
@@ -178,7 +184,11 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         # plan enumerates all of those argument storages for the runtime proof.
         wrapper["capture_pdl_contract"] = "paired-output-stores-v1"
         mode_arg = f", capture_pdl_wait_mode={mode}"
-        if df.config.config.get("cute_pdl_release") == "loader_tail":
+        if df.config.config.get(
+            "cute_pdl_release"
+        ) == "loader_tail" and loader_tail_release_applies(df):
+            # Past one wave the automatic release takes over: the entry of
+            # every CTA (``passes.pdl.prepare_device_body``).
             df.cute_state.lanes.pdl_loader_tail_release = True
             mode_arg += ", capture_release_tail=True"
     coords = semantic.coordinates
@@ -200,6 +210,10 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             # The generic exit release follows the body in every thread: keep
             # one common end so no finished role releases the dependents early.
             panel_arg += ", join_before_exit=True"
+    if schedule.key_clip != MMA_DAG_KEY_CLIP_OFF:
+        assert schedule.paired_items and schedule.fast_math
+        assert not schedule.value_metadata_skip
+        panel_arg += f", key_clip={schedule.key_clip!r}"
     if schedule.probability_schedule != MMA_DAG_PROBABILITY_SCHEDULE_SERIAL:
         assert schedule.paired_items and semantic.score_reference is not None
         panel_arg += f", probability_schedule={schedule.probability_schedule!r}"
@@ -283,4 +297,3 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         ]
     wrappers.append(alias_plan)
     df.cute_state.lanes.owned_root_block_dims = (schedule.launch_warps * 32, 1, 1)
-    df.cute_state.tcgen05.min_blocks_per_mp = schedule.min_blocks_per_mp
