@@ -3,8 +3,8 @@
 their reduction loop, and kernels with a block size that is no tile axis of
 the rows.
 
-Plain functions, which ``test/test_cute_row_seed_gates.py`` binds with the
-settings it needs.
+Plain functions, which ``test/test_cute_row_seed_gates.py`` and
+``test/test_cute_row_packet_seeds.py`` bind with the settings they need.
 """
 
 from __future__ import annotations
