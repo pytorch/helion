@@ -1087,6 +1087,12 @@ class ConfigSpec:
         # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
         # any (``tail_peel_blocks``).
         self.cute_tail_peel_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: the blocks of the device loops whose
+        # reductions over their own tile are all fp32 or fp64 sums added to
+        # a value the loop carries, none in a kernel with a matmul;
+        # ``cute_defer_tile_reduce`` is tunable when there are any
+        # (``carried_tile_sum_blocks``).
+        self.cute_carried_tile_sum_blocks: frozenset[int] = frozenset()
         # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
         # fp32 quotient whose divisor is a scalar or a broadcast row value
         # (``hoist_loop_invariant_recip``'s exact hoist can apply), so

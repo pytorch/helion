@@ -54,7 +54,10 @@ from ..register_tile_admission import RegisterTileOptions
 from ..register_tile_admission import RegisterTileUnsupported
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
 from .markers import _CUTE_UNIFORM_GLOBAL_NAMES
+from .markers import HELION_FINALIZED
+from .markers import HELION_LANE_SPLIT_ATTR
 from .markers import HELION_VECTOR_REDUCTION_OWNER_ATTR
+from .markers import LaneSplitRecord
 from .markers import _combine_expr
 from .markers import _create_lane_loop
 from .markers import _dtype_ctor_from_identity
@@ -1113,9 +1116,11 @@ def _split_one_lane_loop(
     prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
     accumulate_body: list[ast.AST] = [body[i] for i in phase1_indices]
     marker_updates: dict[int, ast.AST] = {}
+    accumulators: list[str] = []
     finalize: list[ast.AST] = []
     for marker_index, m in markers:
         acc_var = f"{m.result_var}_lane_acc"
+        accumulators.append(acc_var)
         prefix.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
         # Cast the per-lane input to the accumulator dtype before combining so
         # the CUTLASS DSL's strict ternary type check (max/min emit a Python
@@ -1241,7 +1246,21 @@ def _split_one_lane_loop(
 
     result: list[ast.AST] = []
     result.extend(prefix)
-    result.append(_clone_lane_loop_with_body(loop, accumulate_body))
+    accumulate_loop = _clone_lane_loop_with_body(loop, accumulate_body)
+    if running_sum is None:
+        # What ``defer_tile_reductions`` moves out of an enclosing device
+        # loop (``cute_defer_tile_reduce``).
+        setattr(
+            accumulate_loop,
+            HELION_LANE_SPLIT_ATTR,
+            LaneSplitRecord(
+                markers=tuple(marker for _, marker in markers),
+                accumulators=tuple(accumulators),
+                resets=tuple(prefix),
+                finalize=tuple(finalize),
+            ),
+        )
+    result.append(accumulate_loop)
     result.extend(finalize)
     result.extend(lane_invariant_tail)
     if lane_varying_tail:
@@ -3232,7 +3251,7 @@ def _rereduce_restored_lane_markers(
         # The per-lane finalize of the restore, assigned to the share instead
         # of the result (the wrap, a cast or reshape, is applied to the total).
         per_lane = dataclasses.replace(
-            marker, result_var=share, wrap_template="__HELION_FINALIZED__"
+            marker, result_var=share, wrap_template=HELION_FINALIZED
         )
         loop_body.extend(_finalize_lane_reduce_marker(per_lane, marker.input_name))
         ctor = _dtype_ctor_from_identity(marker.identity_expr)

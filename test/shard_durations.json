@@ -88,6 +88,7 @@
  "test/test_cute_consumer_packet_prefetch.py": 5.1,
  "test/test_cute_contiguous_copy_analysis.py": 12.6,
  "test/test_cute_deepgemm_selected.py": 33.4,
+ "test/test_cute_defer_tile_reduce_cuda.py": 19.4,
  "test/test_cute_delinearized_packets.py": 2.1,
  "test/test_cute_device_loop_lane_carries.py": 9.3,
  "test/test_cute_device_loop_lane_unroll.py": 6.7,

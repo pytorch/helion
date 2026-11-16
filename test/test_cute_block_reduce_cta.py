@@ -287,12 +287,13 @@ def test_complete_tile_reduction_native(threads):
 
 @pytest.mark.parametrize("threads", [64, 128, 512])
 def test_multiwarp_finalize_without_group_proof_rejects(threads):
+    from helion._compiler.cute.lane_loops.markers import HELION_FINALIZED
     from helion._compiler.cute.lane_loops.markers import _finalize_lane_reduce_marker
     from helion._compiler.cute.lane_loops.markers import _LaneReduceMarker
 
     marker = _LaneReduceMarker(
         input_name="value",
-        wrap_template="__HELION_FINALIZED__",
+        wrap_template=HELION_FINALIZED,
         reduction_type="max",
         identity_expr="cutlass.Float32(float('-inf'))",
         threads_in_group=threads,

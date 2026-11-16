@@ -4,6 +4,7 @@ import ast
 
 import pytest
 
+from helion._compiler.cute.lane_loops.markers import HELION_FINALIZED
 from helion._compiler.cute.lane_loops.markers import _LaneReduceMarker
 from helion._compiler.cute.lane_loops.split import _lane_split_reorders_aliasing_memory
 from helion._compiler.cute.persistent_branch_vec import _BranchLocalPersistentVectorizer
@@ -126,9 +127,7 @@ def test_oversized_lane_dependency_cannot_justify_load_or_store_motion() -> None
         body, store, len(body) - 1, "lane", 4, snapshots
     )
     body.extend(ast.parse("reduced = value").body)
-    marker = _LaneReduceMarker(
-        "reduced", "value", "sum", "0.0", 32, "__HELION_FINALIZED__"
-    )
+    marker = _LaneReduceMarker("reduced", "value", "sum", "0.0", 32, HELION_FINALIZED)
     assert _lane_split_reorders_aliasing_memory(
         list(body), [(len(body) - 1, marker)], set(), "lane", 4, {}
     )
@@ -144,9 +143,7 @@ def test_disjoint_memory_does_not_require_expanding_unrelated_arithmetic() -> No
             "reduced = result\n"
         ).body
     )
-    marker = _LaneReduceMarker(
-        "reduced", "result", "sum", "0.0", 32, "__HELION_FINALIZED__"
-    )
+    marker = _LaneReduceMarker("reduced", "result", "sum", "0.0", 32, HELION_FINALIZED)
     assert _definition_snapshots(body) is None
     assert not _lane_split_reorders_aliasing_memory(
         list(body),
@@ -166,9 +163,7 @@ def test_packed_word_load_without_a_write_has_nothing_to_reorder() -> None:
     # The FP4 decode helpers load a byte-packed word whose element count the
     # access proof cannot see.  With no write in the lane body there is still
     # nothing for the split to reorder; with one, the split stays refused.
-    marker = _LaneReduceMarker(
-        "reduced", "value", "sum", "0.0", 32, "__HELION_FINALIZED__"
-    )
+    marker = _LaneReduceMarker("reduced", "value", "sum", "0.0", 32, HELION_FINALIZED)
     load = (
         "w = cute.arch.load(x.iterator + lane * 8, cutlass.Uint64)\n"
         "value = cutlass.Float32(w)\n"
@@ -216,9 +211,7 @@ def test_address_proof_ignores_unrelated_large_values(
     assert snapshots is not None
     assert ast.unparse(snapshots[1]["pointer"]) == "x.iterator + lane"
     assert all("value_80" not in definitions for definitions in snapshots)
-    marker = _LaneReduceMarker(
-        "reduced", "result", "sum", "0.0", 32, "__HELION_FINALIZED__"
-    )
+    marker = _LaneReduceMarker("reduced", "result", "sum", "0.0", 32, HELION_FINALIZED)
     assert (
         _lane_split_reorders_aliasing_memory(
             list(body), [(len(body) - 1, marker)], set(), "lane", 4, {}

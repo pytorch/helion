@@ -27,6 +27,7 @@ from ...ast_read_writes import dead_assignment_elimination
 from ...ast_read_writes import dead_expression_elimination
 from ..passes.hoist_chunk_recurrence import hoist_lane_invariant_chunk_recurrence
 from ..register_tile_admission import RegisterTileOptions
+from .defer_tile_reductions import defer_tile_reductions
 from .markers import has_lane_reduce_markers
 from .markers import restore_unprocessed_lane_reduce_markers
 from .markers import validate_lane_reduce_owners
@@ -171,6 +172,12 @@ def run_root_lane_passes(codegen: GenerateAST) -> None:
         codegen.device_function.body = restore_unprocessed_lane_reduce_markers(
             list(codegen.device_function.body)
         )
+        if knobs.get("cute_defer_tile_reduce") is True:
+            # Combine a carried tile sum across the threads once, after its
+            # device loop, instead of once per tile.
+            codegen.device_function.body = defer_tile_reductions(
+                list(codegen.device_function.body), lane_rename_groups
+            )
     # Restructure chunked-recurrence ``for chunk: for lane:``
     # nests whose matmul ``dot_acc`` running-sum needs the
     # lane-invariant rescale / chunk-entry stores / final combine
