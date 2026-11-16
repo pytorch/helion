@@ -3857,9 +3857,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfCudaCapabilityLessThan((10, 0), reason="dot roots stay in kernel scope")
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_guarded_task_publishes_relaxed_when_it_writes_nothing(self) -> None:
-        x = torch.randn((128, 64), device=DEVICE, dtype=torch.float16)
-        w = torch.randn((64, 32), device=DEVICE, dtype=torch.float16)
-        w2 = torch.randn((32, 32), device=DEVICE, dtype=torch.float16)
+        x = torch.randint(-2, 3, (128, 64), device=DEVICE).half()
+        w = torch.randint(-2, 3, (64, 32), device=DEVICE).half()
+        w2 = torch.randint(-2, 3, (32, 32), device=DEVICE).half()
         for pattern in ([1, 0, 2, 0, 1, 1, 0, 0], [0] * 8, [1] * 8):
             counts = torch.tensor(pattern, device=DEVICE, dtype=torch.int32)
             counts = counts.repeat_interleave(16)
@@ -3873,9 +3873,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     num_sm_multiplier=1,
                     num_warps=4,
                 )
-                torch.testing.assert_close(
-                    out, staged.float() @ w2.float(), rtol=1e-2, atol=1e-2
-                )
+                torch.testing.assert_close(out, staged.float() @ w2.float())
                 arrivals = [
                     line.strip()
                     for line in code.splitlines()
@@ -3893,9 +3891,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         # The guarded root's stores supersede the zero fill: its consumer relies
         # on the guarded task's release for the zero fill too, so a task that
         # skips its writes still publishes with release.
-        x = torch.randn((128, 64), device=DEVICE, dtype=torch.float16)
-        w = torch.randn((64, 32), device=DEVICE, dtype=torch.float16)
-        w2 = torch.randn((32, 32), device=DEVICE, dtype=torch.float16)
+        x = torch.randint(-2, 3, (128, 64), device=DEVICE).half()
+        w = torch.randint(-2, 3, (64, 32), device=DEVICE).half()
+        w2 = torch.randint(-2, 3, (32, 32), device=DEVICE).half()
         counts = torch.tensor([1, 0, 2, 0, 1, 1, 0, 0], device=DEVICE)
         counts = counts.to(torch.int32).repeat_interleave(16)
         staged = torch.where(counts[:, None] > 0, (x.float() @ w.float()).half(), 0)
@@ -3908,9 +3906,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 num_sm_multiplier=1,
                 num_warps=4,
             )
-            torch.testing.assert_close(
-                out, staged.float() @ w2.float(), rtol=1e-2, atol=1e-2
-            )
+            torch.testing.assert_close(out, staged.float() @ w2.float())
             arrivals = [
                 line
                 for line in code.splitlines()
@@ -3927,9 +3923,9 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         # on ``scaled`` protects, so the wait follows the guard; a guard that
         # reads ``scaled`` keeps the wait before it, as does a guarded root
         # whose writes supersede the zero fill (its consumer relies on it).
-        x = torch.randn((128, 64), device=DEVICE, dtype=torch.float16)
-        w = torch.randn((64, 32), device=DEVICE, dtype=torch.float16)
-        w2 = torch.randn((32, 32), device=DEVICE, dtype=torch.float16)
+        x = torch.randint(-2, 3, (128, 64), device=DEVICE).half()
+        w = torch.randint(-2, 3, (64, 32), device=DEVICE).half()
+        w2 = torch.randint(-2, 3, (32, 32), device=DEVICE).half()
         counts = torch.tensor([1, 0, 2, 0, 1, 1, 0, 0], device=DEVICE)
         counts = counts.to(torch.int32).repeat_interleave(16)
         rows_live = (x[::16, 0] * 2 > 0).repeat_interleave(16)
@@ -3949,9 +3945,7 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     num_sm_multiplier=1,
                     num_warps=4,
                 )
-                torch.testing.assert_close(
-                    out, staged.float() @ w2.float(), rtol=1e-2, atol=1e-2
-                )
+                torch.testing.assert_close(out, staged.float() @ w2.float())
                 (guard,) = [
                     node
                     for node in ast.walk(ast.parse(code))
