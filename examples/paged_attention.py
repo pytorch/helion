@@ -8,6 +8,11 @@ pages, each sequence addresses its pages through a block table, and a batch
 of decode and prefill requests is packed into one ``[total_q_tokens, ...]``
 query tensor.
 
+Based on the PyTorch blog post "Portable paged attention in Helion"
+(https://pytorch.org/blog/portable-paged-attention-in-helion/) and on the
+vLLM Triton attention backend ``triton_unified_attention.py``:
+https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/ops/triton_unified_attention.py
+
 Structure of the kernel (GQA supported; a query tile covers all query heads
 of one KV head, so a tile never straddles KV heads):
 
@@ -26,12 +31,15 @@ of one KV head, so a tile never straddles KV heads):
 - **Ladder specialization**: ``q_block_padded_size`` is the query length
   rounded up to a power of two (the ceiling of the q-block block size), so
   decode and prefill batches of different lengths autotune separately.
+  At the same time, the ladder is required to not compile & autotune every
+  different shape that happens to be scheduled by vLLM.
 - **Default configs**: a small list of tile shapes covering the serving
-  regimes; the autotuner picks among these instead of searching the full
-  space.
+  regimes. The autotuner measures them per specialization key and keeps
+  the fastest, which keeps the example quick and deterministic — but the
+  shapes are informed by measurements of the source kernel on sm_100 GPUs
+  and are not optimal on other targets or workloads. Remove ``configs=``
+  from the decorator to let the autotuner search the full space.
 
-Based on the kernel in ``kernels/helion_unified_attention.py`` of the
-helion-aot-research repo.
 """
 
 # %%
@@ -44,9 +52,6 @@ from __future__ import annotations
 import torch
 
 import helion
-from helion._testing import DEVICE
-from helion._testing import HALF_DTYPE
-from helion._testing import run_example
 import helion.language as hl
 
 # %%
@@ -71,6 +76,8 @@ def _next_power_of_2(n: int) -> int:
 # autotuner measures these per specialization key and keeps the fastest;
 # configs whose q_block exceeds the ladder ceiling of a key (the prefill
 # shapes under a decode key) are dropped automatically.
+# Measured on sm_100 GPUs; not optimal for other targets or workloads —
+# see the module docstring for the caveat and how to enable a full search.
 DEFAULT_CONFIGS = [
     # prefill / mixed: wide query tile
     helion.Config(block_sizes=[32, 4, 4], num_warps=4, num_stages=2, pid_type="flat"),
@@ -88,7 +95,7 @@ DEFAULT_CONFIGS = [
 
 
 # %%
-# Condensed from the kernel in the PyTorch blog post "Portable paged attention
+# Based on the kernel presented in the PyTorch blog post "Portable paged attention
 # in Helion" (https://pytorch.org/blog/portable-paged-attention-in-helion/).
 # Unlike a naive implementation, which materializes each sequence's full
 # [q, kv] score matrix, this kernel runs an online softmax over one KV tile
@@ -141,6 +148,7 @@ def paged_attention_kernel(
 
     out = torch.empty_like(q)
 
+    # pyrefly: ignore [bad-argument-type]
     q_block_size = hl.register_block_size(1, q_block_padded_size)
     num_pages_at_once = hl.register_block_size(1, 32)
     num_pages_at_once_full = hl.register_block_size(1, 32)
@@ -157,6 +165,7 @@ def paged_attention_kernel(
         # vectorized gid -> seq_idx: cu_seqlens_q // q_block + s is monotone
         # in s, so the sequence owning this block is the rank of gid among
         # the per-sequence block starts
+        # pyrefly: ignore [bad-argument-type]
         s_idx = hl.arange(num_seqs_padded)
         valid = s_idx < num_seqs
         cu = hl.load(cu_seqlens_q, [s_idx], extra_mask=valid)
@@ -212,8 +221,11 @@ def paged_attention_kernel(
             for tile_p in hl.tile(full_pages, block_size=num_pages_at_once_full):
                 page_ids = hl.load(
                     block_tables_flat,
-                    [block_table_offset + tile_p.begin
-                     + hl.arange(num_pages_at_once_full)],
+                    [
+                        block_table_offset
+                        + tile_p.begin
+                        + hl.arange(num_pages_at_once_full)
+                    ],
                 )
                 page_ids = page_ids.view([num_pages_at_once_full]).to(torch.int64)
                 block_n = num_pages_at_once_full * page_size
@@ -233,13 +245,10 @@ def paged_attention_kernel(
                 m_i = m_new
 
             # ── boundary tiles around the diagonal: masked body ──────────
-            for tile_p in hl.tile(
-                full_pages, num_blocks, block_size=num_pages_at_once
-            ):
+            for tile_p in hl.tile(full_pages, num_blocks, block_size=num_pages_at_once):
                 page_ids = hl.load(
                     block_tables_flat,
-                    [block_table_offset + tile_p.begin
-                     + hl.arange(num_pages_at_once)],
+                    [block_table_offset + tile_p.begin + hl.arange(num_pages_at_once)],
                 )
                 page_ids = page_ids.view([num_pages_at_once]).to(torch.int64)
                 block_n = num_pages_at_once * page_size
@@ -381,29 +390,40 @@ def test(
     num_kv_heads: int = 8,
     head_dim: int = 128,
     page_size: int = 16,
-    dtype: torch.dtype = HALF_DTYPE,
-    device: torch.device | str = DEVICE,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
 ) -> None:
     """Runs the kernel against the reference on the given batch."""
+    # helion._testing hard-imports pytest; importing it lazily keeps this
+    # module (and the kernel) importable without a test framework installed,
+    # e.g. when a benchmark harness loads the kernel by file path.
+    from helion._testing import DEVICE
+    from helion._testing import HALF_DTYPE
+    from helion._testing import run_example
+
+    dtype = HALF_DTYPE if dtype is None else dtype
+    device = DEVICE if device is None else device
     torch.manual_seed(0)
     # default batch: decodes with context, prefills with and without
     # context, and a ragged length
-    if query_lens is None:
+    if query_lens is None or seq_lens is None:
         query_lens = [1, 1, 1, 128, 512, 2048, 333, 1]
         seq_lens = [4096, 1023, 77, 512, 1024, 2048, 1000, 3]
 
     cu_seqlens_q = [0]
     for n in query_lens:
         cu_seqlens_q.append(cu_seqlens_q[-1] + n)
-    q = torch.randn(
-        cu_seqlens_q[-1], num_heads, head_dim, dtype=dtype, device=device
-    )
+    q = torch.randn(cu_seqlens_q[-1], num_heads, head_dim, dtype=dtype, device=device)
 
     # page pool with a disjoint page range per sequence
     pages_per_seq = [(n + page_size - 1) // page_size for n in seq_lens]
     key_cache = torch.randn(
-        sum(pages_per_seq), page_size, num_kv_heads, head_dim,
-        dtype=dtype, device=device,
+        sum(pages_per_seq),
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
     )
     value_cache = torch.randn_like(key_cache)
     block_table = torch.zeros(
