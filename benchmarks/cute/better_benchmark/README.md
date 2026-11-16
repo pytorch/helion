@@ -41,7 +41,9 @@ and the scripts warn when the checkout is at another commit.
   CUDA graph replay, the way it is timed.
 - `campaign.py`: run autotune and bench jobs for a selection across GPUs;
   a job during which another process computed on its GPU runs again
-  (`--retry-contaminated`). `--configs-from` benches another run's picks.
+  (`--retry-contaminated`). `--configs-from` benches another run's picks,
+  `--seeds-from` searches from another run's random seeds, and every
+  search's per-config log is kept under the run's `logs/search`.
 - `plan_run.py`: plan a campaign from earlier runs' records: every CuTe
   autotune, the Triton autotunes whose earlier records cannot be reused
   (contaminated, unsampled, or no longer generating the code they were
@@ -49,8 +51,9 @@ and the scripts warn when the checkout is at another commit.
 - `report.py`: summarize a campaign: geomean, time-weighted and
   model-weighted speedups over Inductor with and without the T5 outlier,
   per-family rows, %SOL, Helion-Triton, and each kernel next to a
-  `--baseline` run; contaminated and unsampled records are listed and left
-  out of the aggregates.
+  `--baseline` run, with how many of the run's autotunes searched from that
+  run's seeds; contaminated and unsampled records are listed and left out
+  of the aggregates.
 - `audit_activity.py`: list a run's records whose activity samples do not
   cover their jobs (no samples, too many failed ones, a long stretch without
   one, or a sampling thread that died), with the numbers it went by.
@@ -164,8 +167,9 @@ touching its records, bench them into a run directory of their own, which
 
 ```bash
 S=benchmarks/cute/better_benchmark
-python $S/campaign.py --selection $S/selection.json --run-dir RUN-rot \
-    --configs-from RUN/configs --phases bench --rotate-inputs 8 --board-gpus 2
+scripts/gpu_board.py run --gpus 0,1 --purpose "better-benchmark RUN-rot" -- \
+    python $S/campaign.py --selection $S/selection.json --run-dir RUN-rot \
+    --configs-from RUN/configs --phases bench --rotate-inputs 8 --gpus 0,1
 python $S/report.py RUN-rot
 ```
 
@@ -201,12 +205,28 @@ A run needs:
 - A better-benchmark checkout at `selection.json`'s `better_benchmark_commit`,
   found through `BETTER_BENCHMARK_ROOT` unless it sits at `../better-benchmark`
   next to the Helion checkout (next to a worktree it usually does not).
-- GPUs from the machine's GPU board (`scripts/gpu_board.py`): `--board-gpus N`
-  claims up to N free GPUs while jobs can start, renews the claims every third
-  of `--board-ttl` and hands back GPUs no job can use. A renewal extends every
-  claim of the board session, so run the campaign under a `GPU_BOARD_SESSION`
-  of its own. (`--gpus` takes GPUs you hold yourself for the whole run, for
-  example under `scripts/gpu_board.py run --gpus ... --ttl ...`.)
+- GPUs that you hold on the machine's GPU board (`scripts/gpu_board.py`) for
+  the whole run and give the campaign by number: `--gpus 0,1,2,3` under
+  `scripts/gpu_board.py run --gpus 0,1,2,3 -- ...`, as in the commands below.
+  `run` claims exactly those GPUs, renews the claim for as long as the
+  campaign runs and releases it when the campaign ends. The claim's `--ttl`
+  (one hour unless given) does not limit the run: it is at most how long the
+  claim outlives a `run` that was killed, which is a reason to leave it
+  short. `run` does not wait for the GPUs: when one is busy or claimed, by
+  another account or by another session of yours, or holds idle processes of
+  another account, it exits with status 1 and names the GPU, and no campaign
+  has started. Run it again once the GPU is free (`--shared` would start
+  beside those idle processes, and is not for timing); the study's launcher
+  tried once a minute.
+- No other account's jobs on those GPUs. Nothing in the campaign keeps it to
+  a set of GPUs: the numbers you give are that guard (the first guard
+  below). `--board-gpus N` leaves the choice to the board instead: it claims
+  up to N free GPUs while jobs can start, renews the claims every third of
+  `--board-ttl` and hands back GPUs no job can use (a renewal extends every
+  claim of the board session, so run the campaign under a
+  `GPU_BOARD_SESSION` of its own). It takes any GPU that is free when it
+  asks, so it is for a machine where every GPU the board calls free is one
+  to time on.
 
 The study's numbers come from B200s; every record lists its GPU and the
 torch, Triton, cutlass-dsl and Helion versions it ran with. `selection.json`
@@ -221,6 +241,7 @@ A run in a new directory `RUN`, reusing what still holds of earlier runs
 ```bash
 export BETTER_BENCHMARK_ROOT=/path/to/better-benchmark GPU_BOARD_SESSION=bb-RUN
 S=benchmarks/cute/better_benchmark
+G=0,1,2,3  # GPUs of this account that no other account's jobs use
 # Plan: every CuTe autotune, the Triton autotunes whose earlier records do not
 # hold, every bench. Checking a reusable record's pinned code needs a GPU of
 # your own; --no-pin-check reuses nothing.
@@ -228,26 +249,170 @@ scripts/gpu_board.py run -n 1 --purpose "plan a better-benchmark run" -- \
     python $S/plan_run.py --run-dir RUN --prior PRIOR --provisional-triton --write
 # Phase 1: the CuTe autotunes and the benches, which time Helion-Triton on the
 # earlier runs' configs (flagged provisional in the report).
-python $S/campaign.py --selection $S/selection.json --run-dir RUN \
-    --backends cute --board-gpus 4
+scripts/gpu_board.py run --gpus $G --purpose "better-benchmark RUN" -- \
+    python $S/campaign.py --selection $S/selection.json --run-dir RUN \
+    --backends cute --gpus $G
 python $S/report.py RUN --baseline BASE
 # Phase 2: the Triton autotunes, each point benched again after its own.
-python $S/campaign.py --selection $S/selection.json --run-dir RUN \
-    --backends triton --board-gpus 4
+scripts/gpu_board.py run --gpus $G --purpose "better-benchmark RUN" -- \
+    python $S/campaign.py --selection $S/selection.json --run-dir RUN \
+    --backends triton --gpus $G
 python $S/report.py RUN --baseline BASE
 ```
 
-Without earlier runs one campaign does everything (`campaign.py --selection
-$S/selection.json --run-dir RUN --board-gpus 4`, then `report.py RUN`). A
-stopped campaign picks up where it stopped when started again with the same
-arguments. Phase 2 keeps each phase-1 bench record as `bench/<point>.json.prev`,
-so the two phases' Inductor and CuTe times check each other.
+Without earlier runs one campaign does everything (the phase-1 command
+without `--backends`, then `report.py RUN`). A stopped campaign picks up
+where it stopped when started again with the same arguments. Phase 2 keeps
+each phase-1 bench record as `bench/<point>.json.prev`, so the two phases'
+Inductor and CuTe times check each other. Where the comparison with BASE is
+of two trees, give the campaigns `--seeds-from BASE` (next section).
 `plan_run.py --reuse-unsampled` also reuses Triton records made before the
 activity sampling existed; `report.py` counts those ports only with
 `--include-unsampled`, which counts every record made before the sampling.
 
+### Comparing two trees: the same seeds
+
+On a large kernel the pick of a cold autotune follows the initial population
+that its random seed draws. In this study (two kernels, of 2.4 and 8.6 GB)
+one seed started the searches of two Helion trees from the same population
+and ended them at the same level of pick, while searches from different
+seeds ended 4 to 10% apart, more than most compiler changes move a kernel.
+A campaign gives every autotune job a fresh seed, so a before/after
+comparison of two trees with one autotune each compares the trees only
+where both searched from the same seed. `--seeds-from BASE` runs the
+after-campaign that way. The seed draws the population from the port's
+search space, so it is the same population only where both trees build the
+same space: a tree that adds or changes a tunable, a seed config or the way
+the population is drawn starts from another one on the same seed, and its
+before/after still holds that difference. Generation 0 of the two runs'
+`search.csv` (Search logs, below) shows whether the populations are the
+same.
+
+```bash
+scripts/gpu_board.py run --gpus $G --purpose "better-benchmark RUN" -- \
+    python $S/campaign.py --selection $S/selection.json --run-dir RUN \
+    --backends cute --seeds-from BASE --gpus $G
+python $S/report.py RUN --baseline BASE
+```
+
+- Each autotune takes the seed of the autotune record that stands in
+  `BASE/configs` for the same (repro, shape, backend): the
+  `HELION_AUTOTUNE_RANDOM_SEED` in the record's `env`, where `autotune.py`
+  records its job's `HELION_*` environment. That is the seed of the search
+  the pick came from whichever attempt's record stands (the first clean
+  one, or the cleanest kept after contaminated attempts) and whichever run
+  made it (a record `plan_run.py` reused carries its own search's). Every
+  record of the study's runs has it. The `job_start` events of
+  `BASE/campaign.jsonl` are no source for it: a job that started several
+  times has a seed per start there, and the events do not say whose record
+  stands.
+- The job searches from that seed on every start. A rerun after a
+  contaminated attempt repeats it, as does a restart of a stopped campaign
+  with the same arguments; without the option each start draws a fresh
+  seed.
+- A port BASE names no seed for searches from a fresh one: BASE has no ok
+  record of it, only a provisional one (another run's pick standing in for
+  an autotune that did not run), or a record whose search was given no seed
+  (`autotune.py` run by hand). The `seeds_from` event in
+  `RUN/campaign.jsonl` lists the seed of each autotune the campaign is to
+  run and, as `fresh`, the ones left on a fresh seed, with the reason. The
+  campaign stops before it changes anything when BASE names no seed for any
+  selected autotune (`BASE/configs` given for `BASE`, say), and when BASE
+  is `RUN` itself.
+- A paired autotune's record names BASE as `seed_from`, and so does its
+  `job_start` event; an autotune on a fresh seed has neither. `report.py
+  --baseline BASE` says how many of the autotunes the run made searched
+  from the seed of BASE's autotune of the same port, and for the others
+  where their seeds came from (their own, or the run `seed_from` names). It
+  counts by the seeds in the two runs' records, so two runs that both took
+  their seeds from a third count as paired, and a port that BASE has
+  autotuned again since does not.
+- The option combines with `--only`, `--retune` and a planned run: an
+  autotune the campaign does not run takes no seed (a finished one, or a
+  Triton record `plan_run.py` reused), and one that replaces a provisional
+  record takes BASE's like any other. It has no use with `--configs-from`,
+  which autotunes nothing.
+
+The same seed does not make two searches the same. The initial population
+is drawn from the seed (over the tree's search space, above), but the
+generations after it follow the timings.
+Nine searches of pointwise_238e96847398 from the seed of an earlier run's
+all measured that run's initial population: 108 configs whose fastest and
+median readings are those of its log to 0.5%, and the same configs in the
+same order in the seven that kept a search log. No two of those seven
+explored the same first generation (0 to 29 of its 44 to 48 configs in
+common). The nine went on for 2 to 6 generations and 256 to 443 configs,
+where that run's search took 2 and 256. Four ended on that run's pick (17.2
+and 17.4 us in two benches' `cold_us`) and five on five others (16.2 to
+16.6 us in four benches). The same seeds take the seed's share out of a
+before/after, not the rest of a search's spread.
+
+### Search logs
+
+Every autotune job keeps the autotuner's log of its searches
+(`HELION_AUTOTUNE_LOG`) in `RUN/logs/search/<repro>__<shape>__<backend>/`,
+so a campaign's searches can be analysed afterwards instead of replayed
+with the same seed:
+
+- `search.csv`: two rows per benchmarked config, `started` and its outcome,
+  in the order they happened, with `run_id` (one per kernel search: a port
+  with several kernels appends them all), `timestamp_s`, `config_id`,
+  `generation` (0 is the initial population), `status`, `perf_ms`,
+  `compile_time_s` and the config.
+- `search.log`: the search's messages, which the job's log under
+  `RUN/logs/autotune` holds too.
+- `search.sources.csv`, where a search records them: the digests of the
+  code its configs generated.
+
+A job that runs again keeps the earlier logs like its other files: a
+contaminated attempt's as `<directory>.attempt<k>`, the previous run's as
+`<directory>.prev`. The files of one suffix are one start's: where the
+previous run left no search logs (`--no-search-logs`) or no log of its
+own, the older `.prev` ones go instead of staying beside that run's
+record.
+
+A record and its `job_start` event name the files the job wrote while it
+ran (`env.HELION_AUTOTUNE_LOG` and `search_log`, as `log` for the job's
+log), not where they are after the job was set aside: for
+`<record>.attempt<k>` or `<record>.prev`, add that suffix to the directory
+and to the job's log. The record that stands for a job as its cleanest
+attempt (every attempt was contaminated, or a retry failed) is a copy of
+that attempt's record, so its search logs and its log are the attempt's,
+which the job's `job_contaminated` event names (`kept`).
+
+The logs are on by default (`--no-search-logs` keeps none), because they
+cost a search no time that can be measured. The autotuner spends about
+50 us on a config's two rows, where a config of a small port takes 0.6 s to
+compile and time. The nine cold autotunes of pointwise_238e96847398 from
+one seed, on B200s, measured their initial population of 108 configs in 68
+to 77 s and once 86 s with the log (seven of them) and in 70 and 72 s
+without (69 s in the run the seed came from); the machine's load, from
+other jobs compiling, moves that more than the log can.
+
+The CSV takes about 1.1 KB per row, two rows per config: 0.5 MB for that
+port's one search of 257 configs, and 2 to 6 MB for the search of one of
+the study's large kernels. A job logs every kernel of its port. The 51 CuTe
+autotunes of one of the study's campaigns searched 99,419 configs, from 256
+for that port to 7,103 over the four kernels of sum_sum_sum_d2c97d17f3dc,
+and 1,824 in the median job. By those counts the logs take about 4 MB for
+a job, 16 MB for the largest and 0.2 GB for a 51-point CuTe campaign, whose
+run directory took 28 MB without them. Each attempt keeps its own, so a job
+that ran three times holds three searches' logs.
+
 The machine is shared, so the campaign guards the timings:
 
+- Give the campaign GPUs of this account by number while other accounts'
+  jobs come and go on GPUs that look free. `--board-gpus` claims any GPU
+  that is free when it asks, also one that another account uses in bursts
+  without a claim on the board. A campaign of this study took such a GPU:
+  the other account's jobs came back, five attempts of the autotunes it ran
+  there were contaminated (one port's all three, so a contaminated record
+  stood for it) and one point was benched there. Hold the GPUs on the board
+  for the whole run instead and give the campaign the same ones, as the
+  commands above do (`gpu_board.py run --gpus $G ... campaign.py --gpus
+  $G`). This guard is the operator's: the campaign runs on the GPUs it is
+  given, or on those the board hands it, and checks only what else runs on
+  them (the guards below).
 - A job starts only on a GPU that other accounts' processes keep below the
   5% that would contaminate it (below) and where no process of this account
   that the campaign did not start runs.

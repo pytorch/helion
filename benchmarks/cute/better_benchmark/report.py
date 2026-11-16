@@ -44,6 +44,14 @@ it gives
 - the same per family;
 - a row per kernel, next to the ``--baseline`` run's Helion+CuTe speedup.
 
+With ``--baseline`` it also says how many of the run's own autotunes
+searched from the random seed of the baseline's autotune of the same port
+(``campaign.py --seeds-from``; ``seed_pairing``) and names the others: a
+cold search's pick follows its seed, so a port's before and after compare
+the two trees alone only where both searched from one seed (and, since the
+seed draws from the tree's search space, only where the two trees build the
+same one for the port, which the seeds do not tell).
+
 It also lists the records whose numerics gate fell back from the float64
 reference to the eager one (``common.AnchoredGate``'s ``ref_fallback``).
 
@@ -74,6 +82,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -402,6 +411,108 @@ def baseline_speedups(
     return out
 
 
+def seed_pairing(run_dir: Path, baseline: Path) -> dict[str, Any]:
+    """Which of the autotunes the run ``run_dir`` made searched from the
+    random seed of the ``baseline`` run's autotune of the same port, as
+    ``campaign.py --seeds-from`` has them do: ``paired``, by record name,
+    and for the others (``unpaired``) where their seed came from (the
+    record's ``seed_from``, the run ``--seeds-from`` took it from). The
+    run's ok records that are no search of its own stay out: those
+    ``plan_run.py`` took from earlier runs, reused or provisional
+    (``reused_from``), and the copies ``campaign.py --configs-from`` made
+    (``common.holds_copy``, by the run's ``common.COPIED_CONFIGS``). It goes
+    by the seeds the records of the two runs name (``common.record_seed``,
+    ``common.standing_seed``), so two runs that took their seeds from a
+    third are paired as well, and a baseline whose port was autotuned again
+    since is not."""
+    manifest = run_dir / common.COPIED_CONFIGS
+    copied = json.loads(manifest.read_text()) if manifest.exists() else {}
+    paired: list[str] = []
+    unpaired: dict[str, str] = {}
+    for path, rec in ok_records(run_dir, "configs").items():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if rec.get("reused_from") or common.holds_copy(copied.get(path.name), digest):
+            continue
+        name = path.stem
+        seed = common.record_seed(rec)
+        before, why = common.standing_seed(
+            baseline, rec["repro"], rec["shape"], rec["backend"]
+        )
+        source = rec.get("seed_from")
+        if seed is not None and seed == before:
+            paired.append(name)
+        elif source is None:
+            unpaired[name] = "a seed of its own"
+        elif Path(source).resolve() != baseline.resolve():
+            unpaired[name] = f"a seed taken from {Path(source).name}"
+        else:
+            now = "another now" if before is not None else f"none now ({why})"
+            unpaired[name] = f"a seed taken from {baseline.name}, which names {now}"
+    return {"baseline": str(baseline), "paired": paired, "unpaired": unpaired}
+
+
+def seed_pairing_lines(pairing: dict[str, Any], baseline_name: str) -> list[str]:
+    """The report's paragraph on ``seed_pairing``: how many of the run's
+    autotunes searched from the baseline's seeds, and where the seeds of the
+    others came from (with their names where some are paired: the
+    exceptions of a paired run)."""
+    paired, unpaired = pairing["paired"], pairing["unpaired"]
+    total = len(paired) + len(unpaired)
+    if not total:
+        return [
+            (
+                "Autotune seeds: this run made no autotune of its own (its "
+                "autotune records are other runs')."
+            ),
+            "",
+        ]
+    made = f"the {total} autotune{'' if total == 1 else 's'} this run made"
+    how = (
+        f"searched from the seed of {baseline_name}'s autotune of the same port "
+        "(`campaign.py --seeds-from`)"
+    )
+    caveat = (
+        "against that run also compares two random seeds, which a cold "
+        "search's pick follows"
+    )
+    if paired:
+        backends = sorted({name.rsplit("__", 1)[1] for name in (*paired, *unpaired)})
+        counts = ", ".join(
+            f"{backend} {sum(name.endswith(f'__{backend}') for name in paired)} of "
+            f"{sum(name.endswith(f'__{backend}') for name in (*paired, *unpaired))}"
+            for backend in backends
+        )
+        summary = (
+            f"Autotune seeds: {len(paired)} of {made} {how}: {counts}. A "
+            f"kernel's speedup {caveat}, where its port searched from another:"
+        )
+    else:
+        summary = (
+            f"Autotune seeds: none of {made} {how}, so each kernel's speedup "
+            f"{caveat}. Their seeds:"
+        )
+    others: dict[str, list[str]] = collections.defaultdict(list)
+    for name, why in sorted(unpaired.items()):
+        others[why].append(name)
+    lines = [summary, ""]
+    lines += [
+        f"- {why}: {len(names)}" + (f" ({', '.join(names)})" if paired else "")
+        for why, names in sorted(others.items())
+    ]
+    if not unpaired:
+        lines.append("- none")
+    if paired:
+        lines += [
+            "",
+            (
+                "The same seed draws the same initial population only where both "
+                "trees build the same search space for a port; generation 0 of "
+                "the two runs' `logs/search/*/search.csv` shows whether they did."
+            ),
+        ]
+    return [*lines, ""]
+
+
 def aggregate_lines(
     columns: dict[str, dict[str, Any]], baseline_name: str | None
 ) -> list[str]:
@@ -626,7 +737,12 @@ def main() -> None:
             ),
             "",
         ]
-    baseline_name = None if args.baseline is None else args.baseline.name
+    baseline_name = None
+    pairing = None
+    if args.baseline is not None:
+        baseline_name = args.baseline.name
+        pairing = seed_pairing(args.run_dir, args.baseline)
+        lines += seed_pairing_lines(pairing, baseline_name)
     aggregates: dict[str, dict[str, Any]] = {}
     families: dict[str, dict[str, dict[str, Any]]] = {}
     for metric in ("cold_us", "bb_us"):
@@ -834,6 +950,8 @@ def main() -> None:
     }
     if rotation:
         report["rotate_inputs"] = rotation
+    if pairing is not None:
+        report["seed_pairing"] = pairing
     (args.run_dir / "report.json").write_text(json.dumps(report, indent=1) + "\n")
     (args.run_dir / "report.md").write_text("\n".join(lines) + "\n")
     sys.stdout.write("\n".join(lines) + "\n")
