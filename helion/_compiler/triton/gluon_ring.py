@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import functools
 import inspect
+import itertools
 import logging
 import math
 import operator
@@ -28,7 +29,10 @@ from triton.experimental.gluon.language.nvidia.hopper import tma
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 from triton.runtime.jit import JITFunction
 
+from ... import exc
 from ..._compat import torch_dtype_to_tl
+from ...autotuner.config_spec import MAX_REGISTERS
+from ...autotuner.config_spec import MIN_REGISTERS
 from ...autotuner.config_spec import ring_depth
 from ...language.matmul_ops import dot_scaled
 from ..ast_extension import clone_ast
@@ -510,8 +514,6 @@ _MMA_CALLS = frozenset(["ring_acquire", "tmem_dot", "tmem_dot_scaled"]) | _ACC_C
 
 
 # Worker register budgets: default, floors (producers, MMA side); one warp's: the minimum.
-# setmaxnreg's per-thread register range.
-MIN_REGISTERS, MAX_REGISTERS = 24, 256
 _WORKER_REGS = 88
 _WORKER_FLOOR = (40, 48)
 
@@ -533,10 +535,11 @@ def _body_registers(
     workers: list[tuple[int, bool]],
     registers: list[int],
     ctas: int = 1,
+    cap: int | None = MAX_REGISTERS,
 ) -> int:
     """The registers Triton's AllocateWarpGroups leaves the body beside ``workers``
     ((warps, MMA side storing tensors)) of ``registers``: warpgroups at their
-    widest budget, the body the rest."""
+    widest budget, the body the rest (up to ``cap``, setmaxnreg's maximum)."""
     warps = sum(w for w, _ in workers)
     groups = -(-warps // 4)
     padded = [(w, r) for (w, _), r in zip(workers, registers, strict=True)]
@@ -556,7 +559,8 @@ def _body_registers(
         ]
         start += w
     left = maxnreg * body_warps + sum((maxnreg - r) * w for r, w in budgets)
-    return min(left // body_warps // 8 * 8, MAX_REGISTERS)
+    body = left // body_warps // 8 * 8
+    return body if cap is None else min(body, cap)
 
 
 def _worker_registers(
@@ -573,6 +577,93 @@ def _worker_registers(
         [budgets((_WORKER_REGS, _WORKER_REGS)), budgets(_WORKER_FLOOR)],
         key=lambda regs: _body_registers(body_warps, workers, regs, ctas),
     )
+
+
+def _manual_registers(
+    manual: list[int], partitions: list[ast.FunctionDef]
+) -> list[int]:
+    """The ``worker_registers`` config in place of the rule's budgets: one per
+    worker in the order the ring makes them (``partitions``: producers, the MMA
+    side, the claimer)."""
+    if len(manual) != len(partitions):
+        names = ", ".join(p.name for p in partitions)
+        raise exc.InvalidConfig(
+            f"worker_registers has {len(manual)} values for {len(partitions)} "
+            f"workers ({names})"
+        )
+    return list(manual)
+
+
+def _warpgroup_order(
+    body_warps: int,
+    workers: list[tuple[int, bool]],
+    registers: list[int],
+    ctas: int = 1,
+) -> list[int]:
+    """The workers' order in ``gl.warp_specialize``: Triton's AllocateWarpGroups
+    places them most warps first (the padding after them) and gives a warpgroup
+    its members' highest budget, so the order within each warp count decides
+    which budgets share a warpgroup. Of those orders, the one that leaves the
+    body the most registers, counting what it cannot take past the cap; ties go
+    highest budget first (best when the one-warp workers hold the lowest
+    budgets, as the rule's do). Like ``_body_registers``, this relies on
+    AllocateWarpGroups keeping workers of equal warps in the given order (its
+    ``llvm::sort`` is not stable, but keeps a few elements in place outside
+    LLVM's expensive checks)."""
+    classes = [
+        sorted(
+            (i for i, (w, _) in enumerate(workers) if w == warps),
+            key=lambda i: -registers[i],
+        )
+        for warps in sorted({w for w, _ in workers}, reverse=True)
+    ]
+    # ``max`` keeps the first on a tie: highest budget first.
+    return max(
+        (
+            [i for group in groups for i in group]
+            for groups in itertools.product(
+                *(itertools.permutations(c) for c in classes)
+            )
+        ),
+        key=lambda order: _body_registers(
+            body_warps,
+            [workers[i] for i in order],
+            [registers[i] for i in order],
+            ctas,
+            cap=None,
+        ),
+    )
+
+
+def _surplus_registers(
+    body_warps: int,
+    workers: list[tuple[int, bool]],
+    registers: list[int],
+    ctas: int = 1,
+) -> list[int]:
+    """Worker budgets (in ``_warpgroup_order``) grown into the registers the body
+    cannot take: past ``MAX_REGISTERS`` the body leaves the rest of the file
+    unused, so the lowest-budget multi-warp worker grows by 8 while the body
+    keeps ``MAX_REGISTERS`` (values the kernel's entry computes stay live in
+    every partition, and a low budget spills them for all). The lowest budgets
+    grow first: tagged pollers only once the others reach theirs. One-warp
+    workers keep the rule's scalar budget (``_worker_registers``): they issue
+    copies and MMAs from scalars, and growing them would change the budgets of
+    the single-GPU rings (their workers are one warp unless they compute
+    tensors) with no measured gain."""
+    registers = list(registers)
+    multi = [i for i, (w, _) in enumerate(workers) if w > 1]
+    while True:
+        for i in sorted(multi, key=registers.__getitem__):
+            more = [r + 8 * (j == i) for j, r in enumerate(registers)]
+            if (
+                more[i] <= MAX_REGISTERS
+                and _body_registers(body_warps, workers, more, ctas) >= MAX_REGISTERS
+            ):
+                registers = more
+                break
+        else:
+            return registers
 
 
 def _poller_registers(
@@ -1261,7 +1352,6 @@ class RingLowering:
             fn.args.args.extend(create_arg(argument) for argument in extra)
         body.name = f"{name}_body"
         call = f"({', '.join([*arguments, *extra])},)"
-        tasks = ", ".join(f"({fn.name}, {call})" for fn in functions)
         # A persistent grid of ``num_sm_multiplier`` CTAs a SM keeps them resident:
         # each takes its share of the register file (the launch's ``maxnreg``).
         ctas = df.config.num_sm_multiplier
@@ -1279,6 +1369,8 @@ class RingLowering:
         if polling := [
             i for i, p in enumerate(partitions) if _ring_calls(p, "tagged_load")
         ]:
+            # Whether the ring keeps its tagged pollers is the rule's call, also
+            # under hand-set budgets (which then index the workers it keeps).
             regs = _poller_registers(
                 df.config.num_warps,
                 workers,
@@ -1287,11 +1379,33 @@ class RingLowering:
                 [role.startswith(f"producer{_GATED}_") for role, _ in slices],
                 ctas,
             )
+        if (manual := df.config.config.get("worker_registers")) is not None:
+            regs = _manual_registers(cast("list[int]", manual), partitions)
+        # The order whose warpgroups leave the body the most registers; the
+        # rule's budgets then grow into what the body cannot take.
+        order = _warpgroup_order(df.config.num_warps, workers, regs, ctas)
+        partitions, workers, slices, regs = (
+            [partitions[i] for i in order],
+            [workers[i] for i in order],
+            [slices[i] for i in order],
+            [regs[i] for i in order],
+        )
+        if manual is None:
+            regs = _surplus_registers(df.config.num_warps, workers, regs, ctas)
+        functions = [body, *partitions]
+        tasks = ", ".join(f"({fn.name}, {call})" for fn in functions)
         # Workers may hold more than the launch's maxnreg (setmaxnreg moves the
         # rest from the body), so long as the body keeps setmaxnreg's minimum.
         maxnreg = _maxnreg(df.config.num_warps, workers, ctas)
         body_regs = _body_registers(df.config.num_warps, workers, regs, ctas)
         if body_regs < MIN_REGISTERS:
+            # Triton's AllocateWarpGroups would drop every setmaxnreg silently.
+            if manual is not None:
+                raise exc.InvalidConfig(
+                    f"worker_registers {manual} leave the body "
+                    f"{MIN_REGISTERS - body_regs} registers a thread short of "
+                    f"setmaxnreg's minimum of {MIN_REGISTERS} ({ctas} CTAs a SM)"
+                )
             raise RingFallback(
                 f"the ring: {ctas} CTAs a SM leave the body {body_regs} registers "
                 f"a thread beside workers of {regs}"
@@ -2291,7 +2405,7 @@ class GluonRegeneration(RetryPolicy):
       (``TaggedPeerFallback``), the cross-rank pushes keep keyed peer counters
       (``env.tagged_peer_disabled``).
     - A ring the lowering rejects (``RingFallback``) leaves the kernel's loads
-      plain (``env.ring_disabled``).
+      plain (``env.ring_disabled``, the rejection's reason).
 
     Each fires at most once per ``generate_ast`` call (its repair switches off
     what raised it).
@@ -2313,12 +2427,15 @@ class GluonRegeneration(RetryPolicy):
     ) -> Config | None:
         env = CompileEnvironment.current()
         ring = isinstance(signal, RingFallback)
-        flag = "ring_disabled" if ring else "tagged_peer_disabled"
-        if getattr(env, flag):
+        if env.ring_disabled if ring else env.tagged_peer_disabled:
             return None
         what = "gluon ring" if ring else "tagged peer transport"
         log.info("%s disabled: %s", what, signal)
-        setattr(env, flag, True)
+        if ring:
+            # The reason (finalize_ring names it), never empty: a set flag.
+            env.ring_disabled = str(signal) or "rejected"
+        else:
+            env.tagged_peer_disabled = True
         return config
 
 
@@ -2331,6 +2448,15 @@ def finalize_ring(fn_def: ast.FunctionDef, ctx: DeviceBodyContext) -> list[ast.s
     partition; returns the statements after it."""
     df = ctx.device_function
     if df.ring is None:
+        if df.config.config.get("worker_registers"):
+            # Hand-set budgets name the ring's workers: without a ring (none
+            # lowered, or it fell back) they would be ignored silently.
+            fallback = CompileEnvironment.current().ring_disabled
+            raise exc.InvalidConfig(
+                "worker_registers sets a Gluon ring's worker budgets, but this "
+                "kernel lowers no ring for this config"
+                + (f" (its ring fell back: {fallback})" if fallback else "")
+            )
         return []
     if not df.ring.sites:
         raise RingFallback("no TMA load of this kernel can stream through it")

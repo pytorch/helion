@@ -855,6 +855,9 @@ class GluonBackend(TritonBackend):
     _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
 
     def supports_config_key(self, key: str) -> bool:
+        # ``worker_registers``: the ring's worker budgets by hand (``gluon_ring``).
+        if key == "worker_registers":
+            return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
 
     def supports_block_ptr_indexing(self) -> bool:

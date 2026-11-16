@@ -1,0 +1,46 @@
+"""Gluon-backend kernels shared by ``test/test_gluon.py`` (they run on the
+GPU) and ``test/test_gluon_units.py`` (their code generated on CPU)."""
+
+from __future__ import annotations
+
+import torch
+
+import helion
+import helion.language as hl
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def dot_mm(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def nvfp4_mm(
+    x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
+) -> torch.Tensor:
+    """nvfp4 (e4m3 scales per 16) times nvfp4, both packed along K."""
+    m = x.size(0)
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for kk in hl.grid(y.size(0) // 128):
+            acc = hl.dot_scaled(
+                x[tile_m, kk * 128 + hl.arange(128)],
+                x_scale[tile_m, kk * 16 + hl.arange(16)],
+                "e2m1",
+                y[kk * 128 + hl.arange(128), tile_n],
+                y_scale[tile_n, kk * 16 + hl.arange(16)],
+                "e2m1",
+                acc=acc,
+            )
+        out[tile_m, tile_n] = acc
+    return out

@@ -827,8 +827,8 @@ class CompileEnvironment:
         # its cross-rank pushes keep keyed peer counters.
         self.tagged_peer_disabled: bool = False
         # Set while ``generate_ast`` regenerates a kernel whose gluon ring the
-        # lowering rejected (``RingFallback``).
-        self.ring_disabled: bool = False
+        # lowering rejected (``RingFallback``): the rejection's reason.
+        self.ring_disabled: str | None = None
         self._dispatch_guards_enforced: contextvars.ContextVar[bool] = (
             contextvars.ContextVar(
                 f"helion_dispatch_guards_enforced_{id(self)}",

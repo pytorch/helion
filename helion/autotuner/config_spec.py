@@ -748,6 +748,8 @@ def fit_thread_count(threads: int, block_size: int) -> int:
 
 DEFAULT_NUM_WARPS = 4
 DEFAULT_NUM_STAGES = 1
+# setmaxnreg's per-thread register range (``worker_registers``).
+MIN_REGISTERS, MAX_REGISTERS = 24, 256
 VALID_CROSS_LOOP_PIPELINES = ("barrier", "static", "dynamic")
 # Upper bound (power of two) that a matmul tile dimension's block size may reach
 # even when the dimension itself is smaller. Applied only to dimensions that
@@ -787,12 +789,14 @@ def _get_backend_tunable_keys() -> frozenset[str]:
 
 
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
-# Generic keys whose support is gated per backend (the Triton host descriptor
-# and cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap and the
-# cross-loop pipeline) rather than declared by one backend's surface.
+# Generic keys whose support is gated per backend (``supports_config_key``)
+# rather than declared by one backend's surface: the Triton host descriptor and
+# cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap, and the
+# cross-loop pipeline and Gluon ring knobs.
 _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
+        "worker_registers",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -2679,6 +2683,22 @@ class ConfigSpec:
                     f"advanced_controls_file must be a string path, got {value!r}"
                 )
             config["advanced_controls_file"] = value
+
+        if "worker_registers" in config:
+            regs = config["worker_registers"]
+            if regs is None or (isinstance(regs, (list, tuple)) and not regs):
+                config.pop("worker_registers")
+            elif not isinstance(regs, (list, tuple)) or not all(
+                type(r) is int and MIN_REGISTERS <= r <= MAX_REGISTERS and r % 8 == 0
+                for r in regs
+            ):
+                raise InvalidConfig(
+                    "worker_registers must be a list of multiples of 8 in "
+                    f"[{MIN_REGISTERS}, {MAX_REGISTERS}] (setmaxnreg's range), "
+                    f"got {regs!r}"
+                )
+            else:
+                config["worker_registers"] = list(regs)
 
         if "epilogue_subtile" in config:
             val = config["epilogue_subtile"]

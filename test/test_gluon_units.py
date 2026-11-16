@@ -18,6 +18,8 @@ import torch
 import helion
 from helion._compat import gluon_api_available
 from helion._testing import TestCase
+from helion._testing.gluon_kernels import dot_mm
+from helion._testing.gluon_kernels import nvfp4_mm
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
 import helion.language as hl
@@ -33,7 +35,9 @@ from helion._compiler.device_function import SyncRole
 from helion._compiler.triton import gluon_ops
 from helion._compiler.triton import gluon_pipeline
 from helion._compiler.triton import gluon_ring
+from helion._compiler.triton.backend import GluonBackend
 from helion._compiler.triton.gluon_ops import tl_namespace
+from helion.autotuner.config_spec import ConfigSpec
 
 pytestmark = pytest.mark.cpu_only
 
@@ -124,6 +128,20 @@ class TestAccumulatorRings(TestCase):
         self.assertNotIn("warp_specialize", code)
 
 
+def _worker_budgets(code: str) -> dict[str, tuple[int, int]]:
+    """Each ring worker's (warps, registers) in ``gl.warp_specialize``, by
+    function name, in the order the kernel passes them."""
+    call = next(
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "gl.warp_specialize"
+    )
+    warps, regs = (ast.literal_eval(arg) for arg in call.args[1:])
+    tasks = cast("ast.List", call.args[0]).elts[1:]  # the body's first
+    names = [ast.unparse(cast("ast.Tuple", task).elts[0]) for task in tasks]
+    return dict(zip(names, zip(warps, regs, strict=True), strict=True))
+
+
 class TestWorkerRegisters(TestCase):
     def test_workers_shrink_only_for_a_body_below_the_cap(self) -> None:
 
@@ -172,6 +190,171 @@ class TestWorkerRegisters(TestCase):
         # An 8-warp body would lose registers to the added warpgroup: no tagging.
         with self.assertRaises(TaggedPeerFallback):
             gluon_ring._poller_registers(8, ring, floors, [1, 2], extra)
+
+    def test_worker_registers_by_hand(self) -> None:
+
+        parts = [ast.parse(f"def p{i}(): pass").body[0] for i in range(4)]
+        self.assertEqual(
+            gluon_ring._manual_registers([72, 104, 104, 80], parts), [72, 104, 104, 80]
+        )
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "3 values for 4"):
+            gluon_ring._manual_registers([40, 96, 64], parts)
+        # normalize: an empty list is the rule's; budgets outside setmaxnreg's
+        # range (multiples of 8 in [24, 256]) are rejected.
+        spec = ConfigSpec(backend=GluonBackend())
+        config = {"worker_registers": []}
+        spec.normalize(config)
+        self.assertNotIn("worker_registers", config)
+        # A hand override only: the search never proposes it.
+        self.assertNotIn(
+            "worker_registers", {d.name for d in spec.iter_search_dimensions()}
+        )
+        self.assertNotIn("worker_registers", spec.default_config().config)
+        for wrong in ([20, 72], [60, 72], 64):
+            with (
+                self.subTest(worker_registers=wrong),
+                self.assertRaises(helion.exc.InvalidConfig),
+            ):
+                spec.normalize({"worker_registers": wrong})
+
+    def test_worker_registers_reach_their_partitions(self) -> None:
+        """``worker_registers`` sets the workers' budgets, one per worker in the
+        order the ring makes them (producers, then the MMA side), packed into
+        warpgroups; an empty list is the rule's, another count or budgets that
+        leave the body too few are rejected. A multi-warp worker (a partition
+        that computes tensors) grows into what the capped body cannot take."""
+        x = torch.empty([256, 512], dtype=torch.bfloat16)
+        y = torch.empty([512, 128], dtype=torch.bfloat16)
+        config = {
+            **_RING,
+            "block_sizes": [128, 64, 64],
+            "range_warp_specializes": [None, True],  # a producer and the MMA side
+        }
+        with gluon_cpu_codegen():
+            bound = dot_mm.bind((x, y))
+            default = bound.to_triton_code(helion.Config(**config))
+            producer, mma = sorted(_worker_budgets(default), key=lambda n: "mma" in n)
+            self.assertTrue(producer.endswith("producer0") and mma.endswith("mma"))
+            code = bound.to_triton_code(
+                helion.Config(**config, worker_registers=[56, 72])
+            )
+            budgets = _worker_budgets(code)
+            self.assertEqual((budgets[producer][1], budgets[mma][1]), (56, 72))
+            # Packed: the higher budget goes first.
+            self.assertEqual(list(budgets), [mma, producer])
+            self.assertEqual(
+                bound.to_triton_code(helion.Config(**config, worker_registers=[])),
+                default,
+            )
+            with self.assertRaisesRegex(helion.exc.InvalidConfig, "3 values for 2"):
+                bound.to_triton_code(
+                    helion.Config(**config, worker_registers=[56, 72, 32])
+                )
+            # Two CTAs a SM: budgets the body cannot keep setmaxnreg's minimum beside.
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig, "leave the body 24 registers a thread short"
+            ):
+                bound.to_triton_code(
+                    helion.Config(
+                        **{**config, "num_sm_multiplier": 2},
+                        worker_registers=[256, 256],
+                    )
+                )
+            # One stage lowers no ring: the budgets would name no workers.
+            with self.assertRaisesRegex(helion.exc.InvalidConfig, "lowers no ring"):
+                bound.to_triton_code(
+                    helion.Config(
+                        **{**config, "num_stages": 1}, worker_registers=[56, 72]
+                    )
+                )
+            self.assertNotIn(
+                "warp_specialize",
+                bound.to_triton_code(
+                    helion.Config(**{**config, "num_stages": 1}, worker_registers=[])
+                ),
+            )
+            # A block-scaled dot whose scales reach tensor memory through
+            # registers gives the MMA side 4 warps: it grows past the rule's 88.
+            x = torch.empty([256, 256], dtype=torch.uint8)
+            y = torch.empty([256, 128], dtype=torch.uint8)
+            x_scale, y_scale = (
+                torch.empty([rows, 32], dtype=torch.float8_e4m3fn)
+                for rows in (256, 128)
+            )
+            nvfp4 = nvfp4_mm.bind((x, x_scale, y, y_scale))
+            nvfp4_config = {**config, "block_sizes": [128, 64], "num_stages": 3}
+            code = nvfp4.to_triton_code(helion.Config(**nvfp4_config))
+            # Hand-set budgets are reordered, never grown.
+            manual = nvfp4.to_triton_code(
+                helion.Config(**nvfp4_config, worker_registers=[24, 88])
+            )
+            # A ring that falls back names its reason.
+            with self.assertRaisesRegex(
+                helion.exc.InvalidConfig,
+                "lowers no ring for this config \\(its ring fell back: no TMA load",
+            ):
+                bound.to_triton_code(
+                    helion.Config(
+                        **{
+                            **config,
+                            "indexing": ["pointer", "pointer", "tensor_descriptor"],
+                        },
+                        worker_registers=[56, 72],
+                    )
+                )
+        self.assertEqual(list(_worker_budgets(code).values()), [(4, 224), (1, 24)])
+        self.assertEqual(list(_worker_budgets(manual).values()), [(4, 88), (1, 24)])
+
+    def test_equal_budgets_share_warpgroups_and_the_rest_goes_to_workers(
+        self,
+    ) -> None:
+
+        # The pollers' warpgroup also holds the 40-register producer (and the
+        # padding the other poller): two warpgroups at 104.
+        ring = [(2, False), (2, False), (2, False), (4, True)]
+        regs = [40, 104, 104, 48]
+        order = gluon_ring._warpgroup_order(4, ring, regs)
+        self.assertEqual(order, [3, 1, 2, 0])
+        ordered = [ring[i] for i in order]
+        # The pollers together, the producer with the padding: the body would
+        # take 320, past the cap; the lowest-budget workers take what it cannot.
+        self.assertEqual(
+            gluon_ring._surplus_registers(4, ordered, [regs[i] for i in order]),
+            [80, 104, 104, 72],
+        )
+        self.assertEqual(
+            gluon_ring._body_registers(4, ordered, [80, 104, 104, 72]), 256
+        )
+        # Hand-set budgets pack the same way: in the given order these leave the
+        # body 16 registers (below setmaxnreg's minimum), packed 24.
+        manual = [24, 32, 208, 256]
+        order = gluon_ring._warpgroup_order(4, ring, manual)
+        self.assertEqual(gluon_ring._body_registers(4, ring, manual), 16)
+        self.assertEqual(
+            gluon_ring._body_registers(
+                4, [ring[i] for i in order], [manual[i] for i in order]
+            ),
+            24,
+        )
+        # The order is the best within each warp count, never worse than the
+        # given one: the high-budget one-warp claimer (240) shares the padding's
+        # warpgroup with the highest two-warp budget (48) so the two 24s share a
+        # cheap one (highest budget first would pair a 24 with the claimer and
+        # leave the body 8).
+        claimed = [*ring, (1, False)]
+        manual = [24, 24, 48, 216, 240]
+        order = gluon_ring._warpgroup_order(4, claimed, manual)
+        self.assertEqual(gluon_ring._body_registers(4, claimed, manual), 32)
+        self.assertEqual(
+            gluon_ring._body_registers(
+                4, [claimed[i] for i in order], [manual[i] for i in order]
+            ),
+            32,
+        )
+        # A body below the cap keeps every register: nothing to hand out.
+        self.assertEqual(
+            gluon_ring._surplus_registers(8, ring, [40, 40, 40, 48]), [40, 40, 40, 48]
+        )
 
 
 class TestFirstWaits(TestCase):
