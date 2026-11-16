@@ -26,6 +26,7 @@ from torch.testing._internal.common_utils import run_tests
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._compat import GLUON_REQUIREMENT
 from helion._compat import supports_gluon
 from helion._compiler import cross_loop_codegen
 from helion._compiler import tile_dependency
@@ -1347,7 +1348,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         """Tagged words polled into ring slots by two pollers feed the MMA,
         exactly, across skewed launches and CUDA graph replays."""
         if not supports_gluon():
-            self.skipTest("the gluon ring needs Blackwell and Triton >= 3.8")
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
         self._init_process()
         group = dist.group.WORLD
         world, m, k, n = self.world_size, 128, 64, 128
@@ -1404,7 +1405,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         (masked, or slots its guard skipped) read as zeros, every launch
         exactly; the copy ends as the pushes left it."""
         if not supports_gluon():
-            self.skipTest("the gluon ring needs Blackwell and Triton >= 3.8")
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
         self._init_process()
         group = dist.group.WORLD
         world = self.world_size
@@ -2179,7 +2180,7 @@ class TestDistributedTileDependencies(TestCase):
         of the gated group fill alternate steps of z from the mirror, each
         arriving on every step; the producer pushes words, no peer counter."""
         if not supports_gluon():
-            self.skipTest("the gluon ring needs Blackwell and Triton >= 3.8")
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
         group = self._world(4, tagged_ring_exchange_kernel)
         world, m, k, n = 4, 128, 64, 128
         z = torch.zeros(m, world * k, device=DEVICE, dtype=torch.bfloat16)
@@ -2231,7 +2232,7 @@ class TestDistributedTileDependencies(TestCase):
         push outside the guard keeps peer counters, as does one of a tile per
         task; every rank picks the same transport and launches check shares."""
         if not supports_gluon():
-            self.skipTest("the gluon ring needs Blackwell and Triton >= 3.8")
+            self.skipTest(f"the gluon ring needs {GLUON_REQUIREMENT}")
         from helion._compiler.triton import gluon_ring  # needs Triton >= 3.8
 
         ring = {

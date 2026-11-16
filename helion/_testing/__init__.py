@@ -36,6 +36,7 @@ import torch.distributed as dist
 import torch.nn.functional
 from torch.utils._pytree import tree_map
 
+from .._compat import GLUON_REQUIREMENT
 from .._compat import get_mtia_tunable_fragments
 from .._compat import get_tensor_descriptor_fn_name
 from .._compat import requires_torch_version
@@ -997,7 +998,7 @@ def skipIfA10G(reason: str) -> Callable[[Callable], Callable]:
 
 
 def skipUnlessGluon(
-    reason: str = "the gluon backend needs CUDA sm_100 and Triton >= 3.8",
+    reason: str = f"the gluon backend needs {GLUON_REQUIREMENT}",
 ) -> Callable[[Callable], Callable]:
     """Skip unless the gluon backend can run here (``supports_gluon``)."""
     return skipIfFn(lambda: not supports_gluon(), reason)

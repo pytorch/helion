@@ -869,7 +869,7 @@ class GluonBackend(TritonBackend):
         if not _compat.supports_gluon():
             raise exc.BackendUnsupported(
                 self.name,
-                "this device or Triton: it needs CUDA sm100 and Triton >= 3.8",
+                f"this device or Triton: it needs {_compat.GLUON_REQUIREMENT}",
             )
 
     def descriptor_call(self, method: str, desc: str, args: str) -> str:

@@ -735,9 +735,12 @@ class Settings(_Settings):
 
     __slots__ = {
         "backend": (
-            "Code generation backend. One of 'triton' (default), 'gluon' (Triton's "
-            "lowering compiled as Gluon), 'pallas' (JAX/Pallas), "
-            "'cute' (CUTLASS CuTe DSL), or 'metal' (Apple Metal MSL). "
+            "Code generation backend. One of 'triton' (default), 'gluon' "
+            "(experimental: Triton's lowering compiled as Gluon; compute "
+            "capability 10.x and Triton >= 3.8), 'tileir' (CUDA Tile IR; "
+            "set ENABLE_TILE=1), 'pallas' (JAX/Pallas), 'cute' (CUTLASS "
+            "CuTe DSL), 'metal' (experimental: Apple Metal MSL), or 'flydsl' "
+            "(experimental: AMD FlyDSL). "
             "Set HELION_BACKEND=<backend> to override."
         ),
         "ignore_warnings": (
