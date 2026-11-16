@@ -221,7 +221,7 @@ jobs:
       max-runners: 1
       kernels: ${{ github.event.inputs.kernels }}
 
-  run-xpu:
+  run-xpu-b70:
     needs: gen-matrix-xpu
     uses: ./.github/workflows/benchmark.yml
     strategy:
@@ -322,7 +322,7 @@ jobs:
 
   trigger-docs-deploy:
     if: always()
-    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-xpu, run-tpu, run-b200-linattn, run-h100-linattn, run-tpu-bridge]
+    needs: [run-b200, run-b200-cute, run-h100, run-mi350x, run-xpu-b70, run-tpu, run-b200-linattn, run-h100-linattn, run-tpu-bridge]
     runs-on: ubuntu-latest
     permissions:
       actions: write
