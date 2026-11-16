@@ -3094,9 +3094,23 @@ class Backend(abc.ABC):
             self, bound_kernel.settings.autotune_precompile
         )
 
-        if (config := bound_kernel._fixed_config(force=force)) is not None:
+        from ..autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+
+        # ``Kernel.autotune_multi`` asks the hook for unsearched configs of
+        # each of its bindings, the anchor among them: for its carrier this
+        # call returns what it selects, without the hook.
+        multi = isinstance(args, _MultiShapeAutotuneArgs)
+
+        if multi and bound_kernel.kernel._fixed_config_kind(force=force) == "default":
+            # The default as the spec builds it.
+            return bound_kernel.config_spec.default_config()
+        # A default the overrides change is reported, as the selections below.
+        config = bound_kernel._fixed_config(force=force, report=True)
+        if config is not None:
             return config
-        if not force and bound_kernel.kernel.configs:
+        # The application's own configs: the fastest is compiled as written.
+        written = bound_kernel.kernel._selects_given_config(force=force)
+        if written:
             # We have finite predetermined configs, no need to precompile
             bound_kernel.settings.autotune_precompile = None
 
@@ -3109,8 +3123,17 @@ class Backend(abc.ABC):
         if bound_kernel.settings.autotune_handoff:
             from ..autotuner.handoff_pipeline import autotune_with_handoff
 
-            return autotune_with_handoff(autotuner, skip_cache=force)
-        return autotuner.autotune(skip_cache=force)
+            config = autotune_with_handoff(autotuner, skip_cache=force)
+        else:
+            config = autotuner.autotune(skip_cache=force)
+        if written or multi:
+            return config
+        # The autotuner searched under the kernel's overrides, or it read the
+        # config back from a cache or from tuning data, which no search under
+        # those overrides need have written. The built-in caches answer for
+        # their hits themselves; this covers an autotuner of the
+        # application's own.
+        return bound_kernel._unsearched_config(config, report=True)
 
     @staticmethod
     def map_dot_precision(precision: DotPrecision) -> str:

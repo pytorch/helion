@@ -38,6 +38,8 @@ from .._utils import prev_power_of_2
 from .._utils import widest_halvable
 from ..exc import InvalidConfig
 from ..runtime.config import _copy_config_structure
+from ..runtime.structural_policy import SelectedConfig
+from ..runtime.structural_policy import StructuralConfig
 from ..runtime.triton.launcher import MAX_CLUSTER_SIZE
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
@@ -85,6 +87,16 @@ if TYPE_CHECKING:
     from .search_surface import BackendSearchSurface
 
 log = logging.getLogger(__name__)
+
+
+def _override_entries(
+    overrides: Mapping[str, object] | StructuralConfig | None,
+) -> Mapping[str, object] | None:
+    """``autotune_config_overrides`` as the options they name. A late policy
+    envelope, which a search rejects, still names them."""
+    if isinstance(overrides, StructuralConfig):
+        return overrides.config.config
+    return overrides
 
 
 def _live_log_restriction(feature: str, reason: str, verbose: bool) -> None:
@@ -3498,6 +3510,84 @@ class ConfigSpec:
             return config, ()
         self.normalize(options, _fix_invalid=True)
         return helion.Config.from_dict(options), returned
+
+    def unsearched_config(
+        self,
+        config: SelectedConfig,
+        overrides: Mapping[str, object] | StructuralConfig | None,
+    ) -> SelectedConfig | helion.Config:
+        """``config`` as the kernel compiles it when it selected the config
+        without a search under ``overrides``, its settings'
+        ``autotune_config_overrides``: an autotune cache hit, AOT tuning
+        data, the default of a kernel that does not autotune.
+
+        Overrides act on a search, so such a config is compiled as it is,
+        except for the entries the backend holds every config the kernel
+        selects to (``BackendSearchSurface.overrides_without_search``).
+        Returns ``config`` itself unless the backend changes it, whatever
+        an autotuner handed back (``set_config`` reads a ``Config``, a
+        plain dict of its options and a policy envelope alike), and a
+        detached ``Config`` then: caches hand out the configs they hold.
+        Options equal to the config's change nothing, so a hook that
+        answers for its own result with a copy gets ``config`` back too. A
+        config the application passes itself is not selected by the kernel
+        and does not come through here. Neither does what a kernel
+        remembers of its own selections (a bound kernel's compiled config,
+        the configs retained for fresh bindings): those were selected under
+        the kernel's overrides, and ``Kernel.reset()`` drops them when the
+        settings change afterwards.
+
+        The backend's hook is asked only where the backend holds such a
+        config to some of the overrides
+        (``BackendSearchSurface.overrides_held_without_search``). Where it
+        holds none, ``unsearched_overrides_identity`` is ``None`` and the
+        config comes back as it is, whatever the hook would return: what
+        is generated under that identity is what a kernel without
+        overrides generates."""
+        entries, held = self._overrides_held_without_search(overrides)
+        if not held:
+            return config
+        options = config.config if isinstance(config, StructuralConfig) else config
+        changed = self.search_surface.overrides_without_search(self, options, entries)
+        if changed is None or changed == dict(options):
+            return config
+        detached = {
+            key: _copy_config_structure(value) for key, value in changed.items()
+        }
+        if isinstance(config, (helion.Config, StructuralConfig)):
+            return helion.Config.from_dict(detached)
+        # A plain dict of options, read as ``set_config`` reads one.
+        return helion.Config(**detached)  # pyrefly: ignore[bad-argument-type]
+
+    def unsearched_overrides_identity(
+        self, overrides: Mapping[str, object] | StructuralConfig | None
+    ) -> str | None:
+        """What ``unsearched_config`` reads of ``overrides`` for a config of
+        some binding of the kernel
+        (``BackendSearchSurface.overrides_held_without_search``), as one
+        canonical string; ``None`` where it applies nothing, as on every
+        backend that keeps the hook's default.
+
+        Part of the identity of whatever is generated from a config no
+        search produced, such as an AOT standalone export. The same for
+        every binding of a kernel: it depends on the backend and the
+        overrides alone."""
+        _, held = self._overrides_held_without_search(overrides)
+        if not held:
+            return None
+        return json.dumps(held, sort_keys=True, default=repr)
+
+    def _overrides_held_without_search(
+        self, overrides: Mapping[str, object] | StructuralConfig | None
+    ) -> tuple[Mapping[str, object], dict[str, object]]:
+        """The options ``overrides`` name, and what the backend holds a
+        config no search produced to among them
+        (``BackendSearchSurface.overrides_held_without_search``): nothing
+        without overrides."""
+        entries = _override_entries(overrides)
+        if not entries:
+            return {}, {}
+        return entries, self.search_surface.overrides_held_without_search(entries)
 
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())

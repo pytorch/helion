@@ -22,7 +22,6 @@ import csv
 from dataclasses import dataclass
 import hashlib
 import importlib
-import importlib.util
 import inspect
 import json
 import logging
@@ -77,6 +76,7 @@ from .benchmarking import l2_flush_sweep
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
+    from collections.abc import Mapping
     from collections.abc import Sequence
     from typing import Callable
 
@@ -137,7 +137,11 @@ def get_aot_data_dir() -> Path:
 
 
 # Cache for heuristic file lookups
-_heuristic_file_cache: dict[str | tuple[str, ...], Path | None] = {}
+_heuristic_file_cache: dict[tuple[str, ...], Path | None] = {}
+# The kernels, each a source file and a name, that a lookup without a
+# structural policy and without a data directory was made for: the kernel's
+# first answer stands for all its lookups
+_heuristic_file_shared: set[tuple[str, str]] = set()
 
 
 def find_heuristic_file(
@@ -159,24 +163,61 @@ def find_heuristic_file(
     3. Fallback to older compute capabilities within the same device family
     4. AOT data directory: heuristic_<kernel_name>.py (fallback)
 
+    The answer is kept until ``clear_heuristic_cache()``. Without a
+    structural policy it is kept by the kernel, which is its source file
+    and its name, and by the data directory: the kernels of a source file,
+    and kernels with tuning data in two directories, each find their own.
+    A lookup without a data directory (the key function of an
+    ``aot_kernel``) takes the first answer its kernel got, and that answer
+    then stands for every lookup of the kernel, whatever data directory it
+    names: the key function and the cache of a kernel select from one file.
+
+    The data directory is resolved, for the search and for the key, and the
+    answer is the name of the file found in its resolved directory: a
+    relative ``HELION_AOT_DATA_DIR`` is another directory once the working
+    directory changes, and what callers keep by the answer (a module, its
+    selections) is kept by the file. The name itself is not resolved: a
+    heuristic that is a link is read through the link, as a file rewritten
+    in place is read anew. Under a structural policy, whose model is read
+    at each selection, the key holds the other two directories a candidate
+    is searched in resolved as well, the source file's and
+    ``HELION_HEURISTIC_DIR``: one that is relative, or a link, is looked up
+    again once it names another directory. Without a policy the key holds
+    the source file as the kernel's code names it, and neither that
+    variable nor the hardware. Like the files on disk, these are as the
+    first lookup of a key found them: the answer stays the file in the
+    directory they named then.
+
     Args:
         kernel_source_file: Path to the kernel's source file
         kernel_name: Optional kernel name for fallback lookup
         data_dir: Optional AOT data directory for fallback lookup
 
     Returns:
-        Path to heuristic file if found, None otherwise
+        Path to heuristic file, in its resolved directory, if found, None
+        otherwise
     """
-    cache_key: str | tuple[str, ...] = str(kernel_source_file)
+    if data_dir is not None:
+        data_dir = data_dir.resolve()
+    heuristic_dir = os.environ.get(HEURISTIC_DIR_ENV)
+    kernel = (str(kernel_source_file), kernel_name or "")
+    cache_key: tuple[str, ...] = kernel
     if policy is not None:
+        # With the three directories of the candidates, each resolved as
+        # the answer's is.
         cache_key = (
             str(kernel_source_file),
             kernel_name or "",
+            str(Path(kernel_source_file).parent.resolve()),
             str(data_dir),
-            os.environ.get(HEURISTIC_DIR_ENV, ""),
+            "" if heuristic_dir is None else str(Path(heuristic_dir).resolve()),
             get_hardware_info().hardware_id,
             policy.identity(),
         )
+    elif data_dir is None:
+        _heuristic_file_shared.add(kernel)
+    elif kernel not in _heuristic_file_shared:
+        cache_key = (*kernel, str(data_dir))
     if cache_key in _heuristic_file_cache:
         return _heuristic_file_cache[cache_key]
 
@@ -188,7 +229,7 @@ def find_heuristic_file(
     candidates: list[Path] = []
 
     # 1. Check HELION_HEURISTIC_DIR override
-    if (heuristic_dir := os.environ.get(HEURISTIC_DIR_ENV)) is not None:
+    if heuristic_dir is not None:
         heuristic_dir_path = Path(heuristic_dir)
         for compat_compute in compatible_computes:
             candidates.append(
@@ -213,16 +254,20 @@ def find_heuristic_file(
         candidate = policy_path(candidate, policy)
         if candidate.exists():
             log.debug(f"Found heuristic file: {candidate}")
-            result = candidate
+            result = candidate.parent.resolve() / candidate.name
             break
 
     _heuristic_file_cache[cache_key] = result
+    if policy is None:
+        # The first answer of the kernel.
+        _heuristic_file_cache.setdefault(kernel, result)
     return result
 
 
 def clear_heuristic_cache() -> None:
     """Clear the heuristic file cache (useful for testing)."""
     _heuristic_file_cache.clear()
+    _heuristic_file_shared.clear()
 
 
 def load_kernel_source_files(
@@ -340,6 +385,13 @@ class TunedConfig:
     cute_structural_policy: StructuralPolicy | None = None
 
 
+def _configs_text(configs: Sequence[Mapping[str, object]]) -> str:
+    """``configs`` as one string, equal for equal options."""
+    return json.dumps(
+        [dict(config) for config in configs], sort_keys=True, default=repr
+    )
+
+
 class AOTAutotuneCache(AutotuneCacheBase):
     """
     Cache implementation for AOT autotuning workflows.
@@ -368,7 +420,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
     # Class-level caches for heuristic lookup (shared across instances)
     # Maps heuristic file path -> loaded module
     _heuristic_modules: ClassVar[dict[Path | tuple[Path, str], Any]] = {}
-    # Maps (kernel_source_file, kernel_name, shape_features_hash) -> Config
+    # Held while the module of a plain heuristic is executed for its path
+    _heuristic_import_lock: ClassVar[Any] = threading.RLock()
+    # Maps (kernel_source_file, kernel_name, shape_features_hash,
+    # heuristic file) -> Config
     # Using source file ensures kernels with same name in different modules don't collide
     _heuristic_results: ClassVar[
         dict[tuple[str, ...], Config | CuteStructuralConfig]
@@ -399,6 +454,14 @@ class AOTAutotuneCache(AutotuneCacheBase):
     _policy_dynamic_variants: ClassVar[
         dict[tuple[str | bool, ...], dict[tuple[object, ...], tuple[str, ...]]]
     ] = {}
+    # Under held overrides (``BoundKernel._unsearched_overrides_identity``):
+    # what the ordinary dynamic table last published at a path was generated
+    # from besides its binding, the stored configs, and those configs as the
+    # backend's hook left them for that binding
+    # (``_check_ordinary_dynamic_answer``).
+    _ordinary_dynamic_answers: ClassVar[
+        dict[Path, tuple[tuple[object, ...], str, str]]
+    ] = {}
     _standalone_export_owners: ClassVar[dict[Path, tuple[str | bool, ...]]] = {}
     _dynamic_export_contracts: ClassVar[
         dict[Path, tuple[int | None, tuple[str, str] | None]]
@@ -407,13 +470,15 @@ class AOTAutotuneCache(AutotuneCacheBase):
     @classmethod
     def clear_caches(cls) -> None:
         """Clear all class-level caches (heuristic modules and results)."""
-        cls._heuristic_modules.clear()
+        with cls._heuristic_import_lock:
+            cls._heuristic_modules.clear()
         cls._heuristic_results.clear()
         cls._no_heuristic_warned.clear()
         cls._compiled_kernels.clear()
         with cls._compiled_kernel_variants_lock:
             cls._compiled_kernel_variants.clear()
             cls._ordinary_dynamic_children.clear()
+            cls._ordinary_dynamic_answers.clear()
             cls._policy_dynamic_variants.clear()
             cls._standalone_export_owners.clear()
             cls._dynamic_export_contracts.clear()
@@ -829,8 +894,13 @@ class AOTAutotuneCache(AutotuneCacheBase):
             benchmark_provider.setup()
             for i, config in enumerate(all_configs):
                 try:
-                    # Benchmark this config
-                    result = self.autotuner.benchmark(config)
+                    # Collected tuning data: no search under the kernel's
+                    # overrides need have written it, so the config is timed
+                    # as the kernel compiles it. The measurement stays under
+                    # the stored config, which a heuristic selects by.
+                    result = self.autotuner.benchmark(
+                        self.kernel._unsearched_config(config)
+                    )
                     timing = result.perf
                     if timing < float("inf"):
                         results.append((config, timing))
@@ -900,6 +970,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         Args:
             args: Optional arguments to use. If None, uses self.args.
+            snapshot: The heuristic file and its bytes as the caller read
+                them: the selection is made from them and kept by their
+                digest. Without one, a kernel under a structural policy
+                reads the file here, and a kernel without a policy selects
+                from the module kept for the path.
 
         For CUDA/ROCm, if heuristics for the current compute capability aren't found,
         we try older compatible architectures (e.g., sm80 heuristics on sm90 hardware).
@@ -935,6 +1010,12 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 str(heuristic_file.resolve()),
                 hashlib.sha256(source).hexdigest(),
             )
+        else:
+            # The results of the module kept for this heuristic file
+            # (``_load_heuristic_module``), by the path the lookup answers
+            # with, which names a resolved directory: two caches over one
+            # kernel may have their tuning data in different files.
+            cache_key = (*cache_key, str(heuristic_file))
         if cache_key in AOTAutotuneCache._heuristic_results:
             log.debug(
                 f"Using cached heuristic result for {kernel_name} shape={shape_hash}"
@@ -950,9 +1031,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
         try:
             module = self._load_heuristic_module(heuristic_file, policy, source)
-            if module is None:
-                return None
-
             model_configs(module, kernel_name, policy, required=False)
 
             # Call autotune_<kernel>(*args) to get the config
@@ -1002,7 +1080,18 @@ class AOTAutotuneCache(AutotuneCacheBase):
     @classmethod
     def _load_heuristic_module(
         cls, path: Path, policy: StructuralPolicy | None, source: bytes | None = None
-    ) -> types.ModuleType | None:
+    ) -> types.ModuleType:
+        """The module of the heuristic file ``path``, executed from bytes
+        read from the file (``load_policy_module``), never from the bytecode
+        Python keeps for the path.
+
+        A caller that passes ``source``, the bytes it read from the file,
+        gets the module executed from those bytes and kept by their digest,
+        and so does a policy-bearing heuristic, whose file is read here. A
+        plain heuristic without ``source`` is the module kept for its path:
+        the last one executed for it, or one executed here, once, from the
+        bytes the file then holds. ``_get_heuristic_config`` keeps its
+        selections by the path as well (``clear_caches`` drops both)."""
         key: Path | tuple[Path, str] = path
         if source is not None or policy is not None:
             if source is None:
@@ -1013,16 +1102,14 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 cls._heuristic_modules[key] = module
                 cls._heuristic_modules[path] = module
             return cls._heuristic_modules[key]
-        if key not in cls._heuristic_modules:
-            spec = importlib.util.spec_from_file_location("heuristic", path)
-            if spec is None or spec.loader is None:
-                return None
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            cls._heuristic_modules[key] = module
-            # Retain the public diagnostic view of the last module at a path.
-            cls._heuristic_modules[path] = module
-        return cls._heuristic_modules[key]
+        # One module per path, also where two threads get here at once.
+        with cls._heuristic_import_lock:
+            if key not in cls._heuristic_modules:
+                module = load_policy_module(path, path.read_bytes())
+                cls._heuristic_modules[key] = module
+                # Retain the public diagnostic view of the last module at a path.
+                cls._heuristic_modules[path] = module
+            return cls._heuristic_modules[key]
 
     def _maybe_run_compile(self) -> None:
         """
@@ -1048,8 +1135,6 @@ class AOTAutotuneCache(AutotuneCacheBase):
         # selector must all describe the same model, even if it is replaced.
         model_source = heuristic_file.read_bytes()
         module = self._load_heuristic_module(heuristic_file, policy, model_source)
-        if module is None:
-            return
         records = model_configs(module, kernel_name, policy)
 
         # -- extract selected configs ---------------------------------------
@@ -1062,16 +1147,31 @@ class AOTAutotuneCache(AutotuneCacheBase):
         )
         if configs_list is None and policy is None:
             configs_list = self._parse_configs_from_autotune(
-                module, kernel_name, model_source
+                module, kernel_name, heuristic_file, model_source
             )
+
+        # What the backend holds this kernel's unsearched configs to: the
+        # same call exports other code once it changes, so it is part of
+        # every key an export is known by. No call counts as exported on
+        # what other held overrides generated.
+        held = self.kernel._unsearched_overrides_identity()
 
         if self.kernel.settings.static_shapes:
             # Static dispatch already keys exact shape and stride. Enable the two
             # remaining descriptor predicates consistently for the whole file if
             # any heuristic-selected config can use descriptor indexing.
             # Structural-policy (CuTe) files have no Triton descriptor predicates.
+            # Under held overrides the backend's hook may change any config,
+            # and it answers by the binding, while the predicates are one
+            # flag for the file and part of its entry. They are enabled for
+            # every call then: predicates read off what the hook made of the
+            # configs for one binding would set the calls of a kernel apart,
+            # each in an entry that writes the file without the other's
+            # variants. Without held overrides the hook is not asked, and
+            # the stored configs are what the kernel compiles.
             tensor_descriptor_guards = policy is None and (
                 configs_list is None
+                or held is not None
                 or any(
                     _config_uses_tensor_descriptor(
                         # pyrefly: ignore [bad-argument-type]
@@ -1092,21 +1192,17 @@ class AOTAutotuneCache(AutotuneCacheBase):
             log.warning("Cannot extract configs from heuristic for '%s'", kernel_name)
             return
 
-        configs = [
-            Config(**config_dict)  # pyrefly: ignore [bad-argument-type]
-            if policy is None
-            else Config.from_dict(config_dict)
-            for config_dict in configs_list
+        # The stored configs as the kernel selects them for this call's
+        # binding, and as its export compiles them.
+        selected = [
+            self._selected_config(config_dict, policy) for config_dict in configs_list
         ]
-        if policy is None:
-            configs = [
-                self.kernel._normalized_config_copy(config) for config in configs
-            ]
-            if any(map(_config_uses_tensor_descriptor, configs)):
-                raise exc.InvalidAPIUsage(
-                    "dynamic standalone AOT does not support tensor-descriptor "
-                    "indexing; use pointer or block-pointer indexing"
-                )
+        configs = [self._exported_config(config, policy) for config in selected]
+        if policy is None and any(map(_config_uses_tensor_descriptor, configs)):
+            raise exc.InvalidAPIUsage(
+                "dynamic standalone AOT does not support tensor-descriptor "
+                "indexing; use pointer or block-pointer indexing"
+            )
 
         args = tuple(self.args)
         env = self.kernel.env
@@ -1171,6 +1267,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 str(output_path),
                 self.hardware_id,
                 policy.identity(),
+                held or "",
                 source_digest,
                 hashlib.sha256(model_source).hexdigest(),
                 self.kernel.config_spec.cache_fingerprint_hash(),
@@ -1179,6 +1276,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 repr((guards, guard_key)),
             )
         ordinary_identity: tuple[object, ...] = ()
+        answer: tuple[tuple[object, ...], str, str] | None = None
         saved_codes: dict[int, str] = {}
         initial_facts = ()
         with self._compiled_kernel_variants_lock:
@@ -1199,8 +1297,22 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     index_limit,
                     expected_width,
                     key_source,
+                    held,
                     initial_facts,
                 )
+                if held is not None:
+                    # The table is generated from this call's binding and
+                    # serves every call, and the backend's hook answers for
+                    # a binding: the stored configs, and what the hook made
+                    # of them for this one (``_selected_config``).
+                    answer = (
+                        (*ordinary_identity[:3], held),
+                        _configs_text(configs_list),
+                        _configs_text(selected),
+                    )
+                    self._check_ordinary_dynamic_answer(
+                        output_path, kernel_name, answer
+                    )
                 old = self._ordinary_dynamic_children.get(output_path)
                 if (
                     old is not None
@@ -1264,6 +1376,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 output_path,
                 index_limit,
                 key_source,
+                held,
             )
             AOTAutotuneCache._compiled_kernels.add(compile_key)
             return
@@ -1291,6 +1404,10 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     raise exc.InvalidAPIUsage(
                         "Cannot replace an active standalone file with an incompatible partial binding or model"
                     )
+            if answer is not None:
+                # Another binding may have published while this one
+                # generated its code.
+                self._check_ordinary_dynamic_answer(output_path, kernel_name, answer)
             out_path = generate_standalone_file(
                 kernel_name=kernel_name,
                 index_limit=index_limit,
@@ -1312,9 +1429,76 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 ordinary_identity,
                 {i: code for i, code in enumerate(triton_codes) if i not in failed},
             )
+            if answer is None:
+                self._ordinary_dynamic_answers.pop(output_path, None)
+            else:
+                self._ordinary_dynamic_answers[output_path] = answer
             if not failed:
                 AOTAutotuneCache._compiled_kernels.add(compile_key)
         print(f"[AOT] Standalone: {out_path}", file=sys.stderr)
+
+    def _selected_config(
+        self, config_dict: dict[str, object], policy: StructuralPolicy | None
+    ) -> Config:
+        """A config of the heuristic's tuning data as this kernel selects
+        it: no search under the kernel's overrides produced it, so the
+        backend's hook answers for the kernel's binding
+        (``BoundKernel._unsearched_config``)."""
+        return self.kernel._unsearched_config(
+            Config.from_dict(config_dict)
+            if policy is not None
+            else Config(**config_dict)  # pyrefly: ignore [bad-argument-type]
+        )
+
+    def _exported_config(
+        self, config: Config, policy: StructuralPolicy | None
+    ) -> Config:
+        """``config``, of the tuning data as this kernel selects it
+        (``_selected_config``), as the kernel's dynamic export compiles it: a
+        plain export normalizes it, so the descriptor check of
+        ``_maybe_run_compile`` reads the config that is compiled, not the
+        stored one."""
+        if policy is not None:
+            return config
+        return self.kernel._normalized_config_copy(config)
+
+    @classmethod
+    def _check_ordinary_dynamic_answer(
+        cls,
+        path: Path,
+        kernel_name: str,
+        answer: tuple[tuple[object, ...], str, str],
+    ) -> None:
+        """Reject an ordinary dynamic export under held overrides whose
+        binding the backend's hook answers otherwise for than for the
+        binding of the table ``path`` holds.
+
+        Such a table holds the code of one binding for every call, while
+        the hook answers for a binding. ``answer`` is what the table is
+        generated from besides its binding (the heuristic's and the source's
+        bytes, the hardware and the held overrides), the stored configs and
+        those configs as the hook left them for the calling binding
+        (``_maybe_run_compile``). Where the table last published at
+        ``path`` was generated from the same and the hook made something
+        else of the same configs, this call would replace that binding's
+        code for its calls too, without a variant per binding to tell them
+        apart. Without held overrides the hook is not asked and no call is
+        rejected. Called with ``_compiled_kernel_variants_lock`` held."""
+        exported = cls._ordinary_dynamic_answers.get(path)
+        if (
+            exported is not None
+            and exported[:2] == answer[:2]
+            and exported[2] != answer[2]
+        ):
+            raise exc.InvalidAPIUsage(
+                "dynamic standalone AOT holds the code of one binding "
+                f"of '{kernel_name}' for every call, and the kernel's "
+                f"autotune_config_overrides ({answer[0][-1]}) change the tuning "
+                "data's configs for this call's binding otherwise than "
+                "for the binding its export is generated from; export "
+                "the kernel with static_shapes=True, which keeps a "
+                "variant per call"
+            )
 
     @classmethod
     def _check_dynamic_export_contract(
@@ -1347,8 +1531,8 @@ class AOTAutotuneCache(AutotuneCacheBase):
         if owner[:-1] == key[:-1] and unchanged(owner):
             return False
         raise StructuralPolicyError(
-            "A different heuristic model, kernel source, hardware, or export mode "
-            "already owns this standalone file"
+            "A different heuristic model, kernel source, hardware, export mode, or "
+            "set of held autotune_config_overrides already owns this standalone file"
         )
 
     def _compile_policy_dynamic(
@@ -1361,6 +1545,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
         output_path: Path,
         index_limit: int | None,
         key_source: tuple[str, str] | None,
+        held: str | None,
     ) -> None:
         from ..language.constexpr import ConstExpr
         from .aot_compile import generate_standalone_file
@@ -1392,6 +1577,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
             str(output_path),
             self.hardware_id,
             policy.identity(),
+            # The held overrides ``codes`` were generated under, as the
+            # caller read them (``_maybe_run_compile``).
+            held or "",
             model_digest,
             source_digest,
         )
@@ -1490,6 +1678,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 kernel_name,
             )
             return
+        # No search under the kernel's overrides produced the selection: it
+        # is exported as the kernel compiles it, in an entry of the overrides
+        # the backend holds it to (``_maybe_run_compile``).
+        config = self.kernel._unsearched_config(config)
+        held = self.kernel._unsearched_overrides_identity() or ""
 
         from .aot_compile import _standalone_call_key
         from .aot_compile import generate_standalone_file
@@ -1522,6 +1715,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
             hashlib.sha256(model_source).hexdigest(),
             source_digest,
             tensor_descriptor_guards,
+            held,
         )
         if policy is not None:
             variants_key = (
@@ -1530,6 +1724,7 @@ class AOTAutotuneCache(AutotuneCacheBase):
                 kernel_name,
                 self.hardware_id,
                 policy.identity(),
+                held,
                 hashlib.sha256(model_source).hexdigest(),
                 source_digest,
             )
@@ -1647,20 +1842,32 @@ class AOTAutotuneCache(AutotuneCacheBase):
 
     @staticmethod
     def _parse_configs_from_autotune(
-        module: object, kernel_name: str, source: bytes
+        module: object, kernel_name: str, path: Path, source: bytes
     ) -> list[dict[str, object]] | None:
-        """Extract the ``_C`` config list from ``autotune_<kernel>``."""
+        """Extract the ``_C`` config list from ``autotune_<kernel>``. Its
+        text is read from ``source``, the bytes ``module`` was executed from
+        as the file ``path``, where they define the function, and as
+        ``inspect.getsource`` reads it otherwise: from the file of a
+        function the heuristic imports. ``None`` where there is no such text
+        or no list in it."""
         autotune_fn = getattr(module, f"autotune_{kernel_name}", None)
         if autotune_fn is None:
             return None
-        # The module and the selector being published came from these bytes.
-        # inspect.getsource() would reopen the model and could see a replacement.
-        lines = source.decode().splitlines(keepends=True)
-        src = "".join(
-            inspect.getblock(
-                lines[inspect.unwrap(autotune_fn).__code__.co_firstlineno - 1 :]
+        # The function ``inspect.getsource`` reads: the one under decorators.
+        defined = inspect.unwrap(autotune_fn)
+        if inspect.isfunction(defined) and defined.__code__.co_filename == str(path):
+            # The module and the selector being published came from these bytes.
+            # inspect.getsource() would reopen the model and could see a replacement.
+            lines = source.decode().splitlines(keepends=True)
+            src = "".join(
+                inspect.getblock(lines[defined.__code__.co_firstlineno - 1 :])
             )
-        )
+        else:
+            try:
+                src = inspect.getsource(autotune_fn)
+            except (OSError, TypeError):
+                # A function of no file, or a callable that is no function.
+                return None
         start = src.find("_C = [")
         if start < 0:
             return None
@@ -1760,8 +1967,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
             for config in all_configs:
                 try:
                     bound = self.kernel.kernel.bind(input_args)
+                    # Timed as this binding compiles it, and saved under the
+                    # stored config (``measure_all_configs``).
+                    compiled = bound._unsearched_config(config)
                     with _searching_candidates():
-                        fn = bound.compile_config(config)
+                        fn = bound.compile_config(compiled)
 
                     from triton.testing import do_bench
 
@@ -1821,7 +2031,9 @@ class AOTAutotuneCache(AutotuneCacheBase):
                     f"AOT measure: Best config for {self.kernel.kernel.name} "
                     f"shape={self.shape_key.stable_hash()} timing={best_timing:.4f}ms"
                 )
-                return best_config
+                # Collected tuning data: no search under the kernel's
+                # overrides need have written it.
+                return self.kernel._unsearched_config(best_config, report=True)
             # Fall through to regular autotuning if no configs available
             log.warning("No configs to measure, falling through to autotuner")
 

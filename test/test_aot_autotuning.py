@@ -17,7 +17,9 @@ import inspect
 import json
 import os
 from pathlib import Path
+import py_compile
 import runpy
+import stat
 import struct
 import sys
 import threading
@@ -26,6 +28,7 @@ from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import ClassVar
 from typing import NamedTuple
 from unittest.mock import Mock
 from unittest.mock import patch
@@ -42,8 +45,21 @@ from helion._hardware import get_hardware_info
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.aot_export_scenarios import HELD_A
+from helion._testing.aot_export_scenarios import HELD_B
+from helion._testing.aot_export_scenarios import INELIGIBLE
+from helion._testing.aot_export_scenarios import KERNEL
+from helion._testing.aot_export_scenarios import OTHER_DIR
+from helion._testing.aot_export_scenarios import OTHER_SOURCE
+from helion._testing.aot_export_scenarios import PLAIN
+from helion._testing.aot_export_scenarios import SHAPES
+from helion._testing.aot_export_scenarios import TWIN
+from helion._testing.aot_export_scenarios import import_after_rewrite
+from helion._testing.aot_export_scenarios import run_export_scenario
+from helion._testing.aot_export_scenarios import scenario_names
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import load_generated_module
+from helion._testing.held_overrides import hold_block_sizes
 from helion._testing.triton_codegen import interpret_triton_kernel
 from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
@@ -57,8 +73,10 @@ from helion.autotuner.aot_cache import _serialize_value
 from helion.autotuner.aot_cache import get_aot_mode
 from helion.autotuner.aot_compile import _standalone_call_key
 from helion.autotuner.aot_compile import generate_standalone_file
+from helion.autotuner.aot_kernel import HeuristicKeyFunction
 from helion.autotuner.aot_kernel import aot_key
 from helion.autotuner.aot_kernel import extract_shape_features
+from helion.autotuner.aot_structural_policy import policy_path
 from helion.autotuner.base_cache import AutotuneCacheBase
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
@@ -70,12 +88,16 @@ from helion.autotuner.heuristic_generator import select_config_subset
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.cute.structural_policy import CuteStructuralPolicy
 from helion.runtime.kernel import _constexpr_key
 from helion.runtime.settings import Settings
 from helion.runtime.settings import default_autotuner_fn
 from helion.runtime.structural_policy import StructuralPolicyError
 
 pytestmark = pytest.mark.cpu_only
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _STANDALONE_KEY_LIMIT = 3
 
@@ -298,6 +320,10 @@ class TestShapeKey:
         cache.autotuner = SimpleNamespace(
             _search_policy_cacheable=False,
             log=Mock(),
+            config_spec=SimpleNamespace(
+                unsearched_config=lambda config, overrides: config
+            ),
+            settings=SimpleNamespace(autotune_config_overrides={}),
         )
         cache.args = ()
         cache.get = Mock(return_value=selected)  # type: ignore[method-assign]
@@ -878,6 +904,97 @@ def _load_generated(path: Path, name: str) -> Any:
     return module
 
 
+class _BoundKernelStub(SimpleNamespace):
+    """A stand-in for a bound kernel that supports weak references, like the
+    bound kernel the cache keeps for an ordinary dynamic export."""
+
+
+def _stub_export_cache(
+    source_dir: Path | None,
+    *,
+    data_dir: Path | None = None,
+    static: bool = False,
+    heuristic: str = "CONFIGS = [{'block_sizes': [16]}]\n",
+    source: str = "def demo(x):\n    return x\n",
+) -> AOTAutotuneCache:
+    """A compile-mode ``AOTAutotuneCache`` over a stub binding of the kernel
+    ``demo`` whose ``source`` is ``source_dir / "source.py"``, so that it is
+    exported to ``source_dir / "source_demo_standalone.py"``; without a
+    ``source_dir`` the kernel has no source file and is exported to
+    ``data_dir``. Its tuning data, the ``heuristic`` text, is in
+    ``data_dir`` (``source_dir`` by default), where
+    ``cache._find_heuristic_file()`` finds it. The kernel's backend holds no
+    override. A test sets ``to_triton_code`` on ``cache.kernel``, replaces
+    what else it varies and binds other arguments than a tensor of two
+    elements with ``_bind_static_export_inputs``."""
+    filename = "<stdin>"
+    if source_dir is not None:
+        source_dir.mkdir(parents=True, exist_ok=True)
+        (source_dir / "source.py").write_text(source)
+        filename = str(source_dir / "source.py")
+    if data_dir is None:
+        assert source_dir is not None
+        data_dir = source_dir
+    data_dir.mkdir(parents=True, exist_ok=True)
+    namespace: dict[str, Any] = {}
+    exec(compile(source, filename, "exec"), namespace)
+    heuristic_path = data_dir / "_helion_aot_demo_cuda_sm100.py"
+    heuristic_path.write_text(heuristic)
+    cache = object.__new__(AOTAutotuneCache)
+    cache.data_dir = data_dir
+    cache.hardware_id = "test-hardware"
+    cache._get_heuristic_config = lambda _args, snapshot=None: Config(block_sizes=[16])
+    cache._find_heuristic_file = lambda: heuristic_path
+    cache.kernel = _BoundKernelStub(
+        settings=SimpleNamespace(static_shapes=static, index_dtype=None),
+        host_function=SimpleNamespace(constexpr_args={}),
+        env=SimpleNamespace(
+            index_dtype=torch.int32, wide_empty_grid=False, specialized_vars=set()
+        ),
+        kernel=helion.kernel(namespace["demo"], static_shapes=static),
+        _normalized_config_copy=lambda config: config,
+        _unsearched_config=lambda config, report=False: config,
+        _unsearched_overrides_identity=lambda: None,
+    )
+    _bind_static_export_inputs(cache, torch.empty(2))
+    return cache
+
+
+def _stub_code(value: object) -> str:
+    """The code a stub kernel generates: ``demo`` returns ``value``."""
+    return f"from __future__ import annotations\n\ndef demo(x):\n    return {value}\n"
+
+
+def _call_exported(path: Path, size: int) -> int:
+    """Call the ``demo`` of the standalone file at ``path``, executed from
+    its text: the file as it is on disk."""
+    return runpy.run_path(str(path))["demo"](torch.empty(size))
+
+
+def _export_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """What the AOT cache logged, of what ``caplog`` holds."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "helion.autotuner.aot_cache"
+    ]
+
+
+def _rewrite_under_bytecode(path: Path, content: bytes) -> None:
+    """Replace the heuristic at ``path`` by ``content``, of the same size,
+    within the second of the file replaced: Python's import of the path
+    would then run the bytecode of that file, which is written here."""
+    written = path.stat()
+    py_compile.compile(
+        str(path),
+        doraise=True,
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    path.write_bytes(content)
+    os.utime(path, ns=(written.st_atime_ns, written.st_mtime_ns))
+    assert path.stat().st_size == written.st_size
+
+
 def test_static_standalone_call_key_covers_runtime_specialization() -> None:
     class Point(NamedTuple):
         x: int
@@ -1072,6 +1189,8 @@ def test_dynamic_standalone_rejects_tensor_descriptors_before_codegen(
         settings=SimpleNamespace(static_shapes=False),
         kernel=SimpleNamespace(name="demo", __code__=kernel_function.__code__),
         _normalized_config_copy=normalize,
+        _unsearched_config=lambda config, report=False: config,
+        _unsearched_overrides_identity=lambda: None,
         to_triton_code=lambda config: codegen_calls.append(config),
     )
     cache._find_heuristic_file = lambda: heuristic_path
@@ -1084,6 +1203,98 @@ def test_dynamic_standalone_rejects_tensor_descriptors_before_codegen(
     assert not AOTAutotuneCache._compiled_kernels
     assert not (tmp_path / "source_demo_standalone.py").exists()
     AOTAutotuneCache.clear_caches()
+
+
+_HELD_DESCRIPTORS = '{"indexing": "tensor_descriptor"}'
+
+
+def test_dynamic_standalone_descriptor_check_reads_the_config_the_kernel_compiles(
+    tmp_path: Path,
+) -> None:
+    # The tuning data stores a pointer config, and the backend holds the
+    # kernel's unsearched configs to an override that selects descriptor
+    # indexing (stubbed). The export compiles the changed config, so the
+    # descriptor check reads that one: the dynamic export is rejected before
+    # code generation.
+    changed = Config(block_sizes=[16], indexing="tensor_descriptor")
+    compiled: list[Config] = []
+    cache = _stub_export_cache(
+        tmp_path,
+        heuristic="CONFIGS = [{'block_sizes': [16], 'indexing': 'pointer'}]\n",
+    )
+    cache.kernel.to_triton_code = compiled.append
+    cache.kernel._unsearched_config = lambda config, report=False: changed
+    cache.kernel._unsearched_overrides_identity = lambda: _HELD_DESCRIPTORS
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        with pytest.raises(exc.InvalidAPIUsage, match="dynamic standalone AOT"):
+            cache._maybe_run_compile()
+        assert compiled == []
+        assert not (tmp_path / "source_demo_standalone.py").exists()
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_static_export_under_held_overrides_keeps_its_calls_in_one_entry(
+    tmp_path: Path,
+) -> None:
+    # The tuning data stores a pointer config, and the backend's hook, which
+    # answers by the binding, selects descriptor indexing for one call of
+    # the kernel and leaves the config alone for another (stubbed: by the
+    # size of the argument). The descriptor guards are one flag for the
+    # file and part of its entry, so a static export under held overrides
+    # has them for every call: both calls are variants of one entry, and
+    # the file dispatches each to its own. Guards read off the config of
+    # the call at hand would keep the two calls in two entries, each of
+    # which writes the file without the other's variant.
+    output_path = tmp_path / "source_demo_standalone.py"
+    held: list[str | None] = [None]
+    cache = _stub_export_cache(
+        tmp_path,
+        static=True,
+        heuristic="CONFIGS = [{'block_sizes': [16], 'indexing': 'pointer'}]\n",
+    )
+    cache.kernel.to_triton_code = lambda config: _stub_code(
+        1000 * (config.indexing == "tensor_descriptor") + cache.args[0].size(0)
+    )
+    cache.kernel._unsearched_config = lambda config, report=False: (
+        Config(block_sizes=[16], indexing="tensor_descriptor")
+        if held[0] is not None and cache.args[0].size(0) == 3
+        else config
+    )
+    cache.kernel._unsearched_overrides_identity = lambda: held[0]
+
+    def exported(size: int) -> int:
+        _bind_static_export_inputs(cache, torch.empty(size))
+        cache._maybe_run_compile()
+        return _call_exported(output_path, size)
+
+    def entries() -> list[tuple[str | bool, str | bool, int]]:
+        # Of each entry: its descriptor guards, what its kernel holds, and
+        # the number of its variants.
+        return [
+            (key[-2], key[-1], len(variants))
+            for key, variants in AOTAutotuneCache._compiled_kernel_variants.items()
+        ]
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        # Without held overrides the hook is not asked: the guards are read
+        # off the stored configs, which need none.
+        assert [exported(2), exported(3)] == [2, 3]
+        assert entries() == [(False, "", 2)]
+        held[0] = _HELD_DESCRIPTORS
+        assert [exported(2), exported(3)] == [2, 1003]
+        assert entries()[1:] == [(True, _HELD_DESCRIPTORS, 2)]
+        # The call the hook left alone is still dispatched to its variant,
+        # and a tensor the descriptor predicates set apart has none.
+        assert _call_exported(output_path, 2) == 2
+        module = runpy.run_path(str(output_path))
+        with pytest.raises(ValueError, match="No standalone variant"):
+            module["demo"](torch.empty(4)[1:])
+    finally:
+        AOTAutotuneCache.clear_caches()
 
 
 @onlyBackends(["triton"])
@@ -1603,6 +1814,8 @@ def test_dynamic_standalone_still_accepts_pointer_config(tmp_path: Path) -> None
             normalize_args=lambda *args: args,
         ),
         _normalized_config_copy=lambda config: config,
+        _unsearched_config=lambda config, report=False: config,
+        _unsearched_overrides_identity=lambda: None,
         to_triton_code=to_triton_code,
     )
     cache._find_heuristic_file = lambda: heuristic_path
@@ -1780,6 +1993,8 @@ def test_static_aot_compile_accumulates_observed_shapes(
 
     cache.kernel = SimpleNamespace(
         kernel=helion.kernel(kernel_function, static_shapes=True),
+        _unsearched_config=lambda config, report=False: config,
+        _unsearched_overrides_identity=lambda: None,
         to_triton_code=to_triton_code,
     )
 
@@ -1820,6 +2035,1166 @@ def test_static_aot_compile_accumulates_observed_shapes(
     AOTAutotuneCache.clear_caches()
 
 
+def test_a_second_plain_dynamic_call_does_not_publish_the_export_again(
+    tmp_path: Path,
+) -> None:
+    # The plain dynamic export holds every config. A call that arrives while
+    # another call of its binding is still generating the export generates
+    # the code as well and publishes the file; the first call, which then
+    # finds the file written from what it generated, writes nothing, and
+    # neither does a call once the file is written.
+    exported = tmp_path / "source_demo_standalone.py"
+    generating = threading.Event()
+    release = threading.Event()
+    codegen_calls: list[Config] = []
+
+    def to_triton_code(config: Config) -> str:
+        codegen_calls.append(config)
+        if len(codegen_calls) == 1:
+            # The first call's code generation, which the second call meets.
+            generating.set()
+            assert release.wait(60)
+        return _stub_code("x")
+
+    cache = _stub_export_cache(tmp_path)
+    cache.kernel.to_triton_code = to_triton_code
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(cache._maybe_run_compile)
+            try:
+                assert generating.wait(60)
+                cache._maybe_run_compile()
+                assert len(codegen_calls) == 2
+                written = exported.stat().st_mtime_ns
+            finally:
+                release.set()
+            first.result(timeout=60)
+        assert exported.stat().st_mtime_ns == written
+        cache._maybe_run_compile()
+        assert len(codegen_calls) == 2
+        assert exported.stat().st_mtime_ns == written
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_failed_plain_dynamic_export_is_made_again(tmp_path: Path) -> None:
+    # An export that ends without its file leaves nothing behind that would
+    # skip the next call.
+    exported = tmp_path / "source_demo_standalone.py"
+    codegen_calls: list[Config] = []
+
+    def to_triton_code(config: Config) -> str:
+        codegen_calls.append(config)
+        return _stub_code("x")
+
+    cache = _stub_export_cache(tmp_path)
+    cache.kernel.to_triton_code = to_triton_code
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        with (
+            patch(
+                "helion.autotuner.aot_compile.generate_standalone_file",
+                side_effect=OSError("disk full"),
+            ),
+            pytest.raises(OSError, match="disk full"),
+        ):
+            cache._maybe_run_compile()
+        assert not exported.exists()
+        # Nor an owner: a file has one once it is written.
+        assert not AOTAutotuneCache._standalone_export_owners
+        cache._maybe_run_compile()
+        assert len(codegen_calls) == 2
+        assert exported.exists()
+        assert len(AOTAutotuneCache._standalone_export_owners) == 1
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_standalone_export_is_written_from_the_entry_of_its_held_overrides(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A backend may hold the configs a kernel selects without a search to
+    # some of its ``autotune_config_overrides``
+    # (``BackendSearchSurface.overrides_without_search``). The same call then
+    # exports other code once those overrides change: another kernel over
+    # the same function, or the same one after ``Kernel.reset()``. What a
+    # kernel holds is part of the entry its variants are kept in, and the
+    # file is written from the entry of the kernel that exports: the
+    # variants of other overrides neither collide with it nor show in it,
+    # and they are written again when their overrides export next.
+    output_path = tmp_path / "source_demo_standalone.py"
+    held: list[str | None] = [None]
+    codegen_calls: list[Config] = []
+    cache = _stub_export_cache(tmp_path, static=True)
+
+    def to_triton_code(config: Config) -> str:
+        codegen_calls.append(config)
+        return _stub_code(100 * config.block_sizes[0] + cache.args[0].size(0))
+
+    cache.kernel.to_triton_code = to_triton_code
+    # The stored config as the kernel compiles it under the held overrides.
+    cache.kernel._unsearched_config = lambda config, report=False: (
+        config if held[0] is None else Config(block_sizes=[32])
+    )
+    cache.kernel._unsearched_overrides_identity = lambda: held[0]
+
+    def exported(size: int) -> int:
+        _bind_static_export_inputs(cache, torch.empty(size))
+        cache._maybe_run_compile()
+        return _call_exported(output_path, size)
+
+    caplog.set_level("WARNING", logger="helion.autotuner.aot_cache")
+    AOTAutotuneCache.clear_caches()
+    # Static shapes: one variant per observed call.
+    assert [exported(2), exported(3)] == [1602, 1603]
+    held[0] = '{"opt_out": true}'
+    assert exported(2) == 3202
+    with pytest.raises(ValueError, match="No standalone variant"):
+        _call_exported(output_path, 3)
+    # Under one set of overrides the calls accumulate, a repeated call is
+    # not exported again, and other code for a known call still collides.
+    assert [exported(3), exported(2)] == [3203, 3202]
+    assert len(codegen_calls) == 5
+    written = output_path.read_text()
+    assert exported(3) == 3203 and output_path.read_text() == written
+    cache.kernel._unsearched_config = lambda config, report=False: Config(
+        block_sizes=[64]
+    )
+    with pytest.raises(RuntimeError, match="call-key collision"):
+        exported(3)
+    # The overrides the export began under write the file from their own
+    # entry again, which kept both of its calls: the file on disk was
+    # generated under the others. Two kernels that hold different overrides
+    # and export in turn therefore each find a file without the other's
+    # variants.
+    held[0] = None
+    cache.kernel._unsearched_config = lambda config, report=False: config
+    assert exported(3) == 1603
+    assert _call_exported(output_path, 2) == 1602
+
+    # Dynamic shapes: every heuristic config, compiled once while the
+    # binding and what it holds stay the same. One table is kept per file,
+    # so the return to the first overrides generates theirs again.
+    AOTAutotuneCache.clear_caches()
+    cache.kernel.settings.static_shapes = False
+    codegen_calls.clear()
+    assert exported(2) == 1602 and exported(2) == 1602
+    assert len(codegen_calls) == 1
+    for identity, value in (('{"opt_out": true}', 3202), (None, 1602)):
+        held[0] = identity
+        cache.kernel._unsearched_config = (
+            lambda config, report=False, identity=identity: (
+                config if identity is None else Config(block_sizes=[32])
+            )
+        )
+        assert exported(2) == value and exported(2) == value
+    assert len(codegen_calls) == 3
+    # No export warns: each writes every variant of its own entry.
+    assert not _export_warnings(caplog)
+    AOTAutotuneCache.clear_caches()
+
+
+@pytest.mark.parametrize("static", [False, True])
+def test_exports_racing_under_other_overrides_leave_the_last_publishers_file(
+    static: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two kernels over one function hold different overrides and export from
+    # two threads. The first is still generating its code when the second
+    # writes the file. Code is generated outside the lock and a variant is
+    # published into the entry of the overrides its kernel holds, so the
+    # first then writes the file from its own entry, as it would had its
+    # turn come later: the file holds its variant alone, and the second
+    # kernel's call does not count as exported.
+    output_path = tmp_path / "source_demo_standalone.py"
+    first_generating = threading.Event()
+    second_published = threading.Event()
+
+    def make_cache(held: str | None, value: int) -> AOTAutotuneCache:
+        def to_triton_code(_config: Config) -> str:
+            if held is None and not second_published.is_set():
+                first_generating.set()
+                assert second_published.wait(timeout=30)
+            return _stub_code(value)
+
+        cache = _stub_export_cache(tmp_path, static=static)
+        cache.kernel.to_triton_code = to_triton_code
+        cache.kernel._unsearched_overrides_identity = lambda: held
+        return cache
+
+    def published() -> int:
+        return _call_exported(output_path, 2)
+
+    first = make_cache(None, 1)
+    second = make_cache('{"opt_out": true}', 2)
+
+    def export_second() -> None:
+        assert first_generating.wait(timeout=30)
+        try:
+            second._maybe_run_compile()
+        finally:
+            second_published.set()
+
+    caplog.set_level("WARNING", logger="helion.autotuner.aot_cache")
+    AOTAutotuneCache.clear_caches()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(first._maybe_run_compile),
+            pool.submit(export_second),
+        ]
+        for future in futures:
+            future.result()
+    assert published() == 1
+    # The first kernel's call is exported, so it is not written again ...
+    written = output_path.read_text()
+    first._maybe_run_compile()
+    assert output_path.read_text() == written
+    # ... and the second kernel's next call writes the file from its own
+    # entry, as it does when the two take turns.
+    second._maybe_run_compile()
+    assert published() == 2
+    # No export warns: no variant is dropped on the way.
+    assert not _export_warnings(caplog)
+    AOTAutotuneCache.clear_caches()
+
+
+class _StubExports:
+    """Standalone exports of stub kernels through the static or the plain
+    dynamic path, for ``helion._testing.aot_export_scenarios``. The stub
+    backend holds a kernel's unsearched configs to ``block_sizes``."""
+
+    kernels = frozenset({KERNEL, TWIN, OTHER_DIR, OTHER_SOURCE})
+    # A file is written from the entry of the kernel that exports.
+    owned = False
+    # The block size the stored config is compiled with under what a kernel
+    # holds; the generated code returns it.
+    _BLOCK: ClassVar[dict[str | None, int]] = {PLAIN: 16, HELD_A: 32, HELD_B: 64}
+
+    def __init__(self, tmp_path: Path, *, static: bool) -> None:
+        self.static = static
+        # A static export raises the error a scenario expects of failing
+        # code generation; the plain dynamic path raises the compiler's own
+        # where its every config fails.
+        self.codegen_failure_raises = static
+        self._root = tmp_path
+        # Every kernel's tuning data holds the same heuristic.
+        self._caches = {
+            name: _stub_export_cache(
+                self._source(name).parent,
+                data_dir=tmp_path / ("other_aot" if name == OTHER_DIR else "aot"),
+                static=static,
+            )
+            for name in sorted(self.kernels)
+        }
+
+    def _source(self, kernel: str) -> Path:
+        directory = "other_source" if kernel == OTHER_SOURCE else "source"
+        return self._root / directory / "source.py"
+
+    def export(
+        self,
+        kernel: str,
+        held: str | None,
+        shape: int,
+        *,
+        during_codegen: Callable[[], None] | None = None,
+        fail: bool = False,
+    ) -> None:
+        cache = self._caches[kernel]
+        _bind_static_export_inputs(cache, torch.empty(shape))
+        # A static export compiles the config of the call at hand, which the
+        # hook leaves alone for ``INELIGIBLE``; a dynamic export is generated
+        # once, for every call.
+        applies = held is not PLAIN and not (self.static and shape == INELIGIBLE)
+        block = self._BLOCK[held if applies else PLAIN]
+
+        def to_triton_code(config: Config) -> str:
+            if fail:
+                raise ValueError("stub code generation failed")
+            value = 1000 * config.block_sizes[0] + (shape if self.static else 0)
+            if during_codegen is not None:
+                during_codegen()
+            return _stub_code(value)
+
+        cache.kernel._unsearched_config = lambda config, report=False: (
+            Config(block_sizes=[block]) if applies else config
+        )
+        cache.kernel._unsearched_overrides_identity = lambda: (
+            None if held is PLAIN else json.dumps({"held": held})
+        )
+        cache.kernel.to_triton_code = to_triton_code
+        cache._maybe_run_compile()
+
+    def file(self, kernel: str) -> Path:
+        return self._source(kernel).with_name("source_demo_standalone.py")
+
+    def files(self) -> set[Path]:
+        return set(self._root.rglob("*_standalone*.py"))
+
+    def dispatched(self, path: Path) -> dict[int, str | None]:
+        # Executed from its text: the file as it is on disk.
+        module = runpy.run_path(str(path))
+        held = {block: name for name, block in self._BLOCK.items()}
+        variants: dict[int, str | None] = {}
+        for shape in SHAPES:
+            try:
+                value = module["demo"](torch.empty(shape))
+            except ValueError as error:
+                assert "No standalone variant" in str(error)
+                continue
+            block, call = divmod(value, 1000)
+            assert call == (shape if self.static else 0)
+            variants[shape] = held[block]
+        return variants
+
+
+# Each scenario is another sequence of exports, and the static and the
+# dynamic path keep their entries apart, so every scenario runs on both. A
+# scenario with failing code generation runs on the static path, which
+# raises the error it expects.
+@pytest.mark.parametrize(
+    ("scenario", "static"),
+    [
+        (scenario, static)
+        for static in (False, True)
+        for scenario in scenario_names(_StubExports.kernels, failures=static)
+    ],
+)
+def test_standalone_export_scenarios(
+    scenario: str, static: bool, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # What every standalone file holds after each export of kernels whose
+    # held overrides change, differ or agree: see the scenario table.
+    AOTAutotuneCache.clear_caches()
+    try:
+        run_export_scenario(scenario, _StubExports(tmp_path, static=static), caplog)
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_static_call_is_exported_again_once_another_entry_wrote_its_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # One file, two entries: the calls of one kernel on two hardware ids.
+    # Each export writes the file from its own entry, so a call whose entry
+    # did not write the file last is on disk no longer, whatever its entry
+    # remembers. It is written again, with every variant of its entry.
+    AOTAutotuneCache.clear_caches()
+    caplog.set_level("WARNING", logger="helion.autotuner.aot_cache")
+    driver = _StubExports(tmp_path, static=True)
+    cache = driver._caches[KERNEL]
+    small, large = SHAPES[:2]
+
+    def export(hardware: str, shape: int) -> dict[int, str | None]:
+        cache.hardware_id = hardware
+        driver.export(KERNEL, PLAIN, shape)
+        return driver.dispatched(driver.file(KERNEL))
+
+    try:
+        assert export("first", small) == {small: PLAIN}
+        assert export("second", large) == {large: PLAIN}
+        # Not skipped as exported: the other entry wrote the file last.
+        assert export("first", small) == {small: PLAIN}
+        assert export("first", large) == {small: PLAIN, large: PLAIN}
+        assert export("second", large) == {large: PLAIN}
+        # The file is its entry's: a repeated call writes nothing.
+        written = driver.file(KERNEL).stat().st_mtime_ns
+        assert export("second", large) == {large: PLAIN}
+        assert driver.file(KERNEL).stat().st_mtime_ns == written
+        # A switch back to an entry that holds two variants writes both, not
+        # the call at hand alone.
+        assert export("first", small) == {small: PLAIN, large: PLAIN}
+        assert not _export_warnings(caplog)
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_plain_dynamic_call_is_exported_again_once_a_static_kernel_wrote_its_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two kernel objects over one function, one of them with static shapes,
+    # write the same file. The dynamic kernel's export dispatches every
+    # shape; the static kernel then writes the file from its own entry,
+    # which holds the one shape it was called with. The dynamic kernel's
+    # next call is not skipped as exported: the file is written from its
+    # table again.
+    AOTAutotuneCache.clear_caches()
+    caplog.set_level("WARNING", logger="helion.autotuner.aot_cache")
+    dynamic = _StubExports(tmp_path, static=False)
+    static = _StubExports(tmp_path, static=True)
+    path = dynamic.file(KERNEL)
+    assert static.file(KERNEL) == path
+    small, large = SHAPES[:2]
+    every_shape = dict.fromkeys(SHAPES, PLAIN)
+    try:
+        dynamic.export(KERNEL, PLAIN, small)
+        assert dynamic.dispatched(path) == every_shape
+        static.export(KERNEL, PLAIN, large)
+        assert static.dispatched(path) == {large: PLAIN}
+        dynamic.export(KERNEL, PLAIN, small)
+        assert dynamic.dispatched(path) == every_shape
+        # The file is its entry's: a repeated call writes nothing.
+        written = path.stat().st_mtime_ns
+        dynamic.export(KERNEL, PLAIN, large)
+        assert path.stat().st_mtime_ns == written
+        # The static kernel's turn again: its entry kept its variant.
+        static.export(KERNEL, PLAIN, small)
+        assert static.dispatched(path) == {small: PLAIN, large: PLAIN}
+        assert not _export_warnings(caplog)
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_plain_dynamic_call_is_exported_again_once_other_tuning_data_wrote_its_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Two kernels over one function, with tuning data in two directories,
+    # write the same file, each from the configs of its own data: the plain
+    # dynamic path knows an export by its binding, the hardware id and the
+    # bytes of the heuristic and the source. A call does not count as
+    # exported on what another kernel of its name wrote.
+    caplog.set_level("WARNING", logger="helion.autotuner.aot_cache")
+    path = tmp_path / "source_demo_standalone.py"
+    generated: list[int] = []
+    during: list[int] = []
+
+    def to_triton_code(config: Config) -> str:
+        (block,) = config.block_sizes
+        if block == 16 and not generated:
+            # The other kernel's call arrives while this one's code is
+            # being generated.
+            during.append(exported(64))
+        generated.append(block)
+        return _stub_code(block)
+
+    caches = {
+        block: _stub_export_cache(
+            tmp_path,
+            data_dir=tmp_path / f"aot_{block}",
+            heuristic=f"CONFIGS = [{{'block_sizes': [{block}]}}]\n",
+        )
+        for block in (16, 64)
+    }
+    for cache in caches.values():
+        cache.kernel.to_triton_code = to_triton_code
+
+    def exported(block: int) -> int:
+        caches[block]._maybe_run_compile()
+        return _call_exported(path, 2)
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        # The call of another kernel that arrives while this one's code is
+        # generated writes the file, which this kernel's export then
+        # replaces.
+        assert exported(16) == 16
+        assert (during, generated) == ([64], [64, 16])
+        assert [exported(64), exported(16)] == [64, 16]
+        # The file is its kernel's: a repeated call generates nothing.
+        assert exported(16) == 16
+        assert generated == [64, 16, 64, 16]
+        # The same data on another hardware id is exported again.
+        caches[16].hardware_id = "other-hardware"
+        assert exported(16) == 16
+        assert generated == [64, 16, 64, 16, 16]
+        assert not _export_warnings(caplog)
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_static_export_selects_from_its_own_heuristic_file(tmp_path: Path) -> None:
+    # Two static kernels over one function, each handed the heuristic file
+    # of its own tuning data, write the same file from two entries. The
+    # variant of each entry is generated from the config its own heuristic
+    # selects, through the selector itself (``_get_heuristic_config``). The
+    # selections used to be kept by source file, kernel name and shape, so
+    # the second kernel selected what the first one's heuristic had
+    # selected.
+    #
+    # An export reads its heuristic file anew, for the selection, the
+    # entry and the embedded text alike: a file rewritten to the bytes of
+    # the other kernel's shares the entry of those bytes.
+    path = tmp_path / "source_demo_standalone.py"
+    caches = {
+        block: _stub_export_cache(
+            tmp_path,
+            data_dir=tmp_path / f"aot_{block}",
+            static=True,
+            heuristic=(
+                f"CONFIGS = [{{'block_sizes': [{block}]}}]\n"
+                "def autotune_demo(*args):\n    return CONFIGS[0]\n"
+            ),
+        )
+        for block in (16, 64)
+    }
+    for cache in caches.values():
+        # The stub of the selector goes; the class's own selects.
+        del cache._get_heuristic_config
+        cache.kernel.to_triton_code = lambda config: _stub_code(config.block_sizes[0])
+
+    def exported(block: int) -> tuple[list[int], int]:
+        cache = caches[block]
+        config = cache._get_heuristic_config(cache.args)
+        assert config is not None
+        cache._maybe_run_compile()
+        return config.block_sizes, _call_exported(path, 2)
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        # Each export asks the selector again, for the selection of its own
+        # heuristic file.
+        assert [exported(16), exported(64)] == [([16], 16), ([64], 64)]
+        files = {block: cache._find_heuristic_file() for block, cache in caches.items()}
+        _rewrite_under_bytecode(files[16], files[64].read_bytes())
+        assert [exported(16)[1], exported(64)[1]] == [64, 64]
+        # Once the caches are cleared, as in a new process, the module the
+        # selector keeps for the path is executed from the file's bytes,
+        # not from the bytecode of the file replaced: both kernels select
+        # alike.
+        AOTAutotuneCache.clear_caches()
+        assert [exported(16), exported(64)] == [([64], 64), ([64], 64)]
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_heuristic_is_executed_as_an_import_executes_its_file(tmp_path: Path) -> None:
+    # The module of a heuristic is executed from the file's bytes, and
+    # names its file as Python's import of the file does: the module names
+    # its file, its functions name the path they were compiled under, and
+    # the bytes are compiled without the future statements of the module
+    # that executes them, under which an annotation is kept as text.
+    path = tmp_path / "heuristic_demo.py"
+    path.write_text("def autotune_demo(*args) -> dict:\n    return {}\n")
+    try:
+        module = AOTAutotuneCache._load_heuristic_module(path, None)
+        function = module.autotune_demo
+        assert (module.__file__, function.__code__.co_filename) == (str(path),) * 2
+        assert function.__annotations__ == {"return": dict}
+        assert inspect.getsource(function) == path.read_text()
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_dynamic_standalone_selector_executes_its_heuristic_as_the_cache_does(
+    tmp_path: Path,
+) -> None:
+    # The selector of a dynamic standalone file executes the heuristic's
+    # text, in a file that begins with the ``annotations`` future import.
+    # The text is compiled without that import, as the cache compiles the
+    # heuristic (above): a key that reads one of the heuristic's annotations
+    # selects in the file what it selects for the cache. Compiled under the
+    # file's future statements, the annotation was text and the call failed.
+    model = (
+        "def index_type() -> int:\n    return 0\n"
+        "def key_demo(x):\n"
+        "    return index_type.__annotations__['return'](x.numel() > 4)\n"
+    )
+    heuristic = tmp_path / "heuristic_demo.py"
+    heuristic.write_text(model)
+    children = ["def demo(x): return 16", "def demo(x): return 32"]
+    path = generate_standalone_file("demo", children, model, tmp_path)
+    try:
+        key = AOTAutotuneCache._load_heuristic_module(heuristic, None).key_demo
+        select = runpy.run_path(str(path))["demo"]
+        for size in (3, 8):
+            x = torch.empty(size)
+            assert select(x) == (16, 32)[key(x)]
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_plain_heuristic_is_executed_once_for_two_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two threads that ask for a plain heuristic's module at once get one
+    # module, executed once, whatever the file holds when the second thread
+    # gets its turn.
+    path = tmp_path / "heuristic_demo.py"
+    path.write_text("VALUE = 16\n")
+    executed: list[bytes] = []
+    execute = aot_cache_module.load_policy_module
+
+    def slow_execute(path: Path, source: bytes) -> Any:
+        executed.append(source)
+        time.sleep(0.05)
+        return execute(path, source)
+
+    monkeypatch.setattr(aot_cache_module, "load_policy_module", slow_execute)
+    AOTAutotuneCache.clear_caches()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(AOTAutotuneCache._load_heuristic_module, path, None)
+                for _ in range(2)
+            ]
+            modules = [future.result() for future in futures]
+        assert modules[0] is modules[1]
+        assert executed == [b"VALUE = 16\n"]
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_the_key_function_of_an_aot_kernel_executes_the_bytes_of_its_heuristic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The key function of an ``aot_kernel`` executes the heuristic for
+    # itself, beside the module the cache selects from. Both execute the
+    # file's bytes. Python's import would run the bytecode of the file
+    # replaced, and the kernel's key would be the old heuristic's beside a
+    # config of the new one.
+    _lookup_hardware(monkeypatch)
+    monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
+    heuristic = tmp_path / "_helion_aot_source_cuda_sm100.py"
+    heuristic.write_text("def key_demo(*args):\n    return 16\n")
+    _rewrite_under_bytecode(heuristic, b"def key_demo(*args):\n    return 64\n")
+    HeuristicKeyFunction.clear_cache()
+    aot_cache_module.clear_heuristic_cache()
+    try:
+        key = HeuristicKeyFunction(str(tmp_path / "source.py"), "demo")
+        assert key(torch.empty(2)) == 64
+    finally:
+        HeuristicKeyFunction.clear_cache()
+        aot_cache_module.clear_heuristic_cache()
+
+
+def _lookup_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The hardware of ``find_heuristic_file``, which a process without a
+    GPU has none of, and no ``HELION_HEURISTIC_DIR``."""
+    monkeypatch.delenv("HELION_HEURISTIC_DIR", raising=False)
+    monkeypatch.setattr(
+        aot_cache_module,
+        "get_hardware_info",
+        lambda: HardwareInfo(
+            device_kind="cuda",
+            hardware_name="stub",
+            runtime_version="13.0",
+            compute_capability="sm100",
+        ),
+    )
+
+
+@pytest.mark.parametrize("apart", ["data directory", "working directory", "kernel"])
+@pytest.mark.parametrize("order", [(16, 64, 16), (64, 16, 64)])
+def test_a_cache_selects_from_the_heuristic_of_its_kernel_and_data_directory(
+    apart: str, order: tuple[int, ...], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Two caches over one source file, as above, but each finds its
+    # heuristic, a ``heuristic_<kernel>.py``, through the lookup itself
+    # (``find_heuristic_file``): one function with tuning data in two
+    # directories, or two kernels with tuning data in one. The two
+    # directories are named apart, or by one relative
+    # ``HELION_AOT_DATA_DIR`` under two working directories. The lookup
+    # keeps its answer by the kernel and the data directory, resolved, and
+    # answers with the file in that directory, which the selections and the
+    # module are kept by. It used to keep it by the source file alone: the
+    # second cache got the first one's heuristic, and selected from it or,
+    # for another kernel, found no ``autotune_<kernel>`` in it.
+    _lookup_hardware(monkeypatch)
+    caches = {}
+    files = {}
+    working = {}
+    for block in (16, 64):
+        name = "other" if apart == "kernel" and block == 64 else "demo"
+        working[block] = tmp_path
+        data_dir = tmp_path / ("aot" if apart == "kernel" else f"aot_{block}")
+        if apart == "working directory":
+            working[block] = tmp_path / f"cwd_{block}"
+            data_dir = working[block] / "aot"
+        cache = _stub_export_cache(
+            tmp_path,
+            data_dir=data_dir,
+            heuristic=(
+                f"def autotune_{name}(*args):\n"
+                f"    return {{'block_sizes': [{block}]}}\n"
+            ),
+        )
+        cache.kernel.kernel.name = name
+        # The heuristic goes where the lookup searches for the tuning data
+        # of a kernel, and the stubs of the lookup and of the selector go.
+        files[block] = data_dir / f"heuristic_{name}.py"
+        cache._find_heuristic_file().rename(files[block])
+        del cache._find_heuristic_file
+        del cache._get_heuristic_config
+        if apart == "working directory":
+            # The data directory as the cache takes it from the variable.
+            monkeypatch.setenv("HELION_AOT_DATA_DIR", "aot")
+            cache.data_dir = aot_cache_module.get_aot_data_dir()
+            assert not cache.data_dir.is_absolute()
+        caches[block] = cache
+
+    def selected(block: int) -> tuple[Path | None, list[int] | None]:
+        cache = caches[block]
+        monkeypatch.chdir(working[block])
+        config = cache._get_heuristic_config(cache.args)
+        return cache._find_heuristic_file(), config and config.block_sizes
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        assert [selected(block) for block in order] == [
+            (files[block], [block]) for block in order
+        ]
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_a_lookup_without_a_data_directory_answers_for_its_kernel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A lookup without a data directory, the key function's of an
+    # ``aot_kernel``, takes the first answer its kernel got and then answers
+    # for all the kernel's lookups: the key function and the cache of a
+    # kernel select from one file. It used to answer for every kernel of
+    # the source file.
+    _lookup_hardware(monkeypatch)
+    find = aot_cache_module.find_heuristic_file
+    source = tmp_path / "source.py"
+    data = {name: tmp_path / name for name in ("first", "second")}
+    for directory in data.values():
+        directory.mkdir()
+        for kernel in ("demo", "other"):
+            (directory / f"heuristic_{kernel}.py").touch()
+    found = data["first"] / "heuristic_demo.py"
+
+    aot_cache_module.clear_heuristic_cache()
+    try:
+        # Holds what the lookup does, not a wanted result: whether an
+        # ``aot_kernel`` selects from the ``heuristic_<kernel>.py`` of its
+        # data directory, which the key function's lookup does not search,
+        # is a decision on public behavior that is still open. A key
+        # function after a cache gets the file the cache found, which its
+        # own lookup does not search for, and so does every later lookup
+        # of the kernel, over another data directory as well.
+        assert find(source, "demo", data["first"]) == found
+        assert find(source, "demo") == found
+        assert find(source, "demo", data["second"]) == found
+        # The same again: a key function that looked up first found
+        # nothing, for every data directory of its kernel.
+        aot_cache_module.clear_heuristic_cache()
+        assert find(source, "demo") is None
+        assert find(source, "demo", data["first"]) is None
+        assert find(source, "demo", data["second"]) is None
+        # Another kernel of the source file finds its own, whatever the
+        # first kernel's key function found.
+        assert find(source, "other", data["second"]) == (
+            data["second"] / "heuristic_other.py"
+        )
+        # Two key functions and a ``heuristic_<kernel>.py`` for each in
+        # ``HELION_HEURISTIC_DIR``, a relative one here: the answer is the
+        # file found, in its resolved directory.
+        aot_cache_module.clear_heuristic_cache()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HELION_HEURISTIC_DIR", "first")
+        assert find(source, "demo") == found
+        assert find(source, "other") == data["first"] / "heuristic_other.py"
+    finally:
+        aot_cache_module.clear_heuristic_cache()
+
+
+@pytest.mark.parametrize(
+    "policy", [None, CuteStructuralPolicy()], ids=["plain", "policy"]
+)
+def test_a_lookup_names_a_linked_heuristic_by_its_link(
+    policy: CuteStructuralPolicy | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The answer is the file's name in its resolved directory, here a data
+    # directory named by itself and by a link to it. The name is not
+    # resolved: a heuristic that is a link is read through the link, so a
+    # link that is swapped is followed as a file rewritten in place is, by
+    # the next export and, under a structural policy, the next selection.
+    # Resolved, the answer named the link's first target until the lookups
+    # were cleared.
+    _lookup_hardware(monkeypatch)
+    data = tmp_path / "aot"
+    data.mkdir()
+    (data / "tuned.py").touch()
+    link = policy_path(data / "heuristic_demo.py", policy)
+    link.symlink_to("tuned.py")
+    (tmp_path / "linked").symlink_to(data)
+    aot_cache_module.clear_heuristic_cache()
+    try:
+        for directory in (data, tmp_path / "linked"):
+            found = aot_cache_module.find_heuristic_file(
+                tmp_path / "source.py", "demo", directory, policy=policy
+            )
+            assert found == link
+    finally:
+        aot_cache_module.clear_heuristic_cache()
+
+
+@pytest.mark.parametrize("named", ["relative", "linked"])
+@pytest.mark.parametrize("directory", ["source", "HELION_HEURISTIC_DIR", "data"])
+def test_a_lookup_under_a_policy_follows_its_directories(
+    directory: str, named: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Under a structural policy a model is read at each selection, and the
+    # key of the lookup holds every directory a candidate is searched in,
+    # resolved as the answer's is: the source file's,
+    # ``HELION_HEURISTIC_DIR`` and the data directory. A relative one under
+    # another working directory, or a link to a directory that is
+    # retargeted, is another directory, whose model the lookup finds. With
+    # one of them kept as it is spelled, the key answered with the model of
+    # the first directory, which the answer names now that it holds a
+    # resolved directory.
+    _lookup_hardware(monkeypatch)
+    policy = CuteStructuralPolicy()
+    link = tmp_path / "current"
+    file = "heuristic_demo.py"
+    if directory == "source":
+        file = "_helion_aot_source_cuda_sm100.py"
+    for name in ("first", "second"):
+        model = policy_path(tmp_path / name / "models" / file, policy)
+        model.parent.mkdir(parents=True)
+        model.write_text(name)
+
+    def found(name: str) -> str:
+        if named == "relative":
+            monkeypatch.chdir(tmp_path / name)
+            models = "models"
+        else:
+            link.unlink(missing_ok=True)
+            link.symlink_to(tmp_path / name / "models")
+            models = str(link)
+        source = str(tmp_path / "source.py")
+        data_dir = None
+        if directory == "source":
+            # The name the kernel's code has for its file.
+            source = f"{models}/source.py"
+        elif directory == "data":
+            monkeypatch.setenv("HELION_AOT_DATA_DIR", models)
+            data_dir = aot_cache_module.get_aot_data_dir()
+        else:
+            monkeypatch.setenv("HELION_HEURISTIC_DIR", models)
+        model = aot_cache_module.find_heuristic_file(
+            source, "demo", data_dir, policy=policy
+        )
+        assert model is not None
+        return model.read_text()
+
+    order = ["first", "second", "first"]
+    aot_cache_module.clear_heuristic_cache()
+    try:
+        assert [found(name) for name in order] == order
+    finally:
+        aot_cache_module.clear_heuristic_cache()
+
+
+def test_a_rewritten_standalone_file_is_imported_as_written(tmp_path: Path) -> None:
+    # One kernel on two hardware ids, whose exports have the same size. The
+    # second export replaces a file
+    # that has been imported, within the second it was written in. The
+    # writer removes the bytecode of the file it replaces, so the import
+    # that follows runs the file as written.
+    output_path = tmp_path / "source_demo_standalone.py"
+    cache = _stub_export_cache(tmp_path)
+
+    def export(hardware: str, value: int) -> None:
+        cache.hardware_id = hardware
+        cache.kernel.to_triton_code = lambda _config: _stub_code(value)
+        cache._maybe_run_compile()
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        export("first", 16)
+        before, after = import_after_rewrite(output_path, lambda: export("second", 32))
+        assert (before.demo(torch.empty(2)), after.demo(torch.empty(2))) == (16, 32)
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def test_an_export_goes_on_where_bytecode_cannot_be_removed(tmp_path: Path) -> None:
+    # The removal of the bytecode is best effort. Here the bytecode of the
+    # file is in a read-only directory, from which this process cannot
+    # remove it, as it cannot from one that another account wrote. The
+    # export on another hardware id replaces the file all the same, and the
+    # first one's next call writes the file again.
+    output_path = tmp_path / "source_demo_standalone.py"
+    bytecode = importlib.util.cache_from_source(output_path)
+    cache = _stub_export_cache(tmp_path)
+
+    def exported(hardware: str, value: int) -> int:
+        cache.hardware_id = hardware
+        cache.kernel.to_triton_code = lambda _config: _stub_code(value)
+        cache._maybe_run_compile()
+        return _call_exported(output_path, 2)
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        assert exported("first", 16) == 16
+        py_compile.compile(str(output_path), bytecode, doraise=True)
+        directory = os.path.dirname(bytecode)
+        mode = stat.S_IMODE(os.stat(directory).st_mode)
+        os.chmod(directory, 0o500)
+        try:
+            if os.access(directory, os.W_OK):
+                pytest.skip("this process can remove files from a read-only directory")
+            assert exported("second", 32) == 32
+        finally:
+            os.chmod(directory, mode)
+        assert os.path.exists(bytecode)
+        assert exported("first", 16) == 16
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+def _indexed_heuristic(blocks: tuple[int, ...], selected: int, style: str) -> str:
+    """A heuristic for the stub kernel ``demo`` with a config per block size
+    of ``blocks``, which selects the one at index ``selected``. ``style`` is
+    where it keeps the configs: in a module-level ``CONFIGS``, or in the
+    ``_C`` of ``autotune_demo`` as the generated heuristics do."""
+    configs = [f"{{'block_sizes': [{block}]}}" for block in blocks]
+    key = f"def key_demo(*args):\n    return {selected}\n"
+    if style == "CONFIGS":
+        return f"CONFIGS = [{', '.join(configs)}]\n{key}"
+    listed = "".join(f"        {config},\n" for config in configs)
+    return (
+        f"{key}\n\ndef autotune_demo(*args):\n    _C = [\n{listed}    ]\n"
+        "    return _C[key_demo(*args)]\n"
+    )
+
+
+@pytest.mark.parametrize("style", ["CONFIGS", "_C"])
+def test_a_plain_dynamic_export_is_of_one_reading_of_its_heuristic(
+    tmp_path: Path, style: str
+) -> None:
+    # A plain dynamic export embeds the heuristic, which selects among the
+    # exported configs by index, so the configs and the embedded text are of
+    # one reading of the file: also when the file is rewritten between two
+    # exports of a process, which the bytes of the heuristic turn into a
+    # new export, or while an export generates its code.
+    path = tmp_path / "source_demo_standalone.py"
+    generated: list[int] = []
+    rewrites: list[str] = []
+
+    def to_triton_code(config: Config) -> str:
+        (block,) = config.block_sizes
+        if rewrites:
+            heuristic_path.write_text(rewrites.pop())
+        generated.append(block)
+        return _stub_code(block)
+
+    cache = _stub_export_cache(
+        tmp_path, heuristic=_indexed_heuristic((16, 32), 1, style)
+    )
+    cache.kernel.to_triton_code = to_triton_code
+    heuristic_path = cache._find_heuristic_file()
+    assert heuristic_path is not None
+
+    def exported() -> int:
+        cache._maybe_run_compile()
+        return _call_exported(path, 2)
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        assert exported() == 32
+        heuristic_path.write_text(_indexed_heuristic((64, 128, 256), 2, style))
+        assert exported() == 256
+        assert generated == [16, 32, 64, 128, 256]
+        # The file is of these bytes: a repeated call generates nothing.
+        assert exported() == 256
+        assert generated == [16, 32, 64, 128, 256]
+        # Rewritten again, and once more while that export generates its
+        # code: the export is of the bytes it read, and the next call
+        # exports the bytes the file holds then.
+        heuristic_path.write_text(_indexed_heuristic((1, 2, 3, 4), 3, style))
+        rewrites.append(_indexed_heuristic((16, 32), 1, style))
+        assert exported() == 4
+        assert exported() == 32
+        assert generated == [16, 32, 64, 128, 256, 1, 2, 3, 4, 16, 32]
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+_C_FUNCTION = (
+    "def autotune_demo(*args):\n"
+    "    _C = [\n"
+    "        {'block_sizes': [16]},\n"
+    "        {'block_sizes': [64]},\n"
+    "    ]\n"
+    "    return _C[1]\n"
+)
+
+
+@pytest.mark.parametrize("held", [None, "held"])
+def test_a_plain_dynamic_export_reads_the_configs_of_an_imported_function(
+    held: str | None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A heuristic written by hand may import ``autotune_<kernel>``: the
+    # ``_C`` list is then in the file of the function, not in the bytes of
+    # the heuristic the export read, where the function's first line is
+    # some other text. Both configs are exported: sought in the heuristic's
+    # own lines, the list was not found and the export was skipped.
+    #
+    # No digest an export is known by covers that file. A call that reads
+    # other configs from it is skipped while its binding wrote the export
+    # last, as any call of an unchanged entry is, also for a kernel that
+    # holds overrides: the rejection of a binding the hook answers
+    # otherwise for compares what the hook made of the same configs.
+    module = "helion_test_imported_autotune"
+    imported = tmp_path / f"{module}.py"
+    imported.write_text("# The configs of demo.\n\n" + _C_FUNCTION)
+    monkeypatch.syspath_prepend(tmp_path)
+    path = tmp_path / "source_demo_standalone.py"
+    generated: list[int] = []
+
+    def to_triton_code(config: Config) -> str:
+        generated.append(config.block_sizes[0])
+        return _stub_code(config.block_sizes[0])
+
+    cache = _stub_export_cache(
+        tmp_path,
+        heuristic=(
+            f"from {module} import autotune_demo\n\n"
+            "def key_demo(*args):\n    return 1\n"
+        ),
+    )
+    cache.kernel.to_triton_code = to_triton_code
+    cache.kernel._unsearched_overrides_identity = lambda: held
+    AOTAutotuneCache.clear_caches()
+    try:
+        cache._maybe_run_compile()
+        assert generated == [16, 64]
+        assert _call_exported(path, 2) == 64
+        imported.write_text(
+            "# The configs of demo, edited.\n\n" + _C_FUNCTION.replace("[64]", "[128]")
+        )
+        cache._maybe_run_compile()
+        assert generated == [16, 64]
+        assert _call_exported(path, 2) == 64
+    finally:
+        AOTAutotuneCache.clear_caches()
+        sys.modules.pop(module, None)
+
+
+def test_a_static_export_reads_the_configs_of_the_bytes_it_selects_from(
+    tmp_path: Path,
+) -> None:
+    # A static export reads the heuristic's configs for the descriptor
+    # guards of its file. Where they are the ``_C`` of ``autotune_<kernel>``
+    # it reads them from the bytes it read the file as, which its selector
+    # is handed as well: once the file holds other configs, the next export
+    # reads those, for the guards and for the selection alike.
+    guards: list[tuple[bool, bytes]] = []
+
+    def compile_static(
+        heuristic_file: Path,
+        kernel_name: str,
+        *,
+        tensor_descriptor_guards: bool,
+        model_source: bytes,
+    ) -> None:
+        guards.append((tensor_descriptor_guards, model_source))
+
+    descriptor = _C_FUNCTION.replace("[64]}", "[64], 'indexing': 'tensor_descriptor'}")
+    cache = _stub_export_cache(tmp_path, static=True, heuristic=descriptor)
+    cache._compile_current_static_shape = compile_static
+    AOTAutotuneCache.clear_caches()
+    try:
+        cache._maybe_run_compile()
+        cache._find_heuristic_file().write_text(_C_FUNCTION)
+        cache._maybe_run_compile()
+        assert guards == [(True, descriptor.encode()), (False, _C_FUNCTION.encode())]
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+_C_CONFIGS = [{"block_sizes": [16]}, {"block_sizes": [64]}]
+
+
+@pytest.mark.parametrize(
+    ("heuristic", "configs"),
+    [
+        ("import functools\n\n@functools.lru_cache\n" + _C_FUNCTION, _C_CONFIGS),
+        (
+            "import functools\n\n"
+            "def logged(fn):\n"
+            "    @functools.wraps(fn)\n"
+            "    def wrapper(*args):\n"
+            "        return fn(*args)\n"
+            "    return wrapper\n\n"
+            "@logged\n" + _C_FUNCTION,
+            _C_CONFIGS,
+        ),
+        (
+            _C_FUNCTION.replace("autotune_demo", "configs")
+            + "\nimport functools\n\nautotune_demo = functools.partial(configs)\n",
+            None,
+        ),
+    ],
+    ids=["lru_cache", "wraps", "partial"],
+)
+def test_the_configs_of_a_wrapped_function_are_read_from_the_bytes(
+    tmp_path: Path, heuristic: str, configs: list[dict[str, object]] | None
+) -> None:
+    # What ``autotune_<kernel>`` names may be a wrapper, one without code of
+    # its own (``functools.lru_cache``) or with code that is not the
+    # function's. The ``_C`` list is that of the function under the
+    # decorators, as ``inspect.getsource`` reads it, and of the bytes the
+    # module was executed from: the file holds another list by now. A
+    # callable ``inspect.getsource`` has no text for (a ``functools.partial``)
+    # has no list to read, which is no error.
+    path = tmp_path / "heuristic_demo.py"
+    source = heuristic.encode()
+    module = AOTAutotuneCache._load_heuristic_module(path, None, source)
+    path.write_text(heuristic.replace("16", "128"))
+    try:
+        assert (
+            AOTAutotuneCache._parse_configs_from_autotune(module, "demo", path, source)
+            == configs
+        )
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
+_KEY_FUNCTION = "def key_demo(*args):\n    return 1\n\n"
+
+
+@pytest.mark.parametrize(
+    "heuristic",
+    [
+        "import functools\n\n" + _KEY_FUNCTION + "@functools.lru_cache\n" + _C_FUNCTION,
+        "import functools\n\n"
+        + _KEY_FUNCTION
+        + "@functools.lru_cache(\n    maxsize=None,\n)\n"
+        + _C_FUNCTION,
+        # A decorator of the heuristic's own, above ``key_<kernel>``.
+        "import functools\n\n"
+        "def logged(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def wrapper(*args):\n"
+        "        return fn(*args)\n"
+        "    return wrapper\n\n"
+        "@logged\n" + _C_FUNCTION + "\n" + _KEY_FUNCTION,
+    ],
+    ids=["lru_cache", "several_lines", "wraps_before_key"],
+)
+def test_a_plain_dynamic_export_of_a_decorated_autotune_selects_by_its_key(
+    tmp_path: Path, heuristic: str
+) -> None:
+    # The configs of a decorated ``autotune_<kernel>`` are read from under
+    # its decorators, whose lines begin the function's text, and the
+    # exported file, which selects by ``key_<kernel>``, is executed with
+    # what the decorators name: both configs are exported and the file
+    # selects the second.
+    path = tmp_path / "source_demo_standalone.py"
+    generated: list[int] = []
+
+    def to_triton_code(config: Config) -> str:
+        generated.append(config.block_sizes[0])
+        return _stub_code(config.block_sizes[0])
+
+    cache = _stub_export_cache(tmp_path, heuristic=heuristic)
+    cache.kernel.to_triton_code = to_triton_code
+    AOTAutotuneCache.clear_caches()
+    try:
+        cache._maybe_run_compile()
+        assert generated == [16, 64]
+        assert _call_exported(path, 2) == 64
+    finally:
+        AOTAutotuneCache.clear_caches()
+
+
 def test_static_aot_compile_dispatches_descriptor_alignment(tmp_path: Path) -> None:
     source_path = tmp_path / "source.py"
     source_path.write_text("def demo(x):\n    return x\n")
@@ -1848,6 +3223,8 @@ def test_static_aot_compile_dispatches_descriptor_alignment(tmp_path: Path) -> N
 
     cache.kernel = SimpleNamespace(
         kernel=helion.kernel(kernel_function, static_shapes=True),
+        _unsearched_config=lambda config, report=False: config,
+        _unsearched_overrides_identity=lambda: None,
         to_triton_code=to_triton_code,
     )
 
@@ -1884,6 +3261,8 @@ def test_static_aot_compile_supports_non_file_kernel_source(tmp_path: Path) -> N
     cache._get_heuristic_config = lambda _args: config
     cache.kernel = SimpleNamespace(
         kernel=helion.kernel(kernel_function, static_shapes=True),
+        _unsearched_config=lambda config, report=False: config,
+        _unsearched_overrides_identity=lambda: None,
         to_triton_code=lambda _config: (
             "from __future__ import annotations\n\ndef demo(x):\n    return 2\n"
         ),
@@ -1934,6 +3313,8 @@ def test_static_aot_compile_serializes_concurrent_variants(
 
         cache.kernel = SimpleNamespace(
             kernel=helion.kernel(kernel_function, static_shapes=True),
+            _unsearched_config=lambda config, report=False: config,
+            _unsearched_overrides_identity=lambda: None,
             to_triton_code=to_triton_code,
         )
         _bind_static_export_inputs(cache, torch.empty(size))
@@ -2067,6 +3448,254 @@ def test_custom_provider_aot_artifacts_are_deterministic(monkeypatch, tmp_path, 
         monkeypatch.setenv("HELION_AOT_MODE", "evaluate")
         assert make_cache().shape_key == first.shape_key
         assert "cache reuse is disabled" not in caplog.text
+
+
+@onlyBackends(["triton", "cute"])
+def test_overrides_a_backend_does_not_hold_leave_an_unsearched_config_alone() -> None:
+    # A standalone export is identified by what its kernel's backend holds
+    # unsearched configs to (``ConfigSpec.unsearched_overrides_identity``):
+    # a kernel that identity names nothing for shares the export of a kernel
+    # without overrides, so it has to compile what that one compiles.
+    # ``ConfigSpec.unsearched_config`` does not ask the backend's hook then,
+    # whatever the hook would return.
+    with cpu_render_target():
+        bound = cpu_bind(_explicit_aot_pointwise, (torch.arange(8.0),))
+    spec = bound.config_spec
+    config = spec.default_config()
+    overrides = {"block_sizes": [64]}
+    surface = type(spec.search_surface)
+
+    def applied(
+        self: object, spec: object, config: dict[str, object], overrides: dict[str, Any]
+    ) -> dict[str, object]:
+        return {**config, **overrides}
+
+    def nothing(self: object, overrides: dict[str, object]) -> dict[str, object]:
+        return {}
+
+    def everything(self: object, overrides: dict[str, object]) -> dict[str, object]:
+        return dict(overrides)
+
+    with patch.object(surface, "overrides_without_search", applied):
+        with patch.object(surface, "overrides_held_without_search", nothing):
+            assert spec.unsearched_overrides_identity(overrides) is None
+            assert spec.unsearched_config(config, overrides) is config
+        with patch.object(surface, "overrides_held_without_search", everything):
+            assert spec.unsearched_overrides_identity(overrides) == json.dumps(
+                overrides
+            )
+            selected = spec.unsearched_config(config, overrides)
+            assert selected is not config and selected.block_sizes == [64]
+            # This hook answers for its own result with a copy, where its
+            # contract says ``None``. Nothing changes, so the config itself
+            # comes back, in each form an autotuner hands one over in.
+            assert spec.unsearched_config(selected, overrides) is selected
+            options = dict(selected)
+            assert spec.unsearched_config(options, overrides) is options
+
+
+@onlyBackends(["triton", "cute"])
+def test_measure_mode_times_a_stored_config_as_the_kernel_compiles_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Measure mode times the configs of the tuning data, which no search
+    # under the kernel's overrides need have written. A backend that holds
+    # such configs to an override (stubbed as ``block_sizes``) compiles
+    # another config for them, and that is the one timed: on the shape at
+    # hand and on each shape of ``measure_fn``, whose own binding the hook
+    # is asked for. Every timing is saved under the stored config, which a
+    # heuristic selects by.
+    monkeypatch.setenv("HELION_AOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HELION_AOT_MODE", "measure")
+    args = (torch.arange(8, dtype=torch.float32),)
+    inputs = [(torch.empty(size),) for size in (16, 24)]
+    stored = [Config(block_sizes=[16]), Config(block_sizes=[32])]
+    timed: list[Config] = []
+    compiled: list[Config] = []
+
+    def benchmark(config: Config) -> SimpleNamespace:
+        timed.append(config)
+        return SimpleNamespace(perf=float(len(timed)))
+
+    def compile_config(
+        bound: object, config: Config, *, allow_print: bool = True
+    ) -> Callable[..., None]:
+        compiled.append(config)
+        return lambda *args: None
+
+    def measured() -> list[dict[str, list[int]]]:
+        with cache._measurements_file.open() as rows:
+            return [json.loads(row["config"]) for row in csv.DictReader(rows)]
+
+    with (
+        cpu_render_target(),
+        patch.object(
+            aot_cache_module,
+            "get_hardware_info",
+            return_value=HardwareInfo(
+                device_kind="cuda",
+                hardware_name="CPU bookkeeping proof",
+                runtime_version="0",
+                compute_capability="sm100",
+            ),
+        ),
+    ):
+        kernel = helion.aot_kernel(
+            _explicit_aot_pointwise.fn,
+            autotune_config_overrides={"block_sizes": [64]},
+            measure_fn=lambda: iter(inputs),
+        )
+        bound = cpu_bind(kernel, args)
+        surface = type(bound.config_spec.search_surface)
+        search = LFBOTreeSearch(bound, args)
+        search.benchmark_provider = Mock()
+        cache = AOTAutotuneCache(search)
+        for config in stored:
+            cache._add_tuned_config(kernel.name, config, cache.shape_key)
+        with (
+            hold_block_sizes(surface),
+            patch.object(search, "_prepare"),
+            patch.object(search, "benchmark", benchmark),
+        ):
+            assert cache.measure_all_configs() == [(stored[0], 1.0), (stored[1], 2.0)]
+        assert [config.block_sizes for config in timed] == [[64], [64]]
+        assert measured() == [{"block_sizes": [16]}, {"block_sizes": [32]}]
+
+        with (
+            # The hook leaves the cache's own binding alone here: a workflow
+            # that asked it for the shapes of ``measure_fn`` would time the
+            # stored configs.
+            hold_block_sizes(surface, ineligible={id(bound.config_spec)}),
+            patch("helion.runtime.kernel.BoundKernel.compile_config", compile_config),
+            patch("triton.testing.do_bench", return_value=1.25),
+        ):
+            cache._run_measure_fn_workflow()
+        assert [config.block_sizes for config in compiled] == [[64]] * 4
+        assert measured()[2:] == [{"block_sizes": [16]}, {"block_sizes": [32]}] * 2
+
+
+@onlyBackends(["triton", "cute"])
+def test_a_plain_dynamic_export_rejects_a_binding_the_hook_answers_otherwise_for(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The export of a kernel without static shapes holds the code of one
+    # binding, the one that exported last, and serves every call. A
+    # backend's hook answers for a binding (stubbed: it holds unsearched
+    # configs to ``block_sizes`` except on chosen bindings), so two bindings
+    # of one kernel under the same overrides can compile a stored config
+    # differently, and the file has no variant per binding. The export of
+    # such a binding would replace the other binding's config for its calls
+    # without a word. It is rejected, before any code is generated for it.
+    monkeypatch.setenv("HELION_AOT_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("HELION_AOT_MODE", "compile")
+    heuristic = tmp_path / "heuristic.py"
+    heuristic.write_text("CONFIGS = [{'block_sizes': [16]}]\n")
+    generated: list[int] = []
+    exported: list[list[str]] = []
+
+    def export(**written: Any) -> Path:
+        exported.append(written["triton_codes"])
+        return tmp_path / "exported.py"
+
+    def to_triton_code(config: Config) -> str:
+        generated.append(config.block_sizes[0])
+        return _stub_code(config.block_sizes[0])
+
+    def cache_of(dtype: torch.dtype) -> AOTAutotuneCache:
+        args = (torch.zeros(8, dtype=dtype),)
+        bound = cpu_bind(kernel, args)
+        monkeypatch.setattr(bound, "to_triton_code", to_triton_code)
+        cache = AOTAutotuneCache(BaseSearch(bound, args))
+        monkeypatch.setattr(cache, "_find_heuristic_file", lambda: heuristic)
+        return cache
+
+    def rejected(cache: AOTAutotuneCache) -> None:
+        with pytest.raises(exc.InvalidAPIUsage, match="one binding"):
+            cache._maybe_run_compile()
+
+    def left_alone(*caches: AOTAutotuneCache) -> set[int]:
+        return {id(cache.kernel.config_spec) for cache in caches}
+
+    AOTAutotuneCache.clear_caches()
+    try:
+        with (
+            cpu_render_target(),
+            patch.object(
+                aot_cache_module,
+                "get_hardware_info",
+                return_value=HardwareInfo(
+                    device_kind="cuda",
+                    hardware_name="CPU bookkeeping proof",
+                    runtime_version="0",
+                    compute_capability="sm100",
+                ),
+            ),
+            patch("helion.autotuner.aot_compile.generate_standalone_file", export),
+        ):
+            kernel = helion.aot_kernel(
+                _explicit_aot_pointwise.fn,
+                static_shapes=False,
+                autotune_config_overrides={"block_sizes": [64]},
+            )
+            first, alike, other = map(
+                cache_of, (torch.float32, torch.float64, torch.int32)
+            )
+            surface = type(first.kernel.config_spec.search_surface)
+            with hold_block_sizes(surface, left_alone(first, alike)):
+                first._maybe_run_compile()
+                assert exported == [[_stub_code(16)]]
+                # A binding the hook answers alike for exports its own
+                # code, as every other binding does.
+                alike._maybe_run_compile()
+                rejected(other)
+                # The file stays the export of a binding answered alike.
+                first._maybe_run_compile()
+                assert generated == [16] * 3
+                assert exported == [[_stub_code(16)]] * 3
+            # The other way around: the held binding begins the export.
+            AOTAutotuneCache.clear_caches()
+            with hold_block_sizes(surface, left_alone(first)):
+                other._maybe_run_compile()
+                assert exported[3:] == [[_stub_code(64)]]
+                alike._maybe_run_compile()
+                rejected(first)
+                assert generated[3:] == [64] * 2
+                assert exported[3:] == [[_stub_code(64)]] * 2
+            # A binding that exports while another generates its code is
+            # answered by what is published. The binding answered otherwise
+            # that arrives after one answered alike has published is
+            # rejected before its code is generated ...
+            AOTAutotuneCache.clear_caches()
+            arrived: list[str] = []
+
+            def meanwhile(config: Config) -> str:
+                alike._maybe_run_compile()
+                rejected(other)
+                arrived.append("exported, rejected")
+                return to_triton_code(config)
+
+            monkeypatch.setattr(first.kernel, "to_triton_code", meanwhile)
+            with hold_block_sizes(surface, left_alone(first, alike)):
+                first._maybe_run_compile()
+            assert arrived == ["exported, rejected"]
+            assert generated[5:] == [16] * 2
+            assert exported[5:] == [[_stub_code(16)]] * 2
+            # ... and where it published first, the binding still generating
+            # is rejected when its own turn to publish comes: the file
+            # stays the other binding's.
+            AOTAutotuneCache.clear_caches()
+
+            def overtaken(config: Config) -> str:
+                other._maybe_run_compile()
+                return to_triton_code(config)
+
+            monkeypatch.setattr(first.kernel, "to_triton_code", overtaken)
+            with hold_block_sizes(surface, left_alone(first, alike)):
+                rejected(first)
+            assert generated[7:] == [64, 16]
+            assert exported[7:] == [[_stub_code(64)]]
+    finally:
+        AOTAutotuneCache.clear_caches()
 
 
 _AOT_ANCHOR = (2, 3)

@@ -6201,7 +6201,7 @@ def backward(
     tensor_inputs = tuple(t for t in inputs if isinstance(t, torch.Tensor))
     bound = kernel.bind(inputs)
     if bound._config is None:
-        bound._config = bound.env.config_spec.default_config()
+        bound._config = bound._unsearched_default_config()
 
     if autotune_effort is None:
         autotune_effort = "quick" if autotune else "none"
@@ -6779,7 +6779,7 @@ def backward(
 
     if return_code:
         if bwd_bound._config is None:  # pyrefly: ignore [missing-attribute]
-            bwd_bound._config = bwd_bound.env.config_spec.default_config()  # pyrefly: ignore [missing-attribute]
+            bwd_bound._config = bwd_bound._unsearched_default_config()  # pyrefly: ignore [missing-attribute]
         triton_code: str = bwd_bound.to_triton_code(bwd_bound._config)  # pyrefly: ignore [missing-attribute]
         return grads, bwd_source, triton_code
 

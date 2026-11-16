@@ -19,7 +19,10 @@ import helion
 from helion import exc
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
+from helion._testing.held_overrides import hold_block_sizes
 from helion.autotuner import PatternSearch
 from helion.autotuner import benchmark_provider as benchmark_provider_module
 from helion.autotuner.base_search import BaseSearch
@@ -44,6 +47,7 @@ from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
 import helion.language as hl
 from helion.runtime.config import Config
+from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import Kernel
 from helion.runtime.settings import Settings
 from helion.runtime.settings import default_autotuner_fn
@@ -238,6 +242,7 @@ class _RuntimeBackend:
     def __init__(self) -> None:
         self.autotune_calls: list[tuple[object, object]] = []
         self.finalized: list[object] = []
+        self.finalized_configs: list[Config] = []
 
     def make_ephemeral_cache(self) -> contextlib.AbstractContextManager[None]:
         return contextlib.nullcontext()
@@ -250,6 +255,7 @@ class _RuntimeBackend:
 
     def finalize_ephemeral_cache(self, bound_kernel: object, config: Config) -> None:
         self.finalized.append(bound_kernel)
+        self.finalized_configs.append(config)
 
 
 class _RuntimeBoundKernel:
@@ -274,6 +280,9 @@ class _RuntimeBoundKernel:
         )
         self.compile_config = Mock()
         self.set_config = Mock()
+        # A backend that holds no unsearched config to an override: the
+        # default of ``BoundKernel._unsearched_config``.
+        self._unsearched_config = Mock(side_effect=lambda config, report=False: config)
         self.extra_cache_key = Mock(return_value="")
 
 
@@ -483,9 +492,18 @@ class TestMultiShapeRuntime(unittest.TestCase):
             ),
         )
         self.assertEqual(backend.finalized, bounds)
-        for bound in bounds:
+        for bound, finalized in zip(bounds, backend.finalized_configs, strict=True):
+            # With the default hooks every binding gets the winner itself.
+            # The anchor, whose config the call returns, is the one asked
+            # to say where the overrides change it.
+            bound._unsearched_config.assert_called_once_with(
+                winner, report=bound is bounds[0]
+            )
+            self.assertIs(finalized, winner)
             bound.compile_config.assert_called_once_with(winner)
+            self.assertIs(bound.compile_config.call_args.args[0], winner)
             bound.set_config.assert_called_once_with(winner)
+            self.assertIs(bound.set_config.call_args.args[0], winner)
 
     def _structurally_mismatched_kernel(
         self, settings: SimpleNamespace
@@ -590,6 +608,315 @@ class TestMultiShapeRuntime(unittest.TestCase):
                         cache_tag="varying-groups-v1",
                     )
                 self.assertEqual(backend.autotune_calls, [])
+
+
+@helion.kernel()
+def _held_binding_pointwise(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] + 1
+    return out
+
+
+_HELD_ARG_SETS = [(torch.empty(64),), (torch.empty(128),)]
+
+
+@contextlib.contextmanager
+def _held_bindings_on_cpu(
+    arg_sets: Sequence[tuple[torch.Tensor]] = _HELD_ARG_SETS,
+    *,
+    block_size: int = 32,
+    **given: object,
+) -> Iterator[
+    tuple[
+        Kernel[object],
+        list[BoundKernel[object]],
+        list[tuple[object, list[int]]],
+        Mock,
+    ]
+]:
+    """The bindings of ``_held_binding_pointwise`` for ``arg_sets`` under a
+    ``block_sizes`` override of ``block_size``, for ``autotune_multi``
+    without a GPU; ``given`` are other settings of the kernel, such as its
+    ``config=`` or ``configs=``. Yields the kernel, its bindings, the
+    ``(binding, block_sizes)`` of each config a binding compiles, which is
+    recorded and not compiled, and the mock in the place of the backend's
+    ``finalize_ephemeral_cache``."""
+    compiled: list[tuple[object, list[int]]] = []
+
+    def compile_config(
+        bound: BoundKernel[object], config: Config, *, allow_print: bool = True
+    ) -> Callable[..., object]:
+        compiled.append((bound, config.block_sizes))
+        return lambda *args: None
+
+    with (
+        cpu_render_target(),
+        patch.object(BoundKernel, "compile_config", compile_config),
+        patch(
+            "helion.runtime.kernel._canonicalize_multi_shape_device",
+            return_value=torch.device("cuda", 0),
+        ),
+        patch("helion.runtime.kernel._current_device_index", return_value=0),
+    ):
+        kernel = helion.kernel(
+            _held_binding_pointwise.fn,
+            autotune_config_overrides={"block_sizes": [block_size]},
+            **given,
+        )
+        bounds = [kernel.bind(args) for args in arg_sets]
+        backend = type(bounds[0].env.backend)
+        with (
+            patch.object(
+                backend, "make_ephemeral_cache", return_value=contextlib.nullcontext()
+            ),
+            patch.object(backend, "finalize_ephemeral_cache") as finalize,
+        ):
+            yield kernel, bounds, compiled, finalize
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+def test_each_binding_compiles_the_winner_as_its_own_spec_holds_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The backend's autotune selects one config for every binding, and a
+    # backend's hook for unsearched configs may decide by the binding
+    # (``BackendSearchSurface.overrides_without_search``), so
+    # ``autotune_multi`` asks it for each of them. Stubbed here as a backend
+    # that holds such configs to ``block_sizes`` on the second binding only:
+    # that binding finalizes, compiles and installs the config as the
+    # override holds it, the anchor the config selected.
+    with _held_bindings_on_cpu() as (kernel, bounds, compiled, finalize):
+        anchor, held_bound = bounds
+        with (
+            hold_block_sizes(
+                type(anchor.config_spec.search_surface),
+                ineligible={id(anchor.config_spec)},
+            ),
+            # What the backend's autotune selected.
+            patch.object(
+                type(anchor.env.backend),
+                "autotune",
+                return_value=Config(block_sizes=[64]),
+            ),
+        ):
+            winner = kernel.autotune_multi(_HELD_ARG_SETS, cache_tag="held-binding")
+
+    assert winner.block_sizes == [64]
+    assert anchor._config == winner
+    assert held_bound._config is not None
+    assert held_bound._config.block_sizes == [32]
+    # Everything else of the winner stands.
+    assert {**held_bound._config.config, "block_sizes": [64]} == winner.config
+    assert compiled == [(anchor, [64]), (held_bound, [32])] * 2
+    assert [
+        (call.args[0], call.args[1].block_sizes) for call in finalize.call_args_list
+    ] == [(anchor, [64]), (held_bound, [32])]
+    # The call returns the anchor's selection; the binding that compiles
+    # another config says so.
+    assert capsys.readouterr().err.count("autotune_config_overrides change") == 1
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+def test_every_binding_installs_the_winner_of_a_backend_that_replaces_autotune(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A backend may replace ``Backend.autotune`` and select in its own way,
+    # here a config where ``autotune_effort="none"`` has ``Backend.autotune``
+    # take the default. ``autotune_multi`` does not work the selection out
+    # from the settings: every binding installs what the backend's autotune
+    # returned.
+    with _held_bindings_on_cpu(autotune_effort="none") as (
+        kernel,
+        bounds,
+        compiled,
+        finalize,
+    ):
+        assert bounds[0].config_spec.default_config().block_sizes != [16]
+        with patch.object(
+            type(bounds[0].env.backend),
+            "autotune",
+            return_value=Config(block_sizes=[16]),
+        ):
+            winner = kernel.autotune_multi(_HELD_ARG_SETS, cache_tag="replaced")
+
+    assert winner.block_sizes == [16]
+    assert [bound._config for bound in bounds] == [winner, winner]
+    assert compiled == [(bound, [16]) for bound in bounds] * 2
+    assert [call.args for call in finalize.call_args_list] == [
+        (bound, winner) for bound in bounds
+    ]
+    assert "autotune_config_overrides change" not in capsys.readouterr().err
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+@pytest.mark.parametrize("anchor_is_held", [True, False])
+@pytest.mark.parametrize("selection", ["default", "cache_hit", "autotuner"])
+def test_each_binding_is_asked_with_the_selection_as_made(
+    selection: str, anchor_is_held: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # For ``autotune_multi`` the backend's autotune (the real one here)
+    # returns its selection as made, without the hook for unsearched
+    # configs, which ``autotune_multi`` asks for each binding: the default
+    # of a kernel that does not autotune; a hit of the local cache, whose
+    # ``get`` is stubbed; what the kernel's autotuner returns (stubbed in
+    # the place of the cache's ``autotune``: ``autotune_multi`` takes the
+    # registered autotuner only). Stubbed as a backend that holds such
+    # configs to ``block_sizes`` on one binding only, that binding compiles
+    # the held config and the other one the selection as made, whichever of
+    # the two is the anchor. The call returns what the anchor installs.
+    arg_sets = _HELD_ARG_SETS if anchor_is_held else _HELD_ARG_SETS[::-1]
+    settings = {"autotune_effort": "none"} if selection == "default" else {}
+    stored = Config(block_sizes=[8])
+    with (
+        _held_bindings_on_cpu(arg_sets, block_size=16, **settings) as (
+            kernel,
+            bounds,
+            compiled,
+            finalize,
+        ),
+        contextlib.ExitStack() as stack,
+    ):
+        anchor = bounds[0]
+        held_bound, other = bounds if anchor_is_held else bounds[::-1]
+        stack.enter_context(
+            hold_block_sizes(
+                type(anchor.config_spec.search_surface),
+                ineligible={id(other.config_spec)},
+            )
+        )
+        if selection == "default":
+            made = anchor.config_spec.default_config()
+        else:
+            made = stored
+            # The cache's key and its location name the hardware, which a
+            # CPU binding has none of.
+            stubs: dict[str, object] = {"_generate_key": None}
+            if selection == "cache_hit":
+                stubs.update(get=stored, _get_cache_info_message="")
+            else:
+                stubs.update(autotune=stored)
+            for method, value in stubs.items():
+                stack.enter_context(
+                    patch.object(LocalAutotuneCache, method, return_value=value)
+                )
+        winner = kernel.autotune_multi(arg_sets, cache_tag="as-made", force=False)
+
+    assert held_bound._config is not None
+    assert other._config is not None
+    assert held_bound._config.block_sizes == [16]
+    # The selection as made, which is not what the override holds.
+    assert other._config.block_sizes == made.block_sizes != [16]
+    # Everything else of the selection stands.
+    assert {
+        **held_bound._config.config,
+        "block_sizes": made.block_sizes,
+    } == other._config.config
+    assert winner == anchor._config
+    installed = [(bound, bound._config.block_sizes) for bound in bounds]
+    assert compiled == installed * 2
+    assert [
+        (call.args[0], call.args[1].block_sizes) for call in finalize.call_args_list
+    ] == installed
+    err = capsys.readouterr().err
+    # The anchor says where the overrides change the selection, with the
+    # config it installs; a cache hit is reported as stored before that.
+    assert err.count("change the config the autotuner returned") == int(anchor_is_held)
+    assert ("Using cached config:\n" in err) == (selection == "cache_hit")
+    # The binding that installs another config than the one returned says so.
+    assert err.count("than the one returned") == 1
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+def test_a_single_binding_reports_a_default_the_overrides_change(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # ``BoundKernel.autotune`` of a kernel that does not autotune installs
+    # the default as the binding's spec holds it. Where the overrides change
+    # it (stubbed as a backend that holds unsearched configs to
+    # ``block_sizes`` on the first binding only), the binding says so with
+    # the config it installs, as the anchor of ``autotune_multi`` does for
+    # the same selection. A default left alone is installed without a word.
+    with _held_bindings_on_cpu(block_size=16, autotune_effort="none") as (
+        _kernel,
+        bounds,
+        compiled,
+        _finalize,
+    ):
+        held_bound, other = bounds
+        default = other.config_spec.default_config()
+        assert default.block_sizes != [16]
+        with hold_block_sizes(
+            type(held_bound.config_spec.search_surface),
+            ineligible={id(other.config_spec)},
+        ):
+            assert held_bound.autotune(_HELD_ARG_SETS[0]).block_sizes == [16]
+            err = capsys.readouterr().err
+            assert err.count("change the config the autotuner returned") == 1
+            assert "block_sizes=[16]" in err
+            assert other.autotune(_HELD_ARG_SETS[1]) == default
+            assert capsys.readouterr().err == ""
+    assert compiled == [(held_bound, [16]), (other, default.block_sizes)]
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
+@pytest.mark.parametrize("given", ["config", "configs"])
+def test_every_binding_installs_a_config_the_application_passed_as_written(
+    given: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ``config=`` and the fastest of ``configs=[...]`` are the application's
+    # own, and under ``force=False`` the backend's autotune returns them as
+    # written. No binding then passes the config through the hook for
+    # unsearched configs, stubbed here as a backend that holds such configs
+    # to ``block_sizes`` on every binding. Forced, by the argument or by
+    # ``force_autotune``, the kernel sets its configs aside, and what the
+    # backend's autotune selects instead (stubbed) meets the hook.
+    written = Config(block_sizes=[64])
+    passed = (
+        {"config": written}
+        if given == "config"
+        else {"configs": [Config(block_sizes=[16]), written]}
+    )
+    with _held_bindings_on_cpu(**passed) as (kernel, bounds, compiled, finalize):
+        backend = type(bounds[0].env.backend)
+        with (
+            hold_block_sizes(type(bounds[0].config_spec.search_surface)),
+            # The fastest of ``configs=[...]``, without timing them.
+            patch("helion.autotuner.FiniteSearch") as finite,
+        ):
+            finite.return_value.autotune.return_value = written
+            winner = kernel.autotune_multi(
+                _HELD_ARG_SETS, cache_tag="written", force=False
+            )
+            assert finite.called == (given == "configs")
+            assert winner.block_sizes == [64]
+            assert [bound._config for bound in bounds] == [winner, winner]
+            assert compiled == [(bound, [64]) for bound in bounds] * 2
+            assert [call.args for call in finalize.call_args_list] == [
+                (bound, winner) for bound in bounds
+            ]
+            assert "autotune_config_overrides change" not in capsys.readouterr().err
+
+            compiled.clear()
+            with patch.object(
+                backend, "autotune", return_value=Config(block_sizes=[64])
+            ):
+                # ``force`` defaults to True.
+                kernel.autotune_multi(_HELD_ARG_SETS, cache_tag="written")
+                kernel.settings.force_autotune = True
+                kernel.autotune_multi(_HELD_ARG_SETS, cache_tag="written", force=False)
+            assert compiled == [(bound, [32]) for bound in bounds] * 4
+            assert [bound._config.block_sizes for bound in bounds] == [[32], [32]]
+            # Each call says once that the overrides change what was
+            # selected, for the anchor: every binding installs that config.
+            err = capsys.readouterr().err
+            assert err.count("autotune_config_overrides change") == 2
+            assert err.count("change the config the autotuner returned") == 2
 
 
 class _Log:

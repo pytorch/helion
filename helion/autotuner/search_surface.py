@@ -216,6 +216,86 @@ class BackendSearchSurface:
     ) -> None:
         return
 
+    def overrides_without_search(
+        self,
+        config_spec: ConfigSpec,
+        config: Mapping[str, object],
+        overrides: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """The options to compile in place of ``config``, which no search
+        under ``overrides`` produced, or ``None`` to compile it as it is.
+
+        ``autotune_config_overrides`` act on a search: every candidate is
+        built with them. A config the kernel selects without one (an
+        autotune cache hit, AOT tuning data, the default of a kernel that
+        does not autotune) is compiled as it is, whatever the overrides
+        name; the default keeps that. A backend returns a changed copy for
+        the entries that must hold for such a config too, and leaves
+        ``config`` itself alone: caches share the configs they return.
+
+        The contract (``ConfigSpec.unsearched_config`` asks):
+
+        * ``config_spec`` is the spec of the binding that compiles the
+          config, and the answer may depend on it. The AOT standalone
+          export of a kernel without static shapes and without a
+          structural policy cannot follow that: its file holds the code of
+          one binding for every call, and a call whose binding gets
+          another answer than the binding the file holds is rejected
+          (``AOTAutotuneCache._check_ordinary_dynamic_answer``). Under a
+          structural policy such a kernel's calls share a variant by
+          group, and a call whose answer generates other code than its
+          group's is rejected as a binding collision
+          (``AOTAutotuneCache._compile_policy_dynamic``). The export of a
+          kernel with static shapes holds a variant per call and follows
+          the answer. Without a structural policy, the file of a kernel
+          that holds overrides keys every call by the tensor-descriptor
+          predicates too, whichever calls the answer leaves with
+          descriptor indexing (``AOTAutotuneCache._maybe_run_compile``).
+        * The hook returns ``None`` for its own result and for a config a
+          search under ``overrides`` produced. A config may come by more
+          than once before it is compiled, and what a kernel compiles must
+          not depend on how often the hook was asked. Options equal to
+          ``config``'s are read as ``None``.
+        * It reads ``overrides`` through ``overrides_held_without_search``
+          alone, and is not asked where that holds nothing.
+
+        A backend that replaces ``Backend.autotune`` and holds an override
+        passes what it selects through ``BoundKernel._unsearched_config``
+        itself. One exception, which ``Backend.autotune`` makes as well: for
+        the carrier of ``Kernel.autotune_multi``
+        (``_MultiShapeAutotuneArgs``) it returns its selection as made,
+        since that call asks the hook for each of its bindings, the anchor
+        among them."""
+        return None
+
+    def overrides_held_without_search(
+        self, overrides: Mapping[str, object]
+    ) -> dict[str, object]:
+        """What ``overrides_without_search`` reads of ``overrides``: nothing
+        by default.
+
+        What a kernel generates from a config no search produced depends on
+        its overrides through this alone, so it belongs to the identity of
+        such an artifact: an AOT standalone export keeps what it generated
+        under one answer apart from what it generates under another
+        (``ConfigSpec.unsearched_overrides_identity``). A backend
+        returns the entries the hook may apply, and may name entries that
+        act alike once: two override sets with equal answers must generate
+        the same code from every config. The answer is an identity, so the
+        hook is given the overrides themselves; an empty answer is the one
+        case the caller enforces, by not asking the hook
+        (``ConfigSpec.unsearched_config``).
+
+        An export holds a variant for every shape the kernel was called
+        with, so the answer is read off the overrides alone, without the
+        spec of one binding: an entry that can apply to some binding is
+        named for all of them, the bindings it cannot apply to included. An
+        answer that changed with the bound shape would set the shapes of
+        one kernel apart: each would replace the file of the others, or
+        under a structural policy be refused it.
+        """
+        return {}
+
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
         """Drop the optional coordinates the public default config leaves implicit."""
         return

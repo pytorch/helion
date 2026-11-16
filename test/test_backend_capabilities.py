@@ -396,6 +396,7 @@ class TestBackendDispatchTable(unittest.TestCase):
         self.assertIs(lowering.codegen_impls["cute"], handler)
 
 
+@pytest.mark.cpu_only
 class TestSpecWithoutBackendState(unittest.TestCase):
     """A spec of a backend whose search surface stores no per-spec state
     (``new_spec_state`` returns ``None`` for every backend but CuTe) builds
@@ -453,6 +454,39 @@ class TestSpecWithoutBackendState(unittest.TestCase):
                 self.assertIsNone(spec.tcgen05)
                 self.assertFalse(spec.search_surface.pins_thread_knobs(spec, 0))
                 self.assertEqual(spec.default_config().block_sizes, [32])
+
+    def test_every_spec_compiles_an_unsearched_config_as_it_is(self) -> None:
+        # ``autotune_config_overrides`` act on a search. A config the kernel
+        # selects without one (a cache hit, the default of a kernel that
+        # does not autotune) is compiled as it is unless its backend holds
+        # such a config to some of them, and none does
+        # (``BackendSearchSurface.overrides_without_search``).
+        default = BackendSearchSurface.overrides_without_search
+        held = BackendSearchSurface.overrides_held_without_search
+        for name, backend in _backends().items():
+            with self.subTest(backend=name):
+                spec = self._spec(backend)
+                surface = type(spec.search_surface)
+                self.assertIs(surface.overrides_without_search, default)
+                self.assertIs(surface.overrides_held_without_search, held)
+                config = spec.default_config()
+                before = config.to_json()
+                for overrides in (
+                    None,
+                    {},
+                    {"block_sizes": [1]},
+                    {"num_warps": 1, "indexing": "block_ptr"},
+                    {"cute_pdl": False},
+                    {"cute_pdl_capture_overlap": False},
+                ):
+                    self.assertIs(spec.unsearched_config(config, overrides), config)
+                    # So no override is part of what an AOT export is keyed by.
+                    self.assertIsNone(spec.unsearched_overrides_identity(overrides))
+                    # A custom autotuner may hand back a plain dict of
+                    # options, which ``set_config`` reads as well.
+                    options = dict(config.config)
+                    self.assertIs(spec.unsearched_config(options, overrides), options)
+                self.assertEqual(config.to_json(), before)
 
 
 if __name__ == "__main__":

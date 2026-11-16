@@ -369,6 +369,61 @@ class TestCache(RefEagerTestDisabled, TestCase):
             self.assertEqual(counters["autotune"]["cache_miss"], 2)
             self.assertEqual(counters["autotune"]["cache_put"], 1)
 
+    def test_overrides_act_on_a_search_only(self):
+        """``autotune_config_overrides`` are not part of the cache identity,
+        and a kernel compiles a config read back from the cache as stored."""
+        kernel, args_a, _result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.reset()
+        kernel.settings.autotuner_fn = LocalAutotuneCache[BasicSearch]
+        kernel.settings.autotune_effort = "full"
+        self.addCleanup(
+            setattr,
+            kernel.settings,
+            "autotune_config_overrides",
+            kernel.settings.autotune_config_overrides,
+        )
+        bound = kernel.bind(args_a)
+        cache = LocalAutotuneCache(BasicSearch(bound, args_a))
+        cached = bound.config_spec.default_config()
+        cache.put(cached)
+        entry = cache._get_local_cache_path().read_text()
+
+        kernel.settings.autotune_config_overrides = {"block_sizes": [1]}
+        again = LocalAutotuneCache(BasicSearch(bound, args_a))
+        self.assertEqual(again.key, cache.key)
+        self.assertEqual(again.get(), cached)
+        # What the kernel's autotuner hands back is the object the cache read.
+        with patch.object(LocalAutotuneCache, "get", return_value=cached):
+            selected = bound.env.backend.autotune(bound, args_a, force=False)
+        self.assertIs(selected, cached)
+        self.assertEqual(cache._get_local_cache_path().read_text(), entry)
+
+    def test_an_autotuner_may_return_a_plain_dict_under_overrides(self):
+        """``set_config`` reads a plain dict of options, so a custom autotuner
+        may return one, with ``autotune_config_overrides`` as without."""
+
+        class DictSearch(BaseSearch):
+            def autotune(self, *, skip_cache: bool = False):
+                return dict(self.config_spec.default_config().config)
+
+        kernel, args_a, result_a, _args_b, _result_b = KERNELS["add"]()
+        kernel.settings.autotuner_fn = DictSearch
+        kernel.settings.autotune_effort = "full"
+        self.addCleanup(
+            setattr,
+            kernel.settings,
+            "autotune_config_overrides",
+            kernel.settings.autotune_config_overrides,
+        )
+        for overrides in ({}, {"block_sizes": [1]}):
+            kernel.reset()
+            kernel.settings.autotune_config_overrides = overrides
+            bound = kernel.bind(args_a)
+            selected = bound.autotune(args_a, force=False)
+            self.assertIsInstance(selected, dict)
+            self.assertEqual(bound._config, bound.config_spec.default_config())
+            torch.testing.assert_close(bound(*args_a), result_a, rtol=1e-2, atol=5e-2)
+
     def test_force_autotune_skips_read_but_writes(self):
         """HELION_FORCE_AUTOTUNE=1 skips the cache read but writes back the result."""
         counters["autotune"].clear()

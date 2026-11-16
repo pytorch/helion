@@ -103,6 +103,7 @@ from .cute.structural_config import select_structural_policy
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
+from .structural_policy import SelectedConfig
 from .structural_policy import StructuralConfig
 from .structural_policy import StructuralPolicyError
 from .structural_policy import require_same_structural_policy
@@ -3204,7 +3205,13 @@ class Kernel(Generic[_R]):
             options: Additional options forwarded to the registered autotuner.
 
         Returns:
-            The config selected for all supplied specializations.
+            The config selected for the supplied specializations, which each of
+            them compiles and installs. One exception: a config that no search
+            under ``autotune_config_overrides`` produced (a cache hit, a
+            default) is installed as the backend holds it to those overrides
+            for each binding. The call then returns the config the first
+            specialization installs, and a specialization that installs
+            another one says so on stderr.
         """
         from ..autotuner.benchmark_provider import LocalBenchmarkProvider
         from ..autotuner.benchmark_provider import _has_valid_multi_shape_measurement
@@ -3453,17 +3460,55 @@ class Kernel(Generic[_R]):
         ):
             raise exc.NoConfigFound
         winner = _materialize_multi_shape_config(anchor.config_spec, config)
+        if self._selects_given_config(force=force):
+            # The application's own config: every binding compiles it as
+            # written, as the backend's autotune returned it.
+            selected = [(bound_kernel, winner) for bound_kernel in unique_bound_kernels]
+        else:
+            # The backend's autotune returned its selection as made: for
+            # this call's carrier ``Backend.autotune`` and a cache hit leave
+            # the hook for unsearched configs to this loop, since that hook
+            # may decide by the binding. Each binding, the anchor among
+            # them, compiles the winner as its own spec leaves it, which is
+            # the winner itself unless a backend holds such configs to some
+            # of the overrides. The anchor, whose config the call returns,
+            # says so where the overrides change it; a binding that then
+            # installs another config is reported below.
+            selected = [
+                (
+                    bound_kernel,
+                    bound_kernel._unsearched_config(
+                        winner, report=bound_kernel is anchor
+                    ),
+                )
+                for bound_kernel in unique_bound_kernels
+            ]
+        # The call returns what the anchor installs.
+        returned = selected[0][1]
+        for bound_kernel, compiled in selected[1:]:
+            if compiled != returned:
+                decorator = bound_kernel.format_kernel_decorator(
+                    compiled, bound_kernel.settings
+                )
+                print(
+                    "autotune_config_overrides change the selected config by "
+                    "binding; a specialization installs another config than "
+                    f"the one returned:\n\t{decorator}",
+                    file=sys.stderr,
+                )
         if ephemeral is not None:
-            for bound_kernel in unique_bound_kernels:
-                bound_kernel.env.backend.finalize_ephemeral_cache(bound_kernel, winner)
+            for bound_kernel, compiled in selected:
+                bound_kernel.env.backend.finalize_ephemeral_cache(
+                    bound_kernel, compiled
+                )
 
-        for bound_kernel in unique_bound_kernels:
-            bound_kernel.compile_config(winner)
-        for bound_kernel in unique_bound_kernels:
-            bound_kernel.set_config(winner)
+        for bound_kernel, compiled in selected:
+            bound_kernel.compile_config(compiled)
+        for bound_kernel, compiled in selected:
+            bound_kernel.set_config(compiled)
         for bound_kernel, selection_key in fresh_bounds:
             bound_kernel._remember_fresh_selection(selection_key)
-        return winner
+        return returned
 
     def __call__(self, *args: object, **kwargs: object) -> _R:
         """
@@ -3626,6 +3671,13 @@ class Kernel(Generic[_R]):
         if not force and len(self.configs) == 1:
             return "given"
         return None
+
+    def _selects_given_config(self, *, force: bool = False) -> bool:
+        """Whether calls select one of the configs the application passed:
+        the one of ``config=``, or the fastest of ``configs=[...]``. Such a
+        config is compiled as written. ``force`` and ``force_autotune`` set
+        the configs aside."""
+        return not (force or self.settings.force_autotune) and bool(self.configs)
 
     def reset(self) -> None:
         """
@@ -4028,7 +4080,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         """Return the kernel's configured configs (alias for `self.kernel.configs`)."""
         return self.kernel.configs
 
-    def _normalize_config(self, config: ConfigLike) -> Config:
+    def _normalize_config(self, config: ConfigLike | StructuralConfig) -> Config:
         self.kernel._validate_structural_policy()
         if isinstance(config, StructuralConfig):
             require_same_structural_policy(
@@ -5251,12 +5303,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         )
 
-    def _fixed_config(self, *, force: bool = False) -> Config | None:
+    def _fixed_config(
+        self, *, force: bool = False, report: bool = False
+    ) -> Config | None:
         """The config calls take without an autotune search (see
-        ``Kernel._fixed_config_kind``), or None when they search."""
+        ``Kernel._fixed_config_kind``), or None when they search. The default
+        config is the one a kernel that does not autotune runs
+        (``_unsearched_default_config``, which ``report`` is for)."""
         kind = self.kernel._fixed_config_kind(force=force)
         if kind == "default":
-            return self.config_spec.default_config()
+            return self._unsearched_default_config(report=report)
         if kind == "given":
             return self.kernel.configs[0]
         return None
@@ -5271,6 +5327,51 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         # such as block_sizes.  Resolve the same effective config that codegen
         # will see before asking BlockSizeSource to read those fields.
         return self._normalized_config_copy(config)
+
+    def _unsearched_config(
+        self, config: SelectedConfig, *, report: bool = False
+    ) -> SelectedConfig | Config:
+        """``config``, which this kernel selects without a search under its
+        ``autotune_config_overrides`` having produced it, as the kernel
+        compiles it (``ConfigSpec.unsearched_config``): what its autotuner
+        returned, which may be a cache hit; AOT tuning data; its default.
+        A config a search under the overrides did produce comes back
+        unchanged, and a config the application passes does not come here.
+
+        ``report`` says on stderr what the kernel compiles where that is
+        not what its autotuner returned."""
+        selected = self.config_spec.unsearched_config(
+            config, self.settings.autotune_config_overrides
+        )
+        if selected is config:
+            return config
+        assert isinstance(selected, Config)
+        # ``set_config`` would have read ``config``, where a policy envelope
+        # answers for its policy; the replacement carries none.
+        self._normalize_config(config)
+        if report:
+            decorator = self.format_kernel_decorator(selected, self.settings)
+            print(
+                "autotune_config_overrides change the config the autotuner "
+                f"returned; using:\n\t{decorator}",
+                file=sys.stderr,
+            )
+        return selected
+
+    def _unsearched_overrides_identity(self) -> str | None:
+        """The part of this kernel's ``autotune_config_overrides`` that
+        ``_unsearched_config`` can apply, as an identity
+        (``ConfigSpec.unsearched_overrides_identity``); ``None`` where it
+        applies nothing."""
+        return self.config_spec.unsearched_overrides_identity(
+            self.settings.autotune_config_overrides
+        )
+
+    def _unsearched_default_config(self, *, report: bool = False) -> Config:
+        """The spec's default config as a kernel that does not autotune runs
+        it: no search applies the overrides to it. ``report`` says on stderr
+        what the kernel runs where the overrides change the default."""
+        return self._unsearched_config(self.config_spec.default_config(), report=report)
 
     def _user_provided_config(self) -> Config | None:
         """Return a config if the user explicitly provided one, else None.

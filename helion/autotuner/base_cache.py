@@ -362,18 +362,42 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             if (config := self.get()) is not None:
                 counters["autotune"]["cache_hit"] += 1
                 log.debug("cache hit: %s", str(config))
+                # No search under the kernel's overrides need have written
+                # the entry, and a backend may hold every config the kernel
+                # selects to some of them: this autotuner returns what the
+                # kernel compiles, on a hit as on a miss. ``get`` returns
+                # the entry as stored, and so does a hit for
+                # ``Kernel.autotune_multi``, which asks the hook of each of
+                # its bindings itself.
+                selected = config
+                if not isinstance(self.args, _MultiShapeAutotuneArgs):
+                    selected = self.autotuner.config_spec.unsearched_config(
+                        config, self.autotuner.settings.autotune_config_overrides
+                    )
+                if selected is not config:
+                    # ``set_config`` would have read the entry, where a
+                    # policy envelope answers for its policy; the
+                    # replacement carries none
+                    # (``BoundKernel._unsearched_config``).
+                    self.kernel._normalize_config(config)
                 if self._should_report_cache_hit():
                     kernel_decorator = self.kernel.format_kernel_decorator(
-                        config, self.autotuner.settings
+                        selected, self.autotuner.settings
+                    )
+                    changed = (
+                        ""
+                        if selected is config
+                        else ", as autotune_config_overrides change it"
                     )
                     print(
-                        f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr
+                        f"Using cached config{changed}:\n\t{kernel_decorator}",
+                        file=sys.stderr,
                     )
                     cache_info = self._get_cache_info_message()
                     self.autotuner.log(
                         f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
                     )
-                return config
+                return selected
 
         counters["autotune"]["cache_miss"] += 1
         log.debug("cache miss")
