@@ -463,7 +463,9 @@ class TestAutotunerSearch(AutotunerTestCase):
         )
         bound_kernel = basic_kernels.add.bind(args)
         search = PatternSearch(bound_kernel, args, initial_population=1)
-        search.benchmark_provider = SimpleNamespace(take_effective_source_repairs=dict)
+        search.benchmark_provider = SimpleNamespace(
+            take_effective_source_repairs=dict, settles_source_aliases=lambda: False
+        )
         member = search.make_unbenchmarked(search.config_gen.default_flat())
         assert member is not None
         key, value, _ = self._scalar_override()
@@ -1078,7 +1080,12 @@ class TestPolishDescent(TestCase):
     def _make_search(self, polish_rounds: int) -> LFBOTreeSearch:
         search = object.__new__(LFBOTreeSearch)
         search.polish_rounds = polish_rounds
-        search.config_spec = SimpleNamespace(cute_flash_search_enabled=False)
+        search.config_spec = SimpleNamespace(
+            cute_flash_search_enabled=False,
+            backend=SimpleNamespace(
+                collapses_generated_source_aliases=lambda config_spec: False
+            ),
+        )
         search.min_improvement_delta = 0.001
         search.log = Mock()
         search._budgeted_range = lambda *args: iter(range(*args))

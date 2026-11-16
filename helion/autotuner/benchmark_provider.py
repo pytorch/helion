@@ -690,6 +690,31 @@ class BenchmarkProvider(abc.ABC):
         """Return whether a successful measurement produced ``source_hash``."""
         return False
 
+    def settles_source_aliases(self) -> bool:
+        """Whether a config whose generated source an earlier config of the
+        run produced comes back from :meth:`benchmark` as a source alias: the
+        status ``"deduplicated"``, the earlier config's compiled function and
+        its reading, without a timing.
+
+        A search treats aliases as the kernels they repeat only where its
+        provider reports them (``PopulationBasedSearch._collapses_source_aliases``).
+        ``False`` by default, for a provider whose every result is a timing of
+        its own.
+        """
+        return False
+
+    @contextlib.contextmanager
+    def fresh_source_timings(self) -> Iterator[None]:
+        """Time every config of the batches benchmarked inside, also one
+        whose generated source this provider holds a reading of.
+
+        A caller that benchmarks a config again to read it again
+        (``MultiShapeBenchmarkProvider.rebenchmark``) asks for a timing, not
+        for the provider's record of the config's source.  The default does
+        nothing: a provider that settles no aliases times every config.
+        """
+        yield
+
     def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         """Return and clear source-equivalent repairs discovered since last read."""
         return ConfigCache()
@@ -813,6 +838,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # of a worker whose first job was one of them (``compile_deadline_cascade``).
     _compile_deadline_failures: int = 0
     _longest_cold_start_seconds: float = 0.0
+    # Set inside ``fresh_source_timings``: every config of a batch is timed,
+    # also one whose generated source this provider holds a reading of.
+    _fresh_source_timings: bool = False
 
     def __init__(
         self,
@@ -964,6 +992,22 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             and result.status in ("ok", "deduplicated")
             and math.isfinite(result.perf)
         )
+
+    def settles_source_aliases(self) -> bool:
+        return self._effective_source_dedup_enabled()
+
+    @contextlib.contextmanager
+    def fresh_source_timings(self) -> Iterator[None]:
+        """:meth:`benchmark` settles a config whose source it has timed with
+        that first reading; inside this block it times every config.  The
+        records stay as they are: a config that is new after the block is
+        settled with the first reading as before."""
+        previous = self._fresh_source_timings
+        self._fresh_source_timings = True
+        try:
+            yield
+        finally:
+            self._fresh_source_timings = previous
 
     def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         repairs = self._effective_source_repairs
@@ -2141,10 +2185,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         Rank-specialized distributed code can produce a different source
         partition on each rank. Keeping every rank's benchmark loop identical
-        is more important than deduplicating those uncommon searches.
+        is more important than deduplicating those uncommon searches. Not
+        inside ``fresh_source_timings``, whose batches ask for timings.
         """
         return (
-            self.config_spec.backend.should_deduplicate_generated_sources(
+            not self._fresh_source_timings
+            and self.config_spec.backend.should_deduplicate_generated_sources(
                 self.config_spec
             )
             and not dist.is_initialized()
@@ -4039,6 +4085,15 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
                 failures[pair] = (total + failed, kept)
         return _unmeasured_config_values(measured, failures)
 
+    def settles_source_aliases(self) -> bool:
+        # A joint result of ``benchmark`` is a reading of every shape: "ok",
+        # "error" or "timeout".  A child may settle a shape's source with
+        # its record, but two configs are one kernel only when every shape's
+        # source agrees, which no status of the joint result says.  (The
+        # repairs a flash search collects are "deduplicated": that search
+        # runs its own alias policy.)
+        return False
+
     def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         repairs = self._effective_source_repairs
         self._effective_source_repairs = ConfigCache()
@@ -4591,12 +4646,18 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
     ) -> list[float]:
         if self.budget_exceeded_fn():
             return list(previous_timings)
-        results = self._benchmark(
-            configs,
-            desc=desc,
-            record_results=False,
-            check_budget=False,
-        )
+        # A re-timing asks every shape for a new reading.  A child that
+        # deduplicates generated sources would answer each config with the
+        # first reading of its source and time nothing.
+        with contextlib.ExitStack() as fresh:
+            for child in self.children:
+                fresh.enter_context(child.fresh_source_timings())
+            results = self._benchmark(
+                configs,
+                desc=desc,
+                record_results=False,
+                check_budget=False,
+            )
         if self.log.trace_enabled:
             for result in results:
                 self._record_rebenchmark_result(result)

@@ -2015,6 +2015,15 @@ class PopulationBasedSearch(BaseSearch):
         self._compiler_seed_members: list[PopulationMember] = []
         self._best_available_seed_configs: list[Config] = []
         self._selected_member: PopulationMember | None = None
+        # The member that holds each kernel this search has timed, by the
+        # ``id`` of its compiled function (the member keeps it alive), where
+        # the search drops source aliases. Filled where members are settled
+        # (``_settle_benchmarked_members``) and read through
+        # ``_kernel_holder``. A holder stays here after it has left the
+        # population and the final selection's history, so the search can
+        # always name the config that stands for a kernel it timed and the
+        # reading that kernel has now.
+        self._kernels: dict[int, PopulationMember] = {}
         self._terminal_refinement_members: (
             MutableMapping[Config, PopulationMember] | None
         ) = None
@@ -2277,6 +2286,183 @@ class PopulationBasedSearch(BaseSearch):
             "the full-effort final selection ignores them (set "
             f"{_FINAL_SELECTION_ROUNDS_ENV}=0 to run that verification instead)."
         )
+
+    def _collapses_source_aliases(self) -> bool:
+        """Whether this search drops source aliases: the backend asks for it
+        (``Backend.collapses_generated_source_aliases``) and the search's
+        provider reports aliases (``BenchmarkProvider.settles_source_aliases``).
+
+        Such a search counts an alias as the kernel it repeats.  The alias
+        has that kernel's reading (``_settle_benchmarked_members``), a
+        re-timing times the config that holds the kernel once and never the
+        alias (``_rebenchmark_kernels``), two configs of one kernel compare
+        equal (``compare``), and the alias takes no entry in the history the
+        final selection draws its shortlist from (a pinned one passes its
+        pin to the kernel's config), so the final selection times a kernel
+        under one config.  The pattern and LFBO searches also drop a
+        generation's new aliases from the population, so no search path and
+        no polish round moves to one, and start one path per kernel; with
+        the copies gone the LFBO polish descent crosses to new code that
+        reads level with its incumbent, within
+        ``LFBOPatternSearch.polish_patience``.  Aliases that stay members
+        until the final selection: those of an initial population, and of
+        the differential-evolution and LLM-guided searches.
+
+        Two providers of such a backend report no aliases: the one of a
+        multi-shape search, whose ``benchmark`` results are joint readings
+        of every shape, and a local one once torch.distributed is
+        initialized, where every rank keeps the same benchmark loop.  There
+        every config stays a candidate of its own and is timed as one, and
+        none of the above is switched on.
+        """
+        return bool(
+            self.config_spec.backend.collapses_generated_source_aliases(
+                self.config_spec
+            )
+            and self.benchmark_provider.settles_source_aliases()
+        )
+
+    def _is_source_alias(self, member: PopulationMember) -> bool:
+        """Whether ``member`` repeats the generated source of an earlier
+        candidate of this run, in a search that drops such aliases."""
+        return member.status == "deduplicated" and self._collapses_source_aliases()
+
+    def _without_source_aliases(
+        self,
+        members: list[PopulationMember],
+        benchmarked: Sequence[PopulationMember],
+    ) -> list[PopulationMember]:
+        """``members`` without the source aliases among the just benchmarked
+        ``benchmarked``.
+
+        An alias is an earlier candidate's code under another config: its
+        reading is that candidate's (``_settle_benchmarked_members``), so
+        keeping it would let a search path move to code it already has and
+        fill the final selection's shortlist with copies of one kernel.
+        Members benchmarked earlier stay, aliases included (an initial
+        population keeps its own; a verification still times their kernel
+        once: ``_rebenchmark_kernels``).
+        """
+        aliases = {
+            id(member) for member in benchmarked if self._is_source_alias(member)
+        }
+        if not aliases:
+            return members
+        return [member for member in members if id(member) not in aliases]
+
+    def _kernel_holder(
+        self, member: PopulationMember, among: Sequence[PopulationMember] = ()
+    ) -> PopulationMember:
+        """The member that holds ``member``'s kernel: the one place that
+        says which config stands for a kernel and has its reading.
+
+        Where the search drops source aliases, an alias is another config of
+        a kernel an earlier candidate produced and holds that candidate's
+        compiled function (the ``fn`` of a ``"deduplicated"`` result), so
+        several members can be configs of one kernel (an initial population
+        keeps its aliases).  One of them holds it: it is the member a
+        re-timing times, its reading is the kernel's, and its config is the
+        kernel's entry in the final selection.
+
+        It is the member with the function that is no alias: one among
+        ``among`` where the members at hand hold the kernel themselves (a
+        batch with the config that was timed, a list with the final
+        selection's entry of the kernel), else the member the search first
+        timed it under (``_kernels``), wherever that member is now.  Where
+        the search knows the kernel under no such config, the first alias of
+        it stands in.  A member that is no alias holds its own kernel, as
+        does every member of a search that keeps its aliases.
+        """
+        if not self._is_source_alias(member):
+            return member
+        stand_in = None
+        for other in among:
+            if other.fn is member.fn:
+                if not self._is_source_alias(other):
+                    return other
+                if stand_in is None:
+                    stand_in = other
+        return self._kernels.get(id(member.fn)) or stand_in or member
+
+    def _kernels_of(
+        self, members: Sequence[PopulationMember]
+    ) -> list[PopulationMember]:
+        """The members that hold the kernels of ``members``, each once, in
+        the order of ``members``."""
+        kernels = {
+            id(kernel): kernel
+            for kernel in (self._kernel_holder(member, members) for member in members)
+        }
+        return [*kernels.values()]
+
+    def _one_member_per_kernel(
+        self, members: Sequence[PopulationMember]
+    ) -> list[PopulationMember]:
+        """``members`` with one member for each kernel, in their order: the
+        one that holds the kernel where ``members`` has it, else the first
+        config of it.  (A search path that started from a second config of a
+        kernel would generate that kernel's neighborhood again, and a final
+        selection that held one would time the kernel twice.)"""
+        listed = {id(member) for member in members}
+        kept: dict[int, PopulationMember] = {}
+        for member in members:
+            holder = self._kernel_holder(member, members)
+            kept.setdefault(id(holder), holder if id(holder) in listed else member)
+        return [*kept.values()]
+
+    def _settle_benchmarked_members(
+        self,
+        members: Sequence[PopulationMember],
+        batch: Sequence[PopulationMember],
+    ) -> None:
+        """What every member takes once it has a result: ``members`` of the
+        just benchmarked ``batch``, or earlier members that a result of it
+        repaired.
+
+        A member with a kernel of its own holds that kernel from here on
+        (``_kernels``) and is recorded for the final selection
+        (``_record_benchmarked_member``).  A source alias is not recorded:
+        the history already holds its code under the config that holds the
+        kernel.  It takes the reading that kernel has now in place of the
+        provider's record of the kernel's first reading (every verification
+        has re-timed the kernels near the best since).
+
+        A pinned alias passes its pin to the kernel's config.  A pinned
+        config (a compiler seed, the default) reaches the final selection
+        whatever the search read for it; one that repeats an earlier
+        candidate's code takes no entry there, since the kernel would be
+        screened twice (``_refresh_benchmarked_members_after_rebenchmark``),
+        so the kernel keeps its place in the final selection whichever of its
+        configs was benchmarked first.
+        """
+        collapse = self._collapses_source_aliases()
+        aliases = []
+        for member in members:
+            if self._is_source_alias(member):
+                aliases.append(member)
+                continue
+            if collapse and member.perfs and math.isfinite(member.perf):
+                holder = self._kernels.get(id(member.fn))
+                # (an alias stands in until the search times the kernel
+                # under a config of its own)
+                if holder is None or self._is_source_alias(holder):
+                    self._kernels[id(member.fn)] = member
+            self._record_benchmarked_member(member)
+        for alias in aliases:
+            kernel = self._kernel_holder(alias, batch)
+            if kernel is alias:
+                self._kernels.setdefault(id(alias.fn), alias)
+                continue
+            if kernel.perfs:
+                alias.perfs[-1] = kernel.perf
+            if (
+                alias.config in self._pinned_finalist_configs
+                and not self._is_source_alias(kernel)
+            ):
+                self.pin_finalist_config(kernel.config)
+                self._record_best_member_for_config(
+                    self._pinned_finalist_members, kernel.config, kernel
+                )
 
     @property
     def best(self) -> PopulationMember:
@@ -2701,7 +2887,7 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
-            self._record_benchmarked_member(member)
+        self._settle_benchmarked_members(members, members)
         repairs = self.benchmark_provider.take_effective_source_repairs()
         if repairs:
             self._apply_effective_source_repairs(repairs, members)
@@ -2943,7 +3129,15 @@ class PopulationBasedSearch(BaseSearch):
         repairs: MutableMapping[Config, BenchmarkResult],
         current_members: Sequence[PopulationMember],
     ) -> None:
-        """Repair failed members after a later config proves the same source."""
+        """Repair failed members after a later config proves the same source.
+
+        A repaired member is that config's kernel under its own config: a
+        source alias (``"deduplicated"``).  Where the search drops aliases
+        it takes no entry in the final selection's history, which holds the
+        kernel under the config that was timed, and a pinned one passes its
+        pin to that config, as an alias of the batch does
+        (``_settle_benchmarked_members``).
+        """
         candidates = [
             *current_members,
             *self.population,
@@ -2951,8 +3145,10 @@ class PopulationBasedSearch(BaseSearch):
             *self._benchmarked_members.values(),
             *self._pinned_finalist_members.values(),
             *(getattr(self, "_terminal_refinement_members", None) or {}).values(),
+            *self._members_kept_by_algorithm(),
         ]
         seen: set[int] = set()
+        repaired: list[PopulationMember] = []
         for member in candidates:
             if id(member) in seen:
                 continue
@@ -2970,7 +3166,14 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = repair.fn
             member.status = repair.status
             member.compile_time = None
-            self._record_benchmarked_member(member)
+            repaired.append(member)
+        self._settle_benchmarked_members(repaired, current_members)
+
+    def _members_kept_by_algorithm(self) -> Iterable[PopulationMember]:
+        """Members an algorithm still reads after they left the population,
+        which a source repair therefore reaches as well
+        (``_apply_effective_source_repairs``).  None by default."""
+        return ()
 
     def _record_benchmarked_member(self, member: PopulationMember) -> None:
         """Keep successful benchmarked members available for final verification."""
@@ -3117,7 +3320,16 @@ class PopulationBasedSearch(BaseSearch):
                 # refinement re-measures the config instead of resurrecting a
                 # quarantined result.
                 terminal_members.pop(config, None)
-            if config in pinned_configs and member is not None:
+            if (
+                config in pinned_configs
+                and member is not None
+                # A pinned config that is a source alias is its kernel under
+                # another config, and the pin is with the config that holds
+                # the kernel (``_settle_benchmarked_members``): an alias
+                # that is timed itself (it stands in for a kernel the search
+                # timed under no config of its own) takes no entry here.
+                and not self._is_source_alias(member)
+            ):
                 self._record_best_member_for_config(
                     pinned_members,
                     config,
@@ -3439,6 +3651,28 @@ class PopulationBasedSearch(BaseSearch):
             *getattr(self, "population", ()),
             best,
         ]
+        # One entry per kernel. A source alias that is still a member (an
+        # initial population keeps its own, as do the populations of the
+        # differential-evolution and LLM-guided searches) is a kernel that
+        # the config holding it stands for. The search's best stands for its
+        # kernel under its own config: every other config of that kernel (a
+        # member with the same compiled function: the config that holds the
+        # kernel where the best is an alias, or the config a finishing phase
+        # started from when it reset settings the code does not depend on)
+        # stands behind it, so a win returns the config the search ended on.
+        # A pin among them passes to the best's config: the kernel keeps the
+        # rules of a pinned finalist under whichever config stands for it.
+        behind = [
+            member
+            for member in candidates
+            if member is not best and member.fn is best.fn
+        ]
+        if behind and self._collapses_source_aliases():
+            if any(member.config in self._pinned_finalist_configs for member in behind):
+                self.pin_finalist_config(best.config)
+            candidates = [member for member in candidates if member.fn is not best.fn]
+            candidates.append(best)
+        candidates = self._one_member_per_kernel(candidates)
         for member in candidates:
             if not member.perfs or not math.isfinite(
                 self._finalist_history_perf(member)
@@ -4629,8 +4863,18 @@ class PopulationBasedSearch(BaseSearch):
         Returns:
             -1 if a is better than b, 1 if b is better than a, 0 if they are equal.
         """
+        if self._kernel_holder(a, (a, b)) is self._kernel_holder(b, (a, b)):
+            # Two configs of one kernel are equal, whatever each has read:
+            # there is nothing to time, and a child that repeats its
+            # parent's code does not replace it.
+            return 0
+        # A config reads what its kernel reads now. A candidate that was
+        # settled before an earlier comparison re-timed its kernel (a batch
+        # that is benchmarked first and compared afterwards) is not a member
+        # of the population yet, so that re-timing did not reach it.
+        self._follow_kernel_readings((a, b), (a, b))
         if self.should_rebenchmark(a) and self.should_rebenchmark(b):
-            self.rebenchmark([a, b])
+            self._rebenchmark_kernels([a, b])
         return (a.perf > b.perf) - (a.perf < b.perf)
 
     def should_rebenchmark(self, member: PopulationMember) -> bool:
@@ -5368,13 +5612,58 @@ class PopulationBasedSearch(BaseSearch):
         """
         Re-benchmark the entire population to avoid outliers.
 
+        Where the search drops source aliases, each kernel is re-timed once
+        however many of ``members`` are configs of it
+        (``_rebenchmark_kernels``).
+
         Args:
             members: The list of population members to rebenchmark.
             desc: Description for the progress bar.
         """
         if members is None:
             members = self.population
-        self.rebenchmark([p for p in members if self.should_rebenchmark(p)], desc=desc)
+        self._rebenchmark_kernels(
+            [p for p in members if self.should_rebenchmark(p)], desc=desc
+        )
+
+    def _rebenchmark_kernels(
+        self, members: Sequence[PopulationMember], *, desc: str = "Rebenchmarking"
+    ) -> None:
+        """Re-benchmark ``members`` with one timing per kernel, and keep one
+        reading per kernel.
+
+        Every re-timing of a search phase comes through here.  A source
+        alias is its kernel under another config: the member that holds the
+        kernel is timed for it (``_kernel_holder``; its config is the
+        kernel's entry in the final selection's history, and only a member
+        that is timed refreshes its entry there), once however many of
+        ``members`` are configs of it.  A list that is one kernel is not
+        timed at all: a re-timing compares kernels, and ``rebenchmark``
+        leaves a single member as it is.  Afterwards every other config of a
+        kernel, in ``members`` and in the population, has the reading its
+        holder has: an alias that a re-timing leaves out (a polish round
+        verifies its candidates, ``compare`` a pair) does not keep a reading
+        its kernel no longer has.  In a search that keeps its aliases every
+        member is timed, as before.
+        """
+        if not self._collapses_source_aliases():
+            self.rebenchmark([*members], desc=desc)
+            return
+        self.rebenchmark(self._kernels_of(members), desc=desc)
+        self._follow_kernel_readings((*members, *self.population), members)
+
+    def _follow_kernel_readings(
+        self,
+        members: Iterable[PopulationMember],
+        among: Sequence[PopulationMember],
+    ) -> None:
+        """Give each of ``members`` that is a config of another member's
+        kernel the reading that kernel has now (``_kernel_holder``, with
+        ``among`` at hand), as a new reading of its own."""
+        for member in {id(m): m for m in members}.values():
+            kernel = self._kernel_holder(member, among)
+            if kernel is not member and kernel.perfs and member.perf != kernel.perf:
+                member.perfs.append(kernel.perf)
 
     def statistics(self) -> str:
         """
@@ -5442,8 +5731,14 @@ class PopulationBasedSearch(BaseSearch):
                     unbenchmarked, desc=f"Finishing round {round_num}"
                 )
 
-            # Rebenchmark all candidates (including current) for fair comparison
-            self.rebenchmark(candidates, desc=f"Finishing round {round_num}: verifying")
+            # Rebenchmark all candidates (including current) for fair
+            # comparison. A reset the generated code does not depend on is
+            # the incumbent's kernel again: it takes the incumbent's reading
+            # instead of a timing of its own, so it counts as a reset that
+            # kept the performance.
+            self._rebenchmark_kernels(
+                candidates, desc=f"Finishing round {round_num}: verifying"
+            )
 
             # Log performance of each candidate at debug level
             current_perf = current.perf
@@ -5482,7 +5777,7 @@ class PopulationBasedSearch(BaseSearch):
                         [combined],
                         desc=f"Finishing round {round_num}: combined",
                     )
-                    self.rebenchmark(
+                    self._rebenchmark_kernels(
                         [current, combined],
                         desc=f"Finishing round {round_num}: verifying combined",
                     )
@@ -5770,6 +6065,14 @@ class PopulationBasedSearch(BaseSearch):
                         trial["outcome"] = "unkillable_worker"
                         raise
                     trial["outcome"] = member.status
+                    if self._is_source_alias(member):
+                        # Code an earlier candidate already produced: no
+                        # trial of a new kernel, and its reading is that
+                        # candidate's, an earlier sample that must not
+                        # displace the incumbent.
+                        new_trials -= 1
+                        transcript["new_trials"] = new_trials
+                        continue
                 if reusable(member):
                     trial["perf"] = member.perf
                     if member.perf < best.perf:

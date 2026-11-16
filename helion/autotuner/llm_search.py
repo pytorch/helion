@@ -473,19 +473,25 @@ class LLMGuidedSearch(PopulationBasedSearch):
         bench_t0 = time.perf_counter()
         results = self.benchmark_batch(configs, desc=desc)
         self._benchmark_times.append(time.perf_counter() - bench_t0)
+        # As ``benchmark_population`` does: the batch's members are settled
+        # first, then earlier members that a result of the batch repaired,
+        # with the batch at hand (a repaired member is an alias of one of
+        # its configs).
+        members = self._ingest_results(results)
         repairs = self.benchmark_provider.take_effective_source_repairs()
         if repairs:
-            self._apply_effective_source_repairs(repairs, self.population)
+            self._apply_effective_source_repairs(repairs, members)
             for config, repair in repairs.items():
                 self._latest_results_by_config_key[self._config_key(config)] = repair
             self._all_benchmark_results = list(
                 self._latest_results_by_config_key.values()
             )
-        self._ingest_results(results)
+        self._trim_population()
 
-    def _ingest_results(self, results: list[BenchmarkResult]) -> None:
-        """Store raw results and keep a bounded set of top configs for rebenchmarking."""
-        # Retain full results for prompts while keeping only a small top-config set in memory.
+    def _ingest_results(self, results: list[BenchmarkResult]) -> list[PopulationMember]:
+        """Store raw results and add their members to the population
+        (``_trim_population`` bounds it); returns the new members."""
+        # Retain full results for prompts.
         self._store_latest_results(results)
         members = [
             PopulationMember(
@@ -498,10 +504,9 @@ class LLMGuidedSearch(PopulationBasedSearch):
             )
             for result in results
         ]
-        for member in members:
-            self._record_benchmarked_member(member)
+        self._settle_benchmarked_members(members, members)
         self.population.extend(members)
-        self._trim_population()
+        return members
 
     def _trim_population(self) -> None:
         """Keep only the current top configs that future rebenchmarking needs."""

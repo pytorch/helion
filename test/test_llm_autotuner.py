@@ -306,6 +306,10 @@ class TestLLMGuidedSearch(TestCase):
         search._compiler_seed_members = []
         search._benchmarked_members = {}
         search._pinned_finalist_members = {}
+        # (a search that keeps its aliases records a repaired member)
+        search.config_spec.backend = SimpleNamespace(
+            collapses_generated_source_aliases=lambda config_spec: False
+        )
         search._latest_results_by_config_key = {
             search._config_key(failed_config): failed_result
         }
@@ -369,6 +373,9 @@ class TestLLMGuidedSearch(TestCase):
 
             def take_effective_source_repairs(self):
                 return {}
+
+            def settles_source_aliases(self) -> bool:
+                return False
 
             def set_config_roles(self, roles) -> None:
                 pass

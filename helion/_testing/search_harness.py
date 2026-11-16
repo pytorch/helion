@@ -41,6 +41,7 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
             supports_precompile=lambda: True,
             autotune_config_is_viable=lambda config_spec, config: True,
             should_deduplicate_generated_sources=lambda config_spec: False,
+            collapses_generated_source_aliases=lambda config_spec: False,
             get_do_bench=lambda: None,
             default_final_selection_regime=lambda: None,
             classify_autotune_exception=lambda error: None,

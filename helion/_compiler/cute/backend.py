@@ -3056,7 +3056,18 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        # A candidate is its generated module (``BenchmarkJob`` takes the
+        # source and the arguments, never the config), so two configs with one
+        # source are one kernel.  Many are: a ``load_eviction_policies`` slot
+        # whose load the layout serves from registers, an L2 policy on a
+        # packet width without a hinted load, a knob of a pass the config
+        # leaves off.
+        return True
+
+    def collapses_generated_source_aliases(self, config_spec: ConfigSpec) -> bool:
+        # The flash search runs its own alias policy (structural lanes,
+        # source quarantine); every other search drops the aliases.
+        return not config_spec.cute_flash_search_enabled
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or

@@ -430,3 +430,42 @@ def test_refinement_budget_checks_preserve_generation_history(bound, budget):
     assert search._last_generation_boundary == 2.0
     assert search._longest_generation_seconds == 3.0
     assert not search._budget_reserve_released
+
+
+@pytest.mark.parametrize("collapse", [True, False])
+def test_source_alias_is_no_refinement_trial(bound, collapse):
+    """Every trial repeats earlier code (``deduplicated``) and carries a
+    reading below the incumbent's.  Where the search drops source aliases
+    such a trial neither displaces the incumbent nor uses up the trial
+    limit; elsewhere an alias stays a candidate of its own."""
+    search = _search(bound)
+    incumbent = search.best
+    calls = []
+
+    def benchmark(members, **kwargs):
+        for member in members:
+            calls.append(member.config)
+            member.perfs.append(0.5)
+            member.status = "deduplicated"
+        return members
+
+    with (
+        patch.object(search, "benchmark_population", side_effect=benchmark),
+        patch.object(search, "_collapses_source_aliases", return_value=collapse),
+        patch("helion.autotuner.base_search.MAX_REFINEMENT_TRIALS", 2),
+    ):
+        winner = search.run_compiler_refinement(incumbent)
+
+    trace = search._autotune_metrics.compiler_refinement
+    outcomes = [row["outcome"] for row in trace["trials"]]
+    if collapse:
+        assert winner is incumbent
+        assert trace["new_trials"] == 0
+        assert len(calls) == 60
+        assert set(outcomes) == {"deduplicated"}
+        assert not any("perf" in row for row in trace["trials"])
+    else:
+        assert winner is not incumbent
+        assert trace["new_trials"] == 2
+        assert len(calls) == 2
+        assert outcomes.count("trial_limit") == 58
