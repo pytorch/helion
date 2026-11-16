@@ -50,6 +50,9 @@ from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_ON
+from .cute_mma_dag import MMA_DAG_PARTITION_BALANCED
+from .cute_mma_dag import MMA_DAG_PARTITION_KEY
+from .cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
 from .cute_mma_dag import MMA_DAG_PASS_WARP_STAGES
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
@@ -109,6 +112,9 @@ if TYPE_CHECKING:
 # The warp-mode tile ladder's seeds and the leading tensor-memory seeds.
 SEED_TILES = 8
 SEED_TCGEN05 = 4
+# The range skew of the balanced paged-attention seed for kernels without a
+# window, in pages.
+PARTITION_SEED_SKEW = 8
 
 Tile = tuple["Mapping[int, int]", int, int]
 # A ranked ladder entry (``mma_dag_seed_configs``): block sizes by id, warps, stages.
@@ -755,6 +761,7 @@ class MmaDagSeedPlanner:
         sleeping: list[Config] = []
         late_retirement: list[Config] = []
         key_clip_seeds: list[Config] = []
+        partition_seeds: list[Config] = []
         query_tma: list[Config] = []
         value_metadata: list[Config] = []
         value_metadata_policies: list[Config] = []
@@ -939,6 +946,72 @@ class MmaDagSeedPlanner:
                                 MMA_DAG_PROBABILITY_SCHEDULE_EARLY
                             )
                         paired_head.append(Config.from_dict(head))
+                        if (
+                            MMA_DAG_PARTITION_BALANCED in attention.partition_choices
+                            and attention.partition_units > spec.num_sm
+                        ):
+                            # More units than SMs: one unit per CTA runs in
+                            # waves, and the last wave leaves SMs idle while
+                            # its longest units finish. The leading family
+                            # with equal shares of the pages on one wave of
+                            # CTAs follows the other seeds (below); with
+                            # every unit on an SM of its own the partition
+                            # only adds its plan and its merges, and no seed
+                            # names it. B200, 148 SMs, us per call, one unit
+                            # per CTA against balanced: 320 requests 64.1 /
+                            # 59.3 (2047-key window) and 699 / 653 (211
+                            # pages); 200 requests 40.0 / 41.1 and 769 /
+                            # 757 (391 pages); 128 requests 25.2 / 26.1.
+                            balanced = {
+                                **head,
+                                MMA_DAG_PARTITION_KEY: MMA_DAG_PARTITION_BALANCED,
+                            }
+                            partition_seeds.append(Config.from_dict(balanced))
+                            if (
+                                not attention.windowed
+                                and PARTITION_SEED_SKEW
+                                in attention.partition_skew_choices
+                                and spec.cute_mma_dag_partition_skew_searched
+                            ):
+                                # Shares that fall from the first CTA to the
+                                # last, where the search samples the skew:
+                                # elsewhere the benchmark cannot rank this
+                                # seed against the one above, and it would
+                                # only compile and time one more kernel.
+                                # B200, no window, us per call without
+                                # a skew / 8 / 16 pages: 320 requests of 211
+                                # pages 653.0 / 652.4 / 652.7, 200 requests of
+                                # 391 pages 756.7 / 753.1 / 757.4 (over six
+                                # cases each 0.2% and 0.4% better at 8, 0.3%
+                                # and 0.1% worse at 16). A window's few pages
+                                # lose to any skew they would apply whole (8
+                                # pages on shares of 39 and 25: 7% and 10%
+                                # more time), which is why a launch applies
+                                # at most a thirty-second of its share: no
+                                # seed names a skew there.
+                                skewed = {
+                                    **balanced,
+                                    MMA_DAG_PARTITION_SKEW_KEY: PARTITION_SEED_SKEW,
+                                }
+                                if spec.cute_pdl_capture_overlap_searched:
+                                    # With the skew, releasing the dependents
+                                    # at entry beat the loader's tail, the
+                                    # default of one wave. Same B200 cases,
+                                    # handwritten / Helion over twelve, by the
+                                    # means of 3 x 20 samples, in two runs.
+                                    # The four configs side by side: balanced
+                                    # 0.987, with the skew 0.991, with the
+                                    # entry release 0.990, with both 0.993.
+                                    # Three of them again: balanced 0.988,
+                                    # with the skew 0.990, with both 0.994.
+                                    # A cold search of the 320-request kernel
+                                    # settled on both. Only a bank cycle
+                                    # shows a search the release; elsewhere
+                                    # the seed keeps the default.
+                                    skewed["cute_pdl_release"] = (
+                                        CUTE_PDL_RELEASE_DEFAULT
+                                    )
+                                partition_seeds.append(Config.from_dict(skewed))
                         if spec.cute_pdl_capture_overlap_searched:
                             # The benchmark times back-to-back captured
                             # calls and the search samples the policy: seed
@@ -1097,5 +1170,10 @@ class MmaDagSeedPlanner:
         # dependent-launch defaults; the trailing clip alone is left to the
         # search.
         seeds.extend(key_clip_seeds)
+        # Every seed above runs one unit per CTA, the default. Where the
+        # units outnumber the SMs, the leading family follows on the balanced
+        # partition, and for a kernel without a window once more with a range
+        # skew where the search samples the skew.
+        seeds.extend(partition_seeds)
         # The paired head leads; every other seed keeps its order.
         return [*paired_head, *(seed for seed in seeds if seed not in paired_head)]

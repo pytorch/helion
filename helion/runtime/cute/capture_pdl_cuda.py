@@ -13,6 +13,10 @@ cost is paid by every capturing launch of a kernel with the capture contract,
 which a proved paired attention kernel has by default and not only by opting
 in, and never during graph replay or eager execution; avoiding it requires
 another equally strong node-identity proof.
+
+The driver class is also the loader of a lease on the captured graph
+(``graph_lease``): it carries the user-object entry points, and the lease
+reads the stream's capture through the snapshot's query (``stream_capture``).
 """
 
 from __future__ import annotations
@@ -151,16 +155,43 @@ class CudaCaptureDriver:
                 ctypes.POINTER(ctypes.c_size_t),
                 ctypes.POINTER(ctypes.c_size_t),
             ],
+            # A user object and its reference on a graph (``graph_lease``).
+            "cuUserObjectCreate": [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_uint,
+            ],
+            "cuGraphRetainUserObject": [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_uint,
+                ctypes.c_uint,
+            ],
+            "cuUserObjectRelease": [ctypes.c_void_p, ctypes.c_uint],
+            # A stream outside PyTorch's pool, and the calling thread's
+            # capture interaction mode (``paged_partition``).
+            "cuStreamCreate": [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint],
+            "cuThreadExchangeStreamCaptureMode": [ctypes.POINTER(ctypes.c_int)],
         }
         for name, arguments in signatures.items():
             function = getattr(self.library, name)
             function.argtypes = arguments
             function.restype = ctypes.c_int
 
-    def snapshot(self, stream: int) -> CaptureSnapshot | None:
-        context = ctypes.c_void_p()
-        if self.library.cuCtxGetCurrent(ctypes.byref(context)) or not context.value:
-            return None
+    def stream_capture(
+        self, stream: int
+    ) -> tuple[int, int, tuple[Dependency, ...]] | None:
+        """The capture ``stream`` is in: its id, the graph it captures into
+        and what the next node captured on the stream will depend on. None
+        when the stream captures no graph.
+
+        The one capture query of the launch guard (``snapshot``) and of a
+        lease on the graph (``graph_lease``). It takes the edge data with
+        the dependencies, so it is not the lossy query the driver refuses
+        when a dependency carries edge data.
+        """
         status = ctypes.c_int()
         capture_id = ctypes.c_uint64()
         graph = ctypes.c_void_p()
@@ -178,19 +209,35 @@ class CudaCaptureDriver:
         )
         if result or status.value != 1 or not graph.value:
             return None
-        # CaptureInfo's borrowed arrays expire at the next stream API. Consume
-        # their edge restrictions immediately; actual-node edges are read anew
-        # after enqueue, so these borrowed addresses are never retained.
-        for index in range(count.value):
-            edge = edges[index]
-            if not Dependency(
-                dependencies[index],
-                edge.from_port,
-                edge.to_port,
-                edge.kind,
-                bytes(edge.reserved),
-            ).supported():
-                return None
+        # CaptureInfo's borrowed arrays expire at the next stream API. Copy
+        # them out immediately; actual-node edges are read anew after
+        # enqueue, so these borrowed addresses are never retained.
+        return (
+            capture_id.value,
+            graph.value,
+            tuple(
+                Dependency(
+                    dependencies[index],
+                    edges[index].from_port,
+                    edges[index].to_port,
+                    edges[index].kind,
+                    bytes(edges[index].reserved),
+                )
+                for index in range(count.value)
+            ),
+        )
+
+    def snapshot(self, stream: int) -> CaptureSnapshot | None:
+        context = ctypes.c_void_p()
+        if self.library.cuCtxGetCurrent(ctypes.byref(context)) or not context.value:
+            return None
+        capture = self.stream_capture(stream)
+        if capture is None:
+            return None
+        capture_id, graph, pending = capture
+        # The edge restrictions of the stream's pending dependencies.
+        if not all(dependency.supported() for dependency in pending):
+            return None
         count = ctypes.c_size_t()
         if self.library.cuGraphGetNodes(graph, None, ctypes.byref(count)):
             return None
@@ -208,8 +255,8 @@ class CudaCaptureDriver:
                 context.value,
                 threading.get_ident(),
                 stream,
-                capture_id.value,
-                graph.value,
+                capture_id,
+                graph,
             ),
             frozenset(node for node in nodes[: count.value] if node is not None),
         )

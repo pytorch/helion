@@ -1770,6 +1770,10 @@ class CuteBackend(Backend):
             grid_expr = expr_from_string(
                 f"(({{grid}}[0]) // {item_group},)", grid=grid_expr
             )
+            if fn.cute_state.lanes.attention_partition != "item":
+                from .paged_attention_partition import partition_launch_grid
+
+                grid_expr = partition_launch_grid(fn, grid_expr)
         if grid_multiplier != 1:
             # A fused body running one CTA per (grid index, lane).
             assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1

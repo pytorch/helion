@@ -205,6 +205,27 @@ MMA_DAG_KEY_CLIP_OFF = "off"
 MMA_DAG_KEY_CLIP_LEADING = "leading"
 MMA_DAG_KEY_CLIP_TRAILING = "trailing"
 MMA_DAG_KEY_CLIP_BOTH = "both"
+# How the proved paired schedule divides its units (two adjacent leading
+# items, one request with two heads) among CTAs. ``item`` launches one CTA
+# per unit. ``whole`` launches ``min(units, SMs)`` persistent CTAs, each
+# running a contiguous range of whole units as one page stream; its results
+# are bit-identical to ``item``. ``balanced`` launches the same grid and
+# gives every CTA an equal share of the pages: a unit that crosses a share
+# boundary runs in parts, which the kernel merges. That reassociates the
+# unit's sums, so it needs ``fast_math``; units that run in one CTA keep
+# ``item``'s bits.
+MMA_DAG_PARTITION_KEY = "cute_mma_dag_partition"
+MMA_DAG_PARTITION_ITEM = "item"
+MMA_DAG_PARTITION_WHOLE = "whole"
+MMA_DAG_PARTITION_BALANCED = "balanced"
+# A range skew of the balanced partition, in slots (pages): the CTAs' shares
+# fall linearly from the mean plus the skew for the first CTA to the mean
+# minus the skew for the last, so the CTAs of a launch end one after another
+# instead of together and a dependent launch takes their SMs over gradually.
+# Zero, the default, is equal shares. The device applies at most a
+# thirty-second of the launch's mean share, whatever the lengths are.
+MMA_DAG_PARTITION_SKEW_KEY = "cute_mma_dag_partition_skew"
+MMA_DAG_PARTITION_SKEW_CHOICES: tuple[int, ...] = (0, 1, 2, 4, 8, 16)
 MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
@@ -332,6 +353,28 @@ def paged_attention_key_clip_choices(
     if paired is not None:
         return paired.key_clip_choices
     return (MMA_DAG_KEY_CLIP_OFF,)
+
+
+def paged_attention_partition_choices(
+    facts: CuteMmaDagFacts, pass_warps: object
+) -> tuple[str, ...]:
+    """Only the proved paired schedule can run several units in one CTA."""
+    if (
+        facts.attention is not None
+        and facts.attention.paired_items
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return facts.attention.partition_choices
+    return (MMA_DAG_PARTITION_ITEM,)
+
+
+def paged_attention_partition_skew_choices(
+    facts: CuteMmaDagFacts, partition: object
+) -> tuple[int, ...]:
+    """Only the balanced partition cuts ranges that a skew can move."""
+    if facts.attention is not None and partition == MMA_DAG_PARTITION_BALANCED:
+        return facts.attention.partition_skew_choices
+    return (0,)
 
 
 def paged_attention_pass_warps_reason(
@@ -519,6 +562,8 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY,
     MMA_DAG_PROBABILITY_SCHEDULE_KEY,
     MMA_DAG_KEY_CLIP_KEY,
+    MMA_DAG_PARTITION_KEY,
+    MMA_DAG_PARTITION_SKEW_KEY,
     MMA_DAG_LOADS_KEY,
     MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,

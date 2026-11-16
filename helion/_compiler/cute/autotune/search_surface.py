@@ -59,6 +59,8 @@ from ..cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
 from ..cute_mma_dag import MMA_DAG_KEYS
 from ..cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from ..cute_mma_dag import MMA_DAG_PARTITION_KEY
+from ..cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
@@ -211,6 +213,7 @@ from .mma_dag_surface import key_clip_choices
 from .mma_dag_surface import normalize_value_metadata_options
 from .mma_dag_surface import paired_capture_schedule
 from .mma_dag_surface import rederive_overridden_key_clip
+from .mma_dag_surface import take_overridden_partition_transport
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -5764,6 +5767,14 @@ def cute_flat_fields(
         key_clip_fragment = config_spec.cute_mma_dag_key_clip
         if key_clip_fragment is not None:
             fields[MMA_DAG_KEY_CLIP_KEY] = key_clip_fragment
+        # A config without these keys runs one unit per CTA and equal shares,
+        # the fragments' defaults (``_normalize_partition`` drops both).
+        partition_fragment = config_spec.cute_mma_dag_partition
+        if partition_fragment is not None:
+            fields[MMA_DAG_PARTITION_KEY] = partition_fragment
+        skew_fragment = config_spec.cute_mma_dag_partition_skew
+        if skew_fragment is not None:
+            fields[MMA_DAG_PARTITION_SKEW_KEY] = skew_fragment
         fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)
@@ -6442,6 +6453,7 @@ class CuteSearchSurface(BackendSearchSurface):
             capture_policy_available(config_spec), config, overrides
         )
         _keep_overridden_capture_policy(config_spec, config, overrides)
+        take_overridden_partition_transport(config_spec, config, overrides)
         rederive_overridden_key_clip(config_spec, config, overrides)
 
     def overrides_without_search(

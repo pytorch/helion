@@ -28,12 +28,21 @@ PUBLISHED = ("key_ready", "value_ready")
 
 def _publication_waits(module: str, function: str) -> dict[str, set[str]]:
     """Barrier name -> the ``warp == N`` guards its waits run under."""
-    tree = ast.parse((CUTE / module).read_text())
-    body = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == function
-    )
+    return _waits_in((CUTE / module).read_text(), module, function)
+
+
+def _waits_in(source: str, module: str, function: str) -> dict[str, set[str]]:
+    """``_publication_waits`` of ``function`` in a module's ``source``.
+
+    A role helper of the same module runs under the guards of its call. The
+    waits are found by barrier name, so a helper must receive each
+    publication barrier under the barrier's own name: one passed under
+    another name, or as part of an expression, would be waited on unseen.
+    """
+    tree = ast.parse(source)
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
     found: dict[str, set[str]] = {}
 
     def visit(node: ast.AST, guards: tuple[str, ...]) -> None:
@@ -53,10 +62,36 @@ def _publication_waits(module: str, function: str) -> dict[str, set[str]]:
                 owners = {guard for guard in guards if guard.startswith("warp == ")}
                 assert len(owners) == 1, (module, barrier, guards)
                 found.setdefault(barrier, set()).update(owners)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in functions
+        ):
+            helper = functions[node.func.id]
+            bound = dict(
+                zip([arg.arg for arg in helper.args.args], node.args, strict=False)
+            )
+            bound.update({keyword.arg: keyword.value for keyword in node.keywords})
+            for name in PUBLISHED:
+                if name in bound:
+                    assert ast.unparse(bound[name]) == name, (module, helper.name)
+            for argument in (*node.args, *(word.value for word in node.keywords)):
+                for name in PUBLISHED:
+                    if any(
+                        isinstance(part, ast.Name) and part.id == name
+                        for part in ast.walk(argument)
+                    ):
+                        assert bound.get(name) is argument, (
+                            module,
+                            helper.name,
+                            ast.unparse(argument),
+                        )
+            for child in helper.body:
+                visit(child, guards)
         for child in ast.iter_child_nodes(node):
             visit(child, guards)
 
-    visit(body, ())
+    visit(functions[function], ())
     return found
 
 
@@ -85,6 +120,37 @@ def _publication_waits(module: str, function: str) -> dict[str, set[str]]:
 )
 def test_only_the_issuing_warp_waits_for_published_operands(module, function, expected):
     assert _publication_waits(module, function) == expected
+
+
+_HELPER_CALL = """
+def _issue_pv({parameter}, step):
+    mbar_wait({parameter}, step & 1)
+
+def body(warp, value_ready, step):
+    if warp == 18:
+        _issue_pv({argument}, step=step)
+"""
+
+
+@pytest.mark.parametrize(
+    "parameter,argument",
+    [
+        # Positional and by keyword under another name, and inside an
+        # expression under its own.
+        ("ready", "value_ready"),
+        ("ready", "ready=value_ready"),
+        ("ready", "value_ready + 1"),
+        ("value_ready", "value_ready + 1"),
+    ],
+)
+def test_a_publication_barrier_reaches_a_helper_under_its_own_name(parameter, argument):
+    """Otherwise the helper's waits on it, which the audit finds by barrier
+    name, would be missed, and with them a second warp that waits there."""
+    own = _HELPER_CALL.format(parameter="value_ready", argument="value_ready")
+    assert _waits_in(own, "synthetic", "body") == {"value_ready": {"warp == 18"}}
+    renamed = _HELPER_CALL.format(parameter=parameter, argument=argument)
+    with pytest.raises(AssertionError):
+        _waits_in(renamed, "synthetic", "body")
 
 
 def test_stress_watchdog_gives_the_first_call_its_own_bound() -> None:

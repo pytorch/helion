@@ -27,6 +27,9 @@ from .cute_mma_dag import MMA_DAG_LOADS_KEY
 from .cute_mma_dag import MMA_DAG_LOADS_TMA
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
 from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+from .cute_mma_dag import MMA_DAG_PARTITION_ITEM
+from .cute_mma_dag import MMA_DAG_PARTITION_KEY
+from .cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from .cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_SCOPED
@@ -46,6 +49,8 @@ from .cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from .cute_mma_dag import MMA_DAG_WARPS_KEY
 from .cute_mma_dag import paged_attention_early_retirement_default
 from .cute_mma_dag import paged_attention_key_clip_choices
+from .cute_mma_dag import paged_attention_partition_choices
+from .cute_mma_dag import paged_attention_partition_skew_choices
 from .cute_mma_dag import paged_attention_pass_warps_reason
 from .cute_mma_dag import paged_attention_probability_choices
 from .cute_mma_dag import paged_attention_v_lag_choices
@@ -74,6 +79,61 @@ def paged_attention_required_knobs(facts: CuteMmaDagFacts) -> dict[str, object]:
         MMA_DAG_PERSISTENT_KEY: 0,
         MMA_DAG_CLUSTER_KEY: 1,
     }
+
+
+def paged_attention_partition_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration cannot run several units in one persistent CTA.
+
+    A persistent CTA requests each unit's queries with the proved query map,
+    and the value-metadata actor has no walk over a CTA's units.
+    """
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    if type(partition) is str and partition == MMA_DAG_PARTITION_ITEM:
+        return None
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY, MMA_DAG_PASS_WARPS_ATTENTION)
+    choices = paged_attention_partition_choices(facts, pass_warps)
+    if type(partition) is not str or partition not in choices:
+        if type(partition) is str and partition in paged_attention_partition_choices(
+            facts, MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+        ):
+            # The usual way here is a config that names the partition and
+            # little else, on a kernel whose no-config default is paired.
+            return (
+                f"{MMA_DAG_PARTITION_KEY}={partition!r} needs the paired attention "
+                f"schedule ({MMA_DAG_PASS_WARPS_KEY}="
+                f"{MMA_DAG_PASS_WARPS_ATTENTION_PAIRED!r} with "
+                f"{MMA_DAG_QUERY_TMA_KEY}=True), and this config selects "
+                f"{MMA_DAG_PASS_WARPS_KEY}={pass_warps!r}, whose only partition is "
+                f"{MMA_DAG_PARTITION_ITEM!r}. A key that a config leaves out takes "
+                "that key's own default, not the kernel's default config: add the "
+                "partition to a complete config of the paired schedule, such as "
+                "an autotuned one"
+            )
+        return f"{MMA_DAG_PARTITION_KEY} must be one of {choices!r} for {pass_warps}"
+    if config.get(MMA_DAG_QUERY_TMA_KEY, False) is not True:
+        return f"{MMA_DAG_PARTITION_KEY}={partition!r} requires {MMA_DAG_QUERY_TMA_KEY}=True"
+    if config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False) is not False:
+        return f"{MMA_DAG_PARTITION_KEY}={partition!r} requires {MMA_DAG_VALUE_METADATA_SKIP_KEY}=False"
+    return None
+
+
+def paged_attention_partition_skew_reason(
+    facts: CuteMmaDagFacts, config: Mapping[str, object]
+) -> str | None:
+    """Why this configuration cannot skew the ranges of its partition."""
+    skew = config.get(MMA_DAG_PARTITION_SKEW_KEY, 0)
+    if type(skew) is int and skew == 0:
+        return None
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    choices = paged_attention_partition_skew_choices(facts, partition)
+    if type(skew) is not int or skew not in choices:
+        return (
+            f"{MMA_DAG_PARTITION_SKEW_KEY} must be one of {choices!r} for "
+            f"{MMA_DAG_PARTITION_KEY}={partition!r}"
+        )
+    return None
 
 
 def paged_attention_config_reason(
@@ -144,6 +204,11 @@ def paged_attention_config_reason(
     key_clip = config.get(MMA_DAG_KEY_CLIP_KEY, key_clips[0])
     if type(key_clip) is not str or key_clip not in key_clips:
         return f"{MMA_DAG_KEY_CLIP_KEY} must be one of {key_clips!r} for {pass_warps}"
+    partition_reason = paged_attention_partition_reason(
+        facts, config
+    ) or paged_attention_partition_skew_reason(facts, config)
+    if partition_reason is not None:
+        return partition_reason
     for key, expected in paged_attention_required_knobs(facts).items():
         actual = config.get(key, expected)
         if type(actual) is not type(expected) or actual != expected:

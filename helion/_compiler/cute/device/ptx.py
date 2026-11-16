@@ -511,6 +511,32 @@ ldcg_f32 = ptx_op(
     ),
 )
 
+ldcg_v2_f32 = ptx_op(
+    "ldcg_v2_f32",
+    "ld.global.cg.v2.f32 {$0, $1}, [$2];",
+    (cutlass.Int64,),
+    (cutlass.Float32, cutlass.Float32),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``ld.global.cg.v2.f32``: two consecutive fp32 values from L2 "
+        "(another CTA's partial; 8-byte aligned)."
+    ),
+)
+
+ldcg_v4_f32 = ptx_op(
+    "ldcg_v4_f32",
+    "ld.global.cg.v4.f32 {$0, $1, $2, $3}, [$4];",
+    (cutlass.Int64,),
+    (cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``ld.global.cg.v4.f32``: four consecutive fp32 values from L2 "
+        "(another CTA's partial; 16-byte aligned)."
+    ),
+)
+
 # The predicated loads of a ragged root tile: a false ``pred`` (an Int32, 0
 # out of bounds) reads nothing and yields zero (the frontend's masked-value
 # model: a padded element loads as 0).
@@ -1222,5 +1248,75 @@ ld_acquire_gpu_u32 = ptx_op(
     doc=(
         "``ld.acquire.gpu`` of the u32 at the address (the peers' writes "
         "released before their arrivals are visible afterwards), unsigned."
+    ),
+)
+
+atom_add_acq_rel_gpu_u32 = ptx_op(
+    "atom_add_acq_rel_gpu_u32",
+    "atom.add.acq_rel.gpu.global.u32 $0, [$1], $2;",
+    (cutlass.Int64, cutlass.Uint32),
+    (cutlass.Uint32,),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``atom.add.acq_rel.gpu`` on the u32 at the address: the value before "
+        "the add. The arrival releases this thread's earlier writes and "
+        "acquires those every earlier arrival released."
+    ),
+)
+
+ld_relaxed_gpu_u32 = ptx_op(
+    "ld_relaxed_gpu_u32",
+    "ld.relaxed.gpu.global.u32 $0, [$1];",
+    (cutlass.Int64,),
+    (cutlass.Uint32,),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``ld.relaxed.gpu`` of the u32 at the address: an atomic read of a "
+        "counter other CTAs add to, never served from a stale L1 line."
+    ),
+)
+
+stg_u32_l2 = ptx_op(
+    "stg_u32_l2",
+    "st.global.L2::cache_hint.u32 [$0], $1, $2;",
+    (cutlass.Int64, cutlass.Uint32, cutlass.Int64),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``st.global.L2::cache_hint.u32``: one u32 (a counter no other thread "
+        "still uses) under an L2 cache policy (``l2_policy_evict_last``)."
+    ),
+)
+
+stg_v2_f32_l2 = ptx_op(
+    "stg_v2_f32_l2",
+    "st.global.L2::cache_hint.v2.f32 [$0], {$1, $2}, $3;",
+    (cutlass.Int64, cutlass.Float32, cutlass.Float32, cutlass.Int64),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``st.global.L2::cache_hint.v2.f32``: two consecutive fp32 values "
+        "(8-byte aligned) under an L2 cache policy."
+    ),
+)
+
+stg_v4_f32_l2 = ptx_op(
+    "stg_v4_f32_l2",
+    "st.global.L2::cache_hint.v4.f32 [$0], {$1, $2, $3, $4}, $5;",
+    (
+        cutlass.Int64,
+        cutlass.Float32,
+        cutlass.Float32,
+        cutlass.Float32,
+        cutlass.Float32,
+        cutlass.Int64,
+    ),
+    side_effects=True,
+    memory=True,
+    doc=(
+        "``st.global.L2::cache_hint.v4.f32``: four consecutive fp32 values "
+        "(16-byte aligned) under an L2 cache policy."
     ),
 )

@@ -12,19 +12,24 @@ from ...language import memory_ops
 from ..compile_environment import CompileEnvironment
 from ..host_function import HostFunction
 from .autotune.mma_dag_surface import carries_capture_overlap
+from .cute_mma_dag import AXIS_ROOT
 from .cute_mma_dag import MMA_DAG_KEY_CLIP_OFF
+from .cute_mma_dag import MMA_DAG_PARTITION_BALANCED
+from .cute_mma_dag import MMA_DAG_PARTITION_ITEM
 from .cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_SERIAL
 from .cute_mma_dag_codegen import emit_mma_dag_module_statements
 from .cute_mma_dag_codegen import mma_dag_alias_plan
 from .cute_mma_dag_emitter_base import MmaDagEmitterBase
 from .cute_mma_dag_emitter_base import _Evaluator
 from .fx_matcher import _is_call
+from .paged_attention_partition import partition_workspace_arg
 from .paged_attention_transport import paged_attention_launch_warps
 from .paged_attention_transport import paged_attention_tma_accesses
 from .passes.pdl import exit_release_applies
 from .passes.pdl import loader_tail_release_applies
 from .pdl_release import capture_policy_available
 from .state import cute_codegen_state
+from .tile_ops import cute_tile_begin_expr
 
 if TYPE_CHECKING:
     from ..generate_ast import GenerateAST
@@ -58,6 +63,113 @@ class _UniformPrelude(MmaDagEmitterBase):
         self.packable_memo = {}
         self.fold_addresses = False
         self.evaluator = _Evaluator(self)
+
+
+def _unit_bounds_helper(
+    cg: GenerateAST,
+    plan: MmaDagPlan,
+    lines: list[str],
+    values: tuple[str, str, str, str],
+) -> tuple[str, str | None, list[str]]:
+    """Wrap the scalar prelude as module functions of a unit's tile offset.
+
+    A persistent CTA evaluates a unit's item, loop bounds and length once
+    per unit and role instead of once at kernel entry. ``lines`` are the
+    evaluator's own statements, so every integer operation keeps its source
+    width and order; only the leading tile offset becomes the parameter.
+
+    The prelude's global load is the unit's length, which the CTA's plan
+    scan reads for every unit. When every load of the prelude reads that
+    one Int32 word, a second function takes the loaded value as its second
+    parameter and is the first one otherwise, statement for statement: a
+    role then evaluates a unit from the length the scan kept instead of
+    loading it again.
+
+    Return the first function's name, the second's (None without one) and
+    the kernel arguments both take last: passing them from the kernel also
+    keeps the ones only the prelude reads.
+    """
+    df = cg.device_function
+    program = plan.program
+    (lead,) = program.lead_axes
+    unit = cute_tile_begin_expr(cg, lead.block_id)
+    assert unit.isidentifier()
+    # The row and dimension axes have one tile: their offsets are zero.
+    single_tiles = []
+    for axis in program.axes:
+        if axis.kind == AXIS_ROOT:
+            assert plan.block(axis) >= axis.extent
+            offset = cute_tile_begin_expr(cg, axis.block_id)
+            assert offset.isidentifier()
+            single_tiles.append(offset)
+    result = (
+        f"(cutlass.Int32({values[0]}), cutlass.Int64({values[1]}), "
+        f"cutlass.Int64({values[2]}), cutlass.Int32({values[3]}))"
+    )
+    tree = ast.parse("\n".join([*lines, result]))
+    # Each line's target and value, in order.
+    defined: dict[str, ast.expr] = {}
+    for statement in tree.body[:-1]:
+        # Straight-line scalar code: the CuTe tracer runs it as plain Python.
+        assert isinstance(statement, ast.Assign) and len(statement.targets) == 1
+        (target,) = statement.targets
+        assert isinstance(target, ast.Name)
+        defined[target.id] = statement.value
+    assert len(defined) == len(lines)
+    free = {
+        node.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+    } - set(defined)
+    parameters = [argument.name for argument in df.arguments if argument.name in free]
+    name = df.new_var("_helion_pa_unit_bounds")
+    body = [f"{offset} = 0" for offset in single_tiles if offset in free]
+    cg.ensure_module_statements(
+        f"def {name}({', '.join([unit, *parameters])}):\n"
+        + "".join(f"    {line}\n" for line in [*body, *lines])
+        + f"    return {result}\n"
+    )
+    # A unit's length is the prelude's global load: one Int32 word, possibly
+    # read more than once. A second function then takes that word as its
+    # second parameter in place of every load. A persistent partition's
+    # inputs do not change while the kernel runs, so one read stands for all.
+    loads = [
+        target
+        for target, value in defined.items()
+        if any(
+            isinstance(node, ast.Call)
+            and ast.unparse(node.func).rpartition(".")[2].startswith("ldg_")
+            for node in ast.walk(value)
+        )
+    ]
+    addresses = set()
+    for target in loads:
+        value = defined[target]
+        address = None
+        if (
+            isinstance(value, ast.Call)
+            and ast.unparse(value.func).rpartition(".")[2] == "ldg_s32"
+            and len(value.args) == 1
+            and not value.keywords
+        ):
+            (argument,) = value.args
+            if isinstance(argument, ast.Name):
+                address = ast.unparse(defined[argument.id])
+        addresses.add(address)
+    scanned_name = None
+    if values[3] in loads and len(addresses) == 1 and None not in addresses:
+        scanned = df.new_var("scanned_length")
+        scanned_lines = list(lines)
+        order = list(defined)
+        for target in loads:
+            scanned_lines[order.index(target)] = f"{target} = cutlass.Int32({scanned})"
+        scanned_name = df.new_var("_helion_pa_unit_bounds_scanned")
+        cg.ensure_module_statements(
+            f"def {scanned_name}({', '.join([unit, scanned, *parameters])}):\n"
+            + "".join(f"    {line}\n" for line in [*body, *scanned_lines])
+            + f"    return {result}\n"
+        )
+    return name, scanned_name, parameters
 
 
 def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -> None:
@@ -148,6 +260,15 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
     # The occupancy this body launches with; the dependent-launch release
     # rule sizes the grid's waves from it (``passes.pdl``).
     df.cute_state.tcgen05.min_blocks_per_mp = schedule.min_blocks_per_mp
+    if schedule.partition != MMA_DAG_PARTITION_ITEM:
+        # The launch is one wave of persistent CTAs, at most one per SM
+        # (``paged_attention_partition.partition_launch_grid``). That count is
+        # what the dependent-launch release rules size the waves from, so it
+        # is set ahead of the tail-release test below.
+        num_sm = emitter.env.config_spec.num_sm
+        assert num_sm > 1
+        df.cute_state.lanes.attention_partition = schedule.partition
+        df.cute_state.lanes.launch_ctas = min(schedule.partition_units, num_sm)
     # The config asks for the overlap and the rest of it permits that
     # (``carries_capture_overlap``, by the rule normalization applies); the
     # checks below are this emitter's own: one root, and the effect proof.
@@ -182,6 +303,9 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         # only the proved output and row global stores, and every other access is a
         # read (including the generated scalar prelude). Its existing alias
         # plan enumerates all of those argument storages for the runtime proof.
+        # A balanced partition also reads and writes its launch workspace,
+        # every access behind the dependency wait: the plan lists it as a
+        # stored argument that no read ahead of the wait touches.
         wrapper["capture_pdl_contract"] = "paired-output-stores-v1"
         mode_arg = f", capture_pdl_wait_mode={mode}"
         if df.config.config.get(
@@ -271,21 +395,65 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         if io.partial_statistics is not None:
             io_arg += f", statistic_layouts={io.partial_statistics!r}"
     lse_arg = tensor_name(semantic.lse) if semantic.lse is not None else "None"
+    work_item = (
+        f"cutlass.Int32({item}), cutlass.Int64({begin}), cutlass.Int64({end}), "
+        f"cutlass.Int32({length})"
+    )
+    partition_arg = ""
+    workspace_name = None
+    if schedule.partition != MMA_DAG_PARTITION_ITEM:
+        # Every role evaluates the prelude per unit through the module
+        # function; the kernel has no work item of its own. The generic grid
+        # decode stays and is dead: the launch grid counts CTAs, not units.
+        assert schedule.paired_items and schedule.query_tma is not None
+        assert not schedule.value_metadata_skip
+        helper, scanned_helper, parameters = _unit_bounds_helper(
+            cg, selected, emitter.lines, (item, begin, end, length)
+        )
+        emitter.lines.clear()
+        work_item = (
+            "cutlass.Int32(0), cutlass.Int64(0), cutlass.Int64(0), cutlass.Int32(0)"
+        )
+        partition_arg = (
+            f", partition={schedule.partition!r}, units={schedule.partition_units}"
+            f", page_limit={schedule.partition_page_limit}"
+            f", q_stages={schedule.q_stages}"
+            f", slot_bits={schedule.partition_slot_bits}, unit_bounds={helper}"
+            f", unit_bounds_args=({''.join(f'{name}, ' for name in parameters)})"
+        )
+        if scanned_helper is not None:
+            partition_arg += f", unit_bounds_scanned={scanned_helper}"
+        if schedule.partition == MMA_DAG_PARTITION_BALANCED:
+            assert schedule.fast_math and semantic.partial_statistics is None
+            workspace_name = partition_workspace_arg(
+                cg, schedule.partition_record_bytes, emitter.env.config_spec.num_sm
+            ).name
+            partition_arg += (
+                f", partition_workspace={workspace_name}"
+                f", partition_record_bytes={schedule.partition_record_bytes}"
+            )
+            if schedule.partition_skew:
+                partition_arg += f", partition_skew={schedule.partition_skew}"
     emitter.emit(
         f"{body_name}("
         f"{tensor_name(semantic.query)}, {tensor_name(semantic.page_table)}, "
         f"{tensor_name(semantic.output)}, {lse_arg}, "
-        f"cutlass.Int32({item}), cutlass.Int64({begin}), cutlass.Int64({end}), "
-        f"cutlass.Int32({length}), {coords.query_len}, {coords.group}, "
+        f"{work_item}, {coords.query_len}, {coords.group}, "
         f"{transport.query_rows}, {transport.heads}, {semantic.mask.window_left!r}, "
         f"cutlass.Float32({semantic.score_scale!r}), {schedule.fast_math!r}, "
-        f"{', '.join(maps)}, coordinate_dtype=cutlass.{coordinate_dtype}{panel_arg}{io_arg}{query_arg}{mode_arg})"
+        f"{', '.join(maps)}, coordinate_dtype=cutlass.{coordinate_dtype}{panel_arg}{io_arg}{query_arg}{mode_arg}{partition_arg})"
     )
     for statement in ast.parse("\n".join(emitter.lines)).body:
         cg.add_statement(statement)
     wrappers = cute_codegen_state(cg).wrapper_plans
     wrappers.append(wrapper)
     alias_plan = mma_dag_alias_plan(df, selected.program)
+    if workspace_name is not None:
+        # The kernel stores to the workspace and, behind the dependency wait
+        # only, loads from it: no other argument may overlap it, and a
+        # captured launch may still read its inputs ahead of that wait.
+        cast("list[str]", alias_plan["tensor_names"]).append(workspace_name)
+        cast("list[bool]", alias_plan["stored"]).append(True)
     if guarded_pdl:
         loaded = {
             tensor_name(access)

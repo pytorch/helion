@@ -690,6 +690,10 @@ class CuteLaneState:
     # is distinct from split-K/fused-grid expansion and never applies to a
     # materialized multi-root phase.
     attention_item_group: int = 1
+    # How that root divides its units among CTAs (``cute_mma_dag_partition``):
+    # other than ``item``, the launch grid is ``min(units, SMs)`` persistent
+    # CTAs rather than one CTA per unit.
+    attention_partition: str = "item"
     # The proved paired attention body releases this kernel's dependents
     # from its loader's tail (where it renders ``cute_pdl_release:
     # loader_tail``), so ``passes.pdl`` places no release of its own.

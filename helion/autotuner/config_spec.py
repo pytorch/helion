@@ -1514,6 +1514,10 @@ class ConfigSpec:
         # captured graph (``autotune_benchmark_input_banks`` above one), the
         # regime that observes it. Elsewhere searched configs keep the default.
         self.cute_pdl_capture_overlap_searched: bool = False
+        # Whether the search samples the range skew of that kernel's balanced
+        # work partition: the same regime, whose back-to-back launches of
+        # several input banks resolve an effect of a few tenths of a percent.
+        self.cute_mma_dag_partition_skew_searched: bool = False
         # Enabled only when the exact five-factor BT16 recurrence carrier is
         # detected. Choice ordering makes the geometry seed the no-autotune
         # default while leaving both legal schedules in cold/full search.
@@ -1563,6 +1567,10 @@ class ConfigSpec:
         self.cute_mma_dag_value_metadata_read_overlap: EnumFragment | None = None
         self.cute_mma_dag_probability_schedule: EnumFragment | None = None
         self.cute_mma_dag_key_clip: EnumFragment | None = None
+        # The paired schedule's work partition, where the kernel can run more
+        # than one unit per CTA, and the range skew of its balanced partition.
+        self.cute_mma_dag_partition: EnumFragment | None = None
+        self.cute_mma_dag_partition_skew: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
         # How a dot operand that is a pointwise chain over loaded tiles

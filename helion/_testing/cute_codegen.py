@@ -191,15 +191,18 @@ def cpu_bind(
     args: tuple[object, ...],
     *,
     capability: tuple[int, int] | None = (10, 0),
+    num_sm: int = 148,
 ) -> BoundKernel[object]:
     """Bind ``kernel`` for code generation on a CPU-only process.
 
     ``capability`` is the compute capability the bound kernel targets; ``None``
     models an unknown target (``target_device_capability`` without CUDA).
+    ``num_sm`` is the SM count the bind reads for its persistent grids: the
+    B200's unless a test models a device with another count.
     """
     if reason := codegen_skip_reason(kernel.settings.backend):
         raise SkipTest(reason)
-    with patch_target_facts(capability=capability, num_sm=148, is_hip=False):
+    with patch_target_facts(capability=capability, num_sm=num_sm, is_hip=False):
         return kernel._bind_isolated(args)
 
 

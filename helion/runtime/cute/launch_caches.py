@@ -162,8 +162,14 @@ _CAPTURE_COUNT_LOCK = threading.RLock()
 # holds the gate, only tries it; a capture's end does not take it. A count
 # lowered beside a holder cannot make its answer wrong: a block that saw a
 # count has declined, and one that saw none holds the gate against every
-# raise. Never held across torch's entry or exit, a kernel launch or the
-# body of a capture.
+# raise. Never held across torch's entry or exit, a launch of a kernel the
+# caller asked for or the body of a capture: the one launch under it is a
+# spare workspace's fill, on a stream no other code holds.
+#
+# Lock order: the gate comes first. The partition workspaces take their own
+# locks under it (``paged_partition._restore_spare``), and nothing waits for
+# the gate while it holds one of those: the one acquisition that can happen
+# there is a finalizer's, which does not wait.
 _CAPTURE_GATE = threading.Lock()
 
 
@@ -229,7 +235,10 @@ def outside_captures(*, wait: bool) -> Generator[bool, None, None]:
     the block holds the gate for those calls alone and begins no capture.
     What runs under it: the wait of an unload for the devices its launcher
     launched on and the unloads behind it
-    (``CompiledCuteLauncher.unload_libraries``), and a finalizer's unload.
+    (``CompiledCuteLauncher.unload_libraries``), a finalizer's unload, and
+    the making of a spare partition workspace, which is its allocation, the
+    fill it launches on a stream of the workspaces' own and the wait for
+    that fill (``paged_partition._restore_spare``).
 
     ``False`` leaves the block without those calls: a capture may be
     underway, or, without ``wait``, another thread is in such a block or
@@ -237,10 +246,10 @@ def outside_captures(*, wait: bool) -> Generator[bool, None, None]:
     that thread. A finalizer never waits: the collector may have
     interrupted the thread that holds the gate, which then waits for nobody
     but the finalizer. A module that the collector finalizes while another
-    thread is in such a block, in the wait of an unload for instance,
-    therefore keeps its library loaded for the life of the process, as one
-    finalized inside a capture does, and is counted and warned about with
-    those although no capture ran
+    thread is in such a block, in the wait of an unload or for a spare's
+    fill for instance, therefore keeps its library loaded for the life of
+    the process, as one finalized inside a capture does, and is counted and
+    warned about with those although no capture ran
     (``compile_cache.skipped_capture_unloads``).
     """
     if not _CAPTURE_GATE.acquire(blocking=wait):

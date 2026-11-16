@@ -67,8 +67,12 @@ def storage_union(ranges: tuple[StorageRange, ...]) -> tuple[StorageRange, ...]:
 class LaunchEffects:
     """Complete effects of one audited kernel, including every hidden buffer.
 
-    Reads include scalar preludes and descriptor-backed accesses. Writes include
+    Reads are the accesses that may precede the dependency wait in late mode;
+    they include scalar preludes and descriptor-backed accesses. Writes include
     all stores and atomics, even conditionally executed or zero-trip epilogues.
+    A buffer the kernel also reads, but only behind that wait (the launch
+    workspace of a balanced paged-attention partition), is listed with the
+    writes alone: its reads cannot observe a predecessor's pending write.
     An unknown effect or a wrapper that performs another enqueue must not create
     this record. The kernel contract waits before *every* global write in late
     mode, and its all-CTA trigger follows the dependency wait in early mode.
