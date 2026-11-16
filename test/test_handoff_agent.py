@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
@@ -14,6 +13,8 @@ from helion.autotuner import HandoffAgentResult
 from helion.autotuner import HandoffBundle
 from helion.autotuner import HandoffCaseResult
 from helion.autotuner import HandoffEvaluation
+from helion.autotuner import HandoffRequest
+from helion.autotuner.handoff_agent import MAX_CONSECUTIVE_INVALID_PROPOSALS
 from helion.autotuner.handoff_agent import _noise
 from helion.autotuner.handoff_agent import _write_sources
 from helion.autotuner.handoff_agent import run_agent_rounds
@@ -88,13 +89,17 @@ def test_retains_only_valid_noise_separated_improvements(
 
     monkeypatch.setattr(HandoffBundle, "evaluate", measure)
     proposals = iter(["faster", "noisy", "invalid"])
-    prompts = []
+    requests = []
 
-    def agent(workspace):
-        prompts.append(workspace.prompt)
-        assert workspace.sources["kernel.py"] == (
-            "original" if len(prompts) == 1 else "faster"
-        )
+    def agent(request):
+        assert isinstance(request, HandoffRequest)
+        requests.append(request)
+        assert request.deadline == 103
+        assert request.sources == {
+            "kernel.py": "original" if len(requests) == 1 else "faster"
+        }
+        # The bundle holds the retained source while the agent works.
+        assert bundle.sources == request.sources
         return {"kernel.py": next(proposals)}
 
     result = bundle.run_agent_rounds(
@@ -126,7 +131,11 @@ def test_retains_only_valid_noise_separated_improvements(
     expected_prompt = (
         "Original source instructions.\n\nSession deadline (time.monotonic()): 103.0."
     )
-    assert prompts == [expected_prompt] * 3
+    assert [request.prompt for request in requests] == [expected_prompt] * 3
+    assert [
+        None if request.feedback is None else request.feedback["reason"]
+        for request in requests
+    ] == [None, "accepted", "regression_or_noise"]
     assert bundle.prompt == "Original source instructions."
     assert (bundle.directory / "original.py").read_text() == "original"
     output = Path(result.directory)
@@ -140,11 +149,13 @@ def test_retains_only_valid_noise_separated_improvements(
         record = json.loads((saved / "round.json").read_text())
         assert record["round"] == number
         assert {"candidate", "incumbent"} <= record.keys()
-    assert len(json.loads((output / "feedback.json").read_text())["history"]) == 3
+        feedback = json.loads((saved / "feedback.json").read_text())
+        assert feedback["round"] == number
+    assert (output / "prompt.md").read_text() == expected_prompt
 
 
-@pytest.mark.parametrize("failure", ["raise", "unknown_path", "bad_source"])
-def test_agent_errors_restore_sources_and_continue(
+@pytest.mark.parametrize("failure", ["unknown_path", "bad_source", "not_mapping"])
+def test_invalid_proposals_restore_sources_and_continue(
     bundle, monkeypatch, session_clock, failure
 ):
     monkeypatch.setattr(
@@ -154,27 +165,86 @@ def test_agent_errors_restore_sources_and_continue(
             workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
         ),
     )
-    rounds = 0
+    requests = []
 
-    def agent(workspace):
-        nonlocal rounds
-        rounds += 1
-        assert workspace.sources == {"kernel.py": "original"}
-        if rounds == 1:
-            (workspace.directory / "kernel.py").write_text("unreturned edit")
-            if failure == "raise":
-                raise RuntimeError("provider failed")
+    def agent(request):
+        requests.append(request)
+        assert request.sources == {"kernel.py": "original"}
+        if len(requests) == 1:
+            # An edit the agent made in place, without returning it.
+            (bundle.directory / "kernel.py").write_text("unreturned edit")
             if failure == "unknown_path":
                 return {"original.py": "bad"}
-            return {"kernel.py": 42}
+            if failure == "bad_source":
+                return {"kernel.py": 42}
+            return ["kernel.py"]
         return {"kernel.py": "faster"}
 
     result = bundle.run_agent_rounds(agent, budget_seconds=2, log=session_clock.log)
-    assert result.rounds[0].reason == "agent_error"
+    assert result.rounds[0].reason == "invalid_proposal"
     assert result.rounds[0].error is not None
+    assert requests[1].feedback["reason"] == "invalid_proposal"
+    assert requests[1].feedback["error"] == result.rounds[0].error
     assert result.rounds[1].accepted
     assert bundle.sources == {"kernel.py": "faster"}
     assert (bundle.directory / "original.py").read_text() == "original"
+
+
+@pytest.mark.parametrize("submissions", [0, 1])
+def test_agent_exception_ends_session(bundle, monkeypatch, submissions):
+    monkeypatch.setattr(
+        HandoffBundle,
+        "evaluate",
+        lambda workspace, **kwargs: evaluation(
+            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
+        ),
+    )
+    calls = 0
+    log = Mock()
+
+    def agent(request):
+        nonlocal calls
+        calls += 1
+        (bundle.directory / "kernel.py").write_text("unreturned edit")
+        if calls > submissions:
+            raise RuntimeError("provider failed")
+        return {"kernel.py": "faster"}
+
+    result = bundle.run_agent_rounds(agent, budget_seconds=30, log=log)
+    assert result.stop_reason == "agent_error"
+    assert calls == submissions + 1
+    assert len(result.rounds) == submissions
+    assert len(list(Path(result.directory).glob("round_*"))) == submissions
+    assert bundle.sources == {"kernel.py": "faster" if submissions else "original"}
+    # A warning with the traceback, not an INFO line.
+    (warning,) = log.warning.call_args_list
+    assert "RuntimeError: provider failed" in warning.args[0]
+    assert warning.kwargs["exc_info"] is True
+
+
+@pytest.mark.parametrize("submissions", [0, 1])
+def test_agent_returning_none_ends_session_without_extra_round(
+    bundle, monkeypatch, submissions
+):
+    monkeypatch.setattr(
+        HandoffBundle,
+        "evaluate",
+        lambda workspace, **kwargs: evaluation(
+            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
+        ),
+    )
+    proposals = iter(["faster"] * submissions)
+
+    def agent(request):
+        source = next(proposals, None)
+        return None if source is None else {"kernel.py": source}
+
+    result = bundle.run_agent_rounds(agent, budget_seconds=30)
+    assert result.stop_reason == "agent_stopped"
+    assert len(result.rounds) == submissions
+    assert len(list(Path(result.directory).glob("round_*"))) == submissions
+    assert bundle.sources == {"kernel.py": "faster" if submissions else "original"}
+    assert bundle.prompt == "Original source instructions."
 
 
 @pytest.mark.parametrize("late_stage", ["callback", "evaluation"])
@@ -195,15 +265,18 @@ def test_late_results_never_replace_incumbent(bundle, monkeypatch, late_stage):
         return result
 
     monkeypatch.setattr(HandoffBundle, "evaluate", measure)
+    requests = []
 
-    def agent(workspace):
-        assert "Session deadline (time.monotonic()): 105.0." in workspace.prompt
+    def agent(request):
+        requests.append(request)
+        assert "Session deadline (time.monotonic()): 105.0." in request.prompt
         if late_stage == "callback":
             clock[0] = 106
         return {"kernel.py": "faster"}
 
     result = bundle.run_agent_rounds(agent, budget_seconds=5)
     assert result.stop_reason == "deadline"
+    assert len(requests) == 1
     assert len(result.rounds) == 1
     assert result.rounds[0].reason == "deadline"
     assert not result.rounds[0].accepted
@@ -212,23 +285,34 @@ def test_late_results_never_replace_incumbent(bundle, monkeypatch, late_stage):
     assert bundle.sources == {"kernel.py": "original"}
 
 
-def test_time_budget_alone_continues_after_agent_errors(bundle, monkeypatch):
-    clock = [0.0]
+def test_deadline_while_agent_works_has_no_extra_round(bundle, monkeypatch):
+    clock = [100.0]
     monkeypatch.setattr(
         "helion.autotuner.handoff_agent.time.monotonic", lambda: clock[0]
     )
     monkeypatch.setattr(
-        HandoffBundle, "evaluate", lambda workspace, **kwargs: evaluation(workspace, 10)
+        HandoffBundle,
+        "evaluate",
+        lambda workspace, **kwargs: evaluation(
+            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
+        ),
     )
+    calls = 0
 
-    def agent(workspace):
-        clock[0] += 1
-        raise RuntimeError("provider failed")
+    def agent(request):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"kernel.py": "faster"}
+        # An agent that waits for its proposal until the deadline gives up.
+        clock[0] = request.deadline
+        return None
 
-    result = bundle.run_agent_rounds(agent, budget_seconds=3)
-    assert len(result.rounds) == 3
+    result = bundle.run_agent_rounds(agent, budget_seconds=30)
     assert result.stop_reason == "deadline"
-    assert all(not record.accepted for record in result.rounds)
+    assert calls == 2
+    assert len(result.rounds) == 1 and result.rounds[0].accepted
+    assert bundle.sources == {"kernel.py": "faster"}
 
 
 def test_baseline_failure_does_not_call_agent(bundle, monkeypatch):
@@ -238,7 +322,7 @@ def test_baseline_failure_does_not_call_agent(bundle, monkeypatch):
         lambda workspace, **kwargs: evaluation(workspace, 10, ok=False),
     )
 
-    def agent(workspace):
+    def agent(request):
         pytest.fail("An invalid baseline cannot start a source session")
 
     result = bundle.run_agent_rounds(agent, budget_seconds=30)
@@ -259,17 +343,22 @@ def test_baseline_failure_does_not_call_agent(bundle, monkeypatch):
 )
 def test_invalid_budget_fails_before_evaluation(bundle, budget_seconds):
     with pytest.raises(ValueError, match="budget_seconds must be finite and positive"):
-        bundle.run_agent_rounds(lambda workspace: {}, budget_seconds=budget_seconds)
+        bundle.run_agent_rounds(lambda request: {}, budget_seconds=budget_seconds)
     assert not (bundle.directory / "agent_runs").exists()
 
 
 @pytest.mark.parametrize("use_bundle_method", [False, True])
-def test_budget_is_required_before_evaluation(bundle, use_bundle_method):
+def test_agent_and_budget_are_required_before_evaluation(bundle, use_bundle_method):
     with pytest.raises(TypeError, match="budget_seconds"):
         if use_bundle_method:
-            bundle.run_agent_rounds(lambda workspace: {})
+            bundle.run_agent_rounds(lambda request: {})
         else:
-            run_agent_rounds(bundle, lambda workspace: {})
+            run_agent_rounds(bundle, lambda request: {})
+    with pytest.raises(TypeError, match="agent"):
+        if use_bundle_method:
+            bundle.run_agent_rounds(budget_seconds=30)
+        else:
+            run_agent_rounds(bundle, budget_seconds=30)
     assert not (bundle.directory / "agent_runs").exists()
 
 
@@ -296,7 +385,7 @@ def test_failed_incumbent_and_evaluator_exception_cannot_promote(
 
     monkeypatch.setattr(HandoffBundle, "evaluate", measure)
     result = bundle.run_agent_rounds(
-        lambda workspace: {"kernel.py": "faster"},
+        lambda request: {"kernel.py": "faster"},
         budget_seconds=2,
         log=session_clock.log,
     )
@@ -319,10 +408,11 @@ def test_unchanged_source_cannot_win_from_measurement_noise(
 
     monkeypatch.setattr(HandoffBundle, "evaluate", measure)
     result = bundle.run_agent_rounds(
-        lambda workspace: workspace.sources, budget_seconds=1, log=session_clock.log
+        lambda request: request.sources, budget_seconds=1, log=session_clock.log
     )
     assert calls == 1
     assert not result.rounds[0].accepted
+    assert result.rounds[0].reason == "invalid_proposal"
     assert "did not change" in result.rounds[0].error
 
 
@@ -337,19 +427,20 @@ def test_new_session_has_fresh_feedback_and_current_starting_source(
         ),
     )
     first = bundle.run_agent_rounds(
-        lambda workspace: {"kernel.py": "faster"},
+        lambda request: {"kernel.py": "faster"},
         budget_seconds=1,
         log=session_clock.log,
     )
 
-    def agent(workspace):
-        assert workspace.prompt == (
+    def agent(request):
+        assert request.prompt == (
             "Original source instructions.\n\n"
             "Session deadline (time.monotonic()): 102.0."
         )
-        assert first.directory not in workspace.prompt
-        assert workspace.sources == {"kernel.py": "faster"}
-        return workspace.sources
+        assert first.directory not in request.prompt
+        assert request.feedback is None
+        assert request.sources == {"kernel.py": "faster"}
+        return request.sources
 
     second = bundle.run_agent_rounds(agent, budget_seconds=1, log=session_clock.log)
     assert second.directory != first.directory
@@ -379,59 +470,14 @@ def test_source_snapshots_cannot_write_or_chmod_outside_directory(tmp_path, kind
     assert stat.S_IMODE(outside.stat().st_mode) == mode
 
 
-@pytest.fixture
-def continuous(monkeypatch):
-    state = SimpleNamespace(
-        instances=[],
-        actions=iter(()),
-        calls=0,
-        responses=[],
-        closed=[],
-        stop_reason="agent_completed",
-        on_response=None,
-    )
-
-    class Adapter:
-        def __init__(self, directory, *, deadline, log):
-            self.directory = directory
-            self.deadline = deadline
-            self.log = log
-            self.stop_reason = None
-            state.instances.append(self)
-
-        def __call__(self, workspace):
-            # Every completed submission must be answered before waiting again.
-            assert len(state.responses) == state.calls
-            state.calls += 1
-            try:
-                action = next(state.actions)
-            except StopIteration:
-                self.stop_reason = state.stop_reason
-                raise
-            if isinstance(action, BaseException):
-                raise action
-            if callable(action):
-                return action(self, workspace)
-            return {"kernel.py": action}
-
-        def complete_round(self, retained_sources, feedback, *, done):
-            state.responses.append((dict(retained_sources), deepcopy(feedback), done))
-            if state.on_response is not None:
-                state.on_response(retained_sources, feedback, done=done)
-
-        def close(self, *, reason):
-            state.closed.append(reason)
-
-    monkeypatch.setattr("helion.autotuner.handoff_agent.CLISourceAgent", Adapter)
-    state.adapter_type = Adapter
-    return state
-
-
 @pytest.mark.parametrize("use_bundle_method", [False, True])
-def test_default_adapter_gets_session_deadline_and_logs_rounds_immediately(
-    bundle, monkeypatch, continuous, use_bundle_method
+def test_feedback_reports_each_round_after_it_is_recorded(
+    bundle, monkeypatch, use_bundle_method
 ):
-    monkeypatch.setattr("helion.autotuner.handoff_agent.time.monotonic", lambda: 100)
+    clock = [100.0]
+    monkeypatch.setattr(
+        "helion.autotuner.handoff_agent.time.monotonic", lambda: clock[0]
+    )
     monkeypatch.setattr(
         HandoffBundle,
         "evaluate",
@@ -441,97 +487,82 @@ def test_default_adapter_gets_session_deadline_and_logs_rounds_immediately(
         ),
     )
     log = Mock()
-    continuous.actions = iter(["faster", "slower"])
+    proposals = iter(["faster", "slower"])
+    requests = []
 
-    def answered(retained_sources, feedback, *, done):
-        assert bundle.sources == retained_sources == {"kernel.py": "faster"}
-        latest = feedback["history"][-1]
-        saved = Path(latest["directory"]) / "round.json"
-        assert json.loads(saved.read_text()) == json.loads(json.dumps(latest))
-        event = log.record_handoff_event.call_args_list[-1]
-        assert event.args == ("handoff_round",)
-        assert event.kwargs["round"] == latest
-        assert done is False
+    def agent(request):
+        requests.append(request)
+        if request.feedback is not None:
+            # The round is saved and logged before the agent hears of it.
+            event = log.record_handoff_event.call_args_list[-1]
+            assert event.args == ("handoff_round",)
+            assert event.kwargs["round"]["round"] == request.feedback["round"]
+            saved = Path(event.kwargs["round"]["directory"]) / "round.json"
+            assert json.loads(saved.read_text()) == json.loads(
+                json.dumps(event.kwargs["round"])
+            )
+        clock[0] += 1
+        source = next(proposals, None)
+        return None if source is None else {"kernel.py": source}
 
-    continuous.on_response = answered
-    options = {"budget_seconds": 30, "log": log}
     result = (
-        bundle.run_agent_rounds(**options)
+        bundle.run_agent_rounds(agent, budget_seconds=30, log=log)
         if use_bundle_method
-        else run_agent_rounds(bundle, **options)
+        else run_agent_rounds(bundle, agent, budget_seconds=30, log=log)
     )
-    (adapter,) = continuous.instances
-    assert (adapter.directory, adapter.deadline, adapter.log) == (
-        Path(result.directory) / "calls",
-        130,
-        log,
-    )
-    assert continuous.calls == 3
-    assert [response[2] for response in continuous.responses] == [False, False]
-    assert continuous.closed == ["agent_completed"]
+    assert result.stop_reason == "agent_stopped"
     assert [record.accepted for record in result.rounds] == [True, False]
-    assert result.rounds[1].reason == "regression_or_noise"
     assert result.evaluation.perf == 9
+    first, second, third = (request.feedback for request in requests)
+    assert first is None
+    summary = {
+        "ok": True,
+        "unit": "ms",
+        "cases": [{"index": 0, "status": "ok", "noise": 0.01}],
+    }
+
+    def measured(perf):
+        return {
+            **summary,
+            "perf": perf,
+            "cases": [{**summary["cases"][0], "perf": perf}],
+        }
+
+    assert second == {
+        "round": 1,
+        "accepted": True,
+        "reason": "accepted",
+        "current": measured(9),
+        "candidate": measured(9),
+        "incumbent": measured(10),
+        "improvement_threshold": pytest.approx(0.03),
+        "remaining_seconds": 29,
+    }
+    assert third["round"] == 2
+    assert third["reason"] == "regression_or_noise"
+    assert third["current"] == measured(9)
+    assert third["candidate"] == measured(12)
+    assert third["remaining_seconds"] == 28
+    assert "error" not in third
+    assert [request.sources for request in requests] == [
+        {"kernel.py": "original"},
+        {"kernel.py": "faster"},
+        {"kernel.py": "faster"},
+    ]
     assert [call.args[0] for call in log.record_handoff_event.call_args_list] == [
         "handoff_baseline",
         "handoff_round",
         "handoff_round",
         "handoff_completed",
     ]
-    assert all(
-        "perf_ms" not in call.kwargs for call in log.record_handoff_event.call_args_list
-    )
     assert any(
         "Native source baseline: 10 ms" in call.args[0] for call in log.call_args_list
     )
 
 
-def test_default_adapter_unavailable_fails_before_evaluation(bundle, monkeypatch):
-    monkeypatch.setattr("helion.autotuner.handoff_cli.shutil.which", lambda name: None)
-    measure = Mock()
-    monkeypatch.setattr(HandoffBundle, "evaluate", measure)
-    with pytest.raises(FileNotFoundError, match="Codex CLI"):
-        bundle.run_agent_rounds(budget_seconds=30)
-    measure.assert_not_called()
-    assert bundle.sources == {"kernel.py": "original"}
-
-
-@pytest.mark.parametrize(
-    ("adapter_deadline", "budget_seconds", "expected"),
-    [(None, 30, 130), (150, 30, 130), (110, 30, 110)],
-)
-def test_explicit_adapter_and_evaluations_share_earliest_deadline(
-    bundle, monkeypatch, continuous, adapter_deadline, budget_seconds, expected
-):
+@pytest.mark.parametrize("unchanged", [False, True])
+def test_consecutive_invalid_proposals_end_session(bundle, monkeypatch, unchanged):
     monkeypatch.setattr("helion.autotuner.handoff_agent.time.monotonic", lambda: 100)
-    calls = []
-
-    def measure(workspace, **kwargs):
-        calls.append(kwargs["deadline"])
-        return evaluation(
-            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
-        )
-
-    monkeypatch.setattr(HandoffBundle, "evaluate", measure)
-    adapter = continuous.adapter_type(
-        bundle.directory / "explicit", deadline=adapter_deadline, log=None
-    )
-    continuous.actions = iter(["faster"])
-    result = bundle.run_agent_rounds(adapter, budget_seconds=budget_seconds)
-    assert continuous.instances == [adapter]
-    assert adapter.deadline == expected
-    assert calls == [expected, expected, expected]
-    assert result.rounds[0].accepted
-    session = json.loads((Path(result.directory) / "session.json").read_text())
-    assert session["deadline_monotonic"] == expected
-    assert continuous.responses[0][1]["deadline_monotonic"] == expected
-    assert continuous.closed == ["agent_completed"]
-
-
-@pytest.mark.parametrize("submissions", [0, 1])
-def test_continuous_agent_completion_does_not_create_extra_round(
-    bundle, monkeypatch, continuous, submissions
-):
     monkeypatch.setattr(
         HandoffBundle,
         "evaluate",
@@ -539,22 +570,28 @@ def test_continuous_agent_completion_does_not_create_extra_round(
             workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
         ),
     )
-    continuous.actions = iter(["faster"] * submissions)
-    result = bundle.run_agent_rounds(budget_seconds=30)
-    assert result.stop_reason == "agent_completed"
-    assert len(result.rounds) == submissions
-    assert len(list(Path(result.directory).glob("round_*"))) == submissions
-    assert len(continuous.instances) == 1
-    assert continuous.calls == submissions + 1
-    assert len(continuous.responses) == submissions
-    assert continuous.closed == ["agent_completed"]
-    assert bundle.sources == {"kernel.py": "faster" if submissions else "original"}
-    assert bundle.prompt == "Original source instructions."
+    calls = 0
+
+    def agent(request):
+        nonlocal calls
+        calls += 1
+        if calls == 5:
+            # One valid proposal resets the count of invalid ones.
+            return {"kernel.py": "faster"}
+        return dict(request.sources) if unchanged else {}
+
+    result = bundle.run_agent_rounds(agent, budget_seconds=30)
+    assert result.stop_reason == "invalid_proposals"
+    assert calls == 5 + MAX_CONSECUTIVE_INVALID_PROPOSALS
+    assert [r.reason for r in result.rounds[3:6]] == [
+        "invalid_proposal",
+        "accepted",
+        "invalid_proposal",
+    ]
+    assert bundle.sources == {"kernel.py": "faster"}
 
 
-def test_continuous_submissions_have_no_count_limit_while_time_remains(
-    bundle, monkeypatch, continuous
-):
+def test_proposals_have_no_count_limit_while_time_remains(bundle, monkeypatch):
     monkeypatch.setattr("helion.autotuner.handoff_agent.time.monotonic", lambda: 100)
 
     def measure(workspace, **kwargs):
@@ -562,164 +599,37 @@ def test_continuous_submissions_have_no_count_limit_while_time_remains(
         return evaluation(workspace, 100 if source == "original" else 100 - int(source))
 
     monkeypatch.setattr(HandoffBundle, "evaluate", measure)
-    continuous.actions = iter(str(number) for number in range(1, 13))
-    result = bundle.run_agent_rounds(budget_seconds=30)
-    assert result.stop_reason == "agent_completed"
+    proposals = iter(str(number) for number in range(1, 13))
+
+    def agent(request):
+        source = next(proposals, None)
+        return None if source is None else {"kernel.py": source}
+
+    result = bundle.run_agent_rounds(agent, budget_seconds=30)
+    assert result.stop_reason == "agent_stopped"
     assert len(result.rounds) == 12
     assert all(record.accepted for record in result.rounds)
-    assert len(continuous.instances) == 1
-    assert continuous.calls == 13
-    assert continuous.closed == ["agent_completed"]
     assert bundle.sources == {"kernel.py": "12"}
-    assert all(not done for retained, feedback, done in continuous.responses)
-    assert all(
-        feedback["remaining_seconds"] == 30 and "max_rounds" not in feedback
-        for retained, feedback, done in continuous.responses
-    )
     session = json.loads((Path(result.directory) / "session.json").read_text())
     assert "max_rounds" not in session
     assert session["budget_seconds"] == 30
 
 
-@pytest.mark.parametrize("submissions", [0, 1])
-def test_continuous_deadline_while_waiting_has_no_extra_round(
-    bundle, monkeypatch, continuous, submissions
-):
-    clock = [100.0]
-    monkeypatch.setattr(
-        "helion.autotuner.handoff_agent.time.monotonic", lambda: clock[0]
-    )
-    monkeypatch.setattr(
-        HandoffBundle,
-        "evaluate",
-        lambda workspace, **kwargs: evaluation(
-            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
-        ),
-    )
-
-    def expire(adapter, workspace):
-        clock[0] = 130.0
-        adapter.stop_reason = "deadline"
-        raise StopIteration
-
-    continuous.actions = iter([*["faster"] * submissions, expire])
-    result = bundle.run_agent_rounds(budget_seconds=30)
-    assert result.stop_reason == "deadline"
-    assert len(result.rounds) == submissions
-    assert len(list(Path(result.directory).glob("round_*"))) == submissions
-    assert continuous.calls == submissions + 1
-    assert len(continuous.responses) == submissions
-    assert continuous.closed == ["deadline"]
-    assert bundle.sources == {"kernel.py": "faster" if submissions else "original"}
-
-
-@pytest.mark.parametrize("submissions", [0, 1])
-def test_continuous_bridge_failure_closes_without_retry_or_extra_round(
-    bundle, monkeypatch, continuous, submissions
-):
-    monkeypatch.setattr(
-        HandoffBundle,
-        "evaluate",
-        lambda workspace, **kwargs: evaluation(
-            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
-        ),
-    )
-    continuous.actions = iter(
-        [*["faster"] * submissions, RuntimeError("submission bridge unavailable")]
-    )
-    result = bundle.run_agent_rounds(budget_seconds=30)
-    assert result.stop_reason == "agent_error"
-    assert len(result.rounds) == submissions
-    assert len(list(Path(result.directory).glob("round_*"))) == submissions
-    assert len(continuous.instances) == 1
-    assert continuous.calls == submissions + 1
-    assert len(continuous.responses) == submissions
-    assert continuous.closed == ["agent_error"]
-    assert bundle.sources == {"kernel.py": "faster" if submissions else "original"}
-    assert bundle.prompt == "Original source instructions."
-
-
-def test_continuous_feedback_failure_retains_recorded_winner(
-    bundle, monkeypatch, continuous
-):
-    monkeypatch.setattr(
-        HandoffBundle,
-        "evaluate",
-        lambda workspace, **kwargs: evaluation(
-            workspace, 10 if workspace.sources["kernel.py"] == "original" else 9
-        ),
-    )
-    continuous.actions = iter(["faster"])
-
-    def disconnected(retained_sources, feedback, *, done):
-        assert bundle.sources == retained_sources == {"kernel.py": "faster"}
-        latest = feedback["history"][-1]
-        assert (Path(latest["directory"]) / "round.json").exists()
-        raise RuntimeError("agent disconnected before feedback")
-
-    continuous.on_response = disconnected
-    result = bundle.run_agent_rounds(budget_seconds=30)
-    assert result.stop_reason == "agent_error"
-    assert len(result.rounds) == 1 and result.rounds[0].accepted
-    assert continuous.calls == 1
-    assert len(continuous.responses) == 1
-    assert continuous.closed == ["agent_error"]
-    assert result.evaluation.perf == 9
-    assert bundle.sources == {"kernel.py": "faster"}
-
-
-def test_continuous_late_evaluation_replies_with_rollback_and_done(
-    bundle, monkeypatch, continuous
-):
-    clock = [100.0]
-    monkeypatch.setattr(
-        "helion.autotuner.handoff_agent.time.monotonic", lambda: clock[0]
-    )
-
-    def measure(workspace, **kwargs):
-        assert kwargs["deadline"] == 130
-        faster = workspace.sources["kernel.py"] == "faster"
-        if faster:
-            clock[0] = 130.0
-        return evaluation(workspace, 9 if faster else 10)
-
-    monkeypatch.setattr(HandoffBundle, "evaluate", measure)
-    continuous.actions = iter(["faster"])
-    result = bundle.run_agent_rounds(budget_seconds=30)
-    assert result.stop_reason == "deadline"
-    assert len(result.rounds) == 1
-    assert not result.rounds[0].accepted
-    assert result.rounds[0].reason == "deadline"
-    (response,) = continuous.responses
-    retained, feedback, done = response
-    assert done is True
-    assert retained == bundle.sources == {"kernel.py": "original"}
-    assert feedback["incumbent_evaluation"]["perf"] == 10
-    assert feedback["history"][-1]["reason"] == "deadline"
-    assert continuous.calls == 1
-    assert continuous.closed == ["deadline"]
-
-
 @pytest.mark.parametrize("stage", ["waiting", "evaluation"])
-def test_continuous_keyboard_interrupt_closes_and_restores_sources(
-    bundle, monkeypatch, continuous, stage
-):
+def test_keyboard_interrupt_restores_sources(bundle, monkeypatch, stage):
     def measure(workspace, **kwargs):
         if workspace.sources["kernel.py"] == "faster":
             raise KeyboardInterrupt
         return evaluation(workspace, 10)
 
-    def interrupt(adapter, workspace):
-        (workspace.directory / "kernel.py").write_text("unreturned edit")
-        raise KeyboardInterrupt
+    def agent(request):
+        (bundle.directory / "kernel.py").write_text("unreturned edit")
+        if stage == "waiting":
+            raise KeyboardInterrupt
+        return {"kernel.py": "faster"}
 
     monkeypatch.setattr(HandoffBundle, "evaluate", measure)
-    continuous.actions = iter([interrupt if stage == "waiting" else "faster"])
     with pytest.raises(KeyboardInterrupt):
-        bundle.run_agent_rounds(budget_seconds=30)
-    assert len(continuous.instances) == 1
-    assert continuous.calls == 1
-    assert continuous.responses == []
-    assert continuous.closed == ["interrupted"]
+        bundle.run_agent_rounds(agent, budget_seconds=30)
     assert bundle.sources == {"kernel.py": "original"}
     assert bundle.prompt == "Original source instructions."

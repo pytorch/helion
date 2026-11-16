@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import dataclasses
 import functools
 import inspect
@@ -34,8 +35,11 @@ from .cute.structural_policy import StructuralSettingOrigin
 from .ref_mode import RefMode
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from ..autotuner.base_search import BaseAutotuner
     from ..autotuner.base_search import BaseSearch
+    from ..autotuner.handoff_agent import HandoffRequest
     from ..autotuner.pattern_search import InitialPopulationStrategy
     from .config import Config
     from .cute.structural_config import CuteStructuralConfig
@@ -448,16 +452,11 @@ class _Settings:
             _env_get_bool, "HELION_AUTOTUNE_LOG_DETAILS", False
         )
     )
-    autotune_handoff: bool = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_bool, "HELION_AUTOTUNE_HANDOFF", False
-        )
-    )
-    autotune_handoff_budget_seconds: int = dataclasses.field(
-        default_factory=functools.partial(
-            _env_get_int, "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS", 1500
-        )
-    )
+    autotune_handoff: bool = False
+    autotune_handoff_budget_seconds: int = 1500
+    autotune_handoff_agent: (
+        Callable[[HandoffRequest], Mapping[str, str] | None] | None
+    ) = None
     autotune_compile_timeout: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_AUTOTUNE_COMPILE_TIMEOUT", 60
@@ -803,14 +802,26 @@ class Settings(_Settings):
         ),
         "autotune_handoff": (
             "Hand configuration search to a native-source agent automatically. "
-            "Off by default; enable with HELION_AUTOTUNE_HANDOFF=1. "
+            "Off by default; enable it on the kernel together with "
+            "autotune_handoff_agent. "
             "Uses the existing search budget or search completion, "
-            "then saves validated standalone source beside the autotune logs."
+            "then saves validated standalone source beside the autotune logs "
+            "and runs autotune_handoff_agent for autotune_handoff_budget_seconds."
         ),
         "autotune_handoff_budget_seconds": (
             "Wall-clock budget for the native-source agent session, excluding "
-            "search and export. Default 1500 seconds; override with "
-            "HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS."
+            "search and export. Default 1500 seconds."
+        ),
+        "autotune_handoff_agent": (
+            "The source agent autotune_handoff runs: a callable that takes a "
+            "helion.autotuner.HandoffRequest (the task prompt, the retained "
+            "sources, feedback on the previous proposal, and the deadline) and "
+            "returns replacement sources to validate and measure, or None to end "
+            "the session. The agent must return by the deadline: Helion does not "
+            "interrupt it. Each autotuned specialization runs its own session "
+            "with the same agent. Helion runs no agent of its own and does not "
+            "confine the agent. Pass as "
+            "@helion.kernel(..., autotune_handoff_agent=agent)."
         ),
         "autotune_compile_timeout": (
             "Timeout in seconds for one autotune precompile subprocess "
@@ -1258,6 +1269,13 @@ class Settings(_Settings):
 
         if self.autotune_handoff_budget_seconds < 1:
             raise ValueError("autotune_handoff_budget_seconds must be positive")
+        if self.autotune_handoff_agent is not None and not callable(
+            self.autotune_handoff_agent
+        ):
+            raise TypeError(
+                "autotune_handoff_agent must be a callable that takes a "
+                f"HandoffRequest, got {type(self.autotune_handoff_agent).__name__}"
+            )
 
         if (
             self.autotune_worker_start_timeout is not None
@@ -1353,13 +1371,21 @@ class Settings(_Settings):
 
         # Only include fields that are meant to be public (repr=True)
         public_fields = {f.name for f in dataclasses.fields(self) if f.repr}
-        values = dataclasses.asdict(self)
-        for name in public_fields:
-            # ``asdict`` turns a dataclass value (an ``AccuracyCheck``) into a
-            # plain dict; keep the object itself.
-            value = getattr(self, name)
-            if dataclasses.is_dataclass(value) and not isinstance(value, type):
-                values[name] = value
+        # ``asdict`` deep-copies every value. Callables (the hand-off agent,
+        # which may hold a client, a lock or a subprocess) and dataclass values
+        # (an ``AccuracyCheck``, which ``asdict`` would turn into a plain dict)
+        # stay the objects themselves.
+        kept = {
+            name: value
+            for name in public_fields
+            if callable(value := getattr(self, name))
+            or (dataclasses.is_dataclass(value) and not isinstance(value, type))
+        }
+        # A shallow copy: unlike dataclasses.replace, it runs no validation.
+        rest = copy.copy(self)
+        for name in kept:
+            object.__setattr__(rest, name, None)
+        values = {**dataclasses.asdict(rest), **kept}
         return {k: shallow_copy(v) for k, v in values.items() if k in public_fields}
 
     def check_autotuning_disabled(self) -> None:

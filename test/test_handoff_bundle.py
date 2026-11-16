@@ -24,6 +24,7 @@ from helion._testing import skipUnlessCuteAvailable
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffBundle
 from helion.autotuner import HandoffPolicy
+from helion.autotuner import HandoffRequest
 from helion.autotuner import build_handoff
 from helion.autotuner import find_handoff
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
@@ -124,6 +125,7 @@ def test_agent_rejects_non_source_replacements_before_writing(tmp_path: Path) ->
     (tmp_path / "manifest.json").write_text(
         json.dumps({"cases": [{"source": "kernel.py"}]})
     )
+    (tmp_path / "prompt.md").write_text("prompt")
     bundle = HandoffBundle(tmp_path)
     with pytest.raises(ValueError, match="existing native source"):
         bundle.run_agent(lambda _: {"kernel.py": "changed", "reference.pt": "bad"})
@@ -175,6 +177,7 @@ def test_agent_revalidates_source_path_after_callback(tmp_path):
     (directory / "manifest.json").write_text(
         json.dumps({"cases": [{"source": "kernel.py"}]})
     )
+    (directory / "prompt.md").write_text("prompt")
 
     def agent(workspace):
         source.unlink()
@@ -355,7 +358,7 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
     assert dataclasses.fields(bundle)[0].name == "directory"
     originals = bundle.sources
 
-    def agent(workspace: HandoffBundle) -> dict[str, str]:
+    def agent(workspace: HandoffRequest) -> dict[str, str]:
         replacements = {}
         for path, source in workspace.sources.items():
             tree = _EquivalentSource().visit(ast.parse(source))
@@ -381,7 +384,7 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
     # multi-shape bundle (test_handoff_evaluation covers a failed case disabling
     # its aggregate), so it runs once per backend: each round cold-compiles the
     # kernel in a fresh worker.
-    def invalid_agent(workspace: HandoffBundle) -> dict[str, str]:
+    def invalid_agent(workspace: HandoffRequest) -> dict[str, str]:
         source = workspace.sources["case_0/kernel.py"]
         return {
             "case_0/kernel.py": source
