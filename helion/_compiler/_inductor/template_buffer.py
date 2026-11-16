@@ -23,6 +23,7 @@ from torch._inductor.ir import FixedLayout
 from torch._inductor.ir import FlexibleLayout
 from torch._inductor.ir import IRNode
 from torch._inductor.ir import Layout
+from torch._inductor.ir import MultiOutput
 from torch._inductor.ir import MultiOutputLayout
 from torch._inductor.ir import MutationOutput
 from torch._inductor.ir import ReinterpretView
@@ -82,7 +83,6 @@ if TYPE_CHECKING:
     from typing import Iterable
 
     from torch._guards import Source
-    from torch._inductor.ir import MultiOutput
     from torch._inductor.scheduler import BaseSchedulerNode
 
     from ..inductor_lowering import CodegenState
@@ -859,7 +859,7 @@ class HelionTemplateBuffer(TemplateBuffer):
             direct_alias_at_leaf=direct_aliases,
             on_tensor_leaf=on_tensor_leaf,
         )
-        return buf, result
+        return buf, _boxed_outputs(result)
 
     # ------------------------------------------------------------------ #
     # Metadata helpers                                                   #
@@ -1319,6 +1319,20 @@ def _bind_kernel_for_lowering(kernel: Kernel, args: tuple[object, ...]) -> Bound
         return kernel._bind(args)
     finally:
         kernel._bind_lock.release()
+
+
+def _boxed_outputs(outputs: tuple[TensorBox, ...]) -> tuple[TensorBox, ...]:
+    """``outputs`` with each bare ``TensorBox(MultiOutput)`` that
+    ``TemplateBuffer.build_multi_outputs`` builds boxed as ``TensorBox.create``
+    does, in a ``StorageBox`` (an output listed twice keeps one box)."""
+    # TODO(yushangdi): drop once the oldest supported PyTorch's build_multi_outputs
+    # returns TensorBox.create(mo).
+    boxed = {
+        id(o): TensorBox.create(o.data)
+        for o in outputs
+        if isinstance(o.data, MultiOutput)
+    }
+    return tuple(boxed.get(id(o), o) for o in outputs)
 
 
 def _read_offset_uses_size_vars(dep: MemoryDep) -> bool:

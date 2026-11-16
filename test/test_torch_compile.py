@@ -189,6 +189,16 @@ def k_add_masked_twice(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def k_add_next(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Adds ``x``, its next element and ``y``, but for the last element:
+    ``x`` is loaded at two indices."""
+    out = torch.zeros_like(y)
+    for tile in hl.tile(y.size(0) - 1):
+        out[tile] = x[tile] + x[tile.index + 1] + y[tile]
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def k_center_rows(x: torch.Tensor) -> torch.Tensor:
     """Subtracts each row's sum from it: ``x`` is loaded in two loops."""
     out = torch.empty_like(x)
@@ -5032,6 +5042,45 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
 
     @parametrize("allow_torch_compile_fusion", (True, False))
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_output_returned_and_reused(self, allow_torch_compile_fusion):
+        """Test: a kernel output that the graph returns and also uses again
+        lowers (it failed with "'MultiOutput' object has no attribute 'data'")."""
+        if not allow_torch_compile_fusion and not _captured_as_hop():
+            self.skipTest("fullgraph capture requires the Helion kernel HOP")
+
+        def f(
+            x: torch.Tensor, y: torch.Tensor, *, _kernels=(k_add,)
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            out = _kernels[0](x, y)
+            return out, out * 2.0
+
+        x = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(
+            f,
+            (x, y),
+            kernels=[k_add],
+            allow_torch_compile_fusion=allow_torch_compile_fusion,
+            # The Helion kernel and out * 2 (fused into it with fusion on).
+            expected_num_kernels=1 if allow_torch_compile_fusion else 2,
+        )
+
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    def test_kernel_output_returned_directly(self):
+        """Test: a kernel output the graph returns is passed through as is,
+        with no copy kernel (a bare TensorBox(MultiOutput) used to get one)."""
+        if not _captured_as_hop():
+            self.skipTest("fullgraph capture requires the Helion kernel HOP")
+
+        def f(x: torch.Tensor, y: torch.Tensor, *, _kernels=(k_add,)) -> torch.Tensor:
+            return _kernels[0](x, y)
+
+        x = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(4, 16, device=DEVICE, dtype=torch.float32)
+        self._run_compile_test(f, (x, y), kernels=[k_add], expected_num_kernels=1)
+
+    @parametrize("allow_torch_compile_fusion", (True, False))
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_kernel_with_constexpr_parameter(self, allow_torch_compile_fusion):
         """Test: kernel with hl.constexpr parameter.
 
@@ -5695,6 +5744,7 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
         "case",
         (
             "masked_second_load",
+            "load_at_two_indices",
             "load_in_two_loops",
             "load_in_static_range",
             "load_through_merged_dims",
@@ -5718,6 +5768,11 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             "masked_second_load": (
                 k_add_masked_twice,
                 lambda x, y: k_add_masked_twice(x * 2, y),
+                (x, y),
+            ),
+            "load_at_two_indices": (
+                k_add_next,
+                lambda x, y: k_add_next(x * 2, y),
                 (x, y),
             ),
             "load_in_two_loops": (
