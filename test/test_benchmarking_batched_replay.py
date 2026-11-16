@@ -1088,7 +1088,13 @@ def test_do_bench_drains_the_launch_queue_on_hip(monkeypatch, hip: bool) -> None
     and timed loops (each loop counts its own, so the end of the warm-up and the
     start of the timing queue under twice that); elsewhere those loops never
     wait on the device."""
+    from triton import runtime
+
     monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    # Triton picks its driver from ``torch.version.hip`` on first use: build
+    # the device's own before the patch (alone in a process, the test would
+    # otherwise hand do_bench the AMD driver on an NVIDIA device).
+    runtime.driver.active.get_device_interface()
     monkeypatch.setattr(torch.version, "hip", "7.2" if hip else None)
     monkeypatch.setattr(benchmarking, "_HIP_MAX_QUEUED_CALLS", 10)
     trace: list[str] = []
