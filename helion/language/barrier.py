@@ -15,8 +15,8 @@ if TYPE_CHECKING:
 __all__ = ["barrier"]
 
 BARRIER_PID_TYPE_REASON = (
-    "hl.barrier() forces a persistent kernel (sequential phase "
-    "boundary between top-level loops); this pid_type is incompatible"
+    "hl.barrier() needs its phases (the top-level loops between barriers) to "
+    "run in order, which this backend doesn't do under this pid_type"
 )
 
 

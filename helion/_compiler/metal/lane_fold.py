@@ -303,6 +303,37 @@ def tl_load(node: ast.AST) -> ast.Call | None:
     return None
 
 
+def is_store(node: ast.AST) -> TypeGuard[ast.Call]:
+    """Whether ``node`` is a ``tl.store(ptr, value, mask)``, the body's only
+    device-memory write (Metal lowers no atomics).  Codegen always passes all
+    three arguments positionally."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr == "store"
+    )
+
+
+def pointer_base(ptr: ast.expr) -> str | None:
+    """The tensor a ``tl.store`` or ``tl.load`` address points into: the
+    base of ``base + offset``, as codegen writes every address."""
+    while isinstance(ptr, ast.BinOp) and isinstance(ptr.op, ast.Add):
+        ptr = ptr.left
+    return ptr.id if isinstance(ptr, ast.Name) else None
+
+
+def names_in(stmts: list[ast.stmt]) -> set[str]:
+    """Every name ``stmts`` mention, read or written."""
+    return {
+        node.id
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name)
+    }
+
+
 def load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr | None] | None:
     """The mask and fill value (None if it has none) of
     ``tl.load(ptr, mask, other)``, or None for an unmasked load."""

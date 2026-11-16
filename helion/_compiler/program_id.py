@@ -111,6 +111,19 @@ MAX_ACTIVE_CLUSTERS_VAR = "_MAX_ACTIVE_CLUSTERS"
 NUM_XCD_VAR = "_NUM_XCDS"
 
 
+def device_str() -> str:
+    """Host source for the compile device: the device of the first kernel
+    argument on it, else the device itself."""
+    host_function = HostFunction.current()
+    device = CompileEnvironment.current().device
+    origins = [
+        o for t, o in host_function.tensor_to_origin.items() if t.device == device
+    ]
+    if origins:
+        return f"{origins[0].host_str()}.device"
+    return f"torch.{device!r}"
+
+
 class PIDInfo(NamedTuple):
     pid_var: str
     block_size_var: str
@@ -595,18 +608,6 @@ class XYZProgramIDs(ProgramIDs):
         )
 
 
-def _xcd_device_str() -> str:
-    """Device expression for the current compile device (for host-side helpers)."""
-    host_function = HostFunction.current()
-    device = CompileEnvironment.current().device
-    origins = [
-        o for t, o in host_function.tensor_to_origin.items() if t.device == device
-    ]
-    if origins:
-        return f"{origins[0].host_str()}.device"
-    return f"torch.{device!r}"
-
-
 def _maybe_emit_xcd_remap(
     device_function: DeviceFunction,
     pid_expr: str,
@@ -632,7 +633,7 @@ def _maybe_emit_xcd_remap(
     if device_function.constexpr_arg(NUM_XCD_VAR):
         device_function.codegen.host_statements.append(
             statement_from_string(
-                f"{NUM_XCD_VAR} = helion.runtime.get_num_xcd({_xcd_device_str()})"
+                f"{NUM_XCD_VAR} = helion.runtime.get_num_xcd({device_str()})"
             )
         )
 
@@ -1059,14 +1060,7 @@ class PersistentProgramIDs(ProgramIDs):
 
     def get_device_str(self) -> str:
         """Get the device string for the current device, reusing the first tensor's origin."""
-        host_function = HostFunction.current()
-        device = CompileEnvironment.current().device
-        origins = [
-            o for t, o in host_function.tensor_to_origin.items() if t.device == device
-        ]
-        if origins:
-            return f"{origins[0].host_str()}.device"
-        return f"torch.{device!r}"
+        return device_str()
 
     def codegen_grid(self) -> ast.AST:
         # Use num_sms * multiplier for persistent kernels (multi-occupancy)

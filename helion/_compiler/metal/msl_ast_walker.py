@@ -42,12 +42,17 @@ from .fragment_mma import prefetch_loads
 from .fragment_mma import split_range
 from .fragment_mma import split_runs
 from .lane_fold import LANE_PUT
+from .lane_fold import is_store
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_RUN
+from .mpp_matmul import RUN_TILE_DIMS
+from .mpp_matmul import run_operand
+from .mpp_matmul import run_spaces
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
+from .msl_phases import PHASE_NAMESPACE
 from .msl_reduction import REDUCTION_NAMESPACE
 
 
@@ -143,17 +148,6 @@ class EmitState:
 # ---------------------------------------------------------------------------
 
 
-def _is_tl_store_call(node: ast.AST) -> bool:
-    """Return True if *node* is a ``tl.store(...)`` call."""
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "tl"
-        and node.func.attr == "store"
-    )
-
-
 def _emit_tl_store(
     node: ast.Call,
     parts: list[str],
@@ -245,7 +239,7 @@ def _emit_stmts(
         elif isinstance(stmt, ast.Expr):
             call = stmt.value
             # tl.store(ptr + offset, val, mask) → if (mask) { *(ptr+offset) = val; }
-            if _is_tl_store_call(call):
+            if is_store(call):
                 assert isinstance(call, ast.Call)
                 _emit_tl_store(call, parts, indent, subs, state.split)
             elif _is_call_to(call, LANE_PUT):
@@ -536,16 +530,18 @@ def _emit_coop_run(
     assert isinstance(src, ast.Name) and src.id in state.coop
     root = state.coop[src.id]
     gid, dtypes = state.coop_group[root]
-    # _helion_mpp_run's arguments: acc, gid, the lhs and rhs views (nine each), four
+    # _helion_mpp_run's arguments: acc, gid, the lhs and rhs views, four
     # tile-dim flags, four block sizes.
-    tile_dims = [bool(ast.literal_eval(a)) for a in call.args[20:24]]
-    blocks = [int(ast.literal_eval(a)) for a in call.args[24:28]]
-    (spaces,) = [ast.literal_eval(k.value) for k in call.keywords if k.arg == "spaces"]
+    flags = call.args[RUN_TILE_DIMS : RUN_TILE_DIMS + 4]
+    tile_dims = [bool(ast.literal_eval(a)) for a in flags]
+    sizes = call.args[RUN_TILE_DIMS + 4 : RUN_TILE_DIMS + 8]
+    blocks = [int(ast.literal_eval(a)) for a in sizes]
+    spaces = run_spaces(call)
     (outers,) = [k.value for k in call.keywords if k.arg == "outer"]
     assert isinstance(outers, ast.List)
     handles: list[tuple[list[str], list[str], str]] = []
     for i, var in enumerate(("_mpp_a", "_mpp_b")):
-        args = call.args[2 + 9 * i : 11 + 9 * i]
+        args = run_operand(call, i)
         dims = (blocks[2 * i], blocks[2 * i + 1])
         dtype = dtypes[i]
         if spaces[i]:
@@ -1056,7 +1052,9 @@ _NON_FINITE_FLOATS = {
     "nan": "NAN",
 }
 
-_CPP_NAMESPACE_ROOTS = frozenset({"metal", "c10", REDUCTION_NAMESPACE, GLOBAL_SCOPE})
+_CPP_NAMESPACE_ROOTS = frozenset(
+    {"metal", "c10", REDUCTION_NAMESPACE, PHASE_NAMESPACE, GLOBAL_SCOPE}
+)
 
 
 def _is_cpp_namespace_root(node: ast.Attribute) -> bool:

@@ -27,6 +27,7 @@ from ._constants import SIMD_WIDTH
 from .msl_expr import PURE_CALLS
 from .msl_expr import cast_source
 from .msl_expr import parse_msl_expression
+from .msl_phases import PHASE_NAMESPACE
 from .thread_counts import requested_threads
 from .thread_counts import serialize_auto_threads
 from .thread_counts import shrink_tile_threads
@@ -49,10 +50,12 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..device_ir_analysis import DeviceIRAnalysis
+    from ..generate_ast import GenerateAST
     from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import BlockReductionStrategy
     from ..tile_dispatch import TileStrategyDispatch
+    from ..tile_strategy import DeviceGridState
     from ..tile_strategy import TileStrategy
     from .free_arange import FreeArangePlan
     from .grid_budget import RootWork
@@ -418,6 +421,12 @@ class MetalBackend(Backend):
         # by ``create_loop_strategy`` because strategies of the next config
         # are built, and may read ``force_tile_mask``, before it runs.
         self._uniform_extent: int | None = None
+        # The phase counter argument of a flat ``hl.barrier()`` launch, set by
+        # ``pre_codegen`` and read by ``after_device_codegen``.
+        self._phase_state: str | None = None
+        # The thread layout of each root, in root order, set by
+        # ``rewrite_lowered_root``.
+        self._root_dims: list[tuple[int, int, int]] = []
         # The config's ``threadgroup_budget``, its num_warps and whether its
         # tiles take one SIMD group (``search_surface.fragment_tiles``), set
         # by ``create_loop_strategy`` for the reduction strategies built after
@@ -432,6 +441,11 @@ class MetalBackend(Backend):
         # The kernel's root grids and their trips, for screening autotune
         # candidates (``grid_budget``); recorded once the device IR is analysed.
         self._grid_roots: tuple[RootWork, ...] = ()
+
+    def reserved_device_names(self) -> frozenset[str]:
+        # The phase helpers' namespace: an argument of that name reaches the
+        # kernel renamed, so it can't pass for a phased launch's helpers.
+        return frozenset({PHASE_NAMESPACE})
 
     @property
     def name(self) -> str:
@@ -673,6 +687,22 @@ class MetalBackend(Backend):
         from .search_surface import MetalKernelFacts
         from .tabulate import table_sizes
 
+        if len(device_ir.phases) > 1:
+            # hl.barrier() phases run as tickets of one flat launch; a static
+            # persistent split would need every threadgroup co-resident
+            # (hl.barrier() itself rules out the other non-flat pid types).
+            if "flat" not in config_spec.allowed_pid_types:
+                why = config_spec.disallowed_pid_type_reasons.get("flat")
+                raise exc.BackendUnsupported(
+                    "metal",
+                    "hl.barrier(), whose phases run in one flat launch, with "
+                    "pid_type='flat' ruled out" + (f" ({why})" if why else ""),
+                )
+            config_spec.disallow_pid_type(
+                "persistent_blocked",
+                reason="Metal orders hl.barrier() phases in a flat launch "
+                "(metal/ticketed_phases.py)",
+            )
         # Metal reads range_num_stages on fragment K loops only, so it keeps
         # their slots alone (Triton's ``tl.range`` hook adds one per loop when
         # triton imports).
@@ -779,6 +809,24 @@ class MetalBackend(Backend):
                 if block in bounds and loads_ahead(*bounds[block]):
                     stages.append(FragmentNumStagesSpec([block]))
 
+    def barrier_allows_pid_type(self, pid_type: str) -> bool:
+        # ``hl.barrier()`` phases run in order inside one flat launch: each
+        # threadgroup takes an atomic ticket as its program id and waits for
+        # the previous phase (``metal/ticketed_phases.py``).
+        return pid_type == "flat"
+
+    def validate_codegen_config(
+        self, env: CompileEnvironment, device_ir: DeviceIR, config: Config
+    ) -> None:
+        # A config that names another pid type for a barrier kernel is told
+        # the one it can have, where the generic check would ask for a
+        # persistent one, which Metal can't order phases under.
+        if len(device_ir.phases) > 1 and config.pid_type != "flat":
+            raise exc.InvalidConfig(
+                "hl.barrier() on Metal runs its phases in one flat launch: use "
+                f"pid_type='flat' (got '{config.pid_type}')"
+            )
+
     def default_num_sm_multiplier(self) -> int:
         # A threadgroup doesn't fill an Apple GPU core.  On an M4 Pro (16
         # cores), persistent matmul and attention tiles ran about 3x slower at
@@ -839,6 +887,8 @@ class MetalBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         from ..compile_environment import CompileEnvironment
+        from ..device_function import DeviceFunction
+        from ..host_function import HostFunction
         from .fragment_mma import FRAGMENT_LOWERING
         from .fragment_mma import split_refusal
         from .free_arange import check_free_lanes
@@ -851,6 +901,8 @@ class MetalBackend(Backend):
         from .repeated_blocks import plan_repeated_blocks
         from .search_surface import fragment_split
         from .search_surface import metal_matmul
+        from .ticketed_phases import add_phase_state
+        from .ticketed_phases import is_phased_launch
 
         reject_positional_rebinds(graphs)
         reject_literal_dims(graphs, config)
@@ -881,6 +933,90 @@ class MetalBackend(Backend):
             self.free_arange_plan, self.mpp_plan, graphs, self._fragment_tiles
         )
         self._uniform_extent = self._uniform_thread_extent(tile_strategy)
+        device_ir = HostFunction.current().device_ir
+        self._phase_state = (
+            add_phase_state(DeviceFunction.current(), len(device_ir.phases))
+            if is_phased_launch(device_ir, config)
+            else None
+        )
+        self._root_dims = []
+
+    def rewrite_lowered_root(
+        self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
+    ) -> bool:
+        # Record the root's thread layout and start the next root's from
+        # scratch: the launch is built from the roots' layouts
+        # (``_launch_dims``), and a root laid out in fewer threads than the
+        # launch keeps its surplus threads from writing
+        # (``multi_root.guard_surplus_stores``).  Until the last root is
+        # done, ``max_thread_block_dims`` holds the current root's layout;
+        # ``after_device_codegen`` sets it back to the launch's block.
+        dims = list(codegen.max_thread_block_dims)
+        for sizes in (
+            grid_state.thread_axis_sizes,
+            codegen.active_thread_axis_sizes(),
+        ):
+            for axis, size in sizes.items():
+                if 0 <= axis < 3:
+                    dims[axis] = max(dims[axis], size)
+        self._root_dims.append((dims[0], dims[1], dims[2]))
+        codegen.max_thread_block_dims = [1, 1, 1]
+        return False
+
+    def after_device_codegen(
+        self, codegen: GenerateAST, host: HostFunction, config: Config
+    ) -> None:
+        from .multi_root import guard_roots
+        from .ticketed_phases import order_phases
+
+        if not self._root_dims:
+            return
+        launch = self._launch_dims()
+        codegen.max_thread_block_dims = list(launch)
+        if len(self._root_dims) == 1:
+            return
+        # Each root fits a threadgroup, but their per-axis maximum need not:
+        # refuse here rather than when Metal builds the pipeline.  A phased
+        # launch that lays each root out anew fits (``relayout_roots``).
+        if math.prod(launch) > MAX_THREADS_PER_THREADGROUP:
+            raise exc.BackendUnsupported(
+                "metal",
+                f"roots laid out in {self._root_dims} threads share a "
+                f"{list(launch)} launch, more than "
+                f"{MAX_THREADS_PER_THREADGROUP} threads per threadgroup",
+            )
+        if self._phase_state is not None:
+            order_phases(
+                codegen,
+                self._phase_state,
+                self._root_dims,
+                self._matmuls_own_axes(),
+                launch,
+            )
+            return
+        # A narrower root with an MPP or fragment matmul, which no store
+        # guard reaches, keeps its stores, and so does an in-place update its
+        # root's threads repeat: both as before.
+        guard_roots(
+            codegen.device_function, self._root_dims, [launch] * len(self._root_dims)
+        )
+
+    def _launch_dims(self) -> tuple[int, int, int]:
+        """The threadgroup of the launch: a phased one's
+        (``ticketed_phases.launch_dims``), else the per-axis maximum of the
+        roots' thread layouts (``rewrite_lowered_root``, which every root
+        reaches: Metal has no root emitters)."""
+        from .multi_root import axis_max
+        from .ticketed_phases import launch_dims
+
+        if self._phase_state is not None:
+            return launch_dims(self._root_dims, self._matmuls_own_axes())
+        return axis_max(self._root_dims)
+
+    def _matmuls_own_axes(self) -> bool:
+        """Whether this config's codegen lowers matmuls on MPP or fragments
+        (``pre_codegen``'s plan): they run on the launch's own thread axes."""
+        return self.mpp_plan is not None and bool(self.mpp_plan.by_matmul)
 
     def _uniform_thread_extent(self, tile_strategy: TileStrategyDispatch) -> int | None:
         """The one thread extent E of every strategy's thread axes, or
@@ -1294,11 +1430,10 @@ class MetalBackend(Backend):
             settings.autotune_budget_seconds = original_budget
 
     def launcher_keyword_args(self, config: Config, *, has_barrier: bool) -> list[str]:
-        from ..device_function import DeviceFunction
         from .free_arange import check_free_arange_launch
         from .mpp_matmul import check_mpp_launch
 
-        dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
+        dims = self._launch_dims()
         if self._uniform_extent is not None:
             assert all(dim in (1, self._uniform_extent) for dim in dims), (
                 f"tile masks are elided only if every launch axis is 1 or "

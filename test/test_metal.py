@@ -38,8 +38,13 @@ from helion._compiler.metal.msl_reduction import GROUP_PATHS
 from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeuristic
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
+from helion._testing import onlyBackends
 from helion._testing import skipIfRefEager
 from helion._testing.metal import run_with_msl
+from helion._testing.metal import scale_by_tensor
+from helion._testing.metal_multi_root import update_beside_rowsum
+from helion._testing.metal_multi_root import update_then_scale
+from helion._testing.metal_multi_root import write_then_read_back
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -703,6 +708,14 @@ class TestMetalScalarArgs(unittest.TestCase):
         x = torch.randn(1024, device=DEVICE)
         _, _, msl = run_with_msl(saxpy, (x, x, 2.5, -1.0))
         self.assertIn("constant float& a [[buffer", msl)
+
+    def test_zero_dim_tensor(self) -> None:
+        """``hl.load`` of a 0-d tensor argument reads its element."""
+        x = torch.randn(1024, device=DEVICE)
+        scale = torch.tensor(2.5, device=DEVICE)
+        out, _, msl = run_with_msl(scale_by_tensor, (x, scale))
+        torch.testing.assert_close(out, x * scale, rtol=0, atol=0)
+        self.assertIn("device float* scale [[buffer(1)]]", msl)
 
 
 # ---------------------------------------------------------------------------
@@ -15560,15 +15573,14 @@ class TestMetalPersistentPid(unittest.TestCase):
         )
         self.assertNotIn("virtual_pid", bound.to_code(config))
 
-    def test_barrier_stays_rejected(self) -> None:
-        """``hl.barrier`` forces persistent_blocked, and Metal has no grid-wide
-        barrier to lower it to."""
+    def test_barrier_runs_flat(self) -> None:
+        """``hl.barrier`` keeps only the flat pid_type on Metal, whose launch
+        runs the phases in order (``metal/ticketed_phases.py``)."""
         x = torch.randn(100, device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendImplementationMissing, "codegen for API function barrier"
-        ):
-            bound = tile_after_barrier.bind((x,))
-            bound.to_code(bound.config_spec.default_config())
+        bound = tile_after_barrier.bind((x,))
+        self.assertEqual(bound.config_spec.allowed_pid_types, ("flat",))
+        config = bound.config_spec.default_config()
+        torch.testing.assert_close(bound.compile_config(config)(x), (x + 1) * 2)
 
     def test_extent_from_a_tensor_stays_rejected(self) -> None:
         """A root tile over a tensor's value takes a persistent pid_type, whose
@@ -15884,6 +15896,66 @@ class TestMetalTorchCompile(unittest.TestCase):
         torch.testing.assert_close(result, torch.sin(x) * s[:, None] + 1)
         (bound,) = compiled_scale_rows._bound_kernels.values()
         self.assertIsNotNone(bound._config)
+
+
+@onlyBackends(["metal"])
+@_requires_darwin
+class TestMetalMultiRoot(unittest.TestCase):
+    """Kernels with several roots, which all run in the threadgroup of the
+    per-axis maximum of their thread layouts (``metal/multi_root.py``);
+    ``test_metal_multi_root.py`` reads the code generated."""
+
+    def test_surplus_threads(self) -> None:
+        """Block 1 beside block 1024 on 1024 threads (num_warps=32): the
+        first root's in-place update lands once, though the root runs on all
+        32 SIMD groups of the launch."""
+        x = torch.randn(1 << 12, device=DEVICE)
+        y = torch.randn(1 << 12, device=DEVICE)
+        expected_x = x * 2.0 + 1.0
+        out, code, msl = run_with_msl(
+            update_then_scale,
+            (x, y),
+            helion.Config(block_sizes=[1, 1024], num_warps=32),
+        )
+        self.assertIn("_block_dims=(1024, 1, 1)", code)
+        self.assertIn("tid[0] < 1", msl)
+        torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
+        torch.testing.assert_close(out, y * 0.5, rtol=0, atol=0)
+
+    def test_reduction_beside(self) -> None:
+        """A row sum over all 1024 threads beside an update one thread walks
+        in lanes: the update lands once."""
+        y = torch.randn(1 << 12, device=DEVICE)
+        x = torch.randn(64, 1024, device=DEVICE)
+        expected_y = y * 2.0 + 1.0
+        s, code, _ = run_with_msl(
+            update_beside_rowsum,
+            (y, x),
+            helion.Config(block_sizes=[16, 1], num_warps=32),
+        )
+        self.assertIn("_block_dims=(1024, 1, 1)", code)
+        torch.testing.assert_close(y, expected_y, rtol=0, atol=0)
+        torch.testing.assert_close(s, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_written_row_read_back(self) -> None:
+        """Each tile writes its rows of ``s``, then every thread of the tile
+        reads its row back, beside a root laid out in more threads along x
+        (64 x 16 launch, 8 x 16 tile): every thread reads the value it
+        wrote."""
+        x = torch.randn(256, 256, device=DEVICE)
+        s_src = torch.randn(256, device=DEVICE)
+        s = torch.zeros(256, device=DEVICE)
+        y = torch.randn(1 << 12, device=DEVICE)
+        result, _, _ = run_with_msl(
+            write_then_read_back,
+            (x, s_src, s, y),
+            helion.Config(block_sizes=[16, 16, 64]),
+        )
+        assert isinstance(result, tuple)
+        out, out_y = result
+        torch.testing.assert_close(s, s_src * 2.0, rtol=0, atol=0)
+        torch.testing.assert_close(out, x * (s_src * 2.0)[:, None], rtol=0, atol=0)
+        torch.testing.assert_close(out_y, y * 0.5, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

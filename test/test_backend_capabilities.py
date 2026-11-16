@@ -50,7 +50,10 @@ class TestCapabilityHooks(unittest.TestCase):
             with self.subTest(backend=name):
                 self.assertEqual(
                     backend.reserved_device_names(),
-                    frozenset({"_"}) if name == "cute" else frozenset(),
+                    {
+                        "cute": frozenset({"_"}),
+                        "metal": frozenset({"helion_phase"}),
+                    }.get(name, frozenset()),
                 )
                 self.assertEqual(backend.output_only_names(), [])
                 self.assertEqual(
@@ -82,7 +85,7 @@ class TestCapabilityHooks(unittest.TestCase):
                 for pid_type in ("flat", "xyz", "persistent_interleaved"):
                     self.assertEqual(
                         backend.barrier_allows_pid_type(pid_type),
-                        pid_type == "flat" and name == "cute",
+                        pid_type == "flat" and name in ("cute", "metal"),
                     )
                 self.assertEqual(backend.supports_augmented_assign, name != "cute")
                 self.assertEqual(backend.folds_static_program_counts, name == "cute")
@@ -155,7 +158,11 @@ class TestCapabilityHooks(unittest.TestCase):
         device_function, device_ir, program_id and tile_dispatch keep their
         documented no-op defaults on every other backend: ``None`` / ``False``
         answers, the input returned unchanged, and no mutation of the lists
-        they are handed.  The defaults never look at their arguments."""
+        they are handed.  The defaults never look at their arguments.  Metal
+        overrides ``validate_codegen_config``, ``rewrite_lowered_root`` and
+        ``after_device_codegen`` for ``hl.barrier()`` and kernels with several
+        roots, which ``test_metal_phase_codegen.py`` and
+        ``test_metal_multi_root.py`` test."""
         arg = SimpleNamespace()
         for name, backend in _backends().items():
             if name == "cute":
@@ -164,11 +171,12 @@ class TestCapabilityHooks(unittest.TestCase):
                 error = backend.unsupported("a root")
                 body: list[object] = [arg]
                 self.assertIsNone(backend.tile_begin_expr(arg, 0))
-                self.assertFalse(backend.rewrite_lowered_root(arg, arg, body))
-                self.assertEqual(body, [arg])
+                if name != "metal":
+                    self.assertFalse(backend.rewrite_lowered_root(arg, arg, body))
+                    self.assertEqual(body, [arg])
+                    self.assertIsNone(backend.validate_codegen_config(arg, arg, arg))
+                    self.assertIsNone(backend.after_device_codegen(arg, arg, arg))
                 self.assertIs(backend.explain_root_failure(arg, error), error)
-                self.assertIsNone(backend.validate_codegen_config(arg, arg, arg))
-                self.assertIsNone(backend.after_device_codegen(arg, arg, arg))
                 self.assertIsNone(backend.prepare_device_loop(arg, arg, arg))
                 outputs: list[object] = [arg]
                 self.assertIsNone(

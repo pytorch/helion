@@ -48,14 +48,25 @@ from .fragment_mma import is_fragment_acc
 from .fragment_mma import kernel_constants
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
+from .lane_fold import names_in
 from .lane_fold import unroll_lane_folds
 from .mpp_matmul import ACC
+from .mpp_matmul import MARKER_PREFIX
 from .mpp_matmul import RUN
+from .mpp_matmul import run_operand
+from .mpp_matmul import run_spaces
 from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
 from .msl_ast_walker import select_masked_loads
+from .msl_phases import PHASE_ACCESS_GLOBAL
+from .msl_phases import PHASE_PREAMBLE
+from .msl_phases import REPEATED_READS_GLOBAL
+from .msl_phases import SITE_DIMS_GLOBAL
+from .msl_phases import coherent_buffers
+from .msl_phases import coherent_param_prologue
+from .msl_phases import uses_phases
 from .msl_reduction import GROUP_PATHS
 from .msl_reduction import REDUCTION_INCLUDES
 from .msl_reduction import REDUCTION_NAMESPACE
@@ -197,14 +208,16 @@ class _MetalKernel:
         return torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
 
 
-def _shared_storage(args: tuple[object, ...]) -> frozenset[int]:
-    """The positions of the tensor arguments that share storage with another
-    (an in-place call passing one tensor twice, or views of one tensor)."""
+def _shared_storage(args: tuple[object, ...]) -> tuple[tuple[int, ...], ...]:
+    """The groups of tensor argument positions that share a storage (an
+    in-place call passing one tensor twice, or views of one tensor), each of
+    two or more.  The grouping, not only who shares, is part of the plan key:
+    a phased kernel's coherent buffers depend on it."""
     seen: dict[int, list[int]] = {}
     for i, arg in enumerate(args):
         if isinstance(arg, torch.Tensor) and arg.numel() > 0:
             seen.setdefault(arg.untyped_storage().data_ptr(), []).append(i)
-    return frozenset(i for group in seen.values() if len(group) > 1 for i in group)
+    return tuple(sorted(tuple(group) for group in seen.values() if len(group) > 1))
 
 
 def _generate_msl(
@@ -266,12 +279,7 @@ def _generate_msl(
         "#include <c10/metal/special_math.h>",
         "using namespace metal;",
     ]
-    referenced = {
-        node.id
-        for stmt in body_stmts
-        for node in ast.walk(stmt)
-        if isinstance(node, ast.Name)
-    }
+    referenced = names_in(body_stmts)
     reduction_sites = _reduction_sites(fn_globals, referenced, layout)
     body_stmts, threadgroup_buffers = _threadgroup_buffers(
         body_stmts, fn_globals, referenced, reduction_sites, layout
@@ -289,7 +297,7 @@ def _generate_msl(
             },
         },
     )
-    shared = _shared_storage(args)
+    shared = {i for group in _shared_storage(args) for i in group}
     body_stmts = select_masked_loads(
         body_stmts,
         frozenset(
@@ -331,6 +339,29 @@ def _generate_msl(
                 "using namespace mpp::tensor_ops;",
             ]
         )
+    phase_aliases: list[str] = []
+    if uses_phases(body_stmts):
+        msl_parts.append(PHASE_PREAMBLE)
+        storages = {
+            name: arg.untyped_storage().data_ptr()
+            for name, arg in zip(param_names, args, strict=True)
+            if isinstance(arg, torch.Tensor) and arg.numel() > 0
+        }
+        coherent = coherent_buffers(
+            fn_globals[PHASE_ACCESS_GLOBAL],  # type: ignore[arg-type]
+            storages,
+        )
+        _reject_coherent_views(body_stmts, coherent)
+        _reject_aliased_updates(
+            fn_globals[REPEATED_READS_GLOBAL],  # type: ignore[arg-type]
+            storages,
+        )
+        body_stmts, phase_aliases = coherent_param_prologue(
+            body_stmts,
+            coherent,
+            {name: DTYPE_TO_METAL[dtype] for name, dtype in tensor_dtypes.items()},
+            param_names,
+        )
     if ROUND in referenced or BF16_CAST in referenced:
         msl_parts.append(ROUND_PREAMBLE)
     if BF16_CAST in referenced:
@@ -359,16 +390,12 @@ def _generate_msl(
             # one recompiles rather than reusing a stale shader.
             scalar_preamble.append(f"    {_constexpr_decl(name, arg)}")
             continue
-        metal_dtype = DTYPE_TO_METAL[arg.dtype]
-        is_scalar = arg.ndim == 0
-        if is_scalar:
-            buf_param = f"_buf_{name}"
-            params.append(
-                f"device const {metal_dtype}* {buf_param} [[buffer({buf_idx})]]"
-            )
-            scalar_preamble.append(f"    {metal_dtype} {name} = {buf_param}[0];")
-        else:
-            params.append(f"device {metal_dtype}* {name} [[buffer({buf_idx})]]")
+        # Every tensor is a device pointer, a 0-d one included: the body
+        # reads its element where it loads it (``t[0]``), so a later phase
+        # reads what an earlier one wrote.
+        params.append(
+            f"device {DTYPE_TO_METAL[arg.dtype]}* {name} [[buffer({buf_idx})]]"
+        )
         buf_idx += 1
 
     params.append("uint3 tgid [[threadgroup_position_in_grid]]")
@@ -391,6 +418,7 @@ def _generate_msl(
         f"{required_threads_attr}kernel void {kernel_name}(\n    {sig}\n) {{"
     )
     msl_parts.extend(scalar_preamble)
+    msl_parts.extend(f"    {line}" for line in phase_aliases)
 
     # Declare _BLOCK_SIZE_* constants from module globals
     block_sizes = {
@@ -468,6 +496,55 @@ def _constexpr_decl(name: str, value: object) -> str:
     raise exc.BackendUnsupported("metal", f"kernel argument type: {type(value)}")
 
 
+def _reject_coherent_views(body_stmts: list[ast.stmt], coherent: set[str]) -> None:
+    """Refuse an MPP operand viewed in place in a buffer that phases hand on.
+    Codegen stages every operand of a buffer it sees an earlier phase write
+    (``mpp_matmul._order_memory``), but it sees only how the arguments it was
+    bound with share storage: a call whose arguments share a storage that
+    codegen took as two buffers can make a viewed operand coherent, and an
+    MPP tensor view can't read through a coherent pointer."""
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == RUN
+        ):
+            continue
+        for i, staged in enumerate(run_spaces(node)):
+            viewed = names_in([ast.Expr(run_operand(node, i)[0])]) & coherent
+            if viewed and not staged:
+                raise exc.BackendUnsupported(
+                    "metal",
+                    f"an MPP matmul operand viewed in place in {min(viewed)}, which "
+                    "shares its storage with a buffer an earlier hl.barrier() phase "
+                    "writes; pass a separate tensor",
+                )
+
+
+def _reject_aliased_updates(
+    repeated_reads: dict[str, tuple[str, ...]], storage_of: dict[str, int]
+) -> None:
+    """Refuse a call where a tensor that the stores several threads of a
+    phase repeat write shares a storage with one those stores load
+    (``repeated_reads``): at this call they make an in-place update, which
+    each of those threads would apply again.  Codegen refuses such updates
+    through one argument (``multi_root.guard_surplus_stores``), but it tells
+    tensors apart by name, and two arguments can share a storage only at the
+    call."""
+    for target, loaded in repeated_reads.items():
+        if target not in storage_of:
+            continue
+        shared = [name for name in loaded if storage_of.get(name) == storage_of[target]]
+        if shared:
+            raise exc.BackendUnsupported(
+                "metal",
+                f"hl.barrier(): {target} shares its storage with {shared[0]}, which "
+                f"stores that several threads of a phase repeat load while writing "
+                f"{target}: an in-place update each of those threads would apply; "
+                "pass separate tensors",
+            )
+
+
 def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool]:
     """Whether the body needs MPP's ``matmul2d`` and whether it has fragment
     groups (``fragment_mma``), each of which declares its accumulator with a
@@ -478,7 +555,7 @@ def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Name) and func.id.startswith("_helion_mpp_"):
+        if isinstance(func, ast.Name) and func.id.startswith(MARKER_PREFIX):
             markers = True
             fragments |= func.id == ACC and is_fragment_acc(node)
     return markers and not fragments, fragments
@@ -512,6 +589,17 @@ def _uses_reductions(body_stmts: list[ast.stmt]) -> bool:
     return False
 
 
+def _site_dims(
+    fn_globals: dict[str, object], site: str, launch: tuple[int, int, int]
+) -> tuple[int, int, int]:
+    """The thread layout a reduction site's collective runs over: its root's
+    in a phased launch whose roots lay their threads out differently
+    (``ticketed_phases.relayout_roots``), else the launch's."""
+    per_site = fn_globals.get(SITE_DIMS_GLOBAL, {})
+    assert isinstance(per_site, dict)
+    return tuple(per_site.get(site, launch))  # type: ignore[return-value]
+
+
 def _reduction_sites(
     fn_globals: dict[str, object],
     referenced: set[str],
@@ -532,7 +620,7 @@ def _reduction_sites(
         if site not in referenced:
             continue
         assert threads_per_threadgroup is not None
-        path = group_path(axis, threads_per_threadgroup)
+        path = group_path(axis, _site_dims(fn_globals, site, threads_per_threadgroup))
         sites[str(site)] = (path, int(axis))
     return sites
 
@@ -574,7 +662,8 @@ def _threadgroup_buffers(
             return buf_slots
         path, axis = reduction_sites[buf_slots]
         assert threads_per_threadgroup is not None
-        return max(1, group_scratch_slots(path, threads_per_threadgroup, axis))
+        dims = _site_dims(fn_globals, buf_slots, threads_per_threadgroup)
+        return max(1, group_scratch_slots(path, dims, axis))
 
     def site_bytes(site: str) -> int:
         return sum(

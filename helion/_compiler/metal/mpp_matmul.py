@@ -112,7 +112,9 @@ from .lane_fold import LaneJam
 from .lane_fold import const_extent
 from .lane_fold import folded_lanes
 from .lane_fold import is_lane_loop
+from .lane_fold import is_store
 from .lane_fold import load_mask_other
+from .lane_fold import pointer_base
 from .lane_fold import tl_load
 from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
@@ -134,34 +136,43 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
     from .fragment_mma import FragmentLowering
 
-ACC = "_helion_mpp_acc"
+#: The prefix every marker's name starts with.
+MARKER_PREFIX = "_helion_mpp_"
+ACC = f"{MARKER_PREFIX}acc"
 #: Position of ``_helion_mpp_acc``'s seed argument: the name of its staged seed tile,
 #: as a string, or None (``_acc_expr``).
 ACC_SEED = 13
-RUN = "_helion_mpp_run"
-ELEMENTS = "_helion_mpp_elements"
+RUN = f"{MARKER_PREFIX}run"
+#: ``_helion_mpp_run``'s arguments per operand (:func:`run_operand`), after
+#: ``acc, gid``: a view's tensor and ``origin, extent, size, stride`` per dim,
+#: or a staged tile's.  Four tile-dim flags and four block sizes follow both.
+RUN_OPERAND_ARGS = 9
+#: Position of ``_helion_mpp_run``'s four tile-dim flags; its four block sizes
+#: follow them.
+RUN_TILE_DIMS = 2 + 2 * RUN_OPERAND_ARGS
+ELEMENTS = f"{MARKER_PREFIX}elements"
 #: A fragment group's op over one K tile (``fragment_mma``): a loop over the
 #: tile's 8-deep MMA steps holding its two operand loops, ``FRAG_A`` over the
 #: elements each lane holds of the MMA's A fragments, ``FRAG_B`` of its B
 #: fragments.  Each of the three, like an element loop, binds and defines
 #: names private to it.
-FRAG_RUN = "_helion_mpp_fragments"
-FRAG_A = "_helion_mpp_frag_a"
-FRAG_B = "_helion_mpp_frag_b"
+FRAG_RUN = f"{MARKER_PREFIX}fragments"
+FRAG_A = f"{MARKER_PREFIX}frag_a"
+FRAG_B = f"{MARKER_PREFIX}frag_b"
 _ELEMENT_LOOPS = (ELEMENTS, FRAG_RUN, FRAG_A, FRAG_B)
-BIND = "_helion_mpp_bind"
-STAGE = "_helion_mpp_stage"
-MAT = "_helion_mpp_materialize"
+BIND = f"{MARKER_PREFIX}bind"
+STAGE = f"{MARKER_PREFIX}stage"
+MAT = f"{MARKER_PREFIX}materialize"
 #: A barrier that makes this threadgroup's earlier device writes visible.
-FENCE = "_helion_mpp_fence"
+FENCE = f"{MARKER_PREFIX}fence"
 #: A threadgroup barrier between two tiles that share storage (tile_sharing).
-BARRIER = "_helion_mpp_barrier"
+BARRIER = f"{MARKER_PREFIX}barrier"
 #: Name prefix of a materialization's threadgroup tile.
 MAT_TILE = "_mpp_mat"
 #: An in-place element-wise update of a cooperative accumulator.
-UPDATE = "_helion_mpp_update"
+UPDATE = f"{MARKER_PREFIX}update"
 #: The element loop's write of an updated element.
-PUT = "_helion_mpp_put"
+PUT = f"{MARKER_PREFIX}put"
 #: Name prefix of a staged per-element operand's threadgroup tile.
 VEC_TILE = "_mpp_vec"
 #: A float rounded to the nearest bfloat, ties to even, kept as a float.
@@ -284,6 +295,20 @@ def _mpp_round(value: torch.Tensor) -> torch.Tensor:
 
 class _NotAView(Exception):
     """An operand that is not a device view; staging takes it."""
+
+
+def run_operand(call: ast.Call, side: int) -> list[ast.expr]:
+    """The arguments of operand ``side`` (0 the lhs, 1 the rhs) of a
+    ``_helion_mpp_run`` call, its tensor or staged tile first."""
+    start = 2 + RUN_OPERAND_ARGS * side
+    return call.args[start : start + RUN_OPERAND_ARGS]
+
+
+def run_spaces(call: ast.Call) -> list[int]:
+    """A ``_helion_mpp_run`` call's ``spaces``: per operand, 1 when it is
+    staged in a threadgroup tile, 0 when the op views it in device memory."""
+    (spaces,) = [ast.literal_eval(k.value) for k in call.keywords if k.arg == "spaces"]
+    return spaces
 
 
 def metal_unsupported(msg: str) -> exc.BackendUnsupported:
@@ -3623,12 +3648,7 @@ def _assigned(stmt: ast.stmt) -> tuple[str, ast.expr] | None:
 
 
 def _is_store(stmt: ast.stmt) -> bool:
-    return (
-        isinstance(stmt, ast.Expr)
-        and isinstance(stmt.value, ast.Call)
-        and isinstance(stmt.value.func, ast.Attribute)
-        and stmt.value.func.attr == "store"
-    )
+    return isinstance(stmt, ast.Expr) and is_store(stmt.value)
 
 
 def _is_stage(stmt: ast.stmt) -> bool:
@@ -3818,7 +3838,7 @@ class _Copies:
 _CROSS_THREAD_CALLS = ("simd_", "quad_", "threadgroup_barrier", "simdgroup_barrier")
 #: Helion's markers for MPP ops and regions, and for lane folds and lane
 #: reductions, which combine the iterations of a lane loop.
-_CROSS_THREAD_MARKERS = ("_helion_mpp_", "_metal_lane_")
+_CROSS_THREAD_MARKERS = (MARKER_PREFIX, "_metal_lane_")
 
 
 def _cross_thread(node: ast.AST, tg_buffers: frozenset[str]) -> bool:
@@ -4387,10 +4407,9 @@ def _stmts(s: ast.stmt) -> list[ast.stmt]:
 def _store_tensor(s: ast.stmt) -> str:
     """The tensor a ``tl.store(tensor + offset, ...)`` writes."""
     assert isinstance(s, ast.Expr) and isinstance(s.value, ast.Call)
-    ptr = s.value.args[0]
-    while isinstance(ptr, ast.BinOp):
-        ptr = ptr.left
-    return _node_name(ptr)
+    tensor = pointer_base(s.value.args[0])
+    assert tensor is not None
+    return tensor
 
 
 def _distribute_lane_loop(

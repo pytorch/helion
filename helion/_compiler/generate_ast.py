@@ -1508,7 +1508,12 @@ def _generate_ast(
                 continue
             return generator.generate(func, config, emit_repro_caller, transforms)
         if len(func.device_ir.phases) > 1:
-            if not str(config.pid_type).startswith("persistent"):
+            pid_type = str(config.pid_type)
+            # A backend that launches the phases in order itself keeps the pid
+            # type it does that under (``Backend.barrier_allows_pid_type``).
+            if not pid_type.startswith(
+                "persistent"
+            ) and not env.backend.barrier_allows_pid_type(pid_type):
                 raise exc.BarrierRequiresPersistent(config.pid_type)
         codegen = GenerateAST(
             func,

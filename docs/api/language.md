@@ -82,7 +82,7 @@ lets Helion apply the masking implicitly for indices beyond each lane's true len
 .. autofunction:: barrier
 ```
 
-`barrier()` synchronizes all blocks between top-level `hl.tile` or `hl.grid` loops, so one phase completes before the next begins. Depending on the backend and configuration, the compiler uses a persistent kernel or separate ordered kernel launches.
+`barrier()` synchronizes all blocks between top-level `hl.tile` or `hl.grid` loops, so one phase completes before the next begins. Depending on the backend and configuration, the compiler uses a persistent kernel, separate ordered kernel launches, or (on Metal) one launch whose blocks take their program ids from an atomic ticket and wait for the previous phase to finish.
 
 ## Memory Operations
 

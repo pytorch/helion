@@ -65,6 +65,7 @@ from ..ast_extension import expr_from_string
 from ..ast_read_writes import ast_rename
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _to_sympy
+from ..host_function import HostFunction
 from ..inductor_lowering import ReductionLowering
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from ._constants import SIMD_WIDTH
@@ -230,10 +231,12 @@ def split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
     carry nothing but accumulators its runs alone update, and write nothing;
     an accumulator starts from a constant (the first SIMD group's; the
     others start from 0); the kernel reads no tensor it writes, which the
-    SIMD groups past the first would read without having written it; and
-    it has no reduction, whose threadgroup combine would take every SIMD
+    SIMD groups past the first would read without having written it; it
+    has no reduction, whose threadgroup combine would take every SIMD
     group's threads as its own, nor an ``hl.dot`` the runs don't take,
-    whose scalar contraction reduces so too."""
+    whose scalar contraction reduces so too; and it has no ``hl.barrier()``
+    phases, whose ticket, wait and arrival each threadgroup's first thread
+    takes alone (``ticketed_phases``)."""
     known = Graphs(graphs)
     live = live_graphs(graphs)
     if any(
@@ -251,6 +254,8 @@ def split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
             "the kernel has an hl.dot the fragment runs don't take, whose "
             "contraction reduces across threads"
         )
+    if len(HostFunction.current().device_ir.phases) > 1:
+        return "the kernel has hl.barrier() phases"
     loops: dict[Node, list[MppGroup]] = {}
     for group in plan.by_matmul.values():
         if group.seed is None or group.seed.target is not full:

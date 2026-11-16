@@ -9,6 +9,7 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 import helion
+import helion.language as hl
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -55,6 +56,7 @@ def render_msl(
     args: tuple[object, ...],
     config: helion.Config,
     num_sm: int = 16,
+    run_args: tuple[object, ...] | None = None,
 ) -> str:
     """The MSL ``kernel`` generates for ``args`` at ``config``, without an
     Apple GPU: its generated module runs on ``args``, CPU tensors whose
@@ -68,8 +70,21 @@ def render_msl(
     launch plans by everything but the tensors' device, so a shared module
     would hand this render's no-op plan to a GPU run, or a GPU run's shader
     to this render.  The key also holds ``num_sm``, which the generated
-    code doesn't, so each core count renders its own MSL."""
+    code doesn't, so each core count renders its own MSL.
+
+    ``run_args``, when given, are what the module runs on instead of
+    ``args``: the same shapes and dtypes, sharing storage differently from
+    the arguments codegen saw.
+
+    The MPP lowering's device check is skipped too: it asks the MPS device
+    for its name, which crashes a process that has no Metal device, and the
+    MSL doesn't depend on it."""
+    # Imported here, as in _compiled_msl.
+    from .._compiler.metal import metal_jit
+
     module, _, args = _load(kernel, args, config, f"render_msl:{num_sm}")
+    if run_args is not None:
+        args = kernel.normalize_args(*run_args)
     with (
         mock.patch.object(
             torch.mps, "compile_shader", lambda source: _NoShader(), create=True
@@ -79,6 +94,7 @@ def render_msl(
             "get_num_sm",
             lambda device, *, reserved_sms=0: num_sm - reserved_sms,
         ),
+        mock.patch.object(metal_jit, "_raise_if_mpp_unsupported_device", lambda: None),
     ):
         getattr(module, kernel.fn.__name__)(*args)
     return _compiled_msl(module)
@@ -99,3 +115,14 @@ def run_with_msl(
     result = getattr(module, kernel.fn.__name__)(*args)
     torch.mps.synchronize()
     return result, code, _compiled_msl(module)
+
+
+@helion.kernel(
+    backend="metal", static_shapes=True, configs=[helion.Config(block_sizes=[64])]
+)
+def scale_by_tensor(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """``x`` times the 0-d tensor ``scale``, read with ``hl.load(scale, [])``."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * hl.load(scale, [])
+    return out
