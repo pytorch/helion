@@ -42,6 +42,7 @@ def test_an_outlined_helpers_constexprs_are_declared_in_order() -> None:
     device_function.triton_outlined_helpers = []
     device_function.triton_outlined_helper_constexprs = {}
     device_function._variable_renames = {}
+    device_function.sync_roles = {}
     device_function.dce_vars = []
     device_function.config = helion.Config()
     cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])

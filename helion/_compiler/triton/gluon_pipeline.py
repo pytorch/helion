@@ -1,6 +1,7 @@
 """Triton's software pipeliner (``num_stages``) for gluon kernels: loads feeding
 a dot issue ahead as ``cp.async`` copies into shared-memory rings, in a ring
-kernel's body partition too (``GluonBackend.finalize_kernel_def``)."""
+kernel's body partition too (``GluonBackend.pipeline_loops``, which
+``DeviceFunction`` runs on the finalized kernel body)."""
 
 from __future__ import annotations
 

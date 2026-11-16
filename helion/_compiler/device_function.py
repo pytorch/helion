@@ -1557,6 +1557,7 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         trailing = backend.finalize_kernel_def(definition, prefix, body_context)
+        definition.body = backend.pipeline_loops(definition.body, self)
         if not in_body:
             # Explicit entry/exit markers surround the final body: backend
             # schedule rewrites must neither move the wait past memory nor

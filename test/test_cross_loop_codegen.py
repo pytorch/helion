@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import textwrap
 from types import SimpleNamespace
 from typing import Any
 from typing import cast
@@ -28,6 +29,7 @@ from helion._compiler.cross_loop_codegen import _outline_cross_loop_region
 from helion._compiler.cross_loop_codegen import _scope_wait
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
+from helion._compiler.device_function import SyncRole
 from helion._compiler.program_id import PIDInfo
 from helion._compiler.tile_dependency import TILE_DEPENDENCY_SITE_ID_ATTR
 from helion._compiler.tile_dependency import CoordinateRelation
@@ -35,6 +37,8 @@ from helion._compiler.tile_dependency import DenseTaskOrder
 from helion._compiler.tile_dependency import Incidence
 from helion._compiler.tile_dependency import _CoordinateRelationPiece
 from helion._compiler.triton.backend import TritonBackend
+from helion._compiler.triton.spin_loops import pin_spin_loops
+from helion._compiler.triton.spin_loops import pin_spin_loops_of
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestBase
 from helion._testing import TestCase
@@ -1355,7 +1359,125 @@ def fan_in_and_split_keyed_consumers(
     return rows, out
 
 
+def _pinned_task_loops(code: str) -> list[ast.For]:
+    """The persistent task loops of ``code`` pinned to one stage."""
+    return [
+        node
+        for node in ast.walk(ast.parse(code))
+        if isinstance(node, ast.For)
+        and ast.unparse(node.target) == "virtual_pid"
+        and "num_stages=1" in ast.unparse(node.iter)
+    ]
+
+
 class TestCrossLoopCodegenHelpers(TestCase):
+    @pytest.mark.cpu_only
+    @skipIfNotTriton("Triton's software pipeliner")
+    def test_guarded_spin_pins_its_loop_unpipelined(self) -> None:
+        # Triton pipelines a loop without a nested loop of its own, issuing
+        # the next task's loads before the body: a wait under an ``if`` (a
+        # worker's first-task barrier wait) would no longer order them.
+        spin = "while w != e:\n    w = tl.load(s)\n"
+        guarded_spin = "if c:\n" + textwrap.indent(spin, "    ")
+
+        def loop(body: str, stages: str = "") -> str:
+            return f"for t in tl.range(a, b{stages}):\n" + textwrap.indent(
+                body + "x = tl.load(p + t)\n", "    "
+            )
+
+        def stages(
+            source: str, helpers: dict[str, Any] | None = None, num_stages: int = 2
+        ) -> list:
+            body = ast.parse(source).body
+            pin_spin_loops(body, helpers or {}, frozenset({"w"}), num_stages)
+            return [
+                next(
+                    (
+                        ast.unparse(k.value)
+                        for k in node.iter.keywords
+                        if k.arg == "num_stages"
+                    ),
+                    None,
+                )
+                for node in ast.walk(ast.Module(body=body, type_ignores=[]))
+                if isinstance(node, ast.For)
+                and isinstance(node.iter, ast.Call)
+                and ast.unparse(node.iter.func) == "tl.range"
+            ]
+
+        self.assertEqual(stages(loop(guarded_spin, ", num_stages=3")), ["1"])
+        # A loop running one stage needs no pin.
+        self.assertEqual(stages(loop(guarded_spin), num_stages=1), [None])
+        self.assertEqual(stages(loop(guarded_spin, ", num_stages=1")), ["1"])
+        # A wait bound from a call spins in the callee.
+        self.assertEqual(stages(loop("if c:\n    w = helper_wait(s)\n")), ["1"])
+        # A spin directly in the body already keeps Triton off the loop; an
+        # inner loop does not (a one-iteration one folds away first, as does
+        # an empty static range); a loop without a wait keeps its stages, as
+        # does one whose only while loop is not a scheduler wait's.
+        self.assertEqual(stages(loop(spin)), [None])
+        inner = "for k in tl.range(0, 4, 4):\n    y = tl.load(p + k)\n"
+        self.assertEqual(stages(loop(guarded_spin + inner)), ["1", None])
+        empty = "for k in tl.static_range(0):\n" + textwrap.indent(spin, "    ")
+        self.assertEqual(stages(loop(empty + guarded_spin)), ["1"])
+        self.assertEqual(stages(loop("")), [None])
+        self.assertEqual(
+            stages(loop("if c:\n    while v < e:\n        v += 1\n")), [None]
+        )
+
+        # A runtime wait helper spins at its top level: a remote-copy receive
+        # wait (a bare call) under an ``if`` counts, one directly in the body
+        # keeps Triton off the loop like a spin there, bound or not.
+        recv = "helion_dist_utils._wait_and_consume_signal(sig, 1)\n"
+        self.assertEqual(stages(loop("if c:\n    " + recv)), ["1"])
+        self.assertEqual(stages(loop(recv)), [None])
+        peer = "w = helion_dist_utils._wait_at_least(st, 2)\n"
+        self.assertEqual(stages(loop(peer + guarded_spin)), [None])
+
+        # A wait inside an outlined helper counts; an inlined helper's spin
+        # lands directly in the caller's body, a noinline one's does not.
+        def helper(source: str, noinline: bool = False) -> dict[str, Any]:
+            return {"h": (tuple(ast.parse(source).body), noinline)}
+
+        self.assertEqual(stages(loop("h(t)\n"), helper(guarded_spin)), ["1"])
+        self.assertEqual(stages(loop("h(t)\n"), helper(spin)), [None])
+        self.assertEqual(stages(loop("h(t)\n"), helper(spin, True)), ["1"])
+
+    @pytest.mark.cpu_only
+    @skipIfNotTriton("Triton's software pipeliner")
+    def test_spin_loop_pass_reads_waits_renames_and_helpers(self) -> None:
+        # The kernel body is renamed, registered helper bodies are not: a wait
+        # is found under either name, and inside a helper the loop calls.
+        device_function = object.__new__(DeviceFunction)
+        device_function.sync_roles = {
+            "w": SyncRole("wait"),
+            "r": SyncRole("release"),
+        }
+        device_function._variable_renames = {"w": ["w_1"]}
+        device_function.config = helion.Config(num_stages=2)
+        spin = "if c:\n    while {w} != e:\n        {w} = tl.load(s)\n"
+        device_function.triton_outlined_helpers = [
+            ("h", (), tuple(ast.parse(spin.format(w="w")).body), False)
+        ]
+
+        def pinned(source: str) -> bool:
+            body = ast.parse(source).body
+            pin_spin_loops_of(body, device_function)
+            return "num_stages=1" in ast.unparse(body[0])
+
+        self.assertTrue(pinned("for t in tl.range(a, b):\n    h(t)"))
+        renamed = textwrap.indent(spin.format(w="w_1"), "    ")
+        self.assertTrue(pinned("for t in tl.range(a, b):\n" + renamed))
+        released = textwrap.indent(spin.format(w="r"), "    ")
+        self.assertFalse(pinned("for t in tl.range(a, b):\n" + released))
+        # Without scheduler waits (a distributed kernel), a remote-copy
+        # receive wait under an ``if`` still pins its loop.
+        device_function.sync_roles = {}
+        receive = (
+            "    if c:\n        helion_dist_utils._wait_and_consume_signal(s, 1)\n"
+        )
+        self.assertTrue(pinned("for t in tl.range(a, b):\n" + receive))
+
     def test_scope_wait_passes_only_independent_loads(self) -> None:
         wait = ast.parse(
             "w = tl.inline_asm_elementwise(asm='x', constraints='=r,l', "
@@ -1759,6 +1881,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
         device_function.triton_outlined_helpers = []
         device_function.triton_outlined_helper_constexprs = {}
         device_function._variable_renames = {}
+        device_function.sync_roles = {}
         device_function.dce_vars = []
         cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
         cast("Any", device_function).helper_manager = SimpleNamespace(
@@ -1822,6 +1945,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
         device_function.triton_outlined_helpers = []
         device_function.triton_outlined_helper_constexprs = {}
         device_function._variable_renames = {}
+        device_function.sync_roles = {}
         device_function.dce_vars = []
         cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
         cast("Any", device_function).helper_manager = SimpleNamespace(
@@ -1856,6 +1980,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
         )
         device_function.triton_outlined_helper_constexprs = {}
         device_function._variable_renames = {}
+        device_function.sync_roles = {}
         device_function.dce_vars = ["unused"]
         cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
         cast("Any", device_function).helper_manager = SimpleNamespace(
@@ -3242,6 +3367,35 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_pipelined_task_loop_waits_for_the_barrier_first(self) -> None:
+        # Triton pipelines a multi-stage task loop, issuing a task's loads
+        # before a wait in that task: each worker waits before its loop.
+        x = torch.randn((256,), device=DEVICE, dtype=torch.float32)
+        w = torch.randn((64, 256), device=DEVICE, dtype=torch.float32)
+        code, (act, out) = code_and_output(
+            barrier_after_weight_load,
+            (x, w),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=4,
+            num_stages=2,
+        )
+        torch.testing.assert_close(act, x + 1)
+        torch.testing.assert_close(out, (w * (x + 1)[None, :]).sum(1))
+        kernel = ast.unparse(
+            _generated_function(code, "_helion_barrier_after_weight_load")
+        )
+        self.assertNotRegex(
+            code, r"if virtual_pid == [^\n]*:\n\s*tile_dependency_root_barrier_wait"
+        )
+        consumer = kernel.rindex("for virtual_pid in tl.range(")
+        self.assertIn("tile_dependency_root_barrier_wait", kernel[:consumer])
+        # The consumer's loop keeps its stages (Triton prefetches across tasks).
+        self.assertNotIn("num_stages=1", kernel[consumer:].split("\n", 1)[0])
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_invariant_scan_is_hoisted_with_the_guard(self) -> None:
         x = torch.randn((16, 256), device=DEVICE, dtype=torch.float32)
         for live in (0, 3, 16):
@@ -4290,6 +4444,11 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     * scale[:, :, None]
                 ).reshape(batch, intermediate) @ w2.float()
                 torch.testing.assert_close(out, expected, rtol=3e-2, atol=3e-2)
+                if (batch, intermediate, group_size) == (2, 128, 32):
+                    # This schedule's task loop holds a guarded scheduler wait:
+                    # Triton must not pipeline it across the wait (at one stage
+                    # nothing is pinned: the guarded-spin unit test).
+                    self.assertTrue(_pinned_task_loops(code))
 
                 if reverse_groups:
                     self.assertIn("tile_dependency_root_barrier", code)

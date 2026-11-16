@@ -663,6 +663,13 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def compiler_pipelines_ranges(self) -> bool:
+        """Whether the compiler software-pipelines ``tl.range`` loops by their
+        ``num_stages`` (Triton's), issuing an iteration's loads ahead of the
+        body by data dependencies alone."""
+        return False
+
+    @property
     def pad_factory_tensors_to_power_of_2(self) -> bool:
         """Whether on-device tensor factory ops (zeros/ones/empty/full/...) should
         have their integer dim sizes rounded up to the next power of 2.
@@ -2399,9 +2406,10 @@ class Backend(abc.ABC):
     def pipeline_loops(
         self, body: list[ast.stmt], device_function: DeviceFunction
     ) -> list[ast.stmt]:
-        """``body`` (a kernel's or an outlined helper's) with its loops software
-        pipelined by the backend; the default returns it unchanged (Triton's
-        compiler pipelines the loops itself)."""
+        """``body`` (a kernel's, after ``finalize_kernel_def``, or an outlined
+        helper's) with its loops software pipelined by the backend, or
+        constrained for the pipelining its compiler does (Triton's); the
+        default returns it unchanged."""
         return body
 
     def validate_codegen_config(

@@ -4648,10 +4648,21 @@ def emit_cross_loop_schedule(
         task_barriers: list[tuple[list[ast.stmt], frozenset[int]]] = []
         # Producers whose barrier a worker with no task here still waits for.
         no_task_producers: list[int] = []
+        # Triton pipelines a multi-stage task loop, issuing a task's loads
+        # ahead of a wait guarded in that task: the barrier is then waited for
+        # before the loop.
+        task_loop_pipelined = (
+            CompileEnvironment.current().backend.compiler_pipelines_ranges
+            and TileStrategy.effective_range_num_stages(
+                device_function.config, block_ids[0]
+            )
+            > 1
+        )
         for producer in incoming_roots:
             covered, publication = barrier_covers(root, producer)
             if (
-                claimed
+                task_loop_pipelined
+                or claimed
                 or root in ws_roots
                 or guarded_kernel_scope_root(root)
                 or covered is None

@@ -24,6 +24,7 @@ from ..backend import BackendState
 from ..backend import HandlerOpOverrides
 from ..backend import LauncherInfo
 from ..backend import log
+from .spin_loops import pin_spin_loops_of
 
 if TYPE_CHECKING:
     import ast
@@ -103,6 +104,19 @@ class TritonBackend(Backend):
     @property
     def uses_triton_compiler(self) -> bool:
         return True
+
+    @property
+    def compiler_pipelines_ranges(self) -> bool:
+        return True
+
+    def pipeline_loops(
+        self, body: list[ast.stmt], device_function: DeviceFunction
+    ) -> list[ast.stmt]:
+        # Keep Triton's pipeliner off loops holding a wait it would move
+        # loads across.
+        if not self.compiler_pipelines_ranges:
+            return body
+        return pin_spin_loops_of(body, device_function)
 
     def handler_op_overrides(self) -> HandlerOpOverrides:
         return TritonHandlerOpOverrides()
@@ -823,6 +837,11 @@ class GluonBackend(TritonBackend):
         return "gluon"
 
     @property
+    def compiler_pipelines_ranges(self) -> bool:
+        # Gluon pipelines its loops in Helion (``pipeline_loops``).
+        return False
+
+    @property
     def places_pdl_markers(self) -> bool:
         # The ring slices the body into partitions, each keeping the grid wait
         # where its statements need it (and the code prefetch in an idle one).
@@ -879,7 +898,6 @@ class GluonBackend(TritonBackend):
 
         trailing = super().finalize_kernel_def(fn_def, prefix, ctx)
         statements = finalize_ring(fn_def, ctx)
-        fn_def.body = self.pipeline_loops(fn_def.body, ctx.device_function)
         return [*statements, *trailing]
 
     def pipeline_loops(
@@ -955,6 +973,11 @@ class TileIRBackend(TritonBackend):
     @property
     def name(self) -> str:
         return "tileir"
+
+    @property
+    def compiler_pipelines_ranges(self) -> bool:
+        # TileIR's Triton front end feeds another compiler.
+        return False
 
     @property
     def uses_triton_compiler(self) -> bool:

@@ -34,6 +34,7 @@ from ..indexing_strategy import _in_warp_specialized_loop
 from ..tile_dependency import TILE_ACCESS_META
 from ..tile_dependency import _concrete_integer
 from ..tile_strategy import DeviceLoopState
+from .spin_loops import pin_num_stages_one
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1543,10 +1544,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             for loop in loops:
                 call = loop.for_node.iter if isinstance(loop, DeviceLoopState) else None
                 if isinstance(call, ast.Call) and ast.unparse(call.func) == "tl.range":
-                    call.keywords = [
-                        *(kw for kw in call.keywords if kw.arg != "num_stages"),
-                        create(ast.keyword, arg="num_stages", value=ast.Constant(1)),
-                    ]
+                    pin_num_stages_one(call)
         group, pack, threads = None, 1, None
         if indexing.needs_broadcast():
             result = expr_from_string(
