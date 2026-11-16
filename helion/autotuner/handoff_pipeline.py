@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 from typing import TYPE_CHECKING
 from uuid import uuid4
+import warnings
 
 from .base_cache import AutotuneCacheBase
 from .base_search import BaseSearch
@@ -14,7 +15,6 @@ from .handoff import HandoffPolicy
 from .handoff import _active_handoff
 from .handoff import find_handoff
 from .handoff_bundle import build_handoff
-from .handoff_cli import CLISourceAgent
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
@@ -39,7 +39,18 @@ def autotune_with_handoff(
         or _active_handoff.get() is not None
     ):
         return autotuner.autotune(skip_cache=skip_cache)
-    CLISourceAgent.validate_available()
+    agent = settings.autotune_handoff_agent
+    if agent is None:
+        raise ValueError(
+            "autotune_handoff needs a source agent: pass "
+            "@helion.kernel(..., autotune_handoff_agent=agent), a callable that "
+            "takes a HandoffRequest and returns replacement sources"
+        )
+    warnings.warn(
+        "The autotune hand-off (autotune_handoff) is experimental: its API, "
+        "prompt and records may change without notice.",
+        stacklevel=2,
+    )
 
     root = (
         Path(settings.autotune_log).with_suffix(".handoff")
@@ -63,6 +74,7 @@ def autotune_with_handoff(
                     native_baseline=bundle.manifest["baseline_evaluation"],
                 )
                 result = bundle.run_agent_rounds(
+                    agent,
                     budget_seconds=settings.autotune_handoff_budget_seconds,
                     log=search.log,
                 )

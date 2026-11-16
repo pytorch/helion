@@ -35,9 +35,9 @@ from .handoff import HandoffProgress as HandoffProgress
 from .handoff import find_handoff as find_handoff
 from .handoff_agent import HandoffAgentResult as HandoffAgentResult
 from .handoff_agent import HandoffAgentRound as HandoffAgentRound
+from .handoff_agent import HandoffRequest as HandoffRequest
 from .handoff_bundle import HandoffBundle as HandoffBundle
 from .handoff_bundle import build_handoff as build_handoff
-from .handoff_cli import CLISourceAgent as CLISourceAgent
 from .handoff_evaluation import HandoffCaseResult as HandoffCaseResult
 from .handoff_evaluation import HandoffEvaluation as HandoffEvaluation
 from .handoff_evaluation import evaluate_handoff as evaluate_handoff

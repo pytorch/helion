@@ -353,7 +353,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_handoff
 
-   Enable automatic native-source optimization after configuration search with ``HELION_AUTOTUNE_HANDOFF=1``. Off by default. Uses the existing search budget or search completion, then runs one continuous Codex session and saves standalone kernels beside the autotune logs. Each candidate submission records a round.
+   Experimental: Helion warns when it runs, and its API may change. Enable automatic native-source optimization after configuration search, on the kernel together with ``autotune_handoff_agent``: ``@helion.kernel(..., autotune_handoff=True, autotune_handoff_agent=agent)``. Off by default. Uses the existing search budget or search completion, then saves standalone kernels beside the autotune logs and asks ``autotune_handoff_agent`` for replacement sources until the hand-off budget runs out. Each proposal records a round.
 
    Standalone handoff input files reject Python callbacks in the supported
    argument tree, including declared record fields, on both save and load.
@@ -365,7 +365,11 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 
 .. autoattribute:: Settings.autotune_handoff_budget_seconds
 
-   Time budget for native-source rounds, excluding search and export. Defaults to 1500 seconds. Controlled by ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS``.
+   Time budget for native-source rounds, excluding search and export. Defaults to 1500 seconds.
+
+.. autoattribute:: Settings.autotune_handoff_agent
+
+   The source agent ``autotune_handoff`` requires: a callable that takes a ``helion.autotuner.HandoffRequest`` and returns replacement sources, keyed by the request's source paths, or ``None`` to end the session. The request carries the task prompt (the bundle's ``prompt.md`` with the session deadline), the retained sources, feedback on the previous proposal (``None`` at first), and the ``time.monotonic()`` deadline. Helion validates and measures each proposal against the incumbent and keeps it only if it is faster beyond the measurement noise. Calls are synchronous and Helion does not interrupt them, so the agent must return by the deadline. An exception ends the session, as do 20 invalid proposals in a row. Each autotuned specialization runs its own session with the same agent; a session's first request has ``feedback`` ``None``. Helion runs no agent of its own: how the agent produces sources (a model API, a coding-agent CLI) and any confinement of that agent are the caller's. Pass as ``@helion.kernel(..., autotune_handoff_agent=agent)``.
 
 .. autoattribute:: Settings.autotune_ignore_errors
 
@@ -569,11 +573,6 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_AUTOTUNE_MAX_GENERATIONS`` | ``autotune_max_generations`` | Upper bound on generations for Pattern Search and Differential Evolution. |
 | ``HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS`` | ``autotune_benchmark_input_banks`` | Independent argument banks per benchmark graph cycle (default ``1``). Multiple banks require the built-in isolated CUDA provider and matching replay/off search and final timing regimes; reported latency is per kernel call. |
 | ``HELION_AUTOTUNE_BUDGET_SECONDS`` | ``autotune_budget_seconds`` | Wall-clock budget for an autotune run. |
-| ``HELION_AUTOTUNE_HANDOFF`` | ``autotune_handoff`` | Automatically hand configuration search to a native-source agent (default off). |
-| ``HELION_AUTOTUNE_HANDOFF_BUDGET_SECONDS`` | ``autotune_handoff_budget_seconds`` | Native-source session budget in seconds (default 1500). |
-| ``HELION_HANDOFF_AGENT`` | (source agent) | Agent CLI: ``codex`` (default) or ``claude``. |
-| ``HELION_HANDOFF_MODEL`` | (source agent) | Model override; defaults to ``gpt-6-astra`` for Codex, ``opus`` for Claude. |
-| ``HELION_HANDOFF_EFFORT`` | (source agent) | Reasoning effort supported by the selected CLI; defaults to ``ultra`` for Codex, ``max`` for Claude. |
 | ``HELION_AUTOTUNE_ACCURACY_CHECK`` | ``autotune_accuracy_check`` | Toggle baseline validation for candidate configs. |
 | ``HELION_AUTOTUNE_EFFORT`` | ``autotune_effort`` | Select autotuning preset (``"none"``, ``"quick"``, ``"full"``). |
 | ``HELION_AUTOTUNE_SEARCH_ACF`` | ``autotune_search_acf`` | Comma-separated list of PTXAS config file paths to search during autotuning. |

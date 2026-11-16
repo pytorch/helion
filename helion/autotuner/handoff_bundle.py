@@ -27,6 +27,7 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
 from .handoff_agent import HandoffAgentResult
+from .handoff_agent import HandoffRequest
 from .handoff_agent import run_agent_rounds
 from .handoff_evaluation import HandoffEvaluation
 from .handoff_evaluation import _alias_signature
@@ -39,7 +40,6 @@ from .handoff_prompt import build_handoff_prompt
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.settings import Settings
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from .handoff import HandoffCandidate
     from .handoff import HandoffMeasurement
     from .handoff import HandoffPoint
+    from .handoff_agent import SourceAgent
     from .logger import AutotuningLogger
 
 
@@ -55,9 +56,10 @@ if TYPE_CHECKING:
 class HandoffBundle:
     """An editable native-source workspace, independent of its original kernel.
 
-    Construct with an existing directory to reopen a saved bundle. Agent adapters
-    receive this object and return complete replacement files keyed by their
-    relative source paths; they need no Helion configuration or BoundKernel.
+    Construct with an existing directory to reopen a saved bundle. Source agents
+    receive a :class:`HandoffRequest` and return complete replacement files keyed
+    by their relative source paths; they need no Helion configuration or
+    BoundKernel.
     """
 
     directory: Path
@@ -92,14 +94,14 @@ class HandoffBundle:
 
     def run_agent(
         self,
-        agent: Callable[[HandoffBundle], Mapping[str, str]],
+        agent: SourceAgent,
         *,
         repetitions: int = 5,
         timeout: float = 120,
     ) -> HandoffEvaluation:
         """Apply one agent proposal and evaluate it; round selection is separate."""
         paths = set(self.sources)
-        replacements = agent(self)
+        replacements = agent(HandoffRequest(self.prompt, self.sources, None, math.inf))
         if not replacements or not replacements.keys() <= paths:
             raise ValueError(
                 "Agent must replace one or more existing native source files"
@@ -117,7 +119,7 @@ class HandoffBundle:
 
     def run_agent_rounds(
         self,
-        agent: Callable[[HandoffBundle], Mapping[str, str]] | None = None,
+        agent: SourceAgent,
         *,
         budget_seconds: float,
         repetitions: int = 5,
@@ -126,11 +128,10 @@ class HandoffBundle:
     ) -> HandoffAgentResult:
         """Run bounded proposals, retaining only validated, noise-separated gains.
 
-        Set a wall-clock budget. By default, one continuous agent CLI session
-        submits candidates and receives feedback until it exits or time runs out.
-        An explicit synchronous callback must honor
-        the monotonic deadline exposed in its prompt.
-        Sources, feedback, and decisions are saved under ``agent_runs/``.
+        Set a wall-clock budget. ``agent`` receives a :class:`HandoffRequest`
+        per round and returns replacement sources, or ``None`` to stop; see
+        :func:`~helion.autotuner.handoff_agent.run_agent_rounds`. Sources,
+        feedback, and decisions are saved under ``agent_runs/``.
         """
         return run_agent_rounds(
             self,
