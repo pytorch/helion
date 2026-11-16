@@ -1197,6 +1197,35 @@ class Backend(abc.ABC):
         """
         return False
 
+    def autotune_short_kernel_below_us(self, config_spec: ConfigSpec) -> float | None:
+        """Opt the autotuner's search into resolving short kernels.
+
+        The search times a candidate with a CUDA event pair around one
+        flushed launch, which reads in the event clock's steps (about 2 us
+        on a B200) and includes the launch latency, so configs of a kernel
+        of a few tens of microseconds read alike. A population search that
+        reads an initial population (the pattern, LFBO and
+        differential-evolution searches; not the LLM-guided search, which
+        times every batch as it comes and keeps the event timer) and whose
+        initial population's best config reads below the returned number of
+        microseconds reads that population once more and times every later
+        candidate in the benchmark worker from the CUDA activity trace
+        instead, as ``default_final_selection_regime``'s ``kernel`` does for
+        finalists (``PopulationBasedSearch._settle_candidate_timer``), and
+        its pattern search paths count a step smaller than the repeatability
+        of those readings as a tie (``PatternSearch._reading_tolerance``), as
+        the early stop of a differential-evolution search counts such a move
+        of its best reading as no improvement
+        (``DifferentialEvolutionSearch._stop_tolerance``). A
+        search whose best initial reading is at or above it, and every
+        search with ``None``, keeps the event timer and the fixed
+        ``min_improvement_delta``. A backend answers ``None`` for a search
+        that re-times its members with another timer than the benchmark
+        worker's (CuTe: the flash search, whose terminal refinement compares
+        members by mirrored wall-clock sweeps in this process).
+        """
+        return None
+
     def get_interleaved_bench(
         self,
     ) -> Callable[..., list[float]] | None:

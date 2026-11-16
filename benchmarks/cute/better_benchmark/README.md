@@ -73,7 +73,9 @@ third on request, below):
   subtracted); free of launch-latency quantization, so it separates small
   kernels better. A Triton search also picks its final config in this regime.
   A CuTe search picks it by the kernels' durations in the CUDA activity trace
-  (`CuteBackend.default_final_selection_regime`, also flushed per call);
+  (`CuteBackend.default_final_selection_regime`, also flushed per call), which
+  also time the candidates of a search whose best initial config reads under
+  64 us (`autotune_short_kernel_below_us`);
   `HELION_AUTOTUNE_FINAL_L2_FLUSH=1` makes it select in this one.
 
 The rounds alternate the order of the implementations, and a reading depends

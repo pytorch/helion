@@ -62,6 +62,7 @@ from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
 from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import _BATCH_MEMORY_FRACTION
+from .benchmarking import KernelTraceUnreadable
 from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
@@ -842,6 +843,24 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # Set inside ``fresh_source_timings``: every config of a batch is timed,
     # also one whose generated source this provider holds a reading of.
     _fresh_source_timings: bool = False
+    # Set inside ``isolated_timings_within_budget``: ``benchmark_isolated``
+    # asks the budget hook before each function and times none once the
+    # budget is used up.
+    _isolated_timings_budgeted: bool = False
+    # Whether the benchmark worker times the search's candidates and
+    # re-timings (the jobs that name no regime) from the CUDA activity trace
+    # (``BenchmarkJob.trace_kernel_durations``). The search sets it once,
+    # after its initial population
+    # (``PopulationBasedSearch._settle_candidate_timer``), so every later
+    # reading of the search is on one scale. False: CUDA events time them.
+    trace_search_candidates: bool = False
+    # Whether the benchmark worker was asked for a profiling session (the
+    # trace probe, a traced window, a ``kernel`` window) since
+    # ``restart_profiled_benchmark_worker`` last gave it a new process. A
+    # session leaves the activity API attached to its process, where CUDA
+    # events read every later launch longer. (An upper bound: a job that ran
+    # into the timeout since replaced the process as well.)
+    worker_profiled: bool = False
 
     def __init__(
         self,
@@ -1009,6 +1028,62 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             yield
         finally:
             self._fresh_source_timings = previous
+
+    @contextlib.contextmanager
+    def isolated_timings_within_budget(self) -> Iterator[None]:
+        """Inside this block :meth:`benchmark_isolated` asks the budget hook
+        (``budget_exceeded_fn``) before each function and times no further
+        one once the budget is used up.  A function it did not get to comes
+        back as ``None``, a timing that could not be taken, so the caller
+        keeps the reading it has.
+
+        Re-timings are not cut otherwise: a verification finishes the
+        generation in flight, whose members within the re-timing threshold
+        of the best it reads again.  A pass over a whole population
+        (``PopulationBasedSearch._read_on_settled_timer``) is timing work
+        of the size of a batch of candidates, which the budget covers as it
+        covers theirs.  The hook is asked as it is, without agreeing the
+        cutoff across a process group: only a search that reads its
+        candidates from the CUDA activity trace runs such a pass, and none
+        in a process group does.  Without ``autotune_budget_seconds`` the
+        hook never says stop and every function is timed.
+        """
+        previous = self._isolated_timings_budgeted
+        self._isolated_timings_budgeted = True
+        try:
+            yield
+        finally:
+            self._isolated_timings_budgeted = previous
+
+    def refresh_source_reading(self, fn: object, perf: float) -> None:
+        """Replace the recorded reading of ``fn``'s generated source with
+        ``perf``.
+
+        A later config with the same source is settled with this record
+        instead of a timing.  A search that moves its readings to another
+        timer (``PopulationBasedSearch._read_on_settled_timer``) moves the
+        records of the kernels it read again with them, so a config settled
+        from here on does not carry a reading of the timer the search left.
+        """
+        source_hash = self.config_spec.backend.generated_source_hash(fn)
+        if source_hash is None:
+            return
+        result = self._effective_source_results.get(source_hash)
+        if result is not None:
+            self._effective_source_results[source_hash] = result._replace(perf=perf)
+
+    def forget_source_reading(self, fn: object) -> None:
+        """Drop the recorded reading of ``fn``'s generated source, so the
+        next config with that source is timed instead of settled with it.
+
+        For a kernel the search could not read on the timer it moved to
+        (``PopulationBasedSearch._read_on_settled_timer``): the record holds
+        a reading of the timer the search left.  The source stays valid,
+        unlike one that ``invalidate_effective_source_hash`` rejects.
+        """
+        source_hash = self.config_spec.backend.generated_source_hash(fn)
+        if source_hash is not None:
+            self._effective_source_results.pop(source_hash, None)
 
     def take_effective_source_repairs(self) -> MutableMapping[Config, BenchmarkResult]:
         repairs = self._effective_source_repairs
@@ -3182,6 +3257,21 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             # None means the subprocess path could not handle this config
             # (e.g., serialization failed); fall through to in-process.
 
+        if self.trace_search_candidates:
+            # The search reads its candidates from the CUDA activity trace in
+            # the benchmark worker. A candidate the worker cannot take has no
+            # reading, as one whose traced window cannot be read
+            # (``KernelTraceUnreadable``): the in-process timer reads with
+            # CUDA events, on another scale than the readings it would be
+            # compared with.
+            self.log.warning(
+                f"No reading of {config!r}: the benchmark worker cannot time "
+                "it, and this search reads its candidates from the CUDA "
+                "activity trace"
+            )
+            self._record_worker_failure(config, "error")
+            return inf
+
         if self._input_bank_count > 1:
             raise exc.InvalidAPIUsage(
                 "rotating input banks cannot fall back to in-process benchmarking"
@@ -3471,6 +3561,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 "timeout" if isinstance(e, BenchmarkTimeout) else "error",
             )
             return inf
+        except KernelTraceUnreadable as e:
+            # The search reads its candidates from the trace and this window
+            # gave no reading there: the candidate has none, as one whose
+            # job failed in the worker (an event reading would sit on
+            # another scale than the readings it is compared with).
+            self.log.warning(f"No reading of {config!r}: {e}")
+            self._record_worker_failure(config, "error")
+            return inf
         except Exception as e:
             e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
@@ -3691,9 +3789,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             mutated_arg_indices=tuple(self.mutated_arg_indices),
             l2_flush_mode=l2_flush_mode,
             input_banks=self._input_bank_count,
+            # the final selection names its windows' regime; the search's
+            # candidates and re-timings (no regime named) follow its timer
+            trace_kernel_durations=(
+                self.trace_search_candidates and l2_flush_mode is None
+            ),
         )
         if timeout is None:
             timeout = float(self.settings.autotune_benchmark_timeout)
+        if not job.use_wall_clock and (
+            job.trace_kernel_durations or job.l2_flush_mode == "kernel"
+        ):
+            # the window runs a profiling session in the worker
+            self.worker_profiled = True
         try:
             return float(
                 worker.run(
@@ -3760,6 +3868,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             f"falling back in-process: {error}"
         )
 
+    def benchmark_worker_started(self) -> bool:
+        """Whether this provider runs its jobs in a benchmark worker: one
+        was started (for a candidate, an accuracy check or a probe) and was
+        not dropped or disabled since.  Its process may be down: a job that
+        timed out or left a sticky device error killed it, or the provider
+        replaced it after a profiling session
+        (``restart_profiled_benchmark_worker``), and the next job respawns
+        it.  So the answer does not depend on what the last candidate was (a
+        source alias runs no job and respawns nothing)."""
+        return self._benchmark_worker is not None
+
     def steady_window_benchmark_available(self) -> bool:
         """Whether finalists can be timed in the killable benchmark worker."""
         return (
@@ -3776,6 +3895,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             available = False
             if self.steady_window_benchmark_available():
                 device = _cuda_device_of(self.args)
+                # the probe runs a profiling session in the worker
+                self.worker_profiled = True
                 try:
                     reason = self._get_benchmark_worker().run(
                         KernelTimerProbeJob(None if device is None else device.index),
@@ -3803,6 +3924,30 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     )
             self._worker_kernel_timer = available
         return self._worker_kernel_timer
+
+    def restart_profiled_benchmark_worker(self) -> None:
+        """Give the benchmark worker a new process if a profiling session
+        was asked of its current one (``worker_profiled``); the next job
+        starts it, as after a job that ran into the timeout.
+
+        A session leaves the activity API attached to its process, and CUDA
+        events then read every launch of that process longer: on a B200 a
+        short Triton kernel's launch read 16.1 us in a new process and
+        19.1 us after one session in it. A search that tried the trace and
+        goes on with CUDA events (``PopulationBasedSearch._settle_candidate_timer``)
+        read its initial population before the session, so candidates timed
+        in that process would read about 3 us above it there, a fifth of
+        that kernel's reading and more of a shorter one's. The worker itself
+        stays (``benchmark_worker_started``), and so does the probe's answer
+        (``worker_kernel_timer_available``, asked once per provider): a
+        ``kernel`` or traced window checks its own process again
+        (``BenchmarkJob``) and gives no reading where the new one cannot
+        trace. A worker that survives its kill raises
+        ``BenchmarkWorkerUnkillable``.
+        """
+        if self.worker_profiled and self._benchmark_worker is not None:
+            self._benchmark_worker.shutdown()
+        self.worker_profiled = False
 
     def private_argument_copies_affordable(self, count: int) -> bool:
         """Whether ``count`` private copies of the kernel arguments fit on the
@@ -3916,6 +4061,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
 
         timings: list[IsolatedBenchmarkTiming] = []
         for index, (fn, args_slot) in enumerate(zip(fns, args_slots, strict=True)):
+            if self._isolated_timings_budgeted and self.budget_exceeded_fn():
+                # not timed (``isolated_timings_within_budget``): the caller
+                # keeps the reading it has
+                timings.append(None)
+                continue
             if fresh_process and self._benchmark_worker is not None:
                 self._shutdown_isolated_worker(index - 1 if index else None)
             try:
@@ -3954,9 +4104,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self._autotune_metrics.num_isolated_rebenchmark_timeouts += 1
                     timings.append(IsolatedBenchmarkFailure("timeout"))
                     continue
-                except BenchmarkSubprocessError as e:
-                    # A compile deadline or a dead worker: the candidate was
-                    # measured before, so its earlier timing is kept.
+                except (BenchmarkSubprocessError, KernelTraceUnreadable) as e:
+                    # A compile deadline, a dead worker or a window the trace
+                    # could not read: the candidate was measured before, so
+                    # its earlier timing is kept.
                     self.log.warning(f"{self._isolated_failure_subject(fn, desc)}: {e}")
                     timing = None
                 except Exception as e:

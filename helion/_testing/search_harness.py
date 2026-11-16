@@ -42,10 +42,12 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
             autotune_config_is_viable=lambda config_spec, config: True,
             should_deduplicate_generated_sources=lambda config_spec: False,
             collapses_generated_source_aliases=lambda config_spec: False,
+            generated_source_hash=lambda compiled_fn: None,
             get_do_bench=lambda: None,
             default_final_selection_regime=lambda: None,
             classify_autotune_exception=lambda error: None,
             probe_long_autotune_kernels=lambda config_spec: False,
+            autotune_short_kernel_below_us=lambda config_spec: None,
         ),
     )
     kernel = SimpleNamespace(

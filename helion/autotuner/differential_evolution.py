@@ -11,6 +11,7 @@ from .base_search import population_statistics
 from .effort_profile import DIFFERENTIAL_EVOLUTION_DEFAULTS
 from .pattern_search import InitialPopulationStrategy
 from .pattern_search import random_fallback_population_target
+from .pattern_search import trace_tie_tolerance
 from helion._dist_utils import sync_seed
 
 if TYPE_CHECKING:
@@ -56,7 +57,10 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             crossover_rate: The crossover rate for mutation.
             immediate_update: Whether to update population immediately after each evaluation.
             min_improvement_delta: Relative improvement threshold for early stopping.
-                If None (default), early stopping is disabled.
+                If None (default), early stopping is disabled. A search that
+                times its candidates from the CUDA activity trace stops on
+                the larger of this and what its readings repeat to
+                (``_stop_tolerance``), so 0 no longer disables it there.
             patience: Number of generations without improvement before stopping.
                 If None (default), early stopping is disabled.
             initial_population_strategy: Strategy for generating the initial population.
@@ -134,6 +138,23 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             "best_available_pad_random": profile.differential_evolution.best_available_pad_random,
             **super().get_kwargs_from_profile(profile, settings),
         }
+
+    def _population_can_mutate(self) -> bool:
+        """Whether the population has the four members a mutation draws.
+
+        A population can end up smaller than that: a budget that cut the
+        initial population short, a tiny search space, initial configs that
+        a search which moved to the trace timer could not read there
+        (``_read_on_settled_timer``). Such a search ends on what it has
+        instead of failing in ``random.sample``.
+        """
+        if len(self.population) >= 4:
+            return True
+        self.log(
+            f"The population has {len(self.population)} configs, fewer than "
+            "the four a mutation draws: ending the search with them"
+        )
+        return False
 
     def mutate(self, x_index: int) -> FlatConfig:
         with sync_seed(process_group_name=self.kernel.env.process_group_name):
@@ -252,16 +273,14 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
 
         relative_improvement = abs(current_best / past_best - 1.0)
 
-        if (
-            self.min_improvement_delta is not None
-            and relative_improvement < self.min_improvement_delta
-        ):
+        tolerance = self._stop_tolerance(past_best)
+        if tolerance is not None and relative_improvement < tolerance:
             # No significant improvement
             self.generations_without_improvement += 1
             if self.generations_without_improvement >= self.patience:
                 self.log(
                     f"Early stopping at generation {self._autotune_metrics.num_generations}: "
-                    f"no improvement >{self.min_improvement_delta:.1%} for {self.patience} generations"
+                    f"no improvement >{tolerance:.1%} for {self.patience} generations"
                 )
                 return True
             return False
@@ -269,6 +288,40 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
         # Significant improvement - reset counter
         self.generations_without_improvement = 0
         return False
+
+    def _stop_tolerance(self, perf: float) -> float | None:
+        """The relative move of the best reading from ``perf``, over the
+        last ``patience`` generations, below which the early stop counts no
+        improvement.
+
+        ``min_improvement_delta`` (``None``: no early stop was asked for),
+        except in a search that reads its candidates from the CUDA activity
+        trace (``traces_candidates``): there at least what its readings
+        repeat to at ``perf`` (``pattern_search.trace_tie_tolerance``), so a
+        delta of 0 no longer switches the stop off in such a search. That
+        timer resolves steps far smaller than it repeats to: a child can
+        read a little below the best with no difference between the two,
+        which the fixed delta counts as an improvement, so the stop is put
+        off for as long as such readings keep coming. (The CUDA events it
+        replaces read a short kernel in steps of about 2 us, where most
+        such children read the same value.)
+
+        The tolerance's measured part, the spread of the population's
+        re-readings, needs members that were read twice. A comparison of
+        ``evolve_population`` re-times a parent and child that both read
+        within the re-timing threshold of the best (``compare``), so this
+        search has them where that threshold is above 1; the surrogate
+        hybrid's generations re-time no member, so its tolerance is the
+        larger of the delta, the floor and the clock's ticks.
+
+        Which child replaces its parent is unchanged, a lower reading does
+        on either timer: a member replaced on a tie stays among the lowest
+        readings of the history that the final verification draws its
+        finalists from (``final_rebenchmark_best``).
+        """
+        if self.min_improvement_delta is None or not self.traces_candidates:
+            return self.min_improvement_delta
+        return max(self.min_improvement_delta, trace_tie_tolerance(self, perf))
 
     def _autotune(self) -> Config:
         early_stopping_enabled = (
@@ -300,6 +353,8 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             self.generations_without_improvement = 0
 
         for i in self._budgeted_range(2, self.max_generations):
+            if not self._population_can_mutate():
+                break
             self.set_generation(i)
             self.log(f"Generation {i} starting")
             replaced = self.evolve_population()

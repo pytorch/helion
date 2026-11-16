@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import enum
 import math
+import statistics
 from typing import TYPE_CHECKING
 
 from .. import exc
@@ -9,10 +10,12 @@ from ..runtime.config_cache import ConfigSet
 from .base_search import PopulationBasedSearch
 from .base_search import PopulationMember
 from .base_search import performance
+from .benchmarking import KERNEL_TRACE_TICK_US
 from .compiler_coverage import coverage_policy
 from .effort_profile import PATTERN_SEARCH_DEFAULTS
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import MutableSet
     from collections.abc import Sequence
@@ -24,6 +27,109 @@ if TYPE_CHECKING:
     from .base_search import _AutotunableKernel
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+
+
+# A search that reads its candidates from the CUDA activity trace
+# (``PopulationBasedSearch.traces_candidates``) moves on from an incumbent
+# only for a step beyond this many spreads of the population's re-readings
+# (``rereading_spread``): the best of a few hundred readings of one config
+# sits about three spreads of a re-reading below another reading of it.
+_TIE_REREADING_SPREADS = 3.0
+# ... and never for less than this fraction: two steady windows of one config
+# read 0.3-0.5% apart (``base_search``'s final-selection tolerance) ...
+_TIE_FLOOR = 0.005
+# ... or than this many steps of the trace's clock (``KERNEL_TRACE_TICK_US``).
+# A window's median sits on a tick or half-way between two, and a config that
+# sits near a tick's edge reads one tick or the next from window to window
+# (1.6% of a 2 us kernel): of 24 re-readings of an unchanged 1.98 us kernel,
+# 3 read one tick below the other 21. A step of one tick is therefore a tie
+# however many re-readings repeat to the bit, and one of two ticks is not.
+_TIE_TICKS = 1.5
+# Fewer re-read members than this say nothing about the spread.
+_TIE_MIN_REREADINGS = 16
+# The spread is the deviation that this share of the re-readings stay within,
+# in units of the normal deviation with that coverage.
+_SPREAD_COVERAGE = 0.9
+_SPREAD_COVERAGE_DEVIATIONS = statistics.NormalDist().inv_cdf(
+    0.5 + _SPREAD_COVERAGE / 2.0
+)
+
+
+def rereading_spread(members: Iterable[PopulationMember]) -> float:
+    """How far a config's reading moves when it is taken again, as a
+    fraction of the reading.
+
+    A pattern search's generations re-time the members near their best
+    (``rebenchmark_population``), and a differential-evolution comparison
+    re-times a parent and child that both read within the re-timing
+    threshold of the best (``PopulationBasedSearch.compare``), so those
+    members hold two readings of one config: the spread is taken from
+    last / previous - 1 around its median,
+    which takes out what moved every re-reading alike (a longer window, a
+    warmer device). It is the deviation that ``_SPREAD_COVERAGE`` of them
+    stay within, scaled to a normal distribution's standard deviation: the
+    tenth beyond it (bimodal outliers) does not count, and readings that sit
+    on a clock's ticks neither zero it nor inflate it. (A median absolute
+    deviation is zero as soon as half of the re-readings repeat to the bit,
+    and a tick and a half once more than half of them move by one.) ``0.0``
+    when fewer than ``_TIE_MIN_REREADINGS`` members were read twice (always
+    in the surrogate hybrid of differential evolution, whose generations
+    re-time no member).
+
+    Only two readings the member took itself count
+    (``PopulationMember.timer_readings_from``). A config settled with a copy
+    of an earlier candidate's reading holds that copy first, which pairs
+    with nothing; and no member holds readings of two timers: a search that
+    moves to the trace timer replaces its members' CUDA-event readings
+    (``PopulationBasedSearch._read_on_settled_timer``), which sit 4-5 us
+    above the trace readings of one kernel and, left in, put the spread at
+    tens of percent.
+    """
+    steps = [
+        member.perfs[-1] / member.perfs[-2] - 1.0
+        for member in members
+        if len(member.perfs) - member.timer_readings_from >= 2
+        and math.isfinite(member.perfs[-1])
+        and math.isfinite(member.perfs[-2])
+        and member.perfs[-2] > 0.0
+    ]
+    if len(steps) < _TIE_MIN_REREADINGS:
+        return 0.0
+    center = statistics.median(steps)
+    deviations = sorted(abs(step - center) for step in steps)
+    position = _SPREAD_COVERAGE * (len(deviations) - 1)
+    below = math.floor(position)
+    above = min(below + 1, len(deviations) - 1)
+    covered = deviations[below] + (position - below) * (
+        deviations[above] - deviations[below]
+    )
+    return covered / _SPREAD_COVERAGE_DEVIATIONS
+
+
+def trace_tie_tolerance(search: PopulationBasedSearch, perf: float) -> float:
+    """The relative step from a reading of ``perf`` that the readings of a
+    search timed from the CUDA activity trace
+    (``PopulationBasedSearch.traces_candidates``) repeat to: the largest of
+    ``_TIE_REREADING_SPREADS`` spreads of the current population's
+    re-readings (``rereading_spread``, over its kernels: a source alias
+    repeats its kernel's re-reading), ``_TIE_FLOOR`` and ``_TIE_TICKS`` steps
+    of the trace's clock at ``perf``. A step within it is a tie for the
+    pattern paths and the polish descent (``PatternSearch._reading_tolerance``)
+    and no improvement for the early stop of the differential-evolution
+    searches (``DifferentialEvolutionSearch._stop_tolerance``)."""
+    ticks = 0.0
+    if math.isfinite(perf) and perf > 0.0:
+        ticks = _TIE_TICKS * KERNEL_TRACE_TICK_US / (perf * 1000.0)
+    kernels = [
+        member
+        for member in search.population
+        if search._kernel_holder(member, search.population) is member
+    ]
+    return max(
+        _TIE_FLOOR,
+        ticks,
+        _TIE_REREADING_SPREADS * rereading_spread(kernels),
+    )
 
 
 class InitialPopulationStrategy(enum.Enum):
@@ -88,7 +194,12 @@ class PatternSearch(PopulationBasedSearch):
             initial_population: The number of random configurations to generate for the initial population.
             copies: Count of top Configs to run pattern search on.
             max_generations: The maximum number of generations to run.
-            min_improvement_delta: Relative stop threshold; stop if abs(best/current - 1) < this.
+            min_improvement_delta: Relative stop threshold; a path stops if
+                abs(best/current - 1) < this. A search that times its
+                candidates from the CUDA activity trace stops on the larger
+                of this and what its readings repeat to
+                (``_reading_tolerance``), so 0 no longer takes every step
+                there.
             initial_population_strategy: Strategy for generating the initial population.
                 FROM_RANDOM generates initial_population random configs.
                 FROM_BEST_AVAILABLE uses cached configs from prior runs, and fills the
@@ -479,8 +590,11 @@ class PatternSearch(PopulationBasedSearch):
         """
         Check if early stopping criteria are met for the search copy
 
-        Early stops if either the best config has not changed or if
-        the relative improvement is smaller than a user-specified delta
+        Early stops if either the best config has not changed or if the
+        relative improvement is a tie at the incumbent's reading
+        (``_reading_tolerance``: the user-specified delta, and in a search
+        timed from the CUDA activity trace also what its readings repeat
+        to); a tie beyond the delta is logged
 
         Returns:
             True the search copy is terminated, False otherwise.
@@ -488,30 +602,64 @@ class PatternSearch(PopulationBasedSearch):
         if best is current:
             return True  # no improvement, stop searching
         # Stop if the relative improvement is smaller than a user-specified
-        # delta. (A search without one takes every step, and a reading of
-        # zero has no relative step.)
-        return (
-            self.min_improvement_delta > 0.0
+        # delta, or than the incumbent's readings repeat to. (A search
+        # without a tolerance takes every step, and a reading of zero has no
+        # relative step.)
+        tolerance = self._reading_tolerance(current.perf)
+        if not (
+            tolerance > 0.0
             and current.perf != 0.0
-            and self._reads_level(best.perf, current.perf)
-        )
+            and self._reads_level(best.perf, current.perf, tolerance)
+        ):
+            return False
+        step = abs(best.perf / current.perf - 1.0)
+        if step >= self.min_improvement_delta:
+            self.log(
+                f"A step of {step:.2%} from {self.format_performance(current.perf)} "
+                f"is a tie: readings of one config repeat to {tolerance:.2%}"
+            )
+        return True
 
-    def _reads_level(self, perf: float, reference: float) -> bool:
+    def _reads_level(
+        self, perf: float, reference: float, tolerance: float | None = None
+    ) -> bool:
         """Whether a reading of ``perf`` is a tie with ``reference``: equal
-        to it, or within ``min_improvement_delta`` of it in either
-        direction.  It is the step ``_check_early_stopping`` does not count
-        as an improvement and the one the polish descent crosses to new
-        code: one definition of an improvement for the search paths and for
-        the polish descent, its level moves and its patience included."""
+        to it, or within ``tolerance`` of it in either direction
+        (``_reading_tolerance`` at ``reference`` unless given: a caller that
+        compares many readings with one reference computes it once).  It is
+        the step ``_check_early_stopping`` does not count as an improvement
+        and the one the polish descent crosses to new code, by one
+        tolerance."""
         if not math.isfinite(perf) or not math.isfinite(reference):
             return False
         if perf == reference:
             return True
+        if tolerance is None:
+            tolerance = self._reading_tolerance(reference)
         return (
-            self.min_improvement_delta > 0.0
+            tolerance > 0.0
             and reference != 0.0
-            and abs(perf / reference - 1.0) < self.min_improvement_delta
+            and abs(perf / reference - 1.0) < tolerance
         )
+
+    def _reading_tolerance(self, perf: float) -> float:
+        """The relative step from a reading of ``perf`` below which two
+        readings are a tie: the one definition of an improvement for the
+        search paths and for the polish descent, its level moves and its
+        patience included.
+
+        ``min_improvement_delta``, except in a search that reads its
+        candidates from the CUDA activity trace (``traces_candidates``; a
+        search timed with CUDA events keeps the fixed delta whatever its
+        backend): that timer resolves steps far smaller than it repeats to,
+        so a path that took every such step as an improvement would walk on
+        noise through all its generations and polish rounds. There a step
+        also has to exceed what the search's readings repeat to at ``perf``
+        (``trace_tie_tolerance``).
+        """
+        if not self.traces_candidates:
+            return self.min_improvement_delta
+        return max(self.min_improvement_delta, trace_tie_tolerance(self, perf))
 
     def shrink_neighbors(self, neighbors: list[FlatConfig]) -> list[FlatConfig]:
         if self.num_neighbors_cap > 0:
