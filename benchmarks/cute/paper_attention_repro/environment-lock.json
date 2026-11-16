@@ -1,0 +1,286 @@
+{
+  "schema_version": 1,
+  "architecture": "aarch64",
+  "python": {
+    "source_url": "https://www.python.org/ftp/python/3.12.14/Python-3.12.14.tgz",
+    "source_sha256": "6c6df908d2c3fd24e6d76869e92542abd0f33aec9dfc18df8875f89660286d43",
+    "configure": [
+      "./configure",
+      "--prefix=/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-3.12.14",
+      "--enable-shared",
+      "--with-ensurepip=install"
+    ],
+    "build_environment": {
+      "CPPFLAGS": "-I/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-deps/include",
+      "LDFLAGS": "-L/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-deps/lib -Wl,-rpath,/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-deps/lib -Wl,-rpath,/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-3.12.14/lib",
+      "PKG_CONFIG_PATH": "/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-deps/lib/pkgconfig:/data/users/shangdiy/helion-attention_gym_gb300/artifacts/paper-matched-gb300-20261021T212533Z/runtime/python-deps/lib64/pkgconfig"
+    },
+    "jobs": 8
+  },
+  "software_versions": {
+    "forward_fused": {
+      "python": "3.12.14",
+      "torch": "2.15.0.dev20260829+cu130",
+      "triton": "3.8.0+gitb252c7c4",
+      "cudnn": "9.24.0.43",
+      "cuda": "13.0",
+      "cutlass": "4.7.0",
+      "flash-attn-4": "4.0.0b19",
+      "quack-kernels": "0.6.4",
+      "cuda-python": "13.3.1",
+      "cuda-bindings": "13.3.1",
+      "cuda-core": "1.0.1"
+    },
+    "forward_sparse": {
+      "python": "3.12.14",
+      "torch": "2.15.0.dev20260829+cu130",
+      "triton": "3.8.0+gitb252c7c4",
+      "cudnn": "9.24.0.43",
+      "cuda": "13.0",
+      "cutlass": "4.7.0",
+      "flash-attn-4": "4.0.0b19",
+      "quack-kernels": "0.6.4",
+      "cuda-python": "13.3.1",
+      "cuda-bindings": "13.3.1",
+      "cuda-core": "1.0.1"
+    },
+    "backward": {
+      "python": "3.12.14",
+      "torch": "2.16.0.dev20261014+cu130",
+      "triton": "3.9.0+gitfc8d31a5",
+      "cudnn": "9.26.0.51",
+      "cuda": "13.0",
+      "cutlass": "4.7.0",
+      "flash-attn-4": "4.0.0b19",
+      "quack-kernels": "0.6.4",
+      "cuda-python": "13.3.1",
+      "cuda-bindings": "13.3.1",
+      "cuda-core": "1.0.1"
+    }
+  },
+  "wheels": [
+    {
+      "package": "nvidia-cutlass-dsl",
+      "version": "4.7.0",
+      "filename": "nvidia_cutlass_dsl-4.7.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/a3/a7/597b08f293989c3774621f668918bfb6c6c308510cad000abd8ee674f2d4/nvidia_cutlass_dsl-4.7.0-py3-none-any.whl",
+      "sha256": "f96e35c1393a8afa9a20cada1aa08fdca16d673852f3274144e3e81693f13a14",
+      "size": 10459
+    },
+    {
+      "package": "nvidia-cutlass-dsl-libs-base",
+      "version": "4.7.0",
+      "filename": "nvidia_cutlass_dsl_libs_base-4.7.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/bf/d5/9cd7aa0754ba66f4e7b89c169c235cc42333a2affe32d537bd0d736efb1f/nvidia_cutlass_dsl_libs_base-4.7.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "sha256": "c8dfdce6e55cd856fd3ace47b881c41e8f71fbed396ccdeb7870d19356f16af7",
+      "size": 3328631
+    },
+    {
+      "package": "nvidia-cutlass-dsl-libs-core",
+      "version": "4.7.0",
+      "filename": "nvidia_cutlass_dsl_libs_core-4.7.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/76/ce/75a7df4b90256f6924f8355e25bb52351750b2ce654cc926dd6a3aa1e354/nvidia_cutlass_dsl_libs_core-4.7.0-py3-none-any.whl",
+      "sha256": "3c6a128ce314aca3f332eabcb0e55a2c4c3aa951e336584a7aeb2b013bed4474",
+      "size": 1227603
+    },
+    {
+      "package": "nvidia-cutlass-dsl-libs-cu13",
+      "version": "4.7.0",
+      "filename": "nvidia_cutlass_dsl_libs_cu13-4.7.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/85/30/ef2f0f30a27bc0fe1303242c213c278dcb8cdffa9eec72e3ccef2c3c294c/nvidia_cutlass_dsl_libs_cu13-4.7.0-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "sha256": "b037afbba54ba3a1d96502ea70048bee57ab598c63df5158ebc9f0d5b1c0790a",
+      "size": 86972936
+    },
+    {
+      "package": "flash-attn-4",
+      "version": "4.0.0b19",
+      "filename": "flash_attn_4-4.0.0b19-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/e4/0e/5298d57e3efd5b7a07755fa9009fc1f6efc0f2d422915113eb7288a6552b/flash_attn_4-4.0.0b19-py3-none-any.whl",
+      "sha256": "bc3856e018fa32e2b833726566641e51d02d45f2d444849937276a46c01653a2",
+      "size": 377662
+    },
+    {
+      "package": "quack-kernels",
+      "version": "0.6.4",
+      "filename": "quack_kernels-0.6.4-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/28/f5/36ec7e075e90bd92bdf30fee0606f189348c2bbb0af6aebaf7382927c622/quack_kernels-0.6.4-py3-none-any.whl",
+      "sha256": "e77c5d1f1299b0b38487fe8737df6c6975daa16bca7f7eb883bd1a74d09e7e78",
+      "size": 728458
+    },
+    {
+      "package": "cuda-bindings",
+      "version": "13.3.1",
+      "filename": "cuda_bindings-13.3.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/ce/67/5e7dba1ba576dd73da5dee894ca076ca5e959450dfff66d6d510a255d1f7/cuda_bindings-13.3.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "c7855c4868aabc0cfae28abbe83d56734bdfbd08f08fc234ac1912a12858bf49",
+      "size": 6025351
+    },
+    {
+      "package": "cuda-core",
+      "version": "1.0.1",
+      "filename": "cuda_core-1.0.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/0d/a0/1daeae599cadd612689dbbf70d7da1c01883964fc2fbc7386f3c630a68cf/cuda_core-1.0.1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "6816dc020aee6103d8071bc02d8e4e1d91f2b49596f666896d608d92224d79d1",
+      "size": 4789856
+    },
+    {
+      "package": "cuda-python",
+      "version": "13.3.1",
+      "filename": "cuda_python-13.3.1-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/38/31/7ff3f7768eded7535c621abc2fecb9d181a34ea4cae3afe682feb796f242/cuda_python-13.3.1-py3-none-any.whl",
+      "sha256": "280b014139ab447b6dd70a377db1596f310d6e887d9d342e6651b919ec145fb3",
+      "size": 8295
+    },
+    {
+      "package": "numpy",
+      "version": "2.5.2",
+      "filename": "numpy-2.5.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/e5/21/4947e0e9d6c9fc2e2ff15b8949049ee44f63adb9cacc729ab8793f97e712/numpy-2.5.2-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "8ee9c4eeb8454b3660a8b53493563c3e121c2fc94fbd72b848ef814ed7b676a9",
+      "size": 15612696
+    },
+    {
+      "package": "numpy",
+      "version": "2.5.2",
+      "filename": "numpy-2.5.2-cp312-cp312-musllinux_1_2_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/14/25/3f0be4c1b9fdf5dd5e708a6806978564d7c46a055c000496309ff2a2f8af/numpy-2.5.2-cp312-cp312-musllinux_1_2_aarch64.whl",
+      "sha256": "7999d4ddb0c4025018373fd787510d46e04c769467af22869707b3c1cfd459ab",
+      "size": 16974396
+    },
+    {
+      "package": "matplotlib",
+      "version": "3.11.1",
+      "filename": "matplotlib-3.11.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/88/90/4e10e033d9b66589d8ed98b84c95cdbb57033d57c1f41339d7393dbd2f2e/matplotlib-3.11.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "c52f7ad20ef476806ed212380b1d54d20310c8b86bdc2c9a68b51f0024a44472",
+      "size": 10842559
+    },
+    {
+      "package": "apache-tvm-ffi",
+      "version": "0.1.13.post3",
+      "filename": "apache_tvm_ffi-0.1.13.post3-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/a6/c4/db872a3d3ff7ba718cc76b8076b4dfd80eb5b6a36ff5b131aca443754e66/apache_tvm_ffi-0.1.13.post3-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "c108c26935a609b636bb1a53df6d7c53ab776550ad04f17d6dcb35e883112f78",
+      "size": 2755741
+    },
+    {
+      "package": "torch-c-dlpack-ext",
+      "version": "0.1.5",
+      "filename": "torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/87/06/8d760997307a5c3be4384424667bf31aae0a42060838c532c7d846516175/torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "3562ee411258676f9c38b8ad39306d1c8d027b6a86f6a87c920d2d009a9d1510",
+      "size": 443069
+    },
+    {
+      "package": "torch",
+      "version": "2.15.0.dev20260829+cu130",
+      "filename": "torch-2.15.0.dev20260829+cu130-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "url": "https://download-r2.pytorch.org/whl/nightly/cu130/torch-2.15.0.dev20260829%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "sha256": "567fee5fcf6dbf8a743590405bbaec221a5e43f7b4685272468d4fe49fd563d8",
+      "size": 566536104
+    },
+    {
+      "package": "torch",
+      "version": "2.16.0.dev20261014+cu130",
+      "filename": "torch-2.16.0.dev20261014+cu130-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "url": "https://download-r2.pytorch.org/whl/nightly/cu130/torch-2.16.0.dev20261014%2Bcu130-cp312-cp312-manylinux_2_28_aarch64.whl",
+      "sha256": "a7c54eb226b3dbe22523e17beae403f227b0a9f44b06b2853ad08c01c16628fb",
+      "size": 572722385
+    },
+    {
+      "package": "triton",
+      "version": "3.8.0+gitb252c7c4",
+      "filename": "triton-3.8.0+gitb252c7c4-cp312-cp312-linux_aarch64.whl",
+      "url": "https://download-r2.pytorch.org/whl/nightly/triton-3.8.0%2Bgitb252c7c4-cp312-cp312-linux_aarch64.whl",
+      "sha256": "51417e9d466520cd67f97229ae47a84c88ceddc77f8005c32f02d452e9ffadda",
+      "size": 225224987
+    },
+    {
+      "package": "triton",
+      "version": "3.9.0+gitfc8d31a5",
+      "filename": "triton-3.9.0+gitfc8d31a5-cp312-abi3-linux_aarch64.whl",
+      "url": "https://download-r2.pytorch.org/whl/nightly/triton-3.9.0%2Bgitfc8d31a5-cp312-abi3-linux_aarch64.whl",
+      "sha256": "c7c4c34ef2eaf6b06d553b90ba5f992b5f92d6de96f4e6922c471b95cc3f7ebf",
+      "size": 263216647
+    },
+    {
+      "package": "nvidia-cudnn-cu13",
+      "version": "9.24.0.43",
+      "filename": "nvidia_cudnn_cu13-9.24.0.43-py3-none-manylinux_2_27_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/ca/30/7c257e3d5cb4fecb147b93895c66e29c93f8e76d74b45bb418ff0587c4ec/nvidia_cudnn_cu13-9.24.0.43-py3-none-manylinux_2_27_aarch64.whl",
+      "sha256": "a6812a554a1ff0413e9c52b84c26c050380649ab9615f9c16bded368ce9f421f",
+      "size": 650976863
+    },
+    {
+      "package": "nvidia-cudnn-cu13",
+      "version": "9.26.0.51",
+      "filename": "nvidia_cudnn_cu13-9.26.0.51-py3-none-manylinux_2_27_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/c5/1c/01e1dd3dec6ffe0baaff7e722b8946d867353d05a01301f128f1730fde0b/nvidia_cudnn_cu13-9.26.0.51-py3-none-manylinux_2_27_aarch64.whl",
+      "sha256": "8e5b4f5eccff721416f70ecf4353172fc4d5cdd8ca869fe6f983a4a5b0147b20",
+      "size": 595329497
+    },
+    {
+      "package": "nvidia-nvjitlink",
+      "version": "13.4.46rc1",
+      "filename": "nvidia_nvjitlink-13.4.46rc1-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "url": "https://files.pythonhosted.org/packages/9a/d6/b9a29e3a57b2541467c24dc283a4e1f324bb0bfe49f56848030a6332844c/nvidia_nvjitlink-13.4.46rc1-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "sha256": "1f57c6e18959452f7e3e6411ee963c666d97160a02822f0896bcac68ed0a00ab",
+      "size": 40421486
+    },
+    {
+      "package": "pytest",
+      "version": "9.1.1",
+      "filename": "pytest-9.1.1-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl",
+      "sha256": "37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c",
+      "size": 386536
+    }
+  ],
+  "dependency_overrides": {
+    "reason": "Quack0.6.4 wheel metadata pins CuTe4.6.2; paper measured and requested stack is CuTe4.7.0 with Quack0.6.4 from separate no-deps wheel contents.",
+    "packages": {
+      "nvidia-cutlass-dsl": "4.7.0"
+    }
+  },
+  "sources": {
+    "forward_fused": {
+      "helion_commit": "a16ffc60cd6397f3b2bee6895a2609c7b0a7d094",
+      "helion_tree": "da49f9ffbb2b75c474593bc960c3f595940ded7c",
+      "helion_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "harness_commit": "b530d94b233f94f620d92be73832824fbc00f09d",
+      "harness_tree": "ee7944de3a303c11f07161a038067b33e57f0faa",
+      "harness_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "harness_patch_sha256": null,
+      "source_status": "compatible_archived_cleanup",
+      "exact_code": false,
+      "code_deviation": "Original forward measured compiler refs are unavailable; using archived cleanup a16ffc60 on upstream063d8f58f with final item_words/s_resident features; this is a declared compatible replacement."
+    },
+    "forward_sparse": {
+      "helion_commit": "a16ffc60cd6397f3b2bee6895a2609c7b0a7d094",
+      "helion_tree": "da49f9ffbb2b75c474593bc960c3f595940ded7c",
+      "helion_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "harness_commit": "f7844a4ae681c9e65b820b1cfea8e1a56fa07ccc",
+      "harness_tree": "a4f3018e5a7ca6a21a078e683ccec497ca942194",
+      "harness_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "harness_patch_sha256": null,
+      "source_status": "compatible_archived_cleanup",
+      "exact_code": false,
+      "code_deviation": "Original forward measured compiler refs are unavailable; using archived cleanup a16ffc60 on upstream063d8f58f with final item_words/s_resident features; this is a declared compatible replacement."
+    },
+    "backward": {
+      "helion_commit": "61c840f3963a0d98ae15321d03ccdb977be81698",
+      "helion_tree": "d8505ffe7ed89eda717d4d3e5483a70f1c28c5fe",
+      "helion_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "harness_commit": "d8396790869c4963379fe6be68b1372128cc910d",
+      "harness_tree": "da5ac21049d664d3b0b9c9ab399069968f65e40d",
+      "harness_diff_sha256": "999cad67661d89b433ad4d8b6d1393cbe74e738c738ebb8d5e1553bbe06742dd",
+      "harness_patch_sha256": "999cad67661d89b433ad4d8b6d1393cbe74e738c738ebb8d5e1553bbe06742dd",
+      "source_status": "exact_archived_measured_tree",
+      "exact_code": true,
+      "code_deviation": null
+    }
+  },
+  "runtime_dependencies": {
+    "pytest": "9.1.1"
+  }
+}
