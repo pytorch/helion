@@ -13826,6 +13826,22 @@ def widened_into_mm(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def widened_into_scaled_mm(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    m, k2 = a.shape
+    n = w.size(1)
+    kh = k2 // 2
+    out = torch.zeros([m, n], dtype=torch.float32, device=a.device)
+    bk = hl.register_block_size(kh)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(kh, block_size=bk):
+            s = 2 * tk.begin
+            acc = acc + 2 * torch.mm(a[tm, s : s + 2 * bk], w[s : s + 2 * bk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def stack_rows_two_tiles(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, kh = x.shape
     out = torch.zeros([m, 2 * kh], dtype=x.dtype, device=x.device)
@@ -14526,16 +14542,19 @@ class TestMetalFactoredDims(unittest.TestCase):
         self.assertIn("iota_part_1", code)
         self.assertIn("load_part_1", code)
 
-    def test_matmul_over_parts_rejects(self) -> None:
-        """A matmul over parts that the MPP planner doesn't lower (a
-        torch.mm; test_metal_mpp_matmul.py covers the ones it does)."""
+    def test_matmul_over_parts(self) -> None:
+        """``acc + torch.mm`` over parts folds into an addmm the MPP planner
+        lowers; a product scaled before it's added has no such form, and is
+        rejected (test_metal_mpp_matmul.py covers the ones it lowers)."""
+        a, w = torch.randn(5, 16, device=DEVICE), torch.randn(16, 6, device=DEVICE)
+        torch.testing.assert_close(widened_into_mm(a, w), a @ w)
         message = (
             r"a matmul over a dim held as per-thread parts \(a widened hl\.arange\(\) "
             r"slice or a merged torch\.stack\) that the cooperative MPP lowering "
             r"doesn't admit; "
         )
         self._assert_rejected(
-            widened_into_mm, (torch.randn(5, 16), torch.randn(16, 6)), message
+            widened_into_scaled_mm, (torch.randn(5, 16), torch.randn(16, 6)), message
         )
 
     def test_stack_inputs_over_other_blocks_reject(self) -> None:

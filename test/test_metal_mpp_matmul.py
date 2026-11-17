@@ -6737,14 +6737,24 @@ class TestMppRootAddmmRejects(_MppCase):
             None,
             "two MPP K loops whose accumulators start from one value",
         )
-        for kernel in (root_mm_overwrite, root_mm_plus):
-            self._rejects(
-                kernel,
-                (xf, yf),
-                None,
-                "a matmul with no acc over a tiled K, whose result is each K "
-                "tile's product alone",
-            )
+        no_acc = (
+            "a matmul with no acc over a tiled K, whose result is each K "
+            "tile's product alone"
+        )
+        self._rejects(root_mm_overwrite, (xf, yf), None, no_acc)
+        # acc + mm over float16 operands rounds each tile's product to
+        # float16 first, which an addmm would skip: it isn't folded.
+        self._rejects(root_mm_plus, (x, y), None, no_acc)
+
+    def test_acc_plus_mm_folds_into_addmm(self) -> None:
+        """``acc = acc + mm(a, b)``, product and carry both float32, is the
+        accumulation ``addmm(acc, a, b)`` means, and lowers as one."""
+        xf, yf = self.x.float(), self.y.float()
+        for config in (None, helion.Config(block_sizes=[16, 16, 16])):
+            with self.subTest(config=config):
+                out, code, _ = _run(root_mm_plus, (xf, yf), config)
+                self.assertEqual(code.count("_helion_mpp_acc("), 1)
+                _close(out, _d(xf) @ _d(yf))
 
     def test_acc_dtype(self) -> None:
         for dtype in (torch.float16, torch.bfloat16):

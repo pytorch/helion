@@ -894,6 +894,10 @@ class MetalBackend(Backend):
         device_ir: DeviceIR,
         analysis: DeviceIRAnalysis | None = None,
     ) -> None:
+        if stage is DeviceIRStage.BEFORE_GRAPH_LOWERINGS:
+            from .accumulate_matmul import fold_accumulating_matmuls
+
+            fold_accumulating_matmuls(device_ir)
         if stage is DeviceIRStage.AFTER_ANALYSIS:
             # Imported here: the backend registry imports this module while
             # compile_environment loads, and grid_budget imports
