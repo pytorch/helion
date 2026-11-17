@@ -34,6 +34,7 @@ from torch._inductor.virtualized import V
 from torch._ops import OpOverload
 from torch._prims_common import ELEMENTWISE_TYPE_PROMOTION_KIND
 from torch._prims_common import elementwise_dtypes
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 from torch.fx._lazy_graph_module import _LazyGraphModule
 from torch.fx.experimental import proxy_tensor
 from torch.fx.experimental.sym_node import SymNode
@@ -353,7 +354,21 @@ def prepare_node_lowering(
     input_names: list[str] = []
     input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = {}
     with _patched_inductor_config():
-        with node.meta["location"], graph_lowering.set_current_node(node):
+        with (
+            node.meta["location"],
+            graph_lowering.set_current_node(node),
+            # Inductor runs its lowerings outside the fake mode, which it
+            # enters itself where it needs fake tensors.  Under it, a host
+            # computation in a lowering returns a symbol, not a number: the
+            # scalar of ``1.0 - x`` on a float16 MPS tensor, which
+            # ``promote_constants`` rounds with ``torch.tensor(v).item()``,
+            # lowered as an unbacked SymFloat the kernel can't name.  Such a
+            # computation allocates on the default device, a compile's
+            # DeviceContext sets: CPU instead, where it is a number too and
+            # starts no GPU (``get_promoted_dtype`` allocates as well).
+            unset_fake_temporarily(),
+            torch.device("cpu"),
+        ):
             try:
                 result = graph_lowering.call_function(
                     # pyrefly: ignore [bad-argument-type]

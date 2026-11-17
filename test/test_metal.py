@@ -944,10 +944,27 @@ def _bits_mismatch(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (out.view(torch.int16) != ref.view(torch.int16)) & ~nan
 
 
+@helion.kernel(backend="metal", autotune_effort="none")
+def scalar_minus(x: torch.Tensor) -> torch.Tensor:
+    """A Python float minus a 16-bit tensor: inductor rounds the scalar to
+    the tensor's dtype on MPS."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = 1.0 - x[tile]
+    return out
+
+
 @_requires_darwin
 class TestMetalBfloatConversion(unittest.TestCase):
     """Every conversion to bfloat goes through float, the way torch CPU and
     CUDA convert, since c10's BFloat16 is built from a float only."""
+
+    def test_scalar_minus_16_bit(self) -> None:
+        """The scalar is a number in the kernel, not a symbol."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1000, device=DEVICE, dtype=dtype)
+                torch.testing.assert_close(scalar_minus(x), 1.0 - x)
 
     def test_integers_round_through_float(self) -> None:
         # The large values are ones where a direct int -> bfloat cast rounds
@@ -1155,6 +1172,35 @@ def gather_square_third(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def tile_ends_from_3(x: torch.Tensor) -> torch.Tensor:
+    """``tile.end`` of a 1-D tile over a range starting off a multiple of
+    its block size."""
+    out = torch.zeros_like(x)
+    for tile in hl.tile(3, x.size(0)):
+        out[tile] = x[tile] * 0 + tile.end
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def tile_begins_from_3(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tile in hl.tile(3, x.size(0)):
+        out[tile] = x[tile] * 0 + tile.begin
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def tile_begins(x: torch.Tensor) -> torch.Tensor:
+    """``tile.begin`` of a 1-D tile, which takes the per-thread flattened
+    strategy."""
+    (n,) = x.shape
+    out = torch.zeros_like(x)
+    for tile in hl.tile(n):
+        out[tile] = x[tile] * 0 + tile.begin
+    return out
+
+
 @_requires_darwin
 class TestMetalIndexArithmetic(unittest.TestCase):
     """Integer ``//`` and ``%`` of index values (tile offsets, block sizes)
@@ -1189,6 +1235,31 @@ class TestMetalIndexArithmetic(unittest.TestCase):
 
     def _scale_rows(self, x: torch.Tensor, factors: list[int]) -> torch.Tensor:
         return x * torch.tensor(factors, device=DEVICE, dtype=x.dtype)[:, None]
+
+    def test_tile_end_from_an_unaligned_start(self) -> None:
+        """Tiles of ``hl.tile(3, n)`` start at 3, 35, 67, ...: every element
+        of a tile reads its end, clamped to n."""
+        x = torch.zeros(100, device=DEVICE)
+        i = torch.arange(100, device=DEVICE)
+        expected = torch.where(
+            i >= 3, torch.clamp(3 + (i - 3) // 32 * 32 + 32, max=100), 0
+        ).float()
+        config = helion.Config(block_sizes=[32])
+        out = tile_ends_from_3.bind((x,)).compile_config(config)(x)
+        torch.testing.assert_close(out, expected)
+
+    def test_tile_begin_is_uniform(self) -> None:
+        """Every element of a tile reads the tile's start, not its own index,
+        also where the range starts off a multiple of the block size."""
+        x = torch.zeros(100, device=DEVICE)
+        config = helion.Config(block_sizes=[32])
+        expected = (torch.arange(100, device=DEVICE) // 32 * 32).float()
+        out = tile_begins.bind((x,)).compile_config(config)(x)
+        torch.testing.assert_close(out, expected)
+        i = torch.arange(100, device=DEVICE)
+        expected = torch.where(i >= 3, 3 + (i - 3) // 32 * 32, 0).float()
+        out = tile_begins_from_3.bind((x,)).compile_config(config)(x)
+        torch.testing.assert_close(out, expected)
 
     def test_floordiv_tile_offset_by_group(self) -> None:
         """A non-power-of-two group: 9 rows in groups of 3."""

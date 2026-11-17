@@ -1981,6 +1981,14 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         self._mask_elision_decided = False
         self._mask_var: str | None = self.new_var("mask", dce=True)
         self._offsets_var = self.new_var("offsets", dce=True)
+        # The step each block's index multiplies the flat offset by
+        # (``_codegen_common``), None for a unit step or a walk over the
+        # range's elements.
+        self._index_steps: dict[int, str | None] = {}
+        # The name that numbers this strategy's tile (the grid's program id,
+        # a device loop's counter), its block size and its range's begin,
+        # recorded by the codegen: a tile's offsets start at number * block.
+        self._tile_number: tuple[str, str, object] | None = None
         self._grid_origin_vars: dict[int, str] = {}
         # The trip count each block's index is decoded from the flat offset
         # with, recorded by the codegen.
@@ -2223,6 +2231,9 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
             step_expr = self._expr_str(step) if step not in (None, 1) else None
             if step_expr is not None and not elementwise_tile:
                 expr = f"({expr}) * ({step_expr})"
+            else:
+                step_expr = None
+            self._index_steps[block_idx] = step_expr
             if begin != 0:
                 expr = f"({self._expr_str(begin)}) + ({expr})"
             statements.append(statement_from_string(f"{block_index_var} = {expr}"))
@@ -2392,6 +2403,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         dtype = env.index_type()
 
         pid_var = state.device_function.new_var("pid_flat", dce=True)
+        self._tile_number = (pid_var, block_size_var, begins[0])
         pids = self.select_pid_strategy()
         if isinstance(state.device_function.pid, ForEachProgramID):
             pids.shared_pid_var = state.device_function.pid.shared_pid_var
@@ -2472,6 +2484,7 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
         env = CompileEnvironment.current()
         dtype = env.index_type()
         lid = self.new_var("lid")
+        self._tile_number = (lid, block_size_var, begins[0])
         numel_str = self._numel_str(state, total_numel)
         end_var = env.backend.cdiv_expr(numel_str, block_size_var, is_device=True)
         # Mirror ``codegen_grid``: a block-size-1 loop axis need not claim a
@@ -4392,11 +4405,19 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         # ``offset_var`` is the per-element index on this strategy, so
         # ``tile.begin`` must not fall back to it (it would broadcast
         # ``w[tile.begin]`` per element). A single lane-looped block records
-        # its uniform ``begin + pid * BLOCK`` base; otherwise (multi-block flattened
-        # tiles, grids without a lane loop) derive the tile start from the
-        # per-element index: tiles are aligned to their static block size, so
-        # ``index - index % BLOCK`` is the same value for every element of the
-        # tile even though it is rendered per element.
+        # its uniform ``begin + pid * BLOCK`` base, and a multi-block
+        # flattened tile takes the per-element coordinate (below). Otherwise
+        # (a grid or device loop without a lane loop) the start comes from
+        # the tile's number (``_tile_number``: the program id or loop counter
+        # the codegen recorded), ``begin + number * BLOCK * step``, the same
+        # name on every thread.  Where no number is recorded, the fallback
+        # derives it from the per-element index: the flat offset counts the
+        # element's position from the range's start, and tiles are aligned
+        # to their static block size there, so ``index - (offsets % BLOCK) *
+        # step`` is the same value for every element of the tile even though
+        # it is rendered per element (``index - index % BLOCK`` would assume
+        # the range starts at a multiple of the block size, which
+        # ``hl.tile(begin, end)`` need not).
         base = self.cute_tile_base_expr(block_idx)
         if base is not None:
             return base
@@ -4415,7 +4436,22 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         index = self.index_var(block_idx)
         if extent == 1:
             return index
-        return f"(({index}) - (({index}) % {extent}))"
+        step = self._index_steps.get(block_idx)
+        if self._tile_number is not None:
+            # From the tile's number, not the element's index: the same name
+            # on every thread, as a store's address at tile.begin must read
+            # to land once (``index`` is ``begin + offsets * step``).
+            number, size, begin = self._tile_number
+            start = f"({number}) * ({size})"
+            if step is not None:
+                start = f"{start} * ({step})"
+            if begin != 0:
+                start = f"({self._expr_str(begin)}) + {start}"
+            return f"({start})"
+        position = f"(({self._offsets_var}) % {extent})"
+        if step is not None:
+            position = f"({position} * ({step}))"
+        return f"(({index}) - {position})"
 
     def cute_lane_axis(self, block_id: int) -> CuteLaneAxis | None:
         """Static thread / lane distribution of a single flattened block.
