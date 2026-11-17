@@ -398,6 +398,7 @@
  "test/test_indexing.py": 141.0,
  "test/test_inline_asm_elementwise.py": 2.9,
  "test/test_inline_asm_reduction_effects.py": 4.7,
+ "test/test_inline_host_helper_block_size.py": 0.1,
  "test/test_inline_triton.py": 0.0,
  "test/test_int64_indexing.py": 3.8,
  "test/test_ir_features.py": 0.5,

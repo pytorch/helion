@@ -1839,9 +1839,9 @@ class DeviceFunction:
             if not suffix.isdigit():
                 continue
             block_id = int(suffix)
-            self.triton_outlined_helper_constexprs[name] = int(
-                environment.block_sizes[block_id].from_config_assert(self.config)
-            )
+            self.triton_outlined_helper_constexprs[name] = environment.block_sizes[
+                block_id
+            ].from_config_int(self.config)
         argument_names = [
             argument.name
             for argument in self.arguments

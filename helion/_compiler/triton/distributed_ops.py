@@ -1209,9 +1209,7 @@ def tagged_tile(
             scale = access.subscript_index_scales[dim]
             offset = cast("int", access.subscript_offsets[dim])
             scalar = access.subscript_is_scalar[dim]
-            block = env.size_hint(
-                env.block_sizes[block_id].from_config_assert(state.config)
-            )
+            block = env.block_sizes[block_id].from_config_int(state.config)
             # A tile steps through the dimension from 0 and tiles it exactly.
             if not scalar and (scale != 1 or offset or shape[dim] % block):
                 raise fallback(f"{access.tensor_name}: a tile not tiling its dim")
@@ -1317,7 +1315,7 @@ def _record_scatter(
     task = root.task(
         {
             block_id: f"{state.codegen.offset_var(block_id)} // "
-            f"{env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))}"
+            f"{env.block_sizes[block_id].from_config_int(state.config)}"
             for block_id in root.axis_order
         }
     )
@@ -1391,10 +1389,9 @@ def _poll_pack(
     for size in output_size:
         block_id = None if isinstance(size, int) else env.resolve_block_id(size)
         if block_id is not None:
-            # A global block size is a SymInt; read its hint, as int() would pin it.
-            size = env.size_hint(
-                env.block_sizes[block_id].from_config_assert(state.config)
-            )
+            # A global block size is a SymInt; from_config_int reads a size
+            # the config fixes without pinning it.
+            size = env.block_sizes[block_id].from_config_int(state.config)
         if not isinstance(size, int):
             return 1
         numel *= size
@@ -1427,7 +1424,7 @@ def _word_poll(
     assert graph is not None
 
     def block_size(block_id: int) -> int:
-        return env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))
+        return env.block_sizes[block_id].from_config_int(state.config)
 
     tile_strategy = state.tile_strategy
     dims = tile_strategy.shape_dims(output_size)
