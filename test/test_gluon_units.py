@@ -6,6 +6,7 @@ kernels' generated Gluon source (``gluon_cpu_codegen``)."""
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 import re
 from types import SimpleNamespace
@@ -15,10 +16,14 @@ import unittest
 
 import pytest
 import torch
+import torch.distributed as dist
+from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
 from helion._compat import gluon_api_available
 from helion._testing import TestCase
+from helion._testing.distributed_kernels import TAGGED_RING
+from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion._testing.gluon_kernels import dot_mm
 from helion._testing.gluon_kernels import mm_then_mm
 from helion._testing.gluon_kernels import nvfp4_mm
@@ -489,6 +494,58 @@ class TestTmemPrefetch(TestCase):
         gated = split.split("def _helion_scale_then_wx_and_f16_vx_producer1")[1]
         gated = gated.split("\ndef ")[0]
         self.assertLess(gated.rindex("ring_skip("), gated.index("ld.acquire"))
+
+
+class TestRingTimeline(TestCase):
+    def test_entry_clock_joins_the_launch_state(self) -> None:
+        """A timeline keeps a ring megakernel with peer launch state: only its
+        entry clock joins the launch state's function, ahead of every epoch
+        read (the peer launch state's too); the entry stamps stay in the body,
+        and the in-band poll's spin ends a wait (its ready stamp follows)."""
+        if dist.is_initialized():
+            self.skipTest("needs exclusive control of the process group")
+        dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
+        self.addCleanup(dist.destroy_process_group)
+        world, m, k, n = 4, 128, 64, 128
+        bf16 = torch.bfloat16
+        args = (
+            torch.zeros(m, world * k, dtype=bf16),
+            torch.zeros(256),
+            torch.ones(m, k, dtype=bf16),
+            torch.ones(world * k, n, dtype=bf16),
+            torch.zeros(256),
+            dist.group.WORLD.group_name,
+            0,
+        )
+        kernel = helion.kernel(
+            tagged_ring_exchange_kernel.fn,
+            autotune_effort="none",
+            static_shapes=True,
+            backend="gluon",
+            megakernel_timeline=os.path.join(os.getcwd(), "unused"),
+        )
+        with (
+            gluon_cpu_codegen(),
+            self.assertLogs("helion.megakernel", "INFO") as logs,
+        ):
+            bound = kernel.bind(args)
+            config = bound.config_spec.default_config().config
+            config.pop("range_warp_specializes")
+            code = bound.to_triton_code(helion.Config(**{**config, **TAGGED_RING}))
+        log = "\n".join(logs.output)
+        self.assertIn("]: 2 tasks\n", log)
+        # 148 workers' 3 words and 12 tasks' 4, 3936 bytes: rounded up.
+        self.assertIn("148 workers, 12 tasks, 4 KiB a launch", log)
+        self.assertEqual(code.count("_helion_ring.tagged_load("), 2)
+        name = "_helion_tagged_ring_exchange_kernel"
+        launch = code.split(f"def {name}_launch(")[1].split("\n@")[0]
+        clock = launch.index("%globaltimer")
+        self.assertLess(clock, launch.index("tile_dependency_epoch ="))
+        self.assertLess(clock, launch.index("tile_dependency_peer_epoch ="))
+        self.assertNotIn("atomic_max", launch)
+        lines = [line for line in code.splitlines() if "# src[" not in line]
+        (ready,) = [i for i, line in enumerate(lines) if "* 4 + 2)" in line]
+        self.assertRegex(lines[ready - 1], r"inband_word\w*, .* = tl\.inline_asm")
 
 
 class TestWorkerRegisters(TestCase):

@@ -1707,9 +1707,9 @@ class RingLowering:
             dead_assignment_elimination(cast("list[ast.AST]", fn.body), df.dce_vars)
             _first_waits(fn.body)
         if launch_state is not None:
-            launch, finish, launch_names = launch_state
+            launch, finish, launch_names, read_names = launch_state
             # Each partition reads the launch state in place of its grid wait.
-            read = f"{', '.join(launch_names)}, = {launch.name}({', '.join(arguments)})"
+            read = f"{', '.join(read_names)}, = {launch.name}({', '.join(arguments)})"
             waits = any(_is_gdc_wait(st) for st in launch.body)
             for fn in functions:
                 at = next((i for i, st in enumerate(fn.body) if _is_gdc_wait(st)), None)
@@ -2201,9 +2201,11 @@ def _ordered_tensors(device_function: DeviceFunction) -> set[str]:
 
 def _launch_state(
     body: ast.FunctionDef, device_function: DeviceFunction
-) -> tuple[ast.FunctionDef, ast.FunctionDef, list[str]] | None:
+) -> tuple[ast.FunctionDef, ast.FunctionDef, list[str], list[str]] | None:
     """The body's per-launch state reads (a function every partition calls) and
-    rewrites (one the kernel calls after the join): (launch, finish, names)."""
+    rewrites (one the kernel calls after the join): (launch, finish, names, the
+    names the launch function returns: names and the timeline's clock reads
+    ahead of the first state read, which so stay right after the grid wait)."""
     launch = device_function.sync_names("launch")
     statements = [
         s
@@ -2217,9 +2219,21 @@ def _launch_state(
     names = [n for s in statements for n in sorted(_stored_names([s]))]
     # The reads and the statements they depend on, in program order.
     prefix = body.body[: body.body.index(statements[-1]) + 1]
+    stamps = device_function.sync_names("stamp")
+    clocks = [
+        s
+        for s in body.body[: body.body.index(statements[0])]
+        if isinstance(s, ast.Assign)
+        and (targets := _stored_names([s]))
+        and targets <= stamps
+    ]
     prologue = [
         cast("ast.stmt", clone_ast(s))
-        for s in _slice(prefix, set(), lambda s: s in statements or _is_gdc_wait(s))
+        for s in _slice(
+            prefix,
+            set(),
+            lambda s: s in statements or s in clocks or _is_gdc_wait(s),
+        )
     ]
     # Every partition runs the reads (they must not write anything); the rewrites
     # sit at the body's top level, one per read.
@@ -2237,13 +2251,18 @@ def _launch_state(
         or not set(names) <= {n for s in rewrites for n in _names(s)}
     ):
         raise RingFallback("the ring: launch state the partitions cannot share")
-    body.body = [s for s in body.body if s not in statements and s not in rewrites]
-    returned = statement_from_string(f"return {', '.join(names)},")
+    body.body = [
+        s
+        for s in body.body
+        if s not in statements and s not in clocks and s not in rewrites
+    ]
+    read = [*names, *(n for s in clocks for n in sorted(_stored_names([s])))]
+    returned = statement_from_string(f"return {', '.join(read)},")
     launch_fn = _function(f"{body.name}_launch", body.args, [*prologue, returned])
     finish_args = cast("ast.arguments", clone_ast(body.args))
     finish_args.args.extend(create_arg(name) for name in names)
     finish = _function(f"{body.name}_finish", finish_args, rewrites)
-    return launch_fn, finish, names
+    return launch_fn, finish, names, read
 
 
 def _function(
