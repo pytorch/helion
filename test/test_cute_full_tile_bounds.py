@@ -11,43 +11,14 @@ import torch
 import helion
 from helion._compiler.cute.full_tile_bounds import FullTilePlan
 from helion._compiler.cute.full_tile_bounds import lower_full_tile_bounds
-from helion._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from helion._compiler.cute.full_tile_bounds import specialize_full_tile_bounds
 from helion._compiler.cute.tensor_layout_relations import TensorLayoutRelation
 from helion._testing import DEVICE
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_codegen import full_tile_launch_plan as _plan
 import helion.language as hl
-
-
-def _plan(
-    prefix="n = input_tensor.numel(); flat = input_tensor.view(-1)",
-    *,
-    grid="((n + BLOCK - 1) // BLOCK,)",
-    block="(4, 1, 1)",
-    arguments="flat, out, n",
-    keyword="block",
-    integer_parameters=("n",),
-    constants=None,
-    rank=1,
-):
-    body = ast.parse(
-        prefix
-        + "\nout = torch.empty_like(flat)\nBLOCK = 8\n"
-        + f"_launcher(kernel, {grid}, {arguments}, {keyword}={block})\n"
-        + "return out\n"
-    ).body
-    return prove_full_tile_launch(
-        body,
-        kernel_name="kernel",
-        parameter_names=("x", "y", "n"),
-        tensor_parameters={"x": rank, "y": rank},
-        integer_parameters=integer_parameters,
-        tensor_inputs={"input_tensor": 2, "other": 2},
-        scalar_inputs={"length", "runtime"},
-        constexpr_values={"BLOCK": 8} if constants is None else constants,
-    )
 
 
 @pytest.mark.parametrize(

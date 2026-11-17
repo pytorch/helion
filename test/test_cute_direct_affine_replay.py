@@ -580,6 +580,50 @@ def test_feature_reduction_rejects_unsupported_marker(statements: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "lane,accepted",
+    [
+        (
+            "cutlass.Int32(cute.arch.thread_idx()[0]) + cutlass.Int32(cute.arch.thread_idx()[1]) * cutlass.Int32(32)",
+            True,
+        ),
+        ("cute.arch.thread_idx()[0] + cute.arch.thread_idx()[1] * 16", False),
+        ("cute.arch.thread_idx()[0] + cute.arch.thread_idx()[1] * 32 + 1", False),
+        ("cute.arch.thread_idx()[1] + cute.arch.thread_idx()[0] * 32", False),
+        ("unknown(cute.arch.thread_idx()[0]) + cute.arch.thread_idx()[1] * 32", False),
+    ],
+)
+def test_physical_feature_warp_marker_and_owner_have_the_same_proof(
+    lane: str, accepted: bool
+) -> None:
+    coordinates = _coordinates(_plan(3, DirectAffineMma.M16N8))
+    statements = _statements(
+        "partial = source_feature * source_feature\n"
+        "reduced = _helion_lane_reduce(partial, 'sum', cutlass.Float32(0), "
+        f"threads_in_group=32, group_span=32, group_count={coordinates.row.thread_extent}, "
+        f"group_lane_expr={lane!r})"
+    )
+    assert (
+        templates_impl._feature_reduction_markers_are_supported(statements, coordinates)
+        is accepted
+    )
+    assert (
+        templates_impl._ordinary_ownership_guard(
+            _expression(f"(({lane}) % 32) < 1"), coordinates.feature
+        )
+        is accepted
+    )
+    if accepted:
+        wrong_count = _statements(
+            ast.unparse(ast.Module(body=list(statements), type_ignores=[])).replace(
+                f"group_count={coordinates.row.thread_extent}", "group_count=99"
+            )
+        )
+        assert not templates_impl._feature_reduction_markers_are_supported(
+            wrong_count, coordinates
+        )
+
+
 def test_dependency_replay_rejects_marker_owned_by_non_reduction_node() -> None:
     graph = torch.fx.Graph()
     source = graph.placeholder("source")
@@ -625,9 +669,31 @@ def test_dependency_replay_rejects_marker_owned_by_non_reduction_node() -> None:
     )
 
 
-def test_feature_reduction_split_is_two_pass_and_all_lane_owned() -> None:
+@pytest.mark.parametrize("physical_group", [False, True])
+def test_feature_reduction_split_is_two_pass_and_all_lane_owned(
+    physical_group: bool,
+) -> None:
+    loop = _feature_reduction_loop()
+    if physical_group:
+        (call,) = [
+            node
+            for node in ast.walk(loop)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_helion_lane_reduce"
+        ]
+        call.keywords.extend(
+            ast.keyword(arg=key, value=ast.Constant(value))
+            for key, value in {
+                "owner_lane": "source_feature_lane",
+                "group_span": 32,
+                "group_count": 4,
+                "group_lane_expr": "cute.arch.thread_idx()[0] + cute.arch.thread_idx()[1] * 32",
+            }.items()
+        )
+    original = ast.dump(loop)
     split = emission_impl._split_feature_reduction_loop(
-        _feature_reduction_loop(),
+        loop,
         {
             "scratch": DirectAffineSharedBuffer(
                 role="scratch",
@@ -639,6 +705,7 @@ def test_feature_reduction_split_is_two_pass_and_all_lane_owned() -> None:
         },
         "lane",
         frozenset(),
+        source_lane="source_feature_lane" if physical_group else None,
     )
 
     assert split is not None
@@ -646,7 +713,9 @@ def test_feature_reduction_split_is_two_pass_and_all_lane_owned() -> None:
     assert source.count("cute.arch.warp_reduction_sum") == 1
     assert "_helion_lane_reduce" not in source
     assert "cute.arch.lane_idx" not in source
+    assert "cute.arch.thread_idx" not in source
     assert source.count("for element in range(4)") == 2
+    assert ast.dump(loop) == original
 
 
 def test_feature_reduction_split_rejects_raw_fallback_and_name_capture() -> None:
@@ -675,6 +744,25 @@ def test_feature_reduction_split_rejects_raw_fallback_and_name_capture() -> None
             "lane",
             frozenset(("reduced_lane_acc",)),
         )
+        is None
+    )
+
+
+def test_feature_reduction_cannot_insert_cta_barriers_in_one_warp() -> None:
+    loop = _feature_reduction_loop()
+    marker = loop.body[2]
+    assert isinstance(marker, ast.Assign) and isinstance(marker.value, ast.Call)
+    marker.value.keywords.append(
+        ast.keyword(arg="owner_lane", value=ast.Constant("element"))
+    )
+    marker.value.args[0] = ast.Name(id="effect_value", ctx=ast.Load())
+    loop.body[2:2] = ast.parse(
+        "effect_value = _cute_inline_asm_elementwise((value,), "
+        "asm='mov.b32 $0, $1;', constraints='=f,f', "
+        "dtype=cutlass.Float32, is_pure=False, pack=1)"
+    ).body
+    assert (
+        emission_impl._split_feature_reduction_loop(loop, {}, "lane", frozenset())
         is None
     )
 
@@ -1360,6 +1448,42 @@ def test_validated_state_rejects_effectful_slot_extent() -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize("shifted", [False, True])
+def test_output_replay_discharges_only_the_proved_physical_writer(
+    shifted: bool,
+) -> None:
+    effect = _step_replay(0).output_effect
+    lane = "cute.arch.thread_idx()[0] + cute.arch.thread_idx()[1] * 32"
+    if shifted:
+        lane += " + 1"
+    effect = dataclasses.replace(
+        effect,
+        statements=_statements(
+            f"if ({lane}) % 32 < 1 and source_row < runtime_rows:\n"
+            "    output_pointer_0(source_row).store(cutlass.BFloat16(logical_value_0))"
+        ),
+    )
+    original = tuple(ast.dump(statement) for statement in effect.statements)
+    result = templates_impl._discharge_output_effect(
+        effect,
+        _coordinates(_plan(3, DirectAffineMma.M16N8)),
+        allow_pre_wrap=False,
+        expected_argument_name=None,
+        expected_rank=1,
+    )
+    assert tuple(ast.dump(statement) for statement in effect.statements) == original
+    if shifted:
+        assert result is None
+    else:
+        assert result is not None
+        assert [ast.unparse(statement) for statement in result.statements] == [
+            (
+                "if source_row < runtime_rows:\n"
+                "    output_pointer_0(source_row).store(cutlass.BFloat16(logical_value_0))"
+            )
+        ]
 
 
 def test_output_replay_rejects_effectful_residual_guard() -> None:

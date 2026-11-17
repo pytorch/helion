@@ -44,13 +44,16 @@ from collections import Counter
 import re
 from typing import cast
 
+from ... import exc
 from ..ast_extension import statement_from_string
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import constexpr_v_loop
 from ._ast_pass_utils import loop_extent
 from ._ast_pass_utils import names_read
+from ._ast_pass_utils import names_written
 from .reduce_call import CLUSTER_REDUCES
 from .reduce_call import LANE_FOLD_REDUCES
+from .unroll_lane_loads import _loop_trips
 
 # Warp-reduction call attribute names recognised by this pass.  Each maps
 # to the identity element used for the per-thread V-fold accumulator.
@@ -672,6 +675,64 @@ def _replace_reduce_input(
     return new_stmt
 
 
+def _per_lane_reduce_escape(vloop: ast.For) -> str | None:
+    """Why a V-loop the hoist leaves in place computes the wrong values, or
+    None.
+
+    Left in a vector lane loop (``vec_lane_*``: the elements of one packet,
+    which the tile strategy walks), each cross-thread reduce combines one V
+    lane of every thread: its result is a partial of the reduction over the
+    loop's block.  (Other constexpr loops, a fixed recurrence's tokens say,
+    reduce once per iteration by design.)
+    A value computed from a partial and the lane's own elements
+    (``v - sum``) is per element; storing it, carrying it across the lanes
+    (``acc = acc + exp(v) + sum``) or keeping it past the loop keeps the
+    partial where the program has the whole reduction.  Partials folded into
+    a later reduce (Welford's centered squares) or into values the same in
+    every lane (Welford's chunk merge, online softmax's rescaled sums)
+    combine as the hoisted form would.
+    """
+    if not (
+        isinstance(vloop.target, ast.Name) and vloop.target.id.startswith("vec_lane")
+    ):
+        return None
+    lane_values = {vloop.target.id}  # names that differ between the V lanes
+    partials: set[str] = set()  # reduce results and names computed from them
+    lane_partials: dict[str, bool] = {}  # lane-varying partial -> read since
+    carried: set[str] = set()  # names the body reads before writing
+    written: set[str] = set()
+    for stmt in vloop.body:
+        reads = names_read(stmt)
+        writes = names_written(stmt)
+        carried |= reads - written
+        written |= writes
+        for name in reads & lane_partials.keys():
+            lane_partials[name] = True
+        reduces = any(
+            isinstance(node, ast.Assign)
+            and _find_warp_reduce_in_expr(node.value) is not None
+            for node in ast.walk(stmt)
+        )
+        from_partial = reduces or bool(reads & partials)
+        if from_partial:
+            partials |= writes
+        if not reads & lane_values or (reduces and isinstance(stmt, ast.Assign)):
+            continue
+        lane_values |= writes
+        if not from_partial:
+            continue
+        if not isinstance(stmt, ast.Assign):
+            # A store, or a branch or loop around a reduce or a partial.
+            return "a statement other than an assignment reads one V lane's partial"
+        lane_partials.update(dict.fromkeys(writes, False))
+    for name, read in lane_partials.items():
+        if name in carried:
+            return f"{name} carries one V lane's partial into the next"
+        if not read:
+            return f"{name} keeps one V lane's partial past the loop"
+    return None
+
+
 def _hoist_in_body(
     body: list[ast.stmt],
     acc_counter: list[int],
@@ -702,6 +763,11 @@ def _hoist_in_body(
                 if replacement is not None:
                     new_body.extend(replacement)
                     continue
+                reason = _per_lane_reduce_escape(vloop)
+                if reason is not None:
+                    raise exc.BackendUnsupported(
+                        "cute", f"reduction left in a vector lane loop: {reason}"
+                    )
             new_body.append(stmt)
         elif isinstance(stmt, ast.If):
             stmt.body = walk(stmt.body)
@@ -1111,31 +1177,13 @@ def _static_trip_count(
     loop: ast.For, constexpr_values: dict[str, int] | None
 ) -> int | None:
     """Static trip count of a ``range(...)`` / ``cutlass.range_constexpr``
-    for-loop, or None when unknown."""
-    from .fuse_two_pass_loads import _range_bounds
-    from .fuse_two_pass_loads import _trip_count_for
+    for-loop, or None when unknown (``unroll_lane_loads._loop_trips``).
 
-    it = loop.iter
-    if (
-        isinstance(it, ast.Call)
-        and isinstance(it.func, ast.Attribute)
-        and it.func.attr == "range_constexpr"
-    ):
-        # Unrolled at trace time, but a call statement inside still
-        # references the SAME preamble-allocated mbarrier on every
-        # unrolled iteration — so for once-per-kernel placement purposes
-        # the trip count is the unroll factor, not 1.
-        if (
-            it.args
-            and isinstance(it.args[0], ast.Constant)
-            and isinstance(it.args[0].value, int)
-        ):
-            return it.args[0].value
-        return None
-    bounds = _range_bounds(it)
-    if bounds is None:
-        return None
-    return _trip_count_for(*bounds, constexpr_values or {})
+    A ``range_constexpr`` loop is unrolled at trace time, but a call
+    statement inside still references the SAME preamble-allocated mbarrier
+    on every unrolled iteration — so for once-per-kernel placement purposes
+    the trip count is the unroll factor, not 1."""
+    return _loop_trips(loop, constexpr_values)
 
 
 def validate_cluster_reduce_placement(

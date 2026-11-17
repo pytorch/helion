@@ -49,7 +49,7 @@ def _codegen() -> GenerateAST:
             new_var=lambda prefix: f"{prefix}_normalized",
         ),
     )
-    codegen._record_statement_thread_references = lambda statements: None
+    codegen._record_statement_thread_references = lambda *args: None
     return codegen
 
 
@@ -195,7 +195,9 @@ def test_owned_span_replacement_rolls_back_thread_dimensions_on_error() -> None:
         codegen.append_statement(body, source)
     replacement = create(ast.Expr, value=create(ast.Constant, value=1))
 
-    def fail_after_update(statements: list[ast.AST]) -> None:
+    def fail_after_update(
+        statements: list[ast.AST], axis_sizes: dict[int, int] | None = None
+    ) -> None:
         codegen.referenced_thread_block_dims[0] = 32
         raise RuntimeError("injected recorder failure")
 

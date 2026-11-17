@@ -8,6 +8,7 @@ from typing import cast
 import torch
 from torch.fx import Node
 
+from ...language.memory_ops import load
 from ...language.tile_ops import tile_begin
 from ...language.tile_ops import tile_index
 from ...language.view_ops import subscript
@@ -234,6 +235,97 @@ def match_cute_shifted_tile_index(
                 return None
         else:
             return None
+
+
+_CUTE_REMAINDER_TARGETS: frozenset[object] = frozenset(
+    {torch.ops.aten.remainder.Scalar, operator.mod}
+)
+
+
+def cute_lane_remainder_terms(
+    node: object,
+) -> tuple[int | torch.SymInt, tuple[tuple[object, int], ...]] | None:
+    """``(d, terms)`` of a remainder index ``e % d`` by a scalar ``d``.
+
+    ``terms`` are the summands of ``e`` with their signs (1 added, -1
+    subtracted), each behind singleton axes, widening casts and a full-slice
+    re-read of the index.  ``None`` when ``node`` is not a remainder by a
+    scalar.
+    """
+    node = unwrap_cute_broadcast_index(node)
+    if (
+        node is None
+        or node.op != "call_function"
+        or node.target not in _CUTE_REMAINDER_TARGETS
+        or len(node.args) != 2
+        or node.kwargs
+    ):
+        return None
+    dividend, divisor = node.args
+    if isinstance(divisor, Node):
+        divisor = divisor.meta.get("val")
+    if not isinstance(divisor, (int, torch.SymInt)):
+        return None
+    terms: list[tuple[object, int]] = []
+
+    def visit(term: object, sign: int) -> None:
+        unwrapped = unwrap_cute_broadcast_index(term)
+        if unwrapped is None or unwrapped.op != "call_function":
+            terms.append((term, sign))
+            return
+        term = unwrapped
+        if (
+            term.target is load
+            and len(term.args) >= 2
+            and (len(term.args) < 3 or term.args[2] is None)
+            and isinstance(term.args[1], (list, tuple))
+            and all(index is None or index == slice(None) for index in term.args[1])
+        ):
+            # ``tile.index[:, None]`` re-reads the index tensor whole.  Only
+            # the remainder's terms look through it: in
+            # ``unwrap_cute_broadcast_index`` it would also turn the direct
+            # iota and shifted-index sites that read such a re-read into
+            # packets, which nothing here covers.
+            source = unwrap_cute_broadcast_index(term.args[0])
+            term = source if source is not None else term
+        if term.kwargs.get("alpha", 1) != 1 or len(term.args) != 2:
+            terms.append((term, sign))
+            return
+        lhs, rhs = term.args
+        if term.target in (operator.add, torch.ops.aten.add.Tensor):
+            visit(lhs, sign)
+            visit(rhs, sign)
+        elif term.target in (operator.sub, torch.ops.aten.sub.Tensor):
+            visit(lhs, sign)
+            visit(rhs, -sign)
+        else:
+            terms.append((term, sign))
+
+    visit(dividend, 1)
+    return divisor, tuple(terms)
+
+
+def match_cute_lane_remainder(node: object) -> tuple[Node, ...] | None:
+    """The tile indices added into ``e`` of a remainder index ``e % d``.
+
+    ``x[e // d, e % d]`` with ``e = row * d + tile.index`` reads a flat
+    element ``e`` through the rows of ``d`` contiguous elements of a
+    de-linearized view.  The remainder is the lane coordinate of a packet
+    whose candidate lane blocks are the ``tile_index`` nodes this returns:
+    the ones ``e`` adds (not subtracts) as a term of its sum
+    (``cute_lane_remainder_terms``).  ``None`` when ``node`` is not a
+    remainder by a scalar.  Whether the packet is contiguous (the other
+    terms and ``d`` multiples of the vector width) is proved on the lowered
+    expression, not here.
+    """
+    parts = cute_lane_remainder_terms(node)
+    if parts is None:
+        return None
+    return tuple(
+        term
+        for term, sign in parts[1]
+        if sign > 0 and isinstance(term, Node) and term.target is tile_index
+    )
 
 
 def _match_constant_multiple(value: object) -> tuple[object, int]:

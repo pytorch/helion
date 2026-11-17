@@ -28,6 +28,9 @@ from ..type_info import CallableType
 from ..variable_origin import ArgumentOrigin
 from . import target_facts
 from ._ast_pass_utils import assigned_name
+from .compile_options import CONFIG_COMPILE_OPTION_KEYS
+from .compile_options import compile_options_keyword
+from .compile_options import config_compile_options
 from .cute_mma import analyze_cute_mma_node
 from .host_zero_fill_launches import zero_fill_kernel_launch
 from .materialized_fission_codegen import _empty_graph
@@ -73,6 +76,7 @@ def _producer_source(
     schedule: SplitKWorkspaceSchedule,
     owner: CompileEnvironment,
     capacity: int,
+    owner_config: Config,
 ) -> tuple[str, list[dict[str, object]]]:
     """Compile metadata-only batch views after proving the owning inputs."""
     from ...runtime.kernel import maybe_skip_dtype_check_in_meta_registrations
@@ -147,18 +151,20 @@ def _producer_source(
             facts.register_pipeline_smem_facts(
                 child.config_spec._cute_tcgen05_config, pipeline_facts
             )
-            config = child.config_spec.normalized_config(
-                Config(
-                    block_sizes=[schedule.bm, schedule.bn, schedule.bk],
-                    tcgen05_cta_group="two",
-                    tcgen05_cluster_m=2,
-                    tcgen05_cluster_n=1,
-                    tcgen05_ab_stages=schedule.stages,
-                    tcgen05_acc_stages=2,
-                    tcgen05_c_stages=2,
-                    pid_type="persistent_blocked",
-                )
+            producer_config = Config(
+                block_sizes=[schedule.bm, schedule.bn, schedule.bk],
+                tcgen05_cta_group="two",
+                tcgen05_cluster_m=2,
+                tcgen05_cluster_n=1,
+                tcgen05_ab_stages=schedule.stages,
+                tcgen05_acc_stages=2,
+                tcgen05_c_stages=2,
+                pid_type="persistent_blocked",
             )
+            for key in CONFIG_COMPILE_OPTION_KEYS:
+                if key in owner_config:
+                    producer_config.config[key] = owner_config[key]
+            config = child.config_spec.normalized_config(producer_config)
             from ..generate_ast import generate_ast
 
             module = generate_ast(host, config, False)
@@ -869,7 +875,7 @@ def generate_split_k_workspace(
         raise exc.BackendUnsupported(
             "cute", "split-K workspace requires one ordered host launch"
         )
-    native_source, plans = _producer_source(proof, schedule, env, capacity)
+    native_source, plans = _producer_source(proof, schedule, env, capacity, config)
     reduce_source = (
         None if schedule.atomic_epilogue else _reducer_source(proof, schedule)
     )
@@ -974,6 +980,8 @@ def generate_split_k_workspace(
     bias_argument = f", {proof.bias.host_expression}" if proof.bias is not None else ""
     native_kernel = f"{native_module}._helion__native_partition_gemm"
     reduce_kernel = f"{reduce_module}._reduce_partitions"
+    compile_options = config_compile_options(config)
+    option = compile_options_keyword(compile_options)
     fill_definitions: list[ast.stmt] = []
     if schedule.atomic_epilogue:
         # The producer reduces into the output: zero it with a fill kernel
@@ -985,6 +993,7 @@ def generate_split_k_workspace(
             proof.output_name,
             num_sm=env.config_spec.num_sm,
             numel=proof.m * proof.n,
+            compile_options=compile_options,
         )
         new_calls = [
             fill_launch,
@@ -999,7 +1008,7 @@ def generate_split_k_workspace(
             f"{partials} = torch.empty(({p}, {proof.m}, {proof.n}), dtype=torch.float32, device=({proof.lhs_expression}).device)\n"
             + views
             + f"{native_module}._native_partition_gemm({view_a}, {view_b}, {partials}, _launcher=_launcher)\n"
-            f"_launcher({reduce_module}._reduce_partitions, ({(proof.m * proof.n + 127) // 128},), {partials}, {proof.output_name}{bias_argument}, block=(128, 1, 1))\n"
+            f"_launcher({reduce_module}._reduce_partitions, ({(proof.m * proof.n + 127) // 128},), {partials}, {proof.output_name}{bias_argument}, block=(128, 1, 1){option})\n"
         ).body
         kernels = (native_kernel, reduce_kernel)
     index = host.body.index(launch_marker)

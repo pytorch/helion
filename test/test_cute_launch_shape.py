@@ -222,6 +222,7 @@ def _device_function(
         ),
         tile_strategy=SimpleNamespace(
             symbolic_thread_axes=lambda: symbolic_thread_axes or {},
+            synthetic_thread_axes=dict,
             thread_block_dims=lambda: thread_block_dims,
         ),
     )

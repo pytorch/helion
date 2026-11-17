@@ -10,7 +10,6 @@ import sympy
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.reduction_emitter import CuteLoopedReductionEmitter
-from helion._compiler.host_function import HostFunction
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 
 pytestmark = pytest.mark.cpu_only
@@ -54,13 +53,16 @@ def test_static_padded_cluster_bounds_fit_int32(
     strategy._cute_rolled_cluster_checked = False
     state = SimpleNamespace(
         codegen=SimpleNamespace(
-            current_grid_state=SimpleNamespace(thread_axis_sizes={})
+            current_grid_state=SimpleNamespace(thread_axis_sizes={}, lane_loops=[])
         )
     )
-    host = SimpleNamespace(device_ir=SimpleNamespace(has_atomic_ops=lambda: False))
     with (
         patch.object(CompileEnvironment, "current", return_value=env),
-        patch.object(HostFunction, "current", return_value=host),
+        # Nothing here races: the test is about the padded bounds.
+        patch(
+            "helion._compiler.cute.reduction_emitter.cluster_split_races",
+            return_value=False,
+        ),
     ):
         CuteLoopedReductionEmitter(strategy)._maybe_apply_cute_rolled_cluster(state)
     assert strategy._cute_rolled_cluster_n == expected_cluster

@@ -105,11 +105,15 @@ from .factored_dims import widened_iota
 from .free_arange import live_graphs
 from .lane_fold import BF16_CAST
 from .lane_fold import LANE_FOLD
+from .lane_fold import LANE_PUT
 from .lane_fold import MAX_LANE_COPIES
 from .lane_fold import LaneArrayBudget
 from .lane_fold import LaneJam
 from .lane_fold import const_extent
 from .lane_fold import folded_lanes
+from .lane_fold import is_lane_loop
+from .lane_fold import load_mask_other
+from .lane_fold import tl_load
 from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 from .reduction import alloc_threadgroup_buffer
@@ -123,10 +127,12 @@ if TYPE_CHECKING:
     from torch.fx.graph import Graph
 
     from ..aten_lowering import LoweringContext
+    from ..device_ir import ForLoopGraphInfo
     from ..device_ir import GraphInfo
     from ..device_ir import IfGraphInfo
     from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
+    from .fragment_mma import FragmentLowering
 
 ACC = "_helion_mpp_acc"
 #: Position of ``_helion_mpp_acc``'s seed argument: the name of its staged seed tile,
@@ -134,6 +140,15 @@ ACC = "_helion_mpp_acc"
 ACC_SEED = 13
 RUN = "_helion_mpp_run"
 ELEMENTS = "_helion_mpp_elements"
+#: A fragment group's op over one K tile (``fragment_mma``): a loop over the
+#: tile's 8-deep MMA steps holding its two operand loops, ``FRAG_A`` over the
+#: elements each lane holds of the MMA's A fragments, ``FRAG_B`` of its B
+#: fragments.  Each of the three, like an element loop, binds and defines
+#: names private to it.
+FRAG_RUN = "_helion_mpp_fragments"
+FRAG_A = "_helion_mpp_frag_a"
+FRAG_B = "_helion_mpp_frag_b"
+_ELEMENT_LOOPS = (ELEMENTS, FRAG_RUN, FRAG_A, FRAG_B)
 BIND = "_helion_mpp_bind"
 STAGE = "_helion_mpp_stage"
 MAT = "_helion_mpp_materialize"
@@ -159,8 +174,14 @@ ROUND_PREAMBLE = f"""inline float {ROUND}(float v) {{
     uint r = (u & 0x7FFFFFFFu) > 0x7F800000u ? (u | 0x00400000u) : u + 0x7FFFu + ((u >> 16) & 1u);
     return as_type<float>(r & 0xFFFF0000u);
 }}"""
-BF16_CAST_PREAMBLE = f"""inline bfloat {BF16_CAST}(float v) {{
-    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(v)) >> 16));
+#: A bfloat operand is already rounded: its overload returns it as is, as
+#: ``static_cast<bfloat>`` would, NaN payload included.
+BF16_CAST_PREAMBLE = f"""template <typename T>
+inline bfloat {BF16_CAST}(T v) {{
+    return as_type<bfloat>(ushort(as_type<uint>({ROUND}(float(v))) >> 16));
+}}
+inline bfloat {BF16_CAST}(bfloat v) {{
+    return v;
 }}"""
 
 #: Each matmul's (acc, lhs, rhs) argument positions; None for no acc.  The
@@ -264,12 +285,12 @@ class _NotAView(Exception):
     """An operand that is not a device view; staging takes it."""
 
 
-def _unsupported(msg: str) -> exc.BackendUnsupported:
+def metal_unsupported(msg: str) -> exc.BackendUnsupported:
     return exc.BackendUnsupported("metal", msg)
 
 
 @dataclasses.dataclass
-class _Dim:
+class Dim:
     block_id: int
     #: The ``hl.arange`` node of a ``base + hl.arange`` index; None for a tile.
     iota: Node | None = None
@@ -290,11 +311,14 @@ class _Dim:
 
 
 @dataclasses.dataclass
-class _View:
+class View:
     tensor: torch.Tensor
-    dims: tuple[_Dim, _Dim]
+    dims: tuple[Dim, Dim]
     #: The tensor dims the op's two dims read.
     positions: tuple[int, int]
+    #: Their strides, compile-time facts: the descriptor's transpose flag
+    #: and the view's unit-stride dim depend on them.
+    strides: tuple[int, int]
     #: ``(tensor dim, index)`` of every other dim, each a uniform integer.
     outer: tuple[tuple[int, Node | int], ...]
     #: ``(tensor dim, block)`` of a batched matmul's batch tile, whose one
@@ -309,7 +333,7 @@ class _Operand:
     tile before the op (staging)."""
 
     dtype: torch.dtype
-    view: _View | None = None
+    view: View | None = None
     #: The ``_mpp_hoist`` node that stages it before its loop; None to stage
     #: it at the op.
     hoist: Node | None = None
@@ -358,7 +382,7 @@ class MppGroup:
     #: materialization taken right after the value's definition.
     mats: dict[Node, Node] = dataclasses.field(default_factory=dict)
     #: The values an element loop may compute at any element.
-    recomputable: _Recomputable = dataclasses.field(init=False)
+    recomputable: Recomputable = dataclasses.field(init=False)
     #: A batched matmul's batch block (``bmm``, ``baddbmm``): one rank-2 op per
     #: batch index, so the block must hold one index at codegen.  None for a
     #: rank-2 matmul or a batch dim of size 1.
@@ -404,9 +428,14 @@ class MppPlan:
     #: Loads of a staged operand that read a tensor the kernel writes: each
     #: runs after a device-memory barrier.
     fenced: set[Node] = dataclasses.field(default_factory=set)
+    #: The storages the kernel writes, keyed by fake storage so views of one
+    #: tensor fall together (as ``free_arange._check_write_once``).
+    written: set[StorageWeakRef] = dataclasses.field(default_factory=set)
     #: Each op's (M, N) when either is over ``_MAX_TILE``'s, checked against
     #: the launch's SIMD groups (``check_mpp_launch``).
     wide: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
+    #: The lowering of every group when the config asks for fragments.
+    fragment: FragmentLowering | None = None
 
 
 def _node(value: object) -> Node:
@@ -419,7 +448,7 @@ def _seq(value: object) -> Sequence[object]:
     return value
 
 
-def _operands(matmul: Node) -> tuple[Node | None, Node, Node]:
+def matmul_operands(matmul: Node) -> tuple[Node | None, Node, Node]:
     """A matmul's acc (None for none), lhs and rhs nodes."""
     acc, lhs, rhs = _MATMULS[matmul.target]
     return (
@@ -429,7 +458,7 @@ def _operands(matmul: Node) -> tuple[Node | None, Node, Node]:
     )
 
 
-class _Graphs:
+class Graphs:
     """Follows values across the control-flow graphs of one kernel."""
 
     def __init__(self, graphs: list[GraphInfo]) -> None:
@@ -455,9 +484,9 @@ class _Graphs:
         return self.infos[gid]
 
     def if_branch(self, gid: object) -> tuple[IfGraphInfo, list[tuple[int | str, ...]]]:
-        """An if branch graph's info and its ``branches_outputs``: per output
-        of the ``_if``, its slot in each branch graph's output, or the name an
-        else branch leaves as it was."""
+        """An if branch graph's info and its ``branches_outputs``: per
+        variable the ``_if`` gives back, its slot in each branch graph's
+        output, or its name for the branch that leaves it as it was."""
         from ..device_ir import IfGraphInfo
 
         info = self.info(gid)
@@ -530,18 +559,18 @@ def _carry(placeholder: Node, loop: Node) -> Node | None:
     return None
 
 
-def _block(size: object) -> int | None:
+def block_id_of(size: object) -> int | None:
     return CompileEnvironment.current().resolve_block_id(size)
 
 
 def _dim_of(size: object) -> tuple[int, int] | None:
     """A matmul dim as ``(block, factor)``: a block, or a dim of length
     ``factor * block`` held as per-thread parts."""
-    block = _block(size)
+    block = block_id_of(size)
     return (block, 1) if block is not None else factored_size(size)
 
 
-def _uniform_int(value: object, graphs: _Graphs) -> bool:
+def _uniform_int(value: object, graphs: Graphs) -> bool:
     """Every thread holds the same integer: a Python or symbolic int, or a 0-d
     tensor of an integer dtype.  A view's origin and extent are cast to
     ``long``, which would truncate a fractional base or bound."""
@@ -553,7 +582,7 @@ def _uniform_int(value: object, graphs: _Graphs) -> bool:
     return isinstance(val, (int, torch.SymInt)) and not isinstance(val, bool)
 
 
-def _scalar_index(index: object, graphs: _Graphs) -> bool:
+def _scalar_index(index: object, graphs: Graphs) -> bool:
     """Whether a subscript entry selects one element of its tensor dim, the
     same for every thread.  As ``SubscriptIndexing.compute_shape`` decides,
     an int or a SymInt that is not a block size drops its dim; it is uniform
@@ -582,7 +611,7 @@ def _scalar_index(index: object, graphs: _Graphs) -> bool:
     return _uniform_int(index, graphs)
 
 
-def _tile_base(node: Node, graphs: _Graphs) -> tuple[int, Node | int] | None:
+def _tile_base(node: Node, graphs: Graphs) -> tuple[int, Node | int] | None:
     """``(block, base)`` of ``base + tile.index`` (an ``add`` with alpha 1 of
     a tile's index and a uniform integer)."""
     if node.target is not torch.ops.aten.add.Tensor or node.kwargs.get("alpha", 1) != 1:
@@ -594,37 +623,37 @@ def _tile_base(node: Node, graphs: _Graphs) -> tuple[int, Node | int] | None:
             and t.target is tile_index
             and _uniform_int(other, graphs)
         ):
-            block = _block(_node(t.args[0]).meta["val"])
+            block = block_id_of(_node(t.args[0]).meta["val"])
             if block is not None:
                 assert isinstance(other, (Node, int))
                 return block, other
     return None
 
 
-def _view_dim(index: object, size: object, graphs: _Graphs) -> _Dim:
+def _view_dim(index: object, size: object, graphs: Graphs) -> Dim:
     """A view dim from a load index: a tile, ``base + tile.index``, ``base +
     hl.arange(block)``, a widened ``hl.arange``, or a ``:`` slice (``size``
     is the dim's size in the load's value)."""
     if isinstance(index, slice):
-        block = _block(size)
+        block = block_id_of(size)
         if index != slice(None) or block is None:
             raise _NotAView(f"an MPP view index {index!r}")
-        return _Dim(block, full=True)
+        return Dim(block, full=True)
     if not isinstance(index, Node):
         raise _NotAView(f"an MPP view index {index!r}")
     if isinstance(index.meta["val"], torch.SymInt):
-        block = _block(index.meta["val"])
+        block = block_id_of(index.meta["val"])
         if block is None:
             raise _NotAView("an MPP view index that is not a tile")
-        return _Dim(block)
+        return Dim(block)
     node = graphs.origin(index)
     index_node = node
     base: Node | int | None = None
     if widened := widened_iota(node):
         block, factor = widened
-        return _Dim(block, iota=node, index=node, factor=factor)
+        return Dim(block, iota=node, index=node, factor=factor)
     if tb := _tile_base(node, graphs):
-        return _Dim(tb[0], base=tb[1], index=node)
+        return Dim(tb[0], base=tb[1], index=node)
     if node.target is torch.ops.aten.add.Tensor:
         # aten.add.Tensor(x, y, alpha=a) is x + a * y: only alpha 1 adds a
         # unit-step index.
@@ -645,18 +674,18 @@ def _view_dim(index: object, size: object, graphs: _Graphs) -> _Dim:
         raise _NotAView("an MPP view index that is not a tile or base + hl.arange")
     if node.kwargs.get("start", 0) != 0 or node.kwargs.get("step", 1) != 1:
         raise _NotAView("an MPP view hl.arange with a start or a step")
-    block = _block(node.meta["val"].size(0))
+    block = block_id_of(node.meta["val"].size(0))
     if block is None:
         raise _NotAView("an MPP view hl.arange whose length is not a block")
-    return _Dim(block, iota=node, base=base, index=index_node)
+    return Dim(block, iota=node, base=base, index=index_node)
 
 
 def _view(
     operand: Node,
     dims: tuple[tuple[int, int], tuple[int, int]],
     batch: int | None,
-    graphs: _Graphs,
-) -> _View:
+    graphs: Graphs,
+) -> View:
     """A device view: a load, or its transpose, whose value is 2-D, or 3-D
     for a batched matmul's operand.  Its two matrix dims are indexed by
     tiles, ``base + tile.index``, ``base + hl.arange``, a widened
@@ -681,11 +710,7 @@ def _view(
     if len(index) != tensor.ndim:
         raise _NotAView("an MPP view whose subscript does not index every tensor dim")
     if tensor.dtype not in _DTYPES:
-        raise _unsupported(f"an MPP operand of dtype {tensor.dtype}")
-    if not all(isinstance(x, int) for x in (*tensor.shape, *tensor.stride())):
-        # The descriptor's transpose flag and the view's unit-stride dim are
-        # compile-time facts.
-        raise _NotAView("an MPP view of a tensor with symbolic sizes or strides")
+        raise metal_unsupported(f"an MPP operand of dtype {tensor.dtype}")
     positions: list[int] = []
     outer: list[tuple[int, Node | int]] = []
     batch_dim: tuple[int, int] | None = None
@@ -712,7 +737,16 @@ def _view(
             outer.append((b, 0))
         else:
             raise _NotAView("an MPP view whose batch index is not the batch tile")
-    if 1 not in (tensor.stride(positions[0]), tensor.stride(positions[1])):
+    # The matrix dims' strides decide the descriptor's transpose flag and the
+    # view's unit-stride dim, so they must be compile-time facts.  A symbolic
+    # size, or an outer dim's stride, only moves the handle's base or bounds
+    # its extents, which the view reads at run time (view_args).
+    env = CompileEnvironment.current()
+    known = [env.known_stride(tensor, p) for p in positions]
+    if None in known:
+        raise _NotAView("an MPP view whose matrix dims have run-time strides")
+    strides = cast("list[int]", known)
+    if 1 not in strides:
         raise _NotAView("an MPP view without a unit stride")
     first = rank - 2
     value_dims = [
@@ -726,15 +760,21 @@ def _view(
     if transposed:
         value_dims.reverse()
         positions.reverse()
+        strides.reverse()
     view_dims = (value_dims[0], value_dims[1])
     if tuple((d.block_id, d.factor) for d in view_dims) != dims:
-        raise _unsupported("an MPP view whose dims are not the matmul's blocks")
-    return _View(
-        tensor, view_dims, (positions[0], positions[1]), tuple(outer), batch_dim
+        raise metal_unsupported("an MPP view whose dims are not the matmul's blocks")
+    return View(
+        tensor,
+        view_dims,
+        (positions[0], positions[1]),
+        (strides[0], strides[1]),
+        tuple(outer),
+        batch_dim,
     )
 
 
-def _producers(node: Node, graphs: _Graphs) -> list[Node]:
+def _producers(node: Node, graphs: Graphs) -> list[Node]:
     """The nodes a staged operand is computed from, out to its loads,
     placeholders and constants."""
     out: list[Node] = []
@@ -754,7 +794,7 @@ def _producers(node: Node, graphs: _Graphs) -> list[Node]:
     return out
 
 
-def _nested_loads(node: Node, graphs: _Graphs) -> list[Node]:
+def _nested_loads(node: Node, graphs: Graphs) -> list[Node]:
     """The loads in the graphs a control-flow node runs, at any depth."""
     if _tracing_ops.is_for_loop_target(node.target):
         ids = [node.args[0]]
@@ -777,7 +817,7 @@ def _operand(
     node: Node,
     dims: tuple[tuple[int, int], tuple[int, int]],
     batch: int | None,
-    graphs: _Graphs,
+    graphs: Graphs,
 ) -> _Operand:
     """A device view when the operand is one, else staged.  The threads
     compute a staged operand in the Scalar layout, one element per block
@@ -790,7 +830,7 @@ def _operand(
         val = node.meta["val"]
         assert isinstance(val, torch.Tensor)
         if val.dtype not in _DTYPES:
-            raise _unsupported(f"an MPP operand of dtype {val.dtype}") from None
+            raise metal_unsupported(f"an MPP operand of dtype {val.dtype}") from None
         positional_rebind.check_positional_merges(
             _producers(node, graphs), _STAGE_REBIND
         )
@@ -798,7 +838,7 @@ def _operand(
     return _Operand(view.tensor.dtype, view)
 
 
-def _view_mask(extra_mask: object, dims: Sequence[_Dim], graphs: _Graphs) -> None:
+def _view_mask(extra_mask: object, dims: Sequence[Dim], graphs: Graphs) -> None:
     assert isinstance(extra_mask, Node)
     mask = graphs.origin(extra_mask)
     if mask.target is not view_ops.subscript:
@@ -832,13 +872,20 @@ def _view_mask(extra_mask: object, dims: Sequence[_Dim], graphs: _Graphs) -> Non
     dim.mask = cmp
 
 
-def plan_mpp_matmuls(graphs: list[GraphInfo], threaded: set[int]) -> MppPlan:
+def plan_mpp_matmuls(
+    graphs: list[GraphInfo],
+    threaded: set[int],
+    fragment: FragmentLowering | None = None,
+) -> MppPlan:
     """Admit each aten matmul (``addmm``, ``mm``, ``bmm``, ``baddbmm``), each
     ``hl.dot`` over a K held as per-thread parts, and the other ``hl.dot`` calls
     when the planner takes every one of them (:func:`_takes_dots`), of the
     kernel's live graphs as a cooperative group, or raise ``BackendUnsupported``.
     ``threaded`` holds the blocks the config's tile strategies spread over more
-    than one thread.
+    than one thread; ``fragment`` (``fragment_mma.FRAGMENT_LOWERING`` under
+    the config's ``metal_matmul="fragment"``) lowers every group on
+    simdgroup-matrix fragments, or raises ``BackendUnsupported`` for one that
+    can't be.
 
     Each use of a group's cooperative value is decided from the FX graph: an
     element-wise use or a store that an element loop can evaluate at any
@@ -865,18 +912,34 @@ def plan_mpp_matmuls(graphs: list[GraphInfo], threaded: set[int]) -> MppPlan:
     take_dots = (
         bool(dots)
         and all(_dot_admissible(m, dot_ks) for m in dots)
-        and _takes_dots(graphs, threaded)
+        and _takes_dots(graphs, threaded, fragment)
     )
-    return _plan_matmuls(graphs, take_dots)
+    return _plan_matmuls(graphs, take_dots, fragment)
 
 
-def _plan_matmuls(graphs: list[GraphInfo], take_dots: bool) -> MppPlan:
+def has_matmuls(graphs: list[GraphInfo]) -> bool:
+    """Whether any of the kernel's graphs holds a node
+    :func:`plan_mpp_matmuls` plans, an aten matmul or an ``hl.dot``: a cheap
+    test before planning, which needs the kernel's ``DeviceIR`` to find the
+    live graphs."""
+    return any(
+        n.op == "call_function" and n.target in _MATMULS
+        for g in graphs
+        for n in g.graph.nodes
+    )
+
+
+def _plan_matmuls(
+    graphs: list[GraphInfo],
+    take_dots: bool,
+    fragment: FragmentLowering | None = None,
+) -> MppPlan:
     from ..device_ir import ForLoopGraphInfo
 
-    plan = MppPlan()
+    plan = MppPlan(fragment=fragment)
     taken: set[Node] = set()
     live = live_graphs(graphs)
-    known = _Graphs(graphs)
+    known = Graphs(graphs)
     # Collected first: planning inserts conversion nodes into these graphs.
     matmuls = [
         (g, n)
@@ -890,11 +953,11 @@ def _plan_matmuls(graphs: list[GraphInfo], take_dots: bool) -> MppPlan:
                 continue
         elif matmul.target is dot:
             if matmul.args[2] is None:
-                raise _unsupported(
+                raise metal_unsupported(
                     "an hl.dot over a K held as per-thread parts with no acc"
                 )
             if matmul.args[3] not in (None, torch.float32):
-                raise _unsupported(
+                raise metal_unsupported(
                     f"an hl.dot over per-thread parts with out_dtype={matmul.args[3]}"
                 )
         k_block = _full_k(matmul)
@@ -905,7 +968,7 @@ def _plan_matmuls(graphs: list[GraphInfo], take_dots: bool) -> MppPlan:
         if k_block is not None:
             group = _plan_full_k(len(plan.by_matmul), matmul, k_block, known)
         elif not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
-            raise _unsupported(
+            raise metal_unsupported(
                 "a matmul over a tiled K outside its K loop; loop over K with "
                 "hl.tile, or take K whole with a ':' slice"
             )
@@ -915,7 +978,7 @@ def _plan_matmuls(graphs: list[GraphInfo], take_dots: bool) -> MppPlan:
         # only one group's cooperative tensor.
         storage = group.old | group.cur
         if storage & taken:
-            raise _unsupported(
+            raise metal_unsupported(
                 "two MPP K loops whose accumulators start from one value, such as "
                 "one hl.zeros seeding both; give each loop its own"
             )
@@ -926,16 +989,21 @@ def _plan_matmuls(graphs: list[GraphInfo], take_dots: bool) -> MppPlan:
         for vec in group.vecs:
             plan.by_vec[vec] = group
     if plan.by_matmul:
-        _link_element_staging(plan, live)
+        plan.written = {
+            storage_key(n) for gi in live for n in gi.graph.nodes if n.target in _WRITES
+        }
+        _link_element_staging(plan)
         _order_memory(plan, live, known)
         _unlink_dropped(plan)
         for group in plan.by_matmul.values():
             _stage_epilogue_vecs(group, plan, known)
             _finalize(group, plan, known)
+            if fragment is not None:
+                fragment.check_group(group, plan, known)
     return plan
 
 
-def _link_element_staging(plan: MppPlan, live: list[GraphInfo]) -> None:
+def _link_element_staging(plan: MppPlan) -> None:
     """Stage each staged operand that is an element-wise function of another
     group's cooperative value from that group's element loop: each thread
     writes the elements MPP gives it, computed from its own cooperative
@@ -945,12 +1013,10 @@ def _link_element_staging(plan: MppPlan, live: list[GraphInfo]) -> None:
     read before the write.  An element-wise function of the source's value
     lies over the source's M and N, in their order (a permute is not
     element-wise), so the operand's blocks need no check."""
-    written = {
-        _storage_key(n) for gi in live for n in gi.graph.nodes if n.target in _WRITES
-    }
+    written = plan.written
     groups = list(plan.by_matmul.values())
     for g in groups:
-        _, lhs, rhs = _operands(g.matmul)
+        _, lhs, rhs = matmul_operands(g.matmul)
         for operand, node in ((g.lhs, lhs), (g.rhs, rhs)):
             if not operand.staged:
                 continue
@@ -964,7 +1030,7 @@ def _link_element_staging(plan: MppPlan, live: list[GraphInfo]) -> None:
                 # gives each element, which no barrier orders after another
                 # thread's write.
                 if any(
-                    _storage_key(ld) in written
+                    storage_key(ld) in written
                     for c in chain
                     for a in c.all_input_nodes
                     for ld in h.recomputable.nodes(a)
@@ -983,7 +1049,7 @@ def _unlink_dropped(plan: MppPlan) -> None:
     use of it needs the Scalar layout)."""
     groups = {group.gid: group for group in plan.by_matmul.values()}
     for g in plan.by_matmul.values():
-        _, lhs, rhs = _operands(g.matmul)
+        _, lhs, rhs = matmul_operands(g.matmul)
         for operand, node in ((g.lhs, lhs), (g.rhs, rhs)):
             if operand.elements is not None and not _elementwise_of(
                 node, groups[operand.elements]
@@ -1031,17 +1097,22 @@ def _factored_dot(matmul: Node) -> bool:
     return factored_size(_node(matmul.args[0]).meta["val"].size(-1)) is not None
 
 
-def _takes_dots(graphs: list[GraphInfo], threaded: set[int]) -> bool:
+def _takes_dots(
+    graphs: list[GraphInfo],
+    threaded: set[int],
+    fragment: FragmentLowering | None = None,
+) -> bool:
     """Whether the planner takes the kernel's whole-K ``hl.dot`` calls: it
-    plans a copy of the graphs with them without a rejection, no operand it
-    stages lies over an M or N tile that every config makes 1, which codegen
-    rejects, and each operand computed from a matmul's result is staged from
-    that matmul's element loop.  Such a kernel keeps the scalar contraction at
-    a config whose threads codegen rejects around one of its ops
-    (:func:`_foreign_threads`).  Planning rewrites the graphs it plans, so it
-    runs on copies, as each codegen does (``build_codegen_graphs``)."""
+    plans a copy of the graphs with them, with ``fragment``'s lowering when
+    given, without a rejection, no operand MPP stages lies over an M or N
+    tile that every config makes 1, which codegen rejects, and each operand
+    computed from a matmul's result is staged from that matmul's element
+    loop.  Such a kernel keeps the scalar contraction at a config whose
+    threads codegen rejects around one of its ops (:func:`_foreign_threads`).
+    Planning rewrites the graphs it plans, so it runs on copies, as each
+    codegen does (``build_codegen_graphs``)."""
     copies = [g.copy() for g in graphs]
-    known = _Graphs(copies)
+    known = Graphs(copies)
     derived = {
         (m, side)
         for g in live_graphs(copies)
@@ -1050,11 +1121,11 @@ def _takes_dots(graphs: list[GraphInfo], threaded: set[int]) -> bool:
         if _matmul_derived(_node(m.args[side]), known)
     }
     try:
-        plan = _plan_matmuls(copies, take_dots=True)
+        plan = _plan_matmuls(copies, take_dots=True, fragment=fragment)
     except exc.BackendUnsupported:
         return False
     if any(
-        (operand.staged and _static_tile(block) == 1)
+        (operand.staged and fragment is None and _static_tile(block) == 1)
         # A matmul's result reaches another op only from its element loop.
         or (operand.elements is None and (group.matmul, side) in derived)
         for group in plan.by_matmul.values()
@@ -1073,10 +1144,13 @@ def _static_tile(block: int) -> int | None:
     """The block's tile when no config changes it: a ``:`` slice's length
     rounded up to a power of two, a fixed block size, or 1 over an extent of
     1; None otherwise."""
+    from .backend import static_extent
+
     env = CompileEnvironment.current()
     info = env.block_sizes[block]
     if info.reduction:
-        return next_power_of_2(info.size) if isinstance(info.size, int) else None
+        extent = static_extent(info.size)
+        return next_power_of_2(extent) if extent is not None else None
     source = info.block_size_source
     if isinstance(source, FixedBlockSizeSource):
         return source.value if isinstance(source.value, int) else None
@@ -1103,7 +1177,7 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
         (rval.size(-1), 8, _WIDE_TILE, False),
         (lval.size(-1), 16, _MAX_TILE[2], True),
     ):
-        block = _block(size)
+        block = block_id_of(size)
         if block is None or (tile := _static_tile(block)) is None:
             continue
         if env.block_sizes[block].reduction:
@@ -1115,7 +1189,7 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
                 # (backend._lane_floor).
                 high = min(high, MAX_LANE_COPIES)
         elif tile == 1 and not is_k:
-            # _op_dims widens it to 8; a staged operand over it is
+            # op_dims widens it to 8; a staged operand over it is
             # _takes_dots' check.
             continue
         if not low <= tile <= high:
@@ -1123,17 +1197,16 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
     return acc is not None or _full_k(matmul) is not None
 
 
-def _matmul_derived(node: Node, graphs: _Graphs) -> bool:
+def _matmul_derived(node: Node, graphs: Graphs) -> bool:
     """Whether a matmul's result reaches ``node``: through its producers,
     each placeholder's value from the enclosing graph, each loop-carried
-    placeholder's carried-back value and each for loop's output value in its
-    body, up to loads and shape reads.
+    placeholder's carried-back value, each for loop's output value in its
+    body and each ``if`` result's branch output, or the outer value a branch
+    passes through, up to loads and shape reads.
 
     Unlike :func:`_producers`, which stops at a carried placeholder (a staged
     operand's positional check needs only its first-iteration value), this
-    follows every value an operand can hold.  It has no ``_if`` output edge:
-    an ``if`` output that reaches an ``hl.dot`` operand fails in the
-    frontend's masked-value pass (``node_masking.getitem_masked_value``)."""
+    follows every value an operand can hold."""
     work = [node]
     seen: set[Node] = set()
     while work:
@@ -1165,12 +1238,32 @@ def _matmul_derived(node: Node, graphs: _Graphs) -> bool:
             if isinstance(value, Node):
                 work.append(value)
             continue
+        if isinstance(flow, Node) and flow.target is _tracing_ops._if:
+            value = _if_result(flow, cast("int", n.args[1]), graphs)
+            if value is not None:
+                work.append(value)
+            continue
         work += n.all_input_nodes
     return False
 
 
-def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: _Graphs) -> MppGroup:
-    acc, lhs, rhs = _operands(matmul)
+def _if_result(if_node: Node, index: int, graphs: Graphs) -> Node | None:
+    """The value result ``index`` of ``if_node`` takes: a branch output, or
+    for a variable only the other branch writes, the outer value this branch
+    passes through (``IfGraphInfo.result_source``); None for a value that is
+    not a node."""
+    info, _ = graphs.if_branch(if_node.args[1])
+    source = info.result_source(if_node, index)
+    if not isinstance(source, tuple):
+        return source
+    graph_id, slot = source
+    (output,) = graphs.info(graph_id).graph.find_nodes(op="output")
+    value = _seq(output.args[0])[slot]
+    return value if isinstance(value, Node) else None
+
+
+def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: Graphs) -> MppGroup:
+    acc, lhs, rhs = matmul_operands(matmul)
     assert acc is not None
     placeholder = acc
     while placeholder.target is _tracing_ops._new_var:
@@ -1187,17 +1280,17 @@ def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: _Graphs) -> M
             carry = _carry(placeholder, loop)
     if carry is None:
         if _updates_carry(acc, graphs):
-            raise _unsupported(
+            raise metal_unsupported(
                 "a matmul whose acc is computed from a loop carry that its "
                 "result does not replace"
             )
-        raise _unsupported("a matmul whose acc is not its K loop's carry")
+        raise metal_unsupported("a matmul whose acc is not its K loop's carry")
     assert loop is not None
     (output,) = matmul.graph.find_nodes(op="output")
     slot = carry.args[1]
     assert isinstance(slot, int)
     if _seq(output.args[0])[slot] is not matmul:
-        raise _unsupported("a matmul whose result is not its K loop's carry")
+        raise metal_unsupported("a matmul whose result is not its K loop's carry")
     levels = _levels(placeholder, loop, carry, matmul, graphs)
     m, n, kdim, batch = _mnk(matmul, k_loop_block)
     outer = levels[-1]
@@ -1219,7 +1312,7 @@ def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: _Graphs) -> M
         batch_block=batch,
     )
     if group.lhs.dtype != group.rhs.dtype:
-        raise _unsupported("MPP operands of two dtypes")
+        raise metal_unsupported("MPP operands of two dtypes")
     if update:
         upd = _insert(_mpp_upd, acc, args=(placeholder, acc))
         for user in list(acc.users):
@@ -1232,17 +1325,17 @@ def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: _Graphs) -> M
         # readers take a snapshot of it (_finalize), as of the seed's.
         group.old.add(upd)
         group.plumbing.add((placeholder, upd))
-        group.recomputable = _Recomputable(group, graphs)
+        group.recomputable = Recomputable(group, graphs)
         _plan_update(group, graphs)
     else:
         _storage(group, acc)
-        group.recomputable = _Recomputable(group, graphs)
+        group.recomputable = Recomputable(group, graphs)
     _classify_uses(group, graphs)
     return group
 
 
 def _update_chain(
-    matmul: Node, acc: Node, graphs: _Graphs
+    matmul: Node, acc: Node, graphs: Graphs
 ) -> tuple[Node, list[Node]] | None:
     """``(placeholder, nodes)`` when ``acc`` is computed from the carry of the
     matmul's K loop whose exit is the matmul: the carry's placeholder and,
@@ -1290,20 +1383,20 @@ def _update_chain(
         return None
     for n in chain:
         if not (n.target is _tracing_ops._new_var or _pointwise(n)):
-            raise _unsupported(
+            raise metal_unsupported(
                 f"a matmul whose acc is computed from its K loop's carry by {n.name}, "
                 "which is not element-wise (only an element-wise update of the "
                 "carry before the op stays cooperative)"
             )
         if n is not acc and any(u not in reads for u in n.users):
-            raise _unsupported(
+            raise metal_unsupported(
                 f"an update of an MPP accumulator whose intermediate value {n.name} "
                 "has another reader; only the updated acc may be read"
             )
     return placeholder, chain
 
 
-def _plan_update(group: MppGroup, graphs: _Graphs) -> None:
+def _plan_update(group: MppGroup, graphs: Graphs) -> None:
     """Admit the update's other operands: each is recomputable at any
     element, or a Scalar value over the group's blocks, which a ``_mpp_vec``
     node stages for the element loop."""
@@ -1318,12 +1411,12 @@ def _plan_update(group: MppGroup, graphs: _Graphs) -> None:
             if vec is None:
                 val = a.meta.get("val")
                 if not isinstance(val, torch.Tensor):
-                    raise _unsupported(
+                    raise metal_unsupported(
                         f"an update of an MPP accumulator reads {a.name}, a scalar "
                         "that isn't a tensor, such as a float kernel argument"
                     )
                 if not _mn_dims(group, val):
-                    raise _unsupported(
+                    raise metal_unsupported(
                         f"an update of an MPP accumulator reads {a.name}, which is "
                         "neither recomputable at any element nor a value over "
                         "the tile's M or N blocks"
@@ -1339,13 +1432,13 @@ def _mn_dims(group: MppGroup, val: torch.Tensor) -> set[int | None]:
     ``_mpp_vec`` tile can hold a value over one or both."""
     blocks = {group.m_block, group.n_block, group.batch_block}
     blocks.discard(None)
-    dims = {_block(s) for s in val.size() if s != 1}
+    dims = {block_id_of(s) for s in val.size() if s != 1}
     if not dims <= blocks:
         return set()
     return dims & {group.m_block, group.n_block}
 
 
-def _stage_vec(value: Node, before: Node | None, graphs: _Graphs) -> Node:
+def _stage_vec(value: Node, before: Node | None, graphs: Graphs) -> Node:
     positional_rebind.check_positional_merges(_producers(value, graphs), _STAGE_REBIND)
     return _insert(_mpp_vec, value, before=before)
 
@@ -1361,7 +1454,7 @@ def _mnk(matmul: Node, k_block: int) -> tuple[int, int, tuple[int, int], int | N
     value takes the acc's shape, so ``positional_rebind``'s accumulator
     check compares the acc with itself.
     """
-    acc, lhs, rhs = _operands(matmul)
+    acc, lhs, rhs = matmul_operands(matmul)
     lval, rval = lhs.meta["val"], rhs.meta["val"]
     out = matmul.meta["val"]
     batch: int | None = None
@@ -1370,15 +1463,15 @@ def _mnk(matmul: Node, k_block: int) -> tuple[int, int, tuple[int, int], int | N
         if isinstance(b1, int) and isinstance(b2, int) and b1 == b2 == 1:
             batch = None
         else:
-            batch = _block(b1)
-            if batch is None or _block(b2) != batch:
-                raise _unsupported(
+            batch = block_id_of(b1)
+            if batch is None or block_id_of(b2) != batch:
+                raise metal_unsupported(
                     "a batched MPP matmul whose operands' batch dims are not one "
                     "block, or all of size 1"
                 )
         lval, rval = lval[0], rval[0]
         out = out[0]
-    m, n = _block(lval.size(0)), _block(rval.size(1))
+    m, n = block_id_of(lval.size(0)), block_id_of(rval.size(1))
     kdim, kdim2 = _dim_of(lval.size(1)), _dim_of(rval.size(0))
     if (
         m is None
@@ -1388,44 +1481,44 @@ def _mnk(matmul: Node, k_block: int) -> tuple[int, int, tuple[int, int], int | N
         or kdim[0] != k_block
         or len({m, n, kdim[0]}) != 3
     ):
-        raise _unsupported("a matmul whose blocks are not M, N and the loop's K")
+        raise metal_unsupported("a matmul whose blocks are not M, N and the loop's K")
     if acc is not None and matmul.target in _BATCHED:
         aval = acc.meta["val"]
         assert isinstance(aval, torch.Tensor)
         if aval.ndim != 3 or (
-            (aval.size(0) != 1 if batch is None else _block(aval.size(0)) != batch)
-            or [_block(aval.size(1)), _block(aval.size(2))] != [m, n]
+            (aval.size(0) != 1 if batch is None else block_id_of(aval.size(0)) != batch)
+            or [block_id_of(aval.size(1)), block_id_of(aval.size(2))] != [m, n]
         ):
-            raise _unsupported(
+            raise metal_unsupported(
                 "a batched matmul whose acc's dims are not its batch, M and N "
                 "blocks in place"
             )
     if out.dtype != torch.float32:
-        raise _unsupported("a matmul whose acc is not float32")
+        raise metal_unsupported("a matmul whose acc is not float32")
     return m, n, kdim, batch
 
 
 def _full_k(matmul: Node) -> int | None:
     """The block of the matmul's K when K is a ``:`` slice: a reduction
     dimension, which no loop iterates."""
-    _, lhs, _ = _operands(matmul)
-    block = _block(lhs.meta["val"].size(-1))
+    _, lhs, _ = matmul_operands(matmul)
+    block = block_id_of(lhs.meta["val"].size(-1))
     if block is None or not CompileEnvironment.current().block_sizes[block].reduction:
         return None
     return block
 
 
-def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: _Graphs) -> MppGroup:
+def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGroup:
     """A matmul over a ``:`` K: one op over the whole K, seeded by a constant
     fill or a Scalar value of the op's own graph, or, with no acc, by zeros
     the op emits itself."""
-    acc, lhs, rhs = _operands(matmul)
+    acc, lhs, rhs = matmul_operands(matmul)
     m, n, kdim, batch = _mnk(matmul, k_block)
     seed = acc
     while seed is not None and seed.target is _tracing_ops._new_var:
         seed = _node(seed.args[0])
     if seed is not None and seed.op == "placeholder":
-        raise _unsupported(
+        raise metal_unsupported(
             "a matmul over a ':' K whose acc an enclosing loop or if passes in"
         )
     fill = seed.args[1] if seed is not None and seed.target is full else None
@@ -1452,14 +1545,14 @@ def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: _Graphs) -> MppGr
         batch_block=batch,
     )
     if group.lhs.dtype != group.rhs.dtype:
-        raise _unsupported("MPP operands of two dtypes")
+        raise metal_unsupported("MPP operands of two dtypes")
     _storage(group, acc)
-    group.recomputable = _Recomputable(group, graphs)
+    group.recomputable = Recomputable(group, graphs)
     _classify_uses(group, graphs)
     return group
 
 
-def _hoist_invariant(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
+def _hoist_invariant(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     """Stage each staged operand that its loop doesn't change once, before
     the loop: the loop must be outermost (its own graph runs in no loop),
     and the operand computed element-wise, in the loop, from values passed
@@ -1477,7 +1570,7 @@ def _hoist_invariant(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
         return
     info = graphs.info(loop.args[0])
     assert isinstance(info, ForLoopGraphInfo)
-    _, lhs, rhs = _operands(group.matmul)
+    _, lhs, rhs = matmul_operands(group.matmul)
     for side, (node, operand) in enumerate(((lhs, group.lhs), (rhs, group.rhs))):
         cone = _invariant_cone(node, loop, info.graph, set(info.block_ids), graphs)
         if cone is None:
@@ -1488,7 +1581,7 @@ def _hoist_invariant(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
 
 
 def _clone_before(
-    loop: Node, body: Graph, cone: list[Node], graphs: _Graphs
+    loop: Node, body: Graph, cone: list[Node], graphs: Graphs
 ) -> dict[Node, Node]:
     """Clone ``cone`` right before ``loop``: each body placeholder becomes
     the value the loop passes in, and each if's placeholder its outer
@@ -1505,7 +1598,7 @@ def _clone_before(
 
 
 def _invariant_cone(
-    node: Node, loop: Node, body: Graph, blocks: set[int], graphs: _Graphs
+    node: Node, loop: Node, body: Graph, blocks: set[int], graphs: Graphs
 ) -> list[Node] | None:
     """The tensors ``node`` is computed from inside the loop, in dependency
     order, down to the body's placeholders, when the loop doesn't change
@@ -1535,7 +1628,7 @@ def _invariant_cone(
                     n.target in (full, _tracing_ops._new_var, _tracing_ops._mask_to)
                     or _pointwise(n)
                 )
-                and not any(_block(s) in blocks for s in val.size())
+                and not any(block_id_of(s) in blocks for s in val.size())
                 and all(visit(a) for a in n.all_input_nodes)
             )
         if ok:
@@ -1553,7 +1646,7 @@ _NOT_RELOADED = (
 )
 
 
-def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
+def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     """Stage in float32 each bfloat operand staged inside a for loop from a
     value the loop doesn't reload every iteration (:func:`_reloaded`).
     Metal miscompiles bfloat threadgroup stores of such a value, and float
@@ -1567,18 +1660,23 @@ def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
     if loop is None:
         return
     in_for = _tracing_ops.is_for_loop_target(loop.target)
-    _, lhs, rhs = _operands(group.matmul)
+    _, lhs, rhs = matmul_operands(group.matmul)
     for node, operand in ((lhs, group.lhs), (rhs, group.rhs)):
         if (
             not operand.staged
             or operand.hoist is not None
             or operand.elements is not None
             or operand.dtype != torch.bfloat16
-            or (in_for and _reloaded(node, graphs.info(loop.args[0]).graph, graphs))
+            or (
+                in_for
+                and _reloaded(
+                    node, cast("ForLoopGraphInfo", graphs.info(loop.args[0])), graphs
+                )
+            )
         ):
             continue
         if not in_for or group.k_factor != 1:
-            raise _unsupported(_NOT_RELOADED)
+            raise metal_unsupported(_NOT_RELOADED)
         _round_conversions(group.matmul, node, plan, graphs)
         operand.float_tile = True
 
@@ -1600,7 +1698,7 @@ def _op_name(node: Node) -> str:
 
 
 def _not_followed(source: str) -> exc.BackendUnsupported:
-    return _unsupported(
+    return metal_unsupported(
         f"a bfloat MPP operand staged inside a loop from {source}, whose bfloat "
         "conversions the planner does not follow (a loop, an if or a node with "
         "several outputs), which Metal miscompiles; compute the value inside the "
@@ -1608,7 +1706,7 @@ def _not_followed(source: str) -> exc.BackendUnsupported:
     )
 
 
-def _carry_update(placeholder: Node, loop: Node, graphs: _Graphs) -> Node:
+def _carry_update(placeholder: Node, loop: Node, graphs: Graphs) -> Node:
     """The value ``loop``'s body gives back for the carried ``placeholder``."""
     slot = _node(_carry(placeholder, loop)).args[1]
     assert isinstance(slot, int)
@@ -1622,9 +1720,7 @@ def _op_value(node: Node) -> bool:
     return node.target in _MATMULS or node.target is _mpp_upd
 
 
-def _round_conversions(
-    matmul: Node, node: Node, plan: MppPlan, graphs: _Graphs
-) -> None:
+def _round_conversions(matmul: Node, node: Node, plan: MppPlan, graphs: Graphs) -> None:
     """Re-point ``matmul`` from its operand ``node`` to a copy of ``node``'s
     chain in which each float -> bfloat conversion is a ``_mpp_round``.
 
@@ -1673,7 +1769,7 @@ def _round_conversions(
         if isinstance(val, torch.Tensor) and val.dtype == torch.bfloat16:
             if n.target is _CONVERT:
                 if via_carry or n.graph is not graph:
-                    raise _unsupported(
+                    raise metal_unsupported(
                         "a bfloat MPP operand staged inside a loop from a bfloat "
                         "conversion before the loop, in another graph of the loop "
                         "or in a carry, which Metal miscompiles; convert it inside "
@@ -1681,7 +1777,7 @@ def _round_conversions(
                     )
                 converts.append(n)
             elif n.target not in _BF16_MOVES:
-                raise _unsupported(
+                raise metal_unsupported(
                     "a bfloat MPP operand staged inside a loop from a bfloat value "
                     f"computed by {_op_name(n)} that the loop does not reload, which "
                     "Metal miscompiles; compute it in float32 and convert it with "
@@ -1718,7 +1814,7 @@ def _round_conversions(
             graph.erase_node(n)
 
 
-def _enclosing_loop(graph: Graph, graphs: _Graphs) -> Node | None:
+def _enclosing_loop(graph: Graph, graphs: Graphs) -> Node | None:
     """The innermost for or while loop *graph* runs in, or None."""
     while True:
         gid = graphs.graph_id[graph]
@@ -1732,18 +1828,28 @@ def _enclosing_loop(graph: Graph, graphs: _Graphs) -> Node | None:
         graph = owner.graph
 
 
-def _reloaded(node: Node, body: Graph, graphs: _Graphs) -> bool:
-    """Whether every value *node* is computed from is a load inside *body*
-    or a constant fill.  A load ends its path: its index and mask decide
-    where it reads, not whether the loop reloads it."""
+def _reloaded(node: Node, loop: ForLoopGraphInfo, graphs: Graphs) -> bool:
+    """Whether every value *node* is computed from is a load inside *loop*'s
+    body, a constant fill, or the index of a tile *loop* iterates beside such
+    a load (the nibble a dequantized weight element takes from its loaded
+    word is ``tile_k.index % 8``; the index alone may repeat its values every
+    iteration).  A load ends its path: its index and mask decide where it
+    reads, not whether the loop reloads it."""
     work, seen = [node], {node}
+    loaded = indexed = False
     while work:
         n = graphs.origin(work.pop())
         if n.op != "call_function":
             return False
         if n.target is load:
-            if not graphs.within(n.graph, body):
+            if not graphs.within(n.graph, loop.graph):
                 return False
+            loaded = True
+            continue
+        if n.target is tile_index:
+            if block_id_of(n.meta["val"].size(0)) not in loop.block_ids:
+                return False
+            indexed = True
             continue
         if n.target is full:
             value = n.args[1]
@@ -1762,7 +1868,7 @@ def _reloaded(node: Node, body: Graph, graphs: _Graphs) -> bool:
             if i not in seen:
                 seen.add(i)
                 work.append(i)
-    return True
+    return loaded or not indexed
 
 
 def _launch_constant(val: object) -> bool:
@@ -1781,7 +1887,7 @@ def _launch_constant(val: object) -> bool:
     return True
 
 
-def _updates_carry(acc: Node, graphs: _Graphs) -> bool:
+def _updates_carry(acc: Node, graphs: Graphs) -> bool:
     """Whether ``acc`` is computed element-wise, in its own graph, from a
     value its loop carries."""
     work, seen = [acc], {acc}
@@ -1808,7 +1914,7 @@ def _updates_carry(acc: Node, graphs: _Graphs) -> bool:
 
 
 def _levels(
-    placeholder: Node, loop: Node, carry: Node, matmul: Node, graphs: _Graphs
+    placeholder: Node, loop: Node, carry: Node, matmul: Node, graphs: Graphs
 ) -> list[_Level]:
     """The control-flow levels from the K loop out to the seed's graph.
 
@@ -1832,7 +1938,7 @@ def _levels(
         else:
             exit_ = _if_exit(owner, node, inner, graphs)
         if exit_ is None:
-            raise _unsupported(
+            raise metal_unsupported(
                 "an MPP accumulator passed into a loop or an if that doesn't give "
                 "it back as the same variable"
             )
@@ -1840,7 +1946,7 @@ def _levels(
 
 
 def _level(
-    owner: Node, placeholder: Node, exit_: Node, inner: Node, graphs: _Graphs
+    owner: Node, placeholder: Node, exit_: Node, inner: Node, graphs: Graphs
 ) -> _Level:
     arg = _node(graphs.outer(placeholder))
     slot = exit_.args[1]
@@ -1853,7 +1959,7 @@ def _level(
         assert isinstance(out_slot, int)
     (output,) = placeholder.graph.find_nodes(op="output")
     if _seq(output.args[0])[out_slot] is not inner:
-        raise _unsupported(
+        raise metal_unsupported(
             "an MPP accumulator whose loop or if gives back another value than "
             "the updated one"
         )
@@ -1861,12 +1967,12 @@ def _level(
         u for u in exit_.users if u.target is _tracing_ops._phi and u.args[1] is exit_
     ]
     if len(phis) != 1:
-        raise _unsupported("an MPP accumulator read past its loop without a merge")
+        raise metal_unsupported("an MPP accumulator read past its loop without a merge")
     return _Level(owner, arg, placeholder, exit_, phis[0], out_slot)
 
 
 def _if_exit(
-    owner: Node, placeholder: Node, inner: Node, graphs: _Graphs
+    owner: Node, placeholder: Node, inner: Node, graphs: Graphs
 ) -> Node | None:
     """The getitem of ``owner``, an ``_if`` whose if branch holds
     ``placeholder``, for the output that holds ``inner``, when the else
@@ -1889,7 +1995,7 @@ def _if_exit(
 
 
 def _scalar_seed(
-    outer: _Level, m: int, n: int, batch: int | None, graphs: _Graphs
+    outer: _Level, m: int, n: int, batch: int | None, graphs: Graphs
 ) -> Node:
     """Route a seed that is not a constant fill through a ``_mpp_coop`` node
     before the outermost level, which stages it into the cooperative tensor;
@@ -1898,8 +2004,8 @@ def _scalar_seed(
     val = arg.meta["val"]
     assert isinstance(val, torch.Tensor)
     want = (m, n) if val.ndim == 2 else (batch, m, n)
-    if val.ndim not in (2, 3) or tuple(_block(s) for s in val.size()) != want:
-        raise _unsupported("an MPP accumulator seed whose dims are not M and N")
+    if val.ndim not in (2, 3) or tuple(block_id_of(s) for s in val.size()) != want:
+        raise metal_unsupported("an MPP accumulator seed whose dims are not M and N")
     positional_rebind.check_positional_merges(_producers(arg, graphs), _STAGE_REBIND)
     coop = _insert(_mpp_coop, arg, before=outer.owner)
     outer.owner.replace_input_with(arg, coop)
@@ -1982,7 +2088,7 @@ def _pointwise(node: Node) -> bool:
     )
 
 
-class _Recomputable:
+class Recomputable:
     """Whether a value can be computed at any (m, n) of a group's tile, by
     any thread, from uniform values, the M and N indices and loads alone.
 
@@ -1995,7 +2101,7 @@ class _Recomputable:
     value.
     """
 
-    def __init__(self, group: MppGroup, graphs: _Graphs) -> None:
+    def __init__(self, group: MppGroup, graphs: Graphs) -> None:
         self.group = group
         self.graphs = graphs
         self.memo: dict[Node, bool] = {}
@@ -2022,18 +2128,23 @@ class _Recomputable:
         element loop may recompute it."""
         return node in self.group.old
 
-    def _compute(self, node: Node, val: object) -> bool:
-        # A batch block holds one index (_check_batch), the same at every
-        # element.
+    def blocks(self) -> set[int]:
+        """The blocks a recomputable value may lie over: the group's M and
+        N, and its batch block, which holds one index (_check_batch), the
+        same at every element."""
         blocks = {self.group.m_block, self.group.n_block, self.group.batch_block}
         blocks.discard(None)
+        return cast("set[int]", blocks)
+
+    def _compute(self, node: Node, val: object) -> bool:
+        blocks = self.blocks()
         if node.target is _IOTA:
             assert isinstance(val, torch.Tensor)
-            ok = _block(val.size(0)) in blocks
+            ok = block_id_of(val.size(0)) in blocks
         elif node.target is tile_index:
             # The element loop binds the thread and lanes that hold the element
             # in the Scalar layout, which give the tile's index.
-            ok = _block(_node(node.args[0]).meta["val"]) in blocks
+            ok = block_id_of(_node(node.args[0]).meta["val"]) in blocks
         elif node.target is full:
             ok = isinstance(node.args[1], (int, float))
         elif node.target is load:
@@ -2043,7 +2154,7 @@ class _Recomputable:
         else:
             ok = False
         if ok and isinstance(val, torch.Tensor):
-            ok = all(s == 1 or _block(s) in blocks for s in val.size())
+            ok = all(s == 1 or block_id_of(s) in blocks for s in val.size())
         return ok
 
     def nodes(self, value: object) -> list[Node]:
@@ -2068,7 +2179,7 @@ class _Recomputable:
         return out
 
 
-def _classify_uses(group: MppGroup, graphs: _Graphs) -> None:
+def _classify_uses(group: MppGroup, graphs: Graphs) -> None:
     """Find the uses an element loop evaluates on the cooperative tensor's
     own elements: element-wise ops whose other inputs are recomputable at
     any element (``derived``), and stores of the result or such an op at a
@@ -2190,7 +2301,7 @@ def _prune_derived(group: MppGroup) -> None:
         group.stores = stores
 
 
-def _storage_key(node: Node) -> StorageWeakRef:
+def storage_key(node: Node) -> StorageWeakRef:
     """The fake storage a load or a write accesses."""
     tensor = node.args[0]
     if isinstance(tensor, (list, tuple)):
@@ -2199,7 +2310,7 @@ def _storage_key(node: Node) -> StorageWeakRef:
     return StorageWeakRef(tensor.meta["val"].untyped_storage())
 
 
-def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: _Graphs) -> None:
+def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: Graphs) -> None:
     """MPP gives each element to a thread of its own choosing, and no barrier
     orders device memory around an op.  So an element-loop store must write
     a tensor nothing else accesses and re-run no load of a tensor the kernel
@@ -2210,13 +2321,11 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: _Graphs) -> None
     one tensor fall together (as ``free_arange._check_write_once``)."""
 
     accesses: dict[StorageWeakRef, list[Node]] = {}
-    written: set[StorageWeakRef] = set()
+    written = plan.written
     for g in live:
         for n in g.graph.nodes:
             if n.target is load or n.target in _WRITES:
-                accesses.setdefault(_storage_key(n), []).append(n)
-                if n.target in _WRITES:
-                    written.add(_storage_key(n))
+                accesses.setdefault(storage_key(n), []).append(n)
     for group in plan.by_matmul.values():
         _prune_derived(group)
         recomputable = group.recomputable
@@ -2236,8 +2345,8 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: _Graphs) -> None
                 + recomputable.nodes(st.args[3])
                 if n.target is load
             ]
-            if any(n is not st for n in accesses[_storage_key(st)]) or any(
-                _storage_key(ld) in written for ld in reloads
+            if any(n is not st for n in accesses[storage_key(st)]) or any(
+                storage_key(ld) in written for ld in reloads
             ):
                 continue
             kept.append(st)
@@ -2247,13 +2356,13 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: _Graphs) -> None
         # thread MPP gives each element, and unlike a store it can't take the
         # Scalar layout: the op reads its result.
         for ld in _update_reruns(group):
-            if ld.target is load and _storage_key(ld) in written:
-                raise _unsupported(
+            if ld.target is load and storage_key(ld) in written:
+                raise metal_unsupported(
                     f"an update of an MPP accumulator reads {ld.name}, a load of a "
                     "tensor the kernel writes, which its element loop would re-run "
                     "on another thread than the one that wrote it"
                 )
-        _, lhs, rhs = _operands(group.matmul)
+        _, lhs, rhs = matmul_operands(group.matmul)
         for operand, node in ((group.lhs, lhs), (group.rhs, rhs)):
             view = operand.view
             if view is not None and (
@@ -2262,11 +2371,11 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: _Graphs) -> None
                 operand.view = None
             if operand.staged:
                 for ld in _operand_loads(node, group.matmul.graph, graphs):
-                    if _storage_key(ld) in written:
+                    if storage_key(ld) in written:
                         _fence(plan, group, ld)
 
 
-def _operand_loads(node: Node, body: Graph, graphs: _Graphs) -> list[Node]:
+def _operand_loads(node: Node, body: Graph, graphs: Graphs) -> list[Node]:
     """Every load in the K loop's ``body``, at any depth, that a staged operand
     reads: the loads it is computed from, those inside control flow it is
     computed from, and the loads their indices and masks are computed from.  A
@@ -2291,20 +2400,23 @@ def _fence(plan: MppPlan, group: MppGroup, ld: Node) -> None:
     orders device memory between threads only at a barrier, which every
     thread reaches in the op's own graph (:func:`_check_uniform`)."""
     if ld.graph is not group.matmul.graph:
-        raise _unsupported(
+        raise metal_unsupported(
             f"a staged MPP operand computed from {ld.name}, a load of a tensor the "
             "kernel writes, inside control flow in its K loop's body"
         )
     plan.fenced.add(ld)
 
 
-def _finalize(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
+def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     """Route every remaining use of a cooperative value through a
     materialization, and check that the code each layout runs meets dims by
     block (``positional_rebind``)."""
     # After ``_order_memory``, so an operand it demotes to staged is checked.
-    _hoist_invariant(group, plan, graphs)
-    _stage_in_float(group, plan, graphs)
+    # A fragment group's operands never reach threadgroup memory: each lane
+    # computes its own elements at the op.
+    if plan.fragment is None:
+        _hoist_invariant(group, plan, graphs)
+        _stage_in_float(group, plan, graphs)
     coop = group.cur | group.derived
     # The update's nodes read the carry where the update's element loop
     # runs them, before the op.
@@ -2341,7 +2453,7 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
     )
 
 
-def _stage_epilogue_vecs(group: MppGroup, plan: MppPlan, graphs: _Graphs) -> None:
+def _stage_epilogue_vecs(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     """Stage each input of a kept derived value that no element can
     recompute (:func:`_vec_input`) into a ``_mpp_vec`` tile, right after the
     input's definition, so ahead of every derived reader."""
@@ -2369,7 +2481,7 @@ def _update_reruns(group: MppGroup) -> list[Node]:
     ]
 
 
-def _check_uniform(node: Node, graphs: _Graphs) -> None:
+def _check_uniform(node: Node, graphs: Graphs) -> None:
     """Every thread of the threadgroup reaches ``node``: no enclosing if or
     while tests a per-element predicate.  A cooperative op, and the barriers of a
     staged tile or a materialization, need all of them.  Checking the op covers
@@ -2392,29 +2504,33 @@ def _check_uniform(node: Node, graphs: _Graphs) -> None:
         else:
             return
         if per_element:
-            raise _unsupported(
+            raise metal_unsupported(
                 "a cooperative MPP op under an if or a while on a per-element "
                 "predicate; every thread of the threadgroup must reach it"
             )
 
 
-def _live_exit(node: Node, output: Node, graphs: _Graphs) -> bool:
+def _live_exit(node: Node, output: Node, graphs: Graphs) -> bool:
     """Whether a getitem of the graph's owner reads one of ``output``'s slots
-    that hold ``node``.  An if graph outputs every name it writes, so a slot
-    no getitem reads is dead."""
+    that hold ``node``.  A branch graph also outputs the variables local to
+    it, which the ``_if`` does not give back, so their slots are dead."""
     owner = graphs.owner(output)
     if owner is None:
         return True
     slots = {i for i, v in enumerate(_seq(output.args[0])) if v is node}
     if owner.target is _tracing_ops._if:
+        info, _ = graphs.if_branch(owner.args[1])
         gid = graphs.graph_id[output.graph]
-        _, branches = graphs.if_branch(gid)
-        side = 0 if gid == owner.args[1] else 1
-        slots = {i for i, pair in enumerate(branches) if pair[side] in slots}
+        live = {(gid, slot) for slot in slots}
+        return any(
+            u.target is operator.getitem
+            and info.result_source(owner, cast("int", u.args[1])) in live
+            for u in owner.users
+        )
     return any(u.target is operator.getitem and u.args[1] in slots for u in owner.users)
 
 
-def _forward_slice(starts: list[Node], graphs: _Graphs) -> list[Node]:
+def _forward_slice(starts: list[Node], graphs: Graphs) -> list[Node]:
     """Every node that reads one of ``starts``, directly or through other
     nodes, control-flow arguments and outputs included."""
     out: list[Node] = []
@@ -2456,22 +2572,27 @@ def check_mpp_launch(plan: MppPlan, block_dims: Sequence[int]) -> None:
     if not plan.by_matmul:
         return
     threads = math.prod(block_dims)
+    if threads != 32 and plan.fragment is not None:
+        raise metal_unsupported(
+            f"a fragment matmul (metal_matmul='fragment') in a threadgroup of "
+            f"{threads} threads; it runs on one 32-thread SIMD group (num_warps=1)"
+        )
     if threads > 1024 or threads % 32:
-        raise _unsupported(
+        raise metal_unsupported(
             f"a cooperative MPP matmul in a threadgroup of {threads} threads; it "
             "needs whole 32-thread SIMD groups and at most 1024 threads (change "
             "num_threads or the block sizes)"
         )
     for m, n in plan.wide.values():
         if threads // 32 < _WIDE_MIN_SIMDGROUPS:
-            raise _unsupported(
+            raise metal_unsupported(
                 f"an MPP matmul tile {m}x{n} on {threads // 32} SIMD groups; over "
                 f"{_MAX_TILE[0]} rows or columns it needs {_WIDE_MIN_SIMDGROUPS} "
                 "(raise num_warps)"
             )
 
 
-def _plan() -> MppPlan:
+def current_plan() -> MppPlan:
     from .backend import MetalBackend
 
     backend = CompileEnvironment.current().backend
@@ -2482,10 +2603,10 @@ def _plan() -> MppPlan:
 def _transposed(operand: _Operand) -> bool:
     """A staged tile is written row-major."""
     view = operand.view
-    return view is not None and view.tensor.stride(view.positions[1]) != 1
+    return view is not None and view.strides[1] != 1
 
 
-def _sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]:
+def group_sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]:
     """The lhs and rhs, each with its blocks and the position of K in them."""
     return (
         (group.lhs, (group.m_block, group.k_block), 1),
@@ -2493,11 +2614,11 @@ def _sides(group: MppGroup) -> tuple[tuple[_Operand, tuple[int, int], int], ...]
     )
 
 
-def _tile(cg: GenerateAST, blocks: Sequence[int]) -> list[int]:
+def static_tile(cg: GenerateAST, blocks: Sequence[int]) -> list[int]:
     sizes = [cg.device_function.resolved_block_size(b) for b in blocks]
     out = [b for b in sizes if isinstance(b, int)]
     if len(out) != len(sizes):
-        raise _unsupported(
+        raise metal_unsupported(
             "an MPP matmul tile with a block size unknown at codegen time"
         )
     return out
@@ -2514,7 +2635,7 @@ def _expr(node: Node | int) -> str:
 def _(state: CodegenState) -> ast.AST:
     node = state.fx_node
     assert node is not None
-    group = _plan().by_seed.get(node)
+    group = current_plan().by_seed.get(node)
     if group is None:
         return full._codegen["common"](state)  # pyrefly: ignore[missing-attribute]
     fill = node.args[1]
@@ -2526,10 +2647,10 @@ def _(state: CodegenState) -> ast.AST:
 def _(state: CodegenState) -> ast.AST:
     node = state.fx_node
     assert node is not None
-    group = _plan().by_seed[node]
+    group = current_plan().by_seed[node]
     cg = state.codegen
     blocks = (group.m_block, group.n_block)
-    rows, cols = _tile(cg, blocks)
+    rows, cols = static_tile(cg, blocks)
     buf = alloc_threadgroup_buffer("float", rows * cols, prefix="_mpp_seed")
     _stage_writes(cg, buf, [state.ast_arg(0)], torch.float32, blocks, cols)
     return _acc_expr(cg, group, None, buf)
@@ -2541,10 +2662,10 @@ def _(state: CodegenState) -> ast.AST:
     read this thread's element of it in the Scalar layout."""
     node = state.fx_node
     assert node is not None
-    group = _plan().by_mat[node]
+    group = current_plan().by_mat[node]
     cg = state.codegen
     blocks = (group.m_block, group.n_block)
-    rows, cols = _tile(cg, blocks)
+    rows, cols = static_tile(cg, blocks)
     buf = alloc_threadgroup_buffer("float", rows * cols, prefix=MAT_TILE)
     coop = state.ast_arg(0)
     assert isinstance(coop, ast.Name)
@@ -2568,9 +2689,9 @@ def _(state: CodegenState) -> ast.AST:
     """Stage a hoisted operand into its tile, before its loop."""
     node = state.fx_node
     assert node is not None
-    group, side = _plan().by_hoist[node]
-    operand, blocks, k_pos = _sides(group)[side]
-    tile = _tile(state.codegen, blocks)
+    group, side = current_plan().by_hoist[node]
+    operand, blocks, k_pos = group_sides(group)[side]
+    tile = static_tile(state.codegen, blocks)
     tile[k_pos] *= group.k_factor
     operand.tile = _stage_tile(
         state.codegen, group, operand.dtype, state.ast_arg(0), blocks, tile, k_pos
@@ -2593,14 +2714,14 @@ def _(state: CodegenState) -> ast.AST:
     re-run in an element loop, the read gives the element's value."""
     node = state.fx_node
     assert node is not None
-    group = _plan().by_vec[node]
+    group = current_plan().by_vec[node]
     cg = state.codegen
     backend = CompileEnvironment.current().backend
     val = node.meta["val"]
     assert isinstance(val, torch.Tensor)
-    present = {_block(s) for s in val.size() if s != 1}
+    present = {block_id_of(s) for s in val.size() if s != 1}
     blocks = [b for b in (group.m_block, group.n_block) if b in present]
-    sizes = _tile(cg, blocks)
+    sizes = static_tile(cg, blocks)
     # A float value is staged as float32, exact for 16-bit floats, so no
     # bfloat store reaches threadgroup memory (Metal miscompiles some inside
     # a loop); any other value in its own type.
@@ -2620,30 +2741,41 @@ def _acc_expr(
     cg: GenerateAST, group: MppGroup, fill: str | None, seed: str | None
 ) -> ast.AST:
     """``_helion_mpp_acc(...)``: the group's op and cooperative accumulator, filled
-    with the constant ``fill`` or from the staged tile ``seed``."""
-    tile = _tile(cg, (group.m_block, group.n_block, group.k_block))
+    with the constant ``fill`` or from the staged tile ``seed``; a fragment
+    group's carries its fragment grid as ``fragment=(rows, cols,
+    transposed)`` (``FragmentLowering.acc_keywords``)."""
+    lowering = current_plan().fragment
+    tile = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     tile[2] *= group.k_factor
     limits = (_WIDE_TILE, _WIDE_TILE, _MAX_TILE[2])
-    if any(b > limit for b, limit in zip(tile, limits, strict=True)):
-        raise _unsupported(
+    if lowering is None and any(
+        b > limit for b, limit in zip(tile, limits, strict=True)
+    ):
+        raise metal_unsupported(
             f"an MPP matmul tile {tile[0]}x{tile[1]}x{tile[2]}: one op covers M, "
             f"N <= {_WIDE_TILE} and K <= {_MAX_TILE[2]}"
         )
     m, n, k = tile
     block_m, block_n = m, n
     for staged, size in ((group.lhs.staged, m), (group.rhs.staged, n)):
-        if size == 1 and staged:
-            raise _unsupported("a staged MPP operand over a size-1 M or N")
-    m, n = _op_dims(group, m, n)
-    if m > _MAX_TILE[0] or n > _MAX_TILE[1]:
-        _plan().wide[group.gid] = (m, n)
-    # MPP's static_asserts for a SIMD-group scope (MPPTensorOpsMatMul2dImpl.h).
-    if m % 8 or n % 8 or (m % 16 and n % 16) or k % 16:
-        raise _unsupported(
-            f"an MPP matmul tile {m}x{n}x{k}: matmul2d needs M and N multiples of "
-            "8, one of them of 16, and K a multiple of 16"
-        )
-    binds = _virtual_thread(cg, group)
+        # A fragment group stages nothing: a block of 1 grows to 8 and the
+        # element loops skip the rows and columns past it.
+        if size == 1 and staged and lowering is None:
+            raise metal_unsupported("a staged MPP operand over a size-1 M or N")
+    m, n = op_dims(group, m, n)
+    keywords = ""
+    if lowering is not None:
+        keywords = lowering.acc_keywords(cg, group, m, n, k)
+    else:
+        if m > _MAX_TILE[0] or n > _MAX_TILE[1]:
+            current_plan().wide[group.gid] = (m, n)
+        # MPP's static_asserts for a SIMD-group scope (MPPTensorOpsMatMul2dImpl.h).
+        if m % 8 or n % 8 or (m % 16 and n % 16) or k % 16:
+            raise metal_unsupported(
+                f"an MPP matmul tile {m}x{n}x{k}: matmul2d needs M and N multiples "
+                "of 8, one of them of 16, and K a multiple of 16"
+            )
+    binds = virtual_thread(cg, ((group.m_block, "_e_m"), (group.n_block, "_e_n")))
     dtype_str = CompileEnvironment.current().backend.dtype_str
     dtypes = tuple(
         dtype_str(torch.float32 if o.float_tile else o.dtype)
@@ -2654,11 +2786,11 @@ def _acc_expr(
         f"{ACC}({group.gid}, {m}, {n}, {k}, {dtypes!r}, "
         f"{int(_transposed(group.lhs))}, {int(_transposed(group.rhs))}, "
         f"{fill}, [{', '.join(binds)}], {staged[0]}, {staged[1]}, "
-        f"{block_m}, {block_n}, {seed!r})"
+        f"{block_m}, {block_n}, {seed!r}{keywords})"
     )
 
 
-def _op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
+def op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     """The op's M and N: each block, cut to its loop's static extent rounded
     up to 8 when one tile covers the loop.
 
@@ -2673,7 +2805,8 @@ def _op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     cut dim never grows past its block, so a staged tile, sized by the
     block, still holds every row the op reads.  MPP needs one of M and N a
     multiple of 16: a dim this rule changed takes the extra 8, and two
-    unchanged blocks are left to the caller's check.
+    unchanged blocks are left to the caller's check.  A fragment group's op
+    is a grid of 8x8 fragments, which needs no such multiple.
     """
     env = CompileEnvironment.current()
     dims = []
@@ -2686,7 +2819,7 @@ def _op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
             size = min(size, -(-max(extent, 1) // 8) * 8)
         dims.append(size)
     m, n = dims
-    if m % 16 and n % 16:
+    if m % 16 and n % 16 and current_plan().fragment is None:
         if m != block_m:
             m += 8
         elif n != block_n:
@@ -2694,13 +2827,14 @@ def _op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     return m, n
 
 
-def _virtual_thread(cg: GenerateAST, group: MppGroup) -> list[str]:
-    """``(name, expr)`` bindings that make a thread act, inside the element
-    loop, as the thread that holds element ``(_e_m, _e_n)`` in the Scalar
-    layout: ``tid`` and the M and N lane variables."""
+def virtual_thread(cg: GenerateAST, dims: Sequence[tuple[int, str]]) -> list[str]:
+    """``(name, expr)`` bindings that make a thread act, inside an element
+    loop, as the thread that holds the element at index ``e`` of each block
+    in ``dims`` (``(block, e)`` pairs: ``(_e_m, _e_n)`` of an accumulator) in
+    the Scalar layout: ``tid`` and the blocks' lane variables."""
     comps = ["0", "0", "0"]
     binds: list[str] = []
-    for block, e in ((group.m_block, "_e_m"), (group.n_block, "_e_n")):
+    for block, e in dims:
         layout = _block_layout(cg, block)
         tid_e, lane_binds = layout.binds(e)
         binds += lane_binds
@@ -2784,7 +2918,7 @@ def _block_layout(cg: GenerateAST, block: int) -> _BlockLayout:
         )
     states = cg.active_device_loops.get(block)
     if not states:
-        raise _unsupported(
+        raise metal_unsupported(
             f"an MPP matmul whose block {block} is neither a tile loop, a ':' slice "
             "nor a free hl.arange"
         )
@@ -2792,7 +2926,7 @@ def _block_layout(cg: GenerateAST, block: int) -> _BlockLayout:
     assert isinstance(state, (DeviceLoopState, DeviceGridState))
     if isinstance(state.strategy, FlattenedTileStrategy):
         # Its offset is each thread's own index, not the tile's start.
-        raise _unsupported(
+        raise metal_unsupported(
             f"an MPP matmul whose block {block} is a single root hl.tile with no "
             "device loop inside (a flattened tile)"
         )
@@ -2806,7 +2940,7 @@ def _block_layout(cg: GenerateAST, block: int) -> _BlockLayout:
     if len(lanes) > 1 or any(
         state.lane_loop_block_ids[var] != {block} for var, _ in lanes
     ):
-        raise _unsupported(
+        raise metal_unsupported(
             f"an MPP matmul whose block {block} spans two lane loops or "
             "shares one with another block"
         )
@@ -2836,13 +2970,13 @@ def _check_threads(cg: GenerateAST, group: MppGroup) -> None:
         for st in states:
             for block, axis in st.block_thread_axes.items():
                 if block not in allowed and st.thread_axis_sizes.get(axis, 1) > 1:
-                    raise _unsupported(
+                    raise metal_unsupported(
                         f"block {block} is spread over threads around a cooperative "
                         "MPP matmul; only its M, N and K blocks may hold threads"
                     )
     for block, (_axis, threads, _lanes) in backend.free_arange_plan.items():
         if block not in allowed and threads > 1:
-            raise _unsupported(
+            raise metal_unsupported(
                 f"free block {block} is spread over threads around a cooperative "
                 "MPP matmul; only its M, N and K blocks may hold threads"
             )
@@ -2861,7 +2995,7 @@ def _thread_blocks(group: MppGroup) -> set[int]:
     )
 
 
-def _foreign_threads(group: MppGroup, threaded: set[int], graphs: _Graphs) -> bool:
+def _foreign_threads(group: MppGroup, threaded: set[int], graphs: Graphs) -> bool:
     """Whether :func:`_check_threads` rejects the group's op at the config
     whose strategies spread the blocks ``threaded`` over threads: one of them
     is a grid block or a block of a loop the op runs in, and none of
@@ -2885,16 +3019,21 @@ def _group_blocks(group: MppGroup) -> set[int]:
     index tiles included.  The planner admits a seed, an update's operands,
     an epilogue's and a store's only over the group's own blocks or as 0-d
     values, so threads that differ on any other block hold the same element
-    of every value the group stages or reads per element."""
-    nodes = {group.matmul, *(n for n in _operands(group.matmul) if n is not None)}
+    of every value the group stages or reads per element.  A loaded host
+    tensor's dims are host extents, not blocks; only its load's are."""
+    nodes = {group.matmul, *(n for n in matmul_operands(group.matmul) if n is not None)}
     blocks: set[int] = set()
     for n in nodes:
         for v in (n, *n.all_input_nodes):
+            if v.target is _tracing_ops._host_tensor:
+                # An extent that equals a reduction dim's size would
+                # resolve to that block.
+                continue
             val = v.meta.get("val")
             sizes = val.size() if isinstance(val, torch.Tensor) else (val,)
-            # _block maps only ints and SymInts; a float kernel argument's
+            # block_id_of maps only ints and SymInts; a float kernel argument's
             # SymFloat has no block.
-            blocks |= {b for s in sizes if (b := _block(s)) is not None}
+            blocks |= {b for s in sizes if (b := block_id_of(s)) is not None}
     return blocks
 
 
@@ -2905,8 +3044,8 @@ def _check_batch(cg: GenerateAST, group: MppGroup) -> None:
     block = group.batch_block
     if block is None:
         return
-    if _tile(cg, [block]) != [1]:
-        raise _unsupported(
+    if static_tile(cg, [block]) != [1]:
+        raise metal_unsupported(
             f"a batched MPP matmul whose batch block {block} is over 1 (one op "
             "per batch index)"
         )
@@ -2919,13 +3058,13 @@ def _anchor(node: Node | None) -> str | None:
     return code.id if isinstance(code, ast.Name) else None
 
 
-def _view_args(
-    cg: GenerateAST, view: _View, k_block: int, value: object
+def view_args(
+    cg: GenerateAST, view: View, k_block: int, value: object
 ) -> tuple[
     list[str],
     list[tuple[int, str | None]],
     list[bool],
-    list[tuple[str, int, int, str | None]],
+    list[tuple[str, str, str, str | None]],
 ]:
     """``tensor, (origin, extent, size, stride) per dim`` for ``_helion_mpp_run``,
     the anchors through which :class:`_Copies` reads a base or a bound,
@@ -2941,24 +3080,38 @@ def _view_args(
     computed and at the load itself; each anchor names that statement's
     target.
     """
+    from .backend import static_extent
+
     fn = cg.device_function
     t = view.tensor
     value_anchor = value.id if isinstance(value, ast.Name) else None
+
+    def size_of(i: int) -> tuple[int | None, str]:
+        """Dim *i*'s size as an int (None: symbolic, read at run time) and
+        as text."""
+        size = static_extent(t.size(i))
+        return size, str(size) if size is not None else fn.literal_expr(t.size(i))
+
+    def stride_text(i: int) -> str:
+        # Read at run time unless the kernel fixes it.
+        return fn.tensor_stride(t, i).name
+
     parts = [fn.tensor_arg(t).name]
     anchors: list[tuple[int, str | None]] = []
     always_live: list[bool] = []
-    for dim, i in zip(view.dims, view.positions, strict=True):
-        size, stride = int(t.size(i)), int(t.stride(i))
+    for dim, i, stride in zip(view.dims, view.positions, view.strides, strict=True):
+        size, size_expr = size_of(i)
         if dim.full:
-            parts += ["0", str(size), str(size), str(stride)]
+            parts += ["0", size_expr, size_expr, str(stride)]
             always_live.append(True)
             continue
         if dim.factor != 1:
             always_live.append(True)
             # A widened hl.arange covers [c * begin, c * end) of K, and the
             # load's lowering (factored_dims._check_extent) proved the dim is
-            # c x the loop's end: the view's extent, the dim's size, is the
-            # live K.
+            # c x the loop's end, a literal: the view's extent, the dim's
+            # size, is the live K.
+            assert size is not None
             info = cg.active_device_loops[dim.block_id][-1].block_id_to_info[
                 dim.block_id
             ]
@@ -2981,8 +3134,12 @@ def _view_args(
             # from the same base.  Rows and columns past M's and N's loop ends
             # are computed but never stored: the element loop re-runs the
             # store's mask.
+            # Only an end every call the kernel serves matches: a literal K
+            # can match a dynamic loop end in the first call alone.
             if dim.block_id == k_block and not (
-                base is None and info is not None and info.is_end_matching(size)
+                base is None
+                and info is not None
+                and info.is_end_matching_keyed(t.size(i))
             ):
                 assert info is not None and info.end_var_name is not None
                 extent = (
@@ -2994,38 +3151,48 @@ def _view_args(
                     anchors.append((len(parts) + 1, _anchor(dim.index)))
                 always_live.append(False)
             else:
-                extent = str(size)
+                extent = size_expr
                 always_live.append(base is None)
         else:
             always_live.append(False)
             origin = "0" if dim.base is None else _expr(dim.base)
             if dim.bound is None:
-                extent = str(size)
-            elif isinstance(dim.bound, int):
-                # Clamped here: the walker prints a literal extent with no min.
+                extent = size_expr
+            elif isinstance(dim.bound, int) and size is not None:
+                # Clamped here: the walker prints a literal extent beside a
+                # literal size with no min.
                 extent = str(max(0, min(dim.bound, size)))
+            elif isinstance(dim.bound, int):
+                # The walker clamps an extent beside a symbolic size to it.
+                extent = str(max(0, dim.bound))
             else:
                 extent = _expr(dim.bound)
             if dim.base is not None:
                 anchors.append((len(parts), _anchor(dim.index)))
             if isinstance(dim.bound, Node):
                 anchors.append((len(parts) + 1, _anchor(dim.mask)))
-        parts += [origin, extent, str(size), str(stride)]
-    outer: list[tuple[str, int, int, str | None]] = []
+        parts += [origin, extent, size_expr, str(stride)]
+    outer: list[tuple[str, str, str, str | None]] = []
     for i, x in view.outer:
-        size, stride = int(t.size(i)), int(t.stride(i))
         if isinstance(x, int):
             # A negative literal counts from the end, as the Scalar load reads it.
-            outer.append((str(x + size if x < 0 else x), size, stride, None))
+            size, size_expr = size_of(i)
+            if x < 0:
+                if size is None:
+                    raise metal_unsupported(
+                        "an MPP view indexed from the end of a symbolic dim"
+                    )
+                x += size
+            outer.append((str(x), size_expr, stride_text(i), None))
             continue
         val = x.meta["val"]
         # A SymInt prints as the Scalar load prints its index.
         expr = fn.literal_expr(val) if isinstance(val, torch.SymInt) else _expr(x)
-        outer.append((expr, size, stride, value_anchor))
+        outer.append((expr, size_of(i)[1], stride_text(i), value_anchor))
     if view.batch is not None:
         i, block = view.batch
         # The batch block holds one index (_check_batch): its tile's offset.
-        outer.append((cg.offset_var(block), int(t.size(i)), int(t.stride(i)), None))
+        outer.append((cg.offset_var(block), size_of(i)[1], stride_text(i), None))
     return parts, anchors, always_live, outer
 
 
@@ -3060,7 +3227,7 @@ def _in_tile(
     layouts = [_block_layout(cg, b) for b in blocks]
     checks = [
         f"({layout.local}) < {n}"
-        for layout, n in zip(layouts, _tile(cg, blocks), strict=True)
+        for layout, n in zip(layouts, static_tile(cg, blocks), strict=True)
         if force or layout.strided
     ]
     return layouts, checks
@@ -3125,7 +3292,7 @@ def _tile_read(cg: GenerateAST, buf: str, blocks: Sequence[int], zero: str) -> a
     masked off downstream."""
     layouts, inside = _in_tile(cg, blocks)
     locs = [layout.local for layout in layouts]
-    read = f"{buf}[{_flat(locs, _tile(cg, blocks)[-1])}]"
+    read = f"{buf}[{_flat(locs, static_tile(cg, blocks)[-1])}]"
     if not inside:
         return expr_from_string(read)
     return expr_from_string(f"({read} if {' and '.join(inside)} else {zero})")
@@ -3174,7 +3341,7 @@ def _stage_tile(
         # The planner admits a K of c * u by its size; a value of that size
         # that factored_dims doesn't build as parts (hl.full, say) has no
         # thread layout.
-        raise _unsupported(
+        raise metal_unsupported(
             f"a staged MPP operand over a K of {group.k_factor} * a block that "
             "is not held as per-thread parts (only a load at a widened "
             "hl.arange() or a merged torch.stack is)"
@@ -3194,7 +3361,7 @@ def _staged_args(
     # Every handle of the op ends at the K tile's live length.  MPP takes K
     # from the rhs handle alone and reads the lhs up to it (measured on every
     # mix of device and threadgroup handles; MPPTensorOpsMatMul2d.h doesn't
-    # say which handle), and a view's K extent is the live K (_view_args'
+    # say which handle), and a view's K extent is the live K (view_args'
     # end rules).
     info = cg.active_device_loops[group.k_block][-1].block_id_to_info[group.k_block]
     extents = [str(rows), str(cols)]
@@ -3207,9 +3374,13 @@ def _staged_args(
 def _codegen_matmul(
     cg: GenerateAST, node: Node, acc: object, values: tuple[object, object]
 ) -> ast.AST:
-    group = _plan().by_matmul[node]
+    group = current_plan().by_matmul[node]
     _check_threads(cg, group)
     _check_batch(cg, group)
+    lowering = current_plan().fragment
+    if lowering is not None:
+        assert isinstance(acc, ast.Name)
+        return lowering.codegen_run(cg, group, acc, values)
     if acc is None:
         # A matmul with no acc writes a fresh cooperative tensor: zeros, then
         # the op accumulates the product into them.
@@ -3220,12 +3391,12 @@ def _codegen_matmul(
     tile_dims: list[str] = []
     parts: list[list[str]] = []
     anchors: list[tuple[int, str | None]] = []
-    outers: list[list[tuple[str, int, int, str | None]]] = []
+    outers: list[list[tuple[str, str, str, str | None]]] = []
     pos = 2
     for (operand, blocks, k_pos), value, fx_value in zip(
-        _sides(group), values, _operands(node)[1:], strict=True
+        group_sides(group), values, matmul_operands(node)[1:], strict=True
     ):
-        tile = _tile(cg, blocks)
+        tile = static_tile(cg, blocks)
         tile[k_pos] *= group.k_factor
         tiles += tile
         view = operand.view
@@ -3258,14 +3429,13 @@ def _codegen_matmul(
             # Each handle is rebased at its tile in 64 bits, so every offset
             # MPP computes inside it (in int32) is below the tile's span; the
             # outer dims are folded into the base.
-            strides = [view.tensor.stride(p) for p in view.positions]
-            span = 1 + sum((b - 1) * s for b, s in zip(tile, strides, strict=True))
+            span = 1 + sum((b - 1) * s for b, s in zip(tile, view.strides, strict=True))
             if span >= 2**31:
-                raise _unsupported(
+                raise metal_unsupported(
                     f"an MPP view whose tile spans {span} elements (MPP tensor "
                     "handles index in int32)"
                 )
-            op_parts, op_anchors, flags, outer = _view_args(
+            op_parts, op_anchors, flags, outer = view_args(
                 cg, view, group.k_block, value
             )
             anchors += [(pos + i, a) for i, a in op_anchors]
@@ -3297,18 +3467,18 @@ def _check_source(
     k_pos: int,
 ) -> None:
     """Check an operand staged from the source group's element loop.  That
-    loop writes the elements of its op dims, which ``_op_dims`` may cut below
+    loop writes the elements of its op dims, which ``op_dims`` may cut below
     the block; the consumer reads its M or N side over its own op dims, which
     must not exceed the source's."""
-    (h,) = [x for x in _plan().by_matmul.values() if x.gid == source]
+    (h,) = [x for x in current_plan().by_matmul.values() if x.gid == source]
     assert _elementwise_of(value, h), value
-    hm, hn = _op_dims(h, *_tile(cg, (h.m_block, h.n_block)))
-    gm, gn = _op_dims(group, *_tile(cg, (group.m_block, group.n_block)))
+    hm, hn = op_dims(h, *static_tile(cg, (h.m_block, h.n_block)))
+    gm, gn = op_dims(group, *static_tile(cg, (group.m_block, group.n_block)))
     side = blocks[1 - k_pos]
     written = {h.m_block: hm, h.n_block: hn}[side]
     read = gm if k_pos == 1 else gn
     if read > written:
-        raise _unsupported(
+        raise metal_unsupported(
             "an MPP operand staged from another op's elements over a tile that "
             "op cuts to its loop's extent"
         )
@@ -3319,11 +3489,11 @@ def _codegen_aten_matmul(ctx: LoweringContext, node: Node) -> object:
 
     cg = ctx.cg
     assert isinstance(cg, GenerateAST)
-    acc, lhs, rhs = _operands(node)
+    acc, lhs, rhs = matmul_operands(node)
     if not planned(node):
         # The planner plans every matmul with an acc, or raises.
         assert acc is None
-        raise _unsupported(
+        raise metal_unsupported(
             "a matmul with no acc over a tiled K, whose result is each K tile's "
             "product alone; accumulate it with torch.addmm(acc, a, b), or take K "
             "whole with a ':' slice"
@@ -3357,16 +3527,48 @@ def _node_name(node: ast.AST) -> str:
     return node.id
 
 
-def _call_name(node: ast.AST) -> str | None:
+def call_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
         return node.func.id
     return None
 
 
+def assigned_names(node: ast.AST) -> list[str]:
+    """The names ``node`` itself binds, once per binding: an assignment's
+    targets (``=``, annotated, in place, ``:=``), a loop's or a
+    comprehension's target, a ``with``'s variables, unpacked from tuples, or
+    the name an element binding (``BIND``) binds.  A subscript or attribute
+    target binds no name.  Summed over every node of a body, the count of a
+    name's assignments."""
+    if call_name(node) == BIND:
+        assert isinstance(node, ast.Call)
+        return [str(ast.literal_eval(node.args[0]))]
+    targets: list[ast.expr] = []
+    if isinstance(node, ast.Assign):
+        targets = [*node.targets]
+    elif isinstance(
+        node,
+        (ast.AugAssign, ast.AnnAssign, ast.NamedExpr, ast.For, ast.comprehension),
+    ):
+        targets = [node.target]
+    elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+        targets = [node.optional_vars]
+    names: list[str] = []
+    while targets:
+        target = targets.pop()
+        if isinstance(target, ast.Name):
+            names.append(target.id)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            targets.extend(target.elts)
+        elif isinstance(target, ast.Starred):
+            targets.append(target.value)
+    return names
+
+
 def names_read(node: ast.AST) -> set[str]:
     """The names a statement or expression reads; an element loop's own
     definitions are not reads."""
-    if isinstance(node, ast.For) and _call_name(node.iter) == ELEMENTS:
+    if _is_elements(node):
         inner: set[str] = set()
         defs: set[str] = set()
         for s in node.body:
@@ -3374,7 +3576,7 @@ def names_read(node: ast.AST) -> set[str]:
             if (t := _target(s)) is not None:
                 defs.add(t)
             elif isinstance(s, ast.Expr) and isinstance(s.value, ast.Call):
-                if _call_name(s.value) == BIND:
+                if call_name(s.value) == BIND:
                     defs.add(ast.literal_eval(s.value.args[0]))
         return (inner - defs) | names_read(node.iter)
     if isinstance(node, (ast.For, ast.If)):
@@ -3415,7 +3617,7 @@ def _is_store(stmt: ast.stmt) -> bool:
 
 
 def _is_stage(stmt: ast.stmt) -> bool:
-    return isinstance(stmt, ast.Expr) and _call_name(stmt.value) == STAGE
+    return isinstance(stmt, ast.Expr) and call_name(stmt.value) == STAGE
 
 
 def _rename(expr: ast.expr, names: dict[str, str]) -> ast.expr:
@@ -3441,7 +3643,7 @@ def _anchors(call: ast.Call) -> list[tuple[int, str | None]]:
     return out
 
 
-def _outer(call: ast.Call) -> list[list[list[ast.expr]]]:
+def run_outer(call: ast.Call) -> list[list[list[ast.expr]]]:
     """``_helion_mpp_run``'s ``outer=[[(index, size, stride, anchor), ...] per
     operand]``, each entry's elements as a mutable list."""
     (kw,) = [k for k in call.keywords if k.arg == "outer"]
@@ -3498,11 +3700,11 @@ class _Copies:
                     writes[t.id] = writes.get(t.id, 0) + 1
             if (t := _target(a)) is not None:
                 self.defs.setdefault(t, []).append(a)
-            if isinstance(a.value, ast.Call) and _call_name(a.value) == RUN:
+            if isinstance(a.value, ast.Call) and call_name(a.value) == RUN:
                 anchors |= {name for _, name in _anchors(a.value) if name is not None}
                 anchors |= {
                     e[3].id
-                    for o in _outer(a.value)
+                    for o in run_outer(a.value)
                     for e in o
                     if isinstance(e[3], ast.Name)
                 }
@@ -3580,7 +3782,7 @@ class _Copies:
             for r in names_read(expr) & self.reassigned:
                 copies = {self.taken[(t, r)] for t in reach if (t, r) in self.taken}
                 if len(copies) != 1:
-                    raise _unsupported(
+                    raise metal_unsupported(
                         f"an MPP view reads {r}, which the kernel reassigns, away "
                         "from the statement that defines the load's index or mask"
                     )
@@ -3589,7 +3791,7 @@ class _Copies:
 
         for pos, anchor in anchors:
             call.args[pos] = reread(call.args[pos], anchor)
-        for entries in _outer(call):
+        for entries in run_outer(call):
             for entry in entries:
                 name = entry[3].id if isinstance(entry[3], ast.Name) else None
                 entry[0] = reread(entry[0], name)
@@ -3670,17 +3872,23 @@ def elementize(
     tensor_dtypes: Mapping[str, torch.dtype],
     tg_buffers: frozenset[str],
     tg_size: Sequence[int] | None,
+    fragment: FragmentLowering,
 ) -> list[ast.stmt]:
     """Move each store of a cooperative value into a loop over the
     cooperative tensor's elements; ``tensor_dtypes`` are the kernel's tensor
     parameters' dtypes, ``tg_buffers`` its threadgroup buffer names and
-    ``tg_size`` its threadgroup's threads per axis.
+    ``tg_size`` its threadgroup's threads per axis.  ``fragment`` lowers
+    fragment groups' ops.
 
     The loop binds the Scalar layout's thread of each element and re-runs the
     recomputed statements the store reads, in body order.  A collective's
     target (a leaf) is read as it stands: the loop's threads diverge, so a
     collective can't run there, and the planner admits such a value only when
     it is 0-d, the same on every thread.
+
+    A fragment group's op becomes its fragment run (``fragment_mma``), whose
+    operand loops re-run, by the same rules, the statements that compute each
+    operand element.
     """
     groups: dict[str, ast.Call] = {}  # cooperative root -> its _helion_mpp_acc call
     alias: dict[str, str] = {}  # cooperative name -> root
@@ -3689,10 +3897,10 @@ def elementize(
         for s in stmts:
             if (assigned := _assigned(s)) is not None:
                 t, v = assigned
-                if isinstance(v, ast.Call) and _call_name(v) == ACC:
+                if isinstance(v, ast.Call) and call_name(v) == ACC:
                     groups[t] = v
                     alias[t] = t
-                elif isinstance(v, ast.Call) and _call_name(v) in (RUN, UPDATE):
+                elif isinstance(v, ast.Call) and call_name(v) in (RUN, UPDATE):
                     alias[t] = alias[_node_name(v.args[0])]
                 elif isinstance(v, ast.Name) and v.id in alias:
                     alias[t] = alias[v.id]
@@ -3717,6 +3925,14 @@ def elementize(
     leaves = _collectives(body, tg_buffers) - set(alias)
     per_thread = _materialized(body, tg_buffers)
     bound = {_bind_name(b) for acc in groups.values() for b in _binds(acc)}
+    # A fragment run binds its operands' K positions too (fragment_run_binds).
+    bound |= {
+        _bind_name(b)
+        for a in _assigns(body)
+        if call_name(a.value) == RUN
+        for side in fragment.run_binds(cast("ast.Call", a.value))
+        for b in side
+    }
     copies = _Copies(body, bound, set(alias), leaves, vec_reads)
     derived: dict[str, str] = {}  # recomputed name -> its cooperative root
 
@@ -3730,9 +3946,28 @@ def elementize(
         seen = list(visible)
         for s in stmts:
             t, value = _assigned(s) or (None, None)
-            if isinstance(value, ast.Call) and _call_name(value) == RUN:
+            if isinstance(value, ast.Call) and call_name(value) == RUN:
                 copies.rewrite_run(value)
-            if isinstance(value, ast.Call) and _call_name(value) == UPDATE:
+                if fragment.run_binds(value):
+                    # The op on fragments: its loop, then the result's name
+                    # as a reference to the accumulator it updated.
+                    assert t is not None
+                    src = _node_name(value.args[0])
+                    out.append(
+                        fragment.run(
+                            value,
+                            groups[alias[src]],
+                            lambda b, r, c: rerun(b, r, c, seen)[0],
+                        )
+                    )
+                    alias_stmt = ast.Assign(
+                        [ast.Name(t, ast.Store())], ast.Name(src, ast.Load())
+                    )
+                    ast.fix_missing_locations(alias_stmt)
+                    out.append(alias_stmt)
+                    seen.append(alias_stmt)
+                    continue
+            if isinstance(value, ast.Call) and call_name(value) == UPDATE:
                 assert t is not None
                 carry, new = (_node_name(a) for a in value.args)
                 root = alias[carry]
@@ -3749,7 +3984,7 @@ def elementize(
                 out.append(alias_stmt)
                 continue
             if (
-                (isinstance(value, ast.Call) and _call_name(value) in (ACC, RUN))
+                (isinstance(value, ast.Call) and call_name(value) in (ACC, RUN))
                 or (isinstance(value, ast.Name) and value.id in alias)
                 or _is_materialize(s)
             ):
@@ -3763,14 +3998,16 @@ def elementize(
                 else set()
             )
             if len(roots) > 1:
-                raise _unsupported("an element-wise op on two cooperative MPP results")
+                raise metal_unsupported(
+                    "an element-wise op on two cooperative MPP results"
+                )
             if t is not None and roots:
                 (derived[t],) = roots
                 seen.append(s)
                 continue
             if roots:
                 if not (_is_store(s) or _is_stage(s)):
-                    raise _unsupported(
+                    raise metal_unsupported(
                         "a cooperative MPP result reaches a use that needs it in "
                         "the Scalar layout without a materialization"
                     )
@@ -3786,14 +4023,22 @@ def elementize(
             seen.append(s)
         return out
 
-    def element_loop(root: str, store_stmt: ast.stmt, seen: list[ast.stmt]) -> ast.stmt:
-        binds = {_bind_name(b): b.elts[1] for b in _binds(groups[root])}
+    def rerun(
+        binds: Mapping[str, ast.expr],
+        reads: set[str],
+        checked: list[ast.AST],
+        seen: list[ast.stmt],
+    ) -> tuple[list[ast.stmt], list[ast.stmt]]:
+        """The head of a loop over elements that binds ``binds`` and re-runs,
+        in body order, the recomputed statements of ``seen`` that the names
+        ``reads`` depend on, and those statements.  None of them, nor any
+        node of ``checked``, may exchange data between threads."""
         defs = {t: s for s in seen if (t := _target(s)) is not None}
         chosen: dict[int, ast.stmt] = {}
 
         def need(name: str) -> None:
             if name in per_thread:
-                raise _unsupported(
+                raise metal_unsupported(
                     f"an element loop over a cooperative MPP result reads {name}, "
                     "this thread's own element of a materialized MPP result"
                 )
@@ -3806,7 +4051,7 @@ def elementize(
                 # One definition of a reassigned name is not the value the
                 # store read, and a definition outside the store's blocks
                 # can't be re-run here.
-                raise _unsupported(
+                raise metal_unsupported(
                     f"a statement re-run per cooperative MPP element reads {name}, a "
                     "per-thread value the kernel reassigns or defines in another "
                     "block"
@@ -3816,24 +4061,16 @@ def elementize(
                 for r in names_read(s):
                     need(r)
 
-        for r in names_read(store_stmt):
+        for r in reads:
             need(r)
-        last: ast.AST = store_stmt
-        if isinstance(store_stmt, ast.Expr) and _call_name(store_stmt.value) == PUT:
-            assert isinstance(store_stmt.value, ast.Call)
-            last = store_stmt.value.args[0]
-        checked: list[ast.AST] = list(chosen.values())
-        # A staging write's threadgroup tile is what it exists to write.
-        if not _is_stage(store_stmt):
-            checked.append(last)
-        for s in checked:
+        for s in [*chosen.values(), *checked]:
             if _cross_thread(s, tg_buffers):
-                raise _unsupported(
+                raise metal_unsupported(
                     "a statement re-run per cooperative MPP element holds a "
                     f"cross-thread operation: {ast.unparse(s)[:120]}"
                 )
         order = {id(s): i for i, s in enumerate(seen)}
-        loop_body: list[ast.stmt] = [
+        head: list[ast.stmt] = [
             ast.Expr(
                 ast.Call(
                     ast.Name(BIND, ast.Load()), [ast.Constant(n), copy.deepcopy(e)], []
@@ -3841,13 +4078,21 @@ def elementize(
             )
             for n, e in binds.items()
         ]
-        loop_body += [
-            copy.deepcopy(s)
-            for s in sorted(chosen.values(), key=lambda s: order[id(s)])
-        ]
+        ordered = sorted(chosen.values(), key=lambda s: order[id(s)])
+        return head + [copy.deepcopy(s) for s in ordered], ordered
+
+    def element_loop(root: str, store_stmt: ast.stmt, seen: list[ast.stmt]) -> ast.stmt:
+        binds = {_bind_name(b): b.elts[1] for b in _binds(groups[root])}
+        last: ast.AST = store_stmt
+        if isinstance(store_stmt, ast.Expr) and call_name(store_stmt.value) == PUT:
+            assert isinstance(store_stmt.value, ast.Call)
+            last = store_stmt.value.args[0]
+        # A staging write's threadgroup tile is what it exists to write.
+        checked = [] if _is_stage(store_stmt) else [last]
+        loop_body, chosen = rerun(binds, names_read(store_stmt), checked, seen)
         loop_body.append(copy.deepcopy(store_stmt))
         iter_args: list[ast.expr] = [ast.Name(root, ast.Load())]
-        if any(names_read(s) & vec_bufs for s in chosen.values()):
+        if any(names_read(s) & vec_bufs for s in chosen):
             # Barriers on each side: after the vector's staging writes, and
             # before the next writes to its tile.
             iter_args.append(ast.Constant(True))
@@ -3879,7 +4124,7 @@ def _scalar_reads(stmts: list[ast.stmt]) -> set[str]:
         elif (
             isinstance(s, ast.Expr)
             and isinstance(s.value, ast.Call)
-            and _call_name(s.value) == STAGE
+            and call_name(s.value) == STAGE
         ):
             # A staging write names its tile; it doesn't read it.
             out |= set().union(*map(names_read, s.value.args[1:]))
@@ -3902,17 +4147,15 @@ def _bind_name(bind: ast.Tuple) -> str:
 
 
 def _is_materialize(s: ast.stmt) -> bool:
-    return isinstance(s, ast.Expr) and _call_name(s.value) == MAT
+    return isinstance(s, ast.Expr) and call_name(s.value) == MAT
 
 
 def _is_coop_stmt(s: ast.stmt, coop: set[str]) -> bool:
-    if _is_materialize(s) or (
-        isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS
-    ):
+    if _is_materialize(s) or _is_elements(s):
         return True
     if (assigned := _assigned(s)) is not None:
         value = assigned[1]
-        return _call_name(value) in (ACC, RUN) or (
+        return call_name(value) in (ACC, RUN) or (
             isinstance(value, ast.Name) and value.id in coop
         )
     if isinstance(s, (ast.For, ast.If)):
@@ -3940,12 +4183,10 @@ def _prune(stmts: list[ast.stmt], live: set[str]) -> list[ast.stmt] | None:
         t = _target(s)
         if t is not None and t not in live:
             assert isinstance(s, ast.Assign)
-            if _call_name(s.value) not in (ACC, RUN):
+            if call_name(s.value) not in (ACC, RUN):
                 changed = True
                 continue
-        if isinstance(s, (ast.For, ast.While, ast.If)) and not (
-            isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS
-        ):
+        if isinstance(s, (ast.For, ast.While, ast.If)) and not _is_elements(s):
             for field in ("body", "orelse"):
                 pruned = _prune(getattr(s, field), live)
                 if pruned is not None:
@@ -3957,11 +4198,13 @@ def _prune(stmts: list[ast.stmt], live: set[str]) -> list[ast.stmt] | None:
 
 def _is_run(s: ast.stmt) -> bool:
     assigned = _assigned(s)
-    return assigned is not None and _call_name(assigned[1]) == RUN
+    return assigned is not None and call_name(assigned[1]) == RUN
 
 
-def _is_elements(s: ast.stmt) -> bool:
-    return isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS
+def _is_elements(s: ast.AST) -> TypeGuard[ast.For]:
+    """Whether ``s`` is an element loop or a loop of a fragment run, whose
+    bindings and definitions are private to it."""
+    return isinstance(s, ast.For) and call_name(s.iter) in _ELEMENT_LOOPS
 
 
 def _jam_lane_loop(loop: ast.For, coop: set[str]) -> LaneJam:
@@ -3976,12 +4219,12 @@ def _jam_lane_loop(loop: ast.For, coop: set[str]) -> LaneJam:
 
     jam = LaneJam(loop, run_once)
     if carried := jam.carried():
-        raise _unsupported(
+        raise metal_unsupported(
             f"a lane loop around an MPP op carries {min(carried)} across lanes, "
             "which a copy of it per lane can't hold"
         )
     if reading := jam.lane_reading_units():
-        raise _unsupported(
+        raise metal_unsupported(
             "a cooperative MPP statement reads a lane-dependent name: "
             f"{sorted(set().union(*map(names_read, reading)) & jam.dependent)}"
         )
@@ -4001,16 +4244,16 @@ def _split_schedulable(loop: ast.For, coop: set[str]) -> bool:
     for s in loop.body:
         assigned = _assigned(s)
         value = assigned[1] if assigned is not None else None
-        if isinstance(value, ast.Call) and _call_name(value) == LANE_FOLD:
+        if isinstance(value, ast.Call) and call_name(value) == LANE_FOLD:
             return False
-        if isinstance(value, ast.Call) and _call_name(value) == ACC:
+        if isinstance(value, ast.Call) and call_name(value) == ACC:
             seed = value.args[-1]
             if not (isinstance(seed, ast.Constant) and seed.value is None):
                 return False
         is_stage = (
             isinstance(s, ast.Expr)
             and isinstance(s.value, ast.Call)
-            and _call_name(s.value) in (STAGE, FENCE)
+            and call_name(s.value) in (STAGE, FENCE)
         )
         if not (
             _is_run(s) or is_stage or _target(s) is not None or _is_coop_stmt(s, coop)
@@ -4024,7 +4267,7 @@ def _is_vec_stage(s: ast.stmt) -> bool:
     return (
         isinstance(s, ast.Expr)
         and isinstance(s.value, ast.Call)
-        and _call_name(s.value) == STAGE
+        and call_name(s.value) == STAGE
         and _node_name(s.value.args[0]).startswith(VEC_TILE)
     )
 
@@ -4073,7 +4316,7 @@ def _split_lane_loop(loop: ast.For, lane: str, coop: set[str]) -> list[ast.stmt]
         read |= reads
         if (t := _target(s)) is not None and reads & variant_names:
             if t in read:
-                raise _unsupported(
+                raise metal_unsupported(
                     f"a lane loop around an MPP op carries {t} across lanes, which "
                     "a copy of it per lane can't hold"
                 )
@@ -4105,7 +4348,7 @@ def _defines(s: ast.AST) -> set[str]:
     """The names a statement leaves assigned for the statements after it:
     every name it assigns, nested bodies included, except inside an element
     loop, whose definitions are private to it (as in :func:`names_read`)."""
-    if isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS:
+    if _is_elements(s):
         return set()
     if isinstance(s, ast.Name):
         return {s.id} if isinstance(s.ctx, ast.Store) else set()
@@ -4115,7 +4358,7 @@ def _defines(s: ast.AST) -> set[str]:
 def _loaded(s: ast.AST) -> set[str]:
     """The names the pointers of a statement's ``tl.load`` calls read."""
     return set().union(
-        *(names_read(load.args[0]) for node in ast.walk(s) if (load := _tl_load(node)))
+        *(names_read(load.args[0]) for node in ast.walk(s) if (load := tl_load(node)))
     )
 
 
@@ -4270,40 +4513,6 @@ def _distribute_lane_loop(
     return out
 
 
-def _is_lane_loop(s: ast.stmt) -> TypeGuard[ast.For]:
-    # slice_lane_*: a persistent reduction's lanes over a ':' K.
-    return (
-        isinstance(s, ast.For)
-        and isinstance(s.target, ast.Name)
-        and s.target.id.startswith(("lane_", "slice_lane_"))
-        and _call_name(s.iter) == "range"
-    )
-
-
-def _tl_load(node: ast.AST) -> ast.Call | None:
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id == "tl"
-        and node.func.attr == "load"
-    ):
-        return node
-    return None
-
-
-def _load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr] | None:
-    """The mask and fill value of ``tl.load(ptr, mask, other=...)``, or None
-    for an unmasked load."""
-    mask = load.args[1]
-    if isinstance(mask, ast.Constant) and mask.value is None:
-        return None
-    other = load.args[2] if len(load.args) > 2 else None
-    other = next((k.value for k in load.keywords if k.arg == "other"), other)
-    assert other is not None
-    return mask, other
-
-
 def _loads_first_all(
     stmts: list[ast.stmt],
     split: list[ast.For],
@@ -4336,7 +4545,7 @@ def _loads_first_all(
                 out += _loads_first(s, coop, tensor_dtypes, tg_buffers, names)
                 continue
             if isinstance(s, (ast.For, ast.While, ast.If)) and not _is_elements(s):
-                inner = in_lane or _is_lane_loop(s)
+                inner = in_lane or is_lane_loop(s)
                 s.body = walk(s.body, inner)
                 s.orelse = walk(s.orelse, inner)
             out.append(s)
@@ -4389,7 +4598,7 @@ def _loads_first(
     decls: list[ast.stmt] = []
     for i, s in enumerate(body):
         assigned = _assigned(s)
-        if assigned is None or (load := _tl_load(assigned[1])) is None:
+        if assigned is None or (load := tl_load(assigned[1])) is None:
             continue
         # Helion spells every load's pointer ``<tensor> + <offset>``.
         ptr = load.args[0]
@@ -4412,7 +4621,7 @@ def _loads_first(
                     f"{DTYPE_TO_METAL[tensor_dtypes[tensor]]!r}, {lanes})"
                 )
             )
-    loads = sum(1 for s in body for node in ast.walk(s) if _tl_load(node))
+    loads = sum(1 for s in body for node in ast.walk(s) if tl_load(node))
     if not moved or len(moved) < loads:
         return [loop]
     first: list[ast.stmt] = []
@@ -4425,17 +4634,18 @@ def _loads_first(
             continue
         array = moved[i]
         name, value = cast("tuple[str, ast.expr]", _assigned(s))
-        load = cast("ast.Call", _tl_load(value))
+        load = cast("ast.Call", tl_load(value))
         first += [
             s,
-            statement_from_string(f"_metal_lane_put({array}, {lane}, {name})"),
+            statement_from_string(f"{LANE_PUT}({array}, {lane}, {name})"),
         ]
         read = f"_metal_lane_get({array}, {lane})"
-        masked = _load_mask_other(load)
+        masked = load_mask_other(load)
         if masked is None:
             second.append(statement_from_string(f"{name} = {read}"))
             continue
         mask, other = masked
+        assert other is not None
         # The array holds ``mask ? x : other``; the select keeps the load's
         # own MSL type.
         second.append(
@@ -4498,7 +4708,7 @@ class _Replicas:
 
     def _collect(self, stmts: list[ast.stmt], control: tuple[ast.expr, ...]) -> None:
         for s in stmts:
-            if isinstance(s, ast.For) and _call_name(s.iter) == ELEMENTS:
+            if _is_elements(s):
                 # The walker emits an element loop as an isolated scope
                 # (``MslWalkerState.isolated_scope``): each of its bindings
                 # declares a new variable that nothing after the loop sees.
@@ -4630,7 +4840,7 @@ class _Replicas:
                     per_lane.add(assigned[0])
                 else:
                     per_lane.discard(assigned[0])
-            elif isinstance(s, ast.Expr) and _call_name(s.value) == STAGE:
+            elif isinstance(s, ast.Expr) and call_name(s.value) == STAGE:
                 call = cast("ast.Call", s.value)
                 axes = ast.literal_eval(call.args[4])
                 owner = _conjuncts(call.args[3])[-1]
@@ -4655,7 +4865,7 @@ class _Replicas:
         body: list[ast.stmt] = []
         for s in loop.body:
             s = copy.deepcopy(s)
-            if isinstance(s, ast.Expr) and _call_name(s.value) == STAGE:
+            if isinstance(s, ast.Expr) and call_name(s.value) == STAGE:
                 call = cast("ast.Call", s.value)
                 *terms, _owner = _conjuncts(call.args[3])
                 call.args[3] = (
@@ -4728,32 +4938,32 @@ def _run_lane_loops_once(
         """*uniform*: every thread of the threadgroup runs ``ss``."""
         out: list[ast.stmt] = []
         for s in ss:
-            if isinstance(s, ast.For) and _call_name(s.iter) != ELEMENTS:
+            if isinstance(s, ast.For) and not _is_elements(s):
                 s.body = splice(s.body, uniform and replicas.uniform(s.iter))
-                if _is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
+                if is_lane_loop(s) and any(_is_coop_stmt(x, coop) for x in s.body):
                     lane = cast("ast.Name", s.target).id
                     if not any(lane in names_read(x) for x in s.body):
                         out.extend(s.body)
                     elif _split_schedulable(s, coop):
                         parts = _split_lane_loop(s, lane, coop)
-                        split.extend(p for p in parts if _is_lane_loop(p))
+                        split.extend(p for p in parts if is_lane_loop(p))
                         out += parts
                     elif (
                         distributed := _distribute_lane_loop(s, lane, coop)
                     ) is not None:
                         out += [
-                            replicas.spread(x) if uniform and _is_lane_loop(x) else x
+                            replicas.spread(x) if uniform and is_lane_loop(x) else x
                             for x in distributed
                         ]
                     else:
                         if folded_lanes(s.body) - {lane}:
-                            raise _unsupported(
+                            raise metal_unsupported(
                                 "a lane loop around an MPP op holds a reduction "
                                 "over another lane loop"
                             )
                         n = const_extent(s) * copies(s.body)
                         if n > MAX_LANE_COPIES:
-                            raise _unsupported(
+                            raise metal_unsupported(
                                 f"a lane loop around an MPP op would run {n} copies "
                                 f"of its Scalar work per thread (max {MAX_LANE_COPIES})"
                             )

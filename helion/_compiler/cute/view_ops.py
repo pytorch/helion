@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import ast
 import math
-import re
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -27,8 +26,6 @@ from ...language.view_ops import subscript
 from ..ast_extension import expr_from_string
 from ..ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ..compile_environment import CompileEnvironment
-from ..loop_dependency_checker import HOST_UNKNOWN_ROOT
-from ..loop_dependency_checker import collect_host_tensor_roots
 from .target_facts import static_smem_budget
 
 if TYPE_CHECKING:
@@ -45,8 +42,8 @@ _CAST_TARGETS = frozenset(
     }
 )
 
-# Static ``alloc_smem`` without an opt-in carve-out; a larger exchange buffer
-# fails in the NVVM backend rather than at this check.
+# The exchange buffer is a static ``alloc_smem``: 48 KiB, the static limit on
+# sm_8x and a conservative cap from sm_90 (``static_smem_budget``).
 _SPLIT_SMEM_BUDGET_BYTES = static_smem_budget()
 
 
@@ -57,18 +54,6 @@ def _(state: CodegenState) -> ast.AST:
     return state.ast_arg(0)
 
 
-def _host_tensor_name(node: torch.fx.Node) -> str:
-    name = node.args[0]
-    assert isinstance(name, str)
-    return name
-
-
-def _host_tensor_root_name(debug_name: str) -> str:
-    """Leading identifier of a ``_host_tensor`` debug name (``args['x']`` -> ``args``)."""
-    match = re.match(r"[A-Za-z_]\w*", debug_name)
-    return debug_name if match is None else match.group(0)
-
-
 def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
     """True unless no store or atomic in the kernel can target the loaded tensor.
 
@@ -77,41 +62,29 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
     (in this graph or a nested loop graph, before or after the load, by any
     thread) could change what they observe; be conservative and refuse the
     re-read whenever the tensor may be written at all.  Default-deny: a write
-    counts unless its host tensor is provably distinct from the loaded one by
-    ``collect_host_tensor_roots`` (every kernel argument shares one root, and
-    a host value of unknown provenance may alias anything), or both are kernel
-    arguments whose storage the bound kernel's cache key proves disjoint
-    (``runtime_tensors_are_proven_disjoint``: a preallocated ``out``).  A
-    loaded value that is not a host tensor is treated as written, and so is
+    counts unless every possible host-storage origin pair is proved disjoint.
+    Fresh allocations and bound input-span guards are useful only while their
+    provenance remains valid; disjoint syntactic roots alone are insufficient.
+    A loaded value that is not a host tensor is treated as written, and so is
     any tensor when the kernel stores through a stack tensor's pointer table.
     """
-    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 
     tensor = load_node.args[0]
     if not (isinstance(tensor, torch.fx.Node) and tensor.target is _host_tensor):
         return True
-    host_fn = cg.host_function
-    roots = collect_host_tensor_roots(
-        host_fn.body, set(host_fn.params.arguments.keys())
-    )
-    unknown = frozenset({HOST_UNKNOWN_ROOT})
 
-    def tensor_roots(node: torch.fx.Node) -> frozenset[str]:
-        name = _host_tensor_root_name(_host_tensor_name(node))
-        return roots.get(name, unknown)
-
-    def _arguments_disjoint(left: torch.fx.Node, right: torch.fx.Node) -> bool:
+    def _storages_disjoint(left: torch.fx.Node, right: torch.fx.Node) -> bool:
         left_val = left.meta.get("val")
         right_val = right.meta.get("val")
         return (
             isinstance(left_val, torch.Tensor)
             and isinstance(right_val, torch.Tensor)
-            and runtime_tensors_are_proven_disjoint(
+            and tensors_have_proven_disjoint_storage(
                 CompileEnvironment.current(), left_val, right_val
             )
         )
 
-    loaded = tensor_roots(tensor)
     for graph_info in cg.codegen_graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or not node.args:
@@ -123,10 +96,7 @@ def _tensor_written_anywhere(cg: GenerateAST, load_node: torch.fx.Node) -> bool:
                 isinstance(target, torch.fx.Node) and target.target is _host_tensor
             ):
                 return True
-            written = tensor_roots(target)
-            if (
-                HOST_UNKNOWN_ROOT in loaded | written or loaded & written
-            ) and not _arguments_disjoint(tensor, target):
+            if not _storages_disjoint(tensor, target):
                 return True
     return False
 
@@ -149,7 +119,7 @@ def _split_leaf_expr(
         inner = _split_leaf_expr(ctx, source, flat_index)
         if inner is None:
             return None
-        return CompileEnvironment.current().backend.cast_ast(inner, value.dtype)
+        return _cast_reread(ctx, inner, source, value.dtype)
     if node.target is memory_ops.load:
         from ..generate_ast import GenerateAST
 
@@ -158,6 +128,25 @@ def _split_leaf_expr(
             return None
         return cute_reindexed_scalar_load_expr(ctx.cg, node, flat_index)
     return None
+
+
+def _cast_reread(
+    ctx: LoweringContext, inner: ast.AST, source: torch.fx.Node, dtype: torch.dtype
+) -> ast.AST:
+    """``inner``, a re-read of ``source``, cast to ``dtype`` as the chain's
+    cast does: an integer or a bool through ``integer_to_float_expr``."""
+    from .handler_ops import integer_to_float_expr
+
+    src = source.meta.get("val")
+    converted = integer_to_float_expr(
+        inner,
+        dtype,
+        src.dtype if isinstance(src, torch.Tensor) else None,
+        ctx.cg.device_function,
+    )
+    if converted is not None:
+        return converted
+    return CompileEnvironment.current().backend.cast_ast(inner, dtype)
 
 
 def _fold_split_halves(

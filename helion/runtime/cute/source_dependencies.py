@@ -15,8 +15,10 @@ if TYPE_CHECKING:
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 # Ordinary generated kernels import these helpers without a wrapper plan.
-# Include their implementations and transitive cluster support in every key;
-# a generated import statement alone cannot identify the compiled device code.
+# Include their implementations and transitive support (the cluster helpers,
+# the reduce routing ``reduce_helpers`` imports from ``reduce_routing``) in
+# every key; a generated import statement alone cannot identify the compiled
+# device code.
 # The host wrapper emitters are keyed whole as well: they write the ``@cute.jit``
 # wrapper text (and ``flash_flex`` the tile counts baked into it), which the
 # key does not otherwise see; so are the two tables whose results the
@@ -39,10 +41,12 @@ _COMMON_DEPENDENCIES = (
     "runtime/cute/plan_facts.py",
     "runtime/cute/register_tensor.py",
     "_compiler/cute/reduce_helpers.py",
+    "_compiler/cute/reduce_routing.py",
     "_compiler/cute/cluster_helpers.py",
     "_compiler/cute/device/sync.py",
     "_compiler/cute/vec_utils.py",
     "_compiler/cute/l2_policy.py",
+    "_compiler/cute/cache_hint_forms.py",
     "_compiler/cute/cutedsl_compat.py",
     "_compiler/cute/dtypes.py",
 )
@@ -55,17 +59,20 @@ _HELPER_KIND_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "split_k_cluster": ("_compiler/cute/cluster_helpers.py",),
     "resident_reduction": ("_compiler/cute/resident_reduction_runtime.py",),
     "single_host_sum": (
+        "runtime/cute/source_dependencies.py",
         "runtime/cute/single_sum.py",
         "runtime/cute/paired_sum.py",
         "_compiler/cute/single_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
     "paired_host_sum": (
+        "runtime/cute/source_dependencies.py",
         "runtime/cute/paired_sum.py",
         "_compiler/cute/paired_sum_runtime.py",
         "_compiler/cute/resident_reduction_runtime.py",
     ),
     "full_host_sum": (
+        "runtime/cute/source_dependencies.py",
         "runtime/cute/full_sum.py",
         "runtime/cute/paired_sum.py",
         "_compiler/cute/full_sum_runtime.py",

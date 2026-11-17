@@ -41,7 +41,7 @@ from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..dtype_utils import cast_ast
 from ..matmul_utils import _needs_f32_accumulator
-from .fx_matcher import _is_full_slice
+from ..utils import is_full_slice
 from .indexing import CutePackedAffineLoad
 from .indexing import CutePackedTerms
 from .indexing import match_cute_stack_reshape_rhs
@@ -468,7 +468,7 @@ def analyze_direct_grouped_n_loads(
         *,
         required_extent: int | None = None,
     ) -> int | None:
-        if _is_full_slice(index):
+        if is_full_slice(index):
             return 0
         if isinstance(index, Node):
             if index.target is not torch.ops.prims.iota.default:

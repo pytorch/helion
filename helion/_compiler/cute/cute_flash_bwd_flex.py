@@ -38,6 +38,7 @@ from typing import Literal
 import torch
 
 from ..emitter_protocols import source_adapter
+from ..fx_side_effects import is_impure_node
 from . import target_facts
 from .attention_plan import AttentionScorePlan
 from .attention_plan import FlexRegion
@@ -205,7 +206,7 @@ def additive_bias_region(plan: FlexBwdPlan) -> FlexRegion | None:
     mapping: dict[torch.fx.Node, torch.fx.Node] = {}
     graph.graph_copy(region.graph, mapping, return_output_node=False)
     graph.output(mapping[g])
-    graph.eliminate_dead_code()
+    graph.eliminate_dead_code(is_impure_node=is_impure_node)
     graph.lint()
     return FlexRegion(graph, mapping[g])
 

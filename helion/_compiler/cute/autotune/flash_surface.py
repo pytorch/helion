@@ -18,6 +18,7 @@ import torch
 
 from ....exc import InvalidConfig
 from ....runtime.config import Config
+from ....runtime.config_cache import ConfigSet
 from ..cute_flash import FLASH_CAUSAL_LPT_SWIZZLE_KEY
 from ..cute_flash import FLASH_CORR_REGS_KEY
 from ..cute_flash import FLASH_E2E_OFFSET0_KEY
@@ -77,6 +78,7 @@ from ..tcgen05_config import surface
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
+    from collections.abc import MutableSet
     from collections.abc import Sequence
 
     from ....autotuner.config_fragment import ConfigSpecFragment
@@ -204,7 +206,7 @@ def _legalize_cute_flash_compiler_seeds(
 ) -> list[Config]:
     """Legalize and deduplicate compiler seeds while preserving rank order."""
     result: list[Config] = []
-    seen: set[Config] = set()
+    seen: MutableSet[Config] = ConfigSet()
     for seed in seeds:
         projected = _legalize_cute_flash_compiler_seed(config_spec, seed)
         if projected is not None and projected not in seen:
@@ -974,10 +976,13 @@ def _normalize_cute_flash_bwd(
 
 
 def pdl_searched(config_spec: ConfigSpec) -> bool:
-    """Whether the search flips ``cute_pdl``: ``griddepcontrol`` exists
-    on sm_90 and up."""
+    """Automatic PDL is searchable on sm_90+ when explicit markers do not
+    already govern the kernel's launch protocol and its owner permits PDL."""
     return (
-        config_spec.target_device_capability is not None
+        config_spec.supports_config_key("cute_pdl")
+        and not config_spec.has_explicit_pdl
+        and not config_spec.cute_dependent_phase_launches
+        and config_spec.target_device_capability is not None
         and config_spec.target_device_capability >= (9, 0)
     )
 

@@ -412,6 +412,8 @@ class TestTileDependencyBarrierLowering(TestCase):
         self.assertGridBarrier(code)
 
     def test_fixed_capacity_specialization_reuses_existing_buckets(self) -> None:
+        fixed_capacity_runtime_metadata_chain.reset()
+        self.addCleanup(fixed_capacity_runtime_metadata_chain.reset)
         first_x = torch.arange(65, device=DEVICE, dtype=torch.float32)
         first_metadata = torch.zeros_like(first_x)
         first = fixed_capacity_runtime_metadata_chain.bind((first_x, first_metadata))
@@ -434,12 +436,34 @@ class TestTileDependencyBarrierLowering(TestCase):
             (strided_x, strided_metadata)
         )
         self.assertIsNot(first, different_stride)
+        self.assertNotIn(
+            first, fixed_capacity_runtime_metadata_chain._bound_kernels.values()
+        )
+        self.assertNotIn(
+            second_capacity,
+            fixed_capacity_runtime_metadata_chain._bound_kernels.values(),
+        )
+        # The strided layout discovers another guard and invalidates bindings
+        # created before that schema was complete. Repopulate each bucket once,
+        # then check value-independent reuse under the final guard schema.
+        buckets = (
+            (first_x, first_metadata),
+            (second_x, torch.zeros_like(second_x)),
+            (strided_x, strided_metadata),
+        )
+        bounds = [fixed_capacity_runtime_metadata_chain.bind(args) for args in buckets]
+        self.assertEqual(len({id(bound) for bound in bounds}), len(buckets))
+        self.assertIsNot(bounds[0], first)
+        self.assertIsNot(bounds[1], second_capacity)
+        first = bounds[0]
         self.assertIs(
             first,
             fixed_capacity_runtime_metadata_chain.bind(
                 (torch.full_like(first_x, 2), torch.full_like(first_metadata, 3))
             ),
         )
+        for bound, args in zip(bounds, buckets, strict=True):
+            self.assertIs(bound, fixed_capacity_runtime_metadata_chain.bind(args))
 
 
 @skipIfNotTriton("static/dynamic cross-loop pipelines are Triton-only codegen")

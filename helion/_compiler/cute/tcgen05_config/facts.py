@@ -24,11 +24,15 @@ from ..cute_warp_mma_gemm import WARP_MMA_MIN_BM
 from ..cute_warp_mma_gemm import WARP_MMA_MIN_BN
 from ..cute_warp_mma_gemm import warp_mma_admission_reason
 from ..dense_aligned_n import ALIGNED_N_CHOICES
+from ..dense_aligned_n import DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K
 from ..dense_aligned_n import TILE_N_KEY
 from ..dense_aligned_n import DenseAlignedNPlan
 from ..dense_aligned_n import carrier_n
+from ..dense_aligned_n import dense_aligned_n_block_m
 from ..dense_aligned_n import dense_aligned_n_defaults
 from ..dense_aligned_n import dense_aligned_n_plan
+from ..dense_aligned_n import dense_aligned_n_sixteen_bit
+from ..dense_aligned_n import pair_tile_wave_cost
 from ..epilogue_fanout import FANOUT_CONFIG_KEY
 from ..grouped_row_union import CONFIG_KEY as GROUPED_ROW_UNION_KEY
 from ..grouped_row_union import PAIRED_CLC_SCHEDULE
@@ -46,8 +50,11 @@ from ..strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from ..strategies import TCGEN05_WARP_SPEC_STORE_WARPS_KEY
 from ..strategies import Tcgen05LayoutStrategy
 from ..strategies import Tcgen05PersistenceModel
+from ..strategies import tcgen05_explicit_epilogue_tile_supported
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_ACC_WAIT_PLACEMENT_SUBTILE_LOOP
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN
+from ..tcgen05_constants import TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
@@ -59,13 +66,17 @@ from ..tcgen05_constants import TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_WORKLIST_SOURCE_M_TILE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
+from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_N
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_CHOICES
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPE_INHERIT
 from ..tcgen05_constants import TCGEN05_REGION_PID_TYPES_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION
+from ..tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_M
 from ..tcgen05_constants import TCGEN05_TWO_CTA_BLOCK_N
 from ..tcgen05_constants import TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
+from ..tcgen05_constants import TCGEN05_TWO_CTA_NARROW_BLOCK_N
 from ..tcgen05_schedule_facts import Tcgen05FullTileScheduleFacts
 from ..tcgen05_schedule_facts import n_edge_cluster_geometry_supported
 from ..tcgen05_schedule_facts import native_tma_schedule_supported
@@ -601,16 +612,21 @@ def _matmul_config_view(
     return block_sizes, m_index, n_index, k_index
 
 
+def _region_output_facts(
+    state: CuteTcgen05Config, region: int
+) -> Tcgen05PipelineSmemFacts | None:
+    """GEMM launch ``region``'s single-output allocation proof, if any."""
+    if region < len(state.materialized_pipeline_facts):
+        return state.materialized_pipeline_facts[region]
+    return None
+
+
 def region_launch_facts(
     state: CuteTcgen05Config, region: int
 ) -> Tcgen05PipelineSmemFacts | None:
     """Allocation facts of GEMM launch ``region``: the single-output proof,
     else the typed pair proof (two outputs the shared fanout merges)."""
-    facts = (
-        state.materialized_pipeline_facts[region]
-        if region < len(state.materialized_pipeline_facts)
-        else None
-    )
+    facts = _region_output_facts(state, region)
     if facts is None and region < len(state.materialized_pair_budget_facts):
         facts = state.materialized_pair_budget_facts[region]
     return facts
@@ -618,15 +634,44 @@ def region_launch_facts(
 
 def region_has_exact_aux(state: CuteTcgen05Config, region: int) -> bool:
     """Whether GEMM launch ``region``'s epilogue reads an exact-shape
-    auxiliary operand of the output's dtype (the staged and prefetched
-    operand of the aux mechanisms); False without the single-output
+    auxiliary operand of any dtype (a boolean mask too, which the
+    staged rings leave on the direct read: ``region_has_ring_aux``); False
+    without the single-output allocation proof that records it."""
+    facts = _region_output_facts(state, region)
+    return facts is not None and bool(facts.exact_aux_itemsizes)
+
+
+def region_has_ring_aux(state: CuteTcgen05Config, region: int) -> bool:
+    """Whether GEMM launch ``region``'s epilogue reads an operand a staged
+    aux ring (``tma``, ``epi_tma``) carries: an exact-shape one other
+    than a boolean mask, which stays on the direct read
+    (``stages_through_smem_ring``); False without the single-output
     allocation proof that records it."""
-    facts = (
-        state.materialized_pipeline_facts[region]
-        if region < len(state.materialized_pipeline_facts)
-        else None
+    facts = _region_output_facts(state, region)
+    return facts is not None and bool(facts.ring_aux_itemsizes)
+
+
+def exact_aux_mask_only(state: CuteTcgen05Config) -> bool:
+    """Whether the kernel's exact-shape operands are all boolean masks,
+    which no staged aux ring (``tma``, ``epi_tma``) carries: a mask stays
+    on the direct read (``stages_through_smem_ring``), so codegen would
+    find nothing to stage. The single-output allocation proof answers,
+    else the row-vector store facts (computed for every analyzed store, a
+    second output's too). False without facts, and without exact-shape
+    operands -- so ``not exact_aux_mask_only()`` alone does not mean an
+    operand rides the ring: each staged mode's gate also requires
+    ``exact_shape_aux_kernel_detected`` (a bias-only kernel's codegen
+    refuses the producer ring; a kernel with no auxiliary read ignores
+    the mode)."""
+    facts = state.pipeline_smem_facts
+    if facts is not None:
+        return bool(facts.exact_aux_itemsizes) and not facts.ring_aux_itemsizes
+    rowvec = state.rowvec_aux_facts
+    return (
+        rowvec is not None
+        and bool(rowvec.exact_aux_itemsizes)
+        and not rowvec.ring_aux_itemsizes
     )
-    return facts is not None and facts.exact_aux_count > 0
 
 
 def _configured_region_pid_types(
@@ -661,9 +706,10 @@ def region_launch_config(
     launch sheds the cluster; a non-zero ``tcgen05_region_ab_stages`` /
     ``tcgen05_region_c_stages`` entry replaces the shared ring depth; a
     launch that does not own a shared-fanout pair drops the fanout and
-    its placement; and a launch without an exact-shape auxiliary operand
-    takes the register aux reads (no staged ring, no prefetch ring, no
-    hoist).  ``owns_fanout_pair`` defaults to the pair proof over the
+    its placement; a launch with no operand a staged ring carries (none,
+    or only a boolean mask) takes the register aux reads, and one without
+    an exact-shape auxiliary operand also drops the prefetch ring and the
+    hoist.  ``owns_fanout_pair`` defaults to the pair proof over the
     launch's (m, n) axes.
     """
     launch = dict(config)
@@ -695,11 +741,14 @@ def region_launch_config(
             launch.pop(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, None)
             if launch.get(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY) == "before_store":
                 launch.pop(TCGEN05_C_ACQUIRE_PLACEMENT_CONFIG_KEY)
-    if not region_has_exact_aux(state, region):
+    if not region_has_ring_aux(state, region):
+        # A launch whose operands no staged ring carries (none, or only a
+        # boolean mask) takes the register reads.
         if launch.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY) in (
             TCGEN05_AUX_LOAD_MODES_STAGED
         ):
             launch[TCGEN05_AUX_LOAD_MODE_CONFIG_KEY] = TCGEN05_AUX_LOAD_MODE_SIMT
+    if not region_has_exact_aux(state, region):
         if launch.get(TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY):
             launch[TCGEN05_AUX_PREFETCH_SUBTILES_CONFIG_KEY] = 0
         if launch.get(TCGEN05_AUX_FRAGMENT_HOIST_CONFIG_KEY) is True:
@@ -708,14 +757,21 @@ def region_launch_config(
 
 
 def chain_launches(
-    state: CuteTcgen05Config, config: dict[str, object], *, aux_only: bool = False
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    aux_only: bool = False,
+    ring_only: bool = False,
 ) -> list[tuple[int, dict[str, object]]]:
     """``(region, launch config)`` of every GEMM launch of a materialized
-    chain (``aux_only``: those with an exact-shape auxiliary operand)."""
+    chain (``aux_only``: those with an exact-shape auxiliary operand;
+    ``ring_only``: of those, the ones with an operand a staged ring
+    carries)."""
     return [
         (region, region_launch_config(state, config, region))
         for region in range(len(state.materialized_matmul_block_ids))
-        if not aux_only or region_has_exact_aux(state, region)
+        if (not aux_only or region_has_exact_aux(state, region))
+        and (not ring_only or region_has_ring_aux(state, region))
     ]
 
 
@@ -725,14 +781,17 @@ def _chain_launch_refusal(
     judge: Callable[[dict[str, object], int], str | None],
     *,
     aux_only: bool,
+    ring_only: bool = False,
 ) -> str | None:
     """``judge`` over the chain's GEMM launches; the first refusal, named
     by its launch, or the lack of a launch the knob could render on."""
-    launches = chain_launches(state, config, aux_only=aux_only)
+    launches = chain_launches(state, config, aux_only=aux_only, ring_only=ring_only)
     if not launches:
         return (
             "needs a GEMM launch of the materialized chain with an exact-shape "
-            "auxiliary operand and its single-output allocation proof"
+            "auxiliary operand"
+            + (" a staged ring carries (not only a boolean mask)" if ring_only else "")
+            + " and its single-output allocation proof"
         )
     for region, launch in launches:
         reason = judge(launch, region)
@@ -765,6 +824,21 @@ def _matmul_block_fragments(
             )
             for index in indices
         ),
+    )
+
+
+def narrow_n_pair_gemm(state: CuteTcgen05Config) -> bool:
+    """A GEMM one narrow N tile wide (``TCGEN05_TWO_CTA_NARROW_BLOCK_N``),
+    which runs the 256 x N CtaGroup.TWO pair; M may end in a partial pair
+    tile. A registered block size whose range leaves out the pair's tile
+    (``hl.register_block_size(16, 64)`` for N) keeps its range."""
+    extents = state.matmul_compile_time_static_extents
+    if extents is None or extents[1] != TCGEN05_TWO_CTA_NARROW_BLOCK_N:
+        return False
+    fragments = _matmul_block_fragments(state)
+    return fragments is None or (
+        fragments[0].low <= TCGEN05_TWO_CTA_BLOCK_M <= fragments[0].high
+        and fragments[1].low <= TCGEN05_TWO_CTA_NARROW_BLOCK_N <= fragments[1].high
     )
 
 
@@ -856,31 +930,104 @@ def _dense_aligned_n_plan(
     )
 
 
+def _dense_aligned_n_block_m(state: CuteTcgen05Config) -> int | None:
+    """Pair M of the aligned-N family for this kernel's input dtype."""
+    facts = state.dense_gemm_facts
+    return None if facts is None else dense_aligned_n_block_m(facts.input_dtype)
+
+
+def _dense_aligned_n_surface(
+    state: CuteTcgen05Config, *, acc_stages: int = 2, store_mode: str = "normal"
+) -> dict[str, object]:
+    """The family's pinned values in the search schema's representation:
+    an inactive direct-entry control is absent rather than pinned off
+    (``_apply_paired_pipeline_surface``)."""
+    values = dense_aligned_n_defaults(acc_stages=acc_stages, store_mode=store_mode)
+    _drop_inactive_direct_entry_controls(state, values)
+    return values
+
+
+def _drop_inactive_direct_entry_controls(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> None:
+    """Remove the two direct-entry controls where the search schema does
+    not carry them.  ``optional_fragments`` adds them exactly when the
+    direct-entry seed is eligible; asking it directly would recurse
+    through the aligned-N width fragment into the seeds."""
+    if not seeds.full_tile_direct_entry_seed_eligible(state):
+        config.pop(TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY, None)
+        config.pop(TCGEN05_FLAT_ROLE_COORDINATES_CONFIG_KEY, None)
+
+
+def _dense_aligned_n_sixteen_bit(state: CuteTcgen05Config) -> bool:
+    """Whether the aligned-N family runs the 16-bit paired M256 instruction."""
+    facts = state.dense_gemm_facts
+    return facts is not None and dense_aligned_n_sixteen_bit(facts.input_dtype)
+
+
 def _dense_aligned_n_width_plans(
     state: CuteTcgen05Config, width: int
 ) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
-    """Normal-store seed values (in seed order) proved for one physical N."""
+    """Normal-store seed values (in seed order) proved for one physical N;
+    a width with a partial last N tile is seeded (and searched) only where
+    its wave fill pays for the clipped columns."""
     facts = state.dense_gemm_facts
+    if (
+        facts is not None
+        and facts.shape[1] % width
+        and width not in _dense_aligned_n_clipped_widths(state)
+    ):
+        return
+    yield from _dense_aligned_n_proved_plans(state, width)
+
+
+def _dense_aligned_n_proved_plans(
+    state: CuteTcgen05Config, width: int
+) -> Iterator[tuple[dict[str, Any], DenseAlignedNPlan]]:
+    """``_dense_aligned_n_width_plans`` without the clipped-width choice."""
+    facts = state.dense_gemm_facts
+    block_m = _dense_aligned_n_block_m(state)
+    sixteen_bit = _dense_aligned_n_sixteen_bit(state)
     if (
         not state.search_enabled
         or facts is None
-        # dense_aligned_n_plan needs 128-row tiles that divide M and a
-        # physical width that divides N; skip widths that cannot qualify.
-        or facts.shape[0] % 128
-        or facts.shape[1] % width
+        or block_m is None
+        # Each CTA stages half of an N-major B tile as one SMEM row: a
+        # row of fewer than 64-byte swizzle atoms runs the MMA's B reads
+        # at a fraction of their bandwidth (MN-major 8008x2560x4096: the
+        # 160-wide pair 0.74 of cuBLAS against 1.09 at 256; 20008x768x2048
+        # at 96: 0.66 against 0.88). 192 keeps 64-byte atoms.
+        or (
+            not facts.rhs_k_major
+            and (width // 2 * facts.input_dtype.itemsize)
+            % TCGEN05_ALIGNED_N_MN_B_ROW_BYTES
+        )
+        # dense_aligned_n_plan needs a physical width that divides N and
+        # pair-M tiles that divide M (the 16-bit pair: or whole K tiles,
+        # its TMA store clipping the partial last tiles); skip widths
+        # that cannot qualify.
+        or (
+            (facts.shape[0] % block_m or facts.shape[1] % width)
+            and not (
+                sixteen_bit
+                and facts.shape[2] % DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K == 0
+            )
+        )
         or not _tcgen05_mma_impl_allowed()
     ):
         return
     pid = _preferred_persistent_pid_type(state)
     if pid is None:
         return
-    for bk in (64, 128):
-        for acc_stages in (2, 1):
+    # The 16-bit pair's short-K families want the deep 64-wide ring with
+    # both accumulators: one seed per width.
+    for bk in (DENSE_ALIGNED_N_SIXTEEN_BIT_BLOCK_K,) if sixteen_bit else (64, 128):
+        for acc_stages in (2,) if sixteen_bit else (2, 1):
             values: dict[str, Any] = {
-                **dense_aligned_n_defaults(acc_stages=acc_stages),
+                **_dense_aligned_n_surface(state, acc_stages=acc_stages),
                 TILE_N_KEY: width,
                 "block_sizes": _matmul_seed_block_sizes(
-                    state, bm=128, bn=carrier_n(width), bk=bk
+                    state, bm=block_m, bn=carrier_n(width), bk=bk
                 ),
                 "pid_type": pid,
                 "tcgen05_c_stages": 2,
@@ -888,6 +1035,84 @@ def _dense_aligned_n_width_plans(
             plan = _dense_aligned_n_plan(state, values)
             if plan is not None:
                 yield values, plan
+
+
+def _sm_pairs(state: CuteTcgen05Config) -> int:
+    """CTA pairs of one wave (B200's 148 SMs without a device count)."""
+    return max(1, (state.device_sm_count or 148) // 2)
+
+
+def _dense_aligned_n_clipped_widths(state: CuteTcgen05Config) -> frozenset[int]:
+    """The physical widths with a partial last N tile that beat, by
+    ``TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN`` in wave-quantized pair-tile
+    time, every reference width: the power-of-two pair widths the N
+    bounds admit (the ordinary tiles, clipped or not) and the aligned
+    widths that divide N. Computed once per problem (normalization asks
+    for the widths on every fragment pass).
+
+    A pair tile's time is ``pair_tile_wave_cost``'s.
+    3072x1024x6272 bf16 -> fp32 (C4_15) on 74 SM pairs: one wave of 72
+    256x192 pairs against one of 48 256x256, 22% less (measured 36.4 ->
+    33.9 us between the seeds); 256x224 12% less by the model but measured
+    13% more, so the margin is wide. Small problems keep the narrow
+    power-of-two pairs (1024x1024x512: 256x64 pairs measured 2.8 us
+    against 3.5 us for the clipped 96).
+    """
+    facts = state.dense_gemm_facts
+    bounds = _dense_aligned_n_bounds(state)
+    block_m = _dense_aligned_n_block_m(state)
+    if (
+        facts is None
+        or bounds is None
+        or block_m is None
+        # FP8 takes whole N tiles only (``dense_aligned_n_plan``)
+        or not _dense_aligned_n_sixteen_bit(state)
+    ):
+        return frozenset()
+    # everything the proofs below read
+    key = (
+        facts,
+        state.device_sm_count,
+        bounds,
+        tuple(state.allowed_pid_types),
+        state.search_enabled,
+        _tcgen05_mma_impl_allowed(),
+    )
+    cached = state._dense_aligned_n_clipped_cache
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    m, n, k = facts.shape
+    sm_pairs = _sm_pairs(state)
+
+    def cost(width: int) -> float:
+        return pair_tile_wave_cost(
+            m, n, k, width=width, block_m=block_m, sm_pairs=sm_pairs
+        )
+
+    low, high = bounds[1]
+    references = [w for w in (64, 128, TCGEN05_TWO_CTA_BLOCK_N) if low <= w <= high]
+    references.extend(
+        width
+        for width in ALIGNED_N_CHOICES
+        if n % width == 0 and _dense_aligned_n_proved(state, width)
+    )
+    widths: frozenset[int] = frozenset()
+    if references:
+        limit = (1.0 - TCGEN05_ALIGNED_N_CLIPPED_MIN_GAIN) * min(map(cost, references))
+        widths = frozenset(
+            width
+            for width in ALIGNED_N_CHOICES
+            if n % width
+            and cost(width) <= limit
+            and _dense_aligned_n_proved(state, width)
+        )
+    state._dense_aligned_n_clipped_cache = (key, widths)
+    return widths
+
+
+def _dense_aligned_n_proved(state: CuteTcgen05Config, width: int) -> bool:
+    """Whether one physical width has a proved seed, clipped or not."""
+    return next(_dense_aligned_n_proved_plans(state, width), None) is not None
 
 
 def _dense_aligned_n_widths(state: CuteTcgen05Config) -> tuple[int, ...]:
@@ -996,6 +1221,46 @@ def _config_is_two_cta_mma(
     return (
         bm == TCGEN05_TWO_CTA_FP8_SMALL_GRID_BLOCK_M
         and state.matmul_input_dtype == torch.float8_e4m3fn
+    )
+
+
+def _plain_narrow_subtile_facts(
+    state: CuteTcgen05Config, *, bm: int, bn: int, cluster_m: int
+) -> bool:
+    """The epilogue facts of ``cute_mma``'s plain narrow-subtile rule.
+
+    A plain 16-bit store on the 192- or 256-wide two-CTA tile (the
+    aligned-N family's physical width, or the ordinary 256-wide tile) --
+    one output, no broadcast rows, no auxiliary operand (an exact-shape
+    one keeps the plan's with-source subtile) -- renders ``(128,
+    TCGEN05_PLAIN_NARROW_SUBTILE_N)`` subtiles.  The plan also asks for
+    static full tiles (the aligned-N physical tile: whole N and K tiles),
+    a row-major output and a TMA-store epilogue; the callers that know
+    those facts check them.
+    """
+    facts = state.rowvec_aux_facts
+    constraints = state.ab_stages_three_search_constraints
+    return (
+        facts is not None
+        and constraints is not None
+        and facts.output_itemsize == 2
+        and not facts.rows
+        and facts.output_count == 1
+        and not state.aux_kernel_detected
+        and constraints.dtype_bytes == 2
+        and cluster_m == 2
+        and bn in TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_NS
+        and not facts.exact_aux_itemsizes
+        and tcgen05_explicit_epilogue_tile_supported(
+            is_two_cta=True,
+            bm=bm,
+            bn=bn,
+            tile_shape=(
+                128,
+                TCGEN05_PLAIN_NARROW_SUBTILE_N,
+                TCGEN05_PLAIN_NARROW_SUBTILE_N,
+            ),
+        )
     )
 
 

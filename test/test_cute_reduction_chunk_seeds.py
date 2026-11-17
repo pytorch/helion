@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import sympy
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
@@ -24,8 +25,29 @@ from helion.autotuner.config_spec import CuteLaneLayoutSpec
 from helion.autotuner.config_spec import CuteVectorWidthSpec
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.language._tracing_ops import _host_tensor
 
 pytestmark = pytest.mark.cpu_only
+
+
+def _row_env(spec: ConfigSpec) -> MagicMock:
+    # These fixtures model static row axes, including the logical extent
+    # that distinguishes a row tile from a registered configuration knob.
+    env = MagicMock(
+        config_spec=spec,
+        block_sizes={
+            block.block_id: SimpleNamespace(
+                size=block.size_hint,
+                var=sympy.Integer(block.size_hint),
+                numel=sympy.Integer(block.size_hint),
+            )
+            for block in (*spec.block_sizes, *spec.reduction_loops)
+        },
+    )
+    env.is_jagged_tile.return_value = False
+    env.shape_env.replace.side_effect = lambda value: value
+    env.specialize_expr.side_effect = lambda value: value
+    return env
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -70,10 +92,10 @@ def test_reduction_chunks_survive_seed_transfer(
             CuteVectorWidthSpec(block_id=block_id, size_hint=size)
         )
         spec.cute_lane_layouts.append(CuteLaneLayoutSpec(block_id=block_id))
-    env = MagicMock(config_spec=spec)
+    env = _row_env(spec)
     graph = torch.fx.Graph()
     with FakeTensorMode():
-        graph.placeholder("x").meta["val"] = torch.empty(
+        graph.call_function(_host_tensor, ("x",)).meta["val"] = torch.empty(
             (rows, columns), dtype=dtype, device=DEVICE
         )
     device_ir = MagicMock(graphs=[SimpleNamespace(graph=graph)])
@@ -113,9 +135,7 @@ def test_wide_chunk_eligibility_uses_rounded_capped_chunk(
     spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=columns))
     spec.max_reduction_loop = max_chunk
     assert (
-        CuteReductionWideChunkHeuristic.is_eligible(
-            MagicMock(config_spec=spec), MagicMock()
-        )
+        CuteReductionWideChunkHeuristic.is_eligible(_row_env(spec), MagicMock())
         is eligible
     )
 
@@ -177,9 +197,7 @@ def test_ladder_declines_unusable_chunk_caps(cap: int) -> None:
     spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=1048576))
     spec.max_reduction_loop = cap
     assert (
-        CuteRolledRowLadderHeuristic.get_seed_config(
-            MagicMock(config_spec=spec), MagicMock()
-        )
+        CuteRolledRowLadderHeuristic.get_seed_config(_row_env(spec), MagicMock())
         is None
     )
 

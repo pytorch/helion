@@ -23,10 +23,10 @@ from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
 from .device_function import find_block_size_symbols
+from .device_function import substitute_configured_block_sizes
 from .host_function import HostFunction
 from .inductor_lowering import install_inductor_kernel_handlers
 from .roll_reduction import FREE_IOTA_REDUCTION_META
-from .tile_strategy import CompactedShape
 from .tile_strategy import CuteLaneAxis
 from .tile_strategy import DeviceGridState
 from .tile_strategy import DeviceLoopState
@@ -36,6 +36,8 @@ from .tile_strategy import ThreadAxisTracker
 from .tile_strategy import TileStrategy
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from .device_function import DeviceFunction
     from .inductor_lowering import CodegenState
     from .lane_loop_context import LaneLoopContext
@@ -55,11 +57,15 @@ def reduction_acc_dtype(
 
     The reduction input already carries torch's promotion (a bool or integer
     sum arrives as Int64), so a value reduction accumulates in the output's
-    computation dtype; argmin/argmax track the input's values.
+    computation dtype; argmin/argmax track the input's values.  The backend
+    may widen it (``Backend.widen_reduction_acc_dtype``).
     """
-    if CompileEnvironment.current().backend.is_indexed_reduction(reduction_type):
-        return get_computation_dtype(fake_input.dtype)
-    return get_computation_dtype(fake_output.dtype)
+    backend = CompileEnvironment.current().backend
+    if backend.is_indexed_reduction(reduction_type):
+        dtype = get_computation_dtype(fake_input.dtype)
+    else:
+        dtype = get_computation_dtype(fake_output.dtype)
+    return backend.widen_reduction_acc_dtype(reduction_type, dtype)
 
 
 def _strategies_concurrent_with_block(
@@ -71,7 +77,10 @@ def _strategies_concurrent_with_block(
     Drops reduction strategies that live in a control-flow branch mutually
     exclusive with ``block_index``'s branch so the per-block thread budget is
     not over-counted (CuTe branch-by-pid kernels). Outside that pattern (no
-    branch paths) this returns every strategy unchanged.
+    branch paths) this returns every strategy unchanged, those of other root
+    loops included: a kernel with several roots budgets a reduction by their
+    shared launch instead where it can
+    (``TileStrategyDispatch.shared_launch_reduction_threads``).
     """
     from .device_ir import DeviceIR
 
@@ -93,6 +102,28 @@ def _strategies_concurrent_with_block(
             continue
         result.append(strategy)
     return result
+
+
+def _fit_reduction_thread_count(
+    tile_dispatch: TileStrategyDispatch,
+    block_index: int,
+    requested: int,
+    strategies: list[TileStrategy],
+    keeps_threads: Callable[[int], bool] | None = None,
+) -> int:
+    """``requested`` threads for reduction ``block_index``, shrunk to what the
+    strategies it runs beside leave (``Backend.adjust_reduction_thread_count``)
+    or, in a kernel of several root loops, to what their shared launch leaves
+    (``TileStrategyDispatch.shared_launch_reduction_threads``, which asks a
+    persistent reduction's ``keeps_threads``)."""
+    shared = tile_dispatch.shared_launch_reduction_threads(
+        block_index, requested, keeps_threads
+    )
+    if shared is not None:
+        return shared
+    return CompileEnvironment.current().backend.adjust_reduction_thread_count(
+        requested, strategies
+    )
 
 
 S = TypeVar("S", bound="ReductionStrategy")
@@ -138,6 +169,13 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
         """The power-of-2 bucket a hint-sized extent is compiled for."""
 
     @abc.abstractmethod
+    def plan_unpadded_extent(
+        self, fn: DeviceFunction, block_index: int, numel: int
+    ) -> bool:
+        """Whether the config runs a static extent the backend pads unpadded
+        and unmasked (before ``__init__``)."""
+
+    @abc.abstractmethod
     def plan_max_threads(self, max_threads: int) -> int:
         """Cap the backend's thread budget for this reduction."""
 
@@ -148,7 +186,7 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
     @abc.abstractmethod
     def plan_axis_partner(
         self, concurrent: list[TileStrategy], size_hint: int
-    ) -> PersistentReductionStrategy | None:
+    ) -> ReductionStrategy | None:
         """A concurrent sibling whose thread axis this block indexes instead."""
 
     @abc.abstractmethod
@@ -160,14 +198,23 @@ class PersistentReductionEmitter(ReductionEmitter["PersistentReductionStrategy"]
         """Whether the extent is a reshape-merged product of tile blocks."""
 
     @abc.abstractmethod
+    def prove_lanes_keep_threads(
+        self, threads: int, numel: object, size_hint: int
+    ) -> bool:
+        """Whether ``plan_synthetic_lanes`` surely keeps a power-of-two count
+        of ``threads`` threads (asked while the strategy still chooses it)."""
+
+    @abc.abstractmethod
     def plan_synthetic_lanes(
         self,
         lane_extent: int | None,
         size_hint: int,
         mask_var: str | None,
         merged_tiled_extent: bool,
+        numel: sympy.Expr,
     ) -> None:
-        """Size the synthetic lane loop, vector row or register tile."""
+        """Size the synthetic lane loop, vector row or register tile of the
+        reduction extent ``numel`` (specialized)."""
 
     @abc.abstractmethod
     def check_shared_thread_extent(self, extent: int) -> None:
@@ -388,9 +435,6 @@ class ReductionStrategy(TileStrategy):
     def user_size(self, block_index: int) -> sympy.Expr:
         return CompileEnvironment.current().block_sizes[block_index].numel
 
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        return shapes
-
     def _reduction_thread_count(self) -> int:
         """Return threads used for this reduction on thread-aware backends."""
         return 0
@@ -424,10 +468,7 @@ class ReductionStrategy(TileStrategy):
         dispatcher parks it on the lowest axis no threaded reduction holds
         (``TileStrategyDispatch.thread_axis_for_strategy``), which a tile may
         use.  Giving every such reduction a private axis ran past the three
-        hardware axes as soon as a kernel held four reduction dims (an
-        attention kernel whose value head dim differs from the q/k head dim,
-        plus the two tile-sized dims that ``tile.index[:, None]`` slices
-        allocate).
+        hardware axes as soon as a kernel held four reduction dims.
         """
         if (emitter := self.emitter) is not None:
             return emitter.claims_thread_axis()
@@ -623,19 +664,21 @@ class ReductionStrategy(TileStrategy):
     ) -> str:
         backend = CompileEnvironment.current().backend
         acc_dtype = reduction_acc_dtype(reduction_type, fake_input, fake_output)
+        # The value may hold a flattened tile's dims in one dimension.
+        physical_dim = self.fn.tile_strategy.physical_dim([*fake_input.size()], dim)
         if backend.is_indexed_reduction(reduction_type):
             return self.call_indexed_reduction(
                 input_name,
                 self.broadcast_str(self.argreduce_position_var(), fake_input, dim),
                 reduction_type,
-                dim,
+                physical_dim,
                 fake_output,
                 dtype=acc_dtype,
             )
         return backend.reduction_expr(
             input_name,
             reduction_type,
-            dim,
+            physical_dim,
             block_size_var=self.block_size_var(self.block_index),
             dtype=acc_dtype,
         )
@@ -773,13 +816,7 @@ class PersistentReductionStrategy(ReductionStrategy):
             # Reduction extents can refer to tile sizes. Resolve those symbols
             # from this config before planning physical threads or lane loops;
             # the tracing hint can be larger or smaller than the chosen tile.
-            block_symbols, _ = find_block_size_symbols(numel)
-            configured_sizes = {
-                symbol: sympy.Integer(size)
-                for symbol, block_id in block_symbols.items()
-                if isinstance(size := fn.resolved_block_size(block_id), int)
-            }
-            resolved_numel = numel.xreplace(configured_sizes)
+            resolved_numel = substitute_configured_block_sizes(numel, fn.config)
             size_hint = shape_env_size_hint(env.shape_env, resolved_numel)
         else:
             size_hint = env.size_hint(numel)
@@ -794,11 +831,21 @@ class PersistentReductionStrategy(ReductionStrategy):
         # This is true when numel is a power of 2 (Triton doesn't round),
         # or when the backend uses exact RDIM sizes (e.g., Pallas).
         needs_mask = True
+        unpadded = False
         # Guard numel > 0: on PyTorch 2.9, next_power_of_2(0) returns 0
         # (the n <= 0 guard was added later), so static_rdim_size(0) == 0
         # would incorrectly skip the mask for zero-size reductions.
         if isinstance(numel, (int, sympy.Integer)) and int(numel) > 0:
             needs_mask = env.backend.static_rdim_size(int(numel)) != int(numel)
+            # The config may run a padded static extent unpadded, its
+            # threads covering exactly its elements.
+            unpadded = (
+                needs_mask
+                and emitter is not None
+                and emitter.plan_unpadded_extent(fn, block_index, int(numel))
+            )
+            if unpadded:
+                needs_mask = False
         mask_var: str | None = (
             fn.new_var(f"mask_{block_index}", dce=True) if needs_mask else None
         )
@@ -809,13 +856,15 @@ class PersistentReductionStrategy(ReductionStrategy):
             block_size_var=fn.new_var(f"_RDIM_SIZE_{block_index}"),
         )
         self._cute_hint_bucket = hint_bucket
+        # The extent runs unpadded (``plan_unpadded_extent``).
+        self._unpadded_extent = unpadded
         self.offset_vars[block_index] = "0"
         # The ``num_threads`` entry the config spells for this block (0 when
         # it leaves the count to the backend).
         self._cute_requested_threads = 0
-        # A concurrent sibling persistent block whose thread axis this block
+        # A concurrent sibling reduction block whose thread axis this block
         # indexes instead of claiming one (``plan_axis_partner``).
-        self._cute_axis_partner: PersistentReductionStrategy | None = None
+        self._cute_axis_partner: ReductionStrategy | None = None
         # Compute thread count for warp-level reductions
         max_threads = env.backend.max_reduction_threads()
         if max_threads is not None:
@@ -842,24 +891,37 @@ class PersistentReductionStrategy(ReductionStrategy):
             # so they never co-execute and must not be multiplied into this
             # reduction's thread budget. Drop them before adjusting.
             concurrent = _strategies_concurrent_with_block(tile_dispatch, block_index)
+            partner = None
             if emitter is not None:
                 partner = emitter.plan_axis_partner(concurrent, size_hint)
-                if partner is not None:
-                    # The shared axis is already in the budget as the partner.
-                    self._cute_axis_partner = partner
-                    concurrent = [s for s in concurrent if s is not partner]
-            self._thread_count = env.backend.adjust_reduction_thread_count(
-                self._thread_count, concurrent
-            )
+            if partner is not None:
+                # The shared axis is already in the budget as the partner, and
+                # its thread count is this block's.
+                self._cute_axis_partner = partner
+            else:
+                self._thread_count = _fit_reduction_thread_count(
+                    tile_dispatch,
+                    block_index,
+                    self._thread_count,
+                    concurrent,
+                    None
+                    if emitter is None
+                    else functools.partial(
+                        emitter.prove_lanes_keep_threads,
+                        numel=numel,
+                        size_hint=size_hint,
+                    ),
+                )
         self._synthetic_cute_lane_var: str | None = None
         self._synthetic_cute_lane_extent = 1
         # Persistent reductions expose the same unroll-vec protocol as rolled
-        # reductions when one V-wide vector exactly covers each thread's
-        # synthetic slice.  Restricting the first implementation to one vector
-        # per thread avoids introducing a second loop-carried reduction level;
-        # wider slices keep the established scalar synthetic-lane path.
+        # reductions when V-wide vectors cover each thread's synthetic slice:
+        # one vector, or ``_cute_reduction_vec_chunks`` of them ``threads * V``
+        # elements apart (the rolled strided layout), all walked by one
+        # constexpr lane loop.  Other slices keep the scalar synthetic lanes.
         self._cute_reduction_lane_extent = 1
         self._cute_reduction_vec_width = 1
+        self._cute_reduction_vec_chunks = 1
         # The synthetic lane's V-loop and lane body, filled in by the
         # emitter's ``emit_synthetic_lane_preamble`` for the memory lowering
         # (``lane_loop_context.py``).
@@ -902,7 +964,11 @@ class PersistentReductionStrategy(ReductionStrategy):
                 )
                 if emitter is not None:
                     emitter.plan_synthetic_lanes(
-                        lane_extent, size_hint, mask_var, merged_tiled_extent
+                        lane_extent,
+                        size_hint,
+                        self._mask_var,
+                        merged_tiled_extent,
+                        numel,
                     )
 
     @functools.cached_property
@@ -988,9 +1054,12 @@ class PersistentReductionStrategy(ReductionStrategy):
         if state.device_function.constexpr_arg(block_size_var):
             if isinstance(numel, sympy.Integer):
                 # Static size - issue statement immediately
-                stmt = statement_from_string(
-                    f"{block_size_var} = {backend.static_rdim_size(int(numel))}"
+                size = (
+                    int(numel)
+                    if self._unpadded_extent
+                    else backend.static_rdim_size(int(numel))
                 )
+                stmt = statement_from_string(f"{block_size_var} = {size}")
                 state.codegen.host_statements.append(stmt)
             else:
                 # Check for block size dependencies
@@ -1002,7 +1071,9 @@ class PersistentReductionStrategy(ReductionStrategy):
                     )
                 else:
                     # No dependencies - issue statement immediately
-                    expr_str = HostFunction.current().sympy_expr(numel)
+                    expr_str = HostFunction.current().sympy_expr(
+                        numel, state.device_function.config
+                    )
                     stmt = statement_from_string(
                         f"{block_size_var} = {backend.dynamic_rdim_size_expr(expr_str)}"
                     )
@@ -1016,7 +1087,9 @@ class PersistentReductionStrategy(ReductionStrategy):
             self.block_index: LoopDimInfo(end_var_name=end_var_name, end_expr=numel)
         }
         tracker = ThreadAxisTracker()
-        if self._claims_thread_axis():
+        if self._claims_thread_axis() or self._cute_axis_partner is not None:
+            # A block indexing its partner's axis spans that axis's threads
+            # all the same (``plan_axis_partner``).
             tracker.record(
                 self.block_index, self._get_thread_axis(), self._thread_count
             )
@@ -1101,8 +1174,8 @@ class LoopedReductionStrategy(ReductionStrategy):
             thread_count = 0
         tile_dispatch = getattr(fn, "tile_strategy", None)
         if tile_dispatch is not None:
-            thread_count = env.backend.adjust_reduction_thread_count(
-                thread_count, tile_dispatch.strategies
+            thread_count = _fit_reduction_thread_count(
+                tile_dispatch, block_index, thread_count, tile_dispatch.strategies
             )
         self._thread_count = thread_count
         if thread_count > 0:
@@ -1375,7 +1448,7 @@ class LoopedReductionStrategy(ReductionStrategy):
                     acc,
                     acc_index,
                     reduction_type,
-                    dim,
+                    self.fn.tile_strategy.physical_dim([*fake_input.size()], dim),
                     fake_output,
                     dtype=acc_dtype,
                 )

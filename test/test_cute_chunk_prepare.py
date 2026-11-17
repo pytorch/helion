@@ -27,6 +27,7 @@ from helion._compiler.cute.chunk_prepare import _packed_workspace_is_exact
 from helion._compiler.cute.chunk_prepare import _preferred_split_alias_chunks_per_cta
 from helion._compiler.cute.fx_matcher import _TensorRef
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion.runtime.cute.host_wrappers.recurrences import (
     chunk_prepare_expected_tensor_map_specs,
 )
@@ -599,7 +600,7 @@ def _change_q_normalization_rounding(device_ir: DeviceIR) -> None:
         for node in q_raw.users
         if node.target is torch.ops.aten.mul.Tensor
         and node.args[0] is q_raw
-        and node.args[1] is not None
+        and node.args[1] is not q_raw
     )
     rounding = next(
         node
@@ -607,6 +608,17 @@ def _change_q_normalization_rounding(device_ir: DeviceIR) -> None:
         if node.target is torch.ops.prims.convert_element_type.default
     )
     rounding.args = (rounding.args[0], torch.float16)
+
+
+def _remove_repeated_square_operand(device_ir: DeviceIR) -> None:
+    square = next(
+        node
+        for node in _prepare_body_nodes(device_ir)
+        if node.target is torch.ops.aten.mul.Tensor
+        and len(node.args) == 2
+        and node.args[0] is node.args[1]
+    )
+    square.args = (square.args[0], None)
 
 
 def _remove_beta_mask(device_ir: DeviceIR) -> None:
@@ -757,10 +769,21 @@ def _shorten_prepare_root_task_extent(device_ir: DeviceIR) -> None:
         _shorten_prepare_root_task_extent,
     ),
 )
+@pytest.mark.cpu_only
 def test_prepare_rejects_semantic_mutations(
     mutate: Callable[[DeviceIR], None],
 ) -> None:
-    assert _captured_plan_after_mutation(mutate) is None
+    with cpu_render_target(fake_device_sm_count=148):
+        assert _captured_plan_after_mutation(mutate) is None
+
+
+@pytest.mark.cpu_only
+def test_prepare_malformed_square_rejects_stale_lowering() -> None:
+    with (
+        cpu_render_target(fake_device_sm_count=148),
+        pytest.raises(exc.InternalError, match="lowered value inputs changed"),
+    ):
+        _captured_plan_after_mutation(_remove_repeated_square_operand)
 
 
 @pytest.mark.parametrize(

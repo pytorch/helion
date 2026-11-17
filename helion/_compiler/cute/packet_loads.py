@@ -22,12 +22,16 @@ if TYPE_CHECKING:
     from .fragment_context import HostTensor
 
 KEY = "cute_fragment_packet_loads"
-# Element types of a four-scalar packet: 16 bytes of fp32, 8 bytes of 16-bit.
-PACKET_DTYPES = frozenset({torch.float32, torch.bfloat16, torch.float16})
+# Shared dtype allowlist for guarded four-element and static 16-byte packets.
+PACKET_DTYPES = frozenset(
+    {torch.float32, torch.bfloat16, torch.float16, torch.int8, torch.uint8}
+)
 _PURE = frozenset(
     [
         f"cutlass.{name}"
         for name in (
+            "Int8",
+            "Uint8",
             "Int32",
             "Int64",
             "Uint32",
@@ -186,11 +190,11 @@ def materialize_packet_load(
     """Publish the same scalar values at the same dense shared coordinates.
 
     The caller proves the host allocation is readonly for the complete root.
-    Each packet owns four consecutive *logical* slots (16 bytes of fp32, 8
-    bytes of a 16-bit type), independent of pointer strides. Original
-    address/mask code runs first; only four valid consecutive aligned
-    effective addresses select the vector load. Every other packet scalarizes.
-    The final existing CTA barrier protects all later cross-thread consumers.
+    Each packet owns four consecutive *logical* slots (16, 8, or 4 bytes),
+    independent of pointer strides. Original address/mask code runs first;
+    only four valid consecutive aligned effective addresses select the vector
+    load. Every other packet scalarizes. The final existing CTA barrier
+    protects all later cross-thread consumers.
     """
     if (
         not value.shape
@@ -198,10 +202,10 @@ def materialize_packet_load(
         or not tensor_has_specialized_base_alignment(compiler.env, tensor.value, 16)
     ):
         return None
-    # One packet is four scalars: 16 bytes of fp32 or 8 bytes of a 16-bit
-    # type.  Four lanes keep the loop body (and the DSL's AST preprocessing
-    # of its conditionals) the size of the proven fp32 packet; eight 16-bit
-    # lanes doubled the conditionals and the preprocessor no longer finished.
+    # One packet is four scalars: 16, 8, or 4 bytes. Four lanes keep the loop
+    # body and the DSL's AST preprocessing at the proven fp32 packet's size.
+    # Eight 16-bit lanes doubled the conditionals and the preprocessor no
+    # longer finished.
     lanes = 4
     packet_bytes = lanes * value.dtype.itemsize
     scalar = compiler.dtype(value.dtype)

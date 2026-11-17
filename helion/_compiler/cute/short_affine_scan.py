@@ -35,6 +35,7 @@ from ...language import memory_ops
 from ...language import view_ops
 from ...language.matmul_ops import _static_dim_value
 from ..compile_environment import CompileEnvironment
+from ..fx_side_effects import is_impure_node
 from .analysis.match_common import binary_pair
 
 if TYPE_CHECKING:
@@ -825,7 +826,7 @@ def _input_nodes(node: torch.fx.Node) -> set[torch.fx.Node]:
 def _node_is_effectful(node: torch.fx.Node) -> bool:
     if node.op in {"call_method", "call_module"}:
         return True
-    return node.op == "call_function" and node.is_impure()
+    return node.op == "call_function" and is_impure_node(node)
 
 
 def _same_memory_base(node: torch.fx.Node, base: object) -> bool:

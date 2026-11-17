@@ -1,5 +1,6 @@
 """Pure-AST unit tests for ``hoist_warp_reduce_from_vloop``'s running-sum
-handling.
+handling (and for ``validate_cluster_reduce_placement``'s trip counts, at the
+end).
 
 The pass hoists a ``cute.arch.warp_reduction_*`` out of a constexpr V-loop.
 How it hoists depends on the reduce input:
@@ -29,7 +30,9 @@ import textwrap
 
 import pytest
 
+from helion import exc
 from helion._compiler.cute.hoist_warp_reduce import hoist_warp_reduce_from_vloop
+from helion._compiler.cute.hoist_warp_reduce import validate_cluster_reduce_placement
 from helion._testing import TestCase
 
 # Pure-AST tests: they run on every backend row.
@@ -122,6 +125,31 @@ class TestHoistWarpReduceRunningSum(TestCase):
             acc = dot_acc_base + cutlass.Float32(cute.arch.warp_reduction_sum(dot_acc, threads_in_group=32))
         """
         self.assertExpectedJournal(_run(src, running_sums=set()))
+
+
+@pytest.mark.parametrize(
+    ("spelling", "trips"),
+    [
+        ("cutlass.range_constexpr(1, 3)", 2),
+        ("cutlass.range_constexpr(2, 3)", 1),
+        ("cutlass.range_constexpr(N)", 1),
+        ("range(1, -1, -1)", 2),
+    ],
+)
+def test_cluster_reduce_placement_counts_any_range_spelling(
+    spelling: str, trips: int
+) -> None:
+    """A cluster reduce must run once per kernel, so the check counts the
+    trips of the loops around it the way the lane passes do (``_loop_trips``),
+    whatever the range's spelling.  It read a ``range_constexpr``'s first
+    argument as its trip count (``(1, 3)`` once, ``(2, 3)`` twice) and took a
+    bound named by a constexpr value as unknown."""
+    body = ast.parse(f"for i in {spelling}:\n    x = _cute_grouped_reduce_cluster(y)\n")
+    if trips > 1:
+        with pytest.raises(exc.BackendUnsupported, match="exactly once per kernel"):
+            validate_cluster_reduce_placement(body.body, {"N": 1})
+    else:
+        validate_cluster_reduce_placement(body.body, {"N": 1})
 
 
 if __name__ == "__main__":

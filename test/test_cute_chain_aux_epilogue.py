@@ -29,7 +29,6 @@ import torch
 
 from test.cute_population_contracts import with_flat_min_blocks_default
 from test.test_cute_full_slice_matmul import _bind
-from test.test_cute_materialized_fission import _se_args
 from test.test_cute_materialized_fission import _sources
 from test.test_cute_phase_mma_roots import _native_cpu_target  # noqa: F401
 
@@ -38,11 +37,13 @@ from helion._compiler.cute.autotune.heuristics.cute_materialized import (
     CuteMaterializedMmaHeuristic,
 )
 from helion._compiler.cute.tcgen05_config import facts
+from helion._compiler.cute.tcgen05_config import repair
 from helion._compiler.cute.tcgen05_constants import (
     TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION,
 )
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_structural_kernels import _se_args
 from helion.autotuner.config_generation import ConfigGeneration
 from helion.exc import InvalidConfig
 
@@ -461,3 +462,23 @@ def test_the_render_of_a_pinned_record_is_unchanged() -> None:
     expected.update(TCGEN05_REGION_TWO_CTA_LAUNCH_PROJECTION)
     expected.update(pid_type="persistent_blocked", tcgen05_ab_stages=4)
     assert launch == cast("dict[str, object]", expected)
+
+
+def test_flat_chain_keeps_the_swizzle_of_its_persistent_launches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flat ordered chain whose GEMM launch runs persistent
+    (``tcgen05_region_pid_types``) shares the tile scheduler's swizzle with
+    it: the edge repair that returns a flat walk's swizzle to 1 keeps it, and
+    drops it once every launch inherits the flat walk."""
+    bound = _bind_chain()
+    state = bound.config_spec._cute_tcgen05_config
+    monkeypatch.setattr(
+        facts, "_has_any_matmul_fact_edge_tile", lambda state, config: True
+    )
+    config = dict(_pair_config(bound).config)
+    repair._fix_edge_swizzle_search_config(state, config)
+    assert config["tcgen05_l2_swizzle_size"] == 2
+    config["tcgen05_region_pid_types"] = ["inherit"]
+    repair._fix_edge_swizzle_search_config(state, config)
+    assert config["tcgen05_l2_swizzle_size"] == 1

@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 class CuteRegisterChainHeuristic(AutotunerHeuristic):
     name = "cute_register_chain"
     backend = "cute"
-    priority = 53
+    priority = 54
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
 
     @classmethod

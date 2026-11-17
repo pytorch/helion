@@ -302,6 +302,7 @@ _CASES = [
 ]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("variant", "shape", "d", "dv"),

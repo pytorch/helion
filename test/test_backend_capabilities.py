@@ -124,6 +124,10 @@ class TestCapabilityHooks(unittest.TestCase):
                     backend.thread_axis_limit(), 3 if name == "cute" else None
                 )
                 self.assertEqual(
+                    backend.thread_axis_extent_limits(),
+                    (1024, 1024, 64) if name == "cute" else None,
+                )
+                self.assertEqual(
                     backend.rng_streams(),
                     ("auto", "word0", "philox4") if name == "cute" else ("word0",),
                 )

@@ -4,8 +4,10 @@ general-purpose emitter helpers they compose.
 ``ROOT_EMITTERS`` is the ordered tuple ``CuteBackend.root_emitters`` returns:
 ``GenerateAST.visit_For`` tries each entry in turn and the first that owns the
 root emits it; none owning it leaves the root to the ordinary lowering.  The
-order is a priority order (the computed-fragment owner is tried early when the
-root asks for fragments and again last) and is pinned by tests.
+order is a priority order: a required complete owner comes first and refuses
+unproved fallback; optional fragment preference follows register sub-blocks
+and radix selection, and the general fragment emitter is tried again last.
+Tests pin this order.
 
 Planning stays where it is today: the planners run in ``CuteBackend.pre_codegen``
 (and the flash / warp-MMA detectors in ``create_loop_strategy``) and record each
@@ -32,6 +34,7 @@ from typing import TYPE_CHECKING
 
 from .... import exc
 from ...emitter_protocols import RootEmitter
+from ..full_reduction_owner import requires_full_reduction_owner
 from ..state import ROOT_PLAN_SLOTS
 
 if TYPE_CHECKING:
@@ -160,6 +163,39 @@ class ComputedFragmentRootEmitter(RootEmitter):
 
     def decline(self, codegen: GenerateAST, plan: object) -> None:
         return None
+
+
+@dataclasses.dataclass(frozen=True)
+class RequiredComputedFragmentRootEmitter(RootEmitter):
+    """An unmerged full vote cannot fall back to scalar lane code generation."""
+
+    name: str = "required_computed_fragment"
+
+    def plan(self, codegen: GenerateAST) -> object | None:
+        if requires_full_reduction_owner(codegen.host_function.device_ir.graphs):
+            if (
+                any(
+                    isinstance(emitter, PlannedRootEmitter)
+                    and emitter.plan(codegen) is not None
+                    for emitter in ROOT_EMITTERS
+                )
+                or ATTENTION_FLASH_ROOT.plan(codegen) is not None
+            ):
+                raise exc.InvalidConfig(
+                    "an unmerged full reduction cannot override a planned root"
+                )
+            return _FRAGMENT_SCHEDULE
+        return None
+
+    def emit(self, codegen: GenerateAST, plan: object) -> bool:
+        # Keep the required slot independent of optional-emitter try_emit/emit
+        # patches and preference gates. Both resolve the actual module entry.
+        return _entry("computed_fragment", "codegen_computed_fragment_root")(codegen)
+
+    def decline(self, codegen: GenerateAST, plan: object) -> None:
+        raise exc.InvalidConfig(
+            "unmerged full reductions require a supported complete fragment root"
+        )
 
 
 def _requests_fragments(codegen: GenerateAST) -> bool:
@@ -300,6 +336,7 @@ WARP_MMA_GEMM_ROOT = PlannedRootEmitter(
 ATTENTION_FLASH_ROOT = AttentionFlashRootEmitter()
 
 ROOT_EMITTERS: tuple[RootEmitter, ...] = (
+    RequiredComputedFragmentRootEmitter(),
     REGISTER_SUBBLOCKS_ROOT,
     RADIX_SELECTION_ROOT,
     GatedRootEmitter(

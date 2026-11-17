@@ -12,6 +12,8 @@ MetalOverrides (reused from Inductor's MPS codegen) emits MSL expression strings
 Handles:
   - Statement-level Python→C++ translation (assignments, if/for, etc.)
   - ``tl.load(ptr + offset, mask, other=0)`` → ``(mask ? *(ptr+offset) : (T)(0))``
+    (``select_masked_loads`` first turns a read-only buffer's into
+    ``_helion_masked(ptr[mask ? offset : 0], mask, 0)``)
   - ``tl.store(ptr + offset, val, mask)`` → ``if (mask) { *(ptr+offset) = val; }``
   - ``static_cast(T, x)`` → ``static_cast<T>(x)`` (and the other ``TEMPLATE_CALLS``)
   - C++ namespace restoration: ``metal.precise.sin`` → ``metal::precise::sin``
@@ -21,12 +23,22 @@ Handles:
 from __future__ import annotations
 
 import ast
+from collections import Counter
 import contextlib
+import copy
 import dataclasses
 from typing import Iterator
 
 from ... import exc
+from .fragment_mma import emit_fragment_acc
+from .fragment_mma import emit_fragment_run
+from .fragment_mma import fragment_elements
+from .fragment_mma import is_fragment_acc
+from .lane_fold import LANE_PUT
+from .lane_fold import load_mask_other
+from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
+from .mpp_matmul import FRAG_RUN
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
@@ -56,6 +68,15 @@ class EmitState:
     coop_tile: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The cooperative roots whose descriptor rounds a size-1 dim up.
     coop_rounded: set[str] = dataclasses.field(default_factory=set)
+    #: Each fragment group's accumulator root to its fragment grid ``(rows,
+    #: cols, transposed)`` (``fragment_mma``).
+    fragments: dict[str, tuple[int, int, int]] = dataclasses.field(default_factory=dict)
+    #: The kernel's names that are integer constants, which a fragment run
+    #: folds its elements' index arithmetic over (``fragment_mma``'s
+    #: ``kernel_constants``).
+    constants: dict[str, int] = dataclasses.field(default_factory=dict)
+    #: The element an element loop's ``_helion_mpp_put`` writes.
+    put: str = "*_it"
 
     def is_declared(self, name: str) -> bool:
         return name in self.declared or any(name in s for s in self._enclosing)
@@ -190,7 +211,7 @@ def _emit_stmts(
             if _is_tl_store_call(call):
                 assert isinstance(call, ast.Call)
                 _emit_tl_store(call, parts, indent=indent, subs=subs)
-            elif _is_call_to(call, "_metal_lane_put"):
+            elif _is_call_to(call, LANE_PUT):
                 assert isinstance(call, ast.Call)
                 array, lane, value = (_ast_expr_to_msl(a, subs=subs) for a in call.args)
                 parts.append(f"{pad}{array}[{lane}] = {value};")
@@ -205,7 +226,7 @@ def _emit_stmts(
                 # _helion_mpp_update).
                 assert isinstance(call, ast.Call)
                 parts.append(
-                    f"{pad}*_it = {_ast_expr_to_msl(call.args[0], subs=subs)};"
+                    f"{pad}{state.put} = {_ast_expr_to_msl(call.args[0], subs=subs)};"
                 )
             elif _is_call_to(call, "_helion_mpp_fence"):
                 parts.append(
@@ -270,8 +291,12 @@ def _emit_coop_acc(
 
     The op's scope is every SIMD group the launch dispatches, built from the
     launch's own constants; ``check_mpp_launch`` rejects launches that are not
-    whole SIMD groups.
+    whole SIMD groups.  A fragment group's accumulator is
+    ``fragment_mma``'s.
     """
+    if is_fragment_acc(call):
+        emit_fragment_acc(name, call, parts, pad, state)
+        return
     gid, tm, tn, tk, dtypes, lhs_t, rhs_t, fill = (
         ast.literal_eval(a) for a in call.args[:8]
     )
@@ -409,7 +434,8 @@ def _coop_view(
             )
             continue
         ov, ev = f"{var}_o{d}", f"{var}_e{d}"
-        if e == size or e.lstrip("-").isdigit():
+        # mpp_matmul clamps a literal extent beside a literal size.
+        if e == size or (e.lstrip("-").isdigit() and size.isdigit()):
             e = f"(long)({e})"
         else:
             e = f"metal::min((long)({e}), (long)({size}))"
@@ -535,7 +561,10 @@ def _emit_for(
     - ``_helion_mpp_elements(coop, ...)``
       → MPP cooperative_tensor iteration ``for (auto _it = coop.begin();
       _it != coop.end(); _it++)`` with the tensor's names substituted by
-      ``(*_it)`` in the body.
+      ``(*_it)`` in the body, or a fragment group's unrolled loop over the
+      elements each lane holds (``fragment_mma.fragment_elements``)
+    - ``_helion_mpp_fragments(acc, steps, facts)`` → a fragment group's op
+      over one K tile (``fragment_mma.emit_fragment_run``)
     """
     pad = " " * indent
     it = stmt.iter
@@ -544,39 +573,62 @@ def _emit_for(
 
     func = it.func
 
+    # --- A fragment group's op over one K tile (fragment_mma.fragment_run) ---
+    if isinstance(func, ast.Name) and func.id == FRAG_RUN:
+        emit_fragment_run(
+            stmt,
+            parts,
+            indent,
+            state,
+            lambda body, out, ind, st: _emit_stmts(body, out, indent=ind, state=st),
+        )
+        return
+
     # --- MPP element loop over a cooperative tensor (mpp_matmul.elementize) ---
     if isinstance(func, ast.Name) and func.id == "_helion_mpp_elements":
         assert isinstance(it.args[0], ast.Name)
         coop = it.args[0].id
         root = state.coop[coop]
+        # A fragment element is read once, as ``_fv``, and written through
+        # ``state.put``.
+        element = "_fv" if root in state.fragments else "(*_it)"
         element_subs = {
             **(subs or {}),
-            **{name: "(*_it)" for name, r in state.coop.items() if r == root},
+            **{name: element for name, r in state.coop.items() if r == root},
         }
         fenced = len(it.args) > 1 and ast.literal_eval(it.args[1])
         if fenced:
             # The loop reads a staged vector's tile: after its staging writes.
             parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
-        # A cooperative tensor's multidimensional index is (column, row).
-        parts.extend(
-            (
-                f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
-                f"{pad}    if (!{coop}.is_valid_element(_it)) continue;",
-                f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
-                f"{pad}    int _e_n = (int)_md[0];",
-                f"{pad}    int _e_m = (int)_md[1];",
+
+        def body(ind: int) -> list[str]:
+            lines: list[str] = []
+            with state.isolated_scope():
+                _emit_stmts(
+                    stmt.body, lines, indent=ind, state=state, subs=element_subs
+                )
+            return lines
+
+        if root in state.fragments:
+            parts.extend(fragment_elements(coop, root, pad, state, body))
+        else:
+            # A cooperative tensor's multidimensional index is (column, row).
+            parts.extend(
+                (
+                    f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
+                    f"{pad}    if (!{coop}.is_valid_element(_it)) continue;",
+                    f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
+                    f"{pad}    int _e_n = (int)_md[0];",
+                    f"{pad}    int _e_m = (int)_md[1];",
+                )
             )
-        )
-        if root in state.coop_rounded:
-            block_m, block_n = state.coop_tile[root]
-            parts.append(
-                f"{pad}    if (_e_m >= {block_m} || _e_n >= {block_n}) continue;"
-            )
-        with state.isolated_scope():
-            _emit_stmts(
-                stmt.body, parts, indent=indent + 4, state=state, subs=element_subs
-            )
-        parts.append(f"{pad}}}")
+            if root in state.coop_rounded:
+                block_m, block_n = state.coop_tile[root]
+                parts.append(
+                    f"{pad}    if (_e_m >= {block_m} || _e_n >= {block_n}) continue;"
+                )
+            parts.extend(body(indent + 4))
+            parts.append(f"{pad}}}")
         if fenced:
             # Every element has read the tile before its next writes.
             parts.append(f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);")
@@ -820,32 +872,18 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
         return literal
 
     # tl.load(ptr + offset, mask, other=0) → (mask ? *(ptr+offset) : (other))
-    if (
-        isinstance(func, ast.Attribute)
-        and isinstance(func.value, ast.Name)
-        and func.value.id == "tl"
-        and func.attr == "load"
-    ):
-        access = _ptr_access_expr(node.args[0], subs=subs)
-        if len(node.args) >= 2:
-            mask_node = node.args[1]
-            if isinstance(mask_node, ast.Constant) and mask_node.value is None:
-                return access
-            mask = _ast_expr_to_msl(mask_node, subs=subs)
-            other = None
-            if len(node.args) >= 3:
-                other = _ast_expr_to_msl(node.args[2], subs=subs)
-            else:
-                for kw in node.keywords:
-                    if kw.arg == "other":
-                        other = _ast_expr_to_msl(kw.value, subs=subs)
-                        break
-            if other is None:
-                raise exc.BackendUnsupported(
-                    "metal", "tl.load with mask requires 'other' argument"
-                )
-            return f"({mask} ? {access} : ({other}))"
-        return access
+    if (load := tl_load(node)) is not None:
+        access = _ptr_access_expr(load.args[0], subs=subs)
+        masked = load_mask_other(load)
+        if masked is None:
+            return access
+        mask, other = masked
+        if other is None:
+            raise exc.BackendUnsupported(
+                "metal", "tl.load with mask requires 'other' argument"
+            )
+        mask_msl = _ast_expr_to_msl(mask, subs=subs)
+        return f"({mask_msl} ? {access} : ({_ast_expr_to_msl(other, subs=subs)}))"
 
     # A C++ cast or MSL template function: static_cast(T, x) → static_cast<T>(x)
     if _template_name(func) in TEMPLATE_CALLS:
@@ -882,6 +920,82 @@ def _template_arg_to_msl(node: ast.AST, subs: dict[str, str] | None) -> str:
         # decltype(+(*_it)).
         return "decltype(+(*_it))" if inner == "(*_it)" else f"decltype({inner})"
     return _ast_expr_to_msl(node, subs=subs)
+
+
+#: ``m ? v : other`` as a call, so ``v`` (a load at a safe index) is
+#: evaluated unconditionally; the result has the conditional's own type.
+MASKED_LOAD = "_helion_masked"
+MASKED_LOAD_PREAMBLE = f"""template <typename T, typename O>
+inline auto {MASKED_LOAD}(T v, bool m, O other) {{
+    return m ? v : other;
+}}"""
+
+
+def select_masked_loads(
+    stmts: list[ast.stmt], candidates: frozenset[str]
+) -> list[ast.stmt]:
+    """Rewrite each masked ``tl.load(buf + offset, mask, other)`` of a buffer
+    in *candidates* to ``_helion_masked(tl.load(buf + (offset if mask else
+    0)), mask, other)``: load unconditionally, at element 0 when masked off,
+    and select afterwards.  A load under the condition is a branch per load,
+    which keeps Metal from issuing loads together.
+
+    *candidates* are the buffers with an element 0 that no other parameter
+    shares storage with.  A candidate's loads still stay conditional where
+    the kernel uses it other than through ``tl.load`` (a store, an atomic, an
+    MPP operand), since another thread may write element 0 while a
+    masked-off lane reads it."""
+    loaded = Counter(
+        load.args[0].left.id
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if (load := tl_load(node)) is not None
+        and isinstance(load.args[0], ast.BinOp)
+        and isinstance(load.args[0].left, ast.Name)
+    )
+    named = Counter(
+        node.id
+        for stmt in stmts
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name)
+    )
+    read_only = {name for name in candidates if loaded[name] == named[name]}
+
+    class Select(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            self.generic_visit(node)
+            if (load := tl_load(node)) is None or (
+                masked := load_mask_other(load)
+            ) is None:
+                return node
+            mask, other = masked
+            ptr = load.args[0]
+            if not (
+                other is not None
+                and isinstance(ptr, ast.BinOp)
+                and isinstance(ptr.op, ast.Add)
+                and isinstance(ptr.left, ast.Name)
+                and ptr.left.id in read_only
+            ):
+                return node
+            safe = ast.BinOp(
+                left=ptr.left,
+                op=ast.Add(),
+                right=ast.IfExp(
+                    test=copy.deepcopy(mask), body=ptr.right, orelse=ast.Constant(0)
+                ),
+            )
+            return ast.Call(
+                func=ast.Name(id=MASKED_LOAD, ctx=ast.Load()),
+                args=[
+                    ast.Call(func=node.func, args=[safe], keywords=[]),
+                    mask,
+                    other,
+                ],
+                keywords=[],
+            )
+
+    return [Select().visit(stmt) for stmt in stmts]
 
 
 #: What Inductor's ``constant_repr`` emits for non-finite float constants.

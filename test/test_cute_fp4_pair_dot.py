@@ -5,12 +5,11 @@ import ast
 import pytest
 import torch
 
-from test.test_cute_tile_packing import _gemv_args
-
 import helion
 from helion._compiler.cute.fuse_fp4_pair_dot import fuse_fp4_pair_dot
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing.nvfp4_gemv_args import nvfp4_gemv_args
 
 _examples_nvfp4_gemv = import_example("nvfp4_gemv")
 _nvfp4_gemv_fp4in_body = _examples_nvfp4_gemv._nvfp4_gemv_fp4in_body
@@ -36,7 +35,7 @@ def test_fp4_group_dot_replaces_the_byte_chain(threads: int, extra: dict) -> Non
     """The sixteen decode/multiply/add steps of one group become one exact
     f16x2 dot of the two merged 8-byte vectors; the result is unchanged."""
     rows, kbytes = 256, 2048
-    args, expected = _gemv_args(rows, kbytes)
+    args, expected = nvfp4_gemv_args(rows, kbytes)
     config = _config(256, threads, **extra)
     kernel = helion.kernel(
         _nvfp4_gemv_fp4in_body, backend="cute", static_shapes=True, config=config

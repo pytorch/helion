@@ -14,11 +14,11 @@ Before any rewrite:
 
 - find out now whether the stack is submitted; never rely on what you saw
   earlier, because the user may have run `stack-pr submit` since. Record every
-  commit's trailer:
+  commit's trailer with the inventory below.
 
-  ```
-  git log --format='%h %s%n    %(trailers:key=stack-info,valueonly)' origin/main..HEAD
-  ```
+  Read raw messages here: Git's `%(trailers)` formatter can omit `stack-info:`
+  when it shares a paragraph with `autoreview passed:`. An empty formatter
+  result does not establish that a commit is unsubmitted.
 
   A commit with a `stack-info:` line has a pull request. That line must
   survive every rewrite: a commit that loses it looks new to the next submit,
@@ -32,11 +32,27 @@ Before any rewrite:
   `git rebase --abort` undoes a rebase in progress. These are your own
   commits; `reset --hard` is never for changes you did not make.
 
+Run this inventory before changing history. Keep the code fence at the top
+level so copying either its Markdown source or rendered text preserves the
+Python indentation:
+
+```
+git log --reverse --format='%h %s%n%B%x00' origin/main..HEAD |
+  python -c 'import sys
+for entry in sys.stdin.read().split("\0"):
+    lines = entry.strip().splitlines()
+    if lines:
+        print(lines[0])
+        for line in lines[1:]:
+            if line.startswith("stack-info:"):
+                print("    " + line)
+'
+```
+
 Each commit message ends with its `autoreview passed: ...` line, above any
 `stack-info:` trailer. Rewording keeps both. A rewrite that changes a commit's
-content (a squash, a split, a fold of anything but fixes for that commit's own
-review, a conflict resolution) makes the line stale: remove it and review the
-commit again (AGENTS.md, Recording the review).
+content can make the line stale: AGENTS.md (Recording the review) says when
+it does, and which folds and squashes keep it.
 
 Rewrite only with the recipes below. They keep each commit's message, and so
 its trailer, unless you edit it. Do not rebuild commits from saved copies of
@@ -84,7 +100,12 @@ GIT_SEQUENCE_EDITOR="cp $todo" git rebase -i <base>
 
 Then reword the survivor if its message should mention the folded work. Use
 `fixup` rather than `squash`: `squash` opens an editor for the combined
-message.
+message. Both recipes keep the older commit's review line. Drop it when the
+newer commit had none (unless that commit only holds fixes for the older
+one's own review) or when the two lines name no reviewer in common, and
+otherwise trim it to the reviewers both lines name. Both recipes also drop
+the newer commit's message: copy its `Review notes:` items into the
+survivor's paragraph, or the next review raises those findings again.
 
 ## Reorder or drop commits
 
@@ -116,7 +137,7 @@ git commit --amend -F "$msg"
 GIT_EDITOR=true git rebase --continue
 ```
 
-Check afterwards that `git log --format=%B -1 <new sha> | tail -1` still
+Check afterwards that `git log --format=%B -1 <new sha> | awk 'NF {last=$0} END {print last}'` still
 starts with `stack-info:` for a submitted commit.
 
 ## Split a commit
@@ -162,9 +183,8 @@ upstream commits also touched.
   the commit with the same title, and still last. Check it every time, not
   only when you believe the stack is submitted:
 
-  ```
-  git log --format='%h %s%n    %(trailers:key=stack-info,valueonly)' origin/main..HEAD
-  ```
+  Repeat the raw-message inventory above and compare its `stack-info:` lines
+  with the ones recorded before the rewrite.
 
   A missing one is an error: put it back (reword recipe) before anything
   else, and before any submit. `stack-pr view` should show every submitted

@@ -27,7 +27,7 @@ def test_packed_fp4_accuracy_checks_both_nibbles_exactly(
         atol=100,
         rtol=100,
         chunk_size=chunk_size,
-        scale_atol_by_expected_rms=True,
+        atol_scale="rms",
     )
     actual.view(torch.uint8)[-1] ^= bit
     with pytest.raises(AssertionError):
@@ -37,7 +37,7 @@ def test_packed_fp4_accuracy_checks_both_nibbles_exactly(
             atol=100,
             rtol=100,
             chunk_size=chunk_size,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
 
 

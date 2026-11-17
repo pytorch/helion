@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 class CuteSplitKClusterHeuristic(AutotunerHeuristic):
     name = "cute_split_k_cluster"
     backend = "cute"
-    priority = 57
+    priority = 58
 
     @classmethod
     def register_facts(

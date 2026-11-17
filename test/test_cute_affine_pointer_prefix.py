@@ -12,7 +12,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _target
 from test.test_cute_affine_vector_io import _SOURCE
 from test.test_cute_affine_vector_io import _execute
 from test.test_cute_affine_vector_io import _rewrite
@@ -24,6 +23,7 @@ from helion._compiler.runtime_tensor_guards import (
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_codegen import tcgen05_target
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 import helion.language as hl
 
@@ -169,7 +169,7 @@ def test_original_dynamic_aot_add_uses_vector_memory(
     torch.set_num_threads(1)
     try:
         with (
-            _target(),
+            tcgen05_target(),
             mock_cuda_unavailable(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
@@ -216,7 +216,7 @@ def test_external_output_registers_alias_facts_for_vector_memory(
     torch.set_num_threads(1)
     try:
         with (
-            _target(),
+            tcgen05_target(),
             mock_cuda_unavailable(),
             patch("torch.cuda._lazy_init", side_effect=AssertionError("GPU forbidden")),
         ):
@@ -468,6 +468,7 @@ def _save_case(
     (directory / "result.json").write_text(json.dumps(record, indent=2) + "\n")
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype_name", DTYPES)
 @pytest.mark.parametrize("rank", [2, 3], ids=["2d", "3d"])
@@ -516,6 +517,7 @@ def test_pointer_prefix_add_into_cuda(rank: int, dtype_name: str) -> None:
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_original_aot_add_dynamic_cuda() -> None:
     _check_source()

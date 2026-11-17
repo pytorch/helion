@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import collections
 import dataclasses
 import functools
 import itertools
@@ -63,6 +62,7 @@ if TYPE_CHECKING:
     from .cute.lane_loops.statements import LanePlacement
     from .cute.lane_loops.statements import LaneScope
     from .cute.memory_ops import CuteLaneRelocation
+    from .device_ir import DeviceIR
     from .inductor_lowering import CodegenState
     from .lane_loop_context import LaneLoopContext
     from .pallas.dma import DmaResources
@@ -286,33 +286,80 @@ class DeviceLoopState(DeviceLoopOrGridState):
     def lane_loop_headers(self) -> list[ast.For]:
         return _lane_loop_headers(self.lane_loops, self.vec_lane_wrappers)
 
+    def _loops_to_body(
+        self,
+    ) -> list[tuple[ast.For, list[ast.stmt], list[ast.stmt]]]:
+        """The ``for`` statements on the way from ``for_node`` down to
+        ``inner_statements``, outermost first, each with the statements its
+        body runs before the next of them and after it (none for the last)."""
+        loops: list[tuple[ast.For, list[ast.stmt], list[ast.stmt]]] = []
+        loop = self.for_node
+        while loop.body is not self.inner_statements:
+            position, child = next(
+                (
+                    (position, child)
+                    for position, child in enumerate(loop.body)
+                    if isinstance(child, ast.For)
+                    and _encloses(child, self.inner_statements)
+                ),
+                (0, None),
+            )
+            if child is None:
+                break
+            loops.append((loop, loop.body[:position], loop.body[position + 1 :]))
+            loop = child
+        loops.append((loop, [], []))
+        return loops
+
     def loop_headers(self) -> list[ast.For]:
         """The device loops around ``inner_statements``, outermost first.
 
         The ``for`` statements on the way from ``for_node`` down to the body
         (a multi-dimensional tile nests one loop per block); the synthetic
         lane loops and constexpr vector loops among them are per-thread
-        structure, not iteration.
+        structure, not iteration (``per_thread_loops``).
         """
+        return [
+            loop
+            for loop, _before, _after in self._loops_to_body()
+            if not _is_per_thread_loop(loop)
+        ]
+
+    def per_thread_loops(
+        self,
+    ) -> tuple[list[ast.For], frozenset[str], list[ast.AST], list[ast.AST]]:
+        """The per-thread loops around ``inner_statements`` the lane nest does not hold.
+
+        The synthetic lane loops and constexpr vector loops on the way from
+        ``for_node`` down to the body, other than ``lane_loops`` and the vec
+        wrappers' V-loops: a looped reduction walks a thread's share of each
+        chunk with a reduction lane loop and a constexpr V-loop
+        (``reduction_emitter.emit_lane_loop_body``).  Returns them outermost
+        first, the names they redefine per iteration, the statements their
+        bodies run before the body (a lane's base index, its chunk predicate,
+        the hoisted packets) and those they run after it (the packets'
+        store flushes).
+        """
+        registered = {lane_var for lane_var, _extent in self.lane_loops}
+        registered.update(
+            wrapper.vec_lane_var for wrapper in self.vec_lane_wrappers.values()
+        )
         loops: list[ast.For] = []
-        loop: ast.For | None = self.for_node
-        while loop is not None:
-            if getattr(
-                loop, HELION_LANE_LOOP_VAR_ATTR, None
-            ) is None and not _is_constexpr_lane_iter(loop):
+        targets: set[str] = set()
+        definitions: list[ast.AST] = []
+        tails: list[ast.AST] = []
+        for loop, before, after in self._loops_to_body():
+            target = loop.target
+            if (
+                _is_per_thread_loop(loop)
+                and isinstance(target, ast.Name)
+                and target.id not in registered
+            ):
                 loops.append(loop)
-            if loop.body is self.inner_statements:
-                break
-            loop = next(
-                (
-                    child
-                    for child in loop.body
-                    if isinstance(child, ast.For)
-                    and _encloses(child, self.inner_statements)
-                ),
-                None,
-            )
-        return loops
+                targets.add(target.id)
+                definitions.extend(before)
+                tails[:0] = after
+        return loops, frozenset(targets), definitions, tails
 
     def loop_variables(self) -> frozenset[str]:
         """The names the device loops around ``inner_statements`` redefine per iteration."""
@@ -442,6 +489,8 @@ def _live_lane_setup(
     body: list[ast.AST],
     setup: list[ast.AST],
     wrappers: dict[str, VecLaneWrapper],
+    *,
+    semantic_reads: Iterable[str] = (),
 ) -> tuple[set[str], list[ast.AST], set[str]]:
     """The names ``body`` needs, the lane setup statements defining them and
     the vec wrappers whose lane bodies received splices.
@@ -449,15 +498,17 @@ def _live_lane_setup(
     Setup statements (per-lane index / mask definitions) whose results the
     body never reads are dropped, and a lane loop whose variable is then left
     unreferenced is dead (``_lane_loop_is_live``).  An unused rdim block
-    (e.g. one allocated for a ``tile.index`` that codegen serves from the
-    tile's own block) would otherwise wrap the whole body in a dead innermost
-    loop, and the lane-reduce split pass would then try to split reductions
-    on that loop's lane var instead of the loop that actually distributes
-    them.
+    (one whose index the body never reads) would otherwise wrap the whole
+    body in a dead innermost loop, and the lane-reduce split pass would then
+    try to split reductions on that loop's lane var instead of the loop that
+    actually distributes them.
     """
     from .ast_read_writes import ReadWrites
 
-    needed: set[str] = set()
+    # A reduction's owner is a semantic dependency even when its value does
+    # not read the lane coordinate (for example, sum over an expanded axis).
+    # Proved reshape aliases remain prunable by the owner resolver.
+    needed = set(semantic_reads)
     for stmt in body:
         needed |= set(ReadWrites.from_ast(stmt).reads)
     # A vec wrapper whose lane body received memory_ops splices (hoisted vec
@@ -739,6 +790,14 @@ def _lane_loop_headers(
     return headers
 
 
+def _is_per_thread_loop(loop: ast.For) -> bool:
+    """Whether ``loop`` is per-thread structure rather than iteration: a
+    synthetic lane loop or a constexpr vector loop."""
+    return getattr(
+        loop, HELION_LANE_LOOP_VAR_ATTR, None
+    ) is not None or _is_constexpr_lane_iter(loop)
+
+
 @dataclasses.dataclass
 class DeviceGridState(DeviceLoopOrGridState):
     lane_loops: list[tuple[str, int]] = dataclasses.field(default_factory=list)
@@ -797,6 +856,13 @@ class DeviceGridState(DeviceLoopOrGridState):
     # active, before the body's reductions added theirs to
     # ``thread_axis_sizes`` (``GenerateAST.set_active_loops``).
     root_axis_sizes: dict[int, int] = dataclasses.field(default_factory=dict)
+    # Run on the statements ``wrap_body`` returns, which they may rewrite in
+    # place, once the root body is complete and wrapped in its lane loops
+    # (Metal: split a lane loop into passes around the reductions over its
+    # block).
+    body_finalizers: list[Callable[[list[ast.AST]], None]] = dataclasses.field(
+        default_factory=list
+    )
 
     def has_lane_loops(self) -> bool:
         return bool(self.lane_loops)
@@ -887,7 +953,12 @@ class DeviceGridState(DeviceLoopOrGridState):
         self, body: list[ast.AST]
     ) -> tuple[set[str], list[ast.AST], set[str]]:
         return _live_lane_setup(
-            body, self.lane_setup_statements, self.vec_lane_wrappers
+            body,
+            self.lane_setup_statements,
+            self.vec_lane_wrappers,
+            semantic_reads=CompileEnvironment.current().backend.lane_loop_semantic_reads(
+                body
+            ),
         )
 
     def lane_index_definitions(self) -> tuple[list[ast.AST], frozenset[str]]:
@@ -1395,8 +1466,10 @@ class TileStrategy:
     def codegen_preamble(self, state: CodegenState) -> None:
         """Called after a *different* strategy has been used to generate the grid."""
 
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        raise NotImplementedError
+    def compacted_block_ids(self) -> list[int]:
+        """The block ids, in order, whose dims a value holds in one dimension
+        (``compacted_dim_groups``); empty where every dim keeps its own."""
+        return []
 
     def _create_block_id_info_dict(
         self,
@@ -2464,15 +2537,21 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                     if all(c.block_ids != block_ids for c in cands):
                         cands.append(spec)
 
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        # Keep axis structure intact for multi-phase kernels (e.g., barrier) to
-        # avoid mismatched ranks in downstream reductions.
-        if len(HostFunction.current().device_ir.root_ids) > 1:
-            return shapes
+    @staticmethod
+    def compacts_tiles(device_ir: DeviceIR) -> bool:
+        """Whether a flattened tile holds its dims in one dimension of a value
+        (``compacted_block_ids``): not in a kernel of more than one root,
+        whose multi-phase structure (e.g., barrier) keeps each dim so that
+        downstream reductions see matching ranks."""
+        return len(device_ir.root_ids) <= 1
+
+    def compacted_block_ids(self) -> list[int]:
+        if not self.compacts_tiles(HostFunction.current().device_ir):
+            return []
 
         env = CompileEnvironment.current()
         # Filter out unit-sized blocks that don't need compacting
-        compact_block_ids = [
+        return [
             block_id
             for block_id in self.block_ids
             if not (
@@ -2480,40 +2559,6 @@ class FlattenedTileStrategy(BlockSizeTileStrategy):
                 and env.block_sizes[block_id].size == 1
             )
         ]
-        if not compact_block_ids:
-            return shapes
-
-        output = []
-        shape_queue = collections.deque(shapes)
-        while shape_queue:
-            shape = shape_queue.popleft()
-            # Check if this starts our flattened sequence
-            if len(shape.block_ids) != 1 or shape.block_ids[0] != compact_block_ids[0]:
-                output.append(shape)
-                continue
-
-            # Try to collect the full sequence
-            group_shapes = [shape]
-            found_complete_sequence = True
-            for expected in compact_block_ids[1:]:
-                if (
-                    shape_queue
-                    and len(shape_queue[0].block_ids) == 1
-                    and shape_queue[0].block_ids[0] == expected
-                ):
-                    group_shapes.append(shape_queue.popleft())
-                else:
-                    # Partial match - don't combine
-                    found_complete_sequence = False
-                    output.extend(group_shapes)
-                    break
-
-            if found_complete_sequence:
-                # Full match - combine into one
-                for s in group_shapes[1:]:
-                    shape = shape.combine(s)
-                output.append(shape)
-        return output
 
 
 class _BaseNDTileStrategy(BlockSizeTileStrategy):
@@ -2951,10 +2996,6 @@ class _BaseNDTileStrategy(BlockSizeTileStrategy):
             thread_axis_sizes=tracker.sizes,
             block_thread_axes=tracker.block_axes,
         )
-
-    def compact_shape(self, shapes: list[CompactedShape]) -> list[CompactedShape]:
-        # TODO(jansel): we should combine size==1 dimensions here
-        return shapes
 
 
 class NDTileStrategy(_BaseNDTileStrategy):
@@ -3638,7 +3679,14 @@ class PerThreadNDTileStrategy(_LaneContextOwner, NDTileStrategy):
                 )
                 if (
                     vec_width > 1
-                    and uses_thread_axis
+                    # No thread axis is needed: an axis on one thread (by
+                    # config, demoted past the third thread axis, or fitted
+                    # to a shared extent of 1) walks its whole block in the
+                    # lane loop, ``base = offset + outer*V``, as a thread's
+                    # blocked span does.  The step must be 1: a stepped
+                    # grid's elements are not contiguous, so a V-wide chunk
+                    # from ``base`` would read the wrong ones.
+                    and step in (None, 1)
                     and elements_per_thread % vec_width == 0
                     # A matmul fallback may suppress root lane loops AFTER
                     # loads already hoisted into the wrapper (cute_mma's
@@ -4449,6 +4497,11 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             # A packet is V-aligned only when every lane base is: the tile
             # begin must be a multiple of V.
             vec_width = 1
+        # Set when the backend sinks the constexpr V-loop of a one-block tile
+        # into the serial reduction nest it wraps (column sums of a
+        # ``[rows, cols]`` tensor over ``hl.tile(cols)``: one packet per row,
+        # V accumulators; ``Backend.record_flattened_vloop_wrapper``).
+        sink_index_expr: str | None = None
         if vec_width > 1:
             # Same outer x constexpr-V lane partition as
             # ``PerThreadNDTileStrategy.codegen_grid`` so the memory_ops
@@ -4497,11 +4550,21 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
                 vec_lane_var=vec_lane_var,
                 base_index_var=base_index_var,
             )
+            chunk_index = f"{base_index_var} + cutlass.Int32({vec_lane_var})"
             lane_setup_statements.append(
-                statement_from_string(
-                    f"{offsets_var} = {base_index_var} + cutlass.Int32({vec_lane_var})"
-                )
+                statement_from_string(f"{offsets_var} = {chunk_index}")
             )
+            if len(block_ids) == 1 and env.backend.record_flattened_vloop_wrapper(
+                self.fn,
+                vec_wrappers[self._lane_var],
+                block_id=block_id,
+                lane_var=self._lane_var,
+                index_var=self.index_var(block_id),
+                mask_var=self.mask_var(-1),
+                begin=begins[0],
+                extent=env.block_sizes[block_id].numel,
+            ):
+                sink_index_expr = chunk_index
         elif lane_strided:
             # ``offsets = pid*BS + tid + lane * NT`` — consecutive threads
             # touch consecutive elements each lane iter (coalesced even
@@ -4524,6 +4587,11 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
             self.trip_counts[block_idx] = numel
             block_index_var = self.index_var(block_idx)
             expr = offsets_var
+            if sink_index_expr is not None:
+                # The element index is ``offsets`` itself, spelled as the
+                # chunk base plus the V-lane: the form the V-loop sink
+                # recognizes.
+                expr = sink_index_expr
             if total_numel != sympy.S.One:
                 expr = f"({expr}) // ({state.sympy_expr(total_numel)})"
             if i + 1 < len(block_ids):
@@ -4535,9 +4603,14 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
 
         mask_var = self.mask_var(-1)
         if mask_var is not None:
+            # On the element index when the backend sinks the V-loop: the sink
+            # evaluates a mask on that index at the chunk base.
+            bound_var = (
+                offsets_var if sink_index_expr is None else self.index_var(block_ids[0])
+            )
             lane_setup_statements.append(
                 statement_from_string(
-                    f"{mask_var} = {offsets_var} < "
+                    f"{mask_var} = {bound_var} < "
                     f"({state.sympy_expr(begin + total_numel)})"
                 )
             )
@@ -4715,3 +4788,27 @@ class CompactedShape(NamedTuple):
             user_indices=[*self.user_indices, *other.user_indices],
             block_ids=[*self.block_ids, *other.block_ids],
         )
+
+
+def compacted_dim_groups(
+    dim_block_ids: Sequence[Sequence[int]], runs: Iterable[Sequence[int]]
+) -> list[list[int]]:
+    """Group the positions of dims, given each one's block ids, into the
+    dimensions of a value: a complete run of a flattened loop's block ids
+    (``TileStrategy.compacted_block_ids``), in order with one block per dim,
+    is one dimension; every other dim is its own."""
+    # A run of one block groups nothing, and must not shadow a longer run
+    # that starts with the same block.
+    patterns = [[[block_id] for block_id in run] for run in runs if len(run) > 1]
+    groups: list[list[int]] = []
+    start = 0
+    while start < len(dim_block_ids):
+        end = start + 1
+        for pattern in patterns:
+            window = dim_block_ids[start : start + len(pattern)]
+            if [[*block_ids] for block_ids in window] == pattern:
+                end = start + len(pattern)
+                break
+        groups.append([*range(start, end)])
+        start = end
+    return groups

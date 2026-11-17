@@ -20,7 +20,6 @@ from typing import cast
 import torch
 from torch._inductor.codegen.simd import constant_repr
 from torch._inductor.virtualized import V
-from torch.fx.node import map_arg
 
 from ... import exc
 from ...language._tracing_ops import _mask_to
@@ -32,6 +31,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..inductor_lowering import PointwiseLowering
+from ..inductor_lowering import lowering_input_nodes
 from .scalar_lowering import scalar_lowering_context
 
 if TYPE_CHECKING:
@@ -214,15 +214,7 @@ def _tensor(node: Node) -> torch.Tensor | None:
 
 def row_fragment_tensor_inputs(node: Node) -> list[Node]:
     """Tensor operands in ordinary lowering order, excluding scheduler edges."""
-    inputs: list[Node] = []
-
-    def visit(argument: Node) -> Node:
-        if _tensor(argument) is not None:
-            inputs.append(argument)
-        return argument
-
-    map_arg((node.args, {**node.kwargs, "_extra_deps": None}), visit)
-    return inputs
+    return [value for value in lowering_input_nodes(node) if _tensor(value) is not None]
 
 
 def row_fragment_logical_extent(size: int | torch.SymInt) -> int | None:
@@ -471,7 +463,7 @@ class RowFragmentEmitter:
                 with V.set_graph_handler(graph_lowering):
                     prepare_node_lowering(graph_lowering, node)
                 lowering = node.meta.get("lowering")
-                # Preparation may remove duplicate/unused tensor operands.
+                # Preparation names only unique, used tensor operands.
                 input_values = [
                     input_by_node[argument]
                     for argument in row_fragment_tensor_inputs(node)

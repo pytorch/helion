@@ -29,6 +29,7 @@ from helion._testing import TestCase
 from helion._testing import _get_backend
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import pairwise
 from helion._testing import skipIfCute
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfRefEager
@@ -2559,11 +2560,11 @@ class TestIndexing(RefEagerTestBase, TestCase):
         _code, result = code_and_output(bounded_tiles, (x, 40))
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @onlyBackends(["cute"])
     @skipIfRefEager(
         "the tiles kernel sorts and scans each 32-wide tile, so the result depends"
         " on block_sizes, which ref mode does not apply"
     )
+    @skipIfXPU("XPU returns wrong values for these slice sorts")
     def test_sort_and_scan_skip_the_padded_positions(self):
         """Positions past the end of a tile hold no element: a 24-long slice
         on 32 lanes (dynamic shapes) or the 16-element last tile of a 48-wide
@@ -2632,13 +2633,23 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 64], device=DEVICE)
+        # A sort along a tile dim pins the loop unflattened; the refusal backs
+        # that up for a flattened tile that still reaches it.
+        (spec,) = sort_tiles.bind((x,)).config_spec.flatten_loops
+        self.assertTrue(spec.pinned)
+        flattened = helion.kernel(
+            sort_tiles.fn, autotune_effort="none", static_shapes=True
+        )
         for loop_order in ([1, 0], [0, 1]):
             with (
                 self.subTest(loop_order=loop_order),
+                patch(
+                    "helion._compiler.compile_environment.BlockSizeInfo.pin_unflattened"
+                ),
                 self.assertRaisesRegex(exc.BackendUnsupported, "flattened multi-dim"),
             ):
                 code_and_output(
-                    sort_tiles,
+                    flattened,
                     (x,),
                     block_sizes=[16, 4],
                     flatten_loops=[True],
@@ -4421,10 +4432,8 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 )
 
     @onlyBackends(["cute"])
-    def test_topk_feeding_a_computation_is_refused(self):
-        """Top-k output sits on the lanes of the sorted input dim, which only
-        a store addresses; a reduction of it would fold the wrong lanes, and a
-        store index other than a slice or an affine arange cannot address it."""
+    def test_topk_values_feed_a_row_reduction(self):
+        """A complete row owner can reduce selected values into fresh storage."""
 
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def topk_sum(x: torch.Tensor) -> torch.Tensor:
@@ -4435,6 +4444,15 @@ class TestIndexing(RefEagerTestBase, TestCase):
                 out[tile] = top_vals.sum(-1)
             return out
 
+        x = torch.randn([40, 64], device=DEVICE)
+        _code, result = code_and_output(topk_sum, (x,), block_sizes=[8])
+        expected = torch.topk(x, 4, dim=-1).values.sum(-1)
+        torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["cute"])
+    def test_topk_gathered_store_is_refused(self):
+        """A gathered store index cannot address the selected values' lanes."""
+
         @helion.kernel(autotune_effort="none", static_shapes=True)
         def topk_gathered(x: torch.Tensor, cols: torch.Tensor) -> torch.Tensor:
             out = torch.zeros([x.size(0), 8], dtype=x.dtype, device=x.device)
@@ -4444,9 +4462,6 @@ class TestIndexing(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 64], device=DEVICE)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "torch.topk output"):
-            code_and_output(topk_sum, (x,), block_sizes=[8])
-        # A gathered store index is no affine arange of the output position.
         cols = torch.tensor([7, 2, 5, 0], device=DEVICE)
         with self.assertRaisesRegex(exc.BackendUnsupported, "affine hl.arange"):
             code_and_output(topk_gathered, (x, cols), block_sizes=[8])
@@ -5309,24 +5324,13 @@ def _execute_pointwise_thread_program(source, inputs):
     [((3, 67), 73, [4, 32]), ((5, 9), 17, [4, 8]), ((3, 5, 9), 17, [2, 4, 8])],
 )
 @pytest.mark.parametrize("reverse", [False, True])
-def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reverse):
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
+def test_cute_broadcast_coordinates_generated_values(shape, width, tiles, reverse):
     inputs = (torch.arange(math.prod(shape), dtype=torch.float32).reshape(shape), width)
-    aliases = []
-    original = TileStrategyDispatch._inactive_broadcast_aliases
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        aliases.append(result)
-        return result
-
     with (
         mock_cuda_unavailable(),
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
     ):
         bound = cpu_bind(
             _broadcast_coordinate_pad_2d
@@ -5340,7 +5344,9 @@ def test_cute_inactive_broadcast_axes_generated_values(shape, width, tiles, reve
             list(reversed(range(len(shape)))) if reverse else list(range(len(shape)))
         ]
         source = bound.to_code(config)
-    assert any(aliases)
+    # The broadcast coordinates keep their tiles' blocks: no reduction dim
+    # (and so no thread axis) is allocated for them.
+    assert not any(block.reduction for block in bound.env.block_sizes)
     validate_thread_axis_accesses(ast.parse(source).body)
     actual, launches = _execute_pointwise_thread_program(source, inputs)
     expected = torch.full((*shape[:-1], width), -7.0)
@@ -5366,15 +5372,6 @@ def test_cute_pointwise_invalid_axis_rejects_structurally(axis):
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _broadcast_axis_free_iota(x: torch.Tensor):
-    out = torch.empty_like(x)
-    for row in hl.tile(x.size(0)):
-        index = hl.arange(x.size(1))
-        out[row, :] = x[row, :] + index[None, :]
-    return out
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _broadcast_axis_nested(x: torch.Tensor):
     out = torch.empty_like(x)
     for row in hl.tile(x.size(0)):
@@ -5383,70 +5380,11 @@ def _broadcast_axis_nested(x: torch.Tensor):
     return out
 
 
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _broadcast_axis_matmul(x: torch.Tensor, y: torch.Tensor):
-    out = torch.empty((x.size(0), y.size(1)), dtype=x.dtype, device=x.device)
-    for row, col in hl.tile(out.shape):
-        out[row, col] = hl.dot(x[row, :], y[:, col])
-    return out
-
-
-@skipUnlessBackends(["cute"])
-@pytest.mark.parametrize("kind", ["reduction", "free_iota", "matmul"])
-def test_cute_inactive_broadcast_axes_preserve_other_owners(kind):
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
-    cases = {
-        "reduction": (
-            helion.kernel(
-                reduction_sum.fn,
-                backend="cute",
-                static_shapes=True,
-                autotune_effort="none",
-            ),
-            (torch.ones(3, 8),),
-        ),
-        "free_iota": (_broadcast_axis_free_iota, (torch.ones(3, 8),)),
-        "matmul": (
-            _broadcast_axis_matmul,
-            (
-                torch.ones(16, 16, dtype=torch.float16),
-                torch.ones(16, 16, dtype=torch.float16),
-            ),
-        ),
-    }
-    kernel, inputs = cases[kind]
-    aliases = []
-    original = TileStrategyDispatch._inactive_broadcast_aliases
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        aliases.append(result)
-        return result
-
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-    ):
-        bound = cpu_bind(kernel, inputs)
-        config = bound.config_spec.default_config()
-        with patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe):
-            actual = bound.to_code(config)
-        with patch.object(
-            TileStrategyDispatch, "_inactive_broadcast_aliases", return_value=set()
-        ):
-            previous = bound.to_code(config)
-    assert aliases and not any(aliases)
-    assert ast.dump(ast.parse(actual)) == ast.dump(ast.parse(previous))
-
-
 @skipUnlessBackends(["cute"])
 @pytest.mark.parametrize(
     "shape,width,tiles", [((3, 67), 73, [4, 32]), ((3, 5, 9), 17, [2, 4, 8])]
 )
-def test_cute_inactive_broadcast_axes_native(shape, width, tiles):
+def test_cute_broadcast_coordinates_native(shape, width, tiles):
     x = torch.arange(math.prod(shape), device=DEVICE, dtype=torch.float32).reshape(
         shape
     )
@@ -5685,39 +5623,33 @@ def _nested_broadcast_gather(col, val, table, flat: hl.constexpr):
     return out
 
 
+# The first shape leaves a masked tail on every extent, the second mixes exact
+# and ragged ones; ``flat`` gathers through ``hl.load`` on the flattened table
+# instead of a 3-D subscript; ``reverse`` reverses the order of the four grid
+# axes; ``static_shapes`` bakes the extents in.  They are independent knobs, so
+# all pairs of them (six cases) replace the full product of sixteen.
 @skipUnlessBackends(["cute"])
-@pytest.mark.parametrize("shape", [(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)])
-@pytest.mark.parametrize("flat", [False, True])
-@pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("static_shapes", [False, True])
-def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes):
-    from helion._compiler.compile_environment import CompileEnvironment
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
+@pytest.mark.parametrize(
+    ("shape", "flat", "reverse", "static_shapes"),
+    pairwise(
+        shape=[(3, 5, 7, 9, 11), (4, 3, 8, 5, 6)],
+        flat=[False, True],
+        reverse=[False, True],
+        static_shapes=[False, True],
+    ),
+)
+def test_cute_nested_broadcast_coordinates_values(shape, flat, reverse, static_shapes):
     m, n, k, p, q = shape
     column = torch.arange(m * n * k).reshape(m, n, k) % k
     # Small integer-valued FP32 data makes every modeled add/multiply exact.
     values = (torch.arange(m * n * k).reshape(m, n, k) % 5).float()
     table = (torch.arange(k * p * q).reshape(k, p, q) % 7).float()
     inputs = column, values, table, flat
-    aliases = []
-    original = TileStrategyDispatch._inactive_broadcast_aliases
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        env = CompileEnvironment.current()
-        outer = set(function.codegen.host_function.device_ir.grid_block_ids[0])
-        assert result.isdisjoint(env.config_spec.reduction_loops.valid_block_ids())
-        assert all(env.canonical_block_id(block) in outer for block in result)
-        aliases.append(result)
-        return result
-
     with (
         mock_cuda_unavailable(),
         _target(),
         forbid_native_compile(),
         patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
     ):
         kernel = helion.kernel(
             _nested_broadcast_gather.fn,
@@ -5730,7 +5662,8 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
         config.config["block_sizes"] = [2, 2, 4, 4, 4]
         config.config["loop_orders"] = [[3, 2, 1, 0] if reverse else [0, 1, 2, 3]]
         source = bound.to_code(config)
-    assert any(aliases)
+    # The outer tiles' broadcast coordinates allocate no reduction dim.
+    assert not any(block.reduction for block in bound.env.block_sizes)
     actual, launches = _execute_pointwise_thread_program(source, inputs)
     expected = (values[..., None, None] * table[column]).sum(2)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -5738,7 +5671,7 @@ def test_cute_nested_broadcast_alias_values(shape, flat, reverse, static_shapes)
 
 
 @skipUnlessBackends(["cute"])
-def test_cute_nested_pointwise_outer_alias_values():
+def test_cute_nested_pointwise_outer_index_values():
     inputs = (torch.arange(3 * 17, dtype=torch.float32).reshape(3, 17),)
     with mock_cuda_unavailable(), _target(), forbid_native_compile():
         bound = cpu_bind(_broadcast_axis_nested, inputs)
@@ -5750,82 +5683,9 @@ def test_cute_nested_pointwise_outer_alias_values():
 
 
 @skipUnlessBackends(["cute"])
-@pytest.mark.parametrize(
-    "guard", ["second_root", "scalar_loop", "child_owner", "executable", "free_iota"]
-)
-def test_cute_nested_broadcast_alias_scope_guards(guard):
-    import dataclasses
-
-    from helion._compiler.device_ir import ForLoopGraphInfo
-    from helion._compiler.device_ir import RootGraphInfo
-    from helion._compiler.tile_dispatch import TileStrategyDispatch
-
-    column = torch.arange(3 * 5 * 7).reshape(3, 5, 7) % 7
-    inputs = (
-        column,
-        torch.ones_like(column, dtype=torch.float32),
-        torch.ones(7, 9, 11),
-        False,
-    )
-    original = TileStrategyDispatch._inactive_broadcast_aliases
-    checked = []
-
-    def observe(dispatch, function):
-        result = original(dispatch, function)
-        assert result
-        graphs = function.codegen.codegen_graphs
-        child = next(graph for graph in graphs if type(graph) is ForLoopGraphInfo)
-        root = next(graph for graph in graphs if isinstance(graph, RootGraphInfo))
-        if guard == "second_root":
-            replacement = [*graphs, root.copy()]
-            context = patch.object(function.codegen, "codegen_graphs", replacement)
-        elif guard == "scalar_loop":
-            replacement = [
-                dataclasses.replace(graph, block_ids=[]) if graph is child else graph
-                for graph in graphs
-            ]
-            context = patch.object(function.codegen, "codegen_graphs", replacement)
-        elif guard == "child_owner":
-            context = patch.object(
-                function.codegen.host_function.device_ir,
-                "grid_block_ids",
-                [child.block_ids],
-            )
-        elif guard == "executable":
-            context = patch.object(
-                bound.env.config_spec.reduction_loops,
-                "valid_block_ids",
-                return_value=[
-                    *bound.env.config_spec.reduction_loops.valid_block_ids(),
-                    *result,
-                ],
-            )
-        else:
-            changed_root = root.copy()
-            changed_root.graph.call_function(torch.ops.aten.arange.default, (4,))
-            replacement = [changed_root if graph is root else graph for graph in graphs]
-            context = patch.object(function.codegen, "codegen_graphs", replacement)
-        with context:
-            assert not original(dispatch, function)
-        checked.append(guard)
-        return result
-
-    with (
-        mock_cuda_unavailable(),
-        _target(),
-        forbid_native_compile(),
-        patch("torch.cuda._lazy_init", side_effect=AssertionError("CPU only")),
-        patch.object(TileStrategyDispatch, "_inactive_broadcast_aliases", observe),
-    ):
-        bound = cpu_bind(_nested_broadcast_gather, inputs)
-        bound.to_code(helion.Config(block_sizes=[2, 2, 4, 4, 4]))
-    assert checked == [guard]
-
-
-@skipUnlessBackends(["cute"])
 @pytest.mark.parametrize("flat", [False, True])
 @pytest.mark.parametrize("reverse", [False, True])
-def test_cute_nested_broadcast_alias_native(flat, reverse):
+def test_cute_nested_broadcast_coordinates_native(flat, reverse):
     m, n, k, p, q = 3, 5, 7, 9, 11
     column = torch.arange(m * n * k, device=DEVICE).reshape(m, n, k) % k
     values = (torch.arange(m * n * k, device=DEVICE).reshape(m, n, k) % 5).float()

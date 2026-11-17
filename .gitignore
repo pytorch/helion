@@ -123,3 +123,6 @@ cute_sweep_results.jsonl
 
 # Claude Code writes its local settings through the .claude -> .agents symlink.
 .agents/settings.local.json
+
+# Raw SDG autotuner profiles are supplied separately from benchmark source.
+/benchmarks/cute/sdg_attention_kernel/configs.json

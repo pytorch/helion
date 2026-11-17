@@ -68,7 +68,10 @@ def test_one_full_row_profile_strictly_roundtrips(
     assert seed["cute_replicated_reduction"] is True
     assert seed["cute_pdl"] is True
     assert seed["cute_min_blocks_per_mp"] == 0
-    assert set(seed["load_eviction_policies"]) == {"l2_last"}
+    # The three loads the rolled code lowers (``x``, ``residual``, ``weight``)
+    # retain their lines; the slots of the roller's own loop graphs, which it
+    # never lowers, stay "".
+    assert seed["load_eviction_policies"] == ["l2_last"] * 3 + [""] * 2
     with bound.env:
         generation = ConfigGeneration(bound.config_spec)
         flat, effective = generation.strict_config_pair(seed)

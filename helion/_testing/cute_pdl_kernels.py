@@ -1,9 +1,11 @@
-"""Triton reference kernels of the PDL GPU tests (``test_cute_pdl.TestCutePdl``).
+"""Triton producers and consumers for dependent-launch numerical tests.
 
-They live apart from the test module because that module is imported by
-CPU-lane tests (``test_autotuner_final_preference``) on rows without Triton;
-``test_cute_pdl._tk()`` imports this module on first use.
+Imported lazily by CPU-collected modules so CPU-only environments do not need
+Triton just to inspect CuTe source.
 """
+
+# Non-constexpr parameters are Triton DSL values, not Python host type contracts.
+# ruff: noqa: ANN001
 
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ def _late_writer(
     delay,
     RELEASE: tl.constexpr,
     BLOCK: tl.constexpr,
-):
+) -> None:
     """Copies ``src`` to ``dst`` late: releases its dependents at entry (when
     ``RELEASE``) and spins ``delay`` rounds ahead of every store."""
     if RELEASE:
@@ -40,7 +42,7 @@ def _late_writer(
 
 
 @triton.jit
-def _middle(flag_ptr, RELEASE_FIRST: tl.constexpr):
+def _middle(flag_ptr, RELEASE_FIRST: tl.constexpr) -> None:
     """Waits on its predecessor and releases its dependents, in either order."""
     if RELEASE_FIRST:
         gdc_launch_dependents()
@@ -51,7 +53,7 @@ def _middle(flag_ptr, RELEASE_FIRST: tl.constexpr):
 
 
 @triton.jit
-def _poison_tail_without_wait(x_ptr, first, n, BLOCK: tl.constexpr):
+def _poison_tail_without_wait(x_ptr, first, n, BLOCK: tl.constexpr) -> None:
     """Writes ones over ``x[first:n]`` right away: launched as a programmatic
     dependent, it runs as soon as its predecessor releases it."""
     offsets = first + tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -60,7 +62,7 @@ def _poison_tail_without_wait(x_ptr, first, n, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _copy_without_wait(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+def _copy_without_wait(x_ptr, out_ptr, n, BLOCK: tl.constexpr) -> None:
     offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < n
     tl.store(out_ptr + offsets, tl.load(x_ptr + offsets, mask=mask), mask=mask)

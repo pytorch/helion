@@ -74,6 +74,7 @@ EMITTERS = (
         # The entry is rendered and exec'd (``__module__`` None) and its
         # imports are function-local, so the helper walk cannot reach these.
         source_dependencies=(
+            "exc.py",
             "_compiler/cute/block_scaled_config.py",
             "_compiler/cute/block_scaled_prepare.py",
             "_compiler/cute/block_scaled_runtime.py",

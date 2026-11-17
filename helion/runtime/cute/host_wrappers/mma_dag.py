@@ -18,6 +18,7 @@ from ..arg_signature import schema_pointer_alignment
 from ..launch_descriptor import cute_launch_descriptor
 from .context import HostWrapperContext
 from .context import HostWrapperEmitter
+from .flash import ROW_MMA_DEPENDENCIES
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -261,25 +262,103 @@ def tma_namespace(plan: dict[str, object]) -> dict[str, object]:
     return {"_helion_mma_dag_tensor_map": make_tensor_map}
 
 
-ROW_MMA_DEPENDENCIES = (
-    "_compiler/cute/_flash_row_mma_runtime.py",
-    "_compiler/cute/device/ptx.py",
+def emit_paged_attention(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
+    """Build raw-byte and packed-scale maps over the actual argument views."""
+    params: list[str] = []
+    indices: list[int] = []
+    for index in range(4):
+        param = plan.get(f"tma{index}_param")
+        tensor_idx = ctx.plan_int(f"tma{index}_idx")
+        if not isinstance(param, str):
+            raise exc.BackendUnsupported(
+                "cute", "invalid paged attention map parameter"
+            )
+        if ctx.schema_key is not None and (
+            schema_pointer_alignment(ctx.schema_key[tensor_idx]) % 16
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "paged attention tensor maps require 16-byte-aligned bases"
+            )
+        params.append(param)
+        indices.append(tensor_idx)
+    for pair in (0, 2):
+        raw, scale = (f"arg{indices[pair + offset]}" for offset in (0, 1))
+        ctx.body.append(
+            f"    {params[pair]}, {params[pair + 1]} = _helion_paged_maps("
+            f"{raw}, {scale}, "
+            f"tuple({raw}.shape[i] for i in (4, 2, 3, 1, 0)), "
+            f"tuple({raw}.stride[i] for i in (4, 2, 3, 1, 0)), "
+            f"tuple({scale}.shape[i] for i in (2, 3, 1, 0)), "
+            f"tuple({scale}.stride[i] // 4 for i in (2, 3, 1, 0)), 128)"
+        )
+    ctx.call_args.extend(params)
+    if "query_tma_param" in plan:
+        param = cast("str", plan["query_tma_param"])
+        tensor_idx = ctx.plan_int("tma4_idx")
+        shape, strides, box = cast(
+            "tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]",
+            plan["query_tma_layout"],
+        )
+        if (
+            ctx.schema_key is not None
+            and schema_pointer_alignment(ctx.schema_key[tensor_idx]) % 16
+        ):
+            raise exc.BackendUnsupported(
+                "cute", "query TMA requires a 16-byte-aligned base"
+            )
+        ctx.body.append(
+            f"    {param} = _helion_paged_query_map(arg{tensor_idx}, {shape!r}, {strides!r}, {box!r})"
+        )
+        ctx.call_args.append(param)
+    if "capture_pdl_mode_param" in plan:
+        # Every enqueue is safe first. Capture-only proof may replace this
+        # typed runtime argument on the verified node before graph execution.
+        ctx.call_args.append("cutlass.Int32(0)")
+
+
+def paged_attention_namespace(plan: dict[str, object]) -> dict[str, object]:
+    from ...._compiler.cute._paged_attention_runtime import make_paged_query_map
+    from ...._compiler.cute._paged_attention_runtime import make_paged_tma_operands
+
+    return {
+        "_helion_paged_maps": make_paged_tma_operands,
+        "_helion_paged_query_map": make_paged_query_map,
+    }
+
+
+MMA_TMA_DEPENDENCIES = (
+    "_compiler/cute/_mma_dag_runtime.py",
+    "_compiler/cute/_mma_dag_tcgen05_runtime.py",
+    "_compiler/cute/_warp_mma_runtime.py",
+    *ROW_MMA_DEPENDENCIES,
 )
 
 EMITTERS = (
     HostWrapperEmitter("helion_mma_dag_alias", emit_alias),
+    HostWrapperEmitter(
+        "helion_paged_attention",
+        emit_paged_attention,
+        namespace=paged_attention_namespace,
+        source_dependencies=(
+            "_compiler/cute/_paged_attention_runtime.py",
+            "_compiler/cute/_paged_attention_compute.py",
+            "_compiler/cute/_paged_attention_pipeline.py",
+            "_compiler/cute/_paged_attention_partial_compute.py",
+            "_compiler/cute/_paged_attention_partial_pipeline.py",
+            "_compiler/cute/_paged_attention_paired_pipeline.py",
+            "_compiler/cute/_paged_attention_reference_compute.py",
+            "_compiler/cute/_paged_attention_io.py",
+            "_compiler/cute/device/warp_reduce.py",
+            *MMA_TMA_DEPENDENCIES,
+        ),
+    ),
     HostWrapperEmitter("helion_tcgen05_split_k", emit_split_k),
     HostWrapperEmitter("helion_mma_dag_fixup", emit_fixup),
     HostWrapperEmitter(
         "helion_mma_dag_tma",
         emit_tma,
         namespace=tma_namespace,
-        source_dependencies=(
-            "_compiler/cute/_mma_dag_runtime.py",
-            "_compiler/cute/_mma_dag_tcgen05_runtime.py",
-            *ROW_MMA_DEPENDENCIES,
-            "_compiler/cute/_warp_mma_runtime.py",
-        ),
+        source_dependencies=MMA_TMA_DEPENDENCIES,
     ),
     HostWrapperEmitter(
         "helion_register_subblocks",

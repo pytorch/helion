@@ -124,15 +124,15 @@ class PIDInfo(NamedTuple):
 
     def num_pids_expr(self, *, is_device: bool) -> str:
         """Get the number of PIDs expression for device or host."""
-        if is_device:
-            context = DeviceFunction.current()
-        else:
-            context = HostFunction.current()
         # Handle both sympy.Expr and string numel (for data-dependent bounds)
         if isinstance(self.numel, str):
             numel_str = self.numel
+        elif is_device:
+            numel_str = DeviceFunction.current().sympy_expr(self.numel)
         else:
-            numel_str = context.sympy_expr(self.numel)
+            numel_str = HostFunction.current().sympy_expr(
+                self.numel, DeviceFunction.current().config
+            )
         if self.pack > 1:
             assert self.block_size_var == "1"
             return f"(({numel_str}) // {self.pack})"

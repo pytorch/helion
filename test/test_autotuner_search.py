@@ -159,12 +159,16 @@ class TestAutotunerSearch(AutotunerTestCase):
             torch.randn([512, 512], device=DEVICE),
         )
         bound_kernel = _get_examples_matmul().bind(args)
-        bound_kernel.settings.autotune_precompile = None
-        # Smoke test of the RandomSearch loop itself; skip the benchmark
-        # worker subprocess (seconds of startup overhead).
-        bound_kernel.settings.autotune_benchmark_subprocess = False
-        random.seed(123)
-        best = RandomSearch(bound_kernel, args, 5).autotune()
+        # The settings belong to the matmul example's kernel, which other tests
+        # share: restore them afterwards.  Smoke test of the RandomSearch loop
+        # itself; skip the benchmark worker subprocess (seconds of startup
+        # overhead).
+        with (
+            patch.object(bound_kernel.settings, "autotune_precompile", None),
+            patch.object(bound_kernel.settings, "autotune_benchmark_subprocess", False),
+        ):
+            random.seed(123)
+            best = RandomSearch(bound_kernel, args, 5).autotune()
         fn = bound_kernel.compile_config(best)
         torch.testing.assert_close(fn(*args), args[0] @ args[1], rtol=1e-2, atol=1e-1)
 
@@ -335,6 +339,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices=set(),
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
             config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
@@ -372,6 +377,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             ],
             block_size_indices=[0, 1],
             overridden_flat_indices={1},  # freeze block_size[1]
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
         )
         search.num_neighbors_cap = -1
 
@@ -496,6 +502,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices={1, 2},  # freeze block_size[1] and num_warps
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
         )
         search.num_neighbors_cap = -1
 
@@ -582,6 +589,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             block_size_indices=[0, 1],
             num_warps_index=2,
             overridden_flat_indices=set(),
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
             config_spec=SimpleNamespace(tensor_numel_constraints=[]),
         )
         search.num_neighbors_cap = -1
@@ -646,6 +654,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             block_size_indices=[0],
             num_warps_index=-1,
             overridden_flat_indices=set(),
+            conditional_neighbor=lambda base, requested, **kwargs: requested,
             encode_config=lambda flat: spec.encode(flat[0]),
         )
 

@@ -164,12 +164,7 @@ def warp_result_chain(
                 if target is memory_ops.store:
                     if host.target is not _tracing_ops._host_tensor:
                         return {}
-                    indices = [
-                        index.meta["val"] if isinstance(index, Node) else index
-                        for index in cast("list[object]", user.args[1])
-                    ]
-                    destination = host.meta["val"]
-                    sizes = SubscriptIndexing.compute_shape(destination, indices)
+                    sizes = SubscriptIndexing.node_shape(user)
                     # Preserve symbolic proof rather than relying on tracing hints.
                     output_shape = static_sizes(sizes, env)
                 else:

@@ -10,22 +10,26 @@ from __future__ import annotations
 import ast
 from typing import TYPE_CHECKING
 
+import torch
+from torch.fx.node import Node
 from torch.fx.node import map_arg
 
 from ... import exc
+from ..ast_extension import expr_from_string
 from ..aten_lowering import _env_arg
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import stack_lowering
+from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
+from ..compile_environment import CompileEnvironment
 from .factored_dims import StackedValue
 from .factored_dims import merged_stack
 from .factored_dims import stacked
+from .msl_expr import cast_source
 
 if TYPE_CHECKING:
-    from torch.fx.node import Node
-
     from ..aten_lowering import LoweringContext
 
 
@@ -65,4 +69,26 @@ def codegen_view_metal(ctx: LoweringContext, node: Node) -> object:
         "metal",
         f"{node.target}: Metal lowers a view only where it merges a stacked dim "
         "into the block dim before it",
+    )
+
+
+@view_dtype_lowering.register_codegen("metal")
+def codegen_view_dtype_metal(ctx: LoweringContext, node: Node) -> object:
+    """Reinterpret equal-width values within their thread: ``as_type<T>``,
+    after rounding to the declared dtype, since a lowering can hold a narrow
+    value in a wider register."""
+    source_node, target = node.args[:2]
+    assert isinstance(source_node, Node) and isinstance(target, torch.dtype)
+    source = source_node.meta["val"].dtype
+    if source.itemsize != target.itemsize or torch.bool in (source, target):
+        raise exc.BackendUnsupported(
+            "metal",
+            f"view.dtype from {source} to {target}: Metal reinterprets only "
+            "between numeric dtypes of one width",
+        )
+    backend = CompileEnvironment.current().backend
+    return expr_from_string(
+        f"as_type({backend.dtype_str(target)}, "
+        f"{cast_source(backend.dtype_str(source), '{x}')})",
+        x=_input_ast(ctx, node),
     )

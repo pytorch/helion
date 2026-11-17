@@ -12,9 +12,7 @@ from torch.fx import Node
 
 from ...language import _tracing_ops
 from ...language import memory_ops
-from ..host_function import HostFunction
 from .promote_output_axis import _access_tensor
-from .promote_output_axis import _fresh_tensors
 from .promote_output_axis import _ordinary_operation
 from .state import cute_codegen_state
 
@@ -334,7 +332,7 @@ def record_signed_byte_packet(
 
 def _no_alias_effects(state: CodegenState, graph: torch.fx.Graph) -> bool:
     from ..compile_environment import CompileEnvironment
-    from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
+    from ..runtime_tensor_guards import tensors_have_proven_disjoint_storage
 
     if not all(
         _ordinary_operation(node)
@@ -348,10 +346,6 @@ def _no_alias_effects(state: CodegenState, graph: torch.fx.Graph) -> bool:
         for node in graph.nodes
     ):
         return False
-    fresh = {
-        tensor.untyped_storage()._cdata
-        for tensor in _fresh_tensors(HostFunction.current())
-    }
     loads = [node for node in graph.nodes if node.target is memory_ops.load]
     stores = [node for node in graph.nodes if node.target is memory_ops.store]
     env = CompileEnvironment.current()
@@ -363,11 +357,7 @@ def _no_alias_effects(state: CodegenState, graph: torch.fx.Graph) -> bool:
             source = _access_tensor(load)
             if source is None:
                 return False
-            output_storage = output.untyped_storage()._cdata
-            if (
-                output_storage in fresh
-                and output_storage != source.untyped_storage()._cdata
-            ) or runtime_tensors_are_proven_disjoint(env, output, source):
+            if tensors_have_proven_disjoint_storage(env, output, source):
                 continue
             return False
     return True

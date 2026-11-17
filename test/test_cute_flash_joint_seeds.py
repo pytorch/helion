@@ -59,6 +59,8 @@ def test_complete_seed_prefix_and_joint_surface(head_dim, dtype, heads) -> None:
     assert {c.config[flash.FLASH_SOFTMAX_REGS_KEY] for c in added} == {200, 152}
     for parent in parents:
         expected = dict(spec.normalized_config(parent).config)
+        # Flattening materializes this implicit default; legacy seeds stay sparse.
+        expected["cute_compiler_pipeline"] = "default"
         for registers in (200, 152):
             candidate = helion.Config.from_dict(
                 {

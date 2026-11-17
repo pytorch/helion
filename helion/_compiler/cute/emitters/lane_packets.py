@@ -92,23 +92,28 @@ _CUTE_VECTOR_UNROLL_CARRIER: dict[torch.dtype, str] = {
     torch.int32: "cutlass.Uint32",
 }
 
-# One-byte FP8 and signed INT8 inputs use ``unroll`` mode. Rather than a
+# One-byte FP8, signed INT8 and bool inputs use ``unroll`` mode. Rather than a
 # ``VectorType([V], Uint8)`` load (which ICEs at V=8 in the CuTe DSL and
 # emits two LDG.32s for V=4), an fp8 vec chunk is loaded as a SINGLE packed
 # integer (``Uint32`` for V=4, ``Uint64`` for V=8) — one LDG.32 / LDG.64 —
 # and each lane byte is extracted with a shift+mask. FP8 keeps its Uint8
-# payload for downstream decoding; INT8 bitcasts back before signed arithmetic.
+# payload for downstream decoding; INT8 bitcasts back before signed arithmetic;
+# a bool byte is compared against zero, as its scalar load is.
 _CUTE_VECTOR_UNROLL_BYTE_DTYPES: frozenset[torch.dtype] = frozenset(
-    {torch.float8_e4m3fn, torch.int8}
+    {torch.float8_e4m3fn, torch.int8, torch.bool}
 )
 
-# Packed-integer cutlass type per total byte width of an fp8 vec chunk.
+# Packed-integer cutlass type per total byte width of a byte-packed vec chunk
+# (fp8, int8 or bool bytes).
 _CUTE_BYTE_PACK_TYPE: dict[int, str] = {
     1: "cutlass.Uint8",
     2: "cutlass.Uint16",
     4: "cutlass.Uint32",
     8: "cutlass.Uint64",
 }
+# The vector widths of a byte packet: one packed integer of 2, 4 or 8 bytes
+# (``_CUTE_BYTE_PACK_TYPE`` past its one-byte entry).
+_CUTE_BYTE_PACKET_WIDTHS: frozenset[int] = frozenset(_CUTE_BYTE_PACK_TYPE) - {1}
 
 
 def _cute_is_byte_packed(dtype: torch.dtype) -> bool:
@@ -117,7 +122,8 @@ def _cute_is_byte_packed(dtype: torch.dtype) -> bool:
 
 def _cute_is_unroll_dtype(dtype: torch.dtype) -> bool:
     """True for dtypes that use ``unroll`` mode: bf16/fp16 (Uint16 vector +
-    bitcast) and fp8 (packed-integer load + shift extract)."""
+    bitcast) and the byte dtypes fp8, int8 and bool (packed-integer load +
+    shift extract)."""
     return (
         dtype in _CUTE_VECTOR_UNROLL_DTYPES or dtype in _CUTE_VECTOR_UNROLL_BYTE_DTYPES
     )
@@ -126,13 +132,13 @@ def _cute_is_unroll_dtype(dtype: torch.dtype) -> bool:
 def _cute_unroll_vec_elem_type(dtype: torch.dtype, vec_width: int = 1) -> str:
     """Cutlass load type for an ``unroll``-mode hoisted vec load.
 
-    fp8 loads ``vec_width`` bytes as a single packed integer; bf16/fp16/fp32
-    load a same-width integer vector element (the ``VectorType`` width is
-    applied by callers).
+    The byte dtypes (fp8, int8 and bool) load ``vec_width`` bytes as a
+    single packed integer; bf16/fp16/fp32 load a same-width integer vector
+    element (the ``VectorType`` width is applied by callers).
     """
     if _cute_is_byte_packed(dtype):
         pack = _CUTE_BYTE_PACK_TYPE.get(vec_width)
-        assert pack is not None, f"unsupported fp8 vec_width {vec_width}"
+        assert pack is not None, f"unsupported byte packet vec_width {vec_width}"
         return pack
     return _CUTE_VECTOR_UNROLL_CARRIER[dtype]
 
@@ -172,9 +178,10 @@ def _cute_unroll_vec_load_expr(
 def _cute_unroll_vec_extract(hoist_var: str, idx: str, dtype: torch.dtype) -> str:
     """Per-lane extract expr from a hoisted ``unroll``-mode vec load.
 
-    fp8: ``hoist_var`` is a packed integer (Uint32/Uint64); byte ``idx`` is
-    extracted with a shift+mask and returned as a ``Uint8`` (decoded
-    downstream). INT8 bytes bitcast back to Int8 before arithmetic.
+    fp8, int8 and bool: ``hoist_var`` is a packed integer (Uint16 to
+    Uint64); byte ``idx`` is extracted with a shift+mask and returned as a
+    ``Uint8`` (an fp8 byte is decoded downstream, a bool byte compared against
+    zero). INT8 bytes bitcast back to Int8 before arithmetic.
     bf16/fp16: ``hoist_var`` is a ``Uint16`` vector; lane ``idx``
     is bitcast back to the original dtype.
     """
@@ -406,7 +413,9 @@ class TilePacketGuard:
     bound of a gathered row coordinate) the caller proved uniform across the
     V lanes and available above the V-loop; they decide the whole packet and,
     since such a coordinate can itself be out of range, send masked threads
-    to the tensor's first element.
+    to the tensor's first element.  So do ``rows_at_lane_base``: non-lane
+    coordinates evaluated at the lane base (the row ``e // d`` of a
+    de-linearized subscript) leave the tensor where the lane base does.
     """
 
     state: CodegenState
@@ -417,6 +426,7 @@ class TilePacketGuard:
     lane_pos: int
     base_ptr_expr: str
     uniform_mask: str | None
+    rows_at_lane_base: bool = False
 
     def build(self) -> PacketGuard:
         from ...tile_strategy import DeviceGridState
@@ -508,12 +518,12 @@ class TilePacketGuard:
         else:
             anchor_exprs = list(self.index_exprs)
             anchor_exprs[self.lane_pos] = "0"
-            if self.uniform_mask is not None:
-                # A masked outer row or gathered coordinate can itself be
-                # out of range, so the anchor cannot keep it: point at the
-                # tensor's first element instead (in bounds for any
-                # non-empty tensor); the per-lane mask gate discards the
-                # fetched bytes.
+            if self.uniform_mask is not None or self.rows_at_lane_base:
+                # A masked outer row or gathered coordinate, or a row derived
+                # from the lane base, can itself be out of range, so the
+                # anchor cannot keep it: point at the tensor's first element
+                # instead (in bounds for any non-empty tensor); the per-lane
+                # mask gate discards the fetched bytes.
                 anchor_exprs = ["0"] * len(anchor_exprs)
             anchor_ptr_expr = _cute_scalar_pointer_expr(self.tensor_name, anchor_exprs)
         return PacketGuard(" and ".join(guard_terms), anchor_ptr_expr)
@@ -626,6 +636,7 @@ def _cute_register_tile_unroll_vec_hoist(
     signed_byte_site: SignedByteSite | None = None,
     uniform_mask: str | None = None,
     lane_base_expr: str | None = None,
+    rows_at_lane_base: bool = False,
 ) -> str:
     """Tile-loop variant of ``_cute_register_unroll_vec_hoist`` for the
     per-thread tile strategies' lane loops.
@@ -633,8 +644,9 @@ def _cute_register_tile_unroll_vec_hoist(
     Splices a single ``cute.arch.load(base_ptr, <elem>x V)`` into the
     outer-lane body (above the constexpr V-loop) and returns the
     per-element extract expression so the existing scalar pipeline keeps
-    working.  bf16/fp16 load as ``Uint16`` and bitcast; fp8 loads ``vec_width``
-    bytes as one packed integer that the matmul fallback decodes downstream.
+    working.  bf16/fp16 load as ``Uint16`` and bitcast; the byte dtypes load
+    ``vec_width`` bytes as one packed integer, whose bytes an fp8 consumer
+    decodes downstream, int8 bitcasts back and bool compares against zero.
 
     ``uniform_mask`` carries the mask terms other than the lane mask (an
     outer tile mask, the bound of a gathered row coordinate, an
@@ -642,7 +654,9 @@ def _cute_register_tile_unroll_vec_hoist(
     uniform across the V lanes and available above the V-loop
     (``TilePacketGuard``).  ``lane_base_expr`` replaces the block's lane base
     as the lane-axis coordinate of the packet (``lane_base - n1`` for
-    ``tile.index - n1``).
+    ``tile.index - n1``); ``rows_at_lane_base`` says that ``index_exprs``
+    holds non-lane coordinates evaluated at the lane base
+    (``TilePacketGuard``).
     """
     assert context.base_index_var is not None
     assert context.lane_body is not None
@@ -679,6 +693,7 @@ def _cute_register_tile_unroll_vec_hoist(
             lane_pos,
             base_ptr_expr,
             uniform_mask,
+            rows_at_lane_base,
         ),
         var_prefix=f"_tile_unroll_vec_{context.block_id}_",
         wide_packets=hint_wide_packets(state.config.cute_wide_packet_hints),

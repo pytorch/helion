@@ -331,39 +331,6 @@ def _constant_remainder(numel: object, size: object) -> int | None:
     return None
 
 
-def _config_int(value: object, env: CompileEnvironment, config: Config) -> int | None:
-    """``value`` as the integer it takes for ``config``.
-
-    Host integer helpers over ``hl.register_tunable`` values trace as unbacked
-    symbols whose config expression the environment keeps; every other symbol
-    (a dynamic input size) makes the value unknown.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, torch.SymInt):
-        expr = value.node.expr
-    elif isinstance(value, sympy.Basic):
-        expr = value
-    else:
-        return None
-    substitutions: dict[sympy.Basic, sympy.Integer] = {}
-    for symbol in expr.free_symbols:
-        expression = (
-            env.config_value_expressions.get(symbol)
-            if isinstance(symbol, sympy.Symbol)
-            else None
-        )
-        if expression is None:
-            return None
-        substitutions[symbol] = sympy.Integer(expression.evaluate(config))
-    resolved = sympy.simplify(expr.xreplace(substitutions)) if substitutions else expr
-    if isinstance(resolved, sympy.Integer):
-        return int(resolved)
-    return None
-
-
 def _index_block(index: torch.SymInt, host: HostFunction) -> tuple[int, bool] | None:
     """``(block_id, is_tile_id)`` for a tile index, else ``None``.
 
@@ -395,9 +362,9 @@ def _tile_id_remainder(
     ``tiles = cdiv(extent, block_size)``, both evaluated for ``config``.
     """
     info = env.block_sizes[block_id]
-    extent = _config_int(info.size, env, config)
-    block_size = _config_int(info.from_config(config), env, config)
-    size_value = _config_int(size, env, config)
+    extent = env.config_value(info.size, config)
+    block_size = env.config_value(info.from_config(config), config)
+    size_value = env.config_value(size, config)
     if extent is None or block_size is None or size_value is None or block_size <= 0:
         return None
     tiles = -(-extent // block_size)

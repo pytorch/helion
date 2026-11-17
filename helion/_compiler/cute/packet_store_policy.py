@@ -7,6 +7,7 @@ from collections import Counter
 from typing import TYPE_CHECKING
 
 from .cutedsl_compat import fixed_l2_evict_last_store_policy_supported
+from .packet_access import match_packet_access
 from .packet_flush_names import PACKET_FLUSH_BY_POLICY
 from .persistent_branch_vec import PACKET_STORE_BYTES
 
@@ -15,42 +16,23 @@ if TYPE_CHECKING:
 
 
 def _store_call(statement: ast.stmt) -> tuple[ast.Call, str, int | None] | None:
-    """``(call, collector, lanes)`` of a packet flush statement.
+    """``(call, collector, lanes)`` of a plain packet flush statement.
 
     ``lanes`` is the number of collected lanes the flush writes when the
     values are a constant slice of the collector (``values[8:16]``: a lane
-    loop wider than one packet flushes several), ``None`` for the whole list.
+    loop wider than one packet flushes several), ``None`` for the whole list
+    (``PacketAccess.flushed_values``).
     """
-    if not isinstance(statement, ast.Expr) or not isinstance(statement.value, ast.Call):
+    if not isinstance(statement, ast.Expr):
         return None
-    call = statement.value
-    if not (
-        isinstance(call.func, ast.Name)
-        and call.func.id in PACKET_STORE_BYTES
-        and len(call.args) == 2
-        and not call.keywords
-    ):
+    access = match_packet_access(statement.value)
+    if access is None or access.helper not in PACKET_STORE_BYTES:
         return None
-    values = call.args[1]
-    if isinstance(values, ast.Name):
-        return call, values.id, None
-    if (
-        isinstance(values, ast.Subscript)
-        and isinstance(values.value, ast.Name)
-        and isinstance(values.slice, ast.Slice)
-        and values.slice.step is None
-        and isinstance(values.slice.lower, ast.Constant)
-        and isinstance(values.slice.upper, ast.Constant)
-        and type(values.slice.lower.value) is int
-        and type(values.slice.upper.value) is int
-        and 0 <= values.slice.lower.value < values.slice.upper.value
-    ):
-        return (
-            call,
-            values.value.id,
-            values.slice.upper.value - values.slice.lower.value,
-        )
-    return None
+    flushed = access.flushed_values()
+    if flushed is None:
+        return None
+    collector, lanes = flushed
+    return access.call, collector, None if lanes is None else lanes[1] - lanes[0]
 
 
 def _global_pointer(pointer: ast.expr, tensor_names: AbstractSet[str]) -> bool:

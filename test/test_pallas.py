@@ -990,6 +990,8 @@ def kernel_output_index_remapping(
 
     Iterates over the combined batch*heads dimension and the seq_len dimension.
     """
+    batch = hl.specialize(batch)
+    heads = hl.specialize(heads)
     batch_heads, seq_len, head_dim = x.size()
     out = torch.empty([batch, heads, seq_len, head_dim], dtype=x.dtype, device=x.device)
     for bh in hl.grid(batch_heads):
@@ -1125,7 +1127,7 @@ class TestPallas(TestCase):
             atol=1e-5,
             rtol=1e-5,
             chunk_size=1024,
-            scale_atol_by_expected_rms=True,
+            atol_scale="rms",
         )
 
         incorrect = expected.clone()
@@ -1598,7 +1600,7 @@ class TestPallas(TestCase):
         with self.subTest(name="shrunken_blockspec"):
             self.assertIn(
                 "pl.BlockSpec((1, 1, _BLOCK_SIZE_1, 128), "
-                "lambda _j: (offset_0 // heads, offset_0 % heads, _j, 0)",
+                f"lambda _j: (offset_0 // {heads}, offset_0 % {heads}, _j, 0)",
                 code,
             )
 
@@ -6008,6 +6010,65 @@ class TestPallas(TestCase):
         # Launcher return captured into output variable.
         self.assertIn("out = _launcher(", code)
 
+    def test_output_first_scalar_device_uses_input(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def stride_from_container(values):
+            out = torch.empty_like(values[0])
+            for row, column in hl.tile(out.shape):
+                out[row, column] = values[0][row, column] + values[0].stride(0)
+            return out
+
+        x = torch.arange(12, device=DEVICE, dtype=torch.float32).reshape(3, 4)
+        code, result = code_and_output(
+            stride_from_container, ([x],), block_sizes=[4, 4]
+        )
+        torch.testing.assert_close(result, x + x.stride(0))
+        self.assertIn("_output_indices=[0]", code)
+        self.assertIn("device='meta'", code)
+        self.assertIn("device=values[0].device", code)
+
+    @parametrize("size", [8, 5])
+    def test_scalar_store_broadcast(self, size: int) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def filled_output(value: float, size: hl.constexpr, device: torch.device):
+            out = torch.empty((size,), device=device)
+            for tile in hl.tile(out.shape):
+                out[tile] = value
+            return out
+
+        _, result = code_and_output(
+            filled_output, (2.5, size, torch.device(DEVICE)), block_sizes=[8]
+        )
+        torch.testing.assert_close(result, torch.full((size,), 2.5, device=DEVICE))
+
+    def test_singleton_store_broadcast(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def repeat_rows(x: torch.Tensor):
+            out = torch.empty((3, x.numel()), device=x.device, dtype=x.dtype)
+            for rows, columns in hl.tile(out.shape):
+                out[rows, columns] = x[None, columns]
+            return out
+
+        x = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        _, result = code_and_output(repeat_rows, (x,), block_sizes=[4, 8])
+        torch.testing.assert_close(result, x.expand(3, 8))
+
+    def test_output_only_scalar_device_uses_backend_default(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=False)
+        def filled_output(value: float, device: torch.device):
+            out = torch.empty((8,), device=device)
+            for tile in hl.tile(out.numel()):
+                out[tile] = hl.full((tile,), value)
+            return out
+
+        code, result = code_and_output(
+            filled_output, (2.5, torch.device(DEVICE)), block_sizes=[8]
+        )
+        torch.testing.assert_close(result, torch.full((8,), 2.5, device=DEVICE))
+        self.assertIn("_output_indices=[0]", code)
+        self.assertIn("device='meta'", code)
+        self.assertNotIn("device=out.device", code)
+
     def test_new_empty_output_only(self) -> None:
         """new_empty allocations should also be recognized as output-only."""
 
@@ -7619,6 +7680,55 @@ class TestPallas(TestCase):
         s, e = 0, 10
         ref = torch.bmm(y[:, s:e, :].transpose(0, 1), y[:, s:e, :].permute(1, 2, 0))
         torch.testing.assert_close(out.cpu(), ref.cpu(), rtol=2e-2, atol=2e-2)
+
+    def test_loop_carry_update_from_partial_tile_loads(self) -> None:
+        """A carry with a dim on its loop's own block keeps its value in the
+        padded lanes of a partial tile, which would each add exp(0), also in
+        the branch of a runtime ``if`` that adds exp(x): the other branch's
+        constant reaches them."""
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def exp_sum(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    acc = acc + torch.exp(x[tile_m, tile_n])
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def exp_or_one(x: torch.Tensor, beta: float) -> torch.Tensor:
+            m, n = x.shape
+            block_n = hl.register_block_size(n)
+            out = torch.empty([m], device=x.device, dtype=torch.float32)
+            for tile_m in hl.tile(m):
+                acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+                for tile_n in hl.tile(n, block_size=block_n):
+                    if beta > 0:
+                        acc = acc + torch.exp(x[tile_m, tile_n])
+                    else:
+                        acc = acc + 1.0
+                out[tile_m] = acc.sum(dim=1)
+            return out
+
+        # 200 columns end in a tile of 72 of 128.
+        x = -torch.randint(2, 10, [16, 200], device=DEVICE).float()
+        code, result = code_and_output(exp_sum, (x,), block_sizes=[128, 8])
+        self.assertRegex(
+            code,
+            r"_mask_select\w* = jnp\.where\(.*, jnp\.full\(\[\], 0, jnp\.float32\)\)",
+        )
+        torch.testing.assert_close(
+            result, torch.exp(x).sum(dim=1), rtol=1e-5, atol=1e-5
+        )
+        for beta, expected in ((1.0, torch.exp(x).sum(dim=1)), (-1.0, 256.0)):
+            _, result = code_and_output(exp_or_one, (x, beta), block_sizes=[128, 8])
+            torch.testing.assert_close(
+                result, torch.zeros_like(result) + expected, rtol=1e-5, atol=1e-5
+            )
 
     def test_if_branch_intermediate_outputs(self) -> None:
         """Branch intermediates must survive in _if output list."""

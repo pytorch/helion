@@ -7,7 +7,8 @@ lowered module -- the generated device source, the helper sources it
 compiles (``source_dependencies``), the argument schema, launch shape,
 compile options, the IR-affecting ``CUTE_DSL_*`` environment and the cutlass
 version.  Leaf module of the launcher: it imports ``source_dependencies`` and
-``launch_descriptor`` only.
+``launch_descriptor`` only, and, to compile, the standalone launcher's
+``_standalone_compile`` (``compile_with_options``).
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
+from .launch_descriptor import preferred_smem_carveout
 from .launch_descriptor import use_pdl
 from .source_dependencies import referenced_helper_sources
 from .source_dependencies import sass_check_source_dependencies
@@ -82,7 +84,8 @@ def patch_cutlass_jit_shutdown_unload() -> None:
 class CompiledCuteLauncher:
     """Lazily compile a Helion ``@cute.jit`` wrapper via ``cute.compile``.
 
-    The first call uses ``cute.compile(jit_func, *args)`` to produce a compiled
+    The first call compiles ``jit_func`` under the launcher's options
+    (``compile_with_options``) to produce a compiled
     callable; subsequent calls invoke the compiled callable directly. This
     bypasses the per-launch ``@cute.jit`` argument-handling/dispatch path,
     matching Quack's pattern (see ``gemm_tvm_ffi_utils.py``). On B200 this
@@ -156,20 +159,12 @@ class CompiledCuteLauncher:
     def __call__(self, *args: object) -> object:
         compiled = self._compiled
         if compiled is None:
-            import cutlass.cute as cute
-
-            compiled = None
             if self._cache_key is not None:
                 compiled = self._reload_from_disk()
             if compiled is None:
-                if self._compile_options is None:
-                    compiled = cute.compile(self._jit_func, *args)
-                else:
-                    compiled = cute.compile(
-                        self._jit_func,
-                        *args,
-                        options=self._compile_options,
-                    )
+                compiled = compile_with_options(
+                    self._jit_func, args, self._compile_options
+                )
                 if self._sass_checks:
                     from .sass_check import verify_compiled
 
@@ -323,23 +318,58 @@ def is_tvm_ffi_compiled_function(compiled: object) -> bool:
 
 TVM_FFI_COMPILE_OPTION = "--enable-tvm-ffi"
 
+# How libNVVM compiles an fp32 ``/`` (and a 16-bit one, which it divides in
+# fp32).  ``-prec-div=0`` is ``div.full.f32``: within 2 ulp over the full
+# range and without a slow path, what Triton's ``/`` compiles to, and the
+# CuTe backend's division too.  ``-prec-div=1`` is the IEEE ``div.rn.f32``
+# of ``Settings.cute_exact_division``.  A division the kernel spells as an
+# NVVM intrinsic (``cute.math.div(..., rounding=...)``, ``approx=True``) keeps
+# its own rounding under either.
+FULL_RANGE_DIVISION_COMPILE_OPTION = "nvvm-options=-prec-div=0"
+IEEE_DIVISION_COMPILE_OPTION = "nvvm-options=-prec-div=1"
+_DIVISION_COMPILE_OPTIONS = (
+    FULL_RANGE_DIVISION_COMPILE_OPTION,
+    IEEE_DIVISION_COMPILE_OPTION,
+)
 
-def merge_tvm_ffi_compile_option(compile_options: str | None) -> str:
-    """Ensure ``--enable-tvm-ffi`` is present in *compile_options*.
 
-    The generic launcher always benefits from the FFI bridge (it skips
-    CUTLASS-DSL's per-arg cast/pointer work). Other flags such as
-    ``--generate-line-info`` may already be present (e.g. when the
-    autotuner picks ``tcgen05_cubin_lineinfo=True``), so we splice rather
-    than replace.
+def merge_default_compile_options(compile_options: str | None) -> str:
+    """*compile_options* with the launcher's defaults spliced in.
+
+    ``--enable-tvm-ffi``: the generic launcher always benefits from the FFI
+    bridge (it skips CUTLASS-DSL's per-arg cast/pointer work).  The division
+    option, unless the kernel chose one (``IEEE_DIVISION_COMPILE_OPTION``).
+    Other flags such as ``--generate-line-info`` may already be present
+    (e.g. when the autotuner picks ``tcgen05_cubin_lineinfo=True``), so we
+    splice rather than replace.
     """
-    if compile_options is None:
-        return TVM_FFI_COMPILE_OPTION
-    tokens = compile_options.split()
-    if TVM_FFI_COMPILE_OPTION in tokens:
-        return compile_options
-    tokens.append(TVM_FFI_COMPILE_OPTION)
+    tokens = compile_options.split() if compile_options is not None else []
+    if TVM_FFI_COMPILE_OPTION not in tokens:
+        tokens.append(TVM_FFI_COMPILE_OPTION)
+    if not any(token in _DIVISION_COMPILE_OPTIONS for token in tokens):
+        tokens.append(FULL_RANGE_DIVISION_COMPILE_OPTION)
     return " ".join(tokens)
+
+
+def compile_with_options(
+    jit_func: object, args: Sequence[object], compile_options: str | None
+) -> object:
+    """``cute.compile`` of *jit_func* under *compile_options*.
+
+    The DSL's option string has no spelling for a libNVVM option, so the
+    options go in as the DSL's option objects: its public classes for the
+    ones a kernel launches with, and the division option as a raw pass
+    option of the compile pipeline (``ExtraCompilerOpts``, what
+    ``CUTE_DSL_COMPILER_OPT`` sets for a whole process).  The standalone
+    launcher does that (``_standalone_compile``; the exporter splices that
+    module's text into exported files, so the code lives there) and merges
+    the launcher's defaults in as ``merge_default_compile_options`` does, so
+    no caller, with options or without, compiles with the DSL's own
+    division.
+    """
+    from .standalone_launcher import _standalone_compile
+
+    return _standalone_compile(jit_func, args, compile_options)
 
 
 def function_globals(function: object) -> Mapping[str, object]:
@@ -392,7 +422,7 @@ def disk_cache_key(
     (``referenced_helper_sources``), full input
     specialization (dtypes, ranks,
     pointer alignments, baked shapes/strides, constexpr values), launch shape
-    (block/cluster), preferred shared-memory carveout, CuTe compile options,
+    (block/cluster), CuTe compile options,
     the IR-affecting
     ``CUTE_DSL_*`` env vars (target SM arch among them), and the cutlass version.
 
@@ -459,11 +489,7 @@ def disk_cache_key(
             block,
             wrapper_plans,
             repr(cluster_shape),
-            getattr(
-                cast("Any", cute_kernel),
-                "_helion_cute_preferred_smem_carveout",
-                None,
-            ),
+            preferred_smem_carveout(cute_kernel, plans),
             compile_options or "",
             cache_relevant_env(),
             cutlass_version,

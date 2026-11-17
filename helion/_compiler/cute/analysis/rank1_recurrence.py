@@ -23,6 +23,7 @@ from typing import cast
 
 import torch
 
+from ...fx_side_effects import is_impure_node
 from ..fx_matcher import _is_call
 from ..fx_matcher import _load_ref
 from ..fx_matcher import _memory_indices
@@ -40,12 +41,8 @@ _indices = _memory_indices
 def _has_unmatched_side_effect(
     nodes: Sequence[torch.fx.Node], allowed: set[torch.fx.Node]
 ) -> bool:
-    from torch.fx.node import _side_effectful_functions
-
     return any(
-        node.op == "call_function"
-        and node.target in _side_effectful_functions
-        and node not in allowed
+        node.op == "call_function" and is_impure_node(node) and node not in allowed
         for node in nodes
     )
 
@@ -500,9 +497,7 @@ def _match_product(
         or node.kwargs
     ):
         return False
-    # Device-IR reduction extraction may replace the duplicate operand by
-    # None.  Accept only the two equivalent encodings of x*x.
-    return node.args[:2] in ((first, second), (first, None), (None, first))
+    return node.args[:2] == (first, second)
 
 
 def _matches_bias_index(

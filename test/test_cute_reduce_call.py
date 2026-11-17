@@ -103,8 +103,9 @@ def test_role_sets_pin_the_tables_the_passes_used_to_spell_out() -> None:
     # hoist_warp_reduce.validate_cluster_reduce_placement's trio.
     assert {CLUSTER, PAIR, WARP_PAIR} == CLUSTER_REDUCES
     assert {PAIR, WARP_PAIR} == ONLINE_PAIR_REDUCES
-    # finalize_reduce_groups._GROUPED_SHARED_REDUCES.
-    assert {TWO_STAGE, COLUMNS} == GROUPED_SHARED_REDUCES
+    # finalize_reduce_groups._GROUPED_SHARED_REDUCES, plus the fragment form
+    # resized with the scalar reduce it replaces.
+    assert {TWO_STAGE, COLUMNS, FRAGMENT} == GROUPED_SHARED_REDUCES
     assert FRAGMENT in GROUPED_REDUCE_HELPERS
 
 

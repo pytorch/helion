@@ -3,22 +3,36 @@
 from __future__ import annotations
 
 import math
+import shlex
 import types
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import cast
 
 # pyrefly: ignore [missing-import]
+import cuda.bindings.driver as _standalone_cuda_driver
+
+# pyrefly: ignore [missing-import]
 from cuda.bindings.driver import CUstream  # noqa: F401  # Emitted wrapper annotation.
 import cutlass
+from cutlass.base_dsl.compiler import ExtraCompilerOpts
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 import cutlass.torch as cutlass_torch
 import torch
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
+# Frozen copies of ``compile_cache.FULL_RANGE_DIVISION_COMPILE_OPTION`` and of
+# the two division options a launch may name (a test keeps the two launchers'
+# option handling equal).
+_STANDALONE_DIVISION_OPTION = "nvvm-options=-prec-div=0"
+_STANDALONE_DIVISION_OPTIONS = (
+    _STANDALONE_DIVISION_OPTION,
+    "nvvm-options=-prec-div=1",
+)
 _STANDALONE_LAUNCHES: dict[str, tuple[Any, ...]] = {}
 _STANDALONE_COMPILED: dict[tuple[str, int], Any] = {}
 # A frozen copy of ``helion._compiler.cute.dtypes.CUTLASS_POINTER_DTYPE_NAME``
@@ -173,6 +187,73 @@ def _standalone_validate_mma_dag_aliases(
                 )
 
 
+# Looked up once: every launch checks the context, the fast relaunch included.
+_STANDALONE_CUDA_SUCCESS = _standalone_cuda_driver.CUresult.CUDA_SUCCESS
+_standalone_cu_ctx_get_current = _standalone_cuda_driver.cuCtxGetCurrent
+
+
+def _standalone_ensure_cuda_context() -> None:
+    """Make the current device's primary CUDA context current on this thread,
+    before every launch: the compiled host code of a launch that sets function
+    attributes aborts without one, and a thread can lack one at any launch."""
+    # Helion's own launcher runs this check too, and its
+    # helion.runtime.cute.launcher._ensure_cuda_context says why.
+    success = _STANDALONE_CUDA_SUCCESS
+    error, context = _standalone_cu_ctx_get_current()
+    if error == success and int(context) == 0:
+        error, device = _standalone_cuda_driver.cuDeviceGet(torch.cuda.current_device())
+        if error == success:
+            error, context = _standalone_cuda_driver.cuDevicePrimaryCtxRetain(device)
+        if error == success:
+            (error,) = _standalone_cuda_driver.cuCtxSetCurrent(context)
+    if error != success:
+        raise RuntimeError(f"No CUDA context for a CuTe launch: {error}")
+
+
+def _standalone_compile(
+    wrapper: object, launch_args: Sequence[object], options: str | None
+) -> Callable[..., object]:
+    """Compile under the options Helion's launcher compiles with: the FFI
+    bridge, and fp32 ``/`` as ``div.full.f32`` unless the kernel chose the
+    IEEE division (``helion.runtime.cute.compile_cache
+    .merge_default_compile_options`` names the same defaults for the cache
+    key; a test keeps the two equal).  The DSL's option string has no
+    spelling for a libNVVM option, so those go in as raw pass options, next
+    to the DSL's option objects for the options a kernel launches with.
+    Helion's launcher compiles through this function too
+    (``compile_with_options``)."""
+    tokens = shlex.split(options or "")
+    if "--enable-tvm-ffi" not in tokens:
+        tokens.append("--enable-tvm-ffi")
+    if not any(token in _STANDALONE_DIVISION_OPTIONS for token in tokens):
+        tokens.append(_STANDALONE_DIVISION_OPTION)
+    compile_options: list[object] = []
+    division = []
+    remaining = iter(tokens)
+    for token in remaining:
+        if token in _STANDALONE_DIVISION_OPTIONS:
+            division.append(token)
+        elif token == "--enable-tvm-ffi":
+            compile_options.append(cute.EnableTVMFFI(True))
+        elif token == "--generate-line-info":
+            compile_options.append(cute.GenerateLineInfo(True))
+        elif token.startswith("--ptxas-options="):
+            compile_options.append(cute.PtxasOptions(token.partition("=")[2]))
+        elif token == "--opt-level":
+            level = next(remaining, "")
+            if not level.isdecimal():
+                raise ValueError(
+                    f"CuTe compile option --opt-level needs a level: {options!r}"
+                )
+            compile_options.append(cute.OptLevel(int(level)))
+        else:
+            raise ValueError(f"Unsupported CuTe compile option: {token!r}")
+    if len(division) > 1:
+        raise ValueError(f"More than one division option: {options!r}")
+    compile_options.append(ExtraCompilerOpts(" ".join(division)))
+    return cute.compile[tuple(compile_options)](wrapper, *launch_args)
+
+
 def _default_cute_launcher(
     kernel: object, grid: tuple[int, ...], *args: object, **kwargs: object
 ) -> None:
@@ -211,13 +292,11 @@ def _default_cute_launcher(
     device = devices.pop()
     launch_args.extend(grid)
     with torch.cuda.device(device):
+        _standalone_ensure_cuda_context()
         launch_args.append(cutlass_torch.current_stream())
         key = (kernel_name, torch.cuda.current_device())
         compiled = _STANDALONE_COMPILED.get(key)
         if compiled is None:
-            compile_options = options or ""
-            if "--enable-tvm-ffi" not in compile_options:
-                compile_options = (compile_options + " --enable-tvm-ffi").strip()
-            compiled = cute.compile(wrapper, *launch_args, options=compile_options)
+            compiled = _standalone_compile(wrapper, launch_args, options)
             _STANDALONE_COMPILED[key] = compiled
         compiled(*launch_args)

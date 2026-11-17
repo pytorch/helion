@@ -16,12 +16,12 @@ import re
 from typing import TYPE_CHECKING
 
 import torch
-from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..ast_extension import iter_statements
 from ..ast_read_writes import ReadWrites
 from ..compile_environment import CompileEnvironment
-from .memory_ops import tensor_has_specialized_base_alignment
+from ._ast_pass_utils import _bound_names
+from .memory_ops import tensor_proven_base_alignment
 from .persistent_branch_vec import _DTYPE_INFO
 from .persistent_branch_vec import _and_terms
 from .persistent_branch_vec import _binding_write_roots
@@ -29,6 +29,7 @@ from .persistent_branch_vec import _clone_expr
 from .persistent_branch_vec import _definition_snapshots
 from .persistent_branch_vec import _expand
 from .persistent_branch_vec import _lane_scale_value
+from .persistent_branch_vec import _memory_definition_snapshots
 from .persistent_branch_vec import _plain_scalar_load_pointer
 from .persistent_branch_vec import _plain_scalar_store_pointer
 from .persistent_branch_vec import _pointer_integer_affine_form
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
     from ..device_function import DeviceFunction
     from .bounded_loop_cache import OwnedFragment
 
-_LANE = re.compile(r"vec_lane_(\d+)")
+_LANE = re.compile(r"(?:vec_lane_|synthetic_lane_)(\d+)")
 _CASTS = frozenset(
     f"cutlass.{name}"
     for name in (
@@ -639,6 +640,7 @@ class _Vectorizer:
         integer_tensors: frozenset[str] = frozenset(),
         private_accesses: frozenset[str] = frozenset(),
         register_accesses: frozenset[str] = frozenset(),
+        unshadowed_abs: bool = False,
     ) -> None:
         self.strides = strides
         self.alignments = alignments
@@ -652,6 +654,29 @@ class _Vectorizer:
         }
         self.integer_parameters = integer_parameters - writes
         self.integer_tensors = integer_tensors - writes
+        # The caller proves the generated function/module bindings; reject
+        # local rebindings visible in the supplied body as well.
+        self.unshadowed_abs = (
+            unshadowed_abs
+            and "abs" not in (writes | dtypes.keys() | constexpr.keys())
+            and not any(
+                isinstance(
+                    node,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.ClassDef,
+                        ast.Import,
+                        ast.ImportFrom,
+                        ast.Global,
+                        ast.Nonlocal,
+                    ),
+                )
+                and "abs" in _bound_names(node)
+                for statement in body
+                for node in ast.walk(statement)
+            )
+        )
         self.private_accesses = private_accesses
         self.register_accesses = register_accesses
         # Definitions are frozen clones that no pass mutates, so their read
@@ -673,12 +698,18 @@ class _Vectorizer:
         return name
 
     def accesses(self, body: list[ast.stmt]) -> list[_Access]:
-        if not self.private_accesses and not self.register_accesses:
+        if not (self.private_accesses or self.register_accesses or self.unshadowed_abs):
             return _accesses(body)
         return _accesses(
             body,
             extra_pure_call=lambda call: (
-                bool(self.private_accesses)
+                self.unshadowed_abs
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "abs"
+                and len(call.args) == 1
+                and not isinstance(call.args[0], ast.Starred)
+                and not call.keywords
+                or bool(self.private_accesses)
                 and (
                     ast.unparse(call.func) in {"cute.arch.fmax", "cute.arch.fmin"}
                     or ast.unparse(call.func) == "float"
@@ -702,7 +733,7 @@ class _Vectorizer:
         )
 
     def snapshots(self, body: list[ast.stmt]) -> list[dict[str, ast.expr]] | None:
-        return _definition_snapshots(body)
+        return _memory_definition_snapshots(body)
 
     def memory_width(self, width: int, itemsize: int) -> int:
         # Lanes per memory transaction: a lane loop wider than sixteen bytes
@@ -1398,8 +1429,6 @@ def vectorize_affine_tile_lanes(
     from ..device_function import TensorPropertyArg
 
     env = CompileEnvironment.current()
-    inputs = list(env.input_sources)
-    input_storages = {id(tensor.untyped_storage()) for tensor in inputs}
     strides = device_function.proven_tensor_stride_values()
     alignments = {}
     dtypes = {}
@@ -1417,26 +1446,9 @@ def vectorize_affine_tile_lanes(
         for dim, stride in enumerate(tensor.stride()):
             if isinstance(stride, int):
                 strides[arg.name, dim] = stride
-        storage = id(tensor.untyped_storage())
-        offset = tensor.storage_offset() * tensor.element_size()
-        for alignment in (16, 8, 4):
-            aligned = storage not in input_storages and statically_known_true(
-                offset % alignment == 0
-            )
-            if not aligned:
-                aligned = any(
-                    id(source.untyped_storage()) == storage
-                    and tensor_has_specialized_base_alignment(env, source, alignment)
-                    and statically_known_true(
-                        (offset - source.storage_offset() * source.element_size())
-                        % alignment
-                        == 0
-                    )
-                    for source in inputs
-                )
-            if aligned:
-                alignments[arg.name] = alignment
-                break
+        alignment = tensor_proven_base_alignment(env, tensor)
+        if alignment is not None:
+            alignments[arg.name] = alignment
     if env.config_spec.pointwise_facts:
         from .pure_lane_packets import _PacketVectorizer
 
@@ -1519,6 +1531,17 @@ def vectorize_affine_tile_lanes(
         ),
         private_accesses=private_accesses,
         register_accesses=register_accesses | _loaded_vector_register_reads(body),
+        # Only the compiler-emitted scalar builtin is pure here. A parameter
+        # or any generated module reference with this name keeps the refusal.
+        unshadowed_abs=(
+            all(argument.name != "abs" for argument in device_function.arguments)
+            and "abs"
+            not in _bound_names(
+                ast.Module(
+                    body=device_function.codegen.module_statements, type_ignores=[]
+                )
+            )
+        ),
     )
     return ast.fix_missing_locations(
         ast.Module(body=vectorizer.body(body), type_ignores=[])

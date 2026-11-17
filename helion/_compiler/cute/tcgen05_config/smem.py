@@ -45,6 +45,7 @@ from ..tcgen05.knobs import epi_warp_groups_knob
 from ..tcgen05.knobs import epi_warps_knob
 from ..tcgen05_constants import TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
 from ..tcgen05_constants import TCGEN05_AUX_FRAGMENT_HOIST_MAX_BYTES_PER_THREAD
+from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_EPI_TMA
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODE_SIMT
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_MODES_STAGED
@@ -52,11 +53,13 @@ from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
 from ..tcgen05_constants import TCGEN05_AUX_PREFETCH_MAX_SUBTILES
 from ..tcgen05_constants import TCGEN05_AUX_STAGE_COUNT_DEFAULT
+from ..tcgen05_constants import TCGEN05_C_STORE_MODE_CONFIG_KEY
+from ..tcgen05_constants import TCGEN05_C_STORE_MODE_NORMAL
 from ..tcgen05_constants import TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_DYNAMIC_MODES
 from ..tcgen05_constants import TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_GROUPED_MODE_CONFIG_KEY
-from ..tcgen05_constants import TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
+from ..tcgen05_constants import TCGEN05_ONE_CTA_MAX_BLOCK_M
 from ..tcgen05_constants import TCGEN05_SCHED_STAGE_COUNT_CONFIG_KEY
 from ..tcgen05_constants import TCGEN05_SMEM_ROW_STAGE_CHUNK_BYTES
 from ..tcgen05_constants import TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
@@ -70,6 +73,7 @@ from ..tcgen05_constants import tcgen05_c_smem_bytes_per_cta
 from ..tcgen05_constants import tcgen05_default_epilogue_tile_size
 from ..tcgen05_constants import tcgen05_fixed_smem_overhead_bytes
 from ..tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
+from ..tcgen05_constants import tcgen05_partial_output_row_stage_smem_bytes
 from ..tcgen05_constants import tcgen05_round_up_smem_bytes
 from ..tcgen05_constants import tcgen05_rowvec_stage_smem_bytes
 from . import facts
@@ -88,6 +92,7 @@ from .knobs import TCGEN05_GROUPED_WORKLIST_NM_SHAPE_MISMATCH
 from .knobs import Tcgen05AbStagesThreeSearchConstraints
 
 if TYPE_CHECKING:
+    from ..tcgen05_constants import Tcgen05RowvecAuxFacts
     from . import CuteTcgen05Config
 
 
@@ -127,6 +132,10 @@ def _paired_pipeline_stage_limit(
         bk=bk,
         c_stages=c_stages,
         acc_stages=acc_stages,
+        epi_warp_groups=epi_warp_groups_knob(config),
+        epi_subtile_n=seeds._paired_pipeline_store_subtile_n(
+            state, config, bm=bm, bn=bn, bk=bk
+        ),
         aux_load_placement=cast(
             "str",
             config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY, "post_acc_wait"),
@@ -502,6 +511,7 @@ def default_layout_smem_bytes(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_subtile_n: int | None = None,
     epi_warp_groups: int = 1,
+    extra_stage_bytes: int = 0,
 ) -> int | None:
     """Modelled static SMEM arena of a DEFAULT-layout tile, in bytes.
 
@@ -525,12 +535,14 @@ def default_layout_smem_bytes(
     least as large as any narrower output's), so an unanalyzed store
     chain is judged conservatively rather than refused. A staged aux load
     mode (``TCGEN05_AUX_LOAD_MODES_STAGED``) adds one ``aux_stages``-deep
-    ring of the with-source epilogue subtile per exact-shape auxiliary
-    operand (``facts.exact_aux_count``). ``epi_subtile_n`` pins the C
+    ring of the with-source epilogue subtile per operand the ring carries
+    (``facts.ring_aux_itemsizes``). ``epi_subtile_n`` pins the C
     subtile to ``(per-CTA M, epi_subtile_n)`` (``tcgen05_epi_subtile_n``,
     the explicit-tile path) and ``epi_warp_groups`` multiplies the C
     stages (each epilogue warp group owns ``c_stages`` stages of the
-    ring, ``tcgen05_epi_warp_groups``).
+    ring, ``tcgen05_epi_warp_groups``). ``extra_stage_bytes`` adds row
+    stages taken outside ``pre_acc_wait`` (the partial-output store's,
+    ``partial_output_row_stage_fits``) to the leading stage chunk.
     """
     constraints = state.ab_stages_three_search_constraints
     facts = state.rowvec_aux_facts
@@ -538,7 +550,8 @@ def default_layout_smem_bytes(
         return None
     if facts is None and stage_rows:
         return None
-    if bm <= 0 or bn <= 0 or bk <= 0 or ab_stages <= 0 or c_stages <= 0:
+    # ``c_stages=0``: no C ring (a direct store).
+    if bm <= 0 or bn <= 0 or bk <= 0 or ab_stages <= 0 or c_stages < 0:
         return None
     if acc_stages <= 0 or epi_warps <= 0 or epi_warp_groups <= 0:
         return None
@@ -560,6 +573,7 @@ def default_layout_smem_bytes(
             if stage_rows
             else 0
         )
+    stage_bytes += extra_stage_bytes
     if stage_bytes:
         # The row stages lead the arena and the C ring's 1 KiB alignment
         # follows them: a 256 B or 512 B promoted row occupies a whole KiB.
@@ -575,11 +589,15 @@ def default_layout_smem_bytes(
         stage_rows=stage_rows,
         epi_subtile_n=epi_subtile_n,
     )
-    c_bytes = tcgen05_c_smem_bytes_per_cta(
-        epi_tile_m=epi_tile_m,
-        epi_tile_n=epi_tile_n,
-        dtype_bytes=output_itemsize,
-        c_stages=c_stages * epi_warp_groups,
+    c_bytes = (
+        tcgen05_c_smem_bytes_per_cta(
+            epi_tile_m=epi_tile_m,
+            epi_tile_n=epi_tile_n,
+            dtype_bytes=output_itemsize,
+            c_stages=c_stages * epi_warp_groups,
+        )
+        if c_stages
+        else 0
     )
     # One C ring per output store: two fresh outputs of one accumulator
     # (``se_block_fwd``'s ``s`` and ``out``) allocate two rings, with or
@@ -601,9 +619,8 @@ def default_layout_smem_bytes(
         aux_ring_bytes = tcgen05_aux_ring_smem_bytes_per_cta(
             epi_tile_m=ring_tile_m,
             epi_tile_n=ring_tile_n,
-            dtype_bytes=output_itemsize,
             aux_stages=aux_stages,
-            ring_count=facts.exact_aux_count,
+            ring_itemsizes=facts.ring_aux_itemsizes,
         )
     return (
         ab_bytes
@@ -632,6 +649,7 @@ def default_layout_smem_fits(
     aux_stages: int = TCGEN05_AUX_STAGE_COUNT_DEFAULT,
     epi_subtile_n: int | None = None,
     epi_warp_groups: int = 1,
+    extra_stage_bytes: int = 0,
 ) -> bool:
     """Whether a DEFAULT-layout tile's SMEM plan fits the opt-in capacity.
 
@@ -657,19 +675,27 @@ def default_layout_smem_fits(
         aux_stages=aux_stages,
         epi_subtile_n=epi_subtile_n,
         epi_warp_groups=epi_warp_groups,
+        extra_stage_bytes=extra_stage_bytes,
     )
     if arena_bytes is None:
         return False
+    return (
+        arena_bytes + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES
+        <= _arena_capacity_bytes(state)
+    )
+
+
+def _arena_capacity_bytes(state: CuteTcgen05Config) -> int:
+    """The raw per-CTA SMEM capacity the modelled arena may fill:
+    ``per_cta_smem_budget_bytes`` is the opt-in capacity less the fixed
+    AB-gate reservation (``per_cta_ab_smem_budget_bytes``), and the arena
+    is modelled in full, so the capacity itself."""
     constraints = state.ab_stages_three_search_constraints
     assert constraints is not None
-    # ``per_cta_smem_budget_bytes`` is the opt-in capacity less the fixed
-    # AB-gate reservation (``per_cta_ab_smem_budget_bytes``); the arena is
-    # modelled in full here, so compare against the capacity itself.
-    capacity = (
+    return (
         constraints.per_cta_smem_budget_bytes
         + TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES
     )
-    return arena_bytes + TCGEN05_SMEM_SMALL_ALLOCATION_ALLOWANCE_BYTES <= capacity
 
 
 def c_stages_fits(
@@ -736,6 +762,394 @@ def c_stages_fits(
     )
     c_bytes *= max(1, constraints.output_stores)
     return ab_bytes + c_bytes <= constraints.per_cta_smem_budget_bytes
+
+
+def output_edge_tma_store_smem_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+    extra_stage_bytes: int = 0,
+) -> bool:
+    """Whether an output-edge kernel's TMA-store C ring fits beside its AB ring.
+
+    ``c_stages_fits`` charges the C ring against the AB-gate budget, which
+    already holds back ``TCGEN05_AB_STAGES_THREE_RESERVED_SMEM_BYTES`` for
+    the C ring and barriers, so it counts the ring twice and refuses
+    arenas that fit: 1000x4096x2880 bf16 at 2x1 256x256x64 ab=6 (192 KiB
+    AB + 32 KiB (128, 64) C ring + 172 B of barriers = 229 548 B of the
+    232 448 B opt-in) fell back to the SIMT epilogue and lost to ab=5,
+    while the hand-kept TMA store at ab=6 compiled and ran 2.8% faster.
+    This judges the measured arena model (``default_layout_smem_fits``)
+    at the C subtile the output-edge plan renders: power-of-two edge tiles
+    never take the plain (128, 32) narrow subtile (it needs static full
+    tiles; the aligned-N family prices its own M-edge ring), so the ring
+    is charged at CuTe's with-source subtile, or at a configured explicit
+    tile when that is wider. Fails closed like the model.
+    ``extra_stage_bytes`` adds the partial-output store's row stages
+    (``partial_output_row_stage_fits``).
+    """
+    facts = state.rowvec_aux_facts
+    if facts is None or cluster_m not in (1, 2):
+        return False
+    if _store_lowering_stages_rows(config) and facts.rows:
+        # This route does not admit ``pre_acc_wait`` rows (the hybrid
+        # store's edge tiles read them from global memory beside the full
+        # tiles' staged row; the two-stage route,
+        # ``TCGEN05_TWO_CTA_EDGE_TMA_STORE_MAX_AB_STAGES``, and
+        # ``c_stages_fits`` still take the hybrid store for them). The
+        # defaults store an output edge's bias rows after the accumulator
+        # wait (the partial-output store) where it holds them, and rely on
+        # this refusal to keep few-tile rows it does not hold on the SIMT
+        # store, which wins there (32768x576x128 + bias: 36.9 us, against
+        # 51.3 with the staged row beside the TMA store; see
+        # ``CuteTcgen05DefaultTileHeuristic._pick``).
+        return False
+    return _config_arena_fits(
+        state,
+        config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        epi_subtile_n=_output_edge_epi_subtile_n(state, config, bm=bm, bn=bn),
+        extra_stage_bytes=extra_stage_bytes,
+    )
+
+
+def _simt_aux_partial_output_epilogue(config: dict[str, object]) -> bool:
+    """Register (SIMT) auxiliary loads after the accumulator wait and no
+    C-input warp: the epilogues the partial-output TMA-store body takes
+    (``pre_acc_wait``'s per-subtile loads precede the wait, which that
+    body refuses)."""
+    return (
+        config.get(TCGEN05_AUX_LOAD_MODE_CONFIG_KEY, TCGEN05_AUX_LOAD_MODE_SIMT)
+        == TCGEN05_AUX_LOAD_MODE_SIMT
+        and config.get(TCGEN05_AUX_LOAD_PLACEMENT_CONFIG_KEY)
+        != TCGEN05_AUX_LOAD_PLACEMENT_PRE_ACC_WAIT
+        and config.get(TCGEN05_WARP_SPEC_C_INPUT_WARPS_KEY, 0) == 0
+    )
+
+
+def simt_aux_partial_output_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+    output_column_major: bool | None = None,
+) -> bool:
+    """Whether register (SIMT) auxiliary loads take the partial-output
+    TMA store (``cute_mma``'s ``tcgen05_partial_output_tma_store``):
+    every tile of an output-edge GEMM then stores through TMA, where the
+    epilogue qualifies (``_simt_aux_partial_output_epilogue``), the
+    output is row-major or carries no auxiliary operand
+    (``_aux_partial_output_layout_ok``; codegen passes its own
+    ``output_column_major``, the search reads the store facts) and the
+    arena holds its row stages (``partial_output_row_stage_fits``).
+    """
+    return (
+        _simt_aux_partial_output_epilogue(config)
+        and _aux_partial_output_layout_ok(state, output_column_major)
+        and partial_output_row_stage_fits(
+            state,
+            config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=cluster_m,
+            ab_stages=ab_stages,
+            c_stages=c_stages,
+        )
+    )
+
+
+def _aux_partial_output_layout_ok(
+    state: CuteTcgen05Config, output_column_major: bool | None
+) -> bool:
+    """Not a column-major output with auxiliary operands: there the
+    partial-output body's staged and guarded auxiliary reads keep the R2S
+    partition's register layout, not the accumulator's, and CuTe refuses
+    their sum. ``None`` reads the store facts (row-major when there are
+    none: codegen judges the output it builds again)."""
+    if output_column_major is None:
+        facts = state.pipeline_smem_facts
+        output_column_major = facts is not None and facts.output_column_major
+    return not (state.aux_kernel_detected and output_column_major)
+
+
+def one_cta_n_edge_shape(
+    state: CuteTcgen05Config, *, bm: int, bn: int, bk: int
+) -> bool:
+    """A one-CTA tile whose only partial tiles are N-edge tiles of a GEMM
+    the persistent N-edge body runs: 16-bit TMA operands (the role-local
+    edge path loads through TMA only), 128-row tiles (at 64 rows that
+    body's register auxiliary fragment does not match the accumulator's
+    layout), M and K whole, N ragged and at least one tile wide, and
+    every store's destination exactly (M, N) (measured on exact-shape
+    outputs only). Batched GEMMs run partial tiles on the
+    flat one-CTA pipeline only (``cute_mma``'s
+    ``_ragged_batched_tcgen05_config``; a persistent batched partial tile
+    falls back to scalar code)."""
+    extents = state.matmul_compile_time_static_extents
+    constraints = state.ab_stages_three_search_constraints
+    if (
+        extents is None
+        or state.matmul_leading_block_id is not None
+        or not state.matmul_operands_tma_provable
+        or not state.matmul_output_matches_extents
+        # 16-bit operands (codegen's ``tcgen05_one_cta_n_edge_tma_store``)
+        or constraints is None
+        or constraints.dtype_bytes != 2
+    ):
+        return False
+    m, n, k = extents
+    if not (isinstance(m, int) and isinstance(n, int) and isinstance(k, int)):
+        return False
+    return (
+        bm == TCGEN05_ONE_CTA_MAX_BLOCK_M
+        and m % bm == 0
+        and k % bk == 0
+        and n % bn != 0
+        and n >= bn
+    )
+
+
+def one_cta_n_edge_tiles(
+    state: CuteTcgen05Config, config: dict[str, object], *, bm: int, bn: int, bk: int
+) -> bool:
+    """``one_cta_n_edge_shape`` under an epilogue the partial-output TMA
+    store takes: the normal store (``direct`` turns the TMA epilogue
+    off) and register auxiliary loads on a layout the search can read.
+    The rings are judged separately (``one_cta_n_edge_partial_output``):
+    the ring fixups after ``_fix_cluster_m1_persistent_search_config``
+    may still change them, as the auxiliary fixups may change the load
+    mode, so the search judges the epilogue on the final config
+    (``_fix_one_cta_n_edge_rings_search_config``).
+    """
+    if not one_cta_n_edge_shape(state, bm=bm, bn=bn, bk=bk) or (
+        config.get(TCGEN05_C_STORE_MODE_CONFIG_KEY, TCGEN05_C_STORE_MODE_NORMAL)
+        != TCGEN05_C_STORE_MODE_NORMAL
+    ):
+        return False
+    # The search keeps the sample persistent on the layout it can read:
+    # an auxiliary epilogue without store facts (two outputs, say) stays
+    # flat rather than run persistent on the SIMT store codegen would
+    # give a column-major one.
+    facts = state.pipeline_smem_facts
+    return _simt_aux_partial_output_epilogue(config) and (
+        not state.aux_kernel_detected
+        or (facts is not None and not facts.output_column_major)
+    )
+
+
+def one_cta_n_edge_partial_output(
+    state: CuteTcgen05Config, config: dict[str, object], *, bm: int, bn: int, bk: int
+) -> bool:
+    """``one_cta_n_edge_tiles`` at rings that hold the partial-output
+    store's row stages (``cute_mma``'s
+    ``tcgen05_one_cta_n_edge_tma_store``)."""
+    if not one_cta_n_edge_tiles(state, config, bm=bm, bn=bn, bk=bk):
+        return False
+    ab_stages = config.get("tcgen05_ab_stages")
+    c_stages = config.get("tcgen05_c_stages")
+    if not (isinstance(ab_stages, int) and isinstance(c_stages, int)):
+        return False
+    return simt_aux_partial_output_fits(
+        state,
+        config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=1,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+    )
+
+
+def _fix_one_cta_n_edge_rings_search_config(
+    state: CuteTcgen05Config, config: dict[str, object]
+) -> bool:
+    """Fit a persistent one-CTA N-edge sample's AB ring to the
+    partial-output store; True where the sample must go flat.
+
+    The body keeps such a sample persistent on its shape
+    (``one_cta_n_edge_shape``); its later fixups may then leave an
+    epilogue off the partial-output store, which goes flat here, or rings
+    that do not hold the store's row stages. It takes the deepest AB ring
+    from 1 stage that does beside its final C ring (bf16 25216x576x768 +
+    bias on 128x256 tiles: the auxiliary edge epilogue's C ring of 4
+    leaves ab=3 on the TMA store, 39 us, where flattening the sampled
+    ab=4 ran the SIMT store's flat kernel, 52 us), and the flat pipeline
+    where none does.
+    """
+    ab_stages = config.get("tcgen05_ab_stages")
+    c_stages = config.get("tcgen05_c_stages")
+    if not (
+        state.search_enabled
+        and state.output_edge_persistent_admitted
+        and config.get("tcgen05_cluster_m", 1) == 1
+        and config.get("pid_type") in ("persistent_blocked", "persistent_interleaved")
+        and isinstance(ab_stages, int)
+        and isinstance(c_stages, int)
+    ):
+        return False
+    view = facts._matmul_config_view(state, config)
+    if view is None:
+        return False
+    blocks, mi, ni, ki = view
+    bm, bn, bk = blocks[mi], blocks[ni], blocks[ki]
+    if not (
+        isinstance(bm, int)
+        and isinstance(bn, int)
+        and isinstance(bk, int)
+        and one_cta_n_edge_shape(state, bm=bm, bn=bn, bk=bk)
+    ):
+        return False
+    if not one_cta_n_edge_tiles(state, config, bm=bm, bn=bn, bk=bk):
+        # The final epilogue knobs (the auxiliary fixups turn a sampled
+        # ``tma`` load into ``simt``, say) are judged here, where they no
+        # longer change: off the partial-output store the edge tiles run
+        # flat.
+        config["pid_type"] = "flat"
+        return True
+    # Down to one stage: a one-K-tile GEMM's sample (and candidate) runs
+    # a single AB stage on the TMA store (bf16 25216x576x64: 8.2 us
+    # persistent at ab=1, 26.9 on the flat 128x16 default).
+    for depth in range(ab_stages, 0, -1):
+        if partial_output_row_stage_fits(
+            state,
+            config,
+            bm=bm,
+            bn=bn,
+            bk=bk,
+            cluster_m=1,
+            ab_stages=depth,
+            c_stages=c_stages,
+        ):
+            config["tcgen05_ab_stages"] = depth
+            return False
+    config["pid_type"] = "flat"
+    return True
+
+
+def partial_output_row_stage_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+    slots: int = 1,
+) -> bool:
+    """Whether a partial-output TMA-store epilogue's row stages fit.
+
+    With register (SIMT) auxiliary loads the output-edge TMA store also
+    takes the fringe tiles (``cute_mma``'s
+    ``tcgen05_partial_output_tma_store``), and each row-vector operand
+    then stages ``slots`` N tiles in its own dtype through a predicated
+    copy (``store_epilogue``'s ``stage_partial_tma_rowvec``; two when the
+    epilogue loads the next tile's row ahead, ``cute_mma``'s
+    ``tcgen05_partial_output_row_lookahead``), which the arena judged by
+    ``output_edge_tma_store_smem_fits`` does not hold: an unpromoted BF16
+    row is no ``pre_acc_wait`` stage there, but 512 B of a 256-wide tile
+    here. This judges that arena with those stages (an upper bound:
+    ``tcgen05_partial_output_row_stage_smem_bytes``).  Callers keep
+    ``pre_acc_wait`` and C-input configs away (their rows stage
+    elsewhere). That arena model prices power-of-two tiles: an aligned-N
+    pair's physical width (priced by ``dense_aligned_n_plan``, up to 2 KB
+    more at 160 columns) with row stages keeps the split store.
+    """
+    rowvec_facts = state.rowvec_aux_facts
+    if (
+        rowvec_facts is not None
+        and rowvec_facts.rows
+        and facts._dense_aligned_n_plan(state, config) is not None
+    ):
+        return False
+    return rowvec_facts is not None and output_edge_tma_store_smem_fits(
+        state,
+        config,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        extra_stage_bytes=slots
+        * tcgen05_partial_output_row_stage_smem_bytes(rows=rowvec_facts.rows, bn=bn),
+    )
+
+
+def _output_edge_epi_subtile_n(
+    state: CuteTcgen05Config, config: dict[str, object], *, bm: int, bn: int
+) -> int:
+    """The C subtile width the output-edge TMA-store plan renders.
+
+    Power-of-two edge tiles never take the plain (128, 32) narrow subtile
+    (it needs static full tiles), so the ring is charged at CuTe's
+    with-source subtile, or at a configured explicit tile when wider.
+    """
+    facts = state.rowvec_aux_facts
+    assert facts is not None
+    out_bits = facts.output_itemsize * 8
+    _subtile_m, subtile_n = tcgen05_default_epilogue_tile_size(
+        bm, bn, elem_width_d=out_bits, elem_width_c=out_bits
+    )
+    for configured in (
+        epi_subtile_n_knob(config),
+        layout_overrides_from_config(config).epi_tile_n,
+    ):
+        if configured is not None:
+            subtile_n = max(subtile_n, configured)
+    return subtile_n
+
+
+def _config_arena_fits(
+    state: CuteTcgen05Config,
+    config: dict[str, object],
+    *,
+    bm: int,
+    bn: int,
+    bk: int,
+    cluster_m: int,
+    ab_stages: int,
+    c_stages: int,
+    epi_subtile_n: int | None,
+    extra_stage_bytes: int = 0,
+) -> bool:
+    """``default_layout_smem_fits`` with every other input read from ``config``."""
+    return default_layout_smem_fits(
+        state,
+        bm=bm,
+        bn=bn,
+        bk=bk,
+        cluster_m=cluster_m,
+        ab_stages=ab_stages,
+        c_stages=c_stages,
+        stage_rows=_store_lowering_stages_rows(config),
+        epi_warps=epi_warps_knob(config),
+        acc_stages=acc_stages_knob(config),
+        aux_load_mode=aux_load_mode_knob(config),
+        aux_stages=aux_stages_knob(config),
+        epi_subtile_n=epi_subtile_n,
+        epi_warp_groups=epi_warp_groups_knob(config),
+        extra_stage_bytes=extra_stage_bytes,
+    )
 
 
 def _grouped_dynamic_deep_config_matches(config: dict[str, object]) -> bool:
@@ -987,8 +1401,8 @@ def epilogue_subtile(
     The matmul plan's choice (``cute_mma``): a configured subtile
     (``tcgen05_epi_subtile_n``, the explicit-tile path: ``(per-CTA M,
     n)``) wins; then the plan's (128, 32) for promoted 16-bit rows that
-    are staged, or for a plain 16-bit store on the 256-wide two-CTA tile
-    (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
+    are staged, or for a plain 16-bit store on the 192- or 256-wide
+    two-CTA tile (``tcgen05_plain_narrow_subtile``: one output store and no auxiliary
     operand -- a two-output or aux epilogue keeps CuTe's with-source
     (128, 64) subtile there, 64 KiB of C rings for two outputs; the plan
     also asks for a single static-full-tile store, which every plain
@@ -996,36 +1410,21 @@ def epilogue_subtile(
     output width, sized for a 32-bit output without store facts.
     """
     constraints = state.ab_stages_three_search_constraints
-    facts = state.rowvec_aux_facts
+    rowvec_facts = state.rowvec_aux_facts
     if epi_subtile_n is not None:
         return (
             tcgen05_epilogue_subtile_m(bm=bm, is_two_cta=cluster_m == 2),
             epi_subtile_n,
         )
-    out_bits = 32 if facts is None else facts.output_itemsize * 8
+    out_bits = 32 if rowvec_facts is None else rowvec_facts.output_itemsize * 8
     narrow_subtile = (
-        facts is not None
+        rowvec_facts is not None
         and constraints is not None
-        and facts.output_itemsize == 2
+        and rowvec_facts.output_itemsize == 2
         and (
-            (
-                stage_rows
-                and bool(facts.rows)
-                and all(row.promoted for row in facts.rows)
-            )
-            or (
-                not facts.rows
-                and facts.output_count == 1
-                and not state.aux_kernel_detected
-                and constraints.dtype_bytes == 2
-                and cluster_m == 2
-                and bn == TCGEN05_PLAIN_NARROW_SUBTILE_BLOCK_N
-                # An exact-shape auxiliary operand keeps the plan's
-                # with-source subtile (``cute_mma``:
-                # ``tcgen05_plain_narrow_subtile`` needs an aux-free
-                # epilogue).
-                and facts.exact_aux_count == 0
-            )
+            stage_rows
+            and bool(rowvec_facts.rows)
+            and all(row.promoted for row in rowvec_facts.rows)
         )
         and tcgen05_explicit_epilogue_tile_supported(
             is_two_cta=cluster_m == 2,
@@ -1033,7 +1432,7 @@ def epilogue_subtile(
             bn=bn,
             tile_shape=(128, 32, 32),
         )
-    )
+    ) or facts._plain_narrow_subtile_facts(state, bm=bm, bn=bn, cluster_m=cluster_m)
     if narrow_subtile:
         return 128, 32
     return tcgen05_default_epilogue_tile_size(
@@ -1084,6 +1483,14 @@ def epilogue_subtile_count(
     return (rows // epi_tile_m) * (bn // epi_tile_n)
 
 
+def aux_fragment_itemsize(rowvec_facts: Tcgen05RowvecAuxFacts) -> int:
+    """Element size an exact-shape auxiliary fragment is priced at in the
+    register budgets (the hoist, the prefetch ring): the widest of the
+    output and the operands, so an FP32 residual of a BF16 output is not
+    priced at half its registers."""
+    return max((rowvec_facts.output_itemsize, *rowvec_facts.exact_aux_itemsizes))
+
+
 def aux_prefetch_depth_limit(
     state: CuteTcgen05Config, config: dict[str, object], *, region: int | None = None
 ) -> int | None:
@@ -1126,7 +1533,7 @@ def aux_prefetch_depth_limit(
     per_subtile = tcgen05_aux_subtile_fragment_bytes_per_thread(
         epi_tile_m=epi_tile_m,
         epi_tile_n=epi_tile_n,
-        itemsize=rowvec_facts.output_itemsize,
+        itemsize=aux_fragment_itemsize(rowvec_facts),
     )
     groups = epi_warp_groups_knob(config)
     local_count = -(-count // groups)

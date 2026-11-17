@@ -25,7 +25,6 @@ from typing import cast
 
 import torch
 
-from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from .analysis.rank1_recurrence import _MUL_TARGETS
 from .analysis.rank1_recurrence import Rank1DecayMatch
@@ -251,7 +250,7 @@ def _tensor_shapes_match(
     ):
         return None
 
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return None
     runtime_values = tuple(env.runtime_value_for_tensor(tensor) for tensor in tensors)
     if not all(isinstance(tensor, torch.Tensor) for tensor in runtime_values):
@@ -1136,7 +1135,4 @@ for fixed_rank1_token in cutlass.range_constexpr({num_tokens}):
         )
 """
     arguments.install(df, preamble, body)
-    cg.host_statements.append(
-        statement_from_string(f"{df.name}._helion_cute_preferred_smem_carveout = 25")
-    )
     return True

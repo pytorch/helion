@@ -514,6 +514,206 @@ class TestConstExpr(RefEagerTestBase, TestCase):
 
     @skipIfRefEager("compile_config not supported in ref eager mode")
     @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_keeps_a_buffer_slice_live(self):
+        """A full slice of a buffer sized by a block (``buf[tm, :]`` of
+        ``buf = x.new_ones([m, bn])``) indexes a reduction block that reuses
+        ``bn``'s variable.  On the taken side of a branch constant for the
+        config, CuTe recorded the slice as a use of ``bn`` alone, so its
+        reduction block got no strategy and CuTe refused the kernel
+        ("indexing dimension is not active in this scope")."""
+
+        @helion.kernel(static_shapes=True)
+        def zero_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            bn = hl.register_block_size(n)
+            buf = x.new_ones([m, bn])
+            out = torch.empty_like(x)
+            zeroed = hl.constexpr(bn <= 64)
+            for tm in hl.tile(m):
+                if zeroed:
+                    buf[tm, :] = 0
+                for tn in hl.tile(n, block_size=bn):
+                    out[tm, tn] = x[tm, tn] * 2
+            return out, buf
+
+        x = torch.randn(8, 256, device=DEVICE)
+        bound = zero_rows.bind((x,))
+        for bn in (32, 128):
+            out, buf = bound.compile_config(helion.Config(block_sizes=[bn, 8]))(x)
+            torch.testing.assert_close(out, x * 2)
+            fill = 0.0 if bn <= 64 else 1.0
+            torch.testing.assert_close(buf, torch.full((8, bn), fill, device=DEVICE))
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_reads_a_buffer_slice(self):
+        """The taken side of a constant branch reads a full slice of a buffer
+        sized by a block (``buf[tm, :] + 1``), each column its own value."""
+
+        @helion.kernel(
+            static_shapes=True, ignore_warnings=[exc.TensorOperationInWrapper]
+        )
+        def add_one(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            bn = hl.register_block_size(n)
+            buf = x.new_ones([m, bn]).cumsum(1)
+            out = x.new_zeros([m, bn])
+            added = hl.constexpr(bn <= 64)
+            for tm in hl.tile(m):
+                if added:
+                    out[tm, :] = buf[tm, :] + 1
+            return out
+
+        x = torch.randn(8, 256, device=DEVICE)
+        out = add_one.bind((x,)).compile_config(helion.Config(block_sizes=[32, 8]))(x)
+        columns = torch.arange(2, 34, device=DEVICE, dtype=x.dtype)
+        torch.testing.assert_close(out, columns.expand(8, 32))
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_buffer_slice_beside_its_tile(self):
+        """A full slice of a buffer sized by a block, read inside a loop that
+        tiles the block on the taken side of a constant branch.  Triton pairs
+        the slice's elements with the tile's by position; CuTe gives the
+        slice's reduction block coordinates of its own and refuses the
+        kernel, where each lane would store another buffer column into one
+        element."""
+
+        @helion.kernel(
+            static_shapes=True, ignore_warnings=[exc.TensorOperationInWrapper]
+        )
+        def add_rows(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            bn = hl.register_block_size(n)
+            buf = x.new_ones([m, bn]).cumsum(1)
+            out = torch.empty_like(x)
+            added = hl.constexpr(bn <= 64)
+            for tm in hl.tile(m):
+                if added:
+                    for tn in hl.tile(n, block_size=bn):
+                        out[tm, tn] = x[tm, tn] + buf[tm, :]
+            return out
+
+        x = torch.randn(8, 256, device=DEVICE)
+        bound = add_rows.bind((x,))
+        config = helion.Config(block_sizes=[32, 8])
+        if _get_backend() == "cute":
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "full slice of a host tensor dim"
+            ):
+                bound.compile_config(config)
+            return
+        columns = torch.arange(1, 33, device=DEVICE, dtype=x.dtype)
+        torch.testing.assert_close(
+            bound.compile_config(config)(x), x + columns.repeat(8)
+        )
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_masked_buffer_slice_store(self):
+        """A full slice of a buffer sized by a block, stored outside the loop
+        that tiles the block, under a mask that loop computes, on the taken
+        side of a constant branch.  Triton pairs the mask's elements with the
+        slice's by position; on CuTe each buffer column would be gated by
+        another lane's element of the last tile, so it refuses the kernel."""
+
+        @helion.kernel(
+            static_shapes=True, ignore_warnings=[exc.TensorOperationInWrapper]
+        )
+        def zero_where_positive(
+            x: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            m, n = x.size()
+            bn = hl.register_block_size(n)
+            buf = x.new_ones([m, bn])
+            out = torch.empty_like(x)
+            zeroed = hl.constexpr(bn <= 64)
+            for tm in hl.tile(m):
+                if zeroed:
+                    mask = hl.zeros([tm, bn], dtype=torch.bool)
+                    for tn in hl.tile(n, block_size=bn):
+                        mask = x[tm, tn] > 0
+                        out[tm, tn] = x[tm, tn] * 2
+                    hl.store(buf, [tm, slice(None)], 0, extra_mask=mask)
+            return out, buf
+
+        x = torch.randn(8, 256, device=DEVICE)
+        bound = zero_where_positive.bind((x,))
+        config = helion.Config(block_sizes=[32, 8])
+        if _get_backend() == "cute":
+            with self.assertRaisesRegex(
+                exc.BackendUnsupported, "full slice of a host tensor dim"
+            ):
+                bound.compile_config(config)
+            return
+        out, buf = bound.compile_config(config)(x)
+        torch.testing.assert_close(out, x * 2)
+        # The mask of the last 32-wide tile gates the buffer's columns.
+        expected = torch.where(x[:, -32:] > 0, 0.0, 1.0)
+        torch.testing.assert_close(buf, expected)
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
+    def test_block_size_constexpr_branch_buffer_slice_stores_of_the_loop(self):
+        """A full slice of a buffer sized by a block, stored outside the loop
+        that tiles the block, on the taken side of a constant branch: zeroed
+        under a tensor ``if`` on the mask of the loop's last tile, or set to
+        that tile's values.  CuTe refuses both kernels (under the ``if`` each
+        thread's one mask element decided every buffer column the thread
+        stores).  Triton pairs the tile's elements with the slice's by
+        position, and does not compile an ``if`` on a block of values."""
+
+        @helion.kernel(
+            static_shapes=True, ignore_warnings=[exc.TensorOperationInWrapper]
+        )
+        def zero_where_positive(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            bn = hl.register_block_size(n)
+            buf = x.new_ones([m, bn])
+            zeroed = hl.constexpr(bn <= 64)
+            for tm in hl.tile(m):
+                if zeroed:
+                    mask = hl.zeros([tm, bn], dtype=torch.bool)
+                    for tn in hl.tile(n, block_size=bn):
+                        mask = x[tm, tn] > 0
+                    if mask:
+                        buf[tm, :] = 0
+            return buf
+
+        @helion.kernel(
+            static_shapes=True, ignore_warnings=[exc.TensorOperationInWrapper]
+        )
+        def keep_last_tile(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.size()
+            bn = hl.register_block_size(n)
+            buf = x.new_zeros([m, bn])
+            kept = hl.constexpr(bn <= 64)
+            for tm in hl.tile(m):
+                if kept:
+                    row = hl.zeros([tm, bn], dtype=x.dtype)
+                    for tn in hl.tile(n, block_size=bn):
+                        row = x[tm, tn]
+                    buf[tm, :] = row
+            return buf
+
+        x = torch.randn(8, 256, device=DEVICE)
+        config = helion.Config(block_sizes=[32, 8])
+        if _get_backend() == "cute":
+            for kernel in (zero_where_positive, keep_last_tile):
+                with (
+                    self.subTest(kernel=kernel.name),
+                    self.assertRaisesRegex(
+                        exc.BackendUnsupported, "full slice of a host tensor dim"
+                    ),
+                ):
+                    kernel.bind((x,)).compile_config(config)
+            return
+        # The last 32-wide tile pairs with the buffer's columns.
+        out = keep_last_tile.bind((x,)).compile_config(config)(x)
+        torch.testing.assert_close(out, x[:, -32:])
+
+    @skipIfRefEager("compile_config not supported in ref eager mode")
+    @skipIfMTIA("Not supported on MTIA. PE failure crashes on DMA_IN")
     def test_block_size_constexpr_branch_merged_divergent_shapes_rejected(self):
         """Merging a variable with different shapes across the branches is still
         rejected even when the condition is a block-size constexpr: the branches

@@ -10,6 +10,7 @@ from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
+import helion.language as hl
 
 jagged_layer_norm_kernel = import_example("jagged_layer_norm").jagged_layer_norm_kernel
 jagged_mean_kernel = import_example("jagged_mean").jagged_mean_kernel
@@ -17,6 +18,37 @@ jagged_mean_kernel = import_example("jagged_mean").jagged_mean_kernel
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
 
 CPU_DEVICE = "cpu"
+
+
+def test_computed_rows_with_isfinite_pack_the_implicit_feature_axis() -> None:
+    @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+    def kernel(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        batch, rows = weight.shape
+        columns = values.size(2)
+        out = torch.empty((batch, rows, columns), device=values.device)
+        source = values.view(batch * rows * 2, columns)
+        output = out.view(batch * rows, columns)
+        for request, row in hl.tile([batch, rows], block_size=[1, 8]):
+            index = request.id * rows * 2 + row.index
+            first = source[index, :]
+            second = source[index + rows, :]
+            w = weight[request.id, row]
+            merged = first * w[:, None] + second * (1.0 - w[:, None])
+            result = torch.where(torch.isfinite(merged), merged, 0.0)
+            output[request.id * rows + row.index, :] = result
+        return out
+
+    # An odd row count exercises the computed row's padding guard while the
+    # implicit feature axis has four consecutive scalar values per lane.
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, (torch.empty(3, 38, 128), torch.empty(3, 19)))
+        cfg = bound.config_spec.default_config()
+        cfg.config.update(num_threads=[32], cute_vector_widths=[4, 1, 1])
+        code = bound.to_code(cfg)
+    assert "synthetic_lane_" in code
+    assert "_helion_affine_load" in code, code
+    assert "ir.VectorType.get([4]" in code
+    assert "_cute_store_u32_vec" in code
 
 
 @pytest.mark.parametrize("columns", [4, 69, 128])

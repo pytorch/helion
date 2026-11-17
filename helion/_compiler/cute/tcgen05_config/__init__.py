@@ -115,6 +115,13 @@ class CuteTcgen05Config:
         # guards that store alone. Set at bind; a spec that never went
         # through bind keeps the knob off.
         self.split_k_plain_body: bool = False
+        # Split-K runs whole tiles or the flat-edge TMA path: the
+        # ``cute_flat_edge_tma`` setting, recorded at bind.
+        self.split_k_flat_edge_tma: bool = True
+        # The device program runs an ``hl.atomic_*`` (``DeviceIR.has_atomic_ops``):
+        # codegen refuses it beside the CtaGroup.TWO pair's shared tiles
+        # (``reject_atomics_beside_warp_roles``). Set at bind.
+        self.kernel_has_atomics: bool = False
         # Every analyzed store chain loads an auxiliary operand
         # (``aux_tensor.host_function_tcgen05_aux_loads_on_every_store``): the
         # proof that ``pre_acc_wait`` renders on the plain (non-fanout)
@@ -139,6 +146,18 @@ class CuteTcgen05Config:
         # the compiler-facts phase by
         # ``CuteTcgen05ClusterM2FfiHeuristic.register_facts``.
         self.matmul_operands_tma_provable: bool = True
+        # Every MMA's A is an unaligned operand the flat one-CTA kernel's
+        # epilogue warps copy with ``cp.async`` beside a TMA-legal B
+        # (``host_function_cp_async_a_provable``).
+        self.cp_async_a_provable: bool = False
+        # Every MMA's A and B pass the TensorMap proof, whatever its output
+        # (``host_function_matmul_operands_tma_provable(outputs=False)``).
+        self.matmul_inputs_tma_provable: bool = True
+        # The staging pass left such an A in place for the producer
+        # (``stage_aligned_operands._cp_async_lhs_names``) where it would
+        # otherwise have padded it: only then does a config off the
+        # producer's envelope lose the staged copy's TMA pipeline.
+        self.cp_async_a_unstaged: bool = False
         # False when an exact-shape rank-2 auxiliary operand of the analyzed
         # store chains fails the aux TMA proof (a 16-byte base and outer
         # strides, a contiguous last axis: ``cute_mma``
@@ -148,6 +167,10 @@ class CuteTcgen05Config:
         # search surface, the seeds and the normalizer mirror the proof.
         # Decided beside ``matmul_operands_tma_provable``.
         self.exact_aux_tma_provable: bool = True
+        # Every MMA store's destination is exactly the GEMM's (M, N)
+        # (``host_function_matmul_output_matches_extents``): the persistent
+        # one-CTA N-edge tiles were measured on exact-shape outputs only.
+        self.matmul_output_matches_extents: bool = True
         self.cluster_m_search_choices: tuple[int, ...] | None = None
         self.cluster_m2_search_constraints: Tcgen05ClusterM2SearchConstraints | None = (
             None
@@ -202,6 +225,8 @@ class CuteTcgen05Config:
         # SM count of the bound device (0 when unknown); small-grid seeds use
         # it to decide whether the standard tiling can fill the machine.
         self.device_sm_count: int = 0
+        # (key, widths) of ``_dense_aligned_n_clipped_widths``.
+        self._dense_aligned_n_clipped_cache: tuple[object, frozenset[int]] | None = None
         # The register-MMA GEMM family (``cute_matmul_family="warp_mma"``):
         # admitted by the search plan (static latency-bound problem, one
         # matmul, supported layouts); its 16x8 tiles widen the M / N block
@@ -224,6 +249,12 @@ class CuteTcgen05Config:
         self.fission_bundle: bool = False
         self.tcgen05_min_search_m: int = 64
         self.tcgen05_min_search_n: int = 8
+        # A 16-bit output-edge GEMM (ragged M or N, K whole) admitted to the
+        # persistent and CtaGroup.TWO schedules; persistent cluster_m=1 runs
+        # whole tiles, or N-edge tiles on the partial-output TMA store
+        # (``one_cta_n_edge_partial_output``), so its other partial-tile
+        # samples are flattened.
+        self.output_edge_persistent_admitted: bool = False
         # Block id of the leading passthrough (batch) axis, when any.
         self.matmul_leading_block_id: int | None = None
 

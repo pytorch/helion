@@ -58,7 +58,8 @@ def _helion__independent_matmuls(a, b, first, c, d, second):
                 load_remat_1 = (a.iterator + cutlass.Int32(tile_offset_0 + collective_m) * cutlass.Int32(a.layout.stride[0]) + cutlass.Int32(tile_offset_2 + collective_k) * cutlass.Int32(a.layout.stride[1])).load() if mask_0_remat_1 else cutlass.Float16(0)
                 v_0_remat_1 = 0.5
                 v_1_remat_1 = load_remat_1 * v_0_remat_1
-                collective_a[collective_m, collective_k] = cutlass.Float16(v_1_remat_1)
+                mul_remat_1 = cutlass.Float16(v_1_remat_1)
+                collective_a[collective_m, collective_k] = cutlass.Float16(mul_remat_1)
             for collective_bi in cutlass.range(16, unroll=1):
                 collective_flat = collective_tid + collective_bi * 128
                 collective_n = collective_flat % 32
@@ -120,7 +121,8 @@ def _helion__independent_matmuls(a, b, first, c, d, second):
                 load_2_remat_1 = (c.iterator + cutlass.Int32(tile_offset_3 + collective_1_m) * cutlass.Int32(c.layout.stride[0]) + cutlass.Int32(tile_offset_5 + collective_1_k) * cutlass.Int32(c.layout.stride[1])).load() if mask_3_remat_1 else cutlass.Float16(0)
                 v_3_remat_1 = 0.5
                 v_4_remat_1 = load_2_remat_1 * v_3_remat_1
-                collective_1_a[collective_1_m, collective_1_k] = cutlass.Float16(v_4_remat_1)
+                mul_1_remat_1 = cutlass.Float16(v_4_remat_1)
+                collective_1_a[collective_1_m, collective_1_k] = cutlass.Float16(mul_1_remat_1)
             for collective_1_bi in cutlass.range(16, unroll=1):
                 collective_1_flat = collective_1_tid + collective_1_bi * 128
                 collective_1_n = collective_1_flat % 32

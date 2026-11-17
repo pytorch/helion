@@ -51,6 +51,15 @@ for block in range(0, extent, 8):
         maximum = next_maximum
 """
 
+# ``torch.exp`` as lowered without fast_math: the natural exponential.
+NATURAL_SOURCE = SOURCE.replace(
+    "cute.math.exp2(cutlass.Float32(shift) * 1.4426950408889634)",
+    "cute.math.exp(cutlass.Float32(shift))",
+).replace(
+    "cute.math.exp2(cutlass.Float32(shifted) * 1.4426950408889634)",
+    "cute.math.exp(cutlass.Float32(shifted))",
+)
+
 
 class _Values:
     def __init__(self, values):
@@ -108,6 +117,13 @@ def _exp2(value, fastmath=False):
     return np.exp2(np.float32(value), dtype=np.float32)
 
 
+def _exp(value, fastmath=False):
+    assert not fastmath
+    if isinstance(value, _Values):
+        return _Values(np.exp(value.values, dtype=np.float32))
+    return np.exp(np.float32(value), dtype=np.float32)
+
+
 def _fma(a, b, c):
     return np.float32(np.float64(a) * np.float64(b) + np.float64(c))
 
@@ -129,6 +145,7 @@ def _execute(source: str, data):
             ),
             math=SimpleNamespace(
                 max=lambda a, b, propagate_nan=True: np.maximum(a, b),
+                exp=_exp,
                 exp2=_exp2,
                 fma=_fma,
             ),
@@ -187,6 +204,26 @@ def test_max_rescaling_and_tail_match_fp64_logsumexp(length, spread) -> None:
     )
 
 
+def test_natural_exp_chunk_keeps_its_base() -> None:
+    """The natural ``exp`` folds like ``exp2`` and stays natural: the chunk's
+    exponentials have no denormal fixup for the proved initial frame to drop."""
+    result = _changed(NATURAL_SOURCE)
+    assert "cute.make_rmem_tensor(8, cutlass.Float32)" in result
+    assert result.count("_cute_grouped_reduce_warp(") == 2
+    assert "cute.math.exp2(" not in result
+    assert "fastmath" not in result
+    for length, spread in ((9, 20.0), (129, 150.0)):
+        data = np.random.default_rng(length).normal(size=length).astype(np.float32)
+        data *= spread
+        maximum, denominator = _execute(result, data)
+        expected = data.astype(np.float64).max() + np.log(
+            np.exp(data.astype(np.float64) - data.astype(np.float64).max()).sum()
+        )
+        np.testing.assert_allclose(
+            maximum + np.log(denominator), expected, rtol=3e-6, atol=1e-5
+        )
+
+
 def test_nan_propagation_is_retained() -> None:
     data = np.array([2.0, -3.0, math.nan, 6.0, 1.0], dtype=np.float32)
     for source in (SOURCE, _changed(SOURCE)):
@@ -235,6 +272,11 @@ def test_nan_propagation_is_retained() -> None:
         SOURCE.replace(
             "value = cutlass.Float32(loaded)",
             "value = cutlass.Float32(max_acc + loaded)",
+        ),
+        # A rescale in another base than the summands.
+        SOURCE.replace(
+            "cute.math.exp2(cutlass.Float32(shift) * 1.4426950408889634)",
+            "cute.math.exp(cutlass.Float32(shift))",
         ),
     ],
 )

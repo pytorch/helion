@@ -32,16 +32,19 @@ from ...host_function import HostFunction
 from ...source_location import SyntheticLocation
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
-from ..pdl_release import DEFAULT_MAX_SMEM_PER_BLOCK
 from ..pdl_release import DEFAULT_RESIDENT_THREADS_PER_SM
 from ..pdl_release import DEFAULT_SMEM_PER_SM
+from ..pdl_release import SMEM_ALLOCATION_UNIT
 from ..pdl_release import SPREAD_KEEP_HELPER
 from ..pdl_release import SPREAD_PAD_NAME
 from ..pdl_release import resident_ctas_per_sm
 from ..pdl_release import spread_pad_bytes
+from ..smem_footprint import kernel_smem_footprint
 from ..state import cute_codegen_state
+from ..target_facts import max_smem_per_block
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ...device_function import DeviceFunction
@@ -100,6 +103,20 @@ def prepare_device_body(
         with SyntheticLocation():
             wait = statement_from_string("cute.arch.griddepcontrol_wait()")
             dependent_launch = [wait]
+            capture_mode = next(
+                (
+                    plan["capture_pdl_mode_param"]
+                    for plan in cute_codegen_state(fn.codegen).wrapper_plans
+                    if "capture_pdl_mode_param" in plan
+                ),
+                None,
+            )
+            if capture_mode is not None:
+                dependent_launch = [
+                    statement_from_string(
+                        f"if {capture_mode} == 0:\n    cute.arch.griddepcontrol_wait()"
+                    )
+                ]
             # Behind the fill kernels of this kernel's own zero fills the
             # wait may move down to the first statement that touches a
             # filled tensor (``_place_late_pdl_wait``, on the lowered
@@ -117,6 +134,10 @@ def prepare_device_body(
                 if fn.cute_state.tcgen05.pdl_entry_wait
                 else fn.config.config.get("cute_pdl_release", CUTE_PDL_RELEASE_DEFAULT)
             )
+            if placement == "loader_tail" and capture_mode is None:
+                # A later effect proof can decline the normalized capture
+                # route. Keep an ordinary entry wait and automatic release.
+                placement = "auto"
             if placement == "auto":
                 placement = _implicit_pdl_release(fn, "entry")
             release = statement_from_string(
@@ -128,6 +149,10 @@ def prepare_device_body(
                 dependent_release = [release]
             elif placement == "last_wave":
                 dependent_launch.extend(_last_wave_release(fn, release))
+            elif placement == "loader_tail":
+                # Only the proved paired body owns this release. Its EARLY
+                # anchor waits before inputs; a late call waits before stores.
+                assert capture_mode is not None
             if late_wait_names:
                 late = LateWait(wait, list(dependent_launch), late_wait_names)
     body = [
@@ -147,51 +172,22 @@ def place_late_wait(body: list[ast.stmt], late: LateWait) -> list[ast.stmt]:
     return _place_late_pdl_wait(body, late.wait, late.release, late.names)
 
 
-def insert_spread_pad(fn: DeviceFunction, definition: ast.FunctionDef) -> None:
+def insert_spread_pad(
+    fn: DeviceFunction,
+    definition: ast.FunctionDef,
+    constexpr_values: Mapping[str, int],
+) -> None:
     """``cute_pdl_spread``: pad the body's shared memory so that an early
     launch of this kernel cannot pack its CTAs denser than one wave on an
     idle device (``_pdl_spread_statements``).  The pad goes in after every
     body pass, sized against the body they left (a fused two-pass cache
-    allocates late)."""
+    allocates late); ``constexpr_values`` resolves the constexpr names of
+    its sizes and trip counts."""
     if pdl_applies(fn) and fn.config.config.get(CUTE_PDL_SPREAD_KEY):
         index = _pdl_spread_index(definition.body)
-        definition.body[index:index] = _pdl_spread_statements(fn, definition.body)
-
-
-# Element widths of the ``cutlass`` numeric types a generated body allocates
-# shared memory in (``cute.arch.alloc_smem(cutlass.<type>, count, ...)``).
-_CUTLASS_TYPE_BYTES: dict[str, int] = {
-    "cutlass.Int8": 1,
-    "cutlass.Uint8": 1,
-    "cutlass.Int16": 2,
-    "cutlass.Uint16": 2,
-    "cutlass.Float16": 2,
-    "cutlass.BFloat16": 2,
-    "cutlass.Int32": 4,
-    "cutlass.Uint32": 4,
-    "cutlass.Float32": 4,
-    "cutlass.TFloat32": 4,
-    "cutlass.Int64": 8,
-    "cutlass.Uint64": 8,
-    "cutlass.Float64": 8,
-}
-
-
-# Calls through which a body reserves shared memory the literal sum cannot
-# see: the DSL's ``SmemAllocator`` (its ``allocate`` / ``allocate_tensor`` /
-# ``allocate_array`` carve a struct or a layout's bytes out of the kernel's
-# allocation at trace time; the fa4 flash families and the tcgen05 GEMMs
-# hold their rings this way, at the per-block maximum already) and the
-# dynamic shared memory base.
-_OPAQUE_SMEM_CALLS = frozenset(
-    {
-        "SmemAllocator",
-        "allocate",
-        "allocate_tensor",
-        "allocate_array",
-        "get_dyn_smem",
-    }
-)
+        definition.body[index:index] = _pdl_spread_statements(
+            fn, definition, constexpr_values
+        )
 
 
 def _resident_threads_per_sm(device: torch.device) -> int:
@@ -222,51 +218,6 @@ def _smem_per_sm(device: torch.device) -> int:
         if isinstance(capacity, int) and capacity > 0:
             return capacity
     return DEFAULT_SMEM_PER_SM
-
-
-def _max_smem_per_block(device: torch.device) -> int:
-    """The opt-in shared memory one block of ``device`` may allocate."""
-    if device.type == "cuda" and torch.cuda.is_available():
-        properties = torch.cuda.get_device_properties(device)
-        capacity = max(
-            int(getattr(properties, "shared_memory_per_block_optin", 0) or 0),
-            int(properties.shared_memory_per_block),
-        )
-        if capacity > 0:
-            return capacity
-    return DEFAULT_MAX_SMEM_PER_BLOCK
-
-
-def _literal_smem_bytes(statements: Sequence[ast.AST]) -> int | None:
-    """A lower bound of the shared memory ``statements`` allocate themselves:
-    the sum over their ``cute.arch.alloc_smem(<cutlass type>, <literal>, ...)``
-    calls (without alignment padding); ``None`` when a call's size or type is
-    not a literal the sum can account for, or when the body reserves shared
-    memory through a call the sum cannot see (``_OPAQUE_SMEM_CALLS``), so no
-    pad is sized against storage of unknown size."""
-    total = 0
-    for statement in statements:
-        for node in ast.walk(statement):
-            if not (
-                isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-            ):
-                continue
-            if node.func.attr in _OPAQUE_SMEM_CALLS:
-                return None
-            if ast.unparse(node.func) != "cute.arch.alloc_smem":
-                continue
-            if len(node.args) < 2:
-                return None
-            width = _CUTLASS_TYPE_BYTES.get(ast.unparse(node.args[0]))
-            count = node.args[1]
-            if (
-                width is None
-                or not isinstance(count, ast.Constant)
-                or type(count.value) is not int
-            ):
-                return None
-            total += width * count.value
-    return total
 
 
 def _tcgen05_early_pdl_release(
@@ -478,9 +429,10 @@ def _implicit_pdl_release(fn: DeviceFunction, default: str) -> str:
     The CTA count is the one the launcher receives: the program-id
     strategy's static grid (``ProgramIDs.static_grid_size``: the sum
     over the roots of a multi-root kernel, the parent of an L2-grouped
-    one, ``num_sm * num_sm_multiplier`` for a persistent one) times the
-    fused-body or split-K grid multiplier and the cluster size.  The resident
-    capacity is the SM count times the CTAs an SM holds, estimated from
+    one, ``num_sm * num_sm_multiplier`` for a persistent one), divided by the
+    paired-attention item group, then times the fused-body or split-K grid
+    multiplier and the cluster size. The resident capacity is the SM count
+    times the CTAs an SM holds, estimated from
     the launch block (``resident_ctas_per_sm``: the thread limit, or
     ``cute_min_blocks_per_mp`` when the config asked for an occupancy).
     A launch shape or SM count codegen cannot know takes ``default``.
@@ -513,9 +465,10 @@ def _pdl_launch_is_persistent(fn: DeviceFunction) -> bool:
 
 def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
     """The CTA count of this kernel's launch when it is static: the
-    program-id strategy's grid (``ProgramIDs.static_grid_size``) times the
-    fused-body or split-K grid multiplier and the cluster size, or the
-    count a wrapper plan launches (``cute_state.launch_ctas``) where the
+    program-id strategy's grid (``ProgramIDs.static_grid_size``) divided by
+    the attention item group, then times the fused-body or split-K grid
+    multiplier and the cluster size, or the count a wrapper plan launches
+    (``cute_state.lanes.launch_ctas``) where the
     launcher sizes the grid from the plan; ``None`` for a grid the host
     sizes at runtime."""
     if fn.cute_state.lanes.launch_ctas is not None:
@@ -527,6 +480,7 @@ def _pdl_launch_ctas(fn: DeviceFunction) -> int | None:
         return None
     return (
         grid
+        // fn.cute_state.lanes.attention_item_group
         * fn.cute_state.lanes.launch_grid_multiplier
         * max(fn.cute_state.lanes.simt_cluster_n, fn.cute_state.lanes.grid_cluster_n)
     )
@@ -616,19 +570,28 @@ def _last_wave_release(fn: DeviceFunction, release: ast.stmt) -> list[ast.stmt]:
 
 
 def _pdl_spread_statements(
-    fn: DeviceFunction, body: Sequence[ast.AST]
+    fn: DeviceFunction,
+    definition: ast.FunctionDef,
+    constexpr_values: Mapping[str, int],
 ) -> list[ast.stmt]:
     """The statements of ``cute_pdl_spread``: one shared allocation that
     raises the kernel's footprint to the smallest one at which more
     CTAs than ``ceil(CTAs / SMs)`` no longer fit on an SM
     (``spread_pad_bytes``), kept live by ``_helion_pdl_spread_keep``;
-    nothing for a grid the host sizes at runtime, a body whose own
-    allocations already enforce that density or reserve shared memory
-    the sum cannot account for (a non-literal size, or the storage a
-    family allocates through the DSL's ``SmemAllocator``: the fa4 flash
-    backward holds the per-block maximum that way, and a pad on top of
-    it would fail every launch), a density the pad cannot hold with the
-    slack it keeps per CTA, or an SM count codegen cannot know.
+    nothing for a grid the host sizes at runtime, a body whose
+    allocations already enforce that density or that may allocate shared
+    memory codegen cannot bound (``smem_footprint``: a non-literal size,
+    or the storage a family allocates through the DSL's
+    ``SmemAllocator``: the fa4 flash backward holds the per-block maximum
+    that way, and a pad on top of it would fail every launch), a density
+    the pad cannot hold with the slack it keeps per CTA, or an SM count
+    codegen cannot know.  The pad is sized against the bounds of what the
+    body allocates (``kernel_smem_footprint``, the buffers of the
+    shared-memory reduces it calls counted once per traced copy): at one
+    CTA per SM the padded kernel reaches the footprint whatever the compiler
+    drops, while a denser grid's pad assumes the allocations the compiler
+    may drop are live, and a kernel whose compiler drops them stays below
+    the footprint (``spread_pad_bytes``).
 
     A programmatic dependent launches while its primary runs and the
     hardware dispatches its CTAs onto whatever SMs have room: when the
@@ -646,15 +609,19 @@ def _pdl_spread_statements(
     env = CompileEnvironment.current()
     num_sm = env.config_spec.num_sm
     ctas = _pdl_launch_ctas(fn)
-    own = _literal_smem_bytes(body)
-    if num_sm <= 1 or ctas is None or own is None:
+    own = kernel_smem_footprint(definition, constexpr_values, fn.pid)
+    if num_sm <= 1 or ctas is None or own.high is None:
         return []
     pad = spread_pad_bytes(
         ctas,
         num_sm,
-        own,
+        own.low,
+        own.high,
+        own_padding=own.padding,
         smem_per_sm=_smem_per_sm(env.device),
-        max_smem_per_block=_max_smem_per_block(env.device),
+        max_smem_per_block=max_smem_per_block(
+            env.device, env.config_spec.target_device_capability
+        ),
     )
     if pad is None:
         return []
@@ -662,7 +629,7 @@ def _pdl_spread_statements(
         return [
             statement_from_string(
                 f"{SPREAD_PAD_NAME} = cute.arch.alloc_smem("
-                f"cutlass.Uint8, {pad}, alignment=128)"
+                f"cutlass.Uint8, {pad}, alignment={SMEM_ALLOCATION_UNIT})"
             ),
             statement_from_string(f"{SPREAD_KEEP_HELPER}({SPREAD_PAD_NAME}.toint())"),
         ]

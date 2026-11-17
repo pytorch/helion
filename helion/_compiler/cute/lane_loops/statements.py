@@ -47,13 +47,18 @@ from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ...ast_read_writes import HELION_LANE_ORDERED_ATTR
 from ...ast_read_writes import ReadWrites
 from .._ast_pass_utils import _is_proven_relocatable_call
+from .._ast_pass_utils import call_path_str
 from .._ast_pass_utils import exposed_reads
+from .._ast_pass_utils import is_cta_reduce_call
 from .._ast_pass_utils import is_vloop
 from ..access_regions import access_address
 from ..address_maps import Load
 from ..cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from ..reduce_call import CLUSTER_REDUCES
 from .markers import _find_lane_reduce_call
 from .markers import _is_lane_reduce_marker_assign
+from .owner_guards import _VECTOR_ATOMIC_HELPERS
+from .owner_guards import _is_atomic_helper
 from .owner_guards import _memory_write_calls
 
 if TYPE_CHECKING:
@@ -137,19 +142,6 @@ _PERSISTENT_VEC_LOAD = "_helion_persistent_branch_vec_load"
 _PERSISTENT_VEC_STORE = "_helion_persistent_branch_vec_store"
 _PERSISTENT_VEC_STORE_ADDRESS = 3
 _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
-# Float max / min emulated with integer atomics (``cute/atomic_helpers.py``).
-_ATOMIC_HELPERS = frozenset(
-    {
-        "_cute_atomic_max_float32",
-        "_cute_atomic_min_float32",
-        "_cute_warp_fetch_add_int32",
-    }
-)
-# The relaxed ``red.global.add.v{2,4}.f32`` flush of a vectorized atomic site
-# (``cute/atomic_ops.py``): one packet of consecutive elements.
-_VECTOR_ATOMIC_HELPERS = frozenset(
-    {"_cute_red_add_f32_vec", "_cute_red_add_f16_vec", "_cute_red_add_bf16_vec"}
-)
 # The vector type argument of a 16-byte ``cute.arch.load``, the store
 # protocol's register-only conversion of a whole byte packet and the layout
 # arithmetic of an atomic's address.
@@ -232,14 +224,15 @@ def _is_list_append(call: ast.Call) -> bool:
 
 
 def _is_atomic_call(call: ast.Call) -> bool:
-    """``cute.arch.atomic_*(ptr, ...)`` or one of the float max / min helpers."""
+    """``cute.arch.atomic_*(ptr, ...)`` or an atomic called by bare name: a
+    generated atomic helper or an ``atomic_*`` function
+    (``owner_guards._is_atomic_helper``).  A pointer's ``atomic_*`` method is
+    not one, unlike in ``owner_guards._is_atomic_call``."""
     if isinstance(call.func, ast.Attribute):
         return call.func.attr.startswith("atomic_") and (
             ast.unparse(call.func.value) == "cute.arch"
         )
-    return isinstance(call.func, ast.Name) and (
-        call.func.id in _ATOMIC_HELPERS or call.func.id in _VECTOR_ATOMIC_HELPERS
-    )
+    return isinstance(call.func, ast.Name) and _is_atomic_helper(call.func.id)
 
 
 def _uniform_lanes_of(call: ast.Call) -> frozenset[str]:
@@ -279,6 +272,39 @@ def _calls_are_movable(
         or _is_proven_relocatable_call(call, allow_load=True)
         for call in ast.walk(node)
         if isinstance(call, ast.Call)
+    )
+
+
+def _is_collective_reduce(call: ast.Call) -> bool:
+    """A combine across the threads of one CTA (``is_cta_reduce_call``: a
+    reduce helper or the DSL's warp reduction) or cluster
+    (``reduce_call.CLUSTER_REDUCES``)."""
+    return call_path_str(call.func) in CLUSTER_REDUCES or is_cta_reduce_call(call)
+
+
+def _assigns_a_collective_reduce(node: ast.AST) -> bool:
+    """``name = <reduce>(operands)``: a statement of the list binding a
+    cross-thread combine of one CTA or cluster (``_is_collective_reduce``)
+    whose operands the pass sees whole: register computations and plain
+    loads, which stay ordered against the other accesses of their tensor.
+
+    Every thread calls it and receives its group's combined value; its
+    shuffles, shared memory and barriers are its own, and the barrier pass
+    never relies on them (``barriers.py`` adds barriers of its own).  Every
+    statement list of the nest runs on every thread with the same trip
+    counts, so wherever the statement is placed every thread reaches it
+    equally often, and outside a loop its operands ignore it combines once
+    what each iteration would combine again (a cluster exchange must run
+    once: its mbarrier has a single phase).  A loop or branch holding one
+    stays pinned.
+    """
+    return (
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(call, ast.Call) and _is_collective_reduce(call)
+            for call in ast.walk(node.value)
+        )
+        and _calls_are_movable(node, also=_is_collective_reduce)
     )
 
 
@@ -1157,7 +1183,12 @@ def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statemen
         per_call = [_uniform_lanes_of(call) for call in atomics]
         uniform_lanes = frozenset.intersection(*per_call)
         partly_uniform_lanes = frozenset().union(*per_call)
-    pinned = not atomic and not _is_movable(node)
+    # A collective reduce is placed by its operands like a register
+    # computation, but stays ordered against the effects the pass cannot see
+    # (``register_only`` is False for it).
+    pinned = not atomic and not (
+        _is_movable(node) or _assigns_a_collective_reduce(node)
+    )
     unknown = [
         call
         for call in ast.walk(node)

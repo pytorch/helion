@@ -29,6 +29,7 @@ import ast
 import dataclasses
 import gc
 import itertools
+import logging
 import re
 import textwrap
 from typing import TYPE_CHECKING
@@ -44,21 +45,28 @@ from test.test_cute_scan_lowering import _segment_scan_reverse
 import helion
 from helion import exc
 from helion._compiler.ast_read_writes import HELION_ACCESS_REGIONS_ATTR
+from helion._compiler.ast_read_writes import HELION_RAW_BARRIER_TENSORS_ATTR
 from helion._compiler.cute.block_uniform import block_uniform
 from helion._compiler.cute.lane_loops import placement as lane_placement
 from helion._compiler.cute.lane_loops.barriers import add_thread_barriers
 from helion._compiler.cute.lane_loops.placement import check_full_nest
+from helion._compiler.cute.lane_loops.statements import LOGGER_NAME
 from helion._compiler.cute.lane_loops.statements import LanePlacement
 from helion._compiler.cute.lane_loops.statements import LaneScope
 from helion._compiler.cute.lane_loops.statements import _access_addresses
 from helion._compiler.cute.lane_loops.statements import _analyze
+from helion._compiler.cute.lane_loops.statements import _assigns_a_collective_reduce
 from helion._compiler.cute.lane_loops.statements import _is_packet_call
 from helion._compiler.cute.lane_loops.statements import _packets
 from helion._compiler.cute.lane_loops.statements import _tensor_mentions
 from helion._compiler.device_ir import ReductionLoopGraphInfo
+from helion._testing import DEVICE
+from helion._testing import code_and_output
 from helion._testing import import_example
+from helion._testing import skipIfNotCUDA
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_codegen import is_barrier
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
 from helion.language import _tracing_ops
@@ -66,6 +74,7 @@ from helion.language import _tracing_ops
 concat2d_dim1_simple = import_example("concatenate").concat2d_dim1_simple
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["cute"])]
@@ -1268,16 +1277,8 @@ _INNER_THREADED_COLUMNS_CONFIG = {
 }
 
 
-def _is_barrier(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and ast.unparse(node.value.func) == "cute.arch.sync_threads"
-    )
-
-
 def _barriers(node: ast.AST) -> list[ast.Expr]:
-    return [child for child in ast.walk(node) if _is_barrier(child)]  # pyrefly: ignore [bad-return]
+    return [child for child in ast.walk(node) if is_barrier(child)]  # pyrefly: ignore [bad-return]
 
 
 def _index_of(body: Sequence[ast.AST], text: str, *, after: int = -1) -> int:
@@ -1293,9 +1294,7 @@ def _one_barrier_between(body: Sequence[ast.AST], first: str, second: str) -> No
     """``body`` holds one barrier, between the statements mentioning ``first`` and ``second``."""
     start = _index_of(body, first)
     end = _index_of(body, second, after=start)
-    positions = [
-        index for index, statement in enumerate(body) if _is_barrier(statement)
-    ]
+    positions = [index for index, statement in enumerate(body) if is_barrier(statement)]
     assert positions and all(start < p < end for p in positions), (
         [ast.unparse(s)[:60] for s in body],
     )
@@ -1318,7 +1317,7 @@ def test_uniform_read_before_per_lane_stores_on_a_shared_axis_gets_a_barrier(
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
     load = _index_of(row_loop.body, "tile_offset_1")
-    barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(row_loop.body) if is_barrier(s))
     assert load < barrier < row_loop.body.index(column_loop), code
 
 
@@ -1394,7 +1393,7 @@ def test_uniform_read_on_a_thread_axis_without_a_lane_loop_gets_a_barrier() -> N
     (column_loop,) = _loops(function, "lane_1")
     (vloop,) = _loops(column_loop, "vec_lane_1")
     assert len(_barriers(function)) == 1, code
-    barrier = next(i for i, s in enumerate(column_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(column_loop.body) if is_barrier(s))
     flush = _index_of(column_loop.body, "_cute_store_u32_vec")
     assert column_loop.body.index(vloop) < barrier < flush, code
     # Scalar lanes: load and store are statements of the column loop's body.
@@ -1432,7 +1431,7 @@ def test_uniform_store_before_per_lane_stores_gets_a_barrier(
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
     store = _index_of(row_loop.body, ".store(")
-    barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(row_loop.body) if is_barrier(s))
     assert store < barrier < row_loop.body.index(column_loop), code
 
 
@@ -1450,8 +1449,46 @@ def test_idempotent_uniform_stores_need_no_barrier() -> None:
     (row_loop,) = _loops(function, "lane_0")
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
-    assert not any(_is_barrier(s) for s in row_loop.body), code
+    assert not any(is_barrier(s) for s in row_loop.body), code
     assert _barriers(column_loop), code
+
+
+@pytest.mark.parametrize("gathered", [True, False])
+def test_barrier_pass_untags_a_read_after_write_barrier_it_counts_on(
+    gathered: bool,
+) -> None:
+    """A thread's store of ``c`` and another thread's gathered load of it need
+    a barrier between them: a load's read-after-write barrier there counts,
+    and it loses its tag (``HELION_RAW_BARRIER_TENSORS_ATTR``), since it now
+    orders more than the stores of the tensor it names.  A load of another
+    tensor needs none, and the barrier keeps its tag."""
+    load = (
+        "(c.iterator + cutlass.Int32(column)).load()"
+        if gathered
+        else "(d.iterator + indices_1).load()"
+    )
+    body: list = ast.parse(
+        "(c.iterator + indices_1).store(v)\n"
+        "column = (perm.iterator + indices_1).load()\n"
+        "cute.arch.sync_threads()\n"
+        f"g = {load}\n"
+    ).body
+    barrier = body[2]
+    setattr(
+        barrier, HELION_RAW_BARRIER_TENSORS_ATTR, frozenset({"c" if gathered else "d"})
+    )
+    add_thread_barriers(
+        body,
+        [],
+        rename_groups={},
+        axis_sizes={0: 64},
+        definitions=ast.parse(
+            "indices_1 = tile_offset_1 + cutlass.Int32(cute.arch.thread_idx()[0])"
+        ).body,
+        masks=frozenset(),
+    )
+    assert len(body) == 4, ast.unparse(ast.Module(body=body, type_ignores=[]))
+    assert (getattr(barrier, HELION_RAW_BARRIER_TENSORS_ATTR, None) is None) is gathered
 
 
 @pytest.mark.parametrize(
@@ -1474,7 +1511,7 @@ def test_uniform_read_hoisted_out_of_the_innermost_shared_loop_gets_a_barrier(
     (column_loop,) = _loops(outer, "lane_2")
     assert len(_barriers(function)) == 1, code
     load = _index_of(outer.body, "tile_offset_2")
-    barrier = next(i for i, s in enumerate(outer.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(outer.body) if is_barrier(s))
     assert load < barrier < outer.body.index(column_loop), code
 
 
@@ -1630,7 +1667,7 @@ def test_thread_barrier_rules_after_the_loop() -> None:
         (row,) = items
         assert isinstance(row, LanePlacement)
         assert [
-            _is_barrier(item) for item in row.items if isinstance(item, ast.AST)
+            is_barrier(item) for item in row.items if isinstance(item, ast.AST)
         ] == ([True, False] if barrier else [False]), statement
 
 
@@ -1697,7 +1734,7 @@ def test_racing_access_before_a_branch_gets_a_barrier_before_the_branch() -> Non
     (column_loop,) = _loops(row_loop, "lane_1")
     assert len(_barriers(function)) == 1, code
     load = _index_of(row_loop.body, "tile_offset_1")
-    barrier = next(i for i, s in enumerate(row_loop.body) if _is_barrier(s))
+    barrier = next(i for i, s in enumerate(row_loop.body) if is_barrier(s))
     assert load < barrier < row_loop.body.index(column_loop), code
 
 
@@ -2474,7 +2511,7 @@ def test_loop_invariant_read_in_a_device_loop_gets_a_barrier_closing_the_body() 
     function = _kernel_function(code)
     (device_loop,) = _loops(function, "tile_offset_1")
     assert len(_barriers(function)) == 2, code
-    positions = [i for i, s in enumerate(device_loop.body) if _is_barrier(s)]
+    positions = [i for i, s in enumerate(device_loop.body) if is_barrier(s)]
     load = _index_of(device_loop.body, "cutlass.Int32(0) *")
     store = _index_of(device_loop.body, ".store(")
     assert load < store, code
@@ -2581,7 +2618,7 @@ def _kinds(items: list[ast.AST | LanePlacement]) -> list[str]:
         "loop"
         if isinstance(item, LanePlacement)
         else "sync"
-        if _is_barrier(item)
+        if is_barrier(item)
         else "stmt"
         for item in items
     ]
@@ -3616,7 +3653,7 @@ _COLUMN_LANES_ON_ONE_THREAD_CONFIG = {
 
 
 def _barrier_positions(body: Sequence[ast.AST]) -> list[int]:
-    return [index for index, statement in enumerate(body) if _is_barrier(statement)]
+    return [index for index, statement in enumerate(body) if is_barrier(statement)]
 
 
 def test_carry_from_the_previous_tile_closes_the_device_loop_body() -> None:
@@ -3952,7 +3989,7 @@ def test_staging_access_of_another_threads_element_is_rejected(probe: str) -> No
     (branch,) = items
     assert isinstance(branch, ast.If)
     fence = next(
-        index for index, statement in enumerate(branch.orelse) if _is_barrier(statement)
+        index for index, statement in enumerate(branch.orelse) if is_barrier(statement)
     )
     branch.orelse.insert(fence, ast.parse(probe).body[0])
     with pytest.raises(exc.BackendUnsupported, match="inside a branch"):
@@ -4262,6 +4299,149 @@ def _loop_header(text: str) -> ast.For:
     (header,) = ast.parse(f"{text}:\n    pass\n").body
     assert isinstance(header, ast.For)
     return header
+
+
+def _rolled_lanes(
+    body: str,
+    *definitions: str,
+    chunk_shifts: dict[sympy.Symbol, sympy.Expr | None] | None = None,
+    chunks: int = 4,
+    start: str | None = None,
+) -> list[ast.AST | LanePlacement]:
+    """``body`` as one element of a looped reduction's consume sweep: 1024
+    columns a chunk, 64 threads, 16 lanes a thread (``rindex_1``).  The lane
+    loop is a per-thread loop around the body, one of the device loop's;
+    ``chunk_shifts`` makes the device loop's iterations ``chunks`` chunks,
+    from 0 or from ``start``, a uniform value (a cluster split's slice)."""
+    offset = "" if start is None else f"{start} + "
+    headers = [
+        _loop_header(
+            f"for roffset_1 in range(cutlass.Int32({start or 0}),"
+            f" cutlass.Int32({offset}{chunks * 1024}), cutlass.Int32(1024))"
+        ),
+        _loop_header("for reduction_lane_1 in range(16)"),
+    ]
+    items: list[ast.AST | LanePlacement] = list(ast.parse(body).body)
+    add_thread_barriers(
+        items,
+        [],
+        rename_groups={},
+        axis_sizes={0: 64},
+        definitions=ast.parse(
+            "rindex_1 = roffset_1 + cutlass.Int32(cute.arch.thread_idx()[0])"
+            " + cutlass.Int32(reduction_lane_1) * 64\n" + "".join(definitions)
+        ).body,
+        masks=frozenset(),
+        loop_variables=frozenset({"roffset_1", "reduction_lane_1"}),
+        loop_body=items,
+        loop_headers=headers,
+        lane_variables=frozenset({"reduction_lane_1"}),
+        chunk_shifts=chunk_shifts,
+    )
+    return items
+
+
+def test_rolled_lanes_reject_a_pair_meeting_in_two_lanes() -> None:
+    # A lane's own element is never another lane's: the load and the store
+    # need nothing.  A gathered load beside the store may read an element an
+    # earlier lane of the same thread stored, which the program reads before
+    # any store; no barrier orders a thread's own lanes.
+    store = f"{_pointer('out', 'rindex_1')}.store(v + 1.0)\n"
+    own = _rolled_lanes(f"v = {_pointer('out', 'rindex_1')}.load()\n" + store)
+    assert _kinds(own) == ["stmt", "stmt"], _kinds(own)
+    gather = (
+        f"column = {_pointer('idx', 'rindex_1')}.load()\n"
+        f"v = {_pointer('out', 'cutlass.Int32(column)')}.load()\n"
+    )
+    with pytest.raises(exc.BackendUnsupported, match="two lanes"):
+        _rolled_lanes(gather + store)
+
+
+def test_rolled_lanes_take_a_value_loaded_per_lane_as_the_lanes_own() -> None:
+    # ``shift`` is loaded around the body at an address only the lane
+    # variable names, which every thread loads alike: one value within a
+    # lane, but another lane's may differ, so ``rindex_1 + shift`` of two
+    # lanes may be one element and the read-modify-write meets itself
+    # across them.  So may two stores through two such values: with
+    # ``shift_a`` of lane 1 equal to ``shift_b`` of lane 0, lane 1's first
+    # store overwrites lane 0's second, where the program's second store
+    # comes last.
+    address = "rindex_1 + cutlass.Int32(shift)"
+    body = (
+        f"v = {_pointer('out', address)}.load()\n"
+        f"{_pointer('out', address)}.store(v + 1.0)\n"
+    )
+    with pytest.raises(exc.BackendUnsupported, match="two lanes"):
+        _rolled_lanes(
+            body, f"shift = {_pointer('shifts', 'reduction_lane_1')}.load()\n"
+        )
+    # Loaded at an address no lane variable names, ``shift`` is one value in
+    # every lane, and the read-modify-write is the lane's own element.
+    items = _rolled_lanes(body, f"shift = {_pointer('shifts', '0')}.load()\n")
+    assert _kinds(items) == ["stmt", "stmt"], _kinds(items)
+    stores = (
+        f"{_pointer('out', 'cutlass.Int32(shift_a)')}.store(1.0)\n"
+        f"{_pointer('out', 'cutlass.Int32(shift_b)')}.store(2.0)\n"
+    )
+    with pytest.raises(exc.BackendUnsupported, match="two lanes"):
+        _rolled_lanes(
+            stores,
+            f"shift_a = {_pointer('shifts_a', 'reduction_lane_1')}.load()\n",
+            f"shift_b = {_pointer('shifts_b', 'reduction_lane_1')}.load()\n",
+        )
+
+
+def test_rolled_lanes_keep_the_barrier_closing_the_body_across_chunks() -> None:
+    # Thread t's second store writes the element thread t + 1's first store
+    # writes, within a lane and, as neither address names the lane, from one
+    # lane to the next: a barrier between the stores and one closing the
+    # body.  The chunk rule, which only rejects, must leave both: the
+    # barrier pass pairs the body's iterations by every loop variable, the
+    # lanes' included, not only by the chunks the rule checks.
+    tid = "cutlass.Int32(cute.arch.thread_idx()[0])"
+    body = (
+        f"{_pointer('out', f'roffset_1 + {tid}')}.store(1.0)\n"
+        f"{_pointer('out', f'roffset_1 + ({tid} + 1) % 64')}.store(2.0)\n"
+    )
+    for chunk_shifts in (None, {}):
+        items = _rolled_lanes(body, chunk_shifts=chunk_shifts)
+        assert _kinds(items) == ["stmt", "sync", "stmt", "sync"], _kinds(items)
+
+
+def _shifted(load: str, store: str) -> str:
+    """A load of ``out`` at ``load`` and a store of it at ``store``."""
+    return (
+        f"v = {_pointer('out', load)}.load()\n{_pointer('out', store)}.store(v + 1.0)\n"
+    )
+
+
+def test_rolled_lanes_reject_a_pair_meeting_in_two_chunks_unless_one() -> None:
+    # Chunk i stores ``out[rindex_1 + 1024]``, the element chunk i + 1 loads
+    # at ``out[rindex_1]``, where the program loads every element before
+    # storing any: no barrier orders chunks, whatever the addresses, from
+    # chunk 0 or from a cluster slice's first.  A slice's walk of one chunk
+    # (its start a uniform value the terms do not model) has no later chunk,
+    # and the lanes of a chunk never meet (16 lanes of 64 columns); the
+    # barrier closing the body orders the threads across lanes, as the
+    # terms do not know the chunk.
+    body = _shifted("rindex_1", "rindex_1 + 1024")
+    for start in (None, "base"):
+        with pytest.raises(exc.BackendUnsupported, match="two chunks"):
+            _rolled_lanes(body, chunk_shifts={}, start=start)
+    items = _rolled_lanes(body, chunk_shifts={}, chunks=1, start="base")
+    assert _kinds(items) == ["stmt", "stmt", "sync"], _kinds(items)
+
+
+def test_rolled_lanes_tell_which_chunk_reaches_the_other_first() -> None:
+    # Loaded at ``out[rindex_1 + 1024]`` and stored at ``out[rindex_1]``,
+    # an element is loaded one chunk before it is stored, as the program
+    # orders the two.  Stored at ``out[rindex_1 + 1088]``, it is loaded in
+    # the next chunk by the next lane: the chunks meet in two lanes, which
+    # no chunk forces equal.
+    items = _rolled_lanes(_shifted("rindex_1 + 1024", "rindex_1"), chunk_shifts={})
+    assert _kinds(items) == ["stmt", "stmt"], _kinds(items)
+    with pytest.raises(exc.BackendUnsupported, match="two chunks"):
+        _rolled_lanes(_shifted("rindex_1", "rindex_1 + 1088"), chunk_shifts={})
 
 
 _ENCLOSING_LOOP_HEADERS = (
@@ -6010,27 +6190,836 @@ def test_full_slice_store_over_a_rolled_reductions_extent_never_repeats_the_sum(
 
 @pytest.mark.parametrize("variant", sorted(_ROW_SUM_STORE_FNS))
 @pytest.mark.parametrize(("d", "dv"), [(16, 128), (64, 128), (192, 128)])
-def test_full_slice_store_beside_a_rolled_reduction_of_another_extent_keeps_its_lanes(
+def test_full_slice_store_beside_a_rolled_reduction_of_another_extent_shares_its_threads(
     variant: str, d: int, dv: int
 ) -> None:
-    """A store over D next to a rolled reduction over Dv: the store's own
-    synthetic lanes hold it, the reduction's ``for roffset`` loop runs once
-    outside them.  The masked form used to abandon the placement: the mask's
-    flag load was ordered after the shared-memory reduce helper (pinned, so
-    inside the lanes) yet needed by the store inside, and the full nest then
-    repeated the rolled accumulation per lane and was rejected; such a load
-    and the register computation on it now run inside the lanes."""
+    """A store over D next to a rolled reduction over Dv: the store's block
+    indexes the reduction's 64-thread axis (``plan_axis_partner``) instead of
+    being repeated by each of those threads, masked past D, a D wider than
+    the threads walked in synthetic lanes; the reduction's ``for roffset``
+    loop runs once outside them.  The masked form used to abandon the
+    placement: the mask's flag load was ordered after the shared-memory
+    reduce helper (pinned, so inside the lanes) yet needed by the store
+    inside.  The helper is placed by its operands now, so the flag is loaded
+    once, before the store's lanes."""
     code = _row_sum_render(variant, d, dv)
     function = _kernel_function(code)
     (rolled,) = _loops(function, "roffset_")
+    assert "rindex_3 = roffset_3 + cutlass.Int32(cute.arch.thread_idx()[0])" in code
+    assert "block=(64, 2, 2)" in code
     lanes = _loops(function, "synthetic_lane_")
-    assert lanes, code
     assert all(not _loops(lane, "roffset_") for lane in lanes)
-    assert not _loops(rolled, "synthetic_lane_")
-    store_lanes = [lane for lane in lanes if _accesses(lane, "dq")]
-    assert store_lanes, code
-    if variant == "masked":
-        assert any(_accesses(lane, "flag") for lane in store_lanes)
+    assert not _loops(rolled, "synthetic_lane_") and not _accesses(rolled, "dq")
+    index = "indices_4 = cutlass.Int32(cute.arch.thread_idx()[0])"
+    if d > 64:
+        (lane,) = lanes
+        assert f"{index} + cutlass.Int32(synthetic_lane_4) * 64\n" in code
+        assert _accesses(lane, "dq") and not _accesses(lane, "flag"), code
+        # A block indexing its partner's axis walks D's live lanes on the
+        # partner's threads (192 / 64), its padded fourth dropped
+        # (``plan_synthetic_lanes``).
+        assert ast.unparse(lane.iter) == "range(3)", code
+    else:
+        assert not lanes and f"{index}\n" in code, code
+    # The mask comes from D's power-of-two padding: only D = 64, which the 64
+    # threads cover without padding, drops it (D = 192's 3 lanes keep it).
+    assert ("mask_4 = indices_4 < " in code) == (d != 64)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Gemma 3 / Qwen 3 QK-norm before RoPE: RMSNorm over the row, then
+    rotate_half's two half rows, a full slice no reduction reduces."""
+    m, d = x.shape
+    half = d // 2
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        lo = x[tile_m, :half].to(torch.float32) * rstd
+        hi = x[tile_m, half:].to(torch.float32) * rstd
+        out[tile_m, :half] = (-hi).to(out.dtype)
+        out[tile_m, half:] = lo.to(out.dtype)
+    return out
+
+
+def _rotate_half_reference(x: torch.Tensor) -> torch.Tensor:
+    rows = x.float()
+    normed = rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-6)
+    half = x.size(1) // 2
+    return torch.cat([-normed[:, half:], normed[:, :half]], dim=-1).to(x.dtype)
+
+
+_HALF_ROW_CONFIGS = [
+    # A rolled row on 64 threads: two half-row lanes per thread.
+    ({"block_sizes": [16], "reduction_loops": [64]}, (64, 16, 1), 2),
+    # A persistent row on 256 threads: the upper 128 skip the half rows.
+    ({"block_sizes": [1], "reduction_loops": [None]}, (256, 1, 1), 0),
+]
+
+
+@pytest.mark.parametrize(("config", "block", "half_lanes"), _HALF_ROW_CONFIGS)
+def test_half_rows_beside_a_row_reduction_run_once_on_its_threads(
+    config: dict[str, object], block: tuple[int, int, int], half_lanes: int
+) -> None:
+    """The half dim (block 2) claimed a thread axis of its own, or none once
+    the row and the tile filled the CTA: each thread of the row reduction's
+    axis repeated every load and store of rotate_half, in a lane loop that
+    also held the row's shared-memory reduce (pinned there), which ran once
+    per lane.  The half rows now index the reduction's thread axis
+    (``plan_axis_partner``) and the reduce, whose operand reads no lane, runs
+    once before them.  There are as many rows as half-row elements: the
+    argument ``x`` is no tile value holding both the half rows and the row
+    (its extents matched theirs and kept the old layout)."""
+    code = _generate(
+        _rms_norm_rotate_half,
+        (torch.empty((128, 256), dtype=torch.bfloat16),),
+        **config,
+    )
+    function = _kernel_function(code)
+    assert f"block={block}" in code
+    (reduce,) = [
+        stmt
+        for stmt in ast.walk(function)
+        if isinstance(stmt, ast.Assign)
+        and "_cute_grouped_reduce_shared_two_stage(" in ast.unparse(stmt.value)
+    ]
+    assert reduce in function.body, code
+    index = "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0])"
+    if half_lanes:
+        (lane,) = _loops(function, "synthetic_lane_2")
+        assert ast.unparse(lane.iter) == f"range({half_lanes})"
+        assert f"{index} + cutlass.Int32(synthetic_lane_2) * 64\n" in code
+        assert function.body.index(reduce) < function.body.index(lane)
+        assert "mask_2" not in code
+    else:
+        assert not _loops(function, "synthetic_lane_")
+        assert f"{index}\n    mask_2 = indices_2 < 128\n" in code, code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize(("config", "block", "half_lanes"), _HALF_ROW_CONFIGS)
+def test_half_rows_beside_a_row_reduction_match_the_reference(
+    config: dict[str, object], block: tuple[int, int, int], half_lanes: int
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(128, 256, dtype=torch.bfloat16, device=DEVICE)
+    code, out = code_and_output(_rms_norm_rotate_half, (x,), **config)
+    assert f"block={block}" in code
+    torch.testing.assert_close(out, _rotate_half_reference(x), rtol=1e-2, atol=1e-2)
+
+
+_rms_norm_rotate_half_dynamic = helion.kernel(
+    _rms_norm_rotate_half.fn,
+    backend="cute",
+    static_shapes=False,
+    autotune_effort="none",
+)
+
+
+def test_half_rows_of_a_dynamic_row_index_the_reduction_threads() -> None:
+    """``:half`` of a dynamic ``d`` holds its bound as a graph node, which
+    the planning reads through the node's value (subtracting the node itself
+    raised a ``TypeError``): the half rows take the rolled row's 64 threads,
+    masked past ``d // 2``."""
+    code = _generate(
+        _rms_norm_rotate_half_dynamic,
+        (torch.empty((64, 256), dtype=torch.bfloat16),),
+        block_sizes=[16],
+        reduction_loops=[64],
+    )
+    assert "block=(64, 16, 1)" in code
+    assert (
+        "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0]) + "
+        "cutlass.Int32(synthetic_lane_2) * 64"
+    ) in code, code
+    # Masked at the half extent, ``min(d, d // 2)`` spelled branch-free.
+    assert "mask_2 = indices_2 < d * (d <= d // 2) + d // 2 * (d // 2 < d)" in code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_half_rows_of_a_dynamic_row_match_the_reference() -> None:
+    torch.manual_seed(0)
+    x = torch.randn(37, 192, dtype=torch.bfloat16, device=DEVICE)
+    _code, out = code_and_output(
+        _rms_norm_rotate_half_dynamic, (x,), block_sizes=[16], reduction_loops=[64]
+    )
+    torch.testing.assert_close(out, _rotate_half_reference(x), rtol=1e-2, atol=1e-2)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_rotate_half_then_double(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``_rms_norm_rotate_half`` and a second root loop."""
+    m, d = x.shape
+    half = d // 2
+    out = torch.empty_like(x)
+    doubled = torch.empty_like(y)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        lo = x[tile_m, :half].to(torch.float32) * rstd
+        hi = x[tile_m, half:].to(torch.float32) * rstd
+        out[tile_m, :half] = (-hi).to(out.dtype)
+        out[tile_m, half:] = lo.to(out.dtype)
+    for tile_n in hl.tile(y.size(0)):
+        doubled[tile_n] = y[tile_n] * 2
+    return out, doubled
+
+
+_UNSHARED_HALF_ROWS = [
+    # The config spells 32 threads for the half rows, the rolled row has 64.
+    pytest.param(
+        _rms_norm_rotate_half,
+        {"block_sizes": [16], "reduction_loops": [64], "num_threads": [0, 0, 32]},
+        id="other_thread_count",
+    ),
+    # The second root loop is a section of the launch the row never runs in.
+    # The row is rolled in chunks of 32: tile_n's 32 threads lower the
+    # persistent threshold, so ``[None]`` normalizes to this too.
+    pytest.param(
+        _rms_norm_rotate_half_then_double,
+        {"block_sizes": [1, 32], "reduction_loops": [32]},
+        id="two_root_loops",
+    ),
+]
+
+
+@pytest.mark.parametrize(("kernel", "config"), _UNSHARED_HALF_ROWS)
+def test_half_rows_keep_their_own_threads_beside_a_row_they_may_not_share(
+    kernel: object, config: dict[str, object]
+) -> None:
+    """The half rows index no thread axis of the row reduction where the
+    config asks another thread count for them, or where another root loop
+    shares the launch (``_reduction_axis_partner``)."""
+    args: tuple[torch.Tensor, ...] = (torch.empty((64, 256), dtype=torch.bfloat16),)
+    if kernel is _rms_norm_rotate_half_then_double:
+        args = (*args, torch.empty(64))
+    code = _generate(kernel, args, **config)
+    assert "rindex_1 = roffset_1 + cutlass.Int32(cute.arch.thread_idx()[0])" in code
+    assert "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0])" not in code, code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        out[tile_m, :] = (row * rstd).to(out.dtype)
+    return out
+
+
+def _rms_norm_reference(x: torch.Tensor) -> torch.Tensor:
+    rows = x.float()
+    return (rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-6)).to(x.dtype)
+
+
+# A tile of 8 rows on one thread (num_threads 1), each row rolled over 64
+# threads, and a cluster of 16.
+_ROWS_PER_THREAD_CLUSTER = {
+    "block_sizes": [8],
+    "reduction_loops": [64],
+    "cute_cluster_n": 16,
+}
+_ROWS_PER_THREAD_KERNELS = [
+    pytest.param(
+        _rms_norm_rotate_half,
+        [1, 128, 0],
+        _rotate_half_reference,
+        id="rotate_half",
+    ),
+    pytest.param(_rms_norm, [1, 128], _rms_norm_reference, id="rms_norm"),
+]
+
+
+@pytest.mark.parametrize(
+    ("kernel", "num_threads", "reference"), _ROWS_PER_THREAD_KERNELS
+)
+def test_rows_walked_by_one_thread_keep_the_cta_reduce_under_a_cluster(
+    kernel: object, num_threads: list[int], reference: object
+) -> None:
+    """Each thread walks the 8 rows of its tile in a per-thread lane loop,
+    which repeats the rolled row's finalize, while a cluster exchange's
+    single-phase mbarrier admits one round per kernel: the row keeps its
+    CTA reduce under ``cute_cluster_n`` (``_maybe_apply_cute_rolled_cluster``)
+    instead of a split that left the exchange in that loop, refused ("requires
+    the cluster reduce to run exactly once per kernel").  With the half rows
+    on the row's axis no sibling thread axis declined the split any more,
+    and a plain RMSNorm had no such axis to begin with."""
+    code = _generate(
+        kernel,
+        (torch.empty((256, 256), dtype=torch.bfloat16),),
+        num_threads=num_threads,
+        **_ROWS_PER_THREAD_CLUSTER,
+    )
+    function = _kernel_function(code)
+    assert "block=(64, 1, 1)" in code
+    assert "_cute_grouped_reduce_cluster" not in code
+    (rows,) = _loops(function, "lane_0")
+    reduces = [
+        stmt
+        for stmt in rows.body
+        if isinstance(stmt, ast.Assign)
+        and "_cute_grouped_reduce_shared_two_stage(" in ast.unparse(stmt.value)
+    ]
+    assert len(reduces) == 1, code
+    if kernel is _rms_norm_rotate_half:
+        assert (
+            "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0]) + "
+            "cutlass.Int32(synthetic_lane_2) * 64"
+        ) in code, code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    ("kernel", "num_threads", "reference"), _ROWS_PER_THREAD_KERNELS
+)
+def test_rows_walked_by_one_thread_under_a_cluster_match_the_reference(
+    kernel: object, num_threads: list[int], reference: Callable[..., torch.Tensor]
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(256, 256, dtype=torch.bfloat16, device=DEVICE)
+    _code, out = code_and_output(
+        kernel,  # pyrefly: ignore [bad-argument-type]
+        (x,),
+        num_threads=num_threads,
+        **_ROWS_PER_THREAD_CLUSTER,
+    )
+    torch.testing.assert_close(out, reference(x), rtol=1e-2, atol=1e-2)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_gate(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A wide row of ``y`` scaled by a gate summed over a narrow row of ``x``."""
+    out = torch.empty_like(y)
+    for tile_m in hl.tile(x.size(0)):
+        gate = torch.sigmoid(x[tile_m, :].to(torch.float32).sum(-1, keepdim=True))
+        out[tile_m, :] = (y[tile_m, :].to(torch.float32) * gate).to(out.dtype)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("width", "axis", "block"), [(4, 1, (4, 8, 32)), (8, 0, (8, 32, 1))]
+)
+def test_wide_row_takes_a_narrow_reductions_threads_only_when_not_fewer(
+    width: int, axis: int, block: tuple[int, int, int]
+) -> None:
+    """Beside 32 rows of a sum over ``width`` elements, the 4096-wide row of
+    ``y`` would take 8 threads of its own.  It indexes the sum's thread axis
+    when that has as many (``_reduction_axis_partner``), not the sum's 4:
+    a quarter of the CTA's threads ran 1.6x slower, saving only repeats by
+    4 adjacent threads that share each load."""
+    args = (
+        torch.empty((256, width), dtype=torch.bfloat16),
+        torch.empty((256, 4096), dtype=torch.bfloat16),
+    )
+    code = _generate(_row_gate, args, block_sizes=[32])
+    assert f"block={block}" in code
+    assert (
+        f"indices_2 = cutlass.Int32(cute.arch.thread_idx()[{axis}]) + "
+        "cutlass.Int32(synthetic_lane_2) * 8\n"
+    ) in code, code
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_outer(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Two unreduced slices beside a row reduction, meeting in one value."""
+    m, _ = x.shape
+    out = torch.empty([m, 64, 32], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        a = x[tile_m, :64].to(torch.float32) * rstd
+        b = y[tile_m, :32].to(torch.float32)
+        out[tile_m, :, :] = a[:, :, None] * b[:, None, :]
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_then_clear(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Two unreduced slices beside a row reduction, meeting only in a store's
+    subscript: the stored value is a scalar."""
+    m, _ = x.shape
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd[tile_m] = torch.rsqrt(torch.mean(row * row, dim=-1) + 1e-6)
+        out[tile_m, :16, :8] = 0
+    return rstd
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_then_clear_buffers(
+    x: torch.Tensor, template: torch.Tensor, pointers: torch.Tensor
+) -> torch.Tensor:
+    """Two unreduced slices beside a row reduction, meeting only in a stack
+    tensor store: it spans the pointers' dims, then the subscript's."""
+    m, _ = x.shape
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd[tile_m] = torch.rsqrt(torch.mean(row * row, dim=-1) + 1e-6)
+        buffers = hl.stacktensor_like(template, pointers[:])
+        buffers[:] = 0
+    return rstd
+
+
+def _outer_args(device: str = "cpu") -> tuple[torch.Tensor, ...]:
+    return (
+        torch.randn((48, 256), dtype=torch.bfloat16, device=device),
+        torch.randn((48, 128), dtype=torch.bfloat16, device=device),
+    )
+
+
+def _clear_args(device: str = "cpu") -> tuple[torch.Tensor, ...]:
+    return (
+        torch.randn((48, 256), dtype=torch.bfloat16, device=device),
+        torch.ones((48, 64, 64), device=device),
+    )
+
+
+def _clear_buffers_args(
+    buffers: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``_rms_norm_then_clear_buffers``'s arguments clearing each row of
+    ``buffers``."""
+    pointers = [row.data_ptr() for row in buffers]
+    return (
+        torch.randn((48, 256), dtype=torch.bfloat16, device=buffers.device),
+        torch.empty(buffers.size(1), device=buffers.device),
+        torch.tensor(pointers, dtype=torch.uint64, device=buffers.device),
+    )
+
+
+_MEETING_SLICES = [
+    pytest.param(_rms_norm_outer, _outer_args, id="value"),
+    pytest.param(_rms_norm_then_clear, _clear_args, id="store_subscript"),
+]
+
+
+@pytest.mark.parametrize(
+    ("kernel", "make_args"),
+    [
+        *_MEETING_SLICES,
+        pytest.param(
+            _rms_norm_then_clear_buffers,
+            lambda: _clear_buffers_args(torch.ones(8, 16)),
+            id="stack_store",
+        ),
+    ],
+)
+def test_slices_meeting_in_a_value_do_not_share_the_reduction_axis(
+    kernel: object, make_args: Callable[..., tuple[torch.Tensor, ...]]
+) -> None:
+    """``a[:, :, None] * b[:, None, :]``, a scalar stored into
+    ``out[tile, :16, :8]``, or one stored into a stack tensor's buffers (the
+    store spans the 8 pointers and the 16 elements of each) needs every
+    coordinate pair of the two slices: the first takes the row reduction's
+    thread axis, the second keeps an axis of its own instead of indexing
+    the same threads (the stores only cleared their diagonal)."""
+    code = _generate(kernel, make_args(), block_sizes=[1], reduction_loops=[None])
+    assert "indices_2 = cutlass.Int32(cute.arch.thread_idx()[0])\n" in code, code
+    assert (
+        "indices_3 = cutlass.Int32(cute.arch.thread_idx()[1]) + "
+        "cutlass.Int32(synthetic_lane_3) * 4\n"
+    ) in code
+    assert "block=(256, 4, 1)" in code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize(("kernel", "make_args"), _MEETING_SLICES)
+def test_slices_meeting_in_a_value_match_the_reference(
+    kernel: object, make_args: Callable[..., tuple[torch.Tensor, ...]]
+) -> None:
+    torch.manual_seed(0)
+    args = make_args(DEVICE)
+    expected_out = args[1].clone()
+    _code, out = code_and_output(
+        kernel,  # pyrefly: ignore [bad-argument-type]
+        args,
+        block_sizes=[1],
+        reduction_loops=[None],
+    )
+    rows = args[0].float()
+    rstd = torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-6)
+    if kernel is _rms_norm_outer:
+        expected = (rows[:, :64] * rstd)[:, :, None] * args[1][:, :32].float()[:, None]
+        torch.testing.assert_close(out, expected, rtol=1e-2, atol=1e-2)
+    else:
+        torch.testing.assert_close(out, rstd[:, 0], rtol=1e-2, atol=1e-2)
+        expected_out[:, :16, :8] = 0
+        torch.testing.assert_close(args[1], expected_out)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_stack_store_beside_a_row_reduction_clears_every_buffer() -> None:
+    torch.manual_seed(0)
+    buffers = torch.ones(8, 16, device=DEVICE)
+    args = _clear_buffers_args(buffers)
+    _code, rstd = code_and_output(
+        _rms_norm_then_clear_buffers, args, block_sizes=[1], reduction_loops=[None]
+    )
+    rows = args[0].float()
+    expected = torch.rsqrt(rows.pow(2).mean(-1) + 1e-6)
+    torch.testing.assert_close(rstd, expected, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(buffers, torch.zeros_like(buffers))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_scatter_add(
+    x: torch.Tensor, indices: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Each element of the normalized row added at 16 gathered columns: the
+    atomic's subscript spans the indices and its update the row, which meet
+    in no other value."""
+    m, _ = x.shape
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        hl.atomic_add(out, [tile_m, indices[:]], (row * rstd)[:, :, None])
+    return out
+
+
+def _scatter_add_args(device: str = "cpu") -> tuple[torch.Tensor, ...]:
+    return (
+        torch.randn((48, 256), dtype=torch.bfloat16, device=device),
+        torch.arange(16, device=device) // 2,
+        torch.zeros((48, 16), device=device),
+    )
+
+
+def test_an_atomic_update_spanning_the_row_keeps_the_indices_off_its_axis() -> None:
+    """Every pair of a row element and a gathered index adds, so the 16
+    indices keep an axis of their own: on the row's threads, masked to the
+    first 16, the atomic added only the diagonal pairs."""
+    code = _generate(
+        _rms_norm_scatter_add,
+        _scatter_add_args(),
+        block_sizes=[1],
+        reduction_loops=[None],
+    )
+    assert "indices_1 = cutlass.Int32(cute.arch.thread_idx()[0])\n" in code, code
+    assert (
+        "indices_2 = cutlass.Int32(cute.arch.thread_idx()[1]) + "
+        "cutlass.Int32(synthetic_lane_2) * 4\n"
+    ) in code
+    assert "block=(256, 4, 1)" in code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_an_atomic_update_spanning_the_row_matches_the_reference() -> None:
+    torch.manual_seed(0)
+    x, indices, out = _scatter_add_args(DEVICE)
+    _code, result = code_and_output(
+        _rms_norm_scatter_add,
+        (x, indices, out),
+        block_sizes=[1],
+        reduction_loops=[None],
+    )
+    rows = x.float()
+    totals = (rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-6)).sum(-1)
+    counts = torch.bincount(indices, minlength=16).float()
+    torch.testing.assert_close(result, totals[:, None] * counts, rtol=1e-2, atol=1e-2)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_atomic_halves(
+    x: torch.Tensor, row_out: torch.Tensor, half_out: torch.Tensor
+) -> torch.Tensor:
+    """Atomics over the normalized row and over its first half."""
+    m, d = x.shape
+    half = d // 2
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        hl.atomic_add(row_out, [tile_m, slice(None)], row * rstd)
+        lo = x[tile_m, :half].to(torch.float32) * rstd
+        hl.atomic_add(half_out, [tile_m, slice(None, half)], lo)
+    return half_out
+
+
+_ATOMIC_HALVES_CONFIGS = [
+    # A persistent row on 256 threads, combined in shared memory: the upper
+    # 128 threads skip the half rows.
+    pytest.param(
+        [None], (256, 1, 1), "_cute_grouped_reduce_shared_two_stage(", 0, id="shared"
+    ),
+    # A row rolled over 32 threads, combined by the DSL's warp reduction: the
+    # half rows walk 4 lanes of those threads.  The warp reduction stayed
+    # pinned in that lane loop, and the nest was refused ("a lane-invariant
+    # atomic on row_out issued at the first synthetic_lane_2 would run beside
+    # a repeated load of it").
+    pytest.param([32], (32, 1, 1), "cute.arch.warp_reduction_sum(", 4, id="warp"),
+]
+
+
+@pytest.mark.parametrize(
+    ("reduction_loops", "block", "combine", "half_lanes"), _ATOMIC_HALVES_CONFIGS
+)
+def test_atomics_on_a_shared_reduction_axis_run_on_every_thread(
+    reduction_loops: list[int | None],
+    block: tuple[int, int, int],
+    combine: str,
+    half_lanes: int,
+) -> None:
+    """The half rows index the row reduction's thread axis, so an atomic over
+    either block varies along that axis: neither is issued by the axis's
+    leader thread alone, as an atomic over the half rows was (one column per
+    row updated), and the one over the row is no longer refused.  The row's
+    combine (a shared-memory reduce, or the warp reduction of a row rolled
+    over 32 threads) runs once, outside the half rows' lanes."""
+    args = (
+        torch.empty((48, 256), dtype=torch.bfloat16),
+        torch.empty((48, 256)),
+        torch.empty((48, 256)),
+    )
+    code = _generate(
+        _rms_norm_atomic_halves,
+        args,
+        block_sizes=[1],
+        reduction_loops=reduction_loops,
+    )
+    function = _kernel_function(code)
+    assert f"block={block}" in code
+    assert code.count("cute.arch.atomic_add(") == 2
+    assert "thread_idx()[0] == 0" not in code, code
+    (reduce,) = [
+        stmt
+        for stmt in function.body
+        if isinstance(stmt, ast.Assign) and combine in ast.unparse(stmt.value)
+    ]
+    lanes = _loops(function, "synthetic_lane_2")
+    if half_lanes:
+        (lane,) = lanes
+        assert ast.unparse(lane.iter) == f"range({half_lanes})"
+        assert function.body.index(reduce) < function.body.index(lane)
+    else:
+        assert not lanes, code
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    ("reduction_loops", "block", "combine", "half_lanes"), _ATOMIC_HALVES_CONFIGS
+)
+def test_atomics_on_a_shared_reduction_axis_match_the_reference(
+    reduction_loops: list[int | None],
+    block: tuple[int, int, int],
+    combine: str,
+    half_lanes: int,
+) -> None:
+    torch.manual_seed(0)
+    x = torch.randn(48, 256, dtype=torch.bfloat16, device=DEVICE)
+    row_out = torch.zeros(48, 256, device=DEVICE)
+    half_out = torch.zeros(48, 256, device=DEVICE)
+    code, _ = code_and_output(
+        _rms_norm_atomic_halves,
+        (x, row_out, half_out),
+        block_sizes=[1],
+        reduction_loops=reduction_loops,
+    )
+    assert f"block={block}" in code and combine in code
+    rows = x.float()
+    normed = rows * torch.rsqrt(rows.pow(2).mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(row_out, normed, rtol=1e-2, atol=1e-2)
+    expected_half = torch.zeros_like(half_out)
+    expected_half[:, :128] = normed[:, :128]
+    torch.testing.assert_close(half_out, expected_half, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("source", "binds"),
+    [
+        ("total = _cute_grouped_reduce_shared_two_stage(v, 'sum', 0.0, lane)", True),
+        ("total = cute.arch.warp_reduction_sum(v)", True),
+        ("total = _cute_grouped_reduce_cluster(v, 'sum', 0.0, lane, buf, bar)", True),
+        ("total = v + w", False),
+        ("total = _cute_grouped_reduce_warp(opaque(v), 'sum', 0.0, lane)", False),
+    ],
+)
+def test_a_collective_reduce_statement_binds_a_reduce_whose_operands_are_seen(
+    source: str, binds: bool
+) -> None:
+    """The lane-loop placement places such a statement by its operands: a
+    CTA reduce helper, the DSL's warp reduction or a cluster exchange over
+    register values, not a plain computation or a reduce of an opaque
+    call."""
+    assert _assigns_a_collective_reduce(ast.parse(source).body[0]) is binds
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_matmul(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m, b.size(1)], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :]
+        rstd = torch.rsqrt(torch.mean(row * row, dim=-1, keepdim=True) + 1e-6)
+        out[tile_m, :] = (a[tile_m, :] @ b[:, :]) * rstd
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sum_and_max(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, _ = x.shape
+    sums = torch.empty([m], dtype=torch.float32, device=x.device)
+    maxes = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        sums[tile_m] = x[tile_m, :].sum(-1)
+        maxes[tile_m] = hl.reduce(torch.maximum, y[tile_m, :], dim=1)
+    return sums, maxes
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_dims_combined_beyond_torch_reductions_match_the_reference() -> None:
+    """A matmul contraction and an ``hl.reduce`` combine their dims across
+    threads outside the reductions the partner planning knows: beside a row
+    reduction neither dim takes its thread axis (the contraction lost its
+    sum over K, the masked threads' zeros won an all-negative max)."""
+    torch.manual_seed(0)
+    x = torch.randn(48, 256, device=DEVICE)
+    a = torch.randn(48, 64, device=DEVICE)
+    b = torch.randn(64, 32, device=DEVICE)
+    _code, out = code_and_output(
+        _rms_norm_matmul, (x, a, b), block_sizes=[1], reduction_loops=[None]
+    )
+    rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(out, (a @ b) * rstd, rtol=1e-2, atol=1e-2)
+    y = -torch.rand(48, 128, device=DEVICE) - 0.5
+    _code, (sums, maxes) = code_and_output(_row_sum_and_max, (x, y), block_sizes=[4])
+    torch.testing.assert_close(sums, x.sum(-1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(maxes, y.amax(-1))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _rms_norm_and_cumsum(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, _ = x.shape
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+    sums = torch.empty(y.shape, dtype=torch.float32, device=y.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)
+        rstd[tile_m] = torch.rsqrt(torch.mean(row * row, dim=-1) + 1e-6)
+        sums[tile_m, :] = torch.cumsum(y[tile_m, :].to(torch.float32), dim=-1)
+    return rstd, sums
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _two_row_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].sum(-1) + y[tile_m, :].sum(-1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _either_rms_norm_rotate_half(
+    x: torch.Tensor, y: torch.Tensor, flags: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """rotate_half's half rows of ``x`` beside the statistics of ``y``'s row
+    or ``x``'s, chosen under a dynamic branch."""
+    m, d = x.shape
+    half = d // 2
+    rstd = torch.empty([m], dtype=torch.float32, device=x.device)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        if flags[tile_m.begin] > 0:
+            narrow = y[tile_m, :].to(torch.float32)
+            rstd[tile_m] = torch.rsqrt(torch.mean(narrow * narrow, dim=-1) + 1e-6)
+        else:
+            row = x[tile_m, :].to(torch.float32)
+            rstd[tile_m] = torch.rsqrt(torch.mean(row * row, dim=-1) + 1e-6)
+        out[tile_m, :half] = -x[tile_m, half:]
+        out[tile_m, half:] = x[tile_m, :half]
+    return rstd, out
+
+
+def _bf16(*shape: int) -> torch.Tensor:
+    return torch.empty(shape, dtype=torch.bfloat16)
+
+
+_PERSISTENT_ROWS = {"block_sizes": [1], "reduction_loops": [None]}
+_UNPARTNERED_DIMS = [
+    # On the row's axis the contraction lost its sum over K (the GPU test
+    # above); a kernel with a matmul keeps its layout, output columns included.
+    pytest.param(
+        _rms_norm_matmul,
+        lambda: (torch.empty(48, 256), torch.empty(48, 64), torch.empty(64, 32)),
+        _PERSISTENT_ROWS,
+        (2, 3),
+        id="matmul",
+    ),
+    # On it the masked threads' zeros won an all-negative max (the GPU test
+    # above).
+    pytest.param(
+        _row_sum_and_max,
+        lambda: (torch.empty(48, 256), torch.empty(48, 128)),
+        {"block_sizes": [4]},
+        (2,),
+        id="hl_reduce",
+    ),
+    # On it the cumsum's serial lanes became a scan across the row's 256
+    # threads, the upper 128 masked.
+    pytest.param(
+        _rms_norm_and_cumsum,
+        lambda: (_bf16(48, 256), _bf16(48, 128)),
+        {"block_sizes": [1]},
+        (2,),
+        id="scan",
+    ),
+    # ``y``'s row is reduced itself: on the axis of ``x``'s row its combine
+    # would run over 256 threads, 192 of them masked.
+    pytest.param(
+        _two_row_sums,
+        lambda: (torch.empty(48, 256), torch.empty(48, 64)),
+        {"block_sizes": [4]},
+        (2,),
+        id="reduced",
+    ),
+    # ``y``'s 64-wide row and ``x``'s 256-wide row reduce in exclusive
+    # branches, which share thread axis 0, launched with 256 threads: on
+    # y's 64 threads the half rows were refused ("the surplus lanes would
+    # corrupt the cross-lane reduction").
+    pytest.param(
+        _either_rms_norm_rotate_half,
+        lambda: (_bf16(48, 256), _bf16(48, 64), torch.empty(48)),
+        _PERSISTENT_ROWS,
+        (3,),
+        id="branch",
+    ),
+]
+
+
+@pytest.mark.parametrize(("kernel", "make_args", "config", "blocks"), _UNPARTNERED_DIMS)
+def test_dims_the_partner_planning_does_not_model_keep_off_the_reduction_axis(
+    kernel: object,
+    make_args: Callable[[], tuple[torch.Tensor, ...]],
+    config: dict[str, object],
+    blocks: tuple[int, ...],
+) -> None:
+    """Only the combines of torch reductions that run beside every other
+    reduction are modeled (``_reduction_axis_partner``): beside a row
+    reduction, a dim that a matmul, an ``hl.reduce`` or a scan combines, a
+    dim reduced itself, and the half rows beside rows reduced under a
+    dynamic branch keep their own threads or lanes."""
+    code = _generate(kernel, make_args(), **config)
+    for block in blocks:
+        index = f"indices_{block} = "
+        assert index in code, code
+        assert f"{index}cutlass.Int32(cute.arch.thread_idx()[0])" not in code, code
 
 
 def _dq_store_terms(code: str) -> list[list[str]]:
@@ -6243,16 +7232,18 @@ def _row_sum_then_zero_flagged_rows_clearing_fn(
     ],
     ids=["mask_read_after", "flag_written_after"],
 )
-def test_masked_full_slice_store_whose_mask_the_body_reads_or_rewrites_after_it_stays_rejected(
+def test_masked_full_slice_store_whose_mask_the_body_reads_or_rewrites_after_it_loads_the_mask_once(
     fn: object,
 ) -> None:
-    """The mask (a load the reduce helper orders inside the lanes) is needed
-    before the store inside and read again outside after it, or its tensor
-    is rewritten by a later store: neither form can be made the tile program
-    by repeating the mask inside the lanes (the first would leave the outside
-    reader with no definition, the second repeats a load of a written
-    tensor), so both stay rejected with the full nest's verdict.  Before the
-    refusal the first rendered and compiled to a ``NameError``."""
+    """The mask is needed before the store inside the chunk lane loop and
+    read again after it, or its tensor is rewritten by a later store.  While
+    the shared-memory reduce helper was pinned inside the lanes, so was the
+    mask's load, and neither form was the tile program there (the first left
+    the outside reader with no definition and, before it was refused,
+    compiled to a ``NameError``; the second repeated a load of a written
+    tensor).  The helper is placed by its operands now: the mask is loaded
+    once, before the lanes, and both forms render with every name in
+    scope."""
     b, h, m = _ROW_SUM_SHAPE
     o = torch.empty((b, h, m, 128), dtype=torch.bfloat16)
     flag = torch.empty((b, h, m), dtype=torch.int32)
@@ -6269,8 +7260,133 @@ def test_masked_full_slice_store_whose_mask_the_body_reads_or_rewrites_after_it_
     with mock_cuda_unavailable():
         bound = cpu_bind(kernel, args)
         config = _row_sum_store_config(bound, rolled=64)
-        with pytest.raises(exc.BackendUnsupported, match="not the tile program"):
+        code = bound.to_code(helion.Config(**config))
+    function = _kernel_function(code)
+    assert not _escaping_names(function), code
+    (replica,) = _loops(function, "synthetic_lane_")
+    assert _accesses(replica, "dq") and not _accesses(replica, "flag"), code
+    assert code.count("(flag.iterator + ") == (
+        1 if fn is _row_sum_then_zero_flagged_rows_reporting_fn else 2
+    )
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    "fn",
+    [
+        _row_sum_then_zero_flagged_rows_reporting_fn,
+        _row_sum_then_zero_flagged_rows_clearing_fn,
+    ],
+    ids=["mask_read_after", "flag_written_after"],
+)
+def test_masked_full_slice_store_whose_mask_the_body_reads_or_rewrites_after_it_matches_torch(
+    fn: object,
+) -> None:
+    torch.manual_seed(0)
+    b, h, m = _ROW_SUM_SHAPE
+    o = torch.randn((b, h, m, 128), dtype=torch.bfloat16, device=DEVICE)
+    do = torch.randn_like(o)
+    flag = (torch.rand((b, h, m), device=DEVICE) < 0.4).to(torch.int32)
+    dq = torch.full((b, h, m, 128), 7.0, dtype=torch.float32, device=DEVICE)
+    args: tuple[torch.Tensor, ...] = (o, do, flag.clone(), dq)
+    reporting = fn is _row_sum_then_zero_flagged_rows_reporting_fn
+    if reporting:
+        args = (*args, torch.full((b, h, m), -1, dtype=torch.int32, device=DEVICE))
+    kernel = helion.kernel(
+        fn,  # pyrefly: ignore [bad-argument-type]
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    bound = kernel.bind(args)
+    config = _row_sum_store_config(bound, rolled=64)
+    delta = bound.compile_config(helion.Config(**config))(*args)
+    expected = (o.float() * do.float()).sum(-1)
+    torch.testing.assert_close(delta, expected, rtol=1e-3, atol=1e-2)
+    absent = (flag != 0)[..., None].expand_as(dq)
+    assert torch.all(dq[absent] == 0) and torch.all(dq[~absent] == 7.0)
+    if reporting:
+        assert torch.equal(args[4], (flag != 0).to(torch.int32))
+    else:
+        assert torch.all(args[2] == 0)
+
+
+def _row_sum_through_opaque_asm_then_zero_flagged_rows_reporting_fn(
+    o: torch.Tensor,
+    do: torch.Tensor,
+    flag: torch.Tensor,
+    dq: torch.Tensor,
+    flag_out: torch.Tensor,
+) -> torch.Tensor:
+    """``_row_sum_then_zero_flagged_rows_reporting_fn`` with the row sum
+    passed through an asm the lane placement cannot see through."""
+    B, H, M, _ = o.size()
+    D = dq.size(-1)
+    delta = torch.empty((B, H, M), dtype=torch.float32, device=o.device)
+    for tile_b, tile_h, tile_m in hl.tile([B, H, M]):
+        o_rows = o[tile_b, tile_h, tile_m, :].to(torch.float32)
+        do_rows = do[tile_b, tile_h, tile_m, :].to(torch.float32)
+        delta[tile_b, tile_h, tile_m] = hl.inline_asm_elementwise(
+            "mov.f32 $0, $1;",
+            "=f,f",
+            [torch.sum(o_rows * do_rows, dim=-1)],
+            dtype=torch.float32,
+            is_pure=False,
+            pack=1,
+        )
+        absent = flag[tile_b, tile_h, tile_m] != 0
+        hl.store(
+            dq,
+            [tile_b, tile_h, tile_m, slice(None)],
+            hl.zeros([tile_b, tile_h, tile_m, D], dtype=dq.dtype),
+            extra_mask=absent[:, :, :, None],
+        )
+        flag_out[tile_b, tile_h, tile_m] = absent.to(torch.int32)
+    return delta
+
+
+def test_masked_full_slice_store_after_an_opaque_call_whose_mask_the_body_reads_after_it_stays_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The asm (``is_pure=False``) is pinned inside the store's chunk lane
+    loop, and the mask's flag load, ordered after it, with it, while the
+    mask is read again after the loop: the placement cannot move the mask's
+    definition into the loop and is abandoned.  The full nest would repeat
+    the rolled accumulation once per lane, so the body is rejected with its
+    verdict instead of emitting either nest (the abandoned placement leaves
+    the reader after the loop with no definition, which compiled to a
+    ``NameError`` before the refusal)."""
+    b, h, m = _ROW_SUM_SHAPE
+    o = torch.empty((b, h, m, 128), dtype=torch.bfloat16)
+    flag = torch.empty((b, h, m), dtype=torch.int32)
+    args = (
+        o,
+        o.clone(),
+        flag,
+        torch.empty((b, h, m, 128), dtype=torch.float32),
+        torch.empty_like(flag),
+    )
+    kernel = helion.kernel(
+        _row_sum_through_opaque_asm_then_zero_flagged_rows_reporting_fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="none",
+    )
+    caplog.set_level(logging.DEBUG, logger=LOGGER_NAME)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, args)
+        config = _row_sum_store_config(bound, rolled=64)
+        with pytest.raises(
+            exc.BackendUnsupported,
+            match="(?s)not the tile program.*would repeat once per synthetic_lane_",
+        ):
             bound.to_code(helion.Config(**config))
+    assert any(
+        "lane placement abandoned" in record.getMessage()
+        and "outside the loop the definition would move into" in record.getMessage()
+        for record in caplog.records
+    ), caplog.text
 
 
 # --------------------------------------------------------------------------
@@ -6406,6 +7522,7 @@ def _run(kernel: object, args: tuple[object, ...], **config: object) -> torch.Te
     return bound.compile_config(helion.Config.from_dict(config))(*args)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("shape", "config"),
@@ -6469,6 +7586,7 @@ def test_concat_simple_matches_torch_cat(
     torch.testing.assert_close(out, torch.cat([x, y], dim=1), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shapes", "config"),
@@ -6492,6 +7610,7 @@ def test_gathered_row_read_twice_matches_reference(
     torch.testing.assert_close(echo, idx, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shape", "config"),
@@ -6513,6 +7632,7 @@ def test_row_flag_reused_after_the_masked_load_matches_reference(
     torch.testing.assert_close(cnt, flags + 1, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shape", "axis", "config"),
@@ -6549,6 +7669,7 @@ _BYTE_DEVICE_CASES = [
 ]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("columns", "packet_flush"), _BYTE_DEVICE_CASES)
 def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
@@ -6576,6 +7697,7 @@ def test_store_between_a_byte_conversion_and_its_flush_matches_reference(
     torch.testing.assert_close(out, packed.to(torch.bfloat16), rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("packet_flush", [False, True], ids=["values", "packet"])
 def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
@@ -6601,6 +7723,7 @@ def test_store_after_a_per_lane_store_of_its_tensor_matches_reference(
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_read_before_a_flushed_store_matches_reference() -> None:
     # ``first`` reads the zero-initialized output before the copy overwrites
@@ -6616,6 +7739,7 @@ def _small_integers(shape: tuple[int, ...]) -> torch.Tensor:
     return torch.randint(0, 5, shape, device=CUDA_DEVICE).float()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6638,6 +7762,7 @@ def test_masked_tile_uniform_accesses_around_per_lane_stores_reject_the_config(
         _run(_zero_first_row_then_copy, (x, out), **config)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6653,6 +7778,7 @@ def test_masked_tile_uniform_store_after_per_lane_stores_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
     x = _small_integers((8, 512))
@@ -6672,6 +7798,7 @@ def test_tile_uniform_store_in_an_inner_tile_loop_matches_reference() -> None:
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_placed_nest_repeating_a_tile_uniform_access_rejects_the_config_on_device(
@@ -6698,6 +7825,7 @@ def test_placed_nest_repeating_a_tile_uniform_access_rejects_the_config_on_devic
         _run(_first_row_increment_beside_copy, args, **_NESTED_CONFIG)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_scaled_first_row_beside_a_copy_matches_reference(
@@ -6713,6 +7841,7 @@ def test_scaled_first_row_beside_a_copy_matches_reference(
     torch.testing.assert_close(y, x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6752,6 +7881,7 @@ def _first_of_each_tile(extent: int, block: int) -> torch.Tensor:
     return (torch.arange(extent, device=CUDA_DEVICE) // block) * block
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6777,6 +7907,7 @@ def test_uniform_read_before_per_lane_stores_on_a_shared_axis_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6793,6 +7924,7 @@ def test_uniform_read_on_a_thread_axis_without_a_lane_loop_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("config", "block", "shapes"),
@@ -6815,6 +7947,7 @@ def test_uniform_read_hoisted_out_of_the_innermost_shared_loop_matches_reference
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6834,6 +7967,7 @@ def test_uniform_load_then_uniform_store_of_one_element_matches_reference(
     torch.testing.assert_close(result, x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config", [_NESTED_CONFIG, _NESTED_SCALAR_CONFIG], ids=["vector", "scalar"]
@@ -6848,6 +7982,7 @@ def test_uniform_store_before_per_lane_stores_matches_reference(
     torch.testing.assert_close(result, x + 1.0, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_idempotent_uniform_stores_match_reference(shape: tuple[int, int]) -> None:
@@ -6865,6 +8000,7 @@ def test_idempotent_uniform_stores_match_reference(shape: tuple[int, int]) -> No
     torch.testing.assert_close(result, expected + x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_device_loop_body_with_a_thread_axis_matches_reference(
@@ -6878,6 +8014,7 @@ def test_device_loop_body_with_a_thread_axis_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_loop_invariant_read_in_a_device_loop_matches_reference(
@@ -6895,6 +8032,7 @@ def test_loop_invariant_read_in_a_device_loop_matches_reference(
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_gathered_read_before_a_per_lane_store_matches_reference(
@@ -6930,6 +8068,7 @@ def _compiled(kernel: object, args: tuple[object, ...], **config: object) -> obj
 _RUNS = 5
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 257), (6, 251), (16, 1025)])
 def test_carry_from_the_previous_tile_matches_reference(
@@ -6950,6 +8089,7 @@ def test_carry_from_the_previous_tile_matches_reference(
         torch.testing.assert_close(run(x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 257), (6, 251), (16, 1025)])
 def test_carry_to_the_next_tile_matches_reference(shape: tuple[int, int]) -> None:
@@ -6970,6 +8110,7 @@ def test_carry_to_the_next_tile_matches_reference(shape: tuple[int, int]) -> Non
         torch.testing.assert_close(run(x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -6995,6 +8136,7 @@ def test_repeated_inner_loop_matches_reference(
         torch.testing.assert_close(run(x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 320), (6, 314), (16, 1088)])
 def test_two_loops_over_one_block_size_match_reference(shape: tuple[int, int]) -> None:
@@ -7033,6 +8175,7 @@ def test_two_loops_over_one_block_size_match_reference(shape: tuple[int, int]) -
         torch.testing.assert_close(x, updated, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 320), (6, 314)])
 def test_six_loops_over_one_block_size_match_reference(shape: tuple[int, int]) -> None:
@@ -7077,6 +8220,7 @@ def _backwards_reference(
     return out
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kernel", _BACKWARDS_KERNELS)
 @pytest.mark.parametrize("shape", [(8, 4096), (16, 4096)])
@@ -7099,6 +8243,7 @@ def test_accesses_moving_backwards_match_reference(
         torch.testing.assert_close(run(x, out), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_uniform_read_modify_write_in_a_device_loop_matches_reference(
@@ -7128,6 +8273,7 @@ def test_uniform_read_modify_write_in_a_device_loop_matches_reference(
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_uniform_read_modify_write_in_a_repeated_device_loop_rejects_the_config_on_device() -> (
     None
@@ -7145,6 +8291,7 @@ def test_uniform_read_modify_write_in_a_repeated_device_loop_rejects_the_config_
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "config"),
@@ -7197,6 +8344,7 @@ _MAPPED_KERNELS_1D = [
 ]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kernel", _MAPPED_KERNELS_1D)
 def test_mapped_read_beside_the_store_matches_reference(kernel: object) -> None:
@@ -7220,6 +8368,7 @@ def test_mapped_read_beside_the_store_matches_reference(kernel: object) -> None:
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kernel", _MAPPED_KERNELS_1D)
 def test_mapped_read_in_a_lane_loop_rejects_the_config_on_device(
@@ -7239,6 +8388,7 @@ def test_mapped_read_in_a_lane_loop_rejects_the_config_on_device(
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 64), (6, 60), (8, 128)])
 def test_next_column_read_beside_the_store_matches_reference(
@@ -7268,6 +8418,7 @@ def test_next_column_read_beside_the_store_matches_reference(
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 2304), (32, 2304)])
 def test_short_sibling_loop_over_one_block_size_matches_reference(
@@ -7302,6 +8453,7 @@ def test_short_sibling_loop_over_one_block_size_matches_reference(
         assert not z[:, :128].any()
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(256,), (1024,)])
 def test_packet_store_beside_the_previous_elements_read_matches_reference(
@@ -7333,6 +8485,7 @@ def test_packet_store_beside_the_previous_elements_read_matches_reference(
         torch.testing.assert_close(x, v, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     ("kernel", "shape"),
@@ -7384,6 +8537,7 @@ def _repeated_device_loop_reference(
     return out, x
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("kernel", "args"), _REPEATED_DEVICE_LOOP_KERNELS)
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
@@ -7405,6 +8559,7 @@ def test_per_lane_accesses_mapped_differently_in_a_device_loop_match_reference(
         torch.testing.assert_close(inputs[0], expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("kernel", "args"), _REPEATED_DEVICE_LOOP_KERNELS)
 def test_per_lane_accesses_mapped_differently_in_a_repeated_device_loop_reject_the_config_on_device(
@@ -7422,6 +8577,7 @@ def test_per_lane_accesses_mapped_differently_in_a_repeated_device_loop_reject_t
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_previous_row_read_at_the_next_tiles_column_rejects_the_config_on_device() -> (
     None
@@ -7438,6 +8594,7 @@ def test_previous_row_read_at_the_next_tiles_column_rejects_the_config_on_device
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 320), (6, 314)], ids=["full", "partial"])
 def test_previous_row_read_at_the_next_tiles_column_matches_reference(
@@ -7470,6 +8627,7 @@ def test_previous_row_read_at_the_next_tiles_column_matches_reference(
         torch.testing.assert_close(x, expected_x, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_read_modify_write_in_a_vectorized_device_loop_matches_reference(
@@ -7490,6 +8648,7 @@ def test_read_modify_write_in_a_vectorized_device_loop_matches_reference(
         torch.testing.assert_close(x, v, rtol=0, atol=0)
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 2048), (32, 2048)])
 def test_update_under_a_loop_indexed_by_its_begin_matches_reference(
@@ -7523,6 +8682,7 @@ def _shifted_rows_reference(
     return expected
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_folding_store_in_a_repeated_device_loop_rejects_the_config_on_device() -> None:
     # Rows over two threads and a lane loop of two: lane 1's pass stores
@@ -7536,6 +8696,7 @@ def test_folding_store_in_a_repeated_device_loop_rejects_the_config_on_device() 
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_folding_store_per_thread_matches_reference(shape: tuple[int, int]) -> None:
@@ -7555,6 +8716,7 @@ def test_folding_store_per_thread_matches_reference(shape: tuple[int, int]) -> N
         torch.testing.assert_close(run(v, x), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
     "config",
@@ -7596,6 +8758,7 @@ def _overlapping_rows_reference(
     return expected
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_overlapping_flattened_store_rejects_the_config_on_device() -> None:
     # Rows over two threads and a lane loop of two: lane 1's pass stores
@@ -7609,6 +8772,7 @@ def test_overlapping_flattened_store_rejects_the_config_on_device() -> None:
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_overlapping_flattened_store_per_thread_matches_reference(
@@ -7629,6 +8793,7 @@ def test_overlapping_flattened_store_per_thread_matches_reference(
         torch.testing.assert_close(run(v, out), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_dynamic_overlapping_flattened_store_rejects_the_config_on_device() -> None:
     # The stride is a size argument: paired through it as a uniform value,
@@ -7642,6 +8807,7 @@ def test_dynamic_overlapping_flattened_store_rejects_the_config_on_device() -> N
         )
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("shape", [(8, 256), (6, 250)], ids=["full", "partial"])
 def test_dynamic_overlapping_flattened_store_per_thread_matches_reference(
@@ -7660,6 +8826,7 @@ def test_dynamic_overlapping_flattened_store_per_thread_matches_reference(
         torch.testing.assert_close(run(v, out), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_segment_rows_through_a_uniform_start_match_reference() -> None:
     # Three segments of eight rows, each updated in place by its block with
@@ -7678,7 +8845,12 @@ def test_segment_rows_through_a_uniform_start_match_reference() -> None:
         torch.testing.assert_close(run(offsets, v, x.clone()), expected, rtol=0, atol=0)  # pyrefly: ignore [not-callable]
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+# The full product: the store forms lower through different value paths (a
+# constant fill, a scalar argument, a loaded row vector, a select under a
+# per-row mask), and the placements below broke different forms (at d != dv
+# only the masked one).
 @pytest.mark.parametrize("variant", ["zeros", "ones", "scalar", "rowvec", "masked"])
 @pytest.mark.parametrize(
     ("shape", "d", "dv", "rolled"),
@@ -7750,6 +8922,7 @@ def test_full_slice_store_beside_a_row_reduction_matches_torch_and_triton(
     assert torch.equal(outputs["cute"], outputs["triton"])
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("variant", ["zeros", "masked"])
 @pytest.mark.parametrize("pid_type", ["persistent_blocked", "persistent_interleaved"])
@@ -7789,6 +8962,7 @@ def test_full_slice_store_beside_a_row_reduction_under_a_persistent_grid(
     assert torch.equal(outputs["cute"], outputs["triton"])
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(("d", "chunk"), [(128, 64), (64, 16)])
 def test_full_slice_stores_in_two_root_loops_match_torch_and_triton(

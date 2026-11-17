@@ -3,9 +3,11 @@
 A backend contributes config keys, flat fields, normalization phases and
 compiler seeds to the backend-neutral ``ConfigSpec`` through one stateless
 object returned by ``Backend.config_spec_extension()``.  Every method of
-:class:`BackendSearchSurface` is the no-op default (Triton, Pallas and Metal
-add nothing beyond their ``tunable_fragments``); the CuTe implementation lives
-in ``helion/_compiler/cute/autotune/search_surface.py``.
+:class:`BackendSearchSurface` is the no-op default (Triton and Pallas add
+nothing beyond their ``tunable_fragments``); the CuTe implementation lives in
+``helion/_compiler/cute/autotune/search_surface.py``, and Metal's, whose
+keys and fields apply to some kernels only, in
+``helion/_compiler/metal/search_surface.py``.
 
 The surface also hands every ``ConfigGeneration`` one
 :class:`ConfigGenerationExtension` (``config_generation_extension``, stored
@@ -50,6 +52,7 @@ if TYPE_CHECKING:
     from .config_fragment import ConfigSpecFragment
     from .config_generation import ConfigGeneration
     from .config_generation import FlatConfig
+    from .config_spec import BlockSizeSpec
     from .config_spec import ConfigSpec
     from .config_spec import ReductionLoopSpec
 
@@ -66,6 +69,9 @@ class BackendSearchSurface:
     config_keys: frozenset[str] = frozenset()
     debug_keys: frozenset[str] = frozenset()
     implicit_default_keys: frozenset[str] = frozenset()
+    # Scalar compiler and schedule choices worth crossing with discovered layouts
+    # before full-effort final selection. Empty for backends without this phase.
+    compiler_refinement_keys: tuple[str, ...] = ()
 
     def supports_key(self, key: str) -> bool:
         """Whether this surface accepts a backend-specific config key."""
@@ -170,6 +176,12 @@ class BackendSearchSurface:
         """The ordered compiler seeds of the spec's enabled families."""
         return []
 
+    def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
+        """Flat fields appended to the generic table (when ``fields`` returns
+        None), before the user's tunables: the backend's knobs that apply to
+        this kernel (``ConfigSpec.backend_facts``).  Default: none."""
+        return {}
+
     def prepare_config_generation_overrides(
         self, config_spec: ConfigSpec, overrides: Mapping[str, object] | None
     ) -> tuple[dict[str, object] | None, str | None]:
@@ -196,6 +208,16 @@ class BackendSearchSurface:
 
     def trim_default_config(self, config_spec: ConfigSpec, config: Config) -> None:
         """Drop the inert knobs of a normalized promoted default."""
+        return
+
+    def overlay_promoted_default(
+        self,
+        config_spec: ConfigSpec,
+        base: dict[str, object],
+        promoted: Mapping[str, object],
+    ) -> None:
+        """Drop the keys of the base default (``base``) that a promoted
+        default's own knobs (``promoted``, layered over it next) re-derive."""
         return
 
     def prepare_flat_config(
@@ -248,6 +270,15 @@ class BackendSearchSurface:
         keeps the value as given."""
         return value
 
+    def block_size_default(
+        self, config_spec: ConfigSpec, block: BlockSizeSpec, default: int
+    ) -> int:
+        """The default (non-autotuned) size of ``block``.  ``default`` is what
+        ``generic_block_size_default`` gives for the spec's block count and
+        the product of its padded reduction-loop extents; the base surface
+        keeps it."""
+        return default
+
     def family_fragments(
         self, config_spec: ConfigSpec, family: str
     ) -> Mapping[str, ConfigSpecFragment]:
@@ -269,8 +300,11 @@ class ConfigGenerationExtension:
     ``ConfigGeneration`` calls the hooks at fixed positions of its own
     pipeline: ``narrow_search_choices`` before the flat field table is
     collected, ``repair_flat_config`` on every flat config it produces
-    (defaults, random draws, mutations, ``flatten``), and
-    ``initial_population_flats`` first thing in ``random_population_flat``.
+    (defaults, random draws, mutations, ``flatten``),
+    ``conditional_neighbor_updates`` when constructing search neighbors,
+    ``shrink_for_threads`` when ``shrink_config`` bounds a random or mutated
+    config without ``num_warps``, and ``initial_population_flats`` first
+    thing in ``random_population_flat``.
     The structural-coverage hooks size and seed the population-based searches
     (``PatternSearch``, ``PopulationBasedSearch``); the defaults describe a
     surface without a structural design.  The CuTe implementation (SIMT
@@ -287,6 +321,26 @@ class ConfigGenerationExtension:
 
     def repair_flat_config(self, flat_config: FlatConfig) -> None:
         """Repair backend-coupled coordinates of a flat config in place."""
+        return
+
+    def conditional_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> Mapping[int, object]:
+        """Deterministic prerequisite flat values for a requested search transition.
+
+        This hook only affects neighbors, not explicit config normalization or
+        identity. ConfigGeneration applies the updates atomically when all
+        prerequisites are searchable and no frozen coordinate would change.
+        """
+        return {}
+
+    def shrink_for_threads(
+        self, flat_config: FlatConfig, max_elements_per_thread: int
+    ) -> None:
+        """Shrink a random or mutated config without ``num_warps`` in place
+        so that each thread walks at most ``max_elements_per_thread``
+        elements: its block sizes, and any thread count it sets that the
+        launch could not take; the default leaves the config as drawn."""
         return
 
     def initial_population_flats(

@@ -3,12 +3,20 @@ from __future__ import annotations
 import ast
 import math
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
+import helion
+from helion._compiler.cute import collective_matmul
+from helion._compiler.cute.passes import pipeline
 from helion._compiler.cute.proven_loop_bounds import exact_static_grid
 from helion._compiler.cute.proven_loop_bounds import simplify_proven_loop_bounds
+import helion._compiler.cute.simplify_proven_bounds as proven_bounds
 from helion._compiler.cute.simplify_proven_bounds import simplify_proven_bounds
+from helion._testing.cute_codegen import cpu_bind
+import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
 
@@ -114,7 +122,7 @@ def test_bound_simplification_preserves_boolean_operand_values(
         body = simplify_proven_bounds(
             body,
             enabled=True,
-            xyz_grid=True,
+            exact_grid=True,
             thread_block_dims=(1, 1, 1),
             block_grid_dims=(1, 1, 1),
             constexpr_values={},
@@ -280,3 +288,48 @@ def test_exact_grid_can_prove_last_flat_axis_but_unknown_grid_cannot() -> None:
         block_grid_dims=(1024, 1, 1),
     )
     assert "else zero" not in ast.unparse(ast.Module(body=body, type_ignores=[]))
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _doubled(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        out[tile_m, tile_n] = x[tile_m, tile_n] * 2
+    return out
+
+
+@pytest.mark.parametrize("planned", [False, True])
+def test_a_host_wrapper_launch_proves_no_xyz_grid(planned: bool) -> None:
+    """The proven-bounds pass gets an xyz launch's grid from its program
+    ids, (256 / 16, 512 / 64, 1), unless a host wrapper plan launches a grid
+    of its own.  Such a plan can arrive as late as the prologue's collective
+    lowering (the gathered-MMA route), where this one is registered."""
+    lower = collective_matmul.lower_collective_matmul
+    simplify = proven_bounds.simplify_proven_bounds
+    grids = []
+
+    def lower_with_plan(body, fn, **kwargs):
+        if planned:
+            plans = pipeline.cute_codegen_state(fn.codegen).wrapper_plans
+            plans.append({"kind": "own_grid"})
+        return lower(body, fn, **kwargs)
+
+    def recording(body, **kwargs):
+        grids.append(kwargs["block_grid_dims"])
+        return simplify(body, **kwargs)
+
+    bound = cpu_bind(_doubled, (torch.empty(256, 512),))
+    config = bound.config_spec.normalized_config(
+        helion.Config(
+            block_sizes=[16, 64],
+            num_threads=[1, 64],
+            pid_type="xyz",
+            cute_proven_bounds=True,
+        )
+    )
+    with (
+        patch.object(collective_matmul, "lower_collective_matmul", lower_with_plan),
+        patch.object(proven_bounds, "simplify_proven_bounds", recording),
+    ):
+        bound.to_code(config)
+    assert grids == [(None, None, None) if planned else (16, 8, 1)]

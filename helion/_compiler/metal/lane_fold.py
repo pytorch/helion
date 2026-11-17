@@ -1,4 +1,5 @@
-"""Unroll and jam lane loops whose lanes can't run one after another.
+"""Unroll and jam lane loops whose lanes can't run one after another, or
+whose lanes share a load.
 
 A block wider than its threads is walked in a lane loop ``for L in range(E)``
 around the statements over it.  That is valid while no statement needs
@@ -27,6 +28,10 @@ This is the tile's own order.  A Helion statement acts on the whole tile, as
 a Triton op acts on a whole block before the next op runs; the lane loop only
 serialized the block, which is valid until a statement needs every lane.
 
+:func:`jam_lanes_into_loops` jams lane loops for speed rather than validity:
+one around a ``for`` loop that loads a value no lane depends on, so the load
+runs once per iteration instead of once per lane.
+
 Runs on the device body right before MSL emission, with no compile
 environment, so the fold carries its MSL accumulator type.
 """
@@ -35,8 +40,12 @@ from __future__ import annotations
 
 import ast
 import copy
+import math
+import re
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 from typing import TypeVar
+from typing import cast
 
 from .msl_expr import cast_source
 from .reduction import combine_expr
@@ -62,6 +71,23 @@ MAX_LANE_COPIES = 64
 #: reloading, 128 bytes mixed and 256 bytes up to 2.3x slower; 32-bit arrays
 #: were neutral to 5% slower at any size, so only narrower loads are kept.
 MAX_LANE_ARRAY_BYTES = 64
+
+
+#: The bytes of each MSL scalar type.
+MSL_SCALAR_BYTES = {
+    "bool": 1,
+    "char": 1,
+    "uchar": 1,
+    "short": 2,
+    "ushort": 2,
+    "half": 2,
+    "bfloat": 2,
+    "int": 4,
+    "uint": 4,
+    "float": 4,
+    "long": 8,
+    "ulong": 8,
+}
 
 
 class LaneArrayBudget:
@@ -95,6 +121,198 @@ def unroll_lane_folds(
     leaked = lane_names & set().union(*map(reads, result))
     assert not leaked, f"lane-dependent names used outside their lane loop: {leaked}"
     return result
+
+
+#: Most copies of one statement the jams of :func:`jam_lanes_into_loops`
+#: make, counting the earlier jams'.  A jam for speed copies every
+#: lane-dependent statement to save the lane-independent ones; measured on
+#: an M4 Pro, few-row GEMVs at 4-8 copies were 1.3-3x faster jammed, and
+#: kernels with heavy per-lane work up to 1.4x slower at 64.
+MAX_JAMMED_COPIES = 32
+
+#: The suffix a jam gives a name it copies for lane ``l``: ``n__lane<l>``.
+LANE_SUFFIX = "__lane"
+_LANE_COPY = re.compile(rf"{LANE_SUFFIX}(\d+)")
+
+
+def is_lane_loop(stmt: ast.stmt) -> TypeGuard[ast.For]:
+    """A lane loop: ``lane_*`` walks a tile wider than its threads,
+    ``slice_lane_*`` a persistent reduction's lanes over a ':' dim."""
+    return (
+        isinstance(stmt, ast.For)
+        and isinstance(stmt.target, ast.Name)
+        and stmt.target.id.startswith(("lane_", "slice_lane_"))
+        and isinstance(stmt.iter, ast.Call)
+        and isinstance(stmt.iter.func, ast.Name)
+        and stmt.iter.func.id == "range"
+    )
+
+
+def jam_lanes_into_loops(
+    body: list[ast.stmt], read_after: frozenset[str] = frozenset()
+) -> list[ast.stmt]:
+    """Unroll and jam each lane loop around a ``for`` loop whose body loads
+    a value that doesn't depend on the lane.
+
+    ``for L in range(E): ... for k ...: w = W[L, k]; x = X[k]; acc += w * x``
+    loads ``X[k]`` (and computes whatever is derived from it) once per lane;
+    jammed, the lanes move inside the ``for`` loop and that work runs once
+    per iteration, with ``acc`` one scalar per lane.  A GEMV that folds rows
+    into a thread, or one whose x side is computed on its loads (a gate, a
+    dequantization), reads and computes x once instead of once per row.
+
+    A jam reorders every loop in the lane loop's body, so each of them must
+    have such a load: a norm's reduction loop, which loads only its row,
+    runs slower with its lanes interleaved, whatever a later loop shares.
+
+    A loop is jammed only where :class:`LaneJam` can (no control flow on a
+    lane-dependent value), where no value carries from one lane to the next
+    (lane-dependent or not: a jam runs a lane-independent statement once) or
+    out of the loop (*read_after*: the names read after *body* runs), within
+    :data:`MAX_JAMMED_COPIES` copies of a statement, and where the lane
+    arrays it copies fit :data:`MAX_LANE_ARRAY_BYTES`."""
+    # The names a statement of *body* leaves live: read after it before being
+    # assigned again.  Worked out only beside a lane loop: a body can run to
+    # thousands of statements.
+    tail = ast.Expr(
+        ast.Tuple([ast.Name(n, ast.Load()) for n in sorted(read_after)], ast.Load())
+    )
+    out: list[ast.stmt] = []
+    for i, stmt in enumerate(body):
+        if not any(isinstance(n, ast.For) and is_lane_loop(n) for n in ast.walk(stmt)):
+            out.append(stmt)
+            continue
+        after = frozenset(_exposed_reads([*body[i + 1 :], tail], set()))
+        if is_lane_loop(stmt) and (jam := _speed_jam(stmt, after)) is not None:
+            out.extend(jam_lanes_into_loops(jam.jam(), after))
+        elif isinstance(stmt, (ast.For, ast.If)):
+            # A loop's next iteration reads what its body reads before
+            # assigning it.
+            inner = (
+                after | _exposed_reads([stmt], set())
+                if isinstance(stmt, ast.For)
+                else after
+            )
+            jammed = copy.copy(stmt)
+            jammed.body = jam_lanes_into_loops(stmt.body, inner)
+            jammed.orelse = jam_lanes_into_loops(stmt.orelse, after)
+            out.append(jammed)
+        else:
+            out.append(stmt)
+    return out
+
+
+def _speed_jam(loop: ast.For, read_after: frozenset[str]) -> LaneJam | None:
+    """The jam of *loop* if :func:`jam_lanes_into_loops` takes it."""
+    extent = lane_extent(loop)
+    if extent is None or extent < 2:
+        return None
+    if extent * _copies_made(loop.body) > MAX_JAMMED_COPIES:
+        return None
+    jam = LaneJam(loop)
+    if (
+        jam.carried(_writes(loop) | jam.dependent)
+        or jam.dependent & read_after
+        or _branches_on(loop.body, jam.dependent)
+        or not _every_loop_shares_a_load(loop.body, jam.dependent)
+        or extent * _lane_array_bytes(loop.body, jam.dependent) > MAX_LANE_ARRAY_BYTES
+    ):
+        return None
+    return jam
+
+
+def _lane_array_bytes(stmts: list[ast.stmt], dependent: set[str]) -> int:
+    """The bytes of the lane arrays in *stmts* a jam copies per lane: those
+    the lanes write.  Copies past :data:`MAX_LANE_ARRAY_BYTES` per thread
+    cost more than the jam saves."""
+    total = 0
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if (
+                isinstance(node, ast.Assign)
+                and isinstance(call := node.value, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_metal_lane_array"
+                and any(_writes(t) & dependent for t in node.targets)
+            ):
+                dtype, length = (cast("ast.Constant", a).value for a in call.args)
+                assert isinstance(dtype, str) and isinstance(length, int)
+                total += MSL_SCALAR_BYTES[dtype] * length
+    return total
+
+
+def _copies_made(stmts: list[ast.stmt]) -> int:
+    """An estimate of the most copies of one statement the earlier jams of
+    *stmts* made: one they renamed ``n__lane<l>`` has ``l + 1`` or more per
+    jam (a copy that only took its lane as a constant has no such name)."""
+    best = 1
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Name):
+                copies = math.prod(int(i) + 1 for i in _LANE_COPY.findall(node.id))
+                best = max(best, copies)
+    return best
+
+
+def _branches_on(stmts: list[ast.stmt], dependent: set[str]) -> bool:
+    for stmt in stmts:
+        if isinstance(stmt, (ast.For, ast.If)):
+            header = stmt.iter if isinstance(stmt, ast.For) else stmt.test
+            if _reads(header) & dependent or _branches_on(
+                stmt.body + stmt.orelse, dependent
+            ):
+                return True
+    return False
+
+
+def _every_loop_shares_a_load(stmts: list[ast.stmt], dependent: set[str]) -> bool:
+    """Whether *stmts* hold a ``for`` loop, and each outermost one loads
+    something without touching a lane-dependent name.  An inner lane loop is
+    no such loop: what it would share is an element already broadcast to its
+    lanes."""
+    loops: list[ast.For] = []
+
+    def outermost(stmts: list[ast.stmt]) -> None:
+        for stmt in stmts:
+            if isinstance(stmt, ast.For) and not is_lane_loop(stmt):
+                loops.append(stmt)
+            elif isinstance(stmt, (ast.For, ast.If)):
+                outermost(stmt.body + stmt.orelse)
+
+    def shares(stmt: ast.stmt) -> bool:
+        if isinstance(stmt, (ast.For, ast.If)):
+            return any(map(shares, stmt.body + stmt.orelse))
+        return not (_reads(stmt) | _writes(stmt)) & dependent and any(
+            tl_load(n) for n in ast.walk(stmt)
+        )
+
+    outermost(stmts)
+    return bool(loops) and all(any(map(shares, loop.body)) for loop in loops)
+
+
+def tl_load(node: ast.AST) -> ast.Call | None:
+    """*node* if it is a ``tl.load`` call: a read of device memory."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and node.func.attr == "load"
+    ):
+        return node
+    return None
+
+
+def load_mask_other(load: ast.Call) -> tuple[ast.expr, ast.expr | None] | None:
+    """The mask and fill value (None if it has none) of
+    ``tl.load(ptr, mask, other)``, or None for an unmasked load."""
+    if len(load.args) < 2:
+        return None
+    mask = load.args[1]
+    if isinstance(mask, ast.Constant) and mask.value is None:
+        return None
+    other = load.args[2] if len(load.args) > 2 else None
+    return mask, next((k.value for k in load.keywords if k.arg == "other"), other)
 
 
 def balanced_combine(reduction_type: str, parts: list[str]) -> str:
@@ -159,6 +377,28 @@ def _writes(tree: ast.AST) -> set[str]:
     }
 
 
+#: The element store into a lane array (``lane_reduction``'s kept loads,
+#: ``mpp_matmul``'s staged loads): ``_metal_lane_put(array, index, value)``.
+LANE_PUT = "_metal_lane_put"
+
+
+def _array_writes(tree: ast.AST, lane: str) -> set[str]:
+    """The lane arrays *tree* stores into at an index that doesn't read
+    *lane*.  Such an array is one per lane once a stored value depends on
+    the lane: every lane's copy of the store writes the same element.  An
+    array indexed by *lane* itself has one element per lane and stays
+    shared."""
+    return {
+        node.args[0].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == LANE_PUT
+        and isinstance(node.args[0], ast.Name)
+        and lane not in _reads(node.args[1])
+    }
+
+
 #: The integer-rounded float -> bfloat conversion every lane copy uses
 #: (``metal_jit`` emits its definition when it is referenced).
 BF16_CAST = "helion_bf16_cast"
@@ -196,7 +436,7 @@ class _RenameLane(ast.NodeTransformer):
             return ast.copy_location(ast.Constant(value=self.index), node)
         if node.id in self.dependent:
             return ast.copy_location(
-                ast.Name(id=f"{node.id}__lane{self.index}", ctx=node.ctx), node
+                ast.Name(id=f"{node.id}{LANE_SUFFIX}{self.index}", ctx=node.ctx), node
             )
         return node
 
@@ -205,22 +445,64 @@ def _lane_copy(node: _Node, dependent: set[str], lane: str, index: int) -> _Node
     return _RenameLane(dependent, lane, index).visit(copy.deepcopy(node))
 
 
-def const_extent(loop: ast.For) -> int:
-    """The constant trip count of the lane loop *loop*."""
+def lane_extent(loop: ast.For) -> int | None:
+    """The constant trip count of the lane loop *loop*, if it has one."""
     loop_iter = loop.iter
-    assert (
+    if (
         isinstance(loop_iter, ast.Call)
         and isinstance(loop_iter.func, ast.Name)
         and loop_iter.func.id == "range"
         and len(loop_iter.args) == 1
         and isinstance(loop_iter.args[0], ast.Constant)
         and isinstance(loop_iter.args[0].value, int)
-    ), f"lane loop without a constant extent: {ast.unparse(loop_iter)}"
-    return loop_iter.args[0].value
+    ):
+        return loop_iter.args[0].value
+    return None
+
+
+def const_extent(loop: ast.For) -> int:
+    """The constant trip count of the lane loop *loop*."""
+    extent = lane_extent(loop)
+    assert extent is not None, (
+        f"lane loop without a constant extent: {ast.unparse(loop.iter)}"
+    )
+    return extent
 
 
 def _never(stmt: ast.stmt) -> set[str] | None:
     return None
+
+
+def _exposed_reads(
+    stmts: list[ast.stmt],
+    assigned: set[str],
+    unit_reads: Callable[[ast.stmt], set[str] | None] = _never,
+) -> set[str]:
+    """The names *stmts* read where they haven't definitely assigned them
+    (nor are they in *assigned*); *unit_reads* gives what a statement run
+    whole reads, None for one to walk.  An ``if`` assigns what both
+    branches assign, a ``for`` body nothing past the loop: MSL scopes a
+    declaration to its block, so a value assigned only there is gone after
+    it."""
+    found: set[str] = set()
+
+    def walk(stmts: list[ast.stmt], assigned: set[str]) -> set[str]:
+        assigned = set(assigned)
+        for stmt in stmts:
+            reads = unit_reads(stmt)
+            if isinstance(stmt, ast.For) and reads is None:
+                found.update(_reads(stmt.iter) - assigned)
+                walk(stmt.body, assigned | _writes(stmt.target))
+            elif isinstance(stmt, ast.If) and reads is None:
+                found.update(_reads(stmt.test) - assigned)
+                assigned |= walk(stmt.body, assigned) & walk(stmt.orelse, assigned)
+            else:
+                found.update((_reads(stmt) if reads is None else reads) - assigned)
+                assigned |= _writes(stmt)
+        return assigned
+
+    walk(stmts, assigned)
+    return found
 
 
 class LaneJam:
@@ -262,8 +544,8 @@ class LaneJam:
 
     def _lane_dependent(self) -> set[str]:
         """The lane and, to a fixpoint, every name written by a statement
-        that reads a lane-dependent name.  A unit's targets are
-        lane-independent."""
+        that reads a lane-dependent name, a lane array stored into included
+        (see ``_array_writes``).  A unit's targets are lane-independent."""
         dependent = {self.lane}
         simple = [
             stmt
@@ -274,41 +556,18 @@ class LaneJam:
         while changed:
             changed = False
             for stmt in simple:
-                written = _writes(stmt)
+                written = _writes(stmt) | _array_writes(stmt, self.lane)
                 if written - dependent and _reads(stmt) & dependent:
                     dependent |= written
                     changed = True
         return dependent
 
-    def carried(self) -> set[str]:
-        """The lane-dependent names read where the body hasn't definitely
-        assigned them: each would carry from one lane to the next, which a
-        copy per lane can't hold.  An ``if`` assigns what both branches
-        assign, a ``for`` body nothing past the loop: MSL scopes a
-        declaration to its block, so a copy assigned only there is gone
-        after it."""
-        found: set[str] = set()
-
-        def walk(stmts: list[ast.stmt], assigned: set[str]) -> set[str]:
-            assigned = set(assigned)
-            for stmt in stmts:
-                reads = self._unit_reads(stmt)
-                if isinstance(stmt, ast.For) and reads is None:
-                    found.update((_reads(stmt.iter) & self.dependent) - assigned)
-                    walk(stmt.body, assigned | _writes(stmt.target))
-                elif isinstance(stmt, ast.If) and reads is None:
-                    found.update((_reads(stmt.test) & self.dependent) - assigned)
-                    assigned |= walk(stmt.body, assigned) & walk(stmt.orelse, assigned)
-                else:
-                    found.update(
-                        ((_reads(stmt) if reads is None else reads) & self.dependent)
-                        - assigned
-                    )
-                    assigned |= _writes(stmt)
-            return assigned
-
-        walk(self.loop.body, {self.lane})
-        return found
+    def carried(self, names: set[str] | None = None) -> set[str]:
+        """The lane-dependent names (or *names*) read where the body hasn't
+        definitely assigned them: each would carry from one lane to the
+        next, which a copy per lane can't hold."""
+        tracked = self.dependent if names is None else names
+        return _exposed_reads(self.loop.body, {self.lane}, self._unit_reads) & tracked
 
     def lane_reading_units(self) -> list[ast.stmt]:
         """The caller's run-once statements that read a lane-dependent name."""

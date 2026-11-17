@@ -10,6 +10,8 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 from helion import exc
 from helion._compiler.cute import emitters
 from helion._compiler.cute.device_state import CuteDeviceFunctionState
@@ -22,7 +24,10 @@ from helion._compiler.triton.backend import TritonBackend
 from helion._testing import onlyBackends
 from helion.runtime.config import Config
 
+pytestmark = pytest.mark.cpu_only
+
 ROOT_ORDER = (
+    "required_computed_fragment",
     "register_subblocks",
     "radix_selection",
     "requested_computed_fragment",
@@ -41,6 +46,7 @@ ROOT_ORDER = (
     "computed_fragment",
 )
 GENERATOR_ORDER = (
+    "dependent_phases",
     "grouped_prefix_adaptive_n",
     "packed_operand",
     "row_resident",
@@ -168,7 +174,8 @@ class TestRootEmitterRegistry(unittest.TestCase):
         gated = by_name["requested_computed_fragment"]
         self.assertIsInstance(gated, emitters.GatedRootEmitter)
         self.assertIs(gated.inner, emitters.COMPUTED_FRAGMENT_ROOT)
-        # A patch of the owner's ``try_emit`` intercepts both of its entries.
+        # A patch of the optional owner's ``try_emit`` intercepts its entries;
+        # the independent required owner is covered by the full-vote module.
         codegen = cast("GenerateAST", object.__new__(GenerateAST))
         with patch.object(
             emitters.ComputedFragmentRootEmitter, "try_emit", return_value=True

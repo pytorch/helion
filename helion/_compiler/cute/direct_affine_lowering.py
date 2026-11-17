@@ -648,7 +648,7 @@ def _resolve_memory_proof(
 ) -> tuple[DirectAffineStateAccessProof, DirectAffineReplayProof] | None:
     env = CompileEnvironment.current()
     region = candidate.region
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return None
     try:
         proven_sizes = codegen.device_function.proven_tensor_size_values()

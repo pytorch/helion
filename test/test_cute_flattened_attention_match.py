@@ -36,12 +36,16 @@ from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import EXAMPLES_DIR
 from helion._testing import import_path
 from helion._testing.cute_aux import as_sm100
+from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 from helion.language.inline_asm_ops import inline_asm_elementwise
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
     from helion.runtime.kernel import Kernel
+
+
+pytestmark = pytest.mark.cpu_only
 
 
 _MUL_F32X2 = """
@@ -607,15 +611,20 @@ def test_runtime_scale_flattened_form_matches(head_dim: int) -> None:
     assert not cute_flash._standard_dense_score_plan_supported(plan)
 
 
+@pytest.mark.cpu_render(
+    mma_support=tcgen05_mma_support(),
+    fake_device_sm_count=148,
+    reduction_smem_budget_bytes=232448,
+)
 @pytest.mark.parametrize(
-    ("kernel", "raw", "qk_scale_log2", "lse_scale", "lse_log_base"),
+    ("kernel", "host_multiplier", "qk_scale_log2", "lse_scale", "lse_log_base"),
     [
         pytest.param(
-            flattened_attention_raw_scale, True, 1.0, 1.0, "log2", id="raw_scale"
+            flattened_attention_raw_scale, 1.0, 1.0, 1.0, "log2", id="raw_scale"
         ),
         pytest.param(
             flattened_attention_exp_base,
-            True,
+            1.0,
             math.log2(math.e),
             math.log(2.0),
             "log",
@@ -623,7 +632,7 @@ def test_runtime_scale_flattened_form_matches(head_dim: int) -> None:
         ),
         pytest.param(
             flattened_attention_scaled_scores,
-            False,
+            1.44269504,
             1.0,
             1.0,
             "log2",
@@ -633,20 +642,36 @@ def test_runtime_scale_flattened_form_matches(head_dim: int) -> None:
 )
 def test_other_runtime_scale_forms_match(
     kernel: Kernel,
-    raw: bool,
+    host_multiplier: float,
     qk_scale_log2: float,
     lse_scale: float,
     lse_log_base: str,
 ) -> None:
-    bound = _bind(kernel, (*_qkv(), 0.125))
+    inputs = _qkv()
+    kernel.reset()
+    with as_sm100():
+        bound = kernel.bind((*inputs, 0.125))
+        config = bound.config_spec.default_config()
+        source = bound.to_code(config)
+        observed = []
+
+        def observe(_kernel, _grid, *args, **kwargs):
+            observed.append([arg for arg in args if type(arg) is float])
+
+        host = load_host_function(bound, config, observe)
+        for value in (0.125, 0.3, 0.125):
+            assert kernel.bind((*inputs, value)) is bound
+            host(*inputs, value)
+            assert observed[-1] == [value * host_multiplier]
+        assert len(observed) == 3
+        assert bound.to_code(config) == source
     pattern = _pattern(bound)
     assert pattern is not None
     assert pattern.flattened == FlattenedRowOffset(0, 256, 256)
     plan = pattern.score_plan
-    # The raw argument is the scale symbol itself; the host multiply is a
-    # product over it.
+    # An ordered host multiply can have its own scalar symbol. The executed
+    # host calls above check its value without assuming a SymPy product.
     assert isinstance(plan.runtime_scale, sympy.Expr)
-    assert isinstance(plan.runtime_scale, sympy.Symbol) == raw
     assert math.isclose(plan.qk_scale_log2, qk_scale_log2, rel_tol=1e-6)
     assert math.isclose(plan.lse_scale, lse_scale, rel_tol=1e-6)
     assert not plan.modifiers

@@ -40,6 +40,9 @@ from .backend import MetalBackend
 from .backend import budget_note
 from .lane_fold import LANE_FOLD
 from .lane_fold import MAX_LANE_COPIES
+from .lane_reduction import GridLaneSplit
+from .lane_reduction import LaneSplit
+from .lane_reduction import grid_lane_split_for
 from .lane_reduction import lane_split_for
 from .msl_reduction import SUPPORTED_REDUCTIONS
 from .padded_twin import cone_violation
@@ -376,13 +379,19 @@ class MetalBlockReductionStrategy(BlockReductionStrategy):
         fake_input: torch.Tensor,
         fake_output: torch.Tensor,
     ) -> ast.AST:
-        split = lane_split_for(state, self.fn, self.block_index, reduction_type)
+        split: LaneSplit | GridLaneSplit | None = lane_split_for(
+            state, self.fn, self.block_index, reduction_type
+        )
+        if split is None:
+            split = grid_lane_split_for(
+                state, self.fn, self.block_index, reduction_type
+            )
         if split is None:
             return super().codegen_reduction(
                 state, input_name, reduction_type, dim, fake_input, fake_output
             )
         threads = self._reduction_thread_count()
-        assert (threads > 1) == (self.block_index in split.loop.block_thread_axes)
+        assert (threads > 1) == (self.block_index in split.owner.block_thread_axes)
         if self._sums_count_in_int32(state, reduction_type, fake_output):
             fake_input = fake_input.new_empty(fake_input.shape, dtype=torch.int32)
             fake_output = fake_output.new_empty(fake_output.shape, dtype=torch.int32)

@@ -323,6 +323,16 @@ def _assert_exact(actual: object, expected: torch.Tensor) -> None:
         expected = expected.view(torch.uint8)
         if isinstance(actual, torch.Tensor):
             actual = actual.view(torch.uint8)
+    if (
+        expected.is_complex()
+        and isinstance(actual, torch.Tensor)
+        and actual.dtype == expected.dtype
+        and actual.shape == expected.shape
+    ):
+        # ``equal_nan`` matches two complex values whenever either part of
+        # each is a NaN: compare the parts exactly, a NaN matching a NaN.
+        actual = torch.view_as_real(actual.resolve_conj())
+        expected = torch.view_as_real(expected.resolve_conj())
     torch.testing.assert_close(actual, expected, atol=0, rtol=0, equal_nan=True)
 
 
@@ -387,13 +397,6 @@ def _check_result(
     for index, (actual, expected) in enumerate(
         zip(actual_flat, expected_flat, strict=True)
     ):
-        if (
-            isinstance(actual, float)
-            and isinstance(expected, float)
-            and math.isnan(actual)
-            and math.isnan(expected)
-        ):
-            continue
         if isinstance(expected, torch.Tensor) and expected_spec == pristine_spec:
             try:
                 _assert_exact(pristine_flat[index], expected)
