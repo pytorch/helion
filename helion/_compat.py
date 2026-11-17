@@ -832,6 +832,47 @@ def torch_uses_template_producer_fusion() -> bool:
     )
 
 
+def supports_inductor_flex_attention_choices() -> bool:
+    """Whether Inductor has the flex_attention choice hooks
+    ``helion.flex_attention`` registers with (PyTorch 2.15 and later)."""
+    from torch._inductor import choices
+
+    return hasattr(choices, "register_inductor_choices") and hasattr(
+        choices.InductorChoices, "append_flex_attention_backward_choices"
+    )
+
+
+@functools.cache
+def inductor_boxes_template_multi_outputs() -> bool:
+    """Whether Inductor's ``TemplateBuffer.build_multi_outputs`` boxes each
+    output in a ``StorageBox``, as every other lowering's result is. Before
+    pytorch/pytorch#205348 it returned bare ``TensorBox(MultiOutput)`` nodes:
+    a Helion kernel output that the graph returns and also uses again failed
+    to lower, and one returned directly was copied."""
+    # TODO(yushangdi): once PyTorch 2.16 is no longer supported, simplify
+    # this to a version check, torch_version.release >= (2, 17), and drop
+    # the source read and the nightly-date fallback.
+    torch_version = version.parse(torch.__version__.split("+")[0])
+    if torch_version.release != (2, 16, 0) or not torch_version.is_prerelease:
+        # 2.17 and later have it, 2.15 and earlier do not, and release/2.16
+        # branches after #205348 landed.
+        return torch_version.release >= (2, 16)
+    # A 2.16 nightly, release candidate or source build (2.16.0a0+git...):
+    # read the line #205348 changed (``tb = TensorBox(mo)``), so the answer
+    # does not rest on which nightly first has it. Without the source, a
+    # nightly falls back to its date (#205348 landed after the 2026-11-18
+    # nightly was cut).
+    from torch._inductor.ir import TemplateBuffer
+
+    try:
+        source = inspect.getsource(TemplateBuffer.build_multi_outputs)
+    except OSError:
+        return torch_version.is_devrelease and torch_version >= version.parse(
+            "2.16.0.dev20261119"
+        )
+    return "TensorBox.create(mo)" in source
+
+
 @functools.cache
 def supports_torch_compile_template_lowering() -> bool:
     """Check whether Inductor can lower Helion's kernel HOP as a template.

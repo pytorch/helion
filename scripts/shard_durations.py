@@ -11,7 +11,8 @@ the file from junit reports of the CuTe GPU lane with the pull-request filter
     python scripts/shard_durations.py .logs/tests/<run>/cute-gpu*.xml
 
 Do not import CPU-only or slow-tier reports: modules omitted from the CuTe GPU
-PR lane do not receive a shard assignment.
+PR lane do not receive a shard assignment. Modules CI runs in a job of their
+own (``OWN_JOB_MODULES``) are left out of the reports and the file.
 
 Modules in the reports replace their recorded seconds, other entries stay,
 and entries whose module no longer exists are dropped; run it without reports
@@ -39,6 +40,10 @@ from helion._testing.sharding import load_durations
 from helion._testing.sharding import shard_loads
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Modules CI runs in a job of their own (a .github/matrix.json "test-path"
+# entry), which the CuTe shards leave out (--ignore in test.yml). The local
+# CuTe GPU lane still runs them, so they are dropped from its reports.
+OWN_JOB_MODULES = frozenset({"test/test_cute_flex_attention_backend.py"})
 
 
 def _module_of(classname: str, root: Path) -> str | None:
@@ -95,7 +100,11 @@ def main(argv: list[str] | None = None) -> int:
     durations = dict(recorded)
     reported: set[str] = set()
     for report in args.junitxml:
-        seconds = read_junit(report)
+        seconds = {
+            module: elapsed
+            for module, elapsed in read_junit(report).items()
+            if module not in OWN_JOB_MODULES
+        }
         durations.update(
             {
                 module: max(0.1, round(elapsed, 1)) if elapsed > 0 else 0.0
@@ -106,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     durations = {
         module: seconds
         for module, seconds in durations.items()
-        if (REPO_ROOT / module).is_file()
+        if (REPO_ROOT / module).is_file() and module not in OWN_JOB_MODULES
     }
 
     if args.shards:

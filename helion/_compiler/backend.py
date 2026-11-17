@@ -607,6 +607,13 @@ class Backend(abc.ABC):
         """
         return True
 
+    def codegen_versions(self) -> tuple[tuple[str, str | None], ...]:
+        """Versions of the packages this backend's generated code depends on
+        that Inductor's FX graph cache key leaves out (it keys torch, Triton
+        and the CUDA toolkit), as ``(package, version)`` pairs, for the keys
+        of caches that store the code."""
+        return ()
+
     @property
     def dynamo_inline_capture_loses_view_writes(self) -> bool:
         """Whether Dynamo's inline capture drops a launch's write through a view.

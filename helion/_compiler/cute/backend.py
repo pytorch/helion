@@ -63,6 +63,7 @@ from .analysis.specialized_mma import _specialized_mma_root_mn_block_ids
 from .attention_plan import flash_head_dims_supported
 from .cache_policy_loads import PACKET_LOAD_HELPERS
 from .compile_options import config_compile_options
+from .cutedsl_compat import installed_cute_dsl_version
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
 from .exp2_fastmath import FTZ_SAFE_EXP2_META_KEY
 from .exp2_fastmath import TEMPLATE_EXP2_META_KEY
@@ -1778,6 +1779,10 @@ class CuteBackend(Backend):
     @property
     def dynamo_captures_kernel_launch(self) -> bool:
         return False
+
+    def codegen_versions(self) -> tuple[tuple[str, str | None], ...]:
+        version = installed_cute_dsl_version()
+        return (("nvidia-cutlass-dsl", None if version is None else str(version)),)
 
     @property
     def drops_unread_scratch_arguments(self) -> bool:

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
 
     from helion._compiler.host_function import HostFunction
+    from helion.runtime.kernel import BoundKernel
 
 
 def _detect_mutated_inputs(body: list[ast.stmt], param_names: set[str]) -> list[str]:
@@ -211,6 +212,14 @@ def infer_output_spec(
     Remaps helion-internal SymInts back to the caller's values so that symbolic
     shape relationships are preserved for external tracers (make_fx, Dynamo).
     """
+    return _infer_output_spec(kernel, args)[1]
+
+
+def _infer_output_spec(
+    kernel: Kernel,
+    args: tuple[Any, ...],
+) -> tuple[BoundKernel, dict[str, Any]]:
+    """``infer_output_spec``, with the kernel bound for it."""
     names = list(kernel.signature.parameters.keys())
     param_tensors = {
         n: v for n, v in zip(names, args, strict=True) if isinstance(v, torch.Tensor)
@@ -233,7 +242,7 @@ def infer_output_spec(
     )
 
     if tree_spec is None:
-        return {
+        return bound, {
             "leaf_specs": [],
             "tree_spec_str": None,
             "mutated_inputs": _mutated_params(
@@ -348,7 +357,7 @@ def infer_output_spec(
                     f"that share storage ({', '.join(shared_names)}) in a Helion kernel"
                 )
 
-    return {
+    return bound, {
         "leaf_specs": leaf_specs,
         "tree_spec_str": pytree.treespec_dumps(tree_spec),
         "mutated_inputs": mutated,
