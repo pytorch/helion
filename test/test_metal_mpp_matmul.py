@@ -15478,6 +15478,24 @@ class TestMppThreadgroupBudget(unittest.TestCase):
                 self.assertIn(laned, msl)
                 self.assertNotIn("_free_lane_", msl[: msl.index("is_valid_element")])
 
+    def test_staged_free_blocks_take_threads(self) -> None:
+        """A config that leaves num_warps out launches a thread per element
+        of the free blocks a staged operand reads (grouped_gemm's jagged
+        persistent kernel); one that sets it keeps it."""
+        bf = torch.bfloat16
+        a = torch.randn(70, 64, dtype=bf)
+        b = torch.randn(64, 40, dtype=bf)
+        args = (a.to(DEVICE), b.to(DEVICE), 3, 2)
+        bound = free_rows_wide_staged.bind(args)
+        for given, warps in (({}, 32), ({"num_warps": 8}, 8)):
+            config = helion.Config(block_sizes=[32, 32, 32], **given)
+            bound.config_spec.normalize(config)
+            self.assertEqual(config.config["num_warps"], warps)
+        out, _, _ = _run(
+            free_rows_wide_staged, args, helion.Config(block_sizes=[32, 32, 32])
+        )
+        _close(out, _mm(a, b) * 2)
+
     def test_free_lanes_read_by_scalar_code_reject(self) -> None:
         bf = torch.bfloat16
         a = torch.randn(200, 64, dtype=bf)

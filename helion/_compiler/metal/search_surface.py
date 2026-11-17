@@ -84,6 +84,12 @@ class MetalKernelFacts:
     #: roll (``MetalBackend.create_reduction_strategy``): the search and the
     #: default config give them a chunk (:func:`roll_runtime_reductions`).
     runtime_reductions: frozenset[int] = frozenset()
+    #: The free ``hl.arange`` blocks, when an MPP operand stages one from
+    #: the Scalar layout, which has no lane loop over a free block
+    #: (``free_arange.check_free_lanes``): the launch gives each a thread
+    #: per element (:func:`thread_free_blocks`), as the free blocks share
+    #: the threadgroup (``free_arange.free_block_threads``).
+    threaded_free_blocks: frozenset[int] = frozenset()
 
 
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
@@ -303,6 +309,25 @@ def roll_runtime_reductions(config_spec: ConfigSpec, config: dict[str, object]) 
             values[index] = min(next_power_of_2(hint), MAX_THREADS_PER_THREADGROUP)
 
 
+def thread_free_blocks(config_spec: ConfigSpec, config: dict[str, object]) -> None:
+    """Raise an MPP config's ``num_warps`` to launch a thread per element of
+    its free blocks (at most a threadgroup's) when an MPP operand stages one
+    of them, which lanes can't walk; fewer SIMD groups fail in codegen."""
+    blocks = kernel_facts(config_spec).threaded_free_blocks
+    if not blocks or metal_matmul(config) == "fragment":
+        return
+    sizes = config["block_sizes"]
+    assert isinstance(sizes, list)
+    elements = math.prod(
+        int(config_spec.block_sizes.config_get(sizes, b, 1)) for b in blocks
+    )
+    need = min(MAX_THREADS_PER_THREADGROUP, elements) // SIMD_WIDTH
+    warps = config.get("num_warps", DEFAULT_NUM_WARPS)
+    assert isinstance(warps, int)
+    if warps < need:
+        config["num_warps"] = need
+
+
 class MetalSearchSurface(BackendSearchSurface):
     config_keys = frozenset({METAL_MATMUL, METAL_TABULATE})
 
@@ -433,6 +458,8 @@ class MetalSearchSurface(BackendSearchSurface):
             # A config given by hand that spells a runtime-extent dim
             # persistent fails in create_reduction_strategy, saying why.
             roll_runtime_reductions(config_spec, config)
+        if fix_invalid or "num_warps" not in provided_keys:
+            thread_free_blocks(config_spec, config)
         threads = config.get("num_threads", ())
         assert isinstance(threads, (list, tuple))
         # Counts all on auto leave the threads to the backend, so a config

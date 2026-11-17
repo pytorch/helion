@@ -367,6 +367,20 @@ def _loop_bounds(device_ir: DeviceIR) -> dict[int, tuple[object, object]]:
     return {block: b for block, b in bounds.items() if block not in ambiguous}
 
 
+def _staged_blocks(plan: MppPlan) -> set[int]:
+    """The blocks of the MPP operands the plan stages from the Scalar
+    layout (no device view)."""
+    blocks: set[int] = set()
+    for group in plan.by_matmul.values():
+        for operand, sides in (
+            (group.lhs, (group.m_block, group.k_block)),
+            (group.rhs, (group.k_block, group.n_block)),
+        ):
+            if operand.view is None:
+                blocks.update(sides)
+    return blocks
+
+
 def _staged_matmuls(plan: MppPlan) -> tuple[tuple[int, int, int], ...]:
     """``MetalKernelFacts.staged_matmuls``: the MPP plan's K-loop groups
     with one operand staged per K tile beside a device view."""
@@ -771,6 +785,9 @@ class MetalBackend(Backend):
         launch_facts = dataclasses.replace(
             base_facts,
             staged_matmuls=() if mpp is None else _staged_matmuls(mpp),
+            threaded_free_blocks=frozenset(free)
+            if mpp is not None and _staged_blocks(mpp) & set(free)
+            else frozenset(),
         )
         reductions = any(
             info.reduction for info in CompileEnvironment.current().block_sizes
