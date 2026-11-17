@@ -34,6 +34,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfA10G
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfFn
+from helion._testing import skipIfMetal
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfPallas
 from helion._testing import skipIfPallasInterpret
@@ -115,7 +116,20 @@ def tearDownModule() -> None:
     cudnn_conv.fp32_precision = _orig_cudnn_fp32_precision
 
 
-@onlyBackends(["triton", "cute", "pallas"])
+#: The pid_type the hl.barrier() tests pin: Metal runs a barrier's phases in
+#: one flat launch (metal/ticketed_phases.py).
+_BARRIER_PID_TYPE = "flat" if _get_backend() == "metal" else "persistent_blocked"
+
+
+def _pinned(**config: object) -> dict[str, object]:
+    """A test's pinned config, or none (the kernel's default config) on Metal:
+    these block sizes and launch knobs are tuned for the GPU backends' thread
+    models, and at them a Metal MPP op gets too few threads or more lanes
+    than it can run (the default config fits Metal's)."""
+    return {} if _get_backend() == "metal" else config
+
+
+@onlyBackends(["triton", "cute", "pallas", "metal"])
 class TestExamples(RefEagerTestBase, TestCase):
     def test_add(self):
         args = (
@@ -232,7 +246,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             expected,
             fn_name="split_k_matmul",
             block_sizes=[16, 8, 16, 16, 16],
-            pid_type="persistent_blocked",
+            pid_type=_BARRIER_PID_TYPE,
             split_k=64,
         )
 
@@ -251,7 +265,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         m, k, n = 64, 33, 64
         config = helion.Config(
             block_sizes=[16, 8, 16, 16, 16],
-            pid_type="persistent_blocked",
+            pid_type=_BARRIER_PID_TYPE,
             split_k=32,
         )
 
@@ -352,6 +366,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         torch.testing.assert_close(mat1.grad, mat1_ref.grad, atol=1e-1, rtol=1e-2)
         torch.testing.assert_close(mat2.grad, mat2_ref.grad, atol=1e-1, rtol=1e-2)
 
+    @skipIfMetal(
+        "an MPP op covers N <= 256, and fragments can't serve a Scalar-layout read"
+    )
     def test_matmul_layernorm_static_shapes(self):
         args = (
             torch.randn([1024, 256], device=DEVICE, dtype=torch.float32),
@@ -444,6 +461,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
         _compile_only(mod.matmul_layernorm, args, block_sizes=[16, 16])
 
+    @skipIfMetal(
+        "an MPP op covers N <= 256, and fragments can't serve a Scalar-layout read"
+    )
     def test_matmul_layernorm_dynamic_shapes(self):
         args = (
             torch.randn([128, 256], device=DEVICE, dtype=torch.float32),
@@ -477,7 +497,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "bmm",
             args,
             torch.bmm(args[0], args[1]),
-            block_sizes=[16, 16, 16, 16],
+            **_pinned(block_sizes=[16, 16, 16, 16]),
         )
 
     def test_bmm_non_divisible_k(self):
@@ -489,7 +509,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             "bmm",
             args,
             torch.bmm(args[0], args[1]),
-            block_sizes=[1, 128, 128, 256],
+            **_pinned(block_sizes=[1, 128, 128, 256]),
         )
 
     @onlyBackends(["triton", "pallas", "cute"])
@@ -1149,7 +1169,7 @@ class TestExamples(RefEagerTestBase, TestCase):
                 attn_mask=args[3],
             ),
             fn_name="biased_attention_output",
-            block_sizes=[1, 128, 128],
+            **_pinned(block_sizes=[1, 128, 128]),
             atol=5e-2,
             rtol=2e-2,
         )
@@ -1236,11 +1256,12 @@ class TestExamples(RefEagerTestBase, TestCase):
             "attention",
             args,
             (torch.nn.functional.scaled_dot_product_attention(*args), None),
-            block_sizes=[16, 32, 16],
-            num_stages=1,
-            indexing="block_ptr",
+            **_pinned(block_sizes=[16, 32, 16], num_stages=1, indexing="block_ptr"),
         )
 
+    @skipIfMetal(
+        "a lane loop around an MPP op would run 128 copies of its Scalar work under dynamic shapes"
+    )
     def test_attention_dynamic(self):
         args = (
             torch.randn(1, 32, 512, 64, dtype=torch.float32, device=DEVICE),
@@ -1276,6 +1297,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfPallasInterpret("numerical mismatch in JAX interpret mode")
+    @skipIfMetal("a lane fold over the head dim beside the matmul's ':' K")
     def test_sparse_attn_indexer_decode(self):
         mod = import_path(EXAMPLES_DIR / "sparse_attn_indexer.py")
         torch.manual_seed(0)
@@ -1305,7 +1327,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             mod.ref_xsa(*args),
             fn_name="xsa_kernel",
-            block_sizes=[1, 64, 32],
+            **_pinned(block_sizes=[1, 64, 32]),
         )
 
     @xfailIfPallasInterpret("jax interpret-mode discharge bug on fp16 pipeline buffers")
@@ -1322,7 +1344,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             args,
             mod.ref_xsa(*args),
             fn_name="xsa_kernel",
-            block_sizes=[1, 64, 32],
+            **_pinned(block_sizes=[1, 64, 32]),
         )
 
     def test_concat_simple(self):
@@ -1514,6 +1536,7 @@ class TestExamples(RefEagerTestBase, TestCase):
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )
+    @skipIfMetal("hl.associative_scan has no Metal lowering")
     def test_segment_reduction(self):
         num_nodes = 100
         num_edges = 1000
@@ -1571,11 +1594,13 @@ class TestExamples(RefEagerTestBase, TestCase):
             "attention",
             args,
             (torch.nn.functional.scaled_dot_product_attention(*args), None),
-            block_sizes=[16, 32, 16],
-            num_stages=1,
-            pid_type="persistent_interleaved",
-            l2_grouping=4,
-            indexing="block_ptr",
+            **_pinned(
+                block_sizes=[16, 32, 16],
+                num_stages=1,
+                pid_type="persistent_interleaved",
+                l2_grouping=4,
+                indexing="block_ptr",
+            ),
         )
 
     @onlyBackends(["triton", "pallas", "cute"])
@@ -2153,9 +2178,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             (expected(*args), None),
             fn_name="jsd_forward",
             emit_code=False,
-            block_sizes=[1, 4096],
-            num_warps=4,
-            num_stages=3,
+            **_pinned(block_sizes=[1, 4096], num_warps=4, num_stages=3),
         )
 
     def test_kl_div(self):
@@ -2748,7 +2771,7 @@ class TestExamples(RefEagerTestBase, TestCase):
         config: dict[str, typing.Any] = (
             {}
             if automatic
-            else {"block_sizes": [128, 128, 128, 128], "num_warps": 4, "num_stages": 2}
+            else _pinned(block_sizes=[128, 128, 128, 128], num_warps=4, num_stages=2)
         )
         with patch.object(mod, "squeeze_and_excitation_net_fwd", kernel):
             check_example(
@@ -2826,7 +2849,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             (grad_cb_torch, grad_c_torch),
             fn_name="squeeze_and_excitation_net_bwd_dc",
             block_sizes=[16] * 5,
-            pid_type="persistent_blocked",
+            pid_type=_BARRIER_PID_TYPE,
             num_warps=4,
             num_stages=2,
             atol=0.3,
@@ -3161,6 +3184,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         )
 
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @skipIfMetal(
+        "a lane-invariant load repeats after a per-lane store in the lane loop placement"
+    )
     def test_flex_attention(self):
         z, h, n_ctx, head_dim = 2, 4, 256, 64
         q, k, v = [
@@ -3234,6 +3260,9 @@ class TestExamples(RefEagerTestBase, TestCase):
             yield out, lse, expected, expected_lse
 
     @skipIfRefEager("scalar_prefetch indexing not supported in ref interpreter")
+    @skipIfMetal(
+        "a lane-invariant load repeats after a per-lane store in the lane loop placement"
+    )
     def test_flex_attention_block_mask(self):
         """Multi-block BlockMasks: kv_indices are block ids, masks broadcast over kv,
         and partially masked rows must not produce NaN."""
@@ -3252,6 +3281,9 @@ class TestExamples(RefEagerTestBase, TestCase):
         "dim of its TPU block and a block of 1 head is not expressible, so the "
         "Pallas backend keeps the whole H extent in the block and each step "
         "leaves the other heads' rows undefined"
+    )
+    @skipIfMetal(
+        "a lane-invariant load repeats after a per-lane store in the lane loop placement"
     )
     def test_flex_attention_block_mask_lse(self):
         """The LSE matches torch.logsumexp over the dense mask (natural log; -inf for
