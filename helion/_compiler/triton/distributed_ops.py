@@ -1786,6 +1786,8 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
         words = [poll.word for poll in group]
         for word in words:
             device_function.sync_roles[word] = SyncRole("poll")
+        # The poll's spin ends a wait (a timeline's ready stamp follows it).
+        device_function.spin_ends.update(words)
         asm, constraints = _poll_asm(len(words), group[0].pack)
         cg.add_statement(
             _inline_asm(

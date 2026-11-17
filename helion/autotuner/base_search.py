@@ -738,6 +738,15 @@ class BaseSearch(BaseAutotuner):
         """
         if self._prepared:
             return
+        if (
+            self.settings.megakernel_timeline is not None
+            and self.config_spec.offers_megakernel
+        ):
+            # Stamps change a megakernel's timings. (A cache hit returns before
+            # the search, so a tuned config is still used.)
+            raise exc.AutotuningDisallowedInEnvironment(
+                "while megakernel_timeline is set"
+            )
         self._prepared = True
         self._autotune_budget_start = time.perf_counter()
         self._budget_exceeded_logged = ()

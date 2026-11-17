@@ -1964,6 +1964,16 @@ class ConfigSpec:
         self.cross_loop_pipeline = EnumFragment(choices)
 
     @property
+    def offers_megakernel(self) -> bool:
+        """Whether some config compiles this kernel as a megakernel: it has
+        cross-loop dependencies and its backend lowers a pipeline other than
+        root barriers between separate phases."""
+        fragment = self.cross_loop_pipeline
+        return fragment is not None and any(
+            choice != "barrier" for choice in fragment.choices
+        )
+
+    @property
     def cute_l2_evict_last_store_policy_supported(self) -> bool:
         """Whether the fixed store-policy descriptor is valid for this target."""
 

@@ -26,6 +26,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cross_loop_report import log_once
 from .device_function import DeviceFunction
 from .emitter_protocols import KernelTransforms
 from .helper_function import CodegenInterface
@@ -1555,6 +1556,20 @@ def _generate_ast(
                         raise
                     raise failure from error
             env.backend.after_device_codegen(codegen, func, config)
+            if (
+                env.settings.megakernel_timeline is not None
+                and codegen.device_function.timeline is None
+                and env.config_spec.offers_megakernel
+            ):
+                # Kernels no config compiles as a megakernel record nothing.
+                pipeline = config.config.get("cross_loop_pipeline", "barrier")
+                log_once(
+                    f"megakernel_timeline is set, but {func.name} compiles no "
+                    f"megakernel with this config (cross_loop_pipeline={pipeline!r}): "
+                    "nothing is recorded",
+                    logging.getLogger("helion.runtime.timeline"),
+                    logging.WARNING,
+                )
             try:
                 if _bounded_cache_request is None:
                     kernel_def = codegen.device_function.codegen_function_def()

@@ -22,10 +22,14 @@ from __future__ import annotations
 
 import contextvars
 import math
+from typing import TYPE_CHECKING
 from typing import cast
 import weakref
 
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 try:
     import triton
@@ -187,6 +191,8 @@ def default_launcher(
     _persistent_state_process_group_name: str | None = None,
     _persistent_state_rank_digest: str | None = None,
     _persistent_state_rank_shares: tuple[int, ...] = (),
+    _timeline: tuple[int, object] | None = None,
+    _timeline_register: Callable[[torch.Tensor], object] | None = None,
     _minimum_resident_programs: int = 0,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
@@ -267,6 +273,16 @@ def default_launcher(
                     process_group_name=_persistent_state_process_group_name,
                     shares=_persistent_state_rank_shares,
                 )
+            # A megakernel_timeline launch: ``_timeline`` is (its state slot, the
+            # compiler's metadata); helion.runtime's launcher also passes
+            # ``_timeline_register``, which takes the slot's buffer (standalone
+            # code records no timeline).
+            if (
+                _timeline is not None
+                and _timeline_register is not None
+                and slot == _timeline[0]
+            ):
+                _timeline_register(cast("torch.Tensor", state_args[0]))
             args = (*args, *state_args)
     # For both CUDA and MTIA, use the same kernel execution.
     run_kwargs: dict = {
