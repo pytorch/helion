@@ -1532,7 +1532,7 @@ class TestExamples(RefEagerTestBase, TestCase):
             block_sizes=[16, 8, 16],
         )
 
-    @xfailIfPallas("requires triton module")
+    @xfailIfPallas("tuple hl.associative_scan input")
     @skipIfRefEager(
         "torch._higher_order_ops.associative_scan with tuple arg is not supported by ref eager mode yet"
     )

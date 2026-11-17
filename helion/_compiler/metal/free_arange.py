@@ -829,9 +829,10 @@ def _codegen_iota(
             )
         raise exc.BackendUnsupported(
             "metal",
-            f"hl.arange() of length {length}: Metal lowers only a range over a "
-            "block size that no loop owns (hl.register_block_size), or a tile "
-            "widened by a constant c (start c * tile.begin, length c * block_size)",
+            f"hl.arange() of length {length}: Metal lowers only a range of length "
+            "1, over an enclosing tile's block size, over a block size that no "
+            "loop owns (hl.register_block_size), or a tile widened by a constant "
+            "c (start c * tile.begin, length c * block_size)",
         )
     assert block_id is not None
     axis, threads, lanes = planned

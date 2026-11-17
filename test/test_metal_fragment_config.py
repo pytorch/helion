@@ -463,8 +463,8 @@ class TestFragmentConfig(unittest.TestCase):
                 bound.to_code(config)
 
     def test_no_fit_for_several_roots(self) -> None:
-        """The fit models one nest (the grid and one device loop), so a
-        kernel with two roots gets none: counts that launch one SIMD group
+        """The fit models one nest (the grid and the device loops inside it,
+        each in the one before), so a kernel with two roots gets none: counts that launch one SIMD group
         per root (``(8, 4, 1)``) are kept, where treating both roots' tiles
         as one nest made them ``[2, 1, 2, 2, 1, 4]``, which codegen
         refused."""

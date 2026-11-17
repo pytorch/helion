@@ -117,8 +117,8 @@ def codegen_view_metal(ctx: LoweringContext, node: Node) -> object:
         return tensor
     raise exc.BackendUnsupported(
         "metal",
-        f"{node.target}: Metal lowers a view only where it merges a stacked dim "
-        "into the block dim before it",
+        f"{node.target}: Metal lowers a view only where it inserts or drops dims "
+        "of size 1, or merges a stacked dim into the block dim before it",
     )
 
 

@@ -35,6 +35,7 @@ from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..tile_strategy import DeviceGridState
 from ..tile_strategy import DeviceLoopState
+from .backend import MetalBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -61,12 +62,17 @@ def _one_writer_guard(
     state: CodegenState, target: torch.Tensor, index: list[object]
 ) -> str | None:
     """The condition under which a thread applies the atomic, so that one
-    thread and lane applies it per element: for each block spread over
-    several threads, or walked by a lane loop, around the atomic that isn't
-    a dim of its index, only the thread and lane at the tile's first
-    position.  Every thread and lane along such a block holds the same
-    value (it has no dim of the block), and the first position is never
-    masked off.  None when every such block is indexed."""
+    thread and lane applies it per element; None when every thread and lane
+    holds an element of its own.
+
+    The threads and lanes along a block the atomic's index doesn't vary over
+    hold the same element.  Each such block of an enclosing loop, spread
+    over threads or walked by a lane loop, takes its tile's first position,
+    which is never masked off.  And each launch thread axis that some block
+    spreads over several threads but no indexed block does takes its thread
+    0: the axes of loops that have finished
+    (a reduction's, whose result every thread holds), of sibling loops and
+    of other roots, on which the threads run the atomic too."""
     env = CompileEnvironment.current()
     shape = SubscriptIndexing.compute_shape(target, index, state)
     indexed = {env.get_block_id(size) for size in shape} - {None}
@@ -86,6 +92,21 @@ def _one_writer_guard(
         f"({cg.index_var(block)} == {cg.tile_begin_var(block)})"
         for block in sorted(parallel - indexed)
     ]
+    backend = env.backend
+    assert isinstance(backend, MetalBackend)
+
+    def axis_of(block: int) -> int | None:
+        """The launch axis ``block`` spreads over several threads, if any."""
+        if block in backend.free_arange_plan:
+            axis, threads, _ = backend.free_arange_plan[block]
+        else:
+            axis = strategy.thread_axis_for_block_id(block)
+            threads = strategy.thread_extent_for_block_id(block) or 1
+        return axis if threads > 1 else None
+
+    threaded = {axis_of(info.block_id) for info in env.block_sizes} - {None}
+    addressed = {axis_of(block) for block in indexed}
+    terms += [f"(tid[{axis}] == 0)" for axis in sorted(threaded - addressed)]
     return " & ".join(terms) or None
 
 
@@ -106,6 +127,13 @@ def _codegen_atomic(op: str, state: CodegenState) -> ast.AST:
         # stores and loads each phase makes, which don't count atomics.
         raise _unsupported(f"hl.{op} in a kernel with hl.barrier() phases")
     guard = _one_writer_guard(state, target, index)
+    if guard is not None and state.fx_node is not None and state.fx_node.users:
+        # The threads and lanes the guard drops would read 0 for the old
+        # value only the first of them fetched.
+        raise _unsupported(
+            f"the old value of hl.{op} read where several threads or lanes hold "
+            "its element: Metal applies it on one of them, which alone fetches it"
+        )
     (value,) = _to_ast_values([state.ast_args[2]])
     device_fn = state.device_function
     indexing_idx = device_fn.atomic_op_index

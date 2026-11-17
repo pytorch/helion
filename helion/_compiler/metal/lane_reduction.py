@@ -418,8 +418,13 @@ def split_lane_carried_updates(
         split = LaneSplit(fn, lane_var, loop)
         try:
             body = _lane_body(statements, split, groups)
-        except exc.BackendUnsupported:
-            return  # a body the split can't read keeps its lane loop
+        except exc.BackendUnsupported as e:
+            # Left in the lane loop, an update the lanes don't change would
+            # land once per lane.
+            raise _unsupported(
+                "a lane-looped device loop that updates a carry without the "
+                f"lane's dim, beside what the split can't schedule ({str(e).splitlines()[0]})"
+            ) from None
         carries = {groups.get(n, n) for n in loop.carried_names}
         held = {groups.get(n, n) for n in dimless}
         variant = _variance(body, groups.get(lane_var, lane_var), carries - held)
@@ -589,7 +594,8 @@ def _lane_body(
             reductions[index] = lanes.reductions[result]
         elif not (
             _is_store(stmt)
-            or _is_name_assign(stmt)
+            # An atomic's old value is no pure value a pass may recompute.
+            or (_is_name_assign(stmt) and not _memory_writes(stmt))
             or _is_mpp_effect(stmt)
             or _is_compound(stmt)
         ):

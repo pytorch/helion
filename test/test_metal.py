@@ -994,6 +994,36 @@ def atomic_row_sums(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def atomic_after_row_loop(x: torch.Tensor) -> torch.Tensor:
+    """The atomic follows the column loop, whose threads all hold the sum."""
+    out = torch.zeros([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(x.size(0)):
+        acc = hl.zeros([tile_m], dtype=x.dtype)
+        for tile_n in hl.tile(x.size(1)):
+            acc = acc + x[tile_m, tile_n].sum(-1)
+        hl.atomic_add(out, [tile_m], acc)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def atomic_old_value(x: torch.Tensor, counts: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.size()):
+        old = hl.atomic_add(counts, [tile_m], 1.0)
+        out[tile_m, tile_n] = x[tile_m, tile_n] + old[:, None]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def atomic_old_centered(counts: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(counts)
+    for tile in hl.tile(counts.size(0)):
+        old = hl.atomic_add(counts, [tile], 1.0)
+        out[tile] = old - old.mean()
+    return out
+
+
 class TestMetalAtomics(unittest.TestCase):
     """Atomics lower through the pointer strategy to Metal's relaxed
     ``atomic_fetch_<op>_explicit``, one thread per element."""
@@ -1020,6 +1050,36 @@ class TestMetalAtomics(unittest.TestCase):
                 config = helion.Config(block_sizes=[16, 16], num_threads=threads)
                 out = atomic_row_sums.bind((x,)).compile_config(config)(x)
                 torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_one_writer_after_a_finished_loop(self) -> None:
+        """After the column loop, its threads still run the atomic: only
+        thread 0 of their axis adds the row's sum."""
+        x = torch.randn(16, 128, device=DEVICE)
+        bound = atomic_after_row_loop.bind((x,))
+        for threads in ([4, 32], [4, 1]):
+            with self.subTest(num_threads=threads):
+                config = helion.Config(block_sizes=[4, 64], num_threads=threads)
+                out = bound.compile_config(config)(x)
+                torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_old_value_of_a_shared_element_rejects(self) -> None:
+        """Only the thread that applies the atomic fetches the old value."""
+        x = torch.randn(16, 16, device=DEVICE)
+        counts = torch.zeros(16, device=DEVICE)
+        config = helion.Config(block_sizes=[16, 16], num_threads=[16, 4])
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "the old value of hl.atomic_add read where"
+        ):
+            atomic_old_value.bind((x, counts)).to_code(config)
+
+    def test_old_value_beside_a_lane_reduction_rejects(self) -> None:
+        """A lane reduction's passes would each apply the atomic again."""
+        counts = torch.zeros(16, device=DEVICE)
+        config = helion.Config(block_sizes=[16], num_threads=[1])
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "beside a statement the split cannot schedule"
+        ):
+            atomic_old_centered.bind((counts,)).to_code(config)
 
     def test_half_rejects(self) -> None:
         idx = torch.randint(0, 10, (100,), device=DEVICE)
@@ -6790,6 +6850,23 @@ def lane_add_per_k_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def lane_add_beside_store(
+    x: torch.Tensor, y: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """A carry without the n dim beside a store into an argument that may
+    share memory with the loaded one, which the split can't order."""
+    m, n = x.size()
+    sums = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m], dtype=torch.float32)
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = x[tile_m, tile_n] * 2.0
+            acc = acc + y[tile_m]
+        sums[tile_m] = acc
+    return sums
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def lane_center_2d_inner_tile(x: torch.Tensor) -> torch.Tensor:
     b, m, n = x.size()
     out = torch.empty_like(x)
@@ -7337,6 +7414,18 @@ class TestMetalLaneLoopReductions(unittest.TestCase):
                 config = helion.Config(block_sizes=[8, 4], num_threads=num_threads)
                 out, _ = self._run(lane_add_per_k_tile, config, x, y)
                 torch.testing.assert_close(out, 3 * x[:, 0], rtol=1e-5, atol=1e-5)
+
+    def test_carry_update_the_split_cant_schedule_rejects(self) -> None:
+        """Left in its lane loop, the carry's update would land once per
+        lane, so a body the split can't schedule is rejected."""
+        x, out = torch.randn(4, 256, device=DEVICE), torch.empty(4, 256, device=DEVICE)
+        config = helion.Config(block_sizes=[4, 64], num_threads=[4, 16])
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "updates a carry without the lane's dim"
+        ):
+            lane_add_beside_store.bind((x, torch.randn(4, device=DEVICE), out)).to_code(
+                config
+            )
 
     def test_device_loop_in_lane_body(self) -> None:
         """The n loop runs per k lane, in the pass before the fold of
