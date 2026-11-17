@@ -1184,6 +1184,18 @@ def gather_square_third(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_darwin
+@helion.kernel(backend="metal", autotune_effort="none")
+def tile_index_subscripts(x: torch.Tensor) -> torch.Tensor:
+    """``tile.index`` subscripted to broadcast, in the root, which traces as
+    a load of the index value."""
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        flat = tile_m.index[:, None] * n + tile_n.index[None, :]
+        out[tile_m, tile_n] = x[tile_m, tile_n] + flat.to(torch.float32)
+    return out
+
+
 @helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
 def tile_begins(x: torch.Tensor) -> torch.Tensor:
     """``tile.begin`` of a 1-D tile, which takes the per-thread flattened
@@ -1196,14 +1208,15 @@ def tile_begins(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", autotune_effort="none")
-def tile_index_subscripts(x: torch.Tensor) -> torch.Tensor:
-    """``tile.index`` subscripted to broadcast, in the root, which traces as
-    a load of the index value."""
+def tile_ranges(x: torch.Tensor) -> torch.Tensor:
+    """``begin + arange(block_size)``, a tile's index built by hand, and a
+    one-element ``arange(1)`` broadcast against it."""
     m, n = x.shape
     out = torch.empty_like(x)
     for tile_m, tile_n in hl.tile([m, n]):
-        flat = tile_m.index[:, None] * n + tile_n.index[None, :]
-        out[tile_m, tile_n] = x[tile_m, tile_n] + flat.to(torch.float32)
+        rows = (tile_m.begin + hl.arange(tile_m.block_size))[:, None]
+        one = (tile_n.begin + hl.arange(1))[None, :]
+        out[tile_m, tile_n] = x[tile_m, tile_n] + (rows * 1000 + one).to(torch.float32)
     return out
 
 
@@ -1247,6 +1260,16 @@ class TestMetalIndexArithmetic(unittest.TestCase):
         expected = (torch.arange(100, device=DEVICE) // 32 * 32).float()
         out = tile_begins.bind((x,)).compile_config(helion.Config(block_sizes=[32]))(x)
         torch.testing.assert_close(out, expected)
+
+    def test_tile_ranges(self) -> None:
+        """``arange(block_size)`` of an active tile is each thread's position
+        in it; ``arange(1)`` is its start in a dim of size 1."""
+        x = torch.randn(40, 72, device=DEVICE)
+        config = helion.Config(block_sizes=[16, 8])
+        rows = torch.arange(40, device=DEVICE)[:, None] * 1000
+        begins = (torch.arange(72, device=DEVICE) // 8 * 8)[None, :]
+        out = tile_ranges.bind((x,)).compile_config(config)(x)
+        torch.testing.assert_close(out, x + (rows + begins).to(torch.float32))
 
     def test_tile_index_subscripts(self) -> None:
         x = torch.randn(40, 72, device=DEVICE)
@@ -12399,8 +12422,14 @@ class TestMetalFreeArange(unittest.TestCase):
 
     def test_other_lengths_reject(self) -> None:
         message = "Metal lowers only a range over a block size that no loop owns"
-        self._assert_rejected(tile_bound, (torch.randn(1000, device=DEVICE),), message)
         self._assert_rejected(literal_len, (torch.randn(64, device=DEVICE),), message)
+
+    def test_range_over_an_active_tile(self) -> None:
+        """``t.begin + arange(t.block_size)`` is the tile's index: each thread
+        holds its position in the tile."""
+        x = torch.randn(1000, device=DEVICE)
+        idx = torch.arange(1000, device=DEVICE, dtype=torch.float32)
+        torch.testing.assert_close(tile_bound(x), x + idx)
 
 
 @helion.kernel(backend="metal", static_shapes=True)

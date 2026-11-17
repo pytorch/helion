@@ -797,11 +797,36 @@ def _codegen_iota(
     backend = env.backend
     assert isinstance(backend, MetalBackend)
     length = node.meta["val"].shape[0]
+    dtype = node.kwargs.get("dtype")
+    dtype_str = backend.dtype_str(
+        dtype if isinstance(dtype, torch.dtype) else env.index_dtype
+    )
+    if isinstance(length, int) and length == 1:
+        # One element, ``start``, in a dim of size 1, which owns no block:
+        # every thread holds it.
+        return expr_from_string(
+            backend.cast_expr("{start}", dtype_str), start=ctx.to_ast(start)
+        )
     block_id = env.get_block_id(length)
     planned = None if block_id is None else backend.free_arange_plan.get(block_id)
+    cg = ctx.cg
+    assert isinstance(cg, GenerateAST)
     if planned is None:
         if (factored := factored_iota(ctx, node)) is not None:
             return factored
+        if block_id is not None and cg.active_device_loops.get(block_id):
+            # A range over the block size of a tile whose loop is active: the
+            # dim is that block's, so each thread holds its position in the
+            # tile (``begin + arange(block_size)`` is ``tile.index``).
+            position = backend.cast_expr(
+                f"{cg.index_var(block_id)} - {cg.tile_begin_var(block_id)}",
+                dtype_str,
+            )
+            return expr_from_string(
+                backend.cast_expr(f"{{start}} + {{step}} * {position}", dtype_str),
+                start=ctx.to_ast(start),
+                step=ctx.to_ast(step),
+            )
         raise exc.BackendUnsupported(
             "metal",
             f"hl.arange() of length {length}: Metal lowers only a range over a "
@@ -810,13 +835,8 @@ def _codegen_iota(
         )
     assert block_id is not None
     axis, threads, lanes = planned
-    assert isinstance(ctx.cg, GenerateAST)
-    dims = ctx.cg.max_thread_block_dims
+    dims = cg.max_thread_block_dims
     dims[axis] = max(dims[axis], threads)
-    dtype = node.kwargs.get("dtype")
-    dtype_str = backend.dtype_str(
-        dtype if isinstance(dtype, torch.dtype) else env.index_dtype
-    )
     # Not ``backend.thread_index``: that records the axes loops read, which must
     # exclude this one.  ``tid`` and a grid index are unsigned, so both the
     # thread index and the sum are cast, keeping a negative start or step
