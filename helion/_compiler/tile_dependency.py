@@ -4612,6 +4612,11 @@ class TileAccess:
     # A prefetch-only root's load (its values only steer prefetches): it waits
     # for earlier writes, but no later write waits for it.
     hint: bool = False
+    # The conjuncts of the explicit mask that hold one value for the whole
+    # launch (``device_ir_analysis._launch_uniform_terms``), and whether every
+    # conjunct does: such a mask gates the access as a whole.
+    mask_uniform_terms: frozenset[object] = frozenset()
+    mask_is_uniform: bool = False
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4734,6 +4739,9 @@ class TileDependencyGraph:
     inband_allocation_ids: frozenset[int] = frozenset()
     # Roots of inband stores whose words every rank's launch polls in full.
     inband_read_roots: frozenset[int] = frozenset()
+    # Inband allocations whose words may travel as Lamport words (_lamport_failure);
+    # codegen sends the ones config cross_loop_inband_protocol enables so.
+    lamport_candidate_ids: frozenset[int] = frozenset()
     # Symmetric allocations whose pushes may travel as tagged words (rules T1-T3,
     # T5 of _tagged_failure); codegen picks the ones it enables for a config.
     tagged_candidate_ids: frozenset[int] = frozenset()
@@ -4988,8 +4996,9 @@ class TileDependencyGraph:
             edges=edges,
         )
 
-    def rank_digest(self) -> str:
-        """Hash the facts every rank must agree on; owners and regions may differ."""
+    def rank_digest(self, lamport: tuple[object, ...] = ()) -> str:
+        """Hash the facts every rank must agree on; owners and regions may differ,
+        so codegen adds the Lamport mailboxes those regions chose."""
         peer = self.peer_counter_graph()
         facts = (
             tuple(
@@ -4997,11 +5006,23 @@ class TileDependencyGraph:
                 for a in self.accesses
             ),
             tuple((a.dtype, a.tensor_shape, a.tensor_strides) for a in self.accesses),
+            # A gated inband store pushes only when its gate holds: every rank
+            # must gate on the same predicate. Other masks (a peer load's extra
+            # terms, a local store's) may differ, by a rank constant say.
+            tuple(
+                tuple(sorted(map(repr, a.mask_uniform_terms)))
+                if a.kind == "store" and a.allocation_id in self.inband_allocation_ids
+                else ()
+                for a in self.accesses
+            ),
             repr(self.task_families),
             tuple(
                 (allocation_id, self.inband_numel(allocation_id))
                 for allocation_id in sorted(self.inband_allocation_ids)
             ),
+            # Each rank's own peer-load subscripts decide which roots end, and
+            # the done barrier counts their arrivals on every rank.
+            tuple(sorted(self.inband_read_roots)),
             # Keyed peer counters read only these rank-invariant subscripts.
             tuple(
                 (
@@ -5025,6 +5046,7 @@ class TileDependencyGraph:
                     }
                 )
             ),
+            *((lamport,) if lamport else ()),
         )
         return hashlib.sha256(repr(facts).encode()).hexdigest()[:16]
 
@@ -5070,6 +5092,14 @@ def _access_region(
         not 0 <= dimension < len(shape) for dimension in position_by_dim
     ):
         return AllocationRegion(None, False)
+    # Bounds are per dimension: a tile axis that indexes two dimensions (a
+    # diagonal) covers only part of the box its bounds span.
+    shared_axes = {
+        block_id
+        for block_id in access.subscript_affine_block_ids
+        if block_id is not None
+        and access.subscript_affine_block_ids.count(block_id) > 1
+    }
 
     bounds: list[tuple[int, int]] = []
     exact_dimensions: list[bool] = []
@@ -5145,7 +5175,9 @@ def _access_region(
             exact_dimensions.append(False)
             continue
         bounds.append((begin, end))
-        exact_dimensions.append(not access.has_explicit_mask)
+        exact_dimensions.append(
+            not access.has_explicit_mask and block_id not in shared_axes
+        )
 
     return _allocation_region_from_bounds(
         dataclasses.replace(
@@ -5673,6 +5705,7 @@ def _rectangular_overlap_sources(
         query_ranges = {axis: values for axis, *values in query_piece.target_ranges}
         lower = {axis: [] for axis in owner.source_domain.axis_order}
         upper = {axis: [] for axis in owner.source_domain.axis_order}
+        disjoint = False
         for allocation_axis in owner.target_domain.axis_order:
             owner_begin, owner_end, owner_step = owner_ranges[allocation_axis]
             query_begin, query_end, query_step = query_ranges[allocation_axis]
@@ -5683,6 +5716,18 @@ def _rectangular_overlap_sources(
                 and sympy.simplify(owner_end - allocation_counts[allocation_axis]) == 0
             ):
                 continue
+            fixed = _constant_range(owner_begin, owner_end)
+            if fixed is not None:
+                # A range no owner coordinate moves (a fixed index on a view
+                # dimension) constrains no owner item: it only decides whether
+                # a fixed query range on that axis meets it at all.
+                query_fixed = _constant_range(query_begin, query_end)
+                if query_fixed is None:
+                    return None
+                if query_fixed[0] < fixed[1] and fixed[0] < query_fixed[1]:
+                    continue
+                disjoint = True
+                break
             interval = _single_axis_interval(
                 # pyrefly: ignore [bad-argument-type]
                 owner_begin,
@@ -5719,6 +5764,8 @@ def _rectangular_overlap_sources(
             )
             # pyrefly: ignore [unsupported-operation]
             upper[owner_axis].append(sympy.ceiling((query_end - offset) / stride))
+        if disjoint:
+            continue
         pieces.append(
             _CoordinateRelationPiece(
                 query_piece.source_bounds_items,
@@ -5737,7 +5784,29 @@ def _rectangular_overlap_sources(
                 ),
             )
         )
+    if not pieces:
+        # Every piece pair is disjoint (fixed indices that never meet). An empty
+        # relation would claim no source; None leaves the edge to the dense path.
+        return None
     return CoordinateRelation(query.source_domain, owner.source_domain, tuple(pieces))
+
+
+def _constant_range(
+    begin: sympy.Expr | int, end: sympy.Expr | int
+) -> tuple[int, int] | None:
+    """``(begin, end)`` of an integer range that depends on no coordinate."""
+    begin, end = (
+        sympy.simplify(sympy.sympify(begin)),
+        sympy.simplify(sympy.sympify(end)),
+    )
+    if (
+        begin.free_symbols
+        or end.free_symbols
+        or begin.is_integer is not True
+        or end.is_integer is not True
+    ):
+        return None
+    return int(begin), int(end)
 
 
 def _dense_overlap_sources(
@@ -6638,6 +6707,21 @@ def _inband_failure(
     """The first rule a symmetric allocation breaks for inband transport."""
     stores = [access for access in accesses if access.kind == "store"]
     store = stores[0]
+    # A store gated by a launch-uniform mask writes its whole tile or nothing
+    # in a launch: its words travel when the gate is on, and R9 makes every
+    # peer load carry the gate, so no rank polls words a gated-off launch
+    # never pushes. Ranks must agree on the gate's value, as on any launch
+    # input deciding whether a peer's words exist this launch: a rank gated on
+    # while a peer is gated off waits for pushes that never come. The rank
+    # digest checks only that they gate on the same predicate. A word a gate
+    # keeps off for 2**32 launches could alias its epoch tag.
+    gated = (
+        store.has_explicit_mask
+        and store.mask_is_uniform
+        and _scatter_position(store) is None
+    )
+    if gated:
+        store = dataclasses.replace(store, has_explicit_mask=False)
     root_axes = task_families[store.root].logical_axis_order
     tile_axes = [
         block_id
@@ -6670,19 +6754,15 @@ def _inband_failure(
         )
     ):
         return "R1: one unmasked store through the local view, one tile per task"
-    region = _access_region(store, task_families[store.root])
+    region = _inband_store_region(store, task_families[store.root])
     numel = math.prod(region.layout[0]) if region.layout is not None else 0
     row_major = True
     if scatter:
         # Rows land anywhere: the consumer keys row-major offsets back to rows.
-        shape = [
-            _concrete_integer(extent, description="inband shape")
-            for extent in store.tensor_shape
-        ]
-        numel = math.prod(shape)
-        region = _linear_region(0, numel)
+        assert region.address_interval is not None
+        numel = region.address_interval[1]
         row_major = store.storage_offset == 0 and all(
-            stride == math.prod(shape[dim + 1 :])
+            stride == math.prod(store.tensor_shape[dim + 1 :])
             for dim, stride in enumerate(store.tensor_strides)
         )
     peer_loads = [access for access in accesses if access.owner_rank is not None]
@@ -6698,7 +6778,10 @@ def _inband_failure(
         and store.dtype is not torch.bool
         and not store.dtype.is_complex
         and all(
-            (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
+            (
+                (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
+                or (not scatter and _same_dense_storage(load, numel))
+            )
             and load.dtype == store.dtype
             for load in peer_loads
         )
@@ -6706,17 +6789,14 @@ def _inband_failure(
         return "R2: the store fills a dense buffer of at most 4-byte elements"
     if any(load.root <= store.root for load in peer_loads):
         return "R3: peer loads run in a later root than the store"
+    if gated and not all(
+        load.mask_uniform_terms >= stores[0].mask_uniform_terms for load in peer_loads
+    ):
+        return "R9: every peer load of a gated store carries its gate"
     # Every rank receives the whole buffer, so no polled rank's reads may surely miss
     # part of it. A read may touch its whole interval, or all of an unknown one.
-    for rank in {load.owner_rank for load in peer_loads}:
-        spans = [
-            _access_region(load, task_families[load.root]).address_interval
-            for load in peer_loads
-            if load.owner_rank == rank
-        ]
-        covers = tuple(_linear_region(*(span or (0, numel))) for span in spans)
-        if _subtract_regions(region, covers):
-            return "R6: peer loads read the whole buffer of each polled rank"
+    if _misses_a_polled_rank(region, peer_loads, task_families, exact=False):
+        return "R6: peer loads read the whole buffer of each polled rank"
     if 8 * world_size * numel > _INBAND_PUSH_BYTES:
         return "R7: each rank pushes at most 32 MiB of tagged words"
     # Every rank then reads each scatter row it may have to fetch from the owner.
@@ -6725,6 +6805,83 @@ def _inband_failure(
     ):
         return "R8: a scatter's peer loads run unmasked at root"
     return None
+
+
+def _inband_store_region(store: TileAccess, family: TaskFamily) -> AllocationRegion:
+    """The buffer region an inband store fills: its tiles' region, or the whole
+    buffer for a scatter, whose rows land anywhere."""
+    if _scatter_position(store) is None:
+        return _access_region(store, family)
+    shape = [
+        _concrete_integer(extent, description="inband shape")
+        for extent in store.tensor_shape
+    ]
+    return _linear_region(0, math.prod(shape))
+
+
+def _surely_read_in_full(
+    store: TileAccess,
+    accesses: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+) -> bool:
+    """Whether the peer loads of an inband allocation (``store`` writes it)
+    surely read each polled rank's whole buffer: R6 with exact regions in place
+    of bounding intervals.  A region bounds each dimension apart, so a load
+    whose subscripts share a tile axis (a diagonal) does not count."""
+    peer_loads = [access for access in accesses if access.owner_rank is not None]
+    region = _inband_store_region(store, task_families[store.root])
+    return not _misses_a_polled_rank(region, peer_loads, task_families, exact=True)
+
+
+def _misses_a_polled_rank(
+    region: AllocationRegion,
+    peer_loads: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+    *,
+    exact: bool,
+) -> bool:
+    """Whether the peer loads of some polled rank leave part of ``region``
+    unread: may (``exact``: only the regions they surely read cover), or surely
+    (each load covering its whole bounding interval, or all of an unknown
+    one)."""
+    for rank in {load.owner_rank for load in peer_loads}:
+        reads = [
+            _access_region(load, task_families[load.root])
+            for load in peer_loads
+            if load.owner_rank == rank
+        ]
+        if not exact:
+            whole = region.address_interval
+            assert whole is not None
+            reads = [
+                _linear_region(*(read.address_interval or whole)) for read in reads
+            ]
+        if _subtract_regions(region, tuple(reads)):
+            return True
+    return False
+
+
+def _same_dense_storage(load: TileAccess, numel: int) -> bool:
+    """Whether ``load`` views the whole buffer an inband store fills, densely
+    from its start (the test R2 puts to the store's own tiles), in any shape or
+    dimension order.
+
+    Pushes and polls both address a word by the element's offset from the
+    tensor's start, so such a view reads exactly the words the store pushed.
+    Density also keeps the strides above a stride-1 last dimension multiples of
+    its extent, so of a word's lanes, which `_word_poll` assumes.
+    """
+    try:
+        bounds = tuple(
+            (0, _concrete_integer(extent, description="inband shape"))
+            for extent in load.tensor_shape
+        )
+        for stride in load.tensor_strides:
+            _concrete_integer(stride, description="inband stride")
+    except ValueError:
+        return False
+    region = _allocation_region_from_bounds(load, bounds, (True,) * len(bounds))
+    return region.is_exact_contiguous and region.address_interval == (0, numel)
 
 
 def _scatter_tile(
@@ -6771,6 +6928,44 @@ def _scatter_tile(
             if index != position
         )
     )
+
+
+# Per element type, the bits a Lamport lane reserves for "unwritten": a negative
+# NaN (payload 1 where the type has payload bits to spare; float8_e4m3fn's only
+# negative NaN, 0xFF, which a cast of a negative NaN does produce). A lane stores
+# enc(x) = bits(x) ^ key, zero only while unwritten; the key's own NaN travels as
+# key ^ sign, the same NaN made positive, so every other value, -0 included,
+# arrives bit for bit. Types with one NaN encoding (fnuz float8, e8m0) have none
+# to spare.
+LAMPORT_KEYS: dict[torch.dtype, int] = {
+    torch.float32: 0xFF800001,
+    torch.float16: 0xFC01,
+    torch.bfloat16: 0xFF81,
+    torch.float8_e5m2: 0xFD,
+    torch.float8_e4m3fn: 0xFF,
+}
+
+
+def _lamport_failure(
+    accesses: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+    read_in_full: bool,
+) -> str | None:
+    """Why an inband allocation's words cannot travel as Lamport words, else None.
+
+    A reader zeroes the Lamport words it read in the previous launch's slot,
+    and a source writes a slot again three launches on, after reading this
+    rank's pushes of the launch in between: every rank must surely poll every
+    word, every launch.
+    """
+    store = next(access for access in accesses if access.kind == "store")
+    if _scatter_position(store) is not None:
+        return "a scatter (its fallback words carry the epoch)"
+    if store.dtype not in LAMPORT_KEYS:
+        return f"{store.dtype}: no spare NaN encoding to mean unwritten"
+    if not read_in_full or not _surely_read_in_full(store, accesses, task_families):
+        return "a rank may not poll every word"
+    return None
 
 
 def _polls_every_rank(
@@ -7114,9 +7309,20 @@ def build_tile_dependency_graph(
             )
         )
         inband_allocation_ids = set()
-    # R6 covers each polled rank; polls at root on every rank read every task.
-    inband_read_roots = {
+    # Polls at root on every rank that surely read each polled rank's whole
+    # buffer wait for every task of the store's root to push. A root that also
+    # accesses an allocation crossing ranks through keyed counters (a peer load
+    # or its local store) is left out: keyed peer data may arrive after the
+    # push.
+    keyed_peer_roots = {
         access.root
+        for access in accesses
+        if access.allocation_id in crossing_allocation_ids
+        and access.allocation_id not in inband_allocation_ids
+    }
+    # R6 covers each polled rank; polls at root on every rank read every task.
+    inband_read_ids = {
+        allocation_id
         for allocation_id in inband_allocation_ids
         if _polls_every_rank(
             tuple(accesses_by_allocation[allocation_id]),
@@ -7130,8 +7336,24 @@ def build_tile_dependency_graph(
             for access in accesses_by_allocation[allocation_id]
             if access.owner_rank is not None
         )
+    }
+    inband_read_roots = {
+        access.root
+        for allocation_id in inband_read_ids
         for access in accesses_by_allocation[allocation_id]
         if access.kind == "store"
+        and access.root not in keyed_peer_roots
+        and _surely_read_in_full(
+            access, accesses_by_allocation[allocation_id], task_families
+        )
+    }
+    lamport_failures = {
+        allocation_id: _lamport_failure(
+            accesses_by_allocation[allocation_id],
+            task_families,
+            allocation_id in inband_read_ids,
+        )
+        for allocation_id in inband_allocation_ids
     }
     # Tagged candidates among the keyed peer counters.
     tagged_failures = {
@@ -7141,17 +7363,22 @@ def build_tile_dependency_graph(
             runs_at_root,
             runs_in_root_branch,
             world_size,
-            frozenset(inband_read_roots),
+            bool(inband_read_ids),
         )
         for allocation_id, failure in failures.items()
         if failure
     }
     for allocation_id, failure in sorted(failures.items()):
         tagged = tagged_failures.get(allocation_id, "")
+        lamport = lamport_failures.get(allocation_id)
         log.info(
             "Cross-rank dependencies on %s use %s",
             "/".join(sorted(tensor_names_by_allocation.get(allocation_id, ()))),
-            "inband"
+            (
+                "inband (Lamport candidate)"
+                if lamport is None
+                else f"inband (epoch words: {lamport})"
+            )
             if not failure
             else f"peer_counter ({failure}); tagged candidate"
             if tagged is None
@@ -7166,6 +7393,11 @@ def build_tile_dependency_graph(
         noncanonical_axes=noncanonical_task_origin_block_ids,
         inband_allocation_ids=frozenset(inband_allocation_ids),
         inband_read_roots=frozenset(inband_read_roots),
+        lamport_candidate_ids=frozenset(
+            allocation_id
+            for allocation_id, failure in lamport_failures.items()
+            if failure is None
+        ),
         tagged_candidate_ids=frozenset(
             allocation_id
             for allocation_id, failure in tagged_failures.items()
@@ -7181,7 +7413,7 @@ def _tagged_failure(
     runs_at_root: Callable[[TileAccess], bool],
     runs_in_root_branch: Callable[[TileAccess], bool],
     world_size: int,
-    inband_read_roots: frozenset[int],
+    polled_in_full: bool,
 ) -> str | None:
     """The first rule a push-form allocation breaks for tagged transport.
 
@@ -7292,8 +7524,9 @@ def _tagged_failure(
     ):
         return "T3: one later root reads its own copy inside a loop"
     # T5: a rank reuses a mirror two launches later. Some inband words that every
-    # rank polls in full each launch order every rank's readers before that.
-    if not inband_read_roots:
+    # rank polls in full each launch (``polled_in_full``) order every rank's
+    # readers before that; which roots those polls end does not matter here.
+    if not polled_in_full:
         return "T5: every launch polls every rank in full (the parity credit)"
     return None
 

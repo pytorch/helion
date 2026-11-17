@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from dataclasses import field
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -12,6 +13,7 @@ from torch.fx.experimental.symbolic_shapes import guard_int
 
 from ... import exc
 from ...language import _decorators
+from ...language import memory_ops
 from ...language.distributed_ops import _REMOTE_COPY_DESCRIPTOR_ID_META
 from ...language.distributed_ops import _REMOTE_COPY_DESCRIPTOR_OPS_META
 from ...language.distributed_ops import make_async_remote_copy
@@ -32,6 +34,7 @@ from ..device_function import SyncRole
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _in_warp_specialized_loop
+from ..tile_dependency import LAMPORT_KEYS
 from ..tile_dependency import TILE_ACCESS_META
 from ..tile_dependency import _concrete_integer
 from ..tile_strategy import DeviceLoopState
@@ -626,10 +629,30 @@ class ScatterPoll:
     """How a poll of an inband scatter reads a row no task of ``source`` wrote."""
 
     allocation_id: int
-    source: str
+    source: int
     key: str
-    # The tagged word, every lane of it, in the peer's own buffer.
-    word: str
+    # The flat element offset and mask the poll reads, as variables, and as the
+    # expressions they hold (``reads``), which match across the polls of one
+    # tile from different sources, so the fallback handles those in one loop.
+    element: str
+    mask: str | None
+    reads: tuple[str, str | None]
+    # The peer's own buffer, its lanes per mailbox word and its element bits.
+    tensor: str
+    lanes: int
+    bits: str
+
+    def word(self, epoch: str, tensor: str) -> str:
+        """The tagged word, every lane of it, in ``tensor`` (the peer's buffer)."""
+        other = "" if self.mask is None else f", mask={self.mask}, other=0"
+        bits = (
+            f"tl.load({tensor}.to(tl.pointer_type(tl.uint32)) + {self.element} // "
+            f"{self.lanes}{other}, volatile=True)"
+            if self.lanes > 1
+            else f"tl.cast(tl.load({tensor} + {self.element}{other}, volatile=True), "
+            f"{self.bits}, bitcast=True)"
+        )
+        return f"({epoch} << 32) | tl.cast({bits}, tl.uint64)"
 
 
 @dataclass(frozen=True)
@@ -647,10 +670,27 @@ class InbandPoll:
     word: str
     result: ast.stmt
     scatter: ScatterPoll | None = None
+    # The mailbox's Lamport lane width (None: epoch-tagged words) and, if set,
+    # the int64 literal a masked load reads: every lane the unwritten key.
+    lane_bits: int | None = None
+    unwritten: str | None = None
+    # Lamport: the word offset to the previous launch's slot, re-armed (zeroed)
+    # once the poll holds this launch's words (PeerState.rearm).
+    rearm: str | None = None
+    # What the poll reads of which source, and the statement list it was lifted
+    # in: a later poll of the same reads from another source addresses its slot
+    # as ``base`` (an earlier poll's address) plus ``delta`` bytes.
+    reads: tuple[object, ...] | None = None
+    source: int | None = None
+    scope: list[ast.AST] | None = field(default=None, compare=False)
+    base: str | None = None
+    delta: int = 0
 
     def load(self, epoch: str) -> ast.stmt:
-        # A plain volatile load vectorizes; masked lanes read as current.
-        mask = "" if self.mask is None else f", {self.mask}, {epoch} << 32"
+        # A plain volatile load vectorizes; masked lanes read as current (and
+        # as zero elements: a Lamport lane of just the key).
+        current = f"{epoch} << 32" if self.unwritten is None else self.unwritten
+        mask = "" if self.mask is None else f", {self.mask}, {current}"
         return statement_from_string(
             f"{self.word} = tl.load({self.address}{mask}, volatile=True)"
         )
@@ -668,6 +708,24 @@ def _inband_access(state: CodegenState) -> tuple[TileAccess, tuple[int, ...]] | 
 
 def _bits(dtype: torch.dtype) -> str:
     return f"tl.uint{dtype.itemsize * 8}"
+
+
+def _lane_constant(value: int, dtype: torch.dtype) -> str:
+    """``value`` as a ``dtype``-sized unsigned scalar."""
+    return f"tl.full([], {value}, {_bits(dtype)})"
+
+
+def _lane_ones(lane_bits: int) -> int:
+    """A u64 whose every ``lane_bits`` lane is 1: a word no lane of which is
+    unwritten; ``(w - ones) & ~w`` has some lane's top bit set iff some lane is 0
+    (the borrow may flag lanes above the lowest zero lane too)."""
+    return sum(1 << (lane_bits * i) for i in range(64 // lane_bits))
+
+
+def _unwritten_word(lane_bits: int, dtype: torch.dtype) -> str:
+    """The int64 literal of a word whose every lane holds ``dtype``'s key."""
+    keys = _lane_ones(lane_bits) * LAMPORT_KEYS[dtype]
+    return str(keys - (1 << 64) if keys >> 63 else keys)
 
 
 def _inline_asm(
@@ -772,7 +830,8 @@ def _start_mask(
         term = ast.unparse(node)
         if extra_mask is not None and term == ast.unparse(extra_mask):
             # The extra mask broadcasts unchanged if it is constant on the last axis.
-            mask_node = state.fx_node.args[3]
+            position = 2 if state.fx_node.target is memory_ops.load else 3
+            mask_node = state.fx_node.args[position]
             assert isinstance(mask_node, torch.fx.Node)
             fake = mask_node.meta["val"]
             env = CompileEnvironment.current()
@@ -789,7 +848,7 @@ def _start_mask(
 def inband_store_codegen(
     state: CodegenState, codegen_store: StoreCodegen
 ) -> StoreCodegen:
-    """Make an inband store also push its tile, epoch tagged, to every rank."""
+    """Make an inband store also push its tile, as mailbox words, to every rank."""
     inband = _inband_access(state)
     if inband is None:
         return codegen_store
@@ -812,13 +871,24 @@ def inband_store_codegen(
         )
         peer = peer_state(device_function)
         assert peer is not None
-        _, _, lanes, pair = peer.mailboxes[access.allocation_id]
+        box = peer.mailboxes[access.allocation_id]
         indexing, output_size, words, address, masks, store = _epoch_words(
-            state, fake_tensor, subscript, value, extra_mask, peer, lanes, pair
+            state,
+            fake_tensor,
+            subscript,
+            value,
+            extra_mask,
+            peer,
+            box.lanes,
+            box.pair,
+            box.lane_bits,
         )
         slot = peer.mailbox(access.allocation_id, peer.rank)
-        # Each word is single-copy atomic and carries its epoch: no fence needed.
-        # One asm per peer keeps that peer's stores adjacent, which is faster.
+        # Each word is single-copy atomic and current only in its launch (by
+        # its epoch, or by its slot: readers re-arm Lamport words): no fence
+        # needed, and a replicated layout's copies of a word, which all land
+        # within the launch, are harmless.  One asm per peer keeps that peer's
+        # stores adjacent, which is faster.
         for base in peer.bases:
             push = device_function.new_var("inband_push", dce=False)
             device_function.sync_roles[push] = SyncRole("release")
@@ -833,7 +903,7 @@ def inband_store_codegen(
                 )
             )
         if access.allocation_id in peer.scatters:
-            group = lanes * (2 if pair else 1)
+            group = box.lanes * (2 if box.pair else 1)
             _record_scatter(state, access, indexing, output_size, group, words, masks)
         device_function.inband_access_ids.update(ids)
         return local_store
@@ -850,13 +920,15 @@ def _epoch_words(
     peer: PeerState,
     lanes: int,
     pair: bool,
+    lane_bits: int | None = None,
 ) -> tuple[SubscriptIndexing, list[int | torch.SymInt], list[str], str, list[str], str]:
-    """A store tile as epoch-tagged words: the indexing, its shape, the word
+    """A store tile as mailbox words: the indexing, its shape, the word
     values, their word offsets, their masks and the asm store of one word (or
     16-byte pair) at ``[$1]``, guarded by the mask operand when there is one.
 
-    Each word packs ``lanes`` row-adjacent elements; ``pair`` stores two adjacent
-    words with one 16-byte store.
+    Each word packs ``lanes`` row-adjacent elements, epoch tagged or (with
+    ``lane_bits``, a ``Mailbox``'s) Lamport lane-encoded; ``pair`` stores two
+    adjacent words with one 16-byte store.
     """
     backend = CompileEnvironment.current().backend
     indexing = SubscriptIndexing.create(
@@ -882,13 +954,14 @@ def _epoch_words(
         f"tl.cast(tl.cast({{value}}, {backend.dtype_str(dtype)}), "
         f"{_bits(dtype)}, bitcast=True)"
     )
-    epoch = f"({peer.epoch} << 32)"
+    epoch = f" | ({peer.epoch} << 32)" if lane_bits is None else ""
     mask = indexing.mask_expr if indexing.has_mask() else None
     if lanes == 1 and not pair:
+        assert lane_bits is None, "a Lamport word packs a whole 8 bytes"
         words = [
             state.codegen.lift(
                 expr_from_string(
-                    f"tl.cast({bits}, tl.uint64) | {epoch}", value=word_value
+                    f"tl.cast({bits}, tl.uint64){epoch}", value=word_value
                 ),
                 dce=True,
                 prefix="inband_word",
@@ -905,11 +978,20 @@ def _epoch_words(
         shape = f"[{', '.join(dims)}]"
         group = lanes * (2 if pair else 1)
         full = _lift(state, backend.broadcast_to_expr(bits, shape), value)
+        if lane_bits is not None:
+            # enc(x) = bits(x) ^ key, the key's NaN as key ^ sign: only an
+            # unwritten lane is zero (LAMPORT_KEYS).
+            key = LAMPORT_KEYS[dtype]
+            spare = _lane_constant(key ^ (1 << (lane_bits - 1)), dtype)
+            k = _lane_constant(key, dtype)
+            full = _lift(
+                state, "{x}", f"tl.where({full} == {k}, {spare}, {full}) ^ {k}"
+            )
         payload = " | ".join(
             f"(tl.cast({part}, tl.uint64) << {8 * dtype.itemsize * i})"
             for i, part in enumerate(_interleaved(state, full, dims, lanes))
         )
-        word = _lift(state, f"{{x}} | {epoch}", expr_from_string(payload))
+        word = _lift(state, f"{{x}}{epoch}", expr_from_string(payload))
         row = [*dims[:-1], f"{dims[-1]} // {lanes}"]
         words = _interleaved(state, word, row, 2) if pair else [word]
         stored = f"[{', '.join([*row[:-1], f'{dims[-1]} // {group}'])}]"
@@ -1491,18 +1573,33 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 offset=offset,
             )
         slot = peer.mailbox(access.allocation_id, access.owner_rank)
-        _, _, lanes, _ = peer.mailboxes[access.allocation_id]
+        box = peer.mailboxes[access.allocation_id]
+        lanes = box.lanes
         dtype = fake_tensor.dtype
+        # A Lamport lane decodes by xor with its key.
+        key = None if box.lane_bits is None else LAMPORT_KEYS[dtype]
+        decode = "" if key is None else f" ^ {_lane_constant(key, dtype)}"
         scatter = peer.scatters.get(access.allocation_id)
         words = None
-        if lanes > 1 and scatter is None:
+        # A scatter's fallback keys a word by its first lane: every lane of a
+        # word must fall in one key.
+        if lanes > 1 and (scatter is None or scatter.extents[-1] % lanes == 0):
             words = _word_poll(
                 state, fake_tensor, indexing, output_size, extra_mask, access, lanes
             )
         shift = ""
         element = ""
+        # What the poll reads, independent of the variables lifted below.
+        element_text = f"{ast.unparse(offset)}, words={words is not None}"
         if words is not None:
             offset = expr_from_string(words[0])
+            if scatter is not None:
+                # The fallback reads whole words: each at its first lane's element.
+                element = state.codegen.lift(
+                    expr_from_string(f"({words[0]}) * {lanes}"),
+                    dce=True,
+                    prefix="inband_offset",
+                ).id
         elif lanes > 1 or scatter is not None:
             element = state.codegen.lift(offset, dce=True, prefix="inband_offset").id
             offset = expr_from_string(element)
@@ -1512,11 +1609,46 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 f" >> (tl.cast({element} % {lanes}, tl.uint64) * {8 * dtype.itemsize})"
             )
             offset = expr_from_string(f"{element} // {lanes}")
-        address = state.codegen.lift(
-            expr_from_string(f"{peer.state} + ({slot}) + {{offset}}", offset=offset),
-            dce=True,
-            prefix="inband_address",
+        mask_text = ast.unparse(indexing.mask_expr) if indexing.has_mask() else None
+        reads = (access.allocation_id, element_text, mask_text)
+        scope = state.codegen.statements_stack[-1]
+        # The polls of one tile from several sources differ only in their slot:
+        # address the later ones off the first, so their loads and spins take
+        # one address register and immediate offsets.
+        first = (
+            next(
+                (
+                    poll
+                    for poll in device_function.inband_polls
+                    if poll.reads == reads
+                    and poll.scope is scope
+                    and poll.source is not None
+                ),
+                None,
+            )
+            if access.owner_rank is not None
+            else None
         )
+        base, delta = None, 0
+        if first is not None:
+            assert first.source is not None and access.owner_rank is not None
+            base = first.base or first.address
+            delta = first.delta + 8 * peer.mailboxes[access.allocation_id].words * (
+                access.owner_rank - first.source
+            )
+            address = state.codegen.lift(
+                expr_from_string(f"{base} + {delta // 8}"),
+                dce=True,
+                prefix="inband_address",
+            )
+        else:
+            address = state.codegen.lift(
+                expr_from_string(
+                    f"{peer.state} + ({slot}) + {{offset}}", offset=offset
+                ),
+                dce=True,
+                prefix="inband_address",
+            )
         mask = None
         if indexing.has_mask():
             mask_expr = indexing.mask_expr
@@ -1526,14 +1658,14 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             mask = state.codegen.lift(mask_expr, dce=True, prefix="inband_mask").id
         word = device_function.new_var("inband_word", dce=False)
         result = expr_from_string(
-            f"tl.cast(tl.cast({word}{shift}, {_bits(dtype)}), "
+            f"tl.cast(tl.cast({word}{shift}, {_bits(dtype)}){decode}, "
             f"{backend.dtype_str(dtype)}, bitcast=True)"
         )
         if words is not None:
             # A thread unpacks its whole words, keeping each row's lanes in-thread.
             parts = [
                 f"tl.cast(tl.cast({word}{f' >> {8 * dtype.itemsize * i}' * (i > 0)}, "
-                f"{_bits(dtype)}), {backend.dtype_str(dtype)}, bitcast=True)"
+                f"{_bits(dtype)}){decode}, {backend.dtype_str(dtype)}, bitcast=True)"
                 for i in range(lanes)
             ]
             result = expr_from_string(f"tl.reshape({_joined(parts)}, {shape})")
@@ -1564,22 +1696,21 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 threads = cta_threads(device_function)
         else:
             group = "scalar"
+        if group is not None and box.lane_bits is not None:
+            group = f"{group} lamport {box.lane_bits}"  # one wait test per asm
         fallback = None
         if scatter is not None:
-            other = "" if mask is None else f", mask={mask}, other=0"
-            tensor = device_function.tensor_arg(fake_tensor).name
-            bits = (
-                f"tl.load({tensor}.to(tl.pointer_type(tl.uint32)) + {element} // {lanes}"
-                f"{other}, volatile=True)"
-                if lanes > 1
-                else f"tl.cast(tl.load({tensor} + {element}{other}, volatile=True), "
-                f"{_bits(dtype)}, bitcast=True)"
-            )
+            assert access.owner_rank is not None
             fallback = ScatterPoll(
                 allocation_id=access.allocation_id,
-                source=f"({access.owner_rank})",
+                source=access.owner_rank,
                 key=_scatter_key(scatter, element),
-                word=f"({peer.epoch} << 32) | tl.cast({bits}, tl.uint64)",
+                element=element,
+                mask=mask,
+                reads=(element_text, mask_text),
+                tensor=device_function.tensor_arg(fake_tensor).name,
+                lanes=lanes,
+                bits=_bits(dtype),
             )
         value = device_function.new_var("inband_value", dce=True)
         device_function.inband_polls.append(
@@ -1593,6 +1724,18 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
                 word=word,
                 result=statement_from_string(f"{value} = {{result}}", result=result),
                 scatter=fallback,
+                lane_bits=box.lane_bits,
+                unwritten=None
+                if box.lane_bits is None
+                else _unwritten_word(box.lane_bits, dtype),
+                rearm=None
+                if box.lane_bits is None
+                else peer.rearm(access.allocation_id),
+                reads=reads,
+                source=access.owner_rank,
+                scope=scope,
+                base=base,
+                delta=delta,
             )
         )
         device_function.inband_access_ids.update(ids)
@@ -1620,39 +1763,71 @@ def _scatter_key(scatter: Scatter, element: str) -> str:
     return " + ".join(terms) or "0"
 
 
-def _poll_asm(polls: int, pack: int) -> tuple[str, str]:
-    """Reload only the stale words of a first load until all are current.
+def _poll_asm(
+    polls: int, pack: int, lane_bits: int | None, deltas: list[int] | None = None
+) -> tuple[str, str]:
+    """Reload only the stale words of a first load until all are current: a
+    tagged word while its epoch differs from the tag, a Lamport one while a
+    lane is zero.
 
-    Operands: words, first-load words, addresses, then the tag.
+    Operands: words, first-load words, addresses, then the tag. With
+    ``deltas``, one address per lane: poll i reads it plus ``deltas[i]`` bytes.
     """
     count = polls * pack
+    addresses = count if deltas is None else pack
+    tag = 2 * count + addresses
+
+    def address(word: int) -> str:
+        if deltas is None:
+            return f"[${2 * count + word}]"
+        delta = deltas[word // pack]
+        return f"[${2 * count + word % pack}{f'+{delta}' if delta else ''}]"
+
+    def stale(word: int) -> str:
+        if lane_bits is None:
+            return (
+                f"mov.b64 {{lo, hi}}, ${word}; setp.ne.b32 p, hi, ${tag + word % pack};"
+            )
+        ones = _lane_ones(lane_bits)
+        return (
+            f"sub.u64 t, ${word}, 0x{ones:016x}; not.b64 n, ${word}; "
+            f"and.b64 t, t, n; and.b64 t, t, 0x{ones << (lane_bits - 1):016x}; "
+            "setp.ne.u64 p, t, 0;"
+        )
+
     check = [
-        f"mov.b64 {{lo, hi}}, ${word}; setp.ne.b32 p, hi, ${3 * count + word % pack}; "
-        f"@p ld.volatile.global.b64 ${word}, [${2 * count + word}]; "
+        f"{stale(word)} @p ld.volatile.global.b64 ${word}, {address(word)}; "
         "@p mov.u32 stale, 1;"
         for word in range(count)
     ]
     asm = " ".join(
         [
-            "{ .reg .pred p; .reg .b32 lo, hi, stale;",
+            "{ .reg .pred p; .reg .b32 lo, hi, stale;"
+            + (" .reg .b64 t, n;" if lane_bits is not None else ""),
             *(f"mov.b64 ${word}, ${count + word};" for word in range(count)),
             "SPIN${:uid}: mov.u32 stale, 0;",
             *check,
             "setp.ne.u32 p, stale, 0; @p bra SPIN${:uid}; }",
         ]
     )
-    return asm, ",".join(["=l"] * count + ["l"] * 2 * count + ["r"] * pack)
+    return asm, ",".join(["=l"] * count + ["l"] * (count + addresses) + ["r"] * pack)
 
 
 def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
     """Whether any thread of the CTA holds a stale word of a block poll."""
     tag = f"tl.cast({peer_epoch}, tl.uint32)"
-    flags = " + ".join(
-        "tl.sum(("
-        + " | ".join(
-            f"((({poll.word} >> 32).to(tl.uint32)) != {tag})" for poll in group
+
+    def stale(poll: InbandPoll) -> str:
+        if poll.lane_bits is None:
+            return f"((({poll.word} >> 32).to(tl.uint32)) != {tag})"
+        ones = _lane_ones(poll.lane_bits)
+        return (
+            f"((((({poll.word} - {ones}) & ~{poll.word}) >> {poll.lane_bits - 1}) "
+            f"& {ones}) != 0)"
         )
-        + ").to(tl.int32))"
+
+    flags = " + ".join(
+        "tl.sum((" + " | ".join(stale(poll) for poll in group) + ").to(tl.int32))"
         for group in _by_group(polls).values()
     )
     asm = (
@@ -1665,6 +1840,192 @@ def _stale(peer_epoch: str, polls: list[InbandPoll]) -> str:
     )
 
 
+def _select(index: str, values: list[int]) -> str:
+    """``values[index]`` for a runtime ``index``: a constant, an affine term or
+    a chain of selects."""
+    first = values[0]
+    step = values[1] - first if len(values) > 1 else 0
+    if all(value == first + step * i for i, value in enumerate(values)):
+        term = index if step == 1 else f"{step} * {index}"
+        return (
+            str(first) if step == 0 else term if first == 0 else f"({first} + {term})"
+        )
+    expr = str(first)
+    for i, value in enumerate(values[1:], 1):
+        expr = f"tl.where({index} == {i}, {value}, {expr})"
+    return expr
+
+
+# Cover entries one ready word holds, a bit each.
+_READY_BITS = 31
+
+
+def _scatter_cover_calls(
+    cg: CodegenInterface,
+    peer: PeerState,
+    ready: str,
+    entries: list[tuple[int, int]],
+    threads: int,
+) -> list[ast.stmt]:
+    """Set bit ``i`` of ``ready`` once ``entries[i]`` (allocation, source) has
+    covered every key its tasks wrote: one ``_scatter_cover`` in a loop over the
+    entries, so the code does not grow with the peers read."""
+    fields: list[list[int]] = []
+    for allocation_id, source in entries:
+        scatter = peer.scatters[allocation_id]
+        root = peer.scatter_roots[scatter.root]
+        fields.append(
+            [
+                source,
+                scatter.records,
+                root.done,
+                scatter.cover,
+                root.tasks,
+                scatter.lanes,
+                scatter.keys,
+            ]
+        )
+    if len(entries) == 1:
+        index = "0"
+        args = [str(value) for value in fields[0]]
+    else:
+        index = cg.device_function.new_var("inband_entry", dce=False)
+        allocations = list(dict.fromkeys(a for a, _ in entries))
+        sources = [s for a, s in entries if a == allocations[0]]
+        if entries == [(a, s) for a in allocations for s in sources]:
+            # Allocation-major over one source list: select each field on its axis.
+            per_allocation = len(sources)
+            allocation = f"({index} // {per_allocation})"
+            source = f"({index} % {per_allocation})" if len(allocations) > 1 else index
+            args = [_select(source, sources)] + [
+                _select(
+                    allocation,
+                    [
+                        fields[i * per_allocation][field]
+                        for i in range(len(allocations))
+                    ],
+                )
+                for field in range(1, 7)
+            ]
+        else:
+            args = [
+                _select(index, [entry[field] for entry in fields]) for field in range(7)
+            ]
+    source, records, done, cover, tasks, lanes, keys = args
+    call = (
+        f"helion_dist_utils._scatter_cover({peer.state}, {peer.ptrs}, {source}, "
+        f"{peer.epoch}, {records}, {done}, {cover}, {peer.votes}, {tasks}, "
+        f"{lanes}, {keys}, {len(peer.bases)}, {threads})"
+    )
+    if len(entries) == 1:
+        return [statement_from_string(f"{ready} = {call}")]
+    # Not pipelined: the loop's loads poll, and its helper syncs the CTA.
+    loop = statement_from_string(
+        f"for {index} in tl.range({len(entries)}, num_stages=1): pass"
+    )
+    assert isinstance(loop, ast.For)
+    loop.body = [statement_from_string(f"{ready} = {ready} | ({call} << {index})")]
+    return [statement_from_string(f"{ready} = 0"), loop]
+
+
+def _scatter_copy(
+    cg: CodegenInterface,
+    peer: PeerState,
+    poll: InbandPoll,
+    ready: str,
+    bit: str,
+    source: str,
+    tensor: str,
+    address: str,
+) -> list[ast.stmt]:
+    """Copy the rows of ``poll`` that no task of ``source`` wrote (its cover
+    entry is bit ``bit`` of ``ready``) from ``tensor``, the source's own
+    buffer, to ``address`` in this rank's mailbox."""
+    fallback = poll.scatter
+    assert fallback is not None
+    scatter = peer.scatters[fallback.allocation_id]
+    mask = "" if poll.mask is None else f", mask={poll.mask}, other=0"
+    uncovered = cg.device_function.new_var("inband_uncovered", dce=False)
+    return [
+        statement_from_string(
+            f"{uncovered} = ((({ready} >> ({bit})) & 1) != 0)"
+            f" & (tl.load({peer.state} + {scatter.cover} + {source} * "
+            f"{scatter.keys} + {fallback.key}{mask}, volatile=True) != {peer.epoch})"
+            + ("" if poll.mask is None else f" & {poll.mask}")
+        ),
+        statement_from_string(
+            f"tl.store({address}, {fallback.word(peer.epoch, tensor)}, "
+            f"mask={uncovered})"
+        ),
+        statement_from_string(
+            f"tl.store({peer.state} + {peer.flag} + ({fallback.key}) * 0, "
+            f"{peer.epoch} + 1, mask={uncovered} & ({source} == {peer.rank}))"
+        ),
+    ]
+
+
+def _scatter_synthesize(
+    cg: CodegenInterface,
+    peer: PeerState,
+    family: list[InbandPoll],
+    bits: dict[tuple[int, int], tuple[str, int]],
+) -> list[ast.stmt]:
+    """Copy the rows of ``family`` (polls of one tile, by source) no task wrote
+    from each source's own buffer into this rank's mailbox, once
+    ``_scatter_cover`` has marked every written key. Polls from consecutive
+    sources share one loop over them."""
+    fallbacks = [cast("ScatterPoll", poll.scatter) for poll in family]
+    first = fallbacks[0]
+    ready, bit = bits[first.allocation_id, first.source]
+    rolled = len(family) > 1 and all(
+        fallback.source == first.source + i
+        and bits[first.allocation_id, fallback.source] == (ready, bit + i)
+        for i, fallback in enumerate(fallbacks)
+    )
+    if not rolled:
+        result: list[ast.stmt] = []
+        for poll, fallback in zip(family, fallbacks, strict=True):
+            ready, bit = bits[fallback.allocation_id, fallback.source]
+            result.extend(
+                _scatter_copy(
+                    cg,
+                    peer,
+                    poll,
+                    ready,
+                    str(bit),
+                    f"({fallback.source})",
+                    fallback.tensor,
+                    poll.address,
+                )
+            )
+        return result
+    device_function = cg.device_function
+    index = device_function.new_var("inband_peer", dce=False)
+    tensor = device_function.new_var("inband_tensor", dce=False)
+    select = first.tensor
+    for i, fallback in enumerate(fallbacks[1:], 1):
+        select = f"tl.where({index} == {i}, {fallback.tensor}, {select})"
+    words = peer.mailboxes[first.allocation_id].words
+    loop = statement_from_string(
+        f"for {index} in tl.range({len(family)}, num_stages=1): pass"
+    )
+    assert isinstance(loop, ast.For)
+    loop.body = [
+        statement_from_string(f"{tensor} = {select}"),
+        *_scatter_copy(
+            cg,
+            peer,
+            family[0],
+            ready,
+            f"{bit} + {index}" if bit else index,
+            f"({first.source} + {index})" if first.source else index,
+            tensor,
+            f"{family[0].address} + {index} * {words}",
+        ),
+    ]
+    return [loop]
+
+
 def _scatter_fallback(
     cg: CodegenInterface, peer: PeerState, scattered: list[InbandPoll]
 ) -> list[ast.stmt]:
@@ -1673,53 +2034,47 @@ def _scatter_fallback(
     A source's records and skip marks cover every key it wrote once ``ready``.
     The copy lands in this rank's mailbox, so the loop's words keep one layout;
     a consumer on the source flags the next launch to hold for every rank.
+    Both steps loop over the sources read, so this rarely run path stays one
+    copy of code however many peers a root reads.
     """
     if not scattered:
         return []
     device_function = cg.device_function
     spins = device_function.new_var("inband_spins", dce=False)
     cg.add_statement(statement_from_string(f"{spins} = 0"))
-    ready: dict[tuple[int, str], str] = {}
-    cover: list[ast.stmt] = []
-    synthesize: list[ast.stmt] = []
-    for poll in scattered:
-        assert poll.scatter is not None
-        scatter = peer.scatters[poll.scatter.allocation_id]
-        source = poll.scatter.source
-        if (poll.scatter.allocation_id, source) not in ready:
-            flag = device_function.new_var("inband_ready", dce=False)
-            ready[poll.scatter.allocation_id, source] = flag
-            cg.add_statement(statement_from_string(f"{flag} = 0"))
-            root = peer.scatter_roots[scatter.root]
-            cover.append(
-                statement_from_string(
-                    f"{flag} = helion_dist_utils._scatter_cover({peer.state}, "
-                    f"{peer.ptrs}, {source}, {peer.epoch}, {scatter.records}, "
-                    f"{root.done}, {scatter.cover}, {peer.votes}, {root.tasks}, "
-                    f"{scatter.lanes}, {scatter.keys}, {len(peer.bases)}, "
-                    f"{poll.threads})"
-                )
-            )
-        key = poll.scatter.key
-        mask = "" if poll.mask is None else f", mask={poll.mask}, other=0"
-        uncovered = device_function.new_var("inband_uncovered", dce=False)
-        synthesize.extend(
-            [
-                statement_from_string(
-                    f"{uncovered} = ({ready[poll.scatter.allocation_id, source]} != 0)"
-                    f" & (tl.load({peer.state} + {scatter.cover} + {source} * "
-                    f"{scatter.keys} + {key}{mask}, volatile=True) != {peer.epoch})"
-                    + ("" if poll.mask is None else f" & {poll.mask}")
-                ),
-                statement_from_string(
-                    f"tl.store({poll.address}, {poll.scatter.word}, mask={uncovered})"
-                ),
-                statement_from_string(
-                    f"tl.store({peer.state} + {peer.flag} + ({key}) * 0, "
-                    f"{peer.epoch} + 1, mask={uncovered} & ({source} == {peer.rank}))"
-                ),
-            ]
+    fallbacks = [cast("ScatterPoll", poll.scatter) for poll in scattered]
+    allocations = list(dict.fromkeys(f.allocation_id for f in fallbacks))
+    entries = [
+        (allocation_id, source)
+        for allocation_id in allocations
+        for source in sorted(
+            {f.source for f in fallbacks if f.allocation_id == allocation_id}
         )
+    ]
+    threads = scattered[0].threads
+    assert threads is not None and all(p.threads == threads for p in scattered)
+    bits: dict[tuple[int, int], tuple[str, int]] = {}
+    cover: list[ast.stmt] = []
+    for start in range(0, len(entries), _READY_BITS):
+        chunk = entries[start : start + _READY_BITS]
+        ready = device_function.new_var("inband_ready", dce=False)
+        cg.add_statement(statement_from_string(f"{ready} = 0"))
+        bits.update({entry: (ready, i) for i, entry in enumerate(chunk)})
+        cover.extend(_scatter_cover_calls(cg, peer, ready, chunk, threads))
+    families: dict[tuple[object, ...], list[InbandPoll]] = {}
+    for poll, fallback in zip(scattered, fallbacks, strict=True):
+        key = (
+            fallback.allocation_id,
+            fallback.reads,
+            fallback.lanes,
+            fallback.bits,
+            id(poll.scope),
+        )
+        families.setdefault(key, []).append(poll)
+    synthesize: list[ast.stmt] = []
+    for family in families.values():
+        family.sort(key=lambda poll: cast("ScatterPoll", poll.scatter).source)
+        synthesize.extend(_scatter_synthesize(cg, peer, family, bits))
     check = statement_from_string(f"if {spins} % {_SCATTER_SPINS} == 0: pass")
     fallback = statement_from_string(f"if {spins} >= {_SCATTER_SPINS}: pass")
     assert isinstance(check, ast.If) and isinstance(fallback, ast.If)
@@ -1766,16 +2121,23 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
     voting = [poll for poll in polls if poll.threads is not None]
     if voting:
         # A per-thread spin reloads one asm's words at a time; this reloads all.
+        # The first trip votes on the first loads, so the vote is emitted once.
         stale = device_function.new_var("inband_stale", dce=False)
+        first = device_function.new_var("inband_first", dce=False)
         device_function.sync_roles[stale] = SyncRole("poll")
-        cg.add_statement(
-            statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}")
-        )
+        cg.add_statement(statement_from_string(f"{stale} = 1"))
+        cg.add_statement(statement_from_string(f"{first} = 1"))
+        reload = statement_from_string(f"if {first} == 0: pass")
+        assert isinstance(reload, ast.If)
+        reload.body = [
+            *(poll.load(peer.epoch) for poll in voting),
+            *_scatter_fallback(cg, peer, scattered),
+        ]
         loop = statement_from_string(f"while {stale} != 0: pass")
         assert isinstance(loop, ast.While)
         loop.body = [
-            *(poll.load(peer.epoch) for poll in voting),
-            *_scatter_fallback(cg, peer, scattered),
+            reload,
+            statement_from_string(f"{first} = 0"),
             statement_from_string(f"{stale} = {_stale(peer.epoch, voting)}"),
         ]
         cg.add_statement(loop)
@@ -1785,7 +2147,14 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
             device_function.sync_roles[word] = SyncRole("poll")
         # The poll's spin ends a wait (a timeline's ready stamp follows it).
         device_function.spin_ends.update(words)
-        asm, constraints = _poll_asm(len(words), group[0].pack)
+        bases = {poll.base or poll.address for poll in group}
+        shared = len(group) > 1 and len(bases) == 1
+        asm, constraints = _poll_asm(
+            len(words),
+            group[0].pack,
+            group[0].lane_bits,
+            [poll.delta for poll in group] if shared else None,
+        )
         cg.add_statement(
             _inline_asm(
                 ", ".join(words),
@@ -1793,7 +2162,7 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
                 constraints,
                 [
                     *words,
-                    *(poll.address for poll in group),
+                    *([*bases] if shared else (poll.address for poll in group)),
                     f"tl.cast({peer.epoch}, tl.uint32)",
                 ],
                 "tl.uint64" if len(group) == 1 else f"({'tl.uint64, ' * len(group)})",
@@ -1802,3 +2171,21 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
         )
         for poll in group:
             cg.add_statement(poll.result)
+            if poll.rearm is not None:
+                # The zeros must land after the source's previous launch, which
+                # this launch's words prove over (PeerState.rearm).  No PTX
+                # ordering rule puts a weak store after relaxed loads of other
+                # words; what does is that the poll asm is not pure (LLVM keeps
+                # memory operations on their side of it) and that a GPU issues
+                # in order, so the store issues only once the spin has exited on
+                # the words it read (word & 0 folds to a constant: no data
+                # dependency).  sgl-muse-mega's Lamport all-reduce restores its
+                # markers the same way; an acquire would cost each poll a round
+                # trip.
+                mask = "" if poll.mask is None else f", mask={poll.mask}"
+                cg.add_statement(
+                    statement_from_string(
+                        f"tl.store({poll.address} + {poll.rearm}, "
+                        f"{poll.word} & 0{mask})"
+                    )
+                )

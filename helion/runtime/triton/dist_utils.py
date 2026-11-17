@@ -302,15 +302,16 @@ def _scatter_cover(  # noqa: ANN202
     done,  # noqa: ANN001
     cover,  # noqa: ANN001
     votes,  # noqa: ANN001
-    tasks: tl.constexpr,
-    lanes: tl.constexpr,
-    keys: tl.constexpr,
+    tasks,  # noqa: ANN001
+    lanes,  # noqa: ANN001
+    keys,  # noqa: ANN001
     world_size: tl.constexpr,
     threads: tl.constexpr,
 ):
     """Mark the keys ``source``'s scatter tasks wrote this launch in the local
     cover table. 1 on every thread once each task recorded its rows or was
-    skipped, so an unmarked key is one no task wrote."""
+    skipped, so an unmarked key is one no task wrote. The layout arguments may
+    be runtime values: a reader loops over its sources with one copy of this."""
     parity = tl.cast(epoch & 1, tl.int64)
     tag = tl.cast(epoch, tl.uint32)
     remote = tl.load(ptrs.to(tl.pointer_type(tl.uint64)) + source)

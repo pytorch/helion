@@ -245,7 +245,12 @@ class TritonBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         if key == "host_tensor_descriptors":
             return self.name == "triton" and _compat.supports_host_tensor_descriptor()
-        if key in ("cross_loop_pipeline", "cross_loop_dry_passes"):
+        if key in (
+            "cross_loop_pipeline",
+            "cross_loop_dry_passes",
+            # distributed_ops lowers the in-band transport.
+            "cross_loop_inband_protocol",
+        ):
             return self.uses_triton_compiler and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
@@ -839,12 +844,21 @@ class TritonBackend(Backend):
                     f"_persistent_state_process_group_name={process_group_name!r}"
                 )
                 # Ranks compare the digest when they first allocate the state;
-                # it covers the transports this config picked (tagged or not).
+                # it covers the transports this config picked (tagged or Lamport).
                 graph = tagged_codegen_graph(device_fn)
                 assert graph is not None
-                out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
-                # And that their tagged pushes cover each tensor once (T7).
                 peer = device_fn.peer_state
+                lamport = tuple(
+                    (allocation_id, box.lanes, box.lane_bits)
+                    for allocation_id, box in sorted(
+                        peer.mailboxes.items() if peer is not None else ()
+                    )
+                    if box.lane_bits is not None
+                )
+                out.append(
+                    f"_persistent_state_rank_digest={graph.rank_digest(lamport)!r}"
+                )
+                # And that their tagged pushes cover each tensor once (T7).
                 if peer is not None and peer.mirrors:
                     shares = tuple(peer.mirrors[i].share for i in sorted(peer.mirrors))
                     out.append(f"_persistent_state_rank_shares={shares!r}")
