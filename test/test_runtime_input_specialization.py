@@ -249,6 +249,7 @@ class TestCuteRuntimeInputSpecialization(unittest.TestCase):
             specialized_strides=set(),
             tensor_descriptor_layout_guards={},
             runtime_input_specializations={},
+            torch_mode_sensitive=False,
             specialize_expr=lambda expr: expr,
             size_hint=lambda size: hints[str(size)],
             get_block_id=lambda size: block_ids.get(str(size)),
@@ -725,6 +726,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
             specialized_strides=set(),
             tensor_descriptor_layout_guards={},
             runtime_input_specializations={"state_ring_alias": specialization},
+            torch_mode_sensitive=False,
         )
         kernel = SimpleNamespace(signature=inspect.signature(lambda state, other: None))
         bound = SimpleNamespace(
@@ -1108,6 +1110,7 @@ class TestRuntimeInputSpecialization(unittest.TestCase):
                 specialized_strides=set(),
                 tensor_descriptor_layout_guards={},
                 runtime_input_specializations=dict(ordered_entries),
+                torch_mode_sensitive=False,
             )
             kernel = SimpleNamespace(
                 signature=inspect.signature(lambda first, second: None)

@@ -970,6 +970,9 @@ class CompileEnvironment:
         self._container_identities: dict[int, tuple[object, _ContainerIdentity]] = {}
         # Opaque Python container identities cannot be guarded by value metadata.
         self.requires_fresh_binding = False
+        # A host torch.ops call reached the torch-mode check
+        # (type_info._is_known_host_call): the cache key records its answer.
+        self.torch_mode_sensitive = False
         # Opaque helper calls can inspect a fragment's Python identity. Their
         # bindings retain explicit constexpr owners and need a bounded cache.
         self.has_opaque_fragment_inputs = False

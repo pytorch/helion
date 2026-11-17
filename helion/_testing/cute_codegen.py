@@ -27,6 +27,7 @@ from .._compiler.cute.cutedsl_compat import _cute_backend_requirement_error
 from .._compiler.cute.full_tile_bounds import prove_full_tile_launch
 from .._compiler.cute.lane_loops.barriers import is_barrier as is_barrier
 from .._compiler.cute.target_facts import B200
+from .._compiler.tensor_utils import host_dispatch_mode
 from .._utils import triton_is_available
 from ..runtime.config import Config
 from ..runtime.cute.compile_cache import IEEE_DIVISION_COMPILE_OPTION
@@ -298,6 +299,7 @@ def forbid_cuda_work(*, forbid_native: bool = True) -> Generator[None, None, Non
         assert torch.cuda.is_initialized() == initialized
 
 
+@host_dispatch_mode
 class RejectNativeCuda(TorchDispatchMode):
     """Stop direct ATen dispatch before it can reach a live CUDA context."""
 

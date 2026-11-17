@@ -75,6 +75,8 @@ from .._compiler.inductor_lowering_extra import patch_inductor_lowerings
 from .._compiler.kernel_compiler import KernelCompiler
 from .._compiler.output_header import assert_no_conflicts
 from .._compiler.runtime_tensor_guards import _CanonicalLayoutClassifier
+from .._compiler.tensor_utils import function_modes_trusted
+from .._compiler.tensor_utils import host_modes_trusted
 from .._compiler.variable_origin import ArgumentOrigin
 from .._compiler.variable_origin import BlockSizeOrigin
 from .._dist_utils import _find_process_group_name
@@ -741,6 +743,21 @@ class _TensorDescriptorAlignmentExtractor:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class _HostModesTrustedExtractor:
+    """Whether the active torch modes run no Python of their own inside host
+    torch calls (``host_modes_trusted``), which decides whether a binding
+    knows a host torch.ops call.  Modes change between calls with the same
+    arguments, so this runs on every call."""
+
+    def __call__(self, args: Sequence[object]) -> Hashable:
+        if torch.compiler.is_dynamo_compiling():
+            # Dynamo tracks function modes symbolically and runs a frame under
+            # a dispatch mode eagerly (where the full check applies).
+            return function_modes_trusted()
+        return host_modes_trusted()
+
+
 def _implied_by_exact_metadata(
     extractor: Callable[[Sequence[object]], Hashable],
 ) -> bool:
@@ -893,6 +910,10 @@ def _capture_safe_specialization(
     extractor: Callable[[Sequence[object]], Hashable],
 ) -> bool:
     if isinstance(extractor, PreparedMetadataSpecializationExtractor):
+        return True
+    if isinstance(extractor, _HostModesTrustedExtractor):
+        # It reads mode state only: Dynamo's symbolic stack while Dynamo
+        # traces, the real stacks otherwise.
         return True
     if isinstance(extractor, _RuntimeInputSpecializationExtractor):
         # This classifier reads only projected tensor layout/size/stride
@@ -4356,6 +4377,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             and not tensor_descriptor_layout_guards
             and not tensor_descriptor_alignment_guards
             and not self.env.runtime_input_specializations
+            and not self.env.torch_mode_sensitive
         ):
             return []
 
@@ -4612,6 +4634,8 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     specialization,
                 )
             )
+        if self.env.torch_mode_sensitive:
+            extractors.append(_HostModesTrustedExtractor())
         return extractors
 
     def _publish_guarded_input_facts(self) -> None:
