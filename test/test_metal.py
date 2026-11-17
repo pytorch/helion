@@ -1184,6 +1184,17 @@ def gather_square_third(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_darwin
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def tile_begins(x: torch.Tensor) -> torch.Tensor:
+    """``tile.begin`` of a 1-D tile, which takes the per-thread flattened
+    strategy."""
+    (n,) = x.shape
+    out = torch.zeros_like(x)
+    for tile in hl.tile(n):
+        out[tile] = x[tile] * 0 + tile.begin
+    return out
+
+
 @helion.kernel(backend="metal", autotune_effort="none")
 def tile_index_subscripts(x: torch.Tensor) -> torch.Tensor:
     """``tile.index`` subscripted to broadcast, in the root, which traces as
@@ -1229,6 +1240,13 @@ class TestMetalIndexArithmetic(unittest.TestCase):
 
     def _scale_rows(self, x: torch.Tensor, factors: list[int]) -> torch.Tensor:
         return x * torch.tensor(factors, device=DEVICE, dtype=x.dtype)[:, None]
+
+    def test_tile_begin_is_uniform(self) -> None:
+        """Every element of a tile reads the tile's start, not its own index."""
+        x = torch.zeros(100, device=DEVICE)
+        expected = (torch.arange(100, device=DEVICE) // 32 * 32).float()
+        out = tile_begins.bind((x,)).compile_config(helion.Config(block_sizes=[32]))(x)
+        torch.testing.assert_close(out, expected)
 
     def test_tile_index_subscripts(self) -> None:
         x = torch.randn(40, 72, device=DEVICE)

@@ -144,7 +144,9 @@ def _disable_flatten_get_tile(tile: object, state: CodegenState | None = None) -
 @_decorators.codegen(tile_begin, "common")
 def _(state: CodegenState) -> ast.AST:
     index = _disable_flatten_get_tile(state.proxy_arg(0), state)
-    return expr_from_string(state.codegen.offset_var(index))
+    # The uniform tile start, as tile.end and tile.id read it: on a
+    # per-thread flattened tile the offset is each element's own index.
+    return expr_from_string(state.codegen.tile_begin_var(index))
 
 
 @_decorators.ref(tile_begin)
