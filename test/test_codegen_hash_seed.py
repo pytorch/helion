@@ -19,6 +19,7 @@ import torch
 import helion
 from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.device_function import DeviceFunction
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
 from helion._testing.cute_codegen import cpu_bind
@@ -41,6 +42,7 @@ def test_an_outlined_helpers_constexprs_are_declared_in_order() -> None:
     device_function.triton_outlined_helpers = []
     device_function.triton_outlined_helper_constexprs = {}
     device_function._variable_renames = {}
+    device_function.sync_roles = {}
     device_function.dce_vars = []
     device_function.config = helion.Config()
     cast("Any", device_function).codegen = SimpleNamespace(module_statements=[])
@@ -51,18 +53,19 @@ def test_an_outlined_helpers_constexprs_are_declared_in_order() -> None:
     body = ast.parse(f"tl.store(output, {' + '.join(names)})\n").body
     environment = SimpleNamespace(
         backend_name="triton",
+        backend=TritonBackend(),
         block_sizes=[
             SimpleNamespace(from_config_assert=lambda _config: 16) for _ in range(9)
         ],
     )
     with mock.patch.object(CompileEnvironment, "current", return_value=environment):
         device_function.register_triton_outlined_helper("opaque_tile", body)
-    declared = [
-        statement.targets[0].id
-        for statement in device_function.codegen_helper_functions()
-        if isinstance(statement, ast.Assign)
-        and isinstance(statement.targets[0], ast.Name)
-    ]
+        declared = [
+            statement.targets[0].id
+            for statement in device_function.codegen_helper_functions()
+            if isinstance(statement, ast.Assign)
+            and isinstance(statement.targets[0], ast.Name)
+        ]
     assert declared == sorted(names)
 
 

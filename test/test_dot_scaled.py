@@ -512,6 +512,58 @@ class TestDotScaled(TestCase):
         expected = _reference_dot_scaled(x, x_scale, y, y_scale)
         torch.testing.assert_close(result, expected, atol=1e-2, rtol=1e-3)
 
+    @requires_sm100
+    @skipIfRefEager("the reference dot_scaled does not unpack mixed fp4 formats")
+    def test_mixed_formats(self):
+        """fp8 x packed fp4 (K counted per element), and bf16 with no scale."""
+        if _get_backend() == "cute":
+            self.skipTest("mixed formats: triton backend")
+        M, N, K = 128, 128, 256
+
+        @helion.kernel(config=helion.Config(block_sizes=[64, 64]))
+        def fp8_fp4(
+            x: torch.Tensor,
+            x_scale: torch.Tensor,
+            y: torch.Tensor,
+            y_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), y.size(1)], dtype=torch.float32, device=x.device
+            )
+            for tile_m, tile_n in hl.tile([x.size(0), y.size(1)]):
+                out[tile_m, tile_n] = hl.dot_scaled(
+                    x[tile_m, :], x_scale[tile_m, :], "e4m3",
+                    y[:, tile_n], y_scale[tile_n, :], "e2m1",
+                )  # fmt: skip
+            return out
+
+        @helion.kernel(config=helion.Config(block_sizes=[64, 64]))
+        def bf16_fp4(
+            x: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty(
+                [x.size(0), y.size(1)], dtype=torch.float32, device=x.device
+            )
+            for tile_m, tile_n in hl.tile([x.size(0), y.size(1)]):
+                out[tile_m, tile_n] = hl.dot_scaled(
+                    x[tile_m, :], None, "bf16", y[:, tile_n], y_scale[tile_n, :], "e2m1"
+                )
+            return out
+
+        torch.manual_seed(0)
+        y = torch.randint(0, 256, (K // 2, N), device=DEVICE, dtype=torch.uint8)
+        y_scale = torch.full((N, K // 32), 127, device=DEVICE, dtype=torch.uint8)
+        values = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=DEVICE)
+        codes = torch.stack([y & 15, y >> 4], 1).flatten(0, 1).long()
+        w = torch.where(codes >= 8, -values[codes % 8], values[codes % 8])
+        x8 = (torch.randn(M, K, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        x_scale = torch.full((M, K // 32), 127, device=DEVICE, dtype=torch.uint8)
+        result = fp8_fp4(x8, x_scale, y, y_scale)
+        torch.testing.assert_close(result, x8.float() @ w, atol=1e-3, rtol=1e-3)
+        x16 = torch.randn(M, K, device=DEVICE, dtype=torch.bfloat16)
+        result = bf16_fp4(x16, y, y_scale)
+        torch.testing.assert_close(result, x16.float() @ w, atol=1e-3, rtol=1e-3)
+
 
 if __name__ == "__main__":
     unittest.main()

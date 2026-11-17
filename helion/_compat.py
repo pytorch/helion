@@ -403,6 +403,26 @@ def supports_host_tensor_descriptor() -> bool:
     return _supports_host_tensor_descriptor()
 
 
+@functools.cache
+def gluon_api_available() -> bool:
+    """Whether the installed Triton has the Gluon API the gluon backend is
+    written against (Triton 3.8's, or a later one's)."""
+    return triton_is_available() and get_triton_version().release[:2] >= (3, 8)
+
+
+# What ``supports_gluon`` checks, for messages that explain a refusal or skip.
+GLUON_REQUIREMENT = "an NVIDIA GPU of compute capability 10.x and Triton >= 3.8"
+
+
+@functools.cache
+def supports_gluon() -> bool:
+    """Whether the gluon backend can run here: CUDA Blackwell (sm_10x) with
+    ``gluon_api_available``."""
+    if torch.version.hip is not None or not torch.cuda.is_available():
+        return False
+    return gluon_api_available() and torch.cuda.get_device_capability()[0] == 10
+
+
 def tensor_descriptor_supports_dtype(dtype: torch.dtype) -> bool:
     """Whether a Triton tensor descriptor can address elements of ``dtype``.
 

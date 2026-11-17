@@ -2204,7 +2204,9 @@ class TestTileDependency(TestCase):
             tuple(frozenset((task,)) for task in range(8)),
         )
 
-    def test_masked_store_falls_back_to_root(self) -> None:
+    def test_masked_store_keeps_task_producers(self) -> None:
+        # A masked store writes a subset of its tile: the tile still bounds
+        # what it may write, so each consumer task waits for its own producer.
         plan = build_tile_dependency_graph(
             (
                 _access(0, root=0, kind="store", block_ids=(10,), masked=True),
@@ -2213,7 +2215,10 @@ class TestTileDependency(TestCase):
             [[10], [20]],
         )
 
-        self.assertIsNone(_root_producers_by_consumer(plan, _one_dimensional_domains()))
+        self.assertEqual(
+            _root_producers_by_consumer(plan, _one_dimensional_domains()),
+            tuple(frozenset((task,)) for task in range(8)),
+        )
 
     def test_nonzero_or_dynamic_grid_start_falls_back_to_root(self) -> None:
         plan = build_tile_dependency_graph(

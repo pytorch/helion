@@ -1326,16 +1326,21 @@ class TileStrategy:
         return [str(size) for size in self.thread_block_sizes()]
 
     @staticmethod
-    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
-        """Get the range_extra string for loop unroll factor and num_stages based on config."""
+    def get_tl_range_options(
+        config: Config, block_idx: int
+    ) -> list[tuple[str, object]]:
+        """The ``tl.range`` options (name, value) of the loop over ``block_idx``:
+        unroll factor, warp specialization, num_stages and the rest, from config."""
         env = CompileEnvironment.current()
-        kwargs = []
+        kwargs: list[tuple[str, object]] = []
 
         range_unroll_factor = env.config_spec.range_unroll_factors.config_get(
             config.range_unroll_factors, block_idx, 0
         )
         range_warp_specialize = env.config_spec.range_warp_specialize.config_get(
-            config.range_warp_specializes, block_idx, None
+            CompileEnvironment.current().backend.range_warp_specializes(config),
+            block_idx,
+            None,
         )
         range_num_stages = env.config_spec.range_num_stages.config_get(
             config.range_num_stages, block_idx, 0
@@ -1352,8 +1357,13 @@ class TileStrategy:
             if range_num_stages > 0 and not config.host_tensor_descriptors:
                 range_num_stages = 0
             # Host construction has not established that descriptor indexing
-            # is safe with both unrolling and a separate kernel-level pipeline.
-            if range_unroll_factor > 0 and num_stages > 1:
+            # is safe with both unrolling and a separate kernel-level pipeline
+            # (Triton's: gluon has none, its num_stages is the ring's depth).
+            if (
+                range_unroll_factor > 0
+                and num_stages > 1
+                and env.backend.name != "gluon"
+            ):
                 range_unroll_factor = 0
         elif (
             range_num_stages > 1
@@ -1384,23 +1394,23 @@ class TileStrategy:
                 )
 
         if range_unroll_factor > 0:
-            kwargs.append(f"loop_unroll_factor={range_unroll_factor}")
+            kwargs.append(("loop_unroll_factor", range_unroll_factor))
         if range_warp_specialize is not None:
-            kwargs.append(f"warp_specialize={range_warp_specialize}")
+            kwargs.append(("warp_specialize", range_warp_specialize))
         if range_num_stages > 0:
-            kwargs.append(f"num_stages={range_num_stages}")
+            kwargs.append(("num_stages", range_num_stages))
 
         range_multi_buffer = env.config_spec.range_multi_buffers.config_get(
             config.range_multi_buffers, block_idx, None
         )
         if range_multi_buffer is not None:
-            kwargs.append(f"disallow_acc_multi_buffer={not range_multi_buffer}")
+            kwargs.append(("disallow_acc_multi_buffer", not range_multi_buffer))
 
         range_flatten = env.config_spec.range_flattens.config_get(
             config.range_flattens, block_idx, None
         )
         if range_flatten is not None:
-            kwargs.append(f"flatten={range_flatten}")
+            kwargs.append(("flatten", range_flatten))
 
         dpf_range = config.get("_triton_range_id_data_partition_factor", None)
         dpf_value = config.get("_triton_range_value_data_partition_factor", None)
@@ -1410,12 +1420,27 @@ class TileStrategy:
             from .compile_environment import warning
 
             if range_supports_data_partition_factor():
-                kwargs.append(f"data_partition_factor={dpf_value}")
+                kwargs.append(("data_partition_factor", dpf_value))
             elif not _warned_data_partition_factor:
                 _warned_data_partition_factor.append(True)
                 warning(exc.TritonOptionUnavailable("data_partition_factor"))
 
         return kwargs
+
+    @staticmethod
+    def get_tl_range_kwargs(config: Config, block_idx: int) -> list[str]:
+        """``get_tl_range_options`` as ``tl.range`` keyword arguments."""
+        return [
+            f"{name}={value}"
+            for name, value in TileStrategy.get_tl_range_options(config, block_idx)
+        ]
+
+    @staticmethod
+    def effective_range_num_stages(config: Config, block_idx: int) -> int:
+        """The stages of the ``tl.range`` loop over ``block_idx``: its
+        ``num_stages`` option, else the kernel's."""
+        options = dict(TileStrategy.get_tl_range_options(config, block_idx))
+        return cast("int", options.get("num_stages", config.num_stages))
 
     @staticmethod
     def get_range_call_str(

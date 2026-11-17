@@ -15,6 +15,7 @@ from .cute.backend import CuteBackend
 from .flydsl.backend import FlyDSLBackend
 from .metal.backend import MetalBackend
 from .pallas.backend import PallasBackend
+from .triton.backend import GluonBackend
 from .triton.backend import TileIRBackend
 from .triton.backend import TritonBackend
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
 _BUILTIN_BACKENDS: list[type[Backend]] = [
     TritonBackend,
+    GluonBackend,
     PallasBackend,
     CuteBackend,
     TileIRBackend,

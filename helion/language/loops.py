@@ -248,7 +248,7 @@ def _check_matching(a: object, b: object) -> None:
 
 def _allow_static_range(begin: object, end: object, step: object) -> bool:
     """
-    Only enable tl.stagic_range when:
+    Only enable tl.static_range when:
     1) The ranges are statically known at compile time.
     2) The range is small enough to be unrolled without blowing up the compile time.
     """

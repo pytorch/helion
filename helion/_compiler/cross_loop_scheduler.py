@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from typing import Literal
 from typing import cast
 
+import sympy
+
 from .. import exc
 from .tile_dependency import CoordinateDomain
 from .tile_dependency import CoordinateRelation
@@ -25,8 +27,6 @@ from .tile_dependency import nested_logical_axes
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    import sympy
-
     _StaticProducerResolver = Callable[
         [tuple["ReadinessProducer", ...]], tuple[tuple[int, Incidence], ...] | None
     ]
@@ -34,7 +34,10 @@ if TYPE_CHECKING:
 ObligationsByRootPair = tuple[
     tuple[tuple[int, int], frozenset[DependencyObligation]], ...
 ]
-CrossLoopDispatchMode = Literal["static", "dynamic"]
+# static: fixed task ownership. claimed: persistent workers run a fixed first
+# wave, then may claim a root's remaining tasks in order. dynamic: one program
+# per task, in launch-wide ticket order.
+CrossLoopDispatchMode = Literal["static", "claimed", "dynamic"]
 _MAX_SYMBOLIC_RELATION_WORK = 2_000_000
 
 
@@ -234,6 +237,26 @@ def _supports_readiness_counter_lowering(
         and readiness_producer.incidence.count_by_key is not None
         and readiness_producer.incidence.keys_by_item.is_single_valued()
     )
+
+
+def _one_task_per_key(consumer: ReadinessConsumer) -> bool:
+    """Whether each readiness key admits exactly one consumer task: any task
+    order then waits for one key per task."""
+    count = consumer.incidence.count_by_key
+    return (
+        count is not None
+        and count.value_bounds() == (1, 1)
+        and consumer.keys_by_consumer.is_total_function()
+    )
+
+
+def _publishes_to_every_key(
+    readiness_producer: ReadinessProducer, producer_domain: CoordinateDomain
+) -> bool:
+    """Whether every producer task arrives on every readiness key."""
+    count = readiness_producer.incidence.count_by_key
+    bounds = None if count is None else count.value_bounds()
+    return bounds is not None and bounds[0] == producer_domain.size
 
 
 def _record_readiness_event(
@@ -926,10 +949,11 @@ def _compact_nested_loop_counters_for_schedule(
             assert entry is not None
             result.append(entry)
             continue
-        # Segmented quotients are certified in static worker-wave rank. Dynamic
-        # packets retain the exact semantic counter unless the root-entry
-        # quotient above is proved solely by source-ordered root precedence.
-        if pipeline_plan.dispatch_mode == "dynamic" or (
+        # Segmented quotients are certified in static worker-wave rank. Claimed
+        # and dynamic tasks retain the exact semantic counter unless the
+        # root-entry quotient above is proved solely by source-ordered root
+        # precedence.
+        if pipeline_plan.dispatch_mode != "static" or (
             active_roots is not None
             and any(root not in scheduled_roots for root in active_roots)
         ):
@@ -998,7 +1022,7 @@ class StaticPipelinePlan:
     peer_counters: tuple[ReadinessCounterPlan, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.dispatch_mode not in ("static", "dynamic"):
+        if self.dispatch_mode not in ("static", "claimed", "dynamic"):
             raise ValueError(f"invalid cross-loop dispatch mode {self.dispatch_mode!r}")
         if self.worker_count <= 0:
             raise ValueError("worker_count must be positive")
@@ -1120,12 +1144,19 @@ class StaticPipelinePlan:
             kind="value",
         )
 
+    def publisher_count(self, root: int) -> int:
+        """Programs that publish a resident root: each dynamic task, else each
+        worker with a task there (once, after its task loop)."""
+        tasks = self.execution_orders[root].task_count
+        return (
+            tasks if self.dispatch_mode == "dynamic" else min(self.worker_count, tasks)
+        )
+
     def root_barrier_arrival_count(self, root: int) -> int:
         """Return the exact number of physical publishers for one root."""
-        tasks = self.execution_orders[root].task_count
-        if self.dispatch_mode == "dynamic" or root in self.continuation_roots:
-            return tasks
-        return min(self.worker_count, tasks)
+        if root in self.continuation_roots:
+            return self.execution_orders[root].task_count
+        return self.publisher_count(root)
 
 
 def _without_wave_dominated_nested_counters(
@@ -1512,9 +1543,12 @@ def choose_final_arrival_continuations(
             return ()
         execution_by_slot_by_root[root] = execution
     virtual_placements: dict[int, Incidence] = {}
-    counters_by_event = {
-        counter.readiness_key_domain.identity: counter
+    # An event may have several counters (consumer groups): find the one that
+    # serves the continuation's consumer.
+    counters_by_consumer = {
+        (counter.readiness_key_domain.identity, consumer.consumer_id): counter
         for counter in plan.readiness_counters
+        for consumer in counter.consumers
     }
     result: list[FinalArrivalContinuation] = []
     removed_roots: set[int] = set()
@@ -1527,7 +1561,9 @@ def choose_final_arrival_continuations(
         )
         if consumer_root in excluded_roots or consumer_root in removed_roots:
             continue
-        counter = counters_by_event.get(continuation.event_id)
+        counter = counters_by_consumer.get(
+            (continuation.event_id, continuation.consumer_index)
+        )
         if counter is None:
             continue
         dominance = _continuation_dominance_owner(
@@ -1661,6 +1697,130 @@ def _coarsen_event(
     return tuple(producers), tuple(consumers)
 
 
+def _spanned_key_axes(consumer: ReadinessConsumer) -> frozenset[int]:
+    """The key axes a root consumer task reads whole (none if single-valued)."""
+    if (
+        consumer.consumer_site_id is not None
+        or consumer.keys_by_consumer.is_single_valued()
+    ):
+        return frozenset()
+    return frozenset(
+        axis
+        for piece in consumer.keys_by_consumer.pieces
+        for axis, begin, end, step in piece.target_ranges
+        if step != 1 or sympy.simplify(end - begin) != 1  # pyrefly: ignore [unsupported-operation]
+    )
+
+
+def _whole_axis_lowerings(
+    event: ReadinessEvent,
+    lowering_relations: tuple[
+        tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]
+    ],
+    charge: Callable[[int], bool],
+) -> list[tuple[tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]]]:
+    """The event's counter lowerings.
+
+    One over every consumer when the axes its consumers read whole leave a key.
+    Otherwise consumers reading different axes whole (e.g. every token of a
+    split vs every split of a token) cannot share keys: each such group gets
+    its own coarse counter (event-local consumer IDs kept), beside the fine
+    keys of the single-valued consumers.
+    """
+    whole = _coarsen_for_whole_axis_consumers(event, lowering_relations, charge)
+    if whole is not None:
+        return [whole]
+    if lowering_relations[0] is not event.producers:
+        return [lowering_relations]
+    groups: dict[frozenset[int], list[int]] = {}
+    for consumer in lowering_relations[1]:
+        if axes := _spanned_key_axes(consumer):
+            groups.setdefault(axes, []).append(consumer.consumer_id)
+    result = [lowering_relations]
+    if len(groups) < 2:
+        return result
+    for ids in groups.values():
+        subset = dataclasses.replace(
+            event,
+            consumers=tuple(
+                dataclasses.replace(event.consumers[original], consumer_id=index)
+                for index, original in enumerate(ids)
+            ),
+        )
+        coarsened = _coarsen_for_whole_axis_consumers(
+            subset, (subset.producers, subset.consumers), charge
+        )
+        if coarsened is not None:
+            producers, consumers = coarsened
+            result.append(
+                (
+                    producers,
+                    tuple(
+                        dataclasses.replace(
+                            consumer, consumer_id=ids[consumer.consumer_id]
+                        )
+                        for consumer in consumers
+                    ),
+                )
+            )
+    return result
+
+
+def _coarsen_for_whole_axis_consumers(
+    event: ReadinessEvent,
+    lowering_relations: tuple[
+        tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]
+    ],
+    charge: Callable[[int], bool],
+) -> tuple[tuple[ReadinessProducer, ...], tuple[ReadinessConsumer, ...]] | None:
+    """Project out the key axes a root consumer reads whole.
+
+    A consumer task that reads every key along an axis (e.g. every row of its
+    split) has no single fine key; one key per remaining coordinate, published
+    by every producer along that axis, serves it exactly.
+    """
+    spanned = {
+        axis
+        for consumer in lowering_relations[1]
+        for axis in _spanned_key_axes(consumer)
+    }
+    domain = event.readiness_key_domain
+    kept = tuple(axis for axis in domain.axis_order if axis not in spanned)
+    if not spanned or not kept:
+        return None
+    counts = dict(domain.axis_counts_items)
+    coarse_domain = CoordinateDomain(
+        axis_order=kept,
+        axis_counts_items=tuple((axis, counts[axis]) for axis in kept),
+        kind="event",
+        identity=event.event_id,
+    )
+    partition = KeyPartition.projection(domain, coarse_domain)
+    if partition is None:
+        return None
+    # A consumer needs only its key per task, not a per-key consumer count, so a
+    # consumer whose incidence does not coarsen uniformly takes its projected keys.
+    known_consumers: dict[int, Incidence] = {}
+    for index, consumer in enumerate(event.consumers):
+        if consumer.incidence.coarsen(partition) is not None:
+            continue
+        keys = consumer.keys_by_consumer.project_target(coarse_domain)
+        items = consumer.incidence.items_by_key.project_source(coarse_domain)
+        if keys is None or items is None or not keys.is_single_valued():
+            return None
+        known_consumers[index] = Incidence._from_constructed(items, keys_by_item=keys)
+    coarsened = _coarsen_event(
+        event, partition, known_consumer_incidences=known_consumers, charge=charge
+    )
+    if coarsened is None or not all(
+        consumer.consumer_site_id is not None
+        or consumer.keys_by_consumer.is_single_valued()
+        for consumer in coarsened[1]
+    ):
+        return None
+    return coarsened
+
+
 def choose_readiness_counters(
     readiness_graph: ReadinessGraph,
     continuations: tuple[FinalArrivalContinuation, ...],
@@ -1724,54 +1884,65 @@ def choose_readiness_counters(
                     break
         if lowering_relations is None:
             continue
-        lowered_producers, lowered_consumers = lowering_relations
-        retained_consumers: list[ReadinessConsumer] = []
-        continuation_consumer_indices: list[int] = []
-        for consumer_index, readiness_consumer in enumerate(lowered_consumers):
-            if (
-                readiness_consumer.consumer_site_id is not None
-                or readiness_consumer.keys_by_consumer.canonical_single_valued() is None
+        for lowered_producers, lowered_consumers in _whole_axis_lowerings(
+            event, lowering_relations, charge
+        ):
+            retained_consumers: list[ReadinessConsumer] = []
+            continuation_consumer_indices: list[int] = []
+            for readiness_consumer in lowered_consumers:
+                if (
+                    readiness_consumer.consumer_site_id is not None
+                    or readiness_consumer.keys_by_consumer.canonical_single_valued()
+                    is None
+                ):
+                    continue
+                remaining = (
+                    readiness_consumer.covered_obligations - excluded_obligations
+                )
+                is_continuation = (
+                    event.event_id,
+                    readiness_consumer.consumer_id,
+                ) in continuation_consumers
+                if not is_continuation and not remaining:
+                    continue
+                if is_continuation:
+                    continuation_consumer_indices.append(len(retained_consumers))
+                retained_consumers.append(
+                    dataclasses.replace(
+                        readiness_consumer,
+                        covered_obligations=(
+                            readiness_consumer.covered_obligations
+                            if is_continuation
+                            else frozenset(remaining)
+                        ),
+                    )
+                )
+            if len(continuation_consumer_indices) > 1:
+                raise ValueError(
+                    "one readiness counter cannot have multiple continuations"
+                )
+            continuation_consumer_index = (
+                continuation_consumer_indices[0]
+                if continuation_consumer_indices
+                else None
+            )
+            if not retained_consumers:
+                continue
+            candidate = ReadinessCounterPlan(
+                producers=lowered_producers,
+                consumers=tuple(retained_consumers),
+                continuation_consumer_index=continuation_consumer_index,
+            )
+            if not _supports_emitted_counter_plan_lowering(
+                candidate,
+                readiness_graph.root_domains,
             ):
                 continue
-            remaining = readiness_consumer.covered_obligations - excluded_obligations
-            is_continuation = (
-                event.event_id,
-                consumer_index,
-            ) in continuation_consumers
-            if not is_continuation and not remaining:
+            if candidate.is_root_barrier_equivalent(
+                readiness_graph.root_domains, charge
+            ):
                 continue
-            if is_continuation:
-                continuation_consumer_indices.append(len(retained_consumers))
-            retained_consumers.append(
-                dataclasses.replace(
-                    readiness_consumer,
-                    covered_obligations=(
-                        readiness_consumer.covered_obligations
-                        if is_continuation
-                        else frozenset(remaining)
-                    ),
-                )
-            )
-        if len(continuation_consumer_indices) > 1:
-            raise ValueError("one readiness counter cannot have multiple continuations")
-        continuation_consumer_index = (
-            continuation_consumer_indices[0] if continuation_consumer_indices else None
-        )
-        if not retained_consumers:
-            continue
-        candidate = ReadinessCounterPlan(
-            producers=lowered_producers,
-            consumers=tuple(retained_consumers),
-            continuation_consumer_index=continuation_consumer_index,
-        )
-        if not _supports_emitted_counter_plan_lowering(
-            candidate,
-            readiness_graph.root_domains,
-        ):
-            continue
-        if candidate.is_root_barrier_equivalent(readiness_graph.root_domains, charge):
-            continue
-        selected.append(candidate)
+            selected.append(candidate)
     selected_continuation_count = sum(
         counter_plan.continuation_consumer_index is not None
         for counter_plan in selected
@@ -2188,8 +2359,7 @@ def _build_readiness_events(
             )
             + readiness_key_axes,
         )
-        event_producers: list[ReadinessProducer] = []
-        covered_obligations: set[DependencyObligation] = set()
+        lowered: list[tuple[ReadinessProducer, frozenset[DependencyObligation]]] = []
         for producer, incidence, relation_points in merged_relations:
             producer_root, producer_site_id, _producer_domain = producer
             if not charge(
@@ -2201,21 +2371,53 @@ def _build_readiness_events(
             producer_incidence = incidence.coarsen(partition)
             if producer_incidence is None:
                 break
-            event_producers.append(
-                ReadinessProducer(producer_root, producer_incidence, producer_site_id)
+            lowered.append(
+                (
+                    ReadinessProducer(
+                        producer_root, producer_incidence, producer_site_id
+                    ),
+                    relation_points,
+                )
             )
-            covered_obligations.update(relation_points)
         else:
+            keyed = [
+                _supports_readiness_counter_lowering(producer)
+                and not _publishes_to_every_key(producer, relation[0][2])
+                for (producer, _points), relation in zip(
+                    lowered, merged_relations, strict=True
+                )
+            ]
+            if any(keyed) and not all(keyed):
+                # A producer task every key waits on (e.g. a small root each
+                # consumer reads whole) would publish to every key: it gets its
+                # own events, so the other producers keep their keys (and the
+                # consumer can wait for it once).
+                add_producer_key_events(
+                    consumer_root=consumer_root,
+                    consumer_site_id=consumer_site_id,
+                    relations=[
+                        relation
+                        for relation, is_keyed in zip(
+                            merged_relations, keyed, strict=True
+                        )
+                        if not is_keyed
+                    ],
+                )
+                lowered = [
+                    item
+                    for item, is_keyed in zip(lowered, keyed, strict=True)
+                    if is_keyed
+                ]
             _record_readiness_event(
                 pending_events,
                 readiness_key_domain=readiness_key_domain,
-                producers=tuple(event_producers),
+                producers=tuple(producer for producer, _points in lowered),
                 consumers=(
                     ReadinessConsumer(
                         consumer_root,
                         partition.as_incidence(grouped_items=consumer_group_order),
                         0,
-                        frozenset(covered_obligations),
+                        frozenset().union(*(points for _producer, points in lowered)),
                         consumer_site_id,
                     ),
                 ),
@@ -2424,6 +2626,10 @@ def _consumer_major_producer_order(
                 for candidate in exact_candidates[1:]
             ):
                 continue
+            # The root's own order, however expressed, is no reorder.
+            same = exact_candidates[0].tasks_by_ordinal.then(order.ordinal_by_task)
+            if same is not None and same.is_positional_bijection():
+                continue
             result[root] = exact_candidates[0]
         return result
 
@@ -2439,6 +2645,9 @@ def _consumer_major_producer_order(
         if consumer_root in excluded_roots:
             continue
         incoming_counter_roots.add(consumer_root)
+        if consumer.consumer_site_id is None and _one_task_per_key(consumer):
+            # Grouping by key gains nothing: keep the root's own order.
+            continue
         consumer_keys = _keys_by_consumer_root_task(readiness_graph, consumer)
         if consumer.consumer_site_id is not None:
             root_domain = readiness_graph.root_domains[consumer_root]
@@ -2681,7 +2890,7 @@ def _schedule_is_progress_safe(
 
         if not same_root:
             continue
-        # Dynamic tickets establish only source-ordered packet prefixes. A
+        # Dynamic tickets and claims establish only source-ordered prefixes. A
         # same-root inter-CTA wait therefore requires static ownership and its
         # exact worker-rank proof.
         if pipeline_plan.dispatch_mode != "static" or plan is None:
@@ -2976,9 +3185,9 @@ def build_static_pipeline_plan(
     cross_loop_dispatch_mode: CrossLoopDispatchMode = "static",
 ) -> StaticPipelinePlan:
     """Derive all generic readiness strategies without inspecting root bodies."""
-    if cross_loop_dispatch_mode not in ("static", "dynamic"):
+    if cross_loop_dispatch_mode not in ("static", "claimed", "dynamic"):
         raise ValueError(
-            "cross-loop dispatch mode must be either 'static' or 'dynamic'"
+            f"invalid cross-loop dispatch mode {cross_loop_dispatch_mode!r}"
         )
     charge = _new_relation_work_budget()
     root_identities = tuple(
@@ -3172,7 +3381,7 @@ def build_static_pipeline_plan(
         continuations,
     )
     proposal = all_resident_plan
-    if cross_loop_dispatch_mode == "dynamic" or (
+    if cross_loop_dispatch_mode != "static" or (
         continuations and continuation_counters is not None
     ):
         candidate_counters = (
@@ -3206,17 +3415,17 @@ def build_static_pipeline_plan(
             == final_continuations
         ):
             proposal = candidate
-    if cross_loop_dispatch_mode == "dynamic" and proposal.dispatch_mode != "dynamic":
-        # Continuation ownership is optional. Retry the identical dynamic
-        # packet stream with every root resident before rejecting the mode.
+    if proposal.dispatch_mode != cross_loop_dispatch_mode:
+        # Continuation ownership is optional. Retry the identical claimed or
+        # dynamic dispatch with every root resident before rejecting the mode.
         proposal = try_plan(
             all_resident_counters,
             all_resident_barriers,
-            "dynamic",
+            cross_loop_dispatch_mode,
         )
         if proposal is None:
             with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
-                _, _, proposal = finalize_plan((), "dynamic")
+                _, _, proposal = finalize_plan((), cross_loop_dispatch_mode)
         if proposal is None:
             raise exc.InvalidConfig(
                 "the requested dynamic cross-loop pipeline does not admit a "

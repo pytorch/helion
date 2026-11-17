@@ -89,11 +89,10 @@ class TestTritonLauncher(unittest.TestCase):
         )
         self.assertEqual(calls[1][0], (argument,))
         self.assertEqual(calls[1][1], {**calls[0][1], "warmup": False})
+        # The check reads the warp count off the compiled kernel (a
+        # warp-specialized kernel's includes its partitions').
         validate.assert_called_once_with(
-            compiled_kernel,
-            (argument,),
-            num_warps=2,
-            required_programs=7,
+            compiled_kernel, (argument,), required_programs=7
         )
 
     def test_cross_loop_occupancy_failure_is_an_invalid_config(self) -> None:

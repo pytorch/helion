@@ -294,6 +294,8 @@ def _cute_dot_scaled_operand(
     fmt = fx_node.args[position + 2]
     data = state.proxy_arg(position)
     scale = state.proxy_arg(position + 1)
+    if scale is None:
+        raise exc.BackendUnsupported("cute", "hl.dot_scaled without scales")
     assert isinstance(data, torch.Tensor) and isinstance(scale, torch.Tensor)
     if fmt not in _CUTE_DOT_SCALED_FORMATS:
         raise exc.BackendUnsupported("cute", f"hl.dot_scaled with {fmt} operands")

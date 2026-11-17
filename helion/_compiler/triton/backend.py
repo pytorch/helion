@@ -24,8 +24,10 @@ from ..backend import BackendState
 from ..backend import HandlerOpOverrides
 from ..backend import LauncherInfo
 from ..backend import log
+from .spin_loops import pin_spin_loops_of
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Generator
 
     from torch._inductor.ops_handler import OpsHandler
@@ -37,7 +39,11 @@ if TYPE_CHECKING:
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..compile_environment import CompileEnvironment
     from ..device_function import Argument
+    from ..device_function import DeviceBodyContext
+    from ..device_function import DeviceFunction
+    from ..emitter_protocols import RetryPolicy
     from ..inductor_lowering import GenerateASTFromInductor
+    from ..inductor_lowering import GraphInterpreter
 
     InductorOpOverrides = OpsHandler[Any]
 
@@ -94,6 +100,23 @@ class TritonBackend(Backend):
     @property
     def name(self) -> str:
         return "triton"
+
+    @property
+    def uses_triton_compiler(self) -> bool:
+        return True
+
+    @property
+    def compiler_pipelines_ranges(self) -> bool:
+        return True
+
+    def pipeline_loops(
+        self, body: list[ast.stmt], device_function: DeviceFunction
+    ) -> list[ast.stmt]:
+        # Keep Triton's pipeliner off loops holding a wait it would move
+        # loads across.
+        if not self.compiler_pipelines_ranges:
+            return body
+        return pin_spin_loops_of(body, device_function)
 
     def handler_op_overrides(self) -> HandlerOpOverrides:
         return TritonHandlerOpOverrides()
@@ -200,7 +223,7 @@ class TritonBackend(Backend):
         if key == "host_tensor_descriptors":
             return self.name == "triton" and _compat.supports_host_tensor_descriptor()
         if key == "cross_loop_pipeline":
-            return self.name == "triton" and not _compat.is_hip()
+            return self.uses_triton_compiler and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
         if key == "waves_per_eu":
@@ -463,7 +486,7 @@ class TritonBackend(Backend):
         if not do_not_specialize or not _triton_jit_supports_do_not_specialize():
             return self.function_decorator
         return (
-            "triton.jit("
+            f"{self.function_decorator}("
             f"do_not_specialize={do_not_specialize!r}, "
             f"do_not_specialize_on_alignment={do_not_specialize!r})"
         )
@@ -504,6 +527,7 @@ class TritonBackend(Backend):
             "libdevice": "from torch._inductor.runtime.triton_compat import libdevice",
             "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
+            "helion_prefetch_code": "from helion.runtime.triton import prefetch_code as helion_prefetch_code",
             "helion_triton_helpers": "from helion.runtime.triton import helpers as helion_triton_helpers",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
@@ -637,7 +661,7 @@ class TritonBackend(Backend):
         # Workaround for triton bug: warp_specialize requires at least 4 warps
         # See: https://github.com/triton-lang/triton/issues/7354
         num_warps = config.num_warps
-        if any(config.range_warp_specializes):
+        if any(self.range_warp_specializes(config)):
             num_warps = max(4, num_warps)
         return num_warps
 
@@ -712,8 +736,8 @@ class TritonBackend(Backend):
         if has_rng_ops:
             out.append("_rng_seed_buffer")
         from ..compile_environment import CompileEnvironment
+        from ..cross_loop_codegen import tagged_codegen_graph
         from ..device_function import DeviceFunction
-        from ..host_function import HostFunction
 
         device_fn = DeviceFunction.current()
         if device_fn.triton_remote_copy_signal_slots:
@@ -766,10 +790,16 @@ class TritonBackend(Backend):
                 out.append(
                     f"_persistent_state_process_group_name={process_group_name!r}"
                 )
-                # Ranks compare the digest when they first allocate the state.
-                graph = HostFunction.current().device_ir.tile_dependency_graph
+                # Ranks compare the digest when they first allocate the state;
+                # it covers the transports this config picked (tagged or not).
+                graph = tagged_codegen_graph(device_fn)
                 assert graph is not None
                 out.append(f"_persistent_state_rank_digest={graph.rank_digest()!r}")
+                # And that their tagged pushes cover each tensor once (T7).
+                peer = device_fn.peer_state
+                if peer is not None and peer.mirrors:
+                    shares = tuple(peer.mirrors[i].share for i in sorted(peer.mirrors))
+                    out.append(f"_persistent_state_rank_shares={shares!r}")
         env = CompileEnvironment.current()
         if env.pdl_entry or env.pdl_exit:
             out.append("launch_pdl=True")
@@ -793,6 +823,126 @@ class TritonBackend(Backend):
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
         return frozenset({"grid", "warmup", "num_warps", "num_stages"})
+
+
+class GluonBackend(TritonBackend):
+    """Triton's lowering, compiled as one native Gluon kernel: the body traces
+    with Gluon semantics (``gluon_ops.tl_namespace`` as ``tl``), layouts assigned by
+    ``gluon_layout`` as Triton's compiler would; a ring (``num_stages`` >= 2
+    on a persistent program per SM) adds producer and MMA partitions
+    (``gluon_ring``)."""
+
+    @property
+    def name(self) -> str:
+        return "gluon"
+
+    @property
+    def compiler_pipelines_ranges(self) -> bool:
+        # Gluon pipelines its loops in Helion (``pipeline_loops``).
+        return False
+
+    @property
+    def places_pdl_markers(self) -> bool:
+        # The ring slices the body into partitions, each keeping the grid wait
+        # where its statements need it (and the code prefetch in an idle one).
+        return True
+
+    # Keys no Gluon compile pass reads (no loop flatten or accumulator
+    # multi-buffering; the ring sets its .maxnreg): a config carrying one is
+    # rejected. (``host_tensor_descriptors`` is Triton's alone: Gluon's descriptors
+    # are always the host's.) Loop unroll happens as Gluon traces the loop
+    # (``gluon_layout._unrolled``), pipelining in ``gluon_ring``.
+    _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
+
+    def supports_config_key(self, key: str) -> bool:
+        # ``worker_registers``: the ring's worker budgets by hand (``gluon_ring``).
+        if key == "worker_registers":
+            return True
+        return key not in self._IGNORED_KEYS and super().supports_config_key(key)
+
+    def supports_block_ptr_indexing(self) -> bool:
+        return False
+
+    @property
+    def tiles_exceed_extents(self) -> bool:
+        # The ring's MMAs and TMA boxes take hardware-sized tiles.
+        return True
+
+    def validate_environment(self) -> None:
+        if not _compat.supports_gluon():
+            raise exc.BackendUnsupported(
+                self.name,
+                f"this device or Triton: it needs {_compat.GLUON_REQUIREMENT}",
+            )
+
+    def descriptor_call(self, method: str, desc: str, args: str) -> str:
+        return f"tl.{method}_tensor_descriptor({desc}, {args})"
+
+    def host_tensor_descriptors(self, config: Config) -> bool:
+        # Gluon's descriptors carry a shared layout: always host ones.
+        return True
+
+    def range_warp_specializes(self, config: Config) -> list[bool | None]:
+        # The ring's own partitions take the requests (``gluon_ring``).
+        return []
+
+    def retry_policy(self) -> RetryPolicy:
+        from .gluon_ring import REGENERATION
+
+        return REGENERATION
+
+    def finalize_kernel_def(
+        self,
+        fn_def: ast.FunctionDef,
+        prefix: list[ast.stmt],
+        ctx: DeviceBodyContext,
+    ) -> list[ast.stmt]:
+        from .gluon_ring import finalize_ring
+
+        trailing = super().finalize_kernel_def(fn_def, prefix, ctx)
+        statements = finalize_ring(fn_def, ctx)
+        return [*statements, *trailing]
+
+    def pipeline_loops(
+        self, body: list[ast.stmt], device_function: DeviceFunction
+    ) -> list[ast.stmt]:
+        from .gluon_pipeline import software_pipeline
+
+        return software_pipeline(body, device_function)
+
+    def codegen_node(self, interp: GraphInterpreter, node: torch.fx.Node) -> object:
+        from .gluon_ops import codegen_node
+
+        return codegen_node(interp, node)
+
+    @property
+    def function_decorator(self) -> str:
+        return "_helion_gluon.native_kernel"
+
+    @property
+    def helper_decorator(self) -> str:
+        return "gluon.jit"
+
+    @property
+    def library_imports(self) -> dict[str, str]:
+        return {
+            **super().library_imports,
+            "tl": "from helion._compiler.triton.gluon_ops import tl_namespace as tl",
+            "gluon": "from triton.experimental import gluon",
+            "gl": "from triton.experimental.gluon import language as gl",
+            "_helion_gluon": "from helion._compiler.triton import gluon_ops as _helion_gluon",
+            "_helion_ring": "from helion._compiler.triton import gluon_ring as _helion_ring",
+            # Host descriptors carry Gluon's shared layout.
+            "_helion_tensor_descriptor": "from helion._compiler.triton.gluon_ring import ring_descriptor as _helion_tensor_descriptor",
+        }
+
+    @property
+    def state(self) -> BackendState:
+        return BackendState.EXPERIMENTAL
+
+    @property
+    def codegen_name(self) -> str:
+        return "triton"
 
 
 class TritonHandlerOpOverrides(HandlerOpOverrides):
@@ -826,6 +976,15 @@ class TileIRBackend(TritonBackend):
     @property
     def name(self) -> str:
         return "tileir"
+
+    @property
+    def compiler_pipelines_ranges(self) -> bool:
+        # TileIR's Triton front end feeds another compiler.
+        return False
+
+    @property
+    def uses_triton_compiler(self) -> bool:
+        return False
 
     def handler_op_overrides(self) -> HandlerOpOverrides:
         return TileIRHandlerOpOverrides()

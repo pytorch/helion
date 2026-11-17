@@ -25,6 +25,7 @@ from helion._compiler.cute.autotune.search_surface import CUTE_SEARCH_SURFACE
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.cute_flash_gated import FLASH_GATE_WARPGROUPS_KEY
 from helion._compiler.pallas.backend import PallasBackend
+from helion._compiler.triton.backend import GluonBackend
 from helion._compiler.triton.backend import TileIRBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion.autotuner.config_spec import BACKEND_SPECIFIC_KEYS
@@ -200,6 +201,7 @@ _BASE_VALID_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    worker_registers
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -362,6 +364,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    worker_registers
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -595,6 +598,18 @@ _BASE_TRITON_ACCEPTED = """
     store_cache_modifiers
 """
 
+# The same census for ``GluonBackend``: Triton's keys but the ones Gluon
+# ignores (``maxnreg``, ``range_flattens``, ``range_multi_buffers``), and its
+# own: ``worker_registers`` (a hand override the search never proposes).
+_BASE_GLUON_ACCEPTED = """
+    advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    epilogue_subtile flatten_loops indexing l2_groupings load_cache_modifiers
+    load_eviction_policies loop_orders num_sm_multiplier num_stages num_warps
+    pallas_internal_scratch pid_type range_num_stages range_unroll_factors
+    range_warp_specializes reduction_fusion reduction_loops static_ranges
+    store_cache_modifiers worker_registers
+"""
+
 # The same census for ``TileIRBackend``.
 _BASE_TILEIR_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes epilogue_subtile
@@ -677,10 +692,11 @@ def test_cute_backend_acceptance_matches_the_literal_chain() -> None:
     ("backend", "expected"),
     [
         (TritonBackend(), _BASE_TRITON_ACCEPTED),
+        (GluonBackend(), _BASE_GLUON_ACCEPTED),
         (TileIRBackend(), _BASE_TILEIR_ACCEPTED),
         (PallasBackend(), _BASE_PALLAS_ACCEPTED),
     ],
-    ids=["triton", "tileir", "pallas"],
+    ids=["triton", "gluon", "tileir", "pallas"],
 )
 def test_other_backends_reject_the_cute_surface(backend: object, expected: str) -> None:
     # The surface split is what this test pins (the expected tables carry no

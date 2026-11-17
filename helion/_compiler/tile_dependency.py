@@ -39,8 +39,9 @@ _MAX_RELATION_PRODUCT_STATES = 65_536
 # parities per rank). Inband still beat peer counters at 26 MB (16-token TP4 logits).
 _INBAND_PUSH_BYTES = 1 << 25
 DependencyObligation = tuple[int, int | None, int | None]
-# Local counters, tagged data pushed to every rank, or counters every rank sees.
-Transport = Literal["counter", "inband", "peer_counter"]
+# Local counters, tagged data pushed to every rank, counters every rank sees, or
+# tagged words a producer pushes into every rank's mirror of its tile.
+Transport = Literal["counter", "inband", "peer_counter", "tagged"]
 IntegerExpression = Any
 RelationBounds = tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...]
 ConcreteRelationBounds = tuple[tuple[int, int, int, int], ...]
@@ -53,6 +54,9 @@ AffineSubscriptRange = tuple[
     IntegerExpression,
     int,
 ]
+# Per allocation axis, the view dimensions it linearizes: (dimension, size,
+# stride in axis units), outermost first.
+_AxisRuns = tuple[tuple[tuple[int, IntegerExpression, int], ...], ...]
 _AccessLayout = tuple[
     tuple[sympy.Expr, ...],
     tuple[sympy.Expr, ...],
@@ -1598,7 +1602,13 @@ class CoordinateRelation:
         return all(
             target_axis == expected_target_axis
             and step == 1
-            and sympy.simplify(begin - coordinate_axis_symbol(source_axis)) == 0  # pyrefly: ignore[unsupported-operation]
+            # FloorDiv and Mod as floor: ``8 * (x // 8) + x % 8`` is ``x``.
+            and sympy.simplify(
+                (begin - coordinate_axis_symbol(source_axis))  # pyrefly: ignore[unsupported-operation]
+                .replace(FloorDiv, lambda a, b: sympy.floor(a / b))
+                .rewrite(sympy.floor)
+            )
+            == 0
             and sympy.simplify(end - begin) == 1  # pyrefly: ignore[unsupported-operation]
             for source_axis, expected_target_axis, (
                 target_axis,
@@ -4719,6 +4729,11 @@ class TileDependencyGraph:
     inband_allocation_ids: frozenset[int] = frozenset()
     # Roots of inband stores whose words every rank's launch polls in full.
     inband_read_roots: frozenset[int] = frozenset()
+    # Symmetric allocations whose pushes may travel as tagged words (rules T1-T3,
+    # T5 of _tagged_failure); codegen picks the ones it enables for a config.
+    tagged_candidate_ids: frozenset[int] = frozenset()
+    # The candidates this config enables: their dependency is "tagged".
+    tagged_allocation_ids: frozenset[int] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(site.site_id for site in self.execution_sites) != tuple(
@@ -4758,7 +4773,35 @@ class TileDependencyGraph:
             return "counter"
         if producer.allocation_id in self.inband_allocation_ids:
             return "inband"
+        if producer.allocation_id in self.tagged_allocation_ids:
+            return "tagged"
         return "peer_counter"
+
+    def runs_at_root(self, access: TileAccess) -> bool:
+        """Whether ``access`` runs directly in its root, outside any branch."""
+        return _runs_at_root(
+            self.site_ids_by_access[access.access_id], self.execution_sites
+        )
+
+    def tagged_stores(self, allocation_id: int) -> tuple[TileAccess, ...]:
+        """A tagged allocation's pushes, one per destination rank, rank order."""
+        return tuple(
+            sorted(
+                (
+                    access
+                    for access in self.accesses
+                    if access.allocation_id == allocation_id and access.kind == "store"
+                ),
+                key=lambda access: cast("int", access.owner_rank),
+            )
+        )
+
+    def tagged_loads(self, allocation_id: int) -> tuple[TileAccess, ...]:
+        return tuple(
+            access
+            for access in self.accesses
+            if access.allocation_id == allocation_id and access.kind == "load"
+        )
 
     def is_inband(self, access: TileAccess) -> bool:
         """Whether codegen emits an access as an inband push or poll."""
@@ -5139,6 +5182,14 @@ def _access_interval_expression(
     block_size = domain.block_sizes.get(axis)
     if block_size is None:
         return None
+    if (
+        coordinate == 0
+        and offset == 0
+        # pyrefly: ignore [unsupported-operation]
+        and _is_provably_nonnegative(block_size - size, prove_nonnegative)
+    ):
+        # One tile overshooting the whole dimension: its mask keeps it inside.
+        return sympy.Integer(0), size
     begin = coordinate * block_size + offset  # pyrefly: ignore[unsupported-operation]
     return begin, begin + block_size
 
@@ -5189,6 +5240,75 @@ def _access_layout(
     return shape, strides, offset, linear_span, dimensions, positions
 
 
+def _shared_view_axes(
+    views: tuple[tuple[tuple[int, sympy.Expr, sympy.Expr], ...], ...],
+) -> tuple[tuple[int, ...], tuple[_AxisRuns, ...]] | None:
+    """The coarsest axes two views of one buffer both cut its storage at.
+
+    ``views`` holds each view's ``(dimension, size, stride)``.  Between two
+    consecutive common cuts every view's dimensions must form one dense run,
+    one coordinate of that axis.  Returns the axis counts (outermost first)
+    and, per view, each axis' run as ``(dimension, size, stride in axis
+    units)``, outermost first.
+    """
+    try:
+        concrete = [
+            sorted(
+                (
+                    (
+                        dimension,
+                        _concrete_integer(size, description="view shape"),
+                        _concrete_integer(stride, description="view stride"),
+                    )
+                    for dimension, size, stride in view
+                ),
+                key=lambda item: -item[2],
+            )
+            for view in views
+        ]
+    except ValueError:
+        return None
+    cuts = set.intersection(
+        *(
+            {stride for *_, stride in view} | {n * s for _, n, s in view}
+            for view in concrete
+        )
+    )
+    axes = list(itertools.pairwise(sorted(cuts, reverse=True)))
+    runs_by_view: list[_AxisRuns] = []
+    for view in concrete:
+        runs = []
+        for extent, base in axes:
+            run = [item for item in view if base <= item[2] < extent]
+            if (
+                not run
+                or run[-1][2] != base
+                or run[0][1] * run[0][2] != extent
+                or any(o[2] != i[1] * i[2] for o, i in itertools.pairwise(run))
+            ):
+                return None
+            runs.append(tuple((d, n, stride // base) for d, n, stride in run))
+        if sum(map(len, runs)) != len(view):
+            return None
+        runs_by_view.append(tuple(runs))
+    return tuple(extent // base for extent, base in axes), tuple(runs_by_view)
+
+
+def _is_indirect_subscript(access: TileAccess, position: int) -> bool:
+    """Whether subscript ``position`` is neither affine in a block nor a dense
+    span (a loaded or otherwise computed index)."""
+    span = (
+        access.subscript_dense_spans[position]
+        if position < len(access.subscript_dense_spans)
+        else None
+    )
+    return (
+        access.subscript_affine_block_ids[position] is None
+        and access.subscript_offsets[position] is None
+        and span is None
+    )
+
+
 def _symbolic_access_map(
     access: TileAccess,
     *,
@@ -5196,7 +5316,7 @@ def _symbolic_access_map(
     source_domain: CoordinateDomain,
     allocation_domain: CoordinateDomain,
     storage_offset: sympy.Expr | None = None,
-    tensor_dimensions: tuple[int, ...] | None = None,
+    axis_runs: _AxisRuns | None = None,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> _AccessMap | None:
     positions = layout[5]
@@ -5204,40 +5324,46 @@ def _symbolic_access_map(
         return None
     shape, strides = layout[:2]
     source_bounds = _full_bounds(source_domain)
-    if tensor_dimensions is not None:
+    if axis_runs is not None:
         ranges = []
-        for allocation_axis, dimension in zip(
-            allocation_domain.axis_order, tensor_dimensions, strict=True
+        for allocation_axis, run in zip(
+            allocation_domain.axis_order, axis_runs, strict=True
         ):
-            position = positions.get(dimension)
-            if position is None:
-                interval = (sympy.Integer(0), shape[dimension])
-            else:
-                interval = _access_interval_expression(
-                    access,
-                    position=position,
-                    domain=source_domain,
-                    prove_nonnegative=prove_nonnegative,
-                )
-                # An indirect subscript can still contribute a useful
-                # conservative relation: it may touch any coordinate of this
-                # tensor dimension, while the remaining affine dimensions stay
-                # precise.
-                if interval is None:
-                    subscript_span = (
-                        access.subscript_dense_spans[position]
-                        if position < len(access.subscript_dense_spans)
-                        else None
+            # Dimensions down to the first one the access spans are single
+            # coordinates; every dimension inside it is read whole.
+            begin: sympy.Expr = sympy.Integer(0)
+            end: sympy.Expr | None = None
+            for dimension, size, stride in run:
+                position = positions.get(dimension)
+                if position is None:
+                    interval = (sympy.Integer(0), shape[dimension])
+                else:
+                    interval = _access_interval_expression(
+                        access,
+                        position=position,
+                        domain=source_domain,
+                        prove_nonnegative=prove_nonnegative,
                     )
-                    if (
-                        access.subscript_affine_block_ids[position] is None
-                        and access.subscript_offsets[position] is None
-                        and subscript_span is None
-                    ):
+                    # An indirect subscript can still contribute a useful
+                    # conservative relation: it may touch any coordinate of
+                    # this tensor dimension, while the remaining affine
+                    # dimensions stay precise.
+                    if interval is None:
+                        if not _is_indirect_subscript(access, position):
+                            return None
                         interval = (sympy.Integer(0), shape[dimension])
-                    else:
-                        return None
-            ranges.append((allocation_axis, *interval, 1))
+                low, high = interval
+                if end is None:
+                    # pyrefly: ignore [unsupported-operation]
+                    if sympy.simplify(high - low) != 1:
+                        end = begin + high * stride  # pyrefly: ignore [unsupported-operation]
+                    begin = begin + low * stride  # pyrefly: ignore [unsupported-operation]
+                # pyrefly: ignore [unsupported-operation]
+                elif sympy.simplify(low) != 0 or sympy.simplify(high - size) != 0:
+                    return None
+            if end is None:
+                end = begin + 1  # pyrefly: ignore [unsupported-operation]
+            ranges.append((allocation_axis, begin, end, 1))
         relation = CoordinateRelation(
             source_domain,
             allocation_domain,
@@ -5342,7 +5468,12 @@ def _symbolic_access_map(
             )
         )
         if interval is None:
-            return None
+            # As above: an indirect subscript may touch any coordinate of its
+            # dimension, the other dimensions staying precise.
+            if position is None or not _is_indirect_subscript(access, position):
+                return None
+            interval = (sympy.Integer(0), size)
+            position = None
         begin, end = interval
         # pyrefly: ignore [unsupported-operation]
         width = sympy.simplify(end - begin)
@@ -5692,11 +5823,11 @@ def _symbolic_dependency_incidence(
     consumer_domain: CoordinateDomain,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
 ) -> Incidence | None:
+    # A masked access touches a subset of its tile: the tile over-approximates
+    # what it may write or read, so a wait on it is still sufficient.
     if (
         not producer_access.layout_is_symbolically_exact
         or not consumer_access.layout_is_symbolically_exact
-        or producer_access.has_explicit_mask
-        or consumer_access.has_explicit_mask
         or producer_access.allocation_id != consumer_access.allocation_id
     ):
         return None
@@ -5712,16 +5843,42 @@ def _symbolic_dependency_incidence(
             (consumer_layout[0][axis], consumer_layout[1][axis])
             for axis in consumer_dimensions
         )
+        if producer_geometry == consumer_geometry:
+            shared = (
+                tuple(size for size, _stride in producer_geometry),
+                tuple(
+                    tuple(
+                        ((dimension, size, 1),)
+                        for dimension, (size, _stride) in zip(
+                            dimensions, producer_geometry, strict=True
+                        )
+                    )
+                    for dimensions in (producer_dimensions, consumer_dimensions)
+                ),
+            )
+        else:
+            # Views of different shapes (e.g. [s, r*c] and [s, r, c]): both on
+            # the coarsest axes they share.
+            shared = _shared_view_axes(
+                tuple(
+                    tuple(
+                        (dimension, layout[0][dimension], layout[1][dimension])
+                        for dimension in dimensions
+                    )
+                    for layout, dimensions in (
+                        (producer_layout, producer_dimensions),
+                        (consumer_layout, consumer_dimensions),
+                    )
+                )
+            )
         if (
-            producer_geometry == consumer_geometry
+            shared is not None
             and producer_access.storage_offset == consumer_access.storage_offset
         ):
+            counts, (producer_runs, consumer_runs) = shared
             coordinate_domain = CoordinateDomain(
-                tuple(range(len(producer_geometry))),
-                tuple(
-                    (axis, size)
-                    for axis, (size, _stride) in enumerate(producer_geometry)
-                ),
+                tuple(range(len(counts))),
+                tuple(enumerate(counts)),
                 kind="allocation",
                 identity=producer_access.allocation_id,
             )
@@ -5730,14 +5887,14 @@ def _symbolic_dependency_incidence(
                 layout=producer_layout,
                 source_domain=producer_domain,
                 allocation_domain=coordinate_domain,
-                tensor_dimensions=producer_dimensions,
+                axis_runs=producer_runs,
             )
             consumer_map = _symbolic_access_map(
                 consumer_access,
                 layout=consumer_layout,
                 source_domain=consumer_domain,
                 allocation_domain=coordinate_domain,
-                tensor_dimensions=consumer_dimensions,
+                axis_runs=consumer_runs,
             )
             if producer_map is not None and consumer_map is not None:
                 incidence = _access_incidence(
@@ -6556,7 +6713,8 @@ def build_tile_dependency_graph(
     noncanonical_task_origin_block_ids: frozenset[int] | None = None,
     world_size: int = 1,
 ) -> TileDependencyGraph:
-    """Build the minimal source-ordered allocation hazard graph."""
+    """Build the minimal source-ordered allocation hazard graph, with the tagged
+    candidates among its keyed peer counters."""
     if device_ir is not None:
         if task_families is None:
             task_families = tuple(device_ir.task_families)
@@ -6807,8 +6965,7 @@ def build_tile_dependency_graph(
         )
 
     def runs_at_root(access: TileAccess) -> bool:
-        site_ids = site_ids_by_access[access.access_id]
-        return bool(site_ids) and all(execution_sites[i].is_root for i in site_ids)
+        return _runs_at_root(site_ids_by_access[access.access_id], execution_sites)
 
     def runs_in_root_branch(access: TileAccess) -> bool:
         """At root, or in one branch directly under it."""
@@ -6872,11 +7029,29 @@ def build_tile_dependency_graph(
         for access in accesses_by_allocation[allocation_id]
         if access.kind == "store"
     }
+    # Tagged candidates among the keyed peer counters.
+    tagged_failures = {
+        allocation_id: _tagged_failure(
+            accesses_by_allocation[allocation_id],
+            task_families,
+            runs_at_root,
+            runs_in_root_branch,
+            world_size,
+            frozenset(inband_read_roots),
+        )
+        for allocation_id, failure in failures.items()
+        if failure
+    }
     for allocation_id, failure in sorted(failures.items()):
+        tagged = tagged_failures.get(allocation_id, "")
         log.info(
             "Cross-rank dependencies on %s use %s",
             "/".join(sorted(tensor_names_by_allocation.get(allocation_id, ()))),
-            f"peer_counter ({failure})" if failure else "inband",
+            "inband"
+            if not failure
+            else f"peer_counter ({failure}); tagged candidate"
+            if tagged is None
+            else f"peer_counter ({failure}{tagged and f'; {tagged}'})",
         )
     return TileDependencyGraph(
         task_families=task_families,
@@ -6887,7 +7062,139 @@ def build_tile_dependency_graph(
         noncanonical_axes=noncanonical_task_origin_block_ids,
         inband_allocation_ids=frozenset(inband_allocation_ids),
         inband_read_roots=frozenset(inband_read_roots),
+        tagged_candidate_ids=frozenset(
+            allocation_id
+            for allocation_id, failure in tagged_failures.items()
+            if failure is None
+        ),
     )
+
+
+def _tagged_failure(
+    accesses: list[TileAccess],
+    task_families: tuple[TaskFamily, ...],
+    runs_at_root: Callable[[TileAccess], bool],
+    runs_in_root_branch: Callable[[TileAccess], bool],
+    world_size: int,
+    inband_read_roots: frozenset[int],
+) -> str | None:
+    """The first rule a push-form allocation breaks for tagged transport.
+
+    Tagged transport replaces a keyed peer counter: each producer push becomes
+    8-byte words ``epoch << 32 | payload`` in every destination rank's mirror of
+    the allocation (epoch parity selects one of two mirrors), and the consumer
+    polls its mirror's words instead of a release-published counter. Codegen also
+    requires each rank to push one share of the tensor (T7), a push in a branch
+    to be in its root's guard, whose skipped tasks mark their tiles (T4), and
+    consumer loads a ring producer polls in whole tiles (T6); see
+    ``cross_loop_codegen``.
+    """
+    stores = [access for access in accesses if access.kind == "store"]
+    loads = [access for access in accesses if access.kind == "load"]
+    if not stores or not loads:
+        return "T1: a pushed allocation with consumer loads"
+    first = stores[0]
+
+    def subscript(access: TileAccess) -> tuple[object, ...]:
+        return (
+            access.subscript_dims,
+            access.subscript_affine_block_ids,
+            access.subscript_index_scales,
+            access.subscript_offsets,
+            access.subscript_is_scalar,
+            access.subscript_is_full_slice,
+            access.subscript_static_extents,
+            access.subscript_dense_spans,
+        )
+
+    # T1: one producer root pushes the same tile to every rank's copy, once per
+    # task, through the peer views, directly in the root or in one branch under
+    # it (T4 makes that branch the root's guard). A masked push also pushes which
+    # of its rows it wrote (row presence, see cross_loop_codegen).
+    if not (
+        len(stores) == world_size
+        and sorted(
+            cast("int", s.owner_rank) for s in stores if s.owner_rank is not None
+        )
+        == list(range(world_size))
+        and len({s.root for s in stores}) == 1
+        and all(
+            not s.is_atomic
+            and s.has_explicit_mask == first.has_explicit_mask
+            and subscript(s) == subscript(first)
+            and runs_in_root_branch(s)
+            for s in stores
+        )
+    ):
+        return "T1: one push of the same tile to every rank per task"
+    # A push a guard may skip (in the branch) or a masked push has one tile per
+    # task: its row presence words say which rows the task wrote (a skipped task
+    # marks none, T4), so no two tasks may share them. Each root axis places one
+    # subscript.
+    spans = first.subscript_dense_spans or (None,) * len(first.subscript_dims)
+    axes = sorted(
+        cast("int", block_id) if span is None else span[0]
+        for full, block_id, span in zip(
+            first.subscript_is_full_slice,
+            first.subscript_affine_block_ids,
+            spans,
+            strict=True,
+        )
+        if not full and (block_id is not None or span is not None)
+    )
+    if (not runs_at_root(first) or first.has_explicit_mask) and axes != sorted(
+        task_families[first.root].logical_axis_order
+    ):
+        return "T1: a masked or guard-skipped push writes one tile per task"
+    # T2: payloads of at most 4 bytes in a dense row-major tensor (the mirror is
+    # the tensor's elements in order) that every load reads through the same view.
+    try:
+        shape = [
+            _concrete_integer(extent, description="tagged shape")
+            for extent in first.tensor_shape
+        ]
+        strides = [
+            _concrete_integer(stride, description="tagged stride")
+            for stride in first.tensor_strides
+        ]
+        offset = _concrete_integer(first.storage_offset, description="tagged offset")
+    except ValueError:
+        return "T2: a tensor of concrete shape and strides"
+    dtype = first.dtype
+    layout = (first.tensor_shape, first.tensor_strides, first.storage_offset)
+    if not (
+        dtype is not None
+        and dtype.itemsize <= 4
+        and dtype is not torch.bool
+        and not dtype.is_complex
+        and offset == 0
+        and strides == [math.prod(shape[dim + 1 :]) for dim in range(len(shape))]
+        and all(
+            (load.tensor_shape, load.tensor_strides, load.storage_offset) == layout
+            and load.dtype == dtype
+            for load in [*loads, *stores]
+        )
+    ):
+        return "T2: payloads of at most 4 bytes in a dense tensor all accesses share"
+    # T3: one later root reads its own copy inside a loop, never the peer views.
+    if not (
+        len({load.root for load in loads}) == 1
+        and loads[0].root > first.root
+        and all(
+            load.owner_rank is None and not load.is_atomic and not runs_at_root(load)
+            for load in loads
+        )
+    ):
+        return "T3: one later root reads its own copy inside a loop"
+    # T5: a rank reuses a mirror two launches later. Some inband words that every
+    # rank polls in full each launch order every rank's readers before that.
+    if not inband_read_roots:
+        return "T5: every launch polls every rank in full (the parity credit)"
+    return None
+
+
+def _runs_at_root(site_ids: tuple[int, ...], sites: tuple[ExecutionSite, ...]) -> bool:
+    return bool(site_ids) and all(sites[i].is_root for i in site_ids)
 
 
 def _accesses_by_allocation(

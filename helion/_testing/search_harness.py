@@ -50,7 +50,9 @@ def mock_kernel(settings: Settings, **attrs: object) -> SimpleNamespace:
     kernel = SimpleNamespace(
         settings=settings,
         config_spec=config_spec,
-        env=SimpleNamespace(process_group_name=None, device=DEVICE),
+        env=SimpleNamespace(
+            process_group_name=None, device=DEVICE, backend_name="triton"
+        ),
         format_kernel_decorator=lambda config, settings: "decorator",
         to_triton_code=lambda config: "code",
         maybe_log_repro=lambda log_func, args, config=None: None,
