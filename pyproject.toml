@@ -242,6 +242,11 @@ project-excludes = [
   # hl.constexpr kernel arguments (Tensor + ConstExpr, int // ConstExpr) in
   # the device code; check_port.py checks every port on both backends.
   "benchmarks/cute/better_benchmark/kernels",
+  # The MXFP8 repro kernel is a Helion device body: pyrefly cannot type the
+  # hl.tile / hl.arange arithmetic on its block-size arguments (64 false
+  # bad-argument-type errors). The script is run end to end on GPU instead,
+  # and its kernels are checked against the FP64 reference before timing.
+  "benchmarks/cute/repro_mxfp8_latency_by_shape.py",
 ]
 python-version = "3.10"
 search-path = ["../pytorch"]
