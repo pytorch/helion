@@ -113,18 +113,27 @@ _CODEGEN_SETTINGS: tuple[str, ...] = (
     "static_shapes",
     "triton_do_not_specialize",
 )
+# Codegen settings added since: each enters the run_id only away from its
+# default, so the run_ids of kernels that leave it alone stay what they were
+# (test_structural_policy_identity freezes some).
+_LATER_CODEGEN_SETTINGS: dict[str, object] = {"device_asserts": True}
 
 
 def _codegen_signature(settings: dict[str, object] | None) -> str:
     """Generates a stable, reproducible run_id string based on code-generation
     settings. Iterates through a fixed, sorted list of settings. Missing keys
     are marked as None. Any change to a codegen-affecting setting automatically
-    changes the run_id. The complete settings are stored separately in the
-    metadata.
+    changes the run_id. The settings of ``_LATER_CODEGEN_SETTINGS`` follow, each
+    only away from its default (a missing key counts as the default). The
+    complete settings are stored separately in the metadata.
     """
     if not settings:
         return ""
-    return ", ".join(f"{name}={settings.get(name)}" for name in _CODEGEN_SETTINGS)
+    signature = ", ".join(f"{name}={settings.get(name)}" for name in _CODEGEN_SETTINGS)
+    for name, default in _LATER_CODEGEN_SETTINGS.items():
+        if (value := settings.get(name, default)) != default:
+            signature += f", {name}={value}"
+    return signature
 
 
 @dataclasses.dataclass

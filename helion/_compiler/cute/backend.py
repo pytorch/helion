@@ -55,6 +55,7 @@ from .analysis.attention_match import _attention_flash_supported
 from .analysis.attention_match import _attention_pattern_fits_root
 from .analysis.attention_match import _attention_pattern_geometry
 from .analysis.attention_match import _attention_softmax_pattern_head_dim
+from .analysis.attention_match import device_ir_has_device_assert
 from .analysis.match_common import root_grid_origin_is_canonical
 from .analysis.specialized_mma import _grouped_rank3_specialized_mma_plan
 from .analysis.specialized_mma import _kernel_specialized_mma_impl
@@ -1275,6 +1276,19 @@ def _detect_flex_attention_loop(
     return True
 
 
+def _reject_device_asserts(plan: str) -> None:
+    """Raise for a kernel with an hl.device_assert, which ``plan``, emitting
+    the whole body itself, would leave out (the forward search surface leaves
+    such a kernel to the generic lowering)."""
+    from ..host_function import HostFunction
+
+    if device_ir_has_device_assert(HostFunction.current().device_ir):
+        raise exc.BackendUnsupported(
+            "cute",
+            f"hl.device_assert in {plan} (compile it out: device_asserts=False)",
+        )
+
+
 def _detect_attention_mma_loop(
     fn: DeviceFunction,
     block_ids: list[int],
@@ -1569,6 +1583,10 @@ class CuteBackend(Backend):
     # Bump when config_value_priors() changes its candidate distribution.
     config_value_priors_version = 4
     pure_scalar_helpers = PURE_HELPERS
+
+    @property
+    def supports_device_asserts(self) -> bool:
+        return True
 
     @property
     def name(self) -> str:
@@ -2316,6 +2334,7 @@ class CuteBackend(Backend):
             # closed with the reason instead of running tcgen05.
             return detect_warp_mma_gemm(fn, block_ids, config=config)
         if _detect_attention_mma_loop(fn, block_ids, config=config):
+            _reject_device_asserts("a fused attention body")
             # Fused tcgen05 flash-attention: suppress synthetic lane
             # loops (mma_mode) and run a single 128-thread warpgroup
             # like the spike. The dedicated flash codegen emits the
@@ -2326,6 +2345,7 @@ class CuteBackend(Backend):
                 fn.cute_state.flash.block_ids = list(block_ids)
             return True
         if _detect_attention_bwd_mma_loop(fn, block_ids, config=config):
+            _reject_device_asserts("a fused attention backward body")
             # Fused tcgen05 attention BACKWARD: the dedicated bwd
             # codegen emits the whole device body. The flex envelope
             # records every loop it owns up front; keep that list.
@@ -4482,6 +4502,10 @@ class CuteBackend(Backend):
             compile_options = config_compile_options(
                 config, ptxas_options=ptxas_options
             )
+            if device_function.has_device_assert:
+                # The DSL drops cf.assert, which hl.device_assert emits,
+                # without this option.
+                compile_options = f"{compile_options} --enable-assertions".strip()
             if compile_options:
                 launcher_args.append(f"cute_compile_options={compile_options!r}")
             return launcher_args

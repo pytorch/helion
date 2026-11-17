@@ -19,6 +19,7 @@ from ... import exc
 from ...language import _tracing_ops
 from ...language import atomic_ops
 from ...language import barrier
+from ...language import debug_ops
 from ...language import device_print
 from ...language import distributed_ops
 from ...language import inline_asm_ops
@@ -284,7 +285,7 @@ def host_function_has_plain_store_body(host_function: object) -> bool:
     ``tcgen05_split_k`` runs each output tile's body on several CTAs and
     guards only the tcgen05 tile store with the last-arriver check; any
     other side effect (an atomic, a second store, a data-dependent branch, a
-    barrier, inline asm, a remote copy, a device print) would run once per
+    barrier, inline asm, a remote copy, a device print or assert) would run once per
     split. The search offers the knob and the pipeline takes it only when
     this holds.
     """
@@ -308,5 +309,12 @@ def host_function_has_plain_store_body(host_function: object) -> bool:
 # Modules whose ops have effects besides the tcgen05 tile store.
 _SIDE_EFFECT_MODULES = frozenset(
     module.__name__
-    for module in (atomic_ops, barrier, device_print, distributed_ops, inline_asm_ops)
+    for module in (
+        atomic_ops,
+        barrier,
+        debug_ops,
+        device_print,
+        distributed_ops,
+        inline_asm_ops,
+    )
 )

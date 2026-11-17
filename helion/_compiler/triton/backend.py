@@ -177,6 +177,16 @@ class TritonBackend(Backend):
         return True
 
     @property
+    def supports_device_asserts(self) -> bool:
+        # Triton's debug mode, which keeps tl.device_assert, needs Triton 3.7
+        # on ROCm (Inductor's _should_enable_triton_debug_asserts), and a
+        # build whose launch takes the two options the asserts add.
+        if _compat.is_hip() and _compat.get_triton_version().release < (3, 7):
+            return False
+        supported = _compat.supported_launch_options()
+        return supported is None or {"debug", "sanitize_overflow"} <= supported
+
+    @property
     def supports_debug_dtype_asserts(self) -> bool:
         return True
 
@@ -808,7 +818,20 @@ class TritonBackend(Backend):
                 "_minimum_resident_programs="
                 f"{device_fn.triton_minimum_resident_programs}"
             )
-        out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
+        keyword_args = self.launcher_keyword_args(config, has_barrier=has_barrier)
+        if device_fn.has_device_assert:
+            # Triton keeps tl.device_assert only in debug mode, whose overflow
+            # sanitizer would also assert every int32 add, sub and mul of the
+            # kernel; Inductor's kernels turn it off the same way.  These win
+            # over a kernel's _triton_config_debug or _triton_config_sanitize_overflow
+            # tunable, which would repeat the keyword.
+            out.extend(["debug=True", "sanitize_overflow=False"])
+            keyword_args = [
+                arg
+                for arg in keyword_args
+                if arg.partition("=")[0] not in ("debug", "sanitize_overflow")
+            ]
+        out.extend(keyword_args)
         return out
 
     def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
@@ -822,7 +845,10 @@ class TritonBackend(Backend):
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
-        return frozenset({"grid", "warmup", "num_warps", "num_stages"})
+        # debug and sanitize_overflow: hl.device_assert's compile options.
+        return frozenset(
+            {"grid", "warmup", "num_warps", "num_stages", "debug", "sanitize_overflow"}
+        )
 
 
 class GluonBackend(TritonBackend):
@@ -974,6 +1000,11 @@ class TileIRBackend(TritonBackend):
     """TileIR code generation backend (extends Triton)."""
 
     @property
+    def supports_device_asserts(self) -> bool:
+        # Not known to keep tt.assert.
+        return False
+
+    @property
     def name(self) -> str:
         return "tileir"
 
@@ -1044,6 +1075,4 @@ class TileIRBackend(TritonBackend):
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
-        return frozenset(
-            {"grid", "warmup", "num_warps", "num_stages", "num_ctas", "occupancy"}
-        )
+        return TritonBackend.reserved_launch_param_names() | {"num_ctas", "occupancy"}

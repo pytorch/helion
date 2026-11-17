@@ -54,6 +54,7 @@ from .._ast_pass_utils import is_vloop
 from ..access_regions import access_address
 from ..address_maps import Load
 from ..cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from ..debug_ops import CUTE_MEMORYLESS_EFFECT_CALLS
 from ..reduce_call import CLUSTER_REDUCES
 from .markers import _find_lane_reduce_call
 from .markers import _is_lane_reduce_marker_assign
@@ -148,6 +149,8 @@ _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 _PURE_CALLS = frozenset(
     {"ir.VectorType.get", "_cute_signed_bitfield_to_bf16_packed", "cute.crd2idx"}
 )
+# The calls a statement may move by its reads alone.
+_MOVABLE_CALLS = _PURE_CALLS | CUTE_MEMORYLESS_EFFECT_CALLS
 # Attributes querying a tensor's metadata: ``t[...].shape``, ``t[...].layout``
 # and ``t.iterator.alignment`` read no element of ``t`` (an epilogue sizing
 # its register fragment after a slice of the output partition).
@@ -268,7 +271,7 @@ def _calls_are_movable(
         or _is_plain_load(call)
         or _is_list_append(call)
         or (also is not None and also(call))
-        or ast.unparse(call.func) in _PURE_CALLS
+        or ast.unparse(call.func) in _MOVABLE_CALLS
         or _is_proven_relocatable_call(call, allow_load=True)
         for call in ast.walk(node)
         if isinstance(call, ast.Call)
@@ -1198,7 +1201,7 @@ def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statemen
             or _is_plain_load(call)
             or _is_list_append(call)
             or _is_atomic_call(call)
-            or ast.unparse(call.func) in _PURE_CALLS
+            or ast.unparse(call.func) in _MOVABLE_CALLS
             or _is_proven_relocatable_call(call, allow_load=True)
         )
     ]

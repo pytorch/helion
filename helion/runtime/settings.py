@@ -598,6 +598,9 @@ class _Settings:
             _env_get_bool, "HELION_DEBUG_DTYPE_ASSERTS", False
         )
     )
+    device_asserts: bool = dataclasses.field(
+        default_factory=functools.partial(_env_get_bool, "HELION_DEVICE_ASSERTS", True)
+    )
     ref_mode: RefMode = dataclasses.field(default_factory=_get_ref_mode)
     autotune_cache: str = dataclasses.field(
         default_factory=functools.partial(
@@ -1086,6 +1089,11 @@ class Settings(_Settings):
         ),
         "allow_warp_specialize": "If True, allow warp specialization for tl.range calls on CUDA devices.",
         "debug_dtype_asserts": "If True, emit tl.static_assert checks for dtype after each device node.",
+        "device_asserts": (
+            "If True (the default), check each hl.device_assert on the device; "
+            "if False, compile them out, for performance. "
+            "Set HELION_DEVICE_ASSERTS=0 to compile them out globally."
+        ),
         "ref_mode": "Reference mode for kernel execution. Can be RefMode.OFF or RefMode.EAGER.",
         "autotuner_fn": (
             "Function to create an autotuner. "

@@ -24,6 +24,7 @@ from helion.autotuner.base_search import _warn_dataset_without_log
 from helion.autotuner.finite_search import FiniteSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuneLogSink
+from helion.autotuner.metrics import _LATER_CODEGEN_SETTINGS
 from helion.autotuner.metrics import KernelMetadata
 import helion.language as hl
 
@@ -163,6 +164,27 @@ class TestRunId(TestCase):
             with self.subTest(setting=name):
                 changed = {**base_settings, name: pairs[name][1]}
                 self.assertNotEqual(base_run_id, _run_id(changed), name)
+
+
+class TestRunIdLaterSettings(TestCase):
+    def test_default_keeps_run_id(self) -> None:
+        # device_asserts enters the run_id only when False.
+        def _run_id(**extra: object) -> str:
+            return KernelMetadata(
+                kernel_name="k",
+                kernel_source="def k(): ...",
+                settings={"backend": "triton", **extra},
+            ).run_id
+
+        self.assertEqual(_run_id(), _run_id(device_asserts=True))
+        self.assertNotEqual(_run_id(), _run_id(device_asserts=False))
+
+    def test_later_settings_defaults(self) -> None:
+        with patch.dict(os.environ):
+            os.environ.pop("HELION_DEVICE_ASSERTS", None)
+            settings = helion.Settings().to_dict()
+        for name, default in _LATER_CODEGEN_SETTINGS.items():
+            self.assertEqual(settings[name], default, name)
 
 
 class TestAutotuneLogSink(TestCase):

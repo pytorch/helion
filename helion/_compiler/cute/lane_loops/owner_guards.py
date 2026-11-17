@@ -26,6 +26,7 @@ from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
 from .._ast_pass_utils import _is_proven_relocatable_call
 from .._ast_pass_utils import deep_clone
+from ..debug_ops import CUTE_MEMORYLESS_EFFECT_CALLS
 from ..persistent_branch_vec import PACKET_STORE_BYTES
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
@@ -988,6 +989,7 @@ def _validated_owner_store(stmt: ast.AST) -> ast.Call | None:
         isinstance(node, ast.Expr)
         and isinstance(node.value, ast.Call)
         and id(node.value) not in memory_call_ids
+        and ast.unparse(node.value.func) not in CUTE_MEMORYLESS_EFFECT_CALLS
         for node in ast.walk(stmt)
     ):
         raise exc.BackendUnsupported(

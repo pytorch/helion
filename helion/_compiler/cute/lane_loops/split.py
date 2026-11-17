@@ -50,6 +50,7 @@ from .._ast_pass_utils import exposed_reads
 from .._ast_pass_utils import names_written
 from .._ast_pass_utils import resolve_alias
 from .._ast_pass_utils import tensor_roots_may_alias
+from ..debug_ops import CUTE_MEMORYLESS_EFFECT_CALLS
 from ..register_tile_admission import RegisterTileOptions
 from ..register_tile_admission import RegisterTileUnsupported
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
@@ -958,9 +959,15 @@ def _split_one_lane_loop(
             rename_groups=rename_groups,
         )
         if staged is None:
-            raise exc.BackendUnsupported(
-                "cute", "matmul contribution has no complete staged lane schedule"
-            )
+            reason = "matmul contribution has no complete staged lane schedule"
+            if any(
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) in CUTE_MEMORYLESS_EFFECT_CALLS
+                for node in ast.walk(loop)
+            ):
+                # The schedule takes assignments only.
+                reason += " (an hl.device_assert in the loop; device_asserts=False compiles it out)"
+            raise exc.BackendUnsupported("cute", reason)
         _validate_owned_lane_carry_schedule(
             body, staged, lane_var, marker_indices, rename_groups
         )

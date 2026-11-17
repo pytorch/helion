@@ -28,6 +28,7 @@ from typing import Sequence
 
 import torch
 
+from ....language.debug_ops import device_assert
 from ...utils import is_full_slice
 from ..attention_plan import ALIBI_BIAS_KIND
 from ..attention_plan import CAUSAL_MASK_KIND
@@ -2421,6 +2422,16 @@ def _attention_pattern_geometry(
     return _AttentionGeometry(rows // q_seq, q_seq, kv_seq)
 
 
+def device_ir_has_device_assert(device_ir: DeviceIR) -> bool:
+    """Whether a kernel calls hl.device_assert, which the fused attention
+    bodies do not emit: the forward search surface leaves such a kernel to the
+    generic lowering, which checks it, and the fused plans reject it."""
+    return any(
+        graph_info.graph.find_nodes(op="call_function", target=device_assert)
+        for graph_info in device_ir.graphs
+    )
+
+
 def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | None:
     """Config-independent flash detector for the autotune search surface.
 
@@ -2440,6 +2451,9 @@ def detect_flash_search_surface(device_ir: DeviceIR) -> FlashSearchSurface | Non
     if len(device_ir.grid_block_ids) != 1 or not root_grid_origin_is_canonical(
         device_ir
     ):
+        return None
+    # The fused bodies do not emit hl.device_assert.
+    if device_ir_has_device_assert(device_ir):
         return None
     root_grid_ids = device_ir.grid_block_ids[0]
     env = CompileEnvironment.current()

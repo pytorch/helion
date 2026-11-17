@@ -70,6 +70,7 @@ from .compile_environment import _symint_expr
 from .compile_environment import warning
 from .container_identity import compare_container_identity
 from .container_identity import record_opaque_container_result
+from .device_assert_codegen import check_device_asserts
 from .fragment_call import guard_fragment_call_input
 from .fragment_comparison import guard_fragment_comparison
 from .fx_side_effects import is_impure_node
@@ -4423,6 +4424,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             raise exc.NoDeviceLoopsInKernel
         from ..language.random_ops import rewrite_implicit_random_ops
 
+        check_device_asserts(device_ir)
         # Resolve source-level sizes before RNG lowering introduces internal
         # size queries that identify physical tile coordinates.
         extents = restate_reduction_extents()

@@ -377,6 +377,12 @@ The `Tile` class represents a portion of an iteration space with the following k
 .. autofunction:: device_print
 ```
 
+### device_assert()
+
+```{eval-rst}
+.. autofunction:: device_assert
+```
+
 ## Constexpr Operations
 
 ### constexpr()

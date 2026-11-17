@@ -2209,8 +2209,13 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
     """Enable the bwd flash search surface (pins 128x128 block sizes)."""
     from ..compile_environment import CompileEnvironment
     from .analysis.attention_match import _attention_flash_supported
+    from .analysis.attention_match import device_ir_has_device_assert
 
     if not _attention_flash_supported() or not root_grid_origin_is_canonical(device_ir):
+        return False
+    if device_ir_has_device_assert(device_ir):
+        # The fused backward body does not emit hl.device_assert (its plan
+        # rejects one): leave the kernel to the generic lowering.
         return False
     match = match_attention_bwd(device_ir)
     if match is None:

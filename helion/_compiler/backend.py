@@ -525,6 +525,12 @@ class Backend(abc.ABC):
         return False
 
     @property
+    def supports_device_asserts(self) -> bool:
+        """Whether this backend emits ``hl.device_assert``; a kernel with one
+        compiles elsewhere only with ``Settings.device_asserts`` off."""
+        return False
+
+    @property
     def supports_debug_dtype_asserts(self) -> bool:
         """Whether ``Settings.debug_dtype_asserts`` can run on this backend.
 
@@ -1438,11 +1444,12 @@ class Backend(abc.ABC):
         self, value: str, length: int, dim: int, ndim: int, identity: str
     ) -> str | None:
         """``value``, the input of a persistent reduction over dim ``dim`` of
-        an ``ndim``-dim value, with that dim's lanes past the ``length``
-        elements of a padded ``hl.arange`` set to the reduction's
-        ``identity``, or None to leave the input as it is: the default, for
-        backends whose reductions do not read those lanes through this path
-        (masking them in their own emitter, or not padding the range)."""
+        an ``ndim``-dim value (or an ``hl.device_assert`` condition), with that
+        dim's lanes past the ``length`` elements of a padded ``hl.arange`` set
+        to ``identity`` (the reduction's, or True), or None to leave the input
+        as it is: the default, for backends that do not read those lanes
+        through this path (masking them in their own emitter, or not padding
+        the range)."""
         return None
 
     def minimum_expr(self, a: str, b: str) -> str:

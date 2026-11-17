@@ -22,6 +22,7 @@ from ..language._tracing_ops import _get_symnode
 from ..language._tracing_ops import _host_tensor
 from ..language._tracing_ops import _if
 from ..language._tracing_ops import is_for_loop_target
+from ..language.debug_ops import device_assert
 from ..language.matmul_ops import dot as hl_dot
 from ..language.matmul_ops import dot_scaled as hl_dot_scaled
 from ..language.memory_ops import load
@@ -182,6 +183,9 @@ class ReductionRoller:
                 for child in children
                 if self._reads_memory(child)
             )
+        if effect.target is device_assert:
+            # Writes no memory: rows reloaded after it read what it checked.
+            return False
         if effect.target not in (store, *_ATOMIC_OPS) or read.target is not load:
             return True
         written, loaded = effect.args[0], read.args[0]
@@ -353,6 +357,16 @@ class ReductionRoller:
                 # resolves to the grid block_id and only one element per
                 # iteration is written.
                 num_rdims = self._count_rdim_axes_in_subscript(target, index_arg)
+        elif node.target is device_assert:
+            # It has no value: its condition says whether it checks a chunk of
+            # the reduction dim, which outside the loop would check only the
+            # last chunk.
+            condition = node.args[0]
+            num_rdims = (
+                self._count_rdim_axes_in_val(condition.meta.get("val"))
+                if isinstance(condition, torch.fx.Node)
+                else 0
+            )
         elif node.target is prefetch:
             # A prefetch has no value; its subscript says what it covers, less
             # the row segment a bulk prefetch covers by its byte count.

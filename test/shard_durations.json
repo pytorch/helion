@@ -375,6 +375,7 @@
  "test/test_cute_warp_tf32_swizzle.py": 0.1,
  "test/test_cute_zero_fill_launch.py": 8.6,
  "test/test_debug_utils.py": 0.6,
+ "test/test_device_assert.py": 2.1,
  "test/test_distributed.py": 0.5,
  "test/test_dot.py": 29.5,
  "test/test_dot_requirements.py": 13.9,

@@ -3696,6 +3696,9 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
+        if not settings.device_asserts:
+            # A repro or a pasted best config would check the asserts again.
+            parts.append("device_asserts=False")
         # Resolved from the settings' backend: callers pass foreign Settings
         # and ``self`` may be None.
         parts.extend(get_backend(settings.backend).decorator_settings(settings))

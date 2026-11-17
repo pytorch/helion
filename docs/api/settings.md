@@ -238,7 +238,7 @@ def my_kernel(x: torch.Tensor) -> torch.Tensor:
 .. autoattribute:: Settings.autotune_log
 
    When set, Helion writes per-config telemetry (run id, timestamp, config id, generation, status, perf, compile time, config) to ``<value>.csv`` and mirrors the autotune log to ``<value>.log`` (for population-based autotuners: ``PatternSearch``, ``DifferentialEvolution``). Both append, so runs sharing one base path accumulate.
-   CSV rows join to ``.meta.jsonl`` via two hashes: ``run_id`` for the invocation — hash(kernel source, shapes, dtypes, hardware, codegen settings) — and ``config_id`` for the config. The codegen settings hashed into ``run_id`` are: backend, dot_precision, fast_math, static_shapes, index_dtype, allow_warp_specialize, triton_do_not_specialize, pallas_interpret, debug_dtype_asserts, persistent_reserved_sms (the full settings are recorded in ``.meta.jsonl``). Same config_id across started/ok/error and re-benchmarks. The full config is written inline in the trailing ``config`` column of the CSV; it is also stored in the ``.meta.jsonl`` configs map, which is written only when ``autotune_log_details`` is enabled (see below). Controlled by HELION_AUTOTUNE_LOG.
+   CSV rows join to ``.meta.jsonl`` via two hashes: ``run_id`` for the invocation — hash(kernel source, shapes, dtypes, hardware, codegen settings) — and ``config_id`` for the config. The codegen settings hashed into ``run_id`` are: backend, dot_precision, fast_math, static_shapes, index_dtype, allow_warp_specialize, triton_do_not_specialize, pallas_interpret, pallas_collective_id, pallas_topk_recall_target, debug_dtype_asserts, persistent_reserved_sms, and device_asserts when it is False (the full settings are recorded in ``.meta.jsonl``). Same config_id across started/ok/error and re-benchmarks. The full config is written inline in the trailing ``config`` column of the CSV; it is also stored in the ``.meta.jsonl`` configs map, which is written only when ``autotune_log_details`` is enabled (see below). Controlled by HELION_AUTOTUNE_LOG.
 
 
 
@@ -474,6 +474,10 @@ See :class:`helion.autotuner.LocalAutotuneCache` for details on cache keys and b
 .. autoattribute:: Settings.debug_dtype_asserts
 
    Emit ``tl.static_assert`` dtype checks after each lowering step. Default is ``False``. Controlled by ``HELION_DEBUG_DTYPE_ASSERTS``.
+
+.. autoattribute:: Settings.device_asserts
+
+   Check each ``hl.device_assert`` on the device. Default is ``True``; ``False`` compiles them out, for performance. Controlled by ``HELION_DEVICE_ASSERTS`` (set to ``0`` to compile them out).
 ```
 
 ### Device Execution Modes
@@ -604,6 +608,7 @@ Built-in values for ``HELION_AUTOTUNER`` include ``"LFBOTreeSearch"`` (default),
 | ``HELION_IGNORE_WARNINGS`` | ``ignore_warnings`` | Comma-separated warning names defined in ``helion.exc`` to suppress. |
 | ``HELION_ALLOW_WARP_SPECIALIZE`` | ``allow_warp_specialize`` | Permit warp-specialized code generation for ``tl.range``. |
 | ``HELION_DEBUG_DTYPE_ASSERTS`` | ``debug_dtype_asserts`` | Inject dtype assertions after each lowering step. |
+| ``HELION_DEVICE_ASSERTS`` | ``device_asserts`` | Set to ``0`` to compile ``hl.device_assert`` checks out. |
 | ``HELION_INTERPRET`` | ``ref_mode`` | Run kernels through the reference interpreter when set to ``1`` (maps to ``RefMode.EAGER``). |
 | ``HELION_AUTOTUNER`` | ``default_autotuner_fn`` | Select which autotuner implementation to instantiate. Default is ``"LFBOTreeSearch"``. Other options: ``"LFBOPatternSearch"``, ``"DESurrogateHybrid"``, ``"PatternSearch"``, ``"DifferentialEvolutionSearch"``, ``"FiniteSearch"``, ``"RandomSearch"``, ``"LLMGuidedSearch"``, ``"LLMSeededSearch"``, ``"LLMSeededLFBOTreeSearch"``. See :doc:`autotuner` for LLM configuration. |
 | ``HELION_BACKEND`` | ``backend`` | Code generation backend (``"triton"`` (default), ``"pallas"``, ``"cute"``, ``"tileir"``, ``"gluon"``, ``"metal"``, ``"flydsl"``; the last three experimental). ``"cute"`` requires PyTorch built against CUDA 13 or later; ``"tileir"`` requires ``ENABLE_TILE=1``; ``"gluon"`` requires a compute capability 10.x GPU and Triton 3.8 or later. |

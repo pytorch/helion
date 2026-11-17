@@ -407,6 +407,10 @@ class DeviceFunction:
         self.config = config
         self.codegen = codegen
         self.has_barrier = CompileEnvironment.current().has_barrier
+        # Whether the kernel checks an hl.device_assert, which it compiles with
+        # the backend's assertions on (Triton's debug mode, CuTe's
+        # --enable-assertions): without them the check is compiled out.
+        self.has_device_assert = False
         self.uses_async_proxy_global = _selects_tma_access(config)
         self._async_store_drained = False
         self._tma_store_warp_specialized = False

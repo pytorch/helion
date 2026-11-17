@@ -13,6 +13,7 @@ from torch.fx.experimental import proxy_tensor
 
 from .. import exc
 from . import _decorators
+from .debug_ops import tracing_combine_function
 
 if TYPE_CHECKING:
     from .._compiler.helper_function import CombineFunction
@@ -323,9 +324,10 @@ def _(
         )
         fake_inputs = [left_fake_tensor, right_fake_tensor]
 
-    combine_graph = proxy_tensor.make_fx(
-        combine_fn, decomposition_table=select_decomp_table()
-    )(*fake_inputs).graph
+    with tracing_combine_function():
+        combine_graph = proxy_tensor.make_fx(
+            combine_fn, decomposition_table=select_decomp_table()
+        )(*fake_inputs).graph
     combine_graph_id = DeviceIR.current().add_graph(
         combine_graph,
         HelperFunctionGraphInfo,
