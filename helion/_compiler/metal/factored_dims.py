@@ -36,7 +36,9 @@ from typing import TYPE_CHECKING
 
 import sympy
 import torch
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.node import Node
+from torch.utils._sympy.functions import FloorDiv
 
 from ... import exc
 from ...language import _tracing_ops
@@ -287,13 +289,19 @@ def _check_extent(
     access: str,
 ) -> None:
     """Eager clips a widened slice at the tensor's end, while the parts cover
-    ``[c * begin, c * end)`` masked by the loop's mask; they agree only when
-    the indexed dim is ``c * end``."""
+    ``[c * begin, c * end)`` masked by the loop's mask; they agree when the
+    indexed dim is ``c * end``.  A load also passes over a longer dim (as
+    under a loop to ``size // c``): its parts read every element of the
+    loop's widened extent, all inside the tensor, and the dim's elements past
+    that extent lie at positions the loop masks off, which load as masked
+    elements do.  A store there would leave them unwritten, so it doesn't."""
     env = CompileEnvironment.current()
     assert index.end is not None
     tensor_dim = sum(1 for k in subscript[:pos] if k is not None)
     size = tensor.size(tensor_dim)
     if env.known_equal(size, index.factor * index.end):
+        return
+    if access == "load" and _fits(index.factor, index.end, size):
         return
     hint = (
         ""
@@ -309,6 +317,16 @@ def _check_extent(
         f"{index.end}; Metal needs the dim to be exactly {index.factor} x the "
         f"loop's end{hint}"
     )
+
+
+def _fits(factor: int, end: int | torch.SymInt, size: int | torch.SymInt) -> bool:
+    """Whether ``factor * end <= size`` holds at every size: provably, or
+    ``end`` being ``size // factor``."""
+    if isinstance(end, torch.SymInt):
+        expr = size.node.expr if isinstance(size, torch.SymInt) else sympy.Integer(size)
+        if end.node.expr == FloorDiv(expr, factor):
+            return True
+    return statically_known_true(factor * end <= size)
 
 
 def _part_shape(

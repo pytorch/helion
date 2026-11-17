@@ -14846,6 +14846,21 @@ class TestMetalFactoredDims(unittest.TestCase):
             helion.Config(block_sizes=[8, 8, 4]),
         )
 
+    def test_load_within_a_longer_dim(self) -> None:
+        """A widened load over a dim longer than the parts, as under a loop
+        to ``size // 2``: the parts read the loop's widened extent, inside
+        the tensor, symbolic sizes too (``int4_gemm`` packs ``K // 2``)."""
+        for static in (True, False):
+            kernel = helion.kernel(
+                widened_copy_odd.fn,
+                backend="metal",
+                static_shapes=static,
+                autotune_effort="none",
+            )
+            for k in (17, 30):
+                a = torch.randn(5, k, device=DEVICE)
+                torch.testing.assert_close(kernel(a), a[:, : k // 2 * 2])
+
     def test_extent_other_than_the_parts_rejects(self) -> None:
         exact = r"Metal needs the dim to be exactly 2 x the loop's end"
         self._assert_rejected(
@@ -14853,16 +14868,11 @@ class TestMetalFactoredDims(unittest.TestCase):
             (torch.randn(4, 16), torch.zeros(4, 15)),
             rf"a store of dim 1 \(size 15\) .*{exact}(?!, and)",
         )
-        self._assert_rejected(
-            widened_copy_odd,
-            (torch.randn(4, 17),),
-            rf"a load of dim 1 .*{exact}(?!, and)",
-        )
         # Dim 1 is 2 x 37, so a count that took the `...` as one dim would pass.
         self._assert_rejected(
             ellipsis_widened,
             (torch.randn(3, 2 * 37, 80), 37),
-            rf"a load of dim 2 \(size 80\) .*{exact}",
+            rf"a store of dim 2 \(size 80\) .*{exact}",
         )
         hint = (
             rf"{exact}, and can't prove it of symbolic sizes; pass "
