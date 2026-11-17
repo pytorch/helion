@@ -186,6 +186,9 @@ def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None
 
     if not group.levels:
         refuse("a matmul over a ':' K, outside a K loop")
+    if not group.lhs.dtype.is_floating_point:
+        # MSL's is_simdgroup_matrix_element: half, bfloat and float only.
+        refuse(f"{group.lhs.dtype} operands, which simdgroup_matrix can't hold")
     if group.k_factor != 1:
         refuse("a matmul over a K held as per-thread parts")
     if group.batch_block is not None:
