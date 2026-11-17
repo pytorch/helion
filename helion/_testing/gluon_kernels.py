@@ -34,11 +34,11 @@ def nvfp4_mm(
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
         for kk in hl.grid(y.size(0) // 128):
             acc = hl.dot_scaled(
-                x[tile_m, kk * 128 + hl.arange(128)],
-                x_scale[tile_m, kk * 16 + hl.arange(16)],
+                x[tile_m, hl.arange(128) + kk * 128],
+                x_scale[tile_m, hl.arange(16) + kk * 16],
                 "e2m1",
-                y[kk * 128 + hl.arange(128), tile_n],
-                y_scale[tile_n, kk * 16 + hl.arange(16)],
+                y[hl.arange(128) + kk * 128, tile_n],
+                y_scale[tile_n, hl.arange(16) + kk * 16],
                 "e2m1",
                 acc=acc,
             )
