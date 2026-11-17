@@ -110,6 +110,17 @@ CHECKS = {
     "flex_attention": ("test", [(1, 4, 256, 64), (2, 8, 1024, 64), (2, 16, 2048, 128)]),
     "fp8_attention": ("check", [(1, 4, 256, 64), (2, 8, 1024, 64), (2, 16, 2048, 128)]),
     "jagged_hstu_attn": ("test", [(2, 128, 4, 32), (4, 256, 8, 64), (8, 512, 8, 64)]),
+    # (query_lens, seq_lens) per workload: short-context decode, a ragged
+    # mixed decode+prefill batch, and long-context decode. Heads, kv heads,
+    # head dim, and page size keep test()'s tuned defaults.
+    "paged_attention": (
+        "test",
+        [
+            ([1] * 4, [256] * 4),
+            ([1, 1, 1, 128, 333], [1024, 512, 77, 512, 1000]),
+            ([1] * 16, [2048] * 16),
+        ],
+    ),
     "geglu": ("check_geglu_kernel", [((256, 1024),), ((4096, 4096),), ((8192, 8192),)]),
     "swiglu": (
         "check_swiglu_kernel",
