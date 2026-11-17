@@ -335,6 +335,32 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
         """Return a sequence of (description, key) tuples for all cache entries."""
         raise NotImplementedError
 
+    def cached_config(self, *, skip_cache: bool = False) -> Config | None:
+        """The config the cache holds, read as :meth:`autotune` reads it:
+        ``None`` on a miss, under ``skip_cache`` (HELION_FORCE_AUTOTUNE),
+        HELION_SKIP_CACHE, or a search policy without cache I/O. A hit is
+        counted and reported as :meth:`autotune` reports one."""
+        if (
+            skip_cache
+            or should_skip_cache()
+            or not self._search_policy_allows_cache_io()
+        ):
+            return None
+        config = self.get()
+        if config is not None:
+            counters["autotune"]["cache_hit"] += 1
+            log.debug("cache hit: %s", str(config))
+            if self._should_report_cache_hit():
+                kernel_decorator = self.kernel.format_kernel_decorator(
+                    config, self.autotuner.settings
+                )
+                print(f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr)
+                cache_info = self._get_cache_info_message()
+                self.autotuner.log(
+                    f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
+                )
+        return config
+
     def autotune(self, *, skip_cache: bool = False) -> Config:
         """Run autotuning, consulting and updating the on-disk cache.
 
@@ -357,22 +383,8 @@ class AutotuneCacheBase(BaseAutotuner, abc.ABC, metaclass=AutotuneCacheMeta):
             )
             raise exc.CacheAssertionError(self.kernel.kernel.name)
 
-        if not skip_read:
-            if (config := self.get()) is not None:
-                counters["autotune"]["cache_hit"] += 1
-                log.debug("cache hit: %s", str(config))
-                if self._should_report_cache_hit():
-                    kernel_decorator = self.kernel.format_kernel_decorator(
-                        config, self.autotuner.settings
-                    )
-                    print(
-                        f"Using cached config:\n\t{kernel_decorator}", file=sys.stderr
-                    )
-                    cache_info = self._get_cache_info_message()
-                    self.autotuner.log(
-                        f"Found cached config for {self.kernel.kernel.name}, skipping autotuning.\n{cache_info}"
-                    )
-                return config
+        if not skip_read and (config := self.cached_config()) is not None:
+            return config
 
         counters["autotune"]["cache_miss"] += 1
         log.debug("cache miss")

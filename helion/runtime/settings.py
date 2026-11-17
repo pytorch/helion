@@ -292,6 +292,23 @@ def _get_initial_population_strategy(
     return strategy
 
 
+def autotuning_disallowed_reason() -> str | None:
+    """Why the environment disallows autotuning (``HELION_DISALLOW_AUTOTUNING=1``
+    or a MAST job), or None; :meth:`Settings.check_autotuning_disabled` raises
+    with it."""
+    msg = None
+    if os.environ.get("HELION_DISALLOW_AUTOTUNING", "0") == "1":
+        msg = "by HELION_DISALLOW_AUTOTUNING=1"
+    if is_fbcode():
+        from aiplatform.runtime_environment.runtime_environment_pybind import (  # type: ignore[import-untyped]
+            RuntimeEnvironment,
+        )
+
+        if RuntimeEnvironment().get_mast_job_name() is not None:
+            msg = "because autotuning is not allowed in MAST environment"
+    return msg
+
+
 def default_autotuner_fn(
     bound_kernel: BoundKernel, args: Sequence[object], **kwargs: object
 ) -> BaseAutotuner:
@@ -1421,17 +1438,7 @@ class Settings(_Settings):
         return {k: shallow_copy(v) for k, v in values.items() if k in public_fields}
 
     def check_autotuning_disabled(self) -> None:
-        msg = None
-        if os.environ.get("HELION_DISALLOW_AUTOTUNING", "0") == "1":
-            msg = "by HELION_DISALLOW_AUTOTUNING=1"
-        if is_fbcode():
-            from aiplatform.runtime_environment.runtime_environment_pybind import (  # type: ignore[import-untyped]
-                RuntimeEnvironment,
-            )
-
-            if RuntimeEnvironment().get_mast_job_name() is not None:
-                msg = "because autotuning is not allowed in MAST environment"
-        if msg:
+        if (msg := autotuning_disallowed_reason()) is not None:
             raise exc.AutotuningDisallowedInEnvironment(msg)
 
     def get_rebenchmark_threshold(self) -> float:

@@ -176,6 +176,18 @@
       "shards": 2
     },
     {
+      "runner": "linux.dgx.b200",
+      "python-version": "3.12",
+      "ref-eager": false,
+      "image": "nvidia/cuda:13.2.0-devel-ubuntu24.04",
+      "runtime-version": "cu132",
+      "container-options": "--gpus all",
+      "pytorch-version": "pytorch-nightly",
+      "alias": "b200-flex-attention",
+      "backend": "cute",
+      "test-path": "test/test_cute_flex_attention_backend.py"
+    },
+    {
       "runner": "mt-l-x86iavx512-8-64",
       "python-version": "3.12",
       "ref-eager": false,

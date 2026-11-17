@@ -11,7 +11,8 @@ the file from junit reports of the CuTe GPU lane with the pull-request filter
     python scripts/shard_durations.py .logs/tests/<run>/cute-gpu*.xml
 
 Do not import CPU-only or slow-tier reports: modules omitted from the CuTe GPU
-PR lane do not receive a shard assignment.
+PR lane do not receive a shard assignment. Modules CI runs in a job of their
+own (``own_job_modules``) are left out of the reports and the file.
 
 Modules in the reports replace their recorded seconds, other entries stay,
 and entries whose module no longer exists are dropped; run it without reports
@@ -39,6 +40,15 @@ from helion._testing.sharding import load_durations
 from helion._testing.sharding import shard_loads
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def own_job_modules() -> frozenset[str]:
+    """Modules CI runs in a job of their own: the "test-path" entries of
+    .github/matrix.json, which the CuTe shards leave out (--ignore in
+    test.yml). The local CuTe GPU lane still runs them, so they are dropped
+    from its reports."""
+    matrix = json.loads((REPO_ROOT / ".github" / "matrix.json").read_text())
+    return frozenset(e["test-path"] for e in matrix["include"] if "test-path" in e)
 
 
 def _module_of(classname: str, root: Path) -> str | None:
@@ -93,9 +103,14 @@ def main(argv: list[str] | None = None) -> int:
 
     recorded = load_durations(args.output)
     durations = dict(recorded)
+    own_job = own_job_modules()
     reported: set[str] = set()
     for report in args.junitxml:
-        seconds = read_junit(report)
+        seconds = {
+            module: elapsed
+            for module, elapsed in read_junit(report).items()
+            if module not in own_job
+        }
         durations.update(
             {
                 module: max(0.1, round(elapsed, 1)) if elapsed > 0 else 0.0
@@ -106,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
     durations = {
         module: seconds
         for module, seconds in durations.items()
-        if (REPO_ROOT / module).is_file()
+        if (REPO_ROOT / module).is_file() and module not in own_job
     }
 
     if args.shards:
