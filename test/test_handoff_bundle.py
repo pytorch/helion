@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
 from typing import cast
 
@@ -21,12 +22,15 @@ from helion._testing import _has_cute_dsl
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessCuteAvailable
+from helion.autotuner import AccuracyCheck
 from helion.autotuner import FiniteSearch
 from helion.autotuner import HandoffBundle
 from helion.autotuner import HandoffPolicy
+from helion.autotuner import HandoffRequest
 from helion.autotuner import build_handoff
 from helion.autotuner import find_handoff
 from helion.autotuner.benchmark_provider import _MultiShapeAutotuneArgs
+from helion.autotuner.handoff_bundle import _accuracy
 from helion.autotuner.handoff_bundle import _input_metadata
 from helion.autotuner.handoff_bundle import _tolerances
 from helion.autotuner.handoff_inputs import _clone_inputs
@@ -35,6 +39,7 @@ from helion.autotuner.handoff_inputs import _save_inputs
 import helion.language as hl
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Sequence
 
 
@@ -118,11 +123,103 @@ def test_fp8_reference_tolerances() -> None:
     assert _tolerances(bitwise, output, nans, (nans[0].clone(),)) == (0.0, 0.0)
 
 
+def test_accuracy_rule_records_an_accuracy_check() -> None:
+    """A bundle records the rule autotuning applied: an AccuracyCheck's own
+    tolerances and atol scaling, else the autotune_baseline_* settings."""
+    inputs = (torch.ones(8),)
+    output = torch.ones(8)
+    check = AccuracyCheck(atol=0.03, rtol=0.0, atol_scale="peak")
+    assert _accuracy(
+        helion.Settings(autotune_baseline_accuracy_check_fn=check),
+        output,
+        inputs,
+        inputs,
+    ) == {
+        "atol": 0.03,
+        "rtol": 0.0,
+        "atol_scale": "peak",
+        "scale_atol": False,
+        "fp8_accuracy": "ulp",
+    }
+    default = _accuracy(helion.Settings(), output, inputs, inputs)
+    assert default["atol_scale"] == "rms" and default["scale_atol"]
+    explicit = _accuracy(
+        helion.Settings(autotune_baseline_atol=0.02), output, inputs, inputs
+    )
+    assert (explicit["atol"], explicit["atol_scale"], explicit["scale_atol"]) == (
+        0.02,
+        None,
+        False,
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(300)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["triton"])
+def test_handoff_applies_an_accuracy_check(tmp_path: Path) -> None:
+    """build_handoff accepts an AccuracyCheck, whose peak-scaled bound then
+    decides the agent's rounds, and still refuses arbitrary callbacks."""
+
+    def offset_kernel(check: object) -> Any:
+        @helion.kernel(
+            backend="triton",
+            static_shapes=True,
+            autotune_precompile=None,
+            autotune_benchmark_subprocess=False,
+            autotune_baseline_accuracy_check_fn=check,
+        )
+        def offset(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(x.size()):
+                out[tile] = x[tile] + 1.0
+            return out
+
+        return offset
+
+    # x + 1 peaks at 16: atol 0.03 x peak admits 0.48 absolute.
+    args = (torch.arange(16, device=DEVICE, dtype=torch.float32),)
+    configs = [helion.Config(block_sizes=[8]), helion.Config(block_sizes=[16])]
+    check = AccuracyCheck(atol=0.03, rtol=0.0, atol_scale="peak")
+    search = FiniteSearch(offset_kernel(check).bind(args), args, configs)
+    point = find_handoff(search)
+    bundle = build_handoff(search, point, tmp_path / "bundle", repetitions=1)
+    case = bundle.manifest["cases"][0]
+    assert (case["atol"], case["rtol"], case["atol_scale"]) == (0.03, 0.0, "peak")
+    # Version-1 evaluators would read scale_atol=False as an unscaled atol.
+    assert bundle.manifest["schema_version"] == 2
+
+    source = (bundle.directory / "case_0/kernel.py").read_text()
+
+    def shifted(delta: float) -> Any:
+        def agent(workspace: Any) -> dict[str, str]:
+            return {
+                "case_0/kernel.py": source + f"\n_original = offset\ndef offset(x):\n"
+                f"    return _original(x) + {delta}\n"
+            }
+
+        return agent
+
+    rejected = bundle.run_agent(shifted(0.6), repetitions=1)
+    assert rejected.cases[0].status == "accuracy_error", rejected.cases[0].error
+    accepted = bundle.run_agent(shifted(0.4), repetitions=1)
+    assert accepted.cases[0].status == "ok", accepted.cases[0].error
+
+    # Refused before the point is used, so the first search's point serves.
+    custom = FiniteSearch(
+        offset_kernel(lambda actual, expected: None).bind(args), args, configs
+    )
+    with pytest.raises(NotImplementedError, match="AccuracyCheck"):
+        build_handoff(custom, point, tmp_path / "custom", repetitions=1)
+
+
 def test_agent_rejects_non_source_replacements_before_writing(tmp_path: Path) -> None:
     (tmp_path / "kernel.py").write_text("original")
     (tmp_path / "manifest.json").write_text(
         json.dumps({"cases": [{"source": "kernel.py"}]})
     )
+    (tmp_path / "prompt.md").write_text("prompt")
     bundle = HandoffBundle(tmp_path)
     with pytest.raises(ValueError, match="existing native source"):
         bundle.run_agent(lambda _: {"kernel.py": "changed", "reference.pt": "bad"})
@@ -174,6 +271,7 @@ def test_agent_revalidates_source_path_after_callback(tmp_path):
     (directory / "manifest.json").write_text(
         json.dumps({"cases": [{"source": "kernel.py"}]})
     )
+    (directory / "prompt.md").write_text("prompt")
 
     def agent(workspace):
         source.unlink()
@@ -354,7 +452,7 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
     assert dataclasses.fields(bundle)[0].name == "directory"
     originals = bundle.sources
 
-    def agent(workspace: HandoffBundle) -> dict[str, str]:
+    def agent(workspace: HandoffRequest) -> dict[str, str]:
         replacements = {}
         for path, source in workspace.sources.items():
             tree = _EquivalentSource().visit(ast.parse(source))
@@ -380,7 +478,7 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
     # multi-shape bundle (test_handoff_evaluation covers a failed case disabling
     # its aggregate), so it runs once per backend: each round cold-compiles the
     # kernel in a fresh worker.
-    def invalid_agent(workspace: HandoffBundle) -> dict[str, str]:
+    def invalid_agent(workspace: HandoffRequest) -> dict[str, str]:
         source = workspace.sources["case_0/kernel.py"]
         return {
             "case_0/kernel.py": source
@@ -401,6 +499,92 @@ def test_native_source_handoff(backend: str, multi_shape: bool, tmp_path: Path) 
                 reference_fn=lambda x, scale: torch.zeros_like(x),
                 repetitions=1,
             )
+
+
+def _leaky(x: torch.Tensor) -> torch.Tensor:
+    return torch.where(x > 0, x, x * 0.5)
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(300)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@skipIfRefEager("Native handoff requires compilation")
+@skipUnlessBackends(["cute"])
+@skipUnlessCuteAvailable("Native CuTe handoff requires the supported CuTe DSL")
+def test_cute_handoff_with_callable_bool_and_float_arguments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Callables (score/mask mods) are compiled into the kernel, so the exported
+    entry point omits them; with ``HELION_CUTE_EXPORT_HARDCODE_SCALARS=1`` a
+    bool or float the host code branches on is exported as the constant of
+    the case, passed (``check``) or left at its default (``scale``), even when
+    the bound kernel was bound with another value (bools and floats key bound
+    kernels by type), and a float only passed to the launch stays a runtime
+    scalar."""
+    monkeypatch.setenv("HELION_CUTE_EXPORT_HARDCODE_SCALARS", "1")
+
+    @helion.kernel(
+        backend="cute",
+        static_shapes=True,
+        autotune_precompile=None,
+        autotune_benchmark_subprocess=False,
+    )
+    def mapped_add(
+        x: torch.Tensor,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        y: torch.Tensor,
+        check: bool = False,
+        scale: float = 1.0,
+        shift: float = 0.0,
+    ) -> torch.Tensor:
+        if check:
+            assert x.size(0) == y.size(0)
+        assert scale > 0
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.size()):
+            out[tile] = fn(x[tile]) * scale + y[tile] + shift
+        return out
+
+    x = torch.randn(256, device=DEVICE)
+    y = torch.randn(256, device=DEVICE)
+    unchecked = mapped_add.bind((x, _leaky, y, False, 2.0, 1.0))
+    args = (x, _leaky, y, True)
+    assert mapped_add.bind(args) is unchecked
+    search = FiniteSearch(
+        unchecked,
+        args,
+        [helion.Config(block_sizes=[64]), helion.Config(block_sizes=[128])],
+    )
+    point = find_handoff(search, HandoffPolicy())
+    torch.testing.assert_close(point.fn(*args), torch.where(x > 0, x, x * 0.5) + y)
+    bundle = build_handoff(search, point, tmp_path / "bundle", repetitions=1)
+    assert bundle.manifest["baseline_evaluation"]["ok"]
+    assert len(bundle.manifest["cases"][0]["input_metadata"]) == 5
+    source = bundle.sources["case_0/kernel.py"]
+    entry = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "mapped_add"
+    )
+    assert [arg.arg for arg in entry.args.args] == [
+        "x",
+        "y",
+        "check",
+        "scale",
+        "shift",
+    ]
+    # The hard-coded scalars default to the case's values.
+    assert "check: bool=True, scale: float=1.0, shift: float=0.0" in ast.unparse(
+        entry.args
+    )
+    validate = ast.unparse(entry.body[0])
+    assert validate.startswith("_standalone_validate_args((x, y, check, scale, shift),")
+    assert validate.endswith(
+        "('constant', True), ('constant', 1.0), ('scalar', 'float')))"
+    )
+    assert "_source_module" not in source
+    result = bundle.run_agent(lambda workspace: dict(workspace.sources), repetitions=1)
+    assert result.ok, result
 
 
 # The Triton lane's one unmarked fresh-process replay (see _LANE_BACKENDS).

@@ -93,6 +93,15 @@ class TestClosures(RefEagerTestBase, TestCase):
         code, out = code_and_output(sin_func_arg, args)
         torch.testing.assert_close(out, args[0].sin() + basic_kernels.global_float)
 
+    def test_fn_arg_from_different_file_uses_library_import(self):
+        # ``torch`` in a function from another module is the module the
+        # generated code imports, so it is used directly, not imported from
+        # that module.
+        args = (torch.randn([512], device=DEVICE), basic_kernels.sigmoid_with_torch)
+        code, out = code_and_output(sin_func_arg, args)
+        torch.testing.assert_close(out, torch.sigmoid(args[0].sin()))
+        self.assertNotIn("_global_source", code)
+
     def test_fn_arg_with_closure(self):
         def fn_with_closure(x, tile) -> torch.Tensor:
             return x + closure_tensor[tile]

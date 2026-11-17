@@ -20,6 +20,7 @@ from helion.autotuner import benchmarking
 from helion.autotuner.benchmark_provider import _clone_args
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
 import helion.autotuner.handoff_evaluation as evaluation_module
+from helion.autotuner.handoff_evaluation import _atol_scale
 from helion.autotuner.handoff_evaluation import _CaseOutcome
 from helion.autotuner.handoff_evaluation import _device_context
 from helion.autotuner.handoff_evaluation import _EvaluateCase
@@ -106,7 +107,7 @@ def _job(directory: Path, repetitions: int = 3) -> _EvaluateCase:
         case["timing"],
         case["atol"],
         case["rtol"],
-        case["scale_atol"],
+        _atol_scale(case),
         repetitions,
         case.get("alias_signature"),
         fp8_accuracy=case.get("fp8_accuracy", "bitwise"),
@@ -212,6 +213,47 @@ def test_fp8_one_ulp_flips_follow_the_recorded_mode(
     else:
         assert outcome.status == "accuracy_error"
         assert outcome.samples == ()
+
+
+# The reference x + 1 for x = arange(16) peaks at 16: atol 0.03 scaled by the
+# peak admits 0.48, unscaled 0.03.
+@pytest.mark.parametrize(
+    ("atol_scale", "offset", "ok"),
+    [("peak", 0.4, True), ("peak", 0.6, False), (None, 0.4, False)],
+)
+def test_peak_atol_scale_follows_the_recorded_rule(
+    tmp_path: Path, atol_scale: str | None, offset: float, ok: bool
+) -> None:
+    """A case records an AccuracyCheck's per-tensor atol scaling: 'peak'
+    bounds |output - reference| by atol * max|reference|."""
+    manifest = _bundle(tmp_path, f"def kernel(x):\n    return x + 1 + {offset}\n")
+    manifest["cases"][0].update(
+        atol=0.03, rtol=0.0, atol_scale=atol_scale, scale_atol=False
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    outcome = _job(tmp_path)()
+    assert outcome.status == ("ok" if ok else "accuracy_error"), outcome.error
+
+
+@pytest.mark.slow
+def test_peak_bundle_evaluates_in_a_worker(tmp_path: Path) -> None:
+    """A version-2 bundle's 'peak' rule reaches the evaluation worker."""
+    manifest = _bundle(tmp_path, "def kernel(x):\n    return x + 1.4\n")
+    manifest["schema_version"] = 2
+    manifest["cases"][0].update(
+        atol=0.03, rtol=0.0, atol_scale="peak", scale_atol=False
+    )
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    assert evaluate_handoff(tmp_path, repetitions=1, timeout=60).ok
+
+
+def test_atol_scale_reads_older_bundles_and_rejects_unknown_modes() -> None:
+    assert _atol_scale({"scale_atol": True}) == "rms"
+    assert _atol_scale({"scale_atol": False}) is None
+    assert _atol_scale({"scale_atol": False, "atol_scale": "peak"}) == "peak"
+    assert _atol_scale({"atol_scale": "peak"}) == "peak"
+    with pytest.raises(ValueError, match="atol_scale"):
+        _atol_scale({"scale_atol": False, "atol_scale": "max"})
 
 
 def test_small_undeclared_mutation_ignores_output_tolerances(tmp_path: Path) -> None:

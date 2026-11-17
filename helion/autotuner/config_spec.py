@@ -1049,9 +1049,7 @@ class ConfigSpec:
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.reduction_fusion_available: bool = False
-        self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
-            BlockIdSequence()
-        )
+        self.cute_vector_widths: BlockIdSequence[VectorWidthSpec] = BlockIdSequence()
         self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
@@ -4056,10 +4054,10 @@ class CuteLaneLayoutSpec(_BlockIdItem):
         return "blocked"
 
 
-class CuteVectorWidthSpec(_BlockIdItem):
-    """Per-reduction-block vector load width for the CuTe backend.
+class VectorWidthSpec(_BlockIdItem):
+    """Per-reduction-block vector load width (the ``cute_vector_widths`` key).
 
-    V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
+    V=1 disables vectorization (scalar loads). On CuTe, V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
     for the inner reduction load. SM100+ also admits 32-byte vectors.
     A persistent reduction row whose threads each hold a multiple of V
@@ -4092,6 +4090,11 @@ class CuteVectorWidthSpec(_BlockIdItem):
 
     def _fill_missing(self) -> int:
         return 1
+
+
+# Older name; CuTe code still uses it. Not public API (helion.backend_api
+# exports VectorWidthSpec).
+CuteVectorWidthSpec = VectorWidthSpec
 
 
 class _OptionalIntSpec(_BlockIdItem):

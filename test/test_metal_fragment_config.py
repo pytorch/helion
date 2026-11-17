@@ -18,6 +18,8 @@ from helion._compiler.metal.fragment_mma import _max_offset
 from helion._compiler.metal.search_surface import kernel_facts
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.metal_fragment import fp8_rows
+from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import views_epilogue
@@ -35,6 +37,20 @@ REFUSED = "metal_matmul='fragment' can't lower"
 
 def _frag(block_sizes: list[int], **knobs: object) -> helion.Config:
     return helion.Config(block_sizes=block_sizes, **knobs, **FRAG)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def k_from_offset(x: torch.Tensor, y: torch.Tensor, k0: int) -> torch.Tensor:
+    """A K loop from an offset known only at runtime."""
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k0, k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
+        out[tile_m, tile_n] = acc
+    return out
 
 
 @helion.kernel(backend="metal", static_shapes=True)
@@ -207,20 +223,51 @@ class TestFragmentConfig(unittest.TestCase):
         self.assertIn("fragment=", fragment)
         with self.assertRaisesRegex(exc.InvalidConfig, "metal_matmul must be one of"):
             bound.config_spec.normalize(helion.Config(metal_matmul="tensor"))
+        with self.assertRaisesRegex(exc.InvalidConfig, "metal_matmul must be one of"):
+            bound.config_spec.normalize(helion.Config(metal_matmul=None))
+        for cap in (16.0, True, 32, None):
+            with self.assertRaisesRegex(
+                exc.InvalidConfig, "metal_tabulate_max_entries must be one of"
+            ):
+                bound.config_spec.normalize(
+                    helion.Config(
+                        metal_matmul="fragment", metal_tabulate_max_entries=cap
+                    )
+                )
 
     def test_search(self) -> None:
         """The search tries ``metal_matmul`` where both lowerings apply, from
-        a fragment seed beside the MPP default, which leaves the key out, and
-        repairs a fragment config to one SIMD group; a matmul the fragment run
-        can't lower, and a kernel with none, have no such field."""
+        fragment seeds beside the MPP default, which leaves the key out, and
+        ``metal_tabulate_max_entries`` at the caps that admit the kernel's
+        tables, and repairs a fragment config to one SIMD group; a matmul the
+        fragment run can't lower, and a kernel with none, have neither
+        field."""
         spec = nvfp4_rows.bind(nvfp4_cpu_args()).config_spec
         field = spec._flat_fields()["metal_matmul"]
         assert isinstance(field, EnumFragment)
         self.assertEqual(field.choices, ("mpp", "fragment"))
         self.assertNotIn("metal_matmul", spec.default_config().config)
+        tables = spec._flat_fields()["metal_tabulate_max_entries"]
+        assert isinstance(tables, EnumFragment)
+        # The code's nibble takes 16 entries.  The E4M3 scale's 7-bit field
+        # takes none: its shift is an integer of promoted type, and the cast
+        # after it reads the whole byte.
+        self.assertEqual(tables.choices, (0, 16))
         self.assertEqual(
-            [c.config.get("metal_matmul") for c in spec.autotune_seed_configs()],
-            ["fragment"],
+            [
+                (
+                    c.config.get("metal_matmul"),
+                    c.config.get("metal_tabulate_max_entries"),
+                    c.config.get("range_num_stages"),
+                )
+                for c in spec.autotune_seed_configs()
+            ],
+            [
+                ("fragment", None, None),
+                ("fragment", None, [2]),
+                ("fragment", 16, None),
+                ("fragment", 16, [2]),
+            ],
         )
         # The search repairs a fragment config to one SIMD group.
         repaired = helion.Config(
@@ -232,12 +279,73 @@ class TestFragmentConfig(unittest.TestCase):
         bare = helion.Config(block_sizes=[16, 16, 64], metal_matmul="fragment")
         spec.normalize(bare)
         self.assertEqual(bare["num_warps"], 1)
+        # One range_num_stages slot, the K loop's, searched at 0 and 2; 3 is
+        # rejected.
+        self.assertEqual(len(spec.range_num_stages), 1)
+        self.assertEqual(
+            spec.range_num_stages[0]._fragment(spec).search_values(), [0, 2]
+        )
+        with self.assertRaisesRegex(exc.InvalidConfig, r"must be one of \(0, 1, 2\)"):
+            spec.normalize(
+                helion.Config(
+                    block_sizes=[16, 16, 64],
+                    metal_matmul="fragment",
+                    range_num_stages=[3],
+                )
+            )
+        # Only a K loop that can load ahead has a slot (``loads_ahead``): known
+        # bounds it runs between.  One from 16 has one and loads ahead under
+        # it; one from a runtime offset, or to an end known only at runtime,
+        # has none, so the search never asks it for 2 stages.
+        from_16 = k_from_16.bind((torch.randn(16, 64), torch.randn(64, 16)))
+        self.assertEqual(len(from_16.config_spec.range_num_stages), 1)
+        code = from_16.to_code(_frag([16, 16, 16], range_num_stages=[2]))
+        self.assertRegex(code, r"k_step=\('offset_\d+', 16\)")
+        x = torch.randn(8, 64, dtype=torch.float16)
+        y = torch.randn(64, 16, dtype=torch.float16)
+        dynamic = helion.kernel(nvfp4_rows.fn, backend="metal", static_shapes=False)
+        for bound in (k_from_offset.bind((x, y, 16)), dynamic.bind(nvfp4_cpu_args())):
+            with self.subTest(kernel=bound.kernel.name):
+                self.assertEqual(len(bound.config_spec.range_num_stages), 0)
+                # A user's fragment config asking for stages there is
+                # refused; the search's repair drops them.
+                staged = _frag([16, 16, 16], range_num_stages=[2])
+                with self.assertRaisesRegex(
+                    exc.InvalidConfig, "one entry per Metal fragment K loop"
+                ):
+                    bound.config_spec.normalize(staged)
+                bound.config_spec.normalize(staged, _fix_invalid=True)
+                self.assertNotIn("range_num_stages", staged.config)
+        # An MPP config keeps loading with the range_num_stages a config
+        # carried before Metal read the key (a Triton config's), as zeros.
+        mpp = helion.Config(block_sizes=[16, 16, 64], range_num_stages=[3, 4])
+        spec.normalize(mpp)
+        self.assertEqual(mpp["range_num_stages"], [0])
+        # A byte's decode takes a 256-entry table.
+        fp8_args = (
+            torch.randn(8, 224).to(torch.bfloat16),
+            torch.randint(-(2**31), 2**31 - 1, (40, 56), dtype=torch.int32),
+            torch.randint(120, 130, (40, 7), dtype=torch.uint8),
+        )
+        spec = fp8_rows.bind(fp8_args).config_spec
+        tables = spec._flat_fields()["metal_tabulate_max_entries"]
+        assert isinstance(tables, EnumFragment)
+        self.assertEqual(tables.choices, (0, 256))
         x = torch.randn(16, 32, dtype=torch.float16)
         y = torch.randn(32, 16, dtype=torch.float16)
         for kernel, kernel_args in ((centered, (x, y)), (add, (x, x))):
             with self.subTest(kernel=kernel.name):
                 spec = kernel.bind(kernel_args).config_spec
-                self.assertNotIn("metal_matmul", spec._flat_fields())
+                fields = spec._flat_fields()
+                self.assertNotIn("metal_matmul", fields)
+                self.assertNotIn("metal_tabulate_max_entries", fields)
+                self.assertEqual(len(spec.range_num_stages), 0)
+                # A config with range_num_stages loads as before: without it.
+                old = helion.Config(
+                    **spec.default_config().config, range_num_stages=[2]
+                )
+                spec.normalize(old)
+                self.assertNotIn("range_num_stages", old.config)
 
     def test_threads(self) -> None:
         """The search gives a matmul config a threadgroup its matmuls run

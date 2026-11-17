@@ -19,6 +19,23 @@ def e4m3(b: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def k_from_16(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x[:, 16:] @ y[16:]: a K loop from a known offset, over operands it
+    converts to half, whose loads a fragment run can issue a tile early."""
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(16, k):
+            a = x[tile_m, tile_k].to(torch.float16)
+            b = y[tile_k, tile_n].to(torch.float16)
+            acc = torch.addmm(acc, a, b)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def nvfp4_rows(x: torch.Tensor, wq: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """nvfp4 x @ W.T: an E2M1 code (nibble k % 8 of word k // 8) through
     half bits, times its E4M3 group scale; bf16 result."""

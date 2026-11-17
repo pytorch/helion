@@ -169,6 +169,8 @@ class TestFlydslElementwise(TestCase):
         bound = elementwise_double.bind((x,))
         code = bound.to_triton_code(bound.config_spec.default_config())
         self.assertIn("make_buffer_tensor", code)
+        # No reduction, so finalize_device_body emits no warp-reduce helpers.
+        self.assertNotIn("_flydsl_wsum", code)
         self.assertIn("copy_atom_call", code)
 
     def test_elementwise_map_column_tail(self) -> None:
