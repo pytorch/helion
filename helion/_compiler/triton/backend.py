@@ -856,7 +856,11 @@ class GluonBackend(TritonBackend):
     _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
 
     def supports_config_key(self, key: str) -> bool:
-        if key in ("cross_loop_tmem_prefetch", "cross_loop_cluster_edges"):
+        if key in (
+            "cross_loop_tmem_prefetch",
+            "cross_loop_cluster_edges",
+            "cross_loop_claim_lag",
+        ):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
 

@@ -19,6 +19,7 @@ from torch.utils._sympy.functions import Min as SymbolicMin
 from .. import exc
 from .._dist_utils import _resolve_process_group
 from .._utils import indexing_uses_tensor_descriptor
+from ..autotuner.config_spec import CLAIM_LAGS
 from ..language import memory_ops
 from ..language.atomic_ops import ATOMIC_OPS
 from .ast_extension import ExtendedAST
@@ -2122,6 +2123,7 @@ def _key_count(domain: CoordinateDomain, axis: int) -> int | None:
 def _claim_groups(
     runs: list[list[int]],
     *,
+    claimed: frozenset[int],
     counters: tuple[ReadinessCounterPlan, ...],
     orders: tuple[DenseTaskOrder, ...],
     domains: tuple[CoordinateDomain, ...],
@@ -2129,19 +2131,24 @@ def _claim_groups(
     tasks: dict[int, int],
     matmuls: frozenset[int],
     root_barrier_edges: frozenset[tuple[int, int]],
-) -> list[tuple[int, ...]]:
-    """Split runs of consecutive claimed roots (``runs``) into claim
-    groups of up to four: each root key-major over its slowest axis (``axes``,
-    ``tasks`` a key), and waiting on an earlier root of its group only through
-    readiness counters on keys up to its own (``_waits_on_earlier_keys``; a
-    matmul root of ``matmuls`` takes its keys after every earlier key) with
-    more than one key: a single-key counter's wait is the same for every task
-    and goes before the claim loop, where it would wait on the group's own
-    claims.  Each root has at most ``_GROUP_MAX_KEYS`` keys.
+) -> tuple[list[tuple[int, ...]], frozenset[int]]:
+    """Split runs of consecutive guarded roots (``runs``) into claim groups
+    of up to four, each starting at a root of ``claimed`` (one that claims
+    its own tasks; its claim counter becomes the group's), a later member
+    possibly a single wave: each root key-major over its slowest axis
+    (``axes``, ``tasks`` a key), and waiting on an earlier root of its group
+    only through readiness counters on keys up to its own
+    (``_waits_on_earlier_keys``; a ``matmuls`` root needs no proof: its keys
+    come after every earlier key, and trail the light roots' keys only where
+    it holds for them, the second value) with more than one key: a single-key
+    counter's wait is the same for every task and goes before the claim loop,
+    where it would wait on the group's own claims.  Each root has at most
+    ``_GROUP_MAX_KEYS`` keys.
     A group interleaves its roots' claims key by key (``_group_ticket``), so a
     consumer's key follows its producers' as they complete, not their root's
     last claim (``claim_group_body`` places each root's keys)."""
     groups: list[tuple[int, ...]] = []
+    trailing: set[int] = set()
     for run in runs:
         if len(run) < 2:
             continue
@@ -2154,7 +2161,8 @@ def _claim_groups(
                 and _key_major(orders[root], axes[root], tasks[root], keys)
             )
             fits = (
-                key_major
+                bool(group)
+                and key_major
                 and len(group) < _GROUP_SLOTS
                 and not any((earlier, root) in root_barrier_edges for earlier in group)
                 and all(
@@ -2174,12 +2182,40 @@ def _claim_groups(
             if not fits:
                 if len(group) > 1:
                     groups.append(tuple(group))
-                group = [root] if key_major else []
+                group = [root] if key_major and root in claimed else []
                 continue
+            if root in matmuls and all(
+                _waits_on_earlier_keys(
+                    plan, earlier, root, orders, axes, tasks, cast("int", keys)
+                )
+                for plan in counters
+                for earlier in group
+                if earlier not in matmuls
+            ):
+                trailing.add(root)
             group.append(root)
         if len(group) > 1:
             groups.append(tuple(group))
-    return groups
+    return groups, frozenset(trailing)
+
+
+def _round_plus(round_: int | str, count: int | str) -> int | str:
+    """A claim group round ``count`` rounds after ``round_`` (a runtime value
+    when either is one)."""
+    if isinstance(round_, int) and isinstance(count, int):
+        return round_ + count
+    return count if round_ == 0 else f"{round_} + {count}"
+
+
+def _capped_round(terms: list[int | str], cap: int) -> int | str:
+    """``min(max(terms), cap)``: the static terms fold into one."""
+    static = [term for term in terms if isinstance(term, int)]
+    if len(static) == len(terms) or (static and max(static) >= cap):
+        return min(max(static), cap)
+    expression, *rest = [term for term in terms if isinstance(term, str)]
+    for term in rest + ([max(static)] if static else []):
+        expression = f"tl.maximum({expression}, {term})"
+    return f"tl.minimum({expression}, {cap})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -3349,7 +3385,14 @@ def emit_cross_loop_schedule(
         )
 
     def root_barrier_dependency(root: int) -> tuple[str, str]:
-        arrivals = static_pipeline_plan.root_barrier_arrival_count(root)
+        # Every worker publishes a claim group member's barrier after the
+        # group's loop, whichever of its tasks it ran (the plan's count,
+        # ``root_barrier_arrival_count``, is its static publishers).
+        arrivals = (
+            launch_worker_count
+            if root in claim_group_of
+            else static_pipeline_plan.root_barrier_arrival_count(root)
+        )
         return (
             root_barrier_counter(root),
             f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)",
@@ -3716,8 +3759,10 @@ def emit_cross_loop_schedule(
         for access in dependency_graph.accesses
         if dependency_graph.is_inband(access) and access.kind != "store"
     }
-    # Claim groups (``_claim_groups``) among consecutive claimed roots that only
-    # synchronize on this rank, each group one claim counter (its first root's).
+    # Claim groups (``_claim_groups``) among consecutive guarded roots of
+    # claimed dispatch that only synchronize on this rank, each group one claim
+    # counter (its first root's, which claims its tasks itself): a single-wave
+    # root may join a group behind a claimed one.
     peer_counter_roots = {
         endpoint
         for plan in peer_counter_plans
@@ -3729,7 +3774,7 @@ def emit_cross_loop_schedule(
     claim_runs: list[list[int]] = [[]]
     for root in static_pipeline_plan.resident_roots:
         if (
-            root in claim_indices
+            dispatch_mode == "claimed"
             and root in guarded_extents
             and root not in deferred_releases
             and not any(root in edge for edge in peer_edges)
@@ -3744,18 +3789,28 @@ def emit_cross_loop_schedule(
     candidates = [root for run in claim_runs for root in run]
     group_axes = {root: case_geometries[root][0][-1] for root in candidates}
     group_tasks = {root: guarded_extents[root].inner_tasks for root in candidates}
-    group_matmuls = frozenset(
-        root for root in candidates if _calls_module(case_bodies[root], _DOT_CALLS)
+    group_matmuls = dependency_graph.matmul_roots(device_ir.graphs) & frozenset(
+        candidates
     )
-    claim_groups = _claim_groups(
-        claim_runs,
-        counters=static_pipeline_plan.readiness_counters,
-        orders=static_pipeline_plan.execution_orders,
-        domains=root_domains,
-        axes=group_axes,
-        tasks=group_tasks,
-        matmuls=group_matmuls,
-        root_barrier_edges=frozenset(root_barrier_edges),
+    # Waves of claims a consumer's keys trail its light producers' (0: no
+    # group, each root claims its own tasks).
+    claim_lag = cast(
+        "int", device_function.config.get("cross_loop_claim_lag", CLAIM_LAGS[0])
+    )
+    claim_groups, trailing_matmuls = (
+        _claim_groups(
+            claim_runs,
+            claimed=frozenset(claim_indices),
+            counters=static_pipeline_plan.readiness_counters,
+            orders=static_pipeline_plan.execution_orders,
+            domains=root_domains,
+            axes=group_axes,
+            tasks=group_tasks,
+            matmuls=group_matmuls,
+            root_barrier_edges=frozenset(root_barrier_edges),
+        )
+        if claim_lag
+        else ([], frozenset())
     )
     claim_group_of = {root: group for group in claim_groups for root in group}
     for edge in clusters.values():
@@ -5281,12 +5336,19 @@ def emit_cross_loop_schedule(
         Its roots' barrier waits, hoisted statements and guard-skipped tasks'
         arrivals come first (a skipped task writes nothing, and no claimed task
         can then wait on one), its roots' root-barrier arrivals after the loop.
-        A consumer's keys come a wave of claims behind its producers'; a matmul
-        root's after every key of the roots before it: an early matmul task
-        holds its ring slots and accumulator while it waits, and its weight
-        stream would share the bandwidth the earlier roots need (in the group
-        it still takes its first tasks as workers free up, not each its static
-        one)."""
+        The order keeps the weight stream busy.  A matmul root streams its
+        operands (the ring's bandwidth, which every matmul root of the group
+        shares), so it comes after the live keys of the matmul roots before
+        it: interleaved with matmul producers it would only delay their last
+        keys and leave less ready streaming work to cover the dependency
+        chain at the end (in the group it still takes its first tasks as
+        workers free up, not each its static one).  It trails the light
+        roots' keys as a light root does where it waits on their keys up to
+        its own only (``trailing_matmuls``), and comes after every key of
+        theirs otherwise.  Any other root is light: run as a phase
+        of its own it would leave the stream idle, so its keys come
+        ``cross_loop_claim_lag`` waves of claims (one by default) behind its
+        producers', inside the stream (at a lag of 0 no group forms)."""
         assert claim_counter_arg is not None
         parts = [claim_group_parts[root] for root in group]
         tasks = [group_tasks[root] for root in group]
@@ -5294,12 +5356,39 @@ def emit_cross_loop_schedule(
             cast("int", _key_count(root_domains[root], group_axes[root]))
             for root in group
         ]
-        offsets = [0]
+        offsets = [0]  # the most each root lags: its static round
+        rounds: list[int | str] = [0]  # the ticket offsets: a runtime value or not
         for index in range(1, len(group)):
-            offsets.append(
-                max(o + k for o, k in zip(offsets, keys[:index], strict=True))
-                if group[index] in group_matmuls
-                else offsets[-1] + -(-launch_worker_count // sum(tasks[:index]))
+            # After every earlier key: also the most a lag places a root (a
+            # longer one only adds empty rounds).
+            after = max(o + k for o, k in zip(offsets, keys[:index], strict=True))
+            # A wave: the rounds of the earlier roots' tickets that take every
+            # worker's claim once.
+            wave = -(-launch_worker_count // sum(tasks[:index]))
+            lag = min(claim_lag * wave, after)
+            if group[index] not in group_matmuls:
+                offsets.append(min(offsets[-1] + claim_lag * wave, after))
+                # A lag behind the root before it as it runs.
+                rounds.append(_capped_round([_round_plus(rounds[-1], lag)], after))
+                continue
+            offsets.append(after)
+            light = [j for j in range(index) if group[j] not in group_matmuls]
+            if not light or group[index] not in trailing_matmuls:
+                rounds.append(after)
+                continue
+            # After the live keys of the matmul roots before it, and a lag
+            # behind the light ones' keys (key for key, as they trail their
+            # producers): no round of light tickets only between the streams.
+            rounds.append(
+                _capped_round(
+                    [
+                        _round_plus(rounds[j], lag)
+                        if j in light
+                        else _round_plus(rounds[j], f"({parts[j].live}) // {tasks[j]}")
+                        for j in range(index)
+                    ],
+                    after,
+                )
             )
         unused = _GROUP_SLOTS - len(group)
         end = len(group) << 32
@@ -5309,7 +5398,7 @@ def emit_cross_loop_schedule(
                 *["0"] * unused,
                 *map(str, tasks),
                 *["1"] * unused,
-                *map(str, offsets),
+                *map(str, rounds),
                 *["0"] * unused,
                 str(end),
             ]
@@ -5372,7 +5461,7 @@ def emit_cross_loop_schedule(
         log.info(
             "Roots %s claim one interleaved ticket stream (key lags %s rounds)",
             list(group),
-            offsets,
+            offsets,  # the most each lags (a matmul root's runtime lag is capped there)
         )
         return body
 
@@ -5399,9 +5488,14 @@ def emit_cross_loop_schedule(
         skipped_dispatch: list[ast.stmt] = []
         segment_stop = f"({segment_end})"
         live: str | None = None
+        # A claim group runs its members' hoisted statements and root-level
+        # waits on every worker, before the group's loop.
+        every_worker = (
+            active_worker_count == launch_worker_count or root in claim_group_of
+        )
         if extent is not None:
             hoisted, live = guarded_live_tasks(extent)
-            if active_worker_count == launch_worker_count:
+            if every_worker:
                 guard_statements.update(
                     id(statement)
                     for statement in hoisted
@@ -5453,7 +5547,6 @@ def emit_cross_loop_schedule(
         # publication follows it too: after the task loop, or riding the last
         # task's arrivals, both after the first task's top-level wait.
         incoming_roots = root_barrier_incoming.get(root, ())
-        every_worker = active_worker_count == launch_worker_count
         # None: a hoisted load reads through a name that is no tensor argument.
         hoisted_loads = _loaded_allocations(hoisted, argument_allocations)
         hoisted_reads = (
@@ -5472,8 +5565,10 @@ def emit_cross_loop_schedule(
         no_task_producers: list[int] = []
         for producer in incoming_roots:
             covered, _publication = barrier_covers(root, producer)
+            # A claimed task (a claim group's too) is no worker's first.
             if (
                 claimed
+                or root in claim_group_of
                 or root in ws_roots
                 or guarded_kernel_scope_root(root)
                 or covered is None

@@ -797,6 +797,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "cross_loop_cluster_edges",
         "cross_loop_dry_passes",
         "cross_loop_inband_untagged",
+        "cross_loop_claim_lag",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -848,6 +849,9 @@ VALID_PID_TYPES = (
     "persistent_blocked",
     "persistent_interleaved",
 )
+# The lags the autotuner searches for ``cross_loop_claim_lag`` (the first is
+# the default; a config may name any lag >= 0, 0 turning the interleave off).
+CLAIM_LAGS = (1, 2, 0)
 MIN_NUM_SM_MULTIPLIER = 1
 MAX_NUM_SM_MULTIPLIER = 128
 DEFAULT_NUM_SM_MULTIPLIER = 1
@@ -1198,6 +1202,13 @@ class ConfigSpec:
         # One entry per inband allocation whose words may travel untagged
         # (TileDependencyGraph.untagged_candidate_ids, sorted); True sends them so.
         self.cross_loop_inband_untagged = ListOf(BooleanFragment(), length=0)
+        # Waves of claims a claim group's consumers trail their light
+        # producers' keys, and its light consumers every producer's
+        # (cross_loop_codegen.claim_group_body); 0 turns the interleave off:
+        # every root after every earlier key, the per-root order. Set when a
+        # dynamic pipeline is allowed and the graph has such a consumer
+        # (TileDependencyGraph.claim_lag_candidate).
+        self.cross_loop_claim_lag: EnumFragment | None = None
         # Whether a cross-rank dependency transports a scatter in band: its
         # guard-skipped tasks need static or claimed (gluon ring) roots.
         self.inband_scatter: bool = False
@@ -1934,6 +1945,11 @@ class ConfigSpec:
             )
         self.cross_loop_pipeline = EnumFragment(choices)
 
+    def enable_claim_lag(self) -> None:
+        """Expose ``cross_loop_claim_lag`` (claim groups: dynamic pipelines
+        under the gluon ring, a backend that supports the key)."""
+        self.cross_loop_claim_lag = EnumFragment(CLAIM_LAGS)
+
     @property
     def cute_l2_evict_last_store_policy_supported(self) -> bool:
         """Whether the fixed store-policy descriptor is valid for this target."""
@@ -2365,6 +2381,7 @@ class ConfigSpec:
             "cross_loop_cluster_edges",
             "cross_loop_dry_passes",
             "cross_loop_inband_untagged",
+            "cross_loop_claim_lag",
             "indexing",
             "atomic_indexing",
             "pallas_load_buffer_count",
@@ -2507,6 +2524,21 @@ class ConfigSpec:
                 )
             ):
                 config["cross_loop_dry_passes"] = self.cross_loop_dry_passes.default()
+        # Only claim groups (dynamic workers under a ring) read the lag.
+        if (
+            self.cross_loop_claim_lag is None
+            or config.get("cross_loop_pipeline") != "dynamic"
+            or not ring_depth(config, self.backend_name)
+        ):
+            config.pop("cross_loop_claim_lag", None)
+        else:
+            lag = config.setdefault("cross_loop_claim_lag", CLAIM_LAGS[0])
+            if not isinstance(lag, int) or isinstance(lag, bool) or lag < 0:
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        f"cross_loop_claim_lag must be an int >= 0, got {lag!r}"
+                    )
+                config["cross_loop_claim_lag"] = CLAIM_LAGS[0]
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (
@@ -3178,6 +3210,8 @@ class ConfigSpec:
             fields["pid_type"] = EnumFragment(self.allowed_pid_types)
         if self.cross_loop_pipeline is not None:
             fields["cross_loop_pipeline"] = self.cross_loop_pipeline
+        if self.cross_loop_claim_lag is not None:
+            fields["cross_loop_claim_lag"] = self.cross_loop_claim_lag
         if self.supports_config_key("xcd_remap") and self.num_xcd > 1:
             fields["xcd_remap"] = BooleanFragment()
         if self.supports_config_key("num_sm_multiplier"):

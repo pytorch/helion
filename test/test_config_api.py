@@ -109,6 +109,7 @@ from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
+from helion.autotuner.config_spec import CLAIM_LAGS
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import LoopOrderSpec
@@ -847,6 +848,46 @@ class TestConfigAPI(TestCase):
                     config["cross_loop_dry_passes"],
                     [False, True] if kept else [False, False],
                     (type(backend).__name__, pipeline, extra),
+                )
+
+    def test_claim_lag_kept_only_for_claimed_workers(self) -> None:
+        """Only claim groups (dynamic workers on a Gluon ring) read
+        cross_loop_claim_lag: other configs drop it, a config without it takes
+        the default, and a lag must be an int >= 0 (any, not only a searched
+        one).  A kernel that does not expose the knob drops it everywhere, and
+        one that does searches it."""
+        ring = {"num_stages": 2, "num_warps": 4, "indexing": "tensor_descriptor"}
+        with patch("helion._compat.is_hip", return_value=False):
+            spec = ConfigSpec(backend=GluonBackend())
+            spec.enable_cross_loop_pipeline()
+            config = helion.Config(
+                cross_loop_pipeline="dynamic", cross_loop_claim_lag=3, **ring
+            )
+            spec.normalize(config)
+            self.assertNotIn("cross_loop_claim_lag", config)
+            self.assertNotIn("cross_loop_claim_lag", spec._flat_fields())
+            spec.enable_claim_lag()
+            self.assertIn("cross_loop_claim_lag", spec._flat_fields())
+            for pipeline, extra, kept in (
+                ("static", ring, False),
+                ("dynamic", {}, False),
+                ("dynamic", ring, True),
+            ):
+                config = helion.Config(
+                    cross_loop_pipeline=pipeline, cross_loop_claim_lag=3, **extra
+                )
+                spec.normalize(config)
+                self.assertEqual(
+                    config.get("cross_loop_claim_lag"), 3 if kept else None, pipeline
+                )
+            config = helion.Config(cross_loop_pipeline="dynamic", **ring)
+            spec.normalize(config)
+            self.assertEqual(config["cross_loop_claim_lag"], CLAIM_LAGS[0])
+            with self.assertRaisesRegex(exc.InvalidConfig, "int >= 0"):
+                spec.normalize(
+                    helion.Config(
+                        cross_loop_pipeline="dynamic", cross_loop_claim_lag=-1, **ring
+                    )
                 )
 
     def test_legacy_cross_loop_schedule_normalizes_to_pipeline(self) -> None:

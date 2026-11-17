@@ -204,6 +204,7 @@ _BASE_VALID_KEYS = """
     cross_loop_cluster_edges
     cross_loop_dry_passes
     cross_loop_inband_untagged
+    cross_loop_claim_lag
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -369,6 +370,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cross_loop_cluster_edges
     cross_loop_dry_passes
     cross_loop_inband_untagged
+    cross_loop_claim_lag
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.

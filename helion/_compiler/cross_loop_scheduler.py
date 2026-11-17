@@ -1173,7 +1173,11 @@ class StaticPipelinePlan:
         )
 
     def root_barrier_arrival_count(self, root: int) -> int:
-        """Return the exact number of physical publishers for one root."""
+        """Return the exact number of physical publishers for one root under
+        the plan's placement.  Codegen's claim groups (formed after the plan)
+        publish each member from every worker after the group's loop, so a
+        single-wave member's barrier counts the launch's workers instead
+        (``root_barrier_dependency`` in cross_loop_codegen)."""
         if root in self.continuation_roots:
             return self.execution_orders[root].task_count
         return self.publisher_count(root)

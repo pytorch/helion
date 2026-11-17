@@ -4650,6 +4650,12 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         f"{allowed}",
                     )
                 config_spec.enable_cross_loop_pipeline(choices=choices)
+                if (
+                    "dynamic" in choices
+                    and config_spec.supports_config_key("cross_loop_claim_lag")
+                    and graph.claim_lag_candidate(device_ir.graphs)
+                ):
+                    config_spec.enable_claim_lag()
                 if config_spec.supports_config_key("cross_loop_tmem_prefetch"):
                     for block_ids in env.backend.tmem_prefetch_candidates(device_ir):
                         config_spec.cross_loop_tmem_prefetch.append(

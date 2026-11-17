@@ -246,10 +246,10 @@ def _group_tickets_before(  # noqa: ANN202
     A1: tl.constexpr,
     A2: tl.constexpr,
     A3: tl.constexpr,
-    O0: tl.constexpr,
-    O1: tl.constexpr,
-    O2: tl.constexpr,
-    O3: tl.constexpr,
+    O0,  # noqa: ANN001
+    O1,  # noqa: ANN001
+    O2,  # noqa: ANN001
+    O3,  # noqa: ANN001
 ):
     """The tickets of a claim group's rounds before round ``r`` (``_group_ticket``)."""
     return (
@@ -271,10 +271,10 @@ def _group_ticket(  # noqa: ANN202
     A1: tl.constexpr,
     A2: tl.constexpr,
     A3: tl.constexpr,
-    O0: tl.constexpr,
-    O1: tl.constexpr,
-    O2: tl.constexpr,
-    O3: tl.constexpr,
+    O0,  # noqa: ANN001
+    O1,  # noqa: ANN001
+    O2,  # noqa: ANN001
+    O3,  # noqa: ANN001
     end: tl.constexpr,
 ):
     """A claim group's ticket as ``root << 32 | task`` (``end`` past its last).
@@ -282,7 +282,7 @@ def _group_ticket(  # noqa: ANN202
     Root ``i`` of the group has ``n_i`` live tasks, ``A_i`` a key (its slowest
     task axis); round ``r`` holds root ``i``'s tasks of key ``r - O_i``, the
     roots in order, so a consumer's key comes ``O_i`` rounds after its
-    producers' (unused roots: ``n = 0``)."""
+    producers' (unused roots: ``n = 0``; ``O_i`` may follow the live keys)."""
     t = ticket.to(tl.int32)
     k0, k1, k2, k3 = n0 // A0, n1 // A1, n2 // A2, n3 // A3
     total = A0 * k0 + A1 * k1 + A2 * k2 + A3 * k3
@@ -338,10 +338,10 @@ def _group_claim(  # noqa: ANN202
     A1: tl.constexpr,
     A2: tl.constexpr,
     A3: tl.constexpr,
-    O0: tl.constexpr,
-    O1: tl.constexpr,
-    O2: tl.constexpr,
-    O3: tl.constexpr,
+    O0,  # noqa: ANN001
+    O1,  # noqa: ANN001
+    O2,  # noqa: ANN001
+    O3,  # noqa: ANN001
     end: tl.constexpr,
 ):
     """A claim group's next claimed ticket (``_group_ticket``) after the

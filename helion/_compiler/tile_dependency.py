@@ -23,8 +23,10 @@ from .. import exc
 if TYPE_CHECKING:
     import ast
     from collections.abc import Callable
+    from collections.abc import Sequence
 
     from .device_ir import DeviceIR
+    from .device_ir import GraphInfo
 
 log = logging.getLogger(__name__)
 
@@ -5021,6 +5023,42 @@ class TileDependencyGraph:
         if not deep:
             return ()
         return tuple(root for root in sorted(producers) if root > min(deep))
+
+    def matmul_roots(self, graphs: Sequence[GraphInfo]) -> frozenset[int]:
+        """Roots that run a matmul (a ``matmul_operand_positions`` target in
+        one of their graphs, ``graphs`` the DeviceIR's): they stream their
+        operands, so a claim group orders them after every earlier key."""
+        from .device_ir_analysis import matmul_operand_positions
+
+        targets = matmul_operand_positions()
+        return frozenset(
+            site.root
+            for site in self.execution_sites
+            if any(node.target in targets for node in graphs[site.graph_id].graph.nodes)
+        )
+
+    def claim_lag_candidate(self, graphs: Sequence[GraphInfo]) -> bool:
+        """Whether a claim group may have a consumer that trails a producer's
+        keys, so ``cross_loop_claim_lag`` can change the order: a root waiting
+        on an earlier root, one of them running no matmul (``matmul_roots``;
+        a matmul consumer trails only light producers), both and every root
+        between them guarded by a branch in the task body (a data-dependent
+        task count is what claims them; a branch in an inner loop leaves the
+        count static).  Codegen forms the groups for a config."""
+        matmul_roots = self.matmul_roots(graphs)
+        guarded = {
+            site.root
+            for site in self.execution_sites
+            if site.kind == "branch"
+            and site.parent_site_id is not None
+            and self.execution_sites[site.parent_site_id].is_root
+        }
+        return any(
+            (root not in matmul_roots or producer not in matmul_roots)
+            and all(between in guarded for between in range(producer, root + 1))
+            for root, producers in self.root_producers.items()
+            for producer in producers
+        )
 
     @property
     def cluster_candidate_ids(self) -> tuple[int, ...]:
