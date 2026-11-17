@@ -3,11 +3,13 @@ helion/_compiler/backend.py."""
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import functools
 import math
 import os
+from pathlib import Path
 import sys
 import tempfile
 from typing import TYPE_CHECKING
@@ -511,6 +513,57 @@ class TritonBackend(Backend):
             "fast_dividef": "from triton.language.extra.libdevice import fast_dividef",
             "fast_expf": "from triton.language.extra.libdevice import fast_expf",
         }
+
+    def embedded_helper_source(self, body: str) -> str:
+        """Embed the native helper module without importing Helion at runtime.
+
+        Keep its functions and their dependencies together in a private scope,
+        including the target-specific wait implementation. Reading the source
+        also supports CPU code generation where Triton cannot be imported.
+        """
+        if "helion_triton_helpers." not in body:
+            return ""
+        source = Path(__file__).parents[2] / "runtime" / "triton" / "helpers.py"
+        helpers = ast.parse(source.read_text())
+        module = ast.parse(
+            "def _make_helion_triton_helpers():\n"
+            "    _module = types.ModuleType('helion_triton_helpers')\n"
+            "    return _module\n"
+            "helion_triton_helpers = _make_helion_triton_helpers()\n"
+        )
+        factory = module.body[0]
+        assert isinstance(factory, ast.FunctionDef)
+        exports = next(
+            node.value
+            for node in helpers.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "__all__"
+                for target in node.targets
+            )
+        )
+        # Triton's dependency finder recognizes module namespaces. A generic
+        # container would be deep-copied along with the JIT functions' locks.
+        factory.body[1:1] = [
+            ast.Assign(
+                targets=[
+                    ast.Attribute(
+                        value=ast.Name(id="_module", ctx=ast.Load()),
+                        attr=name,
+                        ctx=ast.Store(),
+                    )
+                ],
+                value=ast.Name(id=name, ctx=ast.Load()),
+            )
+            for name in ast.literal_eval(exports)
+        ]
+        factory.body[:0] = [
+            node
+            for node in helpers.body
+            if not (isinstance(node, ast.ImportFrom) and node.module == "__future__")
+        ]
+        ast.fix_missing_locations(module)
+        return ast.unparse(module)
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
         if index_dtype != "tl.int32":

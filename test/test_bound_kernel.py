@@ -187,9 +187,9 @@ class TestToCodeTriton(TestCase):
         self.assertNotIn("import helion", code)
         self.assertNotIn("from helion", code)
         self.assertIn("def default_launcher(", code)
-        self.assertIn(
-            "helion = types.SimpleNamespace(runtime=_make_helion_runtime())", code
-        )
+        self.assertIn("helion = _make_helion_runtime()", code)
+        self.assertIn("def cdiv(", code)
+        self.assertIn("def next_power_of_2(", code)
         self.assertIn("_default_launcher = helion.runtime.default_launcher", code)
         self.assertIn("def add(", code)
 
