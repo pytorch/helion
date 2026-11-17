@@ -20,6 +20,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
+from helion._testing.gluon_kernels import mm_then_mm
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as RING
 import helion.language as hl
 
@@ -402,28 +403,6 @@ def _prefetch_reference() -> tuple[torch.Tensor, ...]:
         scale_then_mm, (x, w), cross_loop_pipeline="static", **PREFETCH_CONFIG
     )
     return x, w, y, out
-
-
-@helion.kernel(static_shapes=True, backend="gluon")
-def mm_then_mm(x: torch.Tensor, w: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """A long dot of inputs, then a dot of its output: both on the MMA
-    partition's channel, the second's activations from the gated producer."""
-    m, k = x.size()
-    _, n = w.size()
-    _, n2 = v.size()
-    y = torch.empty([m, n], dtype=x.dtype, device=x.device)
-    out = torch.empty([m, n2], dtype=torch.float32, device=x.device)
-    for tile_m, tile_n in hl.tile([m, n]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(k):
-            acc = hl.dot(x[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
-        y[tile_m, tile_n] = acc.to(x.dtype)
-    for tile_p, tile_q in hl.tile([m, n2]):
-        acc2 = hl.zeros([tile_p, tile_q], dtype=torch.float32)
-        for tile_j in hl.tile(n):
-            acc2 = hl.dot(y[tile_p, tile_j], v[tile_j, tile_q], acc=acc2)
-        out[tile_p, tile_q] = acc2
-    return out
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -1016,7 +995,9 @@ class TestGluonRing(TestCase):
         producer waits for the slot of every step it fills nothing of (here the
         first root's), else it would run rounds ahead of the slots' phases, and
         arrives on the step's full barrier, else a step could complete without
-        it and leave it a whole phase behind (an aliased parity wait)."""
+        it and leave it a whole phase behind (an aliased parity wait).  Under
+        barrier mode, whose grid barrier only the body runs, the first root's
+        output stays a plain load after it (no gated producer)."""
         x = torch.randn([128, 8192], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn([8192, 128], device=DEVICE, dtype=torch.bfloat16)
         v = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
@@ -1026,24 +1007,33 @@ class TestGluonRing(TestCase):
             "num_sm_multiplier": 1,
             "num_warps": 4,
             "indexing": "tensor_descriptor",
-            "cross_loop_pipeline": "static",
         }
         slots = len(mm_then_mm.bind((x, w, v)).config_spec.range_warp_specialize)
-        _, expected = code_and_output(mm_then_mm, (x, w, v), **base)
-        code, out = code_and_output(
-            mm_then_mm,
-            (x, w, v),
-            num_stages=2,
-            range_warp_specializes=[True] * slots,
-            **base,
+        _, expected = code_and_output(
+            mm_then_mm, (x, w, v), cross_loop_pipeline="static", **base
         )
-        torch.testing.assert_close(out, expected, atol=0, rtol=0)
-        gated = code.split("def _helion_mm_then_mm_producer1(")[1].split("\ndef ")[0]
-        self.assertIn("ring_skip(", gated)
-        self.assertIn("ring_put(", gated)
-        # Both groups arrive on every full phase; the skip passes its full.
-        self.assertIn("ring_barriers(_helion_ring_S, 2)", code)
-        self.assertIn("_helion_ring.ring_skip(_helion_ring_full0,", code)
+        for pipeline in ("static", "barrier"):
+            with self.subTest(pipeline=pipeline):
+                code, out = code_and_output(
+                    mm_then_mm,
+                    (x, w, v),
+                    num_stages=2,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline=pipeline,
+                    **base,
+                )
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+                self.assertIn("warp_specialize(", code)
+                if pipeline == "barrier":
+                    self.assertNotIn("def _helion_mm_then_mm_producer1(", code)
+                    continue
+                gated = code.split("def _helion_mm_then_mm_producer1(")[1]
+                gated = gated.split("\ndef ")[0]
+                self.assertIn("ring_skip(", gated)
+                self.assertIn("ring_put(", gated)
+                # Both groups arrive on every full phase; the skip passes its full.
+                self.assertIn("ring_barriers(_helion_ring_S, 2)", code)
+                self.assertIn("_helion_ring.ring_skip(_helion_ring_full0,", code)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
@@ -1114,7 +1104,9 @@ class TestGluonRing(TestCase):
     @skipUnlessGluon()
     def test_coordinates_written_in_kernel(self) -> None:
         """A ring load whose coordinates read what an earlier root writes: its
-        producer keeps the dependency waits, as a gated one does."""
+        producer keeps the dependency waits, as a gated one does.  Barrier mode
+        has none it could keep (only the body runs its grid barrier): the ring
+        falls back."""
         x = torch.randn([512, 256], device=DEVICE, dtype=torch.bfloat16)
         w = torch.randn([256, 128], device=DEVICE, dtype=torch.bfloat16)
         perms = [torch.randperm(4, device=DEVICE, dtype=torch.int32) for _ in range(4)]
@@ -1128,7 +1120,7 @@ class TestGluonRing(TestCase):
         bound = route_then_mm.bind((x, w, perms[0]))
         flags = len(bound.config_spec.range_warp_specialize)
         for pipeline, specialize in itertools.product(
-            ("static", "dynamic"), (None, True)
+            ("barrier", "static", "dynamic"), (None, True)
         ):
             with self.subTest(pipeline=pipeline, range_warp_specializes=specialize):
                 config = helion.Config(
@@ -1137,6 +1129,8 @@ class TestGluonRing(TestCase):
                     cross_loop_pipeline=pipeline,
                     **base,
                 )
+                if pipeline == "barrier":
+                    self.assertNotIn("ring_put(", bound.to_triton_code(config))
                 results = _replay(
                     bound.compile_config(config), [(x, w, p) for p in perms]
                 )
