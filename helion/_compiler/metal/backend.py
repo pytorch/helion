@@ -702,6 +702,7 @@ class MetalBackend(Backend):
         from .free_arange import free_arange_blocks
         from .mpp_matmul import has_matmuls
         from .mpp_matmul import plan_mpp_matmuls
+        from .padded_twin import padded_twin_owner
         from .search_surface import FragmentNumStagesSpec
         from .search_surface import MetalKernelFacts
         from .tabulate import table_sizes
@@ -727,6 +728,26 @@ class MetalBackend(Backend):
         # triton imports).
         stages = config_spec.range_num_stages
         stages.clear()
+        # The reduction dims of run-time extent, which roll (a padded twin
+        # walks its owner's lanes, and a pinned slot stays persistent).
+        env = CompileEnvironment.current()
+        with HostFunction.current().lent_device_ir(device_ir):
+            runtime = frozenset(
+                loop.block_id
+                for loop in config_spec.reduction_loops
+                if not loop.pinned
+                and static_extent(env.block_sizes[loop.block_id].size) is None
+                and padded_twin_owner(loop.block_id) is None
+            )
+        base_facts = MetalKernelFacts(runtime_reductions=runtime)
+        for block_id in base_facts.runtime_reductions:
+            # Their chunk may cover the whole size hint: one trip at that
+            # size, still a loop for a longer call (rather than None).
+            config_spec.reduction_loops.block_id_lookup(
+                block_id
+            ).allow_full_extent = True
+        if base_facts != MetalKernelFacts():
+            config_spec.backend_facts = base_facts
         if not has_matmuls(device_ir.graphs):
             return
         # The planner reads the kernel's roots and grids through its
@@ -747,8 +768,9 @@ class MetalBackend(Backend):
             free = free_arange_blocks()
         # The MPP matmuls that stage an operand per K tile, which the staged
         # matmul heuristic seeds tall tiles for.
-        launch_facts = MetalKernelFacts(
-            staged_matmuls=() if mpp is None else _staged_matmuls(mpp)
+        launch_facts = dataclasses.replace(
+            base_facts,
+            staged_matmuls=() if mpp is None else _staged_matmuls(mpp),
         )
         reductions = any(
             info.reduction for info in CompileEnvironment.current().block_sizes
@@ -813,7 +835,7 @@ class MetalBackend(Backend):
                         blocks_reduced_after_loop(device_ir) & tunable
                     ),
                 )
-        if launch_facts != MetalKernelFacts():
+        if launch_facts != base_facts:
             config_spec.backend_facts = launch_facts
         if plan is None:
             return

@@ -62,6 +62,27 @@ def test_runtime_persistent_reduction_remains_refused() -> None:
         bound.to_code(helion.Config(block_sizes=[1], reduction_loops=[None]))
 
 
+def test_runtime_reduction_defaults_to_rolled() -> None:
+    """A config that leaves ``reduction_loops`` out rolls a runtime-extent
+    dim, at the whole padded hint (an explicit one-trip loop) or a
+    threadgroup's threads, whichever is smaller."""
+
+    @helion.kernel(backend="metal", static_shapes=False)
+    def row_sum(x: torch.Tensor) -> torch.Tensor:
+        out = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+        for rows in hl.tile(x.size(0)):
+            out[rows] = x[rows, :].sum(-1)
+        return out
+
+    for n, chunk in ((300, 512), (5000, 1024)):
+        bound = cpu_bind(row_sum, (torch.randn(8, n),))
+        assert bound.config_spec.default_config().config["reduction_loops"] == [chunk]
+        config = helion.Config(block_sizes=[1])
+        bound.config_spec.normalize(config)
+        assert config.config["reduction_loops"] == [chunk]
+        assert "for roffset" in bound.to_code(config)
+
+
 def test_specialized_persistent_reduction_still_renders() -> None:
     @helion.kernel(backend="metal", static_shapes=False)
     def row_sum(x: torch.Tensor) -> torch.Tensor:

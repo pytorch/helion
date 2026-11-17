@@ -10,6 +10,8 @@ import math
 from typing import TYPE_CHECKING
 from typing import cast
 
+from torch._inductor.runtime.runtime_utils import next_power_of_2
+
 from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_spec import DEFAULT_NUM_WARPS
 from ...autotuner.config_spec import RangeNumStagesSpec
@@ -77,6 +79,11 @@ class MetalKernelFacts:
     #: the staged tile), the staged operand's other side, and K
     #: (``staged_matmul_heuristic``).
     staged_matmuls: tuple[tuple[int, int, int], ...] = ()
+    #: The reduction dims whose extent is known only at run time.  Metal
+    #: fixes a persistent reduction's threads and lanes at codegen, so these
+    #: roll (``MetalBackend.create_reduction_strategy``): the search and the
+    #: default config give them a chunk (:func:`roll_runtime_reductions`).
+    runtime_reductions: frozenset[int] = frozenset()
 
 
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
@@ -281,6 +288,21 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     config["num_threads"] = counts
 
 
+def roll_runtime_reductions(config_spec: ConfigSpec, config: dict[str, object]) -> None:
+    """Give each reduction dim of run-time extent that ``config`` leaves
+    persistent (``None``) a rolled chunk: the dim's padded size hint, capped
+    at a threadgroup's threads, which steps over any longer extent."""
+    loops = config_spec.reduction_loops
+    values = config.get("reduction_loops")
+    if not isinstance(values, list) or len(values) != len(loops):
+        return
+    for block_id in kernel_facts(config_spec).runtime_reductions:
+        index = loops.block_id_to_index(block_id)
+        if values[index] is None:
+            hint = loops[index].size_hint
+            values[index] = min(next_power_of_2(hint), MAX_THREADS_PER_THREADGROUP)
+
+
 class MetalSearchSurface(BackendSearchSurface):
     config_keys = frozenset({METAL_MATMUL, METAL_TABULATE})
 
@@ -407,6 +429,10 @@ class MetalSearchSurface(BackendSearchSurface):
             # were before Metal took the key: the sequence pass gives it an
             # empty range_num_stages, which this drops.
             config.pop("range_num_stages", None)
+        if fix_invalid or "reduction_loops" not in provided_keys:
+            # A config given by hand that spells a runtime-extent dim
+            # persistent fails in create_reduction_strategy, saying why.
+            roll_runtime_reductions(config_spec, config)
         threads = config.get("num_threads", ())
         assert isinstance(threads, (list, tuple))
         # Counts all on auto leave the threads to the backend, so a config

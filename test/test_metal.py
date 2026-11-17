@@ -2586,6 +2586,17 @@ def row_sum(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=False, autotune_effort="none")
+def row_rms(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        values = x[tile_m, :].to(torch.float32)
+        rms = torch.sqrt(torch.mean(values * values, dim=-1) + 1e-5)
+        out[tile_m, :] = (values / rms[:, None]).to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="metal", configs=_REDUCTION_CONFIG)
 def row_amax(x: torch.Tensor) -> torch.Tensor:
     m, _ = x.shape
@@ -2785,6 +2796,16 @@ class TestMetalReductions(unittest.TestCase):
     def test_sum_deeply_rolled_reduction(self) -> None:
         x = torch.randn(4, 65536, device=DEVICE)
         self._check(row_sum, (x,), x.sum(-1), rtol=1e-2, atol=1e-2)
+
+    def test_runtime_extent_rolls(self) -> None:
+        """Under dynamic shapes the ':' dim's extent is known only at run
+        time, so the default config rolls it at its padded size hint: one
+        kernel serves narrower and wider rows."""
+        for n in (300, 3000, 70):
+            x = torch.randn(16, n, device=DEVICE, dtype=torch.float16)
+            values = x.float()
+            expected = values / torch.sqrt(values.square().mean(-1, True) + 1e-5)
+            self._check(row_rms, (x,), expected.half(), rtol=1e-2, atol=1e-2)
 
     def test_sum_single_row(self) -> None:
         """One row: the whole threadgroup cooperates on a single reduction."""
@@ -3187,7 +3208,7 @@ class TestMetalReductions(unittest.TestCase):
             dyn_row_sum.fn,
             backend="metal",
             static_shapes=False,
-            configs=[helion.Config(block_sizes=[4])],
+            configs=[helion.Config(block_sizes=[4], reduction_loops=[None])],
         )
         with self.assertRaisesRegex(
             exc.BackendUnsupported, r"a ':' dimension of runtime extent \w+"
@@ -3218,8 +3239,9 @@ class TestMetalReductions(unittest.TestCase):
             bound.compile_config(config)(x), x.sum(-1), rtol=3e-3, atol=3e-3
         )
 
-    def test_dynamic_slice_dim_rejects(self) -> None:
-        """A ``:`` slice with no reduction takes the same threads and lanes."""
+    def test_dynamic_slice_dim(self) -> None:
+        """A ``:`` slice with no reduction takes the same threads and lanes:
+        the default config rolls it, and a persistent one is rejected."""
 
         @helion.kernel(backend="metal", autotune_effort="none", static_shapes=False)
         def dyn_scale_rows(x: torch.Tensor) -> torch.Tensor:
@@ -3228,10 +3250,14 @@ class TestMetalReductions(unittest.TestCase):
                 out[tile_m, :] = x[tile_m, :] * 2
             return out
 
+        for n in (100, 300):
+            x = torch.randn(16, n, device=DEVICE)
+            torch.testing.assert_close(dyn_scale_rows(x), x * 2)
+        bound = dyn_scale_rows.bind((x,))
         with self.assertRaisesRegex(
             exc.BackendUnsupported, r"a ':' dimension of runtime extent \w+"
         ):
-            dyn_scale_rows(torch.randn(16, 100, device=DEVICE))
+            bound.to_code(helion.Config(block_sizes=[16], reduction_loops=[None]))
 
     def test_repeated_size_one_slices_are_allowed(self) -> None:
         """Length-1 full slices are indexed by a constant, so they cannot alias.
@@ -6494,11 +6520,14 @@ class TestMetalPermute(unittest.TestCase):
         with self.assertRaisesRegex(
             exc.BackendUnsupported, r"a ':' dimension of runtime extent \w+"
         ):
-            self._run(dynamic, (x,))
+            self._run(
+                dynamic, (x,), helion.Config(block_sizes=[8], reduction_loops=[None])
+            )
         rolled = helion.Config(block_sizes=[8], reduction_loops=[4])
         for shape in ((40, 12), (24, 30)):
             x = torch.randn(*shape, device=DEVICE)
             torch.testing.assert_close(self._run(dynamic, (x,), rolled)[0], x.T + 1)
+            torch.testing.assert_close(self._run(dynamic, (x,))[0], x.T + 1)
         x = torch.randn(48, 16, device=DEVICE)
         y = torch.randn(16, 48, device=DEVICE)
         torch.testing.assert_close(
