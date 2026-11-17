@@ -265,14 +265,8 @@ def _static_case_axes(
             numel = env.specialize_expr(numel)
             if numel.is_number:
                 numel = int(numel)
-        try:
-            block = int(
-                env.block_sizes[info.block_id].from_config_assert(
-                    device_function.config
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        # A block with no size here raises InvalidConfig, which says why.
+        block = env.block_sizes[info.block_id].from_config_int(device_function.config)
         result.append((numel, block))
     return result
 
@@ -317,13 +311,13 @@ def _static_block_axis_geometry(
     # No static extent (data-dependent bounds, reused block sizes): no geometry.
     if not isinstance(info.size, (int, torch.SymInt)):
         return None
+    numel_expr = info.numel
+    if not numel_expr.is_number:
+        return None
+    numel = int(numel_expr)
     try:
-        numel_expr = info.numel
-        if not numel_expr.is_number:
-            return None
-        numel = int(numel_expr)
-        block = int(info.from_config_assert(device_function.config))
-    except (KeyError, TypeError, ValueError):
+        block = info.from_config_int(device_function.config)
+    except exc.InvalidConfig:
         return None
     return (numel + block - 1) // block, block
 
@@ -1221,7 +1215,7 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     config = device_function.config
 
     def block_size(block_id: int) -> int:
-        return env.size_hint(env.block_sizes[block_id].from_config_assert(config))
+        return env.block_sizes[block_id].from_config_int(config)
 
     mailboxes: dict[int, tuple[int, int, int, bool]] = {}
     words = 0

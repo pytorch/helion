@@ -1371,27 +1371,33 @@ class TileStrategy:
             and env.block_sizes[block_idx].size
             and env.block_sizes[block_idx].numel.is_number
         ):
-            loop_numel = int(env.block_sizes[block_idx].numel)
-            block_size = int(env.block_sizes[block_idx].from_config_assert(config))
-            if env.backend.effective_num_warps(config) == 1:
+            if env.backend.effective_num_warps(config) != 1:
+                # Multi-warp unrolling plus pipelining can cause CUDA IMA. The
+                # conservative legacy bound, the last tile's remainder over
+                # one unrolled step, is a single stage whenever unrolling is.
+                range_num_stages = 1
+            else:
                 # One-warp kernels have no cross-warp layout hazard. Keep the
                 # pipeline within the number of complete unrolled iterations;
                 # using only the final tile's remainder would collapse every
-                # exactly divisible reduction to one stage.
-                loop_iterations = int(math.ceil(loop_numel / block_size))
-                unrolled_iterations = int(
-                    math.ceil(loop_iterations / range_unroll_factor)
-                )
-                range_num_stages = min(max(1, unrolled_iterations), range_num_stages)
-            else:
-                # Multi-warp unrolling plus pipelining can cause CUDA IMA. Keep
-                # the conservative legacy bound for those kernels.
-                step = range_unroll_factor * block_size
-                last_offset = ((loop_numel - 1) // block_size) * block_size
-                remainder = loop_numel - last_offset
-                range_num_stages = min(
-                    max(1, int(math.ceil(remainder / step))), range_num_stages
-                )
+                # exactly divisible reduction to one stage.  A block with no
+                # size to count by (a scalar the bound kernel does not key,
+                # or a tunable beside a dynamic size) keeps the stages.
+                loop_numel = int(env.block_sizes[block_idx].numel)
+                try:
+                    block_size = env.block_sizes[block_idx].from_config_int(
+                        config, key=False
+                    )
+                except exc.InvalidConfig:
+                    pass
+                else:
+                    loop_iterations = int(math.ceil(loop_numel / block_size))
+                    unrolled_iterations = int(
+                        math.ceil(loop_iterations / range_unroll_factor)
+                    )
+                    range_num_stages = min(
+                        max(1, unrolled_iterations), range_num_stages
+                    )
 
         if range_unroll_factor > 0:
             kwargs.append(("loop_unroll_factor", range_unroll_factor))

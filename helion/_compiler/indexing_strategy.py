@@ -1315,8 +1315,11 @@ class _PointerLoadContiguity:
             # Blocklist symbolic begins; the proof evaluates a concrete program-0 tile.
             if begin is None or not begin.is_number:
                 return False
-            bs = self._const_int(env.block_sizes[bid].from_config(self.state.config))
-            if bs is None or bs <= 0:
+            try:
+                bs = env.block_sizes[bid].from_config_int(self.state.config)
+            except exc.InvalidConfig:
+                return False
+            if bs <= 0:
                 return False
             self.extents[ti] = bs
             self.begins[ti] = int(begin)
