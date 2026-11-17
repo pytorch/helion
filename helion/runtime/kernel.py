@@ -3594,6 +3594,21 @@ class Kernel(Generic[_R]):
                             )
         return result
 
+    def _fixed_config_kind(
+        self, *, force: bool = False
+    ) -> Literal["default", "given"] | None:
+        """How calls get a config without an autotune search: the default
+        config under ``autotune_effort="none"`` (without configs, or when
+        forced by ``force`` or ``force_autotune``), or the one config given
+        (unless forced); ``None`` when they search."""
+        settings = self.settings
+        force = force or settings.force_autotune
+        if settings.autotune_effort == "none" and (not self.configs or force):
+            return "default"
+        if not force and len(self.configs) == 1:
+            return "given"
+        return None
+
     def reset(self) -> None:
         """
         Clears the cache of bound kernels, meaning subsequent calls will
@@ -5200,19 +5215,20 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             )
         )
 
+    def _fixed_config(self, *, force: bool = False) -> Config | None:
+        """The config calls take without an autotune search (see
+        ``Kernel._fixed_config_kind``), or None when they search."""
+        kind = self.kernel._fixed_config_kind(force=force)
+        if kind == "default":
+            return self.config_spec.default_config()
+        if kind == "given":
+            return self.kernel.configs[0]
+        return None
+
     def _fixed_config_for_td_layout_guards(self) -> Config | None:
         """Return the fixed config if TD layout guards can be filtered safely."""
-        if self._config is not None:
-            config = self._config
-        elif self.kernel.settings.autotune_effort == "none" and (
-            len(self.kernel.configs) == 0 or self.settings.force_autotune
-        ):
-            config = self.config_spec.default_config()
-        elif self.settings.force_autotune:
-            return None
-        elif len(self.kernel.configs) == 1:
-            config = self.kernel.configs[0]
-        else:
+        config = self._config if self._config is not None else self._fixed_config()
+        if config is None:
             return None
 
         # Decorator configs are intentionally allowed to omit inferred fields
@@ -5226,23 +5242,18 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         Checks the kernel's config list and settings to determine if
         a config can be resolved without autotuning.
         """
-        configs = self.kernel.configs
-        if self.kernel.settings.autotune_effort == "none" and (
-            len(configs) == 0 or self.settings.force_autotune
+        config = self._fixed_config()
+        if (
+            config is not None
+            and self.kernel._fixed_config_kind() == "default"
+            and not is_ref_mode_enabled(self.kernel.settings)
         ):
-            config = self.config_spec.default_config()
-            if not is_ref_mode_enabled(self.kernel.settings):
-                kernel_decorator = self.format_kernel_decorator(config, self.settings)
-                print(
-                    f"Using implicit config: {kernel_decorator}",
-                    file=sys.stderr,
-                )
-            return config
-        if self.settings.force_autotune:
-            return None
-        if len(configs) == 1:
-            return configs[0]
-        return None
+            kernel_decorator = self.format_kernel_decorator(config, self.settings)
+            print(
+                f"Using implicit config: {kernel_decorator}",
+                file=sys.stderr,
+            )
+        return config
 
     def _implicit_config(self) -> Config | None:
         """

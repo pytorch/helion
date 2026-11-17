@@ -2976,14 +2976,9 @@ class Backend(abc.ABC):
             self, bound_kernel.settings.autotune_precompile
         )
 
-        if bound_kernel.settings.autotune_effort == "none" and (
-            force or not bound_kernel.kernel.configs
-        ):
-            return bound_kernel.config_spec.default_config()
+        if (config := bound_kernel._fixed_config(force=force)) is not None:
+            return config
         if not force and bound_kernel.kernel.configs:
-            if len(bound_kernel.kernel.configs) == 1:
-                (config,) = bound_kernel.kernel.configs
-                return config
             # We have finite predetermined configs, no need to precompile
             bound_kernel.settings.autotune_precompile = None
 
