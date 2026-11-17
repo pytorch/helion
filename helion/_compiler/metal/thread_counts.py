@@ -5,9 +5,10 @@ three thread axes, when no reduction or free ``hl.arange`` axis reserves any.
 ``MetalBackend._config_with_auto_threads_shrunk`` and
 ``_serialize_nested_auto_tiles`` run the budget rules on each device loop
 while planning a kernel, and the shared planner then fits each loop's tiles
-to the axes (``demote_auto_thread_axes``); :func:`launch_threads` runs them
-over the whole kernel, to tell which threadgroup a config launches before
-any codegen.
+to the axes (``demote_auto_thread_axes``); the search surface's
+``fit_threads`` runs them over the whole kernel (:func:`launch_threads`) to
+tell which threadgroup a config launches before any codegen.  One copy, so
+the two can't disagree.
 """
 
 from __future__ import annotations
@@ -95,27 +96,36 @@ def launch_threads(
     configured: Sequence[int],
     budget: int,
     *,
+    fixed: Sequence[int] = (),
     to_one: Collection[int] = (),
 ) -> list[int]:
     """Each tile's threads in the launch, as the backend plans the loops:
     ``loops`` holds the positions (into ``sizes`` and ``configured``) of
-    each device loop's tiles, the grid's first.  Each loop's tiles shrink to
-    the budget (:func:`shrink_tile_threads`); a nested loop's auto tiles
-    then shrink to what the other loops' requests leave
-    (:func:`serialize_auto_threads`).  A nested explicit count stays as
-    given, and nothing fills a threadgroup short of the budget.  Last, the
-    tiles fit the three thread axes (:func:`demote_auto_tiles`); a config
-    whose explicit counts still take a fourth fails in codegen
-    (``MetalBackend.thread_index``)."""
+    each device loop's tiles, the grid's first, and ``fixed`` (when given)
+    the product of each loop's literal-size tiles, which have no count and
+    run one thread per element.  Each loop's tiles shrink to the budget
+    (:func:`shrink_tile_threads`); a nested loop's auto tiles then shrink to
+    what the other loops' requests leave (:func:`serialize_auto_threads`).
+    A nested explicit count stays as given, and nothing fills a threadgroup
+    short of the budget.  Last, the tiles fit the three thread axes
+    (:func:`demote_auto_tiles`), a fit that leaves out the literal-size
+    tiles, which the planner counts as auto tiles; a config whose explicit
+    counts still take a fourth fails in codegen (``MetalBackend.thread_index``).
+    The launch is the product of the returned threads and ``fixed``."""
     threads = list(starmap(requested_threads, zip(sizes, configured, strict=True)))
     requested = list(threads)
+    literal = list(fixed) or [1] * len(loops)
     for depth, loop in enumerate(loops):
         loop_sizes = [sizes[i] for i in loop]
         loop_to_one = {j for j, i in enumerate(loop) if i in to_one}
         shrunk = shrink_tile_threads(
-            loop_sizes, [requested[i] for i in loop], budget, to_one=loop_to_one
+            loop_sizes,
+            [requested[i] for i in loop],
+            budget,
+            fixed=literal[depth],
+            to_one=loop_to_one,
         )
-        outside = math.prod(
+        outside = math.prod(literal) * math.prod(
             requested[i] for other in loops if other is not loop for i in other
         )
         serial = [j for j, i in enumerate(loop) if configured[i] <= 0] if depth else []
