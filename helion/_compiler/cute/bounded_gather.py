@@ -381,6 +381,15 @@ def integer_bounds(
             if left is not None and right is not None:
                 return min(left[0], right[0]), max(left[1], right[1])
             return None
+        if target in (
+            torch.ops.aten.clamp.default,
+            torch.ops.aten.clamp.Tensor,
+            torch.ops.aten.clamp_min.default,
+            torch.ops.aten.clamp_min.Tensor,
+            torch.ops.aten.clamp_max.default,
+            torch.ops.aten.clamp_max.Tensor,
+        ):
+            return clamp_bounds(value)
         if len(args) < 2:
             return None
         left, right = bounds(args[0]), bounds(args[1])
@@ -412,14 +421,20 @@ def integer_bounds(
             return None
         a, b = left
         c, d = right
-        if target in (torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar):
-            if value.kwargs.get("alpha", 1) != 1:
+        if target in (
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.add.Scalar,
+            torch.ops.aten.sub.Tensor,
+            torch.ops.aten.sub.Scalar,
+        ):
+            # The Scalar overloads take alpha positionally.
+            alpha = args[2] if len(args) > 2 else value.kwargs.get("alpha", 1)
+            if type(alpha) is not int:
                 return None
-            return a + c, b + d
-        if target in (torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar):
-            if value.kwargs.get("alpha", 1) != 1:
-                return None
-            return a - d, b - c
+            if target in (torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar):
+                alpha = -alpha
+            scaled = alpha * c, alpha * d
+            return a + min(scaled), b + max(scaled)
         if target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
             products = a * c, a * d, b * c, b * d
             return min(products), max(products)
@@ -445,13 +460,55 @@ def integer_bounds(
             if a >= 0 and c >= 0:
                 return 0, (1 << max(b, d).bit_length()) - 1
             return None
-        if target in (
-            torch.ops.aten.div.Tensor_mode,
-            torch.ops.aten.div.Scalar_mode,
-        ) and value.kwargs.get("rounding_mode") in ("floor", "trunc"):
+        if (
+            target
+            in (
+                torch.ops.aten.div.Tensor_mode,
+                torch.ops.aten.div.Scalar_mode,
+            )
+            and value.kwargs.get("rounding_mode") in ("floor", "trunc")
+        ) or target in (
+            torch.ops.aten.floor_divide.default,
+            torch.ops.aten.floor_divide.Scalar,
+        ):
             if a >= 0 and c == d and c > 0:
                 return a // c, b // c
         return None
+
+    def clamp_bounds(value: Node) -> tuple[int, int] | None:
+        # clamp(x, lo, hi) is min(max(x, lo), hi), so hi when hi < lo; an
+        # unknown x keeps its dtype's full range.
+        args = value.args
+        if value.target in (torch.ops.aten.clamp.default, torch.ops.aten.clamp.Tensor):
+            low = args[1] if len(args) > 1 else value.kwargs.get("min")
+            high = args[2] if len(args) > 2 else value.kwargs.get("max")
+        elif value.target in (
+            torch.ops.aten.clamp_min.default,
+            torch.ops.aten.clamp_min.Tensor,
+        ):
+            low, high = args[1], None
+        else:
+            low, high = None, args[1]
+        x = bounds(args[0])
+        if x is None:
+            fake = args[0].meta.get("val") if isinstance(args[0], Node) else None
+            if not isinstance(fake, torch.Tensor) or fake.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                return None
+            limits = torch.iinfo(fake.dtype)
+            x = limits.min, limits.max
+        lo, hi = x
+        if low is not None:
+            if (low_bounds := bounds(low)) is None:
+                return None
+            lo, hi = max(lo, low_bounds[0]), max(hi, low_bounds[1])
+        if high is not None:
+            if (high_bounds := bounds(high)) is None:
+                return None
+            lo, hi = min(lo, high_bounds[0]), min(hi, high_bounds[1])
+        return lo, hi
 
     return bounds(node)
 

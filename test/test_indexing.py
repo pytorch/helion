@@ -6500,6 +6500,47 @@ class TestCuteBoundedGatherCPU(TestCase):
             shift.meta["val"] = torch.empty(17, dtype=dtype)
             self.assertEqual(integer_bounds(shift), (-1, 15))
 
+    def test_integer_range_clamp_floor_divide_and_alpha_proofs(self):
+        """Clamps (with scalar or tensor bounds; ``hi`` wins when ``hi < lo``,
+        as in torch.clamp), floor_divide, and add / sub with an integer alpha,
+        which the Scalar overloads take positionally."""
+        from helion._compiler.cute.bounded_gather import integer_bounds
+
+        aten = torch.ops.aten
+        graph = torch.fx.Graph()
+        fake = torch.empty(17, dtype=torch.int32)
+
+        def node(target, *args):
+            result = graph.call_function(target, args)
+            result.meta["val"] = fake
+            return result
+
+        q = graph.placeholder("q")
+        kv = graph.placeholder("kv")
+        raw = graph.placeholder("raw")
+        for placeholder in (q, kv, raw):
+            placeholder.meta["val"] = fake
+        known = {q: (0, 4095), kv: (0, 4095)}
+        difference = node(aten.sub.Tensor, q, kv)
+        cases = [
+            (node(aten.clamp.default, difference, 0, 255), (0, 255)),
+            (node(aten.clamp.default, difference, 0, -1), (-1, -1)),
+            (node(aten.clamp_min.default, raw, 3), (3, torch.iinfo(torch.int32).max)),
+            (node(aten.clamp_max.default, q, 100), (0, 100)),
+            (node(aten.clamp_max.Tensor, q, kv), (0, 4095)),
+            (node(aten.clamp_min.Tensor, difference, q), (0, 4095)),
+            (node(aten.clamp.Tensor, difference, q, kv), (0, 4095)),
+            (node(aten.floor_divide.default, kv, 64), (0, 63)),
+            (node(aten.add.Scalar, q, 1, -5000), (-5000, -905)),
+            (node(aten.sub.Scalar, q, 1, -5000), (5000, 9095)),
+        ]
+        alpha = graph.call_function(aten.add.Tensor, (q, kv), {"alpha": -1})
+        alpha.meta["val"] = fake
+        cases.append((alpha, (-4095, 4095)))
+        for index, expected in cases:
+            with self.subTest(index=index.format_node()):
+                self.assertEqual(integer_bounds(index, captured_bounds=known), expected)
+
     def test_strided_inputs_and_empty_or_unproved_domains(self):
         from test.test_atomic_ops import _simulate_register_load_program
 
