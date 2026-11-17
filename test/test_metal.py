@@ -965,9 +965,26 @@ def half_matmul_full_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", autotune_effort="none")
+def scalar_minus(x: torch.Tensor) -> torch.Tensor:
+    """A Python float minus a 16-bit tensor: inductor rounds the scalar to
+    the tensor's dtype on MPS."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = 1.0 - x[tile]
+    return out
+
+
 class TestMetalBfloatConversion(unittest.TestCase):
     """Every conversion to bfloat goes through float, the way torch CPU and
     CUDA convert, since c10's BFloat16 is built from a float only."""
+
+    def test_scalar_minus_16_bit(self) -> None:
+        """The scalar is a number in the kernel, not a symbol."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1000, device=DEVICE, dtype=dtype)
+                torch.testing.assert_close(scalar_minus(x), 1.0 - x)
 
     def test_float_math_stored_to_bfloat(self) -> None:
         """MSL converts float to bfloat only explicitly: a store of bfloat
