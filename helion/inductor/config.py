@@ -20,8 +20,9 @@ from ..runtime.settings import _get_backend
 # Lower matmuls natively (dot reductions) and emit them as Helion. A matmul that
 # HelionChoices declines when lowering (dynamic shapes, dims of size 1, the
 # strict and deterministic modes, cpp_wrapper) keeps its extern kernel. One whose
-# kernel Helion cannot emit, which only scheduling shows (a[i] @ b, or a CPU
-# scalar in its epilogue), fails the compile with Unsupported.
+# kernel Helion cannot emit, which only scheduling shows (a[i] @ b with an i of
+# unknown range, whose bounds check Helion kernels lack, or a CPU scalar in its
+# epilogue), fails the compile with Unsupported.
 native_matmul: bool = True
 # The generated kernels' @helion.kernel(backend=...): "triton" or "cute", the
 # backends this one supports. HELION_BACKEND=cute sets "cute", read as

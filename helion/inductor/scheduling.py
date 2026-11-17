@@ -16,6 +16,7 @@ from torch._inductor.ops_handler import OpsHandler
 from torch._inductor.utils import get_fused_kernel_name
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
+from torch.utils._sympy.functions import Where
 
 from .._compiler._inductor.template_buffer import HelionTemplateBuffer
 from .._compiler.backend_registry import get_backend
@@ -63,9 +64,14 @@ INHERITED_OPS = OrderedSet(
         "bitwise_not",
     ]
 )
-# Every op a Helion kernel emits: those HelionKernel (load, store, dot, ...) or
-# HelionOverrides (exp, where, ...) implements, the inherited operators,
-# SIMDKernel.store_reduction (which calls HelionKernel.store) and the body's output.
+# Every op a Helion kernel emits: those HelionKernel (load, store, dot,
+# check_bounds, ...) or HelionOverrides (exp, where, ...) implements, the
+# inherited operators, SIMDKernel.store_reduction (which calls HelionKernel.store),
+# indirect_indexing (whose symbol HelionKernel's indices read, see
+# indirect_vars()) and the body's output. check_bounds, which the body of
+# x.gather(1, arange-based index) holds next to its direct index, passes when
+# Inductor proves the index in range (from its value ranges), and fails the
+# compile with "Unsupported: check_bounds" otherwise.
 HELION_OPS = (
     OrderedSet(
         name
@@ -74,7 +80,7 @@ HELION_OPS = (
         if not name.startswith("_") and name in vars(OpsHandler)
     )
     | INHERITED_OPS
-    | OrderedSet(["store_reduction", "output"])
+    | OrderedSet(["store_reduction", "indirect_indexing", "output"])
 )
 MATMUL_DTYPES = OrderedSet([torch.float16, torch.bfloat16, torch.float32])
 
@@ -146,7 +152,7 @@ def unsupported(node: SchedulerNode) -> list[str]:
     """What `node` uses that HelionKernel does not support: a dynamic shape, its
     op and reduction names that supported() lacks, e.g. dropout's "load_seed"
     and "rand", the numerics modes that are on, a CPU scalar input, a dynamic
-    index and an arg reduction over several dims."""
+    index, a direct index with a Where and an arg reduction over several dims."""
     body = node._body
     buffer = cast("ComputedBuffer", node.node)
     reduction_type = buffer.get_reduction_type()
@@ -169,11 +175,21 @@ def unsupported(node: SchedulerNode) -> list[str]:
     if any(V.graph.is_unspec_arg(dep.name) for dep in node.read_writes.reads):
         missing.append("cpu_scalar_input")
     # x[:, :50] * 2 with a dynamic dim 1: the index holds that dim's stride,
-    # "Unsupported Helion index: s27*((xindex//50)) + ...". An index that reads
-    # values (indirect0 in x[i]) is indirect_indexing's.
+    # "Unsupported Helion index: s27*((xindex//50)) + ...". An index may read
+    # values (indirect0 in x.gather(1, i)), into a static dim: x[i] with a
+    # dynamic dim 0 wraps a negative i by i + s0, "Unsupported Helion index: s0".
     known = OrderedSet([*body.var_ranges, *body.indirect_var_ranges])
-    if not all(index.free_symbols <= known for index in body.indexing_exprs.values()):
+    if not all(
+        index.free_symbols <= known for index in body.indexing_exprs.values()
+    ) or not all(
+        isinstance(size, (int, sympy.Integer))
+        for size in body.indirect_var_ranges.values()
+    ):
         missing.append("dynamic_index")
+    # x[torch.arange(10) - 1] wraps -1 at Where(p0 - 1 < 0, p0 + 9, p0 - 1),
+    # which HelionKernel's index printer and bounds do not take.
+    if any(index.has(Where) for index in body.indexing_exprs.values()):
+        missing.append("where_index")
     return missing
 
 
@@ -272,6 +288,15 @@ class HelionScheduling(SIMDScheduling):
         # SIMDScheduling's combo kernels are Triton's: "expected self.kernel_type
         # to subclass TritonKernel".
         raise Unsupported("combo_kernels")
+
+    def codegen_node_schedule_with_kernel(
+        self, node_schedule: list[Any], kernel: SIMDKernel[Any]
+    ) -> None:
+        super().codegen_node_schedule_with_kernel(node_schedule, kernel)
+        # What only emitting the kernel shows: an indirect index that needs a
+        # bounds check (HelionKernel.check_bounds()).
+        if cast("HelionKernel", kernel).needs_bounds_check:
+            raise Unsupported("check_bounds")
 
     def create_kernel_choices(  # pyrefly: ignore [bad-override]
         self,
