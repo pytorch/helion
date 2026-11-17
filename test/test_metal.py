@@ -945,9 +945,27 @@ def _bits_mismatch(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_darwin
+@helion.kernel(backend="metal", autotune_effort="none", fast_math=True)
+def bf16_sigmoid_store(x: torch.Tensor) -> torch.Tensor:
+    """``1 + exp(-x)`` on bfloat runs in float in MSL; the bfloat store
+    converts it explicitly."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.sigmoid(x[tile])
+    return out
+
+
 class TestMetalBfloatConversion(unittest.TestCase):
     """Every conversion to bfloat goes through float, the way torch CPU and
     CUDA convert, since c10's BFloat16 is built from a float only."""
+
+    def test_float_math_stored_to_bfloat(self) -> None:
+        """MSL converts float to bfloat only explicitly: a store of bfloat
+        math, which runs in float, compiles and rounds once."""
+        x = torch.randn(1000, device=DEVICE, dtype=torch.bfloat16)
+        torch.testing.assert_close(
+            bf16_sigmoid_store(x), torch.sigmoid(x), atol=1e-2, rtol=1e-2
+        )
 
     def test_integers_round_through_float(self) -> None:
         # The large values are ones where a direct int -> bfloat cast rounds

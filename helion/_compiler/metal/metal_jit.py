@@ -59,6 +59,7 @@ from .msl_ast_walker import MASKED_LOAD
 from .msl_ast_walker import MASKED_LOAD_PREAMBLE
 from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
+from .msl_ast_walker import cast_stores_to
 from .msl_ast_walker import select_masked_loads
 from .msl_phases import PHASE_ACCESS_GLOBAL
 from .msl_phases import PHASE_PREAMBLE
@@ -271,6 +272,12 @@ def _generate_msl(
         ),
         layout,
         FRAGMENT_LOWERING,
+    )
+    # Before the lane copies, which round a bfloat cast they repeat in
+    # integer arithmetic (``lane_fold.BF16_CAST``).
+    cast_stores_to(
+        body_stmts,
+        {n: "bfloat" for n, d in tensor_dtypes.items() if d == torch.bfloat16},
     )
     body_stmts = jam_lanes_into_loops(unroll_lane_folds(body_stmts, names_read))
     msl_parts: list[str] = [

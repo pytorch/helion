@@ -27,6 +27,7 @@ from collections import Counter
 import contextlib
 import copy
 import dataclasses
+from typing import TYPE_CHECKING
 from typing import Iterator
 
 from ... import exc
@@ -44,6 +45,7 @@ from .fragment_mma import split_runs
 from .lane_fold import LANE_PUT
 from .lane_fold import is_store
 from .lane_fold import load_mask_other
+from .lane_fold import pointer_base
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_RUN
@@ -54,6 +56,9 @@ from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
 from .msl_phases import PHASE_NAMESPACE
 from .msl_reduction import REDUCTION_NAMESPACE
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 @dataclasses.dataclass
@@ -976,6 +981,105 @@ MASKED_LOAD_PREAMBLE = f"""template <typename T, typename O>
 inline auto {MASKED_LOAD}(T v, bool m, O other) {{
     return m ? v : other;
 }}"""
+
+
+def cast_stores_to(stmts: list[ast.stmt], element_types: Mapping[str, str]) -> None:
+    """Wrap the value of each ``tl.store(buf + offset, value, mask)`` into a
+    buffer in *element_types* in ``static_cast(T, value)``, in place.
+
+    A store's value has its tensor's dtype in the graph, but its MSL
+    expression can be wider: arithmetic on ``bfloat`` runs in ``float``
+    (``metal::exp`` has no ``bfloat`` overload, and ``int + float`` is a
+    ``float``), as Triton computes it, rounding once at the store.  MSL
+    converts ``float`` to ``half`` or ``int`` implicitly but not to
+    ``bfloat``, so a ``bfloat`` buffer's stores convert explicitly.  A value
+    already of the element type (a load from a buffer of that type, or a
+    name every assignment gives such a value, as lane copies do) is stored
+    as it is.
+    """
+    typed = _names_of_element_type(stmts, element_types)
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if not is_store(node):
+                continue
+            ptr = node.args[0]
+            if not (
+                isinstance(ptr, ast.BinOp)
+                and isinstance(ptr.left, ast.Name)
+                and (element := element_types.get(ptr.left.id)) is not None
+            ):
+                continue
+            if _of_type(node.args[1], element, element_types, typed[element]):
+                continue
+            node.args[1] = ast.Call(
+                func=ast.Name(id="static_cast", ctx=ast.Load()),
+                args=[ast.Name(id=element, ctx=ast.Load()), node.args[1]],
+                keywords=[],
+            )
+
+
+def _of_type(
+    expr: ast.expr | None,
+    element: str,
+    element_types: Mapping[str, str],
+    names: set[str],
+) -> bool:
+    """Whether ``expr`` is an ``element`` value: a ``tl.load`` from a buffer
+    of that type, a name in ``names``, or a ``static_cast`` to it.  None (a
+    value not tracked) isn't."""
+    if expr is None:
+        return False
+    if isinstance(expr, ast.Name):
+        return expr.id in names
+    if (load := tl_load(expr)) is not None:
+        base = pointer_base(load.args[0])
+        return base is not None and element_types.get(base) == element
+    return (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id == "static_cast"
+        and isinstance(type_arg := expr.args[0], ast.Name)
+        and type_arg.id == element
+    )
+
+
+def _names_of_element_type(
+    stmts: list[ast.stmt], element_types: Mapping[str, str]
+) -> dict[str, set[str]]:
+    """For each element type, the names every assignment in ``stmts`` gives
+    a value of that type (:func:`_of_type`), to a fixed point."""
+    # Each name's assigned values; None for one not tracked (a tuple
+    # target's element, an augmented assignment, a loop variable).
+    assigned: dict[str, list[ast.expr | None]] = {}
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    for name in ast.walk(target):
+                        if isinstance(name, ast.Name):
+                            value = node.value if target is name else None
+                            assigned.setdefault(name.id, []).append(value)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For)):
+                for name in ast.walk(node.target):
+                    if isinstance(name, ast.Name):
+                        assigned.setdefault(name.id, []).append(None)
+    typed: dict[str, set[str]] = {}
+    for element in set(element_types.values()):
+        names = set(assigned)
+        while True:
+            kept = {
+                name
+                for name in names
+                if all(
+                    _of_type(value, element, element_types, names)
+                    for value in assigned[name]
+                )
+            }
+            if kept == names:
+                break
+            names = kept
+        typed[element] = names
+    return typed
 
 
 def select_masked_loads(
