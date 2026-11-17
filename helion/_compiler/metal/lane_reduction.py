@@ -500,7 +500,23 @@ def _tl_call(node: ast.AST, name: str) -> ast.Call | None:
 
 
 def _is_store(stmt: ast.AST) -> bool:
-    return isinstance(stmt, ast.Expr) and _tl_call(stmt.value, "store") is not None
+    """Whether ``stmt`` writes memory and no name: a ``tl.store`` or an
+    atomic whose old value is unused."""
+    return isinstance(stmt, ast.Expr) and stmt.value in _memory_writes(stmt.value)
+
+
+def _memory_writes(stmt: ast.AST) -> list[ast.Call]:
+    """The stores and atomics in ``stmt``, nested ones included: each
+    ``tl.store(ptr, ...)`` or ``tl.atomic_<op>(ptr, ...)``."""
+    return [
+        node
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tl"
+        and (node.func.attr == "store" or node.func.attr.startswith("atomic_"))
+    ]
 
 
 def _is_name_assign(stmt: ast.AST) -> bool:
@@ -585,9 +601,8 @@ def _lane_body(
     stored: set[str] = set()
     loaded: set[str] = set()
     for stmt in statements:
-        for store in filter(_is_store, ast.walk(stmt)):
-            assert isinstance(store, ast.Expr) and isinstance(store.value, ast.Call)
-            for tensor in sorted(tensors_in(store.value.args[0])):
+        for write in _memory_writes(stmt):
+            for tensor in sorted(tensors_in(write.args[0])):
                 if tensor in stored:
                     raise _unsupported(
                         f"lane reduction: {tensor} stored twice in its lane loop"

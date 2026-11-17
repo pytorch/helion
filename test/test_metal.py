@@ -975,6 +975,63 @@ def scalar_minus(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def atomic_histogram(
+    idx: torch.Tensor, w: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """Many elements add into a few bins."""
+    for tile in hl.tile(idx.size(0)):
+        hl.atomic_add(out, [idx[tile]], w[tile])
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def atomic_row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Each row adds into its own element: the index has no column dim."""
+    out = torch.zeros([x.size(0)], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile(x.size()):
+        hl.atomic_add(out, [tile_m], x[tile_m, tile_n].sum(-1))
+    return out
+
+
+class TestMetalAtomics(unittest.TestCase):
+    """Atomics lower through the pointer strategy to Metal's relaxed
+    ``atomic_fetch_<op>_explicit``, one thread per element."""
+
+    def test_add_float_and_int(self) -> None:
+        idx = torch.randint(0, 10, (1000,), device=DEVICE)
+        for dtype in (torch.float32, torch.int32):
+            with self.subTest(dtype=dtype):
+                w = torch.randint(-5, 5, (1000,), device=DEVICE).to(dtype)
+                out = atomic_histogram(
+                    idx, w, torch.zeros(10, device=DEVICE, dtype=dtype)
+                )
+                expected = torch.zeros(10, device=DEVICE, dtype=dtype).index_add_(
+                    0, idx, w
+                )
+                torch.testing.assert_close(out, expected)
+
+    def test_one_writer_per_element(self) -> None:
+        """The index has no column dim, so of the threads and lanes of a
+        column tile, which all hold the row's sum, only the first adds it."""
+        x = torch.randn(32, 64, device=DEVICE)
+        for threads in ([16, 4], [16, 1], [16, 16]):
+            with self.subTest(num_threads=threads):
+                config = helion.Config(block_sizes=[16, 16], num_threads=threads)
+                out = atomic_row_sums.bind((x,)).compile_config(config)(x)
+                torch.testing.assert_close(out, x.sum(-1), rtol=1e-4, atol=1e-4)
+
+    def test_half_rejects(self) -> None:
+        idx = torch.randint(0, 10, (100,), device=DEVICE)
+        w = torch.randn(100, device=DEVICE, dtype=torch.float16)
+        with self.assertRaisesRegex(
+            exc.BackendUnsupported, "atomic_add on torch.float16"
+        ):
+            atomic_histogram(
+                idx, w, torch.zeros(10, device=DEVICE, dtype=torch.float16)
+            )
+
+
 class TestMetalBfloatConversion(unittest.TestCase):
     """Every conversion to bfloat goes through float, the way torch CPU and
     CUDA convert, since c10's BFloat16 is built from a float only."""

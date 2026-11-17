@@ -13,6 +13,7 @@ listing it here, never editing the core ``helion/language`` files.
 from __future__ import annotations
 
 from . import aten_lowering  # noqa: F401
+from . import atomic_ops  # noqa: F401
 from . import free_arange  # noqa: F401
 from . import gelu_tanh_approx  # noqa: F401
 from . import loop_ops  # noqa: F401

@@ -304,9 +304,9 @@ def tl_load(node: ast.AST) -> ast.Call | None:
 
 
 def is_store(node: ast.AST) -> TypeGuard[ast.Call]:
-    """Whether ``node`` is a ``tl.store(ptr, value, mask)``, the body's only
-    device-memory write (Metal lowers no atomics).  Codegen always passes all
-    three arguments positionally."""
+    """Whether ``node`` is a ``tl.store(ptr, value, mask)``.  Codegen always
+    passes all three arguments positionally.  The body's other device-memory
+    writes are atomics (``atomic_ops``)."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)

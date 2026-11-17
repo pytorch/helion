@@ -61,6 +61,7 @@ from .msl_ast_walker import EmitState
 from .msl_ast_walker import _emit_stmts
 from .msl_ast_walker import cast_stores_to
 from .msl_ast_walker import select_masked_loads
+from .msl_ast_walker import type_atomics
 from .msl_phases import PHASE_ACCESS_GLOBAL
 from .msl_phases import PHASE_PREAMBLE
 from .msl_phases import REPEATED_READS_GLOBAL
@@ -304,6 +305,7 @@ def _generate_msl(
             },
         },
     )
+    type_atomics(body_stmts, {n: DTYPE_TO_METAL[d] for n, d in tensor_dtypes.items()})
     shared = {i for group in _shared_storage(args) for i in group}
     body_stmts = select_masked_loads(
         body_stmts,

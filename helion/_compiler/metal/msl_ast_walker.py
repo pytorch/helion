@@ -937,6 +937,21 @@ def _ast_call_to_msl(node: ast.AST, subs: dict[str, str] | None = None) -> str:
         mask_msl = _ast_expr_to_msl(mask, subs=subs)
         return f"({mask_msl} ? {access} : ({_ast_expr_to_msl(other, subs=subs)}))"
 
+    # _metal_atomic(function, T, ptr + offset, value, mask) → the atomic on
+    # the element, under the mask, its old value (T(0) where masked off)
+    if _is_call_to(node, ATOMIC):
+        function, element = (ast.literal_eval(a) for a in node.args[:2])
+        access = _ptr_access_expr(node.args[2], subs=subs)
+        value = _ast_expr_to_msl(node.args[3], subs=subs)
+        atomic = (
+            f"{function}((device metal::atomic<{element}>*)&{access}, "
+            f"static_cast<{element}>({value}), memory_order_relaxed)"
+        )
+        mask = node.args[4]
+        if isinstance(mask, ast.Constant) and mask.value is None:
+            return atomic
+        return f"({_ast_expr_to_msl(mask, subs=subs)} ? {atomic} : {element}(0))"
+
     # A C++ cast or MSL template function: static_cast(T, x) → static_cast<T>(x)
     if _template_name(func) in TEMPLATE_CALLS:
         callee = _ast_expr_to_msl(func, subs=subs)
@@ -1080,6 +1095,54 @@ def _names_of_element_type(
             names = kept
         typed[element] = names
     return typed
+
+
+ATOMIC = "_metal_atomic"
+#: Each ``tl.atomic_<op>`` to its MSL function.
+_ATOMIC_FUNCTIONS = {
+    "atomic_add": "atomic_fetch_add_explicit",
+    "atomic_xchg": "atomic_exchange_explicit",
+    "atomic_and": "atomic_fetch_and_explicit",
+    "atomic_or": "atomic_fetch_or_explicit",
+    "atomic_xor": "atomic_fetch_xor_explicit",
+    "atomic_max": "atomic_fetch_max_explicit",
+    "atomic_min": "atomic_fetch_min_explicit",
+}
+
+
+def type_atomics(stmts: list[ast.stmt], element_types: Mapping[str, str]) -> None:
+    """Rewrite each ``tl.atomic_<op>(buf + offset, value, mask=m, sem=s)``
+    (``atomic_ops``) to ``_metal_atomic(function, T, buf + offset, value,
+    m)``, in place, ``T`` being the buffer's element type, which the atomic
+    view of the element is declared with."""
+
+    class Rewrite(ast.NodeTransformer):
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            self.generic_visit(node)
+            func = node.func
+            if not (
+                isinstance(func, ast.Attribute)
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "tl"
+                and func.attr in _ATOMIC_FUNCTIONS
+            ):
+                return node
+            ptr, value = node.args
+            assert isinstance(ptr, ast.BinOp) and isinstance(ptr.left, ast.Name)
+            mask = next(k.value for k in node.keywords if k.arg == "mask")
+            return ast.Call(
+                func=ast.Name(id=ATOMIC, ctx=ast.Load()),
+                args=[
+                    ast.Constant(_ATOMIC_FUNCTIONS[func.attr]),
+                    ast.Constant(element_types[ptr.left.id]),
+                    ptr,
+                    value,
+                    mask,
+                ],
+                keywords=[],
+            )
+
+    stmts[:] = [Rewrite().visit(stmt) for stmt in stmts]
 
 
 def select_masked_loads(
