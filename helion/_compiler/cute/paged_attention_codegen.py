@@ -22,11 +22,23 @@ from .cute_mma_dag_codegen import mma_dag_alias_plan
 from .cute_mma_dag_emitter_base import MmaDagEmitterBase
 from .cute_mma_dag_emitter_base import _Evaluator
 from .fx_matcher import _is_call
+from .packet_flush_names import PAIRED_BODY_NAME
+from .packet_flush_names import PAIRED_BODY_STORE_POLICY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
 from .paged_attention_partition import partition_workspace_arg
+from .paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
+from .paged_attention_prefetch import boundary_prefetch_form
+from .paged_attention_prefetch import boundary_prefetch_layout
+from .paged_attention_registers import PAIRED_DEFAULT_REGISTER_QUOTAS
+from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from .paged_attention_transport import paged_attention_launch_warps
 from .paged_attention_transport import paged_attention_tma_accesses
 from .passes.pdl import exit_release_applies
 from .passes.pdl import loader_tail_release_applies
+from .passes.pdl import pdl_launch_ctas
+from .passes.pdl import pdl_resident_capacity
 from .pdl_release import capture_policy_available
 from .state import cute_codegen_state
 from .tile_ops import cute_tile_begin_expr
@@ -70,6 +82,8 @@ def _unit_bounds_helper(
     plan: MmaDagPlan,
     lines: list[str],
     values: tuple[str, str, str, str],
+    *,
+    live: bool = False,
 ) -> tuple[str, str | None, list[str]]:
     """Wrap the scalar prelude as module functions of a unit's tile offset.
 
@@ -77,6 +91,11 @@ def _unit_bounds_helper(
     per unit and role instead of once at kernel entry. ``lines`` are the
     evaluator's own statements, so every integer operation keeps its source
     width and order; only the leading tile offset becomes the parameter.
+
+    ``live`` keeps only the statements the four results depend on and makes
+    no second function: a role that evaluates another unit beside the
+    kernel's own prelude (the boundary prefetch of a one-unit CTA) then
+    names the tensors the bounds are read from and no other argument.
 
     The prelude's global load is the unit's length, which the CTA's plan
     scan reads for every unit. When every load of the prelude reads that
@@ -116,6 +135,28 @@ def _unit_bounds_helper(
         assert isinstance(target, ast.Name)
         defined[target.id] = statement.value
     assert len(defined) == len(lines)
+    if live:
+        # Straight-line single assignments: one backward pass finds what the
+        # results read, through every statement they depend on.
+        needed = {
+            node.id for node in ast.walk(tree.body[-1]) if isinstance(node, ast.Name)
+        }
+        for target in reversed(list(defined)):
+            if target in needed:
+                needed |= {
+                    node.id
+                    for node in ast.walk(defined[target])
+                    if isinstance(node, ast.Name)
+                }
+        lines = [
+            line
+            for line, target in zip(lines, defined, strict=True)
+            if target in needed
+        ]
+        defined = {
+            target: value for target, value in defined.items() if target in needed
+        }
+        tree = ast.parse("\n".join([*lines, result]))
     free = {
         node.id
         for node in ast.walk(tree)
@@ -157,7 +198,12 @@ def _unit_bounds_helper(
                 address = ast.unparse(defined[argument.id])
         addresses.add(address)
     scanned_name = None
-    if values[3] in loads and len(addresses) == 1 and None not in addresses:
+    if (
+        not live
+        and values[3] in loads
+        and len(addresses) == 1
+        and None not in addresses
+    ):
         scanned = df.new_var("scanned_length")
         scanned_lines = list(lines)
         order = list(defined)
@@ -195,7 +241,7 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         cg.ensure_module_statements(
             "import helion._compiler.cute._paged_attention_paired_pipeline as _helion_paged_paired\n"
         )
-        body_name = "_helion_paged_paired.paged_attention_paired_body"
+        body_name = f"_helion_paged_paired.{PAIRED_BODY_NAME}"
     elif semantic.denominator_per_key:
         assert schedule.query_columns in (8, 32, 40)
         assert 0 < transport.query_rows <= schedule.query_columns
@@ -294,6 +340,7 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             for access in selected.program.accesses
         )
     mode_arg = ""
+    tail_release = False
     if guarded_pdl:
         mode = df.new_var("capture_pdl_wait_mode")
         df.wrapper_only_params.append(mode)
@@ -315,6 +362,12 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             # every CTA (``passes.pdl.prepare_device_body``).
             df.cute_state.lanes.pdl_loader_tail_release = True
             mode_arg += ", capture_release_tail=True"
+            tail_release = True
+            if schedule.release_lead != MMA_DAG_RELEASE_LEAD_DEFAULT:
+                # The lead is the tail release's: a launch that releases
+                # elsewhere (past one wave, a declined capture contract)
+                # renders the kernel without it, as it does the release.
+                mode_arg += f", capture_release_lead={schedule.release_lead}"
     coords = semantic.coordinates
     coordinate_dtype = "Int64" if coords.key_dtype == torch.int64 else "Int32"
     panel_arg = ""
@@ -338,6 +391,49 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         assert schedule.paired_items and schedule.fast_math
         assert not schedule.value_metadata_skip
         panel_arg += f", key_clip={schedule.key_clip!r}"
+    if schedule.register_quotas != PAIRED_DEFAULT_REGISTER_QUOTAS:
+        assert schedule.paired_items
+        panel_arg += f", register_quotas={schedule.register_quotas!r}"
+    if schedule.value_ring != PAIRED_DEFAULT_VALUE_RING:
+        # The body repeats the contract's check on the table it allocates,
+        # against the capacity the depth was admitted on.
+        assert schedule.paired_items and not schedule.value_metadata_skip
+        panel_arg += (
+            f", value_ring={schedule.value_ring}"
+            f", shared_memory_capacity={schedule.smem_capacity}"
+        )
+    if schedule.page_order != MMA_DAG_PAGE_ORDER_SOURCE:
+        # Another order of a unit's tiles: fast math. The bucketed order
+        # permutes whole interior tiles on the control warp the
+        # value-metadata actor and a persistent partition would take, so it
+        # has one unit per CTA; the reversed walk permutes the source's
+        # iterations and has no role, on any partition.
+        assert schedule.paired_items and schedule.fast_math
+        assert not schedule.value_metadata_skip
+        panel_arg += f", page_order={schedule.page_order!r}"
+        if schedule.page_order == MMA_DAG_PAGE_ORDER_REVERSED:
+            # The walk reflects a loop the source does not, under a window.
+            assert semantic.mask.window_left is not None
+            assert semantic.coordinates.reflected is None
+            if schedule.clipped_page_lead:
+                panel_arg += f", clipped_page_lead={schedule.clipped_page_lead}"
+        else:
+            assert schedule.partition == MMA_DAG_PARTITION_ITEM
+            panel_arg += f", page_order_shift={schedule.page_order_shift}"
+    else:
+        assert not schedule.clipped_page_lead
+    store_policy = df.config.config.get("cute_store_policy", "default")
+    if schedule.paired_items and store_policy != "default":
+        # The policy of the kernel's output stores, which this body makes
+        # itself: its O stores take the streaming cache operator or the L2
+        # evict-last hint, with the values, addresses, count and order of
+        # the plain ones. The hint's policy word is made at run time, so a
+        # config on this schedule keeps ``l2_evict_last`` on every target
+        # (``search_surface._normalize_paired_store_policy``). The value is
+        # the policy's name: normalization replaces whatever compared equal
+        # to one (``search_surface._normalize_cute_store_policy``).
+        assert type(store_policy) is str
+        panel_arg += f", {PAIRED_BODY_STORE_POLICY}={store_policy!r}"
     if schedule.probability_schedule != MMA_DAG_PROBABILITY_SCHEDULE_SERIAL:
         assert schedule.paired_items and semantic.score_reference is not None
         panel_arg += f", probability_schedule={schedule.probability_schedule!r}"
@@ -434,6 +530,73 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             )
             if schedule.partition_skew:
                 partition_arg += f", partition_skew={schedule.partition_skew}"
+    prefetch_arg = ""
+    if schedule.boundary_prefetch:
+        # The config contract admitted the form from the bind's facts; the
+        # render repeats it against this launch and leaves the role out
+        # where it does not hold. The grid is one CTA per unit on a known
+        # capacity, and the form of a one-wave grid serves the units that
+        # wait for the previous launch's SMs, which only a launch with the
+        # capture contract and the release from its loader's tail has.
+        # These are second gates. Normalization rejects every config that
+        # fails one (``paged_attention_boundary_prefetch_reason``,
+        # ``boundary_prefetch_policy_reason``), the paired schedule's launch
+        # has the capacity and grid of the facts, and that schedule owns a
+        # kernel's only root, so no config of today is decided here: a
+        # config that reaches the render another way, or one whose final
+        # effect proof declines the capture contract, gets the kernel
+        # without the role.
+        assert schedule.paired_items and not schedule.value_metadata_skip
+        assert schedule.partition == MMA_DAG_PARTITION_ITEM
+        prefetch_units = transport.items // 2
+        prefetch_capacity = pdl_resident_capacity(df)
+        prefetch_layout = boundary_prefetch_layout(transport)
+        form = schedule.boundary_prefetch_form
+        # The role reads the served unit's bounds and page ids where the
+        # launch may read its inputs, ahead of the dependency wait of a
+        # captured launch. That launch's proof covers the tensors the
+        # program loads. The role names only such tensors (the page table,
+        # the key operands and what the prelude's bounds read), so it is
+        # left out where the program also stores one it loads.
+        program_loads, program_stores = (
+            {
+                tensor_name(access)
+                for access in selected.program.accesses
+                if _is_call(access.node, operation)
+            }
+            for operation in (memory_ops.load, memory_ops.store)
+        )
+        if (
+            prefetch_layout is not None
+            and prefetch_capacity is not None
+            and not program_loads & program_stores
+            and len(HostFunction.current().device_ir.root_ids) == 1
+            and pdl_launch_ctas(df) == prefetch_units
+            and boundary_prefetch_form(prefetch_units, prefetch_capacity) == form
+            and (form != BOUNDARY_PREFETCH_SIBLING or tail_release)
+        ):
+            # The kernel keeps its own prelude; the role evaluates the unit
+            # it serves through the same statements as a function of the
+            # unit.
+            helper, _scanned, parameters = _unit_bounds_helper(
+                cg, selected, emitter.lines, (item, begin, end, length), live=True
+            )
+            key_raw = tensor_name(transport.key.raw)
+            key_scales = tensor_name(transport.key.scale)
+            prefetch_arg = (
+                f", boundary_prefetch={schedule.boundary_prefetch}"
+                f", boundary_prefetch_form={form!r}"
+                f", boundary_prefetch_capacity={prefetch_capacity}"
+                f", boundary_prefetch_key={key_raw}"
+                f", boundary_prefetch_key_scales={key_scales}"
+                f", boundary_prefetch_layout={prefetch_layout!r}"
+                f", units={prefetch_units}, unit_bounds={helper}"
+                f", unit_bounds_args=({''.join(f'{name}, ' for name in parameters)})"
+            )
+            if form == BOUNDARY_PREFETCH_SIBLING:
+                # The host installs, above the wait mode, how many of the
+                # launch's first CTAs start beside the launch ahead.
+                wrapper["capture_pdl_head_start"] = True
     emitter.emit(
         f"{body_name}("
         f"{tensor_name(semantic.query)}, {tensor_name(semantic.page_table)}, "
@@ -441,7 +604,7 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         f"{work_item}, {coords.query_len}, {coords.group}, "
         f"{transport.query_rows}, {transport.heads}, {semantic.mask.window_left!r}, "
         f"cutlass.Float32({semantic.score_scale!r}), {schedule.fast_math!r}, "
-        f"{', '.join(maps)}, coordinate_dtype=cutlass.{coordinate_dtype}{panel_arg}{io_arg}{query_arg}{mode_arg}{partition_arg})"
+        f"{', '.join(maps)}, coordinate_dtype=cutlass.{coordinate_dtype}{panel_arg}{io_arg}{query_arg}{mode_arg}{partition_arg}{prefetch_arg})"
     )
     for statement in ast.parse("\n".join(emitter.lines)).body:
         cg.add_statement(statement)

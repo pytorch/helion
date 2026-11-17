@@ -414,7 +414,12 @@ without it. It then compiles that result without the overlap and leaves the
 cache entry as it is. A result that carries the default policy loses it as a
 compiler seed does in a search: `cute_pdl` is off unless an override sets it
 or names a release beside `cute_pdl_capture_overlap=False`, which keeps
-dependent launch on that release.
+dependent launch on that release. A lead of the tail release that the result
+names (`cute_mma_dag_release_lead`) goes with the policy it belongs to, and so
+do its boundary prefetch pages (`cute_mma_dag_boundary_prefetch`) on a grid of
+fewer units than SMs, where they serve the units that wait for the previous
+launch's SMs and need that policy; on a grid of more units than SMs the pages
+stay.
 A result with the overlap on an `entry`, `last_wave` or automatic release keeps
 `cute_pdl=True` and that release under `cute_pdl_capture_overlap=False`
 (ordinary dependent launch, which holds without the overlap), and loses

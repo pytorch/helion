@@ -18,8 +18,11 @@ def paged_attention_args(
     heads: int = 2,
     requests: int = 2,
     pages: int = 13,
+    table_pages: int = 17,
     device: torch.device | str = "cpu",
 ) -> tuple[object, ...]:
+    """Arguments of the paged attention fixture: a pool of ``pages``
+    physical pages and a page table of ``table_pages`` pages a request."""
     dim = 128
     raw_bytes = width * heads * dim
     scale_bytes = width * heads * 4
@@ -36,7 +39,7 @@ def paged_attention_args(
         storage_v.as_strided(shape, strides),
         storage_k.view(torch.uint8).as_strided(scale_shape, scale_strides, raw_bytes),
         storage_v.view(torch.uint8).as_strided(scale_shape, scale_strides, raw_bytes),
-        torch.empty(requests, 17, dtype=torch.int32, device=device),
+        torch.empty(requests, table_pages, dtype=torch.int32, device=device),
         torch.empty(requests, dtype=torch.int32, device=device),
         5,
         8,

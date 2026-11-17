@@ -79,6 +79,21 @@ from . import target_facts
 from .cache_hint_forms import L2_POLICY_FORMS
 from .cute_warp_mma_gemm import warp_mma_warp_layout
 from .fx_matcher import _is_call
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_BUCKETED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_CHOICES
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_DEFAULT
+from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
+from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_CHOICES
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
+from .paged_attention_shared_memory import value_ring_reason
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -226,6 +241,44 @@ MMA_DAG_PARTITION_BALANCED = "balanced"
 # thirty-second of the launch's mean share, whatever the lengths are.
 MMA_DAG_PARTITION_SKEW_KEY = "cute_mma_dag_partition_skew"
 MMA_DAG_PARTITION_SKEW_CHOICES: tuple[int, ...] = (0, 1, 2, 4, 8, 16)
+# Boundary L2 prefetch of the paired schedule's ``item`` partition: how many
+# K pages (both heads, with their scales) the idle control warp of a CTA
+# requests into L2 for a unit that has not started. Zero, the default and
+# the meaning of a missing key, is off and renders the kernel without it.
+# A prefetch reads nothing back, so results are bit-identical with any
+# value. It pays only where the requested pages are still in L2 when their
+# unit loads them: back-to-back calls of equal-length requests that rotate
+# over two or three inputs measured about 1 us less per call on a window of
+# 17 pages; requests of unequal length kept little of that, and more inputs
+# than L2 holds or units of hundreds of pages measured a loss. No default
+# selects it; a search times it where its benchmark cycles input banks, on
+# the grids that have a form
+# (``paged_attention_prefetch.boundary_prefetch_form`` has the two forms
+# and the grids past which they measured a loss).
+MMA_DAG_BOUNDARY_PREFETCH_KEY = "cute_mma_dag_boundary_prefetch"
+MMA_DAG_BOUNDARY_PREFETCH_CHOICES: tuple[int, ...] = (0, 8, 12, 4)
+# The lead of the paired loader's tail release (``cute_pdl_release=
+# "loader_tail"``), in pages: the loader releases the launch's dependents
+# when its stream has that many pages left. Four, the default and the
+# meaning of a missing key, is the lead the release has always had and
+# renders the kernel without the option. The release moves no data, so
+# results are bit-identical with any lead. The dependent launch follows the
+# last CTA's release by several microseconds, so with four pages the next
+# call of a long stream enters only as this one ends, and a longer lead lets
+# its CTAs take the SMs as they free up; a short stream that releases that
+# early holds its successor's CTAs resident beside its own instead. Measured
+# on a B200 (SDG eval harness, two input banks, us per call against four
+# pages): 16 pages took 1.0 and 0.8 on average, in two batches, off 128
+# requests of 211 and 391 pages (none to 2.0 over twelve cases in the
+# first; 2.05 less to 0.5 more in the second, one case slower), and added
+# 2.0 to 3.4 to 128 requests of a 17-page window (8 pages up to 1.4) and
+# 1.5 where random K and V bound the stream by the CTA and not by memory.
+# No default selects it; like the release it belongs to, a search samples it
+# only where its benchmark times back-to-back captured launches, and only
+# in configs whose release is the loader's own
+# (``paged_attention_release_lead_renders``).
+MMA_DAG_RELEASE_LEAD_KEY = "cute_mma_dag_release_lead"
+MMA_DAG_RELEASE_LEAD_CHOICES: tuple[int, ...] = (MMA_DAG_RELEASE_LEAD_DEFAULT, 8, 16)
 MMA_DAG_PASS_WARPS_KEY = "cute_mma_dag_pass_warps"
 MMA_DAG_PASS_WARPS_OFF = "off"
 MMA_DAG_PASS_WARPS_ON = "on"
@@ -256,7 +309,8 @@ MMA_DAG_ATTENTION_PASS_WARPS: tuple[str, ...] = (
 # topology. ``attention_scoped`` retains the per-key recurrence's pipeline
 # with twelve warps and 128/64/32 compute/conversion/control register quotas.
 # ``attention_paired`` groups two proved independent heads in a twenty-warp
-# CTA with 144/72/48 compute/conversion/control quotas. These are explicit
+# CTA with 144/72/48 compute/conversion/control quotas by default
+# (``cute_mma_dag_register_quotas``). These are explicit
 # search choices; reduced denominators retain only ``attention``.
 MMA_DAG_PASS_WARPS_CHOICES: tuple[str, ...] = (
     MMA_DAG_PASS_WARPS_OFF,
@@ -281,6 +335,17 @@ def paged_attention_pass_warp_choices(facts: CuteMmaDagFacts) -> tuple[str, ...]
     return (MMA_DAG_PASS_WARPS_ATTENTION,)
 
 
+def paired_output_stores(facts: CuteMmaDagFacts | None) -> bool:
+    """Whether some config of the kernel runs the paired attention schedule,
+    whose body stores the kernel's outputs itself and takes every
+    ``cute_store_policy`` for them (``_paged_attention_io.store_output_rows``)."""
+    return (
+        facts is not None
+        and MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+        in paged_attention_pass_warp_choices(facts)
+    )
+
+
 def paged_attention_v_lag_choices(
     facts: CuteMmaDagFacts, pass_warps: object
 ) -> tuple[int, ...]:
@@ -292,6 +357,21 @@ def paged_attention_v_lag_choices(
     ):
         return MMA_DAG_V_LAG_CHOICES
     return (0,)
+
+
+def paged_attention_register_quota_choices(
+    attention: PagedAttentionScheduleFacts | None, pass_warps: object
+) -> tuple[str, ...]:
+    """Register splits of the warp roles, default first: only the paired body
+    has the roles ``cute_mma_dag_register_quotas`` names. Normalization, the
+    config contract, the planner and the seeds take the choices from here."""
+    if (
+        attention is not None
+        and attention.paired_items
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return MMA_DAG_REGISTER_QUOTAS_CHOICES
+    return (MMA_DAG_REGISTER_QUOTAS_DEFAULT,)
 
 
 def paged_attention_early_retirement_default(pass_warps: object) -> bool:
@@ -375,6 +455,258 @@ def paged_attention_partition_skew_choices(
     if facts.attention is not None and partition == MMA_DAG_PARTITION_BALANCED:
         return facts.attention.partition_skew_choices
     return (0,)
+
+
+def paged_attention_boundary_prefetch_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> tuple[int, ...]:
+    """K pages the paired schedule's idle control warp may prefetch per unit.
+
+    The role belongs to the control warp that the value-metadata transport
+    and a balanced partition's merge helper use, serves the units of a grid
+    of one unit per CTA, and needs a form for the bind's grid
+    (``PagedAttentionScheduleFacts.boundary_prefetch_form``). Zero, off,
+    leads everywhere. Normalization, the config contract and the planner
+    take the choices from here.
+    """
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if (
+        paired is not None
+        and paired.boundary_prefetch_form
+        and partition == MMA_DAG_PARTITION_ITEM
+    ):
+        return MMA_DAG_BOUNDARY_PREFETCH_CHOICES
+    return (0,)
+
+
+def paged_attention_release_lead_choices(
+    attention: PagedAttentionScheduleFacts | None, pass_warps: object
+) -> tuple[int, ...]:
+    """Pages ahead of its end at which the paired loader may release the
+    launch's dependents, default first: only the paired body has that
+    release. Whether a config's dependent-launch policy releases from the
+    loader's tail at all is checked once the policy is resolved
+    (``search_surface.release_lead_policy_reason``). Normalization, the
+    config contract and the planner take the choices from here.
+    """
+    if (
+        attention is not None
+        and attention.paired_items
+        and pass_warps == MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+    ):
+        return MMA_DAG_RELEASE_LEAD_CHOICES
+    return (MMA_DAG_RELEASE_LEAD_DEFAULT,)
+
+
+def paged_attention_release_lead_renders(
+    attention: PagedAttentionScheduleFacts | None, partition: object
+) -> bool:
+    """Whether a lead of the tail release can render for a paired config on
+    ``partition``: whether such a config's ``loader_tail`` release is the
+    loader's own on this bind's grid.
+
+    A persistent partition launches one wave of CTAs. One unit per CTA is
+    one wave unless the grid is known to take more
+    (``PagedAttentionScheduleFacts.past_one_wave_units``): there a
+    ``loader_tail`` config renders the automatic release and the kernel it
+    renders without a lead (``passes.pdl.loader_tail_release_applies``). The
+    config contract keeps such a lead, as it keeps the release's name; a
+    search does not sample it, since every value of it is one kernel
+    (``CuteConfigGenerationExtension._repair_release_lead``).
+    """
+    return (
+        attention is not None
+        and attention.paired_items
+        and (partition != MMA_DAG_PARTITION_ITEM or not attention.past_one_wave_units)
+    )
+
+
+def paged_attention_value_ring_facts(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> PagedAttentionScheduleFacts | None:
+    """The bind's attention facts where a config's schedule has a raw V ring
+    whose depth it may name, else None: only the paired body has the ring,
+    the value-metadata actor walks it at its default depth, and the
+    partition has to be one the bind offers. The choices and the config
+    contract's reason both ask here.
+    """
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if paired is None or partition not in paired.partition_choices:
+        return None
+    return paired
+
+
+def paged_attention_value_ring_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> tuple[int, ...]:
+    """Pages of raw V per head the paired body may stage, default first.
+
+    Only the paired body has the ring, and the value-metadata actor walks
+    it at its default depth (``paged_attention_value_ring_facts``). Any
+    other depth must fit the device: the
+    body's shared-memory table is replayed with that depth against the
+    capacity of one CTA, for one unit per CTA or with the query stages and
+    plan tables of the config's persistent partition
+    (``paged_attention_shared_memory.value_ring_reason``). On a B200 one
+    unit per CTA holds three pages per head (the contract admits the depth
+    from 214,936 of 232,448 bytes at 40 query columns); a persistent CTA
+    with two query stages does up to 32 query columns and not at 40.
+    Normalization, the config contract and the planner take the choices
+    from here.
+    """
+    ringed = paged_attention_value_ring_facts(
+        attention, pass_warps, value_metadata_skip, partition
+    )
+    if ringed is None:
+        return (PAIRED_DEFAULT_VALUE_RING,)
+    return tuple(
+        depth
+        for depth in MMA_DAG_VALUE_RING_CHOICES
+        if paged_attention_value_ring_fit(ringed, depth, partition) is None
+    )
+
+
+def paged_attention_value_ring_fit(
+    attention: PagedAttentionScheduleFacts, depth: int, partition: object
+) -> str | None:
+    """Why a paired CTA of ``partition`` cannot stage ``depth`` pages of raw
+    V per head on the bind's device, or None: ``value_ring_reason`` for one
+    unit per CTA, or with the query stages and plan tables of a persistent
+    partition."""
+    persistent = partition != MMA_DAG_PARTITION_ITEM
+    return value_ring_reason(
+        depth,
+        attention.smem_capacity,
+        attention.query_columns,
+        query_stages=attention.partition_q_stages if persistent else 0,
+        units=attention.partition_units if persistent else 0,
+        balanced=partition == MMA_DAG_PARTITION_BALANCED,
+    )
+
+
+def paged_attention_page_order_facts(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> PagedAttentionScheduleFacts | None:
+    """The bind's attention facts where a config's own options would run
+    the bucketed page order, else None: the paired schedule's one-unit CTAs
+    without the value-metadata transport. Whether the bind then offers the
+    order is the facts' to say; the choices and the config contract's
+    reason both ask here.
+    """
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if paired is None or partition != MMA_DAG_PARTITION_ITEM:
+        return None
+    return paired
+
+
+def paged_attention_reversed_order_partition(
+    attention: PagedAttentionScheduleFacts | None, partition: object
+) -> bool:
+    """Whether the reversed walk runs on ``partition`` of this bind: with
+    one unit per CTA, and on a persistent partition of a grid known to hold
+    more units than the device has SMs
+    (``PagedAttentionScheduleFacts.past_one_wave_units``).
+
+    A persistent CTA of such a grid streams several units. In source order
+    each ends on the tile of its newest page, which raises the running
+    maximum and rescales, right ahead of the unit's epilogue; the walk
+    makes that tile the unit's first, which takes the rescale arm anyway.
+    B200, 148 SMs, a 2047-key window over prompts whose K and V are zero
+    (the SDG eval's data, on which the newest page alone raises the
+    maximum), us per call at two calls a sample against the source order,
+    on the balanced partition: with the clipped page 8 pages from a unit's
+    end 1.03 less at 296 units and 0.75 less at 320, with the page last
+    0.65 and 0.15 less. That gain is the data's: over pages that are all
+    nonzero the walk read 0.5 more at 320 units, and on the eval's own
+    cases it gains at some positions and loses a timer step at others. So
+    no default takes the walk on a persistent partition; a search times it
+    per case. The parts of a unit that several CTAs share keep their steps,
+    and a step's page and tile come from the one mapping every role uses.
+    Whole units, which no CTA shares, run the walk by the same rule and
+    were not timed under it. With no more units than SMs a persistent CTA
+    runs about one unit, the form one unit per CTA has, and the walk was
+    not measured there.
+    """
+    return partition == MMA_DAG_PARTITION_ITEM or (
+        attention is not None and attention.past_one_wave_units
+    )
+
+
+def paged_attention_page_order_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> tuple[str, ...]:
+    """Orders in which the paired schedule may stream a unit's pages, the
+    source's first.
+
+    Both other orders change the sequence of the recurrence's tiles, which
+    only fast math licenses, and belong to the paired schedule without the
+    value-metadata transport. The bucketed order permutes whole interior
+    tiles and pays only for units of many interior pages: the bind has it
+    where both hold (``PagedAttentionScheduleFacts.page_order_available``),
+    with one unit per CTA. Its sorting warp is the value-metadata actor's
+    and the spare one of a persistent partition, whose CTAs stream several
+    units. The reversed order walks a work item's pages newest first, for a
+    kernel with a sliding window whose source loop visits them oldest first
+    (``PagedAttentionScheduleFacts.reversed_order_missing`` is empty), with
+    one unit per CTA and on the persistent partitions of a grid of more
+    units than SMs (``paged_attention_reversed_order_partition``); it was
+    not examined with that transport.
+    Normalization, the config contract and the planner take the choices
+    from here.
+    """
+    choices: tuple[str, ...] = (MMA_DAG_PAGE_ORDER_SOURCE,)
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if paired is None:
+        return choices
+    ordered = paged_attention_page_order_facts(
+        attention, pass_warps, value_metadata_skip, partition
+    )
+    if ordered is not None and ordered.page_order_available:
+        choices += (MMA_DAG_PAGE_ORDER_BUCKETED,)
+    walk_runs = paged_attention_reversed_order_partition(paired, partition)
+    if walk_runs and not paired.reversed_order_missing:
+        choices += (MMA_DAG_PAGE_ORDER_REVERSED,)
+    return choices
+
+
+def paged_attention_clipped_page_lead_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+    page_order: object = MMA_DAG_PAGE_ORDER_SOURCE,
+) -> tuple[int, ...]:
+    """Leads of the clipped page a paired config may name, the default
+    first: the pages a reversed walk has left when it takes the work item's
+    oldest page (``paged_attention_page_order``). Only a walk in reversed
+    order has that page to place, so every other config has the default
+    alone. Normalization, the config contract and the planner take the
+    choices from here.
+    """
+    if (
+        page_order == MMA_DAG_PAGE_ORDER_REVERSED
+        and MMA_DAG_PAGE_ORDER_REVERSED
+        in paged_attention_page_order_choices(
+            attention, pass_warps, value_metadata_skip, partition
+        )
+    ):
+        return MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES
+    return (MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT,)
 
 
 def paged_attention_pass_warps_reason(
@@ -564,6 +896,12 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_KEY_CLIP_KEY,
     MMA_DAG_PARTITION_KEY,
     MMA_DAG_PARTITION_SKEW_KEY,
+    MMA_DAG_REGISTER_QUOTAS_KEY,
+    MMA_DAG_BOUNDARY_PREFETCH_KEY,
+    MMA_DAG_RELEASE_LEAD_KEY,
+    MMA_DAG_VALUE_RING_KEY,
+    MMA_DAG_PAGE_ORDER_KEY,
+    MMA_DAG_CLIPPED_PAGE_LEAD_KEY,
     MMA_DAG_LOADS_KEY,
     MMA_DAG_AUX_KEY,
     MMA_DAG_PERSISTENT_KEY,

@@ -9,25 +9,26 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import cutlass
 import pytest
 
 import helion
 from helion._compiler.cute._paged_attention_paired_pipeline import (
     _allocate_pipeline_shared_memory,
 )
-from helion._compiler.cute._paged_attention_paired_pipeline import (
-    _pipeline_barrier_plan,
-)
-from helion._compiler.cute._paged_attention_paired_pipeline import _pipeline_barriers
-from helion._compiler.cute._paged_attention_paired_pipeline import _pipeline_parts
-from helion._compiler.cute._paged_attention_paired_pipeline import (
-    _pipeline_shared_memory,
-)
 from helion._compiler.cute._paged_attention_partition import plan_geometry
 from helion._compiler.cute.cute_mma_dag_seeds import MmaDagSeedPlanner
+from helion._compiler.cute.paged_attention_shared_memory import (
+    paired_shared_memory_bytes,
+)
+from helion._compiler.cute.paged_attention_shared_memory import pipeline_barrier_plan
+from helion._compiler.cute.paged_attention_shared_memory import pipeline_barriers
+from helion._compiler.cute.paged_attention_shared_memory import pipeline_parts
+from helion._compiler.cute.paged_attention_shared_memory import pipeline_shared_memory
 from helion._compiler.cute.pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from helion._compiler.cute.pdl_release import CUTE_PDL_RELEASE_CHOICES
 from helion._testing import cpu_render_target
+from helion._testing.cute_paged_stream import seeds_ahead_of_the_store_hint
 from helion._testing.cute_paged_v_lag import paired_v_lag_bound
 from helion._testing.cute_paged_v_lag import paired_v_lag_config
 from helion.autotuner.config_generation import ConfigGeneration
@@ -928,7 +929,7 @@ def test_setup_rendezvous_follows_the_loader_initialization():
     # on its way there. The partition module follows every quota of the
     # template to its warps.
     assert ast.unparse(quota) == (
-        "if warp >= 16:\n    cute.arch.setmaxregister_decrease(48)"
+        "if warp >= 16:\n    cute.arch.setmaxregister_decrease(control_registers)"
     )
     # Barrier 7 counts the scanning warps and the loader's, once.
     threads = next(
@@ -1013,7 +1014,9 @@ def test_setup_rendezvous_follows_the_loader_initialization():
     # Every other role waited at the rendezvous and reads the record behind
     # it, as its first statement. No role of the persistent dispatch takes a
     # quota for a part of a warpgroup: the conversion warps' is one
-    # statement of their eight warps, and the control warps hold theirs.
+    # statement of their eight warps, since both conversions have one count
+    # in every admitted split (the template asserts it and refuses another);
+    # the control warps hold theirs.
     reader = function(tree, "_planned_units")
     assert ast.unparse(reader.body[-1]) == (
         "return (cutlass.Int32(plan[PLAN_FIRST]), cutlass.Int32(plan[PLAN_LAST]), "
@@ -1032,12 +1035,20 @@ def test_setup_rendezvous_follows_the_loader_initialization():
         "first_unit, last_unit, count = _planned_units(plan)",
     ]
     assert len(calls(body, "_planned_units")) == 3
-    assert ast.unparse(convert_arm.body[1]) == "cute.arch.setmaxregister_decrease(72)"
-    assert [
-        ast.unparse(call)
-        for call in ast.walk(dispatch)
-        if isinstance(call, ast.Call) and "setmaxregister" in ast.unparse(call.func)
-    ] == ["cute.arch.setmaxregister_decrease(72)"]
+    # Both conversions take one statement, which needs one count for both.
+    same, shared, conversions = convert_arm.body[1:4]
+    assert ast.unparse(same) == (
+        "assert cutlass.const_expr(key_registers == value_registers)"
+    )
+    assert ast.unparse(shared) == "cute.arch.setmaxregister_decrease(key_registers)"
+    assert ast.unparse(conversions.test) == "warp < 12"
+    assert (
+        sum(
+            isinstance(call, ast.Call) and "setmaxregister" in ast.unparse(call.func)
+            for call in ast.walk(dispatch)
+        )
+        == 1
+    )
     assert not any(
         isinstance(node, ast.If) and ast.unparse(node.test) == "warp == 17"
         for node in ast.walk(ast.Module(body=control_arm, type_ignores=[]))
@@ -1111,23 +1122,42 @@ def test_setup_rendezvous_follows_the_loader_initialization():
     }
 
 
-# The metadata barriers and a persistent partition's query barriers (one or
-# two stages) are alternative tails of the block.
+# The metadata barriers, a persistent partition's query barriers (one or
+# two stages) and the barrier of a boundary prefetch that waits for the
+# loader's last request are alternative tails of the block.
 @pytest.mark.parametrize(
-    "value_metadata,query_stages", [(False, 0), (True, 0), (False, 1), (False, 2)]
+    "value_metadata,query_stages,prefetch_signal",
+    [
+        (False, 0, False),
+        (True, 0, False),
+        (False, 1, False),
+        (False, 2, False),
+        (False, 0, True),
+    ],
 )
-def test_pipeline_barrier_block_follows_its_table(value_metadata, query_stages):
-    table = _pipeline_barriers(value_metadata, query_stages)
-    offsets, count, rounds = _pipeline_barrier_plan(value_metadata, query_stages)
+def test_pipeline_barrier_block_follows_its_table(
+    value_metadata, query_stages, prefetch_signal
+):
+    table = pipeline_barriers(value_metadata, query_stages, prefetch_signal)
+    offsets, count, rounds = pipeline_barrier_plan(
+        value_metadata, query_stages, prefetch_signal
+    )
     names = [name for name, _width, _arrivals in table]
     assert names[12:] == (
         ["metadata_ready"] * value_metadata
         + ["query_ready", "query_free"] * bool(query_stages)
+        + ["prefetch_signal"] * prefetch_signal
     )
-    # One barrier per stage for the copies, then one per stage for its release.
-    assert [width for _name, width, _arrivals in table[12:]] == (
-        [4] * value_metadata + [query_stages] * (2 * bool(query_stages))
+    # One barrier per stage for the copies, then one per stage for its
+    # release; one for the loader's one arrival behind its last request.
+    assert [(width, arrivals) for _name, width, arrivals in table[12:]] == (
+        [(4, 32)] * value_metadata
+        + [(query_stages, 1)] * (2 * bool(query_stages))
+        + [(1, 1)] * prefetch_signal
     )
+    # The pipeline's own barriers fill one round of 32: each tail starts
+    # the next one.
+    assert count == (32 if len(table) == 12 else 64)
     assert count % 32 == 0 and len(rounds) == count // 32
     # What the lane masks of the initialization rounds give each slot.
     initialized = [
@@ -1143,6 +1173,11 @@ def test_pipeline_barrier_block_follows_its_table(value_metadata, query_stages):
         assert initialized[slot : slot + width] == [arrivals] * width
         slot += width
     assert len(offsets) == len(table) and set(initialized[slot:]) <= {1}
+    # The control warp that prefetches is the value-metadata actor's and a
+    # persistent partition's spare one: its barrier joins neither tail.
+    for other in ((True, 0), (False, 1)):
+        with pytest.raises(AssertionError):
+            pipeline_barriers(*other, True)
 
 
 class _RecordingAllocator:
@@ -1161,18 +1196,26 @@ class _RecordingAllocator:
         return start
 
 
-def _paired_shared_memory(query_columns: int, *parts: str):
+def _paired_shared_memory(
+    query_columns: int, *parts: str, prefetch_signal: bool = False
+):
     """The body's allocations for one panel width and set of optional
     parts: the allocator after them and what the body gets by name. A
-    persistent body is one of 17 units with two query stages."""
+    persistent body is one of 17 units with two query stages.
+    ``prefetch_signal``: a one-unit body whose boundary prefetch waits for
+    the loader, which is one more barrier of the block and no part. The
+    ``page_order`` part is a one-unit body in bucketed page order: its
+    tables, and its barrier in the block."""
     allocator = _RecordingAllocator()
     persistent = "persistent" in parts
-    arrays = _pipeline_shared_memory(
+    arrays = pipeline_shared_memory(
         query_columns,
         "value_metadata" in parts,
         2 if persistent else 0,
         17 if persistent else 0,
         "balanced" in parts,
+        prefetch_signal,
+        page_order="page_order" in parts,
     )
     shared = _allocate_pipeline_shared_memory(allocator, arrays, frozenset(parts))
     return allocator, arrays, vars(shared)
@@ -1191,7 +1234,9 @@ def test_paired_body_allocates_its_shared_memory_table_in_order():
         present = [a for a in arrays if a.guard is None or a.guard in parts]
         # One allocation per entry the body has, in table order, with the
         # entry's own element type, count and alignment.
-        assert allocator.calls == [(a.dtype, a.count, a.alignment) for a in present]
+        assert allocator.calls == [
+            (getattr(cutlass, a.dtype), a.count, a.alignment) for a in present
+        ]
         # The body reads every array by its entry's name; an array of a part
         # it lacks is ``None``.
         assert list(shared) == [a.name for a in arrays]
@@ -1201,63 +1246,129 @@ def test_paired_body_allocates_its_shared_memory_table_in_order():
         }
         # Each array starts where the one before it ends, rounded up.
         assert shared["raw_k"] == 0 and shared["raw_v"] == 4 * 16384
-    arrays = _pipeline_shared_memory(40, True)
+    arrays = pipeline_shared_memory(40, True)
     # Every optional part an entry names is one a body can have: one unit
     # per CTA with a query map and value metadata, or a persistent partition,
     # whose query barriers lie in the block and which has no value metadata.
-    # The barrier block is the one ``_pipeline_barrier_plan`` lays out.
-    persistent = _pipeline_parts(True, False, 17, True)
+    # The barrier block is the one ``pipeline_barrier_plan`` lays out.
+    persistent = pipeline_parts(True, False, 17, True)
     assert persistent == {"persistent", "scanned_lengths"}
-    balanced = _pipeline_parts(True, False, 17, True, True)
+    balanced = pipeline_parts(True, False, 17, True, True)
     assert balanced == persistent | {"balanced"}
     # The scan keeps its lengths only with one unit per scanning thread and
     # a prelude that takes them.
-    assert _pipeline_parts(True, False, 17) == {"persistent"}
-    assert _pipeline_parts(True, False, 640, True) == persistent
-    assert _pipeline_parts(True, False, 641, True) == {"persistent"}
+    assert pipeline_parts(True, False, 17) == {"persistent"}
+    assert pipeline_parts(True, False, 640, True) == persistent
+    assert pipeline_parts(True, False, 641, True) == {"persistent"}
     assert {a.guard for a in arrays} - {None} == (
-        _pipeline_parts(True, True) | balanced
+        pipeline_parts(True, True)
+        | balanced
+        | pipeline_parts(False, False, page_order=True)
     )
-    assert _pipeline_parts(False, False) == frozenset()
-    assert _pipeline_parts(False, False, 0, True) == frozenset()
-    for value_metadata, query_stages in ((False, 0), (True, 0), (False, 1), (False, 2)):
-        (block,) = (
-            a
-            for a in _pipeline_shared_memory(
-                40, value_metadata, query_stages, 17 if query_stages else 0
-            )
-            if a.name == "barriers"
+    assert pipeline_parts(False, False, page_order=True) == {"page_order"}
+    assert pipeline_parts(False, False) == frozenset()
+    assert pipeline_parts(False, False, 0, True) == frozenset()
+    for value_metadata, query_stages, prefetch_signal in (
+        (False, 0, False),
+        (True, 0, False),
+        (False, 1, False),
+        (False, 2, False),
+        (False, 0, True),
+    ):
+        units = 17 if query_stages else 0
+        arrays = pipeline_shared_memory(
+            40, value_metadata, query_stages, units, False, prefetch_signal
         )
-        assert block.count == _pipeline_barrier_plan(value_metadata, query_stages)[1]
+        (block,) = (a for a in arrays if a.name == "barriers")
+        assert (
+            block.count
+            == pipeline_barrier_plan(value_metadata, query_stages, prefetch_signal)[1]
+        )
+        # The prefetch's barrier is a slot of the block: every other entry
+        # is the one of a body without it.
+        assert [a for a in arrays if a is not block] == [
+            a
+            for a in pipeline_shared_memory(40, value_metadata, query_stages, units)
+            if a.name != "barriers"
+        ]
 
 
 def test_paired_shared_memory_stays_inside_its_budget():
     # The transport admits the paired schedule on 180 KiB of shared memory
     # (``capacity >= 184320``). Replay the body's allocations, in order and
-    # with their alignment, for every panel width and both optional parts.
+    # with their alignment, for every panel width and every optional part of
+    # one unit per CTA at the default depth of the raw V ring: the query
+    # map, the value metadata, a boundary prefetch's barrier and a bucketed
+    # page order's tables and barrier. A deeper ring is admitted against the
+    # device's own capacity (test_cute_paged_attention_value_ring.py).
     # A persistent partition's own arrays (the compute groups' walk records
     # and posts, the plan tables, the plan and the scanned lengths) are
     # replayed against that partition's budgets in
     # test_cute_paged_attention_partition.py.
-    def layout(query_columns, *parts):
-        return _paired_shared_memory(query_columns, *parts)[0].size
+    def layout(query_columns, *parts, prefetch_signal=False):
+        return _paired_shared_memory(
+            query_columns, *parts, prefetch_signal=prefetch_signal
+        )[0].size
 
     assert layout(40) == 178952
     assert layout(40, "query_map") == 178960
     assert layout(40, "value_metadata") == 179232
-    largest = max(
-        layout(query_columns, *parts)
-        for query_columns in (8, 32, 40)
-        for parts in (
-            (),
-            ("query_map",),
-            ("value_metadata",),
-            ("query_map", "value_metadata"),
+    # A boundary prefetch that waits for the loader's last request has one
+    # more barrier, the 33rd of the block: a second round of 32. It allocates
+    # nothing else, and never beside the value metadata, whose warp it uses.
+    assert layout(40, prefetch_signal=True) == 178952 + 32 * 8
+    assert layout(40, "query_map", prefetch_signal=True) == 178960 + 32 * 8
+    # A bucketed page order adds the order of one sort, the buckets'
+    # counters and lane words and the run (482 words) and its barrier, the
+    # 33rd of the block as well: beside a prefetch that waits for the
+    # loader the second round is there already. Like the prefetch it never
+    # runs beside the value metadata, whose warp sorts.
+    order = 4 * (416 + 32 + 32 + 2)
+    assert layout(40, "page_order") == 178952 + 32 * 8 + order
+    assert layout(40, "query_map", "page_order") == 178960 + 32 * 8 + order == 181144
+    assert layout(40, "query_map", "page_order", prefetch_signal=True) == 181144
+    assert layout(32, "query_map", "page_order") == 172440
+    assert layout(8, "query_map", "page_order") == 146328
+    sizes = {
+        (query_columns, parts, prefetch_signal): layout(
+            query_columns, *parts, prefetch_signal=prefetch_signal
         )
+        for query_columns in (8, 32, 40)
+        for parts, prefetch_signal in (
+            ((), False),
+            (("query_map",), False),
+            (("value_metadata",), False),
+            (("query_map", "value_metadata"), False),
+            ((), True),
+            (("query_map",), True),
+            (("page_order",), False),
+            (("query_map", "page_order"), False),
+            (("page_order",), True),
+            (("query_map", "page_order"), True),
+        )
+    }
+    # The contract's replay of the table (``paired_shared_memory_bytes``)
+    # gives what the body's allocations occupy, for every one of them.
+    for (query_columns, parts, prefetch_signal), size in sizes.items():
+        assert size == paired_shared_memory_bytes(
+            query_columns,
+            value_metadata="value_metadata" in parts,
+            query_map="query_map" in parts,
+            prefetch_signal=prefetch_signal,
+            page_order="page_order" in parts,
+        ), (query_columns, parts, prefetch_signal)
+    # Without the order the largest is the value metadata's; with it, the
+    # widest panel with the query map.
+    assert max(size for key, size in sizes.items() if "page_order" not in key[1]) == (
+        179232
     )
-    assert largest == 179232
+    largest = max(sizes.values())
+    assert largest == sizes[40, ("query_map", "page_order"), False] == 181144
     gate = (SOURCE.parent / "paged_attention_transport.py").read_text()
     assert largest <= 184320 and "capacity >= 184320" in gate
+    # The gate's comment names what this test replays.
+    assert "test_paired_shared_memory_stays_inside_its_budget" in gate
+    assert "181,144" in gate
 
 
 def test_missing_retirement_is_enabled_only_for_the_paired_schedule():
@@ -1371,7 +1482,9 @@ def test_retirement_seeds_are_four_independent_paired_counterparts():
         planner = MmaDagSeedPlanner(
             facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
         )
-        seeds = planner.configs(planner.ranked())
+        # A windowed kernel's leading family follows once more under the
+        # L2 evict-last store hint, behind every seed these tests are about.
+        seeds = seeds_ahead_of_the_store_hint(planner.configs(planner.ranked()))
         late = [s for s in seeds if s.get(KEY) is False]
         assert len(late) == 4 and seeds[-4:] == late
         # Every other paired seed spells out the schedule's default: the

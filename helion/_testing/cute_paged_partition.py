@@ -34,6 +34,8 @@ def partition_attention_args(
     reference_scores: bool = False,
     reverse_pages: bool = False,
     window: int = PAGES * PAGE - 1,
+    table_pages: int = PAGES,
+    pool_pages: int = 13,
     device: torch.device | str = "cpu",
 ) -> tuple[object, ...]:
     """Per-key paged attention over ``units`` head pairs with an LSE output.
@@ -41,12 +43,19 @@ def partition_attention_args(
     The default window admits every page of the table, so a request's length
     alone selects how many pages its unit streams, from page zero.
     ``SHORT_WINDOW`` instead moves a long request's first page with its
-    length, which is where a boundary key clip applies.
+    length, which is where a boundary key clip applies. ``table_pages`` is
+    the page table's extent, the most pages a request can have, and
+    ``pool_pages`` the physical pages of the K and V pool.
     """
     assert units * 2 % heads == 0
     values = list(
         paged_attention_args(
-            rows=rows, heads=heads, requests=units * 2 // heads, device=device
+            rows=rows,
+            heads=heads,
+            requests=units * 2 // heads,
+            pages=pool_pages,
+            table_pages=table_pages,
+            device=device,
         )
     )
     values[7:10] = [rows // 8, 8, window]
@@ -135,7 +144,8 @@ def set_request_pages(args: tuple[object, ...], pages: list[int]) -> None:
 def set_request_lengths(args: tuple[object, ...], lengths: list[int]) -> None:
     """Give request ``i`` the length ``lengths[i]``, at most the page table's keys."""
     tensor = cast("torch.Tensor", args[6])
-    assert len(lengths) == tensor.numel() and max(lengths) <= PAGES * PAGE
+    limit = cast("torch.Tensor", args[5]).size(1) * PAGE
+    assert len(lengths) == tensor.numel() and max(lengths) <= limit
     tensor.copy_(tensor.new_tensor(lengths))
 
 

@@ -49,6 +49,7 @@ from ..cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_CHOICES
 from ..cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_KEY
 from ..cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from ..cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from ..cute_mma_dag import MMA_DAG_DERIVED_KEY
 from ..cute_mma_dag import MMA_DAG_EARLY_TMEM_RETIREMENT_KEY
@@ -59,12 +60,14 @@ from ..cute_mma_dag import MMA_DAG_KEY_CLIP_KEY
 from ..cute_mma_dag import MMA_DAG_KEYS
 from ..cute_mma_dag import MMA_DAG_LOADS_KEY
 from ..cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
+from ..cute_mma_dag import MMA_DAG_PARTITION_ITEM
 from ..cute_mma_dag import MMA_DAG_PARTITION_KEY
 from ..cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
 from ..cute_mma_dag import MMA_DAG_PERSISTENT_KEY
 from ..cute_mma_dag import MMA_DAG_PROBABILITY_SCHEDULE_KEY
 from ..cute_mma_dag import MMA_DAG_QUERY_TMA_KEY
+from ..cute_mma_dag import MMA_DAG_RELEASE_LEAD_KEY
 from ..cute_mma_dag import MMA_DAG_SLEEP_WAITS_KEY
 from ..cute_mma_dag import MMA_DAG_SPLIT_KEY
 from ..cute_mma_dag import MMA_DAG_STAGES_KEY
@@ -74,6 +77,7 @@ from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from ..cute_mma_dag import MMA_DAG_WARPS_KEY
 from ..cute_mma_dag import paged_attention_early_retirement_default
+from ..cute_mma_dag import paired_output_stores
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import KEY as RSB_KEY
 from ..cute_register_subblocks import KEYS as RSB_KEYS
@@ -90,6 +94,14 @@ from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
 from ..packet_store_policy import store_policy_reaches_a_packet
+from ..paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
+from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
+from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from ..paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
+from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
+from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from ..pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from ..pdl_release import CUTE_PDL_CAPTURE_OVERLAP_KEY
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
@@ -204,6 +216,7 @@ from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
 from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
+from .mma_dag_surface import boundary_prefetch_needs
 from .mma_dag_surface import capture_overlap_eligible
 from .mma_dag_surface import carried_capture_policies
 from .mma_dag_surface import carries_capture_overlap
@@ -211,9 +224,11 @@ from .mma_dag_surface import drop_paired_knob_pins
 from .mma_dag_surface import kept_capture_policy
 from .mma_dag_surface import key_clip_choices
 from .mma_dag_surface import normalize_value_metadata_options
+from .mma_dag_surface import page_order_needs
 from .mma_dag_surface import paired_capture_schedule
 from .mma_dag_surface import rederive_overridden_key_clip
 from .mma_dag_surface import take_overridden_partition_transport
+from .mma_dag_surface import value_ring_needs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1236,6 +1251,23 @@ def _normalize_cute_reduction_schedule(
             )
 
 
+def cute_store_policy_choices(config_spec: ConfigSpec) -> tuple[str, ...]:
+    """The store policies some config of the kernel can keep.
+
+    ``l2_evict_last`` on the packet flushes is a fixed descriptor validated
+    for one target (``cute_l2_evict_last_store_policy_supported``). The
+    paired attention schedule's output stores make their policy word at run
+    time instead (``createpolicy``), on every device the schedule runs on,
+    so a kernel with that schedule (``paired_output_stores``) is offered the
+    choice without the descriptor: ``_normalize_paired_store_policy`` keeps
+    it for the configs on that schedule."""
+    if config_spec.cute_l2_evict_last_store_policy_supported or paired_output_stores(
+        config_spec.cute_mma_dag_facts
+    ):
+        return ("default", "streaming", "l2_evict_last")
+    return ("default", "streaming")
+
+
 def _normalize_cute_store_policy(
     config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
 ) -> None:
@@ -1243,18 +1275,44 @@ def _normalize_cute_store_policy(
     if key not in config:
         return
     value = config[key]
-    if value not in ("default", "streaming", "l2_evict_last"):
+    names = ("default", "streaming", "l2_evict_last")
+    if value not in names:
         if not fix_invalid:
             raise InvalidConfig(
                 f"{key} must be one of ('default', 'streaming', 'l2_evict_last'), "
                 f"got {value!r}"
             )
         config[key] = "default"
-    if (
-        config[key] == "l2_evict_last"
-        and not config_spec.cute_l2_evict_last_store_policy_supported
+    else:
+        # The policy's name, whatever compared equal to it (a member of a
+        # ``StrEnum`` or of a ``str`` enum, whose repr is not that name):
+        # code generation renders the normalized value.
+        config[key] = names[names.index(value)]
+    if config[key] == "l2_evict_last" and "l2_evict_last" not in (
+        cute_store_policy_choices(config_spec)
     ):
         config[key] = "default"
+
+
+def _normalize_paired_store_policy(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Keep ``cute_store_policy="l2_evict_last"`` without the packet
+    flushes' fixed descriptor only on the paired attention schedule.
+
+    Runs behind the MMA-DAG normalization, which settles the schedule: a
+    config of a kernel with the paired schedule that selects another body
+    has only the packet flushes to apply the policy to, and takes the
+    default as it does on a kernel without the schedule
+    (``_normalize_cute_store_policy``)."""
+    if (
+        config.get("cute_store_policy") == "l2_evict_last"
+        and not config_spec.cute_l2_evict_last_store_policy_supported
+        and any(
+            config.get(name) != value for name, value in PAIRED_CAPTURE_SCHEDULE.items()
+        )
+    ):
+        config["cute_store_policy"] = "default"
 
 
 def _normalize_cute_exact_div_form(
@@ -1849,6 +1907,315 @@ def _normalize_cute_pdl_capture_overlap(
         config[key] = value
 
 
+def boundary_prefetch_policy_reason(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> str | None:
+    """Why ``config``, its schedule admitted and its dependent-launch policy
+    resolved, still cannot run the boundary prefetch it names.
+
+    Both forms assume the grid of a kernel whose only root is the proved
+    paired schedule. On a grid of fewer units than SMs the CTAs that
+    prefetch are those that start on the SMs the previous launch left idle,
+    while the others wait for its SMs: only a launch with the capture
+    contract overlaps its predecessor at all, and only a predecessor that
+    releases from its loader's tail is still running when they start.
+    """
+    facts = config_spec.cute_mma_dag_facts
+    if (
+        facts is None
+        or facts.attention is None
+        or not config_spec.cute_pdl_capture_overlap_available
+    ):
+        return (
+            f"{MMA_DAG_BOUNDARY_PREFETCH_KEY} needs a kernel whose only root "
+            "runs the paired attention schedule"
+        )
+    if facts.attention.boundary_prefetch_form == BOUNDARY_PREFETCH_SIBLING and not (
+        carries_capture_overlap(capture_policy_available(config_spec), config)
+        and config.get("cute_pdl_release") == "loader_tail"
+    ):
+        return (
+            f"{MMA_DAG_BOUNDARY_PREFETCH_KEY} on a grid of fewer units than SMs "
+            "serves the units that wait for the previous launch's SMs: it needs "
+            "cute_pdl=True, cute_pdl_capture_overlap=True and "
+            "cute_pdl_release='loader_tail'"
+        )
+    return None
+
+
+def _normalize_boundary_prefetch_policy(
+    config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Repair a boundary prefetch that the kernel or the config's resolved
+    dependent-launch policy cannot run to none, the missing key
+    (``boundary_prefetch_policy_reason``). The schedule's own rules ran
+    before the policy was resolved (``mma_dag_surface._normalize_partition``)."""
+    pages = config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY, 0)
+    if type(pages) is int and pages == 0:
+        return
+    reason = boundary_prefetch_policy_reason(config_spec, config)
+    if reason is None:
+        return
+    if not fix_invalid:
+        raise InvalidConfig(reason)
+    config.pop(MMA_DAG_BOUNDARY_PREFETCH_KEY)
+
+
+def reconcile_overridden_boundary_prefetch(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name a boundary prefetch or take away what the candidate's own
+    prefetch needs.
+
+    The role needs the paired schedule's one-unit CTAs without the
+    value-metadata transport and, on a grid of fewer units than SMs, the
+    guarded capture policy with the release from the loader's tail
+    (``paged_attention_boundary_prefetch_reason``,
+    ``boundary_prefetch_policy_reason``). A search steps onto a prefetch
+    together with those
+    (``CuteConfigGenerationExtension._prefetch_neighbor_updates``); a fixed
+    override is no step, and the seeds that prefetch spell them out:
+
+    - An override that names pages is layered over complete candidates.
+      Every candidate on the paired schedule takes what the step takes,
+      wherever no override says otherwise, as under an overridden partition
+      (``take_overridden_partition_transport``).
+    - An override that contradicts one of those options (another schedule,
+      the value-metadata transport, a partition, either opt-out of the
+      capture policy, another release, spread padding) would leave a
+      candidate's own pages behind for strict normalization to reject. The
+      candidate becomes the one it is without them.
+
+    An overridden option is never changed, and a candidate whose own options
+    cannot run its prefetch without any override is left for validation to
+    reject (``_reconcile_overridden_paired_knob``). This runs ahead of
+    ``_decline_overridden_capture_policy``, which removes what is left of a
+    contradicted policy. A config the kernel selects without a search loses
+    its pages with a declined policy the same way
+    (``_decline_boundary_prefetch_without_search``)."""
+    facts = config_spec.cute_mma_dag_facts
+    if facts is None or facts.attention is None:
+        return
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_BOUNDARY_PREFETCH_KEY,
+        0,
+        boundary_prefetch_needs(facts.attention.boundary_prefetch_form),
+    )
+
+
+def release_lead_policy_reason(config: Mapping[str, object]) -> str | None:
+    """Why ``config``, its schedule admitted and its dependent-launch policy
+    resolved, still cannot release with the lead it names.
+
+    The lead is that of the paired loader's tail release, which a config
+    has only with the guarded capture policy: a normalized config names
+    ``cute_pdl_release="loader_tail"`` exactly where that policy holds
+    (``_normalize_cute_pdl_capture_overlap``). Every other placement
+    releases at a point of its own, and a lead named beside it would be a
+    second spelling of the same kernel.
+
+    Past one wave, or on a grid the host sizes at runtime, a ``loader_tail``
+    config renders the automatic release (``passes.pdl.
+    loader_tail_release_applies``): the lead is kept there and renders
+    nothing, as the release it belongs to keeps its name.
+    """
+    if config.get("cute_pdl_release") != "loader_tail":
+        return (
+            f"{MMA_DAG_RELEASE_LEAD_KEY} is the lead of the paired loader's tail "
+            "release: it needs cute_pdl=True, cute_pdl_capture_overlap=True and "
+            "cute_pdl_release='loader_tail'"
+        )
+    return None
+
+
+def _normalize_release_lead_policy(
+    config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Repair a lead of the tail release that the config's resolved
+    dependent-launch policy does not have to the release's own, the missing
+    key (``release_lead_policy_reason``). The schedule's own rule ran before
+    the policy was resolved (``mma_dag_surface._normalize_partition``)."""
+    lead = config.get(MMA_DAG_RELEASE_LEAD_KEY, MMA_DAG_RELEASE_LEAD_DEFAULT)
+    if type(lead) is int and lead == MMA_DAG_RELEASE_LEAD_DEFAULT:
+        return
+    reason = release_lead_policy_reason(config)
+    if reason is None:
+        return
+    if not fix_invalid:
+        raise InvalidConfig(reason)
+    config.pop(MMA_DAG_RELEASE_LEAD_KEY)
+
+
+def _reconcile_overridden_paired_knob(
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+    key: str,
+    default: object,
+    needed: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name the paired schedule's knob ``key`` or take away what the
+    candidate's own value of it needs.
+
+    ``needed`` are the options a value other than ``default`` needs of a
+    config on the paired schedule, each with its value. A search steps onto
+    such a value together with them; a fixed override is no step:
+
+    - An override that names the knob is layered over complete candidates.
+      Every candidate on the paired schedule takes what the step takes,
+      wherever no override says otherwise.
+    - An override that contradicts one of those options, or selects another
+      schedule, would leave a candidate's own value behind for strict
+      normalization to reject. The candidate becomes the one it is without
+      it.
+
+    An overridden option is never changed, and a candidate whose own options
+    cannot hold its value without any override is left for validation to
+    reject."""
+    own = config.get(key, default)
+    if type(own) is type(default) and own == default:
+        return
+    if any(
+        config.get(name) != value for name, value in PAIRED_CAPTURE_SCHEDULE.items()
+    ):
+        # Another body: its rule pins the knob, unless the override names it.
+        if key not in overrides and any(
+            name in overrides for name in PAIRED_CAPTURE_SCHEDULE
+        ):
+            config.pop(key)
+        return
+    if key not in overrides:
+        if any(
+            name in overrides and overrides[name] != value
+            for name, value in needed.items()
+        ):
+            config.pop(key)
+        return
+    # The capture policy is three options that hold only together, so a
+    # candidate gets each of them by name; any other option only where it
+    # differs.
+    config.update(
+        {
+            name: value
+            for name, value in needed.items()
+            if name not in overrides
+            and (name in CUTE_PDL_CAPTURE_DEFAULT or config.get(name, value) != value)
+        }
+    )
+
+
+def reconcile_overridden_release_lead(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name a lead of the tail release or take away the release the
+    candidate's own lead belongs to (``_reconcile_overridden_paired_knob``).
+
+    A lead needs the guarded capture policy with the release from the
+    loader's tail (``release_lead_policy_reason``). A search steps onto a
+    lead together with that policy
+    (``CuteConfigGenerationExtension._release_lead_neighbor_updates``).
+    Under an override that names a lead every paired candidate takes the
+    policy, and under one that contradicts the policy (either opt-out of it,
+    another release, spread padding, another schedule) a candidate loses its
+    own lead and stays in the search.
+
+    This runs ahead of ``_decline_overridden_capture_policy``, which removes
+    what is left of a contradicted policy. A config the kernel selects
+    without a search loses its lead with a declined policy the same way
+    (``_decline_release_lead_without_search``)."""
+    if not capture_policy_available(config_spec):
+        return
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_RELEASE_LEAD_KEY,
+        MMA_DAG_RELEASE_LEAD_DEFAULT,
+        CAPTURE_POLICY,
+    )
+
+
+def reconcile_overridden_value_ring(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name a depth of the raw V ring or take away what the
+    candidate's own depth needs (``_reconcile_overridden_paired_knob``).
+
+    A depth beyond the default's needs the paired schedule without the
+    value-metadata transport and a partition whose CTA holds it in the
+    device's shared memory (``mma_dag_surface.value_ring_needs``). A search
+    steps onto a depth together with those
+    (``CuteConfigGenerationExtension._value_ring_neighbor_updates``). Under
+    an override that names a depth every paired candidate takes them, and
+    under one that contradicts them (the value-metadata transport, a
+    partition that cannot hold the depth, another schedule) a candidate
+    loses its own depth and stays in the search."""
+    facts = config_spec.cute_mma_dag_facts
+    if facts is None or facts.attention is None:
+        return
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_VALUE_RING_KEY,
+        PAIRED_DEFAULT_VALUE_RING,
+        value_ring_needs(
+            facts.attention,
+            config.get(MMA_DAG_VALUE_RING_KEY),
+            config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM),
+        ),
+    )
+
+
+def reconcile_overridden_page_order(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name a page order or take away what the candidate's own order
+    needs (``_reconcile_overridden_paired_knob``).
+
+    The bucketed order and the reversed walk need the paired schedule
+    without the value-metadata transport, and one unit per CTA unless the
+    bind runs the order on every partition, as it runs the reversed walk
+    on a grid of more units than SMs
+    (``mma_dag_surface.page_order_needs``). A search steps onto either
+    together with those
+    (``CuteConfigGenerationExtension._page_order_neighbor_updates``). Under
+    an override that names such an order every paired candidate takes
+    them, and under one that contradicts them (the value-metadata
+    transport, a partition that does not run the order, another schedule)
+    a candidate loses its own order and stays in the search.
+
+    A lead of the clipped page needs nothing of its own here: it is the
+    reversed walk's, and beside any other order normalization drops it
+    (``paged_attention_clipped_page_lead_applies``). So a candidate that
+    loses its reversed order loses its lead with it, and an override that
+    names a lead and no order applies to the candidates in reversed order
+    and names nothing for the others."""
+    facts = config_spec.cute_mma_dag_facts
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_PAGE_ORDER_KEY,
+        MMA_DAG_PAGE_ORDER_SOURCE,
+        page_order_needs(
+            None if facts is None else facts.attention,
+            config.get(MMA_DAG_PAGE_ORDER_KEY),
+        ),
+    )
+
+
 def _decline_overridden_capture_policy(
     available: bool, config: dict[str, object], overrides: Mapping[str, object]
 ) -> None:
@@ -2215,6 +2582,49 @@ def _decline_capture_policy_without_search(
         if name not in _CUTE_PDL_POLICY_KEYS
     }
     declined.update(stated)
+    return declined
+
+
+def _decline_boundary_prefetch_without_search(
+    config_spec: ConfigSpec, declined: dict[str, object] | None
+) -> dict[str, object] | None:
+    """``declined``, a config whose guarded capture policy overrides declined
+    without a search (``_decline_capture_policy_without_search``), without
+    the boundary prefetch that needed the policy; ``None`` stays ``None``.
+
+    On a grid of fewer units than SMs the pages serve the units that wait
+    for the previous launch's SMs, which takes the capture contract with the
+    release from the loader's tail (``boundary_prefetch_policy_reason``). A
+    selected config that names pages there, a cached search result, and
+    lost that policy would be left for validation to reject. It becomes the
+    config it is without them, as a search candidate under the same
+    overrides does (``reconcile_overridden_boundary_prefetch``). Past one
+    wave the role needs no dependent launch, and the pages stay."""
+    facts = config_spec.cute_mma_dag_facts
+    if (
+        declined is not None
+        and facts is not None
+        and facts.attention is not None
+        and facts.attention.boundary_prefetch_form == BOUNDARY_PREFETCH_SIBLING
+    ):
+        declined.pop(MMA_DAG_BOUNDARY_PREFETCH_KEY, None)
+    return declined
+
+
+def _decline_release_lead_without_search(
+    declined: dict[str, object] | None,
+) -> dict[str, object] | None:
+    """``declined``, a config whose guarded capture policy overrides declined
+    without a search (``_decline_capture_policy_without_search``), without
+    the lead of the tail release that policy had; ``None`` stays ``None``.
+
+    The declined config no longer releases from its loader's tail, so a
+    lead it names, in a cached search result, would be left for validation
+    to reject (``release_lead_policy_reason``). It becomes the config it is
+    without the lead, as a search candidate under the same overrides does
+    (``reconcile_overridden_release_lead``)."""
+    if declined is not None:
+        declined.pop(MMA_DAG_RELEASE_LEAD_KEY, None)
     return declined
 
 
@@ -4665,7 +5075,10 @@ def normalize_recurrence_families(
                 )
     if config_spec.cute_mma_dag is not None:
         _normalize_cute_mma_dag(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_paired_store_policy(config_spec, config)
     _normalize_cute_pdl_capture_overlap(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_boundary_prefetch_policy(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_release_lead_policy(config, fix_invalid=fix_invalid)
     if config_spec.cute_register_subblocks is not None:
         _normalize_cute_register_subblocks(config_spec, config, fix_invalid=fix_invalid)
     prepare_schedule_fragment = config_spec.cute_chunk_prepare_schedule
@@ -5250,12 +5663,11 @@ def cute_flat_fields(
         # ``streaming`` (``st.global.cs``, evict-first) keeps an
         # output written once from displacing re-read inputs;
         # ``l2_evict_last`` needs the validated SM103 descriptor.
+        # The paired attention schedule's own output stores take both
+        # (``paged_attention_codegen``), ``l2_evict_last`` without that
+        # descriptor (``cute_store_policy_choices``).
         fields["cute_store_policy"] = EnumFragment(
-            choices=(
-                ("default", "streaming", "l2_evict_last")
-                if config_spec.cute_l2_evict_last_store_policy_supported
-                else ("default", "streaming")
-            )
+            choices=cute_store_policy_choices(config_spec)
         )
         if config_spec.cute_bool_byte_packet_blocks:
             # A looped reduction's bool rows as byte packets; bitwise
@@ -5775,6 +6187,30 @@ def cute_flat_fields(
         skew_fragment = config_spec.cute_mma_dag_partition_skew
         if skew_fragment is not None:
             fields[MMA_DAG_PARTITION_SKEW_KEY] = skew_fragment
+        quotas_fragment = config_spec.cute_mma_dag_register_quotas
+        if quotas_fragment is not None:
+            fields[MMA_DAG_REGISTER_QUOTAS_KEY] = quotas_fragment
+        # A config without the key has no boundary prefetch, the fragment's
+        # default, which normalization drops again.
+        prefetch_fragment = config_spec.cute_mma_dag_boundary_prefetch
+        if prefetch_fragment is not None:
+            fields[MMA_DAG_BOUNDARY_PREFETCH_KEY] = prefetch_fragment
+        # Likewise the tail release's own lead of four pages.
+        lead_fragment = config_spec.cute_mma_dag_release_lead
+        if lead_fragment is not None:
+            fields[MMA_DAG_RELEASE_LEAD_KEY] = lead_fragment
+        # And the raw V ring's own depth of two pages.
+        ring_fragment = config_spec.cute_mma_dag_value_ring
+        if ring_fragment is not None:
+            fields[MMA_DAG_VALUE_RING_KEY] = ring_fragment
+        # And the source's own page order.
+        order_fragment = config_spec.cute_mma_dag_page_order
+        if order_fragment is not None:
+            fields[MMA_DAG_PAGE_ORDER_KEY] = order_fragment
+        # And the reversed walk's own place for its clipped page.
+        clipped_lead_fragment = config_spec.cute_mma_dag_clipped_page_lead
+        if clipped_lead_fragment is not None:
+            fields[MMA_DAG_CLIPPED_PAGE_LEAD_KEY] = clipped_lead_fragment
         fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)
@@ -6449,11 +6885,20 @@ class CuteSearchSurface(BackendSearchSurface):
     ) -> None:
         prepare_override_normalization(config_spec, config, overrides)
         reopen_load_hint_forms(config, overrides)
+        # The partition, then a page order, which the partition must
+        # run, then a depth of the raw V ring, which the partition's CTA
+        # must hold, then a prefetch, which has a role only with one unit
+        # per CTA and may need the capture policy, then a lead of the tail
+        # release, which needs that policy, then the policy itself.
+        take_overridden_partition_transport(config_spec, config, overrides)
+        reconcile_overridden_page_order(config_spec, config, overrides)
+        reconcile_overridden_value_ring(config_spec, config, overrides)
+        reconcile_overridden_boundary_prefetch(config_spec, config, overrides)
+        reconcile_overridden_release_lead(config_spec, config, overrides)
         _decline_overridden_capture_policy(
             capture_policy_available(config_spec), config, overrides
         )
         _keep_overridden_capture_policy(config_spec, config, overrides)
-        take_overridden_partition_transport(config_spec, config, overrides)
         rederive_overridden_key_clip(config_spec, config, overrides)
 
     def overrides_without_search(
@@ -6462,7 +6907,12 @@ class CuteSearchSurface(BackendSearchSurface):
         config: Mapping[str, object],
         overrides: Mapping[str, object],
     ) -> dict[str, object] | None:
-        return _decline_capture_policy_without_search(config_spec, config, overrides)
+        declined = _decline_capture_policy_without_search(
+            config_spec, config, overrides
+        )
+        return _decline_release_lead_without_search(
+            _decline_boundary_prefetch_without_search(config_spec, declined)
+        )
 
     def overrides_held_without_search(
         self, overrides: Mapping[str, object]

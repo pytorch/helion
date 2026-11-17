@@ -491,7 +491,17 @@ against their own maxima and the merge adds a few FP32 operations. On the
 partition tests' random data that is at most 0.6% of the unit's largest
 output and 2e-6 in the LSE. That is a reassociation only `fast_math`
 licenses, so the choice exists only under it, and only for the normalized
-epilogue (the raw-statistics one has no merge). Which units are split
+epilogue (the raw-statistics one has no merge). The same license covers a
+permutation of whole tiles that every row sees in full
+(`cute_mma_dag_page_order="bucketed"`, below): in real arithmetic the
+recurrence does not depend on the order of such tiles, and in floating point
+another order rounds each probability to BF16 against another running
+maximum and adds the tiles' products and denominators to the FP32
+accumulators in another sequence, as a unit in parts does at its part
+boundaries; no tile with a mask or a key clip is moved. It also covers a
+walk of a unit's tiles newest first (`cute_mma_dag_page_order="reversed"`,
+below), which moves every tile, each with the mask and the key clip of its
+own page. Which units are split
 follows from the lengths and the launch's CTA count, so results are
 reproducible on one device and differ in those bits between devices of
 different SM counts. The inputs must not change while a launch runs, as for
@@ -606,6 +616,732 @@ The exchange is what the window pays: a timing-only probe that ran the
 same ranges without it read 57.4 and 39.3 us, about 2 us less, and at 200
 requests the equal shares alone gain less than that. With 128 requests, an
 SM each, `balanced` reads 26.1 us against 25.2.
+
+The paired schedule's `cute_mma_dag_register_quotas` names the `setmaxnreg`
+count of each warp role as `compute/K conversion/V conversion/control`
+registers per thread. The default, `144/72/72/48`, is the split the body has
+always used: a config that leaves the option out, or names the default,
+renders the same source. The other choices are `136/80/80/48`,
+`136/72/72/48` and `120/96/96/48`. A split changes no result. It changes how
+the DSL's backend and its assembler lay out the roles' unchanged code, and
+with that the page period of a stream that is bound by the CTA's own latency
+rather than by memory: measured on a B200, by up to 7 % of such a call over
+all-zero K and V pages and by 2 to 4 % over random ones. That outcome is not
+a property of the quotas: lowering the compute quota alone speeds up the
+conversion warps, a larger conversion quota can be slower, the gain does not
+add to that of other template changes, a split that is the fastest for one
+kernel can be slower than the default for another, and all of it can flip
+with any edit of the template. So the option is a searched one, in every
+timing regime (it is no cache-residency effect), with one seed per split on
+the leading paired seed, and no rule derives a split: the choices are
+measured splits.
+`setmaxnreg` moves registers between the warps of one CTA, whose pool is what
+its threads launched with: 640 threads at 96 registers, the largest count at
+which they share an SM's 65,536, which is 61,440
+(`paged_attention_registers.py`). Every choice fits that pool, and the
+template asserts it on the quotas it is rendered with, because an increase
+the pool cannot grant never returns; a value that is not one of the choices
+is an `InvalidConfig`. On every body but the paired one the option is pinned
+to the default, like the other paired knobs. That includes a config that
+names a split and nothing else: it does not select the paired schedule, which
+the kernel's own default config does, so it is normalized to the default
+split without an error. Name the split in a config that selects the paired
+schedule.
+A work partition keeps the roles and their warps, so every split runs under
+`item`, `whole` and `balanced`: a persistent CTA's walking compute groups take
+the compute quota, its conversion warps theirs, and its loader, its issuers
+and the spare warp the control quota. A partition therefore pins no split, in
+a config, in a search step onto it or under an override, as it pins nothing
+but the transport it needs; the balanced seeds run the default split, and the
+search crosses the two options.
+
+The paired schedule's `cute_mma_dag_boundary_prefetch=K` gives the control
+warp that is idle with one unit per CTA and no value-metadata transport a
+role: it requests the first K pages of K, both heads with their packed
+scales, of a unit that has not started into L2 (`cp.async.bulk.prefetch.L2`
+byte ranges, two a page; `_paged_attention_prefetch.py`). Zero, the default
+and the meaning of a missing key, is off and renders the kernel without the
+role; a config may name 8, 12 or 4 pages. A prefetch returns no data, so
+results are bit-identical with any value. Which unit a CTA serves follows
+from the grid, whose CTAs the device dispatches in index order onto SMs as
+they free up (`paged_attention_prefetch.boundary_prefetch_form`):
+
+- *Wave ahead*, more units than SMs and at most two and a half waves of
+  them: unit `u` serves unit `u + SMs`, the unit that takes over its SM, and
+  requests when its own loader has issued its last request, lagging V tiles
+  included (one more pipeline barrier, at which the loader arrives and the
+  warp waits).
+- *Siblings*, fewer units than SMs with at most a fifth of the SMs left
+  idle: the launch's first `H` CTAs start on the SMs the launch ahead left
+  idle while the others wait for its SMs, and lane `l` of unit `u < H`
+  requests for unit `u + H * (l + 1)` at entry, on at most six lanes a warp.
+  `H` is not a property of the kernel: the host installs it above the
+  capture guard's wait mode (`capture_pdl_cuda.head_start`), the launch
+  device's SMs less the grid of the launch ahead when that launch is of the
+  same kernel, and zero behind any other launch, for a launch the guard did
+  not overlap and for every eager launch. The form therefore needs the
+  capture contract with the `loader_tail` release, and requests nothing
+  outside back-to-back captured calls of one kernel.
+
+The role keeps its warp's register quota, the control quota, so it runs
+under every register split. Only some lanes of the warp serve a unit, and
+one of them waits. The role synchronizes nothing itself: where the body
+ends with its all-thread join (late retirement, or a release at exit), the
+join waits for the requests, since a barrier instruction "causes executing
+thread to wait for all non-exited threads from its warp" (PTX ISA 9.5,
+section 9.7.15.1), and elsewhere no role waits for them.
+
+Everything else has no role: a grid that exactly fills the device, leaves
+more than a fifth of the SMs idle or holds more than two and a half waves,
+another schedule, the value-metadata transport, a persistent partition, a K
+layout whose pair of heads is not one byte range per page, an unknown SM
+count and a kernel with other roots. A config that names pages there is an
+`InvalidConfig`, repaired to none, where the schedule it names has no role
+for them: the paired schedule in one of those cases, or another
+`cute_mma_dag_pass_warps` (`"attention"`, or none named: unlike a register
+split, which is pinned to its default there, pages named without the paired
+schedule are rejected). Where a config names the paired schedule and runs
+another body all the same, the pages are dropped without an error, as every
+paired knob is pinned there: under `cute_mma_dag="off"`, and where
+normalization repairs the schedule itself (`cute_mma_dag_warps=8`, which no
+attention schedule runs, is repaired to `cute_mma_dag_pass_warps="off"`).
+The role reads only what the launch reads anyway, in tensors the capture
+proof lists as loaded: the served unit's bounds, through the statements of
+the kernel's own scalar prelude that they depend on as a function of the
+unit (`_unit_bounds_helper`; they load the unit's length and, in a kernel
+that takes its page range from a tensor, that tensor), and that unit's first
+page ids, inside its own range and the page table. A request is formed only
+for a page id inside the pool.
+
+The requests pay only where their pages are still in L2 when the unit loads
+them, which is a property of the calls around a launch and not of the
+kernel, so the default is off and nothing promotes it. What was measured, on
+a B200 (148 SMs) with the SDG eval harness and with ladders of its 17-page
+window, per call against the kernel without the role:
+
+- It helps back-to-back calls of a short window that rotate over two or
+  three inputs whose requests have equal lengths: 8 pages take 0.85 to 1.4
+  us off a call of 26 to 67 us on a 2047-key window at the harness's two or
+  three calls per sample.
+- Past one wave most of that is a gain per timed sample of calls and not
+  per call: 200 and 320 requests read 0.9 and 1.4 us less per call at two
+  calls a sample, and at twelve 0.2 and 0.3 us less with 8 pages and 0.8 us
+  more with 12 pages at 320. On one wave it is per call: 128 requests keep
+  0.7 us at twelve calls.
+- With requests of unequal length (4 to 17 pages) most of it is gone: 8
+  pages keep at most 0.3 us, and 12 pages cost about 1 us at 296 and 320
+  requests.
+- On one wave it loses where more inputs rotate than L2 holds: 128 requests
+  read 0.7 to 0.9 us less per call over three inputs and 0.3 to 0.5 us more
+  over six and twelve. That is with the default's load eviction policies: a
+  config without them read 0.7 us more over twelve inputs, of which its 8
+  pages won 0.5 to 0.6 us back. Past one wave, 160 and 296 units kept their
+  gain over twelve inputs.
+- The two limits on the grid are where 8 pages lose even over two or three
+  inputs. One wave: 90 to 108 units read 0.3 to 0.5 us more, 112 and 116
+  units no change, 119 to 144 units 0.1 to 0.9 us less. More waves, in long
+  runs of calls: 320 to 380 units read 0.1 to 0.8 us less, 400 units about
+  1 us more and 443 units 0.3 more.
+- It buys nothing on long ranges, where a unit's first pages are a small
+  part of its traffic: without a window, 8 and 12 pages moved calls of 380
+  to 780 us by less than 0.15% at 128 and 200 requests and added 0.3% to
+  0.6% at 320.
+
+On a one-wave grid a lone or an eager call requests nothing.
+
+So the knob is searched only where candidates are timed over such a cycle of
+input banks (`autotune_benchmark_input_banks` above one,
+`ConfigSpec.cute_mma_dag_boundary_prefetch_searched`), with off always among
+the choices, and there the leading paired family follows the other seeds
+with 8 and with 12 pages; every other search and the autotune-off default
+keep it off. A step onto pages takes what the role needs in the same step
+(`CuteConfigGenerationExtension._prefetch_neighbor_updates`), and an
+`autotune_config_overrides` entry is reconciled with a candidate's pages the
+same way (`reconcile_overridden_boundary_prefetch`). Neither names a
+register split: pages and splits are crossed by the search. A config the
+kernel selects without a search (a cache hit, AOT tuning data) under
+overrides that decline the capture policy loses its pages with that policy
+on a grid of fewer units than SMs, where the role needs it. A search
+resolves the knob only where it moves a call by more than the benchmark's
+timer step per call (2.048 us a sample: 0.7 us at three calls, 1 us at
+two): a smaller effect, such as the cost over many inputs, reads as a tie
+between candidates with and without pages.
+
+The paired schedule's `cute_mma_dag_release_lead`, in pages, is the lead of
+its loader's tail release (`cute_pdl_release="loader_tail"`): the loader
+releases the launch's dependents when its stream has that many pages left.
+Four, the default and the meaning of a missing key, is the lead the release
+has always had and renders the kernel without the option; a config may name
+8 or 16. The release moves no data, so results are bit-identical with any
+lead. A stream shorter than the lead releases at its first page
+(`_tail_release_step` clamps the step at zero), which is never later than
+the default lead releases the same stream; the default keeps its own test,
+which a stream of fewer than four pages meets only behind its loop. On a
+persistent partition the stream is the CTA's whole stream of units.
+
+The lead is the release's: a config may name one only where its resolved
+dependent-launch policy is the guarded capture overlap with the `loader_tail`
+release, and a lead beside any other policy, on another schedule or on a
+kernel that does not take that policy is an `InvalidConfig`, repaired to the
+default. Where a config names the paired schedule and runs another body all
+the same (`cute_mma_dag="off"`, a repaired schedule), the lead is dropped
+without an error, as every paired knob is pinned there. Past one wave, and
+on a grid the host sizes at runtime, a `loader_tail` config renders the
+automatic release (`passes.pdl.loader_tail_release_applies`: on a grid of
+one unit per CTA known to take more than one wave, the entry of every CTA);
+the config keeps its lead there as it keeps the release's name, and renders
+the kernel it renders without one.
+
+What it changes is when the next captured call may start. The dependent
+launch follows the last CTA's release by 4 to 8 us, so with four pages (4.8
+us of a memory-bound stream) the next call of a long stream enters as this
+one ends, and SMs that freed up earlier sit idle; with a longer lead its
+CTAs take them as they free up. A short stream that releases that early
+holds its successor's CTAs resident beside its own instead. Measured on a
+B200 (148 SMs) with the SDG eval harness over two input banks, us per call
+against four pages:
+
+- 128 requests without a window, on one case of 211 pages and one of 391:
+  8 and 16 pages read 1.0 and 2.0 us less at two calls per sample (32 and
+  64 pages nothing more), 1.9 / 2.4 and 4.25 / 5.4 us less at six, and 16
+  pages 5.7 and 6.2 us less at twelve calls over six banks. Over the twelve
+  cases of the class at two calls per sample, in two batches: 16 pages read
+  1.0 us less in the first (none on three cases, 2.0 on three; handwritten /
+  Helion 0.9860 to 0.9886) and 0.8 us less in the second, which also
+  measured the ring and the page order (2.05 less to 0.5 more, one case
+  slower; 0.9857 to 0.9875), with two of the twelve cases at 0.99 in each.
+- 128 requests of a 17-page window, twelve cases at three calls per sample:
+  8 pages read 1.0 us more (none to 1.4) and 16 pages 2.5 us more (2.0 to
+  3.4; handwritten / Helion 0.988, 0.950 and 0.896).
+- 128 requests without a window over random K and V, where the CTA and not
+  memory bounds the stream: 16 pages read 1.5 to 1.6 us more.
+
+So the lead is no default and nothing promotes it. It is sampled where the
+release itself is, in a search whose benchmark times back-to-back captured
+launches (`autotune_benchmark_input_banks` above one,
+`ConfigSpec.cute_pdl_capture_overlap_searched`), with four pages always
+among the choices; there the leading paired family of a kernel without a
+window, on a grid of one unit per CTA that fits one wave, follows the other
+seeds with 16 pages. Every other search and the autotune-off default keep
+four, and no seed names a lead for a windowed kernel. A step onto a lead
+takes the release it belongs to in the same step
+(`CuteConfigGenerationExtension._release_lead_neighbor_updates`), an
+`autotune_config_overrides` entry is reconciled with a candidate's lead as
+with a boundary prefetch (`reconcile_overridden_release_lead`), and a config
+the kernel selects without a search loses its lead with a policy that
+overrides decline. Where a lead renders nothing (one unit per CTA on a grid
+past one wave, whose `loader_tail` config renders the automatic release), a
+search does not sample it: every value is the same kernel, so its rows of
+such configs are one row (`CuteConfigGenerationExtension._repair_release_lead`)
+and a draw or a step onto a lead there is an alias of a config the search
+has, which takes no slot; the step takes no release either. The persistent
+partitions of such a kernel launch one wave of CTAs and keep the lead as a
+searched option, a kernel without them draws four pages alone, and an
+override keeps the lead it names. Like the prefetch, a search resolves the
+lead only where it moves a call by more than the benchmark's timer step per
+call.
+
+The paired schedule's `cute_mma_dag_value_ring` is the depth of its raw V
+ring: the pages of raw V the loader stages per head. Two, the default and
+the meaning of a missing key, is the depth the body has always had and
+renders the kernel without the option; a config may name 3. The loader
+requests K, K, V, V of a page in strict sequence, so a V request that waits
+for its ring slot also holds back the next page's K requests, and one more
+staged page per head decouples them. The depth changes no result, only when
+a raw tile is requested: the loader and the V conversion warps take the
+ring's slots and barriers in turns of the depth (`_ring_slot`,
+`_ring_phase`), under every V lag. The raw K ring keeps two pages; a third
+measured nothing.
+
+One more page per head is two more raw tiles with their scales and two more
+pairs of ring barriers: 33,792 bytes of the CTA's shared memory and, in a
+block of 32 barriers, 256 for its second round. A CTA whose shared memory
+the device does not grant never launches, so the depth is admitted against
+the device. The body's shared memory is one table
+(`paged_attention_shared_memory.py`), from which the template allocates;
+the config contract replays that table with the depth, for one unit per CTA
+or with the query stages and plan tables of the config's persistent
+partition, against the shared memory the device grants one CTA
+(`value_ring_reason`, `paged_attention_value_ring_choices`), and a depth
+that does not fit is an `InvalidConfig` that says what it would take,
+repaired to the default. On a B200 (232,448 bytes) one unit per CTA holds
+three pages at every panel width (the contract admits the depth from
+214,936 bytes at 40 query columns and from 206,232 at 32, the table with
+every optional part), and so does a persistent CTA of up to 32 query columns
+(at most 226,136 bytes with two query stages); at 40 columns its two query
+stages leave no room (233,912 bytes or more). The render repeats the check:
+the body is
+given the capacity its depth was admitted on and asserts the table it
+allocates against it. The value-metadata transport, whose actor walks the
+ring at its default depth, admits no other, and neither does a config that
+names another schedule (`cute_mma_dag_pass_warps="attention"`, or none): a
+depth there is an `InvalidConfig`, repaired to the default, as pages of a
+boundary prefetch are and unlike a register split, which is pinned. Where a
+config names the paired schedule and runs another body all the same
+(`cute_mma_dag="off"`, a repaired schedule), the depth is dropped without an
+error, as every paired knob is pinned there. A render without a device
+has no capacity to check and admits every depth, as it admits the schedule.
+
+The depth is a searched option in every timing regime, since it changes the
+loader's own schedule, wherever the device holds it with one unit per CTA,
+and a search samples it with one unit per CTA alone: a persistent CTA that
+holds it is slower with it (below). A step onto the depth drops the
+value-metadata transport and takes one unit per CTA in the same step,
+whatever room the config's partition has
+(`CuteConfigGenerationExtension._value_ring_neighbor_updates`), and a
+search's rows on a persistent partition hold the default depth
+(`_repair_value_ring`): a draw, a step onto the partition, a seed or a
+cached config that names a depth there is that partition's row without it.
+The contract keeps the depth wherever the CTA holds it, for a config outside
+a search and for an `autotune_config_overrides` entry, which is reconciled
+with a candidate's depth by the contract's rule: the candidate takes one
+unit per CTA only where its partition has no room
+(`reconcile_overridden_value_ring`). What a search can find alone
+is limited, because the depth interacts with two other knobs. Measured on a
+B200 with the SDG eval harness, 128 requests without a window over two input
+banks, us per call:
+
+- Alone it is within the measurement's noise: over eight cases 1.4 us less
+  at two calls per sample (none on one case, 3.0 on another) and 0.5 us
+  less at twelve, with one case 0.8 us slower. Beside the longer lead of
+  the tail release (`cute_mma_dag_release_lead=16`) it reads 2.0 us less
+  at twelve calls, and beside a page order that shortens the stream's
+  period 2.6. Over the twelve cases of the class at two calls per sample,
+  handwritten / Helion read 0.9860 without either, 0.9886 with the lead
+  (1.0 us less) and 0.9942 with the lead, the depth and V issued with its K
+  (3.2 to 3.4 us less, 1.1 to 6.1 by case).
+- It needs the V requests in step with K's (`cute_mma_dag_v_lag=0`): on a
+  case whose config has V three tiles behind, the pair of lead and depth
+  gained 1.0 us where it gained 3.1 with no lag, and the kernel without
+  the pair cannot tell the two lags apart (264.19 against 264.22 us).
+- It loses where the CTA and not memory bounds the stream: 1.9 us more over
+  random K and V. A 17-page window does not move (twelve cases of 128
+  requests at three calls per sample: none on ten, 0.7 us either way on
+  two).
+- It loses on a persistent partition where the device holds it: the six
+  `balanced` configs of 200 and 320 requests at 32 query columns read 4.3
+  to 12.8 us more per call (of 647 to 762 us) with three pages per head. A
+  cold search of one of those kernels that sampled the depth there spent
+  467 of its 576 attention configs on it and returned none of them, which
+  is why a search samples the depth with one unit per CTA alone.
+
+So no seed names the depth alone. Where a search samples the lead and seeds
+it (a kernel without a window, a grid of one wave, a benchmark over bank
+cycles), the seed with 16 pages is followed by its counterpart with three
+pages per head and V issued with its K; everywhere else the search starts
+from two pages and has the depth as one of its moves.
+
+The paired schedule's `cute_mma_dag_page_order` is the order in which a CTA
+streams a unit's pages. `source`, the default and the meaning of a missing
+key, is the order of the source's loop and renders the kernel without the
+option. `bucketed` streams the unit's interior pages in the order of their
+physical page's bucket, one of 32 equal ranges of the page pool (the page id
+without its low bits, `page_order_shift` of the K tensor's page extent), and
+within a bucket in source order; the unit's first four pages and its last
+twelve keep their places. Every CTA of a launch then reads one region of the
+pool at a time, in step with the others. That shortens the page period of a
+memory-bound stream (1.199 to 1.187 us per page on a B200) and needs the CTAs
+in step: the same buckets rotated per request gained nothing. It is not L2
+residency between calls, since the gain holds over six input banks.
+
+What is reordered is decided on the device, by the template's own test
+(`_paged_attention_page_order.py`). The CTA's idle control warp, the one a
+boundary prefetch uses behind it, takes the stream steps behind the head and
+ahead of the tail, at most 416 of them, evaluates
+`logical_attention_tile_is_interior` for each with the step's own
+coordinates, and requires the steps that pass to be one run of at least 32:
+it reduces their number, the first and the last over its lanes, and the run
+holds exactly when the span from the first to the last has that number of
+steps. A unit whose interior candidates are fewer, or not one run, is
+streamed in source order. So every step of the run is a tile without a mask
+and without a key clip: the loader requests it at shift zero and the softmax
+treats it as any interior tile, and each step keeps its logical coordinates
+whichever page of the run it streams. The warp sorts the run's page ids with
+a stable counting sort, a function of the ids alone (shared-memory atomics
+for the bucket counts, a prefix sum over the lanes, then one round of 32 ids
+at a time, each lane taking its bucket's next position plus the number of
+lower lanes in the bucket's word), leaves the order and the run in shared
+memory (1,928 bytes) and arrives, every lane behind its own stores, at one
+more pipeline barrier. The loader streams the head in source order, waits
+there, and takes the run's pages from the order; a unit of no more pages than
+the head has no step that could take the order, and its loader does not wait
+for the warp. The barrier is a pipeline barrier of this role alone; the role
+uses no named barrier and keeps the control warpgroup's register quota. The
+warp synchronizes (`bar.warp.sync`) between the steps of its sort and nowhere
+else: the lanes share the counters, the words and the positions with no other
+barrier between one lane's store and another lane's load, which is what that
+instruction orders.
+
+The order permutes whole tiles, so it changes results within the rounding
+the fast-math paragraph above describes, and only for units it reorders: a
+unit streamed in source order has the source order's bits. Two launches over
+the same inputs have the same bits, since the sort is stable. On random K
+and V a reordered unit's outputs moved by at most 0.7% of the unit's largest
+output and its LSE by 2e-6 (the GPU tests bound both). On the SDG eval
+harness's inputs, eight cases of 128 requests, no output bit changed over
+its timing data; over random K and V the relative RMS against the source
+order was 1.8e-3 to 2.0e-3 with three in ten BF16 outputs changed, none by
+more than one ulp of the output's top binade (7.8e-3), the LSE moved by at
+most 4e-6, and the error against the FP32 reference was the same in both
+orders (relative RMS 1.9e-3 to 2.0e-3 and 1.9e-3 to 2.1e-3). There is no
+bound in output ulps for an element whose terms nearly cancel, as for the
+key clip.
+
+A kernel is offered the order under `fast_math`, on the paired schedule's
+`item` partition without the value-metadata transport, where some unit can
+have enough interior pages for the sort to pay
+(`paged_attention_page_order.page_order_offered`): the page table's extent
+less the head and the tail, and under a window the whole pages of the keys
+every row sees, must reach 32. The order gains 0.012 to 0.015 us per
+reordered page and a sort the stream waits for costs it 0.4 to 0.7 us, and
+three reordered pages of a 17-page window cost 1.4 to 2.05 us: a 2047-key
+window, with at most sixteen interior pages, is not offered the order.
+Elsewhere `bucketed` is an `InvalidConfig`, repaired to `source`, also in
+a config that names another schedule or none; where a config names the
+paired schedule and runs another body all the same, the order is dropped
+without an error, like every paired knob there. The head and the tail are
+constants. The head is what the loader streams while the warp sorts: over
+twelve cases of 128 requests without a window, with the longer lead and the
+deeper ring, a head of two pages read 0.9978 (the stream waits for the
+sort), four pages 0.9999 and eight 0.9989, the same as four in the mean of
+the samples. The tail keeps the newest pages, whose scores are the largest,
+out of mid-stream: with the order's prototype 2 pages read 0.9897 with the
+two cases whose newest pages hold large scores 1 to 3 us slower than the
+source order, 6 pages 0.9913 and 12 pages 0.9932, and no measured class has
+another tail win. A persistent partition has no order
+yet: its CTAs stream several units or parts of them, so the sort would run
+per unit ahead of the loader, on the spare warp that already arrives for the
+compute groups' parts, with a handoff per unit; a host-side reordering sized
+that at 0.2 points on 200 and 320 requests, all of it at 200.
+
+The order is a searched option in every timing regime wherever a kernel is
+offered it, with a seed for kernels without a window on a grid of one wave:
+the leading paired family in bucketed order behind the other seeds, and
+where a search seeds the longer lead of the tail release, the last of those
+seeds once more in bucketed order: the one with the deeper raw V ring where
+the device holds that ring, the lead alone otherwise. Where that seed names
+the ring and the search also samples and seeds a boundary prefetch, it
+follows once more with a prefetch of four pages, the order's head: a
+prefetch requests a unit's first
+pages in source order, which behind the head a bucketed stream no longer
+takes first. Of four cold searches of 128 requests none timed the three
+knobs with a four-page prefetch; set by hand, that form read one timer step
+below the returned config on two of the cases (on the other two the
+hand-set config, one with four pages and one without a prefetch, read one
+step above it). A step onto the order takes
+one unit per CTA and drops the value-metadata transport in the same step
+(`CuteConfigGenerationExtension._page_order_neighbor_updates`), and an
+`autotune_config_overrides` entry is reconciled with a candidate's order the
+same way (`reconcile_overridden_page_order`). Measured on a B200 with the
+SDG eval harness, twelve cases of 128 requests of 211 and 391 pages over two
+input banks at two calls per sample, handwritten / Helion. Two batches have
+the order alone: 0.9856 and 0.9857 in source order and 0.9925 and 0.9922 in
+bucketed order (2.6 and 2.5 us less per call, 1.6 to 1.9 at 211 pages and
+3.4 at 391). The later of them also has the lead of 16 pages, the ring of
+three pages and V issued with its K, in both orders:
+0.9944 in source order and 0.9986 in bucketed order (3.4 and 5.1 us less
+than without the three). The earlier one, the batch that chose the head, has the
+three in bucketed order only, at 0.9999 (5.5 us less); in source order the
+three read 0.9942 in each of two earlier batches (3.2 and 3.4 us less).
+Where the CTA and not memory bounds the stream the order loses (1.1 us more
+over random K and V).
+
+`reversed` walks a work item's pages newest first: step `s` of a walk over
+the pages `[first, last)` takes page `last - 1 - s`, where the source's loop
+takes `first + s`. It is for a kernel with a sliding window, whose every
+work item streams the window's few pages and whose newest pages hold the
+scores a decode step's rows are largest on. Walked first, they set the
+running maximum early, and the older tiles raise it less often: with the
+SDG kernel's rescale threshold, 3.4 to 4.0 rescales per request and head
+where the source order has 5.1 to 5.5, on inputs whose newest five pages of
+seventeen hold random keys (device counters of a prototype). Nothing is
+sorted and no warp has a role. The walk is another mapping from a step to
+its logical page and key base, and the template has one such mapping
+(`attention_page_coordinates`): the loader takes the page it requests and
+its key clip from it, the compute groups the softmax's masks, and a
+boundary prefetch the pages it requests ahead. The body hands all of them
+the same walk, so a step is the same tile to each, and every tile keeps the
+logical coordinates of its own page: a tile at the window's edge is clipped
+and masked as in source order, at another step.
+
+`cute_mma_dag_clipped_page_lead`, in pages, places the walk's oldest page,
+the one a sliding window clips (of its keys only those inside the window
+are visible, and under a leading key clip only those are loaded). The walk
+takes that page when it has the lead's pages left, the page itself
+included, and every newer page behind that step one step later. Zero, the
+default and the meaning of a missing key, leaves the page where the
+reversed order has it, last, and renders the walk without the option; a
+config may name 8. A walk of `n` pages takes the page at step
+`max(n - lead, 0)`: a work item of no more pages than the lead takes it
+first and the others newest first behind it (the step clamps at zero, as
+the tail release's does for a stream shorter than its lead). The lead names
+a place in the reversed walk and nothing beside another order, so
+normalization drops it there without an error, as it drops the default; a
+value that is neither 0 nor 8 is an `InvalidConfig` beside any order.
+
+The walk permutes the source's iterations, so it changes results within the
+rounding the fast-math paragraph above describes, in the bucketed order's
+terms: in real arithmetic the recurrence does not depend on the order of
+its tiles, and in floating point another order rounds each probability to
+BF16 against another running maximum and adds the tiles' products and
+denominators to the FP32 accumulators in another sequence. Which tiles
+raise the running maximum, and so which tiles rescale the accumulators,
+changes with it; that is what the walk is for. Unlike the bucketed order it
+moves every tile, the masked and the clipped ones too, and every work item
+of more than one page (of more than two under a lead): only a work item
+whose walk is the source's own has the source order's bits. Two launches
+over the same inputs have the same bits. With the page last the kernel has
+the bits of a kernel whose source iterates its pages in reverse, which the
+GPU tests assert on the fixture; against the same kernel in source order a
+request's outputs moved by at most 0.72% of the request's largest output
+and its LSE by 1.9e-6 on the tests' fixtures (they bound both at the
+bucketed order's 1.6% and 1e-5, and either order within 5% and 0.002 of the
+FP32 reference). There is no bound in output ulps for an element
+whose terms nearly cancel.
+
+A kernel is offered the walk with the pair proof, under `fast_math`, where
+its mask has a sliding window and its source loop visits the pages oldest
+first (`PagedAttentionScheduleFacts.reversed_order_missing` says what a
+kernel lacks). The window is the mask's fact,
+`PagedAttentionScheduleFacts.windowed`: the proved visibility predicate has
+a lower bound, `key_position >= query_position - window`
+(`LogicalAttentionMask.window_left`). It is no fact about the loop, whose
+bounds stay the source's expressions: the page the lead places is the
+range's first page, which is the window's clipped page wherever the source
+begins its loop at the window's edge, and a tile that no row sees, in a
+range wider than the window, keeps its mask at whatever step it has. A
+source whose loop index is already the reflection `begin + end - 1 -
+iteration` walks newest first in source order and is not offered the
+option. A config may name the walk on the paired schedule without the
+value-metadata transport: with one unit per CTA, and on a persistent
+partition (`whole`, `balanced`) of a grid known to hold more units than the
+device has SMs (`paged_attention_reversed_order_partition`). There every
+unit of a CTA's stream is walked so, and the parts of a unit that several
+CTAs share keep their steps and take the pages the unit's walk has at them.
+On a persistent partition of a smaller grid, whose CTAs run about one unit
+each, and beside that transport's actor the walk was not examined.
+Everything else is an `InvalidConfig` that names the requirement the kernel
+or the config does not meet, repaired to `source`, also in a config that
+names another schedule or none; a lead beside any order but the walk's is
+dropped. Where a config names the paired schedule and runs another body all
+the same, both options are dropped without an error, as every paired knob is
+pinned there.
+
+Both options are searched in every timing regime wherever a kernel is
+offered the walk. A step onto the walk drops the value-metadata transport
+and, where the bind's persistent partitions do not run the walk, takes one
+unit per CTA, as the bucketed order's step always does
+(`CuteConfigGenerationExtension._page_order_neighbor_updates`,
+`page_order_needs`); on a grid of more units than SMs it keeps the
+partition it starts from. A step onto a lead takes the walk in the same
+step, since from source order the lead alone is an alias of where it
+started. An `autotune_config_overrides`
+entry that names the walk is reconciled as one that names the bucketed
+order is (`reconcile_overridden_page_order`); one that names a lead and no
+order applies to the candidates in reversed order and names nothing for the
+others. A deeper raw V ring stays unsampled on persistent partitions, with
+the walk as without. The seeds are two forms, on the leading paired family
+and, where a search samples and seeds a boundary prefetch, on each of those
+seeds, behind every other seed: the page 8 pages ahead of the walk's end
+beside three pages of raw V per head (where the device holds them), and the
+page last beside the default ring. Both keep the family's V lag of two:
+with V issued with its K the first form lost its gains. On a grid of more
+units than SMs one more seed follows them, the leading `balanced` seed in
+reversed order with the page 8 pages ahead of a unit's end (below).
+
+Which form gains is a property of the case, not of the kernel. Measured on a
+B200 (148 SMs) in the SDG eval harness, the class's cases in one process,
+with the handwritten kernel, PR103, and the searched configs in every batch.
+Those configs come from searches that sampled the boundary prefetch and
+none of the lead of the tail release, the ring depth and the bucketed
+order, so they name none of the three, and the two forms are those configs
+with the walk, its lead and the ring. A step is one 2.048 us step of the
+sample timer, and the
+figures are the legs' medians in steps (0.683 us per call at three calls a
+sample, 1.024 at two). 128 requests of a 2047-key window, 17 pages, over
+three input banks at three calls a sample, two arms of six cases each
+(draft and verify at three decode positions, whose newest one, five and
+nine pages hold random keys):
+
+    case                 PR103   source   lead 8, ring 3   page last, ring 2
+    27k draft, 1 page    33-34   34       33-34            34-35
+    27k draft, 5 pages   34      35-36    34               35
+    27k draft, 9 pages   37-38   36       36               36
+    27k verify, 1 page   34-35   35       34-35            35-36
+    27k verify, 5 pages  35      37       38               36-37
+    27k verify, 9 pages  39      39       40               39
+    50k draft, 1 page    34      34-35    33-34            34
+    50k draft, 5 pages   34      36       35               35
+    50k draft, 9 pages   37-38   36       37               36-37
+    50k verify, 1 page   34-35   35-36    36               35-36
+    50k verify, 5 pages  35-36   38       38               37
+    50k verify, 9 pages  39-40   39-40    40               40
+
+A range says the legs read both steps. The first form (twelve legs) takes
+three draft cases one step down, to PR103's step or below it on two of them
+(handwritten / Helion by the pooled medians 0.9710 to 0.9995 and 0.9984 to
+1.0298; the third 0.9449 to 0.9719), keeps a fourth with 0.47 us less in
+the mean, and loses a step on five cases, four of them in verify, where
+the deeper ring costs one. The second (four legs of one batch) takes the
+two verify cases two steps behind one step down (0.9455 to 0.9718 and
+0.9474 to 0.9730) and one draft case (0.9449 to 0.9719), and loses a step
+on two cases. With the best of the source order and the two forms per case,
+nine of the twelve cases are at or above 0.99 where the source order has
+eight, and the class's geomean is 1.0022 against 0.9902. Leads of 0, 3, 5
+and 12 beside the ring were never better than 8 on the draft cases (means
+of 23.47, 23.38, 23.22 and 23.32 us against 22.98 on one of them, where
+only 8 reached the lower step), and with the ring and V issued with its K
+the first form lost its two draft steps (35 timer steps against 34 and 34
+against 33). 200 requests of the same window, six cases over two banks at two
+calls a sample, on configs with a 12-page prefetch: the walk with a lead of
+5, with or without the deeper ring, or with a lead of 8 or 12 beside that
+ring, takes one verify case one of its two steps down (40 to 39, 0.9500 to
+0.9744; the ring with the page last does not, and neither a lead of 8 nor
+the page last was measured beside the default ring there), every form loses
+a step on one draft case where the source order is already a step behind
+PR103 (37 against 36 and 35), and the other four cases keep their steps. So
+no default and no promotion: the search times the forms on the case's own
+inputs, at its benchmark's call count.
+
+Cold full searches of the SDG kernel, each from a fresh seed in the eval's
+timing regime, timed all six seeds in reversed order. On the 27k draft case
+with five pages of random keys (three input banks) they were the first four,
+the seventh and the eighth of the 74 timed members of the initial
+population: 23.21, 23.89, 23.89 and 23.99 us on the two prefetch seeds,
+whose source-order forms read 24.58, and 24.93 and 25.26 on the leading
+family, which read 25.85. The search (541 configs, 1,171 s) returned the
+first form on the 8-page prefetch, with another register split. On the 50k
+verify case at that position they were the first three, the sixth, the
+eighth and the ninth of 59 (25.47 to 26.63 us against 25.94 and 26.80), and
+the search (501 configs, 1,108 s) returned the second form with V three
+tiles behind K; its best reading of the first form was 24.85 us against
+24.57. In one comparison of the class in the eval's layout (three rounds,
+PR103 at both ends of each), one role ran the configs that cold searches of
+the same twelve cases return when the walk is not among their options, on a
+compiler without it, and another the same configs with these two cases'
+replaced by the two above: the draft case read PR103's 34 steps in three of
+three legs where the config without the walk read 35 (handwritten / Helion
+0.9714 to 1.0000), and the verify case 36, 36 and 37 against PR103's 36
+where the config without the walk read 38 (0.9474 to 0.9987); the ten other
+cases kept their readings (pooled medians within 0.31%). On 320 requests of
+the same window the walk with one unit per CTA is no contender: the seeds
+read 62.5 to 64.2 us there (their source-order forms 63.5 to 64.6) against
+the 59.4 us of the `balanced` config in source order that the search
+returned, and 17 of that search's 632 timed configs named the walk.
+
+On such a grid the walk belongs to the persistent partitions. A persistent
+CTA streams several units, and in source order each of them ends on the
+tile of its newest page, which raises the running maximum and rescales
+right ahead of the unit's epilogue; the walk makes that tile the unit's
+first, which takes the rescale arm anyway. Measured on a B200 (148 SMs) on
+`balanced` configs with a 2047-key window over prompts whose K and V are
+zero (the SDG eval's data, on which a unit's newest page alone raises the
+maximum), us per call against the source order at 2 / 12 calls a sample:
+
+    units   page last       lead 3          lead 8
+    296     -0.65 / -0.43   -1.14 / -0.39   -1.03 / -0.84
+    320     -0.15 / -0.34   -0.49 / -0.60   -0.75 / -0.76
+
+An independent repeat read every cell within 0.13 us of these. The gain
+is the data's: over pages that are all nonzero a lead of 8 read 0.5 /
+0.1 us more at 320 units, and in the SDG eval harness (the six cases of
+320 requests over two banks at two calls a sample, steps of 1.024 us, each
+case's searched `balanced` config in source order and with a lead of 8) it
+gains at some decode positions and loses a step at others:
+
+    case            PR103   source   lead 8
+    draft, 0        53      56       56 (0.72 us less)
+    draft, 512      56      58       57
+    draft, 1023     63      61       62
+    verify, 0       55      58       58
+    verify, 512     60      61       61-62
+    verify, 1023    68      67       68
+
+Handwritten / Helion over the six, by geomean: 0.9811 in source order,
+0.9779 with the lead on every case, 0.9844 with the better of the two per
+case. So no default takes the walk on a persistent partition and nothing
+promotes it: a search times it per case, from one seed, since it does not
+get there one knob at a time (the order alone, with the page last, read
+0.15 us of that kernel's 0.75 at 320 units). `whole` runs the walk by the
+same rule and was not timed under it. With no more units than SMs a
+persistent CTA runs about one unit, the form one unit per CTA has, and the
+walk was not measured on a persistent partition there: such a bind offers
+it with one unit per CTA alone.
+
+The paired schedule makes its output stores itself: each compute thread
+stores its column of every query row of the O panel, one element a row, and
+the row owners a row's LSE (`_compute_store`). The generic packet flushes'
+`cute_store_policy` finds no packet to rewrite there, and the body honours
+the option itself (`store_output_rows`), in a one-unit CTA, in a persistent
+CTA's compute groups between two units, and in the part that merges a split
+unit:
+
+- `streaming` stores every O element with the streaming cache operator
+  (`st.global.cs`, evict-first);
+- `l2_evict_last` stores it under the L2 evict-last cache hint
+  (`st.global.L2::cache_hint`), with one policy word a thread makes ahead of
+  its stores (`createpolicy`), the form the balanced partition's workspace
+  stores already use. The word is made at run time, so on this schedule the
+  choice does not need the fixed descriptor that gates it for the packet
+  flushes (`cute_store_policy_choices`, `_normalize_paired_store_policy`): a
+  kernel with the paired schedule is offered all three policies on every
+  target, and a config of it on another body takes `default` for
+  `l2_evict_last` where the descriptor is missing, as before.
+
+Either way the same value goes to the same address, as many stores in the
+same order. A BF16 element is rounded to nearest even inside the store's
+instruction pair, as the plain store's conversion rounds it, and the
+raw-statistics epilogue's fp32 panel is stored as it is, so results are
+bit-identical under all three policies. `default` renders the plain stores;
+the per-row stores (a row's LSE, the raw-statistics epilogue's maxima and
+denominators) are plain under every policy, and the other attention bodies
+store as before. The option was already a searched field of these kernels,
+with one kernel behind its values; now a search times three.
+
+The final selection's tie rule for streaming stores covers these stores.
+Among finalists its windows cannot tell apart,
+`CuteBackend.finalist_preference` ranks a kernel that renders streaming
+stores three ranks back: the kernel's own timing cannot see what an
+evict-first output costs the kernel that reads it next. The rule reads the
+rendered module (`packet_flush_names.streaming_store_rendered`), where a
+packet flush with the policy is a call of its streaming helper. The paired
+body calls none of those helpers, since its stores are operators of its own
+template, and is known by the `store_policy='streaming'` of the kernel's
+call of the body. A paired finalist under `streaming` therefore ranks three
+behind the same config under `default`; one under `l2_evict_last` ranks as
+under `default`, by its release alone.
+
+What the policies are for: the price of an output write is the first touch
+of its lines. Measured on a B200 (148 SMs) in the SDG eval harness on a
+2047-key window, four legs a role, us per call by the legs' means: a store
+into a line that another launch has just put into L2 costs 64 to 80% less,
+twelve rotating input banks instead of two double the cost of the output
+writes, and neither the stores' width nor their alignment nor writing lines
+whole changes it. The handwritten kernel pays the same price in its early
+zeroing. `l2_evict_last` keeps an output's lines in L2 across the K/V stream
+of the following calls; against the plain stores it read
+
+    requests              calls a sample   us per call
+    128 (one unit a CTA)  3 / 12           -0.05 / -0.27
+    200 draft             2 / 12           -0.15 / -0.30
+    200 verify            2 / 12           -0.13 / -0.27
+    320 (balanced)        2 / 12           -1.21 / -0.95
+
+and with twelve rotating banks nothing at 200 requests and -0.56 at 320.
+With each case's searched config (24 window cases over the harness's two or
+three banks, handwritten kernel in every batch) no case lost a timer step
+and two gained one (320 requests, 57 to 56 steps, handwritten / Helion
+0.9300 to 0.9463; 128 requests, 35 to 34, 0.9732 to 1.0000); twelve cases
+without a window read within noise. `streaming` read 0.3 to 0.5 less at 320
+requests and nothing with one unit per CTA (on 320 requests, `balanced`
+configs, six cases over two banks at two calls a sample: 0.37, 0.26 and
+0.22 less on the three draft cases and 0.17, 0.06 and 0.22 on the three
+verify cases); `l2_evict_last` was the better one in every cell. So the
+leading family of a kernel with a window is seeded once more under
+`l2_evict_last`, with one unit per CTA and, where the units outnumber the
+SMs, on the balanced partition in source order and in reversed order (the
+walk there was measured on configs that store under the hint); the search
+times all three per case.
 
 ### 3.3 Whole-kernel generators and regeneration
 

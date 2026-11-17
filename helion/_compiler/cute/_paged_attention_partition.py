@@ -102,12 +102,17 @@ from .paged_attention_partition_bounds import RECORD_HEADER_BYTES
 from .paged_attention_partition_bounds import SKEW_SHARE
 from .paged_attention_partition_bounds import partial_slot_bytes
 from .paged_attention_partition_bounds import plan_grid_bound
+from .paged_attention_shared_memory import MAIL_WORDS
+from .paged_attention_shared_memory import PLAN_WORDS
+from .paged_attention_shared_memory import WALK_WORDS
+from .paged_attention_shared_memory import plan_geometry
 
-# The threads of one paired CTA: all of them scan the units' lengths.
-PLAN_THREADS = 640
 # Words of the plan a balanced CTA's loader leaves in shared memory: its
 # units, pages and slot range, the first unit's header slot, then the slots
-# of all units, the active CTAs and the applied skew.
+# of all units, the active CTAs and the applied skew. The plan's length, a
+# walk record's and a post's are stated with the body's shared-memory table
+# (``paged_attention_shared_memory``), as is the scan's geometry
+# (``plan_geometry``).
 PLAN_FIRST = 0
 PLAN_LAST = 1
 PLAN_PAGES = 2
@@ -117,7 +122,7 @@ PLAN_HEADER = 5
 PLAN_SLOTS = 6
 PLAN_ACTIVE = 7
 PLAN_SKEW = 8
-PLAN_WORDS = 12
+assert PLAN_SKEW < PLAN_WORDS
 # What a part of a split unit does once its pages are done. A merge of a
 # unit in two parts by the part that did not publish is the common one: its
 # loads start inside the part's reduction (``pair_partial``).
@@ -133,7 +138,7 @@ MAIL_KIND = 0
 MAIL_LOWEST = 1
 MAIL_PARTS = 2
 MAIL_ITEM = 3
-MAIL_WORDS = 4
+assert MAIL_ITEM < MAIL_WORDS
 MAIL_NONE = 1
 MAIL_PART = 2
 MAIL_ARRIVED = 3
@@ -160,21 +165,10 @@ WALK_ROLE = 8
 WALK_LOWEST = 9
 WALK_PARTS = 10
 WALK_POSTED = 11
-WALK_WORDS = 16
+assert WALK_POSTED < WALK_WORDS
 # The bound of a launch's skew (``SKEW_SHARE``) and of its active CTAs under
 # Int32 slot products (``plan_grid_bound``) are the compile-time side's too:
 # ``paged_attention_partition_bounds`` states each once.
-
-
-def plan_geometry(units: int) -> tuple[int, int]:
-    """Units per scanning thread, and the warps that scan.
-
-    Thread ``t`` scans the ``chunk`` units from ``t * chunk``, so the first
-    ``warps`` warps cover all of them and up to 640 units take one each.
-    """
-    assert units > 0
-    chunk = -(-units // PLAN_THREADS)
-    return chunk, -(-units // (chunk * 32))
 
 
 def workspace_address(workspace: cute.Tensor) -> cutlass.Int64:

@@ -39,6 +39,7 @@ from helion._testing.cute_paged_bounded import bounded_partial_fixture
 from helion._testing.cute_paged_key_clip import expected_key_shift
 from helion._testing.cute_paged_key_clip import unloaded_keys
 from helion._testing.cute_paged_reference import reference_attention_fixture
+from helion._testing.cute_paged_stream import seeds_ahead_of_the_reversed_order
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.config_generation import ConfigGeneration
@@ -535,9 +536,12 @@ def test_key_clip_seeds_follow_the_old_seed_order(window: int | None) -> None:
     facts = bound.config_spec.cute_mma_dag_facts
     assert facts is not None and bound.host_function is not None
     with cpu_render_target(fake_device_sm_count=148), bound.env, bound.host_function:
-        seeds = MmaDagSeedPlanner(
-            facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
-        ).configs([])
+        # (A windowed kernel's seeds in reversed page order follow them.)
+        seeds = seeds_ahead_of_the_reversed_order(
+            MmaDagSeedPlanner(
+                facts, bound.config_spec, occupancy_key="cute_min_blocks_per_mp"
+            ).configs([])
+        )
         named = [seed for seed in seeds if KEY_CLIP in seed.config]
         if window is None:
             # The trailing clip alone is a search move only.

@@ -60,6 +60,7 @@ from ..cute_flash import FLASH_SOFTMAX_DISC_KEY
 from ..cute_flash import FLASH_SOFTMAX_LOWERING_KEY
 from ..cute_flash import _flash_resident_softmax_overrides
 from ..cute_flash import flash_exp2_packet_is_compound
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from ..cute_mma_dag import MMA_DAG_KEY
 from ..cute_mma_dag import MMA_DAG_OFF
 from ..cute_mma_dag import MMA_DAG_PARTITION_BALANCED
@@ -68,8 +69,18 @@ from ..cute_mma_dag import MMA_DAG_PARTITION_KEY
 from ..cute_mma_dag import MMA_DAG_PARTITION_SKEW_KEY
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
 from ..cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+from ..cute_mma_dag import MMA_DAG_RELEASE_LEAD_KEY
+from ..cute_mma_dag import paged_attention_release_lead_renders
 from ..flash_knobs import FLASH_COVERAGE_CHILD_PARENTS
 from ..packet_store_policy import store_policy_reaches_a_packet
+from ..paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT
+from ..paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_KEY
+from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
+from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
+from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
 from ..pdl_release import CUTE_PDL_SPREAD_KEY
@@ -80,10 +91,15 @@ from ..reduction_lanes import sequence_tile_holds_warp_lanes
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from ..thread_budget import tile_level_axes
 from ..tile_packing import packed_grid_block
+from .mma_dag_surface import CAPTURE_POLICY
 from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
 from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
 from .mma_dag_surface import PARTITION_TRANSPORT
+from .mma_dag_surface import SEARCHED_VALUE_RING_PARTITION
+from .mma_dag_surface import boundary_prefetch_needs
 from .mma_dag_surface import kept_capture_policy
+from .mma_dag_surface import page_order_needs
+from .mma_dag_surface import value_ring_needs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -501,18 +517,334 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
     def __init__(self, generation: ConfigGeneration) -> None:
         super().__init__(generation)
         self._flash_coverage_design_cache: FlashCoverageDesign | None = None
+        # Set while a row is decoded to read the partition it decodes to
+        # (``_decoded_partition``): the repairs that ask stand aside.
+        self._decoding_partition = False
 
     def conditional_neighbor_updates(
         self, base: FlatConfig, requested: FlatConfig
     ) -> Mapping[int, object]:
         """Activate a paired schedule's coupled options together with their
         prerequisites: a work partition and its range skew
-        (``_partition_neighbor_updates``), and the dependent-launch policies
-        (``_pdl_neighbor_updates``)."""
+        (``_partition_neighbor_updates``), the dependent-launch policies
+        (``_pdl_neighbor_updates``), a boundary prefetch
+        (``_prefetch_neighbor_updates``), a lead of the tail release
+        (``_release_lead_neighbor_updates``), a depth of the raw V ring
+        (``_value_ring_neighbor_updates``), and a page order or the
+        reversed order's lead of its clipped page
+        (``_page_order_neighbor_updates``)."""
         return {
             **self._partition_neighbor_updates(base, requested),
             **self._pdl_neighbor_updates(base, requested),
+            **self._prefetch_neighbor_updates(base, requested),
+            **self._release_lead_neighbor_updates(base, requested),
+            **self._value_ring_neighbor_updates(base, requested),
+            **self._page_order_neighbor_updates(base, requested),
         }
+
+    def _steps_onto_paired_knob(
+        self, base: FlatConfig, requested: FlatConfig, key: str, default: object
+    ) -> bool:
+        """Whether ``requested`` steps from ``base`` onto a value of the
+        paired option ``key`` other than ``default``, between two rows on
+        the paired schedule that hold one partition.
+
+        The steps of a page order, a lead of the clipped page, a ring depth
+        and a boundary prefetch share this: each takes what the value needs
+        of the row (``_slots``), and a step that also moves the partition is
+        the partition's."""
+        layout = self.generation._key_to_flat_indices
+        if key not in layout:
+            return False
+        schedule = layout[MMA_DAG_PASS_WARPS_KEY][0][0]
+        if any(
+            values[schedule] != MMA_DAG_PASS_WARPS_ATTENTION_PAIRED
+            for values in (base, requested)
+        ):
+            return False
+        slot = layout[key][0][0]
+        if requested[slot] == default or requested[slot] == base[slot]:
+            return False
+        if MMA_DAG_PARTITION_KEY in layout:
+            partition = layout[MMA_DAG_PARTITION_KEY][0][0]
+            if requested[partition] != base[partition]:
+                return False
+        return True
+
+    def _slots(self, needed: Mapping[str, object]) -> dict[int, object]:
+        """``needed`` by flat slot, for the options the search has."""
+        layout = self.generation._key_to_flat_indices
+        return {
+            layout[key][0][0]: value for key, value in needed.items() if key in layout
+        }
+
+    def _page_order_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a page order other than the source's with what it
+        needs, and onto a lead of the clipped page with the reversed walk it
+        belongs to.
+
+        The warp that sorts a unit's pages into bucketed order is the
+        control warp of a one-unit CTA that the value-metadata transport
+        and a persistent partition use, and the reversed walk runs without
+        that transport, on one unit per CTA and, where the grid holds more
+        units than SMs, on the persistent partitions as well: there a step
+        onto the walk keeps its row's partition
+        (``mma_dag_surface.page_order_needs``). Normalization repairs an order
+        without them to the source's (``paged_attention_page_order_reason``)
+        and never changes another knob, so from such a config the step
+        alone would be an alias of where it started. A lead names a place
+        in the reversed walk and nothing beside another order, where
+        normalization drops it: a step onto one takes that order too, as a
+        step onto a range skew takes the balanced partition. A step that
+        also moves the partition is the partition's.
+        """
+        generation = self.generation
+        layout = generation._key_to_flat_indices
+        if MMA_DAG_PAGE_ORDER_KEY not in layout:
+            return {}
+        updates: dict[int, object] = {}
+        order = layout[MMA_DAG_PAGE_ORDER_KEY][0][0]
+        named = requested[order]
+        if self._steps_onto_paired_knob(
+            base,
+            requested,
+            MMA_DAG_CLIPPED_PAGE_LEAD_KEY,
+            MMA_DAG_CLIPPED_PAGE_LEAD_DEFAULT,
+        ):
+            named = updates[order] = MMA_DAG_PAGE_ORDER_REVERSED
+        elif not self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_PAGE_ORDER_KEY, MMA_DAG_PAGE_ORDER_SOURCE
+        ):
+            return {}
+        facts = generation.config_spec.cute_mma_dag_facts
+        assert facts is not None
+        updates.update(self._slots(page_order_needs(facts.attention, named)))
+        return updates
+
+    def _value_ring_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a depth of the raw V ring with what it needs, on one
+        unit per CTA.
+
+        A deeper ring has no value-metadata actor, and its CTA must hold it
+        in the device's shared memory, which a persistent partition's query
+        stages can leave no room for. Normalization repairs a depth without
+        those to the default's (``paged_attention_value_ring_reason``) and
+        never changes another knob, so from such a config the step alone
+        would be an alias of where it started. A search samples a depth
+        with one unit per CTA alone
+        (``mma_dag_surface.SEARCHED_VALUE_RING_PARTITION``), so the step
+        takes that partition from a persistent one that has room as well.
+        A step that also moves the partition is the partition's: its row
+        holds the default depth (``_repair_value_ring``).
+        """
+        if not self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING
+        ):
+            return {}
+        generation = self.generation
+        layout = generation._key_to_flat_indices
+        ring = layout[MMA_DAG_VALUE_RING_KEY][0][0]
+        partition: object = MMA_DAG_PARTITION_ITEM
+        if MMA_DAG_PARTITION_KEY in layout:
+            partition = requested[layout[MMA_DAG_PARTITION_KEY][0][0]]
+        facts = generation.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.attention is not None
+        return self._slots(
+            {
+                **value_ring_needs(facts.attention, requested[ring], partition),
+                **SEARCHED_VALUE_RING_PARTITION,
+            }
+        )
+
+    def _repair_value_ring(self, flat_config: FlatConfig) -> None:
+        """Keep the raw V ring at its default depth in a row on a
+        persistent partition.
+
+        A search samples a deeper ring with one unit per CTA alone
+        (``mma_dag_surface.SEARCHED_VALUE_RING_PARTITION``): a step onto a
+        depth takes that partition (``_value_ring_neighbor_updates``), and
+        every other row that names a depth beside a persistent partition (a
+        draw, a step onto the partition, a seed or a cached config) is the
+        row of that partition at the default depth. The config contract
+        still admits a depth a persistent CTA holds: a config outside a
+        search keeps it, and so does a search under a fixed override of the
+        depth.
+        """
+        generation = self.generation
+        layout = generation._key_to_flat_indices
+        if (
+            self._decoding_partition
+            or MMA_DAG_VALUE_RING_KEY not in layout
+            or MMA_DAG_VALUE_RING_KEY in generation._override_values
+        ):
+            return
+        ring = layout[MMA_DAG_VALUE_RING_KEY][0][0]
+        if flat_config[ring] == PAIRED_DEFAULT_VALUE_RING:
+            return
+        if (
+            MMA_DAG_PARTITION_KEY not in generation._override_values
+            and MMA_DAG_PARTITION_SKEW_KEY not in generation._override_values
+            and MMA_DAG_PARTITION_KEY in layout
+            and flat_config[layout[MMA_DAG_PARTITION_KEY][0][0]]
+            == MMA_DAG_PARTITION_ITEM
+        ):
+            # Normalization moves no row off one unit per CTA, so without
+            # fixed overrides the slot is the row's partition. An override
+            # layered over the decoded row can move it: a range skew other
+            # than zero takes the balanced partition for every paired row
+            # (``mma_dag_surface.take_overridden_partition_transport``).
+            return
+        if self._decoded_partition(flat_config) != MMA_DAG_PARTITION_ITEM:
+            flat_config[ring] = PAIRED_DEFAULT_VALUE_RING
+
+    def _release_lead_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a lead of the tail release with the release it belongs
+        to.
+
+        The lead is that of the paired loader's tail release, which a config
+        has with the guarded capture policy alone. Normalization repairs a
+        lead without it to the release's own four pages
+        (``search_surface.release_lead_policy_reason``) and never changes
+        another knob, so from a config on another policy the step alone
+        would be an alias of where it started.
+
+        Where the requested config's tail release is not the loader's own
+        (one unit per CTA on a grid past one wave), a lead renders nothing
+        and the step takes nothing: the config it asks for is the kernel it
+        started from, and stays an alias of it (``_repair_release_lead``).
+        """
+        layout = self.generation._key_to_flat_indices
+        if MMA_DAG_RELEASE_LEAD_KEY not in layout:
+            return {}
+        # The step's own test, not ``_steps_onto_paired_knob``. What a lead
+        # takes is the capture policy, so both rows are held to the schedule
+        # that policy needs, as ``_pdl_neighbor_updates`` holds them. And a
+        # step that moves the partition as well still takes the policy: no
+        # partition excludes it, and whether the lead renders is asked of
+        # the partition the requested row decodes to.
+        if any(
+            values[layout[key][0][0]] != value
+            for values in (base, requested)
+            for key, value in PAIRED_CAPTURE_SCHEDULE.items()
+        ):
+            return {}
+        lead = layout[MMA_DAG_RELEASE_LEAD_KEY][0][0]
+        if (
+            requested[lead] == MMA_DAG_RELEASE_LEAD_DEFAULT
+            or requested[lead] == base[lead]
+        ):
+            return {}
+        if not self._release_lead_renders(requested):
+            return {}
+        return {
+            layout[key][0][0]: value
+            for key, value in CAPTURE_POLICY.items()
+            if key in layout
+        }
+
+    def _decoded_partition(self, flat_config: FlatConfig) -> object:
+        """The work partition of the config ``flat_config`` decodes to.
+
+        The row's own slot does not say: normalization repairs a persistent
+        partition that the row's transport cannot run to one unit per CTA,
+        and a fixed override is layered over the decoded row whatever the
+        slot holds. So the row is decoded, a copy of it and without the
+        repairs that ask (they change no option the partition depends on).
+        A row that does not decode is no candidate; it counts as one unit
+        per CTA.
+        """
+        generation = self.generation
+        if (
+            MMA_DAG_PARTITION_KEY not in generation._key_to_flat_indices
+            and MMA_DAG_PARTITION_KEY not in generation._override_values
+        ):
+            return MMA_DAG_PARTITION_ITEM
+        assert not self._decoding_partition
+        self._decoding_partition = True
+        try:
+            config = generation.unflatten(copy.deepcopy(flat_config))
+        except InvalidConfig:
+            return MMA_DAG_PARTITION_ITEM
+        finally:
+            self._decoding_partition = False
+        return config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+
+    def _release_lead_renders(self, flat_config: FlatConfig) -> bool:
+        """Whether a lead of the tail release can render for the paired
+        config ``flat_config`` decodes to
+        (``paged_attention_release_lead_renders`` of its partition)."""
+        facts = self.generation.config_spec.cute_mma_dag_facts
+        if facts is None or facts.attention is None:
+            return False
+        if not facts.attention.past_one_wave_units:
+            # Every partition of the kernel is one wave: no row to decode.
+            return paged_attention_release_lead_renders(
+                facts.attention, MMA_DAG_PARTITION_ITEM
+            )
+        return paged_attention_release_lead_renders(
+            facts.attention, self._decoded_partition(flat_config)
+        )
+
+    def _repair_release_lead(self, flat_config: FlatConfig) -> None:
+        """Keep the lead of the tail release at the release's own where it
+        renders nothing: one unit per CTA on a grid past one wave, whose
+        ``loader_tail`` config renders the automatic release.
+
+        The config contract keeps such a lead, as it keeps the release's
+        name, and every value of it is one kernel. A search that drew them
+        would compile each to find the code it already timed; here the rows
+        are one row, so a draw or a step onto such a lead is an alias of a
+        config the search has and takes no slot. Like the other repairs
+        this runs wherever a flat config is made or decoded, so a seed or a
+        cached config that names such a lead starts the search without it.
+        A fixed override keeps what it names.
+        """
+        generation = self.generation
+        layout = generation._key_to_flat_indices
+        if (
+            self._decoding_partition
+            or MMA_DAG_RELEASE_LEAD_KEY not in layout
+            or MMA_DAG_RELEASE_LEAD_KEY in generation._override_values
+        ):
+            return
+        lead = layout[MMA_DAG_RELEASE_LEAD_KEY][0][0]
+        if flat_config[lead] == MMA_DAG_RELEASE_LEAD_DEFAULT:
+            return
+        if not self._release_lead_renders(flat_config):
+            flat_config[lead] = MMA_DAG_RELEASE_LEAD_DEFAULT
+
+    def _prefetch_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a boundary prefetch with what its role needs.
+
+        The role is the control warp of a one-unit CTA that the
+        value-metadata transport and a balanced partition's merge helper
+        use, and on a grid of fewer units than SMs it serves the units that
+        wait for the previous launch's SMs, which takes the capture contract
+        with the release from the loader's tail. Normalization repairs a
+        prefetch without them to none
+        (``paged_attention_boundary_prefetch_reason``,
+        ``search_surface.boundary_prefetch_policy_reason``) and never
+        changes another knob, so from most configs the step alone would be
+        an alias of where it started. A step that also moves the partition
+        is the partition's.
+        """
+        if not self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_BOUNDARY_PREFETCH_KEY, 0
+        ):
+            return {}
+        facts = self.generation.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.attention is not None
+        return self._slots(
+            boundary_prefetch_needs(facts.attention.boundary_prefetch_form)
+        )
 
     def _partition_neighbor_updates(
         self, base: FlatConfig, requested: FlatConfig
@@ -1372,10 +1704,18 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         """Make a random or mutated flat config one the normalization keeps:
         a proved paired kernel's dependent-launch policy at its default where
         the search does not own it, the packet prefetch, the reduction
-        pipeline and sequence, the thread layouts and the store policy."""
+        pipeline and sequence, the thread layouts and the store policy.
+
+        Two repairs are a search's aliasing rules instead: a row the config
+        contract can keep becomes the row at the option's default, for a
+        lead of the tail release where it renders nothing
+        (``_repair_release_lead``) and for a deeper raw V ring on a
+        persistent partition (``_repair_value_ring``)."""
         self._keep_capture_policy(flat_config)
+        self._repair_release_lead(flat_config)
         self._repair_packet_prefetch(flat_config)
         self._repair_reduction_pipeline_depth(flat_config)
+        self._repair_value_ring(flat_config)
         self._repair_reduction_sequence(flat_config)
         self._repair_thread_layouts(flat_config)
         # Last: it reads the vector widths the other repairs leave.

@@ -43,6 +43,7 @@ from ._paged_attention_runtime import _packed_scale_layout_supported
 from ._paged_attention_runtime import enqueue_paged_tma_operand
 from ._paged_attention_runtime import stage_scaled_s8_rows_to_tmem
 from ._paged_attention_runtime import stage_scaled_s8_transpose_to_tmem
+from .paged_attention_page_order import ReversedWalk
 
 
 @cute.jit
@@ -50,13 +51,48 @@ def attention_page_coordinates(
     first: cutlass.Int64,
     last: cutlass.Int64,
     step: cutlass.Int64,
-    reflected_dtype: cutlass.Constexpr = None,
+    page_walk: cutlass.Constexpr = None,
 ) -> tuple[cutlass.Int64, cutlass.Int64]:
-    """Keep typed source reflection and key-width multiplication before widening."""
-    iteration = first + step
+    """The logical page and key base of step ``step`` of a walk over the
+    pages ``[first, last)``: the one mapping the loader, the softmax's
+    masks, a boundary prefetch and the value-metadata actor share, so that
+    a step is the same tile to all of them.
+
+    ``page_walk`` names the walk (``paged_attention_page_order.PageWalk``).
+    ``None`` is the source's loop, oldest page first. A dtype is the
+    source's own typed reflection
+    ``first + last - 1 - iteration``: keep that reflection and the
+    key-width multiplication typed before widening. A ``ReversedWalk`` is
+    ``cute_mma_dag_page_order="reversed"`` over a source whose loop is not
+    reflected: the iterations of that loop newest first, ``last - 1 -
+    step``, each with the page and the Int64 key base the loop gives it.
+    With a clipped-page lead of ``p > 1`` the walk takes the oldest page,
+    ``first``, when it has ``p`` pages left: at step ``max(last - first -
+    p, 0)``, so a walk of fewer pages takes it first, and every later step
+    takes the page one newer than the plain reversal's. Either way the
+    steps ``[0, last - first)`` take each page of the range once. A step
+    outside them has no page: the result is defined and the caller's own
+    range test discards it (a prefetch evaluates its fixed depth of steps
+    for a unit of any length).
+    """
+    if cutlass.const_expr(not isinstance(page_walk, ReversedWalk)):
+        iteration = first + step
+    else:
+        iteration = last - cutlass.Int64(1) - step
+        if cutlass.const_expr(page_walk.clipped_page_lead > 1):
+            clipped_step = last - first - page_walk.clipped_page_lead
+            if clipped_step < 0:
+                clipped_step = cutlass.Int64(0)
+            if step == clipped_step:
+                iteration = first
+            if step > clipped_step:
+                iteration = iteration + cutlass.Int64(1)
     page = iteration
     key_base = iteration * 128
-    if cutlass.const_expr(reflected_dtype is not None):
+    if cutlass.const_expr(
+        page_walk is not None and not isinstance(page_walk, ReversedWalk)
+    ):
+        reflected_dtype = page_walk
         total = reflected_dtype(reflected_dtype(first) + reflected_dtype(last))
         prefix = reflected_dtype(total - reflected_dtype(1))
         token = reflected_dtype(cutlass.Int64(prefix) - iteration)

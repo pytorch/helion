@@ -55,8 +55,9 @@ def observed_wait_modes() -> Iterator[list[WaitMode]]:
         before: CaptureSnapshot,
         effects: LaunchEffects,
         parameter_sizes: tuple[int, ...],
+        **options: int,
     ) -> WaitMode:
-        mode = finish(driver, guard, before, effects, parameter_sizes)
+        mode = finish(driver, guard, before, effects, parameter_sizes, **options)
         modes.append(mode)
         return mode
 

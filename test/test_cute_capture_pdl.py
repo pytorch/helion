@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from helion.runtime.cute import capture_pdl_launch
+from helion.runtime.cute.capture_pdl import WAIT_MODE_HEAD_START_LIMIT
+from helion.runtime.cute.capture_pdl import WAIT_MODE_HEAD_START_SHIFT
 from helion.runtime.cute.capture_pdl import CaptureGuard
 from helion.runtime.cute.capture_pdl import CaptureKey
 from helion.runtime.cute.capture_pdl import Dependency
@@ -16,11 +18,13 @@ from helion.runtime.cute.capture_pdl import LaunchEffects
 from helion.runtime.cute.capture_pdl import StorageRange
 from helion.runtime.cute.capture_pdl import WaitMode
 from helion.runtime.cute.capture_pdl import storage_union
+from helion.runtime.cute.capture_pdl import wait_mode_argument
 from helion.runtime.cute.capture_pdl_cuda import CaptureSnapshot
 from helion.runtime.cute.capture_pdl_cuda import CudaCaptureDriver
 from helion.runtime.cute.capture_pdl_cuda import _Edge
 from helion.runtime.cute.capture_pdl_cuda import _KernelParams
 from helion.runtime.cute.capture_pdl_cuda import finish_capture_launch
+from helion.runtime.cute.capture_pdl_cuda import head_start
 
 pytestmark = pytest.mark.cpu_only
 KEY = CaptureKey(context=1, thread=2, stream=3, capture_id=4, graph=5)
@@ -167,6 +171,118 @@ class FakeCaptureDriver:
         assert parameter_sizes[-1] == 4
         self.patches.append((node, mode))
         return self.patch_succeeds
+
+
+def test_the_wait_mode_argument_holds_a_head_start_above_the_mode():
+    # The mode alone is the argument every kernel got before, and an early
+    # launch, which overlaps nothing, never has a head start.
+    assert wait_mode_argument(WaitMode.EARLY) == 0
+    assert wait_mode_argument(WaitMode.EARLY, 20) == 0
+    assert wait_mode_argument(WaitMode.BEFORE_WRITES) == 1
+    assert wait_mode_argument(WaitMode.BEFORE_WRITES, 20) == 1 | 20 << 8
+    # Any argument but zero is BEFORE_WRITES to a kernel that tests the mode.
+    assert WAIT_MODE_HEAD_START_SHIFT == 8
+    for count in (-3, 0):
+        assert wait_mode_argument(WaitMode.BEFORE_WRITES, count) == 1
+    largest = wait_mode_argument(WaitMode.BEFORE_WRITES, 2**40)
+    assert largest == 1 | (WAIT_MODE_HEAD_START_LIMIT - 1) << 8 < 2**31
+
+
+class LaunchingCaptureDriver(FakeCaptureDriver):
+    """A capture whose kernel nodes report a function and a grid."""
+
+    def __init__(self, after, dependencies, launches):
+        super().__init__(after, dependencies)
+        self.launches = launches
+
+    def kernel_launch(self, node):
+        return self.launches.get(node)
+
+
+# One predecessor each: the same kernel on 128, 148 and 200 CTAs, another
+# kernel, and a node whose launch cannot be read.
+@pytest.mark.parametrize(
+    "ahead,expected",
+    [((7, 128), 20), ((7, 148), 0), ((7, 200), 0), ((9, 128), 0), (None, 0)],
+)
+def test_a_head_start_is_what_a_launch_of_the_same_kernel_left_idle(ahead, expected):
+    driver = LaunchingCaptureDriver(None, (), {1: ahead, 2: (7, 128)})
+    assert head_start(driver, 2, 1, 148) == expected
+    # The launch's own grid does not matter: its first CTAs take what is idle.
+    driver.launches[2] = (7, 100)
+    assert head_start(driver, 2, 1, 148) == expected
+    driver.launches[2] = None
+    assert head_start(driver, 2, 1, 148) == 0
+
+
+@pytest.mark.parametrize("sms", [0, 148])
+def test_the_head_start_is_installed_only_for_a_kernel_that_reads_it(sms):
+    guard = CaptureGuard()
+    launch(guard, 1, None, writes=(X,))
+    driver = LaunchingCaptureDriver(
+        CaptureSnapshot(KEY, frozenset((1, 2))),
+        (Dependency(1, 1, 0, 1),),
+        {1: (7, 128), 2: (7, 128)},
+    )
+    options = {"head_start_sms": sms} if sms else {}
+    mode = finish_capture_launch(
+        driver,
+        guard,
+        CaptureSnapshot(KEY, frozenset((1,))),
+        LaunchEffects((), (Y,)),
+        (8, 4),
+        **options,
+    )
+    # The mode, and with it the proof state, is the same either way.
+    assert mode == WaitMode.BEFORE_WRITES
+    assert driver.patches == [(2, 1 | 20 << 8 if sms else 1)]
+    assert guard.captures[KEY][2] == (X, Y)
+    # A launch that keeps the early wait gets no argument at all.
+    early = LaunchingCaptureDriver(
+        CaptureSnapshot(KEY, frozenset((1, 2, 3))), (), {3: (7, 128)}
+    )
+    assert (
+        finish_capture_launch(
+            early,
+            guard,
+            CaptureSnapshot(KEY, frozenset((1, 2))),
+            LaunchEffects((), (Y,)),
+            (8, 4),
+            **options,
+        )
+        == WaitMode.EARLY
+    )
+    assert not early.patches
+
+
+def test_a_kernel_nodes_launch_is_its_function_and_grid():
+    nodes = {
+        7: _KernelParams(func=55, grid_x=128, grid_y=1, grid_z=1),
+        8: _KernelParams(func=0, kernel=66, grid_x=4, grid_y=3, grid_z=2),
+        9: _KernelParams(func=0, kernel=0, grid_x=1, grid_y=1, grid_z=1),
+    }
+
+    def node_type(node, output):
+        ctypes.cast(output, ctypes.POINTER(ctypes.c_int))[0] = 0 if node in nodes else 1
+        return 0
+
+    def get_params(node, output):
+        if node == 10:
+            return 1
+        ctypes.memmove(output, ctypes.byref(nodes[node]), ctypes.sizeof(_KernelParams))
+        return 0
+
+    driver = object.__new__(CudaCaptureDriver)
+    driver.library = SimpleNamespace(
+        cuGraphNodeGetType=node_type, cuGraphKernelNodeGetParams_v2=get_params
+    )
+    assert driver.kernel_launch(7) == (55, 128)
+    assert driver.kernel_launch(8) == (66, 24)
+    # No function to compare, a node that is no kernel, a failed query.
+    assert driver.kernel_launch(9) is None
+    assert driver.kernel_launch(11) is None
+    nodes[10] = nodes[7]
+    assert driver.kernel_launch(10) is None
 
 
 def test_post_capture_proof_patches_the_unique_actual_node():
@@ -551,6 +667,60 @@ def test_capturing_launch_with_a_proved_grid_and_suffix_reaches_the_storage_walk
         )
 
 
+class _StoredCudaTensor(_CudaTensor):
+    """Its storage is one allocation, so the launch passes the storage walk."""
+
+    def untyped_storage(self):
+        return SimpleNamespace(data_ptr=lambda: 4096, nbytes=lambda: 64)
+
+
+@pytest.mark.parametrize("asks", [False, True])
+def test_only_a_kernel_that_asks_gets_the_devices_sm_count(
+    asks, capturing, monkeypatch
+):
+    # A kernel whose plan does not ask for a head start gets the argument it
+    # got before: its pending launch carries no SM count, and the device is
+    # not even queried for one.
+    kernel = _contract_kernel()
+    kernel._helion_cute_last_launch_cache = SimpleNamespace(
+        launch=SimpleNamespace(schema=[("tensor", 0, 0, 0, 0)])
+    )
+    if asks:
+        kernel._helion_cute_wrapper_plans[0]["capture_pdl_head_start"] = True
+    before = CaptureSnapshot(KEY, frozenset((1,)))
+    queried = []
+
+    @contextmanager
+    def device_context(device):
+        yield
+
+    def properties(device):
+        queried.append(device)
+        return SimpleNamespace(multi_processor_count=148)
+
+    monkeypatch.setattr(
+        capture_pdl_launch._LOCAL,
+        "driver",
+        SimpleNamespace(snapshot=lambda stream: before),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        capture_pdl_launch._LOCAL, "guard", CaptureGuard(), raising=False
+    )
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: SimpleNamespace(cuda_stream=3)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    pending = capture_pdl_launch.prepare_capture_launch(
+        kernel, (torch.empty(1).as_subclass(_StoredCudaTensor),), (128,)
+    )
+    assert pending is not None and pending.before is before
+    assert pending.parameter_sizes == (8, 128, 128, 128, 128, 4)
+    assert pending.head_start_sms == (148 if asks else 0)
+    assert queried == ([torch.device("cuda", 0)] if asks else [])
+
+
 def test_eager_launch_leaves_before_the_remaining_validation(monkeypatch):
     # Every eager launch of a kernel with the contract pays for this path,
     # so it ends at the capture test: neither the launch cache, the grid, the
@@ -641,7 +811,7 @@ def test_pending_launch_restores_its_device_for_snapshot_and_mode_update(monkeyp
         finally:
             current[0] = previous
 
-    def finish(driver, guard, before, effects, sizes):
+    def finish(driver, guard, before, effects, sizes, *, head_start_sms):
         assert current[0] == launch_device
         events.append((driver, guard, before, effects, sizes))
 
@@ -660,3 +830,14 @@ def test_pending_launch_restores_its_device_for_snapshot_and_mode_update(monkeyp
     pending.finish()
     assert len(events) == 1
     assert current[0] == torch.device("cuda:1")
+    # Every launch passes its head-start SM count: the device's for a kernel
+    # that reads its head start, zero for any other.
+    asked = []
+    monkeypatch.setattr(
+        capture_pdl_launch,
+        "finish_capture_launch",
+        lambda *args, **options: asked.append((len(args), options)),
+    )
+    replace(pending, head_start_sms=148).finish()
+    pending.finish()
+    assert asked == [(5, {"head_start_sms": 148}), (5, {"head_start_sms": 0})]

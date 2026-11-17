@@ -6,8 +6,10 @@ and optionally classify value metadata.
 Physical warp modulo four selects the TMEM row quarter, so all eight converter
 warps keep their full groups. Named barriers 1/2 and 3/4 belong to the separate
 compute groups. Register quotas stay inside disjoint branches, each taken by
-whole warpgroups from one instruction: 144 for compute, 72 for conversion and
-48 for all four control warps (61,440 total).
+whole warpgroups from one instruction: by default 144 for compute, 72 for
+either conversion and 48 for all four control warps, which is the CTA's whole
+launch pool (640 threads at 96 registers: 61,440). ``register_quotas`` names
+another split of that pool in the same role order.
 Optional barrier 5 retires the allocation before output stores: both 128-thread
 compute groups arrive after their final reads and the 32-thread QK role frees it.
 Every role then returns when its own work ends; without that retirement, or
@@ -31,6 +33,11 @@ A persistent partition runs several units (work items) in one CTA. The loader,
 the QK issuer and the compute groups then walk the CTA's units and run their
 helper once per unit; the conversion warps and the PV issuer follow the page
 stream and only need its total length. All barriers keep cycling across units.
+The roles keep their warps, so each takes the register quota of the role it
+extends and every split of the pool fits a persistent CTA as it fits a
+one-unit CTA: the walking compute groups the compute quota, the conversion
+warps theirs, and the loader, the issuers and the spare warp the control
+quota.
 A compute group is the only role that stops at a unit boundary: it stores the
 unit's outputs and resets its panels and row state while the other roles
 already stage the next unit's first pages. Every unit's queries go into one
@@ -65,13 +72,41 @@ workspace only behind the launch's dependency wait. The CTA's spare warp,
 which has no other work on this schedule, makes the arrival of the one
 part per CTA that is not its unit's lowest, so that the compute group does
 not stall the stream behind it for the arrival's memory round trip.
+
+The loader stages two pages of raw K and, by default, two of raw V per head;
+``value_ring`` names another depth of the raw V ring, whose slots and
+barriers the loader and the V conversion warps then take in turns of that
+depth. The body's shared memory is one table
+(``paged_attention_shared_memory``), which the config contract replays
+against the device before it admits a depth.
+
+With one unit per CTA and without the value-metadata transport that warp is
+idle, and a bucketed page order gives it a role
+(``_paged_attention_page_order``): it sorts the unit's interior pages by
+the region of the pool they lie in and hands the order to the loader at one
+more pipeline barrier, behind the loader's first pages. A unit of no more
+pages than those has no step that could take the order, and its loader
+does not wait for the warp.
+
+A reversed page order has no role and no state of its own: it is another
+mapping from a work item's step to its page and key base
+(``attention_page_coordinates``), which the loader, the compute groups and
+a boundary prefetch all take from the one walk the body hands them, so a
+step is the same tile to each.
+
+A boundary prefetch gives that warp a role as well, behind the sort
+(``_paged_attention_prefetch``): it requests the first K pages of a unit
+that has not started into L2. Where the unit served is the one that takes
+over this CTA's SM, the requests wait at one more pipeline barrier, at which
+the loader arrives behind its last request. Only some lanes of the warp
+serve a unit: where the body ends with its all-thread join, the join waits
+for them, as a barrier waits for the lanes of its warp.
 """
 
 from __future__ import annotations
 
 import math
 from types import SimpleNamespace
-from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -86,7 +121,12 @@ from ._paged_attention_compute import normalize_output
 from ._paged_attention_compute import output_normalization_factor
 from ._paged_attention_io import load_query_element
 from ._paged_attention_io import store_output_element
+from ._paged_attention_io import store_output_rows
 from ._paged_attention_io import store_row_element
+from ._paged_attention_page_order import SPAN_FIRST
+from ._paged_attention_page_order import SPAN_STOP
+from ._paged_attention_page_order import SPAN_WORDS
+from ._paged_attention_page_order import order_unit_pages
 from ._paged_attention_partial_compute import load_query_panel
 from ._paged_attention_partial_compute import mma_128xnx128
 from ._paged_attention_partial_compute import online_softmax_per_key
@@ -98,7 +138,6 @@ from ._paged_attention_partition import MAIL_LAST
 from ._paged_attention_partition import MAIL_LOWEST
 from ._paged_attention_partition import MAIL_NONE
 from ._paged_attention_partition import MAIL_PARTS
-from ._paged_attention_partition import MAIL_WORDS
 from ._paged_attention_partition import PART_MERGE
 from ._paged_attention_partition import PART_MERGE_PAIR
 from ._paged_attention_partition import PART_POST
@@ -112,7 +151,6 @@ from ._paged_attention_partition import PLAN_LAST
 from ._paged_attention_partition import PLAN_PAGES
 from ._paged_attention_partition import PLAN_SKEW
 from ._paged_attention_partition import PLAN_SLOTS
-from ._paged_attention_partition import PLAN_WORDS
 from ._paged_attention_partition import POST_BARRIER
 from ._paged_attention_partition import POST_THREADS
 from ._paged_attention_partition import POSTED_BARRIER
@@ -126,7 +164,6 @@ from ._paged_attention_partition import WALK_POSTED
 from ._paged_attention_partition import WALK_ROLE
 from ._paged_attention_partition import WALK_STEP
 from ._paged_attention_partition import WALK_UNIT
-from ._paged_attention_partition import WALK_WORDS
 from ._paged_attention_partition import arrive_part
 from ._paged_attention_partition import merge_pair_other
 from ._paged_attention_partition import merge_pair_own
@@ -135,13 +172,13 @@ from ._paged_attention_partition import merge_parts
 from ._paged_attention_partition import pair_partial
 from ._paged_attention_partition import partition_plan
 from ._paged_attention_partition import partition_scan
-from ._paged_attention_partition import plan_geometry
 from ._paged_attention_partition import post_parts
 from ._paged_attention_partition import split_arrival
 from ._paged_attention_partition import store_part
 from ._paged_attention_partition import unit_page_count
 from ._paged_attention_partition import unit_segment
 from ._paged_attention_partition import workspace_address
+from ._paged_attention_prefetch import prefetch_boundary_units
 from ._paged_attention_reference_compute import online_softmax_reference
 from ._paged_attention_runtime import _load_words4
 from ._paged_attention_runtime import _packed_scale_layout_supported
@@ -151,6 +188,29 @@ from ._paged_attention_runtime import stage_positive_zero_value_tile
 from ._paged_attention_runtime import stage_scaled_s8_rows_to_tmem
 from ._paged_attention_runtime import stage_scaled_s8_transpose_to_tmem
 from .device.warp_reduce import warp_row_sum
+from .paged_attention_page_order import MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_BUCKETED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_CHOICES
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
+from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from .paged_attention_page_order import PAGE_ORDER_CAPACITY
+from .paged_attention_page_order import PAGE_ORDER_HEAD
+from .paged_attention_page_order import ReversedWalk
+from .paged_attention_registers import PAIRED_DEFAULT_REGISTER_QUOTAS
+from .paged_attention_registers import paired_register_quotas_reason
+from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import KEY_RING_PAGES
+from .paged_attention_shared_memory import MAIL_WORDS
+from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
+from .paged_attention_shared_memory import PLAN_WORDS
+from .paged_attention_shared_memory import WALK_WORDS
+from .paged_attention_shared_memory import WHOLE_UNIT_WORDS
+from .paged_attention_shared_memory import SharedArray
+from .paged_attention_shared_memory import pipeline_barrier_plan
+from .paged_attention_shared_memory import pipeline_parts
+from .paged_attention_shared_memory import pipeline_shared_bytes
+from .paged_attention_shared_memory import pipeline_shared_memory
+from .paged_attention_shared_memory import plan_geometry
 
 
 @cute.jit
@@ -306,7 +366,7 @@ def _compute_pages(
     query_columns: cutlass.Constexpr,
     reference_scores: cutlass.Constexpr,
     base2_scores: cutlass.Constexpr,
-    reflected_dtype: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
     coefficients_capped: cutlass.Constexpr,
     probability_schedule: cutlass.Constexpr,
@@ -333,7 +393,7 @@ def _compute_pages(
             assert walk is not None
             step0 = cutlass.Int64(cutlass.Int32(walk[WALK_STEP]))
         _logical_page, logical_key_base = attention_page_coordinates(
-            first_page, last_page, step0 + step, reflected_dtype
+            first_page, last_page, step0 + step, page_walk
         )
         _wait_non_mma(qk_done, (phase + step) & 1, sleep_waits)
         prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
@@ -675,26 +735,53 @@ def _compute_store(
     maximum_output: cute.Tensor | None,
     denominator_output: cute.Tensor | None,
     statistic_layouts: cutlass.Constexpr,
+    store_policy: cutlass.Constexpr = "default",
 ) -> None:
-    """Store a work item's outputs for ``tile`` from its O panel and row state."""
-    for query in cutlass.range_constexpr(query_columns):
-        if cutlass.const_expr(query < query_rows):
+    """Store a work item's outputs for ``tile`` from its O panel and row state.
+
+    ``store_policy`` is the config's ``cute_store_policy``. ``streaming``
+    stores the O elements with the streaming cache operator and
+    ``l2_evict_last`` with the L2 evict-last cache hint, under one policy
+    word the thread makes ahead of its stores: the same values at the same
+    addresses, as many stores in the same order (``store_output_rows``),
+    each value formed ahead of the first store, since a store's instruction
+    is opaque to the compiler and would keep the rows' loads apart.
+    ``default`` keeps the plain stores, and the per-row stores (LSE, raw
+    statistics) are plain under each policy.
+    """
+    if cutlass.const_expr(store_policy != "default"):
+        values = []
+        for query in cutlass.range_constexpr(query_rows):
             if cutlass.const_expr(maximum_output is not None):
-                value = cutlass.Float32(result[query])
+                values.append(cutlass.Float32(result[query]))
             else:
-                value = cutlass.BFloat16(
+                values.append(
                     normalize_output(result[query], state[3, query], output_reciprocal)
                 )
-            store_output_element(
-                output,
-                tile,
-                query,
-                thread,
-                value,
-                heads,
-                group,
-                io_layouts,
-            )
+        store_output_rows(
+            output, tile, thread, tuple(values), heads, group, io_layouts, store_policy
+        )
+    else:
+        for query in cutlass.range_constexpr(query_columns):
+            if cutlass.const_expr(query < query_rows):
+                if cutlass.const_expr(maximum_output is not None):
+                    value = cutlass.Float32(result[query])
+                else:
+                    value = cutlass.BFloat16(
+                        normalize_output(
+                            result[query], state[3, query], output_reciprocal
+                        )
+                    )
+                store_output_element(
+                    output,
+                    tile,
+                    query,
+                    thread,
+                    value,
+                    heads,
+                    group,
+                    io_layouts,
+                )
     if cutlass.const_expr(maximum_output is not None):
         assert maximum_output is not None and denominator_output is not None
         if thread < query_rows:
@@ -740,6 +827,7 @@ def _compute_group(
     query_columns: cutlass.Constexpr,
     probability_schedule: cutlass.Constexpr,
     output_offset: cutlass.Constexpr,
+    compute_registers: cutlass.Constexpr,
 ) -> tuple[
     cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Int32 | None
 ]:
@@ -747,7 +835,7 @@ def _compute_group(
     this thread's index, warp and lane in its group of 128 with the TMEM
     addresses of the group's O panel and, under the TMEM probability
     schedule, of its denominators."""
-    cute.arch.setmaxregister_increase(144)
+    cute.arch.setmaxregister_increase(compute_registers)
     thread = cute.arch.thread_idx()[0] % 128
     warp = cute.arch.make_warp_uniform(thread // 32)
     lane = thread % 32
@@ -797,7 +885,7 @@ def _compute_head(
     io_layouts: cutlass.Constexpr,
     reference_scores: cutlass.Constexpr,
     base2_scores: cutlass.Constexpr,
-    reflected_dtype: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
     output_reciprocal: cutlass.Constexpr,
     output_scale_log2: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
@@ -812,10 +900,12 @@ def _compute_head(
     early_tmem_retirement: cutlass.Constexpr,
     headwide_rescale: cutlass.Constexpr,
     key_clip: cutlass.Constexpr,
+    compute_registers: cutlass.Constexpr,
+    store_policy: cutlass.Constexpr = "default",
 ) -> None:
     """Run one compute group over the CTA's work item and store its outputs."""
     thread, warp, lane, output_address, denominator_address = _compute_group(
-        base, query_columns, probability_schedule, output_offset
+        base, query_columns, probability_schedule, output_offset, compute_registers
     )
     partials, reference_invalid = _compute_begin(
         output_address,
@@ -855,7 +945,7 @@ def _compute_head(
         query_columns,
         reference_scores,
         base2_scores,
-        reflected_dtype,
+        page_walk,
         sleep_waits,
         coefficients_capped,
         probability_schedule,
@@ -909,6 +999,7 @@ def _compute_head(
         maximum_output,
         denominator_output,
         statistic_layouts,
+        store_policy,
     )
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
 
@@ -953,7 +1044,7 @@ def _compute_units(
     io_layouts: cutlass.Constexpr,
     reference_scores: cutlass.Constexpr,
     base2_scores: cutlass.Constexpr,
-    reflected_dtype: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
     output_reciprocal: cutlass.Constexpr,
     output_scale_log2: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
@@ -968,6 +1059,8 @@ def _compute_units(
     early_tmem_retirement: cutlass.Constexpr,
     headwide_rescale: cutlass.Constexpr,
     key_clip: cutlass.Constexpr,
+    compute_registers: cutlass.Constexpr,
+    store_policy: cutlass.Constexpr = "default",
 ) -> None:
     """Run one compute group over the CTA's units and store each unit's outputs.
 
@@ -1000,7 +1093,7 @@ def _compute_units(
     synchronization of its own.
     """
     thread, warp, lane, output_address, denominator_address = _compute_group(
-        base, query_columns, probability_schedule, output_offset
+        base, query_columns, probability_schedule, output_offset, compute_registers
     )
     phase = cutlass.Int32(0)
     unit = first_unit
@@ -1091,7 +1184,7 @@ def _compute_units(
             query_columns,
             reference_scores,
             base2_scores,
-            reflected_dtype,
+            page_walk,
             sleep_waits,
             coefficients_capped,
             probability_schedule,
@@ -1265,6 +1358,7 @@ def _compute_units(
                 maximum_output,
                 denominator_output,
                 statistic_layouts,
+                store_policy,
             )
         # Only the parity of the pages streamed so far selects a phase.
         phase = (phase + cutlass.Int32(count & 1)) & 1
@@ -1338,8 +1432,30 @@ def _compute_units(
                 maximum_output,
                 denominator_output,
                 statistic_layouts,
+                store_policy,
             )
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
+
+
+def _ring_slot(
+    step: cutlass.Int64 | int, head: cutlass.Int32 | int, depth: int
+) -> cutlass.Int64 | cutlass.Int32 | int:
+    """The slot of a raw ring of ``depth`` pages per head, K's or V's, that
+    the stream's step ``step`` stages head ``head`` in: the pages take the
+    depth's slots in turn, two heads each. Plain Python over a static depth,
+    so each call traces the expression of its depth alone, the default's
+    unchanged."""
+    if depth == PAIRED_DEFAULT_VALUE_RING:
+        return 2 * (step & 1) + head
+    return 2 * (step % depth) + head
+
+
+def _ring_phase(step: cutlass.Int64 | int, depth: int) -> cutlass.Int64 | int:
+    """The phase of that slot's barriers at step ``step``: its parity counts
+    the earlier steps that used the slot."""
+    if depth == PAIRED_DEFAULT_VALUE_RING:
+        return step // 2 & 1
+    return (step // depth) & 1
 
 
 @cute.jit
@@ -1434,13 +1550,20 @@ def _enqueue_operand_tile(
     metadata_ready: cute.Pointer | None = None,
     metadata_flags: cute.Tensor | None = None,
     key: cutlass.Int32 = cutlass.Int32(0),  # noqa: B008
+    depth: cutlass.Constexpr = PAIRED_DEFAULT_VALUE_RING,
 ) -> None:
-    ring = 2 * (step & 1) + pair_head
+    """Request one raw tile of the stream's step ``step`` into its slot of a
+    ring of ``depth`` pages per head, once the slot is free."""
+    # The value-metadata actor walks the ring at its default depth.
+    assert cutlass.const_expr(
+        depth == PAIRED_DEFAULT_VALUE_RING or metadata_ready is None
+    )
+    ring = _ring_slot(step, pair_head, depth)
     if cutlass.const_expr(metadata_ready is not None):
         # Acquiring metadata also acquires the preceding raw-free phase. The
         # loader retains the original V order for every lag/drain schedule.
-        assert metadata_flags is not None
-        _wait_non_mma(metadata_ready + ring, step // 2 & 1, sleep_waits)
+        assert metadata_ready is not None and metadata_flags is not None
+        _wait_non_mma(metadata_ready + ring, _ring_phase(step, depth), sleep_waits)
         flag = metadata_flags[ring]
         if flag == 1:
             prims.mbarrier_arrive(ready + ring)
@@ -1472,7 +1595,7 @@ def _enqueue_operand_tile(
                 include_scales=False,
             )
     else:
-        _wait_non_mma(free + ring, (step // 2 & 1) ^ 1, sleep_waits)
+        _wait_non_mma(free + ring, _ring_phase(step, depth) ^ 1, sleep_waits)
         enqueue_paged_tma_operand(
             operand_map,
             scale_map,
@@ -1488,203 +1611,26 @@ def _enqueue_operand_tile(
         )
 
 
-def _pipeline_barriers(
-    value_metadata: bool, query_stages: int = 0
-) -> tuple[tuple[str, int, int], ...]:
-    """The pipeline barriers in block order, as ``(name, width, arrivals)``.
-
-    One barrier per raw ring slot (four) or per head (two), each initialized
-    to ``arrivals``; the value-metadata transport adds its four. A persistent
-    partition adds one barrier per query stage for the copies' completion
-    and one for the QK role's release of the stage: its loader requests
-    the queries of every unit but the first, so the stages' barriers are
-    among those it initializes.
-    """
-    barriers = (
-        ("raw_k_ready", 4, 1),
-        ("raw_k_free", 4, 4),
-        ("raw_v_ready", 4, 1),
-        ("raw_v_free", 4, 128 if value_metadata else 4),
-        ("key_ready", 2, 4),
-        ("key_free", 2, 1),
-        ("value_ready", 2, 4),
-        ("value_free", 2, 1),
-        ("score_free", 2, 4),
-        ("score_ready", 2, 1),
-        ("probability_ready", 2, 4),
-        ("pv_done", 2, 1),
-    )
-    assert not (value_metadata and query_stages)
-    if value_metadata:
-        barriers += (("metadata_ready", 4, 32),)
-    if query_stages:
-        barriers += (
-            ("query_ready", query_stages, 1),
-            ("query_free", query_stages, 1),
-        )
-    return barriers
-
-
-def _pipeline_barrier_plan(
-    value_metadata: bool,
-    query_stages: int = 0,
-) -> tuple[dict[str, int], int, tuple[tuple[tuple[int, int], ...], ...]]:
-    """Where each pipeline barrier lies and how the block is initialized.
-
-    Returns the first slot of every entry of ``_pipeline_barriers``, the
-    block's slot count and its initialization rounds. The block is padded to
-    whole rounds of 32 so that every lane of the initializing warp executes
-    each round's instruction and the rounds never diverge. A round holds the
-    arrival counts of its 32 slots as ``(count - 1, signed lane mask)`` terms.
-    """
-    offsets: dict[str, int] = {}
-    counts: list[int] = []
-    for name, width, arrivals in _pipeline_barriers(value_metadata, query_stages):
-        offsets[name] = len(counts)
-        counts += [arrivals] * width
-    counts += [1] * (-len(counts) % 32)
-    rounds = []
-    for start in range(0, len(counts), 32):
-        terms = []
-        for value in sorted(set(counts[start : start + 32]) - {1}):
-            mask = sum(1 << lane for lane in range(32) if counts[start + lane] == value)
-            terms.append((value - 1, mask - (1 << 32) if mask >= 1 << 31 else mask))
-        rounds.append(tuple(terms))
-    return offsets, len(counts), tuple(rounds)
-
-
-class _SharedArray(NamedTuple):
-    """One shared-memory array of the paired body: its name there, element
-    type, element count and byte alignment, and the optional part of the
-    body it belongs to (``None``: every body allocates it)."""
-
-    name: str
-    dtype: type[cutlass.Numeric]
-    count: int
-    alignment: int
-    guard: str | None = None
-
-
-def _pipeline_shared_memory(
-    query_columns: int,
-    value_metadata: bool,
-    query_stages: int = 0,
-    units: int = 0,
-    balanced: bool = False,
-) -> tuple[_SharedArray, ...]:
-    """The paired body's shared memory, one entry per array in allocation
-    order.
-
-    Four raw K and four raw V pages of 16 KiB with their scales, the query
-    and probability panels and the per-head state and scratch rows of both
-    heads, the role slot and one block for every pipeline barrier
-    (``_pipeline_barrier_plan``). A query map adds its barrier and the
-    value-metadata transport its flags. A persistent partition of ``units``
-    units and ``query_stages`` query stages (both zero with one unit per
-    CTA) has a query panel per stage and the stages' barriers in the block,
-    and adds each compute group's walk record, the plan tables (a word per
-    scanning thread and one per warp), the plan and, where the scan keeps
-    them, the scanned lengths. The balanced partition has longer walk
-    records and a longer plan, and adds what each compute group posts to
-    the spare warp. The body takes every array from here
-    (``_allocate_pipeline_shared_memory``), so a new array is a new entry,
-    and replaying the entries gives what the body occupies.
-    """
-    assert (units > 0) == (query_stages > 0) and (units > 0 or not balanced)
-    panel = 2 * (query_columns * 128)
-    state = 2 * (4 * query_columns)
-    scanning = 32 * plan_geometry(units)[1] if units else 0
-    return (
-        _SharedArray("raw_k", cutlass.Int8, 4 * 16384, 1024),
-        _SharedArray("raw_v", cutlass.Int8, 4 * 16384, 1024),
-        _SharedArray("scale_k", cutlass.Uint8, 4 * 512, 128),
-        _SharedArray("scale_v", cutlass.Uint8, 4 * 512, 128),
-        _SharedArray(
-            "shared_q_raw", cutlass.BFloat16, max(query_stages, 1) * panel, 1024
-        ),
-        _SharedArray("probability_raw", cutlass.BFloat16, panel, 1024),
-        _SharedArray("state_raw", cutlass.Float32, state, 16),
-        _SharedArray("scratch_raw", cutlass.Float32, state, 16),
-        _SharedArray("slot", cutlass.Int32, 1, 4),
-        _SharedArray(
-            "barriers",
-            cutlass.Int64,
-            _pipeline_barrier_plan(value_metadata, query_stages)[1],
-            8,
-        ),
-        _SharedArray(
-            "walk_raw",
-            cutlass.Int32,
-            2 * (WALK_WORDS if balanced else 4),
-            4,
-            guard="persistent",
-        ),
-        _SharedArray("mail_raw", cutlass.Int32, 2 * MAIL_WORDS, 4, guard="balanced"),
-        _SharedArray("plan_prefix", cutlass.Int32, scanning, 4, guard="persistent"),
-        _SharedArray("plan_totals", cutlass.Int32, 32, 4, guard="persistent"),
-        _SharedArray(
-            "plan", cutlass.Int32, PLAN_WORDS if balanced else 4, 4, guard="persistent"
-        ),
-        _SharedArray(
-            "plan_lengths", cutlass.Int32, scanning, 4, guard="scanned_lengths"
-        ),
-        _SharedArray("query_ready", cutlass.Int64, 1, 8, guard="query_map"),
-        _SharedArray("metadata_flags", cutlass.Int32, 4, 16, guard="value_metadata"),
-    )
-
-
 def _allocate_pipeline_shared_memory(
-    smem: utils.SmemAllocator, arrays: tuple[_SharedArray, ...], parts: frozenset[str]
+    smem: utils.SmemAllocator, arrays: tuple[SharedArray, ...], parts: frozenset[str]
 ) -> SimpleNamespace:
-    """Allocate ``arrays`` in table order for a body with the optional
-    ``parts``: one attribute per array, ``None`` for those of a part the
-    body lacks."""
-    return SimpleNamespace(
-        **{
-            array.name: (
-                smem.allocate_array(
-                    array.dtype, array.count, byte_alignment=array.alignment
-                )
-                if array.guard is None or array.guard in parts
-                else None
-            )
-            for array in arrays
-        }
-    )
-
-
-def _pipeline_parts(
-    query_map: bool,
-    value_metadata: bool,
-    units: int = 0,
-    scanned_bounds: bool = False,
-    balanced: bool = False,
-) -> frozenset[str]:
-    """The optional parts of a body, as ``_SharedArray.guard`` names them.
-
-    ``units`` is the unit count of a persistent partition, zero with one
-    unit per CTA. Its query barriers lie in the barrier block, so its body
-    has no query-map barrier of its own. Its plan scan keeps the lengths it
-    loaded where a thread scans one unit and the prelude has the twin that
-    takes a scanned length (``scanned_bounds``). ``balanced``: the
-    persistent partition that splits units.
-    """
-    persistent = units > 0
-    assert persistent or not balanced
-    return frozenset(
-        name
-        for name, present in (
-            ("query_map", query_map and not persistent),
-            ("value_metadata", value_metadata),
-            ("persistent", persistent),
-            ("balanced", balanced),
-            (
-                "scanned_lengths",
-                persistent and scanned_bounds and plan_geometry(units)[0] == 1,
-            ),
+    """Allocate the body's shared-memory table ``arrays``
+    (``paged_attention_shared_memory.pipeline_shared_memory``, which the
+    config contract replays against the device) in its order, for a body
+    with the optional ``parts``: one attribute per array, ``None`` for those
+    of a part the body lacks. An entry names its element type as the DSL
+    does, and the table's byte accounting is of that type. The body
+    allocates nothing else."""
+    allocated = {}
+    for array in arrays:
+        dtype = getattr(cutlass, array.dtype)
+        assert dtype.width == 8 * array.width
+        allocated[array.name] = (
+            smem.allocate_array(dtype, array.count, byte_alignment=array.alignment)
+            if array.guard is None or array.guard in parts
+            else None
         )
-        if present
-    )
+    return SimpleNamespace(**allocated)
 
 
 @cute.jit
@@ -1708,8 +1654,14 @@ def _convert_keys(
     for step in cutlass.range(count):
         for pair_head in cutlass.range(2, unroll=1):
             head = cute.arch.make_warp_uniform(pair_head)
-            ring = 2 * (step & 1) + head
-            _wait_non_mma(raw_k_ready + ring, step // 2 & 1, sleep_waits)
+            # The raw K ring keeps its own depth, which the loader's K
+            # requests name.
+            ring = _ring_slot(step, head, KEY_RING_PAGES)
+            _wait_non_mma(
+                raw_k_ready + ring,
+                _ring_phase(step, KEY_RING_PAGES),
+                sleep_waits,
+            )
             _wait_non_mma(key_free + head, (step & 1) ^ 1, sleep_waits)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             staged_scales = cute.make_tensor(
@@ -1754,13 +1706,17 @@ def _convert_values(
     value_post_scale_log2: cutlass.Constexpr,
     value_positive_zero: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
+    value_ring: cutlass.Constexpr = PAIRED_DEFAULT_VALUE_RING,
 ) -> None:
-    """Convert the V tiles of the ``count`` pages the CTA streams."""
+    """Convert the V tiles of the ``count`` pages the CTA streams, from a
+    raw ring of ``value_ring`` pages per head."""
     for step in cutlass.range(count):
         for pair_head in cutlass.range(2, unroll=1):
             head = cute.arch.make_warp_uniform(pair_head)
-            ring = 2 * (step & 1) + head
-            _wait_non_mma(raw_v_ready + ring, step // 2 & 1, sleep_waits)
+            ring = _ring_slot(step, head, value_ring)
+            _wait_non_mma(
+                raw_v_ready + ring, _ring_phase(step, value_ring), sleep_waits
+            )
             _wait_non_mma(value_free + head, (step & 1) ^ 1, sleep_waits)
             prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
             staged_scales = cute.make_tensor(
@@ -1953,6 +1909,126 @@ def _issue_qk_units(
 
 
 @cute.jit
+def _tail_release_step(
+    total: cutlass.Int64, release_lead: cutlass.Constexpr
+) -> cutlass.Int64:
+    """The stream step at which a loader that streams ``total`` pages releases
+    the launch's dependents ``release_lead`` pages ahead of its end.
+
+    A stream shorter than the lead releases at its first page: the step is
+    clamped at zero, where the bare difference would never meet a step and
+    the release would wait for the end of the stream, later than the default
+    lead's. Both values are Int64, and a nonnegative total minus the lead
+    cannot overflow.
+    """
+    release_step = total - release_lead
+    if release_step < 0:
+        release_step = cutlass.Int64(0)
+    return release_step
+
+
+@cute.jit
+def _release_at_tail(
+    stream_step: cutlass.Int64,
+    total: cutlass.Int64,
+    release_step: cutlass.Int64 | None,
+) -> None:
+    """Release the launch's dependents when the loader, which streams
+    ``total`` pages, is at the stream step of its tail release:
+    ``release_step`` (``_tail_release_step``), or without one the default
+    lead's bare difference. Both values are Int64; a nonnegative total minus
+    four cannot overflow, including empty ranges."""
+    if cutlass.const_expr(release_step is None):
+        if stream_step == total - MMA_DAG_RELEASE_LEAD_DEFAULT:
+            cute.arch.griddepcontrol_launch_dependents()
+    else:
+        if stream_step == release_step:
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def _ordered_page(
+    pages: cute.Tensor,
+    page_order: cute.Tensor | None,
+    request: cutlass.Int32,
+    logical_page: cutlass.Int64,
+    step: cutlass.Int64,
+    order_first: cutlass.Int64 | None,
+    order_stop: cutlass.Int64 | None,
+) -> cutlass.Int32:
+    """The physical page that a work item's step ``step`` requests: the page
+    table's in source order (no ``page_order``), and under a bucketed page
+    order inside the ordered run ``[order_first, order_stop)`` the page the
+    sorting warp left for the step, elsewhere the page table's as well.
+    Every step of the run is an interior tile
+    (``_paged_attention_page_order``), so the step keeps its own
+    coordinates, an all-visible mask and a key shift of zero whichever page
+    of the run it streams."""
+    if cutlass.const_expr(page_order is None):
+        physical = cutlass.Int32(pages[request, logical_page])
+    else:
+        assert page_order is not None
+        assert order_first is not None and order_stop is not None
+        physical = cutlass.Int32(0)
+        if (step >= order_first) & (step < order_stop):
+            physical = cutlass.Int32(page_order[cutlass.Int32(step - order_first)])
+        else:
+            physical = cutlass.Int32(pages[request, logical_page])
+    return physical
+
+
+@cute.jit
+def _loader_step(
+    pages: cute.Tensor,
+    page_order: cute.Tensor | None,
+    request: cutlass.Int32,
+    first_page: cutlass.Int64,
+    last_page: cutlass.Int64,
+    step0: cutlass.Int64,
+    step: cutlass.Int64,
+    order_first: cutlass.Int64 | None,
+    order_stop: cutlass.Int64 | None,
+    length: cutlass.Int32,
+    query_len: cutlass.Constexpr,
+    group: cutlass.Constexpr,
+    window: cutlass.Constexpr,
+    coordinate_dtype: cutlass.Constexpr,
+    query_columns: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
+    key_clip: cutlass.Constexpr,
+) -> tuple[cutlass.Int32, cutlass.Int32]:
+    """What the loader needs of a work item's step ``step0 + step`` before
+    it requests the step's tiles: the physical page (``_ordered_page``, at
+    the logical page the walk gives the step) and the key shift of that
+    page's K and V tiles under ``key_clip``. Both forms of the loader's
+    loop, V with its K and V behind it, begin a step with this."""
+    logical_page, logical_key_base = attention_page_coordinates(
+        first_page, last_page, step0 + step, page_walk
+    )
+    physical = _ordered_page(
+        pages,
+        page_order,
+        request,
+        logical_page,
+        step0 + step,
+        order_first,
+        order_stop,
+    )
+    key_shift = logical_attention_key_shift(
+        logical_key_base,
+        128,
+        length,
+        query_columns,
+        query_len,
+        group,
+        window,
+        coordinate_dtype,
+        key_clip,
+    )
+    return physical, key_shift
+
+
+@cute.jit
 def _load_pages(
     pages: cute.Tensor,
     raw_k: cute.Pointer,
@@ -1989,12 +2065,17 @@ def _load_pages(
     window: cutlass.Constexpr,
     coordinate_dtype: cutlass.Constexpr,
     query_columns: cutlass.Constexpr,
-    reflected_dtype: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
     v_lag: cutlass.Constexpr,
     key_clip: cutlass.Constexpr,
     tma_load_hints: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
     capture_release_tail: cutlass.Constexpr,
+    capture_release_lead: cutlass.Constexpr = MMA_DAG_RELEASE_LEAD_DEFAULT,
+    value_ring: cutlass.Constexpr = PAIRED_DEFAULT_VALUE_RING,
+    page_order: cute.Tensor | None = None,
+    order_first: cutlass.Int64 | None = None,
+    order_stop: cutlass.Int64 | None = None,
 ) -> tuple[
     cutlass.Int32,
     cutlass.Int32,
@@ -2009,34 +2090,53 @@ def _load_pages(
     ``step0 + step``, so a clip applies at the item's own first and last
     page; ring slots and barrier phases follow ``g0 + step``, with ``g0``
     the number of pages the CTA streamed before these and ``total`` the
-    number it streams in all. With a V lag, ``previous_page`` and
+    number it streams in all; the raw V ring holds ``value_ring`` pages per
+    head, the raw K ring two. With a V lag, ``previous_page`` and
     ``older_page`` are the last two pages streamed before this range,
     ``previous_shift`` and ``older_shift`` their key offsets and
     ``previous_head`` and ``older_head`` the first heads of their work
     items, all of which a lagged V tile keeps. The state of the last two
     pages streamed is returned: their V tiles are still to be requested, by
     a later range or by ``_drain_values``.
+
+    With ``capture_release_tail`` the loader releases the launch's
+    dependents when the stream has ``capture_release_lead`` pages left. The
+    default lead of four keeps its test of the bare difference, which a
+    stream of fewer than four pages never meets (the caller's release behind
+    the loop covers it). Any other lead releases at ``_tail_release_step``,
+    which a shorter stream meets at its first page: no later than the
+    default lead would.
+
+    With ``page_order`` the steps of the run ``[order_first, order_stop)``
+    request the pages a bucketed order left for them (``_ordered_page``);
+    a lagged V tile keeps the page its K tile requested.
     """
+    release_step = None
+    if cutlass.const_expr(
+        capture_release_tail and capture_release_lead != MMA_DAG_RELEASE_LEAD_DEFAULT
+    ):
+        release_step = _tail_release_step(total, capture_release_lead)
     if cutlass.const_expr(v_lag == 0):
         for step in cutlass.range(count):
             if cutlass.const_expr(capture_release_tail):
-                # Both values are Int64; a nonnegative total minus
-                # four cannot overflow, including empty ranges.
-                if g0 + step == total - 4:
-                    cute.arch.griddepcontrol_launch_dependents()
-            logical_page, logical_key_base = attention_page_coordinates(
-                first_page, last_page, step0 + step, reflected_dtype
-            )
-            physical = cutlass.Int32(pages[request, logical_page])
-            key_shift = logical_attention_key_shift(
-                logical_key_base,
-                128,
+                _release_at_tail(g0 + step, total, release_step)
+            physical, key_shift = _loader_step(
+                pages,
+                page_order,
+                request,
+                first_page,
+                last_page,
+                step0,
+                step,
+                order_first,
+                order_stop,
                 length,
-                query_columns,
                 query_len,
                 group,
                 window,
                 coordinate_dtype,
+                query_columns,
+                page_walk,
                 key_clip,
             )
             for head in cutlass.range_constexpr(2):
@@ -2054,6 +2154,7 @@ def _load_pages(
                     l2_hints=tma_load_hints[:2],
                     sleep_waits=sleep_waits,
                     key=key_shift,
+                    depth=KEY_RING_PAGES,
                 )
             for head in cutlass.range_constexpr(2):
                 _enqueue_operand_tile(
@@ -2072,6 +2173,7 @@ def _load_pages(
                     l2_hints=tma_load_hints[2:],
                     sleep_waits=sleep_waits,
                     key=key_shift,
+                    depth=value_ring,
                 )
     else:
         # K(i) precedes V(i-lag). Iterating steps then two heads
@@ -2080,21 +2182,24 @@ def _load_pages(
         # Each delayed V tile reuses its K tile's page and shift.
         for step in cutlass.range(count):
             if cutlass.const_expr(capture_release_tail):
-                if g0 + step == total - 4:
-                    cute.arch.griddepcontrol_launch_dependents()
-            logical_page, logical_key_base = attention_page_coordinates(
-                first_page, last_page, step0 + step, reflected_dtype
-            )
-            physical = cutlass.Int32(pages[request, logical_page])
-            key_shift = logical_attention_key_shift(
-                logical_key_base,
-                128,
+                _release_at_tail(g0 + step, total, release_step)
+            physical, key_shift = _loader_step(
+                pages,
+                page_order,
+                request,
+                first_page,
+                last_page,
+                step0,
+                step,
+                order_first,
+                order_stop,
                 length,
-                query_columns,
                 query_len,
                 group,
                 window,
                 coordinate_dtype,
+                query_columns,
+                page_walk,
                 key_clip,
             )
             for head in cutlass.range_constexpr(2):
@@ -2112,6 +2217,7 @@ def _load_pages(
                     l2_hints=tma_load_hints[:2],
                     sleep_waits=sleep_waits,
                     key=key_shift,
+                    depth=KEY_RING_PAGES,
                 )
                 distance = (v_lag + 1 - head) // 2
                 if cutlass.const_expr(distance == 0) or g0 + step >= distance:
@@ -2142,6 +2248,7 @@ def _load_pages(
                         l2_hints=tma_load_hints[2:],
                         sleep_waits=sleep_waits,
                         key=delayed_shift,
+                        depth=value_ring,
                     )
             older_page = previous_page
             previous_page = physical
@@ -2156,6 +2263,178 @@ def _load_pages(
         older_shift,
         previous_head,
         older_head,
+    )
+
+
+@cute.jit
+def _load_ordered_pages(
+    pages: cute.Tensor,
+    raw_k: cute.Pointer,
+    scale_k: cute.Pointer,
+    raw_k_ready: cute.Pointer,
+    raw_k_free: cute.Pointer,
+    kmap: experimental_cuda.TensorMap,
+    ksmap: experimental_cuda.TensorMap,
+    raw_v: cute.Pointer,
+    scale_v: cute.Pointer,
+    raw_v_ready: cute.Pointer,
+    raw_v_free: cute.Pointer,
+    vmap: experimental_cuda.TensorMap,
+    vsmap: experimental_cuda.TensorMap,
+    page_order: cute.Tensor,
+    page_order_span: cute.Tensor,
+    page_order_ready: cute.Pointer,
+    request: cutlass.Int32,
+    first_head: cutlass.Int32,
+    first_page: cutlass.Int64,
+    last_page: cutlass.Int64,
+    count: cutlass.Int64,
+    length: cutlass.Int32,
+    query_len: cutlass.Constexpr,
+    group: cutlass.Constexpr,
+    window: cutlass.Constexpr,
+    coordinate_dtype: cutlass.Constexpr,
+    query_columns: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
+    v_lag: cutlass.Constexpr,
+    key_clip: cutlass.Constexpr,
+    tma_load_hints: cutlass.Constexpr,
+    sleep_waits: cutlass.Constexpr,
+    capture_release_tail: cutlass.Constexpr,
+    capture_release_lead: cutlass.Constexpr,
+    value_ring: cutlass.Constexpr,
+) -> tuple[
+    cutlass.Int32,
+    cutlass.Int32,
+    cutlass.Int32,
+    cutlass.Int32,
+    cutlass.Int32,
+    cutlass.Int32,
+]:
+    """Request the pages of a one-unit CTA's work item under a bucketed
+    page order: the item's first ``PAGE_ORDER_HEAD`` pages in source order,
+    which need nothing of the sorting warp, then the rest once that warp
+    has arrived at ``page_order_ready``, the steps of the run it left in
+    ``page_order_span`` from ``page_order``. An item of no more pages than
+    the head has no step behind it: its loader neither waits for the
+    sorting warp nor reads what that warp leaves, and its run is empty. The
+    stream is one: ring slots, barrier phases, the lagging V tiles and the
+    tail release follow its steps as in source order. Returns what
+    ``_load_pages`` returns.
+    """
+    head = cutlass.Int64(PAGE_ORDER_HEAD)
+    if count < head:
+        head = count
+    (
+        previous_page,
+        older_page,
+        previous_shift,
+        older_shift,
+        previous_head,
+        older_head,
+    ) = _load_pages(
+        pages,
+        raw_k,
+        scale_k,
+        raw_k_ready,
+        raw_k_free,
+        kmap,
+        ksmap,
+        raw_v,
+        scale_v,
+        raw_v_ready,
+        raw_v_free,
+        vmap,
+        vsmap,
+        None,
+        None,
+        request,
+        first_head,
+        first_page,
+        last_page,
+        cutlass.Int64(0),
+        cutlass.Int64(0),
+        head,
+        count,
+        length,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        first_head,
+        first_head,
+        query_len,
+        group,
+        window,
+        coordinate_dtype,
+        query_columns,
+        page_walk,
+        v_lag,
+        key_clip,
+        tma_load_hints,
+        sleep_waits,
+        capture_release_tail,
+        capture_release_lead,
+        value_ring,
+    )
+    # The empty run, which a step never lies in: all an item without a step
+    # behind the head needs, so only a longer one depends on the sorting warp.
+    order_first = cutlass.Int64(0)
+    order_stop = cutlass.Int64(0)
+    if count > head:
+        # One arrival per lane of the sorting warp, each behind its stores:
+        # the run and the order are complete, also for a unit that is not
+        # reordered.
+        _wait_non_mma(page_order_ready, cutlass.Int32(0), sleep_waits)
+        order_first = cutlass.Int64(cutlass.Int32(page_order_span[SPAN_FIRST]))
+        order_stop = cutlass.Int64(cutlass.Int32(page_order_span[SPAN_STOP]))
+    return _load_pages(
+        pages,
+        raw_k,
+        scale_k,
+        raw_k_ready,
+        raw_k_free,
+        kmap,
+        ksmap,
+        raw_v,
+        scale_v,
+        raw_v_ready,
+        raw_v_free,
+        vmap,
+        vsmap,
+        None,
+        None,
+        request,
+        first_head,
+        first_page,
+        last_page,
+        head,
+        head,
+        count - head,
+        count,
+        length,
+        previous_page,
+        older_page,
+        previous_shift,
+        older_shift,
+        previous_head,
+        older_head,
+        query_len,
+        group,
+        window,
+        coordinate_dtype,
+        query_columns,
+        page_walk,
+        v_lag,
+        key_clip,
+        tma_load_hints,
+        sleep_waits,
+        capture_release_tail,
+        capture_release_lead,
+        value_ring,
+        page_order,
+        order_first,
+        order_stop,
     )
 
 
@@ -2179,6 +2458,7 @@ def _drain_values(
     v_lag: cutlass.Constexpr,
     tma_load_hints: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
+    value_ring: cutlass.Constexpr = PAIRED_DEFAULT_VALUE_RING,
 ) -> None:
     """Request the V tiles still lagging after the CTA streamed ``count`` pages."""
     # Drain at most three V tiles from already-loaded page
@@ -2209,6 +2489,7 @@ def _drain_values(
                 l2_hints=tma_load_hints[2:],
                 sleep_waits=sleep_waits,
                 key=delayed_shift,
+                depth=value_ring,
             )
 
 
@@ -2250,12 +2531,14 @@ def _load_units(
     coordinate_dtype: cutlass.Constexpr,
     query_columns: cutlass.Constexpr,
     q_stages: cutlass.Constexpr,
-    reflected_dtype: cutlass.Constexpr,
+    page_walk: cutlass.Constexpr,
     v_lag: cutlass.Constexpr,
     key_clip: cutlass.Constexpr,
     tma_load_hints: cutlass.Constexpr,
     sleep_waits: cutlass.Constexpr,
     capture_release_tail: cutlass.Constexpr,
+    capture_release_lead: cutlass.Constexpr = MMA_DAG_RELEASE_LEAD_DEFAULT,
+    value_ring: cutlass.Constexpr = PAIRED_DEFAULT_VALUE_RING,
 ) -> None:
     """Request the K and V tiles of the CTA's units as one stream, and the
     queries of every unit behind the first one with pages.
@@ -2265,7 +2548,8 @@ def _load_units(
     shifts the tiles at the unit's own window edges and never at the
     boundary between two units; a lagged V tile is requested with the page,
     key offset and first head of its own unit. ``total`` is the number of
-    pages of all units; only the tail release reads it.
+    pages of all units; only the tail release reads it, with the lead
+    ``capture_release_lead`` in pages of the CTA's whole stream.
 
     Under the balanced partition the CTA streams the pages of a unit's
     steps in its slots ``[begin, stop)``, at those steps: the first or the
@@ -2362,12 +2646,14 @@ def _load_units(
                 window,
                 coordinate_dtype,
                 query_columns,
-                reflected_dtype,
+                page_walk,
                 v_lag,
                 key_clip,
                 tma_load_hints,
                 sleep_waits,
                 capture_release_tail,
+                capture_release_lead,
+                value_ring,
             )
             streamed = streamed + count
     _drain_values(
@@ -2389,6 +2675,7 @@ def _load_units(
         v_lag,
         tma_load_hints,
         sleep_waits,
+        value_ring,
     )
     if cutlass.const_expr(capture_release_tail):
         # Every CTA releases, also one with a short range or without units.
@@ -2480,6 +2767,7 @@ def paged_attention_paired_body(
     # A typed immutable scalar keeps unguarded calls constant-foldable.
     capture_pdl_wait_mode: cutlass.Int32 = cutlass.Int32(0),  # noqa: B008
     capture_release_tail: cutlass.Constexpr = False,
+    capture_release_lead: cutlass.Constexpr = MMA_DAG_RELEASE_LEAD_DEFAULT,
     maximum_output: cute.Tensor | None = None,
     denominator_output: cute.Tensor | None = None,
     statistic_layouts: cutlass.Constexpr = None,
@@ -2504,8 +2792,75 @@ def paged_attention_paired_body(
     partition_workspace: cute.Tensor | None = None,
     partition_record_bytes: cutlass.Constexpr = 0,
     partition_skew: cutlass.Constexpr = 0,
+    register_quotas: cutlass.Constexpr = PAIRED_DEFAULT_REGISTER_QUOTAS,
+    boundary_prefetch: cutlass.Constexpr = 0,
+    boundary_prefetch_form: cutlass.Constexpr = None,
+    boundary_prefetch_capacity: cutlass.Constexpr = 0,
+    boundary_prefetch_key: cute.Tensor | None = None,
+    boundary_prefetch_key_scales: cute.Tensor | None = None,
+    boundary_prefetch_layout: cutlass.Constexpr = None,
+    value_ring: cutlass.Constexpr = PAIRED_DEFAULT_VALUE_RING,
+    shared_memory_capacity: cutlass.Constexpr = 0,
+    page_order: cutlass.Constexpr = MMA_DAG_PAGE_ORDER_SOURCE,
+    page_order_shift: cutlass.Constexpr = 0,
+    clipped_page_lead: cutlass.Constexpr = 0,
+    store_policy: cutlass.Constexpr = "default",
 ) -> None:
     assert cutlass.const_expr(partition in ("item", "whole", "balanced"))
+    # The cache policy of the O stores: plain, the streaming operator, or
+    # the L2 evict-last hint.
+    assert cutlass.const_expr(store_policy in ("default", "streaming", "l2_evict_last"))
+    assert cutlass.const_expr(page_order in MMA_DAG_PAGE_ORDER_CHOICES)
+    # The lead is the reversed walk's: no other order has a page to move.
+    assert cutlass.const_expr(
+        clipped_page_lead in MMA_DAG_CLIPPED_PAGE_LEAD_CHOICES
+        and (clipped_page_lead == 0 or page_order == MMA_DAG_PAGE_ORDER_REVERSED)
+    )
+    if cutlass.const_expr(page_order == MMA_DAG_PAGE_ORDER_REVERSED):
+        # The source's iterations newest first, each with its own tile:
+        # another order of the recurrence, which only fast math licenses,
+        # for a kernel with a window whose source loop is not itself
+        # reflected. The walk is a work item's: on a persistent partition
+        # every unit of a CTA's stream is walked newest first, and a part
+        # of a unit keeps its steps of the unit's walk. The value-metadata
+        # actor was not examined under it.
+        assert cutlass.const_expr(fast_math)
+        assert cutlass.const_expr(window is not None and reflected_dtype is None)
+        assert cutlass.const_expr(value_metadata_scales is None)
+    # The walk every role maps its steps through: the source's (its
+    # reflection's dtype or none) or the reversed one. The loader, the
+    # compute groups and a boundary prefetch all hand this one value to
+    # ``attention_page_coordinates``.
+    page_walk = (
+        ReversedWalk(clipped_page_lead)
+        if page_order == MMA_DAG_PAGE_ORDER_REVERSED
+        else reflected_dtype
+    )
+    bucketed = page_order == MMA_DAG_PAGE_ORDER_BUCKETED
+    if cutlass.const_expr(bucketed):
+        # Another order of whole interior tiles rounds the recurrence at
+        # other points, which only fast math licenses. The control warp
+        # that sorts is the value-metadata actor's and the spare one of a
+        # persistent partition, whose stream is several units.
+        assert cutlass.const_expr(fast_math and partition == "item")
+        assert cutlass.const_expr(value_metadata_scales is None)
+    # Only a body that releases from its loader's tail has a lead to choose,
+    # and a lead below the default's four pages would release later than it.
+    assert cutlass.const_expr(type(capture_release_lead) is int)
+    assert cutlass.const_expr(capture_release_lead >= MMA_DAG_RELEASE_LEAD_DEFAULT)
+    assert cutlass.const_expr(
+        capture_release_tail or capture_release_lead == MMA_DAG_RELEASE_LEAD_DEFAULT
+    )
+    if cutlass.const_expr(boundary_prefetch > 0):
+        # The idle control warp of a one-unit CTA requests the first
+        # ``boundary_prefetch`` K pages of the unit ``unit_bounds`` evaluates
+        # for it: nothing else of this body changes.
+        assert cutlass.const_expr(partition == "item" and units > 0)
+        assert cutlass.const_expr(unit_bounds is not None)
+        assert cutlass.const_expr(value_metadata_scales is None)
+        assert cutlass.const_expr(boundary_prefetch_form in ("wave_ahead", "sibling"))
+    else:
+        assert cutlass.const_expr(boundary_prefetch_form is None)
     if cutlass.const_expr(partition == "item"):
         assert cutlass.const_expr(q_stages == 1)
     else:
@@ -2531,6 +2886,12 @@ def paged_attention_paired_body(
         assert cutlass.const_expr(partition_workspace is None)
         assert cutlass.const_expr(partition_skew == 0)
     assert cutlass.const_expr(rowwise_rescale_threshold is None or reference_scores)
+    # An increase the CTA's pool cannot grant would wait forever.
+    quotas_reason = paired_register_quotas_reason(register_quotas)
+    assert cutlass.const_expr(quotas_reason is None), quotas_reason
+    compute_registers, key_registers, value_registers, control_registers = (
+        register_quotas
+    )
     assert cutlass.const_expr(v_lag in (0, 1, 2, 3))
     assert cutlass.const_expr(key_clip in ("off", "leading", "trailing", "both"))
     # The metadata actor copies unshifted scale words for the shifted raw tile.
@@ -2583,23 +2944,41 @@ def paged_attention_paired_body(
     if last_page > first_page:
         count = last_page - first_page
     # Dynamic shared allocations reduce address setup across the warp roles.
-    # ``_pipeline_shared_memory`` lists them; the body allocates nothing else.
+    # The table lists them, stated once for the body it is: a deeper V ring
+    # is checked against the device with it, and the body allocates it and
+    # nothing else.
+    shared_parts = pipeline_parts(
+        query_map is not None,
+        value_metadata_scales is not None,
+        units if partition != "item" else 0,
+        unit_bounds_scanned is not None,
+        partition == "balanced",
+        bucketed,
+    )
+    shared_table = pipeline_shared_memory(
+        query_columns,
+        value_metadata_scales is not None,
+        q_stages if partition != "item" else 0,
+        units if partition != "item" else 0,
+        partition == "balanced",
+        boundary_prefetch_form == "wave_ahead",
+        value_ring,
+        bucketed,
+    )
+    if cutlass.const_expr(value_ring != PAIRED_DEFAULT_VALUE_RING):
+        # The value-metadata actor walks the V ring at its default depth.
+        assert cutlass.const_expr(type(value_ring) is int and value_ring > 2)
+        assert cutlass.const_expr(value_metadata_scales is None)
+        # A CTA whose shared memory the device does not grant never
+        # launches. The config contract admits a depth by replaying this
+        # table against the device; the render repeats it for the table of
+        # the body it actually is, on the capacity it was given.
+        shared_bytes = pipeline_shared_bytes(shared_table, shared_parts)
+        assert cutlass.const_expr(
+            shared_memory_capacity == 0 or shared_bytes <= shared_memory_capacity
+        ), (shared_bytes, shared_memory_capacity)
     shared = _allocate_pipeline_shared_memory(
-        utils.SmemAllocator(),
-        _pipeline_shared_memory(
-            query_columns,
-            value_metadata_scales is not None,
-            q_stages if partition != "item" else 0,
-            units if partition != "item" else 0,
-            partition == "balanced",
-        ),
-        _pipeline_parts(
-            query_map is not None,
-            value_metadata_scales is not None,
-            units if partition != "item" else 0,
-            unit_bounds_scanned is not None,
-            partition == "balanced",
-        ),
+        utils.SmemAllocator(), shared_table, shared_parts
     )
     raw_k = shared.raw_k
     raw_v = shared.raw_v
@@ -2616,9 +2995,12 @@ def paged_attention_paired_body(
     slot = shared.slot
     # One block holds every pipeline barrier so the loader warp can initialize
     # it with one instruction per 32 barriers: lane L owns barrier 32 * r + L.
-    barrier_offsets, _barrier_count, barrier_rounds = _pipeline_barrier_plan(
+    barrier_offsets, _barrier_count, barrier_rounds = pipeline_barrier_plan(
         value_metadata_scales is not None,
         q_stages if partition != "item" else 0,
+        boundary_prefetch_form == "wave_ahead",
+        value_ring,
+        bucketed,
     )
     barriers = shared.barriers
     raw_k_ready = barriers + barrier_offsets["raw_k_ready"]
@@ -2639,7 +3021,7 @@ def paged_attention_paired_body(
     # Per compute group: what it needs again after a unit's pages and, under
     # the balanced partition, the role of a part of a split unit.
     walk_raw = shared.walk_raw
-    walk_words = WALK_WORDS if partition == "balanced" else 4
+    walk_words = WALK_WORDS if partition == "balanced" else WHOLE_UNIT_WORDS
     # What each compute group posts to the spare warp (balanced only).
     mail_raw = shared.mail_raw
     plan_warps = 0
@@ -2662,7 +3044,7 @@ def paged_attention_paired_body(
             shared.plan_prefix, cute.make_layout((32 * plan_warps,))
         )
         plan_totals = cute.make_tensor(shared.plan_totals, cute.make_layout((32,)))
-        plan_words = PLAN_WORDS if partition == "balanced" else 4
+        plan_words = PLAN_WORDS if partition == "balanced" else WHOLE_UNIT_WORDS
         plan = cute.make_tensor(shared.plan, cute.make_layout((plan_words,)))
         if cutlass.const_expr(shared.plan_lengths is not None):
             # One more word per scanning thread: the length it loaded for
@@ -2675,6 +3057,22 @@ def paged_attention_paired_body(
     if cutlass.const_expr(value_metadata_scales is not None):
         metadata_flags = cute.make_tensor(shared.metadata_flags, cute.make_layout((4,)))
         metadata_ready = barriers + barrier_offsets["metadata_ready"]
+    prefetch_signal = None
+    if cutlass.const_expr(boundary_prefetch_form == "wave_ahead"):
+        prefetch_signal = barriers + barrier_offsets["prefetch_signal"]
+    # A bucketed page order: the order of one sort, the run it covers and
+    # the barrier at which the sorting warp hands both to the loader.
+    page_order_table = None
+    page_order_span = None
+    page_order_ready = None
+    if cutlass.const_expr(bucketed):
+        page_order_table = cute.make_tensor(
+            shared.page_order, cute.make_layout((PAGE_ORDER_CAPACITY,))
+        )
+        page_order_span = cute.make_tensor(
+            shared.page_order_span, cute.make_layout((SPAN_WORDS,))
+        )
+        page_order_ready = barriers + barrier_offsets["page_order_ready"]
     if warp == 17:
         # The loader starts the page stream without waiting for the other
         # roles, so it initializes the barriers that stream needs itself.
@@ -2724,7 +3122,7 @@ def paged_attention_paired_body(
             # precedes the setup rendezvous because the loader's role starts
             # ahead of that and runs behind the quota from its first
             # statement; no warp waits for another on its way here.
-            cute.arch.setmaxregister_decrease(48)
+            cute.arch.setmaxregister_decrease(control_registers)
     if warp == 16:
         # The whole warp allocates before any of its lanes takes another path.
         prims.tcgen05_alloc(slot, 512, group=prims.CTAGroup.CTA_1)
@@ -2901,12 +3299,14 @@ def paged_attention_paired_body(
                     coordinate_dtype,
                     query_columns,
                     q_stages,
-                    reflected_dtype,
+                    page_walk,
                     v_lag,
                     key_clip,
                     tma_load_hints,
                     sleep_waits,
                     capture_release_tail,
+                    capture_release_lead,
+                    value_ring,
                 )
         elif warp < 8:
             first_unit, last_unit, _pages = _planned_units(plan)
@@ -2965,7 +3365,7 @@ def paged_attention_paired_body(
                 io_layouts,
                 reference_scores,
                 base2_scores,
-                reflected_dtype,
+                page_walk,
                 output_reciprocal,
                 output_scale_log2,
                 sleep_waits,
@@ -2980,11 +3380,17 @@ def paged_attention_paired_body(
                 early_tmem_retirement,
                 headwide_rescale,
                 key_clip,
+                compute_registers,
+                store_policy,
             )
         elif warp < 16:
             # The conversion warps, like the PV issuer, only follow the stream.
             _first, _last, count = _planned_units(plan)
-            cute.arch.setmaxregister_decrease(72)
+            # Both conversions have one quota in every admitted split
+            # (``MMA_DAG_REGISTER_QUOTAS_CHOICES``), so one instruction ahead
+            # of the branch serves them.
+            assert cutlass.const_expr(key_registers == value_registers)
+            cute.arch.setmaxregister_decrease(key_registers)
             if warp < 12:
                 _convert_keys(
                     raw_k,
@@ -3021,6 +3427,7 @@ def paged_attention_paired_body(
                     value_post_scale_log2,
                     value_positive_zero,
                     sleep_waits,
+                    value_ring,
                 )
         else:
             first_unit, last_unit, count = _planned_units(plan)
@@ -3126,7 +3533,7 @@ def paged_attention_paired_body(
             io_layouts,
             reference_scores,
             base2_scores,
-            reflected_dtype,
+            page_walk,
             output_reciprocal,
             output_scale_log2,
             sleep_waits,
@@ -3141,9 +3548,11 @@ def paged_attention_paired_body(
             early_tmem_retirement,
             headwide_rescale,
             key_clip,
+            compute_registers,
+            store_policy,
         )
     elif warp < 12:
-        cute.arch.setmaxregister_decrease(72)
+        cute.arch.setmaxregister_decrease(key_registers)
         row = (warp % 4) * 32 + lane
         _convert_keys(
             raw_k,
@@ -3162,7 +3571,7 @@ def paged_attention_paired_body(
             sleep_waits,
         )
     elif warp < 16:
-        cute.arch.setmaxregister_decrease(72)
+        cute.arch.setmaxregister_decrease(value_registers)
         dimension = (warp % 4) * 32
         _convert_values(
             raw_v,
@@ -3182,9 +3591,10 @@ def paged_attention_paired_body(
             value_post_scale_log2,
             value_positive_zero,
             sleep_waits,
+            value_ring,
         )
     else:
-        cute.arch.setmaxregister_decrease(48)
+        cute.arch.setmaxregister_decrease(control_registers)
         if warp == 16:
             _issue_qk(
                 shared_q_raw,
@@ -3203,56 +3613,107 @@ def paged_attention_paired_body(
                 _retire_tensor_memory(base)
         elif warp == 17:
             if lane == 0:
-                (
-                    previous_page,
-                    older_page,
-                    previous_shift,
-                    older_shift,
-                    previous_head,
-                    older_head,
-                ) = _load_pages(
-                    pages,
-                    raw_k,
-                    scale_k,
-                    raw_k_ready,
-                    raw_k_free,
-                    kmap,
-                    ksmap,
-                    raw_v,
-                    scale_v,
-                    raw_v_ready,
-                    raw_v_free,
-                    vmap,
-                    vsmap,
-                    metadata_ready,
-                    metadata_flags,
-                    request,
-                    first_head,
-                    first_page,
-                    last_page,
-                    cutlass.Int64(0),
-                    cutlass.Int64(0),
-                    count,
-                    count,
-                    length,
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    cutlass.Int32(0),
-                    first_head,
-                    first_head,
-                    query_len,
-                    group,
-                    window,
-                    coordinate_dtype,
-                    query_columns,
-                    reflected_dtype,
-                    v_lag,
-                    key_clip,
-                    tma_load_hints,
-                    sleep_waits,
-                    capture_release_tail,
-                )
+                if cutlass.const_expr(bucketed):
+                    assert page_order_table is not None
+                    assert page_order_span is not None
+                    assert page_order_ready is not None
+                    (
+                        previous_page,
+                        older_page,
+                        previous_shift,
+                        older_shift,
+                        previous_head,
+                        older_head,
+                    ) = _load_ordered_pages(
+                        pages,
+                        raw_k,
+                        scale_k,
+                        raw_k_ready,
+                        raw_k_free,
+                        kmap,
+                        ksmap,
+                        raw_v,
+                        scale_v,
+                        raw_v_ready,
+                        raw_v_free,
+                        vmap,
+                        vsmap,
+                        page_order_table,
+                        page_order_span,
+                        page_order_ready,
+                        request,
+                        first_head,
+                        first_page,
+                        last_page,
+                        count,
+                        length,
+                        query_len,
+                        group,
+                        window,
+                        coordinate_dtype,
+                        query_columns,
+                        page_walk,
+                        v_lag,
+                        key_clip,
+                        tma_load_hints,
+                        sleep_waits,
+                        capture_release_tail,
+                        capture_release_lead,
+                        value_ring,
+                    )
+                else:
+                    (
+                        previous_page,
+                        older_page,
+                        previous_shift,
+                        older_shift,
+                        previous_head,
+                        older_head,
+                    ) = _load_pages(
+                        pages,
+                        raw_k,
+                        scale_k,
+                        raw_k_ready,
+                        raw_k_free,
+                        kmap,
+                        ksmap,
+                        raw_v,
+                        scale_v,
+                        raw_v_ready,
+                        raw_v_free,
+                        vmap,
+                        vsmap,
+                        metadata_ready,
+                        metadata_flags,
+                        request,
+                        first_head,
+                        first_page,
+                        last_page,
+                        cutlass.Int64(0),
+                        cutlass.Int64(0),
+                        count,
+                        count,
+                        length,
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        cutlass.Int32(0),
+                        first_head,
+                        first_head,
+                        query_len,
+                        group,
+                        window,
+                        coordinate_dtype,
+                        query_columns,
+                        page_walk,
+                        v_lag,
+                        key_clip,
+                        tma_load_hints,
+                        sleep_waits,
+                        capture_release_tail,
+                        capture_release_lead,
+                        value_ring,
+                    )
                 _drain_values(
                     raw_v,
                     scale_v,
@@ -3272,11 +3733,21 @@ def paged_attention_paired_body(
                     v_lag,
                     tma_load_hints,
                     sleep_waits,
+                    value_ring,
                 )
                 if cutlass.const_expr(capture_release_tail):
                     # Every CTA releases even for short or zero-trip ranges.
                     # Repeating a long range's earlier release is harmless.
                     cute.arch.griddepcontrol_launch_dependents()
+                if cutlass.const_expr(prefetch_signal is not None):
+                    # Behind the loader's last request, lagging V tiles
+                    # included: from here this SM's memory traffic only
+                    # drains, and the unit that takes the SM over issues its
+                    # first request a few microseconds later. A prototype
+                    # measured a third less gain for requests issued one
+                    # page earlier, and a loss for requests at entry. One
+                    # arrival per CTA, also for a unit without pages.
+                    prims.mbarrier_arrive(prefetch_signal)
         elif warp == 18:
             _issue_pv(
                 probability_raw,
@@ -3293,7 +3764,7 @@ def paged_attention_paired_body(
             if cutlass.const_expr(value_metadata_scales is not None):
                 for step in cutlass.range(count):
                     logical_page, _logical_key_base = attention_page_coordinates(
-                        first_page, last_page, step, reflected_dtype
+                        first_page, last_page, step, page_walk
                     )
                     physical = cutlass.Int32(pages[request, logical_page])
                     for head in cutlass.range_constexpr(2):
@@ -3310,6 +3781,61 @@ def paged_attention_paired_body(
                             sleep_waits,
                             read_overlap=value_metadata_read_overlap,
                         )
+            if cutlass.const_expr(bucketed):
+                assert page_order_table is not None
+                assert page_order_span is not None
+                assert page_order_ready is not None
+                # Ahead of a boundary prefetch: the loader waits for the
+                # order behind its first pages.
+                order_unit_pages(
+                    pages,
+                    page_order_table,
+                    shared.page_order_buckets,
+                    shared.page_order_members,
+                    page_order_span,
+                    page_order_ready,
+                    request,
+                    first_page,
+                    last_page,
+                    count,
+                    length,
+                    lane,
+                    page_order_shift,
+                    query_columns,
+                    query_len,
+                    group,
+                    window,
+                    coordinate_dtype,
+                    page_walk,
+                )
+            if cutlass.const_expr(boundary_prefetch > 0):
+                assert boundary_prefetch_key is not None
+                assert boundary_prefetch_key_scales is not None
+                # The CTA's unit is its pair of leading items.
+                prefetch_boundary_units(
+                    pages,
+                    boundary_prefetch_key,
+                    boundary_prefetch_key_scales,
+                    tile // 2,
+                    lane,
+                    capture_pdl_wait_mode,
+                    prefetch_signal,
+                    unit_bounds,
+                    unit_bounds_args,
+                    boundary_prefetch_form,
+                    boundary_prefetch,
+                    units,
+                    boundary_prefetch_capacity,
+                    boundary_prefetch_layout,
+                    heads,
+                    query_columns,
+                    query_len,
+                    group,
+                    window,
+                    coordinate_dtype,
+                    page_walk,
+                    key_clip,
+                )
     # With the allocation retired above, nothing else needs a common end: the
     # conversion warps consumed every raw tile, the issuers' MMAs completed
     # before the last O read, and the QK role waited for the query copies and

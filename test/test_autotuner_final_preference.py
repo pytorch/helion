@@ -13,7 +13,8 @@ alike, so their finalists stay a plain tie.
 Behind those it ranks a kernel that flushes a packet with the streaming store
 policy (``cute_store_policy='streaming'``): the evict-first lines of its
 output are what the next kernel of the call sequence reads, and the kernel's
-own timing cannot see that either.
+own timing cannot see that either.  The paired attention body, which stores
+its outputs itself, ranks the same way by the policy its call names.
 """
 
 from __future__ import annotations
@@ -117,6 +118,12 @@ _TAIL = (
     "_helion_k._helion_cute_wrapper_plans = [{'kind': 'helion_paged_attention',"
     " 'capture_pdl_contract': 'paired-output-stores-v1',"
     " 'capture_pdl_mode_param': 'capture_pdl_wait_mode'}]\n"
+)
+# That kernel under the streaming store policy: it flushes no packet, and
+# its call of the body, which stores the outputs itself, names the policy.
+_TAIL_STREAMING = _TAIL.replace(
+    "capture_release_tail=True)",
+    "capture_release_tail=True, store_policy='streaming')",
 )
 
 
@@ -240,6 +247,47 @@ def test_cute_ranks_a_streaming_store_behind_every_default_store() -> None:
     for policy in ("default", "l2_evict_last"):
         config = helion.Config(block_sizes=[64], cute_store_policy=policy)
         assert CuteBackend.finalist_preference(config, never) == 2
+
+
+@skipUnlessBackends(["cute"])
+def test_the_paired_bodys_streaming_stores_rank_as_a_streaming_flush() -> None:
+    # The paired attention body's own output stores are read off its call:
+    # the streaming policy there, on that callee, as a literal.
+    assert _TAIL_STREAMING != _TAIL
+    assert streaming_store_rendered(_TAIL_STREAMING)
+    assert not streaming_store_rendered(_TAIL)
+    hinted = _TAIL_STREAMING.replace("'streaming'", "'l2_evict_last'")
+    for source in (
+        hinted,
+        _TAIL_STREAMING.replace("'streaming'", "policy"),
+        _TAIL_STREAMING.replace("paged_attention_paired_body", "another_body"),
+    ):
+        assert not streaming_store_rendered(source), source
+    # Three behind the same kernel with the default policy, whose release
+    # from the loader's tail ranks 1; the L2 evict-last hint ranks with it.
+    on = {"block_sizes": [64], "cute_pdl": True}
+    streaming = helion.Config(**on, cute_store_policy="streaming")
+    assert CuteBackend.finalist_preference(streaming, lambda: _TAIL_STREAMING) == 4
+    assert CuteBackend.finalist_preference(helion.Config(**on), lambda: _TAIL) == 1
+    evict_last = helion.Config(**on, cute_store_policy="l2_evict_last")
+    assert CuteBackend.finalist_preference(evict_last, lambda: hinted) == 1
+    # Two finalists of that kernel 0.03% apart: the default store wins over
+    # the faster streaming one, which keeps its place against one 2% behind.
+    fastest = _member(34.10, _TAIL_STREAMING, **streaming.config)
+    default = _member(34.11, _TAIL, **on)
+    far_default = _member(34.80, _TAIL, **on, cute_min_blocks_per_mp=1)
+    live = [fastest, default, far_default]
+    search = _search("cute", live)
+    assert search._prefer_backend_preference_within_tolerance(fastest, live) is default
+    search.log.assert_called_once()
+    search = _search("cute", [fastest, far_default])
+    assert (
+        search._prefer_backend_preference_within_tolerance(
+            fastest, [fastest, far_default]
+        )
+        is fastest
+    )
+    search.log.assert_not_called()
 
 
 @skipUnlessBackends(["cute"])

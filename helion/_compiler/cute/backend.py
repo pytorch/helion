@@ -1551,7 +1551,12 @@ class CuteBackend(Backend):
         such a packet is read off its module as well
         (``streaming_store_rendered``): on scalar stores, narrower packets
         and staged stores the policy renders nothing.  A config with the
-        default policy is never rendered for it.
+        default policy is never rendered for it.  The paired attention body
+        flushes no packet and comes under the rule all the same: it stores
+        the elements of its O output itself, with the streaming operator of
+        its own template (``_paged_attention_io.store_output_rows``), and
+        the same reader knows that kernel by the policy its call of the body
+        names.
 
         The direction is fixed, so this is a tie break with a bounded loss
         and not a claim that default stores are faster: it acts only
