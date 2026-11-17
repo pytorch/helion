@@ -851,6 +851,10 @@ class CompileEnvironment:
         # its hints are the ones that trace chose, recorded here so that code
         # generation refuses them whether or not the FakeTensor is still alive.
         self._binds_outer_trace_inputs = False
+        # With ``Backend.orders_overlapping_inputs``: the fake storage id of
+        # each tensor argument that overlaps an earlier one at runtime, mapped
+        # to that one's, for the barrier walks (``_storage_ids``).
+        self.input_storage_aliases: dict[int, int] = {}
         # Host integer helpers such as cdiv/next_power_of_2 deliberately return
         # unbacked SymInts during tracing. Preserve the config expression beside
         # that symbol so a fixed block size derived from a user tunable can still

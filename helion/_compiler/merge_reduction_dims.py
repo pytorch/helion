@@ -33,6 +33,7 @@ from ..language.memory_ops import load
 from .compile_environment import CompileEnvironment
 from .host_function import HostFunction
 from .indexing_strategy import is_block_size_index
+from .loop_dependency_checker import _storage_id
 from .loop_dependency_checker import _storage_ids
 from .loop_dependency_checker import memory_write_target
 from .loop_dependency_checker import opaque_access_target
@@ -253,7 +254,7 @@ def merge_reduction_dims(graphs: Sequence[GraphInfo]) -> set[int]:
                         value = n.meta.get("val")
                         if (
                             isinstance(value, torch.Tensor)
-                            and (storage_id := id(value.untyped_storage())) in excluded
+                            and (storage_id := _storage_id(value)) in excluded
                             and excluded[storage_id] is None
                         ):
                             excluded[storage_id] = value
@@ -444,7 +445,7 @@ class _Merger:
         if not (isinstance(host, torch.fx.Node) and host.target is _host_tensor):
             return None
         tensor = host.meta["val"]
-        if id(tensor.untyped_storage()) in self.excluded_storages:
+        if _storage_id(tensor) in self.excluded_storages:
             return None
 
         def disjoint_inputs(left: torch.Tensor, right: torch.Tensor) -> bool:
