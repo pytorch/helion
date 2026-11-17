@@ -4,6 +4,7 @@ known facts (``metal/affine_fold.py``): pure Python, no Metal device."""
 from __future__ import annotations
 
 import ast
+from fractions import Fraction
 import itertools
 import textwrap
 import unittest
@@ -16,6 +17,8 @@ from helion._compiler.metal.affine_fold import floor_divide
 from helion._compiler.metal.affine_fold import fold
 from helion._compiler.metal.affine_fold import remainder
 from helion._compiler.metal.affine_fold import render
+from helion._compiler.metal.fragment_mma import _assigned_from
+from helion._compiler.metal.fragment_mma import _early_load
 from helion._compiler.metal.fragment_mma import kernel_constants
 from helion._testing import skipUnlessBackends
 
@@ -220,7 +223,7 @@ class TestAffineFold(unittest.TestCase):
             "k": Affine.term("lane") + Affine.of(17),
         }
         self.assertEqual(
-            _src(fold(stmts, env, FACTS)),
+            _src(fold(stmts, env, dict(FACTS))),
             textwrap.dedent(
                 """\
                 _helion_mpp_bind('tid', uint3(lane / 2 + 8, 0, 0))
@@ -233,15 +236,37 @@ class TestAffineFold(unittest.TestCase):
             ),
         )
 
+    def test_floor_term_facts(self) -> None:
+        """``fold`` records the facts of the floor terms it makes, so an index
+        over its values that divides one again evaluates, and a prefetch finds
+        the load (``fragment_mma._early_load``)."""
+        facts = dict(FACTS)
+        env: dict[str, object] = {}
+        fold(ast.parse("r = c10.metal.floor_divide(2 * row, 4)").body, env, facts)
+        r = env["r"]
+        assert isinstance(r, Affine)
+        ((term, _),) = r.terms
+        self.assertIn(term, facts)
+        self.assertNotIn(term, FACTS)
+        load = ast.parse("tl.load(buf + (off + r / 2), None)", mode="eval").body
+        key = _early_load(load, env, facts, "off", set())
+        assert key is not None
+        self.assertEqual((key[0], key[2]), ("buf", Fraction(1)))
+        # Not over a name assigned at or after the load: ``env`` holds its
+        # last value.
+        self.assertIsNone(_early_load(load, env, facts, "off", {"r"}))
+        body = ast.parse("a = 1\nv = tl.load(p + a, None)\na = 2").body
+        self.assertEqual(_assigned_from(body), [{"a", "v"}, {"a", "v"}, {"a"}])
+
     def test_c_division_needs_nonnegative(self) -> None:
         """C's ``/`` and ``%`` are floor division and remainder only at a
         dividend that can't be negative."""
         stmts = ast.parse("a = (row - 8) / 4\nb = row / 4\nc = (row - 8) // 4").body
-        out = _src(fold(stmts, {}, FACTS))
+        out = _src(fold(stmts, {}, dict(FACTS)))
         # Floor division pulls the constant's multiple of 4 out.
         self.assertEqual(out, "a = (row - 8) / 4\nb = row / 4\nc = row / 4 - 2")
         stmts = ast.parse("b = (row + 8) / 16").body
-        self.assertEqual(_src(fold(stmts, {}, FACTS)), "b = 0")
+        self.assertEqual(_src(fold(stmts, {}, dict(FACTS))), "b = 0")
 
 
 if __name__ == "__main__":
