@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import importlib
 import re
 import unittest
@@ -14,6 +15,7 @@ from torch._inductor.codegen import common
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
+from torch._inductor.virtualized import V
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 import torch.utils._pytree as pytree
@@ -453,6 +455,13 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(fn, x, backend="cute")
         self.assertIn("torch.any(", source)
 
+    def test_welford(self):
+        # welford() emits eq, where, truediv, isinf, isnan and logical_or, and
+        # the block's weight sums hl.full([], 1.0).expand(tile_r).
+        x = torch.randn(64, 1000, device=DEVICE)
+        (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, backend="cute")
+        self.assertIn(".expand(tile_r)", source)
+
 
 @skipIfNotCUDA()
 @onlyBackends(["triton"])
@@ -641,6 +650,168 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         (source,) = self.compile(fn, x)
         self.assertIn("torch.amin(", source)
 
+    def test_welford(self):
+        (source,) = self.compile(
+            lambda x: torch.var_mean(x, -1), torch.randn(64, 100, device=DEVICE)
+        )
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
+    for tile_x in hl.tile(64):
+        acc = hl.zeros([tile_x], dtype=torch.float32)
+        acc1 = hl.zeros([tile_x], dtype=torch.float32)
+        acc2 = hl.zeros([tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(100):
+            tmp0 = in0[tile_x, tile_r]
+            tmp1 = hl.full([], 0.0, dtype=torch.float32)
+            tmp2 = hl.full([], 1.0, dtype=torch.float32)
+            tmp3 = tmp2.expand(tile_r)
+            tmp4 = torch.sum(tmp3, -1)
+            tmp5 = tmp2 / tmp4
+            tmp6 = tmp0 * tmp5
+            tmp7 = torch.sum(tmp6, -1)
+            tmp8 = torch.isinf(tmp7)
+            tmp9 = torch.isnan(tmp7)
+            tmp10 = torch.logical_or(tmp8, tmp9)
+            tmp11 = torch.where(tmp10, tmp1, tmp7)
+            tmp12 = tmp11.reshape([tile_x, 1])
+            tmp13 = tmp0 - tmp12
+            tmp14 = tmp13 * tmp5
+            tmp15 = torch.sum(tmp14, -1)
+            tmp16 = tmp11 + tmp15
+            tmp17 = tmp16.reshape([tile_x, 1])
+            tmp18 = tmp0 - tmp17
+            tmp19 = tmp18 * tmp5
+            tmp20 = torch.sum(tmp19, -1)
+            tmp21 = tmp20.reshape([tile_x, 1])
+            tmp22 = tmp18 - tmp21
+            tmp23 = tmp22 * tmp22
+            tmp24 = torch.sum(tmp23, -1)
+            tmp25 = acc2 + tmp4
+            tmp26 = acc == tmp16
+            tmp27 = tmp16 - acc
+            tmp28 = torch.where(tmp26, tmp1, tmp27)
+            tmp29 = tmp25 == tmp1
+            tmp30 = tmp4 / tmp25
+            tmp31 = torch.where(tmp29, tmp1, tmp30)
+            tmp32 = tmp28 * tmp31
+            tmp33 = acc + tmp32
+            tmp34 = acc1 + tmp24
+            tmp35 = acc2 * tmp31
+            tmp36 = tmp28 * tmp35
+            tmp37 = tmp36 * tmp28
+            tmp38 = tmp34 + tmp37
+            acc = tmp33
+            acc1 = tmp38
+            acc2 = tmp25
+        out0[tile_x] = acc
+        tmp39 = hl.full([], 99.0, dtype=torch.float32)
+        tmp40 = acc1 / tmp39
+        out1[tile_x] = tmp40
+""",
+        )
+
+    @parametrize("case", ["split", "rows"])
+    def test_welford_cases(self, case):
+        # split: a kernel that reduces chunks of each row to (mean, m2, weight),
+        # then a welford_combine kernel over them. R = 65537 (few rows and a
+        # long R, which Inductor splits on any GPU) is not a multiple of the
+        # chunk, so the first kernel is a welford_combine over (x, 0, 1), with
+        # (0, 0, 0) past the end of R. rows, one block each: rows 0-7 with one
+        # value of 2000, as in some channels of LLM activations, whose mean is
+        # as close to eager's as Triton's; rows 8-15 of 1e37, whose sum
+        # overflows; rows 16-23 of 100000000 and 100000008 in turn, whose mean
+        # rounds.
+        fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
+        if case == "split":
+            x = torch.randn(8, 65537, device=DEVICE) + 100
+            self.assertEqual(len(self.compile(fn, x)), 2)
+            # Halves of 1e37 and -1e37: partial means of 1e37 with weights of
+            # thousands, whose product overflows. The mean is finite and the
+            # variance overflows, as in eager.
+            x[:, :32768], x[:, 32768:] = 1e37, -1e37
+            var, mean = torch.compile(fn, fullgraph=True)(x)
+            self.assertTrue(torch.isinf(var).all() and torch.isfinite(mean).all())
+            return
+        x = torch.randn(24, 4096, device=DEVICE)
+        x[:8, 100], x[8:16], x[16:] = 2000.0, 1e37, 100000000.0
+        x[16:, ::2] = 100000008.0
+        self.assertEqual(len(self.compile(fn, x)), 1)
+
+    def test_welford_empty_chunks(self):
+        # A reduction_split_factor() of 1024 cuts R = 9000 into chunks of 9, so
+        # the last 24 chunks hold nothing past the end of R.
+        class Choices(InductorChoices):
+            def reduction_split_factor(
+                self,
+                device: torch.device,
+                reduction_numel_hint: int,
+                numel_hint: int,
+                inner_reduction: bool,
+            ) -> int:
+                return 1024 if reduction_numel_hint == 9000 else 1
+
+        x = torch.randn(8, 9000, device=DEVICE)
+        with V.set_choices_handler(Choices()):
+            sources = self.compile(lambda x: torch.var_mean(x, -1), x)
+        self.assertEqual(len(sources), 2)
+
+    def test_welford_layer_norm(self):
+        # bf16 with its affine epilogue, in one kernel.
+        x, w, b = (
+            torch.randn(*shape, device=DEVICE, dtype=torch.bfloat16)
+            for shape in ((64, 1000), (1000,), (1000,))
+        )
+        expected = torch.nn.functional.layer_norm(
+            x.float(), (1000,), w.float(), b.float()
+        ).bfloat16()
+        fn = lambda x: torch.nn.functional.layer_norm(x, (1000,), w, b)  # noqa: E731
+        self.assertEqual(len(self.compile(fn, x, expected=expected, tol=2e-2)), 1)
+
+    @parametrize("case", ["rows", "split", "split_empty"])
+    def test_welford_extremes(self, case):
+        # Blocks of tile_r pinned to 64, or 1 for split_empty (by default one
+        # block covers a row). rows, R = 963, whose last block has 3 lanes:
+        # rows 1 and 2, of inf, get the mean inf, as from Triton's persistent
+        # reductions (eager gives nan), since the delta of two equal means is
+        # 0, where inf - inf is nan. Row 3, of 2e19, gets the variance 0, as on
+        # its first block acc_weight is 0 and delta 2e19, whose square is inf in
+        # float32. Row 4, of 100553424 (c), gets the variance 0, as the last
+        # block's mean is c, where (c + c + c) / 3 is 100553432. Row 5, of 1e38
+        # and 0 in turn, gets the mean 5e37: its deviations of 5e37 are divided
+        # by the weight before they are summed. split: test_welford_cases'
+        # masked split, whose first kernel has partials of weight 0 and mean 0
+        # past the end of R. Rows of -134217720, whose blocks of unequal weight
+        # give their mean exactly only with the correction, and of 2e19, whose
+        # squared deviation from that 0 is inf, get the variance 0.
+        # split_empty: the same split, whose last block of the last chunk holds
+        # only a partial of weight 0, whose mean would be 0 / 0.
+        rows = case == "rows"
+        if rows:
+            x = torch.randn(6, 963, device=DEVICE)
+            x[1], x[2, 480:] = float("inf"), float("inf")
+            x[3], x[4], x[5] = 2e19, 100553424.0, 0.0
+            x[5, ::2] = 1e38
+        elif case == "split":
+            x = torch.full((8, 65537), -134217720.0, device=DEVICE)
+            x[4:] = 2e19
+        else:
+            x = torch.randn(8, 65537, device=DEVICE)
+        var, mean = torch.var_mean(x, -1)
+        if rows:
+            mean[1:3] = float("inf")
+        pinned = helion.Config(block_sizes=[1, 1 if case == "split_empty" else 64])
+        with patch("helion.kernel", functools.partial(helion.kernel, config=pinned)):
+            fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
+            sources = self.compile(fn, x, expected=(var, mean))
+        self.assertEqual(len(sources), 1 if rows else 2)
+
     def test_any(self):
         x = torch.randn(64, 100, device=DEVICE)
         (source,) = self.compile(lambda x: torch.any(x > 2.0, -1), x)
@@ -696,7 +867,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
     @parametrize(
         "case",
         [
-            "welford",
+            "xor_sum",
             "dropout",
             "gather",
             "dynamic",
@@ -713,8 +884,10 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         x = torch.randn(64, 100, device=DEVICE)
         fn = lambda x: x.sum(-1)  # noqa: E731
         args = [x]
-        if case == "welford":
-            fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
+        if case == "xor_sum":
+            # The one reduction type of Inductor's that Helion kernels lack.
+            fn = lambda x: torch.ops.prims.xor_sum(x, [1])  # noqa: E731
+            args = [torch.randint(0, 100, (64, 100), device=DEVICE, dtype=torch.int32)]
         elif case == "dropout":
             fn = lambda x: torch.nn.functional.dropout(x, 0.5)  # noqa: E731
         elif case == "gather":
@@ -726,7 +899,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
             fn = lambda x, y: (x * 2, y + 1)  # noqa: E731
             args = [x, torch.randn(32, 50, device=DEVICE)]
         names, patches = {
-            "welford": ("welford_reduce", {}),
+            "xor_sum": ("xor_sum", {}),
             "dropout": ("load_seed, rand", {}),
             "gather": ("indirect_indexing", {}),
             "dynamic": ("dynamic_shape", {}),
