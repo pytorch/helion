@@ -18,6 +18,7 @@ from torch.fx.node import map_arg
 from ... import exc
 from ..ast_extension import expr_from_string
 from ..aten_lowering import _env_arg
+from ..aten_lowering import expand_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
 from ..aten_lowering import squeeze_lowering
@@ -75,6 +76,32 @@ def _only_unit_dims_change(node: Node) -> bool:
     return len(before) == len(after) and all(
         starmap(env.known_equal, zip(before, after, strict=True))
     )
+
+
+@expand_lowering.register_codegen("metal")
+def codegen_expand_metal(ctx: LoweringContext, node: Node) -> object:
+    """Broadcast dims of size 1, or new leading dims, onto tile blocks.
+
+    A value is held by the block ids of its dims and a dim of size 1 owns
+    none, so the thread at any position of the new block already holds the
+    value for it, as in any broadcasting op.  A dim expanded to a size that
+    is not a tile block (a literal) has no block id to hold it by, and
+    raises.
+    """
+    env = CompileEnvironment.current()
+    source = node.args[0]
+    assert isinstance(source, Node)
+    before = [*source.meta["val"].shape]
+    after = [*node.meta["val"].shape]
+    before = [1] * (len(after) - len(before)) + before
+    for old, new in zip(before, after, strict=True):
+        if not env.known_equal(old, new) and env.get_block_id(new) is None:
+            raise exc.BackendUnsupported(
+                "metal",
+                f"{node.target} to a dim of size {new}: Metal broadcasts only "
+                "onto a tile's block",
+            )
+    return _input_ast(ctx, node)
 
 
 @view_lowering.register_codegen("metal")

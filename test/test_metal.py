@@ -5675,6 +5675,20 @@ def unit_dim_views(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", autotune_effort="none")
+def expanded_row_mask(x: torch.Tensor, n_valid: torch.Tensor) -> torch.Tensor:
+    """A per-row mask broadcast over the tile's columns with ``expand``."""
+    m, n = x.size()
+    out = torch.zeros_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        valid = tile_m.index < n_valid[0]
+        mask = valid.view(tile_m.block_size, 1).expand(
+            tile_m.block_size, tile_n.block_size
+        )
+        out[tile_m, tile_n] = torch.where(mask, x[tile_m, tile_n], 0.0)
+    return out
+
+
 class TestMetalSqueeze(unittest.TestCase):
     """``squeeze`` removes only dims of size 1, which own no thread axis, so
     each thread's value passes through unchanged."""
@@ -5728,6 +5742,14 @@ class TestMetalSqueeze(unittest.TestCase):
         an unsqueeze: each thread keeps its value."""
         x, w = torch.randn(70, 300, device=DEVICE), torch.randn(300, device=DEVICE)
         torch.testing.assert_close(unit_dim_views(x, w), x * w)
+
+    def test_expand_onto_tile_blocks(self) -> None:
+        """``expand`` broadcasts a size-1 dim onto a tile's block: each
+        thread already holds the value for its position."""
+        x = torch.randn(70, 300, device=DEVICE)
+        n_valid = torch.tensor([45], device=DEVICE)
+        expected = torch.where(torch.arange(70, device=DEVICE)[:, None] < 45, x, 0.0)
+        torch.testing.assert_close(expanded_row_mask(x, n_valid), expected)
 
     def test_squeeze_leading_and_middle_dims(self) -> None:
         x = torch.randn(70, 300, device=DEVICE)
