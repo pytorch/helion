@@ -391,6 +391,40 @@ def _block_sequence_values(
     return result
 
 
+def _packed_mxfp8_split_k(
+    m: int,
+    n: int,
+    k: int,
+    num_sm: int,
+    choices: Collection[int],
+    *,
+    block_m: int = 128,
+    block_n: int = 256,
+    compact_swap: bool = False,
+) -> int:
+    """Increase small-grid MXFP8 parallelism to roughly half an SM wave."""
+    if k < 2048:
+        return 1
+    tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+    target_tiles = max(1, math.ceil(num_sm / 2))
+    if compact_swap and tiles >= math.ceil(num_sm / 4):
+        return 1
+    valid = sorted(
+        split
+        for split in choices
+        if type(split) is int
+        and split >= 1
+        and (k // 32) % split == 0
+        and (k // 32 // split) % 4 == 0
+    )
+    if not valid or tiles >= target_tiles:
+        return 1
+    return next(
+        (split for split in valid if tiles * split >= target_tiles),
+        valid[-1],
+    )
+
+
 class TritonB200PackedMXFP8Heuristic(AutotunerHeuristic):
     """AutoWS-style persistent schedule for a proved packed MXFP8 contraction."""
 
@@ -487,18 +521,49 @@ class TritonB200PackedMXFP8Heuristic(AutotunerHeuristic):
             return None
         fact, k_block_id, outer_block_id = matched
         spec = env.config_spec
-        block_sizes = _h100_build_block_sizes(spec, fact, 128, 256, 4)
+        compact_swap = fact.static_m is not None and fact.static_m <= 32
+        block_m = 16 if fact.static_m is not None and fact.static_m <= 16 else 32
+        block_n = 128
+        block_sizes = _h100_build_block_sizes(spec, fact, block_m, block_n, 4)
+        assert fact.m_block_id is not None and fact.n_block_id is not None
+        block_m = block_sizes[fact.m_block_id]
+        block_n = block_sizes[fact.n_block_id]
+        compact_swap = compact_swap and block_m in (16, 32) and block_n >= 128
+        if not compact_swap:
+            block_m, block_n = 128, 256
+            block_sizes = _h100_build_block_sizes(spec, fact, block_m, block_n, 4)
+        split_fragment = spec.user_defined_tunables.get("split_k")
+        split_choices = (
+            split_fragment.search_values() if split_fragment is not None else None
+        )
+        split_k = (
+            _packed_mxfp8_split_k(
+                fact.static_m,
+                fact.static_n,
+                fact.static_k,
+                spec.num_sm,
+                cast("Collection[int]", split_choices),
+                block_m=block_m,
+                block_n=block_n,
+                compact_swap=compact_swap,
+            )
+            if fact.static_m is not None
+            and fact.static_n is not None
+            and fact.static_k is not None
+            and split_choices is not None
+            else 1
+        )
         l2_groupings = _block_sequence_values(spec.l2_groupings, {outer_block_id: 8}, 1)
         outer_inner = {
-            outer_block_id: True,
+            outer_block_id: split_k == 1 and not compact_swap,
             k_block_id: False,
         }
-        stages = 3
+        stages = 5 if compact_swap else 3
         raw: dict[str, object] = {
             "block_sizes": block_sizes,
             "num_warps": 4,
             "num_stages": stages,
-            "split_k": 1,
+            "split_k": split_k,
             "pid_type": "persistent_blocked",
             "num_sm_multiplier": 1,
             "l2_groupings": l2_groupings,

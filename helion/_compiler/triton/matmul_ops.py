@@ -234,7 +234,11 @@ def _packed_mxfp8_scales(
         return None
     lhs_shape = cast("tuple[int, int]", lhs_shape)
     rhs_shape = cast("tuple[int, int]", rhs_shape)
-    if lhs_shape[1] % 4 or groups % lhs_shape[1]:
+    split_k = state.config.get("split_k", 1)
+    if type(split_k) is not int or split_k < 1:
+        return None
+    groups_per_split = (groups + split_k - 1) // split_k
+    if groups % split_k or lhs_shape[1] % 4 or groups_per_split % lhs_shape[1]:
         return None
     lhs_match = match_packed_scale(node.args[1], None, lhs_shape[1], allow_mask=True)
     rhs_match = match_packed_scale(node.args[4], None, rhs_shape[1], allow_mask=True)
@@ -265,6 +269,60 @@ def _packed_mxfp8_scales(
     if rhs_operand is not None and rhs_transposed:
         rhs_operand = expr_from_string("tl.permute({value}, [1, 0])", value=rhs_operand)
     return lhs_operand, lhs_scale, rhs_operand, rhs_scale
+
+
+def _compact_packed_mxfp8_swap(state: CodegenState) -> bool:
+    """Whether a packed MXFP8 dot should use Triton's compact swapped geometry."""
+    node = state.fx_node
+    if node is None or state.proxy_args[2] != "e4m3" or state.proxy_args[5] != "e4m3":
+        return False
+    lhs = tile_load(_unmask_zero_operand(node.args[0]), allow_mask=True)
+    rhs_node = _unmask_zero_operand(node.args[3])
+    if (
+        not isinstance(rhs_node, torch.fx.Node)
+        or rhs_node.target is not torch.ops.aten.permute.default
+        or len(rhs_node.args) != 2
+        or rhs_node.args[1] != [1, 0]
+        or rhs_node.kwargs
+    ):
+        return False
+    rhs = tile_load(rhs_node.args[0], allow_mask=True)
+    lhs_scale_proxy = state.proxy_args[1]
+    rhs_scale_proxy = state.proxy_args[4]
+    if (
+        lhs is None
+        or rhs is None
+        or not isinstance(lhs_scale_proxy, torch.Tensor)
+        or not isinstance(rhs_scale_proxy, torch.Tensor)
+    ):
+        return False
+    try:
+        lhs_shape = tuple(_resolve_dim_size(value) for value in lhs_scale_proxy.shape)
+        rhs_shape = tuple(_resolve_dim_size(value) for value in rhs_scale_proxy.shape)
+    except (AssertionError, TypeError, ValueError):
+        return False
+    if (
+        len(lhs_shape) != 2
+        or len(rhs_shape) != 2
+        or not all(type(value) is int for value in (*lhs_shape, *rhs_shape))
+    ):
+        return False
+    lhs_shape = cast("tuple[int, int]", lhs_shape)
+    rhs_shape = cast("tuple[int, int]", rhs_shape)
+    if (
+        lhs_shape[0] not in (16, 32)
+        or rhs_shape[0] < 128
+        or lhs_shape[1] != rhs_shape[1]
+    ):
+        return False
+    lhs_match = match_packed_scale(node.args[1], None, lhs_shape[1], allow_mask=True)
+    rhs_match = match_packed_scale(node.args[4], None, rhs_shape[1], allow_mask=True)
+    return (
+        lhs_match is not None
+        and rhs_match is not None
+        and lhs[1][0] == lhs_match.row
+        and rhs[1][0] == rhs_match.row
+    )
 
 
 @_decorators.codegen(dot, "triton")
@@ -356,6 +414,25 @@ def _(state: CodegenState) -> object:
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
     acc = None if is_acc_none else acc_ast
+    if _compact_packed_mxfp8_swap(state):
+        lhs_transposed = expr_from_string("tl.permute({value}, [1, 0])", value=lhs_ast)
+        rhs_transposed = expr_from_string("tl.permute({value}, [1, 0])", value=rhs_ast)
+        acc_transposed = (
+            None
+            if acc is None
+            else expr_from_string("tl.permute({value}, [1, 0])", value=acc)
+        )
+        swapped = _emit_tl_dot_scaled(
+            rhs_transposed,
+            rhs_scale_ast,
+            rhs_format,
+            lhs_transposed,
+            lhs_scale_ast,
+            lhs_format,
+            acc=acc_transposed,
+            out_dtype=out_dtype,
+        )
+        return expr_from_string("tl.permute({value}, [1, 0])", value=swapped)
     return _emit_tl_dot_scaled(
         lhs_ast,
         lhs_scale_ast,

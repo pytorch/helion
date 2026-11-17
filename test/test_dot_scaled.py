@@ -254,7 +254,7 @@ class TestDotScaled(TestCase):
     @onlyBackends(["triton"])
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
     def test_packed_mxfp8_utccp_codegen_and_correctness(self):
-        """Packed scales use UTCCP descriptors for the 128x256 seed."""
+        """Packed scales use either UTCCP descriptors or compact swapped MMA."""
         M, N, K = 128, 256, 256
 
         @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -354,6 +354,33 @@ class TestDotScaled(TestCase):
         self.assertNotIn("tl.make_tensor_descriptor", code)
         expected = _reference_dot_scaled(x, x_scale_bytes, y.T, y_scale_bytes)
         torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+
+        compact_m = 8
+        compact_x = (torch.randn(compact_m, K, device=DEVICE) * 0.5).to(
+            torch.float8_e4m3fn
+        )
+        compact_scale_bytes = torch.randint(
+            120, 136, (compact_m, K // 32), device=DEVICE, dtype=torch.uint8
+        )
+        compact_code, compact_result = code_and_output(
+            packed_scaled_kernel,
+            (
+                compact_x,
+                _pack_e8m0_scales(compact_scale_bytes),
+                y,
+                _pack_e8m0_scales(y_scale_bytes),
+            ),
+        )
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(16)", compact_code)
+        self.assertIn("_BLOCK_SIZE_1 = tl.constexpr(128)", compact_code)
+        self.assertIn("tl.dot_scaled(tl.permute(", compact_code)
+        self.assertNotIn("mxfp8_lhs_words", compact_code)
+        compact_expected = _reference_dot_scaled(
+            compact_x, compact_scale_bytes, y.T, y_scale_bytes
+        )
+        torch.testing.assert_close(
+            compact_result.float(), compact_expected, atol=2e-2, rtol=1e-2
+        )
 
         unaligned_n = 129
         unaligned_y = (torch.randn(unaligned_n, K, device=DEVICE) * 0.5).to(
