@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Callable
 from typing import ClassVar
 import unittest
@@ -22,10 +23,15 @@ from helion.autotuner import benchmarking
 from helion.autotuner.pattern_search import PatternSearch
 import helion.language as hl
 
+if TYPE_CHECKING:
+    import ast
+
 
 class _ApiOnlyBackend(backend_api.TritonBackend):
     # A backend written only against helion.backend_api, reusing Triton
     # codegen under a new name (the TileIRBackend pattern).
+    states: ClassVar[list[object]] = []
+
     @property
     def name(self) -> str:
         return "_test_api_only"
@@ -34,12 +40,22 @@ class _ApiOnlyBackend(backend_api.TritonBackend):
     def codegen_name(self) -> str:
         return "triton"
 
+    def finalize_device_body(
+        self, body: list[ast.stmt], ctx: backend_api.DeviceBodyContext
+    ) -> tuple[list[ast.stmt], list[ast.arg]]:
+        # The covered per-function state: a dict a backend may write to.
+        state = ctx.device_function.backend_codegen_state
+        state.setdefault("_test_api_only", {})["seen"] = True
+        type(self).states.append(state)
+        return body, []
+
 
 @onlyBackends(["triton"])
 @skipIfRefEager("compiles a kernel; ref mode runs it eagerly")
 class TestBackendApiCompile(TestCase):
     def test_api_only_backend_compiles_and_runs(self) -> None:
         repaired_before = backend_registry._REPAIRED_CODEGEN_NAMES
+        _ApiOnlyBackend.states = []
         backend_api.register_compiler_backend(_ApiOnlyBackend)
         try:
 
@@ -57,8 +73,12 @@ class TestBackendApiCompile(TestCase):
         finally:
             unregister_compiler_backend("_test_api_only")
             backend_registry._REPAIRED_CODEGEN_NAMES = repaired_before
+            states, _ApiOnlyBackend.states = _ApiOnlyBackend.states, []
         torch.testing.assert_close(out, x + y)
         self.assertIsInstance(bound.env.backend, _ApiOnlyBackend)
+        self.assertTrue(states)
+        for state in states:
+            self.assertEqual(state, {"_test_api_only": {"seen": True}})
 
 
 # What docs/api/backend_api.md says the autotuner passes a plugin's timers.

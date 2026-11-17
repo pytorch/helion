@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import inspect
 import os
@@ -37,6 +38,7 @@ _EXPECTED_ALL = [
     "COVERED_BACKEND_HOOKS",
     "COVERED_STRATEGY_METHODS",
     "Backend",
+    "BackendSearchSurface",
     "BackendState",
     "BlockSizeSpec",
     "BoundKernel",
@@ -46,6 +48,7 @@ _EXPECTED_ALL = [
     "Config",
     "ConfigSpec",
     "ConfigSpecFragment",
+    "DeviceBodyContext",
     "DeviceFunction",
     "DeviceGridState",
     "DeviceIR",
@@ -68,6 +71,8 @@ _EXPECTED_ALL = [
     "codegen",
     "exc",
     "expr_from_string",
+    "list_backends",
+    "load_backend_plugins",
     "mask_to_op",
     "reduce_op",
     "register_compiler_backend",
@@ -103,6 +108,7 @@ _BACKEND_HOOKS = {
     "scalar_load_expr": "(self, tensor_name: 'str', index_expr: 'str | None' = None) -> 'str'",
     "inline_constexpr": "(self, name: 'str', value: 'str') -> 'str'",
     "scalar_arg_preamble": "(self, arg: 'Argument') -> 'list[ast.AST]'",
+    "finalize_device_body": "(self, body: 'list[ast.stmt]', ctx: 'DeviceBodyContext') -> 'tuple[list[ast.stmt], list[ast.arg]]'",
     "cast_expr": "(self, expr_str: 'str', dtype_str: 'str') -> 'str'",
     "cast_scalar_ast": "(self, x: 'ast.AST', target_dtype: 'torch.dtype') -> 'ast.AST'",
     "where_expr": "(self, mask: 'str', true_val: 'str', false_val: 'str') -> 'str'",
@@ -125,6 +131,7 @@ _BACKEND_HOOKS = {
     "launches_surplus_tile_threads": "(self) -> 'bool'",
     "launcher_keyword_args": "(self, config: 'Config', *, has_barrier: 'bool') -> 'list[str]'",
     "supports_config_key": "(self, key: 'str') -> 'bool'",
+    "config_spec_extension": "(self) -> 'BackendSearchSurface'",
     "tunable_fragments": "(self) -> 'dict[str, ConfigSpecFragment]'",
     "supports_precompile": "(self) -> 'bool'",
     "adjust_block_size_constraints": "(self, block_specs: 'list[object]', ndim: 'int', block_sizes: 'list[object] | None' = None, kernel_tensor_sizes: 'dict[tuple[object, ...], int] | None' = None, min_element_bits: 'int' = 32) -> 'None'",
@@ -210,6 +217,11 @@ class TestBackendApiSurface(unittest.TestCase):
         self.assertEqual(
             list(backend_api.COVERED_STRATEGY_METHODS), list(_STRATEGY_HOOKS)
         )
+
+    def test_device_body_context_covered_fields(self) -> None:
+        # The DeviceBodyContext fields finalize_device_body's docs cover.
+        fields = {f.name for f in dataclasses.fields(backend_api.DeviceBodyContext)}
+        self.assertLessEqual({"device_function", "args", "body_start"}, fields)
 
     def test_abstract_members(self) -> None:
         # Making a covered hook abstract breaks every out-of-tree subclass at
@@ -301,6 +313,17 @@ class TestBackendApiSurface(unittest.TestCase):
         for name, expected in _BACKEND_HOOKS.items():
             with self.subTest(name=name):
                 self.assertEqual(_signature(backend_api.Backend, name), expected)
+
+    def test_search_surface_covered_members(self) -> None:
+        # The BackendSearchSurface members the docs cover.
+        for attr in ("config_keys", "debug_keys"):
+            self.assertEqual(
+                getattr(backend_api.BackendSearchSurface, attr), frozenset()
+            )
+        self.assertEqual(
+            _signature(backend_api.BackendSearchSurface, "fingerprint_extra"),
+            "(self, config_spec: 'ConfigSpec') -> 'object | None'",
+        )
 
     def test_strategy_hook_signatures(self) -> None:
         for qualname, expected in _STRATEGY_HOOKS.items():

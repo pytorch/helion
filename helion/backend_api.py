@@ -31,12 +31,15 @@ from ._compiler.backend_registry import COVERED_BACKEND_HOOKS as COVERED_BACKEND
 from ._compiler.backend_registry import (
     COVERED_STRATEGY_METHODS as COVERED_STRATEGY_METHODS,
 )
+from ._compiler.backend_registry import list_backends as list_backends
+from ._compiler.backend_registry import load_backend_plugins as load_backend_plugins
 from ._compiler.backend_registry import (
     register_compiler_backend as register_compiler_backend,
 )
 from ._compiler.compile_environment import CompileEnvironment as CompileEnvironment
 from ._compiler.compile_environment import _symint_sympy_expr as symint_sympy_expr
 from ._compiler.device_function import Argument as Argument
+from ._compiler.device_function import DeviceBodyContext as DeviceBodyContext
 from ._compiler.device_function import DeviceFunction as DeviceFunction
 from ._compiler.device_ir import DeviceIR as DeviceIR
 from ._compiler.device_ir import ForLoopGraphInfo as ForLoopGraphInfo
@@ -63,6 +66,7 @@ from .autotuner.config_fragment import ConfigSpecFragment as ConfigSpecFragment
 from .autotuner.config_spec import BlockSizeSpec as BlockSizeSpec
 from .autotuner.config_spec import ConfigSpec as ConfigSpec
 from .autotuner.config_spec import VectorWidthSpec as VectorWidthSpec
+from .autotuner.search_surface import BackendSearchSurface as BackendSearchSurface
 from .language._decorators import codegen as codegen
 from .language._tracing_ops import _mask_to as mask_to_op
 from .language.reduce_ops import _reduce as reduce_op
@@ -78,6 +82,7 @@ __all__ = [
     "COVERED_STRATEGY_METHODS",
     "Argument",
     "Backend",
+    "BackendSearchSurface",
     "BackendState",
     "BlockSizeSpec",
     "BoundKernel",
@@ -87,6 +92,7 @@ __all__ = [
     "Config",
     "ConfigSpec",
     "ConfigSpecFragment",
+    "DeviceBodyContext",
     "DeviceFunction",
     "DeviceGridState",
     "DeviceIR",
@@ -109,6 +115,8 @@ __all__ = [
     "codegen",
     "exc",
     "expr_from_string",
+    "list_backends",
+    "load_backend_plugins",
     "mask_to_op",
     "reduce_op",
     "register_compiler_backend",

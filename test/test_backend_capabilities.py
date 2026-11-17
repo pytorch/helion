@@ -29,8 +29,8 @@ from helion.language._decorators import BackendDispatchTable
 
 def _backends() -> dict[str, Backend]:
     return {
-        name: backend_registry.get_backend_class(name)()
-        for name in backend_registry.list_backends()
+        name: cls()
+        for name, cls in backend_registry.registered_backend_classes().items()
     }
 
 

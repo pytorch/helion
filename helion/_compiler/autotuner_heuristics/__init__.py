@@ -23,19 +23,20 @@ def _registered_backend(name: str) -> Backend | None:
     needs this lookup; the bind-time entry points use the live ``env.backend``.
     Synthetic backend names (tests) own no hooks.
     """
-    from ..backend_registry import get_backend
-    from ..backend_registry import list_backends
+    from ..backend_registry import registered_backend_classes
 
-    if name not in list_backends():
-        return None
-    return get_backend(name)
+    backend_cls = registered_backend_classes().get(name)
+    return None if backend_cls is None else backend_cls()
 
 
 def _builtin_heuristics() -> dict[str, tuple[AutotunerHeuristicType, ...]]:
-    from ..backend_registry import get_backend
-    from ..backend_registry import list_backends
+    from ..backend_registry import registered_backend_classes
 
-    return {name: get_backend(name).autotuner_heuristics() for name in list_backends()}
+    # From a snapshot of the registered classes: never waits on a plugin load.
+    return {
+        name: cls().autotuner_heuristics()
+        for name, cls in registered_backend_classes().items()
+    }
 
 
 def _current_registry_generation() -> int:
