@@ -65,13 +65,10 @@ INHERITED_OPS = OrderedSet(
     ]
 )
 # Every op a Helion kernel emits: those HelionKernel (load, store, dot,
-# check_bounds, ...) or HelionOverrides (exp, where, ...) implements, the
-# inherited operators, SIMDKernel.store_reduction (which calls HelionKernel.store),
-# indirect_indexing (whose symbol HelionKernel's indices read, see
-# indirect_vars()) and the body's output. check_bounds, which the body of
-# x.gather(1, arange-based index) holds next to its direct index, passes when
-# Inductor proves the index in range (from its value ranges), and fails the
-# compile with "Unsupported: check_bounds" otherwise.
+# check_bounds, device_assert_async, ...) or HelionOverrides (exp, where, ...)
+# implements, the inherited operators, SIMDKernel.store_reduction (which calls
+# HelionKernel.store), indirect_indexing (whose symbol HelionKernel's indices
+# read, see indirect_vars()) and the body's output.
 HELION_OPS = (
     OrderedSet(
         name
@@ -288,15 +285,6 @@ class HelionScheduling(SIMDScheduling):
         # SIMDScheduling's combo kernels are Triton's: "expected self.kernel_type
         # to subclass TritonKernel".
         raise Unsupported("combo_kernels")
-
-    def codegen_node_schedule_with_kernel(
-        self, node_schedule: list[Any], kernel: SIMDKernel[Any]
-    ) -> None:
-        super().codegen_node_schedule_with_kernel(node_schedule, kernel)
-        # What only emitting the kernel shows: an indirect index that needs a
-        # bounds check (HelionKernel.check_bounds()).
-        if cast("HelionKernel", kernel).needs_bounds_check:
-            raise Unsupported("check_bounds")
 
     def create_kernel_choices(  # pyrefly: ignore [bad-override]
         self,

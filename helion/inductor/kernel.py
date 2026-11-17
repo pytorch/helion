@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 from dataclasses import dataclass
+import functools
 import re
 from typing import TYPE_CHECKING
 from typing import Any
@@ -10,6 +11,7 @@ from typing import cast
 
 import sympy
 import torch
+from torch._inductor import config as inductor_config
 from torch._inductor.codegen.common import CSEProxy
 from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.codegen.common import DeferredLine
@@ -30,6 +32,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
+from .._compiler.backend_registry import get_backend
 from . import config as helion_config
 from .overrides import HelionOverrides
 from .overrides import HelionPrinter
@@ -243,8 +246,6 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.dot_results: OrderedSet[CSEVariable] = OrderedSet()
         # Values stored outside the current reduction loop; see disable_reduction().
         self.outer_stores: dict[str, CSEVariable] = {}
-        # Whether an indirect index needs a bounds check; see check_bounds().
-        self.needs_bounds_check = False
         # The values indices read, by the symbols that stand for them.
         self.indirect: dict[sympy.Symbol, CSEVariable] = {}
 
@@ -555,6 +556,16 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             settings += f', dot_precision="{"tf32" if tf32 else "ieee"}"'
         if helion_config.fast_math:
             settings += ", fast_math=True"
+        # Inductor's Triton kernels compile tl.device_assert out with
+        # assert_indirect_indexing=False (torch._assert_async's too), and where
+        # Triton cannot keep it (ROCm below Triton 3.7); these compile
+        # hl.device_assert out the same, and where Helion's backend cannot emit
+        # it (Backend.supports_device_asserts).
+        if not (
+            inductor_config.assert_indirect_indexing
+            and get_backend(helion_config.backend).supports_device_asserts
+        ):
+            settings += ", device_asserts=False"
         code.writeline(f"@helion.kernel({settings})")
         names = self.kernel_arg_names()
         signature = ", ".join(f"{name}: torch.Tensor" for name in names.values())
@@ -826,12 +837,47 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     def check_bounds(
         self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
     ) -> None:
-        # Triton checks x.gather(1, i) with an i of unknown range by
-        #     tl.device_assert((0 <= tmp4) & (tmp4 < 100), "index out of bounds: ...")
-        # Helion kernels have no device assert, so such a kernel fails with
-        # "Unsupported: check_bounds" (HelionScheduling). Raising here, inside
-        # the node's codegen, would log "Error in codegen" before the error.
-        self.needs_bounds_check |= lower or upper
+        """Check an index of unknown range, as Triton does for x.gather(1, i) by
+            tl.device_assert((0 <= tmp4) & (tmp4 < 100), "index out of bounds: ...")
+        with hl.device_assert, which checks the elements of a partial tile only
+        and which Helion's device_asserts setting compiles out:
+            tmp1 = tmp0.to(torch.int64)
+            tmp2 = hl.full([], 0, dtype=torch.int64)
+            tmp3 = tmp1 >= tmp2
+            tmp4 = hl.full([], 100, dtype=torch.int64)
+            tmp5 = tmp1 < tmp4
+            tmp6 = tmp3 & tmp5
+            hl.device_assert(tmp6, 'index out of bounds: 0 <= tmp1 < 100')
+        An index read under ops.masked() is checked where the masks hold."""
+        if not (lower or upper):
+            return
+        if isinstance(expr, sympy.Symbol) and expr.name in self.cse.varname_map:
+            # The value an index reads (or its wrap), which CSEProxy checks
+            # before HelionCSEProxy.indirect_indexing() records its symbol.
+            index = self.cse.varname_map[expr.name]
+        else:
+            # A direct index the body checks, as x[(torch.arange(28) + 25) % 28]
+            # has once IndexPropagation folds the value it was computed from.
+            index = V.ops.index_expr(expr, torch.int64)
+        checks = []
+        if lower:
+            checks.append(V.ops.ge(index, V.ops.constant(0, torch.int64)))
+        if upper:
+            checks.append(V.ops.lt(index, V.ops.constant(int(size), torch.int64)))
+        cond = functools.reduce(V.ops.and_, checks)
+        for mask in self.load_masks:
+            cond = V.ops.or_(cond, V.ops.logical_not(mask))
+        # The kernel's name for the index, as tmp1 for the value read or tmp3
+        # for a direct index, where expr has Inductor's x1 the kernel lacks.
+        bounds = f"{'0 <= ' if lower else ''}{index}{f' < {size}' if upper else ''}"
+        self.device_assert_async(cond, f"index out of bounds: {bounds}")
+
+    def device_assert_async(self, cond: CSEVariable, msg: str) -> None:
+        """torch._assert_async(cond, msg), and the bounds checks of indices,
+        once for each condition: x[i] + y[i] checks i once."""
+        self.cse.generate(
+            self.compute, f"hl.device_assert({cond}, {msg!r})", assignment=False
+        )
 
     def reduction_accumulator(
         self, reduction_type: str, src_dtype: torch.dtype, dtype: torch.dtype

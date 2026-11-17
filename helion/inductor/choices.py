@@ -51,10 +51,8 @@ class HelionChoices(InductorChoices):
         which keeps its extern kernel: e.g. relu(a @ b) with a dynamic dim of a,
         or relu(h[:, -1] @ b) with a dynamic dim 1 of h, whose size s is in the
         stride (64*s) and offset (64*s - 64) of h[:, -1]. What only scheduling
-        shows still fails: an operand with an indirect load that needs a bounds
-        check, as in a[i] @ b with an i of unknown range, or a fused epilogue
-        that Helion does not emit, as in a @ b + torch.tensor(2.0) with the
-        scalar on the CPU."""
+        shows still fails: a fused epilogue that Helion does not emit, as in
+        a @ b + torch.tensor(2.0) with the scalar on the CPU."""
         device = mat1.get_device_or_error()
         if not (device.type == "cuda" and inductor_config.cuda_backend == "helion"):
             return super().use_native_matmul(mat1, mat2)
