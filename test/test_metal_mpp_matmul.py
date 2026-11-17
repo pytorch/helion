@@ -6742,9 +6742,6 @@ class TestMppRootAddmmRejects(_MppCase):
             "tile's product alone"
         )
         self._rejects(root_mm_overwrite, (xf, yf), None, no_acc)
-        # acc + mm over float16 operands rounds each tile's product to
-        # float16 first, which an addmm would skip: it isn't folded.
-        self._rejects(root_mm_plus, (x, y), None, no_acc)
 
     def test_acc_plus_mm_folds_into_addmm(self) -> None:
         """``acc = acc + mm(a, b)``, product and carry both float32, is the
@@ -6755,6 +6752,17 @@ class TestMppRootAddmmRejects(_MppCase):
                 out, code, _ = _run(root_mm_plus, (xf, yf), config)
                 self.assertEqual(code.count("_helion_mpp_acc("), 1)
                 _close(out, _d(xf) @ _d(yf))
+        # Over float16 operands each K tile's product rounds to float16
+        # before it's added, which an addmm would skip: it isn't folded, and
+        # the products take the scalar contraction.
+        x, y = self.x.half(), self.y.half()
+        out, code, _ = _run(
+            root_mm_plus, (x, y), helion.Config(block_sizes=[16, 16, 16])
+        )
+        self.assertNotIn("_helion_mpp_acc(", code)
+        xd, yd = _d(x), _d(y)
+        tiles = [(xd[:, k : k + 16] @ yd[k : k + 16]).half() for k in range(0, 72, 16)]
+        _close(out, sum(t.double() for t in tiles))
 
     def test_acc_dtype(self) -> None:
         for dtype in (torch.float16, torch.bfloat16):
@@ -10161,6 +10169,10 @@ class TestMppBatched(unittest.TestCase):
         xs = torch.randn(3, 48, 64, device=DEVICE)
         ys = torch.randn(3, 64, 40, device=DEVICE)
         self._check(mm_carry_sum, (xs, ys), None, _bmm(xs, ys).sum(0), _ZERO_FILL)
+        # A bfloat16 bmm accumulates in float32 and rounds the finished
+        # product once (half_matmul).
+        xb, yb = xs.bfloat16(), ys.bfloat16()
+        self._check(bmm_bf16_out, (xb, yb), None, _bmm(xb, yb).bfloat16().double())
 
     def test_no_acc_results_materialized(self) -> None:
         """A result with no acc as another op's seed, or beside another
@@ -10236,12 +10248,6 @@ class TestMppBatchedRejects(_MppCase):
             (x, y),
             (None,),
             "a batched MPP matmul whose operands' batch dims are not one block",
-        )
-        self._rejects_at(
-            bmm_bf16_out,
-            (x.bfloat16(), y.bfloat16()),
-            (None,),
-            "a matmul whose acc is not float32",
         )
         self._rejects_at(
             dot_parts_3d,

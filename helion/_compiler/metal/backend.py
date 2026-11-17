@@ -896,7 +896,11 @@ class MetalBackend(Backend):
     ) -> None:
         if stage is DeviceIRStage.BEFORE_GRAPH_LOWERINGS:
             from .accumulate_matmul import fold_accumulating_matmuls
+            from .half_matmul import round_half_matmuls
 
+            # Half-precision products first: their rounding is part of the
+            # value an add of them to a carry sees.
+            round_half_matmuls(device_ir)
             fold_accumulating_matmuls(device_ir)
         if stage is DeviceIRStage.AFTER_ANALYSIS:
             # Imported here: the backend registry imports this module while

@@ -955,6 +955,16 @@ def bf16_sigmoid_store(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def half_matmul_full_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A float16 ``torch.matmul`` over a ``:`` K, its float16 result used as
+    such: accumulated in float32 and rounded once, as torch does."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([x.size(0), y.size(1)]):
+        out[tile_m, tile_n] = torch.relu(x[tile_m, :] @ y[:, tile_n])
+    return out
+
+
 class TestMetalBfloatConversion(unittest.TestCase):
     """Every conversion to bfloat goes through float, the way torch CPU and
     CUDA convert, since c10's BFloat16 is built from a float only."""
@@ -1403,6 +1413,18 @@ def _make_matmul_kernel(
 @_requires_darwin
 class TestMetalMatmul(unittest.TestCase):
     """Matmul kernels using MPP matmul2d through the standard pipeline."""
+
+    def test_half_matmul_rounds_once(self) -> None:
+        """A float16 or bfloat16 matmul's result has its operands' dtype; MPP
+        accumulates it in float32 and rounds it once."""
+        for dtype in (torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(64, 96, device=DEVICE, dtype=dtype)
+                y = torch.randn(96, 48, device=DEVICE, dtype=dtype)
+                expected = torch.relu((x.float() @ y.float()).to(dtype))
+                torch.testing.assert_close(
+                    half_matmul_full_k(x, y), expected, atol=2e-2, rtol=2e-2
+                )
 
     def test_mpp_rejects_paravirtual_mps_device(self) -> None:
         from helion._compiler.metal.metal_jit import _raise_if_mpp_unsupported_device
