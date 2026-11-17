@@ -50,7 +50,18 @@ TileShape = tuple[str | int, ...]
 TILE_NAMES = {"z0_": "tile_z", "y": "tile_y", "x": "tile_x", "r0_": "tile_r"}
 TILE_AXES = {name: axis for axis, name in TILE_NAMES.items()}
 ARG_REDUCTIONS = OrderedSet(["argmax", "argmin"])
-REDUCTIONS = OrderedSet(["sum", "prod", "max", "min", "any", *ARG_REDUCTIONS])
+REDUCTIONS = OrderedSet(
+    [
+        "sum",
+        "prod",
+        "max",
+        "min",
+        "any",
+        "welford_reduce",
+        "welford_combine",
+        *ARG_REDUCTIONS,
+    ]
+)
 
 
 def accumulator_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -776,29 +787,57 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return value
         if reduction_type not in REDUCTIONS:
             raise AssertionError(f"Helion kernels do not support {reduction_type}")
-        if isinstance(value, tuple):
+        if isinstance(value, tuple) and reduction_type != "welford_combine":
             raise AssertionError(f"expected one value to reduce, got {value}")
-        if value.dtype is not None and accumulator_dtype(value.dtype) != value.dtype:
+
+        def upcast(value: CSEVariable) -> CSEVariable:
+            if value.dtype is None or accumulator_dtype(value.dtype) == value.dtype:
+                return value
             line = f"{value}.to(torch.float32)"
-            value = self.cse.generate(
+            return self.cse.generate(
                 self.compute, line, dtype=torch.float32, shape=value.shape
             )
-        value = self.over_tile_r(value)
-        if reduction_type in ARG_REDUCTIONS:
-            return self.arg_reduce(reduction_type, value, accumulator_dtype(src_dtype))
+
+        # As in Triton, a reduction of a value already reduced reuses its result:
+        # the mean and m2 of torch.var_mean(x, -1) are two buffers, whose nodes
+        # each reduce x with welford_reduce. Without the reuse, the second node
+        # writes three more accumulators, acc3 to acc5, which recompute the
+        # mean, m2 and weight.
+        cache_key = (src_dtype, reduction_type, value)
+        if cache_key in self.cse.reduction_cache:
+            return self.cse.reduction_cache[cache_key]
+        values = [
+            self.over_tile_r(upcast(v))
+            for v in (value if isinstance(value, tuple) else (value,))
+        ]
         acc_dtype = accumulator_dtype(dtype)
-        acc = self.reduction_accumulator(reduction_type, src_dtype, acc_dtype)
-        fn = {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin", "any": "any"}
-        part, _ = self.reduce_block(fn[reduction_type], value, acc_dtype)
-        block = {
-            "sum": f"{acc} + {part}",
-            "prod": f"{acc} * {part}",
-            "max": f"torch.maximum({acc}, {part})",
-            "min": f"torch.minimum({acc}, {part})",
-            "any": f"{acc} | {part}",
-        }[reduction_type]
-        self.compute.writeline(f"{acc} = {block}")
-        return acc
+        if reduction_type in ARG_REDUCTIONS:
+            result = self.arg_reduce(
+                reduction_type, values[0], accumulator_dtype(src_dtype)
+            )
+        elif reduction_type in ("welford_reduce", "welford_combine"):
+            result = self.welford(reduction_type, values, acc_dtype)
+        else:
+            acc = self.reduction_accumulator(reduction_type, src_dtype, acc_dtype)
+            fn = {
+                "sum": "sum",
+                "prod": "prod",
+                "max": "amax",
+                "min": "amin",
+                "any": "any",
+            }
+            part, _ = self.reduce_block(fn[reduction_type], values[0], acc_dtype)
+            block = {
+                "sum": f"{acc} + {part}",
+                "prod": f"{acc} * {part}",
+                "max": f"torch.maximum({acc}, {part})",
+                "min": f"torch.minimum({acc}, {part})",
+                "any": f"{acc} | {part}",
+            }[reduction_type]
+            self.compute.writeline(f"{acc} = {block}")
+            result = acc
+        self.cse.reduction_cache[cache_key] = cast("Any", result)
+        return result
 
     def over_tile_r(self, value: CSEVariable) -> CSEVariable:
         """`value`, broadcast over tile_r if it has no tile_r, so that each block
@@ -902,3 +941,129 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.compute.writeline(f"{acc_index} = {new_index}")
         self.compute.writeline(f"{acc} = {new_value}")
         return acc_index
+
+    def welford(
+        self, reduction_type: str, values: Sequence[CSEVariable], dtype: torch.dtype
+    ) -> tuple[CSEVariable, CSEVariable, CSEVariable]:
+        """The mean, m2 (the sum of squared deviations from the mean) and weight
+        (the count) of x over tile_r, which var_mean and layer_norm lower to.
+        welford_reduce reduces x; welford_combine reduces the (mean, m2, weight)
+        partials of a split reduction's first kernel. Each block of tile_r is
+        reduced to its own weight, mean and m2, in sums over the block in
+        registers (the mean, its correction, then m2), and folded into the
+        accumulators acc_mean, acc_m2 and acc_weight as Triton's welford_combine
+        does (Chan et al.), with V.ops.
+        torch.var_mean(x, -1), with the locals each line comes from:
+            tmp3 = tmp2.expand(tile_r)                  # one
+            tmp4 = torch.sum(tmp3, -1)                  # weight
+            tmp5 = tmp2 / tmp4                          # fraction
+            tmp6 = tmp0 * tmp5
+            tmp7 = torch.sum(tmp6, -1)
+            ...
+            tmp11 = torch.where(tmp10, tmp1, tmp7)      # m0
+            ...
+            tmp16 = tmp11 + tmp15                       # mean
+            tmp17 = tmp16.reshape([tile_x, 1])
+            tmp18 = tmp0 - tmp17                        # dev
+            ...
+            tmp22 = tmp18 - tmp21                       # dev less its mean
+            tmp23 = tmp22 * tmp22                       # spread(dev)
+            tmp24 = torch.sum(tmp23, -1)                # m2
+            tmp25 = acc2 + tmp4                         # new_weight
+            ...
+            tmp28 = torch.where(tmp26, tmp1, tmp27)     # delta
+            ...
+            tmp31 = torch.where(tmp29, tmp1, tmp30)     # share
+            tmp32 = tmp28 * tmp31
+            tmp33 = acc + tmp32                         # new_mean
+            ...
+            acc = tmp33
+            acc1 = tmp38                                # new_m2
+            acc2 = tmp25
+        A row of inf gets the mean inf, as from Triton's persistent reductions
+        (eager and Triton's looped ones give nan): the delta of two equal means
+        is 0, where inf - inf would make it nan. A row of 2e19 gets the
+        variance 0: see the order of the products below. As in any float32
+        Welford, the merge takes each block's rounded mean, so on a row whose
+        spread is below the float32 spacing of its mean the variance depends on
+        the block size: [1e8, 1e8 + 8] * 32 + [1e8 + 8, 1e8 + 16] * 32, of
+        variance 32.25, gives 32.25 in one block of 128, 80.6 in blocks of 64
+        and 124.7 in blocks of 16."""
+        ops = V.ops
+        zero = ops.constant(0.0, dtype)
+        acc_mean = self.accumulator(0, dtype)
+        acc_m2 = self.accumulator(0, dtype)
+        acc_weight = self.accumulator(0, dtype)
+
+        def finite_or_zero(value: CSEVariable) -> CSEVariable:
+            isinf, isnan = ops.isinf(value), ops.isnan(value)
+            return ops.where(ops.logical_or(isinf, isnan), zero, value)
+
+        # The block's weight, each value's share of it (1 / weight for x, w[r] /
+        # weight for a partial r, as w[r] times a mean of 1e37 overflows), and
+        # each value's term of m2 given its deviation from the block's mean.
+        if reduction_type == "welford_reduce":
+            (value,) = values
+            # Helion masks the lanes past the end of R, so this counts the others.
+            one = self.over_tile_r(ops.constant(1.0, dtype))
+            weight = self.reduce_block_value("sum", one, dtype)
+            fraction = ops.truediv(ops.constant(1.0, dtype), weight)
+            empty = None
+
+            def spread(dev: CSEVariable) -> CSEVariable:
+                return ops.mul(dev, dev)
+
+        else:
+            value, part_m2, part_weight = values
+            weight = self.reduce_block_value("sum", part_weight, dtype)
+            fraction = ops.truediv(part_weight, weight)
+            # A block of weight 0, the (0, 0, 0) partials past the end of R in a
+            # masked split, gets the mean and m2 0 rather than 0 / 0.
+            empty = ops.eq(weight, zero)
+
+            def spread(dev: CSEVariable) -> CSEVariable:
+                # m2[r] + w[r] * dev^2, the weight first: a partial of weight 0
+                # adds 0, where dev * dev could overflow to inf, and inf * 0 is nan.
+                return ops.add(part_m2, ops.mul(ops.mul(part_weight, dev), dev))
+
+        def weighted_mean(term: CSEVariable) -> CSEVariable:
+            total = self.reduce_block_value("sum", ops.mul(term, fraction), dtype)
+            return total if empty is None else ops.where(empty, zero, total)
+
+        # The mean is m0 + weighted_mean(x - m0), with m0 = weighted_mean(x) (0
+        # if inf or nan): weighted before they are summed, neither sum overflows
+        # where sum(x) / weight would (a row of 1e37 sums to inf over 4096
+        # lanes). The second corrects the rounding of the first, so that equal
+        # values give their value exactly: (c + c + c) / 3 of c = 100553424 is
+        # 100553432, which would make m2 192 rather than 0.
+        m0 = finite_or_zero(weighted_mean(value))
+        mean = ops.add(m0, weighted_mean(ops.sub(value, m0)))
+        # The deviations from the mean, less their own mean, which is not 0 when
+        # the mean rounds: of 100000000 and 100000008 in turn, the mean
+        # 100000004 rounds to 100000000, and the deviations 0 and 8 would give
+        # the variance 32 rather than 16.
+        dev = ops.sub(value, mean)
+        dev = ops.sub(dev, weighted_mean(dev))
+        m2 = self.reduce_block_value("sum", spread(dev), dtype)
+        # Triton's welford_combine of the accumulators and the block, with 0 for
+        # the difference of two equal means, as inf - inf is nan, and for the
+        # share of a new_weight of 0: a split's chunk past the end of R, as in
+        # R = 9000 in 1024 chunks of 9 from a custom reduction_split_factor(),
+        # holds only blocks of weight 0. The weights multiply delta before delta
+        # does: on the first block acc_weight is 0 and delta the block's mean,
+        # whose square overflows float32 for a mean of 2e19, and inf * 0 would
+        # make m2 nan.
+        new_weight = ops.add(acc_weight, weight)
+        delta = ops.where(ops.eq(acc_mean, mean), zero, ops.sub(mean, acc_mean))
+        share = ops.where(
+            ops.eq(new_weight, zero), zero, ops.truediv(weight, new_weight)
+        )
+        new_mean = ops.add(acc_mean, ops.mul(delta, share))
+        new_m2 = ops.add(
+            ops.add(acc_m2, m2),
+            ops.mul(ops.mul(delta, ops.mul(acc_weight, share)), delta),
+        )
+        self.compute.writeline(f"{acc_mean} = {new_mean}")
+        self.compute.writeline(f"{acc_m2} = {new_m2}")
+        self.compute.writeline(f"{acc_weight} = {new_weight}")
+        return acc_mean, acc_m2, acc_weight
