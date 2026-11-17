@@ -444,6 +444,15 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(torch.exp, x, tol=1e-4, backend="cute")
         self.assertIn('backend="cute"', source)
 
+    def test_arg_reduction(self):
+        # arg_reduce()'s combine emits isnan, logical_and/or/not and an int64
+        # where, which backend_ops() does not see in the node's body.
+        x = torch.randn(64, 100, device=DEVICE)
+        x[3, 10] = float("nan")
+        fn = lambda x: (torch.argmax(x, -1), torch.any(x > 2.0, -1))  # noqa: E731
+        (source,) = self.compile(fn, x, backend="cute")
+        self.assertIn("torch.any(", source)
+
 
 @skipIfNotCUDA()
 @onlyBackends(["triton"])
@@ -599,6 +608,44 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 2)
         self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
 
+    @parametrize(
+        "case",
+        ["argmax", "min_dim", "max_dim", "nan", "ties", "int", "neg_inf", "flat"],
+    )
+    def test_arg_reduction(self, case):
+        # min_dim: torch.min(x, -1) with a NaN, an amin and an argmin; nan:
+        # torch.argmax picks the first NaN; ties: argmin's first index; int: no
+        # NaN checks; neg_inf: a row of -inf, where no block is larger than the
+        # accumulator's -inf and the first index wins the tie; flat: a reduction
+        # over both dims of a transposed x, Unsupported (unsupported()).
+        x = torch.randn(64, 300, device=DEVICE)
+        fn = lambda x: torch.argmax(x, -1)  # noqa: E731
+        if case == "min_dim":
+            x[4, 100] = float("nan")
+            fn = lambda x: torch.min(x, -1)  # noqa: E731
+        elif case == "max_dim":
+            fn = lambda x: torch.max(x, -1)  # noqa: E731
+        elif case == "nan":
+            x[3, 10] = x[3, 250] = x[5, 200] = float("nan")
+        elif case == "ties":
+            x = torch.randint(0, 3, (64, 300), device=DEVICE).float()
+            fn = lambda x: torch.argmin(x, -1)  # noqa: E731
+        elif case == "int":
+            x = torch.randint(-50, 50, (64, 300), device=DEVICE, dtype=torch.int32)
+        elif case == "neg_inf":
+            x[2] = float("-inf")
+        elif case == "flat":
+            x = torch.randn(300, 64, device=DEVICE).t()
+            self.assertUnsupported("arg_reduction_over_dims", torch.argmax, x)
+            return
+        (source,) = self.compile(fn, x)
+        self.assertIn("torch.amin(", source)
+
+    def test_any(self):
+        x = torch.randn(64, 100, device=DEVICE)
+        (source,) = self.compile(lambda x: torch.any(x > 2.0, -1), x)
+        self.assertIn("acc = acc | torch.any(", source)
+
     def test_pointwise(self):
         (source,) = self.compile(
             lambda x: torch.relu(x) * 2 + 1, torch.randn(64, 100, device=DEVICE)
@@ -649,7 +696,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
     @parametrize(
         "case",
         [
-            "argmax",
+            "welford",
             "dropout",
             "gather",
             "dynamic",
@@ -666,8 +713,8 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         x = torch.randn(64, 100, device=DEVICE)
         fn = lambda x: x.sum(-1)  # noqa: E731
         args = [x]
-        if case == "argmax":
-            fn = lambda x: x.argmax(-1)  # noqa: E731
+        if case == "welford":
+            fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
         elif case == "dropout":
             fn = lambda x: torch.nn.functional.dropout(x, 0.5)  # noqa: E731
         elif case == "gather":
@@ -679,7 +726,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
             fn = lambda x, y: (x * 2, y + 1)  # noqa: E731
             args = [x, torch.randn(32, 50, device=DEVICE)]
         names, patches = {
-            "argmax": ("argmax", {}),
+            "welford": ("welford_reduce", {}),
             "dropout": ("load_seed, rand", {}),
             "gather": ("indirect_indexing", {}),
             "dynamic": ("dynamic_shape", {}),

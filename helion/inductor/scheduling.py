@@ -11,6 +11,7 @@ from torch._inductor import config
 from torch._inductor.codegen.common import BackendFeature
 from torch._inductor.codegen.simd import SIMDScheduling
 from torch._inductor.codegen.triton import TritonScheduling
+from torch._inductor.ir import Reduction
 from torch._inductor.ops_handler import OpsHandler
 from torch._inductor.utils import get_fused_kernel_name
 from torch._inductor.virtualized import V
@@ -19,6 +20,7 @@ from torch.utils._ordered_set import OrderedSet
 from .._compiler._inductor.template_buffer import HelionTemplateBuffer
 from .._compiler.backend_registry import get_backend
 from . import config as helion_config
+from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
@@ -143,14 +145,24 @@ def supported(backend: str) -> OrderedSet[str]:
 def unsupported(node: SchedulerNode) -> list[str]:
     """What `node` uses that HelionKernel does not support: a dynamic shape, its
     op and reduction names that supported() lacks, e.g. dropout's "load_seed"
-    and "rand", the numerics modes that are on, a CPU scalar input and a dynamic
-    index."""
+    and "rand", the numerics modes that are on, a CPU scalar input, a dynamic
+    index and an arg reduction over several dims."""
     body = node._body
-    reduction_type = cast("ComputedBuffer", node.node).get_reduction_type()
+    buffer = cast("ComputedBuffer", node.node)
+    reduction_type = buffer.get_reduction_type()
     # HelionKernel tiles static sizes (supports_tiling()).
     if not all(isinstance(numel, (int, sympy.Integer)) for numel in node.group[1]):
         return ["dynamic_shape"]
     names = OrderedSet([*body.op_counts, *([reduction_type] if reduction_type else [])])
+    # An arg reduction over several dims gets the flat index of its reduction
+    # ranges, which loop reordering permutes: for torch.argmax(x) of a
+    # transposed x, tile_r runs over x's storage, so its index is the storage
+    # index of the max, not x's. Inductor passes the logical index along with
+    # the value to Triton, MPS and C++ only.
+    if isinstance(buffer.data, Reduction) and reduction_type in ARG_REDUCTIONS:
+        dims = [size for size in buffer.data.reduction_ranges if size != 1]
+        if len(dims) > 1:
+            names.add("arg_reduction_over_dims")
     missing = [*sorted(names - supported(helion_config.backend)), *numerics_modes()]
     # x * torch.tensor(2.0): the kernel gets a CPU tensor, "Pointer argument
     # cannot be accessed from Triton (cpu tensor?)".
