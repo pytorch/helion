@@ -28,6 +28,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import NumThreadsSpec
+from helion.autotuner.search_surface import BackendSearchSurface
 import helion.language as hl
 from helion.language import _tracing_ops
 from helion.language._decorators import BackendDispatchTable
@@ -421,6 +422,27 @@ class TestSpecWithoutBackendState(unittest.TestCase):
         config = dict(spec.default_config())
         self.assertEqual(config["block_sizes"], [32])
         self.assertEqual(config["num_warps"], 4)
+
+    def test_every_non_cute_spec_admits_a_search_proposal_as_it_is(self) -> None:
+        # A proposal that reaches a search from outside its flat fields (the
+        # configs of an LLM's reply) is benchmarked as normalization left it
+        # unless its backend keeps one of its options out of its searches,
+        # and none of these does
+        # (``BackendSearchSurface.repair_search_proposal``).
+        default = BackendSearchSurface.repair_search_proposal
+        for name, backend in _backends().items():
+            if name == "cute":
+                continue
+            with self.subTest(backend=name):
+                spec = self._spec(backend)
+                surface = type(spec.search_surface)
+                self.assertIs(surface.repair_search_proposal, default)
+                config = spec.default_config()
+                before = config.to_json()
+                proposal, returned = spec.search_proposal(config)
+                self.assertIs(proposal, config)
+                self.assertEqual(returned, ())
+                self.assertEqual(config.to_json(), before)
 
     def test_every_non_cute_spec_builds_its_default_config(self) -> None:
         for name, backend in _backends().items():

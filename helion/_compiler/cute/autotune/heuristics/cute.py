@@ -76,6 +76,7 @@ from ...flat_gather_lane import _packet_layout_aligned
 from ...flat_gather_lane import _tile_index_block
 from ...flat_gather_lane import row_is_multiple_of
 from ...fuse_two_pass_loads import FORWARDED_DTYPES
+from ...grouped_d_shift import d_shift_searched
 from ...grouped_full_coverage import FULL_COVERAGE_PIPELINES
 from ...grouped_full_coverage import full_coverage_index_domain
 from ...grouped_full_coverage import full_coverage_pipeline_supported
@@ -8458,7 +8459,14 @@ def _tcgen05_grouped_mn_device_tile_seeds(
 
     These are additive proposals. Row geometry, output buffering, and optional
     worker balancing remain choices measured by the autotuner.
+
+    A tile carries the bounded D shift, and is sized for its fixed
+    descriptors, only where a search proposes the shift
+    (``grouped_d_shift.d_shift_searched``). Otherwise it is the same tile
+    sized with its three mutable descriptors, and it stores through its
+    group's own descriptor, based on the group's first row inside the output.
     """
+    shifted = spec._cute_tcgen05_config.grouped_d_shift_search_enabled
     if (
         not spec._cute_tcgen05_config.grouped_device_worklist_supported
         or not spec._cute_tcgen05_config.grouped_d_shift_supported
@@ -8513,8 +8521,8 @@ def _tcgen05_grouped_mn_device_tile_seeds(
                             c_stages=c_stages,
                             cluster_m=2,
                             orientation="mn",
-                            immutable_ab_tensormaps=True,
-                            immutable_d_tensormap=True,
+                            immutable_ab_tensormaps=shifted,
+                            immutable_d_tensormap=shifted,
                         )
                         if required <= capacity_bytes:
                             break
@@ -8533,9 +8541,10 @@ def _tcgen05_grouped_mn_device_tile_seeds(
                             "tcgen05_grouped_worklist_orientation": "mn",
                             "tcgen05_grouped_worklist_mma_n": column_tile,
                             TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY: True,
-                            TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY: True,
                         }
                     )
+                    if shifted:
+                        candidate.config[TCGEN05_GROUPED_D_SHIFT_CONFIG_KEY] = True
                     variants = [candidate]
                     if spec._cute_tcgen05_config.grouped_balanced_workers_supported:
                         balanced = deepcopy(candidate)
@@ -8676,6 +8685,9 @@ def _tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec: ConfigSpec) -> list[Conf
 
 def _tcgen05_grouped_prefix_adaptive_n_seeds(spec: ConfigSpec) -> list[Config]:
     """Preserve M128 recipes, then append the M256 worker policies."""
+    if not spec._cute_tcgen05_config.grouped_d_shift_search_enabled:
+        # Every recipe stores through the bounded D shift.
+        return []
     return [
         *_tcgen05_grouped_prefix_adaptive_n_m128_seeds(spec),
         *_tcgen05_grouped_prefix_adaptive_n_m256_seeds(spec),
@@ -8870,6 +8882,9 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
             analysis.ab_k_fusion_supported
         )
         spec._cute_tcgen05_config.grouped_d_shift_supported = analysis.d_shift_supported
+        spec._cute_tcgen05_config.grouped_d_shift_search_enabled = (
+            analysis.d_shift_supported and d_shift_searched()
+        )
         # The pure typed device-worklist palette can exceed the nominal search
         # population as physical layouts/panel policies compose. Keep its legal
         # normalized seeds after that unchanged prefix; no sampler budget grows.
@@ -8922,6 +8937,10 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
         model.grouped_prefix_adaptive_n_profiles = prefix_profiles
         model.grouped_prefix_adaptive_n_profile = prefix_profiles.get(128)
         model.grouped_prefix_adaptive_n_supported = bool(prefix_profiles)
+        # True does not mean that a search proposes the recipes: they store
+        # through the bounded D shift, so ``is_eligible``,
+        # ``_tcgen05_grouped_prefix_adaptive_n_seeds`` and
+        # ``surface.flat_fields`` also ask ``grouped_d_shift_search_enabled``.
         model.grouped_prefix_adaptive_n_search_enabled = bool(prefix_profiles) and all(
             _block_size_value_reachable(spec, index, size)
             for index, size in enumerate((256, 128, 64))
@@ -9187,7 +9206,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
                         ),
                     ]
                 )
-        if spec._cute_tcgen05_config.grouped_d_shift_supported:
+        if spec._cute_tcgen05_config.grouped_d_shift_search_enabled:
             shifted = []
             for seed in seeds:
                 if seed.get(TCGEN05_GROUPED_FULL_ALLOCATION_A_CONFIG_KEY) is True:
@@ -9232,9 +9251,11 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return (
-            cls._eligible_inputs(env, device_ir) is not None
-            or env.config_spec._cute_tcgen05_config.grouped_prefix_adaptive_n_search_enabled
+        model = env.config_spec._cute_tcgen05_config
+        return cls._eligible_inputs(env, device_ir) is not None or (
+            model.grouped_prefix_adaptive_n_search_enabled
+            # The recipes are proposed only with the bounded D shift.
+            and model.grouped_d_shift_search_enabled
         )
 
     @classmethod

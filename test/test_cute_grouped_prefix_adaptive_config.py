@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 import random
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +15,6 @@ from test._cute_grouped_gemm_split_sizes import _device_split_sizes_kernel
 from .cute_population_contracts import _target
 from .cute_population_contracts import checked_initial_population
 from .test_cute_grouped_fp32_output import _grouped_fp32_output
-from .test_cute_grouped_large_device_seeds import _kernel
 import helion
 from helion._compiler.cute import cute_mma
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
@@ -22,15 +22,31 @@ from helion._compiler.cute.tcgen05_config import facts
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_d_shift_gate import d_shift_proposals
+from helion._testing.cute_grouped_configs import prefix_recipe_args as _args
+from helion._testing.cute_grouped_configs import prefix_recipes as _recipes
+from helion._testing.cute_grouped_offsets import fresh_grouped_offsets_k64 as _kernel
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
 import helion.language as hl
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 pytestmark = pytest.mark.cpu_only
 
 KEY = "tcgen05_grouped_prefix_adaptive_n"
 BALANCED = "tcgen05_grouped_balanced_workers"
+
+
+@pytest.fixture(autouse=True)
+def _d_shift_proposed() -> Iterator[None]:
+    # The paired prefix recipes store through the bounded D shift,
+    # which a search proposes only behind its gate
+    # (test_cute_grouped_d_shift_gate.py).
+    with d_shift_proposals():
+        yield
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -64,34 +80,6 @@ def _not_pure_fresh(
             out, [row_index, columns], acc.to(out.dtype), extra_mask=valid[:, None]
         )
     return out
-
-
-def _args(
-    *,
-    groups: int = 16,
-    m: int = 2048,
-    n: int = 1536,
-    k: int = 2048,
-    dtype: torch.dtype = torch.bfloat16,
-    offset_dtype: torch.dtype = torch.int32,
-) -> tuple[torch.Tensor, ...]:
-    return (
-        torch.empty((m, k), dtype=dtype),
-        torch.empty((groups, n, k), dtype=dtype),
-        torch.arange(groups + 1, dtype=offset_dtype) * (m // groups),
-    )
-
-
-def _recipes(spec, source_m_tile: int | None = 128) -> list[helion.Config]:
-    return [
-        seed
-        for seed in spec.compiler_seed_configs
-        if seed.get(KEY) is True
-        and (
-            source_m_tile is None
-            or seed.get("tcgen05_grouped_worklist_source_m_tile") == source_m_tile
-        )
-    ]
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])

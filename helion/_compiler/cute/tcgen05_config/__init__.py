@@ -201,6 +201,10 @@ class CuteTcgen05Config:
         self.grouped_source128_search_enabled: bool = False
         self.grouped_ab_k_fusion_supported: bool = False
         self.grouped_d_shift_supported: bool = False
+        # The shift as a search proposal: compiler seeds that carry it and
+        # the knob as a search coordinate (``grouped_d_shift.d_shift_searched``).
+        # ``grouped_d_shift_supported`` alone admits a config that names it.
+        self.grouped_d_shift_search_enabled: bool = False
         self.grouped_balanced_workers_supported: bool = False
         self.grouped_prefix_adaptive_n_supported: bool = False
         self.grouped_prefix_adaptive_n_search_enabled: bool = False

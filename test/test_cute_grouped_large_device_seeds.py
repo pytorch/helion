@@ -14,7 +14,7 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
-import helion.language as hl
+from helion._testing.cute_grouped_offsets import fresh_grouped_offsets_k64 as _kernel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -22,42 +22,7 @@ SOURCE = "tcgen05_grouped_worklist_source_m_tile"
 IMMUTABLE = "tcgen05_grouped_full_allocation_a"
 PHYSICAL_K = "tcgen05_grouped_ab_tile_k"
 SHIFTED = "tcgen05_grouped_d_shift"
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _grouped_offsets_k64(
-    a: torch.Tensor, weights: torch.Tensor, offsets: torch.Tensor
-) -> torch.Tensor:
-    rows, reduction = a.shape
-    groups, columns, _ = weights.shape
-    block_m = hl.register_block_size(256)
-    block_n = hl.register_block_size(128)
-    block_k = hl.register_block_size(64)
-    out = torch.empty((rows, columns), device=a.device, dtype=a.dtype)
-    for group_tile, row_tile, column_tile in hl.tile(
-        [groups, rows, columns], block_size=[1, block_m, block_n]
-    ):
-        group = group_tile.index.sum()
-        start = offsets[group]
-        extent = offsets[group + 1] - offsets[group]
-        row_indices = start + row_tile.index
-        valid = row_tile.index < extent
-        acc = hl.zeros([row_tile, column_tile], dtype=torch.float32)
-        for inner in hl.tile(reduction, block_size=block_k):
-            left = hl.load(a, [row_indices, inner], extra_mask=valid[:, None])
-            acc = torch.addmm(acc, left, weights[group, column_tile, inner].T)
-        hl.store(out, [row_indices, column_tile], acc, extra_mask=valid[:, None])
-    return out
-
-
-def _kernel():
-    # A fresh bind is needed when comparing seed-generation policies.
-    return helion.kernel(
-        _grouped_offsets_k64.fn,
-        backend="cute",
-        static_shapes=True,
-        autotune_effort="none",
-    )
+ORIENTATION = "tcgen05_grouped_worklist_orientation"
 
 
 def _matching(seeds, source=256):
@@ -72,6 +37,7 @@ def _matching(seeds, source=256):
         and seed.get("tcgen05_consumer_regs") == 256
         and seed.get(IMMUTABLE) is True
         and seed.get(SHIFTED) is not True
+        and seed.get(ORIENTATION, "nm") == "nm"
     ]
 
 
@@ -99,16 +65,18 @@ def test_actual_k1_metadata_adds_deep_immutable_seed_without_changing_the_prefix
             old_seeds = [
                 seed
                 for seed in before.config_spec.compiler_seed_configs
-                if seed.get(SHIFTED) is not True
+                if seed.get(ORIENTATION) != "mn"
             ]
             old_default = before.config_spec.compiler_default_config
         bound = cpu_bind(_kernel(), args)
         spec = bound.config_spec
         seeds = spec.compiler_seed_configs
-        unshifted = [seed for seed in seeds if seed.get(SHIFTED) is not True]
-        shifted = [seed for seed in seeds if seed.get(SHIFTED) is True]
-        assert unshifted[: len(old_seeds)] == old_seeds
-        assert seeds == [*unshifted, *shifted]
+        # The M,N tiles follow every N,M seed, so the additions extend the
+        # N,M seeds ahead of them.
+        nm = [seed for seed in seeds if seed.get(ORIENTATION) != "mn"]
+        mn = [seed for seed in seeds if seed.get(ORIENTATION) == "mn"]
+        assert mn and seeds == [*nm, *mn]
+        assert nm[: len(old_seeds)] == old_seeds
         assert spec.compiler_default_config == old_default
         assert spec.block_sizes[2].max_size == 64
         expected = _matching(seeds)

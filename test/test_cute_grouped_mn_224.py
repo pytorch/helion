@@ -10,11 +10,9 @@ import torch
 
 from test.cute_population_contracts import _target
 from test.test_cute_grouped_d_shift import _assignment
-from test.test_cute_grouped_d_shift import _config
 from test.test_cute_grouped_d_shift import _plans
 from test.test_cute_grouped_d_shift import _unsafe_output
 from test.test_cute_grouped_d_shift import _value
-from test.test_cute_grouped_paired_clc_layout import _sdk
 
 import helion
 from helion._compiler.cute.cute_mma import _tcgen05_grouped_b_rank3_index_domain
@@ -29,6 +27,8 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_grouped_configs import d_shift_config as _config
+from helion._testing.cute_sdk_module import sdk_module as _sdk
 from helion.exc import BackendUnsupported
 from helion.exc import InvalidConfig
 import helion.language as hl

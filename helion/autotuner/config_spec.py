@@ -3468,6 +3468,37 @@ class ConfigSpec:
     ) -> None:
         self.search_surface.prepare_override_normalization(self, config, overrides)
 
+    def search_proposal(
+        self, config: helion.Config
+    ) -> tuple[helion.Config, tuple[str, ...]]:
+        """``config``, a proposal that reaches a search from outside its
+        flat search space, as the search admits it, and the options the
+        backend returned to what the search proposes on its own
+        (``BackendSearchSurface.repair_search_proposal``).
+
+        A search draws its candidates from its flat fields. A proposal from
+        elsewhere, the configs of an LLM's reply, can name any option
+        normalization accepts, among them options the backend validates but
+        keeps out of its searches. Such an option goes back to the value a
+        candidate of the search has and the proposal is normalized again;
+        ``InvalidConfig`` rejects one that is not legal without it. Returns
+        ``config`` itself where the backend changes nothing, as on every
+        backend that keeps the hook's default. A config the user passes to
+        the kernel, a cache hit and a seed do not come through here. The
+        first two reach no search: the kernel compiles the config as written
+        and takes the hit from the cache as saved. A seed is transferred
+        onto the flat fields (``ConfigGeneration.flatten``), and a cached
+        config that seeds a search reaches it as the flat config its entry
+        holds."""
+        options = {
+            key: _copy_config_structure(value) for key, value in config.config.items()
+        }
+        returned = self.search_surface.repair_search_proposal(self, options)
+        if not returned:
+            return config, ()
+        self.normalize(options, _fix_invalid=True)
+        return helion.Config.from_dict(options), returned
+
     def _base_default_config(self) -> helion.Config:
         config = self.flat_config(lambda x: x.default())
         self.search_surface.trim_reference_config(self, config)

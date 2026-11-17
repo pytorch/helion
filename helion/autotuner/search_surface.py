@@ -176,6 +176,20 @@ class BackendSearchSurface:
         """The ordered compiler seeds of the spec's enabled families."""
         return []
 
+    def repair_search_proposal(
+        self, config_spec: ConfigSpec, config: dict[str, object]
+    ) -> tuple[str, ...]:
+        """Hold ``config``, the options of a proposal that reaches a search
+        from outside its flat search space, to what a search of this kernel
+        proposes on its own (``ConfigSpec.search_proposal``).
+
+        A backend that keeps an option out of its searches while it still
+        validates the option in a config returns it here, in place, to the
+        value every candidate of the search has, and names the options it
+        changed. The default changes nothing: whatever normalization
+        accepts may be proposed."""
+        return ()
+
     def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
         """Flat fields appended to the generic table (when ``fields`` returns
         None), before the user's tunables: the backend's knobs that apply to

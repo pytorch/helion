@@ -15,11 +15,6 @@ import pytest
 import torch
 
 from test.cute_population_contracts import _target
-from test.test_cute_grouped_d_shift import _config as _ordinary_config
-from test.test_cute_grouped_large_device_seeds import _kernel
-from test.test_cute_grouped_paired_clc_layout import _sdk
-from test.test_cute_grouped_prefix_adaptive_config import _args
-from test.test_cute_grouped_prefix_adaptive_config import _recipes
 from test.test_cute_grouped_prefix_adaptive_n_codegen import _kernel_ast
 from test.test_cute_grouped_prefix_adaptive_n_codegen import _plans
 
@@ -31,13 +26,26 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_codegen import require_cute_codegen
+from helion._testing.cute_d_shift_gate import d_shift_proposals
+from helion._testing.cute_grouped_configs import d_shift_config as _ordinary_config
+from helion._testing.cute_grouped_configs import prefix_recipe_args as _args
+from helion._testing.cute_grouped_configs import prefix_recipes as _recipes
+from helion._testing.cute_grouped_offsets import fresh_grouped_offsets_k64 as _kernel
+from helion._testing.cute_sdk_module import sdk_module as _sdk
 from helion.runtime.cute.launcher import _append_cute_wrapper_plan
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
     import helion
     from helion.autotuner.config_spec import ConfigSpec
+
+
+# The recipe tests bind on the CPU and inspect generated source; the
+# launches at the end of the module carry the ``cuda`` marker and stay in
+# the GPU lane.
+pytestmark = pytest.mark.cpu_only
 
 KEY = "tcgen05_grouped_prefix_adaptive_n"
 SOURCE = "tcgen05_grouped_worklist_source_m_tile"
@@ -54,8 +62,27 @@ def _core(tree: ast.Module, width: int) -> ast.FunctionDef:
     )
 
 
-def _recipe(spec: ConfigSpec, *, balanced: bool = False) -> helion.Config:
-    if recipes := _recipes(spec, 256):
+@pytest.fixture(scope="module", autouse=True)
+def _d_shift_proposed() -> Iterator[None]:
+    # The paired prefix recipes store through the bounded D shift,
+    # which a search proposes only behind its gate
+    # (test_cute_grouped_d_shift_gate.py). Module scope: ``sources``
+    # binds under it as well.
+    with d_shift_proposals():
+        yield
+
+
+def _recipe(
+    spec: ConfigSpec, *, balanced: bool = False, seeded: bool = True
+) -> helion.Config:
+    """The compiler's M=256 recipe for ``spec`` with that worker policy, or
+    with ``seeded=False`` the one built here for a binding the compiler
+    seeds none for. A test says which of the two it renders, and the
+    compiler has to agree: a recipe that stops being proposed, or starts to
+    be, fails here."""
+    recipes = _recipes(spec, 256)
+    assert bool(recipes) is seeded, len(recipes)
+    if recipes:
         return deepcopy(
             next(value for value in recipes if value.get(BALANCED, False) is balanced)
         )
@@ -188,11 +215,13 @@ def test_native_six_payloads_phases_and_common_header_are_preserved(
             assert counts[0] == counts[1], call
 
 
+# The last column: whether the compiler seeds a recipe for the binding (the
+# first lies outside the sampler's logical block domain).
 @pytest.mark.parametrize(
-    "groups,m,n,k,dtype,offset_dtype",
+    "groups,m,n,k,dtype,offset_dtype,seeded",
     [
-        (4, 640, 800, 256, torch.float16, torch.int64),
-        (32, 1024, 768, 256, torch.bfloat16, torch.int32),
+        (4, 640, 800, 256, torch.float16, torch.int64, False),
+        (32, 1024, 768, 256, torch.bfloat16, torch.int32, True),
     ],
 )
 def test_general_tail_dtypes_and_group_counts_use_proved_native_descriptors(
@@ -202,13 +231,16 @@ def test_general_tail_dtypes_and_group_counts_use_proved_native_descriptors(
     k: int,
     dtype: torch.dtype,
     offset_dtype: torch.dtype,
+    seeded: bool,
 ) -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
         bound = cpu_bind(
             _kernel(),
             _args(groups=groups, m=m, n=n, k=k, dtype=dtype, offset_dtype=offset_dtype),
         )
-        config = bound.config_spec.normalized_config(_recipe(bound.config_spec))
+        config = bound.config_spec.normalized_config(
+            _recipe(bound.config_spec, seeded=seeded)
+        )
         source = bound.to_code(config)
         assert config.block_sizes == [256, 128, 64]
         assert bound.config_spec.block_sizes[2].declared_max_size == 64

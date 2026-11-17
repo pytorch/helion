@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import random
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 from unittest.mock import patch
 
@@ -10,8 +11,6 @@ import torch
 
 from test.cute_population_contracts import _target
 from test.cute_population_contracts import checked_initial_population
-from test.test_cute_grouped_ab_k import _unsupported_k_loop
-from test.test_cute_grouped_large_device_seeds import _grouped_offsets_k64
 
 import helion
 from helion._compiler.cute.autotune.heuristics import cute as heuristics
@@ -19,20 +18,27 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_grouped_worklist_sme
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
+from helion._testing.cute_d_shift_gate import d_shift_proposals
+from helion._testing.cute_grouped_offsets import fresh_grouped_offsets_k64 as _kernel
+from helion._testing.cute_grouped_offsets import unsupported_k_loop
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 pytestmark = pytest.mark.cpu_only
 
 
-def _kernel():
-    return helion.kernel(
-        _grouped_offsets_k64.fn,
-        backend="cute",
-        static_shapes=True,
-        autotune_effort="none",
-    )
+@pytest.fixture(autouse=True)
+def _d_shift_proposed() -> Iterator[None]:
+    # The M,N worklist tiles as these tests pin them, on the fixed
+    # descriptors of the bounded D shift, which a search proposes only
+    # behind its gate (test_cute_grouped_d_shift_gate.py has the tiles a
+    # search gets meanwhile, without the shift).
+    with d_shift_proposals():
+        yield
 
 
 def _args(m: int, groups: int, n: int, k: int):
@@ -43,6 +49,7 @@ def _args(m: int, groups: int, n: int, k: int):
     )
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize(
     "m,groups,n,k", [(2048, 16, 1536, 2048), (8192, 16, 1536, 2048), (512, 4, 512, 256)]
 )
@@ -279,7 +286,7 @@ def test_mn_seed_configs_are_in_a_fresh_full_search_population() -> None:
 
 def test_noncanonical_reduction_does_not_receive_immutable_mn_proposals() -> None:
     with forbid_cuda_work(), _target(), mock_cuda_unavailable():
-        bound = cpu_bind(_unsupported_k_loop, (*_args(512, 4, 256, 256), 1))
+        bound = cpu_bind(unsupported_k_loop, (*_args(512, 4, 256, 256), 1))
         assert not bound.config_spec._cute_tcgen05_config.grouped_d_shift_supported
         assert not any(
             seed.get("tcgen05_grouped_worklist_orientation") == "mn"
