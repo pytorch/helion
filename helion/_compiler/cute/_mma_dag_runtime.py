@@ -18,9 +18,13 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T
 from cutlass.cutlass_dsl import dsl_user_op
 
+from ._flash_row_mma_runtime import lane_group_max  # noqa: F401
 from ._flash_row_mma_runtime import lane_group_sum  # noqa: F401
 from ._flash_row_mma_runtime import mma_bf16  # noqa: F401
 from ._flash_row_mma_runtime import mma_f16  # noqa: F401
+
+# The generic sum/max interface propagates NaNs; flash's octet_max uses fmax.
+from ._flash_row_mma_runtime import octet_max_nan as octet_max  # noqa: F401
 from ._flash_row_mma_runtime import octet_sum  # noqa: F401
 from ._flash_row_mma_runtime import pack_bf16x2  # noqa: F401
 from ._flash_row_mma_runtime import pack_f16x2  # noqa: F401
@@ -46,8 +50,10 @@ from .device.ptx import ldg_b32_pred  # noqa: F401
 from .device.ptx import ldg_bf16_as_f32_pred  # noqa: F401
 from .device.ptx import ldg_f16_as_f32_pred  # noqa: F401
 from .device.ptx import ldg_f32_pred  # noqa: F401
+from .device.ptx import ldg_s8_pred  # noqa: F401
 from .device.ptx import ldg_s32_pred  # noqa: F401
 from .device.ptx import ldg_s64  # noqa: F401
+from .device.ptx import ldg_u8_pred  # noqa: F401
 from .device.ptx import ldg_v2_f32_pred  # noqa: F401
 from .device.ptx import ldmatrix_x2  # noqa: F401
 from .device.ptx import ldmatrix_x2_trans  # noqa: F401

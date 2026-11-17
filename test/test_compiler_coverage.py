@@ -13,17 +13,16 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.cute_population_contracts import _pointwise
-from test.cute_population_contracts import _target
-
 import helion
 from helion._compiler.cute.backend import CuteBackend
 from helion._dist_utils import sync_seed
 from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import tcgen05_target
 from helion._testing.cute_flash import flash_config_spec
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.compiler_coverage import CompilerCoverageGroup
 from helion.autotuner.compiler_coverage import CoverageWitness
+from helion.autotuner.compiler_coverage import _WarmCoverageWitness
 from helion.autotuner.compiler_coverage import append_compiler_coverage
 from helion.autotuner.config_fragment import BooleanFragment
 from helion.autotuner.config_fragment import EnumFragment
@@ -37,6 +36,7 @@ from helion.autotuner.pattern_search import PatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOPatternSearch
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
 from helion.exc import InvalidConfig
+import helion.language as hl
 from helion.runtime.config import Config
 from helion.runtime.settings import Settings
 from helion.runtime.settings import default_autotuner_fn
@@ -51,6 +51,13 @@ DOMAINS = {
     "coverage_bool": (False, True),
     "coverage_layout": ("runtime", "static"),
 }
+
+
+def _pointwise(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
 
 
 def make_spec(*, expanded: bool = True, many_seeds: bool = False) -> ConfigSpec:
@@ -766,7 +773,7 @@ def test_coverage_is_after_every_flash_best_available_return(
 
 @skipUnlessBackends(["cute"])
 def test_public_default_full_lfbo_empty_registry_uses_ordinary_source() -> None:
-    with _target():
+    with tcgen05_target():
         args = (torch.empty(37),)
         bound = helion.kernel(_pointwise, backend="cute", autotune_effort="full").bind(
             args
@@ -913,3 +920,102 @@ def test_deferred_coverage_preserves_supplemental_and_warm_prefix():
     assert third.policy()["deferred"] is True
     with pytest.raises(ValueError, match="Boolean"):
         replace(third, deferred=1)
+
+
+@pytest.mark.parametrize("container", [False, True])
+def test_search_field_views_preserve_opaque_enum_values(container):
+    class OpaqueValue:
+        def __deepcopy__(self, memo):
+            raise AssertionError("config enum values must retain their owners")
+
+    class OpaqueList(list):
+        __deepcopy__ = OpaqueValue.__deepcopy__
+
+    value, other = (
+        (OpaqueList([1]), OpaqueList([2]))
+        if container
+        else (OpaqueValue(), OpaqueValue())
+    )
+    spec = ConfigSpec(
+        backend=CuteBackend(),
+        user_defined_tunables={
+            "opaque": EnumFragment((value, other)),
+            "coverage_mode": EnumFragment(("off", "on")),
+        },
+        target_device_capability=None,
+    )
+    spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=128))
+    spec.register_compiler_coverage_group(
+        CompilerCoverageGroup(
+            "coverage_mode",
+            1,
+            "coverage_mode",
+            ("off", "on"),
+            "off",
+            (CoverageWitness(Config(block_sizes=[32]), "on"),),
+        )
+    )
+    full = spec.create_config_generation()
+    view = full.initial_population_view()
+    for generation in (view, view._compiler_coverage_sampler):
+        assert generation is not None
+        slot = generation._key_to_flat_indices["opaque"][0][0]
+        field = generation.flat_spec[slot]
+        assert field is not spec.user_defined_tunables["opaque"]
+        assert field.default() is value
+
+    pins = []
+    population, outcomes = append_compiler_coverage(
+        [], full, cached_configs=lambda: (), pin=pins.append
+    )
+    assert [outcome.outcome for outcome in outcomes] == ["added"]
+    assert len(population) == len(pins) == 1
+    assert full.unflatten(population[0])["opaque"] is value
+    assert pins[0]["opaque"] is value
+    assert outcomes[0].effective is not pins[0]
+    assert outcomes[0].effective["opaque"] is value
+
+    again, outcomes = append_compiler_coverage(
+        population, full, cached_configs=lambda: (), pin=pins.append
+    )
+    assert [outcome.outcome for outcome in outcomes] == ["already_present"]
+    assert len(again) == 1 and again[0] is population[0]
+    assert len(pins) == 2 and pins[1]["opaque"] is value
+    assert pins[1] is not pins[0]
+
+    cached = Config(block_sizes=[64], opaque=other, coverage_mode="on")
+    warm_pins = []
+    warm, outcomes = append_compiler_coverage(
+        [], full, cached_configs=lambda: [cached], pin=warm_pins.append
+    )
+    assert [(entry.origin, entry.outcome) for entry in outcomes] == [
+        ("declared", "added"),
+        ("cache", "added"),
+    ]
+    assert len(warm) == len(warm_pins) == 2
+    assert full.unflatten(warm[1])["opaque"] is other
+    assert warm_pins[1]["opaque"] is other
+    assert outcomes[1].requested["opaque"] is other
+    assert outcomes[1].effective["opaque"] is other
+    outcomes[1].requested.config["block_sizes"][0] = 128
+    assert cached["block_sizes"] == [64]
+    assert warm_pins[1]["block_sizes"] == [64]
+    assert outcomes[1].effective["block_sizes"] == [64]
+
+
+def test_warm_witness_snapshots_containers_and_retains_opaque_owner():
+    opaque = object()
+    carrier = Config.from_dict(
+        {"block_sizes": [32], "nested": {"axes": ([0, 1],)}, "opaque": opaque}
+    )
+    witness = _WarmCoverageWitness(carrier, True)
+    carrier.config["nested"]["axes"][0][0] = 100
+    returned = witness.carrier
+    assert returned["nested"]["axes"] == ([0, 1],)
+    assert returned["opaque"] is opaque
+    returned.config["nested"]["axes"][0][1] = 200
+    returned.config["block_sizes"][0] = 64
+    again = witness.carrier
+    assert again["nested"]["axes"] == ([0, 1],)
+    assert again["block_sizes"] == [32]
+    assert again["opaque"] is opaque

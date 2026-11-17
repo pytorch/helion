@@ -46,7 +46,16 @@ down (in your notes or the reply) rather than relying on `$old` later:
 ```
 git rev-parse HEAD                           # the rollback point: record it
 git merge-base origin/main HEAD              # the base of the stack
-git log --reverse --format='%h%x09%(trailers:key=stack-info,valueonly,separator=)%x09%s' <base>..HEAD
+git log --reverse --format='%h %s%n%B%x00' <base>..HEAD |
+  python -c 'import sys
+for entry in sys.stdin.read().split("\0"):
+    lines = entry.strip().splitlines()
+    if lines:
+        print(lines[0])
+        for line in lines[1:]:
+            if line.startswith("stack-info:"):
+                print("    " + line)
+'
 ```
 
 The top commit that has a `stack-info:` line is the submit head: every submit
@@ -55,8 +64,9 @@ below is `stack-pr submit -H <its current sha>` (check with `stack-pr view -H
 commit without stack-info below the submit head would become a new pull
 request, so if one exists, stop and report instead of submitting.
 
-Each line is a commit (bottom first), its `stack-info` pull request URL, and
-its subject. For each pull request:
+The inventory prints each commit and subject (bottom first), followed by its
+raw `stack-info:` line. Do not use Git's `%(trailers)` formatter here: the
+adjacent `autoreview passed:` record can make it omit an existing PR trailer. For each pull request:
 
 ```
 gh pr view <number> --repo pytorch/helion --json title,state,headRefOid,mergeable
@@ -132,6 +142,20 @@ The stack-history skill has the recipe and the checks (every unmerged pull
 request once, in order, trailer intact; the only commits you may `--skip` are
 ones whose pull request is `MERGED`).
 
+`main` can also move into conflict with the stack between two submits, and
+that has to be caught before the next one: `stack-pr submit` points every pull
+request at `main` while it pushes, and GitHub starts no test workflows for a
+push to a pull request that conflicts with its base. Such a pull request ends
+up with a handful of passing checks and no test job. So fetch before every
+resubmit, and rebase if any commit of the stack no longer merges:
+
+```
+git fetch origin
+for c in $(git rev-list --reverse <base>..<submit head sha>); do
+  git merge-tree --write-tree origin/main $c >/dev/null || echo "conflicts with main: $c"
+done
+```
+
 ## 4. Verify locally, then resubmit
 
 Lint, and run the lanes for the files the fixes touched (verify skill). Fixes
@@ -161,7 +185,10 @@ on a devserver), and use the wait for other work, committed before the next
 fix round and not in this checkout while a local run still reads it. When the
 checks have finished:
 
-- every required check green on every pull request: done, go to step 6;
+- every required check green on every pull request: done, go to step 6. A
+  pull request showing only a few checks, none of them a test, lint or docs
+  job, was not tested (its push conflicted with `main`, step 3): that is a
+  rebase and another submit, not green;
 - an infrastructure failure: `gh run rerun <run-id> --repo pytorch/helion --failed`
   once; a second infrastructure failure of the same job goes in the report;
 - a real failure: back to step 2 for the lowest pull request it appears on.

@@ -50,25 +50,32 @@ def canonicalize_traced_graphs_pass(
     func: HostFunction | None, device_ir: DeviceIR, analysis: DeviceIRAnalysis | None
 ) -> None:
     """Graph rewrites that must precede ``prepare_graph_lowerings``:
-    reduction canonicalization, scaled-contraction and MXFP8 exposure, the
-    no-op store / accumulation / u32-multiply peepholes, affine-reduction
-    factoring under ``fast_math`` and the half-precision atomic output
-    promotion (a host-AST rewrite as well as a graph one)."""
+    reduction canonicalization, the one-hot sum fold, scaled-contraction and
+    MXFP8 exposure, the no-op store / accumulation / u32-multiply peepholes,
+    affine-reduction factoring under ``fast_math`` and the half-precision
+    atomic output promotion (a host-AST rewrite as well as a graph one)."""
     from .canonicalize_reductions import canonicalize_reductions
     from .elide_split_join import elide_split_join_roundtrips
     from .fold_noop_stores import fold_noop_stores
+    from .fold_one_hot_reductions import fold_one_hot_reductions
     from .fuse_mm_accumulation import fuse_mm_accumulation
+    from .fuse_native_s2f6 import fuse_native_s2f6
     from .fuse_u32_multiply import fuse_u32_multiply
     from .mxfp8_mma import expose_mxfp8
     from .scaled_contraction import expose_scaled_contractions
 
     canonicalize_reductions(device_ir)
+    fold_one_hot_reductions(device_ir)
     scaled_contractions = expose_scaled_contractions(device_ir)
     for graph_info in device_ir.graphs:
         elide_split_join_roundtrips(graph_info.graph)
         fold_noop_stores(graph_info.graph)
         fuse_mm_accumulation(graph_info)
         fuse_u32_multiply(graph_info.graph)
+        fuse_native_s2f6(
+            graph_info.graph,
+            CompileEnvironment.current().config_spec.target_device_capability,
+        )
     expose_mxfp8(device_ir)
     # ``refresh_active_blocks_pass`` needs the count after the core's
     # ``prepare_graph_lowerings``; it crosses that step on the env.
@@ -147,13 +154,26 @@ def promote_partitioned_outputs_pass(
 
         spec = env.config_spec
         if len(device_ir.phases) > 1 and ordered_phases_supported(func, device_ir):
+            from .local_atomic import local_atomic_allocations
+            from .reduction_coordinates import captured_reduction_coordinates
+
             # The single persistent launch shares one thread block
             # across phases (and cannot host the tcgen05 pipeline).
-            # Ordered per-phase launches tune each phase alone; the
-            # persistent launch stays the default.
+            # Ordered per-phase launches tune each phase alone.
+            # Give captured reductions and local atomics whole-root ownership
+            # in the conservative reference (see physical_capture_axes).
+            # Alternative PID owners remain searchable subject to codegen's
+            # coordinate proofs. Free iota ownership is config-dependent
+            # (owned_iota_reduction_axes), so it cannot select a bind-time default.
+            persistent = tuple(p for p in spec.allowed_pid_types if p != "flat")
+            spec.cute_ordered_phase_pid_search = True
             spec.allowed_pid_types = (
-                *(p for p in spec.allowed_pid_types if p != "flat"),
-                "flat",
+                ("flat", *persistent)
+                if (
+                    captured_reduction_coordinates(env, device_ir.graphs)
+                    or local_atomic_allocations(device_ir.graphs)
+                )
+                else (*persistent, "flat")
             )
         else:
             spec.disallow_pid_type("flat", reason=BARRIER_PID_TYPE_REASON)
@@ -198,15 +218,15 @@ def mark_rolled_graph_nodes_pass(
 ) -> None:
     """Pre-roll node marks the roller's ``node_copy`` carries into the
     rolled sweeps."""
-    # Mark provably-FTZ-safe exp sites and explicitly rounded FP32
+    # Mark provably-FTZ-safe exp2 sites and explicitly rounded FP32
     # products on the pre-roll graphs so the roller's node_copy
     # carries the marks into the rolled sweeps (consumed by the cute
     # op overrides; inert for other backends).
-    from .exp2_fastmath import mark_ftz_safe_exp_nodes
+    from .exp2_fastmath import mark_ftz_safe_exp2_nodes
     from .scalar_recipe_rounding import mark_narrowed_fp32_multiplies
 
     for graph_info in device_ir.graphs:
-        mark_ftz_safe_exp_nodes(graph_info.graph)
+        mark_ftz_safe_exp2_nodes(graph_info.graph)
         mark_narrowed_fp32_multiplies(graph_info.graph)
 
 
@@ -237,7 +257,10 @@ _STAGE_PASSES: dict[DeviceIRStage, tuple[StagePass, ...]] = {
     DeviceIRStage.AFTER_MULTI_ROOT_PID_RESTRICTION: (
         search_surface.restrict_tcgen05_multi_root_search,
     ),
-    DeviceIRStage.AFTER_ANALYSIS: (search_surface.record_tile_loop_facts,),
+    DeviceIRStage.AFTER_ANALYSIS: (
+        search_surface.record_tile_loop_facts,
+        search_surface.record_scratch_forwarding_sites,
+    ),
     DeviceIRStage.AFTER_KERNEL_MATMUL_FACT: (
         search_surface.register_matmul_alias_specializations,
     ),

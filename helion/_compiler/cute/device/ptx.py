@@ -518,6 +518,26 @@ ldg_s32_pred = ptx_op(
     doc="``ld.global.s32`` under ``pred`` (0 when it is 0).",
 )
 
+ldg_s8_pred = ptx_op(
+    "ldg_s8_pred",
+    "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.s32 $0, 0; @p ld.global.s8 $0, [$1]; }",
+    (cutlass.Int64, cutlass.Int32),
+    (cutlass.Int32,),
+    side_effects=True,
+    memory=True,
+    doc="One signed byte widened to int32 under pred (zero when false).",
+)
+
+ldg_u8_pred = ptx_op(
+    "ldg_u8_pred",
+    "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.u32 $0, 0; @p ld.global.u8 $0, [$1]; }",
+    (cutlass.Int64, cutlass.Int32),
+    (cutlass.Uint32,),
+    side_effects=True,
+    memory=True,
+    doc="One unsigned byte widened to uint32 under pred (zero when false).",
+)
+
 ldg_b32_pred = ptx_op(
     "ldg_b32_pred",
     "{ .reg .pred p; setp.ne.s32 p, $2, 0; mov.b32 $0, 0; @p ld.global.b32 $0, [$1]; }",
@@ -678,8 +698,8 @@ l2_policy_evict_last = ptx_op(
     memory=False,
     doc=(
         "``createpolicy.fractional.L2::evict_last``: the cache-policy word of "
-        "the hinted operand packets (``cp_async_16_l2``), created once per "
-        "kernel."
+        "hinted operand packets (``cp_async_16_l2``) and TMA loads. Callers "
+        "may reuse the word across multiple issues."
     ),
 )
 
@@ -835,6 +855,16 @@ round_bf16_f32 = ptx_op(
     ),
 )
 
+add_bf16x2 = ptx_op(
+    "add_bf16x2",
+    "add.rn.bf16x2 $0, $1, $2;",
+    (cutlass.Int32, cutlass.Int32),
+    (cutlass.Int32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed BF16 add of two b32 registers, rounding each sum.",
+)
+
 mul_bf16x2 = ptx_op(
     "mul_bf16x2",
     "mul.rn.bf16x2 $0, $1, $2;",
@@ -858,6 +888,112 @@ sub_bf16x2 = ptx_op(
         "so one ``sub.rn`` reproduces the ``BF16(V - X)`` boundary for two "
         "values at once."
     ),
+)
+
+# ---- packed fp32 arithmetic (sm_100) ---------------------------------------
+
+# ``cute.math.exp`` of an fp32 value lowers to libdevice's ``__nv_expf``
+# (CUDA 13): ``t = sat(fma.rn(x, log2(e)/252, 0.5))``, ``n = fma.rm(t, 252,
+# 12582913)``, ``r = fma.rn(x, log2(e)_lo, fma.rn(x, log2(e)_hi, -(n -
+# 12583039)))``, then ``exp = ex2.approx.ftz(r) * (n << 23)``.  This row runs
+# it on two values with the packed forms of its FMAs and its subtraction
+# (``fma.rm.f32x2`` rounds each lane as ``fma.rm.f32`` does; ``-(n - c)`` is
+# spelled ``c - n``, equal under round-to-nearest).  The saturating FMA has
+# no packed form and the ex2 and the shift are scalar.  The final product is
+# left to the caller as a plain multiply, so NVVM contracts it into a
+# following add exactly as it contracts the scalar exp's own product.
+exp_f32x2_parts = ptx_op(
+    "exp_f32x2_parts",
+    "{.reg .f32 t0, t1, n0, n1, r0, r1, c1, half, k252, kmag, kpos, l2e, c2;"
+    " .reg .b64 x, t, n, nt, r, kk252, kkmag, kkpos, ll2e, cc2;"
+    " mov.b32 c1, 0f3BBB989D; mov.b32 half, 0f3F000000;"
+    " mov.b32 k252, 0f437C0000; mov.b32 kmag, 0f4B400001;"
+    " mov.b32 kpos, 0f4B40007F; mov.b32 l2e, 0f3FB8AA3B; mov.b32 c2, 0f32A57060;"
+    " fma.rn.f32 t0, $4, c1, half; cvt.sat.f32.f32 t0, t0;"
+    " fma.rn.f32 t1, $5, c1, half; cvt.sat.f32.f32 t1, t1;"
+    " mov.b64 t, {t0, t1}; mov.b64 x, {$4, $5};"
+    " mov.b64 kk252, {k252, k252}; mov.b64 kkmag, {kmag, kmag};"
+    " mov.b64 kkpos, {kpos, kpos}; mov.b64 ll2e, {l2e, l2e}; mov.b64 cc2, {c2, c2};"
+    " fma.rm.f32x2 n, t, kk252, kkmag; sub.rn.f32x2 nt, kkpos, n;"
+    " fma.rn.f32x2 r, x, ll2e, nt; fma.rn.f32x2 r, x, cc2, r;"
+    " mov.b64 {n0, n1}, n; shl.b32 $2, n0, 23; shl.b32 $3, n1, 23;"
+    " mov.b64 {r0, r1}, r; ex2.approx.ftz.f32 $0, r0; ex2.approx.ftz.f32 $1, r1;}",
+    (cutlass.Float32, cutlass.Float32),
+    (cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32),
+    side_effects=False,
+    memory=False,
+    doc=(
+        "``(p0, p1, s0, s1)`` with ``p_i * s_i`` bit-identical to "
+        "``cute.math.exp(x_i)``: ``__nv_expf`` of two values, its FMAs and "
+        "subtraction packed, the final product left to the caller."
+    ),
+)
+
+# ``exact_division.exact_div_fast_f32`` of two dividends over one divisor:
+# ``q = RN(a*y)``, ``r = RN(a - b*q)`` (``fma(q, -b, a)``, the same value as
+# its ``fma(-q, b, a)``) and ``RN(q + r*y)``, each lane rounded as the scalar
+# helper rounds it.  The scalar ``a * y`` is never contracted: both of its
+# readers are FMAs.
+exact_div_fast_f32x2 = ptx_op(
+    "exact_div_fast_f32x2",
+    "{.reg .f32 nb; .reg .b64 a, yy, nbb, q, e, r;"
+    " neg.f32 nb, $4; mov.b64 a, {$2, $3};"
+    " mov.b64 yy, {$5, $5}; mov.b64 nbb, {nb, nb};"
+    " mul.rn.f32x2 q, a, yy; fma.rn.f32x2 e, q, nbb, a;"
+    " fma.rn.f32x2 r, e, yy, q; mov.b64 {$0, $1}, r;}",
+    (cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32),
+    (cutlass.Float32, cutlass.Float32),
+    side_effects=False,
+    memory=False,
+    doc=(
+        "``(exact_div_fast_f32(a0, b, y), exact_div_fast_f32(a1, b, y))`` "
+        "with packed instructions."
+    ),
+)
+
+# ---- packed half-precision extrema (sm_80) ---------------------------------
+
+# Half by half: a NaN half gives the canonical NaN half, -0.0 orders below
+# +0.0 in either operand order (as ``cute.arch.fmax`` / ``fmin`` with
+# ``nan=True`` order fp32 values), and subnormal halves are kept.
+max_nan_bf16x2 = ptx_op(
+    "max_nan_bf16x2",
+    "max.NaN.bf16x2 $0, $1, $2;",
+    (cutlass.Uint32, cutlass.Uint32),
+    (cutlass.Uint32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed NaN-propagating maximum of the bf16 halves of two words.",
+)
+
+min_nan_bf16x2 = ptx_op(
+    "min_nan_bf16x2",
+    "min.NaN.bf16x2 $0, $1, $2;",
+    (cutlass.Uint32, cutlass.Uint32),
+    (cutlass.Uint32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed NaN-propagating minimum of the bf16 halves of two words.",
+)
+
+max_nan_f16x2 = ptx_op(
+    "max_nan_f16x2",
+    "max.NaN.f16x2 $0, $1, $2;",
+    (cutlass.Uint32, cutlass.Uint32),
+    (cutlass.Uint32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed NaN-propagating maximum of the f16 halves of two words.",
+)
+
+min_nan_f16x2 = ptx_op(
+    "min_nan_f16x2",
+    "min.NaN.f16x2 $0, $1, $2;",
+    (cutlass.Uint32, cutlass.Uint32),
+    (cutlass.Uint32,),
+    side_effects=False,
+    memory=False,
+    doc="Packed NaN-propagating minimum of the f16 halves of two words.",
 )
 
 # ---- predicated selects ----------------------------------------------------

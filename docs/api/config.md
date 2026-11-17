@@ -55,6 +55,27 @@ Configs are typically discovered automatically through autotuning, but can also 
    Number of pipeline stages for software pipelining. Higher values can improve memory bandwidth utilization.
 ```
 
+### CuTe Compiler Pipeline
+
+`cute_compiler_pipeline="default"` keeps the SDK compiler options unchanged.
+`"opt2"` requests optimization level 2 for CuTe kernels generated from the
+configuration, including specialized schedules and auxiliary fill/reduction
+launches. Fixed runtime host-sum helpers keep their SDK defaults; their interfaces
+do not take per-configuration compiler options. Autotuning searches both choices
+while retaining the configured population and time limits and compiler seed list.
+Exact enumeration includes both choices, which can double the number of
+configurations when neither choice is overridden. The choice participates in
+generated code and compile-cache keys. Existing configs that omit it retain
+the default behavior; the added search dimension invalidates older persistent
+autotune fingerprints once.
+
+An explicit optimization level in `CUTE_DSL_COMPILER_OPT` overrides the requested
+level, so searching both choices then repeats the same pipeline. Unrelated
+compiler options do not disable the choice. The SDK captures these settings when
+creating its DSL environment, so set them before starting the process. Leave the
+override unset to autotune the pipeline; Helion does not modify process environment
+settings between configurations.
+
 ### Loop Optimizations
 
 ```{eval-rst}

@@ -15,6 +15,9 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing.cuda_context import clear_current_context
+from helion._testing.cuda_context import current_context
+from helion._testing.cuda_context import on_new_thread
 import helion.language as hl
 
 attention_output = import_example("attention").attention_output
@@ -92,6 +95,39 @@ def test_pointwise(tmp_path: Path, layout: str) -> None:
     if layout == "contiguous":
         with pytest.raises(ValueError, match="tensor layout"):
             exported._pointwise(torch.randn(129, device=DEVICE)[1:], 2.0)
+        _check_new_thread_relaunch(exported, x)
+
+
+def _check_new_thread_relaunch(exported: ModuleType, x: torch.Tensor) -> None:
+    """Relaunch ``exported._pointwise`` on a new thread, which has no current
+    CUDA context (as PyTorch's autograd device thread has none): the
+    launcher makes the device's primary context, the main thread's, current
+    before the compiled host code runs, and again on the next launch after
+    other code cleared the thread's context."""
+    main_context = current_context()
+    (key,) = exported._STANDALONE_COMPILED
+    compiled = exported._STANDALONE_COMPILED[key]
+    contexts: list[int] = []
+
+    def recording(*args: object) -> object:
+        contexts.append(current_context())
+        return compiled(*args)
+
+    def launch() -> tuple[int, torch.Tensor, torch.Tensor]:
+        start = current_context()
+        first = exported._pointwise(x, 2.0)
+        clear_current_context()
+        return start, first, exported._pointwise(x, 2.0)
+
+    exported._STANDALONE_COMPILED[key] = recording
+    try:
+        start, first, second = on_new_thread(launch)
+    finally:
+        exported._STANDALONE_COMPILED[key] = compiled
+    assert start == 0
+    assert contexts == [main_context, main_context]
+    torch.testing.assert_close(first, x * 2.0 + 1.0)
+    torch.testing.assert_close(second, x * 2.0 + 1.0)
 
 
 @helion.kernel(backend="cute", autotune_effort="none", static_shapes=True)
@@ -250,8 +286,9 @@ def test_nested_runtime_scalar(tmp_path: Path, named_tuple: bool) -> None:
     torch.testing.assert_close(exported._nested(pair(x, 3.0)), x * 3.0)
 
 
-# The smoke test of the Helion-free interpreter; the flash attention exports
-# below run the same check on far larger kernels and are the slow tier.
+# The smoke test of the Helion-free interpreter; the MMA-DAG and flash
+# attention exports below run the same check on far larger kernels and are the
+# slow tier.
 def test_native_source_edit_without_helion(tmp_path: Path) -> None:
     x = torch.randn(128, device=DEVICE)
     bound = _pointwise.bind((x, 2.0))
@@ -314,12 +351,13 @@ def test_current_stream_and_cuda_graph(tmp_path: Path) -> None:
     torch.testing.assert_close(captured, x * 3.0 + 1.0)
 
 
+@pytest.mark.slow
 def test_mma_dag_kernel_exports_the_shared_ptx_rows(tmp_path: Path) -> None:
-    # ``_mma_dag_runtime`` re-exports ``stg_b32`` / ``unpack_f16x2`` from
-    # ``device/ptx.py``: the export has to carry the table builder with its
-    # rows and bind the re-exports to them, and the module must load and run
-    # with ``helion`` unimportable.  (The warp_mma GEMM family renders the
-    # rows too but its launch plan is not exportable yet.)
+    # The export of an MMA-DAG kernel whose ``_mma_dag_runtime`` re-exports
+    # ``stg_b32`` / ``unpack_f16x2`` from ``device/ptx.py`` loads and runs with
+    # ``helion`` unimportable, the re-exports bound to the exported rows.  The
+    # codegen half is test_cute_mma_dag.py's
+    # test_the_standalone_export_carries_the_shared_ptx_rows, in the CPU lane.
     probes = importlib.import_module("test.test_cute_mma_dag")
     kernel = helion.kernel(
         probes._accumulating_addmm,
@@ -344,14 +382,9 @@ def test_mma_dag_kernel_exports_the_shared_ptx_rows(tmp_path: Path) -> None:
                 cute_mma_dag_loads="lane",
             )
         )
-    code = bound.to_code(config)
-    for name in ("stg_b32", "unpack_f16x2"):
-        assert f"_helion_mma_dag.{name}(" in code, name
     code = bound.to_code(
         config, options=helion.OutputCodeOptions(allow_helion_deps=False)
     )
-    assert "_make_standalone_ptx" in code
-    assert "_make_standalone_mma_dag_runtime" in code
     (tmp_path / "native_addmm.py").write_text(code)
     _run_without_helion(
         tmp_path,

@@ -51,6 +51,7 @@ import torch
 from ..emitter_protocols import source_adapter
 from .analysis.match_common import host_tensor_load
 from .analysis.match_common import is_call
+from .analysis.match_common import root_grid_origin_is_canonical
 from .analysis.match_common import split_scale
 from .analysis.match_common import strip_new_var
 from .autotune.flash_surface import enable_cute_flash_bwd_search
@@ -2209,7 +2210,7 @@ def detect_flash_bwd_search_surface(device_ir: DeviceIR) -> bool:
     from ..compile_environment import CompileEnvironment
     from .analysis.attention_match import _attention_flash_supported
 
-    if not _attention_flash_supported():
+    if not _attention_flash_supported() or not root_grid_origin_is_canonical(device_ir):
         return False
     match = match_attention_bwd(device_ir)
     if match is None:

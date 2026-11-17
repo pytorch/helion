@@ -15,6 +15,8 @@ from ..device_ir import IfGraphInfo
 from ..device_ir import control_flow_parent_entries
 from .local_atomic import local_atomic_allocations
 from .local_atomic import terminal_loop_symbols
+from .scalar_ast import SCALAR_CALLS
+from .scalar_ast import is_flat_scalar_access
 
 if TYPE_CHECKING:
     from torch.fx import Node
@@ -120,10 +122,7 @@ def privatize_scalar_loop(
         for parent in ast.walk(statement):
             for child in ast.iter_child_nodes(parent):
                 if isinstance(child, ast.Name) and child.id in buffers:
-                    if (
-                        not isinstance(parent, ast.Subscript)
-                        or parent.value is not child
-                    ):
+                    if not is_flat_scalar_access(parent, child):
                         reject()  # No escaped shared pointer or hidden storage alias.
         for node in ast.walk(statement):
             if isinstance(
@@ -141,30 +140,14 @@ def privatize_scalar_loop(
             if isinstance(node, ast.Call):
                 name = ast.unparse(node.func)
                 if not (
-                    name in casts | {"_cute_python_mod", "min", "max"}
-                    or name
-                    in {
-                        "operator.add",
-                        "operator.sub",
-                        "operator.mul",
+                    name
+                    in casts
+                    | SCALAR_CALLS
+                    | {
                         "operator.truediv",
-                        "operator.floordiv",
-                        "operator.mod",
-                        "operator.neg",
                         "operator.pos",
-                        "operator.eq",
-                        "operator.ne",
-                        "operator.gt",
-                        "operator.ge",
-                        "operator.lt",
-                        "operator.le",
-                        "operator.and_",
-                        "operator.or_",
-                        "operator.xor",
                         "operator.not_",
                         "operator.invert",
-                        "operator.lshift",
-                        "operator.rshift",
                     }
                     or isinstance(node.func, ast.Attribute)
                     and node.func.attr == "load"

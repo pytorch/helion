@@ -372,6 +372,8 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
         )
         source = self._source(path)
         self.assertIn("tl.dot(", source)
+        self.assertIn("def integer_full(", source)
+        self.assertNotIn("from helion.runtime.triton import helpers", source)
         self.assertNotIn("_source_module", source)
         with (
             patch.object(
@@ -432,6 +434,36 @@ class TestKernelArtifact(RefEagerTestDisabled, TestCase):
 @pytest.mark.cuda
 @onlyBackends(["triton"])
 class TestKernelArtifactCUDA(RefEagerTestDisabled, TestCase):
+    def test_scaled_mm_with_embedded_native_helpers(self):
+        args = _scaled_mm_inputs("cuda")
+        out, a, b, a_scales, b_scales = args
+        expected = ((a.float() @ b.float()) * a_scales * b_scales.T).to(out.dtype)
+        with tempfile.TemporaryDirectory() as directory:
+            path = export_artifact(
+                _scaled_mm_kernel(),
+                [
+                    ArtifactCase(
+                        args,
+                        helion.Config(
+                            block_sizes=[16, 32, 32], split_k=1, swap_ab=False
+                        ),
+                    )
+                ],
+                Path(directory) / "scaled_mm.json",
+            )
+            with (
+                patch.object(
+                    KernelCompiler,
+                    "compile",
+                    side_effect=AssertionError("frontend ran"),
+                ),
+                patch.object(
+                    BoundKernel, "to_code", side_effect=AssertionError("codegen ran")
+                ),
+            ):
+                load_artifact(path)(*args)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
     @pytest.mark.slow
     def test_fresh_process_execution_without_original_kernel_module(self):
         root = Path(self._test_stack.enter_context(tempfile.TemporaryDirectory()))

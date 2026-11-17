@@ -320,9 +320,13 @@ class CuteFullChunkRowHeuristic(AutotunerHeuristic):
             and True in (pdl.search_values() or ())
         )
         policy_domain = spec.load_eviction_policies.inner.search_values() or ()
+        # The load slots of the seeds' code, which rolls the reduction: rolling
+        # numbers them its own way (``DeviceIR.config_memory_op_facts``).
         policy_indices = {
             fact.eviction_index
-            for fact in spec.memory_op_facts
+            for fact in device_ir.config_memory_op_facts(
+                Config.from_dict({"reduction_loops": [chunk]})
+            )
             if fact.kind == "load"
             and fact.eviction_index is not None
             and fact.dtype in dtypes

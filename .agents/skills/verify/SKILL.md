@@ -74,10 +74,15 @@ checkout a run reads corrupts its results.
 --head` (the last commit) when the change is a complete logical unit; skip it
 for trivial fixes and run it once over the finished stack
 (`scripts/autoreview.py origin/main..HEAD`) before handing a larger project
-back. Address every finding or explain why it does not apply. When it passes,
+back. Fix every finding, or classify it as invalid with an explanation in the
+commit message's `Review notes:` paragraph (AGENTS.md, Answering the
+findings); do not make a change you believe is wrong to get a pass. When it passes,
 add the `autoreview passed: ...` line it prints as the last line of each commit
 it covered (above any `stack-info:` line; AGENTS.md, Recording the review). If the review
-itself fails, stop and report it; do not substitute your own review. If it
+itself fails, stop and report it; do not substitute your own review. The one
+exception is Codex's `ERROR:` about a missing temporary directory: pass
+`--codex-sandbox workspace-write` when the reviewers will have to run Helion,
+and run a review that ended in that error again with it (AGENTS.md, Code Review). If it
 warns that only one reviewer (Claude or Codex) is installed, say so to the
 user.
 

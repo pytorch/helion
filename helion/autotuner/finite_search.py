@@ -51,8 +51,6 @@ class FiniteSearch(BaseSearch):
             raise exc.NotEnoughConfigs(len(self.configs))
 
     def _algorithm_cache_policy(self) -> dict[str, object] | None:
-        if self._benchmark_provider_cls is not LocalBenchmarkProvider:
-            return None
         return {
             "finite_version": 1,
             "configs": tuple(self.configs),
@@ -61,6 +59,13 @@ class FiniteSearch(BaseSearch):
 
     def _generation_invalid_config_count(self) -> int:
         return self.config_gen.invalid_config_count
+
+    def _backend_config_is_viable(self, config: Config) -> bool:
+        # The configs are given (the kernel's ``configs=[...]``, or cached
+        # best configs), not generated: the backend's screen
+        # (``autotune_config_is_viable``) is for generated candidates, so each
+        # given config is compiled and timed as given.
+        return True
 
     def _autotune(self) -> Config:
         best_config = None

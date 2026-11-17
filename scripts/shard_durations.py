@@ -4,21 +4,25 @@
 CI splits the CuTe jobs across shards by module (``HELION_TEST_SHARD=i/n`` in
 ``test/conftest.py``), and ``helion._testing.sharding`` assigns the modules to
 shards from the seconds recorded here so the shards finish together. Refresh
-the file from junit reports of the lanes that shard, run with the pull-request
-filter (``not slow``) and ``junit_duration_report=total``:
+the file from junit reports of the CuTe GPU lane with the pull-request filter
+(``not slow and (not cpu_only or cuda)``) and ``junit_duration_report=total``:
 
-    HELION_BACKEND=cute pytest -m "not cpu_only and not slow" \\
-        -o junit_duration_report=total --junitxml=/tmp/cute-gpu.xml
-    HELION_BACKEND=cute HELION_TEST_LANE=cpu CUDA_VISIBLE_DEVICES="" \\
-        pytest -m "cpu_only and not slow" \\
-        -o junit_duration_report=total --junitxml=/tmp/cute-cpu.xml
-    python scripts/shard_durations.py /tmp/cute-gpu.xml /tmp/cute-cpu.xml
+    scripts/run_tests.py --backend cute --lane gpu
+    python scripts/shard_durations.py .logs/tests/<run>/cute-gpu*.xml
+
+Do not import CPU-only or slow-tier reports: modules omitted from the CuTe GPU
+PR lane do not receive a shard assignment.
 
 Modules in the reports replace their recorded seconds, other entries stay,
 and entries whose module no longer exists are dropped; run it without reports
 after deleting or renaming a test module to drop its entry. ``--shards N``
 prints the split the recorded durations give N shards (of the reports'
 modules, or of every recorded module without reports) instead of writing.
+Positive measurements have a minimum recorded weight of 0.1 seconds so
+rounding cannot create a zero placeholder. The original JUnit reports retain
+the unrounded measurements; unreported weights are not changed. This recording
+floor does not change shard assignments: the scheduler separately applies its
+1.0-second minimum weight to these small values.
 """
 
 from __future__ import annotations
@@ -30,7 +34,6 @@ from pathlib import Path
 import sys
 import xml.etree.ElementTree as ET
 
-from helion._testing.sharding import DURATIONS_FILE
 from helion._testing.sharding import assign_shards
 from helion._testing.sharding import load_durations
 from helion._testing.sharding import shard_loads
@@ -81,7 +84,10 @@ def main(argv: list[str] | None = None) -> int:
         help="print the split of the recorded durations into N shards",
     )
     parser.add_argument(
-        "--output", type=Path, default=DURATIONS_FILE, help="durations file"
+        "--output",
+        type=Path,
+        default=REPO_ROOT / "test" / "shard_durations.json",
+        help="durations file (default: this checkout's test/shard_durations.json)",
     )
     args = parser.parse_args(argv)
 
@@ -90,10 +96,15 @@ def main(argv: list[str] | None = None) -> int:
     reported: set[str] = set()
     for report in args.junitxml:
         seconds = read_junit(report)
-        durations.update(seconds)
+        durations.update(
+            {
+                module: max(0.1, round(elapsed, 1)) if elapsed > 0 else 0.0
+                for module, elapsed in seconds.items()
+            }
+        )
         reported.update(seconds)
     durations = {
-        module: round(seconds, 1)
+        module: seconds
         for module, seconds in durations.items()
         if (REPO_ROOT / module).is_file()
     }

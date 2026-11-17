@@ -171,9 +171,22 @@ def prove_full_tile_launch(
         and isinstance(statement.value.func, ast.Name)
         and statement.value.func.id == "_launcher"
     )
-    if len(launch.keywords) != 1 or launch.keywords[0].arg != "block":
+    # Codegen adds only a literal compiler-options string. Keep the old
+    # effect-free boundary for other keywords and runtime expressions.
+    if any(
+        keyword.arg != "block"
+        and not (
+            keyword.arg == "cute_compile_options"
+            and isinstance(keyword.value, ast.Constant)
+            and isinstance(keyword.value.value, str)
+        )
+        for keyword in launch.keywords
+    ):
         return None
-    block = launch.keywords[0].value
+    blocks = [keyword.value for keyword in launch.keywords if keyword.arg == "block"]
+    if len(blocks) != 1:
+        return None
+    block = blocks[0]
     if not (
         isinstance(block, ast.Tuple)
         and len(block.elts) == 3

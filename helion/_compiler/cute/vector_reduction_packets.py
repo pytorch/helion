@@ -14,6 +14,7 @@ from __future__ import annotations
 import ast
 from collections import Counter
 from functools import cached_property
+from itertools import pairwise
 from typing import TYPE_CHECKING
 from typing import TypeVar
 from typing import cast
@@ -23,6 +24,7 @@ from ..ast_extension import statement_from_string
 from ..ast_read_writes import ReadWrites
 from ._ast_pass_utils import _is_proven_relocatable_assignment
 from ._ast_pass_utils import assigned_name
+from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import substitute_names
 from .cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
@@ -32,6 +34,7 @@ from .reduce_call import ReduceScope
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
     from collections.abc import Mapping
 
 
@@ -959,6 +962,55 @@ class _PacketReductions:
         return result
 
 
+def _rolled_sums(body: list[ast.stmt]) -> _PacketReductions:
+    """The splitter ``split_rolled_vector_sums`` runs over ``body``, which
+    ``splits_rolled_sum`` asks the same way."""
+    return _PacketReductions(
+        body, {}, None, prefix="_cute_rolled", statement=_parsed_statement
+    )
+
+
+def splits_rolled_sum(previous: ast.stmt | None, loop: ast.For) -> bool:
+    """Whether ``split_rolled_vector_sums`` may split the rolled sum ``loop``
+    accumulates after ``previous``, as the two statements stand (tried on
+    copies; the reads it counts are those two statements' alone, so this may
+    say yes where the whole body then says no, never the other way around)."""
+    if previous is None:
+        return False
+    init, outer = deep_clone(previous), deep_clone(loop)
+    return _rolled_sums([init, outer]).split_rolled(init, outer) is not None
+
+
+def rolled_sums_split_after(
+    body: list[ast.stmt], prove: Callable[[list[ast.stmt]], list[ast.stmt]]
+) -> Callable[[ast.stmt | None, ast.For], bool]:
+    """Whether ``split_rolled_vector_sums`` may split a loop of ``body``, at
+    any depth, once ``prove`` has rewritten ``body`` as the bounds proofs
+    will before the split runs: a guard or select they remove can make a
+    sum splittable (the matcher refuses an ``if``), and a guard they inline
+    can lift a sum to the top level.  Asked of a copy of ``body``."""
+    copies = [deep_clone(statement) for statement in body]
+    # The proofs rewrite loops in place, so each copy stays its loop's.
+    originals = {
+        id(copy): original
+        for original, copy in zip(_walk(body), _walk(copies), strict=True)
+        if isinstance(original, ast.For)
+    }
+    proven = prove(copies)
+    split = {
+        id(originals[id(loop)])
+        for previous, loop in pairwise(proven)
+        if isinstance(loop, ast.For)
+        and id(loop) in originals
+        and splits_rolled_sum(previous, loop)
+    }
+    return lambda previous, loop: id(loop) in split
+
+
+def _walk(body: list[ast.stmt]) -> Iterator[ast.AST]:
+    return ast.walk(ast.Module(body=body, type_ignores=[]))
+
+
 def split_rolled_vector_sums(body: list[ast.stmt]) -> list[ast.stmt]:
     """Independent FP32 sums across a cached rolled vector traversal.
 
@@ -966,9 +1018,7 @@ def split_rolled_vector_sums(body: list[ast.stmt]) -> list[ast.stmt]:
     loop nest is offered to ``_PacketReductions.split_rolled``.  Fresh names
     use the ``_cute_rolled_*`` prefix and plain parsed statements.
     """
-    reductions = _PacketReductions(
-        body, {}, None, prefix="_cute_rolled", statement=_parsed_statement
-    )
+    reductions = _rolled_sums(body)
     result: list[ast.stmt] = []
     for statement in body:
         if isinstance(statement, ast.For) and result:

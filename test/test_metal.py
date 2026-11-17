@@ -8,7 +8,6 @@ import re
 import sys
 import textwrap
 from typing import TYPE_CHECKING
-from typing import ClassVar
 import unittest
 from unittest.mock import patch
 
@@ -24,9 +23,9 @@ from helion._compiler.metal import free_arange
 from helion._compiler.metal import lane_reduction
 from helion._compiler.metal import row_reduction_heuristic
 from helion._compiler.metal.backend import MetalBackend
-from helion._compiler.metal.fma_fusion import fuse_multiply_adds
 from helion._compiler.metal.lane_fold import LaneJam
 from helion._compiler.metal.lane_fold import balanced_combine
+from helion._compiler.metal.lane_fold import jam_lanes_into_loops
 from helion._compiler.metal.lane_fold import unroll_lane_folds
 from helion._compiler.metal.metal_overrides import MetalOverrides
 from helion._compiler.metal.mpp_matmul import names_read
@@ -37,6 +36,7 @@ from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeur
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
+from helion._testing.metal import run_with_msl
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
 
@@ -81,31 +81,9 @@ DEVICE = "mps"
 _DEFAULT_CONFIG = [helion.Config(block_sizes=[256], num_warps=4)]
 
 
-def _run_with_msl(
-    kernel: helion.Kernel,
-    args: tuple[object, ...],
-    config: helion.Config | None = None,
-) -> tuple[object, str, str]:
-    """Run *kernel* through the normal Helion pipeline; return its result, its
-    Python code and its MSL.
-
-    Uses PyCodeCache to load the generated module (same as Helion's runtime)
-    and calls the host function, which makes metal_jit generate the MSL.
-    """
-    code = kernel.bind(args).to_code(config)
-    module = PyCodeCache.load(code)
-    result = getattr(module, kernel.fn.__name__)(*args)
-    (msl,) = [
-        obj.msl_source
-        for obj in vars(module).values()
-        if isinstance(obj, _MetalKernel) and obj.msl_source is not None
-    ]
-    return result, code, msl
-
-
 def _get_msl(kernel: helion.Kernel, args: tuple[object, ...]) -> str:
     """The MSL *kernel* generates for *args*."""
-    return _run_with_msl(kernel, args)[2]
+    return run_with_msl(kernel, args)[2]
 
 
 def _element_loops(msl: str) -> list[str]:
@@ -176,6 +154,21 @@ def masked_copy(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     out = torch.zeros_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = torch.where(mask[tile], x[tile], 0.0)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def carry_exp_sum(x: torch.Tensor) -> torch.Tensor:
+    """A per-lane accumulator updated from each tile's loads, summed after
+    the loop (``mask_loop_carries``)."""
+    m, n = x.shape
+    bn = hl.register_block_size(n)
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=x.dtype)
+        for tile_n in hl.tile(n, block_size=bn):
+            acc = acc + torch.exp(x[tile_m, tile_n])
+        out[tile_m] = acc.sum(-1)
     return out
 
 
@@ -323,6 +316,17 @@ def special_kernel(x: torch.Tensor) -> torch.Tensor:
         v = x[tile]
         out[tile] = torch.erf(v) + torch.lgamma(v.abs() + 1)
     return out
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def log1p_expm1_kernel(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Ops Inductor's MPS overrides lack, whose fallbacks lose small x."""
+    a = torch.empty_like(x)
+    b = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        a[tile] = torch.log1p(x[tile])
+        b[tile] = torch.expm1(x[tile])
+    return a, b
 
 
 @helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
@@ -605,6 +609,21 @@ class TestMetalBoundsMasking(unittest.TestCase):
             ):
                 kernel(x[:, 0] if kernel is flat else x)
 
+    def test_loop_carry_keeps_a_partial_tiles_fill_values_out(self) -> None:
+        """500 columns end in a 4-column tile of a 16-lane carry: the
+        update's ``torch.exp`` takes 0 in the 12 padded lanes
+        (``_mask_select``), each of which would otherwise add ``exp(0)``."""
+        x = torch.randn(64, 500, device=DEVICE)
+        result, _, msl = run_with_msl(
+            carry_exp_sum, (x,), helion.Config(block_sizes=[16, 4])
+        )
+        torch.testing.assert_close(result, torch.exp(x).sum(-1), rtol=1e-4, atol=1e-4)
+        self.assertRegex(
+            msl,
+            r"_mask_select\w* = \(mask_\d+ \? \w+ : static_cast<float>\(0\)\);",
+            "the operand select not found in generated MSL",
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests – arithmetic
@@ -675,11 +694,11 @@ class TestMetalScalarArgs(unittest.TestCase):
             with self.subTest(shape=shape):
                 x = torch.randn(*shape, device=DEVICE)
                 y = torch.randn(*shape, device=DEVICE)
-                out, _, msl = _run_with_msl(add_sized, (x, y))
+                out, _, msl = run_with_msl(add_sized, (x, y))
                 torch.testing.assert_close(out, x + y)
                 self.assertRegex(msl, r"constant long& \w+ \[\[buffer")
         x = torch.randn(1024, device=DEVICE)
-        _, _, msl = _run_with_msl(saxpy, (x, x, 2.5, -1.0))
+        _, _, msl = run_with_msl(saxpy, (x, x, 2.5, -1.0))
         self.assertIn("constant float& a [[buffer", msl)
 
 
@@ -743,6 +762,49 @@ class TestMetalMathOps(unittest.TestCase):
         x = torch.randn(1024, device=DEVICE)
         expected = torch.erf(x) + torch.lgamma(x.abs() + 1)
         torch.testing.assert_close(special_kernel(x), expected, atol=1e-5, rtol=1e-5)
+
+    def test_log1p_expm1_of_small_values(self) -> None:
+        """Accurate where log(1 + x) and exp(x) - 1 lose the digits of a
+        small x (log1p(1e-8) and expm1(1e-8) were 0), in float and rounded
+        back once for 16-bit inputs: within the dtype's default rtol of
+        float64, with no atol to absorb the tiny values."""
+        rtols = {torch.float32: 1.3e-6, torch.float16: 1e-3, torch.bfloat16: 1.6e-2}
+        generator = torch.Generator().manual_seed(0)
+        sign = torch.randint(0, 2, (1024,), generator=generator) * 2 - 1
+        x64 = (sign * torch.logspace(-12, -0.1, 1024)).double()
+        for dtype, rtol in rtols.items():
+            with self.subTest(dtype=dtype):
+                x = x64.to(dtype).to(DEVICE)
+                log1p, expm1 = log1p_expm1_kernel(x)
+                exact = x.cpu().double()
+                for out, expected in (
+                    (log1p, torch.log1p(exact)),
+                    (expm1, torch.expm1(exact)),
+                ):
+                    torch.testing.assert_close(
+                        out.cpu().double(),
+                        expected.to(dtype).double(),
+                        rtol=rtol,
+                        atol=0,
+                    )
+                # torch's MPS log1p runs the same c10 function.
+                torch.testing.assert_close(log1p, torch.log1p(x), atol=0, rtol=0)
+        # The special values: infinities, NaN, signed zero, the pole, the
+        # domain's edge, the largest finite results and overflow.
+        edges = [float("inf"), float("-inf"), float("nan"), -0.0, 0.0]
+        x = torch.tensor(
+            [*edges, -1.0, -2.0, 85.0, 88.0, 88.7, 89.0, -89.0, 1e-30], device=DEVICE
+        )
+        log1p, expm1 = log1p_expm1_kernel(x)
+        for out, expected in (
+            (log1p, torch.log1p(x.cpu())),
+            (expm1, torch.expm1(x.cpu())),
+        ):
+            torch.testing.assert_close(out.cpu(), expected, equal_nan=True)
+            real = ~expected.isnan()
+            self.assertEqual(
+                out.cpu()[real].signbit().tolist(), expected[real].signbit().tolist()
+            )
 
     def test_atan2(self) -> None:
         y = torch.randn(1024, device=DEVICE)
@@ -893,7 +955,7 @@ class TestMetalBfloatConversion(unittest.TestCase):
         }
         for name, x in sources.items():
             with self.subTest(source=name):
-                out, _, msl = _run_with_msl(to_bfloat16, (x.to(DEVICE),))
+                out, _, msl = run_with_msl(to_bfloat16, (x.to(DEVICE),))
                 self.assertIn(_VIA_FLOAT, msl)
                 ref = x.to(torch.bfloat16)
                 self.assertFalse(_bits_mismatch(out.cpu(), ref).any())
@@ -927,7 +989,7 @@ class TestMetalBfloatConversion(unittest.TestCase):
         x = torch.randint(-1000, 1000, (1000,), device=DEVICE, dtype=torch.int32)
         for kernel, dtype in ((to_float16, "half"), (to_float32, "float")):
             with self.subTest(target=dtype):
-                out, _, msl = _run_with_msl(kernel, (x,))
+                out, _, msl = run_with_msl(kernel, (x,))
                 self.assertRegex(msl, rf"static_cast<{dtype}>\(load")
                 self.assertNotIn(f"static_cast<{dtype}>(static_cast<float>(", msl)
                 torch.testing.assert_close(out, x.to(out.dtype))
@@ -1221,7 +1283,7 @@ class TestMetalLargeBlock(unittest.TestCase):
         x = torch.randn(4096, device=DEVICE)
         y = torch.randn(4096, device=DEVICE)
         config = helion.Config(block_sizes=[2048], num_threads=[4096], num_warps=4)
-        out, code, _ = _run_with_msl(large_block_add, (x, y), config)
+        out, code, _ = run_with_msl(large_block_add, (x, y), config)
         self.assertIn("_block_dims=(128, 1, 1)", code)
         torch.testing.assert_close(out, x + y)
 
@@ -5745,6 +5807,17 @@ def permuted_slice_sum(y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", autotune_effort="none")
+def permuted_unit_dim_sum(x: torch.Tensor) -> torch.Tensor:
+    """A sum over an extent-1 dim lowers element-wise: its ``[tm, tn, 1]``
+    input meets the ``[tm, tn]`` result without the unit dim."""
+    m, n = x.shape
+    out = torch.empty([n, m], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        out[tn, tm] = (x[tm, tn][:, :, None] * 2.0).sum(-1).T
+    return out
+
+
+@helion.kernel(backend="metal", autotune_effort="none")
 def dot_permuted_lhs(x: torch.Tensor, s: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """A computed, transposed lhs over a tile K (mamba2_chunk_state's form)."""
     k, m = x.shape
@@ -6134,6 +6207,13 @@ class TestMetalPermute(unittest.TestCase):
         torch.testing.assert_close(
             self._run(permuted_slice_sum, (y,))[0], y.sum(1).T, rtol=1e-4, atol=1e-4
         )
+
+    def test_permute_beside_a_unit_dim_reduction(self) -> None:
+        """The input of a reduction over an extent-1 dim meets its result
+        without the unit dim (``size1_reduction_positions``), so the kernel
+        that permutes is accepted and each thread reads its own element."""
+        x = torch.randn(48, 80, device=DEVICE)
+        torch.testing.assert_close(self._run(permuted_unit_dim_sum, (x,))[0], (x * 2).T)
 
     def test_permute_into_dot(self) -> None:
         tiled = helion.Config(block_sizes=[16, 16, 16], num_threads=[4, 4, 16])
@@ -7068,6 +7148,112 @@ class TestMetalLaneLoopReductions(unittest.TestCase):
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_row_norm(x: torch.Tensor) -> torch.Tensor:
+    """Per row, x / |x| + max(x): two reductions over the root tile block,
+    then a store that needs both."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        v = x[tile_m, tile_n].to(torch.float32)
+        sum_sq = torch.sum(v * v, -1)
+        hi = torch.amax(v, -1)
+        out[tile_m, tile_n] = (v * torch.rsqrt(sum_sq)[:, None] + hi[:, None]).to(
+            x.dtype
+        )
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_softmax(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n], block_size=[1, None]):
+        v = x[tile_m, tile_n]
+        e = torch.exp(v - torch.amax(v, -1, keepdim=True))
+        out[tile_m, tile_n] = e / torch.sum(e, -1, keepdim=True)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def grid_lane_row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Several rows per tile: the reduced block's threads combine per row,
+    and the store of the sum runs once per thread, after the pass."""
+    m, n = x.size()
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m] = x[tile_m, tile_n].sum(-1)
+    return out
+
+
+@_requires_darwin
+class TestMetalGridLaneLoopReductions(unittest.TestCase):
+    """A reduction over a root tile block that the grid's lane loop walks
+    splits that lane loop into passes, as a device loop's lane loop is split
+    (``TestMetalLaneLoopReductions``); a block on several threads combines
+    their partials once per pass, outside the lane loops."""
+
+    def _run(
+        self, kernel: helion.Kernel, config: helion.Config, *args: object
+    ) -> tuple[object, str]:
+        bound = kernel.bind(args)
+        code = bound.to_code(config)
+        self.assertNotIn(lane_reduction.MARKER, code)
+        return bound.compile_config(config)(*args), code
+
+    def test_two_reductions_then_a_store(self) -> None:
+        """Both folds share the first pass; the store gets the second.  The
+        root block on threads x lanes, on lanes alone, and with a tail
+        (200 of a 256 block); bf16 lanes kept in a lane array for the store
+        pass."""
+        cases = [
+            (128, 32, torch.float32),
+            (128, 1, torch.float32),
+            (200, 64, torch.bfloat16),
+        ]
+        for (n, threads, dtype), static_shapes in itertools.product(
+            cases, (True, False)
+        ):
+            with self.subTest(
+                n=n, threads=threads, dtype=dtype, static_shapes=static_shapes
+            ):
+                x = torch.randn(6, n, device=DEVICE, dtype=dtype)
+                block = 1 << (n - 1).bit_length()
+                config = helion.Config(block_sizes=[block], num_threads=[threads])
+                kernel = helion.kernel(
+                    grid_lane_row_norm.fn,
+                    backend="metal",
+                    static_shapes=static_shapes,
+                )
+                out, code = self._run(kernel, config, x)
+                xf = x.float()
+                expected = xf * xf.square().sum(-1, keepdim=True).rsqrt()
+                expected = (expected + xf.amax(-1, keepdim=True)).to(dtype)
+                torch.testing.assert_close(out, expected)
+                self.assertEqual(code.count("for lane_"), 2)
+                self.assertEqual(code.count("helion_red.group_"), 2 * (threads > 1))
+                self.assertEqual(
+                    "_lanes = _metal_lane_array" in code, dtype == torch.bfloat16
+                )
+
+    def test_dependent_reductions(self) -> None:
+        """The sum needs the max: three passes."""
+        x = torch.randn(5, 512, device=DEVICE)
+        config = helion.Config(block_sizes=[512], num_threads=[128])
+        out, code = self._run(grid_lane_softmax, config, x)
+        torch.testing.assert_close(out, x.softmax(-1))
+        self.assertEqual(code.count("for lane_"), 3)
+
+    def test_rows_on_threads(self) -> None:
+        """Four rows per tile, each on its own threads: 4 x 32 threads, each
+        with 8 lanes of its row (a 200 tail of a 256 block)."""
+        x = torch.randn(10, 200, device=DEVICE)
+        config = helion.Config(block_sizes=[4, 256], num_threads=[4, 32])
+        out, code = self._run(grid_lane_row_sums, config, x)
+        torch.testing.assert_close(out, x.sum(-1), rtol=1e-5, atol=1e-5)
+        self.assertEqual(code.count("for lane_"), 1)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def lane_product_m2(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([m], dtype=torch.float32, device=x.device)
@@ -7313,7 +7499,7 @@ class TestMetalLaneArrays(unittest.TestCase):
             (helion.Config(block_sizes=[4], num_warps=16), False),
         ):
             with self.subTest(config=config):
-                out, code, msl = _run_with_msl(
+                out, code, msl = run_with_msl(
                     grid_online_attention, (q, k, v, scale), config
                 )
                 torch.testing.assert_close(
@@ -7902,7 +8088,7 @@ class TestMetalLaneFold(unittest.TestCase):
     ) -> tuple[object, str]:
         """Run *kernel* at *config*, checking it folds *lanes* lanes, and
         return its result and MSL."""
-        result, code, msl = _run_with_msl(kernel, args, config)
+        result, code, msl = run_with_msl(kernel, args, config)
         self.assertIn("_metal_lane_fold(", code)
         self.assertRegex(code, rf"for slice_lane_\d+ in range\({lanes}\)")
         self.assertIn("__lane1", msl)
@@ -8128,7 +8314,7 @@ class TestMetalLaneFold(unittest.TestCase):
                 q = torch.randn(m, d, device=DEVICE, dtype=dtype) / 4
                 kt = torch.randn(d, n, device=DEVICE, dtype=dtype) / 4
                 v = torch.randn(n, d, device=DEVICE, dtype=dtype)
-                out, code, msl = _run_with_msl(kernel, (q, kt, v), config)
+                out, code, msl = run_with_msl(kernel, (q, kt, v), config)
                 self.assertIn("_helion_mpp_run(", code)
                 self.assertNotIn("dot_product", code)
                 self.assertEqual(msl.count("matmul2d_descriptor("), 2)
@@ -8162,7 +8348,7 @@ class TestMetalLaneFold(unittest.TestCase):
                     "a lane loop around an MPP op would run 80 copies",
                 ),
             ):
-                _run_with_msl(kernel, (q, kt, v), config)
+                run_with_msl(kernel, (q, kt, v), config)
 
     def test_dot_k_beside_another_reduction_dim_rejects(self) -> None:
         c = torch.randn(64, 128, device=DEVICE, dtype=torch.float16)
@@ -8734,7 +8920,7 @@ class TestMetalPaddedTwin(unittest.TestCase):
         self, kernel: helion.Kernel, config: helion.Config, args: tuple[object, ...]
     ) -> tuple[object, str, str]:
         """Run *kernel* at *config*; return its result, code and MSL."""
-        result, code, msl = _run_with_msl(kernel, args, config)
+        result, code, msl = run_with_msl(kernel, args, config)
         if isinstance(result, tuple):
             result = tuple(t.cpu() for t in result if t is not None)
         return result, code, msl
@@ -9782,7 +9968,7 @@ class TestMetalAutotune(unittest.TestCase):
 
         x = torch.randn(128, 128, device=DEVICE)
         y = torch.randn(128, 128, device=DEVICE)
-        out, code, _ = _run_with_msl(matmul, (x, y))
+        out, code, _ = run_with_msl(matmul, (x, y))
         self.assertEqual(math.prod(_launch(code)), 128)
         torch.testing.assert_close(out, x @ y, rtol=1e-4, atol=1e-3)
 
@@ -10114,6 +10300,306 @@ class TestMetalLaneFoldRewrite(unittest.TestCase):
             ):
                 unroll_lane_folds(ast.parse(source).body, names_read)
 
+    def test_lane_loop_jams_into_loop(self) -> None:
+        """A lane loop around a loop with a lane-independent load moves
+        inside it: the load, and what is computed from it, runs once per
+        iteration, and each lane keeps its own carry."""
+        body = ast.parse(
+            textwrap.dedent(
+                """
+                for lane_0 in range(2):
+                    indices_0 = offset_0 + lane_0
+                    acc = 0.0
+                    for offset_1 in range(0, 64, 8):
+                        w = tl.load(wq, indices_0, offset_1)
+                        x = tl.load(xs, offset_1)
+                        xe = exp(x)
+                        acc = acc + w * xe
+                    store(out, indices_0, acc)
+                """
+            )
+        ).body
+        expected = """
+            indices_0__lane0 = offset_0 + 0
+            indices_0__lane1 = offset_0 + 1
+            acc__lane0 = 0.0
+            acc__lane1 = 0.0
+            for offset_1 in range(0, 64, 8):
+                w__lane0 = tl.load(wq, indices_0__lane0, offset_1)
+                w__lane1 = tl.load(wq, indices_0__lane1, offset_1)
+                x = tl.load(xs, offset_1)
+                xe = exp(x)
+                acc__lane0 = acc__lane0 + w__lane0 * xe
+                acc__lane1 = acc__lane1 + w__lane1 * xe
+            store(out, indices_0__lane0, acc__lane0)
+            store(out, indices_0__lane1, acc__lane1)
+            """
+        self.assertEqual(
+            ast.unparse(ast.Module(body=jam_lanes_into_loops(body), type_ignores=[])),
+            ast.unparse(ast.parse(textwrap.dedent(expected))),
+        )
+
+    def test_lane_loop_jams_inside_a_loop(self) -> None:
+        """A lane loop inside another loop jams too: what the outer loop's
+        next iteration reads is assigned before each lane reads it."""
+        body = ast.parse(
+            textwrap.dedent(
+                """
+                for offset_0 in range(0, 8, 2):
+                    for lane_0 in range(2):
+                        indices_0 = offset_0 + lane_0
+                        acc = 0.0
+                        for o in range(4):
+                            v = tl.load(xs, o)
+                            acc = acc + tl.load(wq, indices_0, o) * v
+                        store(out, indices_0, acc)
+                """
+            )
+        ).body
+        expected = """
+            for offset_0 in range(0, 8, 2):
+                indices_0__lane0 = offset_0 + 0
+                indices_0__lane1 = offset_0 + 1
+                acc__lane0 = 0.0
+                acc__lane1 = 0.0
+                for o in range(4):
+                    v = tl.load(xs, o)
+                    acc__lane0 = acc__lane0 + tl.load(wq, indices_0__lane0, o) * v
+                    acc__lane1 = acc__lane1 + tl.load(wq, indices_0__lane1, o) * v
+                store(out, indices_0__lane0, acc__lane0)
+                store(out, indices_0__lane1, acc__lane1)
+            """
+        self.assertEqual(
+            ast.unparse(ast.Module(body=jam_lanes_into_loops(body), type_ignores=[])),
+            ast.unparse(ast.parse(textwrap.dedent(expected))),
+        )
+
+    def test_lane_loop_jams_before_a_sibling(self) -> None:
+        """A later lane loop that assigns the lane names again before reading
+        them doesn't keep an earlier one from jamming."""
+        body = ast.parse(
+            textwrap.dedent(
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for k in range(8):
+                        v = tl.load(y, k)
+                        acc = acc + tl.load(x, lane_0, k) * v
+                    tl.store(out, lane_0, acc)
+                for lane_0 in range(2):
+                    tl.store(out2, lane_0, 1.0)
+                """
+            )
+        ).body
+        jammed = jam_lanes_into_loops(body)
+        self.assertNotIsInstance(jammed[0], ast.For)
+        self.assertEqual(ast.unparse(jammed[-1]), ast.unparse(body[1]))
+
+    def test_lane_loop_kept(self) -> None:
+        """A lane loop stays whole when the jam saves no load, would copy a
+        statement more than ``MAX_JAMMED_COPIES`` times, or can't keep the
+        lanes apart."""
+        for name, source in (
+            (
+                "no lane-independent load",
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        idx = tid[0] * 4 + o
+                        acc = acc + tl.load(x, lane_0, idx)
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "too many lanes",
+                """
+                for lane_0 in range(33):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + tl.load(x, lane_0, o) * v
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "too many copies with an earlier jam's",
+                """
+                for lane_0 in range(16):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + tl.load(x, lane_0, o) * v * s__lane7
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "lane-dependent value read after the loop",
+                """
+                r = 0.0
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + tl.load(x, lane_0, o) * v
+                    r = acc
+                store(out, 0, r)
+                """,
+            ),
+            (
+                "lane-independent value carried across lanes",
+                """
+                for lane_0 in range(8):
+                    acc_copy = acc
+                    t = 0.0
+                    for o in range(4):
+                        v = tl.load(z, o)
+                        t = t + v
+                    acc = acc_copy + t
+                """,
+            ),
+            (
+                "lane value read by the enclosing loop's next iteration",
+                """
+                for o in range(4):
+                    use(acc)
+                    for lane_0 in range(2):
+                        acc = 0.0
+                        for k in range(4):
+                            v = tl.load(y, k)
+                            acc = acc + tl.load(x, lane_0, k) * v
+                """,
+            ),
+            (
+                "a loop with no shared load beside one with it",
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        acc = acc + tl.load(x, lane_0, o)
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        store(out, lane_0, o, acc * v)
+                """,
+            ),
+            (
+                "shared load only in an inner lane loop",
+                """
+                for lane_0 in range(2):
+                    for lane_1 in range(4):
+                        v = tl.load(y, lane_1)
+                        store(out, lane_0, lane_1, tl.load(x, lane_0, lane_1) + v)
+                """,
+            ),
+            (
+                "lane arrays past the budget once copied per lane",
+                """
+                for lane_0 in range(8):
+                    arr = _metal_lane_array('half', 8)
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        _metal_lane_put(arr, o, tl.load(x, lane_0, o) * v)
+                    store(out, lane_0, _metal_lane_get(arr, 0))
+                """,
+            ),
+            (
+                "lane-dependent control flow",
+                """
+                for lane_0 in range(2):
+                    acc = 0.0
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        if lane_0:
+                            acc = acc + v
+                    store(out, lane_0, acc)
+                """,
+            ),
+            (
+                "value carried across lanes",
+                """
+                for lane_0 in range(2):
+                    for o in range(4):
+                        v = tl.load(y, o)
+                        acc = acc + v * lane_0
+                    store(out, lane_0, acc)
+                """,
+            ),
+        ):
+            with self.subTest(name):
+                body = ast.parse(textwrap.dedent(source)).body
+                self.assertEqual(
+                    ast.unparse(
+                        ast.Module(body=jam_lanes_into_loops(body), type_ignores=[])
+                    ),
+                    ast.unparse(ast.Module(body=body, type_ignores=[])),
+                )
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def rows_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x @ w.T with x's few rows walked as lanes of each thread."""
+    m, k = x.size()
+    n = w.size(0)
+    bk = hl.register_block_size(8, 64)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n, bk], dtype=torch.float32)
+        for tile_k in hl.tile(k, block_size=bk):
+            xk = x[tile_m, tile_k].to(torch.float32)[:, None, :]
+            acc = acc + xk * w[tile_n, tile_k].to(torch.float32)[None, :, :]
+        out[tile_m, tile_n] = acc.sum(2)
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def lane_sum_of_row_sums(z: torch.Tensor, n: int) -> torch.Tensor:
+    """Each row's sum, added once per element of an n-wide tile: a value
+    every lane adds to one carry, which depends on no lane."""
+    m, j = z.size()
+    out = torch.empty([m], dtype=torch.float32, device=z.device)
+    bn = hl.register_block_size(8, 8)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, bn], dtype=torch.float32)
+        for _tile_n in hl.tile(n, block_size=bn):
+            t = hl.zeros([tile_m], dtype=torch.float32)
+            for tile_j in hl.tile(j):
+                t = t + z[tile_m, tile_j].sum(-1)
+            acc = acc + t[:, None]
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
+@_requires_darwin
+class TestMetalLaneJam(unittest.TestCase):
+    """``jam_lanes_into_loops`` in a compiled kernel."""
+
+    def test_rows_share_weight_loads(self) -> None:
+        """Four rows on lanes load each weight element once per K step."""
+        x = torch.randn(4, 64, device=DEVICE, dtype=torch.float16)
+        w = torch.randn(48, 64, device=DEVICE, dtype=torch.float16)
+        config = helion.Config(block_sizes=[8, 4, 16], num_threads=[8, 1, 16])
+        out, code, msl = run_with_msl(rows_gemv, (x, w), config)
+        torch.testing.assert_close(
+            out.cpu().double(),
+            x.cpu().double() @ w.cpu().double().T,
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        self.assertRegex(code, r"for lane_\d+ in range\(4\)")
+        self.assertNotIn("for (int lane_", msl)
+        self.assertEqual(msl.count("_helion_masked(w["), 1)
+        self.assertEqual(msl.count("_helion_masked(x["), 4)
+
+    def test_lane_independent_carry(self) -> None:
+        """A carry every lane adds a lane-independent value to keeps its
+        lane loop: jammed, the value would be added once."""
+        z = torch.randn(8, 32, device=DEVICE)
+        config = helion.Config(block_sizes=[8, 4, 8], num_threads=[1, 4, 8])
+        out, _, _ = run_with_msl(lane_sum_of_row_sums, (z, 16), config)
+        torch.testing.assert_close(
+            out.cpu(), 16 * z.cpu().sum(-1), rtol=1e-4, atol=1e-4
+        )
+
 
 @helion.kernel(backend="metal", static_shapes=True)
 def mul_add(x: torch.Tensor, w: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
@@ -10168,9 +10654,7 @@ class TestMetalMaskedLoads(unittest.TestCase):
 
     def test_tail(self) -> None:
         x, y = (torch.randn(1000, device=DEVICE) for _ in range(2))
-        out, _, msl = _run_with_msl(
-            vector_add, (x, y), helion.Config(block_sizes=[256])
-        )
+        out, _, msl = run_with_msl(vector_add, (x, y), helion.Config(block_sizes=[256]))
         self.assertIn("inline auto _helion_masked(", msl)
         self.assertIn("_helion_masked(x[(mask_0 ? indices_0 : 0)], mask_0, 0)", msl)
         torch.testing.assert_close(out, x + y, atol=0, rtol=0)
@@ -10181,7 +10665,7 @@ class TestMetalMaskedLoads(unittest.TestCase):
         that writes it."""
         x = torch.randn(1000, device=DEVICE)
         expected = x * 2
-        _, _, msl = _run_with_msl(
+        _, _, msl = run_with_msl(
             double_in_place, (x,), helion.Config(block_sizes=[256])
         )
         self.assertNotIn("_helion_masked(", msl)
@@ -10231,93 +10715,60 @@ class TestMetalMaskedLoads(unittest.TestCase):
                 torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
-class TestMetalFmaFusionRewrite(unittest.TestCase):
-    """``fuse_multiply_adds`` on hand-written device bodies."""
+@helion.kernel(
+    backend="metal", static_shapes=True, config=helion.Config(block_sizes=[64])
+)
+def index_minus_three(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = (tile.index - 3).to(torch.float32)
+    return out
 
-    TYPES: ClassVar[dict[str, str]] = {
-        "x": "float",
-        "w": "float",
-        "r": "float",
-        "h": "half",
-        "n": "int",
-    }
 
-    def _fuse(self, source: str) -> str:
-        body = ast.parse(textwrap.dedent(source)).body
-        return ast.unparse(
-            ast.Module(body=fuse_multiply_adds(body, self.TYPES), type_ignores=[])
+@helion.kernel(
+    backend="metal", static_shapes=True, config=helion.Config(block_sizes=[128])
+)
+def previous_row(x: torch.Tensor) -> torch.Tensor:
+    """Row t is x's row t - 1, 0 for t = 0: a load whose row goes negative,
+    masked off by a condition on ``tile.index``."""
+    t_len, n = x.shape
+    out = torch.empty_like(x)
+    for tile_n, tile_t in hl.tile([n, t_len], block_size=[None, 1]):
+        t = tile_t.begin
+        out[t, tile_n] = hl.load(
+            x, [t - 1, tile_n], extra_mask=tile_n.index * 0 + t - 1 >= 0
         )
+    return out
 
-    def test_float_product_fuses(self) -> None:
-        """A float product used once by an add in its block, here a loop
-        carry, becomes an fma."""
-        got = self._fuse(
-            """
-            acc = float(0.0)
-            for k in range(4):
-                a = tl.load(x + k, mask, other=0)
-                b = w[k]
-                t = a * b
-                acc = acc + t
-            """
-        )
-        expected = """
-            acc = float(0.0)
-            for k in range(4):
-                a = tl.load(x + k, mask, other=0)
-                b = w[k]
-                acc = metal.fma(a, b, acc)
-            """
-        self.assertEqual(got, ast.unparse(ast.parse(textwrap.dedent(expected))))
 
-    def test_viewed_float_fuses(self) -> None:
-        """A float reinterpreted from int bits (``as_type``) is a float."""
-        got = self._fuse("a = as_type(float, n)\nb = w[0]\nt = a * b\nu = t + r[0]\n")
-        self.assertEqual(
-            got, "a = as_type(float, n)\nb = w[0]\nu = metal.fma(a, b, r[0])"
-        )
+@_requires_darwin
+class TestMetalTileIndexIsSigned(unittest.TestCase):
+    """``tile.index`` has the signed index dtype although Metal's loop
+    indices are ``uint``: arithmetic on it must not wrap."""
 
-    def test_kept(self) -> None:
-        for name, source in (
-            ("int index math", "t = n * 4\nu = t + n\n"),
-            ("half operands", "a = h[0]\nb = h[1]\nc = r[0]\nt = a * b\nu = t + c\n"),
-            (
-                "addend rounded to half",
-                "a = x[0]\nb = w[0]\nc = static_cast(half, r[0])\nt = a * b\nu = t + c\n",
-            ),
-            (
-                "product updated in place",
-                "a = x[0]\nb = w[0]\nc = r[0]\nt = a * b\nt += c\nu = t + c\n",
-            ),
-            (
-                "operand reassigned before the add",
-                "a = x[0]\nb = w[0]\nt = a * b\nb = r[0]\nu = t + b\n",
-            ),
-            ("product used twice", "a = x[0]\nt = a * a\nu = t + t\n"),
-            (
-                "name of two types",
-                "a = x[0]\na = h[0]\nb = w[0]\nc = r[0]\nt = a * b\nu = t + c\n",
-            ),
-            (
-                "add in another block",
-                (
-                    "a = x[0]\nb = w[0]\nc = r[0]\nt = a * b\n"
-                    "for k in range(2):\n    u = t + c\n"
-                ),
-            ),
-        ):
-            with self.subTest(name):
-                source = textwrap.dedent(source)
-                self.assertEqual(self._fuse(source), ast.unparse(ast.parse(source)))
+    def test_negative_values(self) -> None:
+        out = index_minus_three(torch.empty(64, device=DEVICE))
+        expected = torch.arange(-3, 61, dtype=torch.float32, device=DEVICE)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    def test_mask_on_negative_row(self) -> None:
+        """At one row, x's row dimension has size 1 and drops out of the
+        address, so the masked-off load of row -1 lands in bounds on row 0:
+        the mask alone keeps it out (it used to wrap to true)."""
+        for t_len in (1, 3):
+            with self.subTest(t_len=t_len):
+                x = torch.randn(t_len, 128, device=DEVICE)
+                expected = torch.zeros_like(x)
+                expected[1:] = x[:-1]
+                out = previous_row(x)
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 @_requires_darwin
 class TestMetalFmaFusion(unittest.TestCase):
     def test_float_multiply_add(self) -> None:
         x, w, r = (torch.randn(1000, device=DEVICE) for _ in range(3))
-        out, _, msl = _run_with_msl(
-            mul_add, (x, w, r), helion.Config(block_sizes=[256])
-        )
+        out, _, msl = run_with_msl(mul_add, (x, w, r), helion.Config(block_sizes=[256]))
         self.assertIn("metal::fma(", msl)
         torch.testing.assert_close(out, x * w + r, atol=1e-5, rtol=1e-5)
 
@@ -10325,7 +10776,7 @@ class TestMetalFmaFusion(unittest.TestCase):
         """The float16 rounding between the multiply and the add stays:
         bit-exact with eager."""
         x, w, r = (torch.randn(1000, device=DEVICE) for _ in range(3))
-        out, _, msl = _run_with_msl(
+        out, _, msl = run_with_msl(
             mul_round_add, (x, w, r), helion.Config(block_sizes=[256])
         )
         self.assertNotIn("metal::fma(", msl)
@@ -10379,7 +10830,7 @@ class TestMetalViewDtype(unittest.TestCase):
         words = (hi.view(torch.int16).to(torch.int32) << 16) | (
             lo.view(torch.int16).to(torch.int32) & 0xFFFF
         )
-        out, _, msl = _run_with_msl(
+        out, _, msl = run_with_msl(
             high_halves, (words.to(DEVICE),), helion.Config(block_sizes=[64])
         )
         self.assertIn("as_type<half>(static_cast<short>(", msl)
@@ -10395,7 +10846,7 @@ class TestMetalViewDtype(unittest.TestCase):
                 bits = torch.randn(6, 256).to(dtype).view(torch.int16)
                 bits[0, : len(special)] = torch.tensor(special).to(torch.int16)
                 x = bits.view(dtype)
-                out, _, msl = _run_with_msl(
+                out, _, msl = run_with_msl(
                     row_bit_sums,
                     (x.to(DEVICE),),
                     helion.Config(block_sizes=[2], num_warps=1),
@@ -10409,7 +10860,7 @@ class TestMetalViewDtype(unittest.TestCase):
         so the integer sum over the 100 columns of a 128-wide block keeps
         its mask."""
         t = torch.rand(8, 100, dtype=torch.float16) + 0.5
-        out, _, _ = _run_with_msl(
+        out, _, _ = run_with_msl(
             negated_row_bit_sums, (t.to(DEVICE),), helion.Config(block_sizes=[4])
         )
         expected = (-t).view(torch.int16).to(torch.int32).sum(-1, dtype=torch.int32)
@@ -12332,7 +12783,7 @@ class TestMetalRowReductionHeuristic(unittest.TestCase):
             [([128, 4], [32, 0]), ([512, 1], [128, 0])],
         )
 
-    def test_grid_floor_bounds_the_row_block(self) -> None:
+    def test_occupancy_floor_bounds_the_row_block(self) -> None:
         self.assertEqual(
             self._seeds(row_pass_softmax, (65573, 300), dtype=torch.float16),
             [([8, 256], [0, 32]), ([8, 512], [0, 128])],
@@ -12431,7 +12882,7 @@ class TestMetalRowReductionHeuristic(unittest.TestCase):
         self.assertEqual(
             self._seeds(row_pass_jsd, (37, 300), (37, 300)), [([512, 1], [512, 0])]
         )
-        # The grid floor puts 8 rows in a threadgroup, 128 threads each.
+        # The occupancy floor puts 8 rows in a threadgroup, 128 threads each.
         self.assertEqual(
             self._seeds(row_pass_jsd, (65573, 300), (65573, 300)),
             [([128, 8], [128, 0])],
@@ -12957,7 +13408,7 @@ class TestMetalWarmCall(unittest.TestCase):
         args = (x.to(DEVICE), 16777217, 1.0)
         code = dynamic_shift.bind(args).to_code()
         self.assertIn("x.stride(0), k, f", code)
-        self.assertIn("_by_value=(5, 6)", code)
+        self.assertIn("_by_value=(4, 5)", code)
         # k binds exactly; ``k * f`` is float arithmetic, so 16777217 rounds
         # to float32 as torch rounds it.
         self._assert_bitwise(dynamic_shift(*args), torch.full_like(x, 16777216.0))
@@ -14504,7 +14955,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
         if isinstance(config, dict):
             default = kernel.bind(args).config_spec.default_config().config
             config = helion.Config(**{**default, **config})
-        return _run_with_msl(kernel, args, config)
+        return run_with_msl(kernel, args, config)
 
     def test_num_warps_sizes_the_launch(self) -> None:
         x = torch.randn(64, 64, device=DEVICE)
@@ -14625,7 +15076,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
                 device_args = tuple(
                     a.to(DEVICE) if isinstance(a, torch.Tensor) else a for a in args
                 )
-                out, code, msl = _run_with_msl(gdn_fwd_h_metal, device_args, config)
+                out, code, msl = run_with_msl(gdn_fwd_h_metal, device_args, config)
                 self.assertEqual(_launch(code), (32, 4, 1))
                 torch.testing.assert_close(
                     out.cpu().double(), expected, rtol=1e-4, atol=1e-4
@@ -14684,7 +15135,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
         for num_warps in (1, 4, 32):
             with self.subTest(num_warps=num_warps):
                 config = helion.Config(block_sizes=[4096, 1], num_warps=num_warps)
-                out, code, _ = _run_with_msl(sum_after_loop, (x,), config)
+                out, code, _ = run_with_msl(sum_after_loop, (x,), config)
                 self.assertEqual(_launch(code), (1, 1, 1))
                 torch.testing.assert_close(
                     out.cpu(), x.cpu().double().sum(-1).float(), rtol=1e-4, atol=1e-3
@@ -14774,7 +15225,7 @@ class TestMetalThreadgroupBudget(unittest.TestCase):
         device_args = tuple(
             a.to(DEVICE) if isinstance(a, torch.Tensor) else a for a in args
         )
-        out, code, msl = _run_with_msl(
+        out, code, msl = run_with_msl(
             gdn_fwd_h_transposed,
             device_args,
             helion.Config(block_sizes=[32], num_warps=1),
@@ -14931,7 +15382,7 @@ class TestMetalPersistentGrid(unittest.TestCase):
             with self.subTest(m=m, k=k, n=n):
                 a = torch.randn(m, k, device=DEVICE, dtype=torch.float16)
                 b = torch.randn(k, n, device=DEVICE, dtype=torch.float16)
-                out, code, _ = _run_with_msl(persistent_matmul, (a, b), config)
+                out, code, _ = run_with_msl(persistent_matmul, (a, b), config)
                 self.assertIn(
                     f"_launcher(_helion_persistent_matmul, ({workers},)", code
                 )
@@ -15015,7 +15466,7 @@ class TestMetalPersistentPid(unittest.TestCase):
                 for m, n in ((rows, 200), (40, 50)):
                     with self.subTest(pid_type=pid_type, multiplier=multiplier, m=m):
                         x = torch.randn(m, n, device=DEVICE)
-                        out, code, msl = _run_with_msl(tile_scale, (x,), config)
+                        out, code, msl = run_with_msl(tile_scale, (x,), config)
                         self.assertIn(f"_launcher(_helion_tile_scale, ({grid},)", code)
                         self.assertIn(f"constexpr int _NUM_SM = {cores};", msl)
                         self.assertIn("for (int virtual_pid = ", msl)
@@ -15030,7 +15481,7 @@ class TestMetalPersistentPid(unittest.TestCase):
         for pid_type in ("persistent_blocked", "persistent_interleaved"):
             config = helion.Config(block_sizes=[16, 16], pid_type=pid_type)
             with self.subTest(pid_type=pid_type):
-                out, code, msl = _run_with_msl(tile_scale, (x,), config)
+                out, code, msl = run_with_msl(tile_scale, (x,), config)
                 self.assertIn("_launcher(_helion_tile_scale, (_NUM_SM * 4,)", code)
                 self.assertIn(f"constexpr int _NUM_SM = {cores};", msl)
                 torch.testing.assert_close(out, x * 2)
@@ -15077,7 +15528,7 @@ class TestMetalPersistentPid(unittest.TestCase):
                     block_sizes=block_sizes, pid_type=pid_type, num_sm_multiplier=1
                 )
                 with self.subTest(kernel=kernel.name, pid_type=pid_type):
-                    _, _, msl = _run_with_msl(kernel, args, config)
+                    _, _, msl = run_with_msl(kernel, args, config)
                     self.assertIn("for (int virtual_pid = ", msl)
                     self.assertIn(feature, msl)
                     compiled = kernel.bind(args).compile_config(config)
@@ -15193,7 +15644,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
         x = torch.randn(50, 40, device=DEVICE)
         for bm in (8, 16, 32):
             with self.subTest(bm=bm):
-                out, code, msl = _run_with_msl(
+                out, code, msl = run_with_msl(
                     tile_count_grid, (x,), helion.Config(block_sizes=[bm])
                 )
                 self.assertIn(f"constexpr int nt = {(50 + bm - 1) // bm};", msl)
@@ -15204,7 +15655,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
         x = torch.randn(50, 40, device=DEVICE)
         for bk in (8, 16):
             with self.subTest(bk=bk):
-                out, _, msl = _run_with_msl(
+                out, _, msl = run_with_msl(
                     tile_count_device_loop, (x,), helion.Config(block_sizes=[bk, 16])
                 )
                 self.assertIn(f"constexpr int nk = {(40 + bk - 1) // bk};", msl)
@@ -15230,7 +15681,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
             ),
         ):
             with self.subTest(kernel=kernel.name):
-                out, code, msl = _run_with_msl(kernel, args, config)
+                out, code, msl = run_with_msl(kernel, args, config)
                 self.assertIn(by_value[0], code)
                 self.assertIn(by_value[1], msl)
                 torch.testing.assert_close(out, expected)
@@ -15240,7 +15691,7 @@ class TestMetalConfigFixedScalars(unittest.TestCase):
         the config doesn't fix."""
         kernel = helion.kernel(tile_count_grid.fn, backend="metal", static_shapes=False)
         x = torch.randn(50, 40, device=DEVICE)
-        out, code, msl = _run_with_msl(kernel, (x,), helion.Config(block_sizes=[16]))
+        out, code, msl = run_with_msl(kernel, (x,), helion.Config(block_sizes=[16]))
         self.assertRegex(code, r"_launcher\(.*\bnt\b.*_by_value=\(\d+, \d+\)")
         self.assertIn("constant long& nt [[buffer", msl)
         torch.testing.assert_close(out, x * 2)
@@ -15318,7 +15769,7 @@ class TestMetalIntTrueDiv(unittest.TestCase):
                     block_sizes=[bm, 16] if kernel is tile_count_truediv else [bm]
                 )
                 with self.subTest(kernel=kernel.name, bm=bm):
-                    out, _, msl = _run_with_msl(kernel, (x,), config)
+                    out, _, msl = run_with_msl(kernel, (x,), config)
                     self.assertIn("static_cast<float>(c10::metal::floor_divide(", msl)
                     torch.testing.assert_close(out, x * ((50 + bm - 1) // bm / 3))
 
@@ -15326,7 +15777,7 @@ class TestMetalIntTrueDiv(unittest.TestCase):
         x = torch.randn(50, 40, device=DEVICE)
         for bm in (8, 16):
             with self.subTest(bm=bm):
-                out, _, msl = _run_with_msl(
+                out, _, msl = run_with_msl(
                     block_size_truediv, (x,), helion.Config(block_sizes=[bm, 16])
                 )
                 self.assertIn("static_cast<float>(_BLOCK_SIZE_0) / 3", msl)
@@ -15335,7 +15786,7 @@ class TestMetalIntTrueDiv(unittest.TestCase):
     def test_int_argument_truediv(self) -> None:
         """The argument is bound as a float already; the cast keeps it one."""
         x = torch.randn(50, 40, device=DEVICE)
-        out, _, msl = _run_with_msl(
+        out, _, msl = run_with_msl(
             int_arg_truediv, (x, 4), helion.Config(block_sizes=[16, 16])
         )
         self.assertIn("static_cast<float>(n) / 3", msl)

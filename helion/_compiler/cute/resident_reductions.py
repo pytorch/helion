@@ -10,7 +10,6 @@ from typing import cast
 
 import sympy
 import torch
-from torch._subclasses import FakeTensor
 
 from ... import exc
 from ..ast_extension import statement_from_string
@@ -25,6 +24,7 @@ from .interchanged_store_dce import _known_statements
 from .interchanged_store_dce import _known_subscript
 from .interchanged_store_dce import _live_in
 from .interchanged_store_dce import _single_store
+from .lane_loops.markers import _ascending_lane_loop_form
 from .lane_loops.markers import _is_lane_reduce_marker_assign
 from .lane_loops.markers import _LaneReduceMarker
 from .lane_loops.markers import _static_lane_loop_extent
@@ -103,34 +103,30 @@ def proven_resident_tensor_strides(fn: DeviceFunction) -> dict[tuple[str, int], 
 
 
 def _guarded_metadata_constants(fn: DeviceFunction) -> dict[sympy.Expr, sympy.Integer]:
+    """The value of each symbolic input size and stride.
+
+    The ``input_tensor_metadata`` fact keys the bound kernel on exact input
+    sizes and strides, so the traced hint is the value every call it serves
+    has (``CompileEnvironment.keyed_hint``).
+    """
     env = CompileEnvironment.current()
-    if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+    if not env.exact_input_metadata_holds():
         return {}
-    values: dict[sympy.Expr, set[int]] = {}
+    values: dict[sympy.Expr, sympy.Integer] = {}
     for argument in fn.arguments:
         if not isinstance(argument, TensorArg):
             continue
         fake = argument.fake_value
-        runtime = env.runtime_value_for_tensor(fake)
-        if (
-            env.tensor_input_source(fake) is None
-            or not isinstance(runtime, torch.Tensor)
-            or isinstance(runtime, FakeTensor)
-        ):
+        if env.tensor_input_source(fake) is None:
             continue
-        for symbolic, actual in zip(
-            (*fake.shape, *fake.stride()),
-            (*runtime.shape, *runtime.stride()),
-            strict=True,
-        ):
-            if isinstance(symbolic, torch.SymInt):
+        for symbolic in (*fake.shape, *fake.stride()):
+            if not isinstance(symbolic, torch.SymInt):
+                continue
+            value = env.keyed_hint(symbolic)
+            if value is not None:
                 expression = env.shape_env.replace(symbolic._sympy_())
-                values.setdefault(expression, set()).add(int(actual))
-    return {
-        expression: sympy.Integer(next(iter(results)))
-        for expression, results in values.items()
-        if len(results) == 1
-    }
+                values[expression] = sympy.Integer(value)
+    return values
 
 
 def _resolved_integer(
@@ -663,6 +659,9 @@ def _plan(
         not isinstance(loop.target, ast.Name)
         or loop.orelse
         or _static_lane_loop_extent(loop) != layout.lane_extent
+        # The schedule re-emits the feature lanes ascending, inside the row
+        # loop: a reverse scan's descending lane loop would lose its order.
+        or _ascending_lane_loop_form(loop) is None
         or layout.feature_extent != layout.threads * layout.lane_extent
         or layout.feature_extent <= 0
         or layout.feature_extent & (layout.feature_extent - 1)

@@ -27,6 +27,7 @@ import contextlib
 import functools
 import hashlib
 from itertools import starmap
+import math
 import operator
 import os
 import re
@@ -54,13 +55,17 @@ from .analysis.attention_match import _attention_flash_supported
 from .analysis.attention_match import _attention_pattern_fits_root
 from .analysis.attention_match import _attention_pattern_geometry
 from .analysis.attention_match import _attention_softmax_pattern_head_dim
+from .analysis.match_common import root_grid_origin_is_canonical
 from .analysis.specialized_mma import _grouped_rank3_specialized_mma_plan
 from .analysis.specialized_mma import _kernel_specialized_mma_impl
 from .analysis.specialized_mma import _kernel_specialized_mma_plan
 from .analysis.specialized_mma import _specialized_mma_root_mn_block_ids
 from .attention_plan import flash_head_dims_supported
 from .cache_policy_loads import PACKET_LOAD_HELPERS
+from .compile_options import config_compile_options
 from .direct_affine_plan import DIRECT_AFFINE_ORDINARY_SCHEDULE
+from .exp2_fastmath import FTZ_SAFE_EXP2_META_KEY
+from .exp2_fastmath import TEMPLATE_EXP2_META_KEY
 from .launch_shape import LaunchShapeFlags
 from .launch_shape import check_launch_shape
 from .launch_shape import live_grid_thread_extents
@@ -71,15 +76,18 @@ from .math_templates import nan_extremum_expr
 from .pdl_release import ZERO_FILL_KERNEL_PREFIX
 from .pdl_release import generic_release_rendered
 from .pdl_release import spread_rendered
+from .reduction_lanes import fit_reduction_threads
+from .reduction_lanes import synthetic_reduction_lanes
+from .scalar_recipe import PURE_HELPERS
 from .state import cute_codegen_state
 from .state import cute_env_state
 from .state import new_codegen_state
 from .state import new_device_state
 from .state import new_env_state
 from .tcgen05.knobs import launch_epi_warp_groups_knob
-from .tcgen05_constants import TCGEN05_CUBIN_LINEINFO_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_SPLIT_K_CONFIG_KEY
 from .tcgen05_constants import TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY
+from .thread_budget import MAX_THREAD_BLOCK_DIMS
 from .thread_budget import MAX_THREADS_PER_BLOCK
 from .thread_budget import check_thread_block_dims
 from .thread_budget import referenced_thread_axes
@@ -140,6 +148,28 @@ if TYPE_CHECKING:
 
 # Integer dtypes narrower than the Int32 the DSL gives a Python int.
 _NARROW_INTEGER_DTYPES = (torch.int8, torch.int16, torch.uint8)
+
+# Operations the ``fast_math`` setting lowers to an approximate fp32
+# instruction on this backend only (``sqrt.approx.ftz`` for the IEEE
+# ``sqrt.rn``; ``lg2.approx.ftz``, ``sin.approx``, ``cos.approx`` and
+# ``tanh.approx`` for libdevice's routines), by the name
+# ``exc.FastMathUnused`` reports them under.  Each is 4% to 9% of a
+# streaming pointwise kernel's time on a B200 (the Triton backend lowers
+# them the same way with or without the setting).  ``softmax``,
+# ``log_softmax``, ``silu`` and the norms reach the warning through the
+# ``exp``, ``log``, ``sqrt`` and division nodes they decompose into.
+_CUTE_FAST_MATH_SENSITIVE_TARGETS: dict[object, str] = {
+    torch.ops.aten.sqrt.default: "sqrt",
+    torch.ops.aten.log.default: "log",
+    torch.ops.aten.log2.default: "log2",
+    torch.ops.aten.sin.default: "sin",
+    torch.ops.aten.cos.default: "cos",
+    torch.ops.aten.tanh.default: "tanh",
+}
+
+
+def _is_negative_zero(value: float | bool) -> bool:
+    return type(value) is float and value == 0.0 and math.copysign(1.0, value) < 0
 
 
 def validate_thread_axis_accesses(statements: Sequence[ast.AST]) -> None:
@@ -350,19 +380,6 @@ def _reject_dropped_root_threads(
         )
 
 
-def _reduced_block_ids(codegen: GenerateAST) -> set[int]:
-    """The block ids some lowered reduction of the kernel reduces over."""
-    # Local import: see ``_multi_phase_block_dims``.
-    from ..inductor_lowering import ReductionLowering
-
-    return {
-        lowering.block_index
-        for graph in codegen.codegen_graphs
-        for node in graph.graph.nodes
-        if isinstance(lowering := node.meta.get("lowering"), ReductionLowering)
-    }
-
-
 def _reject_multi_root_reduction_surplus(
     device_function: DeviceFunction, dims: Sequence[int]
 ) -> None:
@@ -377,13 +394,14 @@ def _reject_multi_root_reduction_surplus(
     rejected rather than folded with the surplus lanes.
     """
     from ..reduction_strategy import ReductionStrategy
+    from .reduction_coordinates import reduced_block_ids
 
     tile_strategy = device_function.tile_strategy
-    reduced_block_ids = _reduced_block_ids(device_function.codegen)
+    reduced = reduced_block_ids(device_function.codegen)
     for strategy in tile_strategy.strategies:
         if (
             not isinstance(strategy, ReductionStrategy)
-            or strategy.block_index not in reduced_block_ids
+            or strategy.block_index not in reduced
         ):
             continue
         count = strategy._reduction_thread_count()
@@ -418,6 +436,7 @@ def _multi_phase_block_dims(
     # before ``CompileEnvironment`` exists.
     from ..reduction_strategy import ReductionStrategy
     from ..tile_strategy import PerThreadNDTileStrategy
+    from .reduction_coordinates import reduced_block_ids
 
     codegen = device_function.codegen
     tile_strategy = device_function.tile_strategy
@@ -456,7 +475,7 @@ def _multi_phase_block_dims(
             "lanes of another phase would corrupt the cross-lane reduction",
         )
 
-    reduced_block_ids = _reduced_block_ids(codegen)
+    reduced = reduced_block_ids(codegen)
     for strategy in tile_strategy.strategies:
         base_axis = tile_strategy.thread_axis_for_strategy(strategy)
         if base_axis is None:
@@ -472,7 +491,7 @@ def _multi_phase_block_dims(
             size,
             _expr,
         ) in tile_strategy._iter_strategy_thread_axes(strategy):
-            if block_id not in reduced_block_ids or size is None:
+            if block_id not in reduced or size is None:
                 continue
             if isinstance(strategy, PerThreadNDTileStrategy):
                 size = strategy.thread_extent_for_masking(block_id, size)
@@ -799,6 +818,7 @@ def _detect_specialized_mma_loop(
     from .cute_mma import _loop_subrange_parent_block_id
     from .cute_mma import _mma_tiles_are_static_full
     from .cute_mma import _ragged_batched_tcgen05_config
+    from .cute_mma import _tcgen05_cp_async_a_mma_bm
     from .cute_mma import analyze_cute_mma_node
     from .cute_mma import ensure_tcgen05_fragment_epilogue_plan
     from .mma_support import cute_fp32_dot_uses_tf32
@@ -901,7 +921,10 @@ def _detect_specialized_mma_loop(
         lhs_val = candidate.operands.lhs.source_fake
         mma_impl = _choose_mma_impl(
             lhs_val.dtype,
-            bm=bm,
+            # the cp.async-A kernel's 256-row tile runs 128-row subtiles
+            bm=_tcgen05_cp_async_a_mma_bm(
+                env, config, candidate.operands.lhs, candidate.operands.rhs, bm=bm
+            ),
             bn=bn,
             bk=bk,
             config=config,
@@ -1267,8 +1290,11 @@ def _detect_attention_mma_loop(
     if not _attention_flash_gate_enabled() or not _attention_flash_supported():
         return False
     from ..compile_environment import CompileEnvironment
+    from ..host_function import HostFunction
 
     if CompileEnvironment.current().config_spec.cute_attention_generic_fallback_enabled:
+        return False
+    if not root_grid_origin_is_canonical(HostFunction.current().device_ir):
         return False
     shape = _attention_loop_shape(fn, block_ids, config=config)
     if shape is None:
@@ -1284,8 +1310,6 @@ def _detect_attention_mma_loop(
             return False
         fn.cute_state.flash.gated_match = gated
         return True
-    from ..host_function import HostFunction
-
     device_ir = HostFunction.current().device_ir
     root_block_ids = device_ir.grid_block_ids[0]
     bm, bn, score_plan = shape
@@ -1434,6 +1458,8 @@ class CuteBackend(Backend):
     default in ``Backend``, never behind a backend-name comparison in core.
     """
 
+    _pre_inductor_squeeze = True
+
     @classmethod
     def finalist_preference(cls, config: Config, source: Callable[[], str]) -> int:
         """A kernel that renders the generic early release of its programmatic
@@ -1514,8 +1540,13 @@ class CuteBackend(Backend):
 
     def codegen_config(self, config: Config) -> Config:
         from ..compile_environment import CompileEnvironment
+        from .pdl_ops import has_explicit_pdl
         from .tcgen05_config import facts
 
+        if has_explicit_pdl():
+            # Explicit markers own the launch and release placement. Project
+            # away automatic PDL for every ordinary/specialized body renderer.
+            config = type(config).from_dict({**config.config, "cute_pdl": False})
         state = CompileEnvironment.current().config_spec._cute_tcgen05_config
         return facts.project_dense_aligned_n_codegen(
             state, facts.project_row_union_codegen(state, config)
@@ -1523,10 +1554,17 @@ class CuteBackend(Backend):
 
     # Bump when config_value_priors() changes its candidate distribution.
     config_value_priors_version = 4
+    pure_scalar_helpers = PURE_HELPERS
 
     @property
     def name(self) -> str:
         return "cute"
+
+    def default_final_selection_regime(self) -> str | None:
+        """Finalists are timed from the CUDA activity trace (``kernel``):
+        CUDA events read tcgen05 GEMM finalists that differ by 2-3% alike
+        (see ``benchmarking._do_bench_kernel_durations``)."""
+        return "kernel"
 
     @property
     def state(self) -> BackendState:
@@ -1552,7 +1590,19 @@ class CuteBackend(Backend):
         return not in_divergent_control_flow
 
     @property
+    def intra_loop_barriers_order_atomics(self) -> bool:
+        # The thread-barrier pass (``lane_loops/barriers.py``) orders a load
+        # after an atomic itself, and refuses a config that would need such a
+        # barrier in a body a later pass rewrites; a barrier emitted before
+        # the load would hide that refusal.
+        return False
+
+    @property
     def lowers_chunk_unbind(self) -> bool:
+        return True
+
+    @property
+    def lowers_mask_select(self) -> bool:
         return True
 
     def barrier_allows_pid_type(self, pid_type: str) -> bool:
@@ -1590,6 +1640,13 @@ class CuteBackend(Backend):
                 "tcgen05 GEMM pipeline, which this kernel did not take"
             )
         grid_multiplier = fn.cute_state.lanes.launch_grid_multiplier
+        item_group = fn.cute_state.lanes.attention_item_group
+        if item_group != 1:
+            assert item_group == 2 and grid_multiplier == 1
+            assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
+            grid_expr = expr_from_string(
+                f"(({{grid}}[0]) // {item_group},)", grid=grid_expr
+            )
         if grid_multiplier != 1:
             # A fused body running one CTA per (grid index, lane).
             assert isinstance(grid_expr, ast.Tuple) and len(grid_expr.elts) == 1
@@ -1618,6 +1675,12 @@ class CuteBackend(Backend):
         return True
 
     @property
+    def relowered_memory_ops_take_new_slots(self) -> bool:
+        # A load lowered again keeps its ``load_eviction_policies`` slot
+        # (``memory_ops._cute_load_eviction_slot``).
+        return False
+
+    @property
     def reduction_loops_allow_non_power_of_two(self) -> bool:
         return True
 
@@ -1633,9 +1696,44 @@ class CuteBackend(Backend):
     def requires_merged_reduction_dims(self) -> bool:
         return True
 
+    def defer_unmerged_reduction_chain(
+        self, result: torch.fx.Node, source: torch.fx.Node, dims: tuple[int, ...]
+    ) -> bool:
+        from .full_reduction_owner import defer_full_logical_reduction
+
+        return defer_full_logical_reduction(result, source, dims)
+
     @property
     def warns_fast_math_unused(self) -> bool:
         return True
+
+    def fast_math_name(self, node: torch.fx.Node) -> str | None:
+        # There is no float64 ex2.approx: a float64 exp is cute.math.exp under
+        # fast_math too, and a float64 exp2 compiles to the same float64
+        # polynomial with or without ``fastmath=True``
+        # (``HelionCuteDSLOpOverrides.exp`` / ``exp2``).  ``div.approx.ftz``
+        # is fp32's alone: a true division computed in another dtype keeps
+        # its ``/`` (``HelionCuteDSLOpOverrides.truediv``, which reads
+        # ``division_dtype`` too: ``x.div_(y)`` divides in the dtype its
+        # operands promote to, not the dtype of ``x``).  The operations this
+        # backend alone lowers to an approximate fp32 instruction under the
+        # setting (``_CUTE_FAST_MATH_SENSITIVE_TARGETS``) count for the
+        # 32-bit and 16-bit dtypes computed in fp32.
+        from ..inductor_lowering import division_dtype
+        from ..inductor_lowering import functional_target
+
+        val = node.meta.get("val")
+        dtype = val.dtype if isinstance(val, torch.Tensor) else None
+        name = super().fast_math_name(node)
+        if name is None:
+            if dtype == torch.float64:
+                return None
+            return _CUTE_FAST_MATH_SENSITIVE_TARGETS.get(functional_target(node))
+        if (name in ("exp", "exp2") and dtype == torch.float64) or (
+            name == "fp32 division" and division_dtype(node) != torch.float32
+        ):
+            return None
+        return name
 
     @property
     def supports_autotune_multi(self) -> bool:
@@ -1643,6 +1741,12 @@ class CuteBackend(Backend):
 
     @property
     def supports_eager_prepared_call(self) -> bool:
+        return True
+
+    @property
+    def binds_inductor_call_facts(self) -> bool:
+        # The layout proofs read base residues, the dispatch guards and the
+        # traced strides (``keyed_hint``, ``traced_strides_hold``).
         return True
 
     @property
@@ -1660,6 +1764,15 @@ class CuteBackend(Backend):
     @property
     def dynamo_captures_kernel_launch(self) -> bool:
         return False
+
+    @property
+    def drops_unread_scratch_arguments(self) -> bool:
+        # A late pass may leave a scratch tensor unread (its loads forwarded,
+        # its stores dropped); the launcher's keywords hold no positions into
+        # its arguments, and the wrapper plans' argument positions are
+        # resolved after the drop (``finalize_host_statements`` runs after
+        # ``drop_unused_scratch_arguments``).
+        return True
 
     def validate_environment(self) -> None:
         from .cutedsl_compat import check_cute_backend_requirements
@@ -1770,6 +1883,7 @@ class CuteBackend(Backend):
         from .cute_mma_dag import AXIS_LEAD
         from .cute_mma_dag import AXIS_LOOP
         from .cute_mma_dag import AXIS_ROOT
+        from .cute_mma_dag import MMA_DAG_ATTENTION_PASS_WARPS
         from .cute_mma_dag import MMA_DAG_AUX_KEY
         from .cute_mma_dag import MMA_DAG_AUX_REGISTER
         from .cute_mma_dag import MMA_DAG_CLUSTER_KEY
@@ -1780,13 +1894,19 @@ class CuteBackend(Backend):
         from .cute_mma_dag import MMA_DAG_KEY
         from .cute_mma_dag import MMA_DAG_LOOKAHEAD_KEY
         from .cute_mma_dag import MMA_DAG_LOOKAHEAD_OFF
+        from .cute_mma_dag import MMA_DAG_PASS_WARPS_KEY
+        from .cute_mma_dag import MMA_DAG_PASS_WARPS_OFF
         from .cute_mma_dag import MMA_DAG_SPLIT_CLUSTER
         from .cute_mma_dag import MMA_DAG_SPLIT_KEY
         from .cute_mma_dag import MMA_DAG_TCGEN05
         from .cute_mma_dag import MMA_DAG_WARP
         from .cute_mma_dag import apply_mma_dag_cluster
         from .cute_mma_dag import mma_dag_config_reason
+        from .paged_attention_config import paged_attention_config_reason
+        from .pdl_ops import config_conflicts_with_explicit_pdl
 
+        if config_spec.has_explicit_pdl and config_conflicts_with_explicit_pdl(config):
+            return False
         facts = config_spec.cute_mma_dag_facts
         mode = config.config.get(MMA_DAG_KEY)
         if facts is None or mode not in (MMA_DAG_WARP, MMA_DAG_TCGEN05):
@@ -1830,6 +1950,14 @@ class CuteBackend(Backend):
             is not None
         ):
             return False
+        if (
+            config.config.get(MMA_DAG_PASS_WARPS_KEY) in MMA_DAG_ATTENTION_PASS_WARPS
+            and paged_attention_config_reason(
+                facts, sizes, config.config, before_inert_globals=True
+            )
+            is not None
+        ):
+            return False
         return (
             mma_dag_config_reason(
                 facts,
@@ -1852,14 +1980,21 @@ class CuteBackend(Backend):
                     "str",
                     config.config.get(MMA_DAG_AUX_KEY, MMA_DAG_AUX_REGISTER),
                 ),
+                pass_warps=(
+                    cast("str", config.config[MMA_DAG_PASS_WARPS_KEY])
+                    if config.config.get(MMA_DAG_PASS_WARPS_KEY)
+                    in MMA_DAG_ATTENTION_PASS_WARPS
+                    else MMA_DAG_PASS_WARPS_OFF
+                ),
             )
             is None
         )
 
     def pre_inductor_lowering(self, node: torch.fx.Node) -> Lowering | None:
         from ..aten_lowering import sort_lowering
-        from ..aten_lowering import squeeze_lowering
         from .aten_lowering import NumericExtremumLowering
+        from .static_indexing import StaticIndexLowering
+        from .static_indexing import static_tensor_index
         from .uniform_comparison import UniformComparisonLowering
         from .uniform_comparison import match_uniform_float_gt
 
@@ -1867,13 +2002,12 @@ class CuteBackend(Backend):
             # CuTe's rank/fragment sorting already breaks ties by input index.
             # Keep other backends' existing Inductor stable-sort lowering.
             return sort_lowering
-        if node.target in (torch.ops.aten.squeeze.default, torch.ops.aten.squeeze.dims):
-            # These overloads have the same logical-view semantics as squeeze.dim.
-            # Register them before Inductor turns them into a ReinterpretView;
-            # the CuTe handler uses the traced output shape, not a scalar dim.
-            return squeeze_lowering
+        if (lowering := super().pre_inductor_lowering(node)) is not None:
+            return lowering
         if node.target in (torch.ops.aten.fmin.default, torch.ops.aten.fmax.default):
             return NumericExtremumLowering()
+        if static_tensor_index(node) is not None:
+            return StaticIndexLowering()
         if match_uniform_float_gt(node) is not None:
             return UniformComparisonLowering()
         return None
@@ -1987,32 +2121,51 @@ class CuteBackend(Backend):
         self, fn: DeviceFunction, live_graph_ids: frozenset[int]
     ) -> frozenset[int]:
         from ..active_blocks import active_block_ids
+        from ..active_blocks import full_slice_block_ids
         from ..compile_environment import CompileEnvironment
         from ..host_function import HostFunction
 
+        env = CompileEnvironment.current()
+        graphs = [
+            graph
+            for graph in fn.codegen.codegen_graphs
+            if graph.graph_id in live_graph_ids
+        ]
+        # A full slice of a host tensor dim sized by a block reuses its
+        # variable for its own reduction block, which the liveness analysis
+        # records as the block it aliases: keep that block live too.
+        sliced = {
+            block_id
+            for graph in graphs
+            for node in graph.graph.nodes
+            for block_id in full_slice_block_ids(node)
+        }
         return active_block_ids(
-            [
-                graph
-                for graph in fn.codegen.codegen_graphs
-                if graph.graph_id in live_graph_ids
-            ],
+            graphs,
             (
                 block_id
                 for ids in HostFunction.current().device_ir.grid_block_ids
                 for block_id in ids
             ),
-            CompileEnvironment.current(),
-        )
+            env,
+        ) | {
+            block.block_id
+            for block in env.block_sizes
+            if block.reduction and env.canonical_block_id(block.block_id) in sliced
+        }
 
     def shares_sibling_thread_axes(self) -> bool:
         return True
 
-    def inactive_broadcast_alias_block_ids(
-        self, fn: DeviceFunction, strategies: Sequence[TileStrategy]
-    ) -> set[int]:
-        from .active_blocks import inactive_broadcast_alias_block_ids
+    def check_reduction_blocks(
+        self,
+        fn: DeviceFunction,
+        block_ids: Sequence[int],
+        live_graph_ids: frozenset[int] | None,
+    ) -> None:
+        from .active_blocks import reject_tile_alias_reductions
 
-        return inactive_broadcast_alias_block_ids(fn, strategies)
+        reject_tile_alias_reductions(fn, block_ids, live_graph_ids)
 
     def roots_may_reserve_distinct_thread_axes(self) -> bool:
         return True
@@ -2061,11 +2214,41 @@ class CuteBackend(Backend):
             inactive_block_ids=inactive_grid_block_ids,
         )
 
+    def thread_axis_extent_limits(self) -> tuple[int, ...] | None:
+        return MAX_THREAD_BLOCK_DIMS
+
+    def per_thread_reduction_lays_out_tiles(
+        self, config_spec: ConfigSpec, config: Config, tile_threads: int
+    ) -> bool:
+        """A persistent reduction the config spells as a register tile
+        (``cute_config_forms_register_tile``).  This approximates the
+        register-tile decision of ``normalize_reduction_threads``: it budgets
+        the threads the active tiles leave (``tile_loop_thread_count``),
+        where the normalizer multiplies every tile axis, siblings and
+        inactive ones too (``_tile_axis_threads``), and it skips neither a
+        pinned reduction nor the normalizer's ``register_tiles=False``
+        retry.  Its budget is usually the larger, so it errs toward yes,
+        where the planner caps nothing: a config it wrongly says yes to keeps
+        the launch it had without the cap."""
+        from .autotune.search_surface import cute_config_forms_register_tile
+
+        available = max(1, MAX_THREADS_PER_BLOCK // max(tile_threads, 1))
+        return any(
+            config_spec.reduction_loops.config_get(
+                config.reduction_loops, spec.block_id, None
+            )
+            is None
+            and cute_config_forms_register_tile(
+                config_spec, config.config, spec, available
+            )
+            for spec in config_spec.reduction_loops
+        )
+
     def packed_grid_block(self, config: Config) -> tuple[int, int] | None:
         from ..compile_environment import CompileEnvironment
         from .tile_packing import packed_grid_block
 
-        return packed_grid_block(CompileEnvironment.current(), config)
+        return packed_grid_block(CompileEnvironment.current().config_spec, config)
 
     # Tensor-core policy of the shared per-thread planner
     # (``per_thread_planning.plan_per_thread_loop_strategy``).  The detectors
@@ -2300,6 +2483,7 @@ class CuteBackend(Backend):
         from .direct_affine_candidate import discover_direct_affine_candidates
         from .execution_plans import plan_execution
         from .fixed_token_rank1_recurrence import plan_fixed_token_rank1_recurrence
+        from .gdn_recurrence import mark_gdn_recurrence_exponentials
         from .gdn_recurrence import plan_gdn_recurrence
         from .literal_dims import annotate_literal_dims
         from .register_region import plan_register_region
@@ -2312,6 +2496,9 @@ class CuteBackend(Backend):
         from .view_subtile import annotate_view_subtiles
 
         device_function = DeviceFunction.current()
+        # The marks depend on the graphs and the target only, so every config
+        # lowers the marked exps alike, whichever planner below takes the root.
+        gdn_admission = mark_gdn_recurrence_exponentials(graphs)
         device_function.cute_state.root_plans.radix_selection_plan = (
             plan_radix_selection_root(graphs, tile_strategy)
         )
@@ -2376,7 +2563,7 @@ class CuteBackend(Backend):
             is not None
         ):
             return
-        plan_gdn_recurrence(graphs, tile_strategy)
+        plan_gdn_recurrence(gdn_admission, tile_strategy)
         if (
             DeviceFunction.current().cute_state.root_plans.gdn_recurrence_plan
             is not None
@@ -2385,7 +2572,10 @@ class CuteBackend(Backend):
         device_function.cute_state.root_plans.mma_dag_plan = plan_mma_dag(
             graphs, config
         )
-        if device_function.cute_state.root_plans.mma_dag_plan is not None:
+        mma_plan = device_function.cute_state.root_plans.mma_dag_plan
+        if mma_plan is not None:
+            if mma_plan.attention is not None and mma_plan.attention.paired_items:
+                device_function.cute_state.lanes.attention_item_group = 2
             return
         plan_single_token_rank1_recurrence(graphs, tile_strategy)
         if (
@@ -2406,6 +2596,15 @@ class CuteBackend(Backend):
         annotate_view_subtiles(graphs, config)
         annotate_literal_dims(graphs, config)
         plan_execution(graphs, tile_strategy)
+
+    def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
+        return env.config_spec.target_device_capability
+
+    def pdl_instruction(self, operation: str) -> str:
+        return {
+            "wait": "cute.arch.griddepcontrol_wait()",
+            "launch_dependents": "cute.arch.griddepcontrol_launch_dependents()",
+        }[operation]
 
     def finalize_device_body(
         self, body: list[ast.stmt], ctx: DeviceBodyContext
@@ -2434,20 +2633,33 @@ class CuteBackend(Backend):
         from .passes import launch_attributes
         from .passes import pdl
         from .passes.pipeline import run_kernel_def_passes
+        from .pdl_ops import validate_explicit_launch
+        from .smem_footprint import check_smem_budget
 
         run_kernel_def_passes(fn_def, prefix, ctx)
         fn = ctx.device_function
-        pdl.insert_spread_pad(fn, fn_def)
+        pdl.insert_spread_pad(fn, fn_def, ctx.constexpr_values)
+        validate_explicit_launch(fn, fn_def)
+        # The final body, the spread pad included: a kernel whose shared
+        # memory cannot fit one block fails here, not in libNVVM.
+        check_smem_budget(fn_def, ctx.constexpr_values, fn.pid)
         statements = launch_attributes.module_statements(fn)
         launch_attributes.project_launch_block(fn)
         return statements
 
     def tensors_proven_disjoint(
-        self, env: CompileEnvironment, left: torch.Tensor, right: torch.Tensor
+        self,
+        env: CompileEnvironment,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        allow_unbound: bool = False,
     ) -> bool:
         from ..runtime_tensor_guards import runtime_tensors_are_proven_disjoint
 
-        return runtime_tensors_are_proven_disjoint(env, left, right)
+        return runtime_tensors_are_proven_disjoint(
+            env, left, right, allow_unbound=allow_unbound
+        )
 
     def new_env_state(self) -> CuteEnvState:
         return new_env_state()
@@ -2465,8 +2677,9 @@ class CuteBackend(Backend):
 
     def kernel_generators(self) -> tuple[KernelGenerator, ...]:
         from .kernel_generators import KERNEL_GENERATORS
+        from .pdl_ops import guard_kernel_generators
 
-        return KERNEL_GENERATORS
+        return guard_kernel_generators(KERNEL_GENERATORS)
 
     def retry_policy(self) -> RetryPolicy:
         from .kernel_generators import REGENERATION
@@ -2513,8 +2726,21 @@ class CuteBackend(Backend):
         self, env: CompileEnvironment, device_ir: DeviceIR, configs: list[Config]
     ) -> list[Config]:
         from .autotune.heuristics import postprocess_seed_configs
+        from .pdl_ops import config_conflicts_with_explicit_pdl
 
-        return postprocess_seed_configs(env, device_ir, configs)
+        configs = postprocess_seed_configs(env, device_ir, configs)
+        if env.config_spec.has_explicit_pdl:
+            # Promotion precedes this hook; the no-autotuning path consumes
+            # that default without calling autotune_config_is_viable.
+            default = env.config_spec.compiler_default_config
+            if default is not None and config_conflicts_with_explicit_pdl(default):
+                env.config_spec.compiler_default_config = None
+            configs = [
+                config
+                for config in configs
+                if not config_conflicts_with_explicit_pdl(config)
+            ]
+        return configs
 
     def register_coverage_groups(
         self, env: CompileEnvironment, device_ir: DeviceIR
@@ -2709,19 +2935,11 @@ class CuteBackend(Backend):
         compile-cache entries are kept so the winner launches without
         recompiling.
         """
-        from ...runtime.config import Config
-
-        compiled_fn = bound_kernel._compile_cache.get(config)
-        if compiled_fn is None:
-            # The autotuner may return a minimized config (default values
-            # stripped); the compiled entry is keyed by the full config.
-            default = bound_kernel.config_spec.default_config()
-            # pyrefly: ignore [bad-argument-type]
-            full_config = Config(**(default.config | config.config))
-            compiled_fn = bound_kernel._compile_cache.get(full_config)
-        if compiled_fn is None:
-            return
-        kernels = self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        kernels = tuple(
+            kernel
+            for _, compiled_fn in bound_kernel._matching_compiled_configs(config)
+            for kernel in self._compiled_kernels(compiled_fn, bound_kernel.kernel.name)
+        )
         if not kernels:
             return
         device_index = (
@@ -2908,6 +3126,18 @@ class CuteBackend(Backend):
             "_cute_argreduce_index": "from helion._compiler.cute.reduce_helpers import _cute_argreduce_index",
             "_cute_nan_max": "from helion._compiler.cute.reduce_helpers import _cute_nan_max",
             "_cute_nan_min": "from helion._compiler.cute.reduce_helpers import _cute_nan_min",
+            "_cute_warp_reduce_max_redux": (
+                "from helion._compiler.cute.reduce_helpers import "
+                "_warp_reduce_max_native_fp32 as _cute_warp_reduce_max_redux"
+            ),
+            "_cute_warp_reduce_min_redux": (
+                "from helion._compiler.cute.reduce_helpers import "
+                "_warp_reduce_min_native_fp32 as _cute_warp_reduce_min_redux"
+            ),
+            "_cute_warp_reduce_or_redux": (
+                "from helion._compiler.cute.reduce_helpers import "
+                "_warp_reduce_or_native as _cute_warp_reduce_or_redux"
+            ),
             "_helion_pdl_spread_keep": "from helion._compiler.cute._pdl_spread_runtime import keep_smem_live as _helion_pdl_spread_keep",
             "_cute_aux_copy_layout": "from helion._compiler.cute.aux_copy_layout import select_aux_copy_layout as _cute_aux_copy_layout",
             "_cute_gelu_erf_exact_f32x2": (
@@ -2973,6 +3203,9 @@ class CuteBackend(Backend):
             "_cute_bfloat16_x16_to_float16": "from helion._compiler.cute.quantized_helpers import bfloat16_x16_to_float16 as _cute_bfloat16_x16_to_float16",
             "_cute_signed_bitfield_to_bf16_packed": "from helion._compiler.cute.vec_utils import signed_bitfield_to_bf16_packed as _cute_signed_bitfield_to_bf16_packed",
             "_cute_store_u16_vec": "from helion._compiler.cute.vec_utils import store_u16_vec as _cute_store_u16_vec",
+            "_cute_store_u8_vec": "from helion._compiler.cute.vec_utils import store_u8_vec as _cute_store_u8_vec",
+            "_cute_store_u8_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_u8_vec_l2_evict_last as _cute_store_u8_vec_l2_evict_last",
+            "_cute_store_u8_vec_streaming": "from helion._compiler.cute.packet_store_helpers import store_u8_vec_streaming as _cute_store_u8_vec_streaming",
             "_cute_store_fp8e4m3fn_vec": "from helion._compiler.cute.vec_utils import store_fp8e4m3fn_vec as _cute_store_fp8e4m3fn_vec",
             "_cute_store_fp8e5m2_vec": "from helion._compiler.cute.vec_utils import store_fp8e5m2_vec as _cute_store_fp8e5m2_vec",
             "_cute_store_fp8e4m3fn_vec_l2_evict_last": "from helion._compiler.cute.packet_store_helpers import store_fp8e4m3fn_vec_l2_evict_last as _cute_store_fp8e4m3fn_vec_l2_evict_last",
@@ -3007,10 +3240,13 @@ class CuteBackend(Backend):
             "_cute_exact_div_bounds_f32": "from helion._compiler.cute.exact_division import exact_div_bounds_f32 as _cute_exact_div_bounds_f32",
             "_cute_exact_div_fast_f32": "from helion._compiler.cute.exact_division import exact_div_fast_f32 as _cute_exact_div_fast_f32",
             "_cute_exact_div_redo_f32": "from helion._compiler.cute.exact_division import exact_div_redo_f32 as _cute_exact_div_redo_f32",
+            "_cute_exact_div_fast_f32x2": "from helion._compiler.cute.device.ptx import exact_div_fast_f32x2 as _cute_exact_div_fast_f32x2",
+            "_cute_exp_f32x2_parts": "from helion._compiler.cute.device.ptx import exp_f32x2_parts as _cute_exp_f32x2_parts",
+            "_cute_half_packet_extremum_f32": "from helion._compiler.cute.device.half_extrema import half_packet_extremum_f32 as _cute_half_packet_extremum_f32",
             "_cute_copysign": "from helion._compiler.cute.copysign import copysign as _cute_copysign",
             "_cute_atomic_max_float32": "from helion._compiler.cute.atomic_helpers import atomic_max_float32 as _cute_atomic_max_float32",
             "_cute_atomic_min_float32": "from helion._compiler.cute.atomic_helpers import atomic_min_float32 as _cute_atomic_min_float32",
-            "_cute_warp_fetch_add_int32": "from helion._compiler.cute.warp_atomic_runtime import warp_fetch_add_int32 as _cute_warp_fetch_add_int32",
+            "_cute_atomic_warp_fetch_add_int32": "from helion._compiler.cute.warp_atomic_runtime import warp_fetch_add_int32 as _cute_atomic_warp_fetch_add_int32",
         }
 
     def program_id_expr(self, dim: int, *, index_dtype: str) -> str:
@@ -3035,43 +3271,64 @@ class CuteBackend(Backend):
 
         class HelionCuteDSLOpOverrides(CuteDSLOpOverrides):
             @staticmethod
-            def _ftz_safe_current_node() -> bool:
+            # pyrefly: ignore [bad-override]
+            def isnan(x: CuteDSLArg) -> CuteDSLArg:
+                # Ordered values, including infinities and signed zeros, equal
+                # themselves. Reuse the typed unordered comparison for NaNs.
+                return CuteDSLOpOverrides.ne(x, x)
+
+            @staticmethod
+            def _current_node_marked(key: str) -> bool:
                 from torch._inductor.virtualized import V
 
-                from .exp2_fastmath import FTZ_SAFE_EXP_META_KEY
-
                 node = V.current_node
-                return node is not None and bool(node.meta.get(FTZ_SAFE_EXP_META_KEY))
+                return node is not None and bool(node.meta.get(key))
 
             @staticmethod
             def exp(x: CuteDSLArg) -> CuteDSLArg:
-                # Marked sites (sum(exp(x - amax(x)))) are provably
-                # unaffected by flushing denormal exp outputs; skip the
-                # default lowering's denormal fixup (FSETP + 2 predicated
-                # FMULs per element) — see exp2_fastmath.py.
-                if (
-                    HelionCuteDSLOpOverrides._ftz_safe_current_node()
-                    or HelionCuteDSLOpOverrides._fastmath_on()
-                ):
-                    if CuteDSLOpOverrides._get_cse_var(x) is None:
-                        x = CuteDSLOpOverrides._cast_expr(str(x), torch.float32)
+                # A float64 exp stays in float64, and there is no float64
+                # ex2.approx: it is the exact exp under fast_math too.
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                float64 = expected is not None and expected.dtype == torch.float64
+                if CuteDSLOpOverrides._get_cse_var(x) is None:
+                    x = CuteDSLOpOverrides._cast_expr(
+                        str(x), torch.float64 if float64 else torch.float32
+                    )
+                if HelionCuteDSLOpOverrides._fastmath_on() and not float64:
                     return CuteDSLOpOverrides._apply_unary_op(
                         x,
                         f"cute.math.exp2({{x}} * {CuteDSLOpOverrides.LOG2_E}, fastmath=True)",
                     )
-                return CuteDSLOpOverrides.exp(x)
+                if HelionCuteDSLOpOverrides._current_node_marked(
+                    TEMPLATE_EXP2_META_KEY
+                ):
+                    # A whole-root template's exp (``TEMPLATE_EXP2_META_KEY``):
+                    # the configs it declines compute it as it does.
+                    return CuteDSLOpOverrides._apply_unary_op(
+                        x, f"cute.math.exp2({{x}} * {CuteDSLOpOverrides.LOG2_E})"
+                    )
+                # Not the base lowering's exp2(x * log2(e)): rounding the
+                # product costs |x| * 2**-24 of relative error, over 60 ulp
+                # near the overflow threshold (CUDA's ``__expf``).
+                # ``cute.math.exp`` is libdevice's expf, which reduces the
+                # argument exactly (eager's and Inductor's ``libdevice.exp``,
+                # within 2 ulp) and has no denormal fixup for an FTZ-safe
+                # site to skip (see exp2_fastmath.py).
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.exp({x})")
 
             @staticmethod
             def exp2(x: CuteDSLArg) -> CuteDSLArg:
                 if (
-                    HelionCuteDSLOpOverrides._ftz_safe_current_node()
+                    HelionCuteDSLOpOverrides._current_node_marked(
+                        FTZ_SAFE_EXP2_META_KEY
+                    )
                     or HelionCuteDSLOpOverrides._fastmath_on()
                 ):
                     return CuteDSLOpOverrides._apply_unary_op(
                         x, "cute.math.exp2({x}, fastmath=True)"
                     )
                 # Not Inductor's exp(x * ln2) decomposition: rounding x * ln2
-                # and then (x * ln2) * log2(e) in exp costs 2-3 ulp.
+                # costs |x| * ln(2) * 2**-24 of relative error.
                 return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.exp2({x})")
 
             @staticmethod
@@ -3084,12 +3341,15 @@ class CuteBackend(Backend):
             def constant(value: bool | float, dtype: torch.dtype) -> str:
                 from ..inductor_lowering_extra import keeps_negative_nan_literal
 
-                # The DSL types a Python int as Int32, which widens 8- and
-                # 16-bit integer math so it never wraps, and takes a negative
-                # one as signed next to an unsigned value.  Eager converts the
-                # scalar to the tensor's dtype, wrapping it (x_uint8 % -7
-                # divides by 249).
-                if isinstance(value, int) and dtype in _NARROW_INTEGER_DTYPES:
+                # The DSL types a Python int as Int32, or Int64 outside that
+                # range. Eager first converts the scalar to the tensor dtype,
+                # wrapping it (x_uint8 % -7 divides by 249). Comparisons need
+                # this before promotion: int32(0) < 2**31 compares against
+                # -2**31, rather than widening both operands to Int64.
+                if isinstance(value, int) and (
+                    dtype in _NARROW_INTEGER_DTYPES
+                    or (dtype == torch.int32 and not -(2**31) <= value < 2**31)
+                ):
                     bits = torch.iinfo(dtype).bits
                     value &= (1 << bits) - 1
                     if dtype.is_signed and value >= 1 << (bits - 1):
@@ -3097,6 +3357,10 @@ class CuteBackend(Backend):
                     return CuteDSLOpOverrides._cast_expr(repr(value), dtype)
                 if keeps_negative_nan_literal(value):
                     return "-float('nan')"
+                if _is_negative_zero(value):
+                    return CuteDSLOpOverrides._cast_expr(
+                        self.scalar_literal_expr(value), dtype
+                    )
                 return CuteDSLOpOverrides.constant(value, dtype)
 
             @staticmethod
@@ -3296,11 +3560,24 @@ class CuteBackend(Backend):
             @staticmethod
             # pyrefly: ignore [bad-override]
             def sigmoid(x: CuteDSLArg) -> CuteDSLArg:
+                expected = CuteDSLOpOverrides._expected_tensor_val()
+                if expected is not None and expected.dtype == torch.float64:
+                    # There is no float64 ex2.approx (the f64 rcp.approx is a
+                    # coarse approximation), and the fp32 contract below
+                    # would round the result to fp32: compute a float64
+                    # sigmoid in float64, as eager torch.sigmoid does, the
+                    # IEEE quotient of the float64 exp.
+                    if CuteDSLOpOverrides._get_cse_var(x) is None:
+                        x = CuteDSLOpOverrides._cast_expr(str(x), torch.float64)
+                    return CuteDSLOpOverrides._apply_unary_op(
+                        x, "1.0 / (1.0 + cute.math.exp(-({x})))"
+                    )
                 # RCP.APPROX + EX2.APPROX, the same sequence triton's default
                 # tl.sigmoid compiles to (one MUFU.EX2 + one MUFU.RCP).  The
-                # base lowering's accurate IEEE div is a ~20-instruction
-                # BRANCHY SASS expansion (BSSY/BSYNC reconvergence per
-                # element) that buys no accuracy here: sigmoid's error is
+                # base lowering's division (``div.full.f32``, or under
+                # ``cute_exact_division`` the IEEE one, a ~20-instruction
+                # BRANCHY SASS expansion with a BSSY/BSYNC reconvergence per
+                # element) buys no accuracy here: sigmoid's error is
                 # dominated by the shared x*log2e argument rounding, and both
                 # forms measure max 64 ulp / mean 3.5 ulp vs an fp64
                 # reference on [-87, 87] (identical distributions), with
@@ -3321,7 +3598,6 @@ class CuteBackend(Backend):
                     x_fp32,
                     SIGMOID_TEMPLATE,
                 )
-                expected = CuteDSLOpOverrides._expected_tensor_val()
                 expected_dtype = expected.dtype if expected is not None else None
                 if expected_dtype is not None and expected_dtype != torch.float32:
                     result_cse = CuteDSLOpOverrides._get_cse_var(result)
@@ -3336,19 +3612,73 @@ class CuteBackend(Backend):
 
             @staticmethod
             def truediv(a: CuteDSLArg, b: CuteDSLArg) -> CuteDSLArg:
-                # cute.math.div lowers to an NVVM intrinsic that only accepts
-                # fp32 scalars; 16/64-bit operands raise at DSL trace time, so
-                # keep the accurate IEEE path for every other dtype.
-                expected = CuteDSLOpOverrides._expected_tensor_val()
-                if (
-                    HelionCuteDSLOpOverrides._fastmath_on()
-                    and expected is not None
-                    and expected.dtype == torch.float32
-                ):
+                """Divide as the Triton backend does.
+
+                A 32-bit or 16-bit float ``/`` is ``div.full.f32``, what
+                Triton's ``/`` compiles to: within 2 ulp over the full range
+                and without a slow path (ptxas scales the operands, takes the
+                divisor's reciprocal and multiplies, and hoists the
+                reciprocal of a loop-invariant divisor itself).  The
+                generated code spells it ``/``: the launcher compiles every
+                CuTe kernel with libNVVM's ``-prec-div=0``
+                (``helion.runtime.cute.compile_cache``), so the divisions the
+                fused templates and the vector lanes emit round the same way.
+                ``Settings.cute_exact_division`` compiles the kernel with the
+                IEEE ``div.rn.f32`` instead, and float64 is IEEE under both.
+
+                Under ``fast_math`` an fp32 quotient is ``div.approx.ftz``
+                (Triton's ``fast_dividef``): an NVVM intrinsic that only
+                accepts fp32 scalars, so the other dtypes keep ``/``.
+
+                A quotient its node truncates or floors is the IEEE one in
+                every mode: one wrong last bit there is a whole unit in the
+                result (``div.full`` gives 33 / 33 just below 1, which
+                truncates to 0).  The shared lowering asks
+                ``CuteHandlerOpOverrides.div_rn`` for it, an intrinsic that
+                no division option and no ``fast_math`` rewrite changes, so
+                such a quotient arrives here only when it is computed in
+                float64 (``division_dtype``: the operands of ``x.div_(y)``
+                with a float64 ``y`` are float64 whatever the dtype of
+                ``x``).  A float64 division is IEEE as it is, but under
+                ``fast_math`` the reciprocal hoist turns a ``/`` by a
+                loop-invariant divisor into a multiply, and 49 * (1 / 49)
+                truncates to 0 in float64 too: this quotient is spelled as
+                the call ``cute.math.div``, the same division, which that
+                pass does not rewrite.
+
+                ``cute.math.div`` takes two operands of one type, and reads
+                a number literal as an fp32 or an int32 where ``/`` converts
+                it: both calls spell their operands in the dtype they divide
+                in (``x / 3`` under ``fast_math`` did not compile).
+                """
+                from torch._inductor.virtualized import V
+
+                from ..inductor_lowering import division_dtype
+                from ..inductor_lowering import rounds_its_quotient
+
+                node = V.current_node
+                dtype = (
+                    division_dtype(node) if isinstance(node, torch.fx.Node) else None
+                )
+                if dtype == torch.float64 and rounds_its_quotient(node):
                     return CuteDSLOpOverrides._apply_binary_op(
-                        a, b, "cute.math.div({a}, {b}, approx=True, ftz=True)"
+                        a,
+                        b,
+                        "cute.math.div(cutlass.Float64({a}), cutlass.Float64({b}))",
+                    )
+                if HelionCuteDSLOpOverrides._fastmath_on() and dtype == torch.float32:
+                    return CuteDSLOpOverrides._apply_binary_op(
+                        a,
+                        b,
+                        "cute.math.div(cutlass.Float32({a}), cutlass.Float32({b}), "
+                        "approx=True, ftz=True)",
                     )
                 return CuteDSLOpOverrides.truediv(a, b)
+
+            @staticmethod
+            # pyrefly: ignore [bad-override]
+            def isinf(x: CuteDSLArg) -> CuteDSLArg:
+                return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.isinf({x})")
 
             @staticmethod
             # pyrefly: ignore [bad-override]
@@ -3488,18 +3818,29 @@ class CuteBackend(Backend):
                     return x
         return super().cast_ast(x, target_dtype)
 
+    def scalar_literal_expr(self, value: float | bool) -> str:
+        if _is_negative_zero(value):
+            # SDK arith.const caches by Python equality, aliasing +/-0. Emit
+            # the sign bit as an integer so no negative float enters that cache.
+            return "cutlass.Int32(-2147483648).bitcast(cutlass.Float32)"
+        return super().scalar_literal_expr(value)
+
     def scalar_float_operand_ast(
-        self, x: ast.AST, value: torch.SymFloat, *, computes_in_float64: bool
+        self, x: ast.AST, value: torch.SymFloat | float, *, computes_in_float64: bool
     ) -> ast.AST:
         # The DSL types a Python float combined with an Int as Float64
         # (``n + 0.0`` for ``ToFloat(n)``), which would turn the op's float32
         # math, and any loop carry it feeds, into Float64.  Float kernel
         # arguments are Float32 (see the launcher), and so is an expression
-        # of only them and constants.
+        # of only them and constants.  A float constant alone would take the
+        # other operand's type, a 16-bit one too.
         float_symbols = (SymT.FLOAT, SymT.UNBACKED_FLOAT)
-        if computes_in_float64 or all(
-            symbol_is_type(symbol, float_symbols)
-            for symbol in value._sympy_().free_symbols
+        if computes_in_float64 or (
+            isinstance(value, torch.SymFloat)
+            and all(
+                symbol_is_type(symbol, float_symbols)
+                for symbol in value._sympy_().free_symbols
+            )
         ):
             return x
         return self.cast_ast(x, torch.float32)
@@ -3624,6 +3965,18 @@ class CuteBackend(Backend):
     def adjust_reduction_thread_count(
         self, requested: int, existing_strategies: list[TileStrategy]
     ) -> int:
+        """``requested`` threads of a reduction, halved until they fit in the
+        CTA beside those of ``existing_strategies``.  The default block sizes
+        of inner tile loops model this count before any strategy exists
+        (``launch_threads`` in ``autotune.search_surface._inner_loop_shares``),
+        and so does the thread planner where it decides whether a reduction
+        keeps threads and takes a launch axis
+        (``per_thread_planning._reduction_surely_claims_thread_axis``):
+        change them together.  The planner cannot see the emitter leave a
+        reduction one thread (a matmul contraction longer than the CTA's
+        threads, which the scalar fallback folds per output element), so
+        there it may give a tile that lands on y a lane loop it does not
+        need."""
         from ..reduction_strategy import ReductionStrategy
 
         if requested <= 1:
@@ -3632,30 +3985,22 @@ class CuteBackend(Backend):
         for strategy in existing_strategies:
             if isinstance(strategy, ReductionStrategy):
                 count = strategy._reduction_thread_count()
-                if count > 0:
+                # A block indexing a sibling's axis adds no threads
+                # (``CutePersistentReductionEmitter.plan_axis_partner``).
+                if count > 0 and strategy._claims_thread_axis():
                     other_threads *= count
             else:
                 for size in strategy.thread_block_sizes():
                     if size > 1:
                         other_threads *= size
-        while other_threads * requested > MAX_THREADS_PER_BLOCK and requested > 1:
-            requested //= 2
-        return requested
+        return fit_reduction_threads(requested, other_threads)
 
     def create_synthetic_reduction_lanes(
         self,
         thread_count: int,
         size_hint: int,
     ) -> int | None:
-        from torch._inductor.runtime.runtime_utils import next_power_of_2
-
-        if thread_count <= 0:
-            return None
-        padded_size = next_power_of_2(max(1, size_hint))
-        if padded_size > thread_count:
-            # Whole-warp thread counts need not divide the padded extent.
-            return (padded_size + thread_count - 1) // thread_count
-        return None
+        return synthetic_reduction_lanes(thread_count, size_hint)
 
     def reduction_axis_first(self) -> bool:
         return True
@@ -3720,6 +4065,15 @@ class CuteBackend(Backend):
     def next_power_of_2_host_expr(self, expr: str) -> str:
         return f"_next_power_of_2({expr})"
 
+    def widen_reduction_acc_dtype(
+        self, reduction_type: str, dtype: torch.dtype
+    ) -> torch.dtype:
+        if reduction_type == "any":
+            # Cross-warp combines stage partials in shared memory, which
+            # alloc_smem cannot type as Boolean: fold the mask as Int32 0/1.
+            return torch.int32
+        return dtype
+
     def reduction_combine_expr(
         self,
         reduction_type: str,
@@ -3758,6 +4112,8 @@ class CuteBackend(Backend):
             )
         if reduction_type == "prod":
             return f"({acc} * {val})"
+        if reduction_type == "any":
+            return f"({acc} | {val})"
         raise exc.BackendUnsupported(self.name, f"reduction combine {reduction_type!r}")
 
     def _threads_for_block_size_var(self, block_size_var: str | None) -> int:
@@ -3836,6 +4192,8 @@ class CuteBackend(Backend):
             return f"cute.arch.warp_reduction({input_name}, _cute_nan_min{tg})"
         if reduction_type == "prod":
             return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a * b){tg})"
+        if reduction_type == "any":
+            return f"cute.arch.warp_reduction({input_name}, lambda a, b: (a | b){tg})"
         raise exc.BackendUnsupported(self.name, f"reduction {reduction_type!r}")
 
     def thread_linear_index_expr(self, axis_sizes: dict[int, int]) -> str | None:
@@ -3992,7 +4350,6 @@ class CuteBackend(Backend):
                 else None
             )
             launcher_args = [block_arg]
-            compile_options: list[str] = []
             # One --ptxas-options flag carries them all (a second would
             # replace the first).
             ptxas_options: list[str] = []
@@ -4019,14 +4376,6 @@ class CuteBackend(Backend):
                 "split_alias_cpc"
             ):
                 ptxas_options.append("--override-directive-values --maxrregcount=48")
-            if config.advanced_controls_file:
-                ptxas_options.append(
-                    f"--apply-controls {config.advanced_controls_file}"
-                )
-            if ptxas_options:
-                compile_options.append(f"--ptxas-options='{' '.join(ptxas_options)}'")
-            if config.get(TCGEN05_CUBIN_LINEINFO_CONFIG_KEY) is True:
-                compile_options.append("--generate-line-info")
             # ``--enable-tvm-ffi`` is emitted in codegen only when the
             # autotune flag is True so the generated code reflects which
             # configs deliberately requested FFI. The runtime
@@ -4046,11 +4395,11 @@ class CuteBackend(Backend):
                         f"{TCGEN05_TVM_FFI_LAUNCH_CONFIG_KEY}=True requires "
                         "tcgen05 CuTe lowering",
                     )
-                compile_options.append("--enable-tvm-ffi")
+            compile_options = config_compile_options(
+                config, ptxas_options=ptxas_options
+            )
             if compile_options:
-                launcher_args.append(
-                    f"cute_compile_options={' '.join(compile_options)!r}"
-                )
+                launcher_args.append(f"cute_compile_options={compile_options!r}")
             return launcher_args
 
         # A whole-root plan that owns the body owns its launch (the
@@ -4705,7 +5054,19 @@ class CuteBackend(Backend):
     def tile_begin_expr(self, codegen: GenerateAST, block_idx: int) -> str | None:
         from .tile_ops import cute_tile_begin_expr
 
-        return cute_tile_begin_expr(codegen, block_idx)
+        result = cute_tile_begin_expr(codegen, block_idx)
+        plan = codegen.device_function.cute_state.root_plans.mma_dag_plan
+        item_group = codegen.device_function.cute_state.lanes.attention_item_group
+        if (
+            plan is not None
+            and plan.attention is not None
+            and item_group != 1
+            and block_idx == plan.program.lead_axes[0].block_id
+        ):
+            # All origins (tile.id/begin and uniform FX/SymInt expressions)
+            # see the first original item owned by this paired grid index.
+            return f"({result} * {item_group})"
+        return result
 
     def rewrite_lowered_root(
         self, codegen: GenerateAST, grid_state: DeviceGridState, body: list[ast.AST]
@@ -4727,13 +5088,15 @@ class CuteBackend(Backend):
         kernel, failed: the overflow is the actionable message. Callers wrap the
         statement visit and the device function finalization.
 
-        ``RegisterTileUnsupported`` is not a refusal but the register tile's
-        regeneration signal (``generate_ast`` retries with the rolled lane) and
-        passes through unchanged, decline or not.
+        A regeneration signal (``CuteRegeneration.signals``: the register
+        tile's ``RegisterTileUnsupported``, the planned layout's
+        ``VloopSinkLayoutRefused``, ...) is not a refusal: ``generate_ast``
+        generates the kernel again without what raised it, so it passes
+        through unchanged, decline or not.
         """
-        from .register_tile_admission import RegisterTileUnsupported
+        from .kernel_generators import CuteRegeneration
 
-        if isinstance(error, RegisterTileUnsupported):
+        if isinstance(error, CuteRegeneration.signals):
             return error
         declined = (
             codegen.device_function.cute_state.root_plans.fragment_capacity_decline
@@ -4771,6 +5134,7 @@ class CuteBackend(Backend):
     def after_device_codegen(
         self, codegen: GenerateAST, host: HostFunction, config: Config
     ) -> None:
+        from .atomic_privatization import privatize_atomic_targets
         from .cute_reshape import run_deferred_rebound_checks
         from .host_remainder_fills import append_device_remainder_fills
         from .lane_loops.root_passes import reject_lane_reads_without_lane_loops
@@ -4790,6 +5154,7 @@ class CuteBackend(Backend):
         cute_codegen_state(codegen).remainder_fills = append_device_remainder_fills(
             codegen, host, config
         )
+        privatize_atomic_targets(codegen, host)
 
     def finalize_host_statements(
         self, codegen: GenerateAST, host: HostFunction, statements: list[ast.AST]
@@ -4829,7 +5194,11 @@ class CuteBackend(Backend):
             # dependent fill kernels ahead of this (``cute_pdl``)
             # kernel instead of memset nodes.
             statements, fill_kernels = lower_host_zero_fill_launches(
-                host, statements, env=env, kernel_name=fn.name
+                host,
+                statements,
+                env=env,
+                kernel_name=fn.name,
+                compile_options=config_compile_options(fn.config),
             )
         return statements, [*metadata, *fill_kernels]
 
@@ -4870,6 +5239,13 @@ class CuteBackend(Backend):
 
     def roots_fissioned(self, env: CompileEnvironment) -> bool:
         return cute_env_state(env).fission_plan is not None
+
+    def lower_dependency_phases_as_ordered_launches(
+        self, host: HostFunction, ir: DeviceIR
+    ) -> bool:
+        from .dependent_phases import confirm_dependency_phases
+
+        return confirm_dependency_phases(host, ir)
 
     def split_persistent_post_loop(
         self, fn: DeviceFunction, body: list[ast.AST]
@@ -4917,6 +5293,10 @@ class CuteBackend(Backend):
         return True
 
     def reflattens_pointwise_tiles(self) -> bool:
+        return True
+
+    def reduces_every_dim_one_at_a_time(self) -> bool:
+        # ``_reduce_along`` runs each dim's reduction strategy in turn.
         return True
 
     def tunes_lane_vector_widths(self) -> bool:
@@ -4978,6 +5358,38 @@ class CuteBackend(Backend):
             )
         )
 
+    def record_flattened_vloop_wrapper(
+        self,
+        fn: DeviceFunction,
+        wrapper: VecLaneWrapper,
+        *,
+        block_id: int,
+        lane_var: str,
+        index_var: str,
+        mask_var: str | None,
+        begin: object,
+        extent: object,
+    ) -> bool:
+        # Only ``cute_vloop_sink`` sinks a flattened tile's V-loop.  The
+        # respelled index and mask it asks for change the code, so like a
+        # thread layout the knob shapes they are regenerated with the knob
+        # off when nothing sinks (``VloopSinkNotApplied``).
+        if fn.config.config.get("cute_vloop_sink") is not True:
+            return False
+        self.record_vloop_wrapper(
+            fn,
+            wrapper,
+            block_id=block_id,
+            lane_var=lane_var,
+            index_var=index_var,
+            mask_var=mask_var,
+            begin=begin,
+            extent=extent,
+            step=None,
+        )
+        fn.cute_state.lanes.vloop_sink_shaped_code = True
+        return True
+
     def apply_lane_cluster_split(
         self, strategy: PerThreadNDTileStrategy, state: CodegenState
     ) -> None:
@@ -4985,6 +5397,11 @@ class CuteBackend(Backend):
         from .lane_cluster_split import apply_cluster_split
 
         apply_cluster_split(strategy, CompileEnvironment.current(), state)
+
+    def lane_loop_semantic_reads(self, body: list[ast.AST]) -> set[str]:
+        from .lane_loops.markers import required_lane_reduce_owners
+
+        return required_lane_reduce_owners(body)
 
     def check_lane_loop_nest(self, state: DeviceLoopState) -> None:
         from .lane_loops.nest_check import check_lane_loop_nest

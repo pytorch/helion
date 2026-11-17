@@ -376,8 +376,8 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
     def test_fast_math_division(self):
         """``fast_math`` lowers plain fp32 (and upcast half-precision) divisions to
         the approximate ``fast_dividef`` on the Triton backend; without the
-        setting, for fp64, and for the rounding-mode divisions the division stays
-        the default ``/``."""
+        setting and for fp64 the division stays the default ``/``, and a
+        rounding-mode division is ``tl.div_rn`` with or without it."""
 
         def div_kernel(x: torch.Tensor, y: torch.Tensor, s: float) -> torch.Tensor:
             m, n = x.size()
@@ -451,10 +451,10 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             self.assertEqual(code.count("fast_dividef("), 1)
         torch.testing.assert_close(result, xi / yi, atol=1e-5, rtol=1e-5)
 
-        # A rounding-mode division keeps the default quotient (trunc must see
-        # the same value with or without the setting; Triton's default divide
-        # is itself 2 ulp, so the reference comparison allows one step).  The
-        # CuTe backend does not lower rounding-mode divisions at all.
+        # A rounding-mode division takes the correctly rounded quotient with
+        # or without the setting (test_rounded_division.py), so truncation
+        # gives eager's value.  The CuTe backend does not lower rounding-mode
+        # divisions at all.
         if _get_backend() != "triton":
             return
         for dtype in (torch.float32, torch.bfloat16):
@@ -462,12 +462,13 @@ class TestGenerateAst(RefEagerTestBase, TestCase):
             y = (torch.rand(256, 64, device=DEVICE, dtype=dtype) + 0.5).to(dtype)
             code, result = code_and_output(kernel(trunc_kernel, fast_math=True), (x, y))
             self.assertNotIn("fast_dividef", code)
+            self.assertIn("tl.div_rn(", code)
             _, default_result = code_and_output(
                 kernel(trunc_kernel, fast_math=False), (x, y)
             )
             torch.testing.assert_close(result, default_result, atol=0, rtol=0)
             torch.testing.assert_close(
-                result, torch.div(x, y, rounding_mode="trunc"), atol=1.0, rtol=0
+                result, torch.div(x, y, rounding_mode="trunc"), atol=0, rtol=0
             )
 
 

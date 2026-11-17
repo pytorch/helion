@@ -487,6 +487,15 @@ def _split_feature_reduction_loop(
             call = _find_lane_reduce_call(statement)
             assert call is not None
             set_marker_owner(call, destination_lane)
+            # Template validation proved an ordinary whole-feature warp and
+            # its unique modulo-32 writer. This detached materialization uses
+            # the replacement schedule's lane coordinate, so retain the warp
+            # sum while discarding the source CTA's physical group metadata.
+            call.keywords = [
+                keyword
+                for keyword in call.keywords
+                if keyword.arg not in ("group_span", "group_count", "group_lane_expr")
+            ]
     markers = tuple(
         marker
         for statement in loop.body
@@ -511,6 +520,9 @@ def _split_feature_reduction_loop(
             [ast.fix_missing_locations(loop)],
             proven_disjoint_tensor_pairs=disjoint_pairs,
             thread_axis_names={lane_name: frozenset((0,))},
+            # Each materialization is later placed under a single-warp
+            # condition. It cannot use the CTA-wide opaque-input snapshot.
+            cta_uniform=False,
         )
     except exc.BackendUnsupported:
         return None

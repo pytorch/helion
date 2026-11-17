@@ -82,6 +82,7 @@ def _fuse_block(
     products: dict[str, tuple[int, ast.BinOp]] = {}
     dropped: set[int] = set()
     for i, stmt in enumerate(stmts):
+        new_product: tuple[str, ast.BinOp] | None = None
         if isinstance(stmt, (ast.For, ast.If)):
             stmt.body = _fuse_block(stmt.body, uses, assigned, env)
             stmt.orelse = _fuse_block(stmt.orelse, uses, assigned, env)
@@ -125,8 +126,7 @@ def _fuse_block(
                     and uses[target.id] == 1
                     and assigned[target.id] == 1
                 ):
-                    products[target.id] = (i, value)
-                    continue
+                    new_product = target.id, value
         # A product whose operands this statement reassigns, or which it
         # reads or writes itself, can no longer move.
         written = _assigned_names(stmt)
@@ -134,6 +134,9 @@ def _fuse_block(
         for name, (_, mul) in list(products.items()):
             if written & _loaded_names(mul) or name in loaded | written:
                 del products[name]
+        if new_product is not None:
+            name, value = new_product
+            products[name] = (i, value)
     return [stmt for i, stmt in enumerate(stmts) if i not in dropped]
 
 

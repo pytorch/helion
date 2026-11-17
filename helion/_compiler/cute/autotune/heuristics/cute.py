@@ -14,6 +14,7 @@ the config spec.  ``autotune/heuristics/__init__.py`` ranks them by
 
 from __future__ import annotations
 
+import collections
 import contextlib
 from copy import deepcopy
 import functools
@@ -40,6 +41,7 @@ from .....autotuner.config_spec import _CUTE_LANE_UNROLL_CHOICES
 from .....autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from .....autotuner.config_spec import get_valid_eviction_policies
 from .....language._tracing_ops import _host_tensor
+from .....language.inline_asm_ops import inline_asm_elementwise
 from .....language.memory_ops import load as language_load
 from .....language.memory_ops import store as language_store
 from .....language.scan_ops import _associative_scan
@@ -56,11 +58,17 @@ from ....loop_dependency_checker import _storage_ids
 from ....loop_dependency_checker import graph_memory_access_storage_ids
 from ....loop_dependency_checker import intra_loop_raw_reread_block_ids
 from ....utils import compute_slice_size
+from ....utils import normalize_slice
+from ... import jam_grid_lanes
 from ... import target_facts
 from ...cutedsl_compat import cp_async_supported
 from ...cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ...cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
 from ...emitters.lane_packets import _CUTE_VECTOR_MAX_BYTES
+from ...flat_gather_lane import _packet_layout_aligned
+from ...flat_gather_lane import _tile_index_block
+from ...flat_gather_lane import row_is_multiple_of
+from ...fuse_two_pass_loads import FORWARDED_DTYPES
 from ...grouped_full_coverage import FULL_COVERAGE_PIPELINES
 from ...grouped_full_coverage import full_coverage_index_domain
 from ...grouped_full_coverage import full_coverage_pipeline_supported
@@ -78,12 +86,17 @@ from ...grouped_worklist_policy import GroupedBMajor
 from ...grouped_worklist_policy import GroupedWorklistHardwareIdentity
 from ...grouped_worklist_policy import get_grouped_worklist_target_policy
 from ...grouped_worklist_policy import grouped_worklist_target_identities
+from ...indexing import cute_lane_remainder_terms
+from ...indexing import match_cute_lane_remainder
 from ...loop_nesting import sibling_row_loop_blocks
 from ...loop_nesting import tile_loop_paths
 from ...matmul_utils import cute_matmul_root_placements
+from ...memory_ops import cute_vector_strides_aligned
 from ...mma_support import cute_fp32_dot_uses_tf32
 from ...packed_matmul import contraction_axis_for_fact
 from ...pdl_release import CUTE_PDL_SPREAD_KEY
+from ...reduction_lanes import WARP_THREADS
+from ...reduction_lanes import walks_live_lanes
 from ...register_tile_admission import register_tile_reduction_levels
 from ...strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ...strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
@@ -91,6 +104,9 @@ from ...strategies import TCGEN05_STRATEGY_CONFIG_KEY
 from ...strategies import TCGEN05_WARP_SPEC_SCHEDULER_WARPS_KEY
 from ...strategies import Tcgen05PersistenceModel
 from ...strategies import Tcgen05Strategy
+from ...sweep_values import _TRANSCENDENTAL_COST
+from ...sweep_values import MIN_SAVED_COST
+from ...sweep_values import _pure_asm_instructions
 from ...tcgen05_config import TCGEN05_GROUPED_DYNAMIC_AB4_STAGE
 from ...tcgen05_config import facts
 from ...tcgen05_config import seeds
@@ -135,6 +151,8 @@ from ...tcgen05_constants import tcgen05_grouped_worklist_epilogue_shape
 from ...tcgen05_constants import tcgen05_grouped_worklist_smem_bytes
 from ...tcgen05_constants import tcgen05_two_cta_edge_k_tail_seed_overrides
 from ...thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+from ...thread_budget import MAX_THREADS_PER_BLOCK
+from ...unpadded_rows import unpadded_row_layout
 from ..config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
 from ..config_keys import CUTE_CHUNK_PREPARE_SCHEDULE_KEY
 from ..config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
@@ -146,6 +164,8 @@ from ..config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from ..config_keys import _cute_chunk_recurrence_config_is_safe
 from ..flash_surface import cute_flash_gated_seed_configs
 from ..flash_surface import cute_flash_seed_configs
+from ..flash_surface import pdl_searched
+from ..search_surface import cute_lone_row_reduction
 from ..search_surface import enable_cute_affine_scan_search
 from ..search_surface import enable_cute_async_load_pipeline
 from ..search_surface import enable_cute_bf16x2_recurrence
@@ -159,6 +179,8 @@ from ..search_surface import enable_cute_topk_search
 log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -855,7 +877,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
     name = "cute_reduction_tile"
     backend = "cute"
-    priority = 28
+    priority = 29
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -1009,6 +1031,42 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         }
         return Config(**seed)
 
+    @classmethod
+    def two_packet_persistent_row_seed_config(
+        cls, env: CompileEnvironment, rolled: Config
+    ) -> Config | None:
+        """The two-packet row of one warp held in registers.
+
+        When ``rolled``, the two-packet rolled row
+        (``two_packet_rolled_row_seed_config``), is one trip of a single warp,
+        the persistent row keeps its layout -- each thread holds two V-wide
+        packets ``32 * V`` elements apart (``PersistentReductionStrategy``'s
+        chunked lanes, which stay within one warp) -- and every sweep reads
+        registers.  The rolled trip re-reads, in each later sweep, the scalar
+        loads of a tensor whose rows are not packet aligned; the one-vector
+        row of 16 elements per thread spreads those scalar loads over the
+        whole row per warp instruction where the two packets span half of it.
+        XLNet's relative-shift softmax (bf16 rows of 512 beside a position row
+        shifted by one element per row) runs faster in this form, with the
+        native warp reductions (``get_seed_configs``), than in the one-vector
+        row.  It fires only where the rolled seed's block is that one warp, a
+        ``64 * V``-wide row (512 bf16 or f16 elements, 256 fp32): wider rows,
+        whose rolled seed takes more warps, get no one-warp row holding more
+        packets per thread, a layout not measured here.
+        """
+        spec = env.config_spec
+        block_id = cast("ReductionLoopSpec", spec.reduction_loops[0]).block_id
+        threads = spec.num_threads.config_get(
+            cast("list[int]", rolled.config["num_threads"]), block_id, 0
+        )
+        # The rolled row's chunk is the static extent when it fits the
+        # thread budget: one trip.
+        if threads != 32 or rolled.config["reduction_loops"] != [
+            _cute_static_block_extent(env, block_id)
+        ]:
+            return None
+        return Config.from_dict(deepcopy(rolled.config) | {"reduction_loops": [None]})
+
     WARP_ROWS_PER_CTA = (2, 4)
     WARP_ROWS_MAX_EXTENT = 4096
 
@@ -1113,6 +1171,21 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         rolled = cls.two_packet_rolled_row_seed_config(env, device_ir)
         if rolled is not None and rolled not in seeds:
             seeds.append(rolled)
+        persistent = (
+            None
+            if rolled is None
+            else cls.two_packet_persistent_row_seed_config(env, rolled)
+        )
+        if persistent is not None:
+            if env.config_spec.cute_native_redux_sites:
+                # The row's max, min or ``any`` takes one ``redux.sync`` per
+                # warp; the kernel's structure opens the knob at every shape
+                # (``cute_native_redux_sites``).
+                persistent = Config.from_dict(
+                    deepcopy(persistent.config) | {"cute_warp_fp32_redux": True}
+                )
+            if persistent not in seeds:
+                seeds.append(persistent)
         for warp_rows in cls.warp_rows_seed_configs(env, device_ir):
             if warp_rows not in seeds:
                 seeds.append(warp_rows)
@@ -1235,7 +1308,7 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
 
     name = "cute_register_tile"
     backend = "cute"
-    priority = 29
+    priority = 30
     promote_seed_to_default = True
     VECTOR_THREADS = 8
 
@@ -1363,7 +1436,8 @@ class CuteRegisterTileHeuristic(AutotunerHeuristic):
         ``pre > 1`` form reads ``group_span // pre`` partials per column and
         the warp fold does not (fused linear-attention step at
         [512, 128, 128] fp32, L2-warm: 8.4 us -> 8.2 us; the knob-free finer
-        tile was 10.0 us).
+        tile was 10.0 us).  The cooperative fold, which reads fewer still,
+        is not seeded (``RegisterTileOptions``).
         """
         primary = cls.get_seed_config(env, device_ir)
         if primary is None:
@@ -1409,6 +1483,49 @@ def _cute_tile_seed_vec_width_for_dtype(dtype: torch.dtype | None) -> int:
     if dtype in (torch.float16, torch.bfloat16):
         return 8
     return 1
+
+
+def _cute_reduction_dtype(
+    device_ir: DeviceIR, reduction_size: int
+) -> torch.dtype | None:
+    """The loaded dtype of a row ``reduction_size`` long that takes the
+    widest vector (``_cute_tile_seed_vec_width_for_dtype``), or None."""
+    # Ignore the integer FakeTensor produced by ``hl.arange`` itself and
+    # find a vector-loadable tensor value using that trailing dimension.
+    best_dtype: torch.dtype | None = None
+    best_width = 1
+    for graph_info in device_ir.graphs:
+        for node in graph_info.graph.nodes:
+            value = node.meta.get("val")
+            target_name = getattr(node.target, "__name__", "")
+            if (
+                isinstance(value, torch.Tensor)
+                and value.ndim >= 1
+                and isinstance(value.shape[-1], int)
+                and value.shape[-1] == reduction_size
+                and target_name in ("_host_tensor", "load")
+            ):
+                width = _cute_tile_seed_vec_width_for_dtype(value.dtype)
+                if width > best_width:
+                    best_dtype = value.dtype
+                    best_width = width
+    return best_dtype
+
+
+def _row_starts_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, dim: int, start: object, vec: int
+) -> bool:
+    """Whether every row of ``tensor`` walked along ``dim`` from ``start``
+    keeps a ``vec``-wide packet at a multiple of ``vec`` aligned, relative to
+    the tensor's base: ``start`` and the strides of the other dims (a static
+    size-1 dim aside, which never moves an address) are multiples of
+    ``vec``.  Decided by ``specialized_multiple``, which guards no shape."""
+    return env.specialized_multiple(start, vec) and all(
+        env.specialized_multiple(tensor.stride(other), vec)
+        for other in range(tensor.ndim)
+        if other != dim
+        and not (isinstance(tensor.shape[other], int) and tensor.shape[other] == 1)
+    )
 
 
 def _cute_tile_row_blocks(env: CompileEnvironment) -> tuple[int, int] | None:
@@ -1522,27 +1639,18 @@ def _cute_tile_vector_axis(
     return (outer_block_id, block_id, vec, extent) if vec > 1 else None
 
 
-def _cute_persistent_contiguous_block(
-    env: CompileEnvironment, device_ir: DeviceIR
-) -> tuple[int, torch.dtype, int] | None:
-    """The persistent block every load and store addresses at its tensor's
-    stride-1 dim through a unit-step slice, with the widest storage dtype
-    and the block's static extent.
-
-    ``None`` when some access addresses that dim with a tile, a gather or a
-    strided slice, when the slices resolve to different blocks, or when the
-    extent is not static.
-    """
-    from .....language import memory_ops
-    from ....utils import compute_slice_size
-
-    block_id: int | None = None
-    dtype: torch.dtype | None = None
+def _stride_one_accesses(
+    device_ir: DeviceIR,
+) -> Iterator[tuple[torch.Tensor, int, list[object]] | None]:
+    """Each load and store of ``device_ir`` as ``(tensor, its stride-1 dim,
+    the subscripts of its dims)``, ``None`` for one whose tensor or indices
+    are not plain.  An operand with no stride-1 dim (a broadcast, stride 0
+    everywhere) sets no lane axis and is skipped."""
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or node.target not in (
-                memory_ops.load,
-                memory_ops.store,
+                language_load,
+                language_store,
             ):
                 continue
             tensor_node = node.args[0] if node.args else None
@@ -1555,7 +1663,8 @@ def _cute_persistent_contiguous_block(
             if not isinstance(fake, torch.Tensor) or not isinstance(
                 index_list, (list, tuple)
             ):
-                return None
+                yield None
+                continue
             stride1 = next(
                 (
                     dim
@@ -1564,39 +1673,109 @@ def _cute_persistent_contiguous_block(
                 ),
                 None,
             )
-            if stride1 is None:
-                # A broadcast operand (stride-0 everywhere) sets no lane axis.
-                continue
-            tensor_dim = 0
-            subscript: object = None
-            for idx in index_list:
-                if idx is None:
-                    continue
-                if tensor_dim == stride1:
-                    subscript = idx
-                    break
-                tensor_dim += 1
-            if not isinstance(subscript, slice) or subscript.step not in (None, 1):
-                return None
-            size = compute_slice_size(subscript, fake.shape[stride1])
-            matches = [
-                info.block_id
-                for info in env.block_sizes
-                if info.reduction
-                and isinstance(info.size, (int, torch.SymInt))
-                and env.known_equal(info.size, size)
-            ]
-            if len(matches) != 1 or (block_id is not None and block_id != matches[0]):
-                return None
-            block_id = matches[0]
-            if dtype is None or fake.dtype.itemsize > dtype.itemsize:
-                dtype = fake.dtype
+            if stride1 is not None:
+                yield fake, stride1, [idx for idx in index_list if idx is not None]
+
+
+def _slice_reduction_blocks(
+    env: CompileEnvironment, fake: torch.Tensor, dim: int, subscript: object
+) -> tuple[object, list[int]] | None:
+    """``(extent, reduction blocks of that extent)`` of ``subscript``, a
+    unit-step slice of ``fake``'s ``dim``; ``None`` for any other subscript."""
+    if not isinstance(subscript, slice) or subscript.step not in (None, 1):
+        return None
+    size = compute_slice_size(subscript, fake.shape[dim])
+    return size, [
+        info.block_id
+        for info in env.block_sizes
+        if info.reduction
+        and isinstance(info.size, (int, torch.SymInt))
+        and env.known_equal(info.size, size)
+    ]
+
+
+def _cute_persistent_contiguous_block(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> tuple[int, torch.dtype, int] | None:
+    """The persistent block every load and store addresses at its tensor's
+    stride-1 dim through a unit-step slice, with the widest storage dtype
+    and the block's static extent.
+
+    ``None`` when some access addresses that dim with a tile, a gather or a
+    strided slice, when the slices resolve to different blocks, or when the
+    extent is not static.
+    """
+    block_id: int | None = None
+    dtype: torch.dtype | None = None
+    for access in _stride_one_accesses(device_ir):
+        if access is None:
+            return None
+        fake, stride1, subscripts = access
+        subscript = subscripts[stride1] if stride1 < len(subscripts) else None
+        sliced = _slice_reduction_blocks(env, fake, stride1, subscript)
+        if sliced is None:
+            return None
+        _, matches = sliced
+        if len(matches) != 1 or (block_id is not None and block_id != matches[0]):
+            return None
+        block_id = matches[0]
+        if dtype is None or fake.dtype.itemsize > dtype.itemsize:
+            dtype = fake.dtype
     if block_id is None or dtype is None:
         return None
     numel = env.block_sizes[block_id].numel
     if not isinstance(numel, (int, sympy.Integer)):
         return None
     return block_id, dtype, int(numel)
+
+
+def _wide_rows_outweigh_tile(
+    env: CompileEnvironment, device_ir: DeviceIR, tile_block: int, width: int
+) -> bool:
+    """Whether a load or store moves a row wider than ``width`` along its
+    tensor's stride-1 dim through a whole-dim slice (a 30522-wide row beside
+    its label in a folded cross-entropy backward) while no access that
+    ``tile_block`` tiles along its stride-1 dim spans such a row too (a
+    transpose's ``out[:, tile]`` stores its wide dim along the tile)."""
+
+    def wide(fake: torch.Tensor, dim: int, subscript: object) -> bool:
+        sliced = _slice_reduction_blocks(env, fake, dim, subscript)
+        if sliced is None:
+            return False
+        size, blocks = sliced
+        return (
+            bool(blocks)
+            and isinstance(size, (int, torch.SymInt))
+            and env.size_hint(size) > width
+        )
+
+    tile_var = _symint_sympy_expr(env.block_sizes[tile_block].var)
+    wide_row = False
+    for access in _stride_one_accesses(device_ir):
+        if access is None:
+            continue
+        fake, stride1, subscripts = access
+        if len(subscripts) != fake.ndim:
+            continue
+        subscript = subscripts[stride1]
+        tile = (
+            subscript.meta.get("val")
+            if isinstance(subscript, torch.fx.Node)
+            else subscript
+        )
+        if wide(fake, stride1, subscript):
+            wide_row = True
+        elif (
+            isinstance(tile, torch.SymInt)
+            and _symint_sympy_expr(tile) == tile_var
+            and any(
+                wide(fake, dim, other)
+                for dim, other in enumerate(subscripts)
+                if dim != stride1
+            )
+        ):
+            return False
+    return wide_row
 
 
 class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
@@ -1610,7 +1789,7 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
 
     name = "cute_persistent_subwarp_rows"
     backend = "cute"
-    priority = 33
+    priority = 34
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
     FULL_ROW_BLOCK_SIZE = 128
     RECURRENT_STYLE_REDUCTION_SIZE = 128
@@ -1633,48 +1812,26 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
         enable_cute_proven_bounds(env.config_spec)
         return cls.CACHE_SPECIALIZATION_FACTS
 
-    @staticmethod
-    def _reduction_dtype(
-        device_ir: DeviceIR, reduction_size: int
-    ) -> torch.dtype | None:
-        # Ignore the integer FakeTensor produced by ``hl.arange`` itself and
-        # find a vector-loadable tensor value using that trailing dimension.
-        best_dtype: torch.dtype | None = None
-        best_width = 1
-        for graph_info in device_ir.graphs:
-            for node in graph_info.graph.nodes:
-                value = node.meta.get("val")
-                target_name = getattr(node.target, "__name__", "")
-                if (
-                    isinstance(value, torch.Tensor)
-                    and value.ndim >= 1
-                    and isinstance(value.shape[-1], int)
-                    and value.shape[-1] == reduction_size
-                    and target_name in ("_host_tensor", "load")
-                ):
-                    width = _cute_tile_seed_vec_width_for_dtype(value.dtype)
-                    if width > best_width:
-                        best_dtype = value.dtype
-                        best_width = width
-        return best_dtype
-
     @classmethod
     def _plan(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> tuple[int, int, int] | None:
         spec = env.config_spec
-        if spec.matmul_facts or spec.reduction_loops or len(spec.block_sizes) != 1:
+        blocks = cute_lone_row_reduction(
+            spec,
+            spec.cute_vector_widths,
+            spec.cute_lane_layouts,
+            spec.cute_reduction_reloads,
+        )
+        if blocks is None:
             return None
-        reduction_blocks = [block for block in env.block_sizes if block.reduction]
-        if len(reduction_blocks) != 1:
-            return None
-        reduction_block = reduction_blocks[0]
+        row_block_id, reduction_block_id = blocks
         try:
-            reduction_size = int(reduction_block.numel)
+            reduction_size = int(env.block_sizes[reduction_block_id].numel)
         except (TypeError, ValueError):
             return None
         vec = _cute_tile_seed_vec_width_for_dtype(
-            cls._reduction_dtype(device_ir, reduction_size)
+            _cute_reduction_dtype(device_ir, reduction_size)
         )
         if vec <= 1 or not 32 <= reduction_size <= 256:
             return None
@@ -1683,26 +1840,10 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
         reduction_threads = reduction_size // vec
         if reduction_threads not in (4, 8, 16, 32):
             return None
-
         row_spec = cast("Any", spec.block_sizes[0])
-        if len(row_spec.block_ids) != 1:
-            return None
         if not row_spec.min_size <= 16 <= row_spec.max_size:
             return None
-        row_block_id = row_spec.block_id
-        required = (
-            (spec.num_threads, row_block_id),
-            (spec.num_threads, reduction_block.block_id),
-            (spec.cute_vector_widths, reduction_block.block_id),
-            (spec.cute_lane_layouts, reduction_block.block_id),
-            (spec.cute_reduction_reloads, reduction_block.block_id),
-        )
-        if any(
-            block_id not in sequence.valid_block_ids()
-            for sequence, block_id in required
-        ):
-            return None
-        return row_block_id, reduction_block.block_id, reduction_threads
+        return row_block_id, reduction_block_id, reduction_threads
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -1773,7 +1914,7 @@ class CutePersistentSubwarpRowsHeuristic(AutotunerHeuristic):
         if reduction_size != cls.RECURRENT_STYLE_REDUCTION_SIZE:
             return None
         dtype_vec = _cute_tile_seed_vec_width_for_dtype(
-            cls._reduction_dtype(device_ir, reduction_size)
+            _cute_reduction_dtype(device_ir, reduction_size)
         )
         if dtype_vec < cls.RECURRENT_STYLE_VECTOR_WIDTH:
             return None
@@ -1927,7 +2068,7 @@ class CuteAsyncPersistentSubwarpRowsHeuristic(AutotunerHeuristic):
 
     name = "cute_async_persistent_subwarp_rows"
     backend = "cute"
-    priority = 34
+    priority = 35
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
 
     @classmethod
@@ -2081,16 +2222,229 @@ class CuteAsyncPersistentSubwarpRowsHeuristic(AutotunerHeuristic):
         return Config.from_dict(values)
 
 
+class CutePersistentLaneUnrollHeuristic(AutotunerHeuristic):
+    """Seed a masked persistent row whose lanes issue their loads first.
+
+    A persistent row whose length is not a power of two pads to the next one
+    and is masked, which keeps it off the vector-row and register-tile paths:
+    one warp walks it in rolled scalar lanes, each lane loading right before
+    its arithmetic, so a latency-bound row keeps one load in flight per
+    thread (better-benchmark's dual_dropout_residual_layernorm: two Philox
+    draws and a LayerNorm over 768 columns).
+    ``cute_lane_unroll`` issues the loads of that many lanes before any of
+    them computes.  The seed runs eight rows of one warp each, with register
+    reloads and eight lanes per load phase.  The knob's search choices open
+    on the kernel's structure (``cute_lone_row_reduction``), whatever its
+    extents, not on this seed.  It only seeds: a knob-on config may contract
+    a multiply-add the knob-off code keeps separate (see
+    ``cute_lane_unroll`` in ``Config``).
+    """
+
+    name = "cute_persistent_lane_unroll"
+    backend = "cute"
+    priority = 95
+    ROW_BLOCK_SIZE = 8
+    LANE_UNROLL = 8
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int] | None:
+        if not env.config_spec.supports_config_key("cute_lane_unroll"):
+            return None
+        row = _masked_persistent_row(env, cls.ROW_BLOCK_SIZE)
+        # The seed's one warp walks the row's live lanes; an odd count takes
+        # no unroll factor, so the knob would walk them rounded up to its
+        # multiple (``masked_row_lanes``), which the seed does not offer:
+        # whether those beat the rolled live lanes is the search's to find.
+        if row is None or not walks_live_lanes(
+            row[2], WARP_THREADS, proven_bounds=False, unroll=cls.LANE_UNROLL
+        ):
+            return None
+        return row[:2]
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls.get_seed_config(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id = plan
+        spec = env.config_spec
+        seed: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {row_block_id: cls.ROW_BLOCK_SIZE}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {row_block_id: cls.ROW_BLOCK_SIZE, reduction_block_id: 32},
+            ),
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {reduction_block_id: "register"}
+            ),
+            "cute_lane_unroll": cls.LANE_UNROLL,
+        }
+        config = Config(**seed)
+        # Where normalization resets the knob, no lane loop of this layout
+        # takes it (``_cute_config_forms_lane_loop``), and the seed would be
+        # a plain layout.
+        if spec.normalized_config(config).config.get("cute_lane_unroll", 1) == 1:
+            return None
+        return config
+
+
+def _masked_persistent_row(
+    env: CompileEnvironment, row_block_size: int
+) -> tuple[int, int, int] | None:
+    """The row and reduction block ids and the row's length, for a kernel
+    whose one reduction runs persistent (no ``reduction_loops`` slot may roll
+    it, ``cute_lone_row_reduction``) over a static, masked row longer than a
+    warp, beside one tile axis whose block may be ``row_block_size``."""
+    spec = env.config_spec
+    blocks = cute_lone_row_reduction(spec, spec.cute_reduction_reloads)
+    if blocks is None:
+        return None
+    row_block_id, reduction_block_id = blocks
+    numel = env.specialize_expr(env.block_sizes[reduction_block_id].numel)
+    if not isinstance(numel, (int, sympy.Integer)):
+        return None
+    size = int(numel)
+    if size <= 32 or size & (size - 1) == 0:
+        return None
+    row_spec = cast("Any", spec.block_sizes[0])
+    if not row_spec.min_size <= row_block_size <= row_spec.max_size:
+        return None
+    return row_block_id, reduction_block_id, size
+
+
+class CutePersistentUnpaddedRowsHeuristic(AutotunerHeuristic):
+    """Seed a masked persistent row unpadded across several warps.
+
+    The row ``CutePersistentLaneUnrollHeuristic`` seeds walks its live lanes
+    on one warp.  ``cute_unpadded_rows`` instead runs it unpadded when
+    a whole number of warps, one vector per thread, covers it exactly: the
+    multi-warp vector row, whose packets load before the arithmetic and whose
+    sums combine across warps through shared memory, like Inductor's four
+    warps per 768-wide row.  The primary seed takes the widest vector the
+    row's narrowest loaded element allows (8 for bf16: 96 threads for 768
+    columns) that leaves whole warps, the alternate the next narrower one
+    (4: 192 threads); both run one row per CTA with register reloads.  Only
+    a row no ``reduction_loops`` slot may roll is seeded
+    (``_masked_persistent_row``), and no row an ``hl.reduce`` reduces, which
+    keeps its padding (``cute_user_reduce_block_ids``): a rollable row of the
+    same width (a plain softmax over 768 columns) takes the knob too, but no
+    seed offers it the whole-warp thread count, which the search's
+    power-of-two thread counts never reach.  The knob's search choices open
+    on the kernel's structure, not on these seeds.  They only seed: the
+    unpadded row sums in another order and contracts its multiply-adds
+    differently (see ``cute_unpadded_rows`` in ``Config``).
+    """
+
+    name = "cute_persistent_unpadded_rows"
+    backend = "cute"
+    priority = 96
+    ROW_BLOCK_SIZE = 1
+    # The primary layout and one alternate.
+    LAYOUTS = 2
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, list[tuple[int, int]]] | None:
+        """The row and reduction block ids and the exact ``(threads, vec)``
+        layouts, widest vector first."""
+        spec = env.config_spec
+        if not spec.supports_config_key("cute_unpadded_rows"):
+            return None
+        row = _masked_persistent_row(env, cls.ROW_BLOCK_SIZE)
+        if row is None:
+            return None
+        row_block_id, reduction_block_id, size = row
+        if (
+            reduction_block_id not in spec.cute_vector_widths.valid_block_ids()
+            or reduction_block_id in spec.cute_user_reduce_block_ids
+        ):
+            return None
+        vec = _cute_tile_seed_vec_width_for_dtype(
+            _cute_reduction_dtype(device_ir, size)
+        )
+        layouts: list[tuple[int, int]] = []
+        while vec > 1 and len(layouts) < cls.LAYOUTS:
+            threads = size // vec
+            if (
+                unpadded_row_layout(threads, vec, size)
+                and threads * cls.ROW_BLOCK_SIZE <= MAX_THREADS_PER_BLOCK
+            ):
+                layouts.append((threads, vec))
+            vec //= 2
+        if not layouts:
+            return None
+        return row_block_id, reduction_block_id, layouts
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._plan(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        row_block_id, reduction_block_id, layouts = plan
+        spec = env.config_spec
+        seeds: list[Config] = []
+        for threads, vec in layouts:
+            seed: dict[str, Any] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {row_block_id: cls.ROW_BLOCK_SIZE}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads,
+                    {row_block_id: cls.ROW_BLOCK_SIZE, reduction_block_id: threads},
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {reduction_block_id: vec}
+                ),
+                "cute_reduction_reloads": _seq_config_list(
+                    spec.cute_reduction_reloads, {reduction_block_id: "register"}
+                ),
+                "cute_unpadded_rows": True,
+            }
+            seeds.append(Config(**seed))
+        return seeds
+
+
 class CuteTileVecHeuristic(AutotunerHeuristic):
     """Seed config for canonical tile kernels (softmax_two_pass etc.)
     that drive their own explicit tile loop over the reduction axis.
 
     Seeds the "wide reduction + per-thread vec" config: block_size=
     [1, R] on the M and reduction axes (1 row per grid block), num_threads
-    sized so each thread owns V contiguous elements (lane_extent = V),
+    sized so each thread owns one V-wide vector per trip (lane_extent = V),
     cute_vector_widths=[1, V].  This lets the strategy hoist a single
     LDG.64 / LDG.128 per outer-tile iter, lifting the kernel from scalar
-    LDG bandwidth.
+    LDG bandwidth.  Beside it, when the tile admits it and
+    ``cute_lane_layouts`` covers the tile, comes Helion-Triton's block:
+    2048 elements over 64 threads, so several vectors per thread, strided by
+    the thread count (``cute_lane_layouts`` ``strided``) so that a warp's
+    load reads adjacent vectors.  Blocked lanes would put a thread's own
+    vectors side by side and neighbouring threads a whole thread's span
+    apart (64 bytes for four 16-byte vectors), four times the L1 wavefronts
+    per load.
 
     The heuristic fires when:
     * The kernel has exactly 2 tile blocks (one outer row tile + one
@@ -2100,7 +2454,14 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_vec"
     backend = "cute"
-    priority = 39
+    priority = 40
+    # Helion-Triton's tile for these rows: two warps walk a 2048-element
+    # block, 32 elements per thread, which leaves the block's reductions a
+    # quarter as often as one vector per thread does.  Its lanes load each
+    # element once, since a later pass reuses the earlier one's loads
+    # (``cute/stash_lane_loads.py``).
+    WIDE_BLOCK = 2048
+    WIDE_THREADS = 64
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -2110,9 +2471,16 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
         axis = _cute_tile_vector_axis(env, device_ir)
         if axis is None:
-            return None
+            return []
         outer_block_id, inner_block_id, vec, _extent = axis
         spec = env.config_spec
         # Pick a reasonable inner block_size: prefer 1024 (matches
@@ -2121,21 +2489,34 @@ class CuteTileVecHeuristic(AutotunerHeuristic):
         # lane_extent equals V (one vec load per thread per outer iter).
         bn_high = spec.block_sizes.block_id_lookup(inner_block_id)._fragment(spec).high
         block_n = 1024 if bn_high >= 1024 else max(bn_high, vec)
-        # Threads = block_n // V so each thread owns V contiguous elts.
-        nt_n = max(1, block_n // vec)
-        seed: dict[str, Any] = {
-            "block_sizes": _seq_config_list(
-                spec.block_sizes, {outer_block_id: 1, inner_block_id: block_n}
-            ),
-            "num_threads": _seq_config_list(spec.num_threads, {inner_block_id: nt_n}),
-            "cute_vector_widths": _seq_config_list(
-                spec.cute_vector_widths, {inner_block_id: vec}
-            ),
-        }
-        try:
-            return Config(**seed)
-        except Exception:
-            return None
+        shapes = [(block_n, max(1, block_n // vec))]
+        if (
+            bn_high >= cls.WIDE_BLOCK
+            # Its lanes need the strided layout (see the class docstring).
+            and inner_block_id in spec.cute_lane_layouts.valid_block_ids()
+        ):
+            shapes.append((cls.WIDE_BLOCK, cls.WIDE_THREADS))
+        seeds: list[Config] = []
+        for block, threads in shapes:
+            seed: dict[str, Any] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {outer_block_id: 1, inner_block_id: block}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {inner_block_id: threads}
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {inner_block_id: vec}
+                ),
+            }
+            if block > threads * vec:
+                # Several V-wide chunks per thread: strided lanes give a
+                # warp's threads adjacent chunks.
+                seed["cute_lane_layouts"] = _seq_config_list(
+                    spec.cute_lane_layouts, {inner_block_id: "strided"}
+                )
+            seeds.append(Config(**seed))
+        return seeds
 
 
 class CuteScanTileHeuristic(AutotunerHeuristic):
@@ -2159,7 +2540,7 @@ class CuteScanTileHeuristic(AutotunerHeuristic):
 
     name = "cute_scan_tile"
     backend = "cute"
-    priority = 38
+    priority = 39
     SCAN_ROWS = 16
     ALTERNATE_SCAN_ROWS = 32
     # Column strips per CTA (one warp of 16-byte strips).
@@ -2384,7 +2765,7 @@ class CuteTileVecWarpReduceHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_vec_warp_reduce"
     backend = "cute"
-    priority = 40
+    priority = 41
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -3125,6 +3506,104 @@ def _cute_reread_cache_policies(
     return cache_policies
 
 
+def _cute_streaming_input_cache_policies(
+    spec: ConfigSpec,
+    device_ir: DeviceIR,
+    config: Config,
+    reduction_block_id: int,
+    tile_block_id: int,
+    row_elements: int,
+    line_bytes: int,
+) -> list[str]:
+    """``l1_l2_first`` on the load slots of ``config`` that stream an input
+    through once, "" on the others.  Such a load feeds the
+    ``reduction_block_id`` reduction once, addresses every grid axis with no
+    axis broadcast (a zero stride), and is the code's only load of its
+    tensor, so each CTA reads its own slice of the input, once; and the
+    CTA's rows of ``row_elements`` contiguous elements, the
+    ``tile_block_id`` tile along the tensor's stride-1 dim, own the L2 lines
+    (``line_bytes``) they read (``_rows_own_their_lines``), so no
+    neighboring CTA reads them.  A tile wider than that dim counts at its
+    full width, though its CTA reads rows of the dim's extent that can share
+    lines with the neighboring CTAs: the policy still ran the wide seeds of
+    a [64, 784, 4, 40] float32 grouped mean (64-column tiles, 160-byte rows
+    640 bytes apart) 4-5% faster on B200 with a cold L2.  (An input whose
+    stride-1 dim another axis indexes gets no policy: its CTA reads one
+    element per line, or the whole reduced extent, which the seed does not
+    size.)  The slots are numbered as the code for ``config`` lowers the
+    loads (``DeviceIR.config_memory_op_facts``): a reduction rolled in
+    several passes loads its input again in each, and
+    rolling lowers a per-channel weight, which every CTA of a channel tile
+    shares, ahead of the loop.  Two views keep the policy where neighbors
+    read lines marked evict-first again from DRAM: one whose CTAs read the
+    same elements (an ``as_strided`` batch stride below the rows inside it;
+    the strides are not checked for overlap), and one whose storage offset
+    starts its rows inside a line (the line check reads the strides, since
+    the binding does not key on the offset, and a check of the example's
+    offset could leave a stale hint).  The policy is a cache hint, so that
+    costs bandwidth, never a value.
+
+    Under a cold-L2 timer the flush leaves L2 full of dirty lines; a stream
+    whose lines are not evict-first evicts them, so their write-back runs
+    inside the kernel: 27.7 against 24.0 us for a channels-last spatial mean
+    over 127 MB of bf16 on B200, where the evict-first stream writes back
+    4-9 MB instead of 45-49 MB (ncu)."""
+    grid_block_ids = {item.block_id for item in spec.block_sizes}
+    facts = device_ir.config_memory_op_facts(spec.normalized_config(config))
+    loads = collections.Counter(
+        fact.tensor_name for fact in facts if fact.kind == "load"
+    )
+    policies = [""] * spec.load_eviction_policies.length
+    for fact in facts:
+        if (
+            fact.eviction_index is not None
+            and fact.tensor_name is not None
+            and loads[fact.tensor_name] == 1
+            and dict(fact.reductions_fed).get(reduction_block_id) == 1
+            and grid_block_ids <= set(fact.subscript_block_ids)
+            and 0 not in fact.subscript_strides
+            and _contiguous_block_id(fact) == tile_block_id
+            and _rows_own_their_lines(fact, row_elements, line_bytes)
+        ):
+            policies[fact.eviction_index] = "l1_l2_first"
+    return policies
+
+
+def _contiguous_block_id(fact: MemoryOpFact) -> int | None:
+    """The block of ``fact``'s subscript at its tensor's stride-1 dim, or None
+    without exactly one such dim."""
+    positions = [
+        position
+        for position, stride in enumerate(fact.subscript_strides)
+        if stride == 1
+    ]
+    if len(positions) != 1 or positions[0] >= len(fact.subscript_block_ids):
+        return None
+    return fact.subscript_block_ids[positions[0]]
+
+
+def _rows_own_their_lines(
+    fact: MemoryOpFact, row_elements: int, line_bytes: int
+) -> bool:
+    """Whether CTA rows of ``row_elements`` contiguous elements of ``fact``'s
+    tensor own the L2 lines (``line_bytes``) they read: rows of at least two
+    lines (only the lines at the ends may be shared), or whole lines that
+    start on line boundaries (the row and every stride but the contiguous
+    one a multiple of the line in bytes; a narrower row shares its lines with
+    the neighboring CTA, an unaligned one straddles two).  The tensor's
+    storage offset is taken as line-aligned."""
+    if fact.dtype is None:
+        return False
+    itemsize = fact.dtype.itemsize
+    row_bytes = row_elements * itemsize
+    if row_bytes >= 2 * line_bytes:
+        return True
+    return row_bytes % line_bytes == 0 and all(
+        stride == 1 or stride * itemsize % line_bytes == 0
+        for stride in fact.subscript_strides
+    )
+
+
 class CuteSiblingRowHeuristic(AutotunerHeuristic):
     """Coherent vector/thread seeds for distinct sibling row-tile passes.
 
@@ -3136,7 +3615,7 @@ class CuteSiblingRowHeuristic(AutotunerHeuristic):
 
     name = "cute_sibling_row"
     backend = "cute"
-    priority = 46
+    priority = 47
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
 
     @classmethod
@@ -3336,12 +3815,7 @@ def _dependent_launch(spec: ConfigSpec) -> dict[str, bool]:
     idle (vanilla linear attention forward: 7.45 us per call packed, 4.1
     spread); a tie in isolation, it is searched and preferred among ties.
     """
-    capability = spec.target_device_capability
-    if (
-        spec.supports_config_key("cute_pdl")
-        and capability is not None
-        and capability >= (9, 0)
-    ):
+    if pdl_searched(spec):
         return {"cute_pdl": True, CUTE_PDL_SPREAD_KEY: True}
     return {}
 
@@ -3373,7 +3847,7 @@ class CuteNestedRowHeuristic(AutotunerHeuristic):
 
     name = "cute_nested_row"
     backend = "cute"
-    priority = 47
+    priority = 48
     CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
     promote_seed_to_default = True
 
@@ -3639,7 +4113,7 @@ class CuteResidentRowHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_row"
     backend = "cute"
-    priority = 48
+    priority = 49
 
     @classmethod
     def _plan(
@@ -3745,7 +4219,7 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_row_wide_cluster"
     backend = "cute"
-    priority = 49
+    priority = 50
 
     @classmethod
     def _plan(
@@ -3802,7 +4276,7 @@ class CuteResidentRowWideClusterHeuristic(AutotunerHeuristic):
             # registers, so cap the budget for 3 CTAs/SM.
             seed["cute_min_blocks_per_mp"] = 3
         else:
-            # 64/thread: squeeze to ~24 warps/SM (85-register cap at 128
+            # 64/thread: squeeze to ~24 warps/SM (an 80-register cap at 128
             # threads); a handful of spills costs less than the lost CTA.
             seed["cute_min_blocks_per_mp"] = cls._TARGET_THREADS_PER_SM // threads
         try:
@@ -3822,7 +4296,7 @@ class CuteResidentMultiRowHeuristic(AutotunerHeuristic):
 
     name = "cute_resident_multi_row"
     backend = "cute"
-    priority = 50
+    priority = 51
 
     _ROWS_PER_CTA = 4
     _THREADS_PER_ROW = 32
@@ -3921,7 +4395,7 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_vec_warp_per_row"
     backend = "cute"
-    priority = 41
+    priority = 42
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -3966,7 +4440,220 @@ class CuteTileVecWarpPerRowHeuristic(AutotunerHeuristic):
             return None
 
 
-class CuteColumnReductionHeuristic(AutotunerHeuristic):
+# The reductions the column and de-linearized row heuristics seed.
+_REDUCTION_NAMES = ("sum", "amax", "amin", "prod", "mean")
+
+
+def _device_loop_reduction(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> tuple[tuple[int, ...], int, list[Node]] | None:
+    """``(grid_blocks, reduced_block_id, calls)`` when the kernel's single
+    grid loop, over ``grid_blocks``, holds a single device loop over one
+    block, ``reduced_block_id``, no matmul or reduction loop shapes the
+    tiles, and ``block_sizes`` has one entry per block of the two loops.
+    ``calls`` are the ``call_function`` nodes of the device loop."""
+    from ....device_ir import ForLoopGraphInfo
+
+    spec = env.config_spec
+    if spec.matmul_facts or spec.reduction_loops:
+        return None
+    paths = tile_loop_paths(device_ir, device_ir.graphs)
+    if len(paths) != 1 or len(paths[0]) != 2 or len(paths[0][1]) != 1:
+        return None
+    grid_blocks = paths[0][0]
+    (reduced_block_id,) = paths[0][1]
+    if len(spec.block_sizes) != len(grid_blocks) + 1 or any(
+        len(item.block_ids) != 1 for item in spec.block_sizes
+    ):
+        return None
+    calls = [
+        node
+        for graph_info in device_ir.graphs
+        if isinstance(graph_info, ForLoopGraphInfo)
+        and list(graph_info.block_ids) == [reduced_block_id]
+        for node in graph_info.graph.nodes
+        if node.op == "call_function"
+    ]
+    return grid_blocks, reduced_block_id, calls
+
+
+def _shape_exprs(value: object) -> list[object] | None:
+    """The sizes of the tensor ``value``, symbolic ones as sympy expressions
+    (None when ``value`` is no tensor)."""
+    if not isinstance(value, torch.Tensor):
+        return None
+    return [
+        _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else size
+        for size in value.shape
+    ]
+
+
+def _reduced_sizes(node: Node, reduced_symbol: sympy.Expr) -> list[object] | None:
+    """The sizes of the value ``node`` reduces, symbolic ones as sympy
+    expressions, when ``node`` is a ``_REDUCTION_NAMES`` reduction over one
+    dim of extent ``reduced_symbol``."""
+    if getattr(node.target, "__name__", "").split(".")[0] not in _REDUCTION_NAMES:
+        return None
+    dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
+    if isinstance(dims, int):
+        dims = [dims]
+    value = (
+        node.args[0].meta.get("val")
+        if node.args and isinstance(node.args[0], Node)
+        else None
+    )
+    if not (
+        isinstance(dims, (list, tuple))
+        and len(dims) == 1
+        and isinstance(dims[0], int)
+        and isinstance(value, torch.Tensor)
+        and -value.ndim <= dims[0] < value.ndim
+    ):
+        return None
+    sizes = _shape_exprs(value)
+    assert sizes is not None
+    return sizes if sizes[dims[0]] == reduced_symbol else None
+
+
+def _column_row_threads(row_threads: int, rows: int) -> int:
+    """``row_threads`` halved, down to one warp, until each thread takes at
+    least four of a chunk's ``rows``."""
+    while row_threads > 32 and rows // row_threads < 4:
+        row_threads //= 2
+    return row_threads
+
+
+def _load_operands(node: Node) -> tuple[torch.Tensor | None, object]:
+    """The tensor a load node reads (its first operand's value; None when
+    that is no tensor) and its subscript (the second operand, if any)."""
+    tensor_node = node.args[0] if node.args else None
+    tensor = tensor_node.meta.get("val") if isinstance(tensor_node, Node) else None
+    subscript = node.args[1] if len(node.args) > 1 else None
+    return (tensor if isinstance(tensor, torch.Tensor) else None), subscript
+
+
+class _CuteColumnSeedHeuristic(AutotunerHeuristic):
+    """What the column-sum seed heuristics share: ``_match`` finds
+    ``(column_block_id, reduced_block_id, source)`` when the kernel reduces
+    rows of a ``source`` whose last dim is the zero-origin column tile,
+    independently of the binding's extents and strides, and
+    ``get_seed_configs`` builds the seeds from ``_plan``."""
+
+    backend = "cute"
+    # Vector loads over a dynamic extent need the exact input metadata: the
+    # extent and the row strides must be proven multiples of the vector width.
+    # ``register_facts`` asks for it for every dynamic-shape binding that
+    # ``_match`` accepts, even where ``_plan`` then declines or autotuner
+    # heuristics are disabled, so such a ``static_shapes=False`` kernel binds,
+    # and may autotune, once per input shape and stride tuple.
+    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    # The input dtypes the seeds load as one 16-byte vector per thread.
+    SEED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        raise NotImplementedError
+
+    @staticmethod
+    def _lane_knobs(spec: ConfigSpec, block_ids: Sequence[int]) -> bool:
+        """Every block of ``block_ids`` has threads, a vector width and a lane
+        layout the seeds can set."""
+        return all(
+            set(block_ids).issubset(sequence.valid_block_ids())
+            for sequence in (
+                spec.num_threads,
+                spec.cute_vector_widths,
+                spec.cute_lane_layouts,
+            )
+        )
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """The match when sinking can fire for this binding: the column
+        tile's extent and the source's other strides are multiples of the
+        seed vector width (one aligned V-wide chunk per row)."""
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        column_block_id, _reduced_block_id, source = match
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        if not (
+            env.specialized_multiple(env.block_sizes[column_block_id].numel, vec)
+            and all(
+                env.specialized_multiple(source.stride(dim), vec)
+                for dim in range(source.ndim - 1)
+            )
+        ):
+            return None
+        return match
+
+    @staticmethod
+    def _seed(
+        spec: ConfigSpec,
+        column_block_id: int,
+        reduced_block_id: int,
+        vec: int,
+        block_sizes: dict[int, int],
+        num_threads: dict[int, int],
+        **knobs: object,
+    ) -> Config:
+        """A coalesced seed: ``block_sizes`` and ``num_threads`` by block id,
+        the vector width ``vec`` on the column block, a strided lane layout on
+        the reduced one, ``cute_vloop_sink`` and the row lane loop unrolled 8
+        deep, and the other ``knobs``."""
+        return Config.from_dict(
+            {
+                "block_sizes": _seq_config_list(spec.block_sizes, block_sizes),
+                "num_threads": _seq_config_list(spec.num_threads, num_threads),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {column_block_id: vec}
+                ),
+                "cute_lane_layouts": _seq_config_list(
+                    spec.cute_lane_layouts, {reduced_block_id: "strided"}
+                ),
+                "cute_vloop_sink": True,
+                "cute_lane_unroll": 8,
+                **knobs,
+            }
+        )
+
+    @classmethod
+    def register_facts(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> frozenset[CompilerHeuristicSpecializationFact]:
+        match = cls._match(env, device_ir)
+        if match is None:
+            # Nothing this binding's metadata could add would let a seed fire,
+            # so this hook adds no facts.  Other heuristics (the resident
+            # sequence and bounded loop cache seeds) may still key the same
+            # binding on its exact input metadata.
+            return frozenset()
+        column_block_id, _reduced_block_id, source = match
+        # Static extents and strides prove the vector layout by themselves;
+        # only dynamic ones need this binding's exact metadata.
+        if isinstance(env.block_sizes[column_block_id].size, torch.SymInt) or any(
+            isinstance(source.stride(dim), torch.SymInt) for dim in range(source.ndim)
+        ):
+            return cls.CACHE_SPECIALIZATION_FACTS
+        return frozenset()
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+
+class CuteColumnReductionHeuristic(_CuteColumnSeedHeuristic):
     """Coalesced seeds for a reduction over a serial tile axis whose other
     axis is the grid (a column sum: ``acc += sum(x[tile_m, tile_n], dim=0)``).
 
@@ -3984,11 +4671,7 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
     """
 
     name = "cute_column_reduction"
-    backend = "cute"
-    priority = 45
-    # Vector loads over a dynamic extent need the exact input metadata: the
-    # extent and the row strides must be proven multiples of the vector width.
-    CACHE_SPECIALIZATION_FACTS = frozenset({"input_tensor_metadata"})
+    priority = 46
 
     @classmethod
     def _match(
@@ -4000,155 +4683,46 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
         origin, ``source`` is contiguous along the grid axis and the seed
         vector fits one transaction: what sinking needs independently of this
         binding's extents and strides (``_plan`` checks those)."""
-        from ....device_ir import ForLoopGraphInfo
-
         spec = env.config_spec
-        if spec.matmul_facts or spec.reduction_loops:
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None or len(nest[0]) != 1:
             return None
-        paths = tile_loop_paths(device_ir, device_ir.graphs)
-        if (
-            len(paths) != 1
-            or len(paths[0]) != 2
-            or any(len(axis) != 1 for axis in paths[0])
-        ):
-            return None
-        grid_block_id, reduced_block_id = paths[0][0][0], paths[0][1][0]
+        (grid_block_id,), reduced_block_id, calls = nest
         if grid_block_id in device_ir.noncanonical_task_origin_block_ids:
             # ``hl.tile(8, n)``: the chunks are not V-aligned and the column
             # mask differs per element, so no load can be widened.
             return None
-        for sequence in (
-            spec.num_threads,
-            spec.cute_vector_widths,
-            spec.cute_lane_layouts,
-        ):
-            if not {grid_block_id, reduced_block_id}.issubset(
-                sequence.valid_block_ids()
-            ):
-                return None
-        if len(spec.block_sizes) != 2 or any(
-            len(item.block_ids) != 1 for item in spec.block_sizes
-        ):
+        if not cls._lane_knobs(spec, (grid_block_id, reduced_block_id)):
             return None
         grid_symbol = _symint_sympy_expr(env.block_sizes[grid_block_id].var)
         reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
-        for graph_info in device_ir.graphs:
-            if not isinstance(graph_info, ForLoopGraphInfo) or list(
-                graph_info.block_ids
-            ) != [reduced_block_id]:
+        for node in calls:
+            # The sum over the ``[reduced, grid]`` tile's rows.
+            if _reduced_sizes(node, reduced_symbol) != [reduced_symbol, grid_symbol]:
                 continue
-            for node in graph_info.graph.nodes:
-                if node.op != "call_function":
-                    continue
-                target_name = getattr(node.target, "__name__", "")
-                if target_name.split(".")[0] not in (
-                    "sum",
-                    "amax",
-                    "amin",
-                    "prod",
-                    "mean",
-                ):
-                    continue
-                dims = node.args[1] if len(node.args) > 1 else node.kwargs.get("dim")
-                if dims not in (0, [0], (0,)):
-                    continue
-                source = node.args[0]
-                if not isinstance(source, torch.fx.Node):
-                    continue
-                value = source.meta.get("val")
-                if not (isinstance(value, torch.Tensor) and value.ndim == 2):
-                    continue
-                reduced_dim, grid_dim = value.shape
-                if not (
-                    isinstance(reduced_dim, torch.SymInt)
-                    and isinstance(grid_dim, torch.SymInt)
-                    and _symint_sympy_expr(reduced_dim) == reduced_symbol
-                    and _symint_sympy_expr(grid_dim) == grid_symbol
-                ):
-                    continue
-                while (
-                    source.op == "call_function"
-                    and getattr(source.target, "__name__", "").startswith(
-                        "convert_element_type"
-                    )
-                    and isinstance(source.args[0], torch.fx.Node)
-                ):
-                    source = source.args[0]
-                loaded = source.meta.get("val")
-                tensor_node = source.args[0] if source.args else None
-                tensor = (
-                    tensor_node.meta.get("val")
-                    if isinstance(tensor_node, torch.fx.Node)
-                    else None
+            source = cast("Node", node.args[0])
+            while (
+                source.op == "call_function"
+                and getattr(source.target, "__name__", "").startswith(
+                    "convert_element_type"
                 )
-                if not (
-                    source.target is language_load
-                    and isinstance(loaded, torch.Tensor)
-                    and loaded.dtype in (torch.float16, torch.bfloat16, torch.float32)
-                    and isinstance(tensor, torch.Tensor)
-                    and tensor.ndim == 2
-                ):
-                    continue
-                vec = _cute_tile_seed_vec_width_for_dtype(tensor.dtype)
-                column_stride = tensor.stride(1)
-                if (
-                    vec > 1
-                    and vec * tensor.dtype.itemsize <= _CUTE_VECTOR_MAX_BYTES
-                    and isinstance(column_stride, int)
-                    and column_stride == 1
-                ):
-                    return grid_block_id, reduced_block_id, tensor
+                and isinstance(source.args[0], torch.fx.Node)
+            ):
+                source = source.args[0]
+            loaded = source.meta.get("val")
+            tensor, _ = _load_operands(source)
+            if not (
+                source.target is language_load
+                and isinstance(loaded, torch.Tensor)
+                and loaded.dtype in cls.SEED_DTYPES
+                and tensor is not None
+                and tensor.ndim == 2
+            ):
+                continue
+            column_stride = tensor.stride(1)
+            if isinstance(column_stride, int) and column_stride == 1:
+                return grid_block_id, reduced_block_id, tensor
         return None
-
-    @classmethod
-    def _plan(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> tuple[int, int, torch.Tensor] | None:
-        """The match when sinking can fire for this binding: the grid extent
-        and the source's row stride are multiples of the seed vector width
-        (one aligned V-wide chunk per row)."""
-        match = cls._match(env, device_ir)
-        if match is None:
-            return None
-        grid_block_id, _reduced_block_id, source = match
-        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
-        if not (
-            env.specialized_multiple(source.stride(0), vec)
-            and env.specialized_multiple(env.block_sizes[grid_block_id].numel, vec)
-        ):
-            return None
-        return match
-
-    @classmethod
-    def register_facts(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> frozenset[CompilerHeuristicSpecializationFact]:
-        match = cls._match(env, device_ir)
-        if match is None:
-            # Nothing this binding's metadata could add would let a seed fire,
-            # so this hook adds no facts.  Other heuristics (the resident
-            # sequence and bounded loop cache seeds) may still key the same
-            # binding on its exact input metadata.
-            return frozenset()
-        grid_block_id, _reduced_block_id, source = match
-        # Static extents and strides prove the vector layout by themselves;
-        # only dynamic ones need this binding's exact metadata.
-        if isinstance(env.block_sizes[grid_block_id].size, torch.SymInt) or any(
-            isinstance(source.stride(dim), torch.SymInt) for dim in range(source.ndim)
-        ):
-            return cls.CACHE_SPECIALIZATION_FACTS
-        return frozenset()
-
-    @classmethod
-    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return bool(cls.get_seed_configs(env, device_ir))
-
-    @classmethod
-    def get_seed_config(
-        cls, env: CompileEnvironment, device_ir: DeviceIR
-    ) -> Config | None:
-        seeds = cls.get_seed_configs(env, device_ir)
-        return seeds[0] if seeds else None
 
     @classmethod
     def get_seed_configs(
@@ -4183,43 +4757,817 @@ class CuteColumnReductionHeuristic(AutotunerHeuristic):
             if seed_vec < 2:
                 continue
             columns = grid_threads * seed_vec
-            row_threads = cta_threads // grid_threads
-            while row_threads > 32 and rows // row_threads < 4:
-                row_threads //= 2
+            row_threads = _column_row_threads(cta_threads // grid_threads, rows)
             if not (
                 grid_fragment.low <= columns <= grid_fragment.high
                 and reduced_fragment.low <= rows <= reduced_fragment.high
             ):
                 continue
             seeds.append(
-                Config.from_dict(
-                    {
-                        "block_sizes": _seq_config_list(
-                            spec.block_sizes,
-                            {reduced_block_id: rows, grid_block_id: columns},
-                        ),
-                        "num_threads": _seq_config_list(
-                            spec.num_threads,
-                            {
-                                reduced_block_id: row_threads,
-                                grid_block_id: grid_threads,
-                            },
-                        ),
-                        "cute_vector_widths": _seq_config_list(
-                            spec.cute_vector_widths, {grid_block_id: seed_vec}
-                        ),
-                        "cute_lane_layouts": _seq_config_list(
-                            spec.cute_lane_layouts, {reduced_block_id: "strided"}
-                        ),
-                        "cute_vloop_sink": True,
-                        "cute_lane_unroll": 8,
-                        # The launch overlaps the output's zero fill (and the
-                        # default release lets the next kernel launch early).
-                        "cute_pdl": True,
-                        CUTE_PDL_SPREAD_KEY: True,
-                    }
+                cls._seed(
+                    spec,
+                    grid_block_id,
+                    reduced_block_id,
+                    seed_vec,
+                    {reduced_block_id: rows, grid_block_id: columns},
+                    {reduced_block_id: row_threads, grid_block_id: grid_threads},
+                    # The launch overlaps the output's zero fill (and the
+                    # default release lets the next kernel launch early).
+                    cute_pdl=True,
+                    **{CUTE_PDL_SPREAD_KEY: True},
                 )
             )
+        return dedupe_configs(seeds)
+
+
+class CuteSplitColumnReductionHeuristic(_CuteColumnSeedHeuristic):
+    """Coalesced seeds for a split column reduction: a grid of split blocks
+    and a contiguous column tile whose serial device loop walks each split's
+    rows of a ``[rows, C]`` input (Inductor's looped split reductions, the
+    BatchNorm backward sums and Welford partials of channels-last
+    activations)::
+
+        for tile_s, tile_c in hl.tile([splits, C]):
+            for tile_r in hl.tile(rows_per_split):
+                row = tile_s.index[:, None] * rows_per_split + tile_r.index[None, :]
+                acc = acc + torch.sum(f(hl.load(x, [row, tile_c])), dim=1)
+
+    The column sum of ``CuteColumnReductionHeuristic`` (which takes only a
+    one-axis grid) with split axes beside the column tile.  Without a seed
+    the search starts from scalar layouts (a 2-byte load per element), and
+    the coalesced one needs the column tile's vector width, its threads on
+    the lowest lanes, the rest along the rows and ``cute_vloop_sink``
+    together.  Seed it with one split per CTA: warp-sized CTAs that walk the
+    split in chunks with a shuffle combine per chunk, and the column
+    heuristic's whole split per chunk (one cross-warp combine per CTA).  The
+    match takes any such loop nest, so batched column sums (``x[tile_b,
+    tile_r, tile_c]`` summed over the rows) and broadcast-sum contractions
+    (``torch.sum(a[tm, tk][:, :, None] * b[tk, tn][None, :, :], dim=1)``)
+    get these seeds too; seeds only add configs.
+    """
+
+    name = "cute_split_column_reduction"
+    priority = 99
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``(column_block_id, reduced_block_id, source)`` when the kernel's
+        single grid loop tiles two or more axes, its single device loop
+        reduces the rows of tiles that span every grid axis, and that loop
+        loads the 16/32-bit input ``source`` with the zero-origin column tile
+        as the last, stride-1 index."""
+        spec = env.config_spec
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None or len(nest[0]) < 2:
+            return None
+        grid_blocks, reduced_block_id, calls = nest
+        if not cls._lane_knobs(spec, (*grid_blocks, reduced_block_id)):
+            return None
+        grid_symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid_blocks
+        }
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+        reduces_rows = False
+        match: tuple[int, int, torch.Tensor] | None = None
+        for node in calls:
+            if node.target is language_load:
+                # The first such load sets the seeds' vector width and the
+                # strides ``_plan`` checks, whether or not it feeds the row
+                # reduction directly: the reduction may see the loaded rows
+                # through any ``f(...)`` (a mask, a convert, a product with
+                # another load).  A kernel that mixes load dtypes is seeded for
+                # the first; seeds only add configs.
+                if match is not None:
+                    continue
+                tensor, subscript = _load_operands(node)
+                loaded = _shape_exprs(node.meta.get("val"))
+                if not (
+                    tensor is not None
+                    and tensor.ndim >= 2
+                    and tensor.dtype in cls.SEED_DTYPES
+                    and isinstance(subscript, (list, tuple))
+                    and len(subscript) == tensor.ndim
+                    and isinstance(subscript[-1], torch.fx.Node)
+                    and loaded is not None
+                    and reduced_symbol in loaded
+                ):
+                    continue
+                column = subscript[-1].meta.get("val")
+                stride = tensor.stride(-1)
+                if not (
+                    isinstance(column, torch.SymInt)
+                    and isinstance(stride, int)
+                    and stride == 1
+                ):
+                    continue
+                column_block_id = grid_symbols.get(_symint_sympy_expr(column))
+                if (
+                    column_block_id is not None
+                    and column_block_id
+                    not in device_ir.noncanonical_task_origin_block_ids
+                ):
+                    match = (column_block_id, reduced_block_id, tensor)
+                continue
+            sizes = _reduced_sizes(node, reduced_symbol)
+            if (
+                sizes is not None
+                and len(sizes) == len(grid_blocks) + 1
+                and set(sizes) - {reduced_symbol} == set(grid_symbols)
+            ):
+                reduces_rows = True
+        return match if reduces_rows else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return []
+        column_block_id, reduced_block_id, source = plan
+        spec = env.config_spec
+        vec = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        column_fragment = block_specs[column_block_id]._fragment(spec)
+        reduced_fragment = block_specs[reduced_block_id]._fragment(spec)
+        column_extent = next_power_of_2(max(1, block_specs[column_block_id].size_hint))
+        whole = next_power_of_2(max(1, block_specs[reduced_block_id].size_hint))
+        splits = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id not in (column_block_id, reduced_block_id)
+        }
+        # (column threads, row threads, rows per chunk), measured on B200 for
+        # the bf16 BatchNorm backward sums of 2384-row splits over 32 channels
+        # (sum_sum_643db2887a01) and the Welford partials of 680-row splits
+        # over 144 channels (var_mean_mean_e790938418f4).  A warp per CTA, two
+        # column threads over 16 row threads taking 8 rows each per chunk, was
+        # best on both (129 and 63 us, against 71 us for Helion-Triton on the
+        # second); the column heuristic's whole split per chunk with 4 x 128
+        # threads came second on the first (139 us) and 4 x 8 threads with 16
+        # rows each on the second (65 us).  ``None`` is that whole split per
+        # chunk, its 128 row threads halved (``_column_row_threads``) for the
+        # rows the chunk gets once clamped.
+        shapes: tuple[tuple[int, int | None, int | None], ...] = (
+            (2, 16, 128),
+            (4, None, None),
+            (4, 8, 128),
+        )
+        seeds: list[Config] = []
+        for column_threads, fixed_threads, chunk_rows in shapes:
+            columns = column_threads * vec
+            rows = min(chunk_rows or whole, whole, reduced_fragment.high)
+            row_threads = (
+                _column_row_threads(128, rows)
+                if fixed_threads is None
+                else fixed_threads
+            )
+            if not (
+                columns <= column_extent
+                and column_fragment.low <= columns <= column_fragment.high
+                and reduced_fragment.low <= rows
+                and rows >= row_threads
+            ):
+                continue
+            seeds.append(
+                cls._seed(
+                    spec,
+                    column_block_id,
+                    reduced_block_id,
+                    vec,
+                    {**splits, column_block_id: columns, reduced_block_id: rows},
+                    {
+                        **splits,
+                        column_block_id: column_threads,
+                        reduced_block_id: row_threads,
+                    },
+                )
+            )
+        return dedupe_configs(seeds)
+
+
+class CuteDelinearizedRowReductionHeuristic(AutotunerHeuristic):
+    """Seed a device-loop reduction whose loop walks contiguous rows through
+    a de-linearized index: the split Welford partials of an NCHW BatchNorm,
+    which read the input as ``[N, H*W, C]``::
+
+        for tile_s, tile_c in hl.tile([splits, C]):
+            for tile_r in hl.tile(rows_per_split):
+                r = tile_s.index[:, None] * rows_per_split + tile_r.index[None, :]
+                values = hl.load(x, [r // hw, r % hw, tile_c])
+                ... torch.sum(values, dim=1) ...
+
+    The loop's tile reaches the stride-1 ``H*W`` axis through ``r % hw``, so
+    the column heuristics (the column tile on the stride-1 axis) and the
+    row ones (a reduction dimension) do not take the kernel, and without a
+    seed the search neither leaves short chunks nor reaches
+    ``cute_lane_unroll``.  Seed one (split, channel) per CTA whose 128
+    threads walk the rows in chunks of two 32-byte vectors per thread, with
+    ``cute_uniform_lane_compares``: the masks of the chunk (its tile mask,
+    ``r < total``, the bounds of ``r // hw`` and ``r % hw``) then cost one
+    compare per vector instead of one per element.  Measured on B200 (cold
+    L2) for better-benchmark's bn_welford_partials
+    (var_mean_var_mean_5cc92f5d49c1: [32, 256, 56, 56] bf16, 4 splits of
+    25088 rows): 17.0 us, against 32.3 us for the autotuned config
+    (512-element chunks of 64 threads) and 22.5 us for Helion-Triton.
+    Other chunks with the knob measured slower: 2048 elements 18.5 us (128
+    threads, one vector each) and 22.2 us (64 threads, two), 4096 elements
+    19.3 us (64 threads, four) and 19.8 us (256 threads, one), 8192
+    elements 21.5 us (128 threads, four) and 19.8 us (256 threads, two),
+    and 16-byte vectors 20.5 us (2048 elements) and 23.9 us (4096).
+
+    A vector is one packet only where it stays in one row, ``hw`` and the
+    other terms of ``r`` (the split offsets) multiples of its width, where
+    the loop's extent is a multiple of it, and where it starts on a multiple
+    of its width in memory, the input's base address and other strides
+    multiples of it too (a static size-1 dim exempt): the seed halves the
+    vector until they provably are, down to one-element lanes (``hw = 49``;
+    a padded plane; a view one element into its storage; a dynamic shape,
+    whose extents nothing proves), and takes one-element lanes for a loop
+    that does not start at 0, whose lane bases are no multiples of a width.
+    Before SM100 a 32-byte vector is two 16-byte accesses, and the seed
+    starts from 16-byte vectors there (not measured).
+    """
+
+    name = "cute_delinearized_row_reduction"
+    backend = "cute"
+    priority = 102
+    THREADS = 128
+    UNROLL = 2
+    # The input dtypes the seed loads in packets of 32 bytes (16 before SM100).
+    SEED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, torch.Tensor, Node, int] | None:
+        """``(reduced_block_id, source, index, dim)`` when the kernel's single
+        grid loop holds a single device loop that reduces over its own tile
+        and loads the 16/32-bit float ``source`` with the remainder ``index``,
+        ``e % d``, on its stride-1 dim ``dim``, ``e`` adding the loop tile's
+        index."""
+        nest = _device_loop_reduction(env, device_ir)
+        if nest is None:
+            return None
+        _grid_blocks, reduced_block_id, calls = nest
+        spec = env.config_spec
+        # The seed sets the loop tile's threads and vector width (and one
+        # block and thread per grid tile, where those have slots).
+        if not all(
+            reduced_block_id in sequence.valid_block_ids()
+            for sequence in (spec.num_threads, spec.cute_vector_widths)
+        ):
+            return None
+        reduced_symbol = _symint_sympy_expr(env.block_sizes[reduced_block_id].var)
+
+        def walks_rows(index: object) -> bool:
+            return any(
+                _tile_index_block(tile, env) == reduced_block_id
+                for tile in match_cute_lane_remainder(index) or ()
+            )
+
+        match: tuple[int, torch.Tensor, Node, int] | None = None
+        reduces = False
+        for node in calls:
+            if node.target is language_load:
+                tensor, subscript = _load_operands(node)
+                if not (
+                    match is None
+                    and tensor is not None
+                    and tensor.dtype in cls.SEED_DTYPES
+                    and isinstance(subscript, (list, tuple))
+                    and len(subscript) == tensor.ndim
+                ):
+                    continue
+                for dim, index in enumerate(subscript):
+                    stride = tensor.stride(dim)
+                    if (
+                        isinstance(stride, int)
+                        and stride == 1
+                        and isinstance(index, Node)
+                        and walks_rows(index)
+                    ):
+                        match = (reduced_block_id, tensor, index, dim)
+                        break
+                continue
+            if _reduced_sizes(node, reduced_symbol) is not None:
+                reduces = True
+        return match if reduces else None
+
+    @staticmethod
+    def _packet_width(
+        env: CompileEnvironment,
+        index: Node,
+        reduced_block_id: int,
+        widest: int,
+        source: torch.Tensor,
+        dim: int,
+    ) -> int:
+        """The widest power of two up to ``widest`` whose aligned packets the
+        remainder ``index``, ``e % d``, keeps in one row: ``e`` adds the loop
+        tile's index once, and ``d`` and the other terms of ``e`` are static
+        multiples of it, which is what the lowering proves on the generated
+        expression (``_cute_lane_contiguous``: a kernel argument's factors
+        are unknown there, even where ``input_tensor_metadata`` pins them),
+        as is the loop's extent (the lowering's ``known_multiple``), and
+        ``source``'s base address and the strides of its dims other than
+        ``dim`` are multiples of it (``cute_reduction_vector_layout_aligned``
+        in the lowering, read here from the example input's base residue,
+        ``_packet_layout_aligned``), so that each packet starts on a multiple
+        of its width in memory.  1 when no width is."""
+        parts = cute_lane_remainder_terms(index)
+        if parts is None:
+            return 1
+        divisor, terms = parts
+        lanes = [
+            position
+            for position, (term, sign) in enumerate(terms)
+            if sign > 0 and _tile_index_block(term, env) == reduced_block_id
+        ]
+        if len(lanes) != 1:
+            return 1
+        others = [
+            term for position, (term, _) in enumerate(terms) if position != lanes[0]
+        ]
+        vec = widest
+        while vec > 1 and not (
+            env.known_multiple(_to_sympy(divisor), vec)
+            and all(row_is_multiple_of(term, vec, env, static=True) for term in others)
+            and env.block_sizes[reduced_block_id].known_multiple(vec)
+            and _packet_layout_aligned(env, source, dim, vec)
+        ):
+            vec //= 2
+        return vec
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._match(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        reduced_block_id, source, index, dim = match
+        spec = env.config_spec
+        # A 32-byte vector is one load on SM100+, two 16-byte ones before.
+        capability = spec.target_device_capability
+        packet_bytes = _CUTE_VECTOR_MAX_BYTES * (
+            2 if capability is not None and capability >= (10, 0) else 1
+        )
+        # A loop that does not start at 0 (``hl.tile(3, rows)``) loads no
+        # aligned packet: the lowering needs the lane base a multiple of V.
+        vec = (
+            1
+            if reduced_block_id in device_ir.noncanonical_task_origin_block_ids
+            else cls._packet_width(
+                env,
+                index,
+                reduced_block_id,
+                max(1, packet_bytes // source.dtype.itemsize),
+                source,
+                dim,
+            )
+        )
+        # The chunk shrinks with a loop shorter than it, threads first and
+        # then the vector, but the seed keeps the lane unroll and the knob,
+        # one-element lanes included: whether they are searchable must not
+        # depend on the shape (``autotune_multi``).
+        fragment = spec.block_sizes.block_id_lookup(reduced_block_id)._fragment(spec)
+        chunk = max(fragment.low, min(cls.THREADS * vec * cls.UNROLL, fragment.high))
+        vec = max(1, min(vec, chunk // cls.UNROLL))
+        threads = max(1, min(cls.THREADS, chunk // (vec * cls.UNROLL)))
+        others = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id != reduced_block_id
+        }
+        return Config.from_dict(
+            {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {**others, reduced_block_id: chunk}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {**others, reduced_block_id: threads}
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {reduced_block_id: vec}
+                ),
+                "cute_lane_unroll": cls.UNROLL,
+                "cute_uniform_lane_compares": True,
+            }
+        )
+
+
+class CuteStridedReductionHeuristic(AutotunerHeuristic):
+    """Coalesced seeds for a reduction over a strided full slice beside a
+    contiguous grid tile (a channels-last spatial mean or BatchNorm-ReLU pool:
+    ``x[tile_n, :, tile_c]`` reduced over the middle dim).
+
+    The reduction threads take ``thread_idx[0]`` by default, so a warp's
+    lanes read rows ``C`` elements apart, one element each.  With
+    ``cute_vloop_sink`` the contiguous tile's vectors take the lowest thread
+    axes instead (``_plan_vloop_sink_reduction_execution``): each lane loads
+    one vector per row, a 16-byte chunk where the rows are 16-byte aligned
+    (else the widest aligned power of two, down to two elements: 4 bytes for
+    16-bit types), and the reduction combines across the interleaved tile
+    threads in shared memory.
+    The autotuner rarely draws that combination (the tile's vector width,
+    sinking and a deep lane unroll together), so seed it: 16 or 32 vector
+    threads along the contiguous tile (2 or 4 times as many for an 8- or
+    4-byte vector, the wider tile first), 8 or 16 reduction threads over 64-
+    to 128-row chunks with the row lane loop unrolled, and one element of
+    every other grid axis per CTA.  A reduction of at most
+    ``WHOLE_CHUNK_ROWS`` rows also gets a seed that covers it in one chunk,
+    and a seed whose chunk is longer than the reduction runs it in one pass
+    of a clamped chunk; a grid of too few CTAs gets a narrower tile with up
+    to 1024 threads per CTA (``_narrow_tile_shape``).
+
+    Disjoint from ``CuteColumnReductionHeuristic`` (a serial device-loop
+    reduction, no reduction loops) and from ``CuteRegisterTileHeuristic``:
+    this one seeds the rolled chunks of a reduction the register tile does
+    not take and leaves a reduction the register tile seeds to it (its
+    persistent layout beat these seeds 1.6-3.9x on B200 column sums of 128
+    to 1024 bf16 rows).  It registers no specialization: a binding whose
+    extent or strides are not already proven multiples of a two-element
+    vector (a dynamic shape) gets no seed rather than recompiling per input
+    shape.
+    """
+
+    name = "cute_strided_reduction"
+    backend = "cute"
+    priority = 92
+    # The narrow seed (``_narrow_tile_shape``) depends on the SM count.
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
+
+    # CTAs per SM the seeded grid keeps at least before the narrow seed
+    # (``_narrow_tile_shape``) joins the others.
+    NARROW_MIN_CTAS_PER_SM = 4
+    NARROW_CTA_THREADS = 128
+    NARROW_UNROLL = 8
+    # A reduction longer than the first seed's chunk and at most this many
+    # rows also gets a seed that covers it in one chunk with the deepest lane
+    # unroll.
+    WHOLE_CHUNK_ROWS = 256
+    WHOLE_CHUNK_UNROLL = 16
+    # An L2 line: an input whose CTA rows are narrower in its dtype, or one
+    # line wide off the line boundaries, shares its lines with the
+    # neighboring CTAs, so it keeps the default policy
+    # (``_rows_own_their_lines``).
+    STREAM_LINE_BYTES = 128
+
+    @classmethod
+    def _narrow_tile_shape(
+        cls,
+        env: CompileEnvironment,
+        tile_block_id: int,
+        vec: int,
+        tile_threads: int,
+        rows: int,
+    ) -> tuple[int, int, int, int] | None:
+        """A narrower contiguous tile when the seeds launch too few CTAs.
+
+        Every other grid axis keeps one element per CTA, so the grid is their
+        extents times the tiles of the contiguous axis.  A pool of 128 images
+        over 144 channels ([128, 3136, 144] bf16) gets 256 CTAs from
+        128-column tiles, each walking 3136 rows with 8 reduction threads:
+        637 us on B200, against 98 us for 16-column tiles (1152 CTAs) whose
+        64 reduction threads keep 128 threads per CTA.  The narrow tile is the
+        widest power of two that gives ``NARROW_MIN_CTAS_PER_SM`` CTAs per SM,
+        with ``NARROW_CTA_THREADS`` threads per CTA (more reduction threads
+        when even one vector per CTA cannot reach that many CTAs, as long as
+        a chunk stays shorter than the ``rows`` reduced);
+        ``(tile threads, reduction threads, rows per chunk, lane unroll)``.
+        """
+        from .....runtime import get_num_sm
+
+        try:
+            num_sm = get_num_sm(env.device)
+        except (AssertionError, NotImplementedError):
+            return None
+        spec = env.config_spec
+        extent = spec.block_sizes.block_id_lookup(tile_block_id).size_hint
+        other_ctas = math.prod(
+            item.size_hint
+            for item in spec.block_sizes
+            if item.block_id != tile_block_id
+        )
+        target = cls.NARROW_MIN_CTAS_PER_SM * num_sm
+        default_columns = tile_threads * vec
+        if num_sm <= 0 or other_ctas * -(-extent // default_columns) >= target:
+            return None
+        columns = max(vec, prev_power_of_2(extent * other_ctas // target))
+        if columns >= default_columns:
+            return None
+        narrow_threads = columns // vec
+        # One vector per CTA can still leave the grid short of the target
+        # (512 fp32 columns over a lone grid axis: 128 CTAs of 4 columns):
+        # each CTA then takes the reduction threads of the CTAs it lacks, up to
+        # a full CTA, so as many loads stay in flight from a cold L2 (that
+        # column sum: 66 us at 128 threads, 28 us at 512, B200), as long as
+        # their chunk (``NARROW_UNROLL`` rows a thread) stays shorter than
+        # the reduction: 2048 to 4096 rows keep 128 or 256 threads.  The
+        # ``NARROW_CTA_THREADS`` floor alone can make the chunk longer (1024
+        # rows for one vector per CTA), and the seed then runs the reduction
+        # in one pass of a clamped chunk.
+        ctas = other_ctas * -(-extent // columns)
+        reduction_threads = max(
+            cls.NARROW_CTA_THREADS // narrow_threads,
+            prev_power_of_2(
+                cls.NARROW_CTA_THREADS * target // (ctas * narrow_threads),
+                min(
+                    MAX_THREADS_PER_BLOCK // narrow_threads,
+                    (rows - 1) // cls.NARROW_UNROLL,
+                ),
+            ),
+        )
+        return (
+            narrow_threads,
+            reduction_threads,
+            reduction_threads * cls.NARROW_UNROLL,
+            cls.NARROW_UNROLL,
+        )
+
+    @classmethod
+    def _match(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``strided_reduction`` of a kernel whose reduction the register tile
+        does not take."""
+        match = cls.strided_reduction(env, device_ir)
+        if match is None or CuteRegisterTileHeuristic.is_eligible(env, device_ir):
+            return None
+        return match
+
+    @classmethod
+    def strided_reduction(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor] | None:
+        """``(tile_block_id, reduction_block_id, source)`` when a load of the
+        16/32-bit input ``source`` addresses its stride-1 dim with a
+        zero-origin tile of the kernel's single grid loop and a strided dim
+        with the full slice the kernel's one reduction loop reduces.  The
+        kernel's structure decides, never its extents: ``cute_vloop_sink`` and
+        ``cute_lane_unroll`` open on it (``cute_strided_reduction_sites``), so
+        the search space is the same at every extent, though the seeds fit
+        only some."""
+        spec = env.config_spec
+        if spec.matmul_facts or len(spec.reduction_loops) != 1:
+            return None
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if len(paths) != 1 or len(paths[0]) != 1:
+            return None
+        grid_blocks = set(paths[0][0])
+        grid_symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid_blocks
+        }
+        reduction_extent = env.block_sizes[rl_spec.block_id].numel
+        for sequence in (spec.num_threads, spec.cute_vector_widths):
+            if not (grid_blocks | {rl_spec.block_id}) <= set(
+                sequence.valid_block_ids()
+            ):
+                return None
+        for graph_info in device_ir.graphs:
+            for node in graph_info.graph.nodes:
+                if node.op != "call_function" or node.target is not language_load:
+                    continue
+                tensor, subscript = _load_operands(node)
+                if not (
+                    tensor is not None
+                    and isinstance(subscript, (list, tuple))
+                    and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                ):
+                    continue
+                vec = _cute_tile_seed_vec_width_for_dtype(tensor.dtype)
+                if vec < 2 or vec * tensor.dtype.itemsize > _CUTE_VECTOR_MAX_BYTES:
+                    continue
+                # Only static strides and structural extent matches: comparing
+                # a dynamic size or stride would guard (specialize) it.
+                contiguous: int | None = None
+                strided_slices = 0
+                dim = 0
+                for index in subscript:
+                    if isinstance(index, torch.fx.Node):
+                        index = index.meta.get("val")
+                    if index is None:
+                        continue
+                    if dim >= tensor.ndim:
+                        break
+                    stride = tensor.stride(dim)
+                    if isinstance(index, slice):
+                        if not (
+                            index == slice(None)
+                            and isinstance(stride, int)
+                            and stride != 1
+                        ):
+                            strided_slices = -1
+                            break
+                        size = tensor.size(dim)
+                        if (
+                            size if isinstance(size, int) else _symint_sympy_expr(size)
+                        ) == reduction_extent:
+                            strided_slices += 1
+                    elif (
+                        isinstance(index, torch.SymInt)
+                        and isinstance(stride, int)
+                        and stride == 1
+                    ):
+                        contiguous = grid_symbols.get(_symint_sympy_expr(index))
+                    dim += 1
+                if (
+                    strided_slices == 1
+                    and contiguous in grid_blocks
+                    and contiguous not in device_ir.noncanonical_task_origin_block_ids
+                ):
+                    return cast("int", contiguous), rl_spec.block_id, tensor
+        return None
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, torch.Tensor, int, int] | None:
+        """The match, the seed vector width and the dtype's 16-byte vector
+        width when sinking can fire for this binding: the seed width is the
+        widest power of two up to the 16-byte vector that divides the
+        contiguous tile's extent and every other stride of ``source`` (rows
+        of 30522 bf16 elements are only 4-byte aligned: two elements)."""
+        match = cls._match(env, device_ir)
+        if match is None:
+            return None
+        tile_block_id, _reduction_block_id, source = match
+        full = _cute_tile_seed_vec_width_for_dtype(source.dtype)
+        vec = full
+        while vec >= 2 and not (
+            env.specialized_multiple(env.block_sizes[tile_block_id].numel, vec)
+            and all(
+                source.stride(dim) == 1
+                or env.specialized_multiple(source.stride(dim), vec)
+                for dim in range(source.ndim)
+            )
+        ):
+            vec //= 2
+        if vec < 2:
+            return None
+        return (*match, vec, full)
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return bool(cls.get_seed_configs(env, device_ir))
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seeds = cls.get_seed_configs(env, device_ir)
+        return seeds[0] if seeds else None
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return []
+        tile_block_id, reduction_block_id, source, vec, full = plan
+        spec = env.config_spec
+        block_specs = {item.block_id: item for item in spec.block_sizes}
+        tile_fragment = block_specs[tile_block_id]._fragment(spec)
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        chunk_fragment = rl_spec._flat_fragment(spec)
+        tile_extent = next_power_of_2(max(1, block_specs[tile_block_id].size_hint))
+        others = {
+            item.block_id: 1
+            for item in spec.block_sizes
+            if item.block_id != tile_block_id
+        }
+        seeds: list[Config] = []
+        # A vector narrower than 16 bytes (rows only 4- or 8-byte aligned)
+        # takes as many more threads along the tile: each CTA row keeps the
+        # bytes, and each CTA the bytes in flight, of the measured shapes.
+        widen = full // vec
+        # (vector threads along the tile, reduction threads, rows per chunk,
+        # lane unroll): measured on B200 for bf16 [512, 784, 120] and
+        # [128, 324, 1536] (channels-last BatchNorm-ReLU pool and spatial
+        # mean), where 8 reduction threads with an 8-deep unroll keep the
+        # most 16-byte loads in flight per thread.
+        measured = [(16, 8, 128, 8), (32, 8, 64, 8), (16, 16, 128, 4)]
+        # The 128-row-chunk shape the one-chunk seed extends.
+        base_index = 0
+        if widen > 1:
+            # A narrow vector seeds the wider tile first: 256 columns per CTA
+            # beat 128 on the BERT vocabulary gradient ([16384, 30522] bf16,
+            # rows 4-byte aligned; 174.0 against 182.2 us, B200 with a cold
+            # L2, Helion-Triton 174.1 us).  8-byte rows take the same order
+            # without a measurement.
+            measured[0], measured[1] = measured[1], measured[0]
+            base_index = 1
+        shapes = [
+            (
+                max(
+                    1,
+                    min(
+                        tile_threads * widen,
+                        tile_extent // vec,
+                        MAX_THREADS_PER_BLOCK // reduction_threads,
+                    ),
+                ),
+                reduction_threads,
+                chunk,
+                unroll,
+            )
+            for tile_threads, reduction_threads, chunk, unroll in measured
+        ]
+        # The narrow seed joins when the first seed launches too few CTAs;
+        # the one-chunk seed extends the 128-row-chunk shape.
+        narrow = cls._narrow_tile_shape(
+            env, tile_block_id, vec, shapes[0][0], rl_spec.size_hint
+        )
+        if narrow is not None:
+            shapes.append(narrow)
+        base = shapes[base_index]
+        whole = next_power_of_2(max(1, rl_spec.size_hint))
+        # A reduction short enough for one chunk, past the base shape's
+        # 128-row chunks: each reduction thread walks its rows in one fully
+        # unrolled pass, every load in flight at once (bf16 [128, 196, 768]
+        # token sums: 25.4 us with 16 reduction threads, 26.4 with 8, against
+        # 30.9 us for the first seed's 128-row chunks, on B200 with a cold
+        # L2).  The unroll sets the thread count: 16 rows a thread.
+        if base[2] < whole <= cls.WHOLE_CHUNK_ROWS:
+            shapes.append(
+                (
+                    base[0],
+                    whole // cls.WHOLE_CHUNK_UNROLL,
+                    whole,
+                    cls.WHOLE_CHUNK_UNROLL,
+                )
+            )
+        hint_streams = spec.supports_config_key("load_eviction_policies")
+        for tile_threads, reduction_threads, chunk, unroll in shapes:
+            columns = tile_threads * vec
+            # A chunk that reaches the reduction's length (a measured shape's
+            # over at most 128 rows, the narrow seed's over up to 1024) is
+            # clamped to the reduction's power of two: the seed runs the
+            # reduction in one pass, where that pass stays a rolled loop
+            # (``_full_extent_chunk``: from 8 rows; a shorter reduction runs
+            # persistent and nothing sinks).  These seeds give short
+            # reductions the sunk, unrolled layouts, and better-benchmark's
+            # channels-last BatchNorm chain (var_mean_var_mean_mean_0efb69a14422:
+            # 128-row partials, a 49-row combine and spatial mean) ran in 25.3 us
+            # at the configs autotuned with them, against 32.3 us without
+            # (B200, L2 cleared before every call).
+            chunk = min(chunk, whole)
+            if not (
+                tile_fragment.low <= columns <= tile_fragment.high
+                and chunk_fragment.low <= chunk <= chunk_fragment.high
+                and (chunk < rl_spec.size_hint or chunk == rl_spec._full_extent_chunk())
+            ):
+                continue
+            # A clamped chunk can hold fewer rows than the shape's threads
+            # walk: the seed records what runs, at most one reduction thread
+            # a row and a lane unroll no deeper than each thread's rows.
+            reduction_threads = min(reduction_threads, chunk)
+            unroll = min(unroll, chunk // reduction_threads)
+            values: dict[str, object] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {**others, tile_block_id: columns}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads,
+                    {
+                        **others,
+                        tile_block_id: tile_threads,
+                        reduction_block_id: reduction_threads,
+                    },
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {tile_block_id: vec}
+                ),
+                "reduction_loops": [chunk],
+                "cute_vloop_sink": True,
+                "cute_lane_unroll": unroll,
+            }
+            if hint_streams:
+                # The strided input is streamed through once: its lines go
+                # evict-first so the seed keeps the L2 lines it does not own.
+                policies = _cute_streaming_input_cache_policies(
+                    spec,
+                    device_ir,
+                    Config.from_dict(values),
+                    reduction_block_id,
+                    tile_block_id,
+                    columns,
+                    cls.STREAM_LINE_BYTES,
+                )
+                if any(policies):
+                    values["load_eviction_policies"] = policies
+            seeds.append(Config.from_dict(values))
         return dedupe_configs(seeds)
 
 
@@ -4240,7 +5588,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
 
     name = "cute_reduction_wide_chunk"
     backend = "cute"
-    priority = 30
+    priority = 31
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -4290,7 +5638,7 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
 
     name = "cute_rolled_row_ladder"
     backend = "cute"
-    priority = 35
+    priority = 36
     MAX_CHUNK = 65536
 
     @classmethod
@@ -4345,6 +5693,955 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
         return Config(**seed)
 
 
+class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
+    """Seed Triton's rolled-row shape for row kernels that store a row.
+
+    A row-store sweep (a cross-entropy backward, softmax's normalize) is
+    bound by its loads in flight: 64 threads walk a 2048-element chunk, and
+    the loads-first lane unroll (``cute_lane_unroll``) issues 16 lanes' loads
+    before any store, Helion-Triton's 2-warp, 32-elements-per-thread block.
+    The lanes are as wide as every row the sweeps load or store along the
+    reduced dim is aligned for, at most two elements (``_lane_vector``): a
+    vector lane walks a row whose start the packet cannot reach
+    element by element at the vector's stride, 8x the L1 wavefronts at
+    16-byte packets.  Measured on B200 (cold L2): better-benchmark's BART
+    cross-entropy backward (``[8192, 50265]`` bf16 rows at odd offsets)
+    672 us with unvectorized lanes, 1206 us at 128 threads and 16-byte
+    packets (Helion-Triton 733); BERT's masked-LM backward (rows of 30522
+    elements, 4-byte aligned) 724 us with two-wide lanes (Helion-Triton 733).
+    """
+
+    name = "cute_rolled_row_loads_first"
+    backend = "cute"
+    priority = 94
+    CHUNK = 2048
+    THREADS = 64
+    UNROLL = 16
+    # Wider lanes have not measured better on these sweeps.
+    MAX_LANE_VECTOR = 2
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        # Structure only: the seed makes ``cute_lane_unroll`` searchable, and
+        # the search space must not change with the shape.  A row shorter
+        # than the chunk normalizes the seed to a persistent row, which keeps
+        # the lane vector, and the unroll only where normalization finds a
+        # lane loop that takes it (``_cute_config_forms_lane_loop``): one
+        # more candidate.  No reduction is required: a row-store sweep
+        # without one (a cross-entropy backward whose one-hot sum is folded
+        # away, ``out[tile, :] = f(x[tile, :])``) is the same loads-bound
+        # walk.
+        if not is_canonical_row_reduction(env):
+            return False
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        return rl_spec.block_id in spec.num_threads.valid_block_ids() and any(
+            "store" in ops for ops in _rolled_row_sweeps(device_ir)
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        rdim_id = rl_spec.block_id
+        tile_id = spec.block_sizes[0].block_id
+        chunk = cls.CHUNK
+        if spec.max_reduction_loop is not None:
+            chunk = min(chunk, spec.max_reduction_loop)
+        seed: dict[str, Any] = {
+            "block_sizes": [1],
+            "num_threads": _seq_config_list(
+                spec.num_threads, {tile_id: 1, rdim_id: cls.THREADS}
+            ),
+            "reduction_loops": [chunk],
+            "cute_lane_unroll": cls.UNROLL,
+        }
+        vec = cls._lane_vector(env, device_ir, rdim_id)
+        if vec > 1 and rdim_id in spec.cute_vector_widths.valid_block_ids():
+            seed["cute_vector_widths"] = _seq_config_list(
+                spec.cute_vector_widths, {rdim_id: vec}
+            )
+        return Config(**seed)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """The seed, and when the chunk leaves a partial last one, the seed
+        under ``cute_proven_bounds``: its complete chunks then run apart and
+        lose their bounds predicates (``peel_partial_chunks``), 21.25 instead
+        of 24.6 instructions per element in BERT's folded cross-entropy
+        backward (30522 = 14 * 2048 + 1850)."""
+        seed = cls.get_seed_config(env, device_ir)
+        if seed is None:
+            return []
+        spec = env.config_spec
+        rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
+        extent = env.specialize_expr(env.block_sizes[rl_spec.block_id].numel)
+        chunk = cast("list[int]", seed.config["reduction_loops"])[0]
+        if (
+            not spec.cute_proven_bounds_enabled
+            or not isinstance(extent, (int, sympy.Integer))
+            or int(extent) <= chunk
+            or int(extent) % chunk == 0
+        ):
+            return [seed]
+        return [seed, Config.from_dict({**seed.config, "cute_proven_bounds": True})]
+
+    @classmethod
+    def _lane_vector(
+        cls, env: CompileEnvironment, device_ir: DeviceIR, rdim_id: int
+    ) -> int:
+        """The seed's lane vector (see the class docstring): a row is a load
+        or store whose unit-stride dim is indexed by a slice spanning the
+        reduced extent, aligned for the vector when the slice's start and the
+        tensor's other strides are multiples of it (``_row_starts_aligned``).
+        A dynamic stride counts only when the bound kernel is keyed on exact
+        input metadata (``input_tensor_metadata``, which this seed does not
+        request; another heuristic may): otherwise the lanes stay
+        unvectorized.  The base pointer is not read: the bind records the
+        inputs' base residues only after the seeds, so a view whose rows
+        start off a packet boundary at a storage offset still gets the
+        vector, and its lanes then load element by element.  A performance
+        seed only: the generated code proves its own packets."""
+        from ....device_ir import ReductionLoopGraphInfo
+
+        extent = env.block_sizes[rdim_id].size
+        if not isinstance(extent, (int, torch.SymInt)):
+            return 1
+        rows: list[tuple[torch.Tensor, int, object]] = []
+        for graph_info in device_ir.graphs:
+            if not isinstance(graph_info, ReductionLoopGraphInfo):
+                continue
+            for node in graph_info.graph.nodes:
+                if (
+                    node.op != "call_function"
+                    or node.target not in (language_load, language_store)
+                    or len(node.args) < 2
+                    or not isinstance(node.args[0], torch.fx.Node)
+                    or not isinstance(node.args[1], (list, tuple))
+                ):
+                    continue
+                tensor = node.args[0].meta.get("val")
+                indices = [index for index in node.args[1] if index is not None]
+                if not isinstance(tensor, torch.Tensor) or len(indices) != tensor.ndim:
+                    continue
+                for dim, index in enumerate(indices):
+                    stride = tensor.stride(dim)
+                    if (
+                        isinstance(index, slice)
+                        and index.step in (None, 1)
+                        and isinstance(stride, int)
+                        and stride == 1
+                        and env.known_equal(
+                            compute_slice_size(index, tensor.shape[dim]), extent
+                        )
+                    ):
+                        start = normalize_slice(index, tensor.shape[dim]).start
+                        rows.append((tensor, dim, 0 if start is None else start))
+        if not rows:
+            return 1
+        vec = min(
+            cls.MAX_LANE_VECTOR,
+            *(
+                _cute_tile_seed_vec_width_for_dtype(tensor.dtype)
+                for tensor, _, _ in rows
+            ),
+        )
+        # Two elements at most: aligned for two, or unvectorized.
+        if vec > 1 and not all(
+            _row_starts_aligned(env, tensor, dim, start, vec)
+            for tensor, dim, start in rows
+        ):
+            vec = 1
+        return vec
+
+
+def _unit_dims(tensor: torch.Tensor) -> list[int]:
+    """The dimensions that may be ``tensor``'s stride-1 dimension at every
+    extent: its one dimension of stride 1 or, where a size-1 dimension has
+    stride 1 too, each such size-1 dimension, which PyTorch gives stride 1
+    only innermost (a ``[q, k, heads]`` view of one head has stride 1 on both
+    the heads and the keys).  Which of several size-1 dimensions is the
+    innermost at other extents depends on the layout (the keys of contiguous
+    ``[b, h, 1, 1]`` scores, the heads of a heads-innermost ``[b, 1, q, 1]``
+    bias view), so each is a candidate: a seed that picked one would find its
+    operands at some extents only (``autotune_multi`` needs one search
+    space)."""
+    units = [
+        dim
+        for dim in range(tensor.ndim)
+        if isinstance(stride := tensor.stride(dim), int) and stride == 1
+    ]
+    if len(units) > 1:
+        units = [
+            dim
+            for dim in units
+            if isinstance(size := tensor.shape[dim], int) and size == 1
+        ]
+    return units
+
+
+def _stride_one_loads(
+    graph: torch.fx.Graph, among: Collection[torch.fx.Node] | None = None
+) -> list[tuple[torch.Tensor, list[sympy.Expr | None], int]]:
+    """``(tensor, sizes, unit_dim)`` for each load in ``graph`` of a tensor
+    (each of ``among`` only, when given) and each dimension ``unit_dim``
+    that may be its stride-1 dimension (``_unit_dims``).  ``sizes`` are the
+    loaded value's sizes as sympy expressions per dimension of the tensor
+    (``None`` where static, or where a scalar index drops the dimension), so
+    a tile's symbol names the dimension it walks.  The subscripts align
+    them: a scalar index (``bias[0, ...]``) takes no dimension of the value,
+    a ``None`` axis one of the tensor."""
+    loads = []
+    for node in graph.nodes:
+        if (
+            node.op != "call_function"
+            or node.target is not language_load
+            or (among is not None and node not in among)
+            or len(node.args) < 2
+            or not isinstance(node.args[0], torch.fx.Node)
+            or not isinstance(node.args[1], (list, tuple))
+        ):
+            continue
+        tensor = node.args[0].meta.get("val")
+        value = node.meta.get("val")
+        if not (isinstance(tensor, torch.Tensor) and isinstance(value, torch.Tensor)):
+            continue
+        sizes: list[sympy.Expr | None] = []
+        position = 0
+        for index in node.args[1]:
+            if index is None:
+                position += 1
+                continue
+            val = index.meta.get("val") if isinstance(index, torch.fx.Node) else index
+            size = value.shape[position] if position < value.ndim else None
+            if isinstance(val, int) or (
+                isinstance(val, torch.SymInt)
+                and not (
+                    isinstance(size, torch.SymInt)
+                    and _symint_sympy_expr(size) == _symint_sympy_expr(val)
+                )
+            ):
+                # A scalar index, not a tile: the value has no such dimension.
+                sizes.append(None)
+                continue
+            if isinstance(val, torch.Tensor) and val.ndim != 1:
+                break
+            position += 1
+            sizes.append(
+                _symint_sympy_expr(size) if isinstance(size, torch.SymInt) else None
+            )
+        else:
+            if position == value.ndim and len(sizes) == tensor.ndim:
+                loads.extend((tensor, sizes, unit) for unit in _unit_dims(tensor))
+    return loads
+
+
+def _packet_lanes(
+    env: CompileEnvironment, tensor: torch.Tensor, unit: int, lane_block: int
+) -> int | None:
+    """The lanes of one ``cute_grid_lane_jam`` packet of ``tensor``, tiled by
+    ``lane_block``: the elements of the widest vector load
+    (``_CUTE_VECTOR_MAX_BYTES``), halved until they divide the lane block's
+    extent (the jam's lane index is then unmasked) and ``tensor``'s stride-1
+    extent (the lanes' elements are then one packet: 12 bf16 heads take 4
+    lanes, not 8), and until its other strides are multiples of them, as the
+    jam checks (``cute_vector_strides_aligned``; the base pointer is the
+    bound kernel's, which the jam checks itself).  None when either extent is
+    symbolic: the jam proves the lanes unmasked on static values only and
+    leaves the lane loop of a dynamic shape rolled.  One lane (an odd head
+    count) still counts, so that the knob the seed makes searchable is
+    searchable at every static shape (``autotune_multi`` needs one search
+    space)."""
+    extents = [env.block_sizes[lane_block].numel, tensor.shape[unit]]
+    if not all(isinstance(extent, (int, sympy.Integer)) for extent in extents):
+        return None
+    lanes = max(1, _CUTE_VECTOR_MAX_BYTES // tensor.dtype.itemsize)
+    while lanes > 1 and (
+        any(int(extent) % lanes for extent in extents)
+        or not cute_vector_strides_aligned(env, tensor, unit, lanes)
+    ):
+        lanes //= 2
+    return lanes
+
+
+# The keys of a jammed tile, at most.
+_KEY_CHUNK = 1024
+
+
+def _key_chunk(keys: int, vec: int) -> int:
+    """The tile of an axis of ``keys`` elements that ``cute_grid_lane_jam``
+    reads in ``vec``-wide packets (a device loop's keys, or the privatized
+    scatter's grid tile, ``CutePrivatizeAtomicsHeuristic._jam_seed``): up to
+    ``_KEY_CHUNK``, the largest power of two that divides ``keys`` while it
+    still gives the tile a warp of packets (768 keys take 256), so that the
+    tile is unmasked, which the jam needs; else the next power of two, whose
+    masked tile the jam leaves rolled."""
+    chunk = min(_KEY_CHUNK, next_power_of_2(keys))
+    divisor = chunk
+    while keys % divisor:
+        divisor //= 2
+    return divisor if divisor == chunk or divisor >= 32 * vec else chunk
+
+
+class CuteGridLaneJamHeuristic(AutotunerHeuristic):
+    """Seed the rows of a row-innermost operand as one thread's jammed lanes.
+
+    T5's relative-position softmax adds a ``[batch, q, k, heads]`` bias, viewed
+    ``[batch, heads, q, k]``, to the scores in device loops over the keys.  A
+    head per thread gathers its head of each key two bytes at a 16-byte
+    stride, and the kernel is bound by L1 wavefronts.  This seed tiles as many
+    heads as one 16-byte packet of that operand holds per CTA, as one thread's
+    lane loop (``num_threads`` 1 on the head axis), puts the keys of each
+    device loop on threads of 16-byte packets and turns on
+    ``cute_grid_lane_jam``, which loads the heads of one key in a single
+    vector and reduces the heads together.
+    """
+
+    name = "cute_grid_lane_jam"
+    backend = "cute"
+    priority = 97
+
+    @classmethod
+    def _plan(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, int, dict[int, int]] | None:
+        """``(grid_block_id, lanes, widths)``: a tensor some device loop
+        loads with its stride-1 dimension tiled by the root grid axis
+        ``grid_block_id`` (in ``lanes`` lanes of one packet,
+        ``_packet_lanes``), beside a load of a tensor whose stride-1
+        dimension that loop walks, and the vector width of each device loop
+        (``widths``): one packet of the tensors it walks, the scores rather
+        than the bias.  Every device loop must be a single tile directly in
+        the root that walks some tensor: the seed puts each loop's chunk on
+        threads of its own, which a nested loop would multiply, and a loop
+        over strided elements takes no packets.  A dynamic shape, whose
+        packet the jam cannot prove, gets no seed (``_packet_lanes``)."""
+        from ....device_ir import ForLoopGraphInfo
+        from ....device_ir import ReductionLoopGraphInfo
+
+        spec = env.config_spec
+        if (
+            spec.matmul_facts
+            or spec.reduction_loops
+            or len(device_ir.grid_block_ids) != 1
+        ):
+            return None
+        grid = device_ir.grid_block_ids[0]
+        paths = tile_loop_paths(device_ir, device_ir.graphs)
+        if not paths or any(len(path) != 2 or len(path[1]) != 1 for path in paths):
+            return None
+        symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid
+        }
+        operand: tuple[int, torch.Tensor, int] | None = None
+        walked: dict[int, list[tuple[torch.Tensor, int]]] = {}
+        for graph in device_ir.graphs:
+            if (
+                not isinstance(graph, ForLoopGraphInfo)
+                or isinstance(graph, ReductionLoopGraphInfo)
+                or len(graph.block_ids) != 1
+            ):
+                continue
+            loop_block = graph.block_ids[0]
+            loop_symbol = _symint_sympy_expr(env.block_sizes[loop_block].var)
+            lane_operands: list[tuple[int, torch.Tensor, int]] = []
+            for tensor, sizes, unit in _stride_one_loads(graph.graph):
+                symbol = sizes[unit]
+                if symbol == loop_symbol:
+                    walked.setdefault(loop_block, []).append((tensor, unit))
+                elif symbol is not None and symbol in symbols:
+                    lane_operands.append((symbols[symbol], tensor, unit))
+            if operand is None and loop_block in walked and lane_operands:
+                # A tensor the loop walks along another of its candidate
+                # dimensions (the scores at one query and one key) only when
+                # no other tensor is a lane operand.
+                walking = {id(tensor) for tensor, _ in walked[loop_block]}
+                operand = min(lane_operands, key=lambda lane: id(lane[1]) in walking)
+        loops = {item.block_id for item in spec.block_sizes} - set(grid)
+        if operand is None or not loops <= walked.keys():
+            return None
+        lane_block, tensor, unit = operand
+        lanes = _packet_lanes(env, tensor, unit, lane_block)
+        if lanes is None:
+            return None
+        widths = {
+            block_id: max(
+                1,
+                min(
+                    _CUTE_VECTOR_MAX_BYTES // walk.dtype.itemsize
+                    for walk, _ in walked[block_id]
+                ),
+            )
+            for block_id in loops
+        }
+        return lane_block, lanes, widths
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        spec = env.config_spec
+        return cls._plan(env, device_ir) is not None and all(
+            item.block_id in sequence.valid_block_ids()
+            for sequence in (spec.num_threads, spec.cute_vector_widths)
+            for item in spec.block_sizes
+        )
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        plan = cls._plan(env, device_ir)
+        if plan is None:
+            return None
+        lane_block, lanes, vectors = plan
+        spec = env.config_spec
+        blocks: dict[int, int] = {}
+        threads: dict[int, int] = {}
+        widths: dict[int, int] = {}
+        for item in spec.block_sizes:
+            block_id = item.block_id
+            if block_id == lane_block:
+                blocks[block_id] = lanes
+                threads[block_id] = 1
+            elif block_id not in vectors:
+                blocks[block_id] = 1
+                threads[block_id] = 1
+            else:
+                vec = vectors[block_id]
+                chunk = _key_chunk(item.size_hint, vec)
+                blocks[block_id] = chunk
+                threads[block_id] = max(1, chunk // vec)
+                widths[block_id] = min(vec, chunk)
+        seed: dict[str, Any] = {
+            "block_sizes": [blocks[item.block_id] for item in spec.block_sizes],
+            "num_threads": _seq_config_list(spec.num_threads, threads),
+            "cute_vector_widths": _seq_config_list(spec.cute_vector_widths, widths),
+            "cute_grid_lane_jam": True,
+        }
+        return Config(**seed)
+
+
+# The operations whose results ``fuse_two_pass_loads`` carries from a looped
+# reduction's sweep to the later ones under ``register`` reloads, as aten ops
+# (``sweep_values.TRANSCENDENTALS``; sigmoid lowers through exp), besides pure
+# scalar inline asm (``_sweep_cost``).
+_SWEEP_CARRIED_OPS = frozenset(
+    (
+        torch.ops.aten.exp.default,
+        torch.ops.aten.exp2.default,
+        torch.ops.aten.log.default,
+        torch.ops.aten.log2.default,
+        torch.ops.aten.tanh.default,
+        torch.ops.aten.erf.default,
+        torch.ops.aten.sigmoid.default,
+    )
+)
+
+
+def _sweep_cost(node: torch.fx.Node) -> int:
+    """The instructions ``fuse_two_pass_loads`` counts for ``node`` when it
+    weighs carrying a value built from it to a later sweep
+    (``sweep_values.heavy_cost``): a transcendental's, or a pure scalar inline
+    asm's own count (the Philox chain of a word0 ``hl.rand`` draw), else 0."""
+    if node.target in _SWEEP_CARRIED_OPS:
+        return _TRANSCENDENTAL_COST
+    if node.target is inline_asm_elementwise and len(node.args) == 6:
+        asm, constraints, _, _, pure, pack = node.args
+        if (
+            pack == 1
+            and isinstance(asm, str)
+            and isinstance(constraints, str)
+            and isinstance(pure, bool)
+        ):
+            return _pure_asm_instructions(asm, constraints, pure) or 0
+    return 0
+
+
+def _sweep_value_key(
+    node: torch.fx.Node, memo: dict[torch.fx.Node, int], table: dict[object, int]
+) -> int:
+    """``node``'s value number in a sweep's graph, comparable across the
+    sweeps of one looped reduction that share ``table``: a load by its
+    tensor and subscript, an input by its name, any other node by its target
+    and its operands, nodes by their numbers also inside lists (a subscript,
+    an asm's operands).  Numbers rather than nested keys, so that comparing
+    two values costs one comparison per operand however many paths reach a
+    shared one.  Callers number a graph's nodes in order, so that each call
+    finds its operands numbered."""
+
+    def operand(arg: object) -> object:
+        if isinstance(arg, torch.fx.Node):
+            return _sweep_value_key(arg, memo, table)
+        if isinstance(arg, (list, tuple)):
+            return tuple(map(operand, arg))
+        return repr(arg)
+
+    if node not in memo:
+        key: object
+        if node.op == "placeholder":
+            key = ("input", node.name)
+        elif node.target is language_load and isinstance(node.args[0], torch.fx.Node):
+            key = ("load", id(node.args[0].meta.get("val")), operand(node.args[1]))
+        else:
+            key = (
+                str(node.target),
+                tuple(map(operand, node.args)),
+                repr(sorted(node.kwargs.items())),
+            )
+        memo[node] = table.setdefault(key, len(table))
+    return memo[node]
+
+
+class CuteReductionLaneJamHeuristic(AutotunerHeuristic):
+    """Seed the rows of a row-gathered operand as one thread's jammed lanes
+    around a looped row reduction.
+
+    T5's softmax-dropout backward reduces each ``(batch * head, query)`` row
+    over its keys and adds the head's bias row, ``bias[bh % heads, q, :]``,
+    a ``[heads, q, k]`` view of a ``[q, k, heads]`` fp32 tensor.  A row per
+    CTA gathers four bytes of each key at a 32-byte stride, and the kernel is
+    bound by L1 sectors.  This seed tiles as many rows as one 16-byte packet
+    of that operand holds per CTA, as one thread's lane loop (``num_threads``
+    1 on that axis), keeps each row's keys on 128 threads in a looped
+    reduction of at most 1024 keys a chunk whose first sweep caches its values
+    in registers (``cute_reduction_reloads`` ``register``), and turns on
+    ``cute_grid_lane_jam``: the rows' bias elements of one key are one packet,
+    each row keeps its own workspace row and register cache, and the rows'
+    reduces run together.  Measured on B200 (cold L2), better-benchmark's T5
+    backward at ``[64, 1024, 1024]``: the encoder's kernel runs in 210 us at
+    the seed (263 us at the best CuTe config the autotuner found, 321 us at
+    the seed without the jam; Helion-Triton 220 us), the decoder's causal
+    kernel in 241 us (292 us; Helion-Triton 188 us).
+
+    The best vector width along the reduced dimension differs per kernel
+    (packets of the keys against the registers each row keeps live): four
+    keys per thread won the causal kernel (224.8 us against 235.5 at one),
+    eight the encoder's (205.2 us against 209.8).  So the seed comes at one,
+    four and eight elements per thread (``get_seed_configs``; the primary is
+    the first), where the target loads every row's packets whole, and the
+    autotuner picks.
+    """
+
+    name = "cute_reduction_lane_jam"
+    backend = "cute"
+    priority = 100
+    REDUCTION_THREADS = 128
+    REDUCTION_CHUNK = 1024
+    # The seed's widths along the reduced dim beside the primary's one.
+    ALTERNATE_VECTOR_WIDTHS = (4, 8)
+
+    @classmethod
+    def _lane_operand(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[int, torch.Tensor, int, int] | None:
+        """``(grid_block_id, tensor, unit_dim, row_itemsize)``: a tensor the
+        tile body loads along the reduced dimension with its stride-1
+        dimension ``unit_dim`` tiled by a root grid axis (a gathered row),
+        beside loads whose stride-1 dimension is the reduced one (the rows),
+        the widest of which has elements of ``row_itemsize`` bytes (loads
+        only: a row only stored is not counted).  Per-row
+        scalars (a row's max, a query's position) do not span the reduced
+        dimension and are no lane operands.  Structure only (the seed makes
+        ``cute_grid_lane_jam`` searchable): the layout, not the extents."""
+        from ....device_ir import RootGraphInfo
+
+        spec = env.config_spec
+        if (
+            spec.matmul_facts
+            or len(spec.reduction_loops) != 1
+            or spec.reduction_loops[0].pinned
+            or len(device_ir.grid_block_ids) != 1
+        ):
+            return None
+        grid = device_ir.grid_block_ids[0]
+        symbols = {
+            _symint_sympy_expr(env.block_sizes[block_id].var): block_id
+            for block_id in grid
+        }
+        reduced = _symint_sympy_expr(
+            env.block_sizes[spec.reduction_loops[0].block_id].var
+        )
+        lane_operands: list[tuple[int, torch.Tensor, int]] = []
+        row_itemsize = 0
+        for graph in device_ir.graphs:
+            if not isinstance(graph, RootGraphInfo):
+                continue
+            for tensor, sizes, unit in _stride_one_loads(graph.graph):
+                symbol = sizes[unit]
+                if symbol == reduced:
+                    row_itemsize = max(row_itemsize, tensor.dtype.itemsize)
+                elif symbol is not None and symbol in symbols and reduced in sizes:
+                    lane_operands.append((symbols[symbol], tensor, unit))
+        if row_itemsize and lane_operands:
+            return (*lane_operands[0], row_itemsize)
+        return None
+
+    @staticmethod
+    def _cached_values(device_ir: DeviceIR, block_id: int) -> int:
+        """The values each lane's sweeps of the looped reduction over
+        ``block_id`` cache for the later ones under ``register`` reloads
+        (``fuse_two_pass_loads``, where a sweep reads what any earlier sweep
+        cached).  A later sweep reads a value an earlier sweep computes from
+        the same operands from a cache instead of computing it again when the
+        transcendentals and pure scalar inline asm its computation includes
+        cost at least ``MIN_SAVED_COST`` instructions, as
+        ``sweep_values.SweepValues.cacheable`` weighs them (three exponentials
+        of one row are three caches: a softmax's output sweep reads the
+        exponentials of its sum sweep; ``e + 1``, ``e + 2`` and ``e + 3`` of
+        one ``e = exp(v)`` are three caches, as ``sweep_values.plan_cut``
+        cuts them; a one-instruction asm is computed again), and so every
+        load of an earlier sweep it still needs besides those: a load it reads
+        only to compute a cached value is not cached.  One cache may hold an
+        expression of several loads, so the count may err high.
+        """
+        from ....device_ir import ReductionLoopGraphInfo
+
+        sweeps = [
+            graph.graph
+            for graph in device_ir.graphs
+            if isinstance(graph, ReductionLoopGraphInfo)
+            and list(graph.block_ids) == [block_id]
+        ]
+        if not sweeps:
+            return 0
+        table: dict[object, int] = {}
+        memo: dict[torch.fx.Node, int] = {}
+        earlier = {_sweep_value_key(node, memo, table) for node in sweeps[0].nodes}
+        cached: set[int] = set()
+        for graph in sweeps[1:]:
+            memo = {}
+            keys = {node: _sweep_value_key(node, memo, table) for node in graph.nodes}
+            # The values the sweeps carry: those whose computation includes
+            # carried operations worth ``MIN_SAVED_COST`` instructions.
+            carried: dict[torch.fx.Node, frozenset[torch.fx.Node]] = {}
+            for node in graph.nodes:
+                own = frozenset((node,)) if _sweep_cost(node) else frozenset()
+                carried[node] = own.union(
+                    *(carried.get(arg, frozenset()) for arg in node.all_input_nodes)
+                )
+            heavy = {
+                node
+                for node, ops in carried.items()
+                if sum(map(_sweep_cost, ops)) >= MIN_SAVED_COST
+            }
+            # From the sweep's results and stores back to its inputs.
+            pending = [node for node in graph.nodes if not node.users]
+            seen: set[torch.fx.Node] = set()
+            while pending:
+                node = pending.pop()
+                if node in seen:
+                    continue
+                seen.add(node)
+                if node.op == "call_function" and (
+                    node in heavy
+                    or (
+                        node.target is language_load
+                        and isinstance(node.args[0], torch.fx.Node)
+                    )
+                ):
+                    key = keys[node]
+                    if key in earlier:
+                        cached.add(key)
+                        if node in heavy:
+                            # Read from the cache: its operands are not needed.
+                            continue
+                pending.extend(node.all_input_nodes)
+            earlier |= set(keys.values())
+        return len(cached)
+
+    @classmethod
+    def _forwarded_caches(cls, env: CompileEnvironment, device_ir: DeviceIR) -> int:
+        """The caches the seed's ``cute_scratch_forwarding`` adds: a forwarded
+        store's values are cached like a load's.  None here."""
+        return 0
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """Also requires a packet the jam can prove (``_packet_lanes``: a
+        dynamic shape leaves the lane loop rolled, and the seed's knob would
+        change nothing), an N-D grid tile (the jam takes the lane index as
+        the tile offset plus the lane; a one-axis tile lays out flattened
+        unless the planner keeps it N-D, ``cute_nd_tile_loops``, and its
+        lanes index through an alias of the flattened offset, which the jam
+        keeps rolled), every block size to tile a root grid axis (the seed tiles
+        them by its lanes or by 1, which would leave a device loop's block
+        one element on one thread) and every block the seed sets to have its
+        slots: threads for all, a reload mode for the reduction.  Nor may a
+        value span the reduced dimension and another reduction dim
+        (``_spans_another_reduction``)."""
+        spec = env.config_spec
+        match = cls._lane_operand(env, device_ir)
+        if match is None:
+            return False
+        lane_block, tensor, unit, _ = match
+        if _packet_lanes(env, tensor, unit, lane_block) is None:
+            return False
+        level = tuple(device_ir.grid_block_ids[0])
+        if len(level) == 1 and level not in spec.cute_nd_tile_loops:
+            return False
+        grid = set(level)
+        blocks = [item.block_id for item in spec.block_sizes]
+        loop = spec.reduction_loops[0].block_id
+        threaded = spec.num_threads.valid_block_ids()
+        return (
+            all(block_id in grid for block_id in blocks)
+            and all(block_id in threaded for block_id in (*blocks, loop))
+            and loop in spec.cute_reduction_reloads.valid_block_ids()
+            and not cls._spans_another_reduction(env, device_ir)
+        )
+
+    @staticmethod
+    def _spans_another_reduction(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        """Whether a value spans the looped reduction's dimension and another
+        reduction dim.  The seed runs every other reduction dim on one thread
+        (``get_seed_config``), which lowers for a narrow sum of its own beside
+        the looped one, but not for the heads of ``exp(x[tb, tm, :, :])``
+        summed over its keys and then over its heads: "reduction marker is
+        nested in a different lane owner"."""
+        spec = env.config_spec
+        loop = spec.reduction_loops[0].block_id
+        grid = set(device_ir.grid_block_ids[0])
+        others = {
+            _symint_sympy_expr(env.block_sizes[block_id].var)
+            for block_id in spec.num_threads.valid_block_ids()
+            if block_id not in grid and block_id != loop
+        }
+        if not others:
+            return False
+        looped = _symint_sympy_expr(env.block_sizes[loop].var)
+        for graph in device_ir.graphs:
+            for node in graph.graph.nodes:
+                value = node.meta.get("val")
+                if not isinstance(value, torch.Tensor):
+                    continue
+                dims = {
+                    _symint_sympy_expr(size)
+                    for size in value.shape
+                    if isinstance(size, torch.SymInt)
+                }
+                if looped in dims and not others.isdisjoint(dims):
+                    return True
+        return False
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        match = cls._lane_operand(env, device_ir)
+        if match is None:
+            return None
+        lane_block, tensor, unit, _ = match
+        spec = env.config_spec
+        lanes = _packet_lanes(env, tensor, unit, lane_block)
+        if lanes is None:
+            return None
+        blocks: dict[int, int] = {}
+        threads: dict[int, int] = {}
+        for item in spec.block_sizes:
+            blocks[item.block_id] = lanes if item.block_id == lane_block else 1
+            threads[item.block_id] = 1
+        # A second reduction dim (a row's narrow sum beside the looped one)
+        # runs on one thread: an automatic count gives it a thread axis that
+        # the rows' stores do not address but their values vary along, which
+        # does not lower.
+        for block_id in spec.num_threads.valid_block_ids():
+            threads.setdefault(block_id, 1)
+        loop = spec.reduction_loops[0]
+        chunk, threads[loop.block_id] = cls._reduction_chunk(loop.size_hint)
+        # Each lane caches its row's values of the reduction's first sweep
+        # for the later ones, and those of each later sweep for the sweeps
+        # after it: past the register budget the caches would spill, so the
+        # later sweeps reload from memory instead.  The lanes' copies of the
+        # caches share the jam's budget (one thread's under ``"auto"``), and
+        # so do those of the stores the seed forwards.
+        cached = max(
+            1,
+            cls._cached_values(device_ir, loop.block_id)
+            + cls._forwarded_caches(env, device_ir),
+        )
+        # A cache holds a thread's elements of every chunk, a masked last
+        # chunk's padding too: 600 keys in a 1024-key chunk on 128 threads
+        # take eight per value, not five.
+        trips = -(-loop.size_hint // chunk)
+        per_thread = lanes * cached * trips * (chunk // threads[loop.block_id])
+        reload = (
+            "register"
+            if per_thread <= jam_grid_lanes.MAX_PRIVATE_CACHE_ELEMENTS
+            else "gmem"
+        )
+        seed: dict[str, Any] = {
+            "block_sizes": [blocks[item.block_id] for item in spec.block_sizes],
+            "num_threads": _seq_config_list(spec.num_threads, threads),
+            "reduction_loops": [chunk],
+            "cute_reduction_reloads": _seq_config_list(
+                spec.cute_reduction_reloads, {loop.block_id: reload}
+            ),
+            "cute_grid_lane_jam": True,
+        }
+        return Config(**seed)
+
+    @classmethod
+    def _reduction_chunk(cls, size_hint: int) -> tuple[int, int]:
+        """The seed's reduction chunk for rows of ``size_hint`` elements and
+        the threads that share it: up to ``REDUCTION_CHUNK``, the largest
+        power of two that divides the row while it still gives each thread
+        two keys (768 keys take 256, 1536 take 512), so that no chunk is
+        masked, which would keep each lane's gathered loads scalar; else the
+        next power of two, masked (2176 keys, 17 chunks of 128 otherwise,
+        take 1024)."""
+        chunk = min(cls.REDUCTION_CHUNK, next_power_of_2(size_hint))
+        divisor = chunk
+        while size_hint % divisor:
+            divisor //= 2
+        if divisor >= 2 * cls.REDUCTION_THREADS:
+            chunk = divisor
+        return chunk, min(cls.REDUCTION_THREADS, chunk)
+
+    @classmethod
+    def get_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config] | None:
+        primary = cls.get_seed_config(env, device_ir)
+        match = cls._lane_operand(env, device_ir)
+        if primary is None or match is None:
+            return None
+        *_, row_itemsize = match
+        spec = env.config_spec
+        loop = spec.reduction_loops[0]
+        # The primary's chunk and its threads.
+        (chunk,) = cast("list[int]", primary.config["reduction_loops"])
+        threads = cast("list[int]", primary.config["num_threads"])[
+            [item.block_id for item in spec.num_threads].index(loop.block_id)
+        ]
+        # A width must divide the row, or its packets would not tile it (its
+        # loads would stay scalar, at a stride), and give every thread keys
+        # of a full chunk, or of the whole row when that is shorter (a longer
+        # row's last chunk may leave some threads idle).
+        keys = min(chunk, loop.size_hint)
+        # Nor may a packet of the widest row operand loaded (a workspace read
+        # back counts; a row only stored does not) be wider than a lane loads
+        # whole, twice
+        # ``_CUTE_VECTOR_MAX_BYTES`` from sm_100 on: its loads would stay
+        # scalar.
+        capability = spec.target_device_capability
+        packet_bytes = _CUTE_VECTOR_MAX_BYTES * (
+            2 if capability is not None and capability >= (10, 0) else 1
+        )
+        seeds = [primary]
+        for width in cls.ALTERNATE_VECTOR_WIDTHS:
+            if (
+                loop.size_hint % width
+                or threads * width > keys
+                or width * row_itemsize > packet_bytes
+            ):
+                continue
+            values: dict[str, Any] = {
+                **primary.config,
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {loop.block_id: width}
+                ),
+            }
+            seeds.append(Config(**values))
+        return seeds
+
+
+class CuteReductionLaneJamForwardingHeuristic(CuteReductionLaneJamHeuristic):
+    """``cute_reduction_lane_jam``'s seed with ``cute_scratch_forwarding``.
+
+    Those kernels keep each row in a kernel-local workspace between the
+    sweeps (T5's softmax-dropout backward stores its probabilities or
+    products, then reads them back).  Forwarding the stored values from
+    registers saves the workspace's reloads (and, once no load reads them,
+    its stores) but keeps the values live across the sweeps, in registers
+    that may cost occupancy.  The knob is searchable wherever this heuristic
+    is eligible (``ConfigSpec.cute_scratch_forwarding_sites``), whatever the
+    extent, and both seeds start the search, so the autotuner picks per
+    kernel.
+    """
+
+    name = "cute_reduction_lane_jam_forwarding"
+    priority = 101
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return super().is_eligible(env, device_ir) and _reloads_scratch(env, device_ir)
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        seed = super().get_seed_config(env, device_ir)
+        if seed is None:
+            return None
+        # Nothing is forwarded under gmem reloads (the forwarded stores'
+        # caches past the jam's budget too: ``_forwarded_caches``), nor when
+        # the chunk does not divide the row (its stores are masked): the twin
+        # would compile and time the jam seed's code again.
+        (chunk,) = cast("list[int]", seed.config["reduction_loops"])
+        if (
+            "gmem" in cast("list[str]", seed.config["cute_reduction_reloads"])
+            or env.config_spec.reduction_loops[0].size_hint % chunk
+        ):
+            return None
+        forwarding: dict[str, Any] = {**seed.config, "cute_scratch_forwarding": True}
+        return Config(**forwarding)
+
+    @classmethod
+    def _forwarded_caches(cls, env: CompileEnvironment, device_ir: DeviceIR) -> int:
+        """One for each workspace a later sweep reads back
+        (``_reloaded_scratch``)."""
+        return len(_reloaded_scratch(env, device_ir))
+
+
+def _reloads_scratch(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Whether the tile body loads a kernel-local scratch tensor after it
+    stores to it (``_reloaded_scratch``)."""
+    return bool(_reloaded_scratch(env, device_ir))
+
+
+def _reloaded_scratch(env: CompileEnvironment, device_ir: DeviceIR) -> set[int]:
+    """The storages of the kernel-local scratch tensors the tile body loads
+    after it stores to them (``scratch_tensors``): workspaces a later sweep
+    reads back, of a dtype the forwarding moves (``FORWARDED_DTYPES``: not
+    bytes, bools or unsigned integers).  A load before the only store
+    (``ws[t] += x``) reads nothing forwarded."""
+    from ....device_ir import RootGraphInfo
+    from ....scratch_tensors import kernel_local_scratch
+
+    if device_ir.host_function is None:
+        return set()
+    scratch = kernel_local_scratch(device_ir.host_function)
+    reloaded: set[int] = set()
+    for graph in device_ir.graphs:
+        if not isinstance(graph, RootGraphInfo):
+            continue
+        stored: set[int] = set()
+        for node in graph.graph.nodes:
+            if (
+                node.op != "call_function"
+                or node.target not in (language_load, language_store)
+                or not node.args
+                or not isinstance(node.args[0], torch.fx.Node)
+            ):
+                continue
+            tensor = node.args[0].meta.get("val")
+            if (
+                isinstance(tensor, torch.Tensor)
+                and scratch.holds(tensor)
+                and env.backend.dtype_str(tensor.dtype) in FORWARDED_DTYPES
+            ):
+                storage = id(tensor.untyped_storage())
+                if node.target is language_store:
+                    stored.add(storage)
+                elif storage in stored:
+                    reloaded.add(storage)
+    return reloaded
+
+
 class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
     """Cluster row-split seed for very wide rolled row reductions: split
     each row across a thread-block cluster so every CTA rolls a ~16k-element
@@ -4362,7 +6659,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
 
     name = "cute_rolled_cluster_ladder"
     backend = "cute"
-    priority = 36
+    priority = 37
 
     _SLICE_TARGET = 16384
     _MAX_CLUSTER = 16
@@ -4499,7 +6796,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
 
     name = "cute_masked_rolled_cluster"
     backend = "cute"
-    priority = 37
+    priority = 38
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -4603,10 +6900,21 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
             )
             for seed in register_rows
         ]
-        native_redux = [
-            Config.from_dict(deepcopy(seed.config) | {"cute_warp_fp32_redux": True})
-            for seed in ([*register_rows, *kept_inputs] or seeds)
-        ]
+        from ...native_warp_reduction import has_native_redux_reduction
+
+        # The cluster's grouped reduce helpers take only a max or a min
+        # natively under the knob (an ``any`` keeps their shuffle
+        # reduction); elsewhere these copies would render their parents.
+        native_redux = (
+            [
+                Config.from_dict(deepcopy(seed.config) | {"cute_warp_fp32_redux": True})
+                for seed in ([*register_rows, *kept_inputs] or seeds)
+            ]
+            if has_native_redux_reduction(
+                device_ir, spec.target_device_capability, with_any=False
+            )
+            else []
+        )
         return dedupe_configs(
             [*seeds, *independent, *register_rows, *kept_inputs, *native_redux]
         )
@@ -5822,7 +8130,7 @@ class CuteTcgen05GroupedWorklistHeuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_worklist"
     backend = "cute"
-    priority = 24
+    priority = 25
     promote_seed_to_default = True
     PROMOTE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
     CACHE_NAMED_TARGETS = _TCGEN05_GROUPED_TARGET_IDENTITIES
@@ -6481,7 +8789,7 @@ class CuteTcgen05GroupedSource64Heuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_source64"
     backend = "cute"
-    priority = 56
+    priority = 57
     CACHE_SPECIALIZATION_FACTS = frozenset({"config_num_sm", "input_tensor_metadata"})
 
     @classmethod
@@ -6507,7 +8815,7 @@ class CuteTcgen05GroupedStaticCommonKHeuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_static_common_k"
     backend = "cute"
-    priority = 25
+    priority = 26
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -6559,7 +8867,7 @@ class CuteTcgen05GroupedDynamicBk64Heuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_grouped_dynamic_bk64"
     backend = "cute"
-    priority = 26
+    priority = 27
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
@@ -6698,12 +9006,13 @@ class CuteGdnRecurrenceHeuristic(AutotunerHeuristic):
     ) -> GdnRecurrenceGeometry | None:
         from ...gdn_recurrence import detect_gdn_recurrence_search_geometry
 
-        capability = env.config_spec.target_device_capability
         host_function = device_ir.host_function
-        if capability is None or capability[0] != 10 or host_function is None:
+        if host_function is None:
             return None
         with host_function:
-            return detect_gdn_recurrence_search_geometry(device_ir.graphs)
+            return detect_gdn_recurrence_search_geometry(
+                device_ir.graphs, env.config_spec.target_device_capability
+            )
 
     @classmethod
     def register_facts(
@@ -7318,7 +9627,7 @@ class CuteTcgen05ThreadLocalEpilogueHeuristic(AutotunerHeuristic):
 
     name = "cute_tcgen05_thread_local_epilogue"
     backend = "cute"
-    priority = 27
+    priority = 28
     promote_seed_to_default = True
 
     @classmethod
@@ -7782,7 +10091,7 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
 
     name = "cute_pointwise_vec"
     backend = "cute"
-    priority = 51
+    priority = 52
 
     NT = 256  # threads per CTA
     UNROLL = 2  # vectors per thread (outer lane iters)
@@ -7852,10 +10161,24 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             for value in choices
             if cast("int", value) <= 16 // max(1, fact.storage_itemsize)
         )
+        # Where a one-hot sum folded away, a row wider than a CTA of packets
+        # carries the traffic along its stride-1 dim (a 30522-wide row beside
+        # its label in a cross-entropy backward): tile vectors would run
+        # across the rows, one CTA per 1024 rows with every thread walking
+        # whole rows.  Other kernels keep the tile seeds, untimed there.
+        if device_ir.folded_one_hot_sums and _wide_rows_outweigh_tile(
+            env, device_ir, vec_block, cls.NT * full_vec
+        ):
+            return []
         # Power-of-two vector widths must divide the actual extent.
         vec = math.gcd(full_vec, extent)
         flatten_group = next(
-            (f for f in spec.flatten_loops if f.block_ids[-1] == vec_block), None
+            (
+                f
+                for f in spec.flatten_loops
+                if f.block_ids[-1] == vec_block and not f.pinned
+            ),
+            None,
         )
         fragments = {s.block_id: s._fragment(spec) for s in spec.block_sizes}
         # Flatten when one axis cannot supply a full CTA of vector packets.
@@ -8002,6 +10325,9 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 )
                 seeds.append(Config.from_dict(packet))
         seeds.extend(cls._wide_row_packet_seeds(env, fact, candidates, vec_block))
+        seeds.extend(cls._broadcast_hoist_seeds(env, fact, candidates, vec_block))
+        if flatten and narrow:
+            seeds.extend(cls._row_tile_seeds(env, fact, candidates, vec_block, primary))
         if spec.cute_proven_bounds_enabled:
             # Keep the complete existing family and its order. Add independent
             # true counterparts so ordinary cold search can compare the proof
@@ -8021,7 +10347,11 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             # multi-packet tiles; do not invent new geometries or defaults.
             vector_pos = spec.cute_vector_widths.block_id_to_index(vec_block)
             for base in list(seeds):
-                if base.config.get("cute_proven_bounds") is not True:
+                # A sunk vector loop's prefetch twin renders the same source
+                # as its proven-bounds seed: it would only time a duplicate.
+                if base.config.get("cute_proven_bounds") is not True or (
+                    base.config.get("cute_vloop_sink")
+                ):
                     continue
                 block = math.prod(base.block_sizes)
                 threads = math.prod(max(1, n) for n in base.num_threads)
@@ -8058,6 +10388,99 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
             )
         return seeds
 
+    # Row-tile seed: the bytes of a lane's packet, the fewest lanes a row
+    # spans, the most of the row's tile that may be masked off, and the
+    # threads per CTA.
+    ROW_TILE_PACKET_BYTES = 16
+    ROW_TILE_MIN_LANES = 32
+    ROW_TILE_MASKED_FRACTION = 1 / 8
+    ROW_TILE_THREADS = 128
+
+    @classmethod
+    def _row_tile_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+        primary: Config,
+    ) -> list[Config]:
+        """One tile per row of a contiguous axis too narrow for the CTA.
+
+        The primary flattens the tile axes into one when the contiguous axis
+        cannot supply a CTA of packets.  Each element of a flattened tile
+        then takes its indices from a division and a remainder of its offset
+        by the row length, a multiply-high sequence for a length that is no
+        power of two, and loads an operand broadcast over an outer axis as
+        one scalar per lane, which also keeps ``cute_pair_lane_math`` from
+        pairing the lanes.  Here a tile holds a whole row instead (its length
+        rounded up to a power of two, with at most
+        ``ROW_TILE_MASKED_FRACTION`` of the tile masked off), one packet per
+        thread across it, and the rest of the CTA's ``ROW_TILE_THREADS``
+        threads take one row each of the innermost outer axis long enough
+        for them, the other axes a tile of one: the indices are the
+        threads', operands indexed by the rows load once per row and the
+        broadcast ones as packets, and the seed pairs the lanes' fp32 math.
+        gpt-oss's sink-softmax normalize over ``[64, 1000, 1000]`` bf16
+        (better-benchmark's max_amax_sum_66e6dc6d2131), timed interleaved
+        on B200: 70 us at this seed (a row per 128-thread CTA; 72 at two rows
+        per 256-thread CTA, 78 of them without the pairing), 94-138 at the
+        flattened seeds and 94 at the run6 sweep's config.  These tiles lie
+        below the floor that ``raise_grid_block_minimums`` puts under the
+        search's block sizes (its CTAs exceed the grid budget), so the
+        search reaches them only through this seed; its tiles of 16 rows
+        ran 100-123 us.
+        """
+        spec = env.config_spec
+        layout = cls._packet_layout(
+            env, fact, candidates, vec_block, cls.ROW_TILE_PACKET_BYTES, cls.NT
+        )
+        if layout is None or len(candidates) < 2:
+            return []
+        vec, inner, _, fragments = layout
+        row_tile = next_power_of_2(inner)
+        lanes = row_tile // vec
+        if (
+            # A power-of-two row splits a flat offset with shifts and masks.
+            row_tile == inner
+            or row_tile - inner > row_tile * cls.ROW_TILE_MASKED_FRACTION
+            or lanes < cls.ROW_TILE_MIN_LANES
+            or not fragments[vec_block].low <= row_tile <= fragments[vec_block].high
+        ):
+            return []
+        # A row narrower than the primary's CTA of packets spans fewer than
+        # ``NT`` lanes, a power of two: at most ``ROW_TILE_THREADS``.
+        rows = cls.ROW_TILE_THREADS // lanes
+        outer = next(
+            (
+                axis
+                for axis in reversed(candidates[:-1])
+                if rows <= fragments[axis].high
+            ),
+            None,
+        )
+        if outer is None:
+            return []
+        tiles = dict.fromkeys(candidates, 1)
+        values: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {**tiles, outer: rows, vec_block: row_tile}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {**tiles, outer: rows, vec_block: lanes}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+        }
+        evictions = primary.config.get("load_eviction_policies")
+        if evictions:
+            # The seed owns its list (seeds must not alias each other).
+            values["load_eviction_policies"] = deepcopy(evictions)
+        if spec.cute_pair_lane_math_sites:
+            values["cute_pair_lane_math"] = True
+        return [Config(**values)]
+
     # Wide row packets: bytes per lane load, lanes across the contiguous axis,
     # packet loads hoisted per thread, and the CTA's thread budget.
     WIDE_PACKET_BYTES = 32
@@ -8088,34 +10511,27 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         16-byte packet seeds start 30-80% away from it.
         """
         spec = env.config_spec
-        if len(candidates) != 2 or vec_block != candidates[-1]:
+        if len(candidates) != 2:
+            return []
+        layout = cls._packet_layout(
+            env,
+            fact,
+            candidates,
+            vec_block,
+            cls.WIDE_PACKET_BYTES,
+            cls.WIDE_PACKET_LANES,
+        )
+        if layout is None or not spec.supports_config_key("cute_min_blocks_per_mp"):
             return []
         outer_block = candidates[0]
-        if (
-            fact.storage_itemsize <= 0
-            or vec_block not in spec.cute_vector_widths.valid_block_ids()
-            or vec_block not in spec.num_threads.valid_block_ids()
-            or outer_block not in spec.num_threads.valid_block_ids()
-            or not spec.supports_config_key("cute_min_blocks_per_mp")
-        ):
-            return []
-        vec = cls.WIDE_PACKET_BYTES // fact.storage_itemsize
-        choices = {
-            cast("int", value)
-            for value in spec.cute_vector_widths.block_id_lookup(vec_block)
-            ._fragment(spec)
-            .choices
-        }
-        inner = spec.block_sizes.block_id_lookup(vec_block).size_hint
-        if vec not in choices or inner % vec:
-            return []
-        lanes = min(cls.WIDE_PACKET_LANES, inner // vec)
-        inner_tile = min(inner, lanes * vec * cls.WIDE_PACKET_LOADS)
+        vec, inner, lanes, fragments = layout
+        # Block sizes and thread counts must be powers of two. Rounding down
+        # keeps the caps (no more lanes than the row has packets, no tile wider
+        # than the row), so only a row's last tile is ragged; the search times
+        # this seed beside the others, and the doubled tile is one neighbor
+        # step from it.
+        inner_tile = prev_power_of_2(inner, lanes * vec * cls.WIDE_PACKET_LOADS)
         rows = cls.WIDE_PACKET_THREADS // lanes
-        fragments = {
-            bid: spec.block_sizes.block_id_lookup(bid)._fragment(spec)
-            for bid in candidates
-        }
         rows = max(fragments[outer_block].low, min(rows, fragments[outer_block].high))
         if not fragments[vec_block].low <= inner_tile <= fragments[vec_block].high:
             return []
@@ -8145,11 +10561,178 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
         if dependent:
             # The twin owns its lists (seeds must not alias each other).
             variants.append(deepcopy(base) | dependent)
-        seeds: list[Config] = []
-        for values in variants:
-            with contextlib.suppress(Exception):
-                seeds.append(Config(**values))
-        return seeds
+        return [Config(**values) for values in variants]
+
+    @classmethod
+    def _packet_layout(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+        packet_bytes: int,
+        lanes_cap: int,
+    ) -> tuple[int, int, int, dict[int, BlockSizeFragment]] | None:
+        """The packet layout along the contiguous axis: the vector width of
+        a ``packet_bytes`` packet, the axis's extent, the lanes across it (a
+        power of two, at most ``lanes_cap`` and the packets a row holds) and
+        every axis's block-size fragment; None unless the contiguous axis is
+        the inner of the threaded axes and its extent takes whole packets."""
+        spec = env.config_spec
+        if (
+            vec_block != candidates[-1]
+            or fact.storage_itemsize <= 0
+            or vec_block not in spec.cute_vector_widths.valid_block_ids()
+            or not set(spec.num_threads.valid_block_ids()).issuperset(candidates)
+        ):
+            return None
+        vec = packet_bytes // fact.storage_itemsize
+        choices = {
+            cast("int", value)
+            for value in spec.cute_vector_widths.block_id_lookup(vec_block)
+            ._fragment(spec)
+            .choices
+        }
+        inner = spec.block_sizes.block_id_lookup(vec_block).size_hint
+        if vec not in choices or inner % vec:
+            return None
+        fragments = {
+            bid: spec.block_sizes.block_id_lookup(bid)._fragment(spec)
+            for bid in candidates
+        }
+        lanes = prev_power_of_2(inner // vec, lanes_cap)
+        return vec, inner, lanes, fragments
+
+    # Broadcast-hoist seed: rows per thread, the CTAs-per-SM hint, the
+    # lane-unroll block the rows load in, bytes per lane load, lanes across the
+    # contiguous axis and threads per CTA.
+    HOIST_ROWS_PER_THREAD = 8
+    HOIST_CTAS_PER_SM = 3
+    HOIST_LANE_UNROLL = HOIST_ROWS_PER_THREAD
+    HOIST_PACKET_BYTES = 16
+    HOIST_LANES = 16
+    HOIST_THREADS = 128
+
+    @classmethod
+    def _broadcast_hoist_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+    ) -> list[Config]:
+        """Several rows per thread, so operands that do not vary over the rows
+        load once per thread.
+
+        A pointwise kernel that reads operands indexed by the contiguous axis
+        but not by its rows (a BatchNorm epilogue's ``mean[tile_c]``,
+        ``weight[tile_c]``, ...) reloads them for every row under the
+        one-row-per-thread seeds above. Here each thread owns one 16-byte
+        packet column over several rows: ``cute_vloop_sink`` hoists those
+        loads and their arithmetic out of the row loop into fragments, and
+        ``cute_lane_unroll`` issues the rows' loads before any is consumed.
+        The rows are the outer axis the fewest loads index (the innermost on
+        a tie); another outer axis takes its smallest tile, a thread per
+        element: ConvNeXt-V2's GELU + GRN apply over ``[n, hw, c]`` reads
+        ``gx[tile_n, tile_c] / denom[tile_n]``, ``beta[tile_c]`` and
+        ``gamma[tile_c]``, none of them per spatial row, so the rows are
+        ``hw`` and ``n`` takes its smallest tile.  That smallest tile grows
+        with the grid (16 images of a 512-image batch), so where the other
+        axes leave the rows no thread, or the rows do not fit their axis,
+        the next outer axis in that order takes the rows instead.  Where none
+        fits there is no seed: a thread walking the other axes' smallest
+        tiles instead holds 1024 elements (16 query rows of gpt-oss's sink
+        softmax under 8 heads), and that softmax's normalize ran 5.7x slower
+        than its autotuned config.  The seed is the layout and CTAs-per-SM
+        hint that cold full autotunes of repvgg's BatchNorm epilogue
+        converged on.
+        """
+        spec = env.config_spec
+        # One axis leaves no outer axis to hold the rows: no layout to search.
+        # An axis an inner device loop tiles leaves the sinking pass, which
+        # sinks the vector loop of a grid tile, nothing to sink.
+        if (
+            len(candidates) < 2
+            or not set(candidates) <= set(spec.grid_block_ids)
+            or not spec.supports_config_key("cute_vloop_sink")
+            or not spec.supports_config_key("cute_lane_unroll")
+        ):
+            return []
+        layout = cls._packet_layout(
+            env, fact, candidates, vec_block, cls.HOIST_PACKET_BYTES, cls.HOIST_LANES
+        )
+        if layout is None:
+            return []
+        vec, _, lanes, fragments = layout
+        if lanes < 2:
+            # A row of one packet leaves the sinking pass no vector loop to
+            # sink, and the seed would run the knob-off scalar code.
+            return []
+        if not fragments[vec_block].low <= lanes * vec <= fragments[vec_block].high:
+            return []
+        outer = candidates[:-1]
+        loads = [
+            set(op.subscript_block_ids)
+            for op in spec.memory_op_facts
+            if op.kind == "load"
+        ]
+        # The fewest loads first, the innermost axis first on a tie.
+        order = sorted(
+            outer,
+            key=lambda bid: (sum(bid in ids for ids in loads), -outer.index(bid)),
+        )
+        for row in order:
+            # A load along the vector axis that does not vary over the rows
+            # and indexes no gathered position (``weight[idx[tile_b], tile_e]``
+            # is ``(None, vec_block)``): the sinking pass leaves a gather
+            # unsunk.
+            if not any(
+                vec_block in ids and row not in ids and None not in ids for ids in loads
+            ):
+                continue
+            # A thread per element of the other axes' smallest tiles.
+            others = {bid: fragments[bid].low for bid in outer if bid != row}
+            row_threads = cls.HOIST_THREADS // (lanes * math.prod(others.values()))
+            rows = row_threads * cls.HOIST_ROWS_PER_THREAD
+            # A CTA has three thread axes: a fourth axis of several threads
+            # would run as a serial lane loop, which the lane unroll takes.
+            threaded = sum(t > 1 for t in (*others.values(), row_threads, lanes))
+            if (
+                row_threads >= 1
+                and fragments[row].low <= rows <= fragments[row].high
+                and threaded <= 3
+            ):
+                break
+        else:
+            return []
+        layouts = {
+            bid: kind
+            for bid, kind in ((row, "blocked"), (vec_block, "strided"))
+            if bid in spec.cute_lane_layouts.valid_block_ids()
+        }
+        values: dict[str, Any] = {
+            "block_sizes": _seq_config_list(
+                spec.block_sizes, {**others, row: rows, vec_block: lanes * vec}
+            ),
+            "num_threads": _seq_config_list(
+                spec.num_threads, {**others, row: row_threads, vec_block: lanes}
+            ),
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {vec_block: vec}
+            ),
+            "cute_vloop_sink": True,
+            "cute_lane_unroll": cls.HOIST_LANE_UNROLL,
+        }
+        if spec.supports_config_key("cute_min_blocks_per_mp"):
+            values["cute_min_blocks_per_mp"] = cls.HOIST_CTAS_PER_SM
+        if layouts:
+            values["cute_lane_layouts"] = _seq_config_list(
+                spec.cute_lane_layouts, layouts
+            )
+        loop_orders = _reversed_root_loop_orders(env)
+        if loop_orders is not None:
+            values["loop_orders"] = loop_orders
+        return [Config(**values)]
 
     # Per-CTA thread budgets and thread counts on the widest other full-slice
     # axis the persistent family seeds (``_persistent_seed_configs``), and the
@@ -8524,8 +11107,10 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         host_function = device_ir.host_function
         if host_function is None or not env.config_spec.tcgen05.search_enabled:
             return frozenset()
+        from ...cute_mma import host_function_cp_async_a_provable
         from ...cute_mma import host_function_exact_aux_tma_provable
         from ...cute_mma import host_function_matmul_operands_tma_provable
+        from ...cute_mma import host_function_matmul_output_matches_extents
 
         # Codegen proves a pointer-preserving host view operand through its
         # input's exact metadata (``input_view_copy_facts``), which this hook
@@ -8541,6 +11126,12 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
         env.compiler_fact_specialization_facts = saved | facts
         try:
             provable = host_function_matmul_operands_tma_provable(env, host_function)
+            inputs_provable = provable or host_function_matmul_operands_tma_provable(
+                env, host_function, outputs=False
+            )
+            output_matches = host_function_matmul_output_matches_extents(
+                env, host_function
+            )
             # The staged aux modes (``tma`` / ``epi_tma``) bulk-load every
             # exact-shape auxiliary operand through a row-major TensorMap;
             # the same proof over those operands keeps both modes off the
@@ -8548,10 +11139,16 @@ class CuteTcgen05ClusterM2FfiHeuristic(CuteTcgen05ClusterM2Heuristic):
             # strided or column-major residual / gate view (codegen refuses
             # them with ``TCGEN05_AUX_TMA_ILLEGAL_TENSOR_REASON``).
             aux_provable = host_function_exact_aux_tma_provable(env, host_function)
+            cp_async_a = not provable and host_function_cp_async_a_provable(
+                env, host_function
+            )
         finally:
             env.compiler_fact_specialization_facts = saved
         env.config_spec.tcgen05.matmul_operands_tma_provable = provable
+        env.config_spec.tcgen05.matmul_inputs_tma_provable = inputs_provable
+        env.config_spec.tcgen05.cp_async_a_provable = cp_async_a
         env.config_spec.tcgen05.exact_aux_tma_provable = aux_provable
+        env.config_spec.tcgen05.matmul_output_matches_extents = output_matches
         return facts
 
     @classmethod

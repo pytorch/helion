@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
+import types
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import Literal
@@ -11,6 +13,7 @@ import torch
 from torch.utils._pytree import tree_flatten
 
 from .kernel_args import PortableFunction
+from .kernel_args import _input_tree_leaves
 
 if TYPE_CHECKING:
     from typing import Callable
@@ -149,6 +152,12 @@ def effective_fp8_accuracy(settings: Settings) -> str:
     return settings.autotune_fp8_accuracy
 
 
+# Every closeness comparison counts a NaN that matches a NaN at the same
+# position as accurate (see ``assert_close``).
+_assert_close_equal_nan = functools.partial(torch.testing.assert_close, equal_nan=True)
+_allclose_equal_nan = functools.partial(torch.allclose, equal_nan=True)
+
+
 def relative_l2_disagreement(
     actual: object, expected: object, max_relative_l2: float
 ) -> str | None:
@@ -166,11 +175,48 @@ def relative_l2_disagreement(
     too (``|a - b| <= atol + rtol * |b|``: the default ``rtol=1e-2`` admits
     an index of 101 against 100).  Leaves that are not tensors are not
     compared."""
+    return _relative_l2_disagreement(actual, expected, max_relative_l2, {})
+
+
+def _relative_l2_disagreement(
+    actual: object,
+    expected: object,
+    max_relative_l2: float,
+    compared_records: dict[tuple[int, int], tuple[object, object]],
+) -> str | None:
     actual_leaves, actual_spec = tree_flatten(actual)
     expected_leaves, expected_spec = tree_flatten(expected)
     if actual_spec != expected_spec or len(actual_leaves) != len(expected_leaves):
         return "the outputs differ in structure"
     for index, (a, b) in enumerate(zip(actual_leaves, expected_leaves, strict=True)):
+        a_operands = _callback_tensor_values(a)
+        b_operands = _callback_tensor_values(b)
+        if a_operands is not None or b_operands is not None:
+            if a_operands is None or b_operands is None:
+                return f"leaf {index} has a different callback type"
+            reason = _relative_l2_disagreement(
+                a_operands, b_operands, max_relative_l2, compared_records
+            )
+            if reason is not None:
+                return f"leaf {index} callback operands: {reason}"
+            continue
+        a_fields = _record_field_values(a)
+        b_fields = _record_field_values(b)
+        if a_fields is not None or b_fields is not None:
+            if type(a) is not type(b) or a_fields is None or b_fields is None:
+                return f"leaf {index} has a different dataclass type"
+            pair = (id(a), id(b))
+            if pair in compared_records:
+                continue
+            # Pytree flatteners may create temporary records. Keep them alive
+            # so a later sibling cannot reuse a visited pair of object IDs.
+            compared_records[pair] = (a, b)
+            reason = _relative_l2_disagreement(
+                a_fields, b_fields, max_relative_l2, compared_records
+            )
+            if reason is not None:
+                return f"leaf {index}: {reason}"
+            continue
         if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
             if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
                 return f"leaf {index} is a tensor on one side only"
@@ -183,7 +229,7 @@ def relative_l2_disagreement(
         if a.numel() == 0:
             continue
         if a.dtype == torch.float4_e2m1fn_x2:
-            # Packed FP4 has no numeric cast (see ``_assert_close_large``):
+            # Packed FP4 has no numeric cast (see ``_chunked_assert_close``):
             # the two runs must agree byte for byte.
             if not torch.equal(a.view(torch.uint8), b.view(torch.uint8)):
                 return f"leaf {index} ({a.dtype}) differs"
@@ -192,12 +238,20 @@ def relative_l2_disagreement(
             if not torch.equal(a, b):
                 return f"leaf {index} ({a.dtype}) differs"
             continue
-        # float64 leaves keep their range: in float32 two different large
-        # values would both overflow to inf and agree.
-        compute_dtype = torch.float64 if a.dtype == torch.float64 else torch.float32
-        af = a.detach().to(compute_dtype)
-        bf = b.detach().to(compute_dtype)
+        # A complex leaf's real and imaginary parts count as elements of their
+        # own.  Float64 keeps its range (float32 would turn a large finite
+        # value into an infinity); every other float dtype widens exactly.
+        af, bf = (
+            torch.view_as_real(t.detach().resolve_conj())
+            if t.is_complex()
+            else t.detach()
+            for t in (a, b)
+        )
+        if af.dtype != torch.float64:
+            af, bf = af.to(torch.float32), bf.to(torch.float32)
         finite = torch.isfinite(bf)
+        # An infinity must also keep its sign: the masks alone would let -inf
+        # stand for +inf, which is zeroed with the other non-finite elements.
         if (
             not torch.equal(torch.isfinite(af), finite)
             or not torch.equal(torch.isnan(af), torch.isnan(bf))
@@ -206,11 +260,20 @@ def relative_l2_disagreement(
             return f"leaf {index}: the non-finite elements differ"
         af = torch.where(finite, af, torch.zeros((), dtype=af.dtype, device=af.device))
         bf = torch.where(finite, bf, torch.zeros((), dtype=bf.dtype, device=bf.device))
+        # The norms of the finite elements over their largest magnitude, in
+        # float32 (float64 is not available everywhere): squares of values
+        # near either end of the range would overflow or underflow.  The peak
+        # stays a tensor: CUDA divides by a Python number through its
+        # reciprocal in the tensor's dtype, which is infinite for a subnormal
+        # peak.
+        peak = torch.maximum(af.abs().amax(), bf.abs().amax())
+        if not peak.item():
+            continue
+        af = (af / peak).to(torch.float32)
+        bf = (bf / peak).to(torch.float32)
         scale = max(
             torch.linalg.vector_norm(af).item(), torch.linalg.vector_norm(bf).item()
         )
-        if scale == 0.0:
-            continue
         relative_l2 = torch.linalg.vector_norm(af - bf).item() / scale
         if not relative_l2 <= max_relative_l2:
             return (
@@ -218,6 +281,55 @@ def relative_l2_disagreement(
                 f"{max_relative_l2:.0e}"
             )
     return None
+
+
+def entirely_nan(t: torch.Tensor, chunk_size: int = 2**22) -> bool:
+    """Whether ``t`` is a non-empty floating-point tensor of NaNs only.
+
+    A tensor whose first element is a number returns at once.  Otherwise
+    this checks chunks of ``chunk_size`` elements of the flattened tensor (a
+    copy of a non-contiguous one, as in ``_chunked_rms``: an expanded row
+    costs its logical size) and stops at the first one holding a number.
+    """
+    if not (t.is_floating_point() or t.is_complex()) or t.numel() == 0:
+        return False
+    if not bool(torch.isnan(t[(0,) * t.dim()])):
+        return False
+    flat = t.reshape(-1)
+    return all(
+        bool(torch.isnan(flat[start : start + chunk_size]).all())
+        for start in range(0, flat.numel(), chunk_size)
+    )
+
+
+def fp4_bytes(t: torch.Tensor) -> torch.Tensor:
+    """Packed fp4 as its bytes, which ``torch.equal`` compares (it has no
+    fp4 kernel); any other tensor as it is."""
+    return t.view(torch.uint8) if t.dtype == torch.float4_e2m1fn_x2 else t
+
+
+def same_values(new: torch.Tensor, old: torch.Tensor) -> bool:
+    """Whether ``new`` holds exactly ``old``'s values, a NaN matching a NaN at
+    the same position: ``torch.equal`` counts a NaN unequal to itself, so a
+    floating-point tensor it finds different must hold the same bytes (a
+    NaN of another payload, or -0.0 against 0.0, then differs), as packed
+    fp4 always must (``fp4_bytes``).  A conjugate or negative view compares
+    its resolved values (the clones the baseline runs on are resolved)."""
+    if torch.equal(fp4_bytes(new), fp4_bytes(old)):
+        return True
+    if (
+        new.dtype != old.dtype
+        or new.shape != old.shape
+        or not (new.is_floating_point() or new.is_complex())
+    ):
+        return False
+    new, old = (t.resolve_conj().resolve_neg() for t in (new, old))
+    if new.is_complex():
+        new, old = torch.view_as_real(new), torch.view_as_real(old)
+    bits = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+    return torch.equal(
+        new.view(bits[new.element_size()]), old.view(bits[old.element_size()])
+    )
 
 
 def assert_close(
@@ -231,6 +343,14 @@ def assert_close(
     fp8_accuracy: str = "bitwise",
 ) -> None:
     """Like torch.testing.assert_close, with packed floats and large tensor handling.
+
+    A NaN matches a NaN at the same position (as in the fp8 ulp comparison):
+    kernels whose correct output contains NaNs (a sqrt or log of negative
+    inputs) must still autotune; a NaN on one side only is a mismatch.  Where
+    a complex value holds a NaN on either side, its real and imaginary parts
+    compare as numbers of their own (``torch.testing`` matches two complex
+    values whenever either part of each is a NaN); elsewhere complex values
+    compare as ``torch.testing`` compares them.
 
     With ``atol_scale="rms"`` (``scale_atol_by_expected_rms`` for short; used
     when the caller did not specify an explicit atol), the absolute-tolerance
@@ -252,17 +372,37 @@ def assert_close(
     both are 0); ``"ulp"`` compares dequantized values within one fp8 ulp plus
     the tolerances (see ``_assert_close_fp8_ulp``).
     """
-    if fp8_accuracy not in FP8_ACCURACY_MODES:
-        raise ValueError(
-            f"fp8_accuracy must be one of {FP8_ACCURACY_MODES}, got {fp8_accuracy!r}"
-        )
     if scale_atol_by_expected_rms:
         if atol_scale not in (None, "rms"):
             raise ValueError(
                 f"scale_atol_by_expected_rms contradicts atol_scale={atol_scale!r}"
             )
         atol_scale = "rms"
+    _assert_close_records(
+        actual,
+        expected,
+        atol,
+        rtol,
+        atol_scale=atol_scale,
+        fp8_accuracy=fp8_accuracy,
+        compared_records={},
+    )
 
+
+def _assert_close_records(
+    actual: object,
+    expected: object,
+    atol: float,
+    rtol: float,
+    *,
+    atol_scale: AtolScale | None,
+    fp8_accuracy: str,
+    compared_records: dict[tuple[int, int], tuple[object, object]],
+) -> None:
+    if fp8_accuracy not in FP8_ACCURACY_MODES:
+        raise ValueError(
+            f"fp8_accuracy must be one of {FP8_ACCURACY_MODES}, got {fp8_accuracy!r}"
+        )
     actual_flat, actual_spec = tree_flatten(actual)
     expected_flat, expected_spec = tree_flatten(expected)
 
@@ -274,6 +414,52 @@ def assert_close(
         )
 
     for actual_leaf, expected_leaf in zip(actual_flat, expected_flat, strict=True):
+        actual_operands = _callback_tensor_values(actual_leaf)
+        expected_operands = _callback_tensor_values(expected_leaf)
+        if actual_operands is not None or expected_operands is not None:
+            if actual_operands is None or expected_operands is None:
+                raise AssertionError(
+                    "Output leaf type mismatch during autotuner accuracy check: "
+                    f"actual is {type(actual_leaf).__name__}, expected is "
+                    f"{type(expected_leaf).__name__}"
+                )
+            _assert_close_records(
+                actual_operands,
+                expected_operands,
+                atol,
+                rtol,
+                atol_scale=atol_scale,
+                fp8_accuracy=fp8_accuracy,
+                compared_records=compared_records,
+            )
+            continue
+        actual_fields = _record_field_values(actual_leaf)
+        expected_fields = _record_field_values(expected_leaf)
+        if actual_fields is not None or expected_fields is not None:
+            if (
+                type(actual_leaf) is not type(expected_leaf)
+                or actual_fields is None
+                or expected_fields is None
+            ):
+                raise AssertionError(
+                    "Dataclass type mismatch during autotuner accuracy check"
+                )
+            pair = (id(actual_leaf), id(expected_leaf))
+            if pair in compared_records:
+                continue
+            # Pytree flatteners may create temporary records. Keep them alive
+            # so a later sibling cannot reuse a visited pair of object IDs.
+            compared_records[pair] = (actual_leaf, expected_leaf)
+            _assert_close_records(
+                actual_fields,
+                expected_fields,
+                atol=atol,
+                rtol=rtol,
+                atol_scale=atol_scale,
+                fp8_accuracy=fp8_accuracy,
+                compared_records=compared_records,
+            )
+            continue
         actual_kind = _leaf_kind(actual_leaf)
         if actual_kind != _leaf_kind(expected_leaf):
             # Two leaves of different kinds would reach a comparison that has
@@ -315,6 +501,15 @@ def assert_close(
                     atol_scale=atol_scale,
                 )
                 continue
+            if (
+                actual_leaf.is_complex()
+                and actual_leaf.dtype == expected_leaf.dtype
+                and actual_leaf.shape == expected_leaf.shape
+                and actual_leaf.device == expected_leaf.device
+            ):
+                _assert_complex_nan_parts_close(
+                    actual_leaf, expected_leaf, atol=atol, rtol=rtol
+                )
             _chunked_assert_close(
                 actual_leaf,
                 expected_leaf,
@@ -327,15 +522,19 @@ def assert_close(
                 raise AssertionError(
                     f"string mismatch {actual_leaf} vs {expected_leaf}"
                 )
-        elif actual_kind == "function":
-            # A callable argument (an epilogue, possibly serialized by code
-            # for the benchmark subprocess) is not something a kernel can
-            # write to; comparing the post-call arguments against the
-            # baseline's only concerns the tensors around it, and
-            # ``torch.testing.assert_close`` has no pair for functions.
-            pass
         elif _is_number(actual_leaf) and _is_number(expected_leaf):
-            torch.testing.assert_close(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
+            if (
+                isinstance(actual_leaf, complex)
+                and isinstance(expected_leaf, complex)
+                and any(
+                    math.isnan(part)
+                    for value in (actual_leaf, expected_leaf)
+                    for part in (value.real, value.imag)
+                )
+            ):
+                actual_leaf = (actual_leaf.real, actual_leaf.imag)
+                expected_leaf = (expected_leaf.real, expected_leaf.imag)
+            _assert_close_equal_nan(actual_leaf, expected_leaf, atol=atol, rtol=rtol)
         elif actual_leaf != expected_leaf:
             # Leaves torch.testing has no comparison for (a torch.dtype, None)
             # must be equal.
@@ -380,6 +579,45 @@ def _assert_non_finite_bytes_match(
             )
 
 
+def _assert_complex_nan_parts_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    atol: float,
+    rtol: float,
+    chunk_size: int = 2**22,
+) -> None:
+    """Compare, part by part, the complex values of ``actual`` and
+    ``expected`` (same dtype and shape) that hold a NaN on either side: a NaN
+    must face a NaN in the same part, and the other part must be close.
+    ``torch.testing`` counts two complex values equal under ``equal_nan``
+    whenever either part of each is a NaN, so ``NaN+1j`` would match
+    ``NaN+999j``; the other values are left to it.  Chunked as
+    ``_chunked_assert_close`` is."""
+    actual_parts = torch.view_as_real(actual.resolve_conj()).reshape(-1, 2)
+    expected_parts = torch.view_as_real(expected.resolve_conj()).reshape(-1, 2)
+    for start in range(0, actual_parts.shape[0], chunk_size):
+        actual_chunk = actual_parts[start : start + chunk_size]
+        expected_chunk = expected_parts[start : start + chunk_size]
+        nan = actual_chunk.isnan().any(-1) | expected_chunk.isnan().any(-1)
+        if not nan.any():
+            continue
+        close = torch.isclose(
+            actual_chunk[nan],
+            expected_chunk[nan],
+            rtol=rtol,
+            atol=atol,
+            equal_nan=True,
+        ).all(-1)
+        if not bool(close.all()):
+            index = int(nan.nonzero()[int((~close).nonzero()[0, 0]), 0])
+            raise AssertionError(
+                "Complex values holding a NaN differ in a part during autotuner "
+                f"accuracy check, first at flat index {start + index}: actual "
+                f"{complex(*actual_chunk[index].tolist())}, expected "
+                f"{complex(*expected_chunk[index].tolist())}"
+            )
+
+
 def _leaf_kind(leaf: object) -> str:
     if isinstance(leaf, torch.Tensor):
         return "tensor"
@@ -392,6 +630,62 @@ def _leaf_kind(leaf: object) -> str:
 
 def _is_function_leaf(leaf: object) -> bool:
     return callable(leaf) or isinstance(leaf, PortableFunction)
+
+
+def _callback_tensor_values(value: object) -> tuple[torch.Tensor, ...] | None:
+    # Functions themselves are not writable kernel outputs, but their captured
+    # tensors are operands. Reuse cloning's cycle-safe traversal without calling
+    # the callback or comparing its code, opaque metadata, or Python identity.
+    if not _is_function_leaf(value):
+        return None
+    if not isinstance(value, (types.FunctionType, PortableFunction)):
+        # Arbitrary callable objects retain their existing opaque contract.
+        return ()
+    return tuple(
+        leaf for leaf in _input_tree_leaves(value) if isinstance(leaf, torch.Tensor)
+    )
+
+
+def _record_field_values(value: object) -> dict[str, object] | None:
+    if (
+        dataclasses.is_dataclass(value)
+        and not isinstance(value, type)
+        and not _is_function_leaf(value)
+    ):
+        return {
+            field.name: getattr(value, field.name)
+            for field in dataclasses.fields(value)
+        }
+    return None
+
+
+def tensor_dtypes(value: object) -> set[torch.dtype]:
+    """Dtypes of tensor leaves visited by the accuracy comparison.
+
+    Registered pytrees keep their flattening contract; otherwise opaque records
+    expose only the same declared fields as comparison. Retain visited records
+    through this walk so cycles terminate and ephemeral pytree children cannot
+    reuse a visited object's identity. No records or pytrees are rebuilt.
+    """
+    dtypes: set[torch.dtype] = set()
+    records: dict[int, object] = {}
+
+    def collect(tree: object) -> None:
+        for leaf in tree_flatten(tree)[0]:
+            if isinstance(leaf, torch.Tensor):
+                dtypes.add(leaf.dtype)
+            elif id(leaf) not in records:
+                operands = _callback_tensor_values(leaf)
+                if operands is not None:
+                    dtypes.update(tensor.dtype for tensor in operands)
+                    continue
+                fields = _record_field_values(leaf)
+                if fields is not None:
+                    records[id(leaf)] = leaf
+                    collect(fields)
+
+    collect(value)
+    return dtypes
 
 
 def _assert_close(actual: object, expected: object, atol: float, rtol: float) -> None:
@@ -421,9 +715,10 @@ class AccuracyCheck:
       must match exactly (an fp8 one under ``"ulp"`` still gets one ulp).
 
     Scaling applies to floating-point tensors and ignores non-finite baseline
-    elements, which must match exactly.  Integer and bool tensors get the
-    unscaled tolerances, as in the default check (exact when ``rtol=0`` and
-    ``atol < 1``); packed fp4 tensors must match byte for byte.
+    elements, which must match exactly (a NaN matches a NaN).  Integer and
+    bool tensors get the unscaled tolerances, as in the default check (exact
+    when ``rtol=0`` and ``atol < 1``); packed fp4 tensors must match byte for
+    byte.
     ``fp8_accuracy`` selects how fp8 tensors are compared (see
     :func:`assert_close`) in place of the ``autotune_fp8_accuracy`` setting
     (``HELION_AUTOTUNE_FP8_ACCURACY``), which this check ignores like the
@@ -444,7 +739,7 @@ class AccuracyCheck:
     # Bump whenever a behavior reachable from ``assert_close`` changes: cached
     # autotune results are keyed by it, and the loose cache key holds no hash
     # of Helion's source.
-    VERSION: ClassVar[int] = 1
+    VERSION: ClassVar[int] = 4
 
     def __post_init__(self) -> None:
         for name in ("atol", "rtol"):
@@ -662,8 +957,11 @@ def _assert_close_fp8_ulp(
     with ``atol`` scaled by ``max(1, rms(b))`` or ``max(|b|)`` when requested: one ulp admits
     the single-bucket flips, the tolerances cover near-zero elements of a
     large reduction whose few-ulp distance is small against the output scale.
-    NaNs must match NaNs.  ``float8_e8m0fnu`` has no mantissa, so its one ulp
-    is one exponent step (a byte distance of one).
+    The bound applies between finite values: a NaN must match a NaN and an
+    infinity the same infinity.  ``float8_e8m0fnu`` has no mantissa, so its
+    one ulp is one exponent step (a byte distance of one), and it takes no
+    tolerance: the RMS-scaled default atol would let multi-step exponent
+    errors of a scale-factor output through.
 
     The differing elements must additionally not be systematically
     one-directional: reordering noise flips values up and down in equal
@@ -690,10 +988,12 @@ def _assert_close_fp8_ulp(
     expected_flat = expected.reshape(-1)
     total = expected_flat.numel()
     mismatches = 0
+    non_finite_mismatches = 0
     up = 0
     down = 0
-    worst_diff = -1.0
+    worst_rank = -1.0
     worst_index = 0
+    worst_diff = worst_actual = worst_expected = 0.0
     for start in range(0, total, chunk_size):
         a8 = actual_flat[start : start + chunk_size]
         b8 = expected_flat[start : start + chunk_size]
@@ -707,40 +1007,59 @@ def _assert_close_fp8_ulp(
                 a8.view(torch.uint8).to(torch.int16)
                 - b8.view(torch.uint8).to(torch.int16)
             ).abs()
-            # NaN (byte 0xFF) is one byte from the largest finite value.
-            within = (distance <= 1) & ~torch.isnan(a) & ~torch.isnan(b)
+            within = distance <= 1
         else:
             tolerance = _fp8_ulp(torch.maximum(a.abs(), b.abs()), dtype) + atol
             if rtol:
                 tolerance = tolerance + rtol * b.abs()
-            # An infinite element (whose tolerance is infinite too) must match
-            # exactly: ``equal`` covers that.
-            within = (diff <= tolerance) & torch.isfinite(a) & torch.isfinite(b)
-        bad = ~(equal | both_nan | within)
+            within = diff <= tolerance
+        # The bound relates finite values only: against an infinite baseline
+        # element ``rtol * |b|`` is infinite, and the e8m0 NaN (byte 255) is
+        # one byte from 2**127.  A matching infinity passes as ``equal``.
+        finite = torch.isfinite(a) & torch.isfinite(b)
+        bad = ~(equal | both_nan | (finite & within))
         n_bad = int(bad.sum())
         if n_bad:
             mismatches += n_bad
-            # A NaN against a number has a NaN difference; rank it above every
-            # finite excess so the report names it.
+            non_finite_mismatches += int((bad & ~finite).sum())
+            # A NaN against a number has a NaN difference; rank it with the
+            # infinite ones above every finite excess so the report names it.
             excess = torch.where(bad, diff, torch.zeros_like(diff)).nan_to_num(
-                nan=math.inf
+                nan=math.inf, posinf=math.inf
             )
             local = int(excess.argmax())
-            value = float(excess[local])
-            if value > worst_diff:
-                worst_diff = value
+            rank = float(excess[local])
+            if rank > worst_rank:
+                worst_rank = rank
                 worst_index = start + local
+                worst_diff = float(diff[local])
+                worst_actual, worst_expected = float(a[local]), float(b[local])
         differs = ~(equal | both_nan)
         up += int((differs & (a > b)).sum())
         down += int((differs & (a < b)).sum())
     if mismatches:
+        reasons = []
+        if mismatches > non_finite_mismatches:
+            reasons.append(
+                "by more than one ulp (one exponent step: no tolerance applies)"
+                if dtype is torch.float8_e8m0fnu
+                else "by more than one ulp plus the tolerance "
+                f"(atol={atol:.3g}, rtol={rtol:.3g})"
+            )
+        if non_finite_mismatches:
+            reasons.append("in NaN or infinite elements, which must match exactly")
+        non_finite = (
+            f", {non_finite_mismatches} of them NaN or infinite"
+            if non_finite_mismatches
+            else ""
+        )
         raise AssertionError(
-            "fp8 tensors differ by more than one ulp plus the tolerance "
-            f"(atol={atol:.3g}, rtol={rtol:.3g}, dtype={dtype})!\n\n"
+            f"fp8 tensors of dtype {dtype} differ {' and '.join(reasons)}!\n\n"
             f"Mismatched elements: {mismatches} / {total} "
-            f"({100.0 * mismatches / max(total, 1):.1f}%)\n"
+            f"({100.0 * mismatches / max(total, 1):.1f}%){non_finite}\n"
             f"Greatest absolute difference: {worst_diff} at index "
-            f"{_unravel_index(worst_index, expected.shape)}"
+            f"{_unravel_index(worst_index, expected.shape)} "
+            f"(actual {worst_actual}, expected {worst_expected})"
         )
     flips = up + down
     if abs(up - down) > 0.5 * flips + 4.0 * math.sqrt(flips) + 1.0:
@@ -786,17 +1105,17 @@ def _chunked_assert_close(
         and actual.dtype == expected.dtype
         and actual.device == expected.device
         and (
-            torch.allclose(actual, expected, atol=atol, rtol=rtol)
+            _allclose_equal_nan(actual, expected, atol=atol, rtol=rtol)
             if actual.dtype.is_floating_point or actual.dtype.is_complex
             else torch.equal(actual, expected)
         )
     ):
         return
     if actual.numel() <= chunk_size:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        _assert_close_equal_nan(actual, expected, atol=atol, rtol=rtol)
         return
     if actual.dtype != expected.dtype or actual.device != expected.device:
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+        _assert_close_equal_nan(actual, expected, atol=atol, rtol=rtol)
         return
     if actual.device.type == "tpu":
         # ``torch.testing.assert_close`` copies each TPU chunk to the host to
@@ -811,8 +1130,10 @@ def _chunked_assert_close(
         expected_chunk = expected_flat[start : start + chunk_size]
         if actual.device.type == "tpu":
             if actual.dtype.is_floating_point or actual.dtype.is_complex:
-                if torch.allclose(actual_chunk, expected_chunk, atol=atol, rtol=rtol):
+                if _allclose_equal_nan(
+                    actual_chunk, expected_chunk, atol=atol, rtol=rtol
+                ):
                     continue
             elif torch.equal(actual_chunk, expected_chunk):
                 continue
-        torch.testing.assert_close(actual_chunk, expected_chunk, atol=atol, rtol=rtol)
+        _assert_close_equal_nan(actual_chunk, expected_chunk, atol=atol, rtol=rtol)

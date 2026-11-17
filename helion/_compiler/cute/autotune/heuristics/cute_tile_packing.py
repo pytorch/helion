@@ -32,7 +32,7 @@ class CuteTilePackWarpPerRowHeuristic(AutotunerHeuristic):
 
     name = "cute_tile_pack_warp_per_row"
     backend = "cute"
-    priority = 42
+    priority = 43
 
     @classmethod
     def _plan(

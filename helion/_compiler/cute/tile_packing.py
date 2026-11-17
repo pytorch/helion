@@ -28,7 +28,7 @@ from ..compile_environment import FixedBlockSizeSource
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from ...runtime.config import Config
+    from ...autotuner.config_spec import ConfigSpec
     from ..device_ir import DeviceIR
 
 TILES_PER_BLOCK_CHOICES: tuple[int, ...] = (1, 2, 4, 8)
@@ -68,9 +68,11 @@ def l2_grouped(config: Mapping[str, object]) -> bool:
 
 
 def packed_grid_block(
-    env: CompileEnvironment, config: Config
+    config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> tuple[int, int] | None:
-    """``(block_id, tiles_per_block)`` of the packed grid axis under ``config``."""
+    """``(block_id, tiles_per_block)`` of the packed grid axis under ``config``,
+    from the tile counts ``config_spec`` records (the autotuner reads it before
+    any kernel is compiled)."""
     pack = config.get("cute_tiles_per_block", 1)
     if type(pack) is not int or pack <= 1:
         return None
@@ -80,7 +82,7 @@ def packed_grid_block(
         return None
     if l2_grouped(config):
         return None
-    for block_id, count in sorted(env.config_spec.cute_tile_pack_counts.items()):
+    for block_id, count in sorted(config_spec.cute_tile_pack_counts.items()):
         if count % pack == 0:
             return block_id, pack
     return None

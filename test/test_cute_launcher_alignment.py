@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_launcher import mock_cute_launcher_runtime
 from helion.runtime.cute import launcher
 
 # Not a cpu_only module: test_fast_relaunch_capi_executor_raises_cuda_errors
@@ -50,12 +51,7 @@ def fake_runtime(monkeypatch: pytest.MonkeyPatch) -> list[_Pointer]:
         pointers.append(pointer)
         return pointer
 
-    monkeypatch.setattr(
-        launcher, "_get_cute_launcher_imports", lambda: (None, make_ptr, None)
-    )
-    monkeypatch.setattr(launcher, "_validate_cute_launcher_tensor", lambda tensor: None)
-    monkeypatch.setattr(launcher, "_torch_dtype_to_cutlass", str)
-    monkeypatch.setattr(launcher, "_cute_kernel_param_is_constexpr", lambda kernel: ())
+    mock_cute_launcher_runtime(monkeypatch, make_ptr)
     return pointers
 
 

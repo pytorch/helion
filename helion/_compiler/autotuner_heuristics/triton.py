@@ -25,7 +25,6 @@ from ...autotuner.config_spec import LoopAxisFact
 from ...autotuner.config_spec import ReductionCategory
 from ...exc import InvalidConfig
 from ...runtime.config import Config
-from ..compile_environment import _symint_sympy_expr
 from .common import clamp_block_size_targets
 from .common import dedupe_configs
 from .common import matches_hardware
@@ -927,9 +926,9 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             info = env.block_sizes[bid]
             value = info.block_size_source.from_config(candidate, info)
             if isinstance(value, torch.SymInt):
-                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
-                if expression is not None:
-                    value = expression.evaluate(candidate)
+                configured = env.config_value(value, candidate)
+                if configured is not None:
+                    value = configured
             assert isinstance(value, (int, torch.SymInt))
             out[bid] = max(1, env.size_hint(value))
         return out
@@ -4056,12 +4055,18 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
     CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
     # Fires arch-agnostically (is_eligible keys only on the pointwise fact), but
     # its byte/register constants were hill-climbed and validated on H100 (sm90).
-    # Promote to the autotune-off default ONLY on the arches the correctness hunt
-    # has cleared — sm90 (H100) and sm100 (B200) — so a non-validated arch keeps
-    # the conservative base default while still getting the seed as a search
-    # candidate. The seed keeps firing everywhere; only PROMOTION is gated.
+    # Promote to the autotune-off default ONLY on the arches below, so an
+    # unchecked arch keeps the conservative base default while still getting
+    # the seed as a search candidate. The seed keeps firing everywhere; only
+    # PROMOTION is gated.
+    # - sm90 (H100) and sm100 (B200): cleared by the correctness hunt (#3053).
+    # - sm120: every sm120 part (RTX 50-series, RTX PRO Blackwell), not one
+    #   product. Checked on an RTX 5080 only, with the Triton test lane and
+    #   targeted pointwise checks with autotuning off. sm120 is not in
+    #   TUNED_TARGETS, so the seed uses the sm90 constants and sizes its grid
+    #   from the device SM count.
     promote_seed_to_default = True
-    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"))
+    PROMOTE_TARGETS = (("cuda", "sm90"), ("cuda", "sm100"), ("cuda", "sm120"))
 
     # Arches whose pointwise constants have been measured. An allow-list, not a
     # ``>= sm100`` compare: an unmeasured arch (including a same-generation consumer
@@ -4424,6 +4429,8 @@ class _ReductionResources(NamedTuple):
     peak_live_bytes: int
     num_warps: int
     launch_waves: tuple[float | None, ...]
+    max_threads_per_sm: int
+    max_ctas_per_sm: int
 
 
 class _LivenessTileAllocation(NamedTuple):
@@ -4436,15 +4443,18 @@ class _LivenessTileAllocation(NamedTuple):
 
 
 class TritonReductionHeuristic(AutotunerHeuristic):
-    """Candidate-resolved Triton reduction seed for H100 and B200.
+    """Candidate-resolved Triton reduction seed, tuned on H100 and B200.
 
     One allocator resolves every sized reduction and ordinary block axis against the kernel's
     live-step timeline. The primary reduction category affects only final config routing:
     compiler-rolled reductions emit through ``reduction_loops``, while user-written mutable
     ``hl.tile`` reductions emit through ``block_sizes`` and fixed tiles emit no size knob.
 
-    The conservative fallback for other hardware remains the standalone
-    :class:`TritonNarrowReductionHeuristic`.
+    The conservative fallback for a standard reduction on other hardware remains the
+    standalone :class:`TritonNarrowReductionHeuristic`. A user-tiled reduction has no such
+    fallback, so on any other CUDA arch this class still seeds it as a search candidate,
+    but does not promote it there. The occupancy model reads that arch's own thread and
+    CTA residency limits (see ``occupancy_limits_for``).
     """
 
     name = "triton_reduction"
@@ -4454,6 +4464,10 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         ("cuda", "sm90"),
         ("cuda", "sm100"),
     )
+    # Where the user-tiled track seeds without a tuned target: the narrow fallback claims only
+    # standard reductions. ROCm is left out: its wavefront is 64 lanes, and the occupancy model
+    # below counts 32-lane warps against CUDA residency limits.
+    USER_TILE_SEED_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (("cuda", None),)
     # Promote the tuned reduction seed to the compiler default (autotune off) on H100 and B200.
     # The narrow fallback is a separate class and stays unpromoted.
     # This is safe because the seed only emits valid configs: it materializes through
@@ -4461,6 +4475,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     # ``ReductionLoopSpec._normalize`` floors a degenerate looped chunk of 1, and the reduction
     # roller refuses to roll a scan-containing reduction (which would drop the scan's chunk carry).
     promote_seed_to_default = True
+    PROMOTE_TARGETS = HARDWARE_TARGETS
 
     # Candidate capacity, occupancy, and work-exchange policy.
     NORMAL_LIVE_BUDGET = 240 * 1024
@@ -4476,14 +4491,40 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     WARP_DESCENT_MIN_LIVE_BYTES = 8 * 1024
     WARP_DESCENT_CALIBRATION_MAX_SPILL = 0.50
     REGISTER_FILE_REGISTERS_PER_SM = 65536
+    # Resident threads and CTAs per SM. The defaults are the sm80/sm90/sm100/sm103 limits.
     MAX_THREADS_PER_SM = 2048
     MAX_CTAS_PER_SM = 32
+    # Arches with lower limits, as (max resident threads, max resident CTAs) per SM, from the
+    # table "Device and Streaming Multiprocessor (SM) Information per Compute Capability" in
+    # the CUDA Programming Guide (appendix "Compute Capabilities"). 12.x covers sm120 and
+    # sm121; the RTX 5080 driver also reports 1536 threads and 24 CTAs per SM.
+    OCCUPANCY_LIMITS_BY_ARCH: ClassVar[dict[str, tuple[int, int]]] = {
+        "sm75": (1024, 16),
+        "sm86": (1536, 16),
+        "sm87": (1536, 16),
+        "sm89": (1536, 24),
+        "sm110": (1536, 24),
+        "sm120": (1536, 24),
+        "sm121": (1536, 24),
+    }
     GRID_RESIDENCY_GAIN_THRESHOLD = 1.5
     FULL_GRID_SPLIT_GAIN_THRESHOLD = 2.0
     SERIAL_LOOP_COST_ALPHA = 1.1
     MAX_BLOCK_ADJUSTMENT_PASSES = 20
     ROW_PACK_WORKING_SET = 4096
     MIN_ROW_PACK_WAVES = 8
+
+    @classmethod
+    def occupancy_limits_for(cls, env: CompileEnvironment) -> tuple[int, int]:
+        """(max resident threads, max resident CTAs) per SM for this device.
+
+        Arch-keyed, like ``TritonPointwiseSeedHeuristic.tile_bytes_for``: the user-tiled track
+        also seeds consumer arches, whose SMs hold fewer threads and CTAs than sm90/sm100.
+        """
+        for arch, limits in cls.OCCUPANCY_LIMITS_BY_ARCH.items():
+            if matches_hardware(env, (("cuda", arch),)):
+                return limits
+        return cls.MAX_THREADS_PER_SM, cls.MAX_CTAS_PER_SM
 
     # Structural fact accessors.
     @classmethod
@@ -4519,9 +4560,9 @@ class TritonReductionHeuristic(AutotunerHeuristic):
             info = env.block_sizes[block_id]
             value = info.block_size_source.from_config(default, info)
             if isinstance(value, torch.SymInt):
-                expression = env.config_value_expressions.get(_symint_sympy_expr(value))
-                if expression is not None:
-                    value = expression.evaluate(default)
+                configured = env.config_value(value, default)
+                if configured is not None:
+                    value = configured
             if isinstance(value, (int, torch.SymInt)) and env.size_hint(value) > 1:
                 return True
         return False
@@ -4547,15 +4588,31 @@ class TritonReductionHeuristic(AutotunerHeuristic):
     @staticmethod
     def _reread_eviction_policies(
         env: CompileEnvironment,
+        device_ir: DeviceIR,
+        seed: dict[str, Any],
         reread_slot: int | None,
     ) -> list[str] | None:
-        """Keep one re-read input in L2 and evict the other load slots first."""
+        """Keep one re-read input in L2 and evict the other load slots first.
+
+        ``reread_slot`` is the input's slot in ``memory_op_facts``, the order
+        of the configs that roll no reduction.  A seed that rolls the
+        reduction lowers the input in each loop that reads it, in an order of
+        its own (``DeviceIR.config_memory_op_fact_pairs``, which pairs each
+        copy with the input's slot): its first read keeps the lines, and the
+        later reads evict them like the other loads.
+        """
         n = env.config_spec.load_eviction_policies.length
         if reread_slot is None or not 0 <= reread_slot < n:
             return None
-        policy = ["first"] * n
-        policy[reread_slot] = "last"
-        return policy
+        pairs = device_ir.config_memory_op_fact_pairs(Config.from_dict(seed))
+        for persistent, fact in pairs:
+            # The seed's first copy of the input.
+            if persistent.eviction_index == reread_slot:
+                assert fact.eviction_index is not None
+                policy = ["first"] * n
+                policy[fact.eviction_index] = "last"
+                return policy
+        return None
 
     # ======================= candidate-resolved liveness allocator ====================== #
     @classmethod
@@ -4633,10 +4690,13 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         """Resolve the independent resource inputs for one candidate."""
         peak_bytes = cls._reduction_peak_live_bytes(env, candidate)
         warps = max(cls.MIN_NUM_WARPS, min(cls.MAX_NUM_WARPS, num_warps))
+        max_threads_per_sm, max_ctas_per_sm = cls.occupancy_limits_for(env)
         return _ReductionResources(
             peak_live_bytes=peak_bytes,
             num_warps=warps,
             launch_waves=cls._reduction_launch_waves(env, candidate, num_sm),
+            max_threads_per_sm=max_threads_per_sm,
+            max_ctas_per_sm=max_ctas_per_sm,
         )
 
     @classmethod
@@ -4693,8 +4753,8 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         return max(
             1,
             min(
-                cls.MAX_CTAS_PER_SM,
-                cls.MAX_THREADS_PER_SM // threads,
+                resources.max_ctas_per_sm,
+                resources.max_threads_per_sm // threads,
                 register_limit,
             ),
         )
@@ -4804,7 +4864,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         register_estimate_scale: float = 1.0,
     ) -> float:
         """Conservative resident-warp score across independently executing roots."""
-        hardware_warp_slots = cls.MAX_THREADS_PER_SM // 32
+        hardware_warp_slots = resources.max_threads_per_sm // 32
         return min(
             min(float(hardware_warp_slots), value * resources.num_warps)
             for value in cls._reduction_effective_resident_ctas_per_sm(
@@ -4848,9 +4908,7 @@ class TritonReductionHeuristic(AutotunerHeuristic):
                 descriptors_by_block.setdefault(descriptor.block_id, []).append(
                     descriptor
                 )
-        rolled_ids = {
-            reduction_loop.block_ids[0] for reduction_loop in spec.reduction_loops
-        }
+        rolled_ids = spec.rollable_reduction_block_ids()
         raw_reduction_extents = {
             block_id: max(descriptor.size_hint for descriptor in descriptors)
             for block_id, descriptors in descriptors_by_block.items()
@@ -5179,11 +5237,16 @@ class TritonReductionHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not matches_hardware(env, cls.HARDWARE_TARGETS):
-            return False
         if not _triton_reduction_eligible(env, device_ir):
             return False
-        return _primary_descriptor_selected(env) is not None
+        pd = _primary_descriptor_selected(env)
+        if pd is None:
+            return False
+        if matches_hardware(env, cls.HARDWARE_TARGETS):
+            return True
+        return not _is_standard_reduction(pd) and matches_hardware(
+            env, cls.USER_TILE_SEED_TARGETS
+        )
 
     @classmethod
     def get_seed_config(
@@ -5206,34 +5269,33 @@ class TritonReductionHeuristic(AutotunerHeuristic):
         if _is_standard_reduction(pd):
             # Compiler-rolled reductions have no block_sizes slot. Full width is encoded as
             # ``None``; a materialized full reduction has no reduction_loops knob at all.
-            if pd.block_id not in spec.reduction_loops.valid_block_ids():
-                reduction_loops: list[int | None] = []
-            elif len(spec.reduction_loops) <= 1:
-                reduction_loops = [
-                    None
-                    if alloc.primary_r_block >= pd.size_hint
-                    else alloc.primary_r_block
-                ]
-            else:
-                reduction_loops = []
-                for rl_spec in spec.reduction_loops:
-                    block_id = rl_spec.block_ids[0]
-                    width = (
-                        alloc.primary_r_block
-                        if block_id == pd.block_id
-                        else alloc.rolled_loop_sizes[block_id]
-                    )
-                    reduction_loops.append(
-                        None if width >= rl_spec.size_hint else width
-                    )
+            rollable_ids = spec.rollable_reduction_block_ids()
+            reduction_loops: list[int | None] = []
+            for rl_spec in spec.reduction_loops:
+                block_id = rl_spec.block_id
+                if block_id not in rollable_ids:
+                    # Preserve the saved-config slot without proposing a chunk
+                    # that normalization would repair with a warning.
+                    reduction_loops.append(None)
+                    continue
+                width = (
+                    alloc.primary_r_block
+                    if block_id == pd.block_id
+                    else alloc.rolled_loop_sizes[block_id]
+                )
+                reduction_loops.append(None if width >= rl_spec.size_hint else width)
             seed["reduction_loops"] = reduction_loops
             if pd.row_reread and cls._has_floor_batched_nonresident_grid(env):
-                evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+                evict = cls._reread_eviction_policies(
+                    env, device_ir, seed, pd.reread_eviction_index
+                )
                 if evict is not None:
                     seed["load_eviction_policies"] = evict
         elif kf.non_reduction_loop_block_ids or pd.row_reread:
             # A user-written reduction already emits its mutable width through block_sizes.
-            evict = cls._reread_eviction_policies(env, pd.reread_eviction_index)
+            evict = cls._reread_eviction_policies(
+                env, device_ir, seed, pd.reread_eviction_index
+            )
             if evict is not None:
                 seed["load_eviction_policies"] = evict
 
@@ -5248,9 +5310,10 @@ class TritonNarrowReductionHeuristic(AutotunerHeuristic):
     """Conservative upstream reduction fallback for hardware WITHOUT a tuned track (anything
     other than sm90/sm100): one row/program, single persistent pass, ``['last']`` eviction where
     supported. Fires only for a STANDARD (Helion-rolled) reduction — the user-tiled track had no
-    upstream seed, so it stays unclaimed on non-sm90/sm100. Not promoted (the un-tuned baseline
-    should not override the compiler default). This is the verbatim pre-sm100 behavior, now its own
-    class rather than an off-target branch inside the sm90 heuristic.
+    upstream seed, and :class:`TritonReductionHeuristic` seeds it on other CUDA arches. Not
+    promoted (the un-tuned baseline should not override the compiler default). This is the
+    verbatim pre-sm100 behavior, now its own class rather than an off-target branch inside the
+    sm90 heuristic.
     """
 
     name = "triton_reduction_narrow"

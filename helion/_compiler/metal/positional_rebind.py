@@ -31,6 +31,7 @@ from ...language.memory_ops import store
 from ..compile_environment import CompileEnvironment
 from ..indexing_strategy import SubscriptIndexing
 from ..inductor_lowering import PointwiseLowering
+from ..inductor_lowering import size1_reduction_positions
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -98,13 +99,17 @@ def _check_node(node: Node, why: str) -> None:
             if value.ndim == result.ndim:
                 _check("an element-wise operand", node, value.shape, result.shape, why)
             else:
+                # Only a reduction over extent-1 dims, lowered element-wise,
+                # reads an operand of more dims than its result.
                 _check(
-                    "a broadcast element-wise operand",
+                    "a broadcast element-wise operand"
+                    if value.ndim < result.ndim
+                    else "the input of a reduction over extent-1 dims",
                     node,
                     value.shape,
                     result.shape,
                     why,
-                    lower_rank=True,
+                    pointwise_placement=True,
                 )
     elif node.target is torch.ops.aten.where.self:
         assert isinstance(result, torch.Tensor)
@@ -175,12 +180,14 @@ def _check(
     consumer: Shape,
     why: str,
     *,
-    lower_rank: bool = False,
+    pointwise_placement: bool = False,
 ) -> None:
     """Raise if a dim of *value* meets, at its position in *consumer*, another
     block, or a tile meets a dim without one."""
     env = CompileEnvironment.current()
-    positions = _operand_positions(value, consumer, lower_rank=lower_rank)
+    positions = _operand_positions(
+        value, consumer, pointwise_placement=pointwise_placement
+    )
     for dim, (size, position) in enumerate(zip(value, positions, strict=True)):
         if position < 0:
             continue
@@ -215,18 +222,27 @@ def _check(
             )
 
 
-def _operand_positions(value: Shape, consumer: Shape, *, lower_rank: bool) -> list[int]:
+def _operand_positions(
+    value: Shape, consumer: Shape, *, pointwise_placement: bool
+) -> list[int]:
     """The consumer dim each dim of *value* meets, as in CuTe's
     ``operand_positions``.
 
     Right-aligned, so a negative position is a dim the consumer lacks.  With
-    *lower_rank*, a lower-rank operand is placed the way
+    *pointwise_placement* (an element-wise operand of another rank), a
+    lower-rank operand is placed the way
     ``TileStrategyDispatch.broadcast_expand_dims`` expands it: each dim at the
     consumer dim of its block, else at an unused dim without one of equal
-    size, else at the last unused dim, then in the operand's own order.
+    size, else at the last unused dim, then in the operand's own order.  A
+    higher-rank one, the input of a reduction over extent-1 dims, is placed
+    by ``size1_reduction_positions``.
     """
     env = CompileEnvironment.current()
-    if not (lower_rank and 0 < len(value) < len(consumer)):
+    if pointwise_placement and len(value) > len(consumer):
+        positions = size1_reduction_positions(value, consumer)
+        if positions is not None:
+            return positions
+    if not (pointwise_placement and 0 < len(value) < len(consumer)):
         offset = len(consumer) - len(value)
         return [dim + offset for dim in range(len(value))]
     consumer_blocks = [canonical_block(size) for size in consumer]

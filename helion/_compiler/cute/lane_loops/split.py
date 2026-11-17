@@ -28,9 +28,11 @@ from .... import exc
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
+from ...ast_read_writes import HELION_ACCESS_REGIONS_ATTR
 from ...ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ...ast_read_writes import HELION_VEC_LANE_OF_ATTR
+from ...ast_read_writes import ReadWrites
 from ...device_function import DeviceFunction
 from ...host_function import NoCurrentFunction
 from ...tile_strategy import _clone_lane_loop_with_body
@@ -43,6 +45,8 @@ from .._ast_pass_utils import _is_proven_relocatable_call
 from .._ast_pass_utils import _self_addend
 from .._ast_pass_utils import assigned_name
 from .._ast_pass_utils import call_path_str
+from .._ast_pass_utils import deep_clone
+from .._ast_pass_utils import exposed_reads
 from .._ast_pass_utils import names_written
 from .._ast_pass_utils import resolve_alias
 from .._ast_pass_utils import tensor_roots_may_alias
@@ -56,20 +60,19 @@ from .markers import _create_lane_loop
 from .markers import _dtype_ctor_from_identity
 from .markers import _finalize_lane_reduce_marker
 from .markers import _find_lane_reduce_call
+from .markers import _int_literal
 from .markers import _is_constexpr_lane_iter
 from .markers import _is_lane_reduce_marker_assign
 from .markers import _lane_loop_extent
 from .markers import _LaneReduceMarker
 from .markers import _static_lane_loop_extent
-from .owner_guards import _clone_expr
-from .owner_guards import _clone_stmt
 from .owner_guards import _guard_stmt_with_owner
+from .owner_guards import _has_impure_inline_asm
 from .owner_guards import _has_observable_memory_write
 from .owner_guards import _has_side_effect
 from .owner_guards import _is_persistent_branch_vec_store
 from .owner_guards import _is_proven_uniform_name
 from .owner_guards import _lane_reduction_owner_exprs_for_statement
-from .owner_guards import _literal_int_expr
 from .owner_guards import _loop_body_scalar_definitions
 from .owner_guards import _loop_invariant_scalar_definitions
 from .owner_guards import _statement_provenance_before
@@ -77,6 +80,10 @@ from .owner_guards import _update_proven_uniform_names
 from .owner_guards import _update_scalar_definitions
 from .owner_guards import _update_thread_axis_names
 from .owner_guards import _validated_idempotent_store
+from .statements import _analyze
+from .statements import _depends
+from .statements import _is_device_loop
+from .statements import runs_once_outside_lane
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -98,6 +105,7 @@ def split_lane_loop_reductions(
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     """Rewrite single-pass lane loops that contain ``_helion_lane_reduce``
     markers into the two-pass accumulate / finalize / consume structure.
@@ -124,6 +132,7 @@ def split_lane_loop_reductions(
         rename_groups=rename_groups,
         running_sums=running_sums,
         register_tile_options=register_tile_options,
+        cta_uniform=cta_uniform,
     )
     pin_atomics_left_in_lane_loops(result)
     return result
@@ -140,9 +149,18 @@ def _split_lane_loop_reductions(
     rename_groups: dict[str, str] | None = None,
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     if not any(_find_lane_reduce_call(stmt) is not None for stmt in body):
         return body
+
+    # A preceding conditional exit can remove CTA participants even when the
+    # snapshot itself is not nested under that condition.
+    cta_uniform = cta_uniform and not any(
+        isinstance(node, (ast.Break, ast.Continue, ast.Return))
+        for stmt in body
+        for node in ast.walk(stmt)
+    )
 
     proven_uniform = set(_CUTE_UNIFORM_GLOBAL_NAMES)
     if uniform_names is not None:
@@ -162,6 +180,7 @@ def _split_lane_loop_reductions(
                 rename_groups or {},
                 running_sums or set(),
                 register_tile_options,
+                cta_uniform,
             )
         )
         _update_proven_uniform_names(stmt, proven_uniform)
@@ -180,6 +199,7 @@ def _split_stmt_lane_reductions(
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     # Recurse into any statement-list-bearing fields first so nested lane
     # loops are rewritten before the enclosing one.
@@ -189,6 +209,8 @@ def _split_stmt_lane_reductions(
     exit_definitions = _loop_invariant_scalar_definitions(
         stmt, scalar_definitions, rename_groups
     )
+    child_uniform = cta_uniform and _uniform_lane_scope(stmt, uniform_names)
+    child_names = set(uniform_names)
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
         if isinstance(old, list) and all(isinstance(s, ast.stmt) for s in old):
@@ -197,7 +219,7 @@ def _split_stmt_lane_reductions(
                 field,
                 _split_lane_loop_reductions(
                     old,
-                    uniform_names=set(uniform_names),
+                    uniform_names=child_names,
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     proven_tensor_stride_values=proven_tensor_stride_values,
                     thread_axis_names=dict(thread_axis_names),
@@ -207,6 +229,7 @@ def _split_stmt_lane_reductions(
                     rename_groups=rename_groups,
                     running_sums=running_sums,
                     register_tile_options=register_tile_options,
+                    cta_uniform=child_uniform,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -228,6 +251,7 @@ def _split_stmt_lane_reductions(
         rename_groups,
         running_sums,
         register_tile_options,
+        cta_uniform,
     )
 
 
@@ -264,7 +288,7 @@ def _certify_lane_running_sum(
 
     if not running_sums or any(marker.owner_lane is None for _, marker in markers):
         return None
-    body = [_clone_stmt(statement) for statement in loop.body]
+    body = [deep_clone(statement) for statement in loop.body]
     for statement in body:
         ast_rename(statement, rename_groups)
     writes = [
@@ -404,10 +428,6 @@ def _lane_invariant_tail_after_consume(
     register and tensor dependencies, with unknown effects and non-relaxed
     atomics ordered against every memory access.
     """
-    from ...ast_read_writes import ReadWrites
-    from .statements import _analyze
-    from .statements import _depends
-
     analyzed = {
         index: _analyze(index, statements[index], rename_groups)
         for index in invariant | accumulated | consumed
@@ -458,6 +478,292 @@ def _lane_invariant_tail_after_consume(
     return after
 
 
+def _uniform_lane_scope(stmt: ast.AST, uniform_names: set[str]) -> bool:
+    """Whether a nested snapshot barrier is reached by the entire CTA."""
+    from ...ast_read_writes import ReadWrites
+
+    if isinstance(stmt, ast.If):
+        return bool(getattr(stmt, HELION_BLOCK_UNIFORM_ATTR, False)) or (
+            not any(isinstance(node, ast.Call) for node in ast.walk(stmt.test))
+            and all(
+                _is_proven_uniform_name(name, uniform_names)
+                for name in ReadWrites.from_ast(stmt.test).reads
+            )
+        )
+    # An enclosing lane has unsnapshotted elements; a device loop needs a
+    # separate backedge memory-order proof. Neither enters this bounded path.
+    return False
+
+
+def _split_impure_producer(
+    loop: ast.For,
+    lane_var: str,
+    markers: list[tuple[int, _LaneReduceMarker]],
+    impure_indices: set[int],
+    rename_groups: dict[str, str],
+    thread_axis_names: dict[str, frozenset[int]],
+    scalar_definitions: dict[str, ast.AST],
+    *,
+    cta_uniform: bool,
+) -> list[ast.AST] | None:
+    """Snapshot a pure input prefix before a single opaque reduction producer.
+
+    All CTA threads finish their loads before any opaque call can overwrite a
+    later lane's input. Each call then runs once, followed by a second CTA join
+    before the tail may store. Typed constexpr lists retain inputs and live-outs
+    without guessing a scalar or packet dtype. No opaque epilogue,
+    dependent reduction, loop carry, or post-effect memory read is admitted.
+    """
+    from ...ast_read_writes import ReadWrites
+
+    extent = _static_lane_loop_extent(loop)
+    if (
+        not cta_uniform
+        or extent is None
+        or not 1 <= extent <= 256
+        or loop.orelse
+        or len(markers) != 1
+        or len(impure_indices) != 1
+    ):
+        return None
+    marker_index, marker = markers[0]
+    effect_index = next(iter(impure_indices))
+    if effect_index >= marker_index or marker.owner_lane != lane_var:
+        return None
+    body: list[ast.AST] = list(loop.body)
+    effect = body[effect_index]
+    if (
+        assigned_name(effect) is None
+        or not isinstance(effect, ast.Assign)
+        or not isinstance(effect.value, ast.Call)
+        or call_path_str(effect.value.func) != "_cute_inline_asm_elementwise"
+        # The generated operands are materialized scalar values. A nested load
+        # here would bypass the prefix snapshot and run after the CTA join.
+        or len(effect.value.args) != 1
+        or not isinstance(effect.value.args[0], ast.Tuple)
+        or not all(
+            isinstance(operand, (ast.Name, ast.Constant))
+            for operand in effect.value.args[0].elts
+        )
+        or sum(
+            _has_impure_inline_asm(node)
+            for node in ast.walk(effect.value)
+            if isinstance(node, ast.Call)
+        )
+        != 1
+    ):
+        return None
+    prefix = body[:effect_index]
+    middle = body[effect_index + 1 : marker_index]
+    tail = body[marker_index + 1 :]
+    dtype = next(kw.value for kw in effect.value.keywords if kw.arg == "dtype")
+    for stmt in (*middle, *tail):
+        for node in ast.walk(stmt):
+            if not isinstance(node, ast.Subscript):
+                continue
+            # Tuple extraction from this assembly result and immutable tensor
+            # layout metadata are known register/host facts. An arbitrary
+            # tensor subscript could instead load shared memory after the write.
+            path = call_path_str(node.value)
+            tuple_result = (
+                isinstance(node.value, ast.Name)
+                and node.value.id == assigned_name(effect)
+                and isinstance(dtype, ast.Tuple)
+                and isinstance(node.slice, ast.Constant)
+                and type(node.slice.value) is int
+                and 0 <= node.slice.value < len(dtype.elts)
+            )
+            metadata = path is not None and path.endswith(
+                (".layout.stride", ".layout.shape")
+            )
+            thread_index = isinstance(node.value, ast.Call) and call_path_str(
+                node.value.func
+            ) in {"cute.arch.thread_idx", "cute.arch.block_idx"}
+            if not (tuple_result or metadata or thread_index):
+                return None
+    if not all(
+        _is_proven_relocatable_assignment(stmt, allow_load=True) for stmt in prefix
+    ):
+        return None
+    if not all(
+        _is_proven_relocatable_assignment(stmt, allow_load=False) for stmt in middle
+    ):
+        return None
+
+    # Single definitions, including the final rename groups, exclude loop
+    # carries and source values replaced by a later spelling of the same name.
+    defined: set[str] = set()
+    read_before_write: set[str] = set()
+    for stmt in body[:marker_index]:
+        name = assigned_name(stmt)
+        assert name is not None
+        canonical = rename_groups.get(name, name)
+        read_before_write.update(
+            {rename_groups.get(read, read) for read in ReadWrites.from_ast(stmt).reads}
+            - defined
+        )
+        if canonical in defined:
+            return None
+        defined.add(canonical)
+    if defined & read_before_write:
+        return None
+    if marker.result_var in defined:
+        return None
+    # This bounded path preserves the actual scalar names in its lists. Phi
+    # aliases need an explicit carried-value schedule, not a list-name guess.
+    if any(
+        rename_groups.get(node.id, node.id) != node.id
+        for stmt in body
+        for node in ast.walk(stmt)
+        if isinstance(node, ast.Name)
+    ):
+        return None
+    varying = {lane_var} | _lane_varying_names(
+        body[:marker_index], lane_var, rename_groups
+    )
+    if not (
+        {
+            rename_groups.get(name, name)
+            for arg in effect.value.args
+            for name in ReadWrites.from_ast(arg).reads
+        }
+        & varying
+    ):
+        return None
+    stores = []
+    for stmt in tail:
+        if not (
+            _is_proven_relocatable_assignment(stmt, allow_load=False)
+            or _validated_idempotent_store(stmt) is not None
+        ):
+            return None
+        if _validated_idempotent_store(stmt) is not None:
+            stores.append(stmt)
+        if (name := assigned_name(stmt)) is not None:
+            if name in defined or name == marker.result_var:
+                return None
+            defined.add(name)
+            if set(ReadWrites.from_ast(stmt).reads) & varying:
+                varying.add(name)
+    if len(stores) != 1:
+        return None
+    tail_reads = set().union(*(ReadWrites.from_ast(stmt).reads for stmt in tail))
+    per_lane_tail = bool(tail_reads & varying)
+    if per_lane_tail:
+        store_reads = _store_value_and_addr_reads(stores[0])
+        if store_reads is None or not store_reads[1] & varying:
+            return None
+    input_slice, _ = _backward_slice(
+        body[:marker_index], {marker.input_name}, rename_groups
+    )
+    if effect_index not in input_slice:
+        return None
+
+    occupied = {node.id for node in ast.walk(loop) if isinstance(node, ast.Name)}
+    occupied.update(rename_groups)
+    occupied.update(rename_groups.values())
+    try:
+        function = DeviceFunction.current()
+    except NoCurrentFunction:
+        function = None
+
+    def fresh(hint: str) -> str:
+        while True:
+            name = (
+                function.new_var(hint)
+                if function is not None
+                else f"{hint}_{_next_lane_stash_uid()}"
+            )
+            if name not in occupied:
+                occupied.add(name)
+                return name
+
+    later_reads = set().union(
+        *(ReadWrites.from_ast(stmt).reads for stmt in body[effect_index:])
+    )
+    stashes = {
+        name: fresh("opaque_input_stash")
+        for stmt in prefix
+        if (name := assigned_name(stmt)) in later_reads
+    }
+    produced_stashes = {
+        name: fresh("opaque_result_stash")
+        for stmt in body[effect_index:marker_index]
+        if (name := assigned_name(stmt)) in tail_reads
+    }
+    result: list[ast.AST] = [
+        statement_from_string(f"{stash} = []")
+        for stash in (*stashes.values(), *produced_stashes.values())
+    ]
+
+    def unrolled(statements: list[ast.AST]) -> ast.For:
+        clone = _clone_lane_loop_with_body(loop, statements)
+        clone.iter = cast(
+            "ast.expr", expr_from_string(f"cutlass.range_constexpr({extent})")
+        )
+        return clone
+
+    snapshot = [deep_clone(stmt) for stmt in prefix]
+    snapshot.extend(
+        statement_from_string(f"{stash}.append({name})")
+        for name, stash in stashes.items()
+    )
+    result.extend(
+        [unrolled(snapshot), statement_from_string("cute.arch.sync_threads()")]
+    )
+    acc = fresh("opaque_lane_acc")
+    result.append(statement_from_string(f"{acc} = {marker.identity_expr}"))
+    produce: list[ast.AST] = [
+        statement_from_string(f"{name} = {stash}[{lane_var}]")
+        for name, stash in stashes.items()
+    ]
+    produce.extend(deep_clone(stmt) for stmt in body[effect_index:marker_index])
+    produce.extend(
+        statement_from_string(f"{stash}.append({name})")
+        for name, stash in produced_stashes.items()
+    )
+    ctor = _dtype_ctor_from_identity(marker.identity_expr)
+    value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
+    produce.append(
+        statement_from_string(
+            f"{acc} = {_combine_expr(marker.reduction_type, acc, value, ctor)}"
+        )
+    )
+    result.extend(
+        [unrolled(produce), statement_from_string("cute.arch.sync_threads()")]
+    )
+    result.extend(_finalize_lane_reduce_marker(marker, acc))
+    marker_dependencies = [(marker, _forward_live_names(body, {marker.result_var}))]
+    axes_before, definitions_before = _statement_provenance_before(
+        body, thread_axis_names, scalar_definitions, rename_groups
+    )
+    consume: list[ast.AST] = (
+        [
+            statement_from_string(f"{name} = {stash}[{lane_var}]")
+            for name, stash in (stashes | produced_stashes).items()
+            if name in tail_reads
+        ]
+        if per_lane_tail
+        else []
+    )
+    for stmt in tail:
+        owners = _lane_reduction_owner_exprs_for_statement(
+            stmt,
+            markers,
+            marker_dependencies,
+            axes_before[id(stmt)],
+            definitions_before[id(stmt)],
+        )
+        consume.append(
+            _guard_stmt_with_owner(stmt, owners) if owners else deep_clone(stmt)
+        )
+    if per_lane_tail:
+        result.append(unrolled(consume))
+    else:
+        result.extend(consume)
+    return result
+
+
 def _split_one_lane_loop(
     loop: ast.For,
     lane_var: str,
@@ -469,6 +775,7 @@ def _split_one_lane_loop(
     rename_groups: dict[str, str],
     running_sums: set[str] | None = None,
     register_tile_options: RegisterTileOptions | None = None,
+    cta_uniform: bool = True,
 ) -> list[ast.AST]:
     from ...ast_read_writes import ReadWrites
 
@@ -478,6 +785,23 @@ def _split_one_lane_loop(
         parsed = _is_lane_reduce_marker_assign(stmt)
         if parsed is not None:
             markers.append((idx, parsed))
+    impure_indices = {i for i, stmt in enumerate(body) if _has_impure_inline_asm(stmt)}
+    if impure_indices and _find_lane_reduce_call(loop) is not None:
+        producer = _split_impure_producer(
+            loop,
+            lane_var,
+            markers,
+            impure_indices,
+            rename_groups,
+            thread_axis_names,
+            scalar_definitions,
+            cta_uniform=cta_uniform,
+        )
+        if producer is not None:
+            return producer
+        raise exc.BackendUnsupported(
+            "cute", "impure inline assembly has no proved snapshot/order schedule"
+        )
     if not markers:
         nested_owners = {
             marker.owner_lane
@@ -529,6 +853,7 @@ def _split_one_lane_loop(
                 rename_groups=rename_groups,
                 running_sums=running_sums,
                 register_tile_options=register_tile_options,
+                cta_uniform=cta_uniform,
             )
         if register_tile_failure is not None:
             # ``generate_ast`` regenerates the kernel with the rolled lane
@@ -884,6 +1209,8 @@ def _split_one_lane_loop(
     lane_invariant_after_consume: list[ast.AST] = []
     lane_varying_tail: list[ast.AST] = []
     for i, s in enumerate(phase2_body):
+        if i in varying_indices and i not in keep_indices:
+            continue
         owner_exprs = _lane_reduction_owner_exprs_for_statement(
             s,
             markers,
@@ -891,11 +1218,16 @@ def _split_one_lane_loop(
             thread_axes_before.get(id(s), thread_axis_names),
             scalar_defs_before.get(id(s), {}),
         )
+        if phase2_indices[i] in phase1_index_set:
+            # The accumulate loop holds this producer already.  Each position
+            # gets its own node: later passes key facts by node identity and
+            # rewrite in place (the cross-sweep load fusion, for one, saw the
+            # two copies at one position and kept the consume loop's reload).
+            s = _rerun_copy(s)
         if i in varying_indices:
-            if i in keep_indices:
-                lane_varying_tail.append(
-                    _guard_stmt_with_owner(s, owner_exprs) if owner_exprs else s
-                )
+            lane_varying_tail.append(
+                _guard_stmt_with_owner(s, owner_exprs) if owner_exprs else s
+            )
         else:
             if owner_exprs:
                 predicate = " and ".join(
@@ -1152,7 +1484,7 @@ def _validate_owned_lane_carry_schedule(
         return
 
     def normalize(statements: list[ast.AST]) -> list[ast.AST]:
-        result = [_clone_stmt(statement) for statement in statements]
+        result = [deep_clone(statement) for statement in statements]
         for statement in result:
             ast_rename(statement, rename_groups)
         return result
@@ -1305,7 +1637,7 @@ def _validate_renamed_lane_carries(
         not rename_groups or _has_extra_cross_lane_carry(body, lane_var, marker_indices)
     ):
         return
-    normalized = [_clone_stmt(statement) for statement in body]
+    normalized = [deep_clone(statement) for statement in body]
     for statement in normalized:
         ast_rename(statement, rename_groups)
     if _has_extra_cross_lane_carry(
@@ -1392,11 +1724,11 @@ def _lift_lane_invariant_if(
     lane_prefix = [idx for idx in range(len(prefix)) if idx not in condition_index_set]
 
     def branch_loop(field: str) -> list[ast.stmt]:
-        statements = [_clone_stmt(stmt) for stmt in getattr(branch, field)]
+        statements = [deep_clone(stmt) for stmt in getattr(branch, field)]
         if field in unlooped:
             unlooped_body = [
                 *(
-                    _clone_stmt(prefix[idx])
+                    deep_clone(prefix[idx])
                     for idx in lane_prefix
                     if idx not in lane_setup
                 ),
@@ -1406,7 +1738,7 @@ def _lift_lane_invariant_if(
                 return cast("list[ast.stmt]", unlooped_body)
             return [ast.Pass()] if field == "body" else []
         branch_body = [
-            *(_clone_stmt(prefix[idx]) for idx in lane_prefix),
+            *(deep_clone(prefix[idx]) for idx in lane_prefix),
             *statements,
         ]
         if not branch_body:
@@ -1420,13 +1752,13 @@ def _lift_lane_invariant_if(
 
     lifted_if = create(
         ast.If,
-        test=_clone_expr(branch.test),
+        test=deep_clone(branch.test),
         body=branch_loop("body"),
         orelse=branch_loop("orelse"),
     )
     if getattr(branch, HELION_BLOCK_UNIFORM_ATTR, False):
         setattr(lifted_if, HELION_BLOCK_UNIFORM_ATTR, True)
-    return [*(_clone_stmt(stmt) for stmt in condition_nodes), lifted_if]
+    return [*(deep_clone(stmt) for stmt in condition_nodes), lifted_if]
 
 
 def sink_lane_loops_into_uniform_branches(
@@ -1498,9 +1830,6 @@ def _sink_lane_loop_into_branches(
     across iterations too) and keep their effect run once instead of once
     per lane (``runs_once_outside_lane``).
     """
-    from ...ast_read_writes import ReadWrites
-    from .statements import runs_once_outside_lane
-
     if not loop.body or not isinstance(guard := loop.body[-1], ast.If):
         return None
     if not any(_find_lane_reduce_call(node) is not None for node in ast.walk(guard)):
@@ -1584,12 +1913,12 @@ def _split_staged_matmul_lane_reductions(
     ]
     if collective_indices and first_marker <= max(collective_indices):
         return None
-    transformed = [_clone_stmt(statement) for statement in body]
+    transformed: list[ast.AST] = [deep_clone(statement) for statement in body]
     prefix: list[ast.AST] = []
     if collective_indices:
         uid = _next_lane_stash_uid()
-        compute = [
-            _clone_stmt(statement) for statement in body[: max(collective_indices) + 1]
+        compute: list[ast.AST] = [
+            deep_clone(statement) for statement in body[: max(collective_indices) + 1]
         ]
         for index in collective_indices:
             statement = body[index]
@@ -1683,7 +2012,7 @@ def _split_dependent_lane_reductions(
 
         acc_var = f"{marker.result_var}_lane_acc"
         result.append(statement_from_string(f"{acc_var} = {marker.identity_expr}"))
-        acc_body = [_clone_stmt(stmt) for stmt in stage]
+        acc_body = [_rerun_copy(stmt) for stmt in stage]
         ctor = _dtype_ctor_from_identity(marker.identity_expr)
         combine_val = (
             f"{ctor}({marker.input_name})" if ctor is not None else marker.input_name
@@ -1744,9 +2073,7 @@ def _split_dependent_lane_reductions(
             thread_axes_before.get(id(stmt), thread_axis_names),
             scalar_defs_before.get(id(stmt), {}),
         )
-        cloned = _clone_stmt(stmt)
-        if owner_exprs:
-            cloned = _guard_stmt_with_owner(cloned, owner_exprs)
+        cloned = _guard_stmt_with_owner(stmt, owner_exprs)
         if lane_varying_stmt:
             varying.append(cloned)
         elif idx in after_consume:
@@ -2241,9 +2568,9 @@ def _split_lane_loop_with_register_stash(
             if not _assigns_simple_name(rederivable_before[i], marker_result_vars)
         ]
         acc_body: list[ast.AST] = []
-        acc_body.extend(_clone_stmt(s) for s in recompute_kept)
+        acc_body.extend(_rerun_copy(s) for s in recompute_kept)
         acc_body.extend(read_stash_stmts())
-        acc_body.extend(_clone_stmt(s) for s in input_stmts)
+        acc_body.extend(_rerun_copy(s) for s in input_stmts)
         ctor = _dtype_ctor_from_identity(m.identity_expr)
         combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         acc_body.append(
@@ -2265,9 +2592,9 @@ def _split_lane_loop_with_register_stash(
     consume_kept = [s for i, s in enumerate(consume_candidates) if i in keep_idx]
     if consume_kept:
         consume_body: list[ast.AST] = []
-        consume_body.extend(_clone_stmt(s) for s in recompute_kept)
+        consume_body.extend(_rerun_copy(s) for s in recompute_kept)
         consume_body.extend(read_stash_stmts())
-        consume_body.extend(_clone_stmt(s) for s in consume_kept)
+        consume_body.extend(deep_clone(s) for s in consume_kept)
         result.append(_clone_lane_loop_with_body(loop, consume_body))
     return result
 
@@ -2467,7 +2794,7 @@ def _for_is_provably_nonempty(stmt: ast.For) -> bool:
         and 1 <= len(iterator.args) <= 3
     ):
         return False
-    values = [_literal_int_expr(arg) for arg in iterator.args]
+    values = [_int_literal(arg) for arg in iterator.args]
     if any(value is None for value in values):
         return False
     integers = cast("list[int]", values)
@@ -2922,7 +3249,7 @@ def _rereduce_restored_lane_markers(
         )
     result: list[ast.AST] = [*totals, _clone_lane_loop_with_body(loop, loop_body)]
     result.extend(finalized)
-    result.extend(_clone_stmt(stmt) for stmt in rederived)
+    result.extend(deep_clone(stmt) for stmt in rederived)
     marker_dependencies = [
         (marker, _forward_live_names(body, {marker.result_var}))
         for _, marker in markers
@@ -3313,6 +3640,9 @@ def interchange_lane_outside_serial_reductions(
     *,
     proven_disjoint_tensor_pairs: set[frozenset[str]] | None = None,
     protected_names: set[str] | None = None,
+    proven_tensor_stride_values: Mapping[tuple[str, int], int] | None = None,
+    constexpr_value: Callable[[str], int | None] | None = None,
+    rename_groups: Mapping[str, str] | None = None,
 ) -> list[ast.AST]:
     """Interchange a ``for LANE: ... for MB: ...`` nest whose inner serial loop
     contains ``_helion_lane_reduce`` markers.
@@ -3326,15 +3656,27 @@ def interchange_lane_outside_serial_reductions(
 
     * Nest B (grad_w): the original ``for LANE: ... for MB: ...`` loop. Remove
       reduction-consuming stores and their dead producers when aliasing and
-      exact overwrite coverage are proven; otherwise retain the partial stores.
-      A reduction-consuming atomic is always removed (Nest A applies the full
-      reduction once; the lanes' partials must not be added on top), and the
-      nest is declined when it cannot be; Nest B itself goes when that leaves
-      it empty.
+      exact overwrite coverage are proven; otherwise retain the partial stores,
+      unless a load names the tensor one writes (an in-place update): such a
+      store goes once its overwrite is proven, and the nest is declined when
+      it cannot, or when a load of Nest B left behind would read what it
+      wrote (``drop_read_back_partial_stores``). A reduction-consuming atomic
+      is always removed (Nest A applies the full reduction once; the lanes'
+      partials must not be added on top), and the nest is declined when it
+      cannot be, or when a load of Nest B after the lane prefix may read
+      what it updates (``decline_stale_reads``); Nest B itself goes when that
+      leaves it empty.
     * Nest A (grad_x): a ``for MB: ... for LANE: ...`` loop carrying only the
       lane reduction and its broadcast consumer. Its inner lane loop still holds
       the markers so the subsequent ``split_lane_loop_reductions`` pass produces
-      the per-``mb`` accumulate -> warp-combine -> consume structure.
+      the per-``mb`` accumulate -> warp-combine -> consume structure. The nest
+      is declined when Nest A would need a lane-varying value its ``mb`` loop
+      carries from one iteration to the next (a lane's running total the
+      consumer stores), which Nest A's order would carry from lane to lane.
+
+    Names one pending codegen rename merges (``rename_groups``, each name's
+    shared name) are one variable there: ``v_27 = scale_copy * 2.0``, which
+    the loop's carry renames to ``scale``, updates ``scale``.
 
     Returns ``body`` unchanged when no such pattern is present.
     """
@@ -3342,7 +3684,12 @@ def interchange_lane_outside_serial_reductions(
     for stmt in body:
         new_body.extend(
             _interchange_stmt(
-                stmt, proven_disjoint_tensor_pairs or set(), protected_names or set()
+                stmt,
+                proven_disjoint_tensor_pairs or set(),
+                protected_names or set(),
+                proven_tensor_stride_values or {},
+                constexpr_value,
+                rename_groups or {},
             )
         )
     return new_body
@@ -3352,6 +3699,9 @@ def _interchange_stmt(
     stmt: ast.AST,
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
+    proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    constexpr_value: Callable[[str], int | None] | None,
+    rename_groups: Mapping[str, str],
 ) -> list[ast.AST]:
     for field in ("body", "orelse", "finalbody"):
         old = getattr(stmt, field, None)
@@ -3363,6 +3713,9 @@ def _interchange_stmt(
                     old,
                     proven_disjoint_tensor_pairs=proven_disjoint_tensor_pairs,
                     protected_names=protected_names,
+                    proven_tensor_stride_values=proven_tensor_stride_values,
+                    constexpr_value=constexpr_value,
+                    rename_groups=rename_groups,
                 ),
             )
     lane_var = getattr(stmt, HELION_LANE_LOOP_VAR_ATTR, None)
@@ -3374,7 +3727,13 @@ def _interchange_stmt(
     ):
         return [stmt]
     return _interchange_one_lane_loop(
-        stmt, lane_var, proven_disjoint_tensor_pairs, protected_names
+        stmt,
+        lane_var,
+        proven_disjoint_tensor_pairs,
+        protected_names,
+        proven_tensor_stride_values,
+        constexpr_value,
+        rename_groups,
     )
 
 
@@ -3530,10 +3889,44 @@ def _flatten_vector_reduction_lane(
             return node
 
     flattened = [
-        Coordinates().visit(_clone_stmt(statement))
+        Coordinates().visit(deep_clone(statement))
         for statement in [*prefix, *vector_loop.body]
     ]
     return _create_lane_loop(lane_var, outer_size * vector_size, flattened)
+
+
+def _without_access_regions(statement: ast.AST) -> ast.AST:
+    """``statement``, with the access regions of its accesses dropped in
+    place: pass it a copy.
+
+    A region names the tile begins of the device loops around its access by
+    the loop instance (``access_regions.tile_begin_symbol``), and the
+    barrier pass cancels a begin two accesses share.  A copy placed in
+    another loop over the same tiles would keep the original loop's begins,
+    so ``x[..., tk.begin]`` in one loop and ``x[..., tk.begin + 1]`` in the
+    other would look apart, though they meet across iterations.  Without
+    regions the pass compares such a pair through the address maps.
+    """
+    for node in ast.walk(statement):
+        vars(node).pop(HELION_ACCESS_REGIONS_ATTR, None)
+    return statement
+
+
+def _rerun_copy(statement: ast.AST) -> ast.AST:
+    """A copy of a producer that another lane loop reruns beside the one
+    holding it.
+
+    The copy is a node of its own: later passes key facts by node identity
+    and rewrite in place.  The accesses in a loop nested in the producer
+    drop their regions (``_without_access_regions``), since the copy's loop
+    runs apart from the original's: the original's tile begins would make
+    accesses that meet across iterations look apart.
+    """
+    copy = deep_clone(statement)
+    for node in ast.walk(copy):
+        if _is_device_loop(node):
+            _without_access_regions(node)
+    return copy
 
 
 def _interchange_one_lane_loop(
@@ -3541,9 +3934,10 @@ def _interchange_one_lane_loop(
     lane_var: str,
     proven_disjoint_tensor_pairs: set[frozenset[str]],
     protected_names: set[str],
+    proven_tensor_stride_values: Mapping[tuple[str, int], int],
+    constexpr_value: Callable[[str], int | None] | None,
+    rename_groups: Mapping[str, str],
 ) -> list[ast.AST]:
-    from ...ast_read_writes import ReadWrites
-
     body: list[ast.AST] = list(loop.body)
     # Find the single inner serial ``for`` loop that carries lane-reduce
     # markers of THIS lane (or legacy unowned markers).  A vector tile's
@@ -3640,42 +4034,73 @@ def _interchange_one_lane_loop(
     # across both the mb body and the lane prefix. The per-feature accumulators
     # feed only the suffix stores (never the reduction store), so they are
     # naturally excluded — no carry analysis is required.
-    mb_bound_names = set(ReadWrites.from_ast(mb_loop.iter).reads)
-    needed = {m.input_name for _, m in markers} | mb_bound_names
-    keep_mb_a: list[ast.AST] = []
-    for idx in range(len(mb_body) - 1, -1, -1):
-        stmt = mb_body[idx]
-        rw = ReadWrites.from_ast(stmt)
-        if idx in marker_indices:
-            keep_mb_a.append(stmt)
-            needed |= set(rw.reads) - marker_results
-            continue
-        if is_reduction_store(stmt) or (set(rw.writes) & needed):
-            keep_mb_a.append(stmt)
-            needed |= set(rw.reads)
+    def canonical(names: Iterable[str]) -> set[str]:
+        return {rename_groups.get(name, name) for name in names}
+
+    mb_bound_names = canonical(ReadWrites.from_ast(mb_loop.iter).reads)
+    seeds = canonical(m.input_name for _, m in markers) | mb_bound_names
+    results = canonical(marker_results)
+    # The mb loop carries values from one iteration into the next (``scale =
+    # scale * 2.0`` after the statement that reads ``scale``): a name the
+    # slice needs that the body may read before assigning it
+    # (``exposed_reads``) is needed at the end of the body too, so the slice
+    # repeats until the names needed there stop growing.
+    carried_in = exposed_reads(mb_body, renames=rename_groups)
+    live_at_end = set(seeds)
+    while True:
+        needed = set(live_at_end)
+        keep_mb_a: list[ast.AST] = []
+        for idx in range(len(mb_body) - 1, -1, -1):
+            stmt = mb_body[idx]
+            rw = ReadWrites.from_ast(stmt)
+            if idx in marker_indices:
+                keep_mb_a.append(stmt)
+                needed |= canonical(rw.reads) - results
+                continue
+            if is_reduction_store(stmt) or (canonical(rw.writes) & needed):
+                keep_mb_a.append(stmt)
+                needed |= canonical(rw.reads)
+        if seeds | (needed & carried_in) == live_at_end:
+            break
+        live_at_end = seeds | (needed & carried_in)
     keep_mb_a.reverse()
     keep_prefix_a: list[ast.AST] = []
     for stmt in reversed(lane_prefix):
         rw = ReadWrites.from_ast(stmt)
-        if set(rw.writes) & needed:
+        if canonical(rw.writes) & needed:
             keep_prefix_a.append(stmt)
-            needed |= set(rw.reads)
+            needed |= canonical(rw.reads)
     keep_prefix_a.reverse()
+
+    if _has_impure_inline_asm(loop):
+        # Both nests can retain the original producers. The in-place restore
+        # and register-tile fallback above do not clone these effects.
+        raise exc.BackendUnsupported(
+            "cute",
+            "impure inline assembly cannot be interchanged with a lane reduction",
+        )
 
     # Partition kept statements into lane-invariant (run once per mb iteration)
     # vs lane-varying (recomputed per lane inside the inner lane loop).
-    prefix_invariant_a = [_clone_stmt(s) for s in keep_prefix_a if not reads_lane(s)]
-    prefix_varying_a = [_clone_stmt(s) for s in keep_prefix_a if reads_lane(s)]
-    mb_head_a = [_clone_stmt(s) for s in keep_mb_a if not reads_lane(s)]
-    mb_varying_a = [_clone_stmt(s) for s in keep_mb_a if reads_lane(s)]
+    prefix_invariant_a = [_rerun_copy(s) for s in keep_prefix_a if not reads_lane(s)]
+    prefix_varying_a = [_rerun_copy(s) for s in keep_prefix_a if reads_lane(s)]
+    # Nest A's serial loop is another loop over the serial loop's tiles, at
+    # another iteration than Nest B's at any moment: its copies drop the
+    # access regions recorded in Nest B's loop (``_without_access_regions``).
+    mb_head_a = [
+        _without_access_regions(deep_clone(s)) for s in keep_mb_a if not reads_lane(s)
+    ]
+    mb_varying_a = [
+        _without_access_regions(deep_clone(s)) for s in keep_mb_a if reads_lane(s)
+    ]
 
     inner_lane_loop_a = _clone_lane_loop_with_body(
         loop, [*prefix_varying_a, *mb_varying_a]
     )
     mb_loop_a = create(
         ast.For,
-        target=_clone_expr(mb_loop.target),
-        iter=_clone_expr(mb_loop.iter),
+        target=deep_clone(mb_loop.target),
+        iter=deep_clone(mb_loop.iter),
         body=[*mb_head_a, inner_lane_loop_a],
         orelse=[],
         type_comment=None,
@@ -3687,6 +4112,9 @@ def _interchange_one_lane_loop(
     # already correct; its reduction-broadcast store writes a partial (per-lane)
     # value that Nest A re-stores with the full reduction afterwards. Prune the
     # first store only after proving it is unobservable and fully overwritten.
+    # When a load names its tensor (an in-place update) it is pruned once the
+    # overwrite is proven, and the nest is declined when it cannot be or when
+    # a load of Nest B still reads what it wrote.
     # An atomic consumer has no such overwrite: Nest A applies the full
     # reduction once, so Nest B must not apply the lanes' partials at all.
     restored_mb_body = list(mb_loop.body)
@@ -3697,10 +4125,30 @@ def _interchange_one_lane_loop(
     mb_loop.body = restored_mb_body
     nest_b = loop
 
+    from ..interchanged_store_dce import _single_store
     from ..interchanged_store_dce import atomic_write_calls
+    from ..interchanged_store_dce import carried_lane_updates
+    from ..interchanged_store_dce import decline_stale_reads
+    from ..interchanged_store_dce import drop_read_back_partial_stores
     from ..interchanged_store_dce import eliminate_interchanged_atomics
     from ..interchanged_store_dce import eliminate_interchanged_stores
+    from ..interchanged_store_dce import overwrites_later_first_pass_write
 
+    # Nest A runs the serial loop outside the lane loop, so a value a lane
+    # carries from one serial iteration to the next (``running = running +
+    # value``) would run on from lane to lane instead; a lane-invariant
+    # update is the same in every lane, once per iteration.
+    carried_updates = carried_lane_updates(loop, mb_body, rename_groups)
+    if any(
+        reads_lane(statement) and carried_updates(statement)
+        for statement in keep_mb_a
+        if _is_lane_reduce_marker_assign(statement) is None
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "interchanged lane reduction would carry a lane's value from one "
+            "serial iteration to the next through every lane",
+        )
     reduction_consumers = _forward_live_names(mb_body, marker_results)
     consumer_indices = {
         index
@@ -3708,19 +4156,67 @@ def _interchange_one_lane_loop(
         if _has_side_effect(statement)
         and set(ReadWrites.from_ast(statement).reads) & reduction_consumers
     }
+    # A memory write Nest A needs that does not consume the reduction (an
+    # in-place update of the marker's input, ``y[...] = row * 0.5`` beside
+    # ``row.sum()``) runs in both nests, where the tile program runs it once:
+    # an atomic would apply twice, and Nest A would load what Nest B's copy
+    # of a store already wrote.  Nest B's copy goes or the nest is declined,
+    # as it is for a write in the lane prefix Nest A reruns.
+    duplicated_indices = {
+        index
+        for index, statement in enumerate(mb_body)
+        if index not in consumer_indices
+        and statement in keep_mb_a
+        and _has_observable_memory_write(statement)
+    }
+    duplicated_stores = {
+        index for index in duplicated_indices if _single_store(mb_body[index])
+    }
+    if any(
+        _has_observable_memory_write(statement) for statement in keep_prefix_a
+    ) or any(
+        index not in duplicated_stores and not atomic_write_calls(mb_body[index])
+        for index in duplicated_indices
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "interchanged lane reduction would run a memory write both nests need "
+            "twice",
+        )
     atomic_consumers = [
         mb_body[index]
-        for index in sorted(consumer_indices)
+        for index in sorted(consumer_indices | duplicated_indices)
         if atomic_write_calls(mb_body[index])
     ]
     eliminate_interchanged_stores(
         nest_b,
         mb_loop,
         nest_a,
-        consumer_indices,
+        consumer_indices | duplicated_stores,
         proven_disjoint_tensor_pairs,
         protected_names,
     )
+    drop_read_back_partial_stores(
+        nest_b,
+        mb_loop,
+        nest_a,
+        [mb_body[index] for index in sorted(consumer_indices)],
+        proven_disjoint_tensor_pairs,
+        protected_names,
+        proven_tensor_stride_values,
+        constexpr_value,
+        duplicated=[mb_body[index] for index in sorted(duplicated_stores)],
+    )
+    if any(
+        statement is mb_body[index]
+        for statement in mb_loop.body
+        for index in duplicated_stores
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "interchanged lane reduction cannot drop the first pass's copy of a "
+            "store both nests need",
+        )
     if atomic_consumers:
         dropped = eliminate_interchanged_atomics(
             nest_b, mb_loop, nest_a, atomic_consumers, protected_names
@@ -3731,7 +4227,46 @@ def _interchange_one_lane_loop(
                 "interchanged lane reduction has an atomic consumer the first "
                 "pass cannot drop",
             )
-        if not nest_b.body:
-            return nest_a
+    # Nest A runs after all of Nest B: its writes land after every write left
+    # in Nest B, where only Nest B's copies of the consumer stores it stores
+    # again over the same elements are meant to be overwritten, its atomics
+    # after every load of Nest B, and it reruns the lane prefix it needs, its
+    # lane-varying part in every ``mb`` iteration.
+    if overwrites_later_first_pass_write(
+        nest_b,
+        mb_loop,
+        nest_a,
+        [mb_body[index] for index in consumer_indices],
+        proven_disjoint_tensor_pairs,
+        protected_names,
+    ):
+        raise exc.BackendUnsupported(
+            "cute",
+            "a final-pass write of an interchanged lane reduction may overwrite "
+            "a later first-pass write",
+        )
+    # Each statement of Nest A's serial loop head, with the lane-varying ones
+    # it followed in the serial body: it now runs ahead of them in every
+    # iteration.
+    head_moves: list[tuple[ast.AST, list[ast.AST]]] = []
+    heads, varying = iter(mb_head_a), 0
+    for stmt in keep_mb_a:
+        if reads_lane(stmt):
+            varying += 1
+        else:
+            head_moves.append((next(heads), mb_varying_a[:varying]))
+    decline_stale_reads(
+        nest_b,
+        mb_loop,
+        nest_a,
+        prefix_varying_a,
+        lane_prefix,
+        proven_disjoint_tensor_pairs,
+        protected_names,
+        head_moves,
+        rename_groups,
+    )
+    if not nest_b.body:
+        return nest_a
 
     return [nest_b, *nest_a]

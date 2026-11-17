@@ -3,13 +3,10 @@ from __future__ import annotations
 import ast
 import copy
 import csv
-import importlib.util
-import inspect
 import json
 import operator
 import os
 import py_compile
-from types import ModuleType
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import Mock
@@ -18,11 +15,11 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test.test_cute_structural_cache import _cpu_only  # noqa: F401
-from test.test_cute_structural_cache import _search
-from test.test_cute_structural_compatibility import _pointwise
-
 import helion
+from helion._testing.cute_structural import _cpu_only  # noqa: F401
+from helion._testing.cute_structural import _function
+from helion._testing.cute_structural import _module
+from helion._testing.cute_structural import _search
 from helion.autotuner.aot_cache import AOTAutotuneCache
 from helion.autotuner.aot_cache import ShapeKey
 from helion.autotuner.aot_cache import find_heuristic_file
@@ -64,22 +61,6 @@ def _key_cache() -> Iterator[None]:
     HeuristicKeyFunction.clear_cache()
     yield
     HeuristicKeyFunction.clear_cache()
-
-
-def _module(path: Path) -> ModuleType:
-    spec = importlib.util.spec_from_file_location(path.stem, path)
-    assert spec is not None and spec.loader is not None
-    result = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(result)
-    return result
-
-
-def _function(tmp_path: Path) -> Callable[..., Any]:
-    source = tmp_path / "original.py"
-    source.write_text(
-        "import torch\nimport helion.language as hl\n" + inspect.getsource(_pointwise)
-    )
-    return _module(source)._pointwise
 
 
 def _measurements(

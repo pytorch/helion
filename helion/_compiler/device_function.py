@@ -18,7 +18,6 @@ import sympy
 import torch
 from torch._dynamo.source import TensorProperty
 from torch._dynamo.source import TensorPropertySource
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.fx.graph import _Namespace
 
 from .. import exc
@@ -43,11 +42,13 @@ from .host_function import HostFunction
 from .host_function import NoCurrentFunction
 from .lane_loop_context import LaneLoopContext
 from .output_header import reserved_names
+from .runtime_tensor_guards import tensor_pairs_with_proven_disjoint_storage
 from .source_location import SyntheticLocation
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
 from .variable_origin import Origin
 from .variable_origin import TensorSizeOrigin
+from .variable_origin import TensorStrideOrigin
 from .variable_origin import TileBeginOrigin
 from .variable_origin import TileExtentOrigin
 
@@ -83,11 +84,13 @@ def _exact_thread_block_dims(
     """Return a proven-static launch shape, or ``None`` when inference fails.
 
     ``None`` as well when a launch axis is sized by a kernel argument
-    (``TileStrategyDispatch.symbolic_thread_axes``): the static shape holds a
-    one for it, and a pass proving bounds from that one (the lane-tile bounds
-    simplifier erased the leader guard ``cute.arch.thread_idx()[axis] == 0``
-    of an atomic beside the axis, which then ran once per thread of it) would
-    prove the wrong thing.
+    (``TileStrategyDispatch.symbolic_thread_axes``) or claimed outside the
+    strategies by a free ``hl.arange`` dim
+    (``TileStrategyDispatch.synthetic_thread_axes``): the static shape holds
+    a one for it, and a pass proving bounds from that one (the lane-tile
+    bounds simplifier erased the leader guard ``cute.arch.thread_idx()[axis]
+    == 0`` of an atomic beside the axis, which then ran once per thread of
+    it) would prove the wrong thing.
     """
 
     try:
@@ -99,11 +102,13 @@ def _exact_thread_block_dims(
         ):
             return None
         result = int(thread_dims[0]), int(thread_dims[1]), int(thread_dims[2])
-        return result if all(dim > 0 for dim in result) else None
     except (TypeError, ValueError):
         # A sympy extent that is not an integer (``int()`` of a symbolic
         # thread count); every other failure of the strategies surfaces.
         return None
+    if not all(dim > 0 for dim in result) or tile_strategy.synthetic_thread_axes():
+        return None
+    return result
 
 
 @dataclasses.dataclass
@@ -170,6 +175,22 @@ def find_block_size_symbols(
 
     # pyrefly: ignore[bad-return]
     return block_sizes, non_block_size_symbols
+
+
+def substitute_configured_block_sizes(expr: sympy.Expr, config: Config) -> sympy.Expr:
+    """Substitute only block-size symbols fixed by this config, without hints.
+
+    Runtime size symbols remain symbolic. This also works before the device
+    function's strategies exist, when Metal budgets their thread counts.
+    """
+    env = CompileEnvironment.current()
+    block_symbols, _ = find_block_size_symbols(expr)
+    values = {
+        symbol: sympy.Integer(size)
+        for symbol, block_id in block_symbols.items()
+        if isinstance(size := env.block_sizes[block_id].from_config(config), int)
+    }
+    return expr.xreplace(values)
 
 
 def contains_only_block_size_symbols(expr: sympy.Expr) -> bool:
@@ -799,11 +820,24 @@ class DeviceFunction:
         with contextlib.suppress(Exception):
             expr = env.shape_env.simplify(expr)
         expr = env.specialize_expr(expr)
-        if not expr.free_symbols:
-            return env.backend.sympy_printer_expr(expr)
+        host = HostFunction.current()
+        resolved = host.resolve_tunable_expr(expr, self.config)
+        if isinstance(resolved, (int, float, bool)):
+            return env.backend.scalar_literal_expr(resolved)
+        constants = env.config_constants(resolved, self.config)
+        if not constants.free_symbols:
+            return env.backend.sympy_printer_expr(constants)
+        expr_to_origin = host.expr_to_origin
+        # A name for the whole expression passes its value in where the
+        # config's values leave a symbol nothing names alone
+        # (``HostFunction.sympy_expr``).
+        if expr is not constants and expr in self.expr_to_var_info:
+            return self.expr_to_var_info[expr].name
+        if expr is not constants and expr in expr_to_origin:
+            return self._lift_sympy_arg(expr)
+        expr = constants
         if expr in self.expr_to_var_info:
             return self.expr_to_var_info[expr].name
-        expr_to_origin = HostFunction.current().expr_to_origin
         if expr in expr_to_origin:
             return self._lift_sympy_arg(expr)
         if env.backend.lowers_integer_powers:
@@ -816,15 +850,27 @@ class DeviceFunction:
         replacements = {}
         for sym in sorted(expr.free_symbols, key=lambda x: x.name):
             assert isinstance(sym, sympy.Symbol)
-            if sym in self.expr_to_var_info:
+            selected = (
+                host.resolve_tunable_expr(sym, self.config)
+                if sym not in expr_to_origin
+                else sym
+            )
+            if isinstance(selected, (int, float, bool)):
+                # A selected constant cannot depend on an inner-loop alias:
+                # lift_symnode may hoist this expression outside that loop.
+                replacements[sym] = sympy.Symbol(
+                    f"({env.backend.scalar_literal_expr(selected)})"
+                )
+            elif sym in self.expr_to_var_info:
                 replacements[sym] = sympy.Symbol(
                     self.expr_to_var_info[sym].name, integer=True
                 )
-            else:
-                assert sym in expr_to_origin, f"no origin found for {sym.name}"
+            elif sym in expr_to_origin:
                 replacements[sym] = sympy.Symbol(
                     self._lift_sympy_arg(sym), integer=True
                 )
+            else:
+                raise AssertionError(f"no origin found for {sym.name}")
         # pyrefly: ignore [bad-argument-type]
         return env.backend.sympy_printer_expr(expr.xreplace(replacements))
 
@@ -832,12 +878,28 @@ class DeviceFunction:
         env = CompileEnvironment.current()
         origin = HostFunction.current().expr_to_origin[expr]
         if isinstance(origin.origin, TensorSizeOrigin):
+            # A size the config fixes (``out.size(1)`` of ``torch.empty([m,
+            # helion.next_power_of_2(foo)])``) is its value under the config:
+            # a shape needs a constant, which the size argument is not.
+            expression = env.config_value_expression(expr)
+            if expression is not None:
+                value = (
+                    expression
+                    if isinstance(expression, int)
+                    else expression.evaluate(self.config)
+                )
+                return env.backend.sympy_printer_expr(sympy.Integer(value))
             assert origin.fake_value is not None
             arg = self.tensor_size(
                 origin.fake_value,
                 origin.origin.key,
             )
             return arg.name
+        if (
+            isinstance(origin.origin, TensorStrideOrigin)
+            and origin.fake_value is not None
+        ):
+            return self.tensor_stride(origin.fake_value, origin.origin.key).name
         if isinstance(origin.origin, BlockSizeOrigin):
             result = self.block_size_var(env.canonical_block_id(origin.origin.block_id))
             assert result is not None
@@ -1060,7 +1122,9 @@ class DeviceFunction:
                 # literal avoids specializing a dynamic stride solely to build
                 # a launch-time descriptor.
                 strides[-1] = "1"
-                host_block_size = ", ".join(map(host_function.literal_expr, block_size))
+                host_block_size = ", ".join(
+                    host_function.literal_expr(size, self.config) for size in block_size
+                )
                 arg = TensorDescriptorArg(
                     desc_name,
                     fake_value,
@@ -1106,11 +1170,21 @@ class DeviceFunction:
 
     def expr_arg(self, sym: sympy.Expr, origin: Origin) -> NumericArgument:
         if sym not in self._expr_args:
-            # A tunable-only expression is constant for each compiled config.
+            env = CompileEnvironment.current()
+            # An expression over tunables, and over the values a host helper
+            # computes from them (config_value_expressions), is constant for
+            # each compiled config.
             arg_type = (
                 ConstExprArg
                 if sym in self._constexpr_exprs
-                or CompileEnvironment.current().is_tunable_expr(sym)
+                or (
+                    sym.free_symbols
+                    and all(
+                        symbol in env.tunable_symbols
+                        or symbol in env.config_value_expressions
+                        for symbol in sym.free_symbols
+                    )
+                )
                 else SymbolArgument
             )
             arg = arg_type(
@@ -1198,9 +1272,9 @@ class DeviceFunction:
 
         # Handle sympy expressions
         if isinstance(value, sympy.Expr):
-            return HostFunction.current().sympy_expr(value)
+            return HostFunction.current().sympy_expr(value, self.config)
 
-        return HostFunction.current().literal_expr(value)
+        return HostFunction.current().literal_expr(value, self.config)
 
     def _tensor_property(
         self,
@@ -1342,18 +1416,12 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        pdl = {
-            "wait": "tl.extra.cuda.gdc_wait()",
-            "launch_dependents": "tl.extra.cuda.gdc_launch_dependents()",
-        }
         kernel_body: list[ast.stmt] = cast(
             "list[ast.stmt]",
             [
-                *[statement_from_string(pdl[op]) for op in env.pdl_entry],
                 *scalar_preamble,
                 *self.preamble,
                 *self.body,
-                *[statement_from_string(pdl[op]) for op in env.pdl_exit],
             ],
         )
         body_context = DeviceBodyContext(
@@ -1364,7 +1432,7 @@ class DeviceFunction:
             constexpr_to_inline=constexpr_to_inline,
             wrapper_only_params=wrapper_only_params,
             bounded_cache_request=bounded_cache_request,
-            body_start=len(env.pdl_entry) + len(scalar_preamble) + len(self.preamble),
+            body_start=len(scalar_preamble) + len(self.preamble),
         )
         kernel_body, extra_args = backend.finalize_device_body(
             kernel_body, body_context
@@ -1382,6 +1450,20 @@ class DeviceFunction:
             {k: v[0] for k, v in self._variable_renames.items()},
         )
         trailing = backend.finalize_kernel_def(definition, prefix, body_context)
+        # Explicit entry/exit markers surround the final body: backend schedule
+        # rewrites must neither move the wait past memory nor release earlier
+        # than an explicit exit trigger.
+        definition.body = [
+            *[
+                statement_from_string(backend.pdl_instruction(op))
+                for op in env.pdl_entry
+            ],
+            *definition.body,
+            *[
+                statement_from_string(backend.pdl_instruction(op))
+                for op in env.pdl_exit
+            ],
+        ]
         return [*prefix, definition, *trailing]
 
     def proven_disjoint_tensor_pairs(self) -> set[frozenset[str]]:
@@ -1389,48 +1471,24 @@ class DeviceFunction:
 
         Different user/global tensor arguments are not a non-aliasing proof:
         callers may pass the same tensor, or overlapping views, under multiple
-        names.  A tensor backed by storage absent from the original function
-        inputs cannot overlap an external input or a separately allocated
-        output.  Two external inputs are disjoint only when the current runtime
-        storage spans do not overlap and that predicate is part of the bound
-        kernel cache key.  The predicate compares whole storages, so it also
-        covers host-side views (``x.view(...)``) through the input whose
+        names. Positively identified wrapper allocations cannot overlap an
+        external input or another allocation. Synthetic host-join storage
+        instead represents every branch's possible storage, all of which must
+        prove disjointness. Two external inputs are disjoint only when their
+        current runtime storage spans do not overlap and that predicate is part
+        of the bound kernel cache key. The predicate compares whole storages,
+        so it also covers host-side views (``x.view(...)``) through the input whose
         storage they share.  Origin type alone is insufficient: host-local
         ``torch.empty``-family outputs commonly carry ``NameOrigin`` too.
         """
-        env = CompileEnvironment.current()
-        host_function = HostFunction.current()
-        input_storages = {
-            id(tensor.untyped_storage()): tensor for tensor in env.input_sources
-        }
-        origins: dict[str, tuple[str, int, torch.Tensor | None]] = {}
-        for arg in self.arguments:
-            if not isinstance(arg, TensorArg):
-                continue
-            origin = host_function.tensor_to_origin.get(arg.fake_value)
-            root = origin.root_rw_name() if origin is not None else None
-            if root is not None:
-                storage = id(arg.fake_value.untyped_storage())
-                origins[arg.name] = (
-                    root,
-                    storage,
-                    arg.fake_value
-                    if arg.fake_value in env.input_sources
-                    else input_storages.get(storage),
-                )
-        return {
-            frozenset((left_name, right_name))
-            for left_name, (left_root, left_storage, left_input) in origins.items()
-            for right_name, (right_root, right_storage, right_input) in origins.items()
-            if left_name < right_name
-            and left_root != right_root
-            and left_storage != right_storage
-            and (
-                left_input is None
-                or right_input is None
-                or env.backend.tensors_proven_disjoint(env, left_input, right_input)
-            )
-        }
+        return tensor_pairs_with_proven_disjoint_storage(
+            CompileEnvironment.current(),
+            {
+                arg.name: arg.fake_value
+                for arg in self.arguments
+                if isinstance(arg, TensorArg)
+            },
+        )
 
     def proven_tensor_stride_values(self) -> dict[tuple[str, int], int]:
         """Return tensor strides whose exact value is cache-safe.
@@ -1439,10 +1497,12 @@ class DeviceFunction:
         sizes and strides (see ``_tensor_key``), so under that setting every
         input stride is already a cache-safe fact; otherwise a stride is
         cache-safe only when the ``input_tensor_metadata`` compiler fact or an
-        explicit ``hl.specialize`` guard covers it.
+        explicit ``hl.specialize`` guard covers it.  The binding then decides
+        the value (``CompileEnvironment.keyed_hint``), and only while
+        its dispatch guards are enforced.
         """
         env = CompileEnvironment.current()
-        input_metadata_specialized = (
+        input_metadata_specialized = env.dispatch_guards_enforced and (
             env.settings.static_shapes
             or "input_tensor_metadata" in env.compiler_fact_specialization_facts
         )
@@ -1451,9 +1511,8 @@ class DeviceFunction:
             if not isinstance(arg, TensorArg):
                 continue
             source = env.tensor_input_source(arg.fake_value)
-            runtime = env.runtime_value_for_tensor(arg.fake_value)
-            if not isinstance(runtime, torch.Tensor) or isinstance(runtime, FakeTensor):
-                if source is not None or not input_metadata_specialized:
+            if source is None:
+                if not input_metadata_specialized:
                     continue
                 # A tensor the host function allocates (``torch.empty_like``)
                 # has no runtime value at compile time; its layout is what
@@ -1465,28 +1524,30 @@ class DeviceFunction:
                         result[arg.name, dim] = fake_stride
                 continue
             for dim, fake_stride in enumerate(arg.fake_value.stride()):
-                cache_safe = source is not None and (
+                cache_safe = (
                     input_metadata_specialized
                     or TensorPropertySource(source, TensorProperty.STRIDE, dim)
                     in env.specialized_strides
                 )
                 if not cache_safe:
                     continue
-                try:
-                    traced_stride = env.size_hint(fake_stride)
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                runtime_stride = runtime.stride(dim)
-                if runtime_stride == traced_stride:
-                    result[arg.name, dim] = traced_stride
+                stride = env.keyed_hint(fake_stride)
+                if stride is not None:
+                    result[arg.name, dim] = stride
         return result
 
     def proven_tensor_size_values(
         self,
     ) -> dict[tuple[str, int], tuple[str, int]]:
-        """Return cache-safe exact runtime sizes and their generated argument names."""
+        """Return cache-safe exact runtime sizes and their generated argument names.
+
+        The ``input_tensor_metadata`` compiler fact keys the bound kernel on
+        every input tensor's exact sizes, so an input's traced size hint is
+        its size in every call this bound kernel serves, while its dispatch
+        guards are enforced (``CompileEnvironment.keyed_hint``).
+        """
         env = CompileEnvironment.current()
-        if "input_tensor_metadata" not in env.compiler_fact_specialization_facts:
+        if not env.exact_input_metadata_holds():
             return {}
         result: dict[tuple[str, int], tuple[str, int]] = {}
         for tensor_arg in self.arguments:
@@ -1496,11 +1557,6 @@ class DeviceFunction:
                 continue
             fake_tensor = tensor_arg.fake_value
             if env.tensor_input_source(fake_tensor) is None:
-                continue
-            runtime_tensor = env.runtime_value_for_tensor(fake_tensor)
-            if not isinstance(runtime_tensor, torch.Tensor) or isinstance(
-                runtime_tensor, FakeTensor
-            ):
                 continue
             for dim, size in enumerate(fake_tensor.shape):
                 if isinstance(size, int) or isinstance(size._sympy_(), sympy.Integer):
@@ -1513,29 +1569,15 @@ class DeviceFunction:
                     is None
                 ):
                     continue
-                property_runtime = env.runtime_value_for_tensor(
-                    property_arg.tensor_arg.fake_value
-                )
-                if not isinstance(property_runtime, torch.Tensor) or isinstance(
-                    property_runtime, FakeTensor
+                # The launch passes the anchor's size in place of this one, so
+                # the key must fix both.
+                anchor = property_arg.tensor_arg.fake_value
+                value = env.keyed_hint(size)
+                if value is None or value != env.keyed_hint(
+                    anchor.size(property_arg.dim)
                 ):
                     continue
-                property_fake_size = property_arg.tensor_arg.fake_value.size(
-                    property_arg.dim
-                )
-                try:
-                    runtime_size = int(runtime_tensor.size(dim))
-                    source_hint = int(env.size_hint(size))
-                    property_size = int(property_runtime.size(property_arg.dim))
-                    property_hint = int(env.size_hint(property_fake_size))
-                except (RuntimeError, TypeError, ValueError):
-                    continue
-                if not (runtime_size == source_hint == property_size == property_hint):
-                    continue
-                result[tensor_arg.name, dim] = (
-                    property_arg.name,
-                    property_hint,
-                )
+                result[tensor_arg.name, dim] = (property_arg.name, value)
         return result
 
     def codegen_function_call(self) -> ast.AST:
@@ -1622,28 +1664,32 @@ class DeviceFunction:
         # pointers referenced only by placeholder strings, not the AST body).
         # sourceless_prologue_params are intentionally NOT exempted — they are
         # fully inlined by the prologue hook and should be removed by DCE.
-        args_to_remove = {
-            arg.name
-            for arg in self.arguments
-            # pyrefly: ignore [unbound-name]
-            if arg.name not in rw.reads and arg.name not in self.placeholder_args
-        }
-        if args_to_remove:
-            self.arguments = [
-                arg for arg in self.arguments if arg.name not in args_to_remove
-            ]
-            for cache in cast(
-                "list[dict[object, Argument]]",
-                [
-                    self._tensor_args,
-                    self._tensor_descriptor_args,
-                    self._expr_args,
-                    self._tensor_properties,
-                ],
-            ):
-                for k, v in [*cache.items()]:
-                    if v.name in args_to_remove:
-                        del cache[k]
+        self.drop_arguments(
+            {
+                arg.name
+                for arg in self.arguments
+                # pyrefly: ignore [unbound-name]
+                if arg.name not in rw.reads and arg.name not in self.placeholder_args
+            }
+        )
+
+    def drop_arguments(self, names: set[str]) -> None:
+        """Remove the arguments named ``names`` and their cache entries."""
+        if not names:
+            return
+        self.arguments = [arg for arg in self.arguments if arg.name not in names]
+        for cache in cast(
+            "list[dict[object, Argument]]",
+            [
+                self._tensor_args,
+                self._tensor_descriptor_args,
+                self._expr_args,
+                self._tensor_properties,
+            ],
+        ):
+            for k, v in [*cache.items()]:
+                if v.name in names:
+                    del cache[k]
 
     def register_helper_function(
         self, helper_graph_info: HelperFunctionGraphInfo
@@ -1674,6 +1720,8 @@ class DeviceFunction:
         # accidentally turn a module constexpr into a host-wrapper local.
         dead_assignment_elimination(cast("list[ast.AST]", cloned_body), self.dce_vars)
         dead_expression_elimination(cast("list[ast.AST]", cloned_body))
+        if not cloned_body:
+            cloned_body.append(ast.Pass())
         reads = set(ReadWrites.from_list(cloned_body).reads)
         local_names = {
             node.id
@@ -1683,7 +1731,9 @@ class DeviceFunction:
         }
         helper_names = {name for name, _, _, _ in self.triton_outlined_helpers}
         environment = CompileEnvironment.current()
-        for name in reads:
+        # Sorted: the module declares these constexprs in insertion order, and
+        # a set's order follows the string hash seed.
+        for name in sorted(reads):
             if not name.startswith("_BLOCK_SIZE_"):
                 continue
             suffix = name.removeprefix("_BLOCK_SIZE_")
@@ -1794,7 +1844,7 @@ class DeviceFunction:
         """Add all deferred RDIM definitions to host statements."""
         backend = CompileEnvironment.current().backend
         for var_name, expr in self.deferred_rdim_defs:
-            expr_str = HostFunction.current().sympy_expr(expr)
+            expr_str = HostFunction.current().sympy_expr(expr, self.config)
             stmt = statement_from_string(
                 f"{var_name} = {backend.dynamic_rdim_size_expr(expr_str)}"
             )

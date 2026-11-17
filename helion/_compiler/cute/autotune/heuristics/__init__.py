@@ -19,9 +19,11 @@ from copy import deepcopy
 import operator
 from typing import TYPE_CHECKING
 
+from .....autotuner.compiler_coverage import MAX_COMPILER_COVERAGE_CONFIGS
 from .....autotuner.compiler_coverage import CompilerCoverageGroup
 from .....autotuner.compiler_coverage import CoverageDependency
 from .....autotuner.compiler_coverage import CoverageWitness
+from .....exc import InvalidConfig
 from .....runtime.config import Config
 from ....autotuner_heuristics.common import dedupe_configs
 from ...grouped_row_union import AB_STAGES_KEY as GROUPED_ROW_UNION_AB_STAGES_KEY
@@ -42,6 +44,7 @@ from ..fragment_knobs import CuteFragmentAtomicAggregationHeuristic
 from ..fragment_knobs import CuteFragmentAtomicConsumerFusionHeuristic
 from ..fragment_knobs import CuteFragmentBatchedLoadsHeuristic
 from ..fragment_knobs import CuteFragmentBoundedGatherHeuristic
+from ..fragment_knobs import CuteFragmentHalfMmaHeuristic
 from ..fragment_knobs import CuteFragmentIntegerAtomicEpochsHeuristic
 from ..fragment_knobs import CuteFragmentLocalAtomicRegistersHeuristic
 from ..fragment_knobs import CuteFragmentMmaRowsHeuristic
@@ -71,6 +74,7 @@ from ..fragment_knobs import register_fragment_atomic_consumer_fusion_coverage
 from ..fragment_knobs import register_fragment_batched_loads_coverage
 from ..fragment_knobs import register_fragment_bounded_gather_coverage
 from ..fragment_knobs import register_fragment_cta_topk_coverage
+from ..fragment_knobs import register_fragment_half_mma_coverage
 from ..fragment_knobs import register_fragment_integer_atomic_epochs_coverage
 from ..fragment_knobs import register_fragment_local_atomic_registers_coverage
 from ..fragment_knobs import register_fragment_mma_rows_coverage
@@ -95,6 +99,7 @@ from ..fragment_knobs import register_fragment_vector_io_coverage
 from ..fragment_knobs import register_fragment_warp_producer_regions_coverage
 from ..fragment_knobs import register_fragment_warp_results_coverage
 from ..fragment_knobs import register_fragment_warp_scan_coverage
+from ..search_surface import _rolls_a_byte_packet_row
 from .cute import CuteAffineScanHeuristic
 from .cute import CuteAsyncPersistentSubwarpRowsHeuristic
 from .cute import CuteAsyncStateLoadHeuristic
@@ -102,16 +107,22 @@ from .cute import CuteChunkPrepareHeuristic
 from .cute import CuteChunkRecurrenceHeuristic
 from .cute import CuteCollectiveMatmulHeuristic
 from .cute import CuteColumnReductionHeuristic
+from .cute import CuteDelinearizedRowReductionHeuristic
 from .cute import CuteFixedTokenRank1Heuristic
 from .cute import CuteFlashAttentionHeuristic
 from .cute import CuteFlashGatedAttentionHeuristic
 from .cute import CuteFp8GemmSkinnyMHeuristic
 from .cute import CuteGdnRecurrenceHeuristic
+from .cute import CuteGridLaneJamHeuristic
 from .cute import CuteMaskedRolledClusterHeuristic
 from .cute import CuteNestedRowHeuristic
 from .cute import CutePackedSingleTokenRank1Heuristic
+from .cute import CutePersistentLaneUnrollHeuristic
 from .cute import CutePersistentSubwarpRowsHeuristic
+from .cute import CutePersistentUnpaddedRowsHeuristic
 from .cute import CutePointwiseVecHeuristic
+from .cute import CuteReductionLaneJamForwardingHeuristic
+from .cute import CuteReductionLaneJamHeuristic
 from .cute import CuteReductionTileHeuristic
 from .cute import CuteReductionWideChunkHeuristic
 from .cute import CuteRegisterTileHeuristic
@@ -120,8 +131,11 @@ from .cute import CuteResidentRowHeuristic
 from .cute import CuteResidentRowWideClusterHeuristic
 from .cute import CuteRolledClusterLadderHeuristic
 from .cute import CuteRolledRowLadderHeuristic
+from .cute import CuteRolledRowLoadsFirstHeuristic
 from .cute import CuteScanTileHeuristic
 from .cute import CuteSiblingRowHeuristic
+from .cute import CuteSplitColumnReductionHeuristic
+from .cute import CuteStridedReductionHeuristic
 from .cute import CuteTcgen05ClusterM2FfiHeuristic
 from .cute import CuteTcgen05ClusterM2Heuristic
 from .cute import CuteTcgen05GroupedDynamicBk64Heuristic
@@ -159,6 +173,8 @@ from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
 from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
 from .cute_l2_row_swizzle import register_l2_row_swizzle_coverage
+from .cute_launch_bounds import CutePointwiseMinBlocksHeuristic
+from .cute_launch_bounds import pointwise_min_blocks_seeds
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
 from .cute_materialized import CuteMaterializedMmaHeuristic
 from .cute_materialized_operand import CuteMaterializedOperandHeuristic
@@ -166,6 +182,7 @@ from .cute_materialized_pdl import register_materialized_pdl_coverage
 from .cute_mma_dag import CuteMmaDagHeuristic
 from .cute_mxfp8_epilogue_coverage import register_mxfp8_epilogue_coverage
 from .cute_packed_operand import register_packed_operand_coverage
+from .cute_privatize_atomics import CutePrivatizeAtomicsHeuristic
 from .cute_radix_selection import CuteRadixSelectionHeuristic
 from .cute_radix_selection import register_radix_selection_coverage
 from .cute_register_chain import CuteRegisterChainHeuristic
@@ -180,13 +197,17 @@ from .cute_split_k_cluster import CuteSplitKClusterHeuristic
 from .cute_split_k_cluster import cluster_carrier
 from .cute_split_k_cluster import register_cluster_coverage
 from .cute_split_k_workspace import CuteSplitKWorkspaceHeuristic
+from .cute_tcgen05_default import CuteTcgen05DefaultTileHeuristic
 from .cute_tcgen05_schedule import CuteTcgen05ScheduleHeuristic
 from .cute_tile_packing import CuteTilePackWarpPerRowHeuristic
 from .cute_topk_coarse_keys import register_topk_coarse_keys_coverage
 from .cute_topk_coarse_keys import register_topk_key_recovery_coverage
+from .cute_transposed_store_seeds import CuteTransposedStoreSeedsHeuristic
 from .cute_warp_atomic import CuteWarpAtomicHeuristic
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ....autotuner_heuristics.registry import AutotunerHeuristicType
     from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
     from ....compile_environment import CompileEnvironment
@@ -220,6 +241,7 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteTcgen05ClusterM2FfiHeuristic,
     CuteTcgen05ScheduleHeuristic,
     CuteTcgen05ClusterM2Heuristic,
+    CuteTcgen05DefaultTileHeuristic,
     CuteTcgen05GroupedWorklistHeuristic,
     CuteTcgen05GroupedStaticCommonKHeuristic,
     CuteTcgen05GroupedDynamicBk64Heuristic,
@@ -231,7 +253,13 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteResidentSequenceHeuristic,
     CutePersistentSubwarpRowsHeuristic,
     CuteAsyncPersistentSubwarpRowsHeuristic,
+    CutePersistentLaneUnrollHeuristic,
+    CutePersistentUnpaddedRowsHeuristic,
     CuteRolledRowLadderHeuristic,
+    CuteRolledRowLoadsFirstHeuristic,
+    CuteGridLaneJamHeuristic,
+    CuteReductionLaneJamHeuristic,
+    CuteReductionLaneJamForwardingHeuristic,
     CuteRolledClusterLadderHeuristic,
     CuteMaskedRolledClusterHeuristic,
     CuteScanTileHeuristic,
@@ -242,6 +270,8 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteGemvFragmentMmaHeuristic,
     CuteGemvRingMmaHeuristic,
     CuteColumnReductionHeuristic,
+    CuteSplitColumnReductionHeuristic,
+    CuteDelinearizedRowReductionHeuristic,
     CuteSiblingRowHeuristic,
     CuteNestedRowHeuristic,
     CuteResidentRowHeuristic,
@@ -286,6 +316,10 @@ _CUTE_HEURISTIC_CLASSES: tuple[AutotunerHeuristicType, ...] = (
     CuteFragmentBoundedGatherHeuristic,
     CuteFragmentPureProducerRegionsHeuristic,
     CuteRadixSelectionHeuristic,
+    CuteFragmentHalfMmaHeuristic,
+    CuteStridedReductionHeuristic,
+    CutePrivatizeAtomicsHeuristic,
+    CuteTransposedStoreSeedsHeuristic,
 )
 
 
@@ -320,6 +354,7 @@ CUTE_HEURISTICS: tuple[AutotunerHeuristicType, ...] = _ranked(_CUTE_HEURISTIC_CL
 # cache specialization facts.
 CUTE_SEED_FACT_HEURISTICS: tuple[AutotunerHeuristicType, ...] = (
     CuteRolledClusterPacketHeuristic,
+    CutePointwiseMinBlocksHeuristic,
 )
 
 
@@ -331,7 +366,11 @@ def register_seed_facts(
     # ``helion`` package this registry is imported while initializing.
     from ...computed_fragment import computed_fragment_specialization_facts
 
-    return computed_fragment_specialization_facts(env, device_ir)
+    # The appended families outside the ranked tuple register their facts
+    # here, the ranked ones through their own ``register_facts``.
+    return computed_fragment_specialization_facts(
+        env, device_ir
+    ) | CutePointwiseMinBlocksHeuristic.register_facts(env, device_ir)
 
 
 def postprocess_seed_configs(
@@ -449,7 +488,119 @@ def postprocess_seed_configs(
         env.config_spec.autotuner_heuristics.append(
             CuteRolledClusterPacketHeuristic.name
         )
+    pointwise = pointwise_min_blocks_seeds(env)
+    if pointwise:
+        configs.extend(pointwise)
+        env.config_spec.autotuner_heuristics.append(
+            CutePointwiseMinBlocksHeuristic.name
+        )
     return configs
+
+
+def _has_vector_lanes(seed: Config) -> bool:
+    """Whether ``seed`` gives some reduction or tile vector lanes."""
+    widths = seed.config.get("cute_vector_widths")
+    return isinstance(widths, (list, tuple)) and any(
+        isinstance(width, int) and width >= 2 for width in widths
+    )
+
+
+def _register_knob_witnesses(
+    env: CompileEnvironment,
+    *,
+    key: str,
+    mechanism: str,
+    carries: Callable[[Config], bool],
+) -> None:
+    """Cover the boolean knob ``key``, off by default, with a knob-on witness
+    for each of the first compiler seeds that ``carries`` admits, at most
+    ``MAX_COMPILER_COVERAGE_CONFIGS``.  Each carrier is the seed as the
+    search canonicalizes it, kept only when its witness transfers strictly.
+    """
+    spec = env.config_spec
+    # A knob the search surface does not offer here (``cute_flat_fields``)
+    # takes no witnesses: none would transfer.
+    if key not in spec._flat_fields():
+        return
+    generation = spec.create_config_generation()
+    carriers: list[Config] = []
+    for _flat, seed in generation.seed_flat_config_pairs():
+        if not carries(seed):
+            continue
+        try:
+            generation.strict_config_pair(
+                Config.from_dict(deepcopy(seed.config) | {key: True})
+            )
+        except InvalidConfig:
+            continue
+        carriers.append(seed)
+        if len(carriers) == MAX_COMPILER_COVERAGE_CONFIGS:
+            break
+    if carriers:
+        spec.register_compiler_coverage_group(
+            CompilerCoverageGroup(
+                mechanism=mechanism,
+                version=1,
+                key=key,
+                domain=(False, True),
+                legacy=False,
+                witnesses=tuple(CoverageWitness(seed, True) for seed in carriers),
+            )
+        )
+
+
+def register_pair_lane_math_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_pair_lane_math`` on the first compiler seeds that have
+    vector lanes to pair.
+
+    The knob is off by default, so every seed renders as before.  The
+    witnesses are extra candidates, measured like any other: one the packed
+    lanes slow down (a memory-bound kernel losing occupancy to the registers
+    they hold) loses to its control, and one they speed up is tried on the
+    configs the heuristics rank first.  A seed whose lane loops are all one
+    wide (``cute_vector_widths`` and ``cute_lane_unroll`` of 1) has nothing
+    to pair and carries no witness.
+    """
+    spec = env.config_spec
+    if not spec.cute_pair_lane_math_sites:
+        return
+
+    def carries(seed: Config) -> bool:
+        unroll = seed.config.get("cute_lane_unroll")
+        return _has_vector_lanes(seed) or (isinstance(unroll, int) and unroll >= 2)
+
+    _register_knob_witnesses(
+        env, key="cute_pair_lane_math", mechanism="cute.pair_lane_math", carries=carries
+    )
+
+
+def register_uniform_lane_compares_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_uniform_lane_compares`` on the first compiler seeds that
+    have vector lanes.
+
+    The knob is off by default, so every seed renders as before.  A witness
+    compares each vector's lane base once where a lane index meets a bound
+    that is a multiple of the vector width; its only numeric effect is FMA
+    contraction where per-lane selects kept products unfused.  It is an
+    extra candidate, measured like any other.  A seed whose lanes are all
+    one wide (``cute_vector_widths`` of 1) has no vector loop to compare in,
+    and one that sets the knob itself (the de-linearized row reduction's)
+    needs no witness.
+    """
+    spec = env.config_spec
+    if spec.matmul_facts or len(spec.cute_lane_layouts) == 0:
+        return
+
+    def carries(seed: Config) -> bool:
+        knob = seed.config.get("cute_uniform_lane_compares")
+        return knob is not True and _has_vector_lanes(seed)
+
+    _register_knob_witnesses(
+        env,
+        key="cute_uniform_lane_compares",
+        mechanism="cute.uniform_lane_compares",
+        carries=carries,
+    )
 
 
 def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> None:
@@ -578,6 +729,8 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
             )
         )
     register_matmul_min_blocks_coverage(env, device_ir)
+    register_pair_lane_math_coverage(env)
+    register_uniform_lane_compares_coverage(env)
     serial_output = CuteResidentReductionHeuristic.serial_output_carrier(env, device_ir)
     if serial_output is not None:
         env.config_spec.register_compiler_coverage_group(
@@ -741,6 +894,85 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
     )
     register_fragment_scan_exports_coverage(env, device_ir)
     register_fragment_warp_producer_regions_coverage(env, device_ir)
+    register_fragment_half_mma_coverage(
+        env, device_ir, resource_carrier=resource_carrier
+    )
     register_radix_selection_coverage(env, device_ir)
 
     register_mxfp8_epilogue_coverage(env)
+    register_bool_byte_packets_coverage(env)
+    register_tail_peel_coverage(env)
+
+
+def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_bool_byte_packets`` on the first compiler seeds whose
+    looped reductions can take a bool row's byte packets.
+
+    The knob is off by default, so every seed renders as before.  The
+    witnesses are extra candidates, measured like any other: the packets win
+    where no later sweep reloads the row from memory (a single sweep, or
+    register reloads) and can lose where one reloads it from L2 (the cheaper
+    first sweep leaves less of the row there).  A carrier rolls a reduction
+    along the bool row at a vector width one packed integer holds
+    (``_rolls_a_byte_packet_row``).
+    """
+    spec = env.config_spec
+    if not spec.cute_bool_byte_packet_blocks:
+        return
+    _register_knob_witnesses(
+        env,
+        key="cute_bool_byte_packets",
+        mechanism="cute.bool_byte_packets",
+        carries=lambda seed: _rolls_a_byte_packet_row(spec, seed.config),
+    )
+
+
+def register_tail_peel_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_tail_peel`` on the first compiler seeds that run a device
+    loop the pass may split (``cute_tail_peel_blocks``) over several tiles, the
+    last one partial, with vector lanes on one warp's threads.
+
+    The knob is off by default, so every seed renders as before.  A witness
+    runs the loop's complete tiles apart from its partial last tile, their
+    lanes in packets: bitwise identical but for FMA contraction, and the
+    seed's own code where the rows do not align to a packet.  It is an extra
+    candidate, measured like any other.  A seed whose tile covers the loop's
+    extent or divides it has no partial tile to split off, one whose lanes
+    there are one wide has no packet to load, and one that spreads the tile
+    over more than a warp reduces it through shared memory, which keeps the
+    loop whole; none of them carries a witness.
+    """
+    spec = env.config_spec
+    blocks = spec.cute_tail_peel_blocks
+    if not blocks:
+        return
+
+    def carries(seed: Config) -> bool:
+        widths = seed.config.get("cute_vector_widths")
+        sizes = seed.config.get("block_sizes")
+        threads = seed.config.get("num_threads")
+        if not (
+            isinstance(widths, (list, tuple))
+            and isinstance(sizes, (list, tuple))
+            and isinstance(threads, (list, tuple))
+        ):
+            return False
+        for block_id in blocks:
+            extent = env.block_sizes[block_id].size
+            tile = spec.block_sizes.config_get(list(sizes), block_id, None)
+            count = spec.num_threads.config_get(list(threads), block_id, 0)
+            if (
+                spec.cute_vector_widths.config_get(list(widths), block_id, 1) >= 2
+                and isinstance(count, int)
+                and 0 < count <= 32
+                and isinstance(extent, int)
+                and isinstance(tile, int)
+                and tile < extent
+                and extent % tile != 0
+            ):
+                return True
+        return False
+
+    _register_knob_witnesses(
+        env, key="cute_tail_peel", mechanism="cute.tail_peel", carries=carries
+    )

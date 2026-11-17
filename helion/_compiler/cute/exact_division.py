@@ -1,7 +1,9 @@
 """Device helpers for the exact loop-invariant fp32 division hoist.
 
-The generic CuTe lowering renders an fp32 quotient as ``a / b``, which NVVM
-emits as ``div.rn.f32``.  ptxas expands every ``div.rn.f32`` into its own
+The generic CuTe lowering renders an fp32 quotient as ``a / b``, which under
+``Settings.cute_exact_division`` NVVM emits as ``div.rn.f32`` (by default it
+is ``div.full.f32``, a reciprocal and a multiply, and this module is not
+used).  ptxas expands every ``div.rn.f32`` into its own
 ``MUFU.RCP`` + two reciprocal-refinement ``FFMA`` + ``FCHK`` + three
 ``FFMA`` + a slow-path call skeleton, PER ELEMENT, even when the divisor
 is the same for a whole row (a softmax row sum, a kernel-wide
@@ -114,10 +116,11 @@ every piece below is checked by ``test/test_cute_exact_division.py``):
 Everything here is exact in IEEE-754 arithmetic; nothing depends on
 ``fast_math`` (whose fp32 division is the approximate ``cute.math.div``
 and never reaches this module).  ``Settings.cute_exact_division`` turns
-the lowering off; the config knob ``cute_exact_div_form`` picks the form
-(``redo`` / ``plain``) per kernel so the autotuner can keep the plain
-``div.rn`` where the redo copy would push a 1024-thread kernel to the
-register cap.
+the lowering on (without it ``/`` is ``div.full.f32``, the Triton backend's
+division, and none of this runs); the config knob ``cute_exact_div_form``
+picks the form (``redo`` / ``plain``) per kernel so the autotuner can keep
+the plain ``div.rn`` where the redo copy would push a 1024-thread kernel to
+the register cap.
 """
 
 from __future__ import annotations
@@ -140,13 +143,21 @@ _QUOT_EXP_HIGH = 126  # Ea - Eb <= 126: quotient cannot overflow
 
 @cute.jit
 def _opaque_f32(x: Float32) -> Float32:
-    """``x``, through an empty side-effecting asm (``=f,0`` ties the output
-    to the input register; no instruction is emitted).  Applied to the
-    hoisted bounds, which ptxas otherwise rematerializes from the divisor
-    (the ten-instruction exponent chain) at every read instead of keeping
-    two registers live."""
+    """``x``, through a pure opaque identity: an empty asm (``=f,0`` ties
+    the output to the input register; no instruction is emitted).  Applied
+    to the hoisted bounds, which ptxas otherwise rematerializes from the
+    divisor (the ten-instruction exponent chain) at every read instead of
+    keeping two registers live.
+
+    It must stay pure.  LLVM keeps every memory access on its own side of a
+    side-effecting asm, and the bounds sit between a rolled reduction's
+    sweeps: a later sweep that re-reads the row would issue its loads again,
+    and recompute what they feed, instead of reusing the first sweep's (the
+    rolled-softmax SASS check in ``test_cute_exact_division.py`` holds the
+    redo form to twice the plain render's loads and MUFU.EX2: the fast
+    path's and the redo path's)."""
     return inline_asm_elementwise(
-        (x,), asm="", constraints="=f,0", dtype=Float32, is_pure=False
+        (x,), asm="", constraints="=f,0", dtype=Float32, is_pure=True
     )
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from itertools import starmap
 from typing import TYPE_CHECKING
 
 import sympy
@@ -109,7 +110,9 @@ def load_expr(
     scalar_load = classify_vmem_scalar_load(state, tensor, parts, patterns)
     if scalar_load is None:
         result = expr_from_string(f"{active_name}[{', '.join(parts)}]")
-        result = _padded_value_for_load(state, tensor, subscript, parts, result)
+        result = _padded_value_for_load(
+            state, tensor, subscript, parts, result, ref_name=active_name
+        )
     else:
         result = emit_vmem_scalar_load(tensor, active_name, parts, scalar_load)
     mask_expr = _load_mask_expr(state, subscript, tensor)
@@ -416,7 +419,7 @@ def _clamped_dims(
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     index_parts: list[str],
-) -> list[tuple[int, int] | None]:
+) -> list[tuple[int | torch.SymInt, int] | None]:
     """Per consumed tensor dim: ``(dim_size, block_size)`` where the launcher's
     BlockSpec clamp makes the kernel ref smaller than the tile, else ``None``.
 
@@ -424,6 +427,9 @@ def _clamped_dims(
     ``min(block_size, tensor.shape[d])``.  Only grid-tiled dimensions that
     produce ``:`` in the generated Pallas index are affected; dimensions
     indexed via ``pl.ds()`` are ds-padded instead of clamped.
+
+    A symbolic extent may be clamped by the launcher at each call. Loads and
+    stores resolve that extent from the actual indexed ref's shape.
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
@@ -446,7 +452,7 @@ def _clamped_dims(
     )
 
     env = CompileEnvironment.current()
-    clamps: list[tuple[int, int] | None] = []
+    clamps: list[tuple[int | torch.SymInt, int] | None] = []
     tensor_dim = 0
     index_part_idx = 0
 
@@ -464,10 +470,8 @@ def _clamped_dims(
         if isinstance(pattern, TilePattern) and index_part == ":":
             block_size = env.block_sizes[pattern.block_id].from_config(state.config)
             dim_size = tensor.shape[tensor_dim]
-            if (
-                isinstance(block_size, int)
-                and isinstance(dim_size, int)
-                and dim_size < block_size
+            if isinstance(block_size, int) and (
+                isinstance(dim_size, torch.SymInt) or dim_size < block_size
             ):
                 clamp = (dim_size, block_size)
 
@@ -477,12 +481,38 @@ def _clamped_dims(
     return clamps
 
 
+def broadcast_value_for_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    subscript: list[object] | tuple[object, ...],
+    value: ast.AST,
+    value_arg: object,
+) -> ast.AST:
+    """Broadcast a store or atomic operand to its logical tile before clamping."""
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.indexing_strategy import SubscriptIndexing
+
+    target_shape = SubscriptIndexing.compute_shape(tensor, list(subscript))
+    value_shape = value_arg.shape if isinstance(value_arg, torch.Tensor) else ()
+    env = CompileEnvironment.current()
+    if len(value_shape) != len(target_shape) or not all(
+        starmap(env.known_equal, zip(value_shape, target_shape, strict=True))
+    ):
+        # Pallas ref assignment requires an exact shape. Broadcast to the
+        # logical tile before slicing it to a clamped output ref.
+        shape = state.device_function.tile_strategy.shape_str(target_shape)
+        value = expr_from_string(f"jnp.broadcast_to({{value}}, {shape})", value=value)
+    return value
+
+
 def sliced_value_for_store(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
     index_parts: list[str],
     value: ast.AST,
+    *,
+    ref_name: str | None = None,
 ) -> ast.AST:
     """Slice the store value when the Pallas ref is smaller than the tile.
 
@@ -498,15 +528,27 @@ def sliced_value_for_store(
     fori_loop-scratch stores are exempt: their destination is a block-sized
     VMEM scratch (not a clamped ref), so the value stays block-shaped and the
     writeback DMA clamps the extent instead (see ``_build_dma_slices``).
+
+    Normal stores pass their resolved ref name so symbolic dimensions use
+    the indexed ref's static JAX shape without loading its contents.
     """
     if _tensor_routed_to_fori_scratch(state, tensor):
         return value
 
     clamps = _clamped_dims(state, tensor, subscript, index_parts)
-    if not any(clamps):
+    slices = []
+    for dim, clamp in enumerate(clamps):
+        if clamp is None:
+            slices.append(":")
+        elif isinstance(clamp[0], int):
+            slices.append(f":{clamp[0]}")
+        elif ref_name is not None:
+            index = ", ".join(index_parts)
+            slices.append(f":{ref_name}.at[{index}].shape[{dim}]")
+        else:
+            slices.append(":")
+    if all(part == ":" for part in slices):
         return value
-
-    slices = [":" if c is None else f":{c[0]}" for c in clamps]
     return expr_from_string(
         f"{{value}}[{', '.join(slices)}]",
         value=value,
@@ -519,6 +561,8 @@ def _padded_value_for_load(
     subscript: list[object],
     index_parts: list[str],
     value: ast.AST,
+    *,
+    ref_name: str,
 ) -> ast.AST:
     """Zero-pad loads from clamped refs (see ``_clamped_dims``) to block
     shape, so they compose with block-shaped values and OOB positions read 0.
@@ -536,9 +580,20 @@ def _padded_value_for_load(
         return value
 
     clamps = _clamped_dims(state, tensor, subscript, index_parts)
-    pads = [
-        "(0, 0)" if c is None or c[0] <= 1 else f"(0, {c[1] - c[0]})" for c in clamps
-    ]
+    pads = []
+    for dim, clamp in enumerate(clamps):
+        if clamp is None:
+            pads.append("(0, 0)")
+        elif isinstance(clamp[0], int):
+            padding = 0 if clamp[0] <= 1 else clamp[1] - clamp[0]
+            pads.append(f"(0, {padding})")
+        else:
+            # Ref metadata is static inside each Pallas trace, even when the
+            # authored tensor extent was symbolic. Keep singleton broadcasts
+            # intact when one generated program is called with a size-1 ref.
+            index = ", ".join(index_parts)
+            extent = f"{ref_name}.at[{index}].shape[{dim}]"
+            pads.append(f"(0, 0 if {extent} <= 1 else {clamp[1]} - {extent})")
     if all(p == "(0, 0)" for p in pads):
         return value
 

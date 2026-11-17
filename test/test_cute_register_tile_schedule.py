@@ -2,8 +2,10 @@
 
 ``cute_register_tile_warp_fold`` folds the multi-warp shared-memory column
 reduce within each warp first (``_cute_grouped_reduce_shared_columns(...,
-fold='warp')``); ``cute_register_tile_store_first`` emits the per-lane consume
-nest (the state stores) before the reductions' cross-thread combines.  Both
+fold='warp')``); ``cute_register_tile_cooperative_fold`` spreads the column
+reduce's outputs over the group's lanes (``fold='cooperative'``) and wins over
+the warp fold; ``cute_register_tile_store_first`` emits the per-lane consume
+nest (the state stores) before the reductions' cross-thread combines.  All
 are off by default and render the knob-free schedule byte for byte; a knob the
 tile cannot honour is ignored (see ``RegisterTileOptions``).
 """
@@ -11,6 +13,7 @@ tile cannot honour is ignored (see ``RegisterTileOptions``).
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -46,6 +49,8 @@ pytestmark = [
 BH, D, DV = 8, 128, 128
 COLUMN_REDUCE = "_cute_grouped_reduce_shared_columns("
 WARP_FOLD = "fold='warp'"
+COOPERATIVE_FOLD = "fold='cooperative'"
+COOPERATIVE_KNOB = "cute_register_tile_cooperative_fold"
 STATE_STORE = "_cute_store_u32_vec(new_state.iterator"
 KNOBS: dict[str, Any] = {
     "cute_register_tile_warp_fold": True,
@@ -171,6 +176,32 @@ def test_warp_fold_requests_the_fold_of_the_multi_warp_column_reduce() -> None:
     assert code.replace(f", {WARP_FOLD})", ")") == knob_free
 
 
+def test_cooperative_fold_requests_the_cooperative_column_reduce() -> None:
+    """Like the warp fold, the cooperative fold changes the order of the sums,
+    so it is a knob: without it a column reduce of 32 partials per column
+    keeps the serial fold; with it only the fold keyword changes.  It wins
+    over the warp fold, which this group takes alone, so beside it the warp
+    fold renders nothing and normalization drops it: the search's configs,
+    which carry both keys, then do not repeat a render."""
+    bound = cpu_bind(col_sum, (torch.empty(128, 16384),))
+
+    def config(**knobs: bool) -> helion.Config:
+        return column_config(
+            bound, block=16, tile_threads=4, reduction_threads=32, **knobs
+        )
+
+    knob_free = bound.to_code(config())
+    assert "pre=4, group_span=128, group_count=1)" in knob_free
+    cooperative = config(**{COOPERATIVE_KNOB: True})
+    code = bound.to_code(cooperative)
+    assert f"pre=4, group_span=128, group_count=1, {COOPERATIVE_FOLD})" in code
+    assert code.replace(f", {COOPERATIVE_FOLD})", ")") == knob_free
+    assert config(
+        **{COOPERATIVE_KNOB: True, "cute_register_tile_warp_fold": True}
+    ) == config(**{COOPERATIVE_KNOB: True, "cute_register_tile_warp_fold": False})
+    assert WARP_FOLD in bound.to_code(config(cute_register_tile_warp_fold=True))
+
+
 def test_store_first_emits_the_consume_nest_before_the_combine() -> None:
     bound, _arguments = _bind()
     code = bound.to_code(
@@ -231,45 +262,53 @@ def test_store_first_keeps_the_combine_first_when_a_store_needs_the_result() -> 
     )
 
 
-def test_warp_fold_is_ignored_by_the_consecutive_lane_column_reduce() -> None:
+def test_folds_are_ignored_where_the_group_cannot_take_them() -> None:
     # One vector thread under 64 consecutive reduction threads (``pre == 1``):
     # that branch of the helper already folds each warp with a shuffle, so the
-    # knob adds nothing and the render is the knob-free one.
+    # fold knobs add nothing.  Two vector threads under 8 reduction threads
+    # (``pre == 2`` over 16 lanes): both folds need a warp-aligned group (the
+    # helper refuses them on any other at trace time), so the emitter keeps
+    # the serial fold.  Either way the render is the knob-free one.
     arguments = (torch.empty((128, 1024), dtype=torch.float32),)
     bound = cpu_bind(col_sum, arguments)
-    knob_free = bound.to_code(
-        column_config(bound, block=4, tile_threads=1, reduction_threads=64)
-    )
-    code = bound.to_code(
-        column_config(
-            bound,
-            block=4,
-            tile_threads=1,
-            reduction_threads=64,
-            cute_register_tile_warp_fold=True,
-        )
-    )
-    assert code == knob_free
-    assert "pre=1, group_span=64" in code
+    for layout, call in (
+        (
+            {"block": 4, "tile_threads": 1, "reduction_threads": 64},
+            "pre=1, group_span=64",
+        ),
+        (
+            {"block": 8, "tile_threads": 2, "reduction_threads": 8},
+            "pre=2, group_span=16",
+        ),
+    ):
+        knob_free = bound.to_code(column_config(bound, **layout))
+        assert f"{call}, group_count=1)" in knob_free
+        for knob in ("cute_register_tile_warp_fold", COOPERATIVE_KNOB):
+            code = bound.to_code(column_config(bound, **layout, **{knob: True}))
+            assert code == knob_free, (call, knob)
 
 
 def test_knobs_are_dropped_without_a_register_tile() -> None:
     bound, _arguments = _bind()
     spec = bound.config_spec
-    looped = spec.normalized_config(
-        helion.Config(block_sizes=[32], reduction_loops=[64], **KNOBS)
-    )
-    assert looped.config["cute_register_tile_warp_fold"] is False
-    assert looped.config["cute_register_tile_store_first"] is False
-    # The rolled-lane retry re-normalizes with the register tile withheld.
-    tile = _config(bound, dv_threads=8, reduction_threads=16, **KNOBS)
-    assert tile.config["cute_register_tile_warp_fold"] is True
-    retried = spec.normalized_config(tile, _cute_register_tiles=False)
-    assert retried.config["cute_register_tile_warp_fold"] is False
-    assert retried.config["cute_register_tile_store_first"] is False
-    assert {
-        key: value for key, value in retried.config.items() if key not in KNOBS
-    } == {key: value for key, value in tile.config.items() if key not in KNOBS}
+    # The cooperative fold drops the warp fold beside it, so each fold is
+    # requested on its own.
+    for knobs in (KNOBS, {COOPERATIVE_KNOB: True}):
+        looped = spec.normalized_config(
+            helion.Config(block_sizes=[32], reduction_loops=[64], **knobs)
+        )
+        for key in knobs:
+            assert looped.config[key] is False, key
+        # The rolled-lane retry re-normalizes with the register tile withheld.
+        tile = _config(bound, dv_threads=8, reduction_threads=16, **knobs)
+        for key in knobs:
+            assert tile.config[key] is True, key
+        retried = spec.normalized_config(tile, _cute_register_tiles=False)
+        for key in knobs:
+            assert retried.config[key] is False, key
+        assert {
+            key: value for key, value in retried.config.items() if key not in knobs
+        } == {key: value for key, value in tile.config.items() if key not in knobs}
 
 
 def test_seed_alternates_carry_the_knobs_and_the_finer_tile() -> None:
@@ -293,6 +332,7 @@ def test_seed_alternates_carry_the_knobs_and_the_finer_tile() -> None:
     for seed in seeds[1:]:
         assert seed.config["cute_register_tile_warp_fold"] is True
         assert seed.config["cute_register_tile_store_first"] is True
+        assert COOPERATIVE_KNOB not in seed.config
     # The loader plants the alternates, which makes both knobs searchable.
     planted = [
         seed
@@ -307,6 +347,62 @@ def test_seed_alternates_carry_the_knobs_and_the_finer_tile() -> None:
     default = spec.default_config()
     assert default.config.get("cute_register_tile_warp_fold") in (None, False)
     assert WARP_FOLD not in bound.to_code(default)
+
+
+@functools.cache
+def _col_sum_bound(rows: int) -> Any:
+    """``col_sum`` over ``rows`` x 1024 bound on CPU, once per module."""
+    return cpu_bind(col_sum, (torch.empty(rows, 1024),))
+
+
+def test_wide_seed_alternates_leave_the_cooperative_fold_to_the_config() -> None:
+    # 256 rows: both alternate tiles take the warp fold and no seed the
+    # cooperative fold; requested on the finer tile's 32 partials per column,
+    # it renders in place of the warp fold.  The autotune-off default stays
+    # the knob-free serial fold.
+    bound = _col_sum_bound(256)
+    spec = bound.config_spec
+    seeds = CuteRegisterTileHeuristic.get_seed_configs(
+        bound.env, bound.host_function.device_ir
+    )
+    assert seeds is not None
+    (reduction,) = [
+        block.block_id for block in bound.env.block_sizes if block.reduction
+    ]
+    thread_ids = spec.num_threads.valid_block_ids()
+    reduction_threads = [
+        seed.num_threads[thread_ids.index(reduction)] for seed in seeds
+    ]
+    assert reduction_threads == [16, 16, 32]
+    assert [seed.config.get("cute_register_tile_warp_fold") for seed in seeds] == [
+        None,
+        True,
+        True,
+    ]
+    assert all(COOPERATIVE_KNOB not in seed.config for seed in seeds)
+    assert f"pre=8, group_span=256, group_count=1, {WARP_FOLD})" in (
+        bound.to_code(seeds[2])
+    )
+    cooperative = helion.Config.from_dict(seeds[2].config | {COOPERATIVE_KNOB: True})
+    assert f"pre=8, group_span=256, group_count=1, {COOPERATIVE_FOLD})" in (
+        bound.to_code(cooperative)
+    )
+    default = bound.to_code(spec.default_config())
+    assert "pre=8, group_span=128, group_count=1)" in default
+
+
+def test_the_search_space_does_not_change_with_the_reduction_extent() -> None:
+    # ``autotune_multi`` needs a 128- and a 256-row column sum (16 and 32
+    # reduction threads on the finer tile) to share one search space, so no
+    # schedule knob's searchability may follow the extent: the seeds offer
+    # the warp fold at both, and the cooperative fold, which no seed sets
+    # (``RegisterTileOptions``), at neither.
+    specs = [_col_sum_bound(rows).config_spec for rows in (128, 256)]
+    for spec in specs:
+        fields = spec._flat_fields()
+        assert fields["cute_register_tile_warp_fold"].search_choices == (False, True)
+        assert fields[COOPERATIVE_KNOB].search_choices == (False,)
+    assert specs[0].structural_fingerprint() == specs[1].structural_fingerprint()
 
 
 # ---- two reduction levels: the delta-rule correction step -------------------

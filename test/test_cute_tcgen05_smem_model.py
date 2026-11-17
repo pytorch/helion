@@ -35,10 +35,15 @@ from helion._compiler.cute.tcgen05_constants import tcgen05_round_up_smem_bytes
 from helion._testing import DEVICE
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
+from helion._testing.cute_dense_tcgen05 import aligned_n_bf16_config
+from helion._testing.cute_dense_tcgen05 import bf16_mm_args
+from helion._testing.cute_dense_tcgen05 import column_scale_mm_into
+from helion._testing.cute_dense_tcgen05 import plain_mm_into
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 from helion._testing import skipUnlessCuteAvailable
+from helion._testing.cute_dense_tcgen05 import plain_mm
 from helion.autotuner.config_spec import ConfigSpec
 import helion.language as hl
 
@@ -368,6 +373,74 @@ def test_model_needs_a_recorded_budget() -> None:
     )
 
 
+def test_output_edge_tma_store_admission_charges_the_ring_once() -> None:
+    """The edge plan's (128, 64) C ring next to a 256x256x64 ab=6 ring fits."""
+    config = _config(2, NO_ROWS)
+    tile = {"bm": 256, "bn": 256, "bk": 64, "cluster_m": 2}
+    assert smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=6, c_stages=2, **tile
+    )
+    assert not smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=7, c_stages=2, **tile
+    )
+    assert not smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=6, c_stages=4, **tile
+    )
+    # A configured explicit subtile wider than the plan's (128, 32) on a
+    # 128-wide tile is charged at its width: 192 KiB AB + 2 x 16 KiB fits, a
+    # 4-deep ring of the wider subtile does not.
+    narrow = {"bm": 256, "bn": 128, "bk": 64, "cluster_m": 2}
+    explicit = {"tcgen05_layout_overrides_epi_tile_n": 64}
+    assert smem.output_edge_tma_store_smem_fits(
+        config, explicit, ab_stages=8, c_stages=2, **narrow
+    )
+    assert smem.output_edge_tma_store_smem_fits(
+        config, {}, ab_stages=8, c_stages=4, **narrow
+    )
+    assert not smem.output_edge_tma_store_smem_fits(
+        config, explicit, ab_stages=8, c_stages=4, **narrow
+    )
+    # Staged ``pre_acc_wait`` rows keep the SIMT epilogue on edge shapes.
+    staged = _config(2, F32_ROW)
+    assert not smem.output_edge_tma_store_smem_fits(
+        staged,
+        {"tcgen05_aux_load_placement": "pre_acc_wait"},
+        ab_stages=6,
+        c_stages=2,
+        **tile,
+    )
+    # Without store facts the ring cannot be sized; the admission fails closed.
+    assert not smem.output_edge_tma_store_smem_fits(
+        _config(2, None), {}, ab_stages=6, c_stages=2, **tile
+    )
+
+
+def test_partial_output_row_stages_are_charged_in_their_dtype() -> None:
+    """The partial-output row stages hold each row in its own dtype: four
+    BF16 rows (2 KiB of a 256-wide tile) fit beside a 256x256 ab=6 pair, four
+    FP32 rows (4 KiB) do not."""
+    fits = {
+        itemsize: smem.partial_output_row_stage_fits(
+            _config(
+                2,
+                Tcgen05RowvecAuxFacts(
+                    output_itemsize=2,
+                    rows=(Tcgen05RowvecAuxRow(itemsize=itemsize, promoted=False),) * 4,
+                ),
+            ),
+            {},
+            bm=256,
+            bn=256,
+            bk=64,
+            cluster_m=2,
+            ab_stages=6,
+            c_stages=2,
+        )
+        for itemsize in (2, 4)
+    }
+    assert fits == {2: True, 4: False}
+
+
 # Compile checks for the fp32-row geometries the SMEM model admits (sm_100 GPU).
 #
 # Each case is a ``pre_acc_wait`` row-vector GEMM whose 192 KiB AB ring, 32 KiB
@@ -379,10 +452,13 @@ def test_model_needs_a_recorded_budget() -> None:
 
 
 def _sm100_gpu(test: Callable[..., object]) -> Callable[..., object]:
-    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer."""
-    return skipIfNotCUDA()(
-        skipIfCudaCapabilityLessThan((10, 0), reason="tcgen05 requires an sm_100 GPU")(
-            test
+    """Skip ``test`` without a CUDA GPU of capability 10.0 or newer; the
+    ``cuda`` mark sends it to the GPU lane out of this ``cpu_only`` module."""
+    return pytest.mark.cuda(
+        skipIfNotCUDA()(
+            skipIfCudaCapabilityLessThan(
+                (10, 0), reason="tcgen05 requires an sm_100 GPU"
+            )(test)
         )
     )
 
@@ -544,3 +620,158 @@ def test_admitted_fp32_row_geometry_compiles_and_runs(case: str) -> None:
     torch.cuda.synchronize()
     for out in outputs:
         torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=1e-1)
+
+
+@_sm100_gpu
+def test_output_edge_tma_store_beside_six_ab_stages_compiles_and_runs() -> None:
+    """bf16 1000x4096x2880 (a ragged M) at 2x1 256x256x64 and six AB stages:
+    the arena model fits the TMA store's (128, 64) C ring beside them
+    (229 548 of 232 448 B); the kernel compiles and matches torch."""
+    torch.manual_seed(0)
+    x = torch.randn(1000, 2880, device=DEVICE, dtype=torch.bfloat16)
+    y = torch.randn(2880, 4096, device=DEVICE, dtype=torch.bfloat16)
+    bound = plain_mm.bind((x, y))
+    values = {
+        "block_sizes": [256, 256, 64],
+        "pid_type": "persistent_interleaved",
+        "tcgen05_cluster_m": 2,
+        "tcgen05_ab_stages": 6,
+        "tcgen05_c_stages": 2,
+        "tcgen05_acc_stages": 2,
+        "l2_groupings": [1],
+    }
+    projected = dict(values)
+    bound.config_spec.normalize(projected, _fix_invalid=True)
+    assert projected["tcgen05_ab_stages"] == 6
+    assert "tcgen05_tma_store_atom" in bound.to_code(helion.Config(**projected))
+    bound.set_config(helion.Config(**projected))
+    out = bound(x, y)
+    torch.testing.assert_close(
+        out, (x.float() @ y.float()).to(out.dtype), rtol=2e-2, atol=1e-1
+    )
+
+
+@_sm100_gpu
+def test_sixteen_bit_aligned_n_pair_scales_columns() -> None:
+    """A per-column FP32 scale on the 192-wide pair behind the 256 carrier
+    reads the physical columns' scale (8192x768x768)."""
+    torch.manual_seed(0)
+    x, y, out = bf16_mm_args(8192, 768, 768, device=DEVICE)
+    scale = torch.randn((768,), dtype=torch.float32, device=DEVICE)
+    bound = column_scale_mm_into.bind((x, y, scale, out))
+    config = aligned_n_bf16_config(tcgen05_ab_stages=6)
+    assert "_BLOCK_SIZE_1 = 192" in bound.to_code(config)
+    bound.set_config(config)
+    bound(x, y, scale, out)
+    torch.testing.assert_close(
+        out, (x.float() @ y.float() * scale).to(out.dtype), rtol=2e-2, atol=1e-1
+    )
+
+
+@_sm100_gpu
+@pytest.mark.parametrize(
+    ("m", "n", "rhs_k_major", "dtype", "out_dtype", "changes"),
+    (
+        (1024, 768, True, torch.bfloat16, torch.bfloat16, {}),
+        (1024, 768, False, torch.bfloat16, torch.bfloat16, {}),
+        (1152, 768, True, torch.bfloat16, torch.bfloat16, {}),
+        (1024, 768, True, torch.float16, torch.float16, {}),
+        # The seeded grouped raster with N tiles paired (A multicast).
+        (
+            1024,
+            768,
+            True,
+            torch.bfloat16,
+            torch.bfloat16,
+            {
+                "tcgen05_cluster_n": 2,
+                "pid_type": "persistent_interleaved",
+                "l2_groupings": [8],
+            },
+        ),
+        # A weight gradient: fp32 output, a partial last N tile (1024 = 5 x
+        # 192 + 64), six stages beside the with-source fp32 C ring.
+        (1024, 1024, False, torch.bfloat16, torch.float32, {"tcgen05_ab_stages": 6}),
+        # The search's direct register-to-global store on the same tile: the
+        # clipped last N tile written without the TMA store.
+        (
+            1024,
+            1024,
+            False,
+            torch.bfloat16,
+            torch.float32,
+            {"tcgen05_ab_stages": 6, "tcgen05_c_store_mode": "direct"},
+        ),
+        # A bf16 output with a partial last N tile takes the with-source
+        # (128, 64) C ring (six stages); with a partial last M tile too.
+        (1024, 1024, False, torch.bfloat16, torch.bfloat16, {"tcgen05_ab_stages": 6}),
+        (1152, 1024, True, torch.bfloat16, torch.bfloat16, {"tcgen05_ab_stages": 6}),
+    ),
+    ids=(
+        "nt",
+        "nn",
+        "nt_m_tail",
+        "nt_fp16",
+        "nt_2x2_grouped",
+        "nn_n_tail_fp32",
+        "nn_n_tail_fp32_direct",
+        "nn_n_tail",
+        "nt_mn_tail",
+    ),
+)
+def test_sixteen_bit_aligned_n_pair_compiles_and_runs(
+    m: int,
+    n: int,
+    rhs_k_major: bool,
+    dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    changes: dict[str, object],
+) -> None:
+    """The 192-wide paired M256 tile behind the 256 carrier: seven 28 KiB AB
+    stages beside a (128, 32) C ring fill the opt-in, writing an argument
+    output (the Inductor calling convention); a partial last M or N tile is
+    clipped by the TMA store (nothing past column N is written), an fp16
+    GEMM keeps its dtype and a bf16 one may store fp32."""
+    torch.manual_seed(0)
+    x, y, _out = bf16_mm_args(m, n, 512, rhs_k_major=rhs_k_major, device=DEVICE)
+    x, y = x.to(dtype), y.to(dtype)
+    # A partial last N tile writes into a guard band's view: the clipped TMA
+    # store must not reach past column N. Whole tiles keep the contiguous
+    # argument output.
+    guard = 64 if n % 192 else 0
+    storage = torch.full((m, n + guard), float("nan"), dtype=out_dtype, device=DEVICE)
+    out = storage[:, :n]
+    bound = plain_mm_into.bind((x, y, out))
+    config = aligned_n_bf16_config(**changes)
+    assert "_BLOCK_SIZE_1 = 192" in bound.to_code(config)
+    bound.set_config(config)
+    expected = (x.float() @ y.float()).to(out_dtype)
+    for _ in range(LAUNCHES):
+        out.zero_()
+        bound(x, y, out)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, expected, rtol=2e-2, atol=1e-1)
+    assert out.is_contiguous() is not bool(guard)
+    assert storage[:, n:].isnan().all()
+
+
+@_sm100_gpu
+def test_sixteen_bit_aligned_n_pair_scales_columns_over_an_n_tail() -> None:
+    """A per-column FP32 scale on the 192-wide pair over a partial last N
+    tile (1024 = 5 x 192 + 64): the last tile loads its scale and stores
+    behind the edge guard, and nothing past column N is written."""
+    torch.manual_seed(0)
+    m, n = 1024, 1024
+    x, y, _out = bf16_mm_args(m, n, 512, device=DEVICE)
+    scale = torch.randn((n,), dtype=torch.float32, device=DEVICE)
+    storage = torch.full((m, n + 64), float("nan"), dtype=torch.bfloat16, device=DEVICE)
+    out = storage[:, :n]
+    bound = column_scale_mm_into.bind((x, y, scale, out))
+    config = aligned_n_bf16_config(tcgen05_ab_stages=6)
+    assert "_BLOCK_SIZE_1 = 192" in bound.to_code(config)
+    bound.set_config(config)
+    bound(x, y, scale, out)
+    torch.testing.assert_close(
+        out, (x.float() @ y.float() * scale).to(out.dtype), rtol=2e-2, atol=1e-1
+    )
+    assert storage[:, n:].isnan().all()

@@ -32,13 +32,17 @@ from ..aten_lowering import argmax_lowering
 from ..aten_lowering import argmin_lowering
 from ..aten_lowering import baddbmm_lowering
 from ..aten_lowering import bmm_lowering
+from ..aten_lowering import codegen_full
+from ..aten_lowering import codegen_scalar_tensor
 from ..aten_lowering import expand_lowering
+from ..aten_lowering import full_lowering
 from ..aten_lowering import gather_lowering
 from ..aten_lowering import iota_lowering
 from ..aten_lowering import mm_lowering
 from ..aten_lowering import permute_lowering
 from ..aten_lowering import reshape_lowering
 from ..aten_lowering import rolled_reduction_iota_index
+from ..aten_lowering import scalar_tensor_lowering
 from ..aten_lowering import sort_lowering
 from ..aten_lowering import squeeze_lowering
 from ..aten_lowering import stack_lowering
@@ -48,6 +52,7 @@ from ..aten_lowering import view_dtype_lowering
 from ..aten_lowering import view_lowering
 from ..aten_lowering import where_lowering
 from ..compile_environment import CompileEnvironment
+from ..compile_environment import _to_sympy
 from ..dtype_utils import cast_ast
 from .argreduce import codegen_cute_tile_argreduce
 from .cute_mma import codegen_cute_mma
@@ -63,6 +68,7 @@ from .iota_utils import cute_free_arange_lanes
 from .iota_utils import cute_free_arange_memory_index_positions
 from .iota_utils import cute_iota_has_atomic_tensor_index_only_users
 from .iota_utils import cute_iota_is_free_memory_index
+from .iota_utils import cute_padded_range_reduction_block
 from .matmul_fallback import _emit_cute_matmul
 from .matmul_fallback import _emit_cute_matmul_n_collapse
 from .matmul_utils import cute_lower_rhs_for_matmul
@@ -142,6 +148,40 @@ def _serial_mm_from_load_views(
         if _requested_tcgen05_flat_role_coordinates(ctx):
             _reject_tcgen05_flat_role_coordinates_fallback()
     return result
+
+
+def _integer_fill_cute(ctx: LoweringContext, node: Node, value: object) -> object:
+    """One element per thread: the fill's ``value``, an integer or a bool
+    converted to the float dtype as in the pointwise lowering
+    (``integer_to_float_expr``), where MLIR could fold an 8-bit float
+    conversion into it; None for any other fill."""
+    from .handler_ops import integer_to_float_expr
+    from .handler_ops import scalar_value_dtype
+
+    dtype = node.kwargs.get("dtype", torch.get_default_dtype())
+    if not (isinstance(value, Node) and isinstance(dtype, torch.dtype)):
+        return None
+    value_ast = _env_arg(ctx, value)
+    if not isinstance(value_ast, ast.AST):
+        return None
+    return integer_to_float_expr(
+        value_ast,
+        dtype,
+        scalar_value_dtype(value.meta.get("val")),
+        ctx.cg.device_function,
+    )
+
+
+@full_lowering.register_codegen("cute")
+def codegen_full_cute(ctx: LoweringContext, node: Node) -> object:
+    converted = _integer_fill_cute(ctx, node, node.args[1])
+    return codegen_full(ctx, node) if converted is None else converted
+
+
+@scalar_tensor_lowering.register_codegen("cute")
+def codegen_scalar_tensor_cute(ctx: LoweringContext, node: Node) -> object:
+    converted = _integer_fill_cute(ctx, node, node.args[0])
+    return codegen_scalar_tensor(ctx, node) if converted is None else converted
 
 
 @where_lowering.register_codegen("cute")
@@ -1241,6 +1281,17 @@ def _cute_iota_expr(
                 ]
                 if len(grid_candidates) == 1:
                     block_id = grid_candidates[0]
+            if (
+                block_id is None
+                and (
+                    padded := cute_padded_range_reduction_block(
+                        cg, source_node, length_hint
+                    )
+                )
+                is not None
+            ):
+                block_id = padded
+                cute_codegen_state(cg).padded_range_blocks[source_node] = padded
     if block_id is None:
         if (active_expr := active_iota_expr()) is not None:
             return active_expr
@@ -1349,6 +1400,7 @@ def _cute_iota_expr(
 
 @iota_lowering.register_codegen("cute")
 def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
+    _refuse_size_derived_range(ctx, node.args[0])
     return _cute_iota_expr(
         ctx,
         source_node=node,
@@ -1359,8 +1411,56 @@ def codegen_iota_cute(ctx: LoweringContext, node: Node) -> object:
     )
 
 
+def _refuse_size_derived_range(ctx: LoweringContext, length: object) -> None:
+    """Refuse a range whose length is computed from a reduction dim's size
+    (``hl.arange(row.size(1) // 2)``) other than the size itself, unless the
+    dim's block size gives it the value the dim's extent gives, with any other
+    block size in it (``row.size(1) // row.size(0)``) from the config on both
+    sides.  The range runs over the lanes of the dim registered for its
+    shape, which keeps the length traced over the block size
+    (``resolve_reduction_sizes``): half of 129 columns, in 64-column chunks,
+    would run 32 lanes, not 64."""
+    from ..generate_ast import GenerateAST
+    from .cute_reshape import _resolve_tile_extent
+
+    value = length.meta.get("val") if isinstance(length, Node) else length
+    if not isinstance(value, torch.SymInt):
+        return
+    env = CompileEnvironment.current()
+    expr = value.node.expr
+    if env.get_block_id(expr) is not None:
+        return
+    reductions = [
+        (symbol, env.block_sizes[block_id])
+        for symbol in expr.free_symbols
+        if (block_id := env.get_block_id(symbol)) is not None
+        and env.block_sizes[block_id].reduction
+    ]
+    if not reductions:
+        return
+    extents = {
+        symbol: _to_sympy(info.size)
+        for symbol, info in reductions
+        if isinstance(info.size, (int, torch.SymInt))
+    }
+    assert isinstance(ctx.cg, GenerateAST)
+    config = ctx.cg.device_function.config
+    traced = _resolve_tile_extent(value, env, config)
+    extent = expr.xreplace(extents)
+    assert isinstance(extent, sympy.Expr)
+    if (
+        traced is None
+        or len(extents) < len(reductions)
+        or _resolve_tile_extent(extent, env, config) != traced
+    ):
+        raise exc.BackendUnsupported(
+            "cute", "a range whose length is computed from a reduction dim's size"
+        )
+
+
 @arange_default_lowering.register_codegen("cute")
 def codegen_arange_default_cute(ctx: LoweringContext, node: Node) -> object:
+    _refuse_size_derived_range(ctx, node.args[0])
     return _cute_iota_expr(
         ctx,
         source_node=node,

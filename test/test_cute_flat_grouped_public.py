@@ -511,3 +511,29 @@ def test_native_seeds_own_their_nested_mutable_configuration(
         assert [seed.config for seed in fresh] == fresh_snapshots
         assert [seed.config for seed in ordinary] == ordinary_snapshots
         assert base.config == base_snapshot
+
+
+def test_native_grouped_launch_preserves_compile_options():
+    with cuda_binding(
+        static=True, original=True, groups=4, rows=256, k=128, n=128
+    ) as bound:
+        config = _config(bound)
+        control = _source(bound, config)
+        config.config["advanced_controls_file"] = "compile-controls.txt"
+        source = _source(bound, config)
+    assert _native_source(source) == _native_source(control)
+    launches = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_launcher"
+    ]
+    assert len(launches) == 1
+    assert ast.unparse(launches[0].args[0]).endswith("._helion_native_grouped_rna")
+    options = [
+        ast.literal_eval(keyword.value)
+        for keyword in launches[0].keywords
+        if keyword.arg == "cute_compile_options"
+    ]
+    assert options == ["--ptxas-options='--apply-controls compile-controls.txt'"]

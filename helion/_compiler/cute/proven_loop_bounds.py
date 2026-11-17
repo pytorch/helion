@@ -76,7 +76,7 @@ class _Context:
 
 @dataclass
 class _Proof:
-    threads: tuple[int, int, int]
+    threads: tuple[int, int, int] | None
     grid: tuple[int, int, int] | None = None
     symbols: dict[object, int] = field(default_factory=dict)
     intervals: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -102,6 +102,8 @@ class _Proof:
             return context.values.get(node.id)
         axis = _axis_index(node, "thread_idx")
         if axis is not None:
+            if self.threads is None:
+                return None
             high = self.threads[axis] - 1
             return _Value(0, high, self.symbol(("thread", axis), 0, high))
         axis = _axis_index(node, "block_idx")
@@ -454,24 +456,34 @@ def simplify_proven_loop_bounds(
     )
     output = proof.block(body, context)
     if proof.changed:
-        occupied = {node.id for node in ast.walk(module) if isinstance(node, ast.Name)}
-        ordinal = 0
-        while f"_cute_proven_loop_bounds_{ordinal}_abi_version" in occupied:
-            ordinal += 1
-        output.insert(
-            0,
-            ast.Assign(
-                targets=[
-                    ast.Name(
-                        id=f"_cute_proven_loop_bounds_{ordinal}_abi_version",
-                        ctx=ast.Store(),
-                    )
-                ],
-                value=ast.Constant(value=1),
-            ),
-        )
-        ast.fix_missing_locations(ast.Module(body=output, type_ignores=[]))
+        return with_proof_marker(output)
     return output
+
+
+def with_proof_marker(body: list[ast.stmt]) -> list[ast.stmt]:
+    """``body`` after a ``_cute_proven_loop_bounds_<n>_abi_version = 1``
+    statement, ``<n>`` the first ordinal no name in ``body`` takes, which
+    marks code a bounds proof rewrote."""
+    occupied = {
+        node.id
+        for statement in body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+    }
+    ordinal = 0
+    while f"_cute_proven_loop_bounds_{ordinal}_abi_version" in occupied:
+        ordinal += 1
+    marker = ast.Assign(
+        targets=[
+            ast.Name(
+                id=f"_cute_proven_loop_bounds_{ordinal}_abi_version", ctx=ast.Store()
+            )
+        ],
+        value=ast.Constant(value=1),
+    )
+    return ast.fix_missing_locations(
+        ast.Module(body=[marker, *body], type_ignores=[])
+    ).body
 
 
 def exact_static_grid(

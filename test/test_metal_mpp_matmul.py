@@ -19,6 +19,7 @@ import subprocess
 import sys
 import textwrap
 from typing import TYPE_CHECKING
+from typing import cast
 import unittest
 from unittest.mock import patch
 
@@ -30,6 +31,7 @@ from helion import exc
 from helion._compiler.metal import mpp_matmul
 from helion._compiler.metal import tile_sharing
 from helion._testing import import_example
+from helion._testing.metal import run_with_msl
 import helion.language as hl
 
 attention = import_example("attention").attention
@@ -86,25 +88,17 @@ def _masked_load(name: str) -> str:
 
 
 def _run(
-    kernel: helion.Kernel, args: tuple[object, ...], config: helion.Config | None
+    kernel: helion.Kernel,
+    args: tuple[object, ...],
+    config: helion.Config | None,
+    module_key: str = "",
 ) -> tuple[torch.Tensor, str, str]:
     """Compile and run ``kernel`` at ``config`` (None: its default config);
-    return its output, its generated Python and the MSL it compiled."""
-    from torch._inductor.codecache import PyCodeCache
-
-    from helion._compiler.metal.metal_jit import _MetalKernel
-
-    bound = kernel.bind(args)
-    code = bound.to_code(config or bound.config_spec.default_config())
-    module = PyCodeCache.load(code)
-    out = getattr(module, kernel.fn.__name__)(*args)
-    torch.mps.synchronize()
-    (msl,) = [
-        obj.msl_source
-        for obj in vars(module).values()
-        if isinstance(obj, _MetalKernel) and obj.msl_source is not None
-    ]
-    return out, code, msl
+    return its output, its generated Python and the MSL it compiled.  A new
+    *module_key* loads a fresh module, whose MSL is generated anew."""
+    config = config or kernel.bind(args).config_spec.default_config()
+    out, code, msl = run_with_msl(kernel, args, config, module_key)
+    return cast("torch.Tensor", out), code, msl
 
 
 def _element_loops(msl: str) -> str:
@@ -6223,7 +6217,7 @@ class TestMppConversionRejects(_MppCase):
         with patch.object(mpp_matmul, "_inputs_kept", return_value=True):
             self._rejects(mixed_prune, (self.x, y, s), ROWS[0], msg)
         with patch.object(
-            mpp_matmul._Recomputable, "_updated_in_place", return_value=False
+            mpp_matmul.Recomputable, "_updated_in_place", return_value=False
         ):
             self._rejects(stale_seed, (self.x, self.y), TILE16, msg)
 
@@ -9075,9 +9069,10 @@ class TestMppColonSlices(unittest.TestCase):
         y = torch.randn(72, 40, device=DEVICE, dtype=torch.bfloat16)
         c = torch.randn(48, 40, device=DEVICE)
         staged = (re.escape(_staged_tile(torch.bfloat16)), re.escape("(72 - 0)"))
-        ey = torch.exp(y.cpu().double() * 0.1).to(torch.bfloat16)
+        # Match each authored bfloat16 operation before the FP64 matmul reference.
+        ey = torch.exp(y.cpu() * 0.1).to(torch.bfloat16)
         self._check(colon_staged_rhs, (x, y), None, _mm(x, ey), *staged)
-        ex = torch.exp(x.cpu().double() * 0.1).to(torch.bfloat16)
+        ex = torch.exp(x.cpu() * 0.1).to(torch.bfloat16)
         self._check(
             colon_staged_both,
             (x, y, c),
@@ -9345,7 +9340,7 @@ class TestMppColonSlices(unittest.TestCase):
                 )
         x = torch.randn(48, 72, device=DEVICE, dtype=bf)
         v = torch.randn(72, 128, device=DEVICE, dtype=bf)
-        ex = torch.exp(x.cpu().double() * 0.1).to(bf)
+        ex = torch.exp(x.cpu() * 0.1).to(bf)
         self._check(
             colon_n_staged,
             (x, v),
@@ -13120,14 +13115,15 @@ class TestMppOpDims(_MppCase):
             y = torch.randn(32, n, device=DEVICE)
             self._check(kernel, (x, y), config, ref(_mm(x, y)), op)
         # At the default num_warps the 16 x 16 tile runs in a lane loop, and
-        # its column sum is rejected rather than miscompiled.
+        # its column sum is rejected rather than miscompiled: the split of
+        # the grid's lane loop can't reorder the K loop beside it.
         x = torch.randn(4, 32, device=DEVICE)
         y = torch.randn(32, 40, device=DEVICE)
         self._rejects(
             colsum_seeded,
             (x, y),
             helion.Config(block_sizes=[16, 16, 16]),
-            "sum reduction over an axis strided by a tile lane loop",
+            "lane reduction beside a statement the split cannot schedule",
         )
 
     def test_unchanged_dims(self) -> None:
@@ -13375,6 +13371,23 @@ def dot_if_seed(x: torch.Tensor, w: torch.Tensor, flag: torch.Tensor) -> torch.T
 
 
 @helion.kernel(**S)
+def dot_in_else(x: torch.Tensor, y: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+    """A dot in an else branch whose result leaves it.  The if branch writes
+    another variable: one that both branches assign is declared inside each
+    branch's block of the shader, out of scope for the code after them."""
+    out = torch.empty([x.size(0), y.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), y.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        bias = hl.zeros([tm, tn], dtype=torch.float32)
+        if flag[0] > 0:
+            bias = bias + 1.0
+        else:
+            acc = hl.dot(x[tm, :], y[:, tn])
+        out[tm, tn] = acc + bias
+    return out
+
+
+@helion.kernel(**S)
 def dot_f16_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty([x.size(0), y.size(1)], dtype=torch.float16, device=x.device)
     for tm, tn in hl.tile([x.size(0), y.size(1)]):
@@ -13450,6 +13463,40 @@ def dot_of_outer_dot(
         for _ in hl.tile(steps.size(0)):
             acc = hl.dot(p.to(w.dtype), w[:, tn], acc=acc * 0.5)
         out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_if_dot(
+    x: torch.Tensor, u: torch.Tensor, w: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    """``p = x @ u`` in an if branch, then a dot that reads ``p``."""
+    hl.specialize(u.size(1))
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        p = hl.zeros([tm, u.size(1)], dtype=torch.float32)
+        if flag[0] > 0:
+            p = hl.dot(x[tm, :], u[:, :])
+        out[tm, tn] = hl.dot(p.to(w.dtype), w[:, tn])
+    return out
+
+
+@helion.kernel(**S)
+def dot_of_else_dot(
+    x: torch.Tensor, u: torch.Tensor, w: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    """``p = x @ u`` in an else branch, then a dot that reads ``p``; the if
+    branch writes another variable (``dot_in_else``)."""
+    hl.specialize(u.size(1))
+    out = torch.empty([x.size(0), w.size(1)], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([x.size(0), w.size(1)]):
+        p = hl.zeros([tm, u.size(1)], dtype=torch.float32)
+        bias = hl.zeros([tm, tn], dtype=torch.float32)
+        if flag[0] > 0:
+            bias = bias * 2.0
+        else:
+            p = hl.dot(x[tm, :], u[:, :])
+        out[tm, tn] = hl.dot(p.to(w.dtype), w[:, tn]) + bias
     return out
 
 
@@ -14364,6 +14411,17 @@ class TestMppWholeKDot(_WholeKDotCase):
         for config in (None, helion.Config(block_sizes=[32, 32, 16])):
             self._mpp(dot_if_seed, (x, w, flag), config, xd @ wd + 1)
 
+    def test_dot_in_an_else_branch(self) -> None:
+        """A dot in an else branch whose result leaves the branch, with an
+        if branch that writes another variable: the planner finds the result
+        the ``_if`` gives back for the dot among the else branch's, where it
+        has another slot than in the ``_if``'s results."""
+        x, y = _randn(32, 64), _randn(64, 48)
+        xd, yd = _cpu64(x, y)
+        for value, ref in ((0.0, xd @ yd), (1.0, torch.ones(32, 48).double())):
+            flag = torch.full([1], value, device=DEVICE)
+            self._mpp(dot_in_else, (x, y, flag), None, ref)
+
     def test_staging_budget(self) -> None:
         """Both float32 operands staged over a ``:`` K of 256 fit threadgroup
         memory at 16 x 16 tiles, not at the default 32 x 32."""
@@ -14501,8 +14559,8 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
 
     def test_operand_computed_from_a_matmul(self) -> None:
         """A matmul's result that reaches an operand other than from that
-        matmul's element loop: from the enclosing graph and through a loop's
-        output."""
+        matmul's element loop: from the enclosing graph, through a loop's
+        output and out of an if or an else branch."""
         x, u, w = _randn(32, 16), _randn(16, 32), _randn(32, 16)
         xd, ud, wd = _cpu64(x, u, w)
         self._scalar(
@@ -14521,6 +14579,15 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         for config in (None, one):
             ref = (xd @ ud).half().double() @ wd
             self._scalar(dot_of_loop_dot, (x, u, w), config, ref)
+        x, u, w = _randn(32, 16), _randn(16, 32), _randn(32, 16)
+        xd, ud, wd = _cpu64(x, u, w)
+        ref = (xd @ ud).half().double() @ wd
+        full = helion.Config(block_sizes=[16, 16], num_warps=32)
+        for kernel, taken in ((dot_of_if_dot, 1.0), (dot_of_else_dot, 0.0)):
+            for value in (0.0, 1.0):
+                flag = torch.full([1], value, device=DEVICE)
+                expected = ref if value == taken else 0 * ref
+                self._scalar(kernel, (x, u, w, flag), full, expected)
 
     def test_colon_dims_past_one_op(self) -> None:
         """A ``:`` K of 8 is under the table's 16 and one of 257 over its
@@ -15935,15 +16002,25 @@ class TestMppLaneDistribution(unittest.TestCase):
         so every other name it assigns is per lane too: its start and its
         readers stay in the lane loop."""
         ysum = self.y.cpu().double().sum(0)
-        for config in (
-            None,
-            helion.Config(block_sizes=[32, 16, 16, 16], num_warps=4),
-        ):
+        configs = (None, helion.Config(block_sizes=[32, 16, 16, 16], num_warps=4))
+        for config in configs:
             with self.subTest(kernel="loop", config=config):
-                out, _, msl = _run(dist_loop_reset, (self.x, self.y), config)
+                out, _, _ = _run(dist_loop_reset, (self.x, self.y), config)
                 _close(out, self.xy + 2.0 * ysum[None, :])
-                self.assertTrue(_lane_looped(msl, re.escape("auto t = float(0.0);")))
-                self.assertTrue(_lane_looped(msl, r"\(t \* v_\d+\)"))
+        # The lane loops as distributed, before metal_jit's jam takes the
+        # loop's lane-independent load of y out of the lanes.
+        with patch(
+            "helion._compiler.metal.metal_jit.jam_lanes_into_loops",
+            lambda body: body,
+        ):
+            for config in configs:
+                with self.subTest(kernel="loop", config=config, jam=False):
+                    _, _, msl = _run(
+                        dist_loop_reset, (self.x, self.y), config, "no jam"
+                    )
+                    t0 = re.escape("auto t = float(0.0);")
+                    self.assertTrue(_lane_looped(msl, t0))
+                    self.assertTrue(_lane_looped(msl, r"\(t \* v_\d+\)"))
         flag = torch.ones(1, dtype=torch.int32, device=DEVICE)
         config = helion.Config(
             block_sizes=[16, 16, 16], num_threads=[8, 16, 0], num_warps=4

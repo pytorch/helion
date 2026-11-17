@@ -332,6 +332,15 @@ def _compose_flat_grouped_host(
         f"{proof.b_argument}.transpose(1, 2), {proof.bias_argument}, {output}.view(({m}, {n})), "
         f"{workspace}, block={thread_block!r})\n"
     ).body
+    native_launch = replacement[-1]
+    assert isinstance(native_launch, ast.Expr) and isinstance(
+        native_launch.value, ast.Call
+    )
+    original_launch = launches[0].value
+    assert isinstance(original_launch, ast.Call)
+    native_launch.value.keywords.extend(
+        keyword for keyword in original_launch.keywords if keyword.arg != "block"
+    )
     position = host.body.index(launches[0])
     host.body[position : position + 1] = replacement
     loads = ast.parse(

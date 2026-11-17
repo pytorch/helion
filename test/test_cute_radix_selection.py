@@ -16,6 +16,10 @@ from test.cute_population_contracts import tcgen05_mma_support
 
 import helion
 from helion import exc
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.ast_extension import unparse
+from helion._compiler.compile_environment import HELION_STATIC_DIMS_ATTR
+from helion._compiler.compile_environment import tensor_input_sources
 from helion._compiler.cute.autotune.heuristics.cute_radix_selection import (
     CuteRadixSelectionHeuristic,
 )
@@ -36,6 +40,8 @@ pytestmark = pytest.mark.cpu_only
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from helion.runtime.kernel import BoundKernel
 
 
 @pytest.fixture(autouse=True)
@@ -788,7 +794,9 @@ def test_packet_width_and_source_unroll_keep_uniform_candidate_loops(
     assert "_helion_radix_consumer" not in source
 
 
-def test_wide_packet_has_separate_cache_alignment_fact_and_scalar_fallback() -> None:
+def _packet_bindings() -> tuple[BoundKernel, BoundKernel]:
+    """The payload selection bound to rows 32-byte aligned and to rows only
+    16-byte aligned."""
     cols = 32
     arena = torch.empty(3 * cols + 8, dtype=torch.bfloat16)
     x = arena[: 3 * cols].view(3, cols)
@@ -796,8 +804,14 @@ def test_wide_packet_has_separate_cache_alignment_fact_and_scalar_fallback() -> 
     assert x.data_ptr() % 32 == 0
     assert shifted.data_ptr() % 16 == 0 and shifted.data_ptr() % 32 == 16
     lengths = torch.empty(3, dtype=torch.int32)
-    aligned = cpu_bind(_payload_selection, (x, lengths, 17))
-    unaligned = cpu_bind(_payload_selection, (shifted, lengths, 17))
+    return (
+        cpu_bind(_payload_selection, (x, lengths, 17)),
+        cpu_bind(_payload_selection, (shifted, lengths, 17)),
+    )
+
+
+def test_wide_packet_has_separate_cache_alignment_fact_and_scalar_fallback() -> None:
+    aligned, unaligned = _packet_bindings()
     key = "cute_radix_packet_alignment_32_v1"
     assert aligned.env.bound_runtime_input_specialization_results[key] == 0
     assert unaligned.env.bound_runtime_input_specialization_results[key] == 16
@@ -813,6 +827,63 @@ def test_wide_packet_has_separate_cache_alignment_fact_and_scalar_fallback() -> 
         aligned.env.bound_runtime_input_specialization_results, {key: None}
     ):
         assert "num_bits_per_copy=256" not in aligned.to_code(config)
+
+
+@pytest.mark.skipif(
+    not supports_torch_compile_template_lowering(),
+    reason="this PyTorch build lacks Helion's Inductor template lowering",
+)
+def test_inductor_render_takes_no_wide_packet_proof_from_its_inputs() -> None:
+    # Inductor aligns its graph's inputs only to 16 bytes, and the placeholder
+    # it binds reproduces only that residue: its render of a 256-bit config
+    # keeps the scalar path.
+    from helion._compiler._inductor.template_buffer import render_inductor_ast
+
+    aligned, _unaligned = _packet_bindings()
+    config = _radix_config(aligned, cute_radix_packet_bits=256)
+    inductor = unparse(
+        render_inductor_ast(aligned, config, symbolic_input_layouts=False)
+    )
+    assert "num_bits_per_copy=256" not in inductor
+    assert "align(32)" not in inductor
+
+
+@pytest.mark.skipif(
+    not supports_torch_compile_template_lowering(),
+    reason="this PyTorch build lacks Helion's Inductor template lowering",
+)
+def test_inductor_render_bakes_no_placeholder_stride() -> None:
+    # A dynamic-shape graph viewing its input at a dynamic column step keeps
+    # the inner stride symbolic; lower_helion_kernel's placeholder gives it 1,
+    # which the bind traces as a literal (the sizes stay static).  Radix
+    # selection bakes the row stride and unit-stride columns into its code
+    # (every row of a step-2 view was wrong on a B200), so the render of such
+    # a graph refuses it, while the binding's own launches and a graph whose
+    # strides are static keep it.
+    from helion._compiler._inductor.template_buffer import render_inductor_ast
+
+    x, lengths, k = _args()
+    setattr(x, HELION_STATIC_DIMS_ATTR, frozenset({0, 1}))
+    setattr(lengths, HELION_STATIC_DIMS_ATTR, frozenset({0}))
+    kernel = helion.kernel(
+        _payload_selection.fn,
+        backend="cute",
+        static_shapes=False,
+        autotune_effort="none",
+    )
+    bound = cpu_bind(kernel, (x, lengths, k))
+    config = _radix_config(bound)
+    row_base = "radix_input_row_base = cutlass.Int64(radix_row) * cutlass.Int64(33)"
+    assert row_base in bound.to_code(config)
+    static = render_inductor_ast(bound, config, symbolic_input_layouts=True)
+    assert row_base in unparse(static)
+    with pytest.raises(exc.InvalidConfig, match="current graph/storage proof"):
+        render_inductor_ast(
+            bound,
+            config,
+            symbolic_input_layouts=True,
+            symbolic_strides=tensor_input_sources({"x": x}, [x]),
+        )
 
 
 def test_pipeline_coordinates_reject_untyped_or_unbounded_choices() -> None:

@@ -22,6 +22,7 @@ import torch
 
 from ...language.matmul_ops import dot
 from ..compile_environment import CompileEnvironment
+from ..utils import is_full_slice
 from .autotune.config_keys import CUTE_CHUNK_RECURRENCE_DV_PARTITIONS_KEY
 from .chunk_prepare import _packed_workspace_is_proven
 from .chunk_prepare import _register_packed_workspace_specialization
@@ -30,7 +31,6 @@ from .fx_matcher import _binary_args
 from .fx_matcher import _canonical_root_axis_ids
 from .fx_matcher import _is_call
 from .fx_matcher import _is_convert
-from .fx_matcher import _is_full_slice
 from .fx_matcher import _is_matrix_transpose_of
 from .fx_matcher import _linear_offsets_fit_i32
 from .fx_matcher import _load_ref
@@ -287,7 +287,7 @@ def _subscript_source(
         return None
     for actual, expected in zip(node.args[1], indices, strict=True):
         if expected == "full":
-            if not _is_full_slice(actual):
+            if not is_full_slice(actual):
                 return None
         elif actual is not expected:
             return None
@@ -560,10 +560,10 @@ def _validate_recurrence_semantics(
         or len(state_indices) != 4
         or len(state_store_indices) != 4
         or any(
-            (not _is_full_slice(lhs) if _is_full_slice(rhs) else lhs is not rhs)
+            (not is_full_slice(lhs) if is_full_slice(rhs) else lhs is not rhs)
             for lhs, rhs in zip(state_indices, state_store_indices, strict=True)
         )
-        or not _is_full_slice(state_indices[3])
+        or not is_full_slice(state_indices[3])
         or any(
             len(node.args) != 4 or node.args[2:] != (None, None)
             for node in (
@@ -873,7 +873,7 @@ def _validate_recurrence_semantics(
     if (
         not _same_scalar_index(aq_indices[0], chunk_head)
         or not _same_scalar_index(decay_indices[0], chunk_head)
-        or not _is_full_slice(decay_indices[1])
+        or not is_full_slice(decay_indices[1])
     ):
         return False
 

@@ -180,17 +180,24 @@ def test_complete_tensor_copy_uses_proved_thread_geometry(threads: int) -> None:
 
 
 @pytest.mark.parametrize("threads", [128, 256, 512])
-@pytest.mark.parametrize("vector_width", [4, 8])
-def test_fp32_tensor_copy_keeps_original_precision_and_geometry(
-    threads: int, vector_width: int
-) -> None:
-    code = _generate(threads=threads, dtype=torch.float32, vector_width=vector_width)
+def test_fp32_tensor_copy_keeps_original_precision_and_geometry(threads: int) -> None:
+    code = _generate(threads=threads, dtype=torch.float32, vector_width=4)
     assert code.count("_cute_complete_row_tensor_copy(") == 1
-    assert f"columns=16384, threads={threads}, vector_width={vector_width}" in code
+    assert f"columns=16384, threads={threads}, vector_width=4" in code
     assert "cutlass.BFloat16" not in code
     assert "cutlass.Float16" not in code
     assert code.count(".reduce(cute.ReductionOp.MAX") == 1
     assert code.count(".reduce(cute.ReductionOp.ADD") == 1
+
+
+def test_fp32_copy_past_the_declared_pointer_alignment_keeps_the_loader() -> None:
+    """Eight fp32 lanes copy 32 bytes, but the launcher declares each pointer
+    at most 16-byte aligned: the DSL refused the copy atom on the GPU ("S ptr
+    alignment (128 bits) does not meet requirement (256 bits)"), however the
+    input was aligned, so the row keeps its loader."""
+    code = _generate(dtype=torch.float32, vector_width=8)
+    assert "_cute_complete_row_tensor_copy(" not in code
+    assert "_register_row = cute.make_rmem_tensor" in code
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])

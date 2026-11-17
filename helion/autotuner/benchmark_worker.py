@@ -9,6 +9,7 @@ import dataclasses
 import functools
 import logging
 import multiprocessing as mp
+from multiprocessing import connection as mp_connection
 import os
 import signal
 import sys
@@ -36,13 +37,83 @@ _log = logging.getLogger(__name__)
 # provider does not set ``autotune_worker_start_timeout``.
 _DEFAULT_START_TIMEOUT_SECONDS = 120.0
 
-# How long a SIGKILLed worker may take to exit before it counts as unreapable.
+# How long a SIGKILLed worker may take to exit before it counts as unreapable
+# (one past closing its descriptors counts as exited: ``_wait_for_exit``), and
+# how long the next worker's start, or a rerun, then waits for it to be reaped
+# (``_reap_exiting``).
 # A worker killed mid-kernel exits only once the driver has torn down its
 # context, which for a hung or minutes-long kernel takes seconds: a 5 second
 # window turned the fourth benchmark timeout of a sweep's swiglu search (a
 # one-CTA tile of 8M elements) into a fatal BenchmarkWorkerUnkillable that
 # discarded the whole autotune.
 _REAP_TIMEOUT_SECONDS = 60.0
+
+# How long ``shutdown`` lets a worker it asked to stop exit on its own before
+# killing it.
+_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+
+# Killed workers that counted as exited before they were reaped
+# (``_wait_for_exit``): a CUDA teardown may still run the kernel they were
+# killed in and hold their device memory.  One list for every
+# ``BenchmarkWorker`` of this process, since the provider replaces its worker
+# after a shutdown. It ignores their devices, which callers leave unset
+# today: a worker killed on one device would make the workers on others wait
+# and rerun as well.
+_exiting: list[mp.process.BaseProcess] = []
+_exiting_lock = threading.Lock()
+
+
+def _poll_until_reaped(process: mp.process.BaseProcess, deadline: float) -> None:
+    """Poll ``process`` every 10 ms until it is reaped (``is_alive`` reaps it
+    with ``WNOHANG``) or ``time.monotonic()`` reaches ``deadline``."""
+    while process.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def _prune_exiting() -> bool:
+    """Forget the workers of ``_exiting`` that have been reaped; returns
+    whether any remain."""
+    with _exiting_lock:
+        _exiting[:] = [process for process in _exiting if process.exitcode is None]
+        return bool(_exiting)
+
+
+def _reap_exiting() -> bool:
+    """Wait up to ``_REAP_TIMEOUT_SECONDS`` for the workers of ``_exiting``
+    to be reaped, then forget them; returns whether one was still exiting by
+    then.  Such a worker is stuck, and waiting for it again would stall every
+    later start and rerun as long.  Multiprocessing still joins it, without
+    a timeout, at interpreter exit: a teardown that never finishes blocks the
+    exit, outside any test timeout."""
+    with _exiting_lock:
+        exiting = list(_exiting)
+    deadline = time.monotonic() + _REAP_TIMEOUT_SECONDS
+    for process in exiting:
+        _poll_until_reaped(process, deadline)
+    with _exiting_lock:
+        _exiting[:] = [process for process in _exiting if process not in exiting]
+    return any(process.exitcode is None for process in exiting)
+
+
+def _wait_for_exit(process: mp.process.BaseProcess, timeout: float) -> bool:
+    """Wait up to ``timeout`` seconds for ``process`` to exit, reaping it once
+    it has; returns whether it runs no more code by then.
+
+    ``process.join(timeout)`` bounds only its wait for the process's sentinel,
+    which the kernel closes partway through the exit; it then reaps the
+    process with a blocking ``waitpid``, which a worker still tearing down its
+    CUDA context on a loaded GPU held for over a minute.  This polls instead,
+    so a process reaped while a descendant that inherited the sentinel holds
+    it open returns at once too.  A process whose sentinel has closed by the
+    deadline is exiting and counts as exited (``_exiting``): multiprocessing
+    reaps it once the exit completes (at the next ``Process.start``, or at
+    interpreter exit, which then waits for it).
+    """
+    _poll_until_reaped(process, time.monotonic() + timeout)
+    return process.exitcode is not None or bool(
+        mp_connection.wait([process.sentinel], 0)
+    )
 
 
 def _set_pdeathsig() -> None:
@@ -239,7 +310,15 @@ class BenchmarkWorker:
         out-of-memory error there is the job's own: it is raised and doubles
         the successful jobs required before the next rerun, so jobs that run
         out of memory on their own cost few reruns; a rerun that succeeds
-        resets that count.
+        resets that count.  A job that runs out of memory while a killed
+        worker, of any ``BenchmarkWorker`` of this process, is still exiting
+        (``_exiting``) reruns too, however many jobs the worker completed,
+        since the killed one may hold that memory; that rerun leaves the
+        count alone.  A rerun first waits up to ``_REAP_TIMEOUT_SECONDS`` for
+        the killed workers to be reaped and then forgets them, so one that
+        never finishes exiting delays a single rerun.  A job is rerun once at
+        most.  A new worker starts only once the killed ones are reaped, or
+        forgotten after that wait (``_start``).
 
         With ``compile_timeout`` a :class:`PhasedJob` is held to two
         deadlines: ``compile_timeout`` seconds for the compile phase (until
@@ -251,6 +330,17 @@ class BenchmarkWorker:
         start, and a ``BenchmarkCompileTimeout`` it raises carries the
         start's measured seconds as ``cold_start_seconds``.
         """
+        return self._run(job, timeout, compile_timeout, may_rerun=True)
+
+    def _run(
+        self,
+        job: Callable[[], _T],
+        timeout: float,
+        compile_timeout: float | None,
+        *,
+        may_rerun: bool,
+    ) -> _T:
+        """``run``; ``may_rerun`` is False for the rerun of a job."""
         self._raise_if_unusable()
         cold_start_seconds: float | None = None
         if not self.alive():
@@ -354,26 +444,34 @@ class BenchmarkWorker:
             if _UNRECOVERABLE_RUNTIME_ERROR_RE.search(str(result)):
                 self._kill_if_current(process, connection)
             elif match_device_out_of_memory(result):
-                retry = self._jobs_succeeded >= self._retry_after_jobs
+                # before this worker's own kill, which may remember it
+                beside_exit = _prune_exiting()
+                retry = may_rerun and (
+                    beside_exit or self._jobs_succeeded >= self._retry_after_jobs
+                )
                 self._kill_if_current(process, connection)
                 if not retry:
-                    # spawn the replacement now: its imports overlap the
-                    # parent's next steps (it has no CUDA context until a job)
+                    # replace the worker now; ``_start`` returns once the new
+                    # one is ready, its device initialized
                     self._start()
                     raise result
                 if self._log_warning is not None:
                     first_line = str(result).split("\n", 1)[0]
+                    cause = (
+                        "while a killed worker was still exiting"
+                        if beside_exit
+                        else f"after {self._jobs_succeeded} successful job(s)"
+                    )
                     self._log_warning(
-                        f"Benchmark worker ran out of device memory after "
-                        f"{self._jobs_succeeded} successful job(s) "
+                        f"Benchmark worker ran out of device memory {cause} "
                         f"({type(result).__name__}: {first_line}); "
                         "retrying the job in a fresh worker"
                     )
                 try:
-                    # the fresh worker has no successful job: no second retry
-                    retried = self.run(job, timeout, compile_timeout=compile_timeout)
+                    retried = self._run(job, timeout, compile_timeout, may_rerun=False)
                 except Exception as error:
-                    if match_device_out_of_memory(error):
+                    # only reruns after successful jobs move the back-off
+                    if not beside_exit and match_device_out_of_memory(error):
                         self._retry_after_jobs *= 2
                         if self._log_warning is not None:
                             self._log_warning(
@@ -382,7 +480,8 @@ class BenchmarkWorker:
                                 f"{self._retry_after_jobs} successful job(s) first"
                             )
                     raise
-                self._retry_after_jobs = 1
+                if not beside_exit:
+                    self._retry_after_jobs = 1
                 return retried
             raise result
         self._jobs_succeeded += 1
@@ -393,7 +492,7 @@ class BenchmarkWorker:
         if process is not None and process.is_alive() and connection is not None:
             with contextlib.suppress(Exception):
                 connection.send(None)
-                process.join(timeout=5)
+                _wait_for_exit(process, _SHUTDOWN_TIMEOUT_SECONDS)
         self._kill()
         self._raise_if_unusable()
 
@@ -401,10 +500,20 @@ class BenchmarkWorker:
         """Spawn the worker and wait for its ready report; returns the
         seconds that took.
 
-        A worker that is not ready within ``start_timeout`` (or exits
-        first) is killed and raises ``BenchmarkWorkerDied``.
+        A killed worker still exiting (``_exiting``) may still run the
+        kernel it was killed in, and candidates timed beside it would
+        measure slow, so the new one starts once the killed ones are reaped
+        or ``_reap_exiting`` gives up on them, which is logged.  A worker
+        that is not ready within ``start_timeout`` (or exits first) is
+        killed and raises ``BenchmarkWorkerDied``.
         """
         self._raise_if_unusable()
+        if _reap_exiting():
+            (self._log_warning or self.log)(
+                "A killed benchmark worker is still exiting after "
+                f"{_REAP_TIMEOUT_SECONDS:g}s more; the next one starts beside "
+                "it, and the candidates it times may measure slow"
+            )
         context = mp.get_context("spawn")
         parent_connection, child_connection = context.Pipe(duplex=True)
         process = context.Process(
@@ -470,15 +579,15 @@ class BenchmarkWorker:
 
     def _kill(self, *, close_connection: bool = True) -> None:
         process, connection = self._process, self._parent_connection
+        exited = True
         if process is not None:
             with contextlib.suppress(Exception):
                 signal_process_tree(process, signal.SIGKILL)
-            with contextlib.suppress(Exception):
-                process.join(timeout=_REAP_TIMEOUT_SECONDS)
+            exited = _wait_for_exit(process, _REAP_TIMEOUT_SECONDS)
         if close_connection and connection is not None:
             with contextlib.suppress(Exception):
                 connection.close()
-        if process is not None and process.is_alive():
+        if process is not None and not exited:
             if self._fatal_error is None:
                 self._fatal_error = (
                     f"benchmark worker pid {process.pid} did not exit within "
@@ -486,5 +595,8 @@ class BenchmarkWorker:
                     "launch another worker"
                 )
             return
+        if process is not None and process.exitcode is None:
+            with _exiting_lock:
+                _exiting.append(process)
         self._process = None
         self._parent_connection = None

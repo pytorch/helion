@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from .cute_population_contracts import checked_initial_population
 from .test_cute_bounded_cache_codegen import _bound
 from .test_cute_bounded_cache_codegen import _cpu_target
 from .test_cute_bounded_cache_codegen import _functions
@@ -53,7 +54,8 @@ def _population(bound, count=None, explicit=None):
                 == InitialPopulationStrategy.FROM_RANDOM
             )
             random.seed(bound.settings.autotune_random_seed)
-            flat = search._generate_initial_population_flat()
+            # The budgeted rows; compiler coverage witnesses follow them.
+            flat = checked_initial_population(search)[: count or 100]
             configs = [search.config_gen.unflatten(item) for item in flat]
             assert len(configs) == len(set(configs)) == (count or 100)
             assert [search.config_gen.flatten(config) for config in configs] == flat

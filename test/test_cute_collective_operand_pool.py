@@ -9,12 +9,12 @@ import torch
 from test.test_cute_collective_native_seeded import _mamba_kernel
 from test.test_cute_collective_native_seeded import _mamba_sizes
 from test.test_cute_collective_seeds import _independent_matmuls
-from test.test_cute_collective_tf32 import _round_tf32
 
 import helion
 from helion._compiler.cute.collective_tcgen05 import CollectiveOperandSmem
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_collective import round_tf32
 from helion.autotuner.benchmarking import _make_cudagraph_replay
 
 CUDA_DEVICE = "cuda"
@@ -142,7 +142,7 @@ def test_mixed_dtype_sequential_pool_tails_and_mutating_graphs(
             left = (a * 0.5).float()
             right = b.float()
             if a.dtype is torch.float32:
-                left, right = _round_tf32(left), _round_tf32(right)
+                left, right = round_tf32(left), round_tf32(right)
             expected = (left @ right).to(a.dtype)
             torch.testing.assert_close(reference[index], expected, rtol=0.02, atol=0.02)
         for actual in (run(), replay()):

@@ -26,6 +26,8 @@ from helion._testing import skipUnlessChunkLowering
 from helion._testing import skipUnlessTensorDescriptor
 from helion._testing import xfailIfPallas
 from helion._testing import xfailIfPallasInterpret
+from helion._testing.squeeze_overloads import squeeze_overloads
+from helion._testing.tensor_views import chunk_unbind_axes
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -93,6 +95,16 @@ class TestViews(RefEagerTestBase, TestCase):
         torch.testing.assert_close(
             result, torch.nn.functional.softmax(x, dim=1), rtol=1e-2, atol=1e-1
         )
+
+    @skipIfPallas("Pallas has no pre-Inductor squeeze overload lowering")
+    def test_squeeze_default_and_dims(self):
+        x = torch.randn(19, 23, device=DEVICE)
+        for mode in range(4):
+            with self.subTest(mode=mode):
+                _code, actual = code_and_output(
+                    squeeze_overloads, (x, mode), block_sizes=[8, 16]
+                )
+                torch.testing.assert_close(actual, x.sin())
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     def test_squeeze(self):
@@ -563,29 +575,7 @@ class TestViews(RefEagerTestBase, TestCase):
 
     @skipUnlessChunkLowering
     def test_torch_chunk_unbind_axes(self):
-        @helion.kernel(autotune_effort="none")
-        def fn(
-            x: torch.Tensor, leading_axis: hl.constexpr
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            n, d, k = x.shape
-            d, k = hl.specialize((d, k))
-            lo = x.new_empty((n, d // 2, k))
-            hi = torch.empty_like(lo)
-            for tile in hl.tile(n):
-                values = x[tile, :, :].reshape(tile, d, k)
-                if leading_axis:
-                    # Default dim=0 and the unbound Tensor method form.
-                    transposed = values.permute(1, 0, 2)
-                    left, right = torch.Tensor.chunk(transposed, 2)
-                    a = left.permute(1, 0, 2)
-                    b = right.permute(1, 0, 2)
-                else:
-                    a, b = values.chunk(2, dim=-2)
-                grouped = torch.stack((a, b), dim=0)
-                c, e = grouped.unbind()
-                lo[tile, :, :] = c
-                hi[tile, :, :] = e
-            return lo, hi
+        fn = helion.kernel(chunk_unbind_axes, autotune_effort="none")
 
         x = torch.arange(65 * 8 * 4, device=DEVICE, dtype=torch.float32).reshape(
             65, 8, 4
@@ -1479,10 +1469,7 @@ def _execute_triton_stack_lowering(values, dim):
             device_function=SimpleNamespace(
                 new_var=lambda name: f"{name}_{next(sequence)}",
                 tile_strategy=SimpleNamespace(
-                    compact_shape=lambda shape: [
-                        SimpleNamespace(user_indices=[axis])
-                        for axis in range(len(shape))
-                    ]
+                    physical_dims=lambda shape: [[axis] for axis in range(len(shape))]
                 ),
             ),
         ),

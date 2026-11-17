@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import csv
 import dataclasses
+import io
 import itertools
 import json
 import logging
@@ -35,6 +37,7 @@ from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
+from helion._testing.search_harness import mock_search
 from helion.autotuner import AccuracyCheck
 from helion.autotuner import DifferentialEvolutionSearch
 from helion.autotuner import PatternSearch
@@ -645,6 +648,52 @@ class TestAutotunerAccuracy(AutotunerTestCase):
         big = torch.tensor([1e100], dtype=torch.float64)
         self.assertIn(
             "relative L2", relative_l2_disagreement(big, big * 1e-10, 0.05) or ""
+        )
+        # ... and an infinity must keep its sign.
+        inf = a.clone()
+        inf[5] = float("inf")
+        opposite = inf.clone()
+        opposite[5] = float("-inf")
+        self.assertIsNone(relative_l2_disagreement(inf, inf.clone(), 0.05))
+        self.assertIn("non-finite", relative_l2_disagreement(opposite, inf, 0.05) or "")
+        self.assertIn("non-finite", relative_l2_disagreement(inf, opposite, 0.05) or "")
+        # A float64 leaf keeps its range, the norms neither overflow nor
+        # underflow, and a complex leaf's imaginary parts count.
+        wide = torch.tensor([1e100, 1.0], dtype=torch.float64, device=DEVICE)
+        wider = torch.tensor([1e200, 1.0], dtype=torch.float64, device=DEVICE)
+        infinite = torch.tensor([math.inf, 1.0], dtype=torch.float64, device=DEVICE)
+        self.assertIsNone(relative_l2_disagreement(wide, wide.clone(), 0.05))
+        self.assertIn(
+            "non-finite", relative_l2_disagreement(wide, infinite, 0.05) or ""
+        )
+        self.assertIn("relative L2", relative_l2_disagreement(wide, wider, 0.05) or "")
+        large = torch.full([2], 1e20, device=DEVICE)
+        self.assertIn(
+            "relative L2", relative_l2_disagreement(large, large * 1.1, 0.05) or ""
+        )
+        tiny = torch.full([2], 1e-30, device=DEVICE)
+        self.assertIn("relative L2", relative_l2_disagreement(tiny, -tiny, 0.05) or "")
+        # A subnormal peak: CUDA divides by a Python number through its
+        # reciprocal in the tensor's dtype, an infinity here.
+        for subnormal in (
+            torch.full([4], 1e-40, device=DEVICE),
+            torch.full([4], 1e-310, dtype=torch.float64, device=DEVICE),
+        ):
+            self.assertIsNone(
+                relative_l2_disagreement(subnormal, subnormal.clone(), 0.05)
+            )
+            self.assertIn(
+                "relative L2",
+                relative_l2_disagreement(subnormal, -subnormal, 0.05) or "",
+            )
+        twisted = torch.tensor([1 + 2j, 3 + 4j], device=DEVICE)
+        self.assertIsNone(relative_l2_disagreement(twisted, twisted.clone(), 0.05))
+        self.assertIn(
+            "relative L2",
+            relative_l2_disagreement(
+                twisted, torch.tensor([1 - 5j, 3 + 9j], device=DEVICE), 0.05
+            )
+            or "",
         )
         ints = torch.arange(8, device=DEVICE)
         self.assertIsNone(relative_l2_disagreement(ints, ints.clone(), 0.05))
@@ -1404,62 +1453,27 @@ class TestMismatchTolerance(TestCase):
 
 @onlyBackends(["triton", "cute"])
 class TestAutotuneIgnoreErrors(TestCase):
-    def _make_search(
-        self, settings: Settings, *, args: tuple[object, ...] = ()
-    ) -> BaseSearch:
-        # NOTE: construct via __init__ (mock kernel) instead of hand-mirroring
-        # its attributes, so new __init__ fields don't need to be added here.
-        config_spec = SimpleNamespace(
-            default_config=lambda: helion.Config(block_sizes=[1]),
-            cute_flash_search_enabled=False,
-            compiler_seed_timeout_retry_repetitions=None,
-            backend=SimpleNamespace(
-                supports_precompile=lambda: True,
-                autotune_config_is_viable=lambda _config_spec, _config: True,
-                should_deduplicate_generated_sources=lambda config_spec: False,
-                get_do_bench=lambda: None,
-                classify_autotune_exception=lambda error: None,
-                probe_long_autotune_kernels=lambda _config_spec: False,
-            ),
-        )
-        kernel = SimpleNamespace(
-            settings=settings,
-            config_spec=config_spec,
-            format_kernel_decorator=lambda config, s: "decorator",
-            to_triton_code=lambda config: "code",
-            maybe_log_repro=lambda log_func, args, config=None: None,
-            supports_subprocess_benchmark=lambda: False,
-            env=SimpleNamespace(process_group_name=None, device=DEVICE),
-        )
-        search = BaseSearch(kernel, args)
-        with patch.object(
-            LocalBenchmarkProvider,
-            "_compute_baseline",
-            return_value=(None, [], None),
-        ):
-            search._prepare()
-        return search
-
     def _make_compile_failure_search(self) -> BaseSearch:
-        search = self._make_search(
+        return mock_search(
             Settings(
                 autotune_precompile=None,
                 autotune_log_level=logging.CRITICAL,
-            )
+            ),
+            compile_config=None,
         )
-        search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
-        search.kernel.compile_config = None
-        return search
 
     def _run_late_compile_failures(
         self,
-        late_configs: Sequence[str],
-        error_for: Callable[[str], Exception],
+        late_configs: Sequence[helion.Config],
+        error_for: Callable[[helion.Config], Exception],
     ) -> tuple[list[object], list[object]]:
         search = self._make_compile_failure_search()
+        valid = helion.Config(block_sizes=[1])
 
-        def compile_config(config: str, **_kwargs: object) -> Callable[..., None]:
-            if config == "valid":
+        def compile_config(
+            config: helion.Config, **_kwargs: object
+        ) -> Callable[..., None]:
+            if config == valid:
                 return lambda *args, **kwargs: None
             raise error_for(config)
 
@@ -1471,8 +1485,11 @@ class TestAutotuneIgnoreErrors(TestCase):
                 return_value=1.0,
             ),
         ):
-            initial = search.benchmark_batch(["valid"], desc="initial")
+            initial = search.benchmark_batch([valid], desc="initial")
             late = search.benchmark_batch(list(late_configs), desc="late")
+        self.assertIs(initial[0].config, valid)
+        for result, config in zip(late, late_configs, strict=True):
+            self.assertIs(result.config, config)
         return initial, late
 
     def test_settings_flag_from_env(self):
@@ -1487,7 +1504,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("boom")
@@ -1504,7 +1521,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("failed to translate module to LLVM IR")
@@ -1521,7 +1538,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise torch.cuda.OutOfMemoryError("CUDA out of memory")
@@ -1538,7 +1555,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("boom")
@@ -1556,7 +1573,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
         calls = []
 
         class FakeJITFunction:
@@ -1580,7 +1597,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         class FakeJITFunction:
             def __init__(self) -> None:
@@ -1609,7 +1626,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         class FakeJITFunction:
             def clear_fast_path_caches(self) -> None:
@@ -1631,7 +1648,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         def compiled_fn(*_args):
             return None
@@ -1661,7 +1678,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("boom")
@@ -1684,7 +1701,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         def bad_fn(*_args):
             raise RuntimeError("test error with meaningful message")
@@ -1711,7 +1728,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=False,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         original_exception = RuntimeError("original error in except block")
 
@@ -1737,6 +1754,7 @@ class TestAutotuneIgnoreErrors(TestCase):
         # Verify we can still get the error type and message
         assert type(err.value.__cause__).__name__ == "RuntimeError"
 
+    @pytest.mark.cpu_only
     def test_benchmark_results_aligned_when_compile_fails(self):
         """benchmark_batch must return one result per input config even when some
         fail to compile."""
@@ -1744,7 +1762,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_precompile=None,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings)
+        search = mock_search(settings)
 
         call_count = 0
 
@@ -1757,7 +1775,7 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         search.kernel.compile_config = None
         search.kernel.env = SimpleNamespace(process_group_name=None, device=DEVICE)
-        configs = ["cfg_a", "cfg_b", "cfg_c"]
+        configs = [helion.Config(block_sizes=[size]) for size in (1, 2, 4)]
         with (
             patch.object(search.kernel, "compile_config", side_effect=fail_second),
             patch.object(
@@ -1769,12 +1787,77 @@ class TestAutotuneIgnoreErrors(TestCase):
             results = search.benchmark_batch(configs, desc="test")
 
         self.assertEqual(len(results), 3)
+        for result, config in zip(results, configs, strict=True):
+            self.assertIs(result.config, config)
         self.assertEqual(results[0].perf, 1.0)
         self.assertEqual(results[1].perf, float("inf"))
         self.assertEqual(results[1].status, "error")
         self.assertEqual(results[2].perf, 1.0)
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
+    @pytest.mark.cpu_only
+    def test_compile_failure_diagnostics_follow_error_policy(self) -> None:
+        cases = (
+            (
+                torch.cuda.OutOfMemoryError("allocation failed"),
+                False,
+                logging.WARNING,
+                None,
+                False,
+            ),
+            (
+                torch.cuda.OutOfMemoryError("allocation failed"),
+                False,
+                logging.DEBUG,
+                None,
+                True,
+            ),
+            (
+                RuntimeError("PassManager::run failed"),
+                False,
+                logging.WARNING,
+                None,
+                True,
+            ),
+            (RuntimeError("unexpected compiler bug"), True, logging.DEBUG, None, False),
+            (
+                RuntimeError("backend resource limit"),
+                False,
+                logging.WARNING,
+                "debug",
+                False,
+            ),
+        )
+        for error, ignore, level, backend_action, visible in cases:
+            with self.subTest(error=error, ignore=ignore, level=level):
+                output = io.StringIO()
+                with redirect_stderr(output):
+                    search = mock_search(
+                        Settings(
+                            autotune_precompile=None,
+                            autotune_ignore_errors=ignore,
+                            autotune_log_level=level,
+                        )
+                    )
+                    search.kernel.compile_config = Mock(side_effect=error)
+                    search.kernel.config_spec.backend.classify_autotune_exception = (
+                        Mock(return_value=backend_action)
+                    )
+                    results = search.benchmark_batch(
+                        [helion.Config(block_sizes=[1])],
+                        raise_if_no_viable_config=False,
+                    )
+                self.assertEqual([r.status for r in results], ["error"])
+                self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
+                text = output.getvalue()
+                self.assertEqual(
+                    "Skipping config that failed to compile" in text, visible
+                )
+                self.assertEqual("Traceback (most recent call last):" in text, visible)
+                if visible:
+                    self.assertIn(str(error), text)
+
+    @pytest.mark.cpu_only
     def test_initial_compile_failures_raise(self) -> None:
         cases: tuple[tuple[str, type[Exception], str, Exception], ...] = (
             (
@@ -1801,22 +1884,28 @@ class TestAutotuneIgnoreErrors(TestCase):
                     ),
                     self.assertRaisesRegex(error_type, message),
                 ):
-                    search.benchmark_batch([config], desc="initial")
+                    search.benchmark_batch(
+                        [helion.Config(block_sizes=[1])], desc="initial"
+                    )
 
+    @pytest.mark.cpu_only
     def test_initial_compile_failures_skipped_when_fallback_available(self) -> None:
         search = self._make_compile_failure_search()
+        config = helion.Config(block_sizes=[1])
         with patch.object(
             search.kernel,
             "compile_config",
             side_effect=exc.BackendUnsupported("cute", "seed config unsupported"),
         ):
             results = search.benchmark_batch(
-                ["seed"], desc="initial", raise_if_no_viable_config=False
+                [config], desc="initial", raise_if_no_viable_config=False
             )
+        self.assertIs(results[0].config, config)
         self.assertEqual([result.perf for result in results], [float("inf")])
         self.assertEqual([result.status for result in results], ["error"])
         self.assertEqual(search._autotune_metrics.num_compile_failures, 1)
 
+    @pytest.mark.cpu_only
     def test_late_compile_failures_are_skipped(self) -> None:
         cases = (
             (
@@ -1834,7 +1923,8 @@ class TestAutotuneIgnoreErrors(TestCase):
         for prefix, error_for in cases:
             with self.subTest(prefix=prefix):
                 initial, late = self._run_late_compile_failures(
-                    (f"{prefix}_a", f"{prefix}_b"), error_for
+                    (helion.Config(block_sizes=[2]), helion.Config(block_sizes=[4])),
+                    error_for,
                 )
                 self.assertEqual(initial[0].perf, 1.0)
                 self.assertEqual([result.perf for result in late], [float("inf")] * 2)
@@ -2015,7 +2105,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_log_level=logging.CRITICAL,
             autotune_compile_timeout=5,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         parent_pid = os.getpid()
         lazy_calls: list[int] = []
@@ -2026,8 +2116,8 @@ class TestAutotuneIgnoreErrors(TestCase):
 
         def fake_make_precompiler(_kernel_obj, _config, _bound_kernel):
             def binder(*_args: object, **_kwargs: object):
-                def run() -> None:
-                    return None
+                def run() -> bool:
+                    return True
 
                 return run
 
@@ -2076,7 +2166,7 @@ class TestAutotuneIgnoreErrors(TestCase):
                     autotune_ignore_errors=False,
                     autotune_log_level=logging.CRITICAL,
                 )
-                search = self._make_search(settings, args=("arg0",))
+                search = mock_search(settings, ("arg0",))
 
                 def fake_compiled_fn(
                     *fn_args: object, _launcher: Callable[..., object]
@@ -2103,7 +2193,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]
@@ -2129,7 +2219,7 @@ class TestAutotuneIgnoreErrors(TestCase):
             autotune_ignore_errors=True,
             autotune_log_level=logging.CRITICAL,
         )
-        search = self._make_search(settings, args=("arg0",))
+        search = mock_search(settings, ("arg0",))
 
         def fake_compiled_fn(
             *fn_args: object, _launcher: Callable[..., object]
@@ -2277,6 +2367,100 @@ class TestAutotuneIgnoreErrors(TestCase):
         self.assertFalse(base_path.with_suffix(".meta.jsonl").exists())
 
 
+@onlyBackends(["triton"])
+@skipIfRefEager("Autotuning not supported in ref eager mode")
+class TestBaselinePrecompileCache(TestCase):
+    """The accuracy baseline's precompile holds the backend compile to
+    ``autotune_compile_timeout`` only if the attempt's run then loads its
+    binary from Triton's cache: a run that compiled again would run ptxas in
+    this process, where no deadline reaches it."""
+
+    def _baseline_compiles(self, precompile: str, n: int) -> tuple[list[int], int]:
+        """Compute the accuracy baseline of an add kernel over ``n`` elements
+        with ``precompile`` against an empty Triton cache; the pids that ran
+        Triton's make_cubin (this process, and a fork child, which inherits
+        the recording) and the cubins in the cache.  Each test passes its own
+        ``n``: the generated code holds the static sizes, so no test loads a
+        module another one compiled (PyCodeCache keeps the modules it loaded
+        by source, with the kernels Triton compiled for them)."""
+        # Only importable with Triton's NVIDIA backend.
+        from triton.backends.nvidia.compiler import CUDABackend
+
+        @helion.kernel(
+            static_shapes=True,
+            autotune_log_level=0,
+            autotune_benchmark_subprocess=False,
+            autotune_precompile=precompile,
+        )
+        def add(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(a)
+            for tile in hl.tile(out.size()):
+                out[tile] = a[tile] + b[tile]
+            return out
+
+        # A lone contiguous view 4 bytes into its allocation: the baseline
+        # runs on a clone of it, aligned (Triton specializes on a pointer's
+        # alignment), and the precompile has to compile that specialization.
+        args = (
+            torch.randn([n + 1], device=DEVICE)[1:],
+            torch.randn([n], device=DEVICE),
+        )
+        make_cubin = CUDABackend.make_cubin
+        calls = itertools.count()
+        with (
+            tempfile.TemporaryDirectory() as cache,
+            tempfile.TemporaryDirectory() as compilers,
+        ):
+
+            def recorded_make_cubin(
+                backend: object, *args: object, **kwargs: object
+            ) -> object:
+                Path(compilers, f"{os.getpid()}-{next(calls)}").touch()
+                return make_cubin(backend, *args, **kwargs)
+
+            # _prepare() computes the baseline; it compiles no candidate.
+            search = FiniteSearch(
+                add.bind(args),
+                args,
+                configs=[
+                    helion.Config(block_sizes=[16], num_warps=4),
+                    helion.Config(block_sizes=[32], num_warps=4),
+                ],
+            )
+            with (
+                patch.dict(os.environ, {"TRITON_CACHE_DIR": cache}),
+                patch.object(CUDABackend, "make_cubin", recorded_make_cubin),
+            ):
+                search._prepare()
+            try:
+                torch.testing.assert_close(
+                    search.benchmark_provider._baseline_output, args[0] + args[1]
+                )
+            finally:
+                search.benchmark_provider.cleanup()
+            pids = [int(name.split("-")[0]) for name in os.listdir(compilers)]
+            return pids, len(list(Path(cache).rglob("*.cubin")))
+
+    @skipIfNotCUDA()
+    def test_a_forked_baseline_precompile_compiles_for_the_run(self) -> None:
+        pids, cubins = self._baseline_compiles("fork", 1024)
+        # The child compiled each baseline config; this process loaded it.
+        self.assertTrue(pids)
+        self.assertNotIn(os.getpid(), pids)
+        self.assertGreater(cubins, 0)
+
+    @skipIfNotCUDA()
+    @pytest.mark.slow
+    def test_a_spawned_baseline_precompile_compiles_for_the_run(self) -> None:
+        # A spawned child loads the arguments from a file, which holds them as
+        # the run clones them: on the candidates' file, with the view's
+        # offset, the child would compile another specialization and this
+        # process the run's again.  The child records no make_cubin.
+        pids, cubins = self._baseline_compiles("spawn", 2048)
+        self.assertEqual(pids, [])
+        self.assertGreater(cubins, 0)
+
+
 class TestFp8UlpAccuracy(unittest.TestCase):
     """``accuracy.assert_close`` on fp8 leaves (CPU; no kernel involved)."""
 
@@ -2387,10 +2571,62 @@ class TestFp8UlpAccuracy(unittest.TestCase):
     def test_nan_must_match_nan(self) -> None:
         expected = torch.tensor([float("nan"), 1.0, -2.0]).to(self.DTYPE)
         self._check(expected.clone(), expected, "ulp")
-        with self.assertRaisesRegex(AssertionError, "more than one ulp"):
+        with self.assertRaisesRegex(AssertionError, "NaN or infinite elements"):
             self._check(torch.tensor([1.0, 1.0, -2.0]).to(self.DTYPE), expected, "ulp")
 
+    def test_an_infinity_must_match_the_same_infinity(self) -> None:
+        # Against an infinite baseline element rtol * |inf| is infinite: no
+        # finite value, nor the opposite infinity, may pass there.  The
+        # alternating signs keep the directional check balanced.
+        signs = torch.tensor([1.0, -1.0]).repeat(2048)
+        expected = (signs * math.inf).to(torch.float8_e5m2)
+        self._check(expected.clone(), expected, "ulp")
+        for actual in (torch.zeros(4096), -signs * math.inf):
+            with self.assertRaisesRegex(AssertionError, "NaN or infinite elements"):
+                self._check(actual.to(torch.float8_e5m2), expected, "ulp")
+
+    def test_the_report_tells_non_finite_mismatches_and_the_worst_values(
+        self,
+    ) -> None:
+        expected = torch.tensor([1.0, 2.0, 4.0, 8.0]).to(torch.float8_e5m2)
+        nan = torch.tensor([float("nan"), 2.0, 4.0, 8.0]).to(torch.float8_e5m2)
+        with self.assertRaisesRegex(
+            AssertionError, "differ in NaN or infinite elements, which must match"
+        ) as caught:
+            self._check(nan, expected, "ulp")
+        report = str(caught.exception)
+        self.assertNotIn("more than one ulp", report)
+        self.assertIn("(25.0%), 1 of them NaN or infinite", report)
+        self.assertIn(
+            "difference: nan at index (0,) (actual nan, expected 1.0)", report
+        )
+        # A finite element off by more than one ulp beside an infinity: both
+        # reasons, the infinite one reported as the worst.
+        both = torch.tensor([math.inf, 2.0, 16.0, 8.0]).to(torch.float8_e5m2)
+        with self.assertRaisesRegex(
+            AssertionError,
+            r"plus the tolerance \(atol=.*\) and in NaN or infinite elements",
+        ) as caught:
+            self._check(both, expected, "ulp")
+        self.assertIn("(actual inf, expected 1.0)", str(caught.exception))
+
+    def test_e8m0_nan_is_not_one_ulp_from_the_largest_value(self) -> None:
+        # float8_e8m0fnu: byte 254 is 2**127 and byte 255 is NaN.
+        def e8m0(byte: int) -> torch.Tensor:
+            return torch.tensor([byte, 127], dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            )
+
+        largest, nan = e8m0(254), e8m0(255)
+        self._check(e8m0(253), largest, "ulp")
+        for actual, expected in ((nan, largest), (largest, nan)):
+            with self.assertRaisesRegex(AssertionError, "NaN or infinite elements"):
+                self._check(actual, expected, "ulp")
+        self._check(e8m0(255), nan, "ulp")
+
     def test_e8m0_one_exponent_step(self) -> None:
+        from helion.autotuner.accuracy import assert_close
+
         expected = torch.tensor([1.0, 2.0, 0.5, 8.0]).to(torch.float8_e8m0fnu)
         self._check(
             torch.tensor([2.0, 2.0, 0.25, 8.0]).to(torch.float8_e8m0fnu),
@@ -2403,6 +2639,19 @@ class TestFp8UlpAccuracy(unittest.TestCase):
                 expected,
                 "ulp",
             )
+        # An atol as large as the difference does not widen the step, and
+        # the report names no tolerance.
+        with self.assertRaisesRegex(
+            AssertionError, "one exponent step: no tolerance applies"
+        ) as caught:
+            assert_close(
+                torch.tensor([4.0, 2.0, 0.5, 8.0]).to(torch.float8_e8m0fnu),
+                expected,
+                atol=4.0,
+                rtol=0.0,
+                fp8_accuracy="ulp",
+            )
+        self.assertNotIn("atol", str(caught.exception))
 
     def test_mixed_leaves_and_mode_validation(self) -> None:
         from helion.autotuner.accuracy import assert_close
@@ -2416,6 +2665,7 @@ class TestFp8UlpAccuracy(unittest.TestCase):
             helion.Settings(autotune_fp8_accuracy="exact")
 
 
+@pytest.mark.cpu_only
 class TestAccuracyCheck(unittest.TestCase):
     """``AccuracyCheck`` on CPU tensors (no kernel involved)."""
 
@@ -2588,14 +2838,17 @@ class TestAccuracyCheck(unittest.TestCase):
         settings = Settings(autotune_baseline_accuracy_check_fn=check)
         self.assertIs(settings.to_dict()["autotune_baseline_accuracy_check_fn"], check)
 
-    def test_other_kernels_key_only_an_enabled_accuracy_check(self) -> None:
+    def test_other_kernels_key_enabled_accuracy_check_with_clone_version(self) -> None:
         def key(check: object = None, *, enabled: bool = True) -> str:
             settings = Settings(
                 autotune_baseline_accuracy_check_fn=check,  # type: ignore[arg-type]
                 autotune_accuracy_check=enabled,
             )
             return _search_policy_hash(
-                SimpleNamespace(settings=settings),  # type: ignore[arg-type]
+                SimpleNamespace(  # type: ignore[arg-type]
+                    settings=settings,
+                    _benchmark_provider_cls=LocalBenchmarkProvider,
+                ),
                 cute_flash_search_enabled=False,
             )
 
@@ -2605,15 +2858,15 @@ class TestAccuracyCheck(unittest.TestCase):
         class Subclass(AccuracyCheck):
             pass
 
-        self.assertEqual(key(), "")
-        self.assertNotEqual(key(peak()), "")
+        self.assertNotEqual(key(), "")
+        self.assertNotEqual(key(peak()), key())
         self.assertEqual(key(peak()), key(peak()))
         self.assertNotEqual(key(peak()), key(peak(0.05)))
         # A disabled check validates nothing; arbitrary callbacks keep the
-        # historical key.
-        self.assertEqual(key(peak(), enabled=False), "")
-        self.assertEqual(key(lambda actual, expected: None), "")
-        self.assertEqual(key(Subclass(atol=0.02, rtol=0.0)), "")
+        # baseline key within the current input-cloning version.
+        self.assertEqual(key(peak(), enabled=False), key())
+        self.assertEqual(key(lambda actual, expected: None), key())
+        self.assertEqual(key(Subclass(atol=0.02, rtol=0.0)), key())
 
     def test_bitwise_fp8_byte_tolerance_never_reaches_inf_or_nan(self) -> None:
         check = AccuracyCheck(atol=0.02, rtol=0.02, fp8_accuracy="bitwise")
@@ -2669,7 +2922,7 @@ class TestAccuracyCheck(unittest.TestCase):
             base.cache_policy(),
             {
                 "check": "accuracy_check",
-                "version": 1,
+                "version": 4,
                 "atol": 0.02,
                 "rtol": 0.0,
                 "atol_scale": "peak",

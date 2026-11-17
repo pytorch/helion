@@ -6,6 +6,8 @@ import pytest
 import torch
 
 import helion
+from helion._compat import supports_torch_compile_template_lowering
+from helion._compiler.ast_extension import unparse
 from helion._compiler.cute.autotune.heuristics.cute import CuteCollectiveMatmulHeuristic
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
@@ -71,6 +73,81 @@ def test_original_gathered_contraction_emits_pipeline(shape, dtype, static) -> N
     assert "gathered_logical_row" in source
     assert "% 8 == 0" in source
     ast.parse(source)
+
+
+@pytest.mark.skipif(
+    not supports_torch_compile_template_lowering(),
+    reason="this PyTorch build lacks Helion's Inductor template lowering",
+)
+def test_dynamic_inductor_render_runs_the_warp_lowering() -> None:
+    """The gathered pipeline takes its operands' exact sizes and strides,
+    which Inductor's render of a dynamic-shape graph cannot prove: it runs at
+    every size the graph accepts, without the binding's dispatch guards.  The
+    render takes the warp lowering, as without the knob, rather than refusing
+    a config Inductor's tuner may have chosen; a static graph's keeps the
+    pipeline."""
+    from helion._compiler._inductor.template_buffer import render_inductor_ast
+
+    bound = _bound((256, 128, 128, 4), torch.bfloat16, False)
+
+    def render(compute: str, *, symbolic: bool) -> str:
+        config = helion.Config(
+            block_sizes=[128, 32, 64],
+            num_threads=[4, 32, 1],
+            cute_vector_widths=[1, 1, 1, 1],
+            cute_collective_mma=True,
+            cute_collective_compute=compute,
+            cute_gathered_mma_n=512,
+            cute_gathered_mma_stages=2,
+        )
+        return unparse(
+            render_inductor_ast(bound, config, symbolic_input_layouts=symbolic)
+        )
+
+    assert "gathered_mma_tma" in render("tma_gather", symbolic=False)
+    dynamic = render("tma_gather", symbolic=True)
+    assert "gathered_mma_tma" not in dynamic
+    assert dynamic == render("warp", symbolic=True)
+
+
+def test_an_outer_trace_binding_refuses_the_gathered_config() -> None:
+    """Only Inductor's render of a dynamic graph skips the binding's dispatch
+    guards.  A binding from an outer trace's FakeTensors keeps them, but its
+    hints are that trace's and prove no exact size, so the pinned gathered
+    config is refused, as before, not replaced by the warp lowering."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    rows, k, n, groups = 256, 128, 128, 4
+    with FakeTensorMode():
+        inputs = (
+            torch.empty((rows, k), dtype=torch.bfloat16),
+            torch.empty((groups, k, n), dtype=torch.bfloat16),
+            torch.empty(groups, dtype=torch.int32),
+            torch.empty(groups + 1, dtype=torch.int32),
+            torch.empty(rows, dtype=torch.int32),
+            rows // groups + 32,
+        )
+        kernel = helion.kernel(
+            moe_matmul_ogs.fn,
+            backend="cute",
+            static_shapes=False,
+            autotune_effort="none",
+        )
+        bound = cpu_bind(kernel, inputs)
+    with pytest.raises(
+        helion.exc.BackendUnsupported, match="gathered MMA requires one isolated"
+    ):
+        bound.to_code(
+            helion.Config(
+                block_sizes=[128, 32, 64],
+                num_threads=[4, 32, 1],
+                cute_vector_widths=[1, 1, 1, 1],
+                cute_collective_mma=True,
+                cute_collective_compute="tma_gather",
+                cute_gathered_mma_n=512,
+                cute_gathered_mma_stages=2,
+            )
+        )
 
 
 def test_gathered_seeds_keep_wide_columns_and_pipeline_depth() -> None:

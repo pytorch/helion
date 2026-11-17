@@ -313,7 +313,10 @@ def _match_mxfp8(graphs: Sequence[GraphInfo], ir: DeviceIR) -> Mxfp8Match | None
     rhs_row = rhs[1][0] if permuted else rhs[1][1]
     if (rhs[1][1] if permuted else rhs[1][0]) != slice(None):
         return None
-    groups = env.size_hint(lhs[0].shape[1]) // 32
+    extent = env.keyed_hint(lhs[0].shape[1])
+    if extent is None:
+        return None
+    groups = extent // 32
     sa, sb = (
         _scale(dot.args[1], lhs[1][0], groups),
         _scale(dot.args[4], rhs_row, groups),
@@ -503,10 +506,7 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
     ):
         return None
     match = _match_mxfp8(graphs, host.device_ir)
-    if (
-        match is None
-        or "input_tensor_metadata" not in env.compiler_fact_specialization_facts
-    ):
+    if match is None or not env.exact_input_metadata_holds():
         return None
     if match.partition_key is not None and (
         type(df.config.get(match.partition_key)) is not int
@@ -621,10 +621,15 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
         (match.lhs, match.scale_a, match.row_axes[0]),
         (match.rhs, match.scale_b, match.row_axes[1]),
     ):
-        ss = tuple(env.size_hint(x) for x in scale.stride())
+        sizes = [env.keyed_hint(size) for size in scale.shape]
+        strides = [env.keyed_hint(stride) for stride in scale.stride()]
+        numel = env.keyed_hint(tensor.numel())
+        if numel is None or None in sizes or None in strides:
+            return None
+        ss = cast("list[int]", strides)
         span = 1 + sum(
-            (env.size_hint(size) - 1) * env.size_hint(stride)
-            for size, stride in zip(scale.shape, scale.stride(), strict=True)
+            (size - 1) * stride
+            for size, stride in zip(cast("list[int]", sizes), ss, strict=True)
         )
         operands.append(
             PreparedOperand(
@@ -635,7 +640,7 @@ def plan_mxfp8(graphs: Sequence[GraphInfo]) -> BlockScaledMmaPlan | None:
                     if scale.dtype == torch.int32
                     else f"row * {ss[0]} + group * {ss[1]}"
                 ),
-                env.size_hint(tensor.numel()),
+                numel,
                 span * (4 if scale.dtype == torch.int32 else 1),
                 False,
             )

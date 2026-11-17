@@ -324,8 +324,9 @@ def _paired_seeds(bound):
 
 def test_paired_seeds_carry_2x2_twins_of_the_deep_rings() -> None:
     """nvjet stages its 2x2 clusters 64 deep in K: the deepest bk=64 ring of
-    every 256-row pair tile with whole N-tile pairs gets a cluster_n=2 twin
-    (and nothing else does); each twin is a strict fixed point."""
+    every 256-row pair tile with whole N-tile pairs gets a cluster_n=2 twin,
+    also grouped by 8 M tiles (and nothing else does); each twin is a strict
+    fixed point."""
     with _target(), mock_cuda_unavailable():
         bound = _bind(gemm, 4096, 1024, 1024)
         seeds = _paired_seeds(bound)
@@ -334,17 +335,29 @@ def test_paired_seeds_carry_2x2_twins_of_the_deep_rings() -> None:
             (tuple(seed.block_sizes), seed.config["tcgen05_ab_stages"])
             for seed in twins
         } == {((256, 64, 64), 10), ((256, 128, 64), 8), ((256, 256, 64), 6)}
+        assert {
+            tuple(seed.block_sizes)
+            for seed in twins
+            if seed.config.get("l2_groupings") == [8]
+        } == {(256, 64, 64), (256, 128, 64), (256, 256, 64)}
+
+        def ungrouped(config: dict[str, object]) -> dict[str, object]:
+            return {
+                key: value for key, value in config.items() if key != "l2_groupings"
+            }
+
         for twin in twins:
             # The twin keeps its CTAs persistent over the co-resident
             # clusters (``tcgen05_persistent_grid_cap``); its cluster_n=1
-            # sibling takes the pair cap, so it carries no such key.
+            # sibling (the ungrouped seed) takes the pair cap, so it carries
+            # no such key.
             assert twin.config["tcgen05_persistent_grid_cap"] == "resident_clusters"
             sibling = {
                 key: value
-                for key, value in twin.config.items()
+                for key, value in ungrouped(twin.config).items()
                 if key != "tcgen05_persistent_grid_cap"
             } | {"tcgen05_cluster_n": 1}
-            assert any(seed.config == sibling for seed in seeds)
+            assert any(ungrouped(seed.config) == sibling for seed in seeds)
             normalized = dict(twin.config)
             bound.config_spec.normalize(normalized)
             assert normalized["tcgen05_cluster_n"] == 2

@@ -370,6 +370,7 @@ def test_generic_register_coarse_sdk(tmp_path, recovery):
     assert torch.cuda.is_initialized() == cuda_initialized
 
 
+@pytest.mark.cpu_only
 def test_register_region_uses_bound_runtime_disjointness():
     x = torch.zeros((3, 4, 8), dtype=torch.int64)
     out = torch.empty_like(x)
@@ -377,10 +378,11 @@ def test_register_region_uses_bound_runtime_disjointness():
         _, _, plan = _plan(_with_output, (x, out))
         assert plan is not None
         with patch(
-            "helion._compiler.cute.register_region.runtime_tensors_are_proven_disjoint",
+            "helion._compiler.cute.register_region.tensors_have_proven_disjoint_storage",
             return_value=False,
-        ):
+        ) as disjoint:
             _, _, rejected = _plan(_with_output, (x, out))
+        disjoint.assert_called()
         assert rejected is None
 
 

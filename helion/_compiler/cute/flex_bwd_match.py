@@ -53,9 +53,9 @@ from typing import cast
 import torch
 
 from ..inductor_lowering import prepare_added_node_lowering
+from ..utils import is_full_slice
 from .analysis.match_common import host_tensor_name as _host_tensor_name
 from .analysis.match_common import is_call as _is_call
-from .analysis.match_common import is_full_slice as _is_full_slice
 from .analysis.match_common import strip_new_var as _strip_new_var
 from .analysis.match_common import unit_fixed_block as _unit_fixed_block
 from .flex_match import FLEX_KV_BLOCK
@@ -683,7 +683,7 @@ def _match_root(
             or not ctx.unit_axis_index(indices[0], ctx.b_id)
             or not ctx.unit_axis_index(indices[1], ctx.hk_id)
             or ctx.block_symnode_id(indices[2]) != ctx.m_id
-            or not _is_full_slice(indices[3])
+            or not is_full_slice(indices[3])
         ):
             ctx.decline("flex_bwd: K/V load is not key[b, hk, tile_n, :]")
             return None
@@ -737,7 +737,7 @@ def _match_root(
             and ctx.block_symnode_id(index[0]) == ctx.b_id
             and ctx.block_symnode_id(index[1]) == ctx.hk_id
             and ctx.block_symnode_id(index[2]) == ctx.m_id
-            and _is_full_slice(index[3])
+            and is_full_slice(index[3])
         ):
             ctx.decline("flex_bwd: dK/dV store is not out[tile_b, tile_hk, tile_n, :]")
             return None
@@ -1043,7 +1043,7 @@ def _match_inner_body(
             or not ctx.unit_axis_index(indices[0], ctx.b_id)
             or not ctx.unit_axis_index(indices[1], ctx.h_id)
             or ctx.block_symnode_id(indices[2]) != ctx.kv_id
-            or (ndim == 4 and not _is_full_slice(indices[3]))
+            or (ndim == 4 and not is_full_slice(indices[3]))
         ):
             return None
         return name, value
@@ -1170,7 +1170,7 @@ def _match_inner_body(
         or not ctx.unit_axis_index(index[0], ctx.b_id)
         or not ctx.unit_axis_index(index[1], ctx.h_id)
         or ctx.block_symnode_id(index[2]) != ctx.kv_id
-        or not _is_full_slice(index[3])
+        or not is_full_slice(index[3])
     ):
         ctx.decline(
             "flex_bwd: the dQ atomic is not atomic_add(dq, [b, h, tile_m, :], ...)"
@@ -1249,7 +1249,7 @@ def _match_inner_body(
 def _permute_is_transpose(node: object) -> bool:
     if _is_call(node, _aten.permute.default):
         assert isinstance(node, torch.fx.Node)
-        return bool(node.args[1] == [1, 0])
+        return bool(isinstance(node.args[1], list) and node.args[1] == [1, 0])
     if _is_call(node, _aten.transpose.int):
         assert isinstance(node, torch.fx.Node)
         return tuple(node.args[1:3]) in ((0, 1), (1, 0))

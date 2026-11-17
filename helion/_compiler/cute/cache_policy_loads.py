@@ -11,7 +11,9 @@ as a call to the inline-PTX helpers of ``l2_policy.py`` /
 packet load's call shape, ``NAME(PTR, ir.VectorType.get([V], ELEM.mlir_type))``,
 one helper per packet width (``CachePolicy.vector_helper``; the 32-byte row
 of the L2 policies -- the 256-bit ``.v8.b32`` load, SM100+ PTX -- only behind
-the ``cute_wide_packet_hints`` config knob, ``hint_wide_packets``).
+the ``cute_wide_packet_hints`` config knob, ``hint_wide_packets``).  The
+predicated packet loads of ``masked_packet_load`` take the hint as their
+priority argument instead (``CachePolicy.masked_priority``), at every width.
 
 The load lowering threads the hint through its load-site facts
 (``CuteScalarLoadSite``, ``CuteVloopLoadFact``, the persistent branch-vec
@@ -41,6 +43,8 @@ from typing import ClassVar
 
 import torch
 
+from ... import exc
+from .cache_hint_forms import L1_PRIORITY_QUALIFIERS
 from .cutedsl_compat import readonly_packet_load_supported
 
 if TYPE_CHECKING:
@@ -223,10 +227,20 @@ class CachePolicy:
 
     @classmethod
     def explicit(cls, eviction_policy: str) -> CachePolicy:
-        """The hint of an explicit ``hl.load(..., eviction_policy=...)``: the
-        spelling is forwarded as the L1 priority; "" is no hint."""
+        """The hint of an explicit ``hl.load(..., eviction_policy=...)``: an
+        L1 eviction priority (``L1_PRIORITY_QUALIFIERS``), forwarded as the
+        L1 priority; "" is no hint.  Any other spelling is refused: the
+        predicated packet loads take an L2 policy family's name in the same
+        argument, so ``nc_l2_first`` would load noncoherently with no check
+        that the kernel never writes the source."""
         if not eviction_policy:
             return cls.NONE
+        if eviction_policy not in L1_PRIORITY_QUALIFIERS:
+            raise exc.BackendUnsupported(
+                "cute",
+                f"hl.load(..., eviction_policy={eviction_policy!r}): a CuTe load "
+                f"takes an L1 eviction priority ({', '.join(L1_PRIORITY_QUALIFIERS)})",
+            )
         return cls(l1_priority=eviction_policy)
 
     @classmethod
@@ -326,8 +340,12 @@ class CachePolicy:
     @property
     def masked_priority(self) -> str:
         """The priority argument of the predicated packet loads
-        (``_cute_load_vNb_if``): the L1 priority, ``cs`` for streaming, ""
-        otherwise (the L2 helper families have no predicated form)."""
+        (``_cute_load_vNb_if``): the L2 helper family (the predicated loads
+        carry its ``createpolicy`` descriptor, at every width, 32 and 64
+        bytes too without ``cute_wide_packet_hints``), the L1 priority,
+        ``cs`` for streaming, "" otherwise."""
+        if self.l2_helper:
+            return self.l2_helper
         if self.l1_priority:
             return self.l1_priority
         if self.streaming:

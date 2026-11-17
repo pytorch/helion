@@ -29,6 +29,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 import torch
 
 from . import cutedsl_compat
+from .cache_hint_forms import L2_POLICY_FORMS
 from .cutedsl_compat import L2_EVICT_LAST_STORE_ABI_VERSION
 
 if TYPE_CHECKING:
@@ -54,11 +55,12 @@ def _vector_suffix(words: int) -> str:
     return f".v{words}.b32" if words > 1 else ".b32"
 
 
-def _policy_assembly(words: int, policy: str, *, l1: bool) -> str:
+def _policy_assembly(words: int, family: str) -> str:
     """``createpolicy.fractional.L2::<policy>`` + a cache-hinted load of
     ``words`` 32-bit words (32, 16, 8 or 4 bytes; the 32-byte ``.v8`` form
-    is SM100+ PTX), with the matching L1 eviction priority under ``l1``."""
-    level1 = f".L1::{policy}" if l1 else ""
+    is SM100+ PTX) in the form of the L2 cache-policy ``family``
+    (``L2_POLICY_FORMS``: its descriptor's policy and its L1 qualifier)."""
+    level1, policy = L2_POLICY_FORMS[family]
     return (
         "{\n"
         ".reg .b64 pol;\n"
@@ -183,14 +185,12 @@ def _load_vector_with_policy(
     return _vector_dialect.bitcast(vec_type, v4, loc=loc, ip=ip)
 
 
-def _policy_load(
-    name: str, words: int, policy: str, *, l1: bool = False
-) -> Callable[..., ir.Value]:
+def _policy_load(name: str, words: int, family: str) -> Callable[..., ir.Value]:
     """The ``@dsl_user_op`` loading one ``words``-word packet (``4 * words``
-    bytes) under the L2 ``policy`` (``evict_last`` / ``evict_first``) and,
-    under ``l1``, the matching L1 eviction priority, bitcast to the requested
-    vector type."""
-    assembly = _policy_assembly(words, policy, l1=l1)
+    bytes) with the hint of the L2 cache-policy ``family`` (``l2_last``,
+    ``l1_l2_first`` or ``l1_l2_last``), bitcast to the requested vector
+    type."""
+    assembly = _policy_assembly(words, family)
 
     def load(
         ptr: object,
@@ -204,44 +204,34 @@ def _policy_load(
         )
 
     load.__name__ = load.__qualname__ = name
-    load.__doc__ = f"{4 * words}-byte vector load with an L2 ``{policy}`` hint" + (
-        " and the matching L1 eviction priority." if l1 else "."
-    )
+    load.__doc__ = f"{4 * words}-byte vector load with the ``{family}`` cache hint."
     return dsl_user_op(load)
 
 
-load_v4b_l2_evict_last = _policy_load("load_v4b_l2_evict_last", 1, "evict_last")
+load_v4b_l2_evict_last = _policy_load("load_v4b_l2_evict_last", 1, "l2_last")
 load_v4b_l1_l2_evict_first = _policy_load(
-    "load_v4b_l1_l2_evict_first", 1, "evict_first", l1=True
+    "load_v4b_l1_l2_evict_first", 1, "l1_l2_first"
 )
-load_v4b_l1_l2_evict_last = _policy_load(
-    "load_v4b_l1_l2_evict_last", 1, "evict_last", l1=True
-)
-load_v8b_l2_evict_last = _policy_load("load_v8b_l2_evict_last", 2, "evict_last")
+load_v4b_l1_l2_evict_last = _policy_load("load_v4b_l1_l2_evict_last", 1, "l1_l2_last")
+load_v8b_l2_evict_last = _policy_load("load_v8b_l2_evict_last", 2, "l2_last")
 load_v8b_l1_l2_evict_first = _policy_load(
-    "load_v8b_l1_l2_evict_first", 2, "evict_first", l1=True
+    "load_v8b_l1_l2_evict_first", 2, "l1_l2_first"
 )
-load_v8b_l1_l2_evict_last = _policy_load(
-    "load_v8b_l1_l2_evict_last", 2, "evict_last", l1=True
-)
-load_v16b_l2_evict_last = _policy_load("load_v16b_l2_evict_last", 4, "evict_last")
+load_v8b_l1_l2_evict_last = _policy_load("load_v8b_l1_l2_evict_last", 2, "l1_l2_last")
+load_v16b_l2_evict_last = _policy_load("load_v16b_l2_evict_last", 4, "l2_last")
 load_v16b_l1_l2_evict_first = _policy_load(
-    "load_v16b_l1_l2_evict_first", 4, "evict_first", l1=True
+    "load_v16b_l1_l2_evict_first", 4, "l1_l2_first"
 )
-load_v16b_l1_l2_evict_last = _policy_load(
-    "load_v16b_l1_l2_evict_last", 4, "evict_last", l1=True
-)
+load_v16b_l1_l2_evict_last = _policy_load("load_v16b_l1_l2_evict_last", 4, "l1_l2_last")
 # 32-byte packets (``cute_vector_widths`` 8 fp32 / 16 bf16-fp16 on SM100+):
 # one ``ld.global...v8.b32`` carrying the same policies as the 16-byte forms.
 # Rendered only under the ``cute_wide_packet_hints`` config knob
 # (``cache_policy_loads.hint_wide_packets``).
-load_v32b_l2_evict_last = _policy_load("load_v32b_l2_evict_last", 8, "evict_last")
+load_v32b_l2_evict_last = _policy_load("load_v32b_l2_evict_last", 8, "l2_last")
 load_v32b_l1_l2_evict_first = _policy_load(
-    "load_v32b_l1_l2_evict_first", 8, "evict_first", l1=True
+    "load_v32b_l1_l2_evict_first", 8, "l1_l2_first"
 )
-load_v32b_l1_l2_evict_last = _policy_load(
-    "load_v32b_l1_l2_evict_last", 8, "evict_last", l1=True
-)
+load_v32b_l1_l2_evict_last = _policy_load("load_v32b_l1_l2_evict_last", 8, "l1_l2_last")
 
 
 def _store_u32x4_l2_evict_last(ptr: object, values: list[object]) -> None:

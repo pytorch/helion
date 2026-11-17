@@ -24,12 +24,12 @@ from .... import exc
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_extension import statement_from_string
-from ...ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
-from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from .._ast_pass_utils import _is_proven_relocatable_call
+from .._ast_pass_utils import deep_clone
 from ..persistent_branch_vec import PACKET_STORE_BYTES
 from ..thread_budget import MAX_THREADS_PER_BLOCK
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
+from .markers import _int_literal
 from .markers import _is_lane_reduce_marker_assign
 from .markers import _LaneReduceMarker
 
@@ -212,30 +212,6 @@ def _lane_reduction_owner_exprs_for_statement(
     return list(dict.fromkeys(owner_exprs))
 
 
-def _literal_int_expr(node: ast.AST) -> int | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, int):
-        return node.value
-    if isinstance(node, ast.UnaryOp):
-        value = _literal_int_expr(node.operand)
-        if value is None:
-            return None
-        if isinstance(node.op, ast.USub):
-            return -value
-        if isinstance(node.op, ast.UAdd):
-            return value
-    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
-        is_builtin_int = isinstance(node.func, ast.Name) and node.func.id == "int"
-        is_cutlass_int = (
-            isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-            and node.func.value.id == "cutlass"
-            and node.func.attr in ("Int32", "Int64")
-        )
-        if is_builtin_int or is_cutlass_int:
-            return _literal_int_expr(node.args[0])
-    return None
-
-
 def _lane_reduce_owner_expr(
     marker: _LaneReduceMarker,
     store_axes: _StoreThreadAxes | None = None,
@@ -281,12 +257,15 @@ def _lane_reduce_axis(marker: _LaneReduceMarker) -> int | None:
     return None
 
 
-def _linear_thread_axis_strides(expr: str) -> dict[int, int] | None:
+def _linear_thread_axis_strides(expr: str | ast.expr) -> dict[int, int] | None:
     """Recover ``thread_idx`` coefficients from a flattened lane expression."""
-    try:
-        root = ast.parse(expr, mode="eval").body
-    except SyntaxError:
-        return None
+    if isinstance(expr, str):
+        try:
+            root = ast.parse(expr, mode="eval").body
+        except SyntaxError:
+            return None
+    else:
+        root = expr
 
     def merge(
         left: tuple[dict[int, int], int],
@@ -371,29 +350,58 @@ def _contains_sync_threads(stmt: ast.AST) -> bool:
     )
 
 
-def _memory_write_calls(stmt: ast.AST) -> list[ast.Call]:
-    helper_stores = {*PACKET_STORE_BYTES, "_helion_persistent_branch_vec_store"}
-    helper_atomics = {
+# Atomic helpers generated code calls by bare name, each taking the pointer
+# first as ``cute.arch``'s atomics do: the float max / min emulated with
+# integer atomics (``cute/atomic_helpers.py``) and the warp-aggregated ticket
+# fetch-add (``cute/warp_atomic_runtime.py``).  Their names start with
+# ``_cute_atomic_`` and the vector flushes' below with ``_cute_red_``, the
+# prefixes by which ``fuse_two_pass_loads._is_store_call`` (the write check of
+# the lane split and of the passes that move loads) recognizes them as writes.
+_ATOMIC_HELPERS = frozenset(
+    {
         "_cute_atomic_max_float32",
         "_cute_atomic_min_float32",
-        "_cute_red_add_f32_vec",
+        "_cute_atomic_warp_fetch_add_int32",
     }
+)
+# The relaxed ``red.global.add`` flush of a vectorized atomic site
+# (``cute/atomic_ops.py``), one packet of consecutive f32, f16 or bf16
+# elements: a bare-name atomic taking the pointer first, too.
+_VECTOR_ATOMIC_HELPERS = frozenset(
+    {"_cute_red_add_f32_vec", "_cute_red_add_f16_vec", "_cute_red_add_bf16_vec"}
+)
+_HELPER_STORES = frozenset({*PACKET_STORE_BYTES, "_helion_persistent_branch_vec_store"})
+
+
+def _is_atomic_helper(name: str) -> bool:
+    """Whether a call of the bare name ``name`` is an atomic read-modify-write."""
+    return (
+        name.startswith("atomic_")
+        or name in _ATOMIC_HELPERS
+        or name in _VECTOR_ATOMIC_HELPERS
+    )
+
+
+def _is_atomic_call(call: ast.Call) -> bool:
+    """``cute.arch.atomic_*``, a pointer's ``atomic_*`` method or an atomic
+    called by bare name (``_is_atomic_helper``)."""
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr.startswith("atomic_")
+    return isinstance(func, ast.Name) and _is_atomic_helper(func.id)
+
+
+def _memory_write_calls(stmt: ast.AST) -> list[ast.Call]:
     result: list[ast.Call] = []
     for node in ast.walk(stmt):
         if not isinstance(node, ast.Call):
             continue
         if (
-            isinstance(node.func, ast.Attribute)
-            and (
-                node.func.attr in ("store", "__setitem__")
-                or node.func.attr.startswith("atomic_")
-            )
+            _is_atomic_call(node)
+            or isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("store", "__setitem__")
             or isinstance(node.func, ast.Name)
-            and (
-                node.func.id in helper_stores
-                or node.func.id in helper_atomics
-                or node.func.id.startswith("atomic_")
-            )
+            and node.func.id in _HELPER_STORES
         ):
             result.append(node)
     return result
@@ -423,16 +431,10 @@ def _is_vector_flush_store(call: ast.Call) -> bool:
 
 
 def _atomic_pointer_and_value(call: ast.Call) -> tuple[ast.AST, ast.AST] | None:
-    if isinstance(call.func, ast.Name) and (
-        call.func.id.startswith("atomic_")
-        or call.func.id
-        in (
-            "_cute_atomic_max_float32",
-            "_cute_atomic_min_float32",
-            "_cute_red_add_f32_vec",
+    if isinstance(call.func, ast.Name):
+        return (
+            _pointer_first_operands(call) if _is_atomic_helper(call.func.id) else None
         )
-    ):
-        return (call.args[0], call.args[1]) if len(call.args) >= 2 else None
     if not (
         isinstance(call.func, ast.Attribute) and call.func.attr.startswith("atomic_")
     ):
@@ -440,16 +442,21 @@ def _atomic_pointer_and_value(call: ast.Call) -> tuple[ast.AST, ast.AST] | None:
     # ``cute.arch.atomic_add(ptr, value)`` carries its pointer as the first
     # argument; pointer-method atomics carry it in the callee receiver.
     if ast.unparse(call.func.value) == "cute.arch":
-        if len(call.args) >= 2:
-            return (call.args[0], call.args[1])
-        # The emitted form spells the operand by its parameter name,
-        # ``cute.arch.atomic_add(ptr, val=value, sem='relaxed')``; a
-        # compare-and-swap carries two operands and is not a plain update.
-        values = [keyword.value for keyword in call.keywords if keyword.arg != "sem"]
-        if len(call.args) == 1 and len(values) == 1:
-            return (call.args[0], values[0])
-        return None
+        return _pointer_first_operands(call)
     return (call.func.value, call.args[0]) if call.args else None
+
+
+def _pointer_first_operands(call: ast.Call) -> tuple[ast.AST, ast.AST] | None:
+    """The pointer and the operand of an atomic taking the pointer first."""
+    if len(call.args) >= 2:
+        return (call.args[0], call.args[1])
+    # The emitted form spells the operand by its parameter name,
+    # ``cute.arch.atomic_add(ptr, val=value, sem='relaxed')``; a
+    # compare-and-swap carries two operands and is not a plain update.
+    values = [keyword.value for keyword in call.keywords if keyword.arg != "sem"]
+    if len(call.args) == 1 and len(values) == 1:
+        return (call.args[0], values[0])
+    return None
 
 
 def _is_isolated_store_statement(stmt: ast.AST, store: ast.Call) -> bool:
@@ -509,8 +516,8 @@ def _uniquely_predicated_thread_axes(predicate: ast.AST) -> set[int]:
         return set()
     lhs_axis = _direct_thread_coordinate(predicate.left)
     rhs_axis = _direct_thread_coordinate(predicate.comparators[0])
-    lhs_literal = _literal_int_expr(predicate.left)
-    rhs_literal = _literal_int_expr(predicate.comparators[0])
+    lhs_literal = _int_literal(predicate.left)
+    rhs_literal = _int_literal(predicate.comparators[0])
     if lhs_axis is not None and rhs_literal is not None:
         return {lhs_axis}
     if rhs_axis is not None and lhs_literal is not None:
@@ -616,8 +623,8 @@ def _thread_axis_linear_coefficient(
         if isinstance(node.op, ast.Sub):
             return left - right
         if isinstance(node.op, ast.Mult):
-            left_literal = _literal_int_expr(node.left)
-            right_literal = _literal_int_expr(node.right)
+            left_literal = _int_literal(node.left)
+            right_literal = _int_literal(node.right)
             if left_literal is not None:
                 return left_literal * right
             if right_literal is not None:
@@ -821,7 +828,7 @@ def _predicate_accepts_zero_thread_axis(
         return False
     lhs = _resolve_scalar_definition(predicate.left, scalar_definitions)
     rhs = _resolve_scalar_definition(predicate.comparators[0], scalar_definitions)
-    literal_end = _literal_int_expr(rhs)
+    literal_end = _int_literal(rhs)
     bounded_coordinate = (
         literal_end is not None
         and 0 < literal_end < 2**31
@@ -1067,12 +1074,17 @@ def _thread_axis_owner_exprs(
 
 
 def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
+    """A copy of ``stmt`` that runs only where every predicate holds (an
+    unguarded copy for none)."""
     if not predicates:
-        return stmt
+        return deep_clone(stmt)
     store = _validated_owner_store(stmt)
     if store is None:
         raise exc.BackendUnsupported("cute", "owner predicate requires one store")
     predicate = " and ".join(f"({expr})" for expr in dict.fromkeys(predicates))
+    # The guarded copy keeps the statement's markers and source location
+    # (``deep_clone``), as the lane split's other copies do.
+    guarded = deep_clone(stmt)
     if _is_persistent_branch_vec_store(store):
         mask = store.args[5]
         mask_source = (
@@ -1080,29 +1092,49 @@ def _guard_stmt_with_owner(stmt: ast.AST, predicates: list[str]) -> ast.AST:
             if isinstance(mask, ast.Constant) and mask.value is None
             else ast.unparse(mask)
         )
-        guarded = _clone_stmt(stmt)
-        assert isinstance(guarded, ast.Expr)
-        guarded_store = cast("ast.Call", guarded.value)
+        # The copy's own store, which may sit under an ``if``
+        # (``_is_isolated_store_statement``).
+        guarded_store = _validated_owner_store(guarded)
+        assert guarded_store is not None
         guarded_mask = expr_from_string(
             predicate if mask_source is None else f"({mask_source}) and ({predicate})"
         )
         assert isinstance(guarded_mask, ast.expr)
         guarded_store.args[5] = guarded_mask
         return guarded
-    return statement_from_string(
-        f"if {predicate}:\n"
-        + "\n".join(f"    {line}" for line in ast.unparse(stmt).splitlines())
-    )
+    branch = cast("ast.If", statement_from_string(f"if {predicate}:\n    pass"))
+    branch.body = [cast("ast.stmt", guarded)]
+    return branch
+
+
+def _has_impure_inline_asm(stmt: ast.AST) -> bool:
+    """Recognize opaque assembly even when its result is an unused assignment.
+
+    CuTe emits ``is_pure`` as a literal Boolean keyword. Inspect nested
+    expressions too: a pure outer call does not make an impure argument pure.
+    """
+    for node in ast.walk(stmt):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_cute_inline_asm_elementwise"
+        ):
+            continue
+        purity = next(kw.value for kw in node.keywords if kw.arg == "is_pure")
+        assert isinstance(purity, ast.Constant) and type(purity.value) is bool
+        if not purity.value:
+            return True
+    return False
 
 
 def _has_side_effect(stmt: ast.AST) -> bool:
     """Return True when ``stmt`` produces an observable side effect (a store,
-    an in-place / atomic write, or any non-plain-assignment statement such as
+    an in-place / atomic write, impure assembly, or any non-plain-assignment such as
     an ``if mask: tensor[...].store(...)``)."""
-    from ...ast_read_writes import ReadWrites
-
     if isinstance(stmt, ast.Assign):
-        return bool(ReadWrites.from_ast(stmt).inplace_writes)
+        # An atomic whose old value is bound to a name writes memory too
+        # (``old = cute.arch.atomic_add(...)``).
+        return _has_observable_memory_write(stmt) or _has_impure_inline_asm(stmt)
     # Conservatively treat structured / expression statements as
     # side-effecting (store calls live inside ``if`` blocks / bare exprs).
     return True
@@ -1115,36 +1147,6 @@ def _has_observable_memory_write(stmt: ast.AST) -> bool:
     if ReadWrites.from_ast(stmt).inplace_writes:
         return True
     return bool(_memory_write_calls(stmt))
-
-
-def _clone_stmt(stmt: ast.AST) -> ast.AST:
-    """Return an independent copy of ``stmt`` via unparse + reparse.
-
-    ``interchange_lane_outside_serial_reductions`` emits two loop nests that
-    both re-run the shared (side-effect-free) producers. Splicing the same node
-    objects into two places in the tree breaks AST walking, so each reused
-    statement is rebuilt from its source text into a fresh ExtendedAST node.
-    The atomics keep the lane loops they are uniform along
-    (``HELION_ATOMIC_UNIFORM_LANES_ATTR``) and the lane loops inside keep
-    their lane variable (``HELION_LANE_LOOP_VAR_ATTR``) for the pins of
-    ``pin_atomics_left_in_lane_loops``.
-    """
-    clone = statement_from_string(ast.unparse(stmt))
-    for kind, attr in (
-        (ast.Call, HELION_ATOMIC_UNIFORM_LANES_ATTR),
-        (ast.For, HELION_LANE_LOOP_VAR_ATTR),
-    ):
-        copies = [node for node in ast.walk(clone) if isinstance(node, kind)]
-        originals = [node for node in ast.walk(stmt) if isinstance(node, kind)]
-        for original, copy in zip(originals, copies, strict=True):
-            value = getattr(original, attr, None)
-            if value is not None:
-                setattr(copy, attr, value)
-    return clone
-
-
-def _clone_expr(node: ast.AST) -> ast.AST:
-    return expr_from_string(ast.unparse(node))
 
 
 def _validated_idempotent_store(stmt: ast.AST) -> ast.Call | None:

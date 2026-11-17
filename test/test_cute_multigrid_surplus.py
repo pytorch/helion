@@ -4,6 +4,7 @@ import ast
 import operator
 import re
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 import torch
@@ -15,6 +16,9 @@ import helion
 from helion import exc
 from helion._testing import DEVICE
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
@@ -69,6 +73,35 @@ def _row_sums_and_row_maxes(
     for tile in hl.tile(y.size(0)):
         maxes[tile] = y[tile, :].amax(-1)
     return sums, maxes
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _row_sums_barrier_row_maxes(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    sums = torch.empty([x.size(0)], device=x.device)
+    maxes = torch.empty([y.size(0)], device=y.device)
+    for tile in hl.tile(x.size(0)):
+        sums[tile] = x[tile, :].sum(-1)
+    hl.barrier()
+    for tile in hl.tile(y.size(0)):
+        maxes[tile] = y[tile, :].amax(-1)
+    return sums, maxes
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _center_rows_then_row_maxes(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    out = torch.empty_like(x)
+    maxes = torch.empty([y.size(0)], device=y.device)
+    for tile_m in hl.tile(x.size(0)):
+        mean = torch.mean(x[tile_m, :], dim=-1)
+        for tile_n in hl.tile(x.size(1)):
+            out[tile_m, tile_n] = x[tile_m, tile_n] - mean[:, None]
+    for tile in hl.tile(y.size(0)):
+        maxes[tile] = y[tile, :].amax(-1)
+    return out, maxes
 
 
 def _config(
@@ -403,23 +436,6 @@ def test_multigrid_no_lane_root_keeps_coordinate_setup(reverse, tail, wide_first
     torch.testing.assert_close((x, y), before, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    ("x_shape", "y_shape"), [((16, 8), (8, 40)), ((64, 32), (32, 16))]
-)
-def test_reduction_narrower_than_the_shared_launch_is_rejected(
-    x_shape: tuple[int, int], y_shape: tuple[int, int]
-) -> None:
-    # Each root reduces its rows over its own lane count, but the roots share
-    # the widest launch: the narrower reduction's surplus lanes read past its
-    # row, reduce among themselves and race the row's result.
-    with pytest.raises(exc.BackendUnsupported, match="surplus lanes"):
-        _code(
-            _row_sums_and_row_maxes,
-            (torch.empty(x_shape), torch.empty(y_shape)),
-            helion.Config(block_sizes=[1, 1]),
-        )
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_reductions_spanning_the_shared_launch_run() -> None:
     x = torch.randn(64, 32, device=DEVICE)
@@ -429,4 +445,64 @@ def test_reductions_spanning_the_shared_launch_run() -> None:
     )
     sums, maxes = run(x, y)
     torch.testing.assert_close(sums, x.sum(-1), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(maxes, y.amax(-1))
+
+
+def _row_sums(x: torch.Tensor) -> torch.Tensor:
+    return x.sum(-1)
+
+
+def _centered_rows(x: torch.Tensor) -> torch.Tensor:
+    return x - x.mean(-1, keepdim=True)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    ("kernel", "x_shape", "y_shape", "values", "reference"),
+    [
+        # The 40-wide max takes the 8-wide sum's eight threads.
+        (_row_sums_and_row_maxes, (16, 8), (8, 40), {}, _row_sums),
+        # A rolled 65536-wide max on the 512 threads of a persistent sum.
+        (
+            _row_sums_and_row_maxes,
+            (64, 512),
+            (64, 65536),
+            {"reduction_loops": [None, 4096]},
+            _row_sums,
+        ),
+        # Two rolled reductions around an hl.barrier(), 1024 threads each.
+        (
+            _row_sums_barrier_row_maxes,
+            (64, 8192),
+            (64, 65536),
+            {"reduction_loops": [4096, 4096]},
+            _row_sums,
+        ),
+        # The max runs on the sum's 64 threads beside the first root's
+        # 16-thread loop, repeated on that loop's axis.
+        (
+            _center_rows_then_row_maxes,
+            (64, 8192),
+            (64, 65536),
+            {"block_sizes": [1, 16, 1], "reduction_loops": [4096, 4096]},
+            _centered_rows,
+        ),
+    ],
+)
+def test_reduction_of_another_root_runs_on_the_shared_launch(
+    kernel: helion.Kernel,
+    x_shape: tuple[int, int],
+    y_shape: tuple[int, int],
+    values: dict[str, object],
+    reference: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    # The second root's reduction no longer divides its threads with the
+    # first root's strategies (test_cute_multigrid_reduction_threads.py).
+    x = torch.randn(x_shape, device=DEVICE)
+    y = torch.randn(y_shape, device=DEVICE)
+    run = kernel._bind_isolated((x, y)).compile_config(
+        helion.Config(**{"block_sizes": [1, 1], **values})
+    )
+    first, maxes = run(x, y)
+    torch.testing.assert_close(first, reference(x), rtol=1e-4, atol=1e-3)
     torch.testing.assert_close(maxes, y.amax(-1))

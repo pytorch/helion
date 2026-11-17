@@ -122,6 +122,34 @@ def _fp8_gemv_1dgrid_kernel(
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True)
+def _masked_double(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.shape):
+        out[tile_m, tile_n] = torch.where(
+            mask[tile_m, tile_n], x[tile_m, tile_n] * 2.0, 0.0
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _scale_columns(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile(x.shape):
+        scaled = x[tile_m, tile_n].float() * w[tile_n].float()[None, :]
+        out[tile_m, tile_n] = scaled.to(x.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _bool_and_to_float(m: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(m.shape, dtype=torch.float32, device=m.device)
+    for tile_m, tile_n in hl.tile(m.shape):
+        both = torch.logical_and(m[tile_m, tile_n], n[tile_m, tile_n])
+        out[tile_m, tile_n] = both.float() + m[tile_m, tile_n].float()
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteTileLoopVecHoist(TestCase):
     def test_vec_hoist_fires_at_v4_fp16(self) -> None:
@@ -189,6 +217,22 @@ class TestCuteTileLoopVecHoist(TestCase):
         torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
         self.assertIn("ir.VectorType.get([4]", code)
         self.assertIn("cutlass.BFloat16", code)
+
+    def test_vec_hoist_bool_mask_byte_packet(self) -> None:
+        """A bool mask loads as one integer of V bytes per lane, each element
+        a byte compared against zero."""
+        x = torch.randn(64, 1024, device=DEVICE, dtype=torch.bfloat16)
+        mask = torch.rand(64, 1024, device=DEVICE) > 0.5
+        code, out = code_and_output(
+            _masked_double,
+            (x, mask),
+            block_sizes=[1, 1024],
+            num_threads=[1, 128],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("cutlass.Uint64)", code)
+        self.assertIn("& 255) != cutlass.Uint8(0)", code)
+        torch.testing.assert_close(out, torch.where(mask, x * 2.0, 0.0), rtol=0, atol=0)
 
     def test_vec_hoist_fp8_matmul_both_operands(self) -> None:
         """fp8 matmul operands must vectorize through the tile-loop hoist as
@@ -362,6 +406,46 @@ class TestCuteTileLoopVecHoist(TestCase):
         self.assertIn("_cute_store_u16_vec(", code)
         # No scalar per-element store of the output remains.
         self.assertNotIn(").store(cutlass.", code)
+
+    def test_store_only_packet_lanes_skip_the_select(self) -> None:
+        """Loads that reach only stores of their own tiles skip the zero of
+        their masked-off packet lanes (``store_only_loads``): the 1024-wide
+        tile over 1000 columns renders no select, and the exact comparison
+        with the eager result checks what it stores."""
+        x = torch.randn(64, 1000, device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn(1000, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            _scale_columns,
+            (x, w),
+            block_sizes=[1, 1024],
+            num_threads=[0, 128],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("_tile_unroll_vec_", code)
+        self.assertNotIn("else cutlass.BFloat16(0)", code)
+        expected = (x.float() * w.float()).to(torch.bfloat16)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+    def test_store_only_bool_packet_lanes_compare_their_bytes(self) -> None:
+        """A store-only bool packet drops its select but not its compare
+        against zero: bytes 2 and 255 (a uint8 tensor viewed as bool) read
+        as True, so ``&`` and ``.float()`` see what the scalar load gives."""
+        torch.manual_seed(0)
+        values = torch.tensor([0, 1, 2, 255], dtype=torch.uint8, device=DEVICE)
+        m_bytes = values[torch.randint(0, 4, (64, 1000), device=DEVICE)]
+        n_bytes = values[torch.randint(0, 4, (64, 1000), device=DEVICE)]
+        code, out = code_and_output(
+            _bool_and_to_float,
+            (m_bytes.view(torch.bool), n_bytes.view(torch.bool)),
+            block_sizes=[1, 1024],
+            num_threads=[0, 128],
+            cute_vector_widths=[1, 8],
+        )
+        self.assertIn("_tile_unroll_vec_", code)
+        self.assertNotIn("else cutlass.Boolean(0)", code)
+        m_true, n_true = m_bytes != 0, n_bytes != 0
+        expected = (m_true & n_true).float() + m_true.float()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
     def test_scalar_store_when_vec_width_is_one(self) -> None:
         """When V=1 the vec store must NOT fire — scalar stores remain."""

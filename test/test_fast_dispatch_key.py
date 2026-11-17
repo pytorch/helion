@@ -22,17 +22,20 @@ These tests pin down:
 7. A prepared call's extra guards (``_partition_prepared_extra_guards``) drop
    the same extractors, looking through omitted-default aliases.
 
-The key is pure argument-metadata bookkeeping, so it needs no compilation and
-runs on CPU-only bots.
+The key checks run on CPU. Fragment integration tests also bind kernels and
+render generated source under a CPU target; callable-default checks inspect
+traced device graphs. None compile or launch GPU code.
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import enum
 import gc
 import importlib
 import operator
+import struct
 import types
 from typing import TYPE_CHECKING
 from typing import NamedTuple
@@ -56,6 +59,14 @@ from helion._compiler.compile_environment import (
 from helion._compiler.cute.grouped_static_tail import make_tail_extractor
 from helion._compiler.cute.runtime_hooks import _CuteReductionExtent
 from helion._compiler.cute.runtime_hooks import _CuteReductionExtentExtractor
+from helion._testing import cpu_render_target
+from helion._testing import onlyBackends
+from helion.autotuner import EnumFragment
+from helion.autotuner import IntegerFragment
+from helion.autotuner import LocalAutotuneCache
+from helion.autotuner.base_search import BaseSearch
+from helion.autotuner.config_fragment import BooleanFragment
+from helion.autotuner.config_fragment import NumThreadsFragment
 import helion.language as hl
 from helion.language.constexpr import ConstExpr
 from helion.runtime.kernel import PreparedMetadataSpecializationExtractor
@@ -78,6 +89,227 @@ if TYPE_CHECKING:
 kernel_module = importlib.import_module("helion.runtime.kernel")
 
 _MODULE_SCALE = 2
+
+
+@pytest.mark.parametrize("kind", ["tensor_list", "constexpr", "callable"])
+def test_fast_key_skips_fragment_walk_without_fragments(kind):
+    kernel = helion.kernel(lambda x, value: x)
+    tensor = torch.empty(3)
+
+    def scalar_default(x, scale=3):
+        return x * scale
+
+    values = {
+        "tensor_list": [tensor] * 64,
+        "constexpr": hl.constexpr(4),
+        "callable": scalar_default,
+    }
+    with patch.object(
+        kernel_module,
+        "_input_fragment_aliases",
+        side_effect=AssertionError("unexpected fragment walk"),
+    ):
+        assert kernel._fast_dispatch_key((tensor, values[kind])) is not None
+
+
+@pytest.mark.parametrize("kind", ["closure", "default", "keyword_default"])
+def test_callable_fast_key_keeps_fragment_alias_relationships(kind):
+    kernel = helion.kernel(lambda x, value: x)
+    tensor = torch.empty(3)
+
+    def args(shared):
+        first = BooleanFragment()
+        fragments = (first, first if shared else BooleanFragment())
+        if kind == "closure":
+            value = hl.constexpr(fragments)
+
+            def fn(x):
+                return x, value
+        elif kind == "default":
+
+            def fn(x, value=fragments):
+                return x, value
+        else:
+
+            def fn(x, *, value=fragments):
+                return x, value
+
+        return tensor, fn
+
+    same, distinct = args(True), args(False)
+    assert kernel._base_specialization_key(same) != kernel._base_specialization_key(
+        distinct
+    )
+    first = kernel._fast_dispatch_key(same)
+    second = kernel._fast_dispatch_key(distinct)
+    assert first is not None and second is not None and first != second
+    assert kernel._fast_dispatch_key(args(True)) == first
+    assert kernel._fast_dispatch_key(args(False)) == second
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_callable_float_defaults_preserve_signed_zero_in_cached_programs(nested):
+    @helion.kernel(autotune_effort="none")
+    def apply_default(x, fn):
+        out = torch.empty_like(x)
+        for tile in hl.tile(x.numel()):
+            out[tile] = fn(x[tile])
+        return out
+
+    def with_default(bias):
+        if nested:
+
+            def fn(value, bias=(bias,)):
+                return value + bias[0]
+
+        else:
+
+            def fn(value, bias=bias):
+                return value + bias
+
+        return fn
+
+    def offsets(bound):
+        return [
+            node.args[1].hex()
+            for graph in bound.host_function.device_ir.graphs
+            for node in graph.graph.nodes
+            if node.target is torch.ops.aten.add.Tensor
+        ]
+
+    tensor = torch.empty(17)
+    positive, negative = with_default(0.0), with_default(-0.0)
+    with cpu_render_target():
+        first = apply_default.bind((tensor, positive))
+        second = apply_default.bind((tensor, negative))
+        fresh = helion.kernel(apply_default.fn, autotune_effort="none").bind(
+            (tensor, with_default(-0.0))
+        )
+        assert second is not first
+        assert offsets(first) == ["0x0.0p+0"]
+        assert offsets(second) == offsets(fresh) == ["-0x0.0p+0"]
+        assert apply_default.bind((tensor, with_default(0.0))) is first
+        assert apply_default.bind((tensor, with_default(-0.0))) is second
+        assert apply_default._fast_dispatch_key(
+            (tensor, positive)
+        ) != apply_default._fast_dispatch_key((tensor, negative))
+        guard = _make_prepared_arg_guard(apply_default, (tensor, positive))
+        assert guard((tensor, with_default(0.0)))
+        assert not guard((tensor, negative))
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_constexpr_bool_and_integer_bind_to_their_own_program(wrapped, nested):
+    def add_direct(x, scalar: hl.constexpr):
+        out = torch.empty_like(x, dtype=torch.int64)
+        for tile in hl.tile(x.numel()):
+            out[tile] = x[tile] + scalar
+        return out
+
+    def add_nested(x, scalar: hl.constexpr):
+        out = torch.empty_like(x, dtype=torch.int64)
+        for tile in hl.tile(x.numel()):
+            out[tile] = x[tile] + scalar[0][0]
+        return out
+
+    add = helion.kernel(add_nested if nested else add_direct, autotune_effort="none")
+    tensor = torch.ones(17, dtype=torch.bool)
+
+    def args(value):
+        if nested:
+            value = ((value,),)
+        return tensor, hl.constexpr(value) if wrapped else value
+
+    with cpu_render_target():
+        boolean = add.bind(args(True))
+        integer = add.bind(args(1))
+        assert boolean is not integer
+        assert add.bind(args(True)) is boolean
+        assert add.bind(args(1)) is integer
+        assert add._fast_dispatch_key(args(True)) != add._fast_dispatch_key(args(1))
+        for value, bound in ((True, boolean), (1, integer)):
+            additions = [
+                node
+                for graph in bound.host_function.device_ir.graphs
+                for node in graph.graph.nodes
+                if node.target is torch.ops.aten.add.Tensor
+            ]
+            assert len(additions) == 1
+            assert type(additions[0].args[1]) is type(value)
+            assert additions[0].args[1] == value
+            expected_dtype = torch.bool if type(value) is bool else torch.int64
+            assert additions[0].meta["val"].dtype == expected_dtype
+            ast.parse(bound.to_code())
+        assert boolean.to_code() != integer.to_code()
+        guard = _make_prepared_arg_guard(add, args(True))
+        assert guard(args(True))
+        assert not guard(args(1))
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_constexpr_float_binding_preserves_signed_zero(wrapped):
+    fn = _dynamic_add_scalar.fn if wrapped else _dynamic_add_constexpr.fn
+    kernel = helion.kernel(fn, autotune_effort="none")
+    tensor = torch.empty(17)
+
+    def args(value):
+        return tensor, hl.constexpr(value) if wrapped else value
+
+    with cpu_render_target():
+        positive = kernel.bind(args(0.0))
+        negative = kernel.bind(args(-0.0))
+        assert negative is not positive
+        for value, bound in ((0.0, positive), (-0.0, negative)):
+            offsets = [
+                node.args[1]
+                for graph in bound.host_function.device_ir.graphs
+                for node in graph.graph.nodes
+                if node.target is torch.ops.aten.add.Tensor
+            ]
+            assert [struct.pack("!d", offset) for offset in offsets] == [
+                struct.pack("!d", value)
+            ]
+            ast.parse(bound.to_code())
+            assert kernel.bind(args(value)) is bound
+        assert kernel._fast_dispatch_key(args(0.0)) != kernel._fast_dispatch_key(
+            args(-0.0)
+        )
+        guard = _make_prepared_arg_guard(kernel, args(0.0))
+        assert guard(args(0.0))
+        assert not guard(args(-0.0))
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_constexpr_float_keys_preserve_nan_payloads(wrapped):
+    fn = _dynamic_add_scalar.fn if wrapped else _dynamic_add_constexpr.fn
+    kernel = helion.kernel(fn, autotune_effort="none")
+    tensor = torch.empty(17)
+    payloads = ("7ff8000000000001", "7ff8000000000002", "fff8000000000001")
+
+    def args(payload):
+        value = struct.unpack("!d", bytes.fromhex(payload))[0]
+        return tensor, hl.constexpr(value) if wrapped else value
+
+    with cpu_render_target():
+        bounds = [kernel.bind(args(payload)) for payload in payloads]
+        assert len({id(bound) for bound in bounds}) == len(payloads)
+        for payload, bound in zip(payloads, bounds, strict=True):
+            assert kernel.bind(args(payload)) is bound
+            offsets = [
+                node.args[1]
+                for graph in bound.host_function.device_ir.graphs
+                for node in graph.graph.nodes
+                if node.target is torch.ops.aten.add.Tensor
+            ]
+            assert [struct.pack("!d", offset).hex() for offset in offsets] == [payload]
+        assert len({kernel._fast_dispatch_key(args(p)) for p in payloads}) == 3
+        with pytest.raises(TypeError, match="constexpr NaN"):
+            _make_prepared_arg_guard(kernel, args(payloads[0]))
 
 
 def _reads_module_global(t: torch.Tensor) -> torch.Tensor:
@@ -117,11 +349,127 @@ def _dynamic_add_constexpr(x: torch.Tensor, s: hl.constexpr) -> torch.Tensor:
 
 
 @helion.kernel(static_shapes=False)
+def _nested_constexpr_float(x: torch.Tensor, values: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + values[0][0]
+    return out
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_nested_constexpr_float_identity(wrapped):
+    kernel = helion.kernel(_nested_constexpr_float.fn, autotune_effort="none")
+    tensor = torch.empty(17)
+    payloads = (
+        "0000000000000000",
+        "8000000000000000",
+        "7ff8000000000001",
+        "fff8000000000002",
+    )
+
+    def args(payload):
+        value = ((struct.unpack("!d", bytes.fromhex(payload))[0],),)
+        return tensor, hl.constexpr(value) if wrapped else value
+
+    def observe_bound(bound, *call_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*call_args)
+
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        bounds = [kernel.bind(args(payload)) for payload in payloads]
+        assert len({id(bound) for bound in bounds}) == len(payloads)
+        for payload, bound in zip(payloads, bounds, strict=True):
+            offsets = [
+                node.args[1]
+                for graph in bound.host_function.device_ir.graphs
+                for node in graph.graph.nodes
+                if node.target is torch.ops.aten.add.Tensor
+            ]
+            assert [struct.pack("!d", offset).hex() for offset in offsets] == [payload]
+            assert kernel.bind(args(payload)) is bound
+        assert len({kernel._fast_dispatch_key(args(p)) for p in payloads}) == len(
+            payloads
+        )
+        guard = _make_prepared_arg_guard(kernel, args(payloads[0]))
+        assert guard(args(payloads[0]))
+        assert not guard(args(payloads[1]))
+        for payload, bound in zip(payloads[:2], bounds[:2], strict=True):
+            assert kernel(*args(payload)) is bound
+            assert kernel._prepared_call is not None
+            assert kernel._prepared_call.bound is bound
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            for payload, bound in zip(payloads[:2], bounds[:2], strict=True):
+                assert kernel(*args(payload)) is bound
+        for _ in range(2):
+            for payload, bound in zip(payloads[2:], bounds[2:], strict=True):
+                assert kernel(*args(payload)) is bound
+
+
+@helion.kernel(static_shapes=False)
 def _dynamic_add_scalar_list(x: torch.Tensor, values: list[int]) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = x[tile] + values[0]
     return out
+
+
+@onlyBackends(["triton", "cute"])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("float_first", [False, True])
+def test_nested_finite_constexpr_preserves_type_in_both_cache_orders(
+    wrapped, float_first
+):
+    kernel = helion.kernel(_nested_constexpr_float.fn, autotune_effort="none")
+    tensor = torch.empty(17, dtype=torch.int32)
+
+    def args(value):
+        nested = ((value,),)
+        return tensor, hl.constexpr(nested) if wrapped else nested
+
+    def observe_bound(bound, *call_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*call_args)
+
+    values = (1.0, 1) if float_first else (1, 1.0)
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        bounds = [kernel.bind(args(value)) for value in values]
+        assert bounds[0] is not bounds[1]
+        generated = []
+        for value, bound in zip(values, bounds, strict=True):
+            additions = [
+                node
+                for graph in bound.host_function.device_ir.graphs
+                for node in graph.graph.nodes
+                if node.target is torch.ops.aten.add.Tensor
+            ]
+            assert len(additions) == 1
+            assert type(additions[0].args[1]) is type(value)
+            assert additions[0].meta["val"].dtype == (
+                torch.float32 if type(value) is float else torch.int32
+            )
+            generated.append(bound.to_code())
+            assert kernel.bind(args(value)) is bound
+            guard = _make_prepared_arg_guard(kernel, args(value))
+            assert guard(args(value))
+            assert not guard(args(1 if type(value) is float else 1.0))
+        assert generated[0] != generated[1]
+        assert kernel._fast_dispatch_key(args(1)) != kernel._fast_dispatch_key(
+            args(1.0)
+        )
+        for value, bound in zip(values, bounds, strict=True):
+            assert kernel(*args(value)) is bound
+            assert kernel._prepared_call is not None
+            assert kernel._prepared_call.bound is bound
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            for value, bound in zip(values, bounds, strict=True):
+                assert kernel(*args(value)) is bound
 
 
 def _flatten_key(key: object):
@@ -979,7 +1327,7 @@ class TestFastDispatchKey(unittest.TestCase):
         scale_7_5 = _dynamic_add_scalar.specialization_key(
             (x, with_scale(closing_over(7.5)))
         )
-        self.assertIn((float, 7.5), list(_flatten_key(scale_7_5)))
+        self.assertIn((float, struct.pack("!d", 7.5)), list(_flatten_key(scale_7_5)))
         self.assertNotEqual(
             scale_7_5,
             _dynamic_add_scalar.specialization_key((x, with_scale(closing_over(2.5)))),
@@ -1854,6 +2202,492 @@ class TestMemoizedFastDispatchKey(unittest.TestCase):
                 ((torch.device("cuda"), aligned),),
                 memoized=False,
             )
+
+
+@helion.kernel(autotune_effort="none")
+def _register_dispatch_fragment(x, fragment):
+    factor = hl.register_tunable("factor", fragment)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] * factor
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def _register_annotated_dispatch_fragment(x, fragment: hl.constexpr):
+    factor = hl.register_tunable("factor", fragment)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] * factor
+    return out
+
+
+def _dispatch_fragment(kind):
+    if kind == "threads":
+        return NumThreadsFragment(128)
+    if kind == "enum":
+        return EnumFragment((2, 8))
+    return IntegerFragment(2, 8, 2)
+
+
+def _mutate_dispatch_fragment(fragment):
+    if isinstance(fragment, EnumFragment):
+        fragment.choices = (4, 16)
+    else:
+        fragment.high *= 2
+
+
+@pytest.mark.parametrize("kind", ["threads", "enum", "integer"])
+@pytest.mark.parametrize("annotation", [False, True])
+def test_fragment_fast_key_refines_mutated_constexpr_domain(kind, annotation):
+    kernel = (
+        _register_annotated_dispatch_fragment
+        if annotation
+        else _register_dispatch_fragment
+    )
+    tensor = torch.empty(37)
+    fragment = _dispatch_fragment(kind)
+
+    def args(value):
+        return tensor, value if annotation else hl.constexpr(value)
+
+    with cpu_render_target():
+        before = kernel._fast_dispatch_key(args(fragment))
+        assert before is not None
+        assert before == kernel._fast_dispatch_key(args(_dispatch_fragment(kind)))
+        full_before = kernel._base_specialization_key(args(fragment))
+        _mutate_dispatch_fragment(fragment)
+        assert full_before != kernel._base_specialization_key(args(fragment))
+        assert before != kernel._fast_dispatch_key(args(fragment))
+
+
+@pytest.mark.parametrize("kind", ["threads", "enum"])
+def test_nested_fragment_fast_key_and_prepared_guard_snapshot_domain(kind):
+    fragment = _dispatch_fragment(kind)
+    args = (torch.empty(37), [hl.constexpr(fragment)])
+    before = _dynamic_add_scalar_list._fast_dispatch_key(args)
+    assert before is not None
+    guard = _make_prepared_arg_guard(_dynamic_add_scalar_list, args)
+    assert guard(args)
+    _mutate_dispatch_fragment(fragment)
+    assert before != _dynamic_add_scalar_list._fast_dispatch_key(args)
+    assert not guard(args)
+
+
+@pytest.mark.parametrize("keyed", [False, True])
+@onlyBackends(["triton", "cute"])
+def test_fragment_mutation_routes_actual_cached_dispatch_to_new_bound(keyed):
+    # Real bind/type propagation/cache publication, replacing only native
+    # execution with a return of the selected BoundKernel identity.
+    kernel = helion.kernel(
+        _register_dispatch_fragment.fn,
+        autotune_effort="none",
+        key=(lambda *args: 0) if keyed else None,
+    )
+    fragment = NumThreadsFragment(128)
+    args = (torch.empty(37), hl.constexpr(fragment))
+
+    def observe_bound(bound, *unused_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*unused_args)
+
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        first = kernel(*args)
+        assert kernel._dispatch_cache
+        if not keyed:
+            assert kernel._prepared_call is not None
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            assert kernel(*args) is first
+        fragment.high = 256
+        changed = kernel(*args)
+        assert changed is not first
+        assert changed is kernel.bind(args)
+        assert first.config_spec.user_defined_tunables["factor"].high == 128
+        assert changed.config_spec.user_defined_tunables["factor"].high == 256
+
+
+@onlyBackends(["triton", "cute"])
+def test_nan_fragment_mutation_invalidates_prepared_cached_dispatch():
+    kernel = helion.kernel(_register_dispatch_fragment.fn, autotune_effort="none")
+    first_bits, changed_bits = "7ff8000000000001", "fff8000000000002"
+    fragment = EnumFragment((struct.unpack("!d", bytes.fromhex(first_bits))[0],))
+    args = (torch.empty(37), hl.constexpr(fragment))
+
+    def observe_bound(bound, *unused_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*unused_args)
+
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        first = kernel(*args)
+        assert kernel._prepared_call is not None
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            assert kernel(*args) is first
+        fragment.choices = (struct.unpack("!d", bytes.fromhex(changed_bits))[0],)
+        changed = kernel(*args)
+        assert changed is not first
+        assert changed is kernel.bind(args)
+        for bound, expected in ((first, first_bits), (changed, changed_bits)):
+            value = bound.config_spec.user_defined_tunables["factor"].default()
+            assert struct.pack("!d", value).hex() == expected
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            assert kernel(*args) is changed
+
+
+@onlyBackends(["triton", "cute"])
+def test_fragment_without_immutable_key_declines_optional_preparation():
+    kernel = helion.kernel(_register_dispatch_fragment.fn, autotune_effort="none")
+    fragment = NumThreadsFragment(128)
+    args = (torch.empty(37), hl.constexpr(fragment))
+    with cpu_render_target():
+        bound = kernel.bind(args)
+        # An explicit unsupported-key sentinel after a valid bind exercises
+        # the optional preparation boundary, not new domain/API support.
+        with patch.object(fragment, "high", object()):
+            with pytest.raises(TypeError, match="immutable constexpr key"):
+                _make_prepared_arg_guard(kernel, args)
+            assert (
+                kernel_module._PreparedCall.build(
+                    kernel,
+                    bound,
+                    args,
+                    dist_initialized=False,
+                    extra_guards=(),
+                    is_distributed=False,
+                )
+                is None
+            )
+
+
+@helion.kernel(autotune_effort="none")
+def _register_container_dispatch_fragment(x, fragments):
+    factor = hl.register_tunable("factor", fragments[0][0])
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] * factor
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def _register_annotated_container_dispatch_fragment(x, fragments: hl.constexpr):
+    factor = hl.register_tunable("factor", fragments[0][0])
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] * factor
+    return out
+
+
+@pytest.mark.parametrize("annotation", [False, True])
+@pytest.mark.parametrize("keyed", [False, True])
+@onlyBackends(["triton", "cute"])
+def test_constexpr_container_mutation_rebinds_cached_dispatch(annotation, keyed):
+    original = (
+        _register_annotated_container_dispatch_fragment
+        if annotation
+        else _register_container_dispatch_fragment
+    )
+    kernel = helion.kernel(
+        original.fn,
+        autotune_effort="none",
+        key=(lambda *args: 0) if keyed else None,
+    )
+    fragment = NumThreadsFragment(128)
+    container = ((fragment,),)
+    args = (torch.empty(37), container if annotation else hl.constexpr(container))
+
+    def observe_bound(bound, *unused_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*unused_args)
+
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        first = kernel(*args)
+        assert kernel(*args) is first
+        before = kernel._base_specialization_key(args)
+        fast_before = kernel._fast_dispatch_key(args)
+        assert fast_before is not None
+        guard = _make_prepared_arg_guard(kernel, args)
+        assert guard(args)
+        fragment.high = 256
+        changed = kernel(*args)
+        assert changed is not first
+        assert changed is kernel.bind(args)
+        assert before != kernel._base_specialization_key(args)
+        assert fast_before != kernel._fast_dispatch_key(args)
+        assert not guard(args)
+        assert first.config_spec.user_defined_tunables["factor"].high == 128
+        assert changed.config_spec.user_defined_tunables["factor"].high == 256
+
+
+@pytest.mark.parametrize("kind", ["boolean", "threads", "boolean_threads_high"])
+@onlyBackends(["triton", "cute"])
+def test_constexpr_container_persistent_keys_are_structural(kind):
+    def make_args():
+        # NumThreadsFragment historically accepts True as its high value.
+        # Fresh objects must still reuse both binding and persistent cache keys.
+        fragment = (
+            BooleanFragment()
+            if kind == "boolean"
+            else NumThreadsFragment(True if kind == "boolean_threads_high" else 128)
+        )
+        return tensor, hl.constexpr(((fragment,),))
+
+    def persistent_key(bound, args):
+        with (
+            patch(
+                "helion.autotuner.local_cache.extract_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            patch(
+                "helion.autotuner.local_cache.get_device_name",
+                return_value="cpu-test-target",
+            ),
+            patch("torch.cuda.is_available", return_value=True),
+        ):
+            return LocalAutotuneCache(BaseSearch(bound, args)).key
+
+    tensor = torch.empty(37)
+    kernel = helion.kernel(
+        _register_container_dispatch_fragment.fn, autotune_effort="none"
+    )
+    args = make_args()
+    with cpu_render_target():
+        first = kernel.bind(args)
+        assert kernel.bind(make_args()) is first
+        key = persistent_key(first, args)
+        assert hex(id(args[1].value[0][0])) not in repr(key)
+        fresh_kernel = helion.kernel(
+            _register_container_dispatch_fragment.fn, autotune_effort="none"
+        )
+        fresh_args = make_args()
+        fresh = fresh_kernel.bind(fresh_args)
+        assert persistent_key(fresh, fresh_args).stable_hash() == key.stable_hash()
+        if kind != "boolean":
+            args[1].value[0][0].high = 256
+            changed = kernel.bind(args)
+            assert changed is not first
+            assert persistent_key(changed, args).stable_hash() != key.stable_hash()
+
+
+def test_constexpr_boolean_container_keys_are_typed():
+    key = kernel_module._constexpr_key
+    for wrap in (lambda value: ((value,),), lambda value: (frozenset((value,)),)):
+        assert key(wrap(True)) != key(wrap(1))
+        assert key(wrap(False)) != key(wrap(0))
+        assert key(wrap(True)) == key(wrap(True))
+
+
+def test_constexpr_fragment_set_keys_preserve_domain_multiplicity():
+    def fragments(*highs):
+        return frozenset(NumThreadsFragment(high) for high in highs)
+
+    key = kernel_module._constexpr_key
+    original = fragments(128, 128, 256)
+    before = key((original,))
+    assert before == key((fragments(256, 128, 128),))
+    assert repr(before) == repr(key((fragments(128, 256, 128),)))
+    assert before != key((fragments(128, 256, 256),))
+    assert before != key((fragments(128, 256),))
+    assert all(hex(id(fragment)) not in repr(before) for fragment in original)
+    next(iter(original)).high = 512
+    assert before != key((original,))
+
+
+def test_constexpr_container_keys_preserve_other_equality_and_refusals():
+    key = kernel_module._constexpr_key
+    ordinary = ((1, "two"), frozenset((3, 4)))
+    assert key(ordinary) is ordinary
+    assert key(((1, 2.0), frozenset((3, 4)))) != key(((1.0, 2), frozenset((3.0, 4))))
+
+    class IdentityTuple(tuple):
+        __slots__ = ()
+
+        __eq__ = object.__eq__
+        __hash__ = object.__hash__
+
+    custom = IdentityTuple((NumThreadsFragment(128),))
+    assert key(custom) is custom
+    assert key((custom,)) != key((IdentityTuple(custom),))
+    cyclic = []
+    cyclic.append(cyclic)
+    for unsupported in ([1], {"x": 1}, (cyclic,)):
+        assert key(unsupported) is unsupported
+        with pytest.raises(TypeError, match="unhashable"):
+            hash(key(unsupported))
+
+
+@helion.kernel(autotune_effort="none")
+def _read_fragment_offset(x, fragment):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] + fragment.offset
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def _read_annotated_fragment_offset(x, fragment: hl.constexpr):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        out[tile] = x[tile] + fragment.offset
+    return out
+
+
+@pytest.mark.parametrize("boolean", [False, True])
+@pytest.mark.parametrize("annotation", [False, True])
+@pytest.mark.parametrize("keyed", [False, True])
+@onlyBackends(["triton", "cute"])
+def test_fragment_extra_state_keeps_distinct_cached_bindings(
+    boolean, annotation, keyed
+):
+    original = _read_annotated_fragment_offset if annotation else _read_fragment_offset
+    kernel = helion.kernel(
+        original.fn,
+        autotune_effort="none",
+        key=(lambda *args: 0) if keyed else None,
+    )
+    tensor = torch.empty(37)
+    fragments = [
+        BooleanFragment() if boolean else NumThreadsFragment(128) for _ in range(2)
+    ]
+    fragments[0].offset = 2
+    fragments[1].offset = 17
+    args = [
+        (tensor, fragment if annotation else hl.constexpr(fragment))
+        for fragment in fragments
+    ]
+
+    def observe_bound(bound, *unused_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*unused_args)
+
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        first = kernel.bind(args[0])
+        second = kernel.bind(args[1])
+        assert first is not second
+        assert first.to_code() != second.to_code()
+        assert kernel(*args[0]) is first
+        assert kernel(*args[1]) is second
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            assert kernel(*args[0]) is first
+            assert kernel(*args[1]) is second
+        assert kernel._fast_dispatch_key(args[0]) != kernel._fast_dispatch_key(args[1])
+        with pytest.raises(TypeError, match="immutable constexpr key"):
+            _make_prepared_arg_guard(kernel, args[0])
+
+
+@pytest.mark.parametrize(
+    ("value", "changed"),
+    [(2, 17), ((1, 2, 3, 4), (1, 2, 3, 5)), (frozenset((2, 3)), frozenset((2, 4)))],
+)
+def test_ordinary_constexpr_prepared_guard_matches_key_semantics(value, changed):
+    assert kernel_module._constexpr_key(value) is value
+    tensor = torch.empty(37)
+    args = (tensor, hl.constexpr(value))
+    guard = _make_prepared_arg_guard(_dynamic_add_scalar, args)
+    assert guard(args)
+    assert not guard((tensor, hl.constexpr(changed)))
+    if isinstance(value, (tuple, frozenset)):
+        assert not guard((tensor, hl.constexpr(type(value)(float(v) for v in value))))
+        assert "_constexpr_key" in guard.__code__.co_names
+    else:
+        assert not guard((tensor, hl.constexpr(float(value))))
+        # Scalar constants retain their direct, type-checked comparison.
+        assert "_constexpr_key" not in guard.__code__.co_names
+
+
+@helion.kernel(autotune_effort="none")
+def _compare_fragment_pair(x, pair: hl.constexpr):
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.numel()):
+        if pair[0] == pair[1]:
+            out[tile] = x[tile] + 2.0
+        else:
+            out[tile] = x[tile] + 5.0
+    return out
+
+
+@pytest.mark.parametrize("fragment_type", [BooleanFragment, NumThreadsFragment])
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("keyed", [False, True])
+@onlyBackends(["triton", "cute"])
+def test_fragment_equality_partition_routes_cached_binding(
+    fragment_type, wrapped, keyed
+):
+    # Eight cases cover the two identity-equality fragments, explicit/annotated
+    # constexpr values, and prepared-call/custom-key dispatch paths.
+    kernel = helion.kernel(
+        _compare_fragment_pair.fn,
+        autotune_effort="none",
+        key=(lambda *args: 0) if keyed else None,
+    )
+    tensor = torch.empty(37)
+
+    def args(shared):
+        left = (
+            fragment_type() if fragment_type is BooleanFragment else fragment_type(128)
+        )
+        right = (
+            left
+            if shared
+            else (
+                fragment_type()
+                if fragment_type is BooleanFragment
+                else fragment_type(128)
+            )
+        )
+        pair = (left, right)
+        return tensor, hl.constexpr(pair) if wrapped else pair
+
+    shared, distinct = args(True), args(False)
+
+    def observe_bound(bound, *unused_args):
+        bound._run = lambda *run_args: bound
+        return bound._run(*unused_args)
+
+    with (
+        cpu_render_target(),
+        patch.object(kernel_module.BoundKernel, "__call__", observe_bound),
+    ):
+        first = kernel(*shared)
+        guard = _make_prepared_arg_guard(kernel, shared)
+        assert guard(args(True))
+        assert not guard(distinct)
+        assert kernel._base_specialization_key(
+            shared
+        ) != kernel._base_specialization_key(distinct)
+        assert kernel._fast_dispatch_key(shared) != kernel._fast_dispatch_key(distinct)
+        second = kernel(*distinct)
+        assert second is not first
+        fresh = helion.kernel(_compare_fragment_pair.fn, autotune_effort="none")
+        assert second.to_code() == fresh.bind(distinct).to_code()
+        assert first.to_code() != second.to_code()
+        with patch.object(kernel, "bind", side_effect=AssertionError("cache miss")):
+            assert kernel(*args(False)) is second
+            assert kernel(*args(True)) is first
+
+
+def test_fragment_alias_partition_spans_arguments_and_unordered_membership():
+    fragment = BooleanFragment()
+    other = BooleanFragment()
+    aliases = kernel_module._input_fragment_aliases
+    shared = (hl.constexpr(fragment), [hl.constexpr((fragment,))])
+    distinct = (hl.constexpr(fragment), [hl.constexpr((other,))])
+    assert aliases(shared) != aliases(distinct)
+    assert aliases((fragment, frozenset((fragment, other)))) != aliases(
+        (BooleanFragment(), frozenset((fragment, other)))
+    )
+    fresh = BooleanFragment()
+    assert aliases(shared) == aliases((hl.constexpr(fresh), [hl.constexpr((fresh,))]))
 
 
 if __name__ == "__main__":

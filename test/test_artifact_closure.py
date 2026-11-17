@@ -143,6 +143,23 @@ def test_native_runtime_shim_remains_closed() -> None:
     assert close_artifact_source(closed) == closed
 
 
+def test_embedded_triton_helpers_support_dependency_hashing() -> None:
+    pytest.importorskip("triton")
+    from torch._inductor.codecache import PyCodeCache
+
+    source = (
+        "from __future__ import annotations\n"
+        "import types\nimport triton\nimport triton.language as tl\n"
+        + TritonBackend().embedded_helper_source("helion_triton_helpers.integer_full")
+        + "\n@triton.jit\ndef helper_kernel(x):\n"
+        "    return helion_triton_helpers.integer_full([1], x, tl.int32)\n"
+    )
+    module = PyCodeCache.load(close_artifact_source(source))
+    assert isinstance(module.helion_triton_helpers, types.ModuleType)
+    # Computing the key traverses the actual JIT dependencies without a GPU.
+    assert isinstance(module.helper_kernel.cache_key, str)
+
+
 def test_standalone_host_helpers_execute_canonical_implementations() -> None:
     source = (
         "from __future__ import annotations\nimport types\n"
