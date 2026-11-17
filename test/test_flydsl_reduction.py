@@ -164,6 +164,8 @@ class TestFlydslReduction(TestCase):
         self.assertNotIn("_flydsl_bsum", code)
         self.assertNotIn("_FlyDSLRedBuf", code)
         self.assertIn("_flydsl_wsum", code)  # warp-only path still emitted
+        # finalize_device_body emits the helper defs once per kernel.
+        self.assertEqual(code.count("def _flydsl_wsum("), 1)
 
     def test_softmax_w1(self) -> None:
         # Whole-row softmax with a 64-lane chunk (W=1).
