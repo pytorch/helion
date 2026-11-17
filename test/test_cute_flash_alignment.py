@@ -196,6 +196,34 @@ def test_staging_clones_under_aligned_operands_and_copies_outputs_back() -> None
     assert len(copy_backs) == 2
 
 
+@pytest.mark.cpu_only
+def test_staging_keeps_a_non_dense_operand_strides() -> None:
+    """A copy keeps the operand's strides, which the kernel may have been
+    compiled for: a non-dense view's (clone() compacted it) and a
+    broadcast's zero strides."""
+    kernel = _fake_kernel(
+        {"kind": "helion_flash", "q_idx": 0, "k_idx": 1, "v_idx": 2, "o_idx": 3}
+    )
+    shape = (2, 8, 16)
+    numel = math.prod(shape)
+    wide = torch.randn(2 * numel + 8, dtype=torch.bfloat16)
+    q = wide[4 : 4 + 2 * numel].view(2, 8, 32)[..., :16]
+    k = torch.randn(shape, dtype=torch.bfloat16)
+    v = torch.randn(numel + 8, dtype=torch.bfloat16)[4 : 4 + 16].expand(shape)
+    o = torch.zeros(shape, dtype=torch.bfloat16)
+    assert q.data_ptr() % 16 == 8 and v.data_ptr() % 16 == 8
+    staging = cute_launcher._cute_stage_under_aligned_operands(kernel, (q, k, v, o))
+    assert staging is not None
+    staged, _ = staging
+    for index, source in ((0, q), (2, v)):
+        copy = staged[index]
+        assert isinstance(copy, torch.Tensor)
+        assert copy.data_ptr() % 16 == 0
+        torch.testing.assert_close(copy, source)
+    assert staged[0].stride() == q.stride() == (256, 32, 1)
+    assert staged[2].stride() == v.stride() == (0, 0, 1)
+
+
 def test_staging_passes_aligned_and_foreign_operands_through() -> None:
     shape = (4, 16)
     aligned = tuple(torch.randn(shape, dtype=torch.bfloat16) for _ in range(5))
