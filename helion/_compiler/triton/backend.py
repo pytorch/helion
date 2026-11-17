@@ -144,6 +144,10 @@ class TritonBackend(Backend):
     def supports_inter_loop_barriers(self) -> bool:
         return True
 
+    @property
+    def orders_overlapping_inputs(self) -> bool:
+        return True
+
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
         # Triton branches are uniform per program, so the barrier is always
         # placeable.
@@ -1034,6 +1038,11 @@ class TileIRBackend(TritonBackend):
     def supports_inter_loop_barriers(self) -> bool:
         # ``tl.debug_barrier()`` lowers to ``ttg.barrier``, which the TileIR
         # pass pipeline does not legalize.
+        return False
+
+    @property
+    def orders_overlapping_inputs(self) -> bool:
+        # No barrier walk runs here.
         return False
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:

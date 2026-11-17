@@ -460,6 +460,7 @@
  "test/test_scalar_float_opmath.py": 3.2,
  "test/test_specialize.py": 51.6,
  "test/test_stack_tensor.py": 3.0,
+ "test/test_storage_alias_keys.py": 0.1,
  "test/test_tensor_descriptor.py": 0.0,
  "test/test_tensor_key_fast_path.py": 0.1,
  "test/test_tile_dependency.py": 5.5,

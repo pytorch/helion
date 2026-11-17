@@ -382,6 +382,15 @@ class Backend(abc.ABC):
         write and then read the same tensor (``needs_barrier_before``)."""
         return False
 
+    @property
+    def orders_overlapping_inputs(self) -> bool:
+        """Whether the barrier walks order accesses through tensor arguments
+        that overlap at runtime as accesses of one storage
+        (``CompileEnvironment.input_storage_aliases``), so the cache key
+        partitions tensor arguments by overlap rather than by identity
+        (``_overlap_aliases``)."""
+        return False
+
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
         """Whether a load that reads a tensor an earlier store of the same
         body wrote can be preceded by a barrier; ``in_divergent_control_flow``
