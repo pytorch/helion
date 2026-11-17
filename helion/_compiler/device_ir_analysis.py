@@ -266,6 +266,155 @@ def _accessed_tensor_fake(node: torch.fx.Node) -> torch.Tensor | None:
     return None
 
 
+# Pure functions a launch-uniform predicate may apply (``_launch_uniform_terms``).
+_UNIFORM_OPS = frozenset(
+    (
+        torch.ops.aten.eq.Scalar,
+        torch.ops.aten.eq.Tensor,
+        torch.ops.aten.ne.Scalar,
+        torch.ops.aten.ne.Tensor,
+        torch.ops.aten.lt.Scalar,
+        torch.ops.aten.lt.Tensor,
+        torch.ops.aten.le.Scalar,
+        torch.ops.aten.le.Tensor,
+        torch.ops.aten.gt.Scalar,
+        torch.ops.aten.gt.Tensor,
+        torch.ops.aten.ge.Scalar,
+        torch.ops.aten.ge.Tensor,
+        torch.ops.aten.bitwise_and.Tensor,
+        torch.ops.aten.bitwise_or.Tensor,
+        torch.ops.aten.bitwise_xor.Tensor,
+        torch.ops.aten.bitwise_not.default,
+        torch.ops.aten.logical_and.default,
+        torch.ops.aten.logical_or.default,
+        torch.ops.aten.logical_not.default,
+        torch.ops.prims.convert_element_type.default,
+        operator.and_,
+        operator.or_,
+        operator.invert,
+    )
+)
+_CONJUNCTIONS = (
+    torch.ops.aten.bitwise_and.Tensor,
+    torch.ops.aten.logical_and.default,
+    operator.and_,
+)
+
+
+def _launch_uniform_terms(
+    mask: object,
+    uniform_tensor: Callable[[torch.Tensor], object | None],
+) -> tuple[frozenset[object], bool]:
+    """The conjuncts of an extra mask that hold one value for the whole launch
+    (keys equal across roots for the same predicate), and whether every
+    conjunct does.
+
+    A launch-uniform conjunct is one element, reads no tile index or program
+    id and reads some data: it is built from constants, one-element loads at
+    constant indices of tensors the kernel never writes (``uniform_tensor``
+    keys a load's tensor by name and view, None when it may change during the
+    launch), broadcasts and the pure functions of ``_UNIFORM_OPS``. Keys hold
+    only names and numbers, so the rank digest compares them across ranks (a
+    gate built from a rank constant differs there).
+    """
+    from ..language import memory_ops
+    from ..language import view_ops
+
+    def broadcast_only(index: object) -> bool:
+        return isinstance(index, (list, tuple)) and all(
+            item is None or is_full_slice(item) for item in index
+        )
+
+    def constant_index(item: object) -> object | None:
+        if type(item) is int:
+            return item
+        if (
+            isinstance(item, torch.fx.Node)
+            and item.target is torch.ops.prims.iota.default
+            and item.args[:1] == (1,)
+            and item.kwargs.get("start", 0) == 0
+        ):
+            return 0
+        return None
+
+    memo: dict[torch.fx.Node, object | None] = {}
+
+    def single(node: torch.fx.Node) -> bool:
+        """One element: a value the whole launch shares, not one per lane."""
+        fake = node.meta.get("val")
+        return isinstance(fake, torch.Tensor) and fake.numel() == 1
+
+    def key(value: object) -> object | None:
+        if isinstance(value, (bool, int, float)):
+            return ("constant", type(value).__name__, value)
+        if isinstance(value, torch.dtype):
+            return ("dtype", str(value))
+        if (
+            not isinstance(value, torch.fx.Node)
+            or value.op != "call_function"
+            or not single(value)
+        ):
+            return None
+        if value in memo:
+            return memo[value]
+        memo[value] = None
+        target, args = value.target, value.args
+        result: object | None = None
+        if target is view_ops.subscript and len(args) >= 2 and broadcast_only(args[1]):
+            result = key(args[0])
+        elif target in _UNIFORM_OPS and not value.kwargs.keys() - {"dtype"}:
+            operands = [key(arg) for arg in args]
+            if all(operand is not None for operand in operands):
+                result = (str(target), *operands, value.kwargs.get("dtype"))
+        elif target is memory_ops.load and len(args) >= 2:
+            fake = _accessed_tensor_fake(value)
+            tensor = None if fake is None else uniform_tensor(fake)
+            index = args[1]
+            extra_mask = args[2] if len(args) >= 3 else None
+            if (
+                tensor is not None
+                and extra_mask is None
+                and isinstance(index, (list, tuple))
+            ):
+                items = [constant_index(item) for item in index]
+                if all(item is not None for item in items):
+                    result = ("load", tensor, tuple(items))
+        memo[value] = result
+        return result
+
+    def boolean(value: object) -> bool:
+        fake = value.meta.get("val") if isinstance(value, torch.fx.Node) else None
+        return isinstance(fake, torch.Tensor) and fake.dtype is torch.bool
+
+    def conjuncts(value: object) -> list[object]:
+        if isinstance(value, torch.fx.Node):
+            if (
+                value.target in _CONJUNCTIONS
+                and len(value.args) == 2
+                and all(boolean(arg) for arg in value.args)
+            ):
+                return [*conjuncts(value.args[0]), *conjuncts(value.args[1])]
+            if (
+                value.target is view_ops.subscript
+                and len(value.args) >= 2
+                and broadcast_only(value.args[1])
+                and isinstance(value.args[0], torch.fx.Node)
+                and value.args[0].target in _CONJUNCTIONS
+            ):
+                return conjuncts(value.args[0])
+        return [value]
+
+    def reads_data(term: object) -> bool:
+        return isinstance(term, tuple) and (
+            term[:1] == ("load",) or any(reads_data(part) for part in term)
+        )
+
+    keys = [key(term) for term in conjuncts(mask)]
+    keys = [k if reads_data(k) else None for k in keys]
+    uniform = frozenset(k for k in keys if k is not None)
+    return uniform, bool(keys) and all(k is not None for k in keys)
+
+
 def _subscript_block_id(env: CompileEnvironment, subscript: object) -> int | None:
     """Return the block axis indexed by a tile-provenance subscript."""
     info = subscript_tile_info(env, subscript)
@@ -1870,6 +2019,50 @@ class DeviceIRAnalysis:
             if node.target in (memory_ops.load, memory_ops.store):
                 slots.setdefault(node, slot)
 
+        def allocation_of(
+            fake: torch.Tensor,
+        ) -> tuple[torch.UntypedStorage, int | None] | None:
+            """The local allocation a tensor views and the rank whose copy a
+            peer view reaches (None: this rank's), or None when unknown."""
+            source = host.compiler_state.ssa_source(fake)
+            if source is None:
+                return None
+            storage = source.untyped_storage()
+            return host.compiler_state.peer_views.get(storage, (storage, None))
+
+        # Allocations some memory op of the kernel writes: a load of this
+        # rank's copy of any other one reads one value for the whole launch.
+        written: set[torch.UntypedStorage] = set()
+        for graph_analysis in self.graphs:
+            for node in graph_analysis.nodes:
+                if node.op == "call_function" and (
+                    node.target is memory_ops.store or node.target in ATOMIC_OPS
+                ):
+                    fake = _accessed_tensor_fake(node)
+                    allocation = None if fake is None else allocation_of(fake)
+                    if allocation is not None:
+                        written.add(allocation[0])
+
+        def uniform_tensor(fake: torch.Tensor) -> object | None:
+            allocation = allocation_of(fake)
+            origin = host.tensor_to_origin.get(fake)
+            if (
+                allocation is None
+                or allocation[1] is not None
+                or allocation[0] in written
+                or origin is None
+                or origin.root_rw_name() is None
+            ):
+                return None
+            # The whole host path (gates[0] and gates[1] differ).
+            return (
+                origin.host_str(),
+                str(fake.dtype),
+                tuple(map(str, fake.shape)),
+                tuple(map(str, fake.stride())),
+                str(fake.storage_offset()),
+            )
+
         for graph_analysis in self.graphs:
             for graph_node_index, node in enumerate(graph_analysis.nodes):
                 if node.op != "call_function":
@@ -1998,6 +2191,12 @@ class DeviceIRAnalysis:
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
+                mask_uniform_terms: frozenset[object] = frozenset()
+                mask_is_uniform = False
+                if has_explicit_mask and not is_flat_load:
+                    mask_uniform_terms, mask_is_uniform = _launch_uniform_terms(
+                        node.args[2 if is_load else 3], uniform_tensor
+                    )
                 owner_roots = owners_of(graph_analysis.graph_id)
                 if owner_roots:
                     node.meta[TILE_ACCESS_META] = tuple(
@@ -2026,6 +2225,8 @@ class DeviceIRAnalysis:
                             subscript_offsets=subscript_offsets,
                             subscript_is_scalar=subscript_is_scalar,
                             has_explicit_mask=has_explicit_mask,
+                            mask_uniform_terms=mask_uniform_terms,
+                            mask_is_uniform=mask_is_uniform,
                             subscript_is_full_slice=subscript_is_full_slice,
                             subscript_static_extents=subscript_static_extents,
                             subscript_dense_spans=subscript_dense_spans,
