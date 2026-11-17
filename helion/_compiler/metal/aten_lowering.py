@@ -8,6 +8,7 @@ registrations; ``_codegen_modules`` imports it.
 from __future__ import annotations
 
 import ast
+from itertools import starmap
 from typing import TYPE_CHECKING
 
 import torch
@@ -59,12 +60,34 @@ def codegen_stack_metal(ctx: LoweringContext, node: Node) -> object:
     return stacked(ctx, node)
 
 
+def _only_unit_dims_change(node: Node) -> bool:
+    """Whether a view only inserts or drops dims of size 1, keeping the
+    other dims, in order, at their sizes."""
+    source = node.args[0]
+    assert isinstance(source, Node)
+    env = CompileEnvironment.current()
+
+    def kept(shape: torch.Size) -> list[int | torch.SymInt]:
+        return [s for s in shape if not env.known_equal(s, 1)]
+
+    before = kept(source.meta["val"].shape)
+    after = kept(node.meta["val"].shape)
+    return len(before) == len(after) and all(
+        starmap(env.known_equal, zip(before, after, strict=True))
+    )
+
+
 @view_lowering.register_codegen("metal")
 @reshape_lowering.register_codegen("metal")
 def codegen_view_metal(ctx: LoweringContext, node: Node) -> object:
     tensor = map_arg(node.args[0], lambda arg: _env_arg(ctx, arg))
     if isinstance(tensor, StackedValue):
         return merged_stack(node, tensor)
+    if _only_unit_dims_change(node):
+        # Like squeeze: each thread keeps its element, held by the same
+        # block ids, since the dims that carry them are unchanged.
+        assert isinstance(tensor, ast.AST)
+        return tensor
     raise exc.BackendUnsupported(
         "metal",
         f"{node.target}: Metal lowers a view only where it merges a stacked dim "

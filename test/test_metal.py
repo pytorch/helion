@@ -5663,6 +5663,18 @@ def squeezed_dims_row_max(x: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_darwin
+@helion.kernel(backend="metal", autotune_effort="none")
+def unit_dim_views(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Views that keep every size (``view(-1)``), append a dim of size 1
+    (``view(n, 1)``) and move it to the front (``view(1, -1)``)."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        column = w[tile_n].view(-1).view(tile_n.block_size, 1)
+        out[tile_m, tile_n] = x[tile_m, tile_n] * column.view(1, -1)
+    return out
+
+
 class TestMetalSqueeze(unittest.TestCase):
     """``squeeze`` removes only dims of size 1, which own no thread axis, so
     each thread's value passes through unchanged."""
@@ -5710,6 +5722,12 @@ class TestMetalSqueeze(unittest.TestCase):
             re.sub(r"//.*", "", squeezed).replace("squeezed_row_max", "K"),
             re.sub(r"//.*", "", unsqueezed).replace("unsqueezed_row_max", "K"),
         )
+
+    def test_views_of_unit_dims(self) -> None:
+        """A view that only inserts or drops dims of size 1 is a squeeze or
+        an unsqueeze: each thread keeps its value."""
+        x, w = torch.randn(70, 300, device=DEVICE), torch.randn(300, device=DEVICE)
+        torch.testing.assert_close(unit_dim_views(x, w), x * w)
 
     def test_squeeze_leading_and_middle_dims(self) -> None:
         x = torch.randn(70, 300, device=DEVICE)
