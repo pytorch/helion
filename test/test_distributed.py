@@ -930,11 +930,19 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         args = (symm, x, w, rows, count, group.group_name)
         bound = scatter_matmul_exchange_kernel.bind(args)
         config = bound.config_spec.default_config().config
-        ws = {"block_sizes": [32], "range_warp_specializes": [None, True, None]}
+        # num_warps below 4, which the warp-specialized loop raises.
+        ws = {
+            "block_sizes": [32],
+            "num_warps": 2,
+            "range_warp_specializes": [None, True, None],
+        }
         bound.set_config(helion.Config(**{**config, **ws}))
         code = bound.to_triton_code()
         self.assertIn("warp_specialize=True", code)
         self.assertIn("_scatter_cover(", code)
+        # The loop raises the launch to 4 warps; the poll barriers count them all.
+        self.assertIn("num_warps=4", code)
+        self.assertIn("bar.red.or.pred q, 0, 128, p", code)
         written = torch.zeros(tasks * lanes, 1, device=self.device, dtype=torch.bool)
         written[rows[0][rows[0] >= 0].long()] = True
         # Each written element sums k // 2 ones; unwritten rows keep rank + 1.

@@ -25,6 +25,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import TaggedPeerFallback
+from ..cross_loop_codegen import cta_threads
 from ..cross_loop_codegen import peer_state
 from ..cross_loop_codegen import tagged_allocations
 from ..device_function import SyncRole
@@ -1399,7 +1400,7 @@ def _poll_pack(
             return 1
         numel *= size
     numel //= lanes
-    threads = 32 * state.config.num_warps
+    threads = cta_threads(state.device_function)
     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
 
 
@@ -1563,7 +1564,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             group = shape if words is None else words[2]
             pack = _poll_pack(state, output_size, 1 if words is None else lanes)
             if not _in_warp_specialized_loop(state):
-                threads = 32 * state.config.num_warps
+                threads = cta_threads(device_function)
         else:
             group = "scalar"
         fallback = None

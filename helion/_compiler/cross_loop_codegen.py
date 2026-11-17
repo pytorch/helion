@@ -866,8 +866,21 @@ def _bound_wait(device_function: DeviceFunction, call: str) -> ast.stmt:
     return statement_from_string(f"{token} = {call}")
 
 
+def cta_threads(device_function: DeviceFunction) -> int:
+    """The threads that run code outside warp-specialized partitions: the warps
+    the launch's ``num_warps`` requests (the default warpgroup), which is more
+    than the config's ``num_warps`` when the backend raises it (Triton launches
+    at least four warps for a warp-specialized loop). Worker warps of a
+    partitioned loop are not counted: Triton's default-warpgroup barriers
+    leave them out too. A count-carrying barrier over other threads would mix
+    counts on one barrier with Triton's own (undefined: hangs, illegal
+    instructions)."""
+    env = CompileEnvironment.current()
+    return 32 * env.backend.effective_num_warps(device_function.config)
+
+
 def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
-    if cast("int", device_function.config.get("num_warps", 1)) != 1:
+    if cta_threads(device_function) != 32:
         return statement_from_string("tl.debug_barrier()")
     sync = device_function.new_var("tile_dependency_publication_sync", dce=False)
     device_function.sync_roles[sync] = SyncRole("release")
@@ -2586,7 +2599,7 @@ def emit_cross_loop_schedule(
         ]
 
     lanes = 1 << (world_size - 1).bit_length()
-    threads = 32 * device_function.config.num_warps
+    threads = cta_threads(device_function)
 
     def peer_publications(root: int) -> list[ast.stmt]:
         if peer is None:
