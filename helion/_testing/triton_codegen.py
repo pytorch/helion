@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from ..runtime.kernel import BoundKernel
+
 
 @pytest.fixture
 def cpu_codegen() -> Generator[None, None, None]:
@@ -59,6 +61,28 @@ GLUON_RING_CONFIG: Mapping[str, object] = MappingProxyType(
         "num_stages": 2,
     }
 )
+
+
+def gluon_tail_ring_config(
+    bound: BoundKernel, *, task_loop: int = -1, **extra: object
+) -> dict[str, object]:
+    """The ring config of the ``cross_loop_tmem_prefetch`` tests (their
+    ``scale_then_*`` kernels): the ``task_loop``-th
+    warp-specializable loop warp-specialized, 128-row weight tiles over K steps
+    of 64, a four-stage ring; ``extra`` overrides."""
+    slots: list[bool | None] = [None] * len(bound.config_spec.range_warp_specialize)
+    slots[task_loop] = True
+    block_sizes = [32, 64, 128, 32, 64]
+    block_sizes += [64] * (len(bound.config_spec.block_sizes) - len(block_sizes))
+    return {
+        **GLUON_RING_CONFIG,
+        "block_sizes": block_sizes,
+        "range_warp_specializes": slots,
+        "cross_loop_pipeline": "static",
+        "num_warps": 4,
+        "num_stages": 4,
+        **extra,
+    }
 
 
 @contextmanager
