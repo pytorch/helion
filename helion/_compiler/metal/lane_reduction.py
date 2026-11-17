@@ -85,11 +85,11 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Sequence
+    from collections.abc import Set as AbstractSet
 
     import torch
 
     from ..device_function import DeviceFunction
-    from ..generate_ast import GenerateAST
     from ..inductor_lowering import CodegenState
     from ..tile_strategy import DeviceLoopOrGridState
 
@@ -194,16 +194,25 @@ class _LaneReductions:
         return result
 
     def split(
-        self, parent: list[ast.AST], lane_loop: ast.For, groups: dict[str, str]
+        self,
+        parent: list[ast.AST],
+        lane_loop: ast.For,
+        groups: dict[str, str],
+        per_lane: frozenset[str] = frozenset(),
     ) -> None:
         """Replace ``lane_loop``, an element of ``parent``, by its passes, or
-        fold its markers in place when it holds a cooperative MPP op."""
+        fold its markers in place when it holds a cooperative MPP op;
+        ``per_lane`` names carries that hold one value per lane."""
         statements: list[ast.AST] = [*lane_loop.body]
         body = _lane_body(statements, self, groups)
         if any(map(_is_mpp_effect, statements)):
             lane_loop.body[:] = self._folded(lane_loop)
             return
-        schedule = _schedule(body, groups.get(self.lane_var, self.lane_var))
+        schedule = _schedule(
+            body,
+            groups.get(self.lane_var, self.lane_var),
+            {groups.get(name, name) for name in per_lane},
+        )
         check_schedule(body, schedule)
         position = next(i for i, stmt in enumerate(parent) if stmt is lane_loop)
         parent[position : position + 1] = _emit(body, schedule, lane_loop, self.fn)
@@ -240,6 +249,9 @@ class LaneSplit(_LaneReductions):
     """The lane reductions of one device loop, split once its body is done."""
 
     loop: DeviceLoopState
+    #: Carries holding a dim of the lane-looped block: per-lane state that
+    #: each thread folds across its lanes (``split_lane_carried_updates``).
+    per_lane: frozenset[str] = dataclasses.field(default=frozenset(), kw_only=True)
 
     @property
     def owner(self) -> DeviceLoopState:
@@ -249,7 +261,7 @@ class LaneSplit(_LaneReductions):
         loop = self.loop
         parent, lane_loop = _find_lane_loop(loop, self.lane_var)
         groups = _merge_carried_names(_current_rename_groups(), loop.carried_names)
-        self.split(parent, lane_loop, groups)
+        self.split(parent, lane_loop, groups, self.per_lane)
         # The passes now hold the body; statements added to the loop later go
         # beside them.
         loop.inner_statements = parent
@@ -348,9 +360,12 @@ def lane_split_for(
         or len(loop.lane_loops) != 1
         or codegen.statements_stack[-1] is not loop.inner_statements
         or reduction_type not in SUPPORTED_REDUCTIONS
-        or _in_enclosing_device_lane_loop(codegen, loop)
     ):
         return None
+    return _loop_split(fn, loop)
+
+
+def _loop_split(fn: DeviceFunction, loop: DeviceLoopState) -> LaneSplit:
     split = next((f for f in loop.body_finalizers if isinstance(f, LaneSplit)), None)
     if split is None:
         (lane_var, _) = loop.lane_loops[0]
@@ -359,18 +374,71 @@ def lane_split_for(
     return split
 
 
-def _in_enclosing_device_lane_loop(codegen: GenerateAST, loop: DeviceLoopState) -> bool:
-    """Whether ``loop`` runs inside another device loop's lane loop.
+def split_lane_carried_updates(
+    fn: DeviceFunction, loop: DeviceLoopState, dimless: set[str]
+) -> None:
+    """Run the updates of a lane-looped device loop's ``dimless`` carries,
+    which hold no dim of a lane-looped block, once per tile.
 
-    That lane loop re-runs ``loop`` whole once per lane, carry updates
-    included, while the carries are initialised outside it.  A grid's lane
-    loops are fine: they wrap the carry initialisations too.
+    The lane loop around the body runs it once per lane, so an update the
+    lanes don't change would land once per lane: ``acc = acc + v`` adds
+    ``v`` lane-count times.  The split (``LaneSplit``) runs every statement
+    that doesn't read the lane once, outside the lane loop, and rejects a
+    dimless carry written per lane.  A carry holding the block's dim
+    (declared with the loop's registered block size) takes one value per
+    lane, each thread folding its lanes into one partial, so its updates
+    stay in the lane loop.  A body that writes no dimless carry is left
+    alone: rerunning its statements per lane changes nothing.
     """
-    return any(
-        isinstance(active, DeviceLoopState) and active is not loop and active.lane_loops
-        for loops in codegen.active_device_loops.values()
-        for active in loops
-    )
+    if not loop.lane_loops or not dimless:
+        return
+
+    def finalize() -> None:
+        if any(isinstance(f, LaneSplit) for f in loop.body_finalizers):
+            return  # the reductions' split runs after this and covers it
+        writes = ReadWrites.from_list(loop.inner_statements).writes
+        if not dimless & writes.keys():
+            return
+        if len(loop.lane_loops) != 1 or loop.vec_lane_wrappers:
+            raise _unsupported(
+                "a device loop with several lane loops that updates a carry "
+                "without their dims: each lane would apply the update"
+            )
+        ((lane_var, _),) = loop.lane_loops
+        groups = _merge_carried_names(_current_rename_groups(), loop.carried_names)
+        parent, lane_loop = _find_lane_loop(loop, lane_var)
+        statements: list[ast.AST] = [*lane_loop.body]
+        if any(
+            isinstance(node, ast.Name) and node.id.startswith(mpp_matmul.MARKER_PREFIX)
+            for node in ast.walk(lane_loop)
+        ):
+            # A matmul's lane loop is mpp_matmul's: its jam runs the body
+            # once per lane in tile order and removes the loop.
+            return
+        split = LaneSplit(fn, lane_var, loop)
+        try:
+            body = _lane_body(statements, split, groups)
+        except exc.BackendUnsupported:
+            return  # a body the split can't read keeps its lane loop
+        carries = {groups.get(n, n) for n in loop.carried_names}
+        held = {groups.get(n, n) for n in dimless}
+        variant = _variance(body, groups.get(lane_var, lane_var), carries - held)
+        # A carry a variant statement writes takes one update per lane on
+        # purpose: a contraction over the lanes, like a matmul whose K the
+        # lane loop walks.  Only a write the lanes don't change repeats.
+        repeated = {
+            name
+            for index, stmt_writes in enumerate(body.writes)
+            if not variant[index]
+            for name in stmt_writes & held
+        }
+        if not repeated:
+            return
+        split.per_lane = frozenset(carries - repeated)
+        # Called here, not registered: the finalizers are being iterated.
+        split()
+
+    loop.body_finalizers.insert(0, finalize)
 
 
 def _find_lane_loop(
@@ -443,6 +511,50 @@ def _is_name_assign(stmt: ast.AST) -> bool:
     )
 
 
+def _is_compound(stmt: ast.AST) -> bool:
+    """Whether *stmt* is a nested loop or branch, which the split moves as
+    one unit: it runs once per tile or once per lane, whole.  A cooperative
+    MPP op's effects inside one can't be ordered against the passes."""
+    return isinstance(stmt, (ast.For, ast.While, ast.If)) and not any(
+        map(_is_mpp_effect, ast.walk(stmt))
+    )
+
+
+def _exposed_reads(statements: Sequence[ast.AST], defined: set[str]) -> set[str]:
+    """The names ``statements`` read before writing them, in program order;
+    ``defined`` (updated in place) holds the names written so far.
+
+    A nested loop's body is walked once: a name it writes and reads back on
+    the next iteration is read before the write in that order too, and a
+    value defined in a branch counts as defined after it only when both
+    branches define it.
+    """
+    exposed: set[str] = set()
+
+    def visit_body(body: Sequence[ast.AST], names: set[str]) -> None:
+        exposed.update(_exposed_reads(body, names))
+
+    for stmt in statements:
+        if isinstance(stmt, ast.For):
+            exposed.update(set(ReadWrites.from_ast(stmt.iter).reads) - defined)
+            defined.update(ReadWrites.from_ast(stmt.target).writes)
+            inner = set(defined)
+            visit_body(stmt.body, inner)
+            visit_body(stmt.orelse, set(defined))
+        elif isinstance(stmt, (ast.While, ast.If)):
+            exposed.update(set(ReadWrites.from_ast(stmt.test).reads) - defined)
+            then, other = set(defined), set(defined)
+            visit_body(stmt.body, then)
+            visit_body(stmt.orelse, other)
+            if isinstance(stmt, ast.If):
+                defined.update(then & other)
+        else:
+            rw = ReadWrites.from_ast(stmt)
+            exposed.update(set(rw.reads) - defined)
+            defined.update(rw.writes)
+    return exposed
+
+
 def _lane_body(
     statements: list[ast.AST], lanes: _LaneReductions, groups: dict[str, str]
 ) -> LaneBody:
@@ -459,7 +571,12 @@ def _lane_body(
     for index, stmt in enumerate(statements):
         if (result := _marker_result(stmt)) is not None:
             reductions[index] = lanes.reductions[result]
-        elif not (_is_store(stmt) or _is_name_assign(stmt) or _is_mpp_effect(stmt)):
+        elif not (
+            _is_store(stmt)
+            or _is_name_assign(stmt)
+            or _is_mpp_effect(stmt)
+            or _is_compound(stmt)
+        ):
             raise _unsupported(
                 "lane reduction beside a statement the split cannot schedule: "
                 + ast.unparse(stmt).partition("\n")[0]
@@ -468,9 +585,9 @@ def _lane_body(
     stored: set[str] = set()
     loaded: set[str] = set()
     for stmt in statements:
-        if _is_store(stmt):
-            assert isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)
-            for tensor in sorted(tensors_in(stmt.value.args[0])):
+        for store in filter(_is_store, ast.walk(stmt)):
+            assert isinstance(store, ast.Expr) and isinstance(store.value, ast.Call)
+            for tensor in sorted(tensors_in(store.value.args[0])):
                 if tensor in stored:
                     raise _unsupported(
                         f"lane reduction: {tensor} stored twice in its lane loop"
@@ -496,7 +613,7 @@ def _lane_body(
             )
     return LaneBody(
         statements=statements,
-        reads=[canonical(ReadWrites.from_ast(stmt).reads) for stmt in statements],
+        reads=[canonical(_exposed_reads([stmt], set())) for stmt in statements],
         writes=[
             set() if _is_store(stmt) else canonical(ReadWrites.from_ast(stmt).writes)
             for stmt in statements
@@ -505,18 +622,42 @@ def _lane_body(
     )
 
 
-def _schedule(body: LaneBody, lane_var: str) -> list[int | LanePass]:
-    """The passes and the once-per-tile statements between them, in order."""
+def _variance(body: LaneBody, lane_var: str, per_lane: AbstractSet[str]) -> list[bool]:
+    """Per statement, whether it is lane-variant: it reads a per-lane name,
+    or writes one.  A nested loop that reads and rewrites a name holds
+    per-lane state in it, so the name's other definitions (``row_sums = 0``
+    before the loop) rerun per lane too.  A later variant write can make an
+    earlier statement variant, hence the fixed point.  A marker's result is
+    invariant."""
+    count = len(body.statements)
+    variant = [False] * count
+    variant_names = {lane_var, *per_lane}
+    changed = True
+    while changed:
+        changed = False
+        for index in range(count):
+            if (
+                not variant[index]
+                and index not in body.reductions
+                and (body.reads[index] | body.writes[index]) & variant_names
+            ):
+                variant[index] = True
+                variant_names |= body.writes[index]
+                changed = True
+    return variant
+
+
+def _schedule(
+    body: LaneBody, lane_var: str, per_lane: AbstractSet[str]
+) -> list[int | LanePass]:
+    """The passes and the once-per-tile statements between them, in order;
+    ``per_lane`` names carries that hold one value per lane, which each
+    thread folds across its lanes."""
     count = len(body.statements)
     definitions = body.reaching_definitions()
-    variant = [False] * count
-    variant_names = {lane_var}
+    variant = _variance(body, lane_var, per_lane)
     for index in range(count):
-        if index not in body.reductions and body.reads[index] & variant_names:
-            variant[index] = True
-            variant_names |= body.writes[index]
-    for index in range(count):
-        for name in sorted(body.reads[index] - definitions[index].keys()):
+        for name in sorted(body.reads[index] - definitions[index].keys() - per_lane):
             # The loop-entry value, later overwritten per lane: each lane
             # would continue from the previous lane's value.
             if any(
@@ -553,7 +694,7 @@ def _schedule(body: LaneBody, lane_var: str) -> list[int | LanePass]:
                     pending.append(writer)
         return sorted(needed)
 
-    last = max(stage[index] for index in body.reductions)
+    last = max((stage[index] for index in body.reductions), default=0)
     schedule: list[int | LanePass] = []
     folded: set[int] = set()
     for current in range(last + 1):

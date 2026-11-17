@@ -8273,6 +8273,9 @@ class TestMppLaneJam(unittest.TestCase):
             helion.Config(block_sizes=[32, 16], num_threads=[16, 1], num_warps=32),
         ):
             self._check(row_sum_after, (x, y64), config, (0, _mm(x, y64).sum(-1)))
+        # A lane reduction whose lane body holds the op's K loop: the split
+        # runs the loop once per tile, before the per-lane sum.
+        self._check(row_sum, (self.x, y64.float()), None, (0, _mm(self.x, y64).sum(-1)))
         self._check(
             root_scaled,
             (self.x, self.y, 0.5),
@@ -8411,16 +8414,6 @@ class TestMppLaneJamRejects(_MppCase):
                 block_sizes=[128, 32, 16], num_threads=[1, 32, 1], num_warps=32
             ),
             "would run 128 copies of its Scalar work per thread (max 64)",
-        )
-
-    def test_lane_reduction(self) -> None:
-        """A lane reduction whose lane body holds a ``for``, the op's K loop."""
-        y = torch.randn(72, 64, device=DEVICE)
-        self._rejects(
-            row_sum,
-            (self.x, y),
-            None,
-            "lane reduction beside a statement the split cannot schedule",
         )
 
     def test_colon_k_seed_positions(self) -> None:
@@ -13119,17 +13112,13 @@ class TestMppOpDims(_MppCase):
             x = torch.randn(m, 32, device=DEVICE)
             y = torch.randn(32, n, device=DEVICE)
             self._check(kernel, (x, y), config, ref(_mm(x, y)), op)
-        # At the default num_warps the 16 x 16 tile runs in a lane loop, and
-        # its column sum is rejected rather than miscompiled: the split of
-        # the grid's lane loop can't reorder the K loop beside it.
+        # At the default num_warps the 16 x 16 tile runs in a lane loop: the
+        # split of the grid's lane loop runs the K loop once per tile, before
+        # the column sum.
         x = torch.randn(4, 32, device=DEVICE)
         y = torch.randn(32, 40, device=DEVICE)
-        self._rejects(
-            colsum_seeded,
-            (x, y),
-            helion.Config(block_sizes=[16, 16, 16]),
-            "lane reduction beside a statement the split cannot schedule",
-        )
+        out, _, _ = _run(colsum_seeded, (x, y), helion.Config(block_sizes=[16, 16, 16]))
+        _close(out, col_sums(_mm(x, y)))
 
     def test_unchanged_dims(self) -> None:
         """A block the extent fills, a loop of several tiles, symbolic
@@ -14568,12 +14557,15 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         output and out of an if or an else branch."""
         x, u, w = _randn(32, 16), _randn(16, 32), _randn(32, 16)
         xd, ud, wd = _cpu64(x, u, w)
-        self._scalar(
-            dot_of_outer_dot,
-            (x, u, w, torch.zeros(4, device=DEVICE)),
-            helion.Config(block_sizes=[16, 16, 4], num_warps=32),
-            1.875 * ((xd @ ud).half().double() @ wd),
-        )
+        # Tiles of 1 step take four updates, each halving the acc before
+        # adding; one tile of 4 steps (four lanes) takes one.
+        for steps, scale in ((1, 1.875), (4, 1.0)):
+            self._scalar(
+                dot_of_outer_dot,
+                (x, u, w, torch.zeros(4, device=DEVICE)),
+                helion.Config(block_sizes=[16, 16, steps], num_warps=32),
+                scale * ((xd @ ud).half().double() @ wd),
+            )
         x, u, w = _randn(48, 64), _randn(64, 32), _randn(32, 40)
         xd, ud, wd = _cpu64(x, u, w)
         # With its output columns on one thread the thread rule doesn't

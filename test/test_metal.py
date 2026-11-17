@@ -6553,6 +6553,20 @@ def lane_sum_per_k_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def lane_add_per_k_tile(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Adds a value without a k dim to a carry once per k tile."""
+    b, _n = x.size()
+    k = y.size(0)
+    out = torch.empty([b], dtype=torch.float32, device=x.device)
+    for tile_b in hl.tile(b):
+        acc = hl.zeros([tile_b], dtype=torch.float32)
+        for _tile_k in hl.tile(k):
+            acc = acc + x[tile_b, 0]
+        out[tile_b] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def lane_center_2d_inner_tile(x: torch.Tensor) -> torch.Tensor:
     b, m, n = x.size()
     out = torch.empty_like(x)
@@ -7058,16 +7072,17 @@ class TestMetalLaneLoopReductions(unittest.TestCase):
             torch.empty(16, device=DEVICE),
         )
 
-    def test_enclosing_device_lane_loop_rejected(self) -> None:
-        """k in lanes re-runs the n loop, carry updates included, per k lane."""
+    def test_enclosing_device_lane_loop(self) -> None:
+        """k in lanes would re-run the n loop, and its update of ``acc``, per
+        k lane; ``acc`` holds no k dim, so the loop runs once per k tile."""
         x = torch.randn(8, 40, device=DEVICE)
         y = torch.empty(12, device=DEVICE)
         for num_threads in ([8, 1, 1], [8, 2, 1], [8, 1, 4], [8, 2, 4]):
             with self.subTest(num_threads=num_threads):
                 config = helion.Config(block_sizes=[8, 4, 16], num_threads=num_threads)
-                self._assert_rejected(
-                    lane_sum_per_k_tile, config, _LANE_MESSAGE.format("sum"), x, y
-                )
+                out, _ = self._run(lane_sum_per_k_tile, config, x, y)
+                # 12 / 4 = 3 k tiles, each adding the row sums once.
+                torch.testing.assert_close(out, 3 * x.sum(-1), rtol=1e-4, atol=1e-4)
 
     def test_per_lane_carry_rejected(self) -> None:
         """Block 0 is ``block_n`` (registered first), so n is in lanes."""
@@ -7089,15 +7104,24 @@ class TestMetalLaneLoopReductions(unittest.TestCase):
                     lane_center_2d_inner_tile, config, _LANE_MESSAGE.format("max"), x
                 )
 
-    def test_device_loop_in_lane_body_rejected(self) -> None:
+    def test_carry_update_without_lane_dim(self) -> None:
+        """No reduction: an update of a carry without the k dim runs once per
+        k tile, not once per k lane."""
+        x = torch.randn(8, 40, device=DEVICE)
+        y = torch.empty(12, device=DEVICE)
+        for num_threads in ([8, 1], [8, 2]):
+            with self.subTest(num_threads=num_threads):
+                config = helion.Config(block_sizes=[8, 4], num_threads=num_threads)
+                out, _ = self._run(lane_add_per_k_tile, config, x, y)
+                torch.testing.assert_close(out, 3 * x[:, 0], rtol=1e-5, atol=1e-5)
+
+    def test_device_loop_in_lane_body(self) -> None:
+        """The n loop runs per k lane, in the pass before the fold of
+        ``part`` over k; ``part`` starts at zero in each lane."""
         x = torch.randn(8, 12, 40, device=DEVICE)
         config = helion.Config(block_sizes=[8, 4, 16], num_threads=[8, 1, 16])
-        self._assert_rejected(
-            lane_loop_in_lane_body,
-            config,
-            "lane reduction beside a statement the split cannot schedule",
-            x,
-        )
+        out, _ = self._run(lane_loop_in_lane_body, config, x)
+        torch.testing.assert_close(out, x.sum((1, 2)), rtol=1e-4, atol=1e-4)
 
     def test_schedule_check(self) -> None:
         """The replay accepts the built schedule and rejects reordered ones."""

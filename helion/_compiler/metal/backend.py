@@ -3,8 +3,10 @@ helion/_compiler/backend.py."""
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import math
+import operator
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -33,7 +35,6 @@ from .thread_counts import serialize_auto_threads
 from .thread_counts import shrink_tile_threads
 
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Callable
 
     from torch._inductor.ops_handler import OpsHandler
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
     from ..reduction_strategy import BlockReductionStrategy
     from ..tile_dispatch import TileStrategyDispatch
     from ..tile_strategy import DeviceGridState
+    from ..tile_strategy import DeviceLoopState
     from ..tile_strategy import TileStrategy
     from .free_arange import FreeArangePlan
     from .grid_budget import RootWork
@@ -1206,6 +1208,37 @@ class MetalBackend(Backend):
             index=index,
             dtype=dtype,
         )
+
+    def finish_device_loop_body(
+        self,
+        state: CodegenState,
+        device_loop: DeviceLoopState,
+        outputs: list[object],
+        initials: dict[int, str],
+    ) -> None:
+        from ..compile_environment import CompileEnvironment
+        from .lane_reduction import split_lane_carried_updates
+
+        env = CompileEnvironment.current()
+        lane_blocks = device_loop.lane_loop_blocks
+        dimless: set[str] = set()
+        assert state.fx_node is not None
+        for user in state.fx_node.users:
+            if user.target is not operator.getitem:
+                continue
+            index = user.args[1]
+            assert isinstance(index, int)
+            value, output = user.meta["val"], outputs[index]
+            if (
+                index in initials
+                and isinstance(output, ast.Name)
+                and isinstance(value, torch.Tensor)
+                and not any(
+                    env.get_block_id(size) in lane_blocks for size in value.shape
+                )
+            ):
+                dimless |= {output.id, initials[index]}
+        split_lane_carried_updates(state.device_function, device_loop, dimless)
 
     def create_reduction_strategy(
         self, fn: DeviceFunction, block_id: int, reduction_loop: int | None
