@@ -1184,6 +1184,18 @@ def gather_square_third(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @_requires_darwin
+@helion.kernel(backend="metal", autotune_effort="none")
+def tile_index_subscripts(x: torch.Tensor) -> torch.Tensor:
+    """``tile.index`` subscripted to broadcast, in the root, which traces as
+    a load of the index value."""
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        flat = tile_m.index[:, None] * n + tile_n.index[None, :]
+        out[tile_m, tile_n] = x[tile_m, tile_n] + flat.to(torch.float32)
+    return out
+
+
 class TestMetalIndexArithmetic(unittest.TestCase):
     """Integer ``//`` and ``%`` of index values (tile offsets, block sizes)
     follow Python's floor semantics for any operand sign.  An expression
@@ -1217,6 +1229,11 @@ class TestMetalIndexArithmetic(unittest.TestCase):
 
     def _scale_rows(self, x: torch.Tensor, factors: list[int]) -> torch.Tensor:
         return x * torch.tensor(factors, device=DEVICE, dtype=x.dtype)[:, None]
+
+    def test_tile_index_subscripts(self) -> None:
+        x = torch.randn(40, 72, device=DEVICE)
+        flat = torch.arange(40 * 72, device=DEVICE, dtype=torch.float32).view(40, 72)
+        torch.testing.assert_close(tile_index_subscripts(x), x + flat)
 
     def test_floordiv_tile_offset_by_group(self) -> None:
         """A non-power-of-two group: 9 rows in groups of 3."""

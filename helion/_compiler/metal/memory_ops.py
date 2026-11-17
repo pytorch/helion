@@ -17,6 +17,7 @@ from ... import exc
 from ...language import _decorators
 from ...language.memory_ops import load
 from ...language.memory_ops import store
+from ...language.tile_ops import tile_index
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
@@ -215,6 +216,23 @@ def _(state: CodegenState) -> ast.AST | None:
     raise exc.BackendUnsupported("metal", f"store target type: {type(tensor)}")
 
 
+def _tile_index_view(state: CodegenState, subscript: list[object]) -> ast.AST | None:
+    """A load of a ``tile.index`` value that only adds dims of size 1 or
+    takes its dim whole (``tile_m.index[:, None]``): the index itself.  A
+    value is held by the block ids of its dims, so each thread already holds
+    its element; the value is the kernel's own, with no tensor to read."""
+    node = state.fx_node.args[0] if state.fx_node is not None else None
+    if not (
+        isinstance(node, torch.fx.Node)
+        and node.target is tile_index
+        and all(k is None or k == slice(None) for k in subscript)
+    ):
+        return None
+    index = state.ast_args[0]
+    assert isinstance(index, ast.AST)
+    return index
+
+
 @_decorators.codegen(load, "metal")
 def _(state: CodegenState) -> ast.AST | FactoredValue:
     # Metal delegates to the same PointerIndexingStrategy as Triton, except
@@ -232,6 +250,8 @@ def _(state: CodegenState) -> ast.AST | FactoredValue:
     assert isinstance(eviction_policy, (type(None), ast.AST))
 
     if isinstance(tensor, torch.Tensor):
+        if (index := _tile_index_view(state, [*subscript])) is not None:
+            return index
         if mpp_matmul.fenced(state.fx_node):
             state.add_statement(statement_from_string(f"{mpp_matmul.FENCE}()"))
         device_fn = state.device_function
