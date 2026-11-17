@@ -9,6 +9,72 @@ This interface is experimental. Out-of-tree backends should pin one Helion
 minor version (e.g. `helion>=1.Y,<1.(Y+1)`).
 ```
 
+## Packaging a backend plugin
+
+Declare the backend class in the `helion.backends` entry-point group of the
+plugin's `pyproject.toml`, using the backend's name as the entry-point name,
+and declare the version of this API it targets on the class:
+
+```toml
+[project.entry-points."helion.backends"]
+mybackend = "my_pkg.backend:MyBackend"
+```
+
+```python
+class MyBackend(helion.backend_api.Backend):
+    HELION_BACKEND_API_VERSION = 1
+
+    @property
+    def name(self) -> str:
+        return "mybackend"
+```
+
+- Installed plugins are listed by `helion.backend_api.list_backends()` (so
+  `HELION_BACKEND` can name them), but a plugin is imported only when its
+  backend is first used, e.g. `HELION_BACKEND=mybackend` or
+  `@helion.kernel(backend="mybackend")`. A fresh process (e.g. a spawned
+  worker) loads it the same way on its first lookup.
+  `helion.backend_api.load_backend_plugins()` loads all of them eagerly.
+- Per-op `@codegen` handlers go in `my_pkg/_codegen_modules.py` (the package
+  of the backend class's module); Helion imports it right after registering
+  the backend. These modules run twice: once when the plugin loads, and again
+  on the backend's first use, when Helion's codegen repair reloads
+  `_codegen_modules` and each of the package's modules it imports. Keep them
+  free of import-time side effects, and do not rely on `isinstance` checks
+  against classes they define (the reload creates new class objects).
+- A plugin that registers itself (`register_compiler_backend` at import) and
+  is imported directly before any lookup is used as registered: the
+  entry-point checks below are skipped and its `_codegen_modules` is imported
+  only when its codegen is first needed. Let Helion load it through the
+  entry point instead.
+- Helion instantiates backend classes more than once (plugin validation,
+  registration, and again per compile), so `__init__` must be cheap and free
+  of side effects.
+- Using a plugin raises `ValueError` if it fails to import, is not a `Backend`
+  subclass, lacks or mismatches `HELION_BACKEND_API_VERSION`, names its
+  backend differently from its entry point, or replaces another backend while
+  importing. Every backend name registered during the failed load is then
+  unregistered (names registered before it stay); nothing else is undone
+  (`@codegen` handlers, modules in `sys.modules`, other import side effects).
+  A plugin cannot overwrite an existing handler (unless Python runs with
+  `-O`). The failure, including an interrupted load (e.g. Ctrl-C), is
+  remembered for the process lifetime, so a fresh process is required to
+  retry.
+- Plugins load one at a time. Do not look up your own backend while your
+  modules are being imported (e.g. defining kernels for it at import time):
+  during Helion's load the lookup sees the backend as not yet available, and
+  if your module is imported directly while another thread loads the plugin,
+  the two threads can deadlock.
+- Entry points named after a built-in backend are ignored with a warning. A
+  backend name provided by more than one installed distribution is an error:
+  using it raises `ValueError` naming every provider, and none is imported,
+  unless a class was already registered under that name by hand, which wins.
+- Set `HELION_DISABLE_BACKEND_PLUGINS=1` to ignore installed plugins. It is
+  read once, when plugins are first discovered (the first `list_backends()`,
+  or the first use of a backend name that is not registered); set it before
+  that. Plugins already registered stay usable. An unrecognized value is an
+  error.
+
 ## What is covered
 
 `BACKEND_API_VERSION` covers exactly the following. Anything else, including
@@ -112,6 +178,10 @@ other attributes of the classes listed here, may change without notice.
    codegen state shared across a backend's op handlers while one device
    function is generated. Use your backend's name as the key; the value is
    yours.
+7. **Plugin contract.** The `helion.backends` entry-point group, the rule that
+   an entry point is named after its backend, the
+   `HELION_BACKEND_API_VERSION` class attribute, and the
+   `<package>._codegen_modules` convention, as described above.
 
 ## What is not covered
 

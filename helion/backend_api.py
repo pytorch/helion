@@ -31,6 +31,8 @@ from ._compiler.backend_registry import COVERED_BACKEND_HOOKS as COVERED_BACKEND
 from ._compiler.backend_registry import (
     COVERED_STRATEGY_METHODS as COVERED_STRATEGY_METHODS,
 )
+from ._compiler.backend_registry import list_backends as list_backends
+from ._compiler.backend_registry import load_backend_plugins as load_backend_plugins
 from ._compiler.backend_registry import (
     register_compiler_backend as register_compiler_backend,
 )
@@ -113,6 +115,8 @@ __all__ = [
     "codegen",
     "exc",
     "expr_from_string",
+    "list_backends",
+    "load_backend_plugins",
     "mask_to_op",
     "reduce_op",
     "register_compiler_backend",

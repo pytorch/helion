@@ -6,11 +6,16 @@ All backend lookup and instantiation should go through this module.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import os
+import re
 import sys
 import threading
 import types
 from typing import TYPE_CHECKING
+import warnings
 
+from .backend import Backend
 from .cute.backend import CuteBackend
 from .flydsl.backend import FlyDSLBackend
 from .metal.backend import MetalBackend
@@ -20,8 +25,9 @@ from .triton.backend import TileIRBackend
 from .triton.backend import TritonBackend
 
 if TYPE_CHECKING:
+    from importlib.metadata import EntryPoint
+
     from ..autotuner.search_surface import BackendSearchSurface
-    from .backend import Backend
 
 # Version of the out-of-tree backend contract in ``helion.backend_api``; covers
 # only the names and hooks listed in docs/api/backend_api.md, bumped per the
@@ -96,6 +102,22 @@ COVERED_STRATEGY_METHODS: tuple[str, ...] = (
     "TileStrategy.codegen_preamble",
     "ReductionStrategy.codegen_reduction",
 )
+# Out-of-tree backends register an entry point in this group, named after the
+# backend, whose value is a ``Backend`` subclass, e.g.
+# ``mybackend = "my_pkg.backend:MyBackend"``.  A plugin is imported the first
+# time its backend is looked up by name.  A name with more than one provider is
+# an error.
+PLUGIN_ENTRY_POINT_GROUP = "helion.backends"
+_PLUGIN_ENTRY_POINTS: dict[str, EntryPoint] | None = None
+_FAILED_PLUGINS: dict[str, str] = {}
+# Guards discovery; never held during an import.
+_DISCOVERY_LOCK = threading.Lock()
+# Serializes plugin loads.  Taken only to load a name not yet registered, so
+# lookups of registered backends never wait on it.
+_PLUGIN_LOAD_LOCK = threading.RLock()
+# Names being loaded, set under _PLUGIN_LOAD_LOCK: a plugin that looks up its
+# own backend while it imports (same thread) sees the registry as it is.
+_LOADING: set[str] = set()
 
 _BUILTIN_BACKENDS: list[type[Backend]] = [
     TritonBackend,
@@ -212,8 +234,15 @@ def registry_generation() -> int:
 
 
 def get_backend_class(name: str) -> type[Backend]:
-    """Look up a registered backend class by name."""
+    """Look up a backend class by name, loading its plugin on first use."""
     if name not in _REGISTRY:
+        _load_plugin_by_name(name)
+    if name not in _REGISTRY:
+        if name in _LOADING:  # only ever this thread's own load
+            raise ValueError(
+                f"Backend {name!r} is still loading: it was looked up while its "
+                "plugin is being imported"
+            )
         raise ValueError(
             f"Unknown backend: {name!r}. Available backends: {list_backends()}"
         )
@@ -232,8 +261,19 @@ def get_backend(name: str) -> Backend:
 
 
 def list_backends() -> list[str]:
-    """Return the names of all registered backends."""
-    return list(_REGISTRY.keys())
+    """Return registered backends plus installed, not-yet-loaded plugins."""
+    names = list(_REGISTRY)
+    names.extend(n for n in _plugin_entry_points() if n not in _REGISTRY)
+    return names
+
+
+def registered_backend_classes() -> dict[str, type[Backend]]:
+    """A snapshot of the backends registered so far; never loads a plugin.
+
+    For tables derived from the registry: they refresh on
+    ``registry_generation()`` when a plugin loads later.
+    """
+    return dict(_REGISTRY)
 
 
 def all_reserved_launch_param_names() -> frozenset[str]:
@@ -244,7 +284,7 @@ def all_reserved_launch_param_names() -> frozenset[str]:
     of which backend is currently active.
     """
     result: set[str] = set()
-    for backend_cls in _REGISTRY.values():
+    for backend_cls in list(_REGISTRY.values()):
         result.update(backend_cls.reserved_launch_param_names())
     return frozenset(result)
 
@@ -257,7 +297,7 @@ def all_search_surfaces() -> list[BackendSearchSurface]:
     object (the no-op default) contribute it once.
     """
     surfaces: list[BackendSearchSurface] = []
-    for backend_cls in _REGISTRY.values():
+    for backend_cls in list(_REGISTRY.values()):
         surface = backend_cls().config_spec_extension()
         if not any(surface is seen for seen in surfaces):
             surfaces.append(surface)
@@ -280,7 +320,7 @@ def import_backend_codegen() -> None:
     backend class (below) and adding its ``_codegen_modules`` module.
     """
     seen: set[str] = set()
-    for backend_cls in _REGISTRY.values():
+    for backend_cls in list(_REGISTRY.values()):
         # e.g. "helion._compiler.cute.backend" -> "helion._compiler.cute".
         # Subclasses that share a folder (e.g. TileIRBackend in the triton
         # package) collapse to one import.
@@ -288,15 +328,167 @@ def import_backend_codegen() -> None:
         if package in seen:
             continue
         seen.add(package)
-        module = f"{package}._codegen_modules"
+        _import_codegen_modules(backend_cls)
+
+
+def _import_codegen_modules(backend_cls: type[Backend]) -> None:
+    module = f"{backend_cls.__module__.rsplit('.', 1)[0]}._codegen_modules"
+    try:
+        importlib.import_module(module)
+    except ModuleNotFoundError as e:
+        # A backend without any per-op codegen modules is allowed; only
+        # swallow the missing _codegen_modules module itself, never a
+        # broken import inside it.
+        if e.name != module:
+            raise
+
+
+def load_backend_plugins() -> None:
+    """Load every installed backend plugin now, warning about any that fail.
+
+    Plugins otherwise load on first lookup by name (:func:`get_backend_class`).
+    """
+    for name in list(_plugin_entry_points()):
         try:
-            importlib.import_module(module)
-        except ModuleNotFoundError as e:
-            # A backend without any per-op codegen modules is allowed; only
-            # swallow the missing _codegen_modules module itself, never a
-            # broken import inside it.
-            if e.name != module:
-                raise
+            _load_plugin_by_name(name)
+        except ValueError as e:
+            warnings.warn(str(e), stacklevel=2)
+
+
+def _plugins_disabled() -> bool:
+    from ..runtime.settings import _parse_env_bool  # settings imports this module
+
+    var = "HELION_DISABLE_BACKEND_PLUGINS"
+    return _parse_env_bool(var, os.environ.get(var), False)
+
+
+def _plugin_entry_points() -> dict[str, EntryPoint]:
+    """Installed ``helion.backends`` entry points by name (discovered once)."""
+    global _PLUGIN_ENTRY_POINTS
+
+    entry_points = _PLUGIN_ENTRY_POINTS
+    if entry_points is not None:
+        return entry_points
+    # Imports helion.runtime.settings, so not under the lock.
+    disabled = _plugins_disabled()
+    ignored: list[EntryPoint] = []
+    with _DISCOVERY_LOCK:
+        if _PLUGIN_ENTRY_POINTS is None:
+            found, ignored = _discover_plugin_entry_points(disabled)
+            for name, eps in found.items():
+                if len(eps) > 1:
+                    # Remembered like a load failure; neither plugin is imported.
+                    _FAILED_PLUGINS[name] = (
+                        f"Helion backend {name!r} is provided by more than one "
+                        "installed package: "
+                        f"{', '.join(repr(_dist_name(ep)) for ep in eps)}; "
+                        "uninstall all but one"
+                    )
+            _PLUGIN_ENTRY_POINTS = {name: eps[0] for name, eps in found.items()}
+        entry_points = _PLUGIN_ENTRY_POINTS
+    # After the lock: a warning filter or hook may run arbitrary code.
+    for ep in ignored:
+        warnings.warn(
+            f"Ignoring {_describe(ep)}: {ep.name!r} is a built-in backend",
+            stacklevel=2,
+        )
+    return entry_points
+
+
+def _discover_plugin_entry_points(
+    disabled: bool,
+) -> tuple[dict[str, list[EntryPoint]], list[EntryPoint]]:
+    """Plugin entry points by name, and those named after a built-in."""
+    found: dict[str, list[EntryPoint]] = {}
+    ignored: list[EntryPoint] = []
+    if not disabled:
+        builtins = {cls().name for cls in _BUILTIN_BACKENDS}
+        entry_points = importlib.metadata.entry_points(group=PLUGIN_ENTRY_POINT_GROUP)
+        for ep in sorted(entry_points, key=lambda ep: (_dist_name(ep), ep.name)):
+            if ep.name in builtins:
+                ignored.append(ep)
+            else:
+                found.setdefault(ep.name, []).append(ep)
+    return found, ignored
+
+
+def _dist_name(ep: EntryPoint) -> str:
+    """Normalized distribution name providing ``ep`` (PEP 503)."""
+    dist = ep.dist  # None for hand-built EntryPoints
+    if dist is None or not dist.name:
+        return "<unknown>"
+    # PEP 503 normalization, so names compare ignoring case and -/_/. differences.
+    return re.sub(r"[-_.]+", "-", dist.name).lower()
+
+
+def _describe(ep: EntryPoint) -> str:
+    return f"Helion backend plugin {ep.name!r} ({ep.value}) from {_dist_name(ep)!r}"
+
+
+def _load_plugin_by_name(name: str) -> None:
+    ep = _plugin_entry_points().get(name)
+    if ep is None:
+        return
+    with _PLUGIN_LOAD_LOCK:
+        if name in _REGISTRY or name in _LOADING:
+            # Loaded meanwhile or registered by hand; or looked up by the
+            # plugin itself while it imports.
+            return
+        if name in _FAILED_PLUGINS:
+            raise ValueError(_FAILED_PLUGINS[name])
+        _LOADING.add(name)
+        try:
+            _load_backend_plugin(ep)
+        # Remembered for the process lifetime, interrupted loads too: a fresh
+        # process is required to retry (a half-imported plugin would not
+        # re-import cleanly).
+        except Exception as e:
+            message = f"{_describe(ep)} failed to load: {type(e).__name__}: {e}"
+            _FAILED_PLUGINS[name] = message
+            raise ValueError(message) from e
+        except BaseException as e:
+            _FAILED_PLUGINS[name] = (
+                f"{_describe(ep)} failed to load: interrupted ({type(e).__name__})"
+            )
+            raise
+        finally:
+            _LOADING.discard(name)
+
+
+def _load_backend_plugin(ep: EntryPoint) -> None:
+    """Import, validate and register one plugin.  The caller holds
+    ``_PLUGIN_LOAD_LOCK``.
+
+    On failure every name registered during the load is unregistered; names
+    registered before it (built-ins included) stay.  Nothing else is undone:
+    ``@codegen`` handlers (keyed by the plugin's own codegen name) and other
+    import side effects remain.
+    """
+    registered_before = set(_REGISTRY)
+    try:
+        backend_cls = ep.load()
+        if not (isinstance(backend_cls, type) and issubclass(backend_cls, Backend)):
+            raise TypeError("entry point is not a Backend subclass")
+        version = getattr(backend_cls, "HELION_BACKEND_API_VERSION", None)
+        if type(version) is not int or version != BACKEND_API_VERSION:
+            raise RuntimeError(
+                f"it declares HELION_BACKEND_API_VERSION={version!r}, but this "
+                f"Helion provides {BACKEND_API_VERSION}"
+            )
+        name = backend_cls().name
+        if name != ep.name:
+            raise RuntimeError(
+                f"its backend is named {name!r}; the entry point must use the "
+                "backend name"
+            )
+        # A no-op if the plugin registered itself; raises if another class
+        # holds the name.
+        register_compiler_backend(backend_cls)
+        _import_codegen_modules(backend_cls)
+    except BaseException:
+        for key in [k for k in list(_REGISTRY) if k not in registered_before]:
+            unregister_compiler_backend(key)
+        raise
 
 
 def _codegen_repair_scope(
@@ -307,7 +499,7 @@ def _codegen_repair_scope(
             backend_class().codegen_name,
             backend_class.__module__.rsplit(".", 1)[0],
         )
-        for backend_class in _REGISTRY.values()
+        for backend_class in list(_REGISTRY.values())
     ]
     codegen_names = {codegen_name}
     packages: set[str] = set()
@@ -332,7 +524,7 @@ def _reload_backend_codegen(codegen_name: str) -> None:
     _, packages = _codegen_repair_scope(codegen_name)
     preexisting_modules = frozenset(sys.modules)
     seen_packages: set[str] = set()
-    for backend_cls in _REGISTRY.values():
+    for backend_cls in list(_REGISTRY.values()):
         package = backend_cls.__module__.rsplit(".", 1)[0]
         if package not in packages or package in seen_packages:
             continue

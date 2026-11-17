@@ -71,6 +71,8 @@ _EXPECTED_ALL = [
     "codegen",
     "exc",
     "expr_from_string",
+    "list_backends",
+    "load_backend_plugins",
     "mask_to_op",
     "reduce_op",
     "register_compiler_backend",
