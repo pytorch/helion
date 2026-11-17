@@ -19,6 +19,7 @@ import helion
 from helion._compat import gluon_api_available
 from helion._testing import TestCase
 from helion._testing.gluon_kernels import dot_mm
+from helion._testing.gluon_kernels import mm_then_mm
 from helion._testing.gluon_kernels import nvfp4_mm
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
@@ -423,6 +424,40 @@ class TestPartitionWaits(TestCase):
         self.assertFalse(orders("reads", frozenset(), True))
         self.assertTrue(orders("publishes", frozenset(), True))
         self.assertTrue(orders("unknown", frozenset([2]), False))
+
+
+class TestBarrierMode(TestCase):
+    def test_other_roots_writes_stay_plain_loads(self) -> None:
+        """Barrier mode orders the roots by a grid barrier only the body runs,
+        with no dependency waits a producer could keep: the first root's
+        output, which the second dot reads, stays a plain load in the body
+        (no gated producer, so no skips), where the static pipeline streams it
+        from the gated producer, which skips the first root's steps."""
+        x = torch.empty([128, 8192], dtype=torch.bfloat16)
+        w = torch.empty([8192, 128], dtype=torch.bfloat16)
+        v = torch.empty([128, 128], dtype=torch.bfloat16)
+        codes = {}
+        with gluon_cpu_codegen():
+            bound = mm_then_mm.bind((x, w, v))
+            slots = len(bound.config_spec.range_warp_specialize)
+            for pipeline in ("barrier", "static"):
+                codes[pipeline] = bound.to_triton_code(
+                    helion.Config(
+                        **_RING,
+                        block_sizes=[128, 128, 64, 128, 64, 64],
+                        num_warps=4,
+                        range_warp_specializes=[True] * slots,
+                        cross_loop_pipeline=pipeline,
+                    )
+                )
+        gated = "def _helion_mm_then_mm_producer1("
+        barrier, static = codes["barrier"], codes["static"]
+        self.assertIn("warp_specialize", barrier)
+        self.assertIn("x_grid_barrier(", barrier)
+        self.assertNotIn(gated, barrier)
+        self.assertNotIn("ring_skip(", barrier)
+        self.assertIn(gated, static)
+        self.assertEqual(static.count("ring_skip("), 1)
 
 
 class TestPacedFill(TestCase):

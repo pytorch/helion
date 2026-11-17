@@ -1150,17 +1150,21 @@ class RingLowering:
                 env[operand] = SharedValue(ast_rename(expr, slots))
         return replaced
 
-    @staticmethod
-    def _group(node: torch.fx.Node, tensor: torch.Tensor) -> int | None:
+    def _group(self, node: torch.fx.Node, tensor: torch.Tensor) -> int | None:
         """Ungated if nothing writes the load's allocation, gated if only other
-        roots do, else None."""
+        roots do and waits a producer can keep order the roots
+        (``_waits_order_roots``), else None (a plain load)."""
         allocation = _allocation(tensor)
         if (roots := _roots()) is None:
             return None if allocation in _written_allocations() else _UNGATED
         writers = roots.get(allocation, (set(), set()))[0]
         graph = HostFunction.current().device_ir.tile_dependency_graph
         own = {graph.accesses[i].root for i in node.meta[TILE_ACCESS_META]}  # pyrefly: ignore [missing-attribute]
-        return _UNGATED if not writers else None if writers & own else _GATED
+        if not writers:
+            return _UNGATED
+        if writers & own or not _waits_order_roots(self.device_function):
+            return None
+        return _GATED
 
     # -- the ring kernel
 
@@ -1680,8 +1684,17 @@ def _roots() -> dict[int, tuple[set[int], set[int]]] | None:
     return roots
 
 
+def _waits_order_roots(device_function: DeviceFunction) -> bool:
+    """Whether dependency waits, which a partition can keep, order the roots:
+    barrier mode orders them by a grid barrier only the body runs."""
+    return device_function.config.cross_loop_pipeline != "barrier"
+
+
 def _ordered_tensors(device_function: DeviceFunction) -> set[str]:
-    """Tensor arguments only roots that do not read them write."""
+    """Tensor arguments only roots that do not read them write, which a gated
+    partition's kept waits order (none without such waits)."""
+    if not _waits_order_roots(device_function):
+        return set()
     roots = _roots() or {}
     return {
         name
