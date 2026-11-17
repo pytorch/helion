@@ -380,6 +380,15 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(torch.exp, x, tol=1e-4, backend="cute")
         self.assertIn('backend="cute"', source)
 
+    def test_online_softmax(self):
+        # online_softmax_reduce's combine emits exp, abs, maximum and where,
+        # which backend_ops() does not see in the node's body.
+        x = torch.randn(64, 100, device=DEVICE)
+        (source,) = self.compile(
+            lambda x: torch.softmax(x, -1), x, tol=1e-4, backend="cute"
+        )
+        self.assertIn("torch.amax(", source)
+
 
 @skipIfNotCUDA()
 @onlyBackends(["triton"])
@@ -495,6 +504,73 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
                     torch.compile(lambda x: x.sum(-1))(x)
         self.assertEqual(counters["inductor"]["fxgraph_cache_miss"], 2)
         self.assertEqual(counters["inductor"]["fxgraph_cache_hit"], 1)
+
+    def test_online_softmax(self):
+        (source,) = self.compile(
+            lambda x: torch.softmax(x, -1), torch.randn(64, 100, device=DEVICE)
+        )
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x in hl.tile(64):
+        acc = hl.full([tile_x], float("-inf"), dtype=torch.float32)
+        acc1 = hl.zeros([tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(100):
+            tmp0 = in0[tile_x, tile_r]
+            tmp1 = torch.amax(tmp0, -1)
+            tmp2 = hl.full([], float("-inf"), dtype=torch.float32)
+            tmp3 = tmp1 == tmp2
+            tmp4 = hl.full([], 0.0, dtype=torch.float32)
+            tmp5 = torch.where(tmp3, tmp4, tmp1)
+            tmp6 = tmp5.reshape([tile_x, 1])
+            tmp7 = tmp0 - tmp6
+            tmp8 = torch.exp(tmp7)
+            tmp9 = torch.sum(tmp8, -1)
+            tmp10 = torch.maximum(acc, tmp1)
+            tmp11 = acc - tmp1
+            tmp12 = torch.abs(tmp11)
+            tmp13 = -tmp12
+            tmp14 = torch.exp(tmp13)
+            tmp15 = hl.full([], 1.0, dtype=torch.float32)
+            tmp16 = acc == tmp10
+            tmp17 = torch.where(tmp16, tmp15, tmp14)
+            tmp18 = acc1 * tmp17
+            tmp19 = tmp1 == tmp10
+            tmp20 = torch.where(tmp19, tmp15, tmp14)
+            tmp21 = tmp9 * tmp20
+            tmp22 = tmp18 + tmp21
+            acc1 = tmp22
+            acc = tmp10
+        for tile_r in hl.tile(100):
+            tmp23 = in0[tile_x, tile_r]
+            tmp24 = acc.reshape([tile_x, 1])
+            tmp25 = tmp23 - tmp24
+            tmp26 = torch.exp(tmp25)
+            tmp27 = acc1.reshape([tile_x, 1])
+            tmp28 = tmp26 / tmp27
+            out0[tile_x, tile_r] = tmp28
+""",
+        )
+
+    @parametrize("case", ["split", "neg_inf_row"])
+    def test_online_softmax_inf(self, case):
+        # split: the second kernel of a split reduction reduces the first's (max,
+        # sum) pairs, and the first reduces blocks of the -inf half; neg_inf_row:
+        # softmax of a row of -inf is nan, as in eager.
+        if case == "split":
+            x = torch.randn(8, 65536, device=DEVICE)
+            x[:, :32768] = float("-inf")
+        else:
+            x = torch.randn(4, 300, device=DEVICE)
+            x[1] = float("-inf")
+        sources = self.compile(lambda x: torch.softmax(x, -1), x, tol=1e-4)
+        self.assertEqual(len(sources), 3 if case == "split" else 1)
 
     def test_pointwise(self):
         (source,) = self.compile(

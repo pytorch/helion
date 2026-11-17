@@ -41,12 +41,14 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing_extensions import Self
 
+    from torch._inductor.ops_handler import ReductionType
+
 
 # A tile name per dim, or 1 for a broadcast dim.
 TileShape = tuple[str | int, ...]
 TILE_NAMES = {"z0_": "tile_z", "y": "tile_y", "x": "tile_x", "r0_": "tile_r"}
 TILE_AXES = {name: axis for axis, name in TILE_NAMES.items()}
-REDUCTIONS = OrderedSet(["sum", "prod", "max", "min"])
+REDUCTIONS = OrderedSet(["sum", "prod", "max", "min", "online_softmax_reduce"])
 
 
 def tile_axes(shape: Iterable[str | int] | None) -> list[str]:
@@ -715,30 +717,65 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self,
         dtype: torch.dtype,
         src_dtype: torch.dtype,
-        reduction_type: str,
+        reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
         if reduction_type == "dot":
             return value
         if reduction_type not in REDUCTIONS:
             raise AssertionError(f"Helion kernels do not support {reduction_type}")
-        if not isinstance(value, CSEVariable):
+        if isinstance(value, tuple) and reduction_type != "online_softmax_reduce":
             raise AssertionError(f"expected one value to reduce, got {value}")
-        if "tile_r" not in map(str, value.shape or ()):
-            # Broadcast over tile_r, so that each block reduces one copy per lane.
-            axes = tile_axes(value.shape)
-            shape = self.value_shape([*axes, "r0_"])
-            zeros = f"hl.zeros([{', '.join(map(str, shape))}], dtype={value.dtype})"
-            line = f"{self.align(value, shape)} + {zeros}"
-            value = self.cse.generate(
-                self.compute, line, dtype=value.dtype, shape=shape
+        # As in Triton, a reduction of a value already reduced reuses its result:
+        # softmax's max and sum are two buffers, whose nodes each reduce x with
+        # online_softmax_reduce. Without the reuse, the second node writes another
+        # pair of accumulators, acc2 and acc3, which recompute the max and sum.
+        cache_key = (src_dtype, reduction_type, value)
+        if cache_key in self.cse.reduction_cache:
+            return self.cse.reduction_cache[cache_key]
+        values = [
+            self.over_tile_r(v)
+            for v in (value if isinstance(value, tuple) else (value,))
+        ]
+        acc_dtype = upcast_compute_type(dtype)
+        if reduction_type == "online_softmax_reduce":
+            result = self.online_softmax_reduce(values, acc_dtype)
+        else:
+            init = Reduction.default_accumulator(
+                reduction_type, upcast_compute_type(src_dtype)
             )
-        init = Reduction.default_accumulator(
-            reduction_type, upcast_compute_type(src_dtype)
-        )
-        if not isinstance(init, (bool, float, int)):
-            raise AssertionError(f"expected one initial value, got {init}")
-        acc = self.accumulator(init, upcast_compute_type(dtype))
+            if not isinstance(init, (bool, float, int)):
+                raise AssertionError(f"expected one initial value, got {init}")
+            acc = self.accumulator(init, acc_dtype)
+            fn = {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin"}
+            part, _ = self.reduce_block(fn[reduction_type], values[0], acc_dtype)
+            block = {
+                "sum": f"{acc} + {part}",
+                "prod": f"{acc} * {part}",
+                "max": f"torch.maximum({acc}, {part})",
+                "min": f"torch.minimum({acc}, {part})",
+            }[reduction_type]
+            self.compute.writeline(f"{acc} = {block}")
+            result = acc
+        self.cse.reduction_cache[cache_key] = cast("Any", result)
+        return result
+
+    def over_tile_r(self, value: CSEVariable) -> CSEVariable:
+        """`value`, broadcast over tile_r if it has no tile_r, so that each block
+        reduces one copy per lane."""
+        if "tile_r" in map(str, value.shape or ()):
+            return value
+        axes = tile_axes(value.shape)
+        shape = self.value_shape([*axes, "r0_"])
+        zeros = f"hl.zeros([{', '.join(map(str, shape))}], dtype={value.dtype})"
+        line = f"{self.align(value, shape)} + {zeros}"
+        return self.cse.generate(self.compute, line, dtype=value.dtype, shape=shape)
+
+    def reduce_block(
+        self, fn: str, value: CSEVariable, dtype: torch.dtype
+    ) -> tuple[str, TileShape]:
+        """torch.<fn> of a block of `value` over tile_r, e.g. torch.sum(tmp0, -1),
+        for an accumulator of `dtype`, and its shape."""
         # Reduce tile_r wherever the axis order puts it: last without a dot, before
         # tile_x in a matmul's K loop, as in (a @ b, (a[:, :, None] * b[None]).sum(1)):
         #     acc = torch.addmm(acc, tmp0, tmp1)
@@ -748,26 +785,73 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # [u0, u2]". The result is aligned to the accumulator, e.g. (tile_y, 1).
         dims = [str(dim) for dim in value.shape or ()]
         kept = [TILE_AXES[dim] for dim in dims if dim not in ("tile_r", "1")]
-        fn = {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin"}[
-            reduction_type
-        ]
         # torch.sum and torch.prod return int64 for an integer tile. For
         # x.sum(-1, dtype=torch.int32), acc = acc + torch.sum(tmp0, -1) would make
         # the int32 acc int64: "Tensor mismatch in control flow for variable
         # 'None': dtype torch.int32 != torch.int64".
         args = [str(value), str(dims.index("tile_r") - len(dims))]
         integer = value.dtype is not None and not value.dtype.is_floating_point
-        if fn in ("sum", "prod") and integer and acc.dtype != torch.int64:
-            args.append(f"dtype={acc.dtype}")
+        if fn in ("sum", "prod") and integer and dtype != torch.int64:
+            args.append(f"dtype={dtype}")
         part = f"torch.{fn}({', '.join(args)})"
         aligned = scope_shape(kept, self.outer_axes)
         if aligned != self.value_shape(kept):
             part = f"{part}.reshape([{', '.join(map(str, aligned))}])"
-        block = {
-            "sum": f"{acc} + {part}",
-            "prod": f"{acc} * {part}",
-            "max": f"torch.maximum({acc}, {part})",
-            "min": f"torch.minimum({acc}, {part})",
-        }[reduction_type]
-        self.compute.writeline(f"{acc} = {block}")
-        return acc
+        return part, aligned
+
+    def online_softmax_reduce(
+        self, values: Sequence[CSEVariable], dtype: torch.dtype
+    ) -> tuple[CSEVariable, CSEVariable]:
+        """The max m of x and the sum of exp(x - m), which softmax lowers to
+        (prepare_softmax_online). `values` is x, or x and a weight w of each exp:
+        a split reduction gives its first kernel (x, 1), and (-inf, 0) past the
+        end of R, and its second the first's (max, sum) pairs. Like the other
+        reductions, each block of tile_r is reduced, here to its max and its sum
+        of exps, and folded into the accumulators acc_max and acc_sum with
+        V.ops, which reshape the [tile_x] block max next to the [tile_x, tile_r]
+        block. torch.softmax(x, -1), with the locals each line comes from:
+            tmp1 = torch.amax(tmp0, -1)             # block_max
+            tmp5 = torch.where(tmp3, tmp4, tmp1)    # shift: tmp1 == -inf ? 0 : tmp1
+            tmp6 = tmp5.reshape([tile_x, 1])
+            tmp7 = tmp0 - tmp6
+            tmp8 = torch.exp(tmp7)                  # exp
+            tmp9 = torch.sum(tmp8, -1)              # block_sum
+            tmp10 = torch.maximum(acc, tmp1)        # new_max
+            ...
+            tmp14 = torch.exp(tmp13)                # scale: exp(-|acc - tmp1|)
+            ...
+            acc1 = tmp22    # new_sum: acc1 * (1 if acc == tmp10 else tmp14) + tmp9 * (1 if tmp1 == tmp10 else tmp14)
+            acc = tmp10
+        Of the two rescale factors exp(acc - new_max) and exp(block_max -
+        new_max), one is 1 and the other scale, so one exp does. A block of -inf
+        (masked out, padding past the end of R, or the -inf half of a split
+        reduction) is shifted by 0 rather than by its max: its exps are then
+        exp(-inf) = 0, where x - block_max would give exp(-inf - -inf) = nan,
+        and nan * 0 = nan for the padding too, which reaches the sum and every
+        output."""
+        ops = V.ops
+        value, *weight = values
+
+        def block(fn: str, arg: CSEVariable) -> CSEVariable:
+            line, shape = self.reduce_block(fn, arg, dtype)
+            return self.cse.generate(self.compute, line, dtype=dtype, shape=shape)
+
+        acc_max = self.accumulator(float("-inf"), dtype)
+        acc_sum = self.accumulator(0, dtype)
+        block_max = block("amax", value)
+        neg_inf = ops.constant(float("-inf"), dtype)
+        shift = ops.where(
+            ops.eq(block_max, neg_inf), ops.constant(0.0, dtype), block_max
+        )
+        exp = ops.exp(ops.sub(value, shift))
+        block_sum = block("sum", ops.mul(weight[0], exp) if weight else exp)
+        new_max = ops.maximum(acc_max, block_max)
+        scale = ops.exp(ops.neg(ops.abs(ops.sub(acc_max, block_max))))
+        one = ops.constant(1.0, dtype)
+        new_sum = ops.add(
+            ops.mul(acc_sum, ops.where(ops.eq(acc_max, new_max), one, scale)),
+            ops.mul(block_sum, ops.where(ops.eq(block_max, new_max), one, scale)),
+        )
+        self.compute.writeline(f"{acc_sum} = {new_sum}")
+        self.compute.writeline(f"{acc_max} = {new_max}")
+        return acc_max, acc_sum
