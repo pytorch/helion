@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 import math
 import operator
 from typing import TYPE_CHECKING
@@ -64,6 +65,22 @@ if TYPE_CHECKING:
     from .mpp_matmul import MppPlan
 
     InductorOpOverrides = OpsHandler[Any]
+
+
+def _loop_nest(device_ir: DeviceIR) -> dict[int, set[int]]:
+    """Each graph's enclosing graphs: its parent, the parent's parent, and
+    so on up to the root."""
+    from ..device_ir import control_flow_parent_ids
+
+    parents = control_flow_parent_ids(device_ir.graphs)
+    result: dict[int, set[int]] = {}
+    for info in device_ir.graphs:
+        found: set[int] = set()
+        graph_id = info.graph_id
+        while (graph_id := parents.get(graph_id, -1)) != -1 and graph_id not in found:
+            found.add(graph_id)
+        result[info.graph_id] = found
+    return result
 
 
 def _contracted_reduction_blocks(device_ir: DeviceIR) -> set[int]:
@@ -763,17 +780,31 @@ class MetalBackend(Backend):
             grid_ids = [b for ids in device_ir.grid_block_ids for b in ids]
             loops = [tuple(b for b in grid_ids if b in tunable)]
             literals = [literal(grid_ids)]
-            for info in device_ir.graphs:
-                if isinstance(info, ForLoopGraphInfo):
-                    loop = tuple(b for b in info.block_ids if b in tunable)
-                    if loop and loop not in loops:
-                        loops.append(loop)
-                        literals.append(literal(info.block_ids))
+            loop_graphs: list[int] = []
+            nest = _loop_nest(device_ir)
+            for info in sorted(
+                (i for i in device_ir.graphs if isinstance(i, ForLoopGraphInfo)),
+                key=lambda i: len(nest.get(i.graph_id, ())),
+            ):
+                loop = tuple(b for b in info.block_ids if b in tunable)
+                if loop and loop not in loops:
+                    loops.append(loop)
+                    literals.append(literal(info.block_ids))
+                    loop_graphs.append(info.graph_id)
             # launch_threads multiplies the loops' threads together, as one
-            # nest: the grid and one device loop in it.  A kernel's roots are
-            # cases of one launch, each with its own tiles, and sibling loops
-            # don't nest, so those kernels get no fit (follow-up).
-            if any(loops) and len(device_ir.grid_block_ids) == 1 and len(loops) <= 2:
+            # nest, outermost first: the grid and the device loops in it, each
+            # inside the one before (through any branches between them).  A
+            # kernel's roots are cases of one launch, each with its own tiles,
+            # and sibling loops don't nest, so those kernels get no fit
+            # (follow-up).
+            if (
+                any(loops)
+                and len(device_ir.grid_block_ids) == 1
+                and all(
+                    outer in nest.get(inner, ())
+                    for outer, inner in itertools.pairwise(loop_graphs)
+                )
+            ):
                 launch_facts = dataclasses.replace(
                     launch_facts,
                     thread_loops=tuple(loops),

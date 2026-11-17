@@ -64,6 +64,21 @@ def fixed_m(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def grid_tile_k(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A grid, a tile loop in it and a K loop in that: one nest of three."""
+    e, m, k = a.shape
+    n = w.shape[2]
+    out = torch.empty([e, m, n], dtype=torch.float32, device=a.device)
+    for g in hl.grid(e):
+        for tile_m, tile_n in hl.tile([m, n]):
+            acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+            for tile_k in hl.tile(k):
+                acc = torch.addmm(acc, a[g, tile_m, tile_k], w[g, tile_k, tile_n])
+            out[g, tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def two_roots(
     x: torch.Tensor, y: torch.Tensor, u: torch.Tensor, v: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -428,6 +443,23 @@ class TestFragmentConfig(unittest.TestCase):
                 )
                 spec.normalize(config, _fix_invalid=True)
                 self.assertEqual(config.config["num_threads"], fitted)
+                bound.to_code(config)
+
+    def test_fit_for_a_nest_of_three_loops(self) -> None:
+        """The grid, a tile loop and the matmul's K loop nest, so the fit
+        applies.  Counts all on auto, as in the default config or a config
+        that gives only block sizes, launched 8 threads, which MPP refused;
+        the fit makes them explicit, whole SIMD groups."""
+        a = torch.randn(3, 40, 64, dtype=torch.float16)
+        w = torch.randn(3, 64, 48, dtype=torch.float16)
+        bound = grid_tile_k.bind((a, w))
+        spec = bound.config_spec
+        self.assertEqual(kernel_facts(spec).thread_loops, ((), (1, 2), (3,)))
+        default = spec.default_config()
+        self.assertEqual(default["num_threads"], [16, 8, 1])
+        given = helion.Config(block_sizes=[16, 16, 16])
+        for config in (default, given):
+            with self.subTest(config=config):
                 bound.to_code(config)
 
     def test_no_fit_for_several_roots(self) -> None:

@@ -209,7 +209,8 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     ones filling what is left in block order, and the smallest count below
     its block grown while the threadgroup falls short.  All explicit, the
     counts launch as given.  A config with every count on auto, as the
-    default config has, is left as it is.  Literal-size tiles (a fixed
+    default config has, keeps them when the backend's own placement
+    launches a threadgroup its matmuls take.  Literal-size tiles (a fixed
     ``block_size=``) have no count and take one thread per element first;
     the counts fit what they leave.
 
@@ -222,9 +223,6 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     # Normalization leaves out counts that are all auto.
     threads = config.get("num_threads", [0] * len(spec))
     assert isinstance(blocks, list) and isinstance(threads, list)
-    if not any(t > 0 for t in threads):
-        # Every count on auto, as in the default config: left as it is.
-        return
     # A tile over a size-1 dimension runs on one thread.
     sizes = [
         1
@@ -409,7 +407,12 @@ class MetalSearchSurface(BackendSearchSurface):
             # were before Metal took the key: the sequence pass gives it an
             # empty range_num_stages, which this drops.
             config.pop("range_num_stages", None)
-        if fix_invalid and kernel_facts(config_spec).thread_loops:
+        threads = config.get("num_threads", ())
+        assert isinstance(threads, (list, tuple))
+        # Counts all on auto leave the threads to the backend, so a config
+        # given by hand is fitted too; explicit counts only when asked.
+        all_auto = not any(t > 0 for t in threads)
+        if (fix_invalid or all_auto) and kernel_facts(config_spec).thread_loops:
             fit_threads(config_spec, config)
 
 
