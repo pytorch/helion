@@ -172,6 +172,23 @@ class TestRefEagerMisc(TestCase):
             expected = torch.arange(8, device=DEVICE, dtype=torch.float32)
             torch.testing.assert_close(result, expected)
 
+    def test_tile_over_an_empty_dimension_runs_no_iterations(self):
+        @helion.kernel(ref_mode=helion.RefMode.EAGER)
+        def kernel(x: torch.Tensor) -> torch.Tensor:
+            m, n = x.shape
+            out = torch.zeros_like(x)
+            for tile_m, tile_n in hl.tile([m, n]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            for tile_m, tile_n in hl.tile([m, n], block_size=[2, 2]):
+                out[tile_m, tile_n] += 1
+            return out
+
+        with assert_ref_eager_mode():
+            for shape in ((4, 0), (0, 4), (0, 0)):
+                with self.subTest(shape=shape):
+                    x = torch.randn(shape, device=DEVICE)
+                    torch.testing.assert_close(kernel(x), x + 2)
+
     def test_store_with_duplicate_indices_raises_error(self):
         """Test that hl.store with duplicate indices raises an error in ref mode."""
 

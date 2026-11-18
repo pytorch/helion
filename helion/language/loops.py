@@ -576,8 +576,11 @@ def _(
     for b, e, bs in zip(begin_list, end_list, bs_list, strict=True):
         b_int, e_int = _to_int(b), _to_int(e)
         assert b_int is not None and e_int is not None
-        if b_int == e_int:
-            continue
+        if e_int <= b_int:
+            # An empty dimension leaves the whole loop without iterations, as
+            # it leaves the compiled kernel's grid; dropping it would yield
+            # tuples short of that dimension's tile.
+            return
         bs_int = _to_int(bs) if bs is not None else (e_int - b_int)
         assert bs_int is not None
         dim_ranges.append(
