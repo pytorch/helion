@@ -41,7 +41,7 @@ _INBAND_PUSH_BYTES = 1 << 25
 DependencyObligation = tuple[int, int | None, int | None]
 # Local counters, tagged data pushed to every rank, counters every rank sees, or
 # tagged words a producer pushes into every rank's mirror of its tile.
-Transport = Literal["counter", "inband", "peer_counter", "tagged"]
+Transport = Literal["cluster", "counter", "inband", "peer_counter", "tagged"]
 IntegerExpression = Any
 RelationBounds = tuple[tuple[int, IntegerExpression, IntegerExpression, int], ...]
 ConcreteRelationBounds = tuple[tuple[int, int, int, int], ...]
@@ -4747,6 +4747,9 @@ class TileDependencyGraph:
     tagged_candidate_ids: frozenset[int] = frozenset()
     # The candidates this config enables: their dependency is "tagged".
     tagged_allocation_ids: frozenset[int] = frozenset()
+    # The cluster candidates this config carries in launch clusters
+    # (``cross_loop_dsmem``): their dependency is "cluster".
+    dsmem_allocation_ids: frozenset[int] = frozenset()
     # (root, allocation id) of each hint load (``TileAccess.hint``) that a
     # later write in its phase overlaps: without hints that write would wait.
     unordered_hint_reads: frozenset[tuple[int, int]] = frozenset()
@@ -4785,6 +4788,8 @@ class TileDependencyGraph:
     def transport(self, dependency: AccessDependency) -> Transport:
         """How the scheduler must order one dependency."""
         producer = self.accesses[dependency.producer_access_id]
+        if producer.allocation_id in self.dsmem_allocation_ids:
+            return "cluster"
         if not _crosses_ranks(producer, self.accesses[dependency.consumer_access_id]):
             return "counter"
         if producer.allocation_id in self.inband_allocation_ids:
@@ -4898,10 +4903,43 @@ class TileDependencyGraph:
             return None
         return _scatter_position(self.inband_store(allocation_id))
 
+    @property
+    def dsmem_candidate_ids(self) -> tuple[int, ...]:
+        """Allocations a launch cluster may carry from one root to a later one
+        (one ``cross_loop_dsmem`` entry each, in this order): written by one
+        non-atomic store and read by one load in a later root, both on this
+        rank's own copy.  Normalize and codegen check the rest for a
+        config."""
+        by_allocation: dict[int, list[TileAccess]] = {}
+        for access in self.accesses:
+            by_allocation.setdefault(access.allocation_id, []).append(access)
+        candidates = []
+        for allocation_id, accesses in sorted(by_allocation.items()):
+            if len(accesses) != 2:
+                continue
+            store, load = sorted(accesses, key=lambda a: a.kind != "store")
+            if (
+                store.kind == "store"
+                and load.kind == "load"
+                and store.root < load.root
+                and not store.is_atomic
+                and store.owner_rank is None
+                and load.owner_rank is None
+            ):
+                candidates.append(allocation_id)
+        return tuple(candidates)
+
+    def dsmem_accesses(self, allocation_id: int) -> tuple[TileAccess, TileAccess]:
+        """A cluster candidate's store and load."""
+        accesses = [a for a in self.accesses if a.allocation_id == allocation_id]
+        store = next(a for a in accesses if a.kind == "store")
+        load = next(a for a in accesses if a.kind == "load")
+        return store, load
+
     def crosses_ranks(self) -> bool:
         """Whether any dependency needs a cross-rank transport."""
         return any(
-            self.transport(dependency) != "counter"
+            self.transport(dependency) not in ("counter", "cluster")
             for edge in self.edges
             for dependency in edge.access_dependencies
         )
