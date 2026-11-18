@@ -38,12 +38,16 @@ if TYPE_CHECKING:
     from torch._inductor.scheduler import SchedulerNode
 
 
-# Python operators HelionOverrides inherits from OpOverrides (BasicMathOpsMixin's
-# a + b, a < b, ~a), which mean the same on torch tensors. Not every inherited
-# spelling does: BasicMathOpsMixin.mod writes a % b, which floors on torch
-# tensors (-7 % 2 == 1) while Inductor's mod truncates (-1).
+# Ops HelionOverrides inherits from OpOverrides that mean the same in a Helion
+# kernel: Python operators (BasicMathOpsMixin's a + b, a < b, ~a), which mean the
+# same on torch tensors, and load_seed, ops.load(seeds, i), which reads seeds[i]
+# through a 0-d view of the seed buffer, reinterpret_tensor(buf0, (), (), i):
+#     tmp0 = in0[()]
+# Not every inherited spelling does: BasicMathOpsMixin.mod writes a % b, which
+# floors on torch tensors (-7 % 2 == 1) while Inductor's mod truncates (-1).
 INHERITED_OPS = OrderedSet(
     [
+        "load_seed",
         "add",
         "sub",
         "mul",
@@ -93,13 +97,14 @@ def backend_ops(backend: str) -> OrderedSet[str]:
     lgamma, so a CuTe kernel with it would fail to compile with
     NotImplementedError; unsupported() names it instead: "Unsupported: lgamma".
     index_expr, value_expr and masked are HelionKernel code (hl.load, tile
-    indices) rather than torch calls."""
+    indices) rather than torch calls, and rand is hl.rand(...), which CuTe
+    compiles though its op overrides have no rand."""
     cls = type(get_backend(backend).inductor_op_overrides())
     torch_calls = OrderedSet(
         name
         for name in vars(HelionOverrides)
         if name in vars(OpsHandler)
-        and name not in ("index_expr", "value_expr", "masked")
+        and name not in ("index_expr", "value_expr", "masked", "rand")
     )
     return HELION_OPS - OrderedSet(
         name for name in torch_calls if getattr(cls, name) is getattr(OpsHandler, name)
@@ -150,9 +155,9 @@ def supported(backend: str) -> OrderedSet[str]:
 
 def unsupported(node: SchedulerNode) -> list[str]:
     """What `node` uses that HelionKernel does not support: a dynamic shape, its
-    op and reduction names that supported() lacks, e.g. dropout's "load_seed"
-    and "rand", the numerics modes that are on, a CPU scalar input, a dynamic
-    index, a direct index with a Where and an arg reduction over several dims."""
+    op and reduction names that supported() lacks, e.g. randn_like's "randn",
+    the numerics modes that are on, a CPU scalar input, a dynamic index, a
+    direct index with a Where and an arg reduction over several dims."""
     body = node._body
     buffer = cast("ComputedBuffer", node.node)
     reduction_type = buffer.get_reduction_type()
