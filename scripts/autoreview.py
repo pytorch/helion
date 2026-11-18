@@ -16,6 +16,8 @@ Either reviewer is enough: when only one of the claude and codex CLIs is
 installed, the review runs with that one and prints a warning that the agent
 must pass on to the user. With neither installed it fails. It also warns when
 its Python cannot import pytest: the reviewers run tests with that Python.
+A backend whose toolchain that Python can't import (triton, cutlass, jax) is
+named in the reviewers' prompt as a lane they list as not run.
 
 When the review finds nothing (LGTM), the script prints the line that records
 it in the reviewed commits' messages, naming the reviewers that ran:
@@ -253,7 +255,47 @@ def build_review_prompt(head: bool, review_args: list[str] | None = None) -> str
     else:
         prefix = PROMPT_HEAD_PREFIX if head else PROMPT_DIFF_PREFIX
     body = PROMPT_REVIEW_BODY.format(python=shlex.quote(sys.executable))
+    if (missing := unavailable_lanes_note()) is not None:
+        body = f"{body}\n\n{missing}"
     return f"{prefix}\n\n{body}"
+
+
+#: The modules each runnable backend's lanes import, by run_tests.py's
+#: backend name; Metal's need only torch.
+BACKEND_MODULES = {
+    "triton": ("triton",),
+    "cute": ("triton", "cutlass"),
+    "pallas-interpret": ("jax",),
+}
+
+
+def unavailable_lanes_note() -> str | None:
+    """A note for the reviewers naming the backends whose toolchain this
+    Python can't import, so they list those lanes as not run rather than
+    stop.  Triton and CuTe need CUDA, which a Mac developing the Metal
+    backend doesn't have, so CI runs those lanes.  pallas-interpret only
+    needs jax, which installs anywhere: the note names it when jax is
+    missing so the review still finishes, and installing jax lets the
+    reviewers run that lane locally."""
+    missing = {
+        backend: [m for m in modules if importlib.util.find_spec(m) is None]
+        for backend, modules in BACKEND_MODULES.items()
+    }
+    lanes = [
+        f"{backend} (no {', '.join(names)})"
+        for backend, names in missing.items()
+        if names
+    ]
+    if not lanes:
+        return None
+    return (
+        f"These backends' lanes can't run on this machine, whose Python lacks "
+        f"their toolchain: {'; '.join(lanes)}. That is not a system error: do "
+        "not stop the review for it. Review the change for those backends by "
+        "reading the code and the code it generates where another backend's "
+        "lane shows it, and list their lanes among the checks not run (CI runs "
+        "them)."
+    )
 
 
 def subprocess_env() -> dict[str, str]:

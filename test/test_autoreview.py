@@ -307,6 +307,27 @@ def test_python_without_pytest_is_warned_about(monkeypatch):
     )
 
 
+def test_missing_backend_toolchains_are_named_in_the_prompt(monkeypatch):
+    """A backend whose toolchain this Python can't import is named in the
+    review prompt as a lane the reviewers list as not run, so a machine
+    without it reviews instead of ending in an ERROR; with every toolchain
+    present the prompt says nothing."""
+    monkeypatch.setattr(autoreview, "BACKEND_MODULES", {"triton": ("sys",)})
+    assert autoreview.unavailable_lanes_note() is None
+    assert "can't run on this machine" not in autoreview.build_review_prompt(True)
+    monkeypatch.setattr(
+        autoreview,
+        "BACKEND_MODULES",
+        {"triton": ("helion_no_such_module",), "cute": ("sys", "helion_nope")},
+    )
+    note = autoreview.unavailable_lanes_note()
+    assert note is not None
+    assert "triton (no helion_no_such_module); cute (no helion_nope)" in note
+    assert "not a system error" in note
+    assert note in autoreview.build_review_prompt(True)
+    assert note in autoreview.build_review_prompt(False, ["origin/main..HEAD"])
+
+
 @pytest.mark.slow
 def test_python_without_pytest_warns_before_and_after_the_review(review, monkeypatch):
     monkeypatch.setattr(autoreview, "PYTEST_MODULES", ("helion_no_such_module",))
