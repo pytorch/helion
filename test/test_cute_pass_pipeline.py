@@ -101,6 +101,9 @@ KERNEL_DEF_PASS_NAMES = [
     "pair_lane_math",
     "select_native_warp_reductions",
     "stage_cta_stores",
+    # After the table: the element hints of ``cute_scalar_load_hints``, on
+    # the loads every earlier pass left plain.
+    "hint_element_loads",
 ]
 
 

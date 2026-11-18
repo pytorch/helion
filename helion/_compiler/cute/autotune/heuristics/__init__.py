@@ -173,6 +173,8 @@ from .cute_host_paired_sum import add_host_sum_seeds
 from .cute_integer_loop_reduction import CuteIntegerLoopReductionHeuristic
 from .cute_integer_loop_reduction import register_integer_loop_reduction_coverage
 from .cute_l2_row_swizzle import register_l2_row_swizzle_coverage
+from .cute_lane_unrolled_warp_rows import CuteLaneUnrolledWarpRowsHeuristic
+from .cute_lane_unrolled_warp_rows import lane_unrolled_warp_rows_seed_configs
 from .cute_launch_bounds import CutePointwiseMinBlocksHeuristic
 from .cute_launch_bounds import pointwise_min_blocks_seeds
 from .cute_launch_bounds import register_matmul_min_blocks_coverage
@@ -192,6 +194,8 @@ from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
 from .cute_row_packets import row_packet_seed_configs
 from .cute_row_resident import register_row_resident_coverage
+from .cute_row_stream_retention import CuteRowStreamRetentionHeuristic
+from .cute_row_stream_retention import row_stream_retention_seed_configs
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_simt_mma import CuteSimtMmaHeuristic
 from .cute_split_k_cluster import CuteSplitKClusterHeuristic
@@ -503,6 +507,20 @@ def postprocess_seed_configs(
         if row_seeds:
             configs.extend(row_seeds)
             env.config_spec.autotuner_heuristics.append(family)
+    # The lane-unrolled row at several one-warp rows per CTA.
+    warp_rows = lane_unrolled_warp_rows_seed_configs(env, device_ir, configs)
+    if warp_rows:
+        configs.extend(warp_rows)
+        env.config_spec.autotuner_heuristics.append(
+            CuteLaneUnrolledWarpRowsHeuristic.name
+        )
+    # Twins of the row seeds above with one input stream kept in L2.
+    retention = row_stream_retention_seed_configs(env, device_ir, configs)
+    if retention:
+        configs.extend(retention)
+        env.config_spec.autotuner_heuristics.append(
+            CuteRowStreamRetentionHeuristic.name
+        )
     return configs
 
 

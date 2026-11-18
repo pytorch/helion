@@ -1555,6 +1555,20 @@ def _lower_scalar_policy_loads(s: _KernelDefState) -> None:
     s.definition.body = lower_scalar_policy_loads(s.definition.body)
 
 
+def _hint_element_loads(s: _KernelDefState) -> None:
+    from ..scalar_policy_loads import hint_element_loads
+
+    s.definition.body = hint_element_loads(
+        s.definition,
+        s.fn.cute_state.element_load_hints,
+        predicate_lowered=s.ctx.config.cute_scalar_load_hints,
+    )
+
+
+def _element_load_hints(s: _KernelDefState) -> bool:
+    return s.ctx.config.cute_scalar_load_hints or s.ctx.config.cute_narrow_load_hints
+
+
 def _pack_half_extremum_folds(s: _KernelDefState) -> None:
     from ..half_extremum_folds import pack_half_extremum_folds
 
@@ -2081,7 +2095,19 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         _config_flag("cute_staged_store"),
         _stage_cta_stores,
         # After every pass that reads the kernel's stores: its proof runs the
-        # final body, and the image's stores name no tensor.
+        # body they left, and the image's stores name no tensor.  Before
+        # ``hint_element_loads``: the proof takes plain loads, not the
+        # hinted helper calls, and would leave a hinted kernel unstaged.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "hint_element_loads",
+        _element_load_hints,
+        _hint_element_loads,
+        # Last, after every pass that reads, moves or merges an element load
+        # (the staged store's proof reads them): the loads still plain here
+        # are the ones that take a hint.  A hint changes no value and no
+        # store, and the staged image's loads name no tensor parameter.
         requires=(RENAMED,),
     ),
 )

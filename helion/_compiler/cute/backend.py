@@ -3109,31 +3109,59 @@ class CuteBackend(Backend):
         # those are is decided by the lane passes after codegen, so it is
         # read off renders: every policy reset at once first (one render when
         # all are dead), else slot by slot, keeping each reset that leaves
-        # the source as it is.  What is returned is a config ``same_source``
-        # accepted, as it was asked about, or ``config`` itself.
+        # the source as it is.  The load-form knobs the search set for the
+        # policies go with them where the source allows.  What is returned
+        # is a config ``same_source`` accepted, as it was asked about, or
+        # ``config`` itself.
         policies = config.config.get("load_eviction_policies")
         if not isinstance(policies, list) or not any(policies):
             return config
+        from .autotune.config_keys import CUTE_LOAD_HINT_FORM_KEYS
 
         def with_policies(values: list[object]) -> Config:
             return config.from_dict(
                 {**config.config, "load_eviction_policies": [*values]}
             )
 
-        cleared = with_policies([""] * len(policies))
+        cleared = config.from_dict(
+            {
+                **{
+                    name: value
+                    for name, value in config.config.items()
+                    if name not in CUTE_LOAD_HINT_FORM_KEYS
+                },
+                "load_eviction_policies": [""] * len(policies),
+            }
+        )
         if same_source(cleared):
             return cleared
+        # ``cleared`` dropped the form knobs too.  Where the config names
+        # one, the policies may all be dead with the knob alive (it also
+        # predicates a masked element whose hint the kernel spells out), so
+        # resetting the last set policy is asked about as well.
+        forms = any(config.config.get(key) is True for key in CUTE_LOAD_HINT_FORM_KEYS)
         accepted = config
         live = list(policies)
         for index, policy in enumerate(policies):
             trial = [*live]
             trial[index] = ""
-            # ``cleared`` is answered: the last set policy stays.
-            if policy == "" or not any(trial):
+            # Without a form knob ``cleared`` is answered: the last set
+            # policy stays.
+            if policy == "" or not (forms or any(trial)):
                 continue
             candidate = with_policies(trial)
             if same_source(candidate):
                 live = trial
+                accepted = candidate
+        # A load-form knob the search set for the policies (``open_load_hint_
+        # forms``) is dead when no policy that stays needs its form.
+        for key in CUTE_LOAD_HINT_FORM_KEYS:
+            if accepted.config.get(key) is not True:
+                continue
+            candidate = config.from_dict(
+                {name: value for name, value in accepted.config.items() if name != key}
+            )
+            if same_source(candidate):
                 accepted = candidate
         return accepted
 

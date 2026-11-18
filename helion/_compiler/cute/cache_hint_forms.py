@@ -1,10 +1,11 @@
 """The PTX forms of a CuTe load site's cache hint.
 
 Role: general-purpose emitter.  The device helpers that write hinted loads as
-inline PTX (``l2_policy``, ``masked_packet_load``) and the MMA DAG's hinted
-``cp.async`` packets (``cute_mma_dag``) take their L1 and L2 qualifiers from
-these tables.  The ``createpolicy`` descriptor setup is still written out in
-``l2_policy._policy_assembly`` and ``masked_packet_load``, and
+inline PTX (``l2_policy``, ``masked_packet_load``, ``element_policy_loads``)
+and the MMA DAG's hinted ``cp.async`` packets (``cute_mma_dag``) take their
+L1 and L2 qualifiers from these tables.  The ``createpolicy`` descriptor
+setup is still written out in ``l2_policy._policy_assembly``,
+``masked_packet_load`` and ``element_policy_loads._assembly``, and
 ``l2_policy.scalar_policy_load``, ``readonly_packet_load_helpers``' 32-byte
 load, ``device/ptx.py`` and ``row_matrix_transport_codegen`` keep literal
 forms.  The module is DSL-free and imports nothing, so the passes import it

@@ -757,6 +757,16 @@ class CuteDeviceFunctionState:
         # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a
         # matmul operand re-lowered under a block remap) keeps its slot.
         self.load_eviction_slots: dict[Node, int] = {}
+        # Tensor name -> (cutlass type of its elements, policy): the cache
+        # policy the tensor's plain element loads take at the end of the
+        # pipeline under ``cute_scalar_load_hints`` or
+        # ``cute_narrow_load_hints``
+        # (``scalar_policy_loads.hint_element_loads``).  The first load slot
+        # of the tensor, in lowering order, that names such a policy sets it
+        # (``cache_policy_loads.element_load_hint``).  None for a tensor that
+        # takes no hint: one of its 2-byte element loads spells out a policy
+        # of its own (``spelled_hint_excludes_element_hints``).
+        self.element_load_hints: dict[str, tuple[str, str] | None] = {}
         # Merging / splitting reshapes lowered so far: True when each thread
         # holds the element at its own coordinates (proven by
         # ``cute_reshape._chain_keeps_thread_elements``), False when the

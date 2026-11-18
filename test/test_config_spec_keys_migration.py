@@ -123,7 +123,7 @@ _BASE_VALID_KEYS = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -140,7 +140,7 @@ _BASE_VALID_KEYS = """
     cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -295,7 +295,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -312,7 +312,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -406,7 +406,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_grid_lane_jam
     cute_host_paired_sum cute_independent_reduction cute_integer_loop_reduction
     cute_lane_unroll cute_materialized_operand_schedule cute_materialized_schedule
-    cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
+    cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release cute_pointwise_pid_type
     cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -420,7 +420,7 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_register_tile_cooperative_fold cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma
@@ -526,7 +526,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_mma_dag_value_metadata_read_overlap
     cute_mma_dag_store cute_mma_dag_v_lag
     cute_mma_dag_warps
-    cute_mma_f32_conversion cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
+    cute_mma_f32_conversion cute_narrow_load_hints cute_packet_prefetch cute_pair_lane_math cute_pdl cute_pdl_capture_overlap cute_pdl_release
     cute_pointwise_pid_type cute_proven_bounds cute_radix_boundary_early_exit
     cute_radix_cached_payload_inverse cute_radix_candidate_capacity
     cute_radix_candidate_key_cache cute_radix_cluster_ctas cute_radix_defer_output
@@ -543,7 +543,7 @@ _BASE_CUTE_ACCEPTED = """
     cute_register_tile_store_first
     cute_register_tile_warp_fold cute_replicated_reduction cute_rng_packet
     cute_scalar_epilogue cute_scalar_epilogue_keep_inputs
-    cute_scalar_epilogue_owner_fold cute_scaled_cluster_m cute_scaled_compact_m
+    cute_scalar_epilogue_owner_fold cute_scalar_load_hints cute_scaled_cluster_m cute_scaled_compact_m
     cute_scaled_epilogue_mode cute_scaled_epilogue_n cute_scaled_fused_scales
     cute_scaled_mma cute_scaled_persistent cute_scaled_prepare
     cute_scaled_prepare_rows cute_scaled_sf_inplace cute_scaled_sf_tma

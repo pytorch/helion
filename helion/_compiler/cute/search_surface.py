@@ -225,10 +225,15 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     # sinking its V-loop and unrolling its lanes are tunable at every extent,
     # though the seeds that sink it fit only some.
     from .autotune.heuristics.cute import CuteStridedReductionHeuristic
+    from .autotune.heuristics.cute import lane_rows_stay_in_registers
 
     config_spec.cute_strided_reduction_sites = (
         CuteStridedReductionHeuristic.strided_reduction(env, device_ir) is not None
     )
+    # Whether a row of this kernel may stay in registers on vector lanes: no
+    # two of its memory accesses can need a thread barrier, which that
+    # layout has no place for.
+    config_spec.cute_register_lane_rows = lane_rows_stay_in_registers(env, device_ir)
     config_spec.cute_signed_bitfield_bf16_available = (
         config_spec.target_device_capability == (10, 0)
         and any(has_signed_byte_field(info.graph) for info in device_ir.graphs)

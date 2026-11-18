@@ -35,6 +35,7 @@ from ....autotuner.search_surface import BackendSearchSurface
 from ....exc import InvalidConfig
 from ..block_scaled_config import block_scaled_choices
 from ..block_scaled_config import normalize_block_scaled_config
+from ..cache_hint_forms import L2_POLICY_FORMS
 from ..cute_flash import FLASH_KV_STAGE_KEY
 from ..cute_flash import FLASH_PIPELINE_FAMILY_KEY
 from ..cute_flash_bwd_row_mma import FLASH_BWD_FA4_FAMILY
@@ -170,6 +171,7 @@ from .config_keys import CUTE_GDN_RECURRENCE_MMA_M_KEY
 from .config_keys import CUTE_GDN_RECURRENCE_STAGES_KEY
 from .config_keys import CUTE_GDN_RECURRENCE_TOKEN_GROUPS_KEY
 from .config_keys import CUTE_IMPLICIT_DEFAULT_KEYS
+from .config_keys import CUTE_LOAD_HINT_FORM_KEYS
 from .config_keys import CUTE_TOPK_CHOICES
 from .config_keys import VALID_CUTE_CHUNK_PREPARE_SCHEDULES
 from .config_keys import VALID_CUTE_CHUNK_RECURRENCE_REGISTER_CAPS
@@ -807,6 +809,82 @@ def _cute_config_forms_one_vector_lane(
         return False
     vec = config_spec.cute_vector_widths.config_get(vec_list, rl_spec.block_id, 1)
     return isinstance(vec, int) and vec > 1 and rl_spec.size_hint // requested == vec
+
+
+def _cute_config_forms_lane_unrolled_row(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    rl_spec: ReductionLoopSpec,
+    available: int,
+) -> bool:
+    """Whether ``config`` spells out a lane-unrolled row for the persistent
+    reduction ``rl_spec``: ``cute_lane_unroll`` above 1 and an explicit
+    thread count that fits the remaining budget, walks the static extent in
+    whole lanes (it divides it) and is the count the row runs on.  Like the
+    one-vector lane, that is the requested geometry, not a thread count the
+    budget shrank: the threads keep the row in registers across its sweeps,
+    several rows to a CTA, where rolling it would re-read every operand the
+    roll does not prefetch.  A one-warp row beside one row per CTA leaves an
+    SM at 32 warps (its CTA limit); four such rows per CTA read 1.5-2%
+    faster on a 768-wide fp32 LayerNorm with a stride-2 operand (B200, hand
+    edit of the same code).
+
+    The persistent row must form the lane loop the unroll takes
+    (``_cute_reduction_plans``: a masked row walking its live lanes on one
+    warp, an even number of them) on exactly the requested threads: a count
+    the plan lowers (a lane-loop row runs on one warp at most) would render
+    the code of the lower count, so it rolls as before and each admitted
+    count is a kernel of its own.  ``cute_vloop_sink``
+    excludes it (its row loop takes the unroll instead), and so does a row
+    whose extent is not static: only a hint says a symbolic row is walked
+    in whole lanes.  So does a kernel whose memory accesses may need an
+    order across threads (``ConfigSpec.cute_register_lane_rows``: it reads
+    back storage it stores, touches a tensor it stores into a second time,
+    or writes a tensor that may share a buffer with another it accesses): a
+    row held in registers on lanes has no
+    place for the thread barrier, the code generator refuses it, and the
+    rolled row the config meant before this rule compiles.
+    ``_normalize_cute_lane_knobs`` keeps the knob for an
+    admitted row, so the normalized config names it and normalizes to
+    itself; any other row (a power-of-two row whose lanes are a vector's
+    elements) rolls as before.
+
+    A config without the knob keeps the looped reduction a shrunk thread
+    count always meant.  So does a normalized config saved before this rule,
+    with or without the knob (a rolled row's lane loops take the unroll
+    too): where normalization rolled the row it wrote the chunk into
+    ``reduction_loops``, and only a row the config leaves persistent is
+    asked here.
+    """
+    unroll = config.get("cute_lane_unroll", 1)
+    if (
+        not isinstance(unroll, int)
+        or isinstance(unroll, bool)
+        or unroll <= 1
+        # Under ``cute_vloop_sink`` the unroll belongs to the sunk nest's
+        # row loop, whatever the reduction forms.
+        or config.get("cute_vloop_sink")
+        # Accesses that need an order across threads take a barrier, which
+        # the lane loop of a row held in registers has no place for.
+        or not config_spec.cute_register_lane_rows
+    ):
+        return False
+    nt_list = cast("list[int]", config.get("num_threads", []) or [])
+    requested = config_spec.num_threads.config_get(nt_list, rl_spec.block_id, 0)
+    extent = config_spec.cute_static_reduction_extents.get(rl_spec.block_id)
+    if (
+        not isinstance(requested, int)
+        or not 0 < requested <= available
+        or extent is None
+        or extent % requested
+    ):
+        return False
+    return any(
+        plan.block_id == rl_spec.block_id
+        and plan.lane_loop
+        and plan.threads == requested
+        for plan in _cute_reduction_plans(config_spec, config)
+    )
 
 
 def cute_config_forms_register_tile(
@@ -1506,24 +1584,103 @@ def _normalize_cute_tiles_per_block(
         config["cute_tiles_per_block"] = pack
 
 
-def _normalize_cute_wide_packet_hints(
+# The ``load_eviction_policies`` values ``cute_wide_packet_hints`` carries
+# onto 32-byte packets and ``cute_scalar_load_hints`` onto element loads:
+# the L2 families but the read-only one, a packet form at every width.
+_CUTE_L2_HELPER_POLICIES = frozenset(L2_POLICY_FORMS) - {"nc_l2_first"}
+# The values an element load can carry: those, and the L1 priorities and the
+# streaming operator, whose masked loads ``cute_scalar_load_hints`` predicates.
+_CUTE_ELEMENT_HINT_POLICIES = _CUTE_L2_HELPER_POLICIES | {"first", "last", "streaming"}
+# The load-form knobs the search sets on the configs it decodes
+# (``open_load_hint_forms``), each with the policies that need its form.
+_CUTE_SEARCHED_LOAD_HINT_FORMS: dict[str, frozenset[str]] = {
+    "cute_wide_packet_hints": _CUTE_L2_HELPER_POLICIES,
+    "cute_scalar_load_hints": _CUTE_ELEMENT_HINT_POLICIES,
+}
+
+
+def _normalize_cute_load_hint_forms(
     config: dict[str, object], *, fix_invalid: bool
 ) -> None:
-    """``cute_wide_packet_hints`` is a boolean, absent meaning False: the
-    L2 policies of ``load_eviction_policies`` reach 32-byte packets
-    through the SM100 ``_32b`` helpers only when it is set (and only on a
-    toolchain with the 256-bit hinted load, which codegen checks the way
-    it does for ``nc_l2_first``).  Not in the flat search layout: the knob
-    is default-off until its effect is measured."""
-    key = "cute_wide_packet_hints"
-    if key not in config:
+    """``CUTE_LOAD_HINT_FORM_KEYS`` are booleans, absent meaning False: a
+    config saved before a knob existed renders the loads it was tuned with.
+    ``cute_wide_packet_hints`` takes the SM100 ``_32b`` helpers (only on a
+    toolchain with the 256-bit hinted load, which codegen checks the way it
+    does for ``nc_l2_first``); ``cute_scalar_load_hints`` the L2 policies
+    and the predicated form of the element loads.  Neither is in the flat
+    search layout: a config with a knob off renders what the same config
+    without the policy renders (the scalar knob: with the older conditional
+    form of a masked hinted element), so a searched boolean would mostly
+    repeat code.  ``open_load_hint_forms`` sets both on the configs the
+    search decodes.  ``cute_narrow_load_hints`` (every policy on the 2-byte
+    element loads) is set by hand only: see the knob in ``Config``."""
+    for key in CUTE_LOAD_HINT_FORM_KEYS:
+        if key not in config:
+            continue
+        value = config[key]
+        if type(value) is not bool:
+            if not fix_invalid:
+                raise InvalidConfig(f"{key} must be a boolean")
+            value = False
+        config[key] = value
+
+
+def open_load_hint_forms(config: dict[str, object]) -> None:
+    """Give a config decoded from the flat search layout the load forms
+    that carry its ``load_eviction_policies``: ``cute_wide_packet_hints``
+    when they name an L2 policy, ``cute_scalar_load_hints`` when they name
+    any policy an element load takes.
+
+    With the wide-packet knob off, an L2 policy on a 32-byte packet renders
+    the plain load, losing the ``nc_l2_first`` the load had too, so from a
+    32-byte incumbent the hinted family was two coordinated changes away,
+    one of them in no search layout.  With the scalar knob off an L2 policy
+    on an element load renders nothing, and an L1 priority on a masked one
+    renders inline PTX under a branch.  Every search-side config takes the
+    hinted forms instead, and a policy change is one coordinate from any
+    layout.  Neither knob changes which loads are packets: the wide-packet
+    knob picks the helper of a packet that is a packet either way, and the
+    scalar knob rewrites the element loads that remain after every pass has
+    run (``hint_element_loads``).  Only decoded configs are touched: a
+    config given to ``normalize`` (a saved or pinned one) keeps the forms it
+    names, so it renders the code it was tuned with.
+
+    ``cute_narrow_load_hints`` is not opened: the hinted 2-byte element
+    load measured slower than the plain one where it was tried (the value
+    arrives through a 32-bit register and an L2 policy rebuilds its
+    descriptor for every second load)."""
+    policies = config.get("load_eviction_policies")
+    if isinstance(policies, str):
+        policies = [policies]
+    if not isinstance(policies, list):
         return
-    value = config[key]
-    if type(value) is not bool:
-        if not fix_invalid:
-            raise InvalidConfig(f"{key} must be a boolean")
-        value = False
-    config[key] = value
+    for key, needed in _CUTE_SEARCHED_LOAD_HINT_FORMS.items():
+        if any(policy in needed for policy in policies):
+            config[key] = True
+
+
+def reopen_load_hint_forms(
+    config: dict[str, object], overrides: Mapping[str, object]
+) -> None:
+    """``open_load_hint_forms`` again for a decoded config whose
+    ``load_eviction_policies`` an override (``autotune_config_overrides``)
+    replaced: the forms follow the policies the config runs with, not the
+    sampled ones the override threw away, so every candidate of a search
+    with fixed policies renders them the same way and one with none carries
+    no form.  A form the overrides name themselves stays as they set it."""
+    if "load_eviction_policies" not in overrides:
+        return
+    forms: dict[str, object] = {
+        "load_eviction_policies": config.get("load_eviction_policies")
+    }
+    open_load_hint_forms(forms)
+    for key in _CUTE_SEARCHED_LOAD_HINT_FORMS:
+        if key in overrides:
+            continue
+        if key in forms:
+            config[key] = True
+        else:
+            config.pop(key, None)
 
 
 def _normalize_cute_bool_byte_packets(
@@ -1912,6 +2069,9 @@ class _CuteReductionPlan(NamedTuple):
     # The vector width of a looped reduction's lanes (``looped_reduction_lanes``),
     # 1 for a persistent row.
     rolled_width: int
+    # The threads the reduction runs on: the requested count once the budget,
+    # the lane tiling and the one-warp rule of a lane-loop row have lowered it.
+    threads: int
 
 
 def _cute_reduction_plans(
@@ -2061,7 +2221,12 @@ def _cute_reduction_plans(
                     lane_loop = _unrollable_lanes(lanes)
         plans.append(
             _CuteReductionPlan(
-                block_id, unpadded, exact and not unpadded, lane_loop, rolled_width
+                block_id,
+                unpadded,
+                exact and not unpadded,
+                lane_loop,
+                rolled_width,
+                threads,
             )
         )
         others *= threads
@@ -2700,7 +2865,7 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
-    _normalize_cute_wide_packet_hints(config, fix_invalid=fix_invalid)
+    _normalize_cute_load_hint_forms(config, fix_invalid=fix_invalid)
     _normalize_cute_pdl(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_fragment_mma(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_ring_mma(config_spec, config, fix_invalid=fix_invalid)
@@ -3161,12 +3326,19 @@ def normalize_reduction_threads(
                             config_spec, config, spec, available
                         )
                     )
-                    if forms_register_tile or _cute_config_forms_one_vector_lane(
-                        config_spec, config, spec, available
+                    if (
+                        forms_register_tile
+                        or _cute_config_forms_one_vector_lane(
+                            config_spec, config, spec, available
+                        )
+                        or _cute_config_forms_lane_unrolled_row(
+                            config_spec, config, spec, available
+                        )
                     ):
                         # Only the register tile honours the schedule
-                        # knobs; a one-vector lane that is not one keeps
-                        # its lane loop but drops them below.
+                        # knobs; a one-vector lane or a lane-unrolled row
+                        # that is not one keeps its lane loop but drops
+                        # them below.
                         register_tile = register_tile or forms_register_tile
                         continue
                     chunk = min(spec.size_hint, available)
@@ -4584,6 +4756,7 @@ def prepare_flat_config(config_spec: ConfigSpec, config: dict[str, object]) -> N
     ):
         if config.get(key) is None:
             config.pop(key, None)
+    open_load_hint_forms(config)
 
 
 # ``load_eviction_policies`` values of the CuTe loads.  "first"/"last" lower to
@@ -4603,7 +4776,13 @@ def prepare_flat_config(config_spec: ConfigSpec, config: dict[str, object]) -> N
 # evict it after its final use.  Both reach 16-, 8- and 4-byte packets; the
 # unpredicated 32-byte packet (SM100+) only under the cute_wide_packet_hints
 # knob, while the predicated packets of a masked row strip carry them at every
-# width up to 64 bytes.
+# width up to 64 bytes.  An element load (a gather, a strided or unaligned
+# lane) takes the L1 priorities and the streaming operator at 4 and 8 bytes
+# and, under the cute_scalar_load_hints knob, the L2 policies at those sizes
+# (per tensor: ``hint_element_loads``).  The search sets both knobs on the
+# configs it decodes (``open_load_hint_forms``).  A 2-byte element takes a
+# policy only under the cute_narrow_load_hints knob, which the search leaves
+# alone.
 CUTE_EVICTION_POLICIES: tuple[str, ...] = (
     "",
     "first",
@@ -5010,6 +5189,7 @@ class CuteSearchSurface(BackendSearchSurface):
         overrides: Mapping[str, object],
     ) -> None:
         prepare_override_normalization(config_spec, config, overrides)
+        reopen_load_hint_forms(config, overrides)
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
         trim_reference_config(config_spec, config)
