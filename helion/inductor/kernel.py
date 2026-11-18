@@ -239,6 +239,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.load_masks: list[CSEVariable] = []
         self.accumulator_count = 0
         self.has_fp32_dot = False
+        # Whether the kernel draws random numbers; see rand().
+        self.uses_rand = False
         # Dot accumulators and the casts of them that run after the K loop.
         self.dot_results: OrderedSet[CSEVariable] = OrderedSet()
         # Values stored outside the current reduction loop; see disable_reduction().
@@ -555,6 +557,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             settings += f', dot_precision="{"tf32" if tf32 else "ieee"}"'
         if helion_config.fast_math:
             settings += ", fast_math=True"
+        # CuTe's hl.rand draws offset i from Philox(seed, i // 4)[i % 4] by
+        # default (cute_rng_stream "auto", four numbers per Philox evaluation),
+        # where Inductor and Helion's Triton backend draw Philox(seed, i)[0]:
+        # word0 keeps a model's dropout masks the same on every backend.
+        if self.uses_rand and helion_config.backend == "cute":
+            settings += ', cute_rng_stream="word0"'
         code.writeline(f"@helion.kernel({settings})")
         names = self.kernel_arg_names()
         signature = ", ".join(f"{name}: torch.Tensor" for name in names.values())
@@ -832,6 +840,23 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # "Unsupported: check_bounds" (HelionScheduling). Raising here, inside
         # the node's codegen, would log "Error in codegen" before the error.
         self.needs_bounds_check |= lower or upper
+
+    def rand(self, seed: CSEVariable, offset: CSEVariable) -> str:
+        """Inductor's ops.rand: Triton's tl.rand(seed, offset.to(tl.uint32)), a
+        uniform float32 from the first word of Philox(seed) at the counter
+        (offset, 0, 0, 0), where offset is the element's flat index in int32.
+        hl.rand with explicit offsets draws the same numbers:
+            tmp0 = in0[()]                          # seeds[i] (ops.load_seed)
+            tmp1 = (tile_x.index).to(torch.int32)   # offset
+            tmp2 = hl.rand([], seed=tmp0, offsets=tmp1.to(torch.int64) & 0xFFFFFFFF)
+        Its counter is the offset's low and high 32 bits. Past 2**31 elements the
+        int32 offset wraps negative, whose high word would be 0xFFFFFFFF in
+        hl.rand(..., offsets=tmp1.to(torch.int64)) but is 0 in Triton's uint32:
+        the elements from 2**31 on would get other numbers than Inductor's."""
+        self.uses_rand = True
+        return (
+            f"hl.rand([], seed={seed}, offsets={offset}.to(torch.int64) & 0xFFFFFFFF)"
+        )
 
     def reduction_accumulator(
         self, reduction_type: str, src_dtype: torch.dtype, dtype: torch.dtype
