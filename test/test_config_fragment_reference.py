@@ -10,6 +10,7 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
@@ -81,6 +82,7 @@ FRAGMENT = EnumFragment((2,))
     "value", [_IntegerEnum.VALUE, _FloatSubclass(2.5), np.float64(2.5)]
 )
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_reference_and_compiler_reject_scalar_subclass_defaults(value):
     fragment = EnumFragment((value,))
     with (
@@ -98,6 +100,7 @@ def test_reference_and_compiler_reject_scalar_subclass_defaults(value):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_reference_rejects_integer_subclass_before_clamping():
     fragment = IntegerFragment(1, 8, _IntegerEnum.VALUE)
     with (

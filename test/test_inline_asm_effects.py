@@ -14,6 +14,7 @@ from helion._compiler.autotuner_heuristics import triton as triton_heuristics
 from helion._compiler.roll_reduction import EffectfulReductionReplay
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.inline_asm_kernels import overwrite_after_reduction
 from helion._testing.inline_asm_kernels import overwritten_reduction_input
@@ -21,7 +22,10 @@ from helion._testing.inline_asm_kernels import read_after_reduction_effect
 from helion._testing.inline_asm_kernels import store_between_reductions
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 @helion.kernel(autotune_effort="none")

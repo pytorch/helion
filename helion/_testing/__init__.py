@@ -326,6 +326,14 @@ def skipIfRefEager(reason: str) -> Callable[[Callable], Callable]:
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") == "1", reason)
 
 
+def skipIfRefEagerMark(reason: str) -> pytest.MarkDecorator:
+    """Return a pytest mark that skips in ref eager mode (HELION_INTERPRET=1).
+
+    For a module's ``pytestmark``, which takes pytest marks rather than the
+    unittest decorator :func:`skipIfRefEager` returns."""
+    return pytest.mark.skipif(os.environ.get("HELION_INTERPRET") == "1", reason=reason)
+
+
 def skipIfNormalMode(reason: str) -> Callable[[Callable], Callable]:
     """Skip test if running in normal mode (i.e. if HELION_INTERPRET=1 is not set)."""
     return unittest.skipIf(os.environ.get("HELION_INTERPRET") != "1", reason)

@@ -61,6 +61,7 @@ from helion._compiler.cute.runtime_hooks import _CuteReductionExtent
 from helion._compiler.cute.runtime_hooks import _CuteReductionExtentExtractor
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion.autotuner import EnumFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner import LocalAutotuneCache
@@ -149,6 +150,7 @@ def test_callable_fast_key_keeps_fragment_alias_relationships(kind):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("nested", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_callable_float_defaults_preserve_signed_zero_in_cached_programs(nested):
     @helion.kernel(autotune_effort="none")
     def apply_default(x, fn):
@@ -202,6 +204,7 @@ def test_callable_float_defaults_preserve_signed_zero_in_cached_programs(nested)
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("nested", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_bool_and_integer_bind_to_their_own_program(wrapped, nested):
     def add_direct(x, scalar: hl.constexpr):
         out = torch.empty_like(x, dtype=torch.int64)
@@ -251,6 +254,7 @@ def test_constexpr_bool_and_integer_bind_to_their_own_program(wrapped, nested):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("wrapped", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_float_binding_preserves_signed_zero(wrapped):
     fn = _dynamic_add_scalar.fn if wrapped else _dynamic_add_constexpr.fn
     kernel = helion.kernel(fn, autotune_effort="none")
@@ -285,6 +289,7 @@ def test_constexpr_float_binding_preserves_signed_zero(wrapped):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("wrapped", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_float_keys_preserve_nan_payloads(wrapped):
     fn = _dynamic_add_scalar.fn if wrapped else _dynamic_add_constexpr.fn
     kernel = helion.kernel(fn, autotune_effort="none")
@@ -358,6 +363,7 @@ def _nested_constexpr_float(x: torch.Tensor, values: hl.constexpr) -> torch.Tens
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("wrapped", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_constexpr_float_identity(wrapped):
     kernel = helion.kernel(_nested_constexpr_float.fn, autotune_effort="none")
     tensor = torch.empty(17)
@@ -420,6 +426,7 @@ def _dynamic_add_scalar_list(x: torch.Tensor, values: list[int]) -> torch.Tensor
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("float_first", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_finite_constexpr_preserves_type_in_both_cache_orders(
     wrapped, float_first
 ):
@@ -2276,6 +2283,7 @@ def test_nested_fragment_fast_key_and_prepared_guard_snapshot_domain(kind):
 
 @pytest.mark.parametrize("keyed", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fragment_mutation_routes_actual_cached_dispatch_to_new_bound(keyed):
     # Real bind/type propagation/cache publication, replacing only native
     # execution with a return of the selected BoundKernel identity.
@@ -2310,6 +2318,7 @@ def test_fragment_mutation_routes_actual_cached_dispatch_to_new_bound(keyed):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nan_fragment_mutation_invalidates_prepared_cached_dispatch():
     kernel = helion.kernel(_register_dispatch_fragment.fn, autotune_effort="none")
     first_bits, changed_bits = "7ff8000000000001", "fff8000000000002"
@@ -2385,6 +2394,7 @@ def _register_annotated_container_dispatch_fragment(x, fragments: hl.constexpr):
 @pytest.mark.parametrize("annotation", [False, True])
 @pytest.mark.parametrize("keyed", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_container_mutation_rebinds_cached_dispatch(annotation, keyed):
     original = (
         _register_annotated_container_dispatch_fragment
@@ -2543,6 +2553,7 @@ def _read_annotated_fragment_offset(x, fragment: hl.constexpr):
 @pytest.mark.parametrize("annotation", [False, True])
 @pytest.mark.parametrize("keyed", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fragment_extra_state_keeps_distinct_cached_bindings(
     boolean, annotation, keyed
 ):
@@ -2620,6 +2631,7 @@ def _compare_fragment_pair(x, pair: hl.constexpr):
 @pytest.mark.parametrize("wrapped", [False, True])
 @pytest.mark.parametrize("keyed", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fragment_equality_partition_routes_cached_binding(
     fragment_type, wrapped, keyed
 ):

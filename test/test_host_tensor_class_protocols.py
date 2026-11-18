@@ -14,12 +14,16 @@ from helion._compiler.type_info import _is_known_host_value
 from helion._compiler.variable_origin import AttributeOrigin
 from helion._compiler.variable_origin import NameOrigin
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.tensor_views import chunk_unbind_axes
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 def _revisit_tensor_class(x: torch.Tensor, offset):

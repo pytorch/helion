@@ -21,6 +21,7 @@ from helion._compiler.inductor_lowering import prepare_graph_lowerings
 from helion._compiler.inductor_lowering import strip_unused_inputs
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner._metadata.ir_features import _has_networkx_node_link
@@ -36,6 +37,7 @@ pytestmark = [
 
 
 @pytest.mark.skipif(not _has_networkx_node_link(), reason="networkx>=3.4 required")
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_rolled_placeholder_metadata_is_not_a_lowered_call():
     bound = cpu_bind(import_example("softmax").softmax, (torch.empty(128, 128),))
     ir = bound.host_function.device_ir
@@ -105,6 +107,7 @@ def _self_compare(x: torch.Tensor, reduce: hl.constexpr, isnan: hl.constexpr):
 
 @pytest.mark.parametrize("reduce", [False, True])
 @pytest.mark.parametrize("isnan", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_bound_self_comparison_operands(reduce, isnan):
     cuda_initialized = torch.cuda.is_initialized()
     bound = cpu_bind(_self_compare, (torch.empty(31, 8), reduce, isnan))
@@ -145,6 +148,7 @@ def _repeated_binary(x: torch.Tensor, multiply: hl.constexpr):
 
 
 @pytest.mark.parametrize("multiply", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_repeated_binary_keeps_semantic_args_and_unique_lowered_inputs(multiply):
     bound = cpu_bind(_repeated_binary, (torch.empty(31), multiply))
     target = torch.ops.aten.mul.Tensor if multiply else torch.ops.aten.add.Tensor
@@ -178,6 +182,7 @@ def _merged_comparison(x: torch.Tensor):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_cse_preserves_distinct_lowering_names_after_input_merge():
     bound = cpu_bind(_merged_comparison, (torch.empty(31, 8),))
     nodes = [
@@ -251,6 +256,7 @@ def test_pruning_keeps_keyword_order_and_excludes_scheduler_dependencies():
 
 
 @pytest.mark.parametrize("replace_first", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_changed_lowered_occurrence_count_refuses_before_render(replace_first):
     bound = cpu_bind(_repeated_binary, (torch.empty(31), True))
     node = next(
@@ -295,6 +301,7 @@ def _square_and_other(x: torch.Tensor, y: torch.Tensor):
 
 
 @pytest.mark.parametrize("keyword", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_splitting_repeated_lowering_input_refuses_before_render(keyword):
     bound = cpu_bind(_square_and_other, (torch.empty(31), torch.empty(31)))
     nodes = [
@@ -329,6 +336,7 @@ def _square_and_scale(x: torch.Tensor, scale: float):
     return square, scaled
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_reprepare_uses_current_operands_for_opmath_dtype():
     bound = cpu_bind(_square_and_scale, (torch.empty(31, dtype=torch.bfloat16), 1.1))
     graph = next(

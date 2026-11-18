@@ -13,7 +13,6 @@ cross-loop split-K; test_register_tunable.py runs one too.
 
 from __future__ import annotations
 
-import os
 import re
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -27,6 +26,7 @@ from helion._testing import DEVICE
 from helion._testing import cpu_render_target
 from helion._testing import import_example
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessBackends
 from helion._testing import skipUnlessGluon
@@ -43,9 +43,8 @@ pytestmark = [
     pytest.mark.cpu_only,
     skipUnlessBackends(["triton", "cute"]),
     # Every test binds a kernel and reads its config spec or generated code.
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="inspects config specs and generated code; ref mode has neither",
+    skipIfRefEagerMark(
+        "inspects config specs and generated code; ref mode has neither"
     ),
 ]
 

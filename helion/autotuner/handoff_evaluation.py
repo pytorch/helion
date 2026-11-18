@@ -111,7 +111,19 @@ class _EvaluateCase:
     def __call__(self) -> _CaseOutcome:
         # Each measured call receives its original inputs; implicit graph
         # warmups/replays would add unaccounted calls on mutated inputs.
+        # Restore it afterwards: a case may run in the caller's process (the
+        # tests do), whose later do_bench calls keep their own setting.
+        previous = os.environ.get("HELION_BENCHMARK_CUDAGRAPH")
         os.environ["HELION_BENCHMARK_CUDAGRAPH"] = "0"
+        try:
+            return self._evaluate()
+        finally:
+            if previous is None:
+                del os.environ["HELION_BENCHMARK_CUDAGRAPH"]
+            else:
+                os.environ["HELION_BENCHMARK_CUDAGRAPH"] = previous
+
+    def _evaluate(self) -> _CaseOutcome:
         source = Path(self.source_path).read_text()
         status = "load_error"
         samples: list[float] = []

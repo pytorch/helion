@@ -9,13 +9,17 @@ import helion
 from helion._compiler.tuple_constants import TupleConstants
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.binding_observation import assert_scalar_addition
 from helion._testing.binding_observation import observe_compiled_binding
 import helion.language as hl
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.ref_mode import RefMode
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 def _distinct_tuple(value):

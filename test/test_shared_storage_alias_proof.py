@@ -7,13 +7,17 @@ import helion
 from helion._compiler.merge_reduction_dims import _Merger
 from helion._compiler.roll_reduction import ReductionRoller
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
 from helion.language._tracing_ops import _host_tensor
 from helion.language.memory_ops import load
 from helion.language.memory_ops import store
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 def _storage_values(x: torch.Tensor, y: torch.Tensor, choose: int):

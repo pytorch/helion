@@ -9,11 +9,15 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_fragment import ConfigSpecFragment
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 class _DirectAllocator(ConfigSpecFragment):

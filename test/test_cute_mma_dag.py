@@ -63,6 +63,7 @@ from helion import exc
 from helion._testing import DEVICE
 from helion._testing import import_example
 from helion._testing import pairwise
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_mma_dag import DETERMINISM_LAUNCHES
 from helion._testing.cute_mma_dag import LAUNCHES
@@ -88,10 +89,7 @@ if TYPE_CHECKING:
 pytestmark = [
     pytest.mark.cpu_only,
     skipUnlessBackends(["cute"]),
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="codegen pins and search-surface checks need the compiled path",
-    ),
+    skipIfRefEagerMark("codegen pins and search-surface checks need the compiled path"),
     # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
     # as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
     pytest.mark.cpu_render(

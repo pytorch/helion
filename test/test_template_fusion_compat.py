@@ -13,6 +13,7 @@ from torch.utils._ordered_set import OrderedSet
 
 import helion
 from helion import _compat
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 import helion.language as hl
@@ -449,6 +450,7 @@ def _reads_dynamic(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         ),
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_reads_besides_loads(kernel, expected):
     """What a fused prologue's stand-in must match: device loads, device-code
     dtypes and static grid bounds read nothing of it; ``x is None`` and a

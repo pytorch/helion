@@ -14,6 +14,7 @@ from helion._compiler.ast_read_writes import dead_assignment_elimination
 from helion._compiler.ast_read_writes import dead_expression_elimination
 from helion._compiler.ast_read_writes import definitely_does_not_have_side_effects
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import load_host_function
@@ -239,6 +240,7 @@ block_size = 128
 
 
 @pytest.mark.parametrize("form", ["assignment", "specialize"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_generated_host_retains_empty_branch(form):
     @helion.kernel(autotune_effort="none")
     def fn(x, form: hl.constexpr, enabled: hl.constexpr):
@@ -318,6 +320,7 @@ def test_empty_required_suites_preserve_execution(source):
 
 
 @pytest.mark.parametrize("form", ["except", "finally"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_generated_host_retains_empty_exception_suites(form):
     @helion.kernel(autotune_effort="none")
     def fn(x, form: hl.constexpr):

@@ -14,9 +14,13 @@ from helion._compiler import backend_registry
 from helion._compiler.backend_registry import unregister_compiler_backend
 from helion._testing import TestCase
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 _SCALAR_MARKER = "_scalar_marker"
 _BODY_MARKER = "_body_marker"

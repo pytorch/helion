@@ -21,6 +21,7 @@ from helion._compiler import type_info
 from helion._compiler.tensor_utils import function_modes_trusted
 from helion._compiler.tensor_utils import host_modes_trusted
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.tunable_fragments import load_host_function
 from helion.exc import TypeInferenceError
@@ -41,6 +42,7 @@ def _post_mutation(x, flag: int):
 
 
 @pytest.mark.parametrize("flag", [0, 1])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_post_mutation_specialization_requires_an_entry_input_source(flag):
     kernel = helion.kernel(_post_mutation, static_shapes=True)
     x = torch.arange(35, dtype=torch.float32).reshape(5, 7)
@@ -64,6 +66,7 @@ def _before_mutation(x, flag: hl.constexpr):
     return x, out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_specializing_input_metadata_before_mutation_preserves_valid_replay():
     kernel = helion.kernel(_before_mutation, static_shapes=True)
     with cpu_render_target():
@@ -92,6 +95,7 @@ def _input_backed(x, scalar: int):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_input_backed_size_stride_and_scalar_specialization_still_bind():
     kernel = helion.kernel(_input_backed, static_shapes=False)
     x = torch.empty(5, 7)
@@ -206,6 +210,7 @@ def _after_operator(x, mode: hl.constexpr):
         "resolved_effect",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_torch_ops_calls_keep_view_strides_unless_they_change(mode):
     # Looking up and calling a torch.ops operator keeps the exact layout of a
     # specialized input's view unless the call restrides it or the operator
@@ -264,6 +269,7 @@ def _patched_operator(x, call: hl.constexpr):
         "no_effect_query",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_patched_operator_hooks_stay_opaque(monkeypatch, patch):
     # A Python hook on the registry may run anything on lookup or call; a torch
     # without the effect query cannot prove a call free of effects.
@@ -396,6 +402,7 @@ class _PassthroughPreDispatchMode(SchemaCheckMode):
 
 @skipUnlessBackends(["triton"])
 @pytest.mark.parametrize("user_mode", ["function", "dispatch", "pre_dispatch"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_user_torch_modes_make_torch_ops_calls_opaque(user_mode):
     # A user's torch mode runs Python inside every torch.ops call, which may
     # restride tensors the call does not take. Whether one is active is part
@@ -440,6 +447,7 @@ def _mode_answered(x):
 
 
 @skipUnlessBackends(["triton"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_torch_ops_call_a_mode_answers_binds_opaque():
     # Under a torch mode the call is opaque before its schemas are matched: the
     # mode may answer arguments no schema takes.

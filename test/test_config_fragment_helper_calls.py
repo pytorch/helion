@@ -15,6 +15,7 @@ import helion
 from helion._compiler.compile_environment import RuntimeInputSpecialization
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion.autotuner import BooleanFragment
 from helion.autotuner import IntegerFragment
 from helion.autotuner.config_fragment import ConfigSpecFragment
@@ -22,7 +23,10 @@ import helion.language as hl
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.kernel import _RuntimeInputSpecializationExtractor
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 ANCHOR = BooleanFragment()
 HELPER_CALLS = []
