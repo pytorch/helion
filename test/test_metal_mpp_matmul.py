@@ -4825,6 +4825,21 @@ class TestMppStaging(_MppCase):
                 )
                 _close(out, _mm(torch.where(rows, a, 0), rhs))
                 self._assert_staged(msl, "float", tiles=2)
+        # The scalar contraction sums each thread's parts' products.
+        for m, k2, n in ((48, 128, 40), (16, 74, 64)):
+            a = torch.randn(m, k2, device=DEVICE, dtype=torch.float16)
+            w = torch.randn(k2, n, device=DEVICE, dtype=torch.float16)
+            for kernel in (dot_two_widened, addmm_two_widened_root):
+                bound = kernel.bind((a, w))
+                config = bound.config_spec.default_config()
+                config.config["metal_matmul"] = "scalar"
+                with self.subTest(
+                    kernel=kernel.name, m=m, k2=k2, n=n, lowering="scalar"
+                ):
+                    out, code, _ = _run(kernel, (a, w), config)
+                    self.assertIn("dot_product", code)
+                    self.assertNotIn("_helion_mpp", code)
+                    _close(out, _mm(a, w))
 
     @_full_threadgroup
     def test_staged_addmm_operands(self) -> None:
@@ -6753,13 +6768,15 @@ class TestMppRootAddmmRejects(_MppCase):
             None,
             "two MPP K loops whose accumulators start from one value",
         )
-        self._rejects(
+        # The planner leaves it to the scalar contraction, which sums a K
+        # tile on its threads.
+        out, code, _ = _run(
             root_mm_in_if,
             (xf, yf),
-            None,
-            "a per-K-tile matmul (without an acc argument, over a tiled K) not "
-            "at the top level of a loop over its K alone: under an if",
+            helion.Config(block_sizes=[16, 16, 16], num_threads=[1, 16, 16]),
         )
+        self.assertIn("dot_product", code)
+        _close(out, _mm(xf, yf))
 
     def test_acc_dtype(self) -> None:
         for dtype in (torch.float16, torch.bfloat16):
@@ -14935,22 +14952,20 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         self._scalar(dot_bf16_out, (xb, yb), None, _mm(xb, yb))
         y32 = _randn(48, 40, dtype=torch.float32)
         self._scalar(dot_mixed_dtypes, (x, y32), None, (2 * xd) @ y32.cpu().double())
+        # A float32 out_dtype over a float16 acc: the product sum, rounded to
+        # float32, adds to the acc, whose dtype the result takes.
+        xh, yh = _randn(32, 48).half(), _randn(48, 40).half()
+        self._scalar(dot_f16_acc_f32_out, (xh, yh), None, _mm(xh, yh).half().double())
 
     def test_scalar_rejections_keep_their_messages(self) -> None:
-        """A float16 acc under a float32 result, float8 operands and a dim
-        that is no block, which the scalar contraction rejects with its own
-        message."""
+        """Float8 operands and a dim that is no block, which the scalar
+        contraction rejects with its own message."""
         x, y = torch.randn(32, 48).half(), torch.randn(48, 40).half()
-        bound = dot_f16_acc_f32_out.bind((x, y))
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "pass an out_dtype equal to the acc's dtype"
-        ):
-            bound.to_code(bound.config_spec.default_config())
         f8 = torch.float8_e4m3fn
         bound = dot_plain.bind((x.to(f8), y.to(f8)))
         with self.assertRaisesRegex(
             exc.BackendUnsupported,
-            "outside an MPP region; only float16, bfloat16 and float32",
+            "on the scalar contraction; only float16, bfloat16 and float32",
         ):
             bound.to_code(bound.config_spec.default_config())
         bound = dot_constant_rows.bind((torch.randn(16, 24),))

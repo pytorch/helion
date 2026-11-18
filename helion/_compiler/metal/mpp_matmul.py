@@ -7,11 +7,13 @@ acc or without one (``torch.mm``, ``torch.bmm``, ``hl.dot``), is one op over
 the whole K, its result a cooperative value too; so is a per-K-tile product,
 a matmul without an acc argument at the top level of the loop over its tiled
 K, one op per K tile.  An ``hl.dot`` over a K held as per-thread parts
-(``factored_dims``) has no other lowering; the kernel's other ``hl.dot``
-calls reach the planner only when it can lower every one of them
+(``factored_dims``) is always planned; the kernel's other ``hl.dot`` calls
+reach the planner only when it can lower every one of them
 (:func:`_dot_admissible`), and keep the scalar contraction (``matmul_ops``)
-otherwise.  A batched matmul is one rank-2 op on the matrices of its batch
-tile's one index:
+otherwise, as a per-K-tile product elsewhere in its K loop does.  Under
+``metal_matmul="scalar"`` nothing is planned and every matmul lowers on the
+scalar contraction.  A batched matmul is one rank-2 op on the matrices of
+its batch tile's one index:
 
 - :func:`plan_mpp_matmuls` (``MetalBackend.pre_codegen``) admits each such
   matmul and raises ``BackendUnsupported`` for every form it can't lower.
@@ -100,6 +102,7 @@ from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
 from ..host_function import HostFunction
 from ..inductor_lowering import APIFuncLowering
+from ..inductor_lowering import CodegenState
 from ..variable_origin import BlockSizeOrigin
 from ..variable_origin import GridOrigin
 from ..variable_origin import TileBeginOrigin
@@ -120,6 +123,7 @@ from .lane_fold import folded_lanes
 from .lane_fold import is_lane_loop
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
+from .matmul_ops import scalar_contraction
 from .msl_expr import PURE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
 from .reduction import alloc_threadgroup_buffer
@@ -137,7 +141,6 @@ if TYPE_CHECKING:
     from ..device_ir import GraphInfo
     from ..device_ir import IfGraphInfo
     from ..generate_ast import GenerateAST
-    from ..inductor_lowering import CodegenState
     from .fragment_mma import FragmentLowering
 
 ACC = "_helion_mpp_acc"
@@ -203,6 +206,9 @@ _MATMULS: dict[object, tuple[int | None, int, int]] = {
     torch.ops.aten.bmm.dtype: (None, 0, 1),
     torch.ops.aten.baddbmm.default: (0, 1, 2),
 }
+#: The aten matmuls among them, which lower on MPP, on fragments or on the
+#: scalar contraction as ``hl.dot`` does.
+ATEN_MATMULS = tuple(target for target in _MATMULS if target is not dot)
 _BATCHED = (
     torch.ops.aten.bmm.default,
     torch.ops.aten.bmm.dtype,
@@ -1008,10 +1014,9 @@ def _plan_matmuls(
             # Over a tiled K, a matmul without an acc argument gives each K
             # tile's product alone: one op over the tile, at the top level of
             # a loop over its K alone.  Elsewhere (under an if, in an inner
-            # loop, K tiled with another block or by the grid) an aten one is
-            # rejected at its codegen, after the loads' own lowerings; an
-            # hl.dot there is refused here, so that _takes_dots keeps every
-            # dot of the kernel on the scalar contraction.
+            # loop, K tiled with another block or by the grid) an aten one
+            # lowers on the scalar contraction; an hl.dot there is refused
+            # here, so that _takes_dots keeps every dot of the kernel there.
             k_block = _tile_product_k(g, matmul)
             if k_block is None:
                 if matmul.target is dot:
@@ -3831,16 +3836,25 @@ def _codegen_aten_matmul(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(cg, GenerateAST)
     acc, lhs, rhs = matmul_operands(node)
     if not planned(node):
-        # The planner plans every matmul with an acc, and each one without
-        # over a ':' K or at the top level of a loop over its K alone, or
-        # raises.
-        assert acc is None
-        raise metal_unsupported(
-            "a per-K-tile matmul (without an acc argument, over a tiled K) not "
-            "at the top level of a loop over its K alone: under an if, in an "
-            "inner loop, or with K tiled beside another block or by the grid; "
-            "accumulate it with torch.addmm(acc, a, b), take K whole with a "
-            "':' slice, or move it to the top level of a loop over K alone"
+        # A matmul the planner doesn't take lowers as an hl.dot would.
+        return scalar_contraction(
+            CodegenState(
+                cg,
+                fx_node=node,
+                env=ctx.env,
+                proxy_args=[
+                    lhs.meta["val"],
+                    rhs.meta["val"],
+                    None if acc is None else acc.meta["val"],
+                    None,
+                ],
+                ast_args=[
+                    ctx.env[lhs],
+                    ctx.env[rhs],
+                    None if acc is None else ctx.env[acc],
+                    None,
+                ],
+            )
         )
     return _codegen_matmul(
         cg, node, None if acc is None else ctx.env[acc], (ctx.env[lhs], ctx.env[rhs])

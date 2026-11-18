@@ -9,6 +9,7 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 import helion
+import helion.language as hl
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -99,3 +100,18 @@ def run_with_msl(
     result = getattr(module, kernel.fn.__name__)(*args)
     torch.mps.synchronize()
     return result, code, _compiled_msl(module)
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def addmm_k_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A K loop accumulating ``torch.addmm``: every Metal matmul lowering
+    takes it."""
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out

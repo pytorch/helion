@@ -39,6 +39,7 @@ from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeur
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
+from helion._testing.metal import addmm_k_loop
 from helion._testing.metal import run_with_msl
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -2108,6 +2109,29 @@ def int8_group_dots(
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def mm_whole_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        out[tm, tn] = torch.mm(x[tm, :], y[:, tn])
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def baddbmm_k_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    b, m, k = x.size()
+    n = y.size(2)
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tb, tm, tn in hl.tile([b, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.baddbmm(acc, x[tb, tm, tk], y[tb, tk, tn])
+        out[tb, tm, tn] = acc
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tests - scalar hl.dot (outside an MPP region)
 # ---------------------------------------------------------------------------
@@ -2364,7 +2388,7 @@ class TestMetalScalarDot(unittest.TestCase):
     def test_m_and_n_on_one_block_rejected(self) -> None:
         q = torch.randn(64, 16, device=DEVICE)
         with self.assertRaisesRegex(
-            exc.BackendUnsupported, "indexes two of M, K, N with one block"
+            exc.BackendUnsupported, "indexes two of its dims with one block"
         ):
             dot_state_square.bind((q.T.contiguous(), q, 16)).to_code(
                 helion.Config(block_sizes=[1])
@@ -2380,11 +2404,21 @@ class TestMetalScalarDot(unittest.TestCase):
                 helion.Config(block_sizes=[16, 16], num_threads=[4, 4])
             )
 
-    def test_batched_rejected(self) -> None:
-        x = torch.randn(2, 16, 32, device=DEVICE)
-        y = torch.randn(2, 32, 16, device=DEVICE)
-        with self.assertRaisesRegex(exc.BackendUnsupported, "batched"):
-            dot_batched.bind((x, y)).to_code(helion.Config(block_sizes=[1, 16, 16]))
+    def test_batched(self) -> None:
+        """A 3-D hl.dot, which MPP doesn't take: each thread holds one batch
+        index beside its M, K and N.  K's reduction keeps batch indices
+        apart with a batch tile of 2, on threads (N on lanes, as a
+        threadgroup has three axes) and on one thread's lanes."""
+        x = torch.randn(4, 16, 32, device=DEVICE)
+        y = torch.randn(4, 32, 16, device=DEVICE)
+        expected = (x.cpu().double() @ y.cpu().double()).float()
+        for config in (
+            helion.Config(block_sizes=[1, 16, 16]),
+            helion.Config(block_sizes=[2, 8, 8], num_threads=[2, 8, 1]),
+            helion.Config(block_sizes=[2, 8, 8], num_threads=[1, 8, 8]),
+        ):
+            out, _ = self._run(dot_batched, (x, y), config)
+            torch.testing.assert_close(out.cpu(), expected)
 
     def test_int8_whole_k(self) -> None:
         """int8 operands contract in int32 (stored here into an int8 out,
@@ -2404,13 +2438,43 @@ class TestMetalScalarDot(unittest.TestCase):
         ):
             _default_code(matmul_full_k, (x, y))
 
-    def test_acc_with_other_out_dtype_rejected(self) -> None:
+    def test_acc_with_other_out_dtype(self) -> None:
+        """The product sum is rounded to out_dtype, then added to the acc in
+        the acc's dtype, as Triton does."""
         x = torch.randn(16, 32, device=DEVICE)
         y = torch.randn(32, 16, device=DEVICE)
-        with self.assertRaisesRegex(
-            exc.BackendUnsupported, "pass an out_dtype equal to the acc's dtype"
+        out, _ = self._run(dot_acc_bf16_out, (x, y))
+        ref = (x.cpu().double() @ y.cpu().double()).float().bfloat16().float()
+        torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    def test_scalar_choice(self) -> None:
+        """``metal_matmul="scalar"`` lowers every matmul on the scalar
+        contraction: aten ones over a K loop, a ':' K and a batch, and an
+        hl.dot."""
+        x, y = torch.randn(32, 64, device=DEVICE), torch.randn(64, 32, device=DEVICE)
+        xb = torch.randn(2, 32, 64, device=DEVICE)
+        yb = torch.randn(2, 64, 32, device=DEVICE)
+        scalar = {"metal_matmul": "scalar"}
+        for kernel, args, config in (
+            (addmm_k_loop, (x, y), helion.Config(block_sizes=[16, 16, 16], **scalar)),
+            (mm_whole_k, (x, y), helion.Config(block_sizes=[16, 16], **scalar)),
+            (
+                baddbmm_k_loop,
+                (xb, yb),
+                helion.Config(block_sizes=[1, 16, 16, 16], **scalar),
+            ),
+            (dot_kernel, (x, y), helion.Config(block_sizes=[16, 16, 16], **scalar)),
         ):
-            _default_code(dot_acc_bf16_out, (x, y))
+            with self.subTest(kernel=kernel.name):
+                out, code = self._run(kernel, args, config)
+                self.assertNotIn("_helion_mpp", code)
+                a, b = args
+                torch.testing.assert_close(
+                    out.cpu(),
+                    (a.cpu().double() @ b.cpu().double()).float(),
+                    rtol=1e-4,
+                    atol=1e-4,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -13797,6 +13861,19 @@ def widened_into_mm(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def mm_parts_of_n(a: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    m, _ = a.shape
+    n2 = w.size(1)
+    out = torch.zeros([m, n2], dtype=torch.float32, device=a.device)
+    bn = hl.register_block_size(n2 // 2)
+    for tm in hl.tile(m):
+        for tn in hl.tile(n2 // 2, block_size=bn):
+            s = 2 * tn.begin
+            out[tm, s : s + 2 * bn] = torch.mm(a[tm, :], w[:, s : s + 2 * bn])
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def stack_rows_two_tiles(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     m, kh = x.shape
     out = torch.zeros([m, 2 * kh], dtype=x.dtype, device=x.device)
@@ -14497,16 +14574,26 @@ class TestMetalFactoredDims(unittest.TestCase):
         self.assertIn("iota_part_1", code)
         self.assertIn("load_part_1", code)
 
-    def test_matmul_over_parts_rejects(self) -> None:
-        """A matmul over parts that the MPP planner doesn't lower (a
-        torch.mm; test_metal_mpp_matmul.py covers the ones it does)."""
-        message = (
-            r"a matmul over a dim held as per-thread parts \(a widened hl\.arange\(\) "
-            r"slice or a merged torch\.stack\) that the cooperative MPP lowering "
-            r"doesn't admit; "
-        )
+    def test_matmul_over_parts_of_n_rejects(self) -> None:
+        """Only a K held as parts lowers on the scalar contraction; the
+        message names the operand and dim held so."""
         self._assert_rejected(
-            widened_into_mm, (torch.randn(5, 16), torch.randn(16, 6)), message
+            mm_parts_of_n,
+            (torch.randn(16, 32), torch.randn(32, 32)),
+            re.escape("whose rhs holds its dim 1, not K, as per-thread parts"),
+            helion.Config(block_sizes=[16, 8], metal_matmul="scalar"),
+        )
+
+    def test_matmul_over_parts(self) -> None:
+        """A matmul over parts that the MPP planner doesn't lower (a
+        torch.mm with no acc over a K of parts;
+        test_metal_mpp_matmul.py covers the ones it does) sums each thread's
+        parts' products on the scalar contraction."""
+        a, w = torch.randn(5, 16, device=DEVICE), torch.randn(16, 6, device=DEVICE)
+        self._check(
+            widened_into_mm,
+            (a, w),
+            (a.cpu().double() @ w.cpu().double()).float().to(DEVICE),
         )
 
     def test_stack_inputs_over_other_blocks_reject(self) -> None:
