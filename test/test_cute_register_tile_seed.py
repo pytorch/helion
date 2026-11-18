@@ -15,7 +15,6 @@ from test._cute_register_tile_kernels import col_sum_dynamic
 from test._cute_register_tile_kernels import col_sum_f32_out
 from test._cute_register_tile_kernels import col_sum_guarded
 from test._cute_register_tile_kernels import col_sum_nested
-from test._cute_vloop_sink_kernels import col_reduce_sum_static
 from test.test_cute_register_tile_reductions import COLUMN_REDUCE
 from test.test_cute_register_tile_reductions import CONSTEXPR_OWNER
 from test.test_cute_register_tile_reductions import ROLLED_OWNER
@@ -26,6 +25,7 @@ from helion._compiler.autotuner_heuristics import get_heuristics
 from helion._compiler.cute.autotune.heuristics.cute import CuteColumnReductionHeuristic
 from helion._compiler.cute.autotune.heuristics.cute import CuteRegisterTileHeuristic
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
 import helion.language as hl
 
 # ``test_cute_register_tile_reductions``'s CPU model (its ``_cpu_only`` fixture

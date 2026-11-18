@@ -31,26 +31,6 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from test._cute_vloop_sink_kernels import FRAGMENT_REDUCE
-from test._cute_vloop_sink_kernels import TWO_STAGE_REDUCE
-from test._cute_vloop_sink_kernels import _sink_config
-from test._cute_vloop_sink_kernels import col_reduce_max_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_atomic_then_load_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_from8_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_from8_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_gather_then_atomic_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_lower_triangle_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_pair_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_const_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_dynamic
-from test._cute_vloop_sink_kernels import col_reduce_sum_rescaled_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_static
-from test._cute_vloop_sink_kernels import col_reduce_sum_with_policy_dynamic
-from test._cute_vloop_sink_kernels import col_weighted_mean_dynamic
-from test._cute_vloop_sink_kernels import col_weighted_mean_static
-
 import helion
 from helion._compiler.ast_read_writes import ReadWrites
 from helion._compiler.cute import device_state
@@ -78,6 +58,29 @@ from helion._testing import onlyBackends
 from helion._testing import patch_target_facts
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_vloop_sink_kernels import FRAGMENT_REDUCE
+from helion._testing.cute_vloop_sink_kernels import TWO_STAGE_REDUCE
+from helion._testing.cute_vloop_sink_kernels import _sink_config
+from helion._testing.cute_vloop_sink_kernels import col_reduce_max_dynamic
+from helion._testing.cute_vloop_sink_kernels import (
+    col_reduce_sum_atomic_then_load_static,
+)
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_from8_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_from8_static
+from helion._testing.cute_vloop_sink_kernels import (
+    col_reduce_sum_gather_then_atomic_static,
+)
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_lower_triangle_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_pair_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_pair_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_rescaled_const_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_rescaled_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_rescaled_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_static
+from helion._testing.cute_vloop_sink_kernels import col_reduce_sum_with_policy_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_weighted_mean_dynamic
+from helion._testing.cute_vloop_sink_kernels import col_weighted_mean_static
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only

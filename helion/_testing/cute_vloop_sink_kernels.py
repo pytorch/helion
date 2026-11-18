@@ -37,6 +37,7 @@ def _col_reduce_sum_with_policy_fn(
     for tile_n in hl.tile(n, block_size=block_n):
         col_acc = hl.zeros([tile_n], dtype=torch.float32)
         for tile_m in hl.tile(m, block_size=block_m):
+            # pyrefly: ignore [bad-argument-type]
             tile = hl.load(x, [tile_m, tile_n], eviction_policy=policy)
             col_acc += torch.sum(tile.to(torch.float32), dim=0)
         out[tile_n] = col_acc.to(out.dtype)
