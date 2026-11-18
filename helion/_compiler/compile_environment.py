@@ -1487,12 +1487,14 @@ class CompileEnvironment:
     ) -> Source | None:
         """Find the input whose base-alignment predicate applies to ``fake_tensor``.
 
-        A zero-offset, statically exact view has the same data pointer as its
-        unique input storage owner.  Layout legality remains a separate proof;
-        this only lets the descriptor reuse that owner's runtime alignment guard.
+        A statically exact view starting a constant multiple of 16 bytes past
+        its unique input storage owner (e.g. a row-block slice of a weight) has
+        a 16-byte aligned base exactly when that owner does.  Layout legality
+        remains a separate proof; this only lets the descriptor reuse that
+        owner's runtime alignment guard.
         """
         owner = self.tensor_alignment_owner(fake_tensor)
-        if owner is None or owner[1] != 0:
+        if owner is None or owner[1] % 16 != 0:
             return None
         return owner[0]
 

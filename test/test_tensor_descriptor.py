@@ -623,6 +623,39 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         )
         self.assertIs(pointer_bound, pointer_copy_view.bind((unaligned,)))
 
+    @skipIfRefEager("asserts the generated code")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_tensor_descriptor_on_view_past_input_base(self):
+        """A view starting a multiple of 16 bytes past its input shares the
+        input's alignment guard and loads through a tensor descriptor; a view
+        4 bytes past does not."""
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_16_bytes_in(x: torch.Tensor) -> torch.Tensor:
+            view = x[4 : 4 + 32 * 64].view(32, 64)
+            out = torch.empty_like(view)
+            for tile in hl.tile(view.size(), block_size=[16, 16]):
+                out[tile] = view[tile]
+            return out
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_4_bytes_in(x: torch.Tensor) -> torch.Tensor:
+            view = x[1 : 1 + 32 * 64].view(32, 64)
+            out = torch.empty_like(view)
+            for tile in hl.tile(view.size(), block_size=[16, 16]):
+                out[tile] = view[tile]
+            return out
+
+        x = torch.randn(32 * 64 + 4, device=DEVICE)
+        descriptors = {}
+        for start, kernel in ((4, copy_16_bytes_in), (1, copy_4_bytes_in)):
+            code, result = code_and_output(kernel, (x,), indexing="tensor_descriptor")
+            torch.testing.assert_close(result, x[start : start + 32 * 64].view(32, 64))
+            descriptors[start] = code.count(get_tensor_descriptor_fn_name())
+        # Both store through a descriptor; only the 16-byte offset view loads
+        # through one.
+        self.assertEqual(descriptors[4], descriptors[1] + 1)
+
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")
     def test_host_tensor_descriptor_view_alignment_dynamic_shapes(self):
