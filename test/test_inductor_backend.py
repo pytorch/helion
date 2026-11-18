@@ -480,6 +480,14 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(fn, x, backend="cute")
         self.assertIn("torch.any(", source)
 
+    def test_online_softmax(self):
+        # online_softmax_reduce()'s combine emits exp, abs, neg, maximum and
+        # where, which backend_ops() does not see in the node's body.
+        x = torch.randn(64, 100, device=DEVICE)
+        fn = lambda x: torch.softmax(x, -1)  # noqa: E731
+        (source,) = self.compile(fn, x, tol=1e-4, backend="cute")
+        self.assertIn("torch.maximum(acc, ", source)
+
     def test_welford(self):
         # welford() emits eq, where, truediv, isinf, isnan and logical_or, and
         # the block's weight sums hl.full([], 1.0).expand(tile_r).
@@ -559,13 +567,16 @@ class TestInductorBackend(InductorBackendTestCase):
             )
 
     def test_keeps_cuda_custom_pass(self):
+        # HelionPostGradPass runs the CUDA pass registered before it first.
         custom_pass = object()
         with (
             patch.dict(common.device_codegens),
             patch.dict(common.custom_backend_passes, {"cuda": custom_pass}),
         ):
             helion.inductor._register()
-            self.assertIs(common.custom_backend_passes["cuda"], custom_pass)
+            registered = common.custom_backend_passes["cuda"]
+            self.assertIsInstance(registered, helion.inductor.HelionPostGradPass)
+            self.assertIs(registered.inner, custom_pass)
 
     def test_options(self):
         # The settings are torch.compile options with a "helion." prefix.
@@ -591,13 +602,132 @@ class TestInductorBackend(InductorBackendTestCase):
         code, _ = code_and_output(scale_kernel, (randn(64, 128),))
         self.assertIn("tl.full([], 0.1, tl.float32)", code)
 
-    def test_softmax(self):
+    @parametrize("case", ["online_softmax_off", "pattern_matcher_off", "integer"])
+    def test_softmax(self, case):
+        # Without online softmax (turned off, or with Inductor's pattern
+        # rewrites turned off, or for an integer x, whose exps
+        # prepare_softmax_online would sum in an int64 accumulator), the max and
+        # the sum are two reductions.
         # The sum's value derives from the max: exp(x - max), whose dtype and
         # shape HelionCSEProxy propagates.
-        (source,) = self.compile(
-            lambda x: torch.softmax(x, -1), torch.randn(64, 1000, device=DEVICE)
-        )
+        x = torch.randn(64, 1000, device=DEVICE)
+        fn = lambda x: torch.softmax(x, -1)  # noqa: E731
+        if case == "integer":
+            x = torch.randint(-5, 5, (64, 1000), device=DEVICE)
+            fn = lambda x: (  # noqa: E731
+                (x - x.amax(-1, keepdim=True)).exp().sum(-1, keepdim=True)
+            )
+        settings = {
+            "online_softmax_off": {"online_softmax": False},
+            "pattern_matcher_off": {"pattern_matcher": False},
+            "integer": {},
+        }[case]
+        with config.patch(settings):
+            (source,) = self.compile(fn, x, tol=1e-4)
         self.assertIn("acc1 = acc1 + torch.sum(", source)
+
+    def test_online_softmax(self):
+        # helion.inductor's post-grad pass rewrites softmax to
+        # prepare_softmax_online, as Inductor's does for Triton only: one pass
+        # over each row for its max and its sum of exps, then one for the output.
+        (source,) = self.compile(
+            lambda x: torch.softmax(x, -1), torch.randn(64, 100, device=DEVICE)
+        )
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x in hl.tile(64):
+        acc = hl.full([tile_x], float("-inf"), dtype=torch.float32)
+        acc1 = hl.zeros([tile_x], dtype=torch.float32)
+        for tile_r in hl.tile(100):
+            tmp0 = in0[tile_x, tile_r]
+            tmp1 = hl.full([], float("-inf"), dtype=torch.float32)
+            tmp2 = hl.full([], 0.0, dtype=torch.float32)
+            tmp3 = torch.amax(tmp0, -1)
+            tmp4 = tmp3.reshape([tile_x, 1])
+            tmp5 = tmp0 - tmp4
+            tmp6 = torch.exp(tmp5)
+            tmp7 = tmp0 == tmp1
+            tmp8 = torch.where(tmp7, tmp2, tmp6)
+            tmp9 = torch.sum(tmp8, -1)
+            tmp10 = torch.maximum(acc, tmp3)
+            tmp11 = acc - tmp3
+            tmp12 = torch.abs(tmp11)
+            tmp13 = -tmp12
+            tmp14 = torch.exp(tmp13)
+            tmp15 = hl.full([], 1.0, dtype=torch.float32)
+            tmp16 = acc == tmp1
+            tmp17 = acc == tmp10
+            tmp18 = torch.where(tmp17, tmp15, tmp14)
+            tmp19 = acc1 * tmp18
+            tmp20 = torch.where(tmp16, tmp2, tmp19)
+            tmp21 = tmp3 == tmp10
+            tmp22 = torch.where(tmp21, tmp15, tmp14)
+            tmp23 = tmp9 * tmp22
+            tmp24 = tmp10 == tmp1
+            tmp25 = hl.full([], float("nan"), dtype=torch.float32)
+            tmp26 = tmp20 + tmp23
+            tmp27 = torch.where(tmp24, tmp25, tmp26)
+            acc1 = tmp27
+            acc = tmp10
+        for tile_r in hl.tile(100):
+            tmp28 = in0[tile_x, tile_r]
+            tmp29 = acc.reshape([tile_x, 1])
+            tmp30 = tmp28 - tmp29
+            tmp31 = torch.exp(tmp30)
+            tmp32 = acc1.reshape([tile_x, 1])
+            tmp33 = tmp31 / tmp32
+            out0[tile_x, tile_r] = tmp33
+""",
+        )
+
+    def test_online_softmax_sum(self):
+        # The bare sum of a row of only -inf is nan, as in eager:
+        # exp(-inf - -inf). Its -inf terms are 0, and the sum is nan where the
+        # max is -inf.
+        x = torch.randn(4, 300, device=DEVICE)
+        x[1] = float("-inf")
+        fn = lambda x: (  # noqa: E731
+            (x - x.amax(-1, keepdim=True)).exp().sum(-1, keepdim=True)
+        )
+        (source,) = self.compile(fn, x, tol=1e-4)
+        self.assertRegex(source, r"acc1 = tmp\d+\n")
+
+    def test_online_softmax_looped(self):
+        # Blocks of 64 over rows whose first half is -inf: the accumulators hold
+        # (-inf, nan) when the first finite block arrives, whose nan sum the
+        # combine leaves out (nan * 0 would keep it).
+        x = torch.randn(4, 4096, device=DEVICE)
+        x[:, :2048] = float("-inf")
+        pinned = helion.Config(block_sizes=[1, 64, 64])
+        with patch("helion.kernel", functools.partial(helion.kernel, config=pinned)):
+            self.compile(lambda x: torch.softmax(x, -1), x, tol=1e-4)
+
+    @parametrize("case", ["split", "neg_inf_row", "log_softmax"])
+    def test_online_softmax_cases(self, case):
+        # split: the second kernel of a split reduction reduces the first's
+        # (max, sum) pairs, and the first reduces blocks of the -inf half, and
+        # (-inf, 0) past the end of R (65537 elements, a prime: no split divides
+        # it);
+        # neg_inf_row: softmax of a row of -inf is nan, as in eager;
+        # log_softmax: the same rewrite, x - max - log(sum).
+        if case == "split":
+            x = torch.randn(8, 65537, device=DEVICE)
+            x[:, :32768] = float("-inf")
+        else:
+            x = torch.randn(4, 300, device=DEVICE)
+            x[1] = float("-inf")
+        fn = torch.log_softmax if case == "log_softmax" else torch.softmax
+        sources = self.compile(lambda x: fn(x, -1), x, tol=1e-4)
+        self.assertEqual(len(sources), 3 if case == "split" else 1)
+        # The sum's accumulator takes the combine, not acc1 + torch.sum(...).
+        self.assertRegex("\n".join(sources), r"acc1 = tmp\d+\n")
 
     @parametrize("op", ["cumsum", "sort"])
     def test_aten_fallback(self, op):

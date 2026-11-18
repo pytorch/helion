@@ -59,6 +59,7 @@ REDUCTIONS = OrderedSet(
         "any",
         "welford_reduce",
         "welford_combine",
+        "online_softmax_reduce",
         *ARG_REDUCTIONS,
     ]
 )
@@ -917,7 +918,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return value
         if reduction_type not in REDUCTIONS:
             raise AssertionError(f"Helion kernels do not support {reduction_type}")
-        if isinstance(value, tuple) and reduction_type != "welford_combine":
+        if isinstance(value, tuple) and reduction_type not in (
+            "welford_combine",
+            "online_softmax_reduce",
+        ):
             raise AssertionError(f"expected one value to reduce, got {value}")
 
         def upcast(value: CSEVariable) -> CSEVariable:
@@ -947,6 +951,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             )
         elif reduction_type in ("welford_reduce", "welford_combine"):
             result = self.welford(reduction_type, values, acc_dtype)
+        elif reduction_type == "online_softmax_reduce":
+            result = self.online_softmax_reduce(values, acc_dtype)
         else:
             acc = self.reduction_accumulator(reduction_type, src_dtype, acc_dtype)
             fn = {
@@ -1071,6 +1077,71 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.compute.writeline(f"{acc_index} = {new_index}")
         self.compute.writeline(f"{acc} = {new_value}")
         return acc_index
+
+    def online_softmax_reduce(
+        self, values: Sequence[CSEVariable], dtype: torch.dtype
+    ) -> tuple[CSEVariable, CSEVariable]:
+        """The max m of x over tile_r and the sum of exp(x - m), which softmax
+        and log_softmax lower to (prepare_softmax_online). `values` is x, or x
+        and a weight w of each exp: a split reduction gives its first kernel
+        (x, 1), and (-inf, 0) past the end of R, and its second the first's
+        (max, sum) pairs. Each block of tile_r is reduced to its max and its sum
+        of exps, and folded into the accumulators acc_max and acc_sum with
+        V.ops. torch.softmax(x, -1), with the locals each line comes from:
+            tmp3 = torch.amax(tmp0, -1)               # block_max
+            ...
+            tmp6 = torch.exp(tmp5)
+            tmp8 = torch.where(tmp7, tmp2, tmp6)      # term: x == -inf ? 0 : tmp6
+            tmp9 = torch.sum(tmp8, -1)                # block_sum
+            tmp10 = torch.maximum(acc, tmp3)          # new_max
+            ...
+            tmp14 = torch.exp(tmp13)                  # scale: exp(-|acc - tmp3|)
+            ...
+            tmp20 = torch.where(tmp16, tmp2, tmp19)   # acc_part: acc == -inf ? 0 : ...
+            ...
+            tmp27 = torch.where(tmp24, tmp25, tmp26)  # new_sum: tmp10 == -inf ? nan : ...
+            acc1 = tmp27
+            acc = tmp10
+        Of the two rescale factors exp(acc - new_max) and exp(block_max -
+        new_max), one is 1 and the other scale, so one exp does. A -inf adds
+        nothing: its term is 0, also in a block of only -inf (masked out, the
+        padding past the end of R, or the -inf half of a split reduction), where
+        x - block_max would make it exp(-inf - -inf) = nan; an accumulator whose
+        max is -inf adds nothing either. The sum of a row of only -inf is nan,
+        as in eager (exp(-inf - -inf)): so is the partial sum a split's first
+        kernel writes for such a part of a row, which its second, whose term is
+        0 for a max of -inf, ignores."""
+        ops = V.ops
+        value, *weight = values
+        neg_inf = ops.constant(float("-inf"), dtype)
+        zero = ops.constant(0.0, dtype)
+        acc_max = self.accumulator(float("-inf"), dtype)
+        acc_sum = self.accumulator(0, dtype)
+        block_max = self.reduce_block_value("amax", value, dtype)
+        exp = ops.exp(ops.sub(value, block_max))
+        term = ops.where(
+            ops.eq(value, neg_inf), zero, ops.mul(weight[0], exp) if weight else exp
+        )
+        block_sum = self.reduce_block_value("sum", term, dtype)
+        new_max = ops.maximum(acc_max, block_max)
+        scale = ops.exp(ops.neg(ops.abs(ops.sub(acc_max, block_max))))
+        one = ops.constant(1.0, dtype)
+        acc_part = ops.where(
+            ops.eq(acc_max, neg_inf),
+            zero,
+            ops.mul(acc_sum, ops.where(ops.eq(acc_max, new_max), one, scale)),
+        )
+        block_part = ops.mul(
+            block_sum, ops.where(ops.eq(block_max, new_max), one, scale)
+        )
+        new_sum = ops.where(
+            ops.eq(new_max, neg_inf),
+            ops.constant(float("nan"), dtype),
+            ops.add(acc_part, block_part),
+        )
+        self.compute.writeline(f"{acc_sum} = {new_sum}")
+        self.compute.writeline(f"{acc_max} = {new_max}")
+        return acc_max, acc_sum
 
     def welford(
         self, reduction_type: str, values: Sequence[CSEVariable], dtype: torch.dtype
