@@ -65,6 +65,7 @@ from .cute_flash_bwd_common import FLASH_BWD_TABLE_STEPS_KEY
 from .cute_flash_bwd_common import FLASH_BWD_TILE_GROUP_KEY
 from .cute_flash_bwd_common import FLASH_BWD_TWO_CTA_KEY
 from .cute_flash_bwd_common import FbwdPSpec
+from .cute_flash_bwd_common import FbwdTailClear
 from .cute_flash_bwd_common import chunked_region_renderer
 from .cute_flash_bwd_common import fbwd_clc_consume_only
 from .cute_flash_bwd_common import fbwd_clc_setup
@@ -80,6 +81,7 @@ from .cute_flash_bwd_common import fbwd_mma_tile_entry
 from .cute_flash_bwd_common import fbwd_p_pass
 from .cute_flash_bwd_common import fbwd_p_passes
 from .cute_flash_bwd_common import fbwd_p_store_views
+from .cute_flash_bwd_common import fbwd_tail_clear
 from .cute_flash_bwd_common import fbwd_tile_loop
 from .cute_flash_bwd_common import fbwd_tmem_warp
 from .cute_flash_bwd_common import hook_chunk_prefix
@@ -172,6 +174,36 @@ def fbwd_aux_smem_candidates(plan: FlexBwdPlan) -> tuple[int, ...]:
 def fbwd_aux_smem_layout(plan: FlexBwdPlan, budget: int) -> list[FlexAuxSmem]:
     """The staged tables of ``cute_flash_bwd_aux_smem`` with their offsets."""
     return flex_aux_smem_layout(flex_bwd_hook_plan(plan), budget)
+
+
+def flex_bwd_tail_clear(
+    plan: FlexBwdPlan, *, q_frame: bool = False
+) -> FbwdTailClear | None:
+    """``fbwd_tail_clear`` of the flex backward's P in the transposed
+    frame (rows = KV, lanes = Q) or, with ``q_frame``, the pair kernel's
+    dQ-cluster frame (rows = Q, lanes = KV): None when every visited tile
+    lies inside both sequences. The KV tiles are the ``kv_block = 128`` grid
+    (``ragged_n``); the Q tiles past ``q_seq`` include a 256-row Q block's
+    padded tile (``walk_past_q``, the condition of the launcher's spanned
+    coordinate maps)."""
+    q_past = plan.walk_past_q
+    if q_frame:
+        return fbwd_tail_clear(
+            row_tile_expr="fbwd_m_tile_h",
+            row_seq=plan.q_seq,
+            row_past=q_past,
+            lane_tile_expr="fbwd_n_tile_h",
+            lane_seq=plan.kv_seq,
+            lane_past=plan.ragged_n,
+        )
+    return fbwd_tail_clear(
+        row_tile_expr="fbwd_n_tile",
+        row_seq=plan.kv_seq,
+        row_past=plan.ragged_n,
+        lane_tile_expr="fbwd_m_tile_h",
+        lane_seq=plan.q_seq,
+        lane_past=q_past,
+    )
 
 
 def additive_bias_region(plan: FlexBwdPlan) -> FlexRegion | None:
@@ -420,6 +452,9 @@ def _compute_block(
             ind, h=h, hook_cols=hook_cols, pre_scaled=pre_scaled, has_grad=has_grad
         )
 
+    # P (and, after the Jacobian, dS) = 0 past the sequences on the steps
+    # whose tile reaches past them.
+    tail_clear = flex_bwd_tail_clear(plan)
     p_spec = FbwdPSpec(
         hook_cols=hook_cols,
         p_scale=p_scale,
@@ -437,6 +472,7 @@ def _compute_block(
             p_spec,
             h=h,
             lse_prescaled=plan.lse_prescaled,
+            tail=tail_clear,
             lse_in_mma=lse_in_mma,
         )
 

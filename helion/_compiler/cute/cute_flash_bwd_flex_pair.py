@@ -49,6 +49,7 @@ from .cute_flash_bwd_common import fbwd_dq_reduce_partitions
 from .cute_flash_bwd_common import fbwd_p_passes
 from .cute_flash_bwd_common import fbwd_p_sub_loop
 from .cute_flash_bwd_common import fbwd_tmem_warp
+from .cute_flash_bwd_common import fbwd_zero_past_lines
 from .cute_flash_bwd_common import indent_lines
 from .cute_flash_bwd_common import merge_blocks
 from .cute_flash_bwd_common import reg_split_counts
@@ -63,6 +64,7 @@ from .cute_flash_bwd_flex import flex_bwd_exp2_emu
 from .cute_flash_bwd_flex import flex_bwd_hook_plan
 from .cute_flash_bwd_flex import flex_bwd_pair_split_p
 from .cute_flash_bwd_flex import flex_bwd_pair_table_steps
+from .cute_flash_bwd_flex import flex_bwd_tail_clear
 from .cute_flash_bwd_flex import flex_bwd_wrapper_plan
 from .flash_score_mod import render_flex_hook
 from .flex_bwd_match import flex_bwd_tmem_plan
@@ -377,8 +379,17 @@ def _pair_compute_block(
         )
     )
 
+    # P = 0 past the sequences (dS = P (dP - delta) follows) on the steps
+    # whose tile reaches past them (the dQ clusters in their own frame); the
+    # thread's 32 columns start at ``fbwd_c0``.
+    tail_clear = flex_bwd_tail_clear(plan, q_frame=dq_role)
+
     def p_pass(hook: FlexHookCode | None, ind: str) -> str:
-        return lse_load.format(ind=ind) + fbwd_p_sub_loop(ind, hook, p_spec)
+        return (
+            lse_load.format(ind=ind)
+            + fbwd_p_sub_loop(ind, hook, p_spec)
+            + fbwd_zero_past_lines(ind, "tLDrS", "fbwd_c0", tail_clear)
+        )
 
     p_passes = fbwd_p_passes(
         p_pass, masked=masked, unmasked=None if bias_fold else plain
@@ -392,7 +403,7 @@ def _pair_compute_block(
             f"                fbwd_cchunk = cute.logical_divide(tLDcS_h, {hook_cols})[None, fbwd_sub]\n"
             + indent_lines(jac.chunk_body, 16)
             + f"                fbwd_ds_sub = cute.make_tensor(tLDrdP.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
-            f"                _helion_flash_rt.fbwd_mul_pairs_packed(fbwd_ds_sub, fbwd_spre, fbwd_sub * {hook_cols}, {hook_cols})\n"
+            f"                _helion_flash_rt.fbwd_mul_jacobian_packed(fbwd_ds_sub, fbwd_spre, tLDrS, fbwd_sub * {hook_cols}, {hook_cols})\n"
         )
     spre_alloc = (
         "            fbwd_spre = cute.make_rmem_tensor(tLDcS_h.shape, cutlass.Float32)\n"

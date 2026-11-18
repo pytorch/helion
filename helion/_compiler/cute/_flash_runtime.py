@@ -916,8 +916,7 @@ def fbwd_mul_pairs_packed(
     src_off: int,
     cnt: int,
 ) -> None:
-    """In-place ``dst[i] *= src[src_off + i]`` over one chunk, packed pairs
-    (the ``score_mod_bwd`` Jacobian applied to dS)."""
+    """In-place ``dst[i] *= src[src_off + i]`` over one chunk, packed pairs."""
     dst_any = cast("Any", dst_frg)
     src_any = cast("Any", src_frg)
     for v in range(cnt // 2):
@@ -927,6 +926,60 @@ def fbwd_mul_pairs_packed(
         )
         dst_any[2 * v] = a
         dst_any[2 * v + 1] = b
+
+
+# The smallest normal float32: a P below it is a masked entry's 0, or the
+# subnormal the exp2 emulation returns for -inf.
+_FLT_MIN = 1.1754943508222875e-38
+
+
+def fbwd_mul_jacobian_packed(
+    dst_frg: cute.Tensor,
+    src_frg: cute.Tensor,
+    p_frg: cute.Tensor,
+    src_off: int,
+    cnt: int,
+) -> None:
+    """In-place ``dst[i] *= src[src_off + i]``: the ``score_mod_bwd``
+    Jacobian ``src`` applied to dS ``dst``, setting dS to 0 where P
+    (``p_frg[src_off + i]``) is 0 or subnormal. At an entry the mask_mod
+    masks, P is 0 (about 2e-41 under the exp2 emulation, which clamps -inf,
+    so dS = P (dP - delta) can still be a normal float) while the Jacobian
+    of its score need not be finite (``score / (1 + q - kv)`` past the
+    diagonal), and 0 times inf is NaN in the dK and dQ MMAs, where Triton
+    and eager drop the masked entries' dS. The default exp2 paths never
+    give a positive P below FLT_MIN (``ex2.approx.ftz`` flushes it, packed
+    f16 cannot hold it), so there the rule drops exactly the entries whose
+    P is 0; under the emulation, whose P can be subnormal at an unmasked
+    entry too, it flushes those entries the same way."""
+    dst_any = cast("Any", dst_frg)
+    src_any = cast("Any", src_frg)
+    p_any = cast("Any", p_frg)
+    zero = Float32(0.0)
+    tiny = Float32(_FLT_MIN)
+    for v in range(cnt // 2):
+        a, b = cute.arch.mul_packed_f32x2(
+            (dst_any[2 * v], dst_any[2 * v + 1]),
+            (src_any[src_off + 2 * v], src_any[src_off + 2 * v + 1]),
+        )
+        drop0 = cutlass.Boolean(Float32(p_any[src_off + 2 * v]) < tiny)
+        drop1 = cutlass.Boolean(Float32(p_any[src_off + 2 * v + 1]) < tiny)
+        dst_any[2 * v] = Float32(cutlass.select_(drop0, zero, Float32(a)))
+        dst_any[2 * v + 1] = Float32(cutlass.select_(drop1, zero, Float32(b)))
+
+
+def fbwd_zero_past(frg: cute.Tensor, limit: cutlass.Int32) -> None:
+    """In-place ``frg[i] = 0`` for ``i >= limit`` over a rank-1 chunk of P:
+    the entries of a ragged tile past the sequences (``limit`` is the
+    chunk's in-sequence lane count, 0 on a row past its sequence). Their
+    operands are zero-filled, but their exp2 can still overflow (a
+    coordinate-dependent score_mod, or the score 0 against an LSE below the
+    fp32 exp range), and inf times the zero rows is NaN in the dV, dK and dQ
+    MMAs."""
+    frg_any = cast("Any", frg)
+    for i in range(cute.size(frg)):
+        keep = cutlass.Boolean(cutlass.Int32(i) < limit)
+        frg_any[i] = Float32(cutlass.select_(keep, Float32(frg_any[i]), Float32(0.0)))
 
 
 def fbwd_ds_pairs_packed(

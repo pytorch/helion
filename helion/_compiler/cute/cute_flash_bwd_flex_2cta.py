@@ -84,6 +84,7 @@ from .cute_flash_bwd_flex import _render_hooks
 from .cute_flash_bwd_flex import additive_bias_region
 from .cute_flash_bwd_flex import flex_bwd_bindings
 from .cute_flash_bwd_flex import flex_bwd_exp2_emu
+from .cute_flash_bwd_flex import flex_bwd_tail_clear
 from .cute_flash_bwd_flex import flex_bwd_wrapper_plan
 from .state import cute_codegen_state
 
@@ -578,6 +579,9 @@ def _compute_block_2cta(
             ind, h=h, hook_cols=hook_cols, pre_scaled=pre_scaled, has_grad=has_grad
         )
 
+    # P (and, after the Jacobian, dS) = 0 past the sequences on the steps
+    # whose tile reaches past them.
+    tail_clear = flex_bwd_tail_clear(plan)
     p_spec = FbwdPSpec(
         hook_cols=hook_cols,
         p_scale=p_scale,
@@ -588,7 +592,14 @@ def _compute_block_2cta(
     )
 
     def p_pass(hook: FlexHookCode | None, ind: str) -> str:
-        return fbwd_p_pass(hook, ind, p_spec, h=h, lse_prescaled=plan.lse_prescaled)
+        return fbwd_p_pass(
+            hook,
+            ind,
+            p_spec,
+            h=h,
+            lse_prescaled=plan.lse_prescaled,
+            tail=tail_clear,
+        )
 
     p_body = fbwd_p_passes(p_pass, masked=masked, unmasked=None if bias_fold else plain)
     jac_lines = hook_jacobian_lines(

@@ -422,7 +422,7 @@ def test_softcap_jacobian_region_with_gradient_arithmetic(
     bound = _bind(_args(t, _causal, _softcap_20, score_mod_bwd))
     plan = _match_or_fail(bound).plan
     assert plan.grad_region is not None
-    assert "fbwd_mul_pairs_packed" in _render(bound)
+    assert "fbwd_mul_jacobian_packed" in _render(bound)
 
 
 def test_transformed_gradient_operands_keep_tensor_slots() -> None:
@@ -464,6 +464,30 @@ def test_bare_constant_gradient_region() -> None:
     assert region.output.kwargs["dtype"] == torch.float32
     assert region.output.meta["val"].dtype == torch.float32
     _render(bound)
+
+
+def _squared(score, b, h, q_idx, kv_idx):
+    return score * score
+
+
+def _squared_bwd(grad, score, b, h, q_idx, kv_idx):
+    # The VJP as traced from ``score * score``: one product per use.
+    return grad * score + grad * score
+
+
+def test_jacobian_reading_one_value_twice_renders() -> None:
+    """``grad * s + grad * s``: with the unit gradient both products become
+    ``s``, so the sum's two lowering inputs are one node. The renderer binds
+    one value per operand (merging repeats left one value for two input
+    names and the render failed)."""
+    bound = _bind(_args(_tensors(), _causal, _squared, _squared_bwd))
+    plan = _match_or_fail(bound).plan
+    assert plan.grad_region is not None
+    (add,) = (
+        node for node in plan.grad_region.graph.nodes if node.target is _aten.add.Tensor
+    )
+    assert add.args[0] is add.args[1]
+    assert "fbwd_mul_jacobian_packed" in _render(bound)
 
 
 def test_ragged_lengths_match() -> None:
@@ -1063,6 +1087,41 @@ def test_walk_past_the_q_sequence_spans_the_coordinate_tensors() -> None:
     aligned = _wrapper_plan(_render(_bind(_args(_tensors(), _causal))))
     assert "flex_walk_q_rows" not in aligned
     assert "_fbwd_mQt = cute.make_tensor(" not in _host_lines(aligned)
+
+
+def _far_bias(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> torch.Tensor:
+    return score + (q_idx - kv_idx).abs().to(torch.float32)
+
+
+def test_entries_past_the_sequences_are_cleared_on_the_tiles_reaching_them() -> None:
+    """P (so dS too, which a Jacobian hook keeps 0) is cleared past the sequences, per
+    32-column chunk after its pass, on the steps whose tile reaches past one
+    -- the last KV tile of a ragged N (the thread's row checked) and the Q
+    tiles from ``q_seq // 128`` on (the lanes checked) -- with or without a
+    score_mod; an aligned walk renders no clear."""
+    ragged = _render(_bind(_args(_tensors(q_seq=257, kv_seq=257), _causal)))
+    clear = (
+        "if (cutlass.Int32(fbwd_m_tile_h) >= cutlass.Int32(2)) | "
+        "(cutlass.Int32(fbwd_n_tile) >= cutlass.Int32(2)):\n"
+        "{ind}_helion_flash_rt.fbwd_zero_past(cute.make_tensor(tLDrS[None, None, "
+        "fbwd_ch].iterator, cute.make_layout(32)), cutlass.Int32(cutlass.select_("
+        "cutlass.Int32(fbwd_n_tile) * cutlass.Int32(128) + cutlass.Int32(fbwd_thr_row) "
+        "< cutlass.Int32(257), cutlass.Int32(257) - cutlass.Int32(fbwd_m_tile_h) * "
+        "cutlass.Int32(128) - cutlass.Int32(tLDcS[None, None, fbwd_ch][0][1]), "
+        "cutlass.Int32(0))))"
+    )
+    # Both compute warpgroups, each with its masked and plain pass.
+    assert ragged.count(clear.format(ind=" " * 24)) == 4
+    jacobian = _render(
+        _bind(_args(_tensors(q_seq=192), None, _softcap_20, _softcap_20_bwd_scaled))
+    )
+    # Only the Q lanes reach past their sequence (N = 512 is aligned); dS
+    # needs no clear of its own.
+    assert "if cutlass.Int32(fbwd_m_tile_h) >= cutlass.Int32(1):\n" in jacobian
+    clears = [line for line in jacobian.splitlines() if "fbwd_zero_past(" in line]
+    assert clears and all("fbwd_zero_past(cute.make_tensor(tLDrS[" in c for c in clears)
+    assert "fbwd_thr_row) < cutlass.Int32(512)" not in jacobian
+    assert "fbwd_zero_past" not in _render(_bind(_args(_tensors(), None, _far_bias)))
 
 
 # -- the step table: one table per walk, or chunks of it ---------------------
