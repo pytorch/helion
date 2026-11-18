@@ -47,8 +47,10 @@ loop of a recorded wrapper, only when at least one scalar load nested in an
 inner loop becomes a vector load (or a store a packet), and it leaves the
 body untouched whenever any statement or value is outside the proven forms
 (a load under a per-lane condition the facts do not cover, a hoist whose
-operands only the V-loop defines, ...).  When the knob shaped the thread
-layout but nothing was sunk, ``generate_ast`` regenerates the knob-off code.
+operands only the V-loop defines, a packet's trace-time list that the body
+creates or that the interchange would fill in another order, ...).  When the
+knob shaped the thread layout but nothing was sunk, ``generate_ast``
+regenerates the knob-off code.
 
 A masked load becomes one predicated packet load that leaves zeros
 (``cute/masked_packet_load.py``); the per-lane selects that only repeat the
@@ -316,6 +318,7 @@ class _Sinker:
     def run(self) -> list[ast.stmt] | None:
         body = self.body
         self._check_statement_forms(body)
+        self._check_trace_list_order(body)
         self._uniformize_vector_mask(body)
         self.persistent_markers_nested = self._nested_persistent_markers(body)
         self._define_chunk_mask(body)
@@ -579,6 +582,47 @@ class _Sinker:
                 for node in ast.walk(stmt)
             ):
                 raise _Unsupported
+
+    def _check_trace_list_order(self, body: list[ast.stmt]) -> None:
+        """Refuse a body whose trace-time lists the distribution would fill
+        in another order or another number of times.
+
+        A trace-time list is consumed in the order of its appends: a packet
+        flush stores its values as consecutive elements.  Distribution keeps
+        that order only for a collector of this V-loop: a list created
+        outside the loop whose appends are all statements of one segment of
+        the body, so the lanes still append one after another.  Everything
+        else is outside the proven forms:
+
+        - an append inside a loop of the body, which the V-loop would move
+          into: ``for v: for k: vals.append(f(v, k))`` fills the list
+          V-lane-major and ``for k: for v: ...`` the other way round, under
+          a flush that still stores it V-lane-major;
+        - appends to one list in two segments, each of which would run all
+          the lanes before the next;
+        - a list the body creates (the collector of an inner axis's lanes,
+          created, filled and flushed once per lane of this loop): its
+          creation is lane-invariant and would run once, while its appends
+          and its flush would repeat for every lane over one growing list.
+        """
+        from .register_tile_reductions import _append_target
+
+        segment_of: dict[str, int] = {}
+        for position, group in enumerate(self._segments(body)):
+            nested = isinstance(group, ast.For)
+            for stmt in self._walk_statements([group] if nested else group):
+                if (
+                    isinstance(stmt, ast.Assign)
+                    and _plain_target(stmt) is not None
+                    and isinstance(stmt.value, ast.List)
+                    and not stmt.value.elts
+                ):
+                    raise _Unsupported
+                append = _append_target(stmt)
+                if append is None or append[0] not in self.trace_lists:
+                    continue
+                if nested or segment_of.setdefault(append[0], position) != position:
+                    raise _Unsupported
 
     def _uniformize_vector_mask(self, body: list[ast.stmt]) -> None:
         """Evaluate the vectorized axis' bounds mask at the chunk base.
@@ -1431,7 +1475,9 @@ class _Sinker:
         is bound to a name (``old = cute.arch.atomic_add(...)``) or a
         shared-memory reduce is such a call.  Appending a pure value to a
         trace-time list (``self.trace_lists``, where packet flushes collect
-        their lanes) does not count; every other statement form (``if``
+        their lanes) does not count: the lists a sunk body appends to are
+        collectors of its V-loop, which the lanes fill in their order
+        (``_check_trace_list_order``).  Every other statement form (``if``
         blocks, bare expressions) does.
         """
         from ._ast_pass_utils import _is_proven_relocatable_call

@@ -351,6 +351,91 @@ def row_is_multiple_of(
     return prove(node, 0)
 
 
+@dataclass(frozen=True)
+class LaneGatherStore:
+    """A flattened gather along one tile and a store along another
+    (:func:`lane_gather_stores`)."""
+
+    gather: Node
+    # The gathered tensor's dimension that the lane subscript indexes.
+    gather_dim: int
+    split: FlatGatherLaneSplit
+    store: Node
+    # The block ids of the store's subscripts (None for one that is not a
+    # tile).
+    store_blocks: list[int | None]
+
+
+def lane_gather_stores(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> list[LaneGatherStore]:
+    """Each flattened gather of a graph whose lane tile is a tile of a store
+    of that graph but not the tile on the stored tensor's last dimension,
+    with dtypes that have packets: one site per lane subscript and store.
+
+    Along the gather's lane tile the loads are contiguous
+    (:func:`match_flat_gather_lane`) and the stores are not: they are
+    contiguous along the tile of the last subscript, so no thread layout
+    makes packets of both (an unfold, ``out[tile_n, tile_k] = x_flat[tile_n
+    .index[:, None] + C * tile_k.index[None, :]]``).  The gathered tensor
+    must have a dtype the V-loop sink loads in packets and the stored one a
+    dtype ``cute_staged_store`` flushes in packets (bf16, fp16, fp32, int16,
+    int32): for any other the knobs these sites open would change nothing.
+    Only the kernel's structure and dtypes are read, never an extent: the
+    knobs opened on it (``cute_staged_store``, ``cute_vloop_sink``,
+    ``cute_lane_unroll``) keep the search space the same at every shape.
+    """
+    from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
+    from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
+
+    found: list[LaneGatherStore] = []
+    for graph_info in device_ir.graphs:
+        stores: list[tuple[Node, list[int | None]]] = []
+        gathers: list[tuple[Node, int, FlatGatherLaneSplit]] = []
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                memory_ops.load,
+                memory_ops.store,
+            ):
+                continue
+            subscript = node.args[1]
+            tensor = node_tensor(node.args[0])
+            if not isinstance(subscript, (list, tuple)) or tensor is None:
+                continue
+            if node.target is memory_ops.store:
+                if tensor.dtype not in _CUTE_VECTOR_UNROLL_CARRIER:
+                    continue
+                stores.append(
+                    (
+                        node,
+                        [
+                            _block_id_of_size(env, _scalar(item))
+                            for item in subscript
+                            if item is not None
+                        ],
+                    )
+                )
+                continue
+            if tensor.dtype not in _CUTE_VECTOR_UNROLL_DTYPES:
+                continue
+            for position, item in enumerate(subscript):
+                split = match_flat_gather_lane(item, env)
+                if split is not None:
+                    # ``None`` subscripts index no dimension of the tensor.
+                    dim = sum(
+                        1 for before in subscript[:position] if before is not None
+                    )
+                    gathers.append((node, dim, split))
+        found.extend(
+            LaneGatherStore(gather, dim, split, node, blocks)
+            for gather, dim, split in gathers
+            for node, blocks in stores
+            if split.lane_block_id in blocks[:-1]
+            and blocks[-1] not in (None, split.lane_block_id)
+        )
+    return found
+
+
 def flat_gather_sink_vec_width(
     env: CompileEnvironment,
     device_ir: DeviceIR,
@@ -543,25 +628,19 @@ def flat_gather_row_width_hint(
     return min(widths) if widths else None
 
 
-def _packet_layout_aligned(
-    env: CompileEnvironment, tensor: torch.Tensor, lane_dim: int, vec_width: int
+def _example_base_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
 ) -> bool:
-    """``cute_reduction_vector_layout_aligned`` for a seed heuristic.
-
-    Seeds are generated before the binding snapshots its runtime input
-    specializations, so the bound alignment residues the codegen reads are
-    not available yet.  Read the example input's residue live through the
-    registered alignment specialization instead (the snapshot pins the same
-    residue into the cache key, so the codegen will prove what is read here).
-    """
+    """Whether the example input that owns ``tensor`` puts its base on a
+    multiple of ``alignment`` bytes, read live through the registered
+    alignment specialization; False once the binding has snapshot its
+    residues (the bound facts then decide) and for a tensor no specialized
+    input owns."""
     from torch._subclasses import FakeTensor
 
     from ..compile_environment import _replay_tensor_input_source
     from .memory_ops import _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
-    from .memory_ops import cute_reduction_vector_layout_aligned
 
-    if cute_reduction_vector_layout_aligned(env, tensor, lane_dim, vec_width):
-        return True
     key = _PERSISTENT_VEC_ALIGNMENT_SPECIALIZATION_KEY
     if key in env.bound_runtime_input_specialization_results:
         return False
@@ -575,7 +654,43 @@ def _packet_layout_aligned(
     value = _replay_tensor_input_source(source, env.runtime_arg_values_by_name)
     if not isinstance(value, torch.Tensor) or isinstance(value, FakeTensor):
         return False
-    if (int(value.data_ptr()) + offset_bytes) % (vec_width * tensor.dtype.itemsize):
+    return (int(value.data_ptr()) + offset_bytes) % alignment == 0
+
+
+def base_aligned_for_seed(
+    env: CompileEnvironment, tensor: torch.Tensor, alignment: int
+) -> bool:
+    """``cute_tensor_base_is_aligned`` for a seed heuristic, which runs
+    before the binding snapshots the inputs' pointer residues (see
+    ``_packet_layout_aligned``): a kernel argument's base is read from the
+    example input, under the conditions the bound proof will hold it to."""
+    from .memory_ops import _CUTE_ALIGNMENT_MAX_BYTES
+    from .memory_ops import cute_tensor_base_is_aligned
+
+    return cute_tensor_base_is_aligned(env, tensor, alignment) or (
+        _CUTE_ALIGNMENT_MAX_BYTES % alignment == 0
+        and env.traced_strides_hold(tensor)
+        and env.input_residues_hold_modulo(alignment)
+        and _example_base_aligned(env, tensor, alignment)
+    )
+
+
+def _packet_layout_aligned(
+    env: CompileEnvironment, tensor: torch.Tensor, lane_dim: int, vec_width: int
+) -> bool:
+    """``cute_reduction_vector_layout_aligned`` for a seed heuristic.
+
+    Seeds are generated before the binding snapshots its runtime input
+    specializations, so the bound alignment residues the codegen reads are
+    not available yet.  Read the example input's residue live through the
+    registered alignment specialization instead (the snapshot pins the same
+    residue into the cache key, so the codegen will prove what is read here).
+    """
+    from .memory_ops import cute_reduction_vector_layout_aligned
+
+    if cute_reduction_vector_layout_aligned(env, tensor, lane_dim, vec_width):
+        return True
+    if not _example_base_aligned(env, tensor, vec_width * tensor.dtype.itemsize):
         return False
     for dim in range(tensor.ndim):
         if dim == lane_dim:

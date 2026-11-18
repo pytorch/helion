@@ -498,6 +498,12 @@ class CuteLaneState:
     # for it); when no V-loop is sunk after all, codegen restarts with the
     # knob off.
     vloop_sink_shaped_code: bool = False
+    # The vector loops (by constexpr lane variable) with an access whose
+    # address ``cute_vloop_sink`` respelled for the sink: a flattened gather
+    # that is contiguous along the lane (``_cute_flat_gather_sink_pointer``).
+    # The loops inside such a vector loop are the sink's to interchange, so
+    # no component packet takes them (``_cute_component_store_ctx``).
+    vloop_sink_shaped_lanes: set[str] = dataclasses.field(default_factory=set)
     # The sinking pass unrolled a lane loop itself (``cute_lane_unroll``);
     # otherwise the loads-first unroll of ``cute/unroll_lane_loads.py``
     # applies to the sunk lane loops once their packets are placed.

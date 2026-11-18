@@ -149,7 +149,8 @@ _BASE_VALID_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
+    cute_split_k_workspace cute_staged_store cute_store_policy cute_tail_peel
+    cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
@@ -320,7 +321,8 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
+    cute_split_k_workspace cute_staged_store cute_store_policy cute_tail_peel
+    cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode
@@ -427,7 +429,8 @@ _BASE_CUTE_IMPLICIT_DEFAULT_KEYS = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_topk_coarse_keys
+    cute_split_k_workspace cute_staged_store cute_store_policy cute_tail_peel
+    cute_topk_coarse_keys
     cute_topk_key_recovery cute_uniform_lane_compares cute_unpadded_rows
     cute_vector_packet_unroll cute_vloop_sink
     cute_warp_aggregated_atomics cute_warp_fp32_redux cute_wide_packet_hints flatten_loops indexing
@@ -549,7 +552,8 @@ _BASE_CUTE_ACCEPTED = """
     cute_selection_algorithm cute_signed_bitfield_bf16
     cute_simt_mma cute_simt_mma_layout cute_split_k_finalizer_warps
     cute_split_k_partitions cute_split_k_schedule cute_split_k_stages
-    cute_split_k_workspace cute_store_policy cute_tail_peel cute_tiles_per_block
+    cute_split_k_workspace cute_staged_store cute_store_policy cute_tail_peel
+    cute_tiles_per_block
     cute_topk_coarse_keys cute_topk_defer_value_gathers cute_topk_key_dtype
     cute_topk_key_encoder cute_topk_key_recovery cute_topk_lanes_per_row
     cute_topk_merge_schedule cute_topk_output_vector_width cute_topk_rank_mode

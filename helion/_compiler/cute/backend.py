@@ -5536,15 +5536,86 @@ class CuteBackend(Backend):
         demoted = False
         for context in strategy.lane_contexts_with_vec_stores():
             inside = None
-            if placement is not None:
+            component_scope: tuple[list[ast.AST], list[ast.AST]] = ([], [])
+            if placement is not None or state.component_lane_vars:
                 assert context.vloop is not None
                 lane_var = state.vec_wrapper_lane_var(context.vloop)
-                inside = statements_inside_loop(placement, lane_var)
+                if placement is not None:
+                    inside = statements_inside_loop(placement, lane_var)
+                component_scope = self._component_loop_statements(
+                    state, body, placement, lane_var
+                )
             if demote_reordered_tile_vec_stores(
-                context, strategy.fn, body, inside=inside
+                context,
+                strategy.fn,
+                body,
+                inside=inside,
+                component_scope=component_scope,
             ):
                 demoted = True
         return demoted
+
+    @staticmethod
+    def _component_loop_statements(
+        state: DeviceGridState,
+        body: list[ast.AST],
+        placement: list[ast.AST | LanePlacement] | None,
+        lane_var: str,
+    ) -> tuple[list[ast.AST], list[ast.AST]]:
+        """The statements of ``body`` that run inside every trace-time
+        component loop of the grid (``DeviceGridState.component_lane_vars``)
+        and those inside any, for the stores collected in ``lane_var``'s lane.
+
+        A store that names every component of a lane element appends once
+        per component, in component order, only inside each of those loops,
+        with the loops innermost in the nest and right inside ``lane_var``'s
+        V-loop, as they were when the store was lowered, and walking their
+        components upwards: a reverse scan over a component tile runs its
+        loop from the last component down
+        (``DeviceGridState.reversed_lane_vars``), which would fill the list
+        against the order its flush stores.  A loop the body no longer reads
+        is not materialized and holds nothing.
+        """
+        from .lane_loops.placement import statements_inside_loop
+
+        lanes = state.component_lane_vars
+        if not lanes:
+            return [], []
+        nest = [name for name, _extent in state.lane_loops]
+        depth = len(nest) - len(lanes)
+        ordered = (
+            depth >= 1
+            and set(nest[depth:]) == lanes
+            and nest[depth - 1] == lane_var
+            and not lanes & state.reversed_lane_vars
+        )
+        if placement is None:
+            needed, _setup, spliced = state._live_lane_setup(body)
+            live = [
+                lane
+                for lane in lanes
+                if state._lane_loop_is_live(lane, needed, spliced)
+            ]
+            every = list(body) if ordered and len(live) == len(lanes) else []
+            return every, list(body) if live else []
+        inside = [statements_inside_loop(placement, lane) for lane in sorted(lanes)]
+        some: list[ast.AST] = []
+        for statements in inside:
+            some.extend(
+                statement
+                for statement in statements
+                if not any(statement is other for other in some)
+            )
+        every = [
+            statement
+            for statement in inside[0]
+            if ordered
+            and all(
+                any(statement is other for other in statements)
+                for statements in inside[1:]
+            )
+        ]
+        return every, some
 
     def demote_loop_tile_vec_stores(
         self, strategy: TileStrategy, block_ids: list[int]

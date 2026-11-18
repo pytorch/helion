@@ -100,6 +100,7 @@ KERNEL_DEF_PASS_NAMES = [
     "pack_half_extremum_folds",
     "pair_lane_math",
     "select_native_warp_reductions",
+    "stage_cta_stores",
 ]
 
 
