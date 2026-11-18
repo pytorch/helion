@@ -399,6 +399,7 @@
  "test/test_host_block_size_order.py": 4.1,
  "test/test_host_tensor_slices.py": 10.7,
  "test/test_indexing.py": 141.0,
+ "test/test_inductor_backend.py": 2.2,
  "test/test_inline_asm_elementwise.py": 2.9,
  "test/test_inline_asm_reduction_effects.py": 4.7,
  "test/test_inline_triton.py": 0.0,

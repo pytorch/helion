@@ -83,6 +83,11 @@ if TYPE_CHECKING:
 def _patched_inductor_config() -> contextlib.AbstractContextManager[None]:
     settings = CompileEnvironment.current().settings
     patch: dict[str, object] = {
+        # Lower as for Inductor's Triton backend, whatever cuda_backend the
+        # caller set: with cuda_backend "helion" (helion.inductor), Inductor's
+        # upcast_compute_type() keeps bf16, and x * 0.1 multiplies by
+        # tl.full([], 0.1, tl.bfloat16) rather than tl.float32.
+        "cuda_backend": "triton",
         # Allow implicit upcasts to FP32 for elementwise math correctness
         "triton.codegen_upcast_to_fp32": True,
         # Ensure Inductor preserves reductions (even tiny ones) as Reduction IR
