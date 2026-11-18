@@ -47,6 +47,16 @@ it gives
 It also lists the records whose numerics gate fell back from the float64
 reference to the eager one (``common.AnchoredGate``'s ``ref_fallback``).
 
+When bench records carry ``rot_us`` (``bench.py --rotate-inputs``: the cold
+timer on private input sets, one per call, which hinted loads cannot keep in
+L2), the ``cold_us`` section gains two aggregate rows, the geomean speedup
+of Helion+CuTe over Inductor by ``rot_us`` over the kernels that have it
+counted for both (with their number) and the ``cold_us`` geomean of those
+same kernels, and a ``cute/ind rot`` column per kernel; a last section says
+which records were timed that way, why the others were not, and that the two
+speedups bracket the hint-free one only where the CuTe config has no such
+hints (``ROTATION_CAVEAT``). Every other number is computed as without them.
+
 ``--rebalance`` recomputes every ``cold_us`` and ``bb_us``, the baseline
 run's included, from the recorded rounds by ``bench.py``'s current rule, the
 mean of the forward-order and reverse-order values (``rebalance``). Records
@@ -85,6 +95,16 @@ PORTS = {"helion_cute": "cute", "helion_triton": "triton"}
 # T5's relative-position-bias backward, the selection's longest kernel under
 # Inductor by far: it dominates any time-weighted total.
 OUTLIERS = ["sum_sum_sum_d2c97d17f3dc"]
+# How to read the rot_us speedup beside the cold_us one, said in the report
+# of a run that has it (the measurements are in the README's Timers section).
+ROTATION_CAVEAT = (
+    "Loads with an `L2::evict_last` hint, which Inductor emits by policy and a "
+    "CuTe search can pick (`l2_last`), bias both timers: `cold_us` reads a "
+    "hinted kernel partly warm, `rot_us` reads it slower than the same kernel "
+    "without its hints. The two speedups bracket the hint-free one only where "
+    "the CuTe config has no such hints; where it has, both can lean the same "
+    "way and their agreement settles nothing (README, Timers)."
+)
 
 
 def geomean(values: list[float]) -> float | None:
@@ -162,15 +182,7 @@ def timed_record_issue(
     autotune that runs after the bench (phase 2 of a run on provisional
     configs) moves that record aside while it runs and replaces it if it
     succeeds."""
-    kernels = (config or {}).get("kernels", {})
-    if "autotune_code_sha256" in info:
-        same = info["autotune_code_sha256"] == {
-            name: k["code_sha256"] for name, k in kernels.items()
-        }
-    else:
-        same = info.get("decorators") == {
-            name: k["decorator"] for name, k in kernels.items()
-        }
+    same = common.timed_kernels_held(info, config)
     if config is not None and same and not config.get("provisional"):
         return None
     if info.get("autotune_provisional"):
@@ -281,10 +293,12 @@ def aggregate(
     rows: list[dict[str, Any]],
     weights: dict[tuple[str, str], float],
     baseline: dict[tuple[str, str], float],
+    rotating: dict[tuple[str, str], float] | None = None,
 ) -> dict[str, Any]:
     """The aggregates over ``rows`` (see the module docstring); ``weights``
     and ``baseline`` map (repro, shape) to the model share and to the
-    baseline run's Helion+CuTe speedup over Inductor."""
+    baseline run's Helion+CuTe speedup over Inductor, ``rotating`` (None
+    when no record has one) to this run's by ``rot_us``."""
     timed = [
         (row, value)
         for row in rows
@@ -336,6 +350,17 @@ def aggregate(
         "baseline": geomean([before for before, _ in same]),
         "this_run": geomean([after for _, after in same]),
     }
+    if rotating is not None:
+        both = [
+            (value, rotating[row["repro"], row["shape"]])
+            for row, value in timed
+            if (row["repro"], row["shape"]) in rotating
+        ]
+        out["rot_us"] = {
+            "kernels": len(both),
+            "cute_vs_inductor": geomean([rotated for _, rotated in both]),
+            "same_kernels_by_this_timer": geomean([value for value, _ in both]),
+        }
     return out
 
 
@@ -419,6 +444,19 @@ def aggregate_lines(
             lambda a: times(a["cute_vs_oracle"], a["cute_vs_oracle_kernels"]),
         ),
     ]
+    if any("rot_us" in a for a in columns.values()):
+        entries += [
+            (
+                "Helion+CuTe vs Inductor by rot_us, private inputs, geomean (kernels)",
+                lambda a: times(
+                    a["rot_us"]["cute_vs_inductor"], a["rot_us"]["kernels"]
+                ),
+            ),
+            (
+                "the same kernels by cold_us, geomean",
+                lambda a: times(a["rot_us"]["same_kernels_by_this_timer"]),
+            ),
+        ]
     if baseline_name is not None:
         entries.append(
             (
@@ -499,6 +537,24 @@ def main() -> None:
         ]
         for metric in ("cold_us", "bb_us")
     }
+    # rot_us, where bench.py --rotate-inputs timed it: its rows, and each
+    # kernel's Helion+CuTe speedup over Inductor where both count.
+    rotated = [
+        r for r in records if any("rot_us" in info for info in r["impls"].values())
+    ]
+    rotating: dict[tuple[str, str], float] | None = None
+    if rotated:
+        rows["rot_us"] = [
+            summarize(
+                r, "rot_us", tuned[r["repro"], r["shape"]], args.include_unsampled
+            )
+            for r in rotated
+        ]
+        rotating = {
+            (row["repro"], row["shape"]): value
+            for row in rows["rot_us"]
+            if (value := ratio(row, "helion_cute", "inductor")) is not None
+        }
     weights = {}
     if args.selection.exists():
         weights = {
@@ -581,17 +637,20 @@ def main() -> None:
             else baseline_speedups(args.baseline, metric, args.rebalance)
         )
         without = [r for r in table if r["repro"] not in args.without]
-        columns = {"all kernels": aggregate(table, weights, baseline)}
+        # rot_us cross-checks the cold timer.
+        check = rotating if metric == "cold_us" else None
+        columns = {"all kernels": aggregate(table, weights, baseline, check)}
         if len(without) < len(table):
             columns[f"without {', '.join(args.without)}"] = aggregate(
-                without, weights, baseline
+                without, weights, baseline, check
             )
         aggregates[metric] = columns
         members: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
         for r in table:
             members[r["family"]].append(r)
         families[metric] = {
-            name: aggregate(group, weights, baseline) for name, group in members.items()
+            name: aggregate(group, weights, baseline, check)
+            for name, group in members.items()
         }
         lines += [f"## {metric}", "", *aggregate_lines(columns, baseline_name), ""]
         lines += [
@@ -612,14 +671,23 @@ def main() -> None:
                 f" | {fmt(agg['triton_vs_inductor'], '.3f')} ({agg['triton_vs_inductor_kernels']}) |"
             )
         baseline_column = f" | {baseline_name} cute/ind" if baseline_name else ""
+        # Each kernel's speedup by rot_us, as timed (the aggregates count it
+        # under the conditions of the cold_us one beside it).
+        by_rot = (
+            {(r["repro"], r["shape"]): r["cute_vs_inductor"] for r in rows["rot_us"]}
+            if check is not None
+            else None
+        )
+        rot_column = "" if by_rot is None else " | cute/ind rot"
         lines += [
             "",
             (
                 "| repro | shape | MB | inductor | helion-cute | cute/ind"
-                f"{baseline_column} | helion-triton | triton/ind | oracle | memcopy"
-                " | ind %SOL | cute %SOL | numerics | left out of the aggregates |"
+                f"{rot_column}{baseline_column} | helion-triton | triton/ind | oracle"
+                " | memcopy | ind %SOL | cute %SOL | numerics"
+                " | left out of the aggregates |"
             ),
-            f"|{'---|' * (15 if baseline_name else 14)}",
+            f"|{'---|' * (14 + bool(rot_column) + bool(baseline_column))}",
         ]
         for r in sorted(table, key=lambda r: r["cute_vs_inductor"] or 0):
             num = ",".join(f"{k.split('_')[-1]}={v}" for k, v in r["numerics"].items())
@@ -631,10 +699,15 @@ def main() -> None:
             left_out = "; ".join(
                 f"{kind} {issue.split(':')[0]}" for kind, issue in r["issues"].items()
             )
+            rot = (
+                ""
+                if by_rot is None
+                else f" | {fmt(by_rot.get((r['repro'], r['shape'])), '.3f')}"
+            )
             lines.append(
                 f"| {r['repro']} | {r['shape']} | {fmt((r['total_bytes'] or 0) / 1e6, '.1f')}"
                 f" | {fmt(r['inductor'])} | {fmt(r['helion_cute'])}"
-                f" | {fmt(r['cute_vs_inductor'], '.3f')}{before}"
+                f" | {fmt(r['cute_vs_inductor'], '.3f')}{rot}{before}"
                 f" | {fmt(r['helion_triton'])} | {fmt(r['triton_vs_inductor'], '.3f')}"
                 f" | {fmt(r['oracle'])} | {fmt(r['memcopy'])}"
                 f" | {fmt(100 * r['inductor_of_sol'] if r.get('inductor_of_sol') else None, '.0f')}"
@@ -696,6 +769,36 @@ def main() -> None:
     if not eager_reference:
         lines.append("- none")
     lines.append("")
+    # What bench.py --rotate-inputs decided for each record it ran on.
+    rotation = {
+        f"{rec['repro']}__{rec['shape']}": rec["rotate_inputs"]
+        for rec in records
+        if "rotate_inputs" in rec
+    }
+    if rotation:
+        timed = [d for d in rotation.values() if d.get("status") == "ok"]
+        sets = sorted({d["sets"] for d in timed})
+        lines += [
+            "## Rotating inputs (rot_us)",
+            "",
+            (
+                f"`bench.py --rotate-inputs` timed {len(timed)} of {len(rotation)} "
+                f"records on private input sets ({', '.join(map(str, sets)) or '-'} "
+                "per implementation), one per call of a flushed batch; not timed:"
+            ),
+            "",
+        ]
+        # A skipped record gives its reason, a failed pass its exception.
+        left = {
+            name: d.get("skipped")
+            or f"failed: {(d.get('error') or '?').strip().splitlines()[-1]}"
+            for name, d in rotation.items()
+            if d.get("status") != "ok"
+        }
+        lines += [f"- {name}: {why}" for name, why in sorted(left.items())]
+        if not left:
+            lines.append("- none")
+        lines += ["", ROTATION_CAVEAT, ""]
     if args.goal is not None:
         shapes = []
         for r in rows[args.metric]:
@@ -729,6 +832,8 @@ def main() -> None:
         "uncovered": uncovered,
         "eager_reference": eager_reference,
     }
+    if rotation:
+        report["rotate_inputs"] = rotation
     (args.run_dir / "report.json").write_text(json.dumps(report, indent=1) + "\n")
     (args.run_dir / "report.md").write_text("\n".join(lines) + "\n")
     sys.stdout.write("\n".join(lines) + "\n")

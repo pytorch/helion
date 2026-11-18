@@ -10,7 +10,9 @@ Implementations (``--impls``):
   to the decorators a cold full autotune reported (``autotune.py``); the
   record names that autotune record's code digests and whether it was
   provisional (``autotune_code_sha256``, ``autotune_provisional``), so
-  ``report.py`` tells the timing from one of a later autotune of the port
+  ``report.py`` tells the timing from one of a later autotune of the port.
+  It names them before the port loads (``pinned_port``): an entry without
+  them found no ok autotune record, whatever else failed
 - ``memcopy``: better-benchmark's speed-of-light proxy, a copy of the repro's
   effective bytes (``byte_accounting.count_bytes_effective``)
 
@@ -37,6 +39,23 @@ even:
   rounds, a forward-order reading).
 - ``kernel_us``: summed device time of the kernels one replay launches
   (torch.profiler; back-to-back replays, so L2-warm), with per-kernel names.
+- ``rot_us`` (only with ``--rotate-inputs N``): ``cold_us``'s regime on
+  inputs no earlier call left in L2. ``cold_us`` replays every call on the
+  same input tensors, and lines loaded with an ``L2::evict_last`` hint
+  (Triton's ``eviction_policy="evict_last"``, which Inductor emits on the
+  operands it expects to read again; CuTe's ``l2_last`` load policies) stay
+  in L2 through the 256 MB flush, so an implementation that hints its loads
+  reads part of its inputs warm there. Here every implementation gets N
+  private input sets of its own (one implementation's hinted lines cannot
+  serve another's reads) and is timed as a graph of N x [L2 flush; call on
+  the next set] minus a graph of the N flushes (``rotating_bench``), in
+  ``--cold-rounds`` rounds that alternate the order like ``cold_us``'s:
+  ``rot_runs_us``, ``rot_order_medians_us`` and ``rot_sets`` go with it. A
+  cross-check for ``cold_us``, not a proof of coldness (see the README);
+  only for ports whose inputs are small enough for hinted lines to matter
+  and for N sets per implementation to fit, and that ``cold_us`` times in
+  batches too (``rotation_skip_reason``; the record's ``rotate_inputs`` says
+  what was decided and why).
 
 Correctness is checked on what the timers run, a replay of the
 implementation captured in a CUDA graph (the oracles of the dropout repros
@@ -73,6 +92,8 @@ from __future__ import annotations
 
 import argparse
 import gc
+import itertools
+import math
 from pathlib import Path
 import statistics
 import sys
@@ -80,6 +101,7 @@ import time
 import traceback
 from typing import Any
 from typing import Callable
+from typing import NamedTuple
 from typing import cast
 
 if __name__ == "__main__":
@@ -90,21 +112,53 @@ import torch
 from torch.profiler import ProfilerActivity
 from torch.profiler import profile
 
+from helion.autotuner.benchmarking import _BATCHED_REPLAY_BELOW_US
+from helion.autotuner.benchmarking import _batched_flushed_replays
+from helion.autotuner.benchmarking import _make_l2_cache_clearer
+from helion.autotuner.benchmarking import _positive_median
 from helion.autotuner.benchmarking import interleaved_bench
 from helion.autotuner.benchmarking import steady_graph_dispatch
 
-ALL_IMPLS = (
-    "inductor",
-    "inductor_cd",
-    "oracle",
-    "helion_triton",
-    "helion_cute",
-    "memcopy",
-)
 # Judged by the gate against the default Inductor compile ("inductor"),
 # which the gate judges too: against itself, that fails only an output that
 # is not finite where the reference is (common._anchored_leaf).
 GATED_IMPLS = ("inductor", "inductor_cd", "oracle", "helion_triton", "helion_cute")
+
+# What the rounds of ``cold_us`` and of ``rot_us`` share. Untimed replays run
+# for ``SETTLE_S`` before the timed rounds: the GPU idles while the
+# implementations are checked and while the input sets are made, and a
+# power-capped one then starts on a higher clock than it holds under the
+# rounds. ``COLD_REPEAT`` is the ``repeat`` of a round's ``interleaved_bench``
+# (``cold_round``), its sample count before batching.
+SETTLE_S = 0.5
+COLD_REPEAT = 100
+
+# ``--rotate-inputs`` applies to ports whose inputs total at most this many
+# times the device's L2 (``--rotate-max-l2``). A hint keeps at most an L2's
+# worth of lines resident, so beyond twice the L2 less than half of a port's
+# inputs can be warm whatever it hints, while the private sets would cost
+# sets x implementations x input bytes of device memory: the selection's
+# multi-GB ports (4.3 GB of inputs) would need 206 GB for 8 sets of 6
+# implementations, more than a B200 has. On a B200 (L2: 126.5 MiB,
+# ``torch.cuda.get_device_properties(0).L2_cache_size``) the default admits
+# inputs up to 265 MB, at most 12.7 GB of sets.
+ROTATE_MAX_L2_MULTIPLE = 2.0
+# ... and whose private sets fit this share of the free device memory (a
+# device with less memory than a B200, or one that other work fills).
+ROTATE_MEMORY_FRACTION = 0.25
+# ... and that ``cold_us`` times in batches, as ``rot_us`` is timed: from this
+# per-call time of the fastest implementation on, ``interleaved_bench`` times
+# single replays instead, each with a graph launch (about 4.5 us on a B200)
+# and with idle time between the calls, and the two timers would differ by
+# more than the rotation: by the launch, and by the clock a power-capped GPU
+# holds under each load. On any_amax_sum_e232f7a3d0d8 (201 MB of inputs, a
+# 750 W-capped B200) Inductor read 88 to 101 us in ``cold_us`` from one
+# process to the next and 90 to 103 us in batches of 8 as the SM clock moved
+# between 1485 and 1935 MHz under the cap (84 us at 1965 MHz before the cap
+# set in), the memcopy 61 us throughout once the launch is taken off.
+ROTATE_BELOW_US = _BATCHED_REPLAY_BELOW_US
+# The fewest samples of a round that times batches (``rotating_samples``).
+BATCHED_MIN_SAMPLES = 20
 
 
 def _profile_kernels(replay: Callable[[], None], calls: int = 10) -> dict[str, Any]:
@@ -152,12 +206,77 @@ def _replayed(
     return run
 
 
+def pinned_port(
+    info: dict[str, Any], configs_dir: Path, repro_id: str, shape: str, backend: str
+) -> tuple[Any, dict[str, Any]]:
+    """The port of ``repro_id`` on ``backend`` with its kernels pinned to
+    their autotune record, and that record. ``info``, the port's entry in
+    the bench record, names the record first (its path, its decorators and
+    ``common.timed_record_fields``), so an entry of a port that then fails
+    to load or to run still says what it was pinned to, and an entry
+    without those fields says that the run had no ok record
+    (``common.timed_on_record``)."""
+    info["autotune_record"] = str(
+        common.config_record_path(configs_dir, repro_id, shape, backend)
+    )
+    tuned = common.autotune_record(configs_dir, repro_id, shape, backend)
+    info["decorators"] = common.per_kernel(tuned["kernels"], "decorator")
+    info.update(common.timed_record_fields(tuned))
+    return common.load_port(repro_id, backend, pinned=info["decorators"]), tuned
+
+
 def do_bench(fn: Callable[[], object], **kwargs: object) -> object:
     """``triton.testing.do_bench``, imported when first called: the test
     module imports this one on lanes whose torch build ships no Triton."""
     from triton.testing import do_bench as triton_do_bench
 
     return triton_do_bench(fn, **kwargs)
+
+
+def cold_round(fns: list[Callable[[], Any]]) -> list[float]:
+    """One round of ``cold_us``: the per-call time of each of ``fns`` in
+    milliseconds, by ``interleaved_bench`` on CUDA graphs with the L2 flushed
+    before every call."""
+    return interleaved_bench(
+        fns, repeat=COLD_REPEAT, default_cudagraph=True, l2_flush_mode="call"
+    )
+
+
+def settle(replay: Callable[[], object]) -> None:
+    """Run ``replay`` untimed for ``SETTLE_S``, which settles a power-capped
+    GPU on the clock it sustains under the rounds that follow."""
+    started = time.perf_counter()
+    while time.perf_counter() - started < SETTLE_S:
+        replay()
+
+
+def alternating_rounds(
+    names: list[str], rounds: int, round_ms: Callable[[list[str]], list[float]]
+) -> dict[str, list[float]]:
+    """The readings of ``rounds`` rounds over the implementations ``names``,
+    in microseconds, round by round for each: ``round_ms`` times them in the
+    order it is given (their per-call milliseconds in that order), which is
+    ``names`` in even rounds and its reverse in odd ones. Every round-based
+    timer takes its rounds through here, so all alternate alike."""
+    runs: dict[str, list[float]] = {name: [] for name in names}
+    for r in range(rounds):
+        order = names if r % 2 == 0 else names[::-1]
+        for name, ms in zip(order, round_ms(order), strict=True):
+            runs[name].append(ms * 1000.0)
+    return runs
+
+
+def cold_fields(prefix: str, runs: list[float]) -> dict[str, Any]:
+    """What a cold timer records of an implementation's rounds, for
+    ``cold_us`` and ``rot_us`` alike: ``<prefix>_us``, the median over each
+    order's rounds, averaged (``common.order_balanced``), then those medians
+    (``<prefix>_order_medians_us``) and the rounds (``<prefix>_runs_us``)."""
+    value, orders = common.order_balanced(runs, statistics.median)
+    return {
+        f"{prefix}_us": value,
+        f"{prefix}_order_medians_us": orders,
+        f"{prefix}_runs_us": runs,
+    }
 
 
 def time_impls(
@@ -187,42 +306,278 @@ def time_impls(
             out[name]["timing_error"] = traceback.format_exc()
             torch.cuda.synchronize()
     names = list(graphs)
-    # Settle a power-capped GPU on its sustained clock before timing.
-    started = time.perf_counter()
-    while time.perf_counter() - started < 0.5:
-        for name in names:
-            graphs[name].replay()
+    settle(lambda: [graphs[name].replay() for name in names])
     torch.cuda.synchronize()
-    bb_runs: dict[str, list[float]] = {name: [] for name in names}
-    for r in range(rounds):
-        order = names if r % 2 == 0 else names[::-1]
-        for name in order:
-            ms = do_bench(graphs[name].replay, warmup=25, rep=rep_ms, return_mode="min")
-            bb_runs[name].append(float(cast("float", ms)) * 1000.0)
-    cold_runs: dict[str, list[float]] = {name: [] for name in names}
-    for r in range(cold_rounds):
-        order = names if r % 2 == 0 else names[::-1]
-        timings = interleaved_bench(
-            [fns[name] for name in order],
-            repeat=100,
-            default_cudagraph=True,
-            l2_flush_mode="call",
-        )
-        for name, ms in zip(order, timings, strict=True):
-            cold_runs[name].append(ms * 1000.0)
+
+    def bb_ms(name: str) -> float:
+        ms = do_bench(graphs[name].replay, warmup=25, rep=rep_ms, return_mode="min")
+        return float(cast("float", ms))
+
+    bb_runs = alternating_rounds(
+        names, rounds, lambda order: [bb_ms(name) for name in order]
+    )
+    cold_runs = alternating_rounds(
+        names, cold_rounds, lambda order: cold_round([fns[name] for name in order])
+    )
     for name in names:
         bb_us, bb_order = common.order_balanced(bb_runs[name], min)
-        cold_us, cold_order = common.order_balanced(cold_runs[name], statistics.median)
         out[name].update(
             bb_us=bb_us,
             bb_order_mins_us=bb_order,
             bb_runs_us=bb_runs[name],
-            cold_us=cold_us,
-            cold_order_medians_us=cold_order,
-            cold_runs_us=cold_runs[name],
+            **cold_fields("cold", cold_runs[name]),
         )
         out[name].update(_profile_kernels(graphs[name].replay))
     return out
+
+
+class Rotating(NamedTuple):
+    """What ``--rotate-inputs`` needs of an implementation: its call on an
+    input set, what makes it a fresh, private set, and the bytes of one set
+    (None: the port's inputs)."""
+
+    call: Callable[[list[Any]], Any]
+    fresh: Callable[[], list[Any]]
+    set_bytes: int | None = None
+
+
+def rotation_skip_reason(
+    input_bytes: int,
+    sets_bytes: int,
+    *,
+    fastest_impl: str,
+    fastest_us: float,
+    l2_bytes: int,
+    free_bytes: int,
+    max_l2_multiple: float = ROTATE_MAX_L2_MULTIPLE,
+) -> str | None:
+    """Why the rotating timer leaves a port out, or None when it applies:
+    ``input_bytes`` is one input set of the port, ``sets_bytes`` what the
+    private sets of every timed implementation take together,
+    ``fastest_impl`` the fastest of them by ``cold_us`` (the memcopy, where
+    it is timed and the ports take longer: ``interleaved_bench`` sizes
+    ``cold_us``'s batches by the fastest function it is given too) and
+    ``fastest_us`` its ``cold_us``, ``l2_bytes`` the device's L2 size and
+    ``free_bytes`` its free memory (``ROTATE_MAX_L2_MULTIPLE``,
+    ``ROTATE_BELOW_US``, ``ROTATE_MEMORY_FRACTION``)."""
+    limit = max_l2_multiple * l2_bytes
+    if input_bytes > limit:
+        return (
+            f"inputs of {input_bytes / 1e6:.1f} MB exceed {max_l2_multiple:g} x "
+            f"the {l2_bytes / 1e6:.1f} MB L2 ({limit / 1e6:.1f} MB), the limit "
+            "for private input sets (--rotate-max-l2)"
+        )
+    if fastest_us >= ROTATE_BELOW_US:
+        return (
+            f"the fastest implementation, {fastest_impl}, takes "
+            f"{fastest_us:.1f} us a call: from "
+            f"{ROTATE_BELOW_US:g} us cold_us times single replays, not the "
+            "batches of flushed calls that rot_us would time"
+        )
+    budget = ROTATE_MEMORY_FRACTION * free_bytes
+    if sets_bytes > budget:
+        return (
+            f"the private input sets need {sets_bytes / 1e9:.2f} GB, over "
+            f"{ROTATE_MEMORY_FRACTION:.0%} of the {free_bytes / 1e9:.2f} GB of "
+            "free device memory"
+        )
+    return None
+
+
+def rotating_bench(
+    fns: list[Callable[[], object]],
+    clear_cache: Callable[[], None],
+    *,
+    calls: int,
+    repeat: int,
+) -> list[float]:
+    """One round of the rotating timer: the per-call time of each of ``fns``
+    in milliseconds, timed the way ``interleaved_bench`` times a batch in
+    the per-call flushed regime, with batches of exactly ``calls`` calls.
+
+    Each function is captured as one CUDA graph of ``calls`` x
+    [``clear_cache``; ``fn()``] and the flushes alone as another
+    (``helion.autotuner.benchmarking``'s capture, which ``interleaved_bench``
+    uses). A sample replays every function's graph, in the order given, and
+    then the flush-only graph, each between a pair of CUDA events; a
+    function's time is the median over the samples of (its replay - the
+    flush replay of the same sample) / ``calls``, the positive samples'
+    when that median is not positive. ``fns`` are stateful: each call reads
+    the next of the function's input sets, so a graph of as many calls as
+    there are sets reads each set once per replay.
+
+    ``interleaved_bench`` itself cannot time them: it sizes a batch from the
+    kernel's time (1 to 16 calls, a single call above 64 us), so a graph
+    would rotate through that many of the sets, or replay one."""
+    built = _batched_flushed_replays(fns, clear_cache, calls)
+    if built is None:
+        raise RuntimeError(f"could not capture graphs of {calls} flushed calls")
+    replays, flush_replay = built
+    assert flush_replay is not None
+    timed = [*replays, flush_replay]
+    events = [
+        [
+            (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+            for _ in range(repeat)
+        ]
+        for _ in timed
+    ]
+    for sample in range(repeat):
+        for replay, pairs in zip(timed, events, strict=True):
+            start, end = pairs[sample]
+            start.record()
+            replay()
+            end.record()
+    torch.cuda.synchronize()
+    *elapsed, flush = (
+        [start.elapsed_time(end) for start, end in pairs] for pairs in events
+    )
+    return [
+        _positive_median(
+            [
+                (ms - flush_ms) / calls
+                for ms, flush_ms in zip(samples, flush, strict=True)
+            ]
+        )
+        for samples in elapsed
+    ]
+
+
+def rotating_samples(calls: int) -> int:
+    """The samples of one ``rot_us`` round, each a replay of a batch of
+    ``calls`` calls: as many as a ``cold_us`` round (``cold_round``) takes of
+    a batch that long, so both timers average as many executions of a
+    kernel. ``interleaved_bench`` has that rule inside it (its ``repeat``
+    over the batch size, and at least 20 samples); the module's device test
+    holds this count against the samples it takes."""
+    return max(min(COLD_REPEAT, BATCHED_MIN_SAMPLES), math.ceil(COLD_REPEAT / calls))
+
+
+def _on_the_next_set(
+    call: Callable[[list[Any]], Any], sets: list[list[Any]]
+) -> Callable[[], object]:
+    """``call`` on the next of ``sets`` each time, round and round."""
+    inputs = itertools.cycle(sets)
+    return lambda: call(next(inputs))
+
+
+def time_rotating(
+    calls: dict[str, Callable[[list[Any]], Any]],
+    sets: dict[str, list[list[Any]]],
+    *,
+    rounds: int,
+) -> dict[str, dict[str, Any]]:
+    """``rot_us`` of every implementation: ``calls[impl]`` on the input sets
+    ``sets[impl]`` (as many for every implementation, private to it), one
+    set after the other, in ``rounds`` rounds of ``rotating_bench`` that
+    alternate the order of the implementations as ``time_impls``'s cold
+    rounds do (``alternating_rounds``), after untimed ones (``settle``); the
+    median over each order's rounds, averaged (``cold_fields``)."""
+    names = list(calls)
+    (count,) = {len(sets[name]) for name in names}
+    fns: dict[str, Callable[[], object]] = {}
+    for name in names:
+        fns[name] = _on_the_next_set(calls[name], sets[name])
+        # Every set once, eagerly: nothing compiles or allocates for the
+        # first time inside a capture.
+        for _ in range(count):
+            fns[name]()
+    torch.cuda.synchronize()
+    clear_cache = _make_l2_cache_clearer()
+    samples = rotating_samples(count)
+
+    def rotating_round(order: list[str]) -> list[float]:
+        return rotating_bench(
+            [fns[name] for name in order], clear_cache, calls=count, repeat=samples
+        )
+
+    settle(lambda: rotating_round(names))
+    runs = alternating_rounds(names, rounds, rotating_round)
+    return {
+        name: {**cold_fields("rot", runs[name]), "rot_sets": count} for name in names
+    }
+
+
+def rotate_inputs(
+    args: argparse.Namespace,
+    record: dict[str, Any],
+    rotating: dict[str, Rotating],
+    input_bytes: int,
+) -> None:
+    """The ``--rotate-inputs`` pass over the implementations the other
+    timers timed (``rotating``; ``input_bytes``: one set of the port's
+    inputs): decide whether the port takes it (``rotation_skip_reason``),
+    make the private sets, time them (``time_rotating``) and record
+    ``rot_us`` beside the other timings. The decision and its numbers go to
+    ``record["rotate_inputs"]``, and so does a failure of the pass: the
+    other timings stand without it."""
+    count = args.rotate_inputs
+    decision: dict[str, Any] = {
+        "sets": count,
+        "rounds": args.cold_rounds,
+        "input_bytes": input_bytes,
+        "max_l2_multiple": args.rotate_max_l2,
+        "status": "error",
+    }
+    record["rotate_inputs"] = decision
+    # Everything that can fail from here on is inside the try, the device
+    # queries included: the record keeps the timings it has.
+    try:
+        fastest = min(
+            rotating, key=lambda name: record["impls"][name]["cold_us"], default=None
+        )
+        free_bytes, _total = torch.cuda.mem_get_info()
+        decision.update(
+            fastest_impl=fastest,
+            fastest_cold_us=(
+                None if fastest is None else record["impls"][fastest]["cold_us"]
+            ),
+            sets_bytes=count
+            * sum(
+                input_bytes if impl.set_bytes is None else impl.set_bytes
+                for impl in rotating.values()
+            ),
+            l2_cache_bytes=torch.cuda.get_device_properties(0).L2_cache_size,
+            free_bytes=free_bytes,
+        )
+        reason = (
+            "no implementation was timed"
+            if fastest is None
+            else rotation_skip_reason(
+                input_bytes,
+                decision["sets_bytes"],
+                fastest_impl=fastest,
+                fastest_us=decision["fastest_cold_us"],
+                l2_bytes=decision["l2_cache_bytes"],
+                free_bytes=free_bytes,
+                max_l2_multiple=args.rotate_max_l2,
+            )
+        )
+        if reason is not None:
+            decision.update(status="skipped", skipped=reason)
+            return
+        sets = {
+            name: [impl.fresh() for _ in range(count)]
+            for name, impl in rotating.items()
+        }
+        torch.cuda.synchronize()
+        gc.collect()
+        with torch.no_grad(), common.gc_paused():
+            timings = time_rotating(
+                {name: impl.call for name, impl in rotating.items()},
+                sets,
+                rounds=args.cold_rounds,
+            )
+        total_bytes = record.get("total_bytes")
+        for name, values in timings.items():
+            info = record["impls"][name]
+            info.update(values)
+            if total_bytes and values["rot_us"] > 0:
+                info["rot_gbps"] = total_bytes / values["rot_us"] / 1e3
+        decision["status"] = "ok"
+    except Exception:
+        decision["error"] = traceback.format_exc()
+        print(f"[rotate-inputs] {decision['error']}", file=sys.stderr, flush=True)
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -247,8 +602,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             return common.make_inputs(args.repro_id, shape, seed=0)
 
         instance = common.load_repro_module(args.repro_id).Repro()
+        first_inputs = inputs()
+        # What one set of the port's inputs takes, for --rotate-inputs.
+        input_bytes = common.input_bytes(first_inputs)
         with torch.no_grad():
-            expected = instance(*inputs())
+            expected = instance(*first_inputs)
+        del first_inputs
         record["outputs"] = [
             {"shape": list(t.shape), "stride": list(t.stride()), "dtype": str(t.dtype)}
             for t in common.flatten_outputs(expected)
@@ -257,6 +616,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         record["total_bytes"] = total_bytes
 
         fns: dict[str, Callable[[], Any]] = {}
+        rotating: dict[str, Rotating] = {}
         default_compile: Callable | None = None
         gate: common.AnchoredGate | None = None
 
@@ -286,6 +646,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     src = torch.empty(n, dtype=torch.float32, device="cuda")
                     dst = torch.empty_like(src)
                     fns[impl] = lambda src=src, dst=dst: torch.add(src, 1, out=dst)
+                    # Private sources; the stores keep their one buffer, as
+                    # the outputs of the other implementations' calls do.
+                    rotating[impl] = Rotating(
+                        lambda inp, dst=dst: torch.add(inp[0], 1, out=dst),
+                        lambda n=n: [
+                            torch.empty(n, dtype=torch.float32, device="cuda")
+                        ],
+                        src.nbytes,
+                    )
                     info["status"] = "ok"
                     continue
                 port = None
@@ -302,19 +671,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 elif impl == "oracle":
                     call = common.load_oracle(args.repro_id, inputs())
                 elif impl.startswith("helion_"):
-                    backend = impl.removeprefix("helion_")
-                    info["autotune_record"] = str(
-                        common.config_record_path(
-                            args.configs_dir, args.repro_id, shape, backend
-                        )
+                    port, tuned = pinned_port(
+                        info,
+                        args.configs_dir,
+                        args.repro_id,
+                        shape,
+                        impl.removeprefix("helion_"),
                     )
-                    port, tuned = common.load_autotuned_port(
-                        args.configs_dir, args.repro_id, shape, backend
-                    )
-                    info["decorators"] = {
-                        n: k["decorator"] for n, k in tuned["kernels"].items()
-                    }
-                    info.update(common.timed_record_fields(tuned))
                     call = port.forward
                 else:
                     raise ValueError(f"unknown implementation {impl}")
@@ -353,6 +716,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     info["numerics_pass"] = bool(verdict["pass"])
                 run_inputs = inputs()
                 fns[impl] = lambda call=call, run_inputs=run_inputs: call(run_inputs)
+                rotating[impl] = Rotating(call, inputs)
                 info["status"] = "ok"
             except Exception:
                 info["error"] = traceback.format_exc()
@@ -380,6 +744,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     us = values.get(key)
                     if us and us > 0:
                         info[key.replace("_us", "_gbps")] = total_bytes / us / 1e3
+        if args.rotate_inputs:
+            # After the other timers, which thus run as they do without it.
+            rotate_inputs(
+                args,
+                record,
+                {
+                    impl: rotating[impl]
+                    for impl, values in timings.items()
+                    if "timing_error" not in values
+                },
+                input_bytes,
+            )
         record["temperature_after_c"] = common.gpu_temperature()
         record["foreign_gpu_processes_after"] = common.foreign_gpu_processes()
         record["status"] = "ok"
@@ -400,15 +776,42 @@ def main() -> None:
     )
     parser.add_argument("--configs-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--impls", default=",".join(ALL_IMPLS))
+    parser.add_argument("--impls", default=",".join(common.ALL_IMPLS))
     # Even round counts: as many rounds in each order (module docstring).
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--rep-ms", type=int, default=200)
     parser.add_argument("--cold-rounds", type=int, default=6)
+    parser.add_argument(
+        "--rotate-inputs",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also time every implementation on N private input sets of its "
+        "own, one per call of a flushed batch (rot_us, in --cold-rounds "
+        "rounds): cold_us without the L2 lines that hinted loads keep through "
+        "the flush. Only for ports whose inputs fit --rotate-max-l2 and whose "
+        "fastest implementation cold_us times in batches; 8 is the count the "
+        "study used (default: off)",
+    )
+    parser.add_argument(
+        "--rotate-max-l2",
+        type=float,
+        default=ROTATE_MAX_L2_MULTIPLE,
+        metavar="X",
+        help="--rotate-inputs leaves out ports whose inputs total more than X "
+        "times the device's L2 size (default: %(default)s)",
+    )
     args = parser.parse_args()
     for flag, count in (("--rounds", args.rounds), ("--cold-rounds", args.cold_rounds)):
         if count <= 0 or count % 2:
             parser.error(f"{flag} {count}: a positive, even count is needed")
+    if args.rotate_inputs < 0 or args.rotate_inputs == 1:
+        parser.error(
+            f"--rotate-inputs {args.rotate_inputs}: at least 2 input sets are "
+            "needed (0 turns it off)"
+        )
+    if args.rotate_max_l2 <= 0:
+        parser.error(f"--rotate-max-l2 {args.rotate_max_l2}: a positive factor")
     activity: dict[str, Any] = {}
     with common.watch_foreign_gpu_activity(activity):
         record = run(args)
@@ -417,13 +820,19 @@ def main() -> None:
     common.write_json(args.output, record)
     summary = {
         impl: (
-            f"{info['bb_us']:.2f}/{info['cold_us']:.2f}us"
+            f"{info['bb_us']:.2f}/{info['cold_us']:.2f}"
+            + (f"/{info['rot_us']:.2f}" if "rot_us" in info else "")
+            + "us"
             if "bb_us" in info
             else info["status"]
         )
         for impl, info in record["impls"].items()
     }
     print(f"{record['status']} {args.repro_id}[{record['shape']}] {summary}")
+    rotation = record.get("rotate_inputs")
+    if rotation is not None and rotation["status"] != "ok":
+        reason = rotation.get("skipped") or rotation.get("error", "").strip()[-300:]
+        print(f"rot_us {rotation['status']}: {reason}")
     if record["status"] != "ok":
         print(record.get("error", ""), file=sys.stderr)
         sys.exit(1)
