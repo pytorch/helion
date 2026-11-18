@@ -3558,6 +3558,49 @@ class TestTorchCompile(RefEagerTestDisabled, TestCase):
             k_default_dtype_output.reset()
             torch._dynamo.reset()
 
+    @skipIfTileIR("torch.compile missing kernel metadata on tileir")
+    @skipIfFn(
+        lambda: not _captured_as_hop(),
+        "only the HOP capture searches configs during Inductor's lowering",
+    )
+    def test_autotune_while_compiling(self):
+        # Compiled before any eager call, so the config search runs inside
+        # Inductor's lowering. Which binding gets the config is the point, not
+        # the search, so the search is stubbed to pick the first config.
+        @helion.kernel(
+            configs=[
+                helion.Config(block_sizes=[32]),
+                helion.Config(block_sizes=[64]),
+            ],
+        )
+        def k_add_one(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for tile in hl.tile(out.size(0)):
+                out[tile] = x[tile] + 1
+            return out
+
+        def f(x: torch.Tensor) -> torch.Tensor:
+            return k_add_one(x * 2) - 3
+
+        def first_config(backend, bound_kernel, args, *, force=True, **kwargs):
+            return bound_kernel.kernel.configs[0]
+
+        x = torch.randn(1024, device=DEVICE)
+        torch._dynamo.reset()
+        with (
+            fresh_cache(),
+            patch.object(get_backend_class(_get_backend()), "autotune", first_config),
+        ):
+            actual = torch.compile(f, fullgraph=True, backend="inductor")(x)
+        torch.testing.assert_close(actual, x * 2 + 1 - 3)
+        (bound,) = k_add_one._bound_kernels.values()
+        if get_backend_class(_get_backend())().binds_inductor_call_facts:
+            # The lowering tuned a binding of its own, so the cached one, which
+            # serves eager calls, has no config compiled under its facts.
+            self.assertIsNone(bound._config)
+        else:
+            self.assertIsNotNone(bound._config)
+
     @requires_fusion_support
     @skipIfTileIR("torch.compile missing kernel metadata on tileir")
     def test_fused_lowering_revalidates_changed_index_dtype(self):
