@@ -163,6 +163,9 @@ os.write(1, b"ready\\n")
 assert sys.stdin.readline() == "start\\n"
 gate.set()
 assert sys.stdin.readline() == "exit\\n"
+# Skip interpreter shutdown, where the still-armed C watchdog's dump of the
+# main thread can crash the child after its reports were read.
+os._exit(0)
 """
         read_fd, write_fd = os.pipe()
         pipe_limit = os.fpathconf(write_fd, "PC_PIPE_BUF")
@@ -308,6 +311,10 @@ try:
 except RuntimeError as exc:
     os.write(1, ('propagated:' + str(exc) + '\\n').encode())
     assert sys.stdin.readline() == 'exit\\n'
+# Skip interpreter shutdown: the context leaves its C watchdog armed (here
+# every 0.13 s), and a dump that walks the main thread while it finalizes
+# can crash the child (SIGSEGV) after the checks above passed.
+os._exit(0)
 """
         child = subprocess.Popen(
             [sys.executable, "-c", script],
@@ -366,6 +373,7 @@ except RuntimeError as exc:
     def test_independent_fallback_reports_while_gil_is_held(self) -> None:
         script = """
 import ctypes
+import os
 from helion._testing.distributed_diagnostics import queued_copy_diagnostics
 hold_gil = ctypes.PyDLL(None).sleep
 hold_gil.argtypes = [ctypes.c_uint]
@@ -373,6 +381,9 @@ hold_gil.restype = ctypes.c_uint
 with queued_copy_diagnostics(3, timeout=0.1) as mark:
     mark("holding_gil")
     hold_gil(1)
+# Skip interpreter shutdown, where the still-armed C watchdog's dump of the
+# main thread can crash the child after the context returned.
+os._exit(0)
 """
         result = subprocess.run(
             [sys.executable, "-c", script], capture_output=True, timeout=30

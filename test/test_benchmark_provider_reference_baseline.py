@@ -643,27 +643,39 @@ def test_a_baseline_compile_past_the_deadline_backs_off() -> None:
                 autotune_compile_timeout=2,
             )
         try:
-            assert precompiled == [32, 16]
+            # On a loaded host the precompile of block size 16, a fork of the
+            # multi-threaded test worker that does nothing, can miss the 2 s
+            # deadline too and back off once more (to 8): every back-off
+            # must be such a kill, checked below.
+            assert precompiled[:2] == [32, 16], precompiled
+            baseline = precompiled[-1]
             # Each attempt compiles once: the run reuses its precompile's
             # compiled config.
-            assert compiled == [32, 16]
-            assert ran == [16]
-            assert torch.equal(provider._baseline_output, torch.full((4,), 16.0))
+            assert compiled == precompiled
+            assert ran == [baseline]
+            assert torch.equal(
+                provider._baseline_output, torch.full((4,), float(baseline))
+            )
             # The compiler the killed precompile started is gone too (on a
             # loaded host the deadline may come before the fork started it).
             pids = [int(name) for name in os.listdir(compilers)]
             assert len(pids) <= 1 and all(_exited(pid) for pid in pids)
         finally:
             provider.cleanup()
-    (backoff,) = [w for w in log.warnings if "retrying the baseline" in w]
-    assert "block_sizes=[32]" in backoff
-    assert re.search(
-        r"compile exceeded autotune_compile_timeout=2s "
-        r"\(HELION_AUTOTUNE_COMPILE_TIMEOUT\) in the precompile subprocess, "
-        r"killed after \d+\.\ds\); retrying the baseline with block sizes \[16\]$",
-        backoff,
-    ), backoff
-    assert log.warnings[-1].startswith("Using block sizes [16] for the accuracy")
+    backoffs = [w for w in log.warnings if "retrying the baseline" in w]
+    assert len(backoffs) == len(precompiled) - 1, log.warnings
+    for size, backoff in zip(precompiled[:-1], backoffs, strict=True):
+        assert f"block_sizes=[{size}]" in backoff
+        assert re.search(
+            r"compile exceeded autotune_compile_timeout=2s "
+            r"\(HELION_AUTOTUNE_COMPILE_TIMEOUT\) in the precompile subprocess, "
+            rf"killed after \d+\.\ds\); retrying the baseline with block sizes "
+            rf"\[{size // 2}\]$",
+            backoff,
+        ), backoff
+    assert log.warnings[-1].startswith(
+        f"Using block sizes [{baseline}] for the accuracy"
+    )
 
 
 def _die_from_a_signal() -> None:

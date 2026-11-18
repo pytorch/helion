@@ -1935,8 +1935,12 @@ def checked_killpg(pgid, sig):
     if sig == signal.SIGKILL:
         proc = supervisors[0]
         assert pgid == proc.pid and proc.returncode is None
-        status = os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
-        assert status is not None, 'dead supervisor must still reserve its PID'
+        # Its exit-pipe EOF can arrive before the dying supervisor becomes a
+        # zombie (waitid then returns None); either way it must be unreaped.
+        try:
+            os.waitid(os.P_PID, pgid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except ChildProcessError:
+            raise AssertionError('dead supervisor must still reserve its PID') from None
         retained.append(pgid)
     killpg(pgid, sig)
 os.killpg = checked_killpg
