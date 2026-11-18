@@ -1,8 +1,9 @@
 # ruff: noqa: ANN401
 """Profile one implementation of a better-benchmark repro under Nsight Compute.
 
-Builds the implementation the way ``bench.py`` does (Inductor with or
-without coordinate descent, the oracle, or a Helion port pinned to its
+Builds the implementation the way ``bench.py`` does (one of Inductor's
+compiles: default, coordinate descent or the options of
+``mode="max-autotune"``; the oracle; or a Helion port pinned to its
 autotuned decorators), warms it up, captures it in a CUDA graph as
 ``bench.py``'s timers do, and profiles one replay of the graph with ``ncu``
 (an implementation may take another path under capture: the dropout oracles
@@ -55,10 +56,10 @@ METRICS = (
 def build(args: argparse.Namespace) -> Any:
     """The implementation as a callable taking the input list."""
     shape = args.shape or common.default_shape(args.repro_id)
-    if args.impl in ("inductor", "inductor_cd"):
+    if args.impl in common.INDUCTOR_IMPLS:
         instance = common.load_repro_module(args.repro_id).Repro()
         compiled = common.compile_inductor(
-            args.repro_id, shape, instance, cd=args.impl == "inductor_cd"
+            args.repro_id, shape, instance, impl=args.impl
         )
         return lambda inp: compiled(*inp)
     if args.impl == "oracle":
@@ -191,7 +192,7 @@ def main() -> None:
     parser.add_argument(
         "--impl",
         default="helion_cute",
-        choices=("inductor", "inductor_cd", "oracle", "helion_cute", "helion_triton"),
+        choices=(*common.INDUCTOR_IMPLS, "oracle", "helion_cute", "helion_triton"),
     )
     parser.add_argument("--configs-dir", type=Path, default=None)
     parser.add_argument(

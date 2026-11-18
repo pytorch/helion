@@ -1,7 +1,8 @@
 """Write the Triton code Inductor generates for a better-benchmark repro.
 
-Compiles the repro at one shape point (``coordinate_descent_tuning=True``,
-better-benchmark's tuned configuration) in a private Inductor cache and copies
+Compiles the repro at one shape point in a private Inductor cache (with
+``coordinate_descent_tuning=True``, better-benchmark's tuned configuration,
+unless ``--impl`` names another of ``bench.py``'s Inductor compiles) and copies
 the generated output module(s) to ``--output`` (stdout by default) under a
 header that lists the launched kernels (also printed when writing to
 ``--output``). Use it to see which Triton kernels a Helion port has to
@@ -37,7 +38,17 @@ def main() -> None:
         default=None,
         help="shape hash (default: the repro's selection.json point, else its first)",
     )
-    parser.add_argument("--no-cd", action="store_true")
+    # --no-cd names a compile too: with --impl it would override it.
+    which = parser.add_mutually_exclusive_group()
+    which.add_argument(
+        "--impl",
+        choices=common.INDUCTOR_IMPLS,
+        default="inductor_cd",
+        help="which Inductor compile to dump (default: %(default)s)",
+    )
+    which.add_argument(
+        "--no-cd", action="store_true", help="the same as --impl inductor"
+    )
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -57,7 +68,7 @@ def dump(args: argparse.Namespace, cache: str) -> None:
     instance = common.load_repro_module(args.repro_id).Repro()
     inputs = common.make_inputs(args.repro_id, shape, seed=0)
     compiled = common.compile_inductor(
-        args.repro_id, shape, instance, cd=not args.no_cd
+        args.repro_id, shape, instance, impl="inductor" if args.no_cd else args.impl
     )
     with torch.no_grad():
         compiled(*inputs)

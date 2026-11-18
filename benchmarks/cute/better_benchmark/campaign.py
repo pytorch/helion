@@ -44,7 +44,19 @@ The jobs:
 - ``bench``: ``bench.py`` for one (repro, shape) once its autotunes have
   finished, whether or not they succeeded (a backend without a usable
   autotune record fails on its own; the other implementations are timed),
-  written to ``<run>/bench/<repro>__<shape>.json``.
+  written to ``<run>/bench/<repro>__<shape>.json``. With ``--bench-repeats
+  N`` a point has N bench jobs, each a fresh process with a cache directory
+  (and so an Inductor cache) and a placement of its own, written to
+  ``<run>/bench/<repro>__<shape>.r<k>.json``; every rule below about a
+  bench holds for each of them. Once none of a point's repeats is left to
+  run, ``<repro>__<shape>.json`` is written as the aggregate of those that
+  are ok (``common.aggregate_bench_records``: each implementation's median
+  over the processes, with the per-process values and Inductor picks; the
+  ``bench_aggregate`` event names the records it counts, leaves out and
+  misses). ``report.py`` takes a point's ratio from it process by process
+  (README, Baseline). A repeat that starts again sets the aggregate aside
+  as ``<record>.prev``, like its own record, and a restart writes it again
+  when the records it is of have changed (another count of repeats, say).
 
 A ``provisional`` autotune record, an earlier run's Triton record that
 ``plan_run.py --provisional-triton`` copied into the run, stands in for an
@@ -252,11 +264,15 @@ class Job:
     attempt: int = 1
     avoid_gpu: str | None = None
     contaminated: tuple[str, ...] = ()
+    # Which of a point's bench processes this is under --bench-repeats
+    # (from 1); None for the one bench of a point without it.
+    repeat: int | None = None
 
     @property
     def key(self) -> str:
         suffix = f"__{self.backend}" if self.backend else ""
-        return f"{self.kind}:{self.repro}__{self.shape}{suffix}"
+        repeat = "" if self.repeat is None else f"#r{self.repeat}"
+        return f"{self.kind}:{self.repro}__{self.shape}{suffix}{repeat}"
 
 
 @dataclasses.dataclass
@@ -758,6 +774,17 @@ def main() -> None:
         "(bench.py --rotate-inputs: rot_us)",
     )
     parser.add_argument(
+        "--bench-repeats",
+        type=int,
+        default=1,
+        metavar="N",
+        help="bench every point in N fresh processes (records <point>.r1.json "
+        "to <point>.rN.json), each with its own Inductor cache and placement, "
+        "and write <point>.json as their aggregate: every implementation's "
+        "median over the processes, with the per-process values "
+        "(common.aggregate_bench_records)",
+    )
+    parser.add_argument(
         "--retry-contaminated",
         type=int,
         default=2,
@@ -891,6 +918,13 @@ def main() -> None:
             )
     if args.rotate_inputs < 0 or args.rotate_inputs == 1:
         parser.error(f"--rotate-inputs {args.rotate_inputs}: at least 2 input sets")
+    if args.bench_repeats < 1:
+        parser.error(f"--bench-repeats {args.bench_repeats}: at least 1 process")
+    # The repeats of a point's bench (None: its one bench, as without the
+    # option).
+    repeats: list[int | None] = (
+        [None] if args.bench_repeats == 1 else list(range(1, args.bench_repeats + 1))
+    )
     bench_dir = run_dir / "bench"
     logs_dir = run_dir / "logs"
     for d in (configs_dir, bench_dir, logs_dir / "autotune", logs_dir / "bench"):
@@ -903,6 +937,8 @@ def main() -> None:
         if job.kind == "autotune":
             assert job.backend is not None
             return config_file(job.repro, job.shape, job.backend)
+        if job.repeat is not None:
+            return common.bench_repeat_path(bench_dir, job.repro, job.shape, job.repeat)
         return common.bench_record_path(bench_dir, job.repro, job.shape)
 
     def set_aside(job: Job, suffix: str) -> Path:
@@ -1146,6 +1182,50 @@ def main() -> None:
             return not settle(job, None)
         return False
 
+    def set_aggregate_aside(repro: str, shape: str) -> None:
+        """Move a point's aggregate record to ``<record>.prev``: a repeat of
+        its bench starts again, or it is to be replaced."""
+        out = common.bench_record_path(bench_dir, repro, shape)
+        with stop_signals_deferred():
+            if out.exists():
+                out.replace(out.with_name(f"{out.name}.prev"))
+
+    def aggregate(repro: str, shape: str) -> None:
+        """Write a point's aggregate record from the ok records of its
+        repeats (``common.aggregate_bench_records``), unless the one that
+        is there is of those very records. Without an ok record the point
+        has no aggregate, like a point whose one bench failed."""
+        out = common.bench_record_path(bench_dir, repro, shape)
+        processes: dict[str, dict[str, Any]] = {}
+        digests: dict[str, str] = {}
+        names: list[str] = []
+        for repeat in repeats:
+            assert repeat is not None
+            path = common.bench_repeat_path(bench_dir, repro, shape, repeat)
+            names.append(path.name)
+            record = read(path)
+            if record is not None and record.get("status") == "ok":
+                processes[path.name] = record
+                digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        standing = read(out)
+        if standing is not None and (standing.get("aggregate") or {}).get(
+            "records"
+        ) == (digests or None):
+            return
+        set_aggregate_aside(repro, shape)
+        if not processes:
+            return
+        record = common.aggregate_bench_records(processes, digests)
+        common.write_json(out, record)
+        event(
+            kind="bench_aggregate",
+            point=f"{repro}__{shape}",
+            record=str(out),
+            processes=record["aggregate"]["counted"],
+            left_out=record["aggregate"]["left_out"],
+            missing=[name for name in names if name not in processes],
+        )
+
     if args.configs_from is not None:
         # The records byte for byte. Each copy is in COPIED_CONFIGS before
         # it is made, with the digest of the copy it replaces, and a removed
@@ -1206,6 +1286,9 @@ def main() -> None:
     # records lack the timing on that many sets: they have none, one on
     # another count of sets, or a pass on that count that failed.
     unrotated = []
+    # --bench-repeats: the repeats of each point that are still to finish,
+    # by job key. The point's aggregate record is written once none is left.
+    unaggregated: dict[tuple[str, str], set[str]] = {}
     for e in entries:
         repro, shape = e["repro"], e["shape"]
         deps = []
@@ -1215,27 +1298,40 @@ def main() -> None:
             deps.append(job.key)
             if "autotune" in phases and queue(job, args.retune):
                 autotune_pending = True
-        bench = Job("bench", repro, shape, None, tuple(deps))
-        bench_out = record_path(bench)
-        # A finished bench stands while none of the point's autotune records
-        # is newer than it or another record than its port was timed on: one
-        # that an autotune or --configs-from replaced, added or removed
-        # since, which the dates need not show (a copy of an older record, a
-        # clock that stepped back).
-        finished = read(bench_out) if ok(bench_out) else None
-        stale = finished is not None and not (
-            newer_than_all(bench_out, [config_file(repro, shape, b) for b in backends])
-            and timed_on_current(bench, finished)
-        )
-        if "bench" in phases:
-            queued = queue(bench, args.rebench or autotune_pending or stale)
-            if args.rotate_inputs and not queued:
-                decision = (read(bench_out) or {}).get("rotate_inputs") or {}
-                if (
-                    decision.get("sets") != args.rotate_inputs
-                    or decision["status"] == "error"
-                ):
-                    unrotated.append(bench_out.name)
+        for repeat in repeats:
+            bench = Job("bench", repro, shape, None, tuple(deps), repeat=repeat)
+            bench_out = record_path(bench)
+            # A finished bench stands while none of the point's autotune
+            # records is newer than it or another record than its port was
+            # timed on: one that an autotune or --configs-from replaced,
+            # added or removed since, which the dates need not show (a copy
+            # of an older record, a clock that stepped back).
+            finished = read(bench_out) if ok(bench_out) else None
+            stale = finished is not None and not (
+                newer_than_all(
+                    bench_out, [config_file(repro, shape, b) for b in backends]
+                )
+                and timed_on_current(bench, finished)
+            )
+            if "bench" in phases:
+                queued = queue(bench, args.rebench or autotune_pending or stale)
+                if queued and repeat is not None:
+                    unaggregated.setdefault((repro, shape), set()).add(bench.key)
+                if args.rotate_inputs and not queued:
+                    decision = (read(bench_out) or {}).get("rotate_inputs") or {}
+                    if (
+                        decision.get("sets") != args.rotate_inputs
+                        or decision["status"] == "error"
+                    ):
+                        unrotated.append(bench_out.name)
+        if (
+            "bench" in phases
+            and args.bench_repeats > 1
+            and (repro, shape) not in unaggregated
+        ):
+            # Every repeat has finished (in an earlier start, or with
+            # another count of repeats): the aggregate is of these records.
+            aggregate(repro, shape)
     if unrotated:
         event(
             kind="rotate_inputs_not_added",
@@ -1338,6 +1434,9 @@ def main() -> None:
         # the superseded config. Its log goes along.
         if out.exists():
             set_aside(job, ".prev")
+        if job.repeat is not None:
+            # Nor the aggregate of the repeats that this one replaces.
+            set_aggregate_aside(job.repro, job.shape)
         if job.kind == "autotune":
             # The search logs of a start that left no record (stopped,
             # killed): the autotuner appends to the files it finds, and this
@@ -1389,8 +1488,10 @@ def main() -> None:
         if reason is not None:
             return
         if code == 0:
-            if settle(job.job, gpu):
-                done[job.job.key] = True
+            if not settle(job.job, gpu):
+                # Queued again: the point's aggregate waits for the rerun.
+                return
+            done[job.job.key] = True
         elif job.job.contaminated:
             # A retry that failed (timed out, ran out of memory) leaves the
             # cleanest attempt before it standing, flagged, as when every
@@ -1408,6 +1509,15 @@ def main() -> None:
             done[job.job.key] = True
         else:
             done[job.job.key] = False
+        if job.job.repeat is not None:
+            # The last of a point's repeats to finish, ok or not: the
+            # aggregate is of those that are ok.
+            point = (job.job.repro, job.job.shape)
+            left = unaggregated[point]
+            left.discard(job.job.key)
+            if not left:
+                del unaggregated[point]
+                aggregate(*point)
 
     def schedule() -> None:
         last_pick = 0.0

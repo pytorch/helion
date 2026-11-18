@@ -4,7 +4,10 @@ Runs the port's ``forward`` once on the repro's inputs, which autotunes every
 Helion kernel it calls (in call order, each on its real arguments), then
 records each kernel's winning ``@helion.kernel(...)`` decorator. The record is
 checked by rebuilding the kernels from those decorators and comparing their
-generated code and outputs, which is how ``bench.py`` pins them later.
+generated code and outputs, which is how ``bench.py`` pins them later. That
+call of the pinned port starts from poisoned memory, and a pick that leaves
+part of an output unwritten fails the record (``common.check_written``): the
+search's own calls left the allocator's free blocks full of right results.
 
 Run it through ``campaign.py``, which gives every job a fresh process, a
 random seed (a fresh one, or with ``--seeds-from`` the one another run's
@@ -15,7 +18,12 @@ cache directories and a file for the search's per-config log; standalone::
         var_mean_004f9a9ea198 --backend cute --output /tmp/cfg.json
 
 Either way the autotune is cold: ``HELION_FORCE_AUTOTUNE=1`` unless the
-environment sets it, so no config comes from Helion's autotune cache.
+environment sets it (an empty value sets nothing), so no config comes from
+Helion's autotune cache. It is a full search (``HELION_AUTOTUNE_EFFORT=full``)
+unless the environment names another effort: ``common.load_port`` runs an
+unpinned port's default configs when neither variable asks for a search, so
+the script names the effort also where the cache is allowed
+(``HELION_FORCE_AUTOTUNE=0``).
 """
 
 from __future__ import annotations
@@ -30,8 +38,16 @@ from typing import Any
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    # A cold autotune: no config from Helion's autotune cache.
-    os.environ.setdefault("HELION_FORCE_AUTOTUNE", "1")
+    # A cold autotune: no config from Helion's autotune cache. And a search
+    # also when the environment allows the cache: load_port runs an unpinned
+    # port's default configs unless an effort or the force is set. An empty
+    # value sets neither, for load_port as for Helion's settings.
+    for name, value in (
+        ("HELION_FORCE_AUTOTUNE", "1"),
+        ("HELION_AUTOTUNE_EFFORT", "full"),
+    ):
+        if not os.environ.get(name, "").strip():
+            os.environ[name] = value
 
 from benchmarks.cute.better_benchmark import common
 import torch
@@ -43,7 +59,12 @@ def check(
     actual: object, expected: object, args: argparse.Namespace, record: dict[str, Any]
 ) -> None:
     """Structure and exact outputs must match eager; float drift beyond the
-    loose tolerance is recorded (bench.py runs the anchored gate)."""
+    loose tolerance is recorded (bench.py runs the anchored gate). An integer
+    or boolean output that the default Inductor compile's does not reproduce
+    either must equal Inductor's instead (``common.check_outputs``), which
+    the record says (``exact_vs_inductor``): the only case in which this job
+    compiles the repro with Inductor."""
+    vs_inductor: list[dict[str, Any]] = []
     try:
         common.check_outputs(
             actual,
@@ -51,9 +72,13 @@ def check(
             rtol=args.rtol,
             atol=args.atol,
             stochastic=args.stochastic,
+            inductor=args.inductor,
+            vs_inductor=vs_inductor,
         )
     except common.FloatMismatch as error:
         record.setdefault("eager_allclose_warnings", []).append(str(error)[:1000])
+    if vs_inductor:
+        record["exact_vs_inductor"] = vs_inductor
 
 
 def new_record(repro_id: str, shape: str, backend: str) -> dict[str, Any]:
@@ -88,6 +113,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         with torch.no_grad():
             expected = instance(*common.make_inputs(args.repro_id, shape))
         args.stochastic = common.stochastic_outputs(args.repro_id, shape, instance)
+        args.inductor = common.inductor_outputs(args.repro_id, shape, instance)
         port = common.load_port(args.repro_id, args.backend)
         tuned_at = time.monotonic()
         with torch.no_grad():
@@ -105,9 +131,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.backend,
             pinned={name: k["decorator"] for name, k in kernels.items()},
         )
-        with torch.no_grad():
-            again = pinned.forward(common.make_inputs(args.repro_id, shape))
-        torch.cuda.synchronize()
+
+        again = common.forward_on_poisoned_memory(pinned, args.repro_id, shape)
+        common.check_written(
+            again,
+            lambda byte: common.forward_on_poisoned_memory(
+                pinned, args.repro_id, shape, byte
+            ),
+        )
         check(again, expected, args, record)
         record["pin_roundtrip"] = common.pin_roundtrip(pinned, kernels)
         if not all(record["pin_roundtrip"].values()):
