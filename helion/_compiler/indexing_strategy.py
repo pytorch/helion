@@ -37,6 +37,7 @@ from .variable_origin import TileBeginOrigin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.config import Config
@@ -1869,6 +1870,152 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
     """Use TensorDescriptor to load/store from tensors"""
 
     @staticmethod
+    def _extra_mask_dimension_bounds(
+        state: CodegenState,
+        fake_tensor: torch.Tensor,
+        subscript: list[object],
+        *,
+        for_store: bool = False,
+    ) -> dict[int, ast.AST] | None:
+        """Represent ``extra_mask`` via descriptor dimension bounds if it is a
+        conjunction of ``index < bound`` checks on contiguous tensor-indexed axes.
+
+        Args:
+            state: Codegen state providing ``fx_node`` (index nodes and
+                ``extra_mask``) and active variable resolution scope.
+            fake_tensor: Target FakeTensor whose dimensions and stride-1 layout
+                are checked against the mask bounds.
+            subscript: Parsed subscript elements for the load or store.
+            for_store: Whether lowering a store (``extra_mask`` at ``args[3]``)
+                rather than a load (``extra_mask`` at ``args[2]``).
+
+        Returns:
+            ``{}`` if all bounds match the tensor's static sizes; a non-empty
+            ``{tensor_dim: bound_ast}`` mapping for dimensions requiring a
+            device-side dynamic upper bound; or ``None`` if ``extra_mask``
+            cannot be folded into descriptor bounds and requires fallback
+            masking or pointer indexing.
+
+        Example::
+
+            # For out of shape [total_M, N] (stride [N, 1]):
+            #   row_idx = base_row + hl.arange(BM)
+            #   col_idx = base_col + hl.arange(BN)
+            #   mask = (row_idx < group_end)[:, None] & (col_idx < N)[None, :]
+            #   hl.store(out, [row_idx, col_idx], val, extra_mask=mask)
+            #
+            # Returns {0: <AST for group_end>} (dim 1 matches N statically),
+            # eliminating the software mask / tl.where by folding both bounds
+            # into the descriptor shape:
+            #   bound_0 = tl.minimum(group_end, total_M)
+            #   out_desc = tl.make_tensor_descriptor(
+            #       out, [bound_0, N], [stride_0, 1], [BM, BN]
+            #   )
+            #   out_desc.store([base_row, base_col], val)
+        """
+        from ..language import view_ops
+
+        fx_node = state.fx_node
+        assert fx_node is not None
+        index_nodes = fx_node.args[1]
+        assert isinstance(index_nodes, (list, tuple))
+        mask_node = fx_node.args[3 if for_store else 2]
+
+        resolved_axes = subscript_index_axes(subscript, fx_node)
+        if resolved_axes is None:
+            return None
+        index_axes, output_rank = resolved_axes
+
+        dims_by_index_and_axis: dict[
+            tuple[object, int], tuple[int, int | torch.SymInt]
+        ] = {}
+        tensor_dim = 0
+        for pos, k in enumerate(subscript):
+            if k is None:
+                continue
+            if (dims := index_axes.get(pos)) is not None and len(dims) == 1:
+                axis = dims[0]
+                assert axis is not None
+                dims_by_index_and_axis[
+                    (_unwrap_subgraph_placeholder(index_nodes[pos]), axis)
+                ] = (tensor_dim, fake_tensor.size(tensor_dim))
+            tensor_dim += 1
+
+        if not dims_by_index_and_axis:
+            return None
+
+        env = CompileEnvironment.current()
+        layout_sig = env.tensor_descriptor_layout_signature(fake_tensor)
+        assert layout_sig is not None
+        stride_one_dim = layout_sig[0]
+        host_td = env.backend.host_tensor_descriptors(state.device_function.config)
+
+        dynamic_bounds: dict[int, ast.AST] = {}
+        seen_dims: set[int] = set()
+
+        def check_mask(node: object, outer_axes: tuple[int, ...]) -> bool:
+            node = _unwrap_subgraph_placeholder(node)
+            if not isinstance(node, torch.fx.Node):
+                return False
+            val = node.meta.get("val")
+            if (
+                not isinstance(val, torch.Tensor)
+                or val.ndim == 0
+                or val.ndim > len(outer_axes)
+            ):
+                return False
+            axes = outer_axes[len(outer_axes) - val.ndim :]
+            if node.target is view_ops.subscript:
+                sub_spec = node.args[1]
+                assert isinstance(sub_spec, (list, tuple))
+                if not all(s is None or s == slice(None) for s in sub_spec):
+                    return False
+                inner_axes = tuple(
+                    ax for ax, s in zip(axes, sub_spec, strict=True) if s == slice(None)
+                )
+                return check_mask(node.args[0], inner_axes)
+            if node.target is torch.ops.aten.bitwise_and.Tensor:
+                return check_mask(node.args[0], axes) and check_mask(node.args[1], axes)
+            if len(axes) != 1 or node.target not in (
+                torch.ops.aten.lt.Scalar,
+                torch.ops.aten.lt.Tensor,
+            ):
+                return False
+            lhs = _unwrap_subgraph_placeholder(node.args[0])
+            match = dims_by_index_and_axis.get((lhs, axes[0]))
+            if match is None:
+                return False
+            t_dim, dim_size = match
+            if t_dim in seen_dims:
+                return False
+            rhs = _unwrap_subgraph_placeholder(node.args[1])
+            if node.target is torch.ops.aten.lt.Scalar:
+                rhs_val = rhs.meta.get("val") if isinstance(rhs, torch.fx.Node) else rhs
+                if isinstance(rhs_val, (int, torch.SymInt)) and env.known_equal(
+                    rhs_val, dim_size
+                ):
+                    seen_dims.add(t_dim)
+                    return True
+                return False
+            if (
+                not host_td
+                and t_dim != stride_one_dim
+                and isinstance(rhs, torch.fx.Node)
+                and isinstance(rhs_val := rhs.meta.get("val"), torch.Tensor)
+                and rhs_val.ndim == 0
+                and rhs_val.dtype in (torch.int32, torch.int64)
+                and (resolved := _resolve_node_ast(state, rhs)) is not None
+            ):
+                seen_dims.add(t_dim)
+                dynamic_bounds[t_dim] = resolved
+                return True
+            return False
+
+        return (
+            dynamic_bounds if check_mask(mask_node, tuple(range(output_rank))) else None
+        )
+
+    @staticmethod
     def is_supported(
         state: CodegenState,
         fake_tensor: torch.Tensor,
@@ -2115,19 +2262,26 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                 eviction_policy,
                 cache_modifier,
             )
+        dynamic_bounds = (
+            self._extra_mask_dimension_bounds(
+                state, fake_tensor, subscript, for_store=False
+            )
+            if extra_mask is not None
+            else {}
+        )
+        desc_arg = indexing.tensor_descriptor_arg(state, dynamic_bounds=dynamic_bounds)
 
         # Load from tensor descriptor with permuted offsets
         backend = CompileEnvironment.current().backend
         load_expr = expr_from_string(
             backend.descriptor_call(
                 "load",
-                indexing.tensor_descriptor(state),
-                indexing.offsets_str_permuted(state),
+                desc_arg.name,
+                indexing.offsets_str_permuted(state, desc_arg),
             )
         )
 
         # Apply inverse permutation to the loaded result if needed
-        desc_arg = indexing.tensor_descriptor_arg(state)
         if desc_arg.permutation is not None:
             load_expr = expr_from_string(
                 f"tl.permute({{load_result}}, {desc_arg.inverse_permutation!r})",
@@ -2136,7 +2290,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
 
         result = indexing.reshape_load(state, load_expr)
 
-        if extra_mask is not None:
+        if extra_mask is not None and dynamic_bounds is None:
             result = expr_from_string(
                 "tl.where({extra_mask}, {value}, 0)",
                 extra_mask=extra_mask,
@@ -2154,9 +2308,18 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
-        if extra_mask is not None or not self.is_supported(
-            state, fake_tensor, subscript, for_store=True
-        ):
+        if not self.is_supported(state, fake_tensor, subscript, for_store=True):
+            return PointerIndexingStrategy().codegen_store(
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
+            )
+        dynamic_bounds = (
+            self._extra_mask_dimension_bounds(
+                state, fake_tensor, subscript, for_store=True
+            )
+            if extra_mask is not None
+            else {}
+        )
+        if dynamic_bounds is None:
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
             )
@@ -2175,8 +2338,7 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
             for statement in state.device_function.async_store_drain():
                 state.add_statement(statement)
 
-        # Apply permutation to the value being stored if needed
-        desc_arg = indexing.tensor_descriptor_arg(state)
+        desc_arg = indexing.tensor_descriptor_arg(state, dynamic_bounds=dynamic_bounds)
         store_value = indexing.reshape_store(state, value)
         store_value = cast_ast(store_value, fake_tensor.dtype)
 
@@ -2191,8 +2353,8 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         return expr_from_string(
             backend.descriptor_call(
                 "store",
-                indexing.tensor_descriptor(state),
-                f"{indexing.offsets_str_permuted(state)}, {{value}}",
+                desc_arg.name,
+                f"{indexing.offsets_str_permuted(state, desc_arg)}, {{value}}",
             ),
             value=store_value,
         )
@@ -3141,22 +3303,31 @@ class BlockedSubscriptIndexing:
         )
 
     def tensor_descriptor(self, state: CodegenState) -> str:
-        return state.device_function.tensor_descriptor_arg(
-            self.base, self.block_shape
-        ).name
+        return self.tensor_descriptor_arg(state).name
 
-    def tensor_descriptor_arg(self, state: CodegenState) -> TensorDescriptorArg:
-        return state.device_function.tensor_descriptor_arg(self.base, self.block_shape)
+    def tensor_descriptor_arg(
+        self,
+        state: CodegenState,
+        *,
+        dynamic_bounds: Mapping[int, ast.AST] | None = None,
+    ) -> TensorDescriptorArg:
+        return state.device_function.tensor_descriptor_arg(
+            self.base, self.block_shape, dynamic_bounds=dynamic_bounds
+        )
 
     def offsets_str(self) -> str:
         return f"[{', '.join(self.offsets)}]"
 
-    def offsets_str_permuted(self, state: CodegenState) -> str:
+    def offsets_str_permuted(
+        self, state: CodegenState, desc_arg: TensorDescriptorArg | None = None
+    ) -> str:
         """Get offsets string with permutation applied if needed."""
-        desc_arg = self.tensor_descriptor_arg(state)
-        offsets = self.offsets
-        if desc_arg.permutation is not None:
-            offsets = [offsets[i] for i in desc_arg.permutation]
+        if desc_arg is None:
+            desc_arg = self.tensor_descriptor_arg(state)
+        perm = desc_arg.permutation
+        offsets = (
+            [self.offsets[i] for i in perm] if perm is not None else [*self.offsets]
+        )
         if CompileEnvironment.current().backend.host_tensor_descriptors(
             DeviceFunction.current().config
         ):

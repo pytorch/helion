@@ -641,7 +641,13 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             autotune_effort="none",
             static_shapes=True,
             config=helion.Config(
-                indexing=["pointer", "tensor_descriptor", "tensor_descriptor"],
+                indexing=[
+                    "pointer",
+                    "pointer",
+                    "pointer",
+                    "tensor_descriptor",
+                    "tensor_descriptor",
+                ],
             ),
         )
         def accumulate_shifted_blocks(
@@ -651,11 +657,19 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             for worker in hl.grid(1):
                 base_r = bounds[worker]
                 for step in hl.grid(2):
+                    row_end = bounds[1]
+                    if step > 0:
+                        row_end = bounds[2]
                     row_index = base_r + hl.arange(16)
                     col_index = hl.arange(16)
+                    rows_valid = row_index < row_end
                     acc = hl.zeros([16, 16], dtype=torch.float32)
                     for k_tile in hl.tile(32, block_size=16):
-                        blk = hl.load(x, [row_index, k_tile])
+                        blk = hl.load(
+                            x,
+                            [row_index, k_tile],
+                            extra_mask=rows_valid[:, None],
+                        )
                         acc = acc + blk
                     hl.store(
                         out,
@@ -666,12 +680,12 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
             return out
 
         x = torch.randn([40, 32], device=DEVICE, dtype=torch.float32)
-        bounds = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        bounds = torch.tensor([4, 16, 30], dtype=torch.int32, device=DEVICE)
         code, result = code_and_output(accumulate_shifted_blocks, (x, bounds))
 
-        expected = torch.empty([32, 16], device=DEVICE, dtype=torch.float32)
-        expected[:16] = x[4:20, :16] + x[4:20, 16:32]
-        expected[16:] = x[20:36, :16] + x[20:36, 16:32]
+        expected = torch.zeros([32, 16], device=DEVICE, dtype=torch.float32)
+        expected[:12] = x[4:16, :16] + x[4:16, 16:32]
+        expected[16:26] = x[20:30, :16] + x[20:30, 16:32]
         torch.testing.assert_close(result, expected)
         self.assertEqual(code.count(get_tensor_descriptor_fn_name()), 2)
 
