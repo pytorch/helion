@@ -176,6 +176,7 @@
  "test/test_cute_grouped_source128.py": 28.9,
  "test/test_cute_grouped_tail_epilogue.py": 7.1,
  "test/test_cute_grouped_worklist_runtime.py": 4.0,
+ "test/test_cute_guarded_lanes_cuda.py": 8.1,
  "test/test_cute_half_extremum_folds.py": 2.9,
  "test/test_cute_hoist_loop_invariant_recip.py": 3.5,
  "test/test_cute_hoist_warp_reduce.py": 1.9,

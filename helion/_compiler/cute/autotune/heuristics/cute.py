@@ -186,6 +186,10 @@ from ..search_surface import enable_cute_gdn_recurrence_search
 from ..search_surface import enable_cute_packet_prefetch
 from ..search_surface import enable_cute_proven_bounds
 from ..search_surface import enable_cute_topk_search
+from ..search_surface import fmnmx_extrema_offered
+from ..search_surface import guarded_lanes_offered
+from ..search_surface import loads_take_packets
+from ..search_surface import packet_tile_storage_order
 
 log = logging.getLogger(__name__)
 
@@ -11086,6 +11090,129 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 for seed in list(seeds)
                 if not seed.config.get("cute_rng_packet", False)
             )
+        # Last, so the families above keep their seeds and their order.
+        seeds.extend(cls._packet_tile_seeds(env, fact, candidates, vec_block))
+        return seeds
+
+    # N-D packet tile seed: the bytes of a lane's packet and the threads per
+    # CTA and per warp.
+    PACKET_TILE_PACKET_BYTES = 16
+    PACKET_TILE_THREADS = 128
+    PACKET_TILE_WARP = 32
+
+    @classmethod
+    def _packet_tile_seeds(
+        cls,
+        env: CompileEnvironment,
+        fact: PointwiseElementwiseFact,
+        candidates: list[int],
+        vec_block: int,
+    ) -> list[Config]:
+        """A CTA of packets across several tile axes, threads in storage order.
+
+        A kernel that gathers its loads through computed coordinates (a
+        pooling window, a stencil) cannot flatten its tile axes, and its
+        stride-1 axis is often too short for a CTA of packets (64 channels
+        of a channels-last activation are eight 16-byte packets).  The
+        primary then seeds one row of packets per CTA: eight threads each.
+        Here the tile holds the largest power-of-two run of the row that
+        divides it, one packet per thread, and the rest of the CTA's
+        ``PACKET_TILE_THREADS`` threads take one element each of the next
+        storage axes, the first of them filling the warp: a warp then loads
+        whole runs of the stride-1 axis, the other axes keep a tile of one
+        (no serial loop), and the loop order is the storage order, so the
+        packet threads are thread x and the CTAs walk memory in order.  With
+        the packet threads on another thread axis each warp's loads touch a
+        fraction of many rows and every row is fetched by several warps
+        (2.7x slower on the pool below).  The sibling puts every remaining
+        thread on the next storage axis.
+
+        The seeds carry ``cute_guarded_lanes`` (and ``cute_fmnmx_extrema``
+        where the kernel has an fp32 extremum): one packet per thread only
+        pays once a thread that the tile masks turn off skips its loads and
+        the lanes carry no selects, so the family is seeded where that
+        lowering applies (``guarded_lanes_offered``).  Like the other
+        pointwise seeds they also set ``cute_proven_bounds`` where the
+        kernel is offered it.  Inception-v3's 3x3
+        max pooling over ``[128, 147, 147, 64]`` bf16
+        (better-benchmark's pointwise_b0a24575ebc9), timed interleaved on
+        B200: 72 us at tiles of ``[1, 4, 4, 64]`` with these knobs, 118 at
+        the best config a search of 701 found without them, and 198 with
+        the same tiles and W on thread x.  These tiles lie below the floor
+        ``raise_grid_block_minimums`` puts under the search's block sizes
+        where the grid is large, so the search reaches them through the
+        seeds.
+        """
+        spec = env.config_spec
+        if not guarded_lanes_offered(spec) or len(candidates) < 2:
+            return []
+        layout = cls._packet_layout(
+            env,
+            fact,
+            candidates,
+            vec_block,
+            cls.PACKET_TILE_PACKET_BYTES,
+            cls.PACKET_TILE_THREADS,
+        )
+        storage = packet_tile_storage_order(spec, candidates, vec_block)
+        if (
+            layout is None
+            or storage is None
+            or len(spec.loop_orders) != 1
+            or not loads_take_packets(spec, vec_block)
+        ):
+            return []
+        order_spec = spec.loop_orders[0]
+        if set(order_spec.block_ids) != set(candidates):
+            return []
+        vec, inner, _, fragments = layout
+        # The largest power-of-two tile that divides the row: no thread of
+        # the packet axis is masked off.
+        tile = min(inner & -inner, cls.PACKET_TILE_THREADS * vec)
+        lanes = tile // vec
+        if not fragments[vec_block].low <= tile <= fragments[vec_block].high:
+            return []
+        rest = cls.PACKET_TILE_THREADS // lanes
+        fill = min(rest, max(1, cls.PACKET_TILE_WARP // lanes))
+        shapes = [(fill, rest // fill), (rest, 1)] if len(storage) > 2 else [(rest, 1)]
+        ids = list(order_spec.block_ids)
+        knobs: dict[str, Any] = {"cute_guarded_lanes": True}
+        if fmnmx_extrema_offered(spec):
+            knobs["cute_fmnmx_extrema"] = True
+        if spec.cute_proven_bounds_enabled:
+            knobs["cute_proven_bounds"] = True
+        n_evict = (
+            spec.load_eviction_policies.length
+            if spec.supports_config_key("load_eviction_policies")
+            else 0
+        )
+        hinted = bool(n_evict) and "l2_last" in get_valid_eviction_policies(env.backend)
+        seeds: list[Config] = []
+        for index, shape in enumerate(dict.fromkeys(shapes)):
+            threads = {vec_block: lanes}
+            for axis, count in zip(storage[1:], shape, strict=False):
+                threads[axis] = min(count, fragments[axis].high)
+            values: dict[str, Any] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes,
+                    {**dict.fromkeys(candidates, 1), **threads, vec_block: tile},
+                ),
+                "num_threads": _seq_config_list(spec.num_threads, threads),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {vec_block: vec}
+                ),
+                "loop_orders": [[ids.index(block_id) for block_id in storage]],
+                **knobs,
+            }
+            seeds.append(Config.from_dict(values))
+            if index == 0 and hinted:
+                # The first shape's hinted twin, as the primary seeds it.
+                seeds.append(
+                    Config.from_dict(
+                        deepcopy(values)
+                        | {"load_eviction_policies": ["l2_last"] * n_evict}
+                    )
+                )
         return seeds
 
     # Component-packet seeds: the threads per CTA of each.  Their dtypes are

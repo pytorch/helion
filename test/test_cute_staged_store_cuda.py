@@ -112,6 +112,56 @@ def test_windows_match_eager(
     assert torch.equal(kernel(x, window, pad), expected)
 
 
+_ELEMENT_PER_THREAD = {
+    "block_sizes": [64, 16],
+    "num_threads": [64, 1],
+    "cute_staged_store": True,
+}
+
+
+@pytest.mark.parametrize(
+    ("shape", "dtype", "window", "config"),
+    [
+        # Every CTA stages: the lanes run under the staged store's mask.
+        ((2, 32, 16), torch.bfloat16, 9, _WARP),
+        ((2, 32, 16), torch.bfloat16, 9, _ELEMENT_PER_THREAD),
+        (
+            (2, 20, 16),
+            torch.float32,
+            3,
+            register_tile_config(threads=32, window_block=4, vec=4),
+        ),
+        # A partial last tile: the stores are split by CTA and the lanes
+        # stay ahead of them.
+        ((3, 40, 16), torch.bfloat16, 9, _WARP),
+        ((3, 41, 16), torch.bfloat16, 9, _ELEMENT_PER_THREAD),
+    ],
+    ids=[
+        "packets",
+        "element_per_thread",
+        "fp32",
+        "packets_partial_last_tile",
+        "element_per_thread_partial_last_tile",
+    ],
+)
+def test_guarded_lanes_with_a_staged_store_match_eager(
+    shape: tuple[int, int, int],
+    dtype: torch.dtype,
+    window: int,
+    config: dict[str, object],
+) -> None:
+    # ``cute_guarded_lanes`` leaves the staged form in place
+    # (``stage_cta_stores`` runs first) and moves the gather's lanes under
+    # the mask of the store into the image.
+    torch.manual_seed(0)
+    x = torch.randn(shape, device=DEVICE, dtype=dtype)
+    pad = window // 2
+    kernel = _kernel(sliding_windows.fn, config | {"cute_guarded_lanes": True})
+    assert _is_staged(kernel, (x, window, pad))
+    expected = sliding_windows_reference(x.view(-1), shape[1], shape[2], window, pad)
+    assert torch.equal(kernel(x, window, pad), expected)
+
+
 @pytest.mark.parametrize(
     ("dtype", "vec"), [(torch.float32, 4), (torch.bfloat16, 8)], ids=["fp32", "bf16"]
 )

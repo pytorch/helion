@@ -158,6 +158,7 @@ from ..tcgen05_tma_rn import CONVERSION_KEY as CUTE_MMA_F32_CONVERSION_KEY
 from ..tcgen05_tma_rn import TMA_RN as CUTE_MMA_F32_TMA_RN
 from ..tcgen05_tma_rn import WARP_RAW as CUTE_MMA_F32_WARP_RAW
 from ..thread_budget import CUTE_REGISTER_TILE_MAX_ELEMENTS
+from ..thread_budget import MAX_THREAD_BLOCK_DIMS
 from ..unpadded_rows import unpadded_row_layout
 from .config_generation_ext import CuteConfigGenerationExtension
 from .config_keys import CUTE_AFFINE_SCAN_SCHEDULE_KEY
@@ -1417,6 +1418,76 @@ def _normalize_cute_vector_reductions(
             config[key] = False
         else:
             raise InvalidConfig(f"{key} requires cute_register_row")
+
+
+def guarded_lanes_offered(config_spec: ConfigSpec) -> bool:
+    """Whether ``cute_guarded_lanes`` is offered: a pointwise kernel (no
+    reduction, matmul or atomic: the kernels the knob was measured on) with
+    a load whose mask is more than its tiles' own
+    (``guarded_lanes.has_guarded_lane_sites``).  Structure only."""
+    return config_spec.cute_guarded_lane_sites and bool(config_spec.pointwise_facts)
+
+
+def fmnmx_extrema_offered(config_spec: ConfigSpec) -> bool:
+    """Whether ``cute_fmnmx_extrema`` is offered: a pointwise kernel with an
+    fp32 maximum or minimum of two tensors
+    (``handler_ops.has_fp32_extrema``).  Structure only."""
+    return config_spec.cute_fmnmx_extrema_sites and bool(config_spec.pointwise_facts)
+
+
+def loads_take_packets(config_spec: ConfigSpec, packet_block: int) -> bool:
+    """Whether the loads along ``packet_block`` read its tile itself at their
+    stride-1 position, so the threads of a vector lane there load packets: a
+    load that gathers along the axis (a window over the contiguous dim, a
+    scaled coordinate) reads scalars, one per lane."""
+    direct = False
+    for access in config_spec.memory_op_facts:
+        if access.kind != "load":
+            continue
+        for block, affine, stride, scale in zip(
+            access.subscript_block_ids,
+            access.subscript_affine_block_ids,
+            access.subscript_strides,
+            access.subscript_index_scales,
+            strict=False,
+        ):
+            if packet_block not in (block, affine):
+                continue
+            if block != packet_block or stride != 1 or scale != 1:
+                return False
+            direct = True
+    return direct
+
+
+def packet_tile_storage_order(
+    config_spec: ConfigSpec, blocks: Sequence[int], packet_block: int
+) -> list[int] | None:
+    """The tile ``blocks`` from the stride-1 axis outward, as every store
+    that indexes all of them lays them out (by ascending stride); None
+    without such a store, or when two disagree or ``packet_block`` is not the
+    stride-1 axis of one."""
+    found: list[int] | None = None
+    for access in config_spec.memory_op_facts:
+        indexed = access.subscript_block_ids
+        if (
+            access.kind != "store"
+            or len(indexed) != len(blocks)
+            or set(indexed) != set(blocks)
+            or len(access.subscript_strides) != len(indexed)
+        ):
+            continue
+        by_stride = sorted(zip(access.subscript_strides, indexed, strict=True))
+        strides = [stride for stride, _ in by_stride]
+        order = [cast("int", block) for _, block in by_stride]
+        if (
+            strides[0] != 1
+            or len(set(strides)) != len(strides)
+            or order[0] != packet_block
+            or (found is not None and found != order)
+        ):
+            return None
+        found = order
+    return found
 
 
 def _normalize_gated_boolean(
@@ -3050,6 +3121,28 @@ def normalize_knobs(
     )
     _normalize_gated_boolean(
         config,
+        "cute_guarded_lanes",
+        enabled=guarded_lanes_offered(config_spec),
+        requirement=(
+            "a load through a computed or gathered coordinate or with an "
+            "extra_mask, in a pointwise kernel (no reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_fmnmx_extrema",
+        enabled=fmnmx_extrema_offered(config_spec),
+        requirement=(
+            "an fp32 torch.maximum or torch.minimum of two tensors, in a "
+            "pointwise kernel (no reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
         "cute_defer_tile_reduce",
         enabled=bool(config_spec.cute_carried_tile_sum_blocks),
         requirement=(
@@ -3235,6 +3328,96 @@ def normalize_after_sequences(
             ):
                 canonical_layouts[index] = "blocked"
         config["cute_lane_layouts"] = canonical_layouts
+    if fix_invalid:
+        _lead_threads_with_the_packet_axis(config_spec, config)
+
+
+def _lead_threads_with_the_packet_axis(
+    config_spec: ConfigSpec, config: dict[str, object]
+) -> None:
+    """Under ``cute_guarded_lanes``, keep the packet threads of an N-D packet
+    tile on thread x in the configs the search generates.
+
+    A tile's threaded blocks take the thread axes in loop order
+    (``_thread_axis_map``).  Once the lanes run under their stores' guard a
+    pointwise packet tile is bound by its loads, and with another axis on
+    thread x each warp's packets touch a fraction of many rows of the
+    stride-1 axis, every row fetched by several warps: the same code ran
+    2.7x slower on a channels-last pooling window (198 against 72 us on
+    B200; measured on that one kernel).  Two thirds of the loop orders of a
+    tile with three threaded axes are that layout, so a generated config
+    that has it moves the packet block ahead of the first threaded block of
+    its loop order; the other blocks keep their order.  The move shifts the
+    threaded blocks it passes one thread axis up, so a config keeps its
+    order where one of them would then exceed its axis' limit (a block of
+    more than 64 threads on z, ``MAX_THREAD_BLOCK_DIMS``): the launch would
+    be refused, and the config as generated may be launchable.
+
+    The rule covers the tiles the N-D packet tile seeds lay out
+    (``CutePointwiseVecHeuristic._packet_tile_seeds``): the loads along the
+    packet block take packets (``loads_take_packets``) and a store lays out
+    the loop's blocks with the packet block at stride 1
+    (``packet_tile_storage_order``).  Any other kernel the knob is offered
+    to keeps its loop orders, and so the search's whole range of thread
+    layouts under the knob.  A config a user or a saved search pinned is
+    left as it is (``fix_invalid`` only), and so is a config without the
+    knob, whose compute-bound code preferred the other layouts.
+    """
+    if config.get("cute_guarded_lanes") is not True or not guarded_lanes_offered(
+        config_spec
+    ):
+        return
+    loop_orders = config.get("loop_orders")
+    vector_widths = config.get("cute_vector_widths")
+    if not isinstance(loop_orders, list) or not isinstance(vector_widths, list):
+        return
+    contiguous = set(config_spec.pointwise_facts[0].contig_block_ids)
+    threaded = _tile_axis_threads(
+        config_spec, config, _reduction_axis_block_ids(config_spec)
+    )
+    for index, order_spec in enumerate(config_spec.loop_orders):
+        order = loop_orders[index]
+        if not isinstance(order, list):
+            continue
+        blocks = [order_spec.block_ids[position] for position in order]
+        leading = [block_id for block_id in blocks if block_id in threaded]
+        packets = [
+            block_id
+            for block_id in leading
+            if block_id in contiguous
+            and cast(
+                "int",
+                config_spec.cute_vector_widths.config_get(vector_widths, block_id, 1),
+            )
+            > 1
+        ]
+        if (
+            len(packets) != 1
+            or len(leading) < 2
+            or leading[0] == packets[0]
+            or not loads_take_packets(config_spec, packets[0])
+            or packet_tile_storage_order(config_spec, order_spec.block_ids, packets[0])
+            is None
+        ):
+            continue
+        moved_threads = [
+            threaded[block_id][1]
+            for block_id in (
+                packets[0],
+                *(block_id for block_id in leading if block_id != packets[0]),
+            )
+        ]
+        if any(
+            threads > limit
+            for threads, limit in zip(
+                moved_threads, MAX_THREAD_BLOCK_DIMS, strict=False
+            )
+        ):
+            continue
+        entry = order[blocks.index(packets[0])]
+        moved = [position for position in order if position != entry]
+        moved.insert(blocks.index(leading[0]), entry)
+        loop_orders[index] = moved
 
 
 # A persistent reduction nested in a tile keeps at least a warp of the
@@ -4311,6 +4494,20 @@ def cute_flat_fields(
             # last dimension, an unaligned output view) the code stays as it
             # is (``staged_stores``).
             fields["cute_staged_store"] = BooleanFragment()
+        if guarded_lanes_offered(config_spec):
+            # A tile's loads and lane arithmetic under the guard of the
+            # stores they feed, the selects that guard implies dropped and
+            # padded packets loaded predicated; the same values but for FMA
+            # contraction and the sign and payload bits of a NaN.  Where no
+            # store of the config's code is guarded (every tile divides its
+            # extent) the pass leaves the code as it is (``guard_lanes``);
+            # a padded packet still loads predicated.
+            fields["cute_guarded_lanes"] = BooleanFragment()
+        if fmnmx_extrema_offered(config_spec):
+            # An fp32 maximum / minimum as one FMNMX.NaN instead of two
+            # compares and a select; the same values but for the sign of a
+            # zero where zeros of both signs meet.
+            fields["cute_fmnmx_extrema"] = BooleanFragment()
         if config_spec.cute_carried_tile_sum_blocks:
             # A carried tile sum's threads combined once after the device
             # loop instead of once per tile; changes the summation order

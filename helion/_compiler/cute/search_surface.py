@@ -187,7 +187,9 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     env = CompileEnvironment.current()
     env_state = cute_env_state(env)
     register_lane_vector_width_specs(config_spec)
+    from .guarded_lanes import has_guarded_lane_sites
     from .half_extremum_folds import has_half_extremum_reduction
+    from .handler_ops import has_fp32_extrema
     from .hoist_loop_invariant_recip import has_hoistable_fp32_divisions
     from .pair_lane_math import has_fp32_arithmetic
     from .pair_lane_math import has_pairable_exps_or_divisions
@@ -203,6 +205,15 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         env.settings.cute_exact_division
         and has_hoistable_fp32_divisions(info.graph for info in device_ir.graphs)
     )
+    # A load whose mask is more than its tiles' own (a computed or gathered
+    # coordinate, an ``extra_mask``): running the lanes under their stores'
+    # guard is tunable at every extent (on pointwise kernels,
+    # ``guarded_lanes_offered``).
+    config_spec.cute_guarded_lane_sites = has_guarded_lane_sites(device_ir)
+    # An fp32 maximum or minimum of two computed values: its one-instruction
+    # form is tunable (it can lose on a memory-bound gather; on pointwise
+    # kernels, ``fmnmx_extrema_offered``).
+    config_spec.cute_fmnmx_extrema_sites = has_fp32_extrema(device_ir)
     # Exps (sigmoids lower through one), exact divisions or fp32 products,
     # sums and differences to pair over vector lanes in Blackwell's packed
     # fp32 instructions, or half-precision maxima to fold as half2 words;

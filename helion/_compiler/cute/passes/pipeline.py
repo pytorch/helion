@@ -889,7 +889,11 @@ def _fuse_fma(s: _DeviceBodyState) -> None:
     # backend.
     from ..fuse_fma import fuse_fma
 
-    s.kernel_body = fuse_fma(s.kernel_body, rename_groups=s.ctx.rename_groups)
+    s.kernel_body = fuse_fma(
+        s.kernel_body,
+        rename_groups=s.ctx.rename_groups,
+        fp32_extrema=bool(s.ctx.config.get("cute_fmnmx_extrema", False)),
+    )
 
 
 def _ring_mma_dot(s: _DeviceBodyState) -> None:
@@ -1629,6 +1633,14 @@ def _lower_packet_store_policy(s: _KernelDefState) -> None:
     )
 
 
+def _guard_lanes(s: _KernelDefState) -> None:
+    from ..guarded_lanes import guard_lanes
+
+    s.definition.body = guard_lanes(
+        s.definition.body, s.fn.cute_state.lanes.zero_filled_packets
+    )
+
+
 def _stage_cta_stores(s: _KernelDefState) -> None:
     from ..memory_ops import cute_tensor_base_is_aligned
     from ..staged_stores import PACKET_BYTES
@@ -2094,10 +2106,27 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         "stage_cta_stores",
         _config_flag("cute_staged_store"),
         _stage_cta_stores,
-        # After every pass that reads the kernel's stores: its proof runs the
-        # body they left, and the image's stores name no tensor.  Before
-        # ``hint_element_loads``: the proof takes plain loads, not the
+        # After every pass that rewrites the kernel's stores: its proof runs
+        # the body they left, and the image's stores name no tensor.  Before
+        # ``guard_lanes``: the proof takes a store alone under its mask, and
+        # would leave a kernel whose lanes moved under that mask unstaged.
+        # Before ``hint_element_loads``: the proof takes plain loads, not the
         # hinted helper calls, and would leave a hinted kernel unstaged.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "guard_lanes",
+        _config_flag("cute_guarded_lanes"),
+        _guard_lanes,
+        # After every pass that matches a packet's hoists directly above its
+        # V-loop and its flushes directly after it, or a store alone under
+        # its mask (``stage_cta_stores``): this one nests them under the
+        # stores' guard.  A staged store is a store under the same mask, so
+        # its lanes move under it too; a store the staged form split by CTA
+        # (a partial last tile) is no group of stores and keeps its lanes.
+        # Before ``hint_element_loads``: the run ahead of a store ends at a
+        # call the relocation proofs do not know, the hinted helpers among
+        # them.
         requires=(RENAMED,),
     ),
     KernelDefPass(
@@ -2105,9 +2134,10 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         _element_load_hints,
         _hint_element_loads,
         # Last, after every pass that reads, moves or merges an element load
-        # (the staged store's proof reads them): the loads still plain here
-        # are the ones that take a hint.  A hint changes no value and no
-        # store, and the staged image's loads name no tensor parameter.
+        # (the staged store's proof reads them, ``guard_lanes`` moves them):
+        # the loads still plain here are the ones that take a hint.  A hint
+        # changes no value and no store, and the staged image's loads name
+        # no tensor parameter.
         requires=(RENAMED,),
     ),
 )

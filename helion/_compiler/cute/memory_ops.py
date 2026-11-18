@@ -83,6 +83,7 @@ from .emitters.lane_packets import _CUTE_BYTE_PACKET_WIDTHS
 from .emitters.lane_packets import _CUTE_VECTOR_DTYPES
 from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
 from .emitters.lane_packets import _FLAT_GATHER_SINK_MAX_BYTES
+from .emitters.lane_packets import PREDICATED_LANE_DTYPES
 from .emitters.lane_packets import CuteTileVecStoreSite
 from .emitters.lane_packets import FlatRowPacket
 from .emitters.lane_packets import LanePacketEmitter
@@ -107,6 +108,7 @@ from .emitters.memory_access import _cute_tensor_dim_size_expr
 from .emitters.memory_access import _cute_unique_graph_block_id
 from .emitters.memory_access import _matching_block_ids
 from .emitters.memory_access import _maybe_codegen_cute_packed_affine_lhs_load
+from .gathered_bounds import proven_gather_positions
 from .indexing import CUTE_SCALAR_LOAD_SITE_META
 from .indexing import CuteScalarLoadSite
 from .indexing import is_cute_direct_iota_index
@@ -3309,8 +3311,15 @@ def _load_access_site(
         inactive_singleton_slice_expr="0",
     )
     regions = _cute_access_regions(state, subscript, tensor)
+    # Under ``cute_guarded_lanes`` a gathered coordinate that the masks of
+    # its tiles keep inside its dim carries no bound of its own.
+    proven_index_bounds = (
+        proven_gather_positions(state, tensor, subscript)
+        if state.config.config.get("cute_guarded_lanes") is True
+        else frozenset()
+    )
     mask_expr = _cute_resolved_load_mask(
-        state, tensor, subscript, index_exprs, extra_mask
+        state, tensor, subscript, index_exprs, extra_mask, proven_index_bounds
     )
     return AccessSite(tensor_name, index_exprs, regions, mask_expr)
 
@@ -7135,6 +7144,7 @@ def _cute_resolved_load_mask(
     subscript: Sequence[object],
     index_exprs: Sequence[str],
     extra_mask: ast.AST | None,
+    proven_index_bounds: frozenset[int] = frozenset(),
 ) -> str | None:
     """Mask full slices with the same axis that supplies their address.
 
@@ -7179,6 +7189,7 @@ def _cute_resolved_load_mask(
         extra_mask,
         tensor=tensor,
         include_tensor_index_masks=False,
+        proven_index_bounds=proven_index_bounds,
     )
 
 
@@ -8016,6 +8027,40 @@ def _(state: CodegenState) -> object:
                 )
             )
 
+            # A packet lane the load masks off is a lane no store writes when
+            # the value reaches only stores of the same tiles
+            # (``store_only_loads``): the packet then goes without the
+            # per-lane select.  A scalar load keeps it, since there the
+            # select is what keeps a masked-off thread from reading.
+            fill_is_dead = site.mask_expr is not None and load_fill_is_dead(
+                state.fx_node
+            )
+            # Under ``cute_guarded_lanes`` a packet whose fill is observed (a
+            # padding ``extra_mask``, a gathered coordinate) loads
+            # predicated: its mask is uniform across the lanes of the packet
+            # (the tile's extent, its start and the per-thread span are
+            # multiples of V, ``_cute_vector_load_ctx``; every other term was
+            # proven uniform above), so the packet guard is each lane's mask
+            # and the zeros the predicated load leaves are the lanes' fill
+            # (+0.0 and integer 0 are all-zero bits).  The lanes then take no
+            # select, which is what lets the arithmetic that consumes them
+            # fuse its half-precision widening.  The byte dtypes load packed
+            # integers and keep the anchored form, and so does fp16, whose
+            # select-free lanes ptxas widens from the wrong half of the
+            # loaded word (``PREDICATED_LANE_DTYPES``).  So does a load that
+            # feeds a sort or a top-k, whose lowering takes the load's
+            # masked value as recorded below (``CuteSortableLoad``), which
+            # the whole-value return would skip.
+            predicated = (
+                state.config.config.get("cute_guarded_lanes") is True
+                and site.mask_expr is not None
+                and not fill_is_dead
+                and tensor.dtype in PREDICATED_LANE_DTYPES
+                and not _cute_load_feeds_sort_or_scan(state.fx_node)
+            )
+            # The packet lane replaces the whole masked value.
+            whole_value = fill_is_dead or predicated
+
             def emit_tile_load() -> ast.AST | None:
                 # The packet reads before every statement of the V-loop body,
                 # so a store, atomic or barrier that precedes this load in the
@@ -8049,54 +8094,43 @@ def _(state: CodegenState) -> object:
                     lane_base_expr = plan.lane_base_expr
                     packet_exprs = plan.index_exprs
                     rows_at_lane_base = plan.rows_at_lane_base
-                return expr_from_string(
-                    _cute_register_tile_unroll_vec_hoist(
-                        state,
-                        context,
-                        strategy,
-                        tensor,
-                        site.tensor_name,
-                        packet_exprs,
-                        vec_width,
-                        eviction_suffix=eviction_suffix,
-                        lane_axis_pos=lane_axis_pos,
-                        mask_expr=site.mask_expr,
-                        signed_byte_site=load_site,
-                        uniform_mask=packet_mask,
-                        lane_base_expr=lane_base_expr,
-                        rows_at_lane_base=rows_at_lane_base,
-                        flat_rows=flat_rows,
-                    )
+                extract, zero_filled = _cute_register_tile_unroll_vec_hoist(
+                    state,
+                    context,
+                    strategy,
+                    tensor,
+                    site.tensor_name,
+                    packet_exprs,
+                    vec_width,
+                    eviction_suffix=eviction_suffix,
+                    lane_axis_pos=lane_axis_pos,
+                    mask_expr=site.mask_expr,
+                    signed_byte_site=load_site,
+                    uniform_mask=packet_mask,
+                    lane_base_expr=lane_base_expr,
+                    rows_at_lane_base=rows_at_lane_base,
+                    flat_rows=flat_rows,
+                    predicated=predicated,
                 )
-
-            # A packet lane the load masks off is a lane no store writes when
-            # the value reaches only stores of the same tiles
-            # (``store_only_loads``): the packet then goes without the
-            # per-lane select.  A scalar load keeps it, since there the
-            # select is what keeps a masked-off thread from reading.
-            fill_is_dead = site.mask_expr is not None and load_fill_is_dead(
-                state.fx_node
-            )
-
-            def emit_tile_value() -> ast.AST | None:
-                # A dead fill's packet lane is the load's whole value, so it
-                # still takes the rest of ``_cute_masked_value_expr``: a bool
-                # byte is compared against zero, as in every other bool load.
-                vector_load = emit_tile_load()
-                if vector_load is None or not fill_is_dead:
+                vector_load = expr_from_string(extract)
+                if not whole_value:
                     return vector_load
+                # The packet lane is the load's whole value, so it still
+                # takes the rest of ``_cute_masked_value_expr``: a bool byte
+                # is compared against zero, as in every other bool load.  A
+                # packet meant to load predicated that has no guard of its
+                # own (every thread's packet is in bounds) keeps the select.
                 return _cute_masked_value_expr(
                     "{tile_vector_load}",
-                    None,
+                    None if fill_is_dead or zero_filled else site.mask_expr,
                     dtype=tensor.dtype,
                     zero=_cute_scalar_storage_dtype(tensor.dtype),
                     tile_vector_load=vector_load,
                 )
 
             deferred: ast.AST = scalar_load
-            if fill_is_dead:
-                # The packet replaces the whole masked value; the scalar
-                # fallback keeps its select.
+            if whole_value:
+                # The scalar fallback keeps its select.
                 deferred = _cute_masked_value_expr(
                     "{tile_vector_load}",
                     site.mask_expr,
@@ -8104,8 +8138,8 @@ def _(state: CodegenState) -> object:
                     zero=_cute_scalar_storage_dtype(tensor.dtype),
                     tile_vector_load=scalar_load,
                 )
-            if _cute_defer_grid_vector_op(state, context, deferred, emit_tile_value):
-                if fill_is_dead:
+            if _cute_defer_grid_vector_op(state, context, deferred, emit_tile_load):
+                if whole_value:
                     value_expr = deferred
                 else:
                     load_placeholders["tile_vector_load"] = scalar_load
@@ -8121,9 +8155,9 @@ def _(state: CodegenState) -> object:
                     eviction_suffix,
                 )
             else:
-                vector_load = emit_tile_value()
+                vector_load = emit_tile_load()
                 if vector_load is not None:
-                    if fill_is_dead:
+                    if whole_value:
                         value_expr = vector_load
                     else:
                         load_expr = ast.unparse(vector_load)

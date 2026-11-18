@@ -489,6 +489,13 @@ class CuteLaneState:
     vloop_sink_stores: dict[str, CuteVloopStoreFact] = dataclasses.field(
         default_factory=dict
     )
+    # The hoisted tile packets loaded by a predicated load, which leaves
+    # zeros where the packet's guard fails (``LanePacketEmitter.hoist_load``
+    # under ``cute_guarded_lanes``): their lanes take no select against the
+    # mask.  Each with the load it is where that guard is known to hold, as
+    # a template over its ``{pointer}`` (``guarded_lanes`` renders it for a
+    # packet whose whole predicate the guard of its store implies).
+    zero_filled_packets: dict[str, str] = dataclasses.field(default_factory=dict)
     # Persistent-reduction lane loops walking several V-wide chunks per
     # thread, by lane variable: V.  The branch-local persistent vectorizer
     # places one packet per chunk in them.

@@ -218,6 +218,8 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_bool_byte_packets",
     "cute_uniform_lane_compares",
     "cute_tail_peel",
+    "cute_guarded_lanes",
+    "cute_fmnmx_extrema",
     "cute_defer_tile_reduce",
     "cute_staged_store",
     "cute_dot_fragment_mma",

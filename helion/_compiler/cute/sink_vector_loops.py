@@ -103,16 +103,13 @@ from ._ast_pass_utils import rename_names
 from ._ast_pass_utils import replace_call
 from ._ast_pass_utils import replace_node
 from ._ast_pass_utils import statement_lists
-from .cache_policy_loads import MASKED_PACKET_LOAD_HELPERS
-from .cache_policy_loads import CachePolicy
 from .cache_policy_loads import hint_wide_packets
 from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
 from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
-from .emitters.lane_packets import _cute_unroll_vec_elem_type
 from .emitters.lane_packets import _cute_unroll_vec_load_expr
+from .emitters.lane_packets import masked_packet_load_expr
 from .lane_invariant_division import uniform_load_predicates
 from .packet_access import match_packet_access
-from .packet_access import render_masked_packet_load
 from .persistent_branch_vec import _LOAD_MARKER
 from .persistent_branch_vec import _STORE_MARKER
 from .persistent_branch_vec import _marker_call
@@ -1796,7 +1793,7 @@ class _Sinker:
                 # needs it, so ptxas keeps every row's load in flight.  The
                 # per-lane selects on the value stay correct and are dropped
                 # where they only repeat the zero fill (``visit_IfExp``).
-                load_expr = _masked_packet_load_expr(
+                load_expr = masked_packet_load_expr(
                     pointer_text,
                     guard,
                     load_fact.dtype,
@@ -2021,26 +2018,6 @@ def _is_zero_literal(node: ast.expr) -> bool:
 def _is_lane_extract(node: ast.expr) -> bool:
     """``Uint32(_vsink_vec[v]).bitcast(T)``, optionally in a dtype ctor."""
     return _LANE_EXTRACT.match(ast.unparse(node)) is not None
-
-
-def _masked_packet_load_expr(
-    pointer: str, guard: str, dtype: torch.dtype, vec_width: int, eviction_suffix: str
-) -> str:
-    """``_cute_load_v16b_if(ptr, guard, vec_type[, priority])`` for the packet.
-
-    The cache hint of the site is kept: its L1 eviction priority
-    (``'evict_first'`` / ``'evict_last'``), the streaming ``cop='cs'``, or its
-    L2 policy family, which the predicated load carries as a ``createpolicy``
-    descriptor like the unpredicated L2 helpers.
-    """
-    return render_masked_packet_load(
-        MASKED_PACKET_LOAD_HELPERS[vec_width * dtype.itemsize],
-        pointer,
-        guard,
-        vec_width,
-        _cute_unroll_vec_elem_type(dtype),
-        CachePolicy.from_suffix(eviction_suffix).masked_priority,
-    )
 
 
 def _statement_reads_outside_bodies(stmt: ast.AST) -> set[str]:

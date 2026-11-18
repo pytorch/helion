@@ -186,6 +186,8 @@ class Config(Mapping[str, object]):
         cute_bool_byte_packets: bool | None = None,
         cute_uniform_lane_compares: bool | None = None,
         cute_tail_peel: bool | None = None,
+        cute_guarded_lanes: bool | None = None,
+        cute_fmnmx_extrema: bool | None = None,
         cute_defer_tile_reduce: bool | None = None,
         cute_staged_store: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
@@ -428,6 +430,49 @@ class Config(Mapping[str, object]):
                 over a static extent that loads a float tensor along its tile
                 and no matmul, and elsewhere rejected (an explicit False is
                 dropped).
+            cute_guarded_lanes: Run the loads and the arithmetic of a tile's
+                lanes under the guard of the stores they feed, so a thread
+                that the tile masks turn off (a partial last tile, a block
+                with more threads than the extent has elements) skips them
+                instead of loading from an in-bounds anchor and computing a
+                value no store writes.  Selects and load predicates that the
+                stores' guard implies are dropped; a packet whose mask the
+                guard does not imply (a padding ``extra_mask``) loads
+                predicated and reads as zeros where masked off, instead of
+                through one select per lane (an fp16 packet never loads
+                predicated: the assembler widens the wrong half of a
+                predicated packet's word for an fp16 lane without a select,
+                so it keeps its plain load and the selects the guard does
+                not imply); and a gathered coordinate that
+                the masks of its tiles keep inside its dim carries no bound
+                of its own.  Every stored value is computed as before from
+                the same elements; like ``cute_uniform_lane_compares`` its
+                only possible numeric effects are FMA contraction where
+                per-lane selects kept products unfused, and which NaN (its
+                sign and payload bits) a NaN result is: without the selects
+                an fp32 chain over widened half-precision lanes can run in
+                half-precision instructions.  Off by default;
+                offered to the autotuner on pointwise kernels (no reduction,
+                matmul or atomic) with a load through a computed or gathered
+                coordinate or with an ``extra_mask``, and elsewhere rejected
+                (an explicit False is dropped).
+            cute_fmnmx_extrema: Lower an fp32 ``torch.maximum`` /
+                ``torch.minimum`` (and the ``relu`` and ``clamp`` beside it)
+                to the single NaN-propagating instruction the extremum
+                reductions use (FMNMX.NaN) instead of two compares and a
+                select per element; over widened bf16 / fp16 lanes the
+                assembler then folds the maxima into packed half-precision
+                instructions.  NaN results are NaNs in the same places;
+                which NaN (its sign and payload bits) is not part of the
+                result and can differ.  The sign of a zero
+                result can differ: the instruction orders ``-0.0`` below
+                ``+0.0`` (IEEE 754-2019 maximum / minimum), where the
+                compare-and-select form returns one of its operands by
+                position, so ``maximum(-0.0, +0.0)`` is ``+0.0`` in either
+                operand order.  Off by default; offered to the autotuner on
+                pointwise kernels (no reduction, matmul or atomic) with an
+                fp32 ``torch.maximum`` or ``torch.minimum`` of two tensors,
+                and elsewhere rejected (an explicit False is dropped).
             cute_defer_tile_reduce: Combine a carried tile sum across the
                 threads once, after its ``hl.tile`` loop, instead of once per
                 tile: in ``for tile in hl.tile(n): acc = acc + x[tile].sum(0)``
@@ -712,6 +757,8 @@ class Config(Mapping[str, object]):
             "cute_bool_byte_packets": cute_bool_byte_packets,
             "cute_uniform_lane_compares": cute_uniform_lane_compares,
             "cute_tail_peel": cute_tail_peel,
+            "cute_guarded_lanes": cute_guarded_lanes,
+            "cute_fmnmx_extrema": cute_fmnmx_extrema,
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_staged_store": cute_staged_store,
             "cute_wide_packet_hints": cute_wide_packet_hints,
