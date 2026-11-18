@@ -511,6 +511,10 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
     )
     PIPE = 4  # baseline K-loop pipeline depth (bk sized to fit >= this many stages)
     MAX_STAGES = 6  # num_stages ceiling for the latency-bound (non-saturated) regime
+    # Optional num_stages ceiling for a launch grid larger than one wave of SMs. There a
+    # shallower operand ring can keep one more CTA resident per SM. Within one wave every
+    # CTA already has an SM of its own, so MAX_STAGES applies. None = MAX_STAGES always.
+    MULTI_WAVE_MAX_STAGES: int | None = None
     L2_TALL_RATIO = (
         3  # l2_grouping=2 when the tile-grid is tall (grid_m >= this * grid_n)
     )
@@ -2126,8 +2130,13 @@ class TritonH100MatmulHeuristic(AutotunerHeuristic):
             _kit = max(
                 1, k // _bk
             )  # no point pipelining deeper than the K-loop is long
+            _depth = max_depth
+            if cls.MULTI_WAVE_MAX_STAGES is not None:
+                assert launch_grid is not None
+                if launch_grid(_bm, _bn) > num_sm:
+                    _depth = min(_depth, cls.MULTI_WAVE_MAX_STAGES)
             _ns = 2
-            for s in range(min(max_depth, max(2, _kit)), 1, -1):
+            for s in range(min(_depth, max(2, _kit)), 1, -1):
                 if cls._smem_bytes(_bm, _bn, _bk, itemsize, s) <= smem_budget:
                     _ns = s
                     break
@@ -3293,6 +3302,30 @@ class TritonH100FormulaMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
                 # Triton lowering/compiler fix once that path is repaired.
                 return 1
         return None
+
+
+class TritonSm120FormulaMatmulHeuristic(TritonH100FormulaMatmulHeuristic):
+    """SM120 (consumer Blackwell, e.g. RTX 5080) formula front end: the sm90 policy with
+    sm120 shared memory.
+
+    sm120 has no WGMMA and no tcgen05. Every dot lowers to warp-level ``mma.sync`` and
+    keeps its fp32 accumulator in registers, so the sm90 register-resident resource
+    policy applies unchanged. The difference is shared memory: 101376 B per CTA
+    (``shared_memory_per_block_optin``) against 232448 B on sm90. With the sm90 budget
+    the formula emits ``[128, 256, 64]`` at 4 stages, which needs 147-164 KB here and
+    fails to compile. The enforced budget shrinks the tile until it fits.
+
+    The K-loop pipeline is also shallower when the grid is larger than one wave. An SM
+    has only 102400 B of shared memory, so a deep operand ring costs a resident CTA.
+    Measured for the [128, 128, 32] tile: 4 stages against 6 is 196 vs 210 us at
+    2048^3, 1218 vs 1319 us at 4096^3 and 11918 vs 13627 us at 8192^3 (5 stages is as
+    slow as 6). Within one wave the deep ring is faster: 4 stages against 6 is 38 vs
+    33 us at 512x4096x512 and 50 vs 47 us at 64x4096x4096 (64 programs, 84 SMs)."""
+
+    name = "triton_sm120_formula_matmul"
+    HARDWARE_TARGETS = (("cuda", "sm120"),)
+    SMEM_BUDGET = 101376
+    MULTI_WAVE_MAX_STAGES = 4
 
 
 class TritonB200MultiMatmulHeuristic(TritonB200FormulaMatmulHeuristic):
@@ -5487,6 +5520,8 @@ TRITON_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
     # autotune-off defaults as well as autotuner seeds.
     TritonB200FormulaMatmulHeuristic,
     TritonB200MultiMatmulHeuristic,
+    # The sm120 front end uses the sm90 policy with sm120 shared memory.
+    TritonSm120FormulaMatmulHeuristic,
     TritonMatmulReductionEpilogueHeuristic,
     TritonReductionHeuristic,
     TritonNarrowReductionHeuristic,
