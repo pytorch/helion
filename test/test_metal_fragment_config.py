@@ -1,7 +1,8 @@
 """The search surface of K-loop matmuls lowered on simdgroup fragments
 (``metal_matmul="fragment"``): the config keys, seeds and normalization,
-the thread fit (``search_surface.fit_threads``) and the code each config
-generates.  Binds CPU tensors only."""
+the thread fit (``search_surface.fit_threads``), the code each config
+generates, and the lowering a config without the key falls back to
+(``search_surface.MatmulFallback``).  Binds CPU tensors only."""
 
 from __future__ import annotations
 
@@ -18,6 +19,8 @@ from helion._compiler.metal.fragment_mma import _max_offset
 from helion._compiler.metal.search_surface import kernel_facts
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
+from helion._testing.metal import addmm_k_loop
+from helion._testing.metal import render_msl
 from helion._testing.metal_fragment import fp8_rows
 from helion._testing.metal_fragment import fragment_config
 from helion._testing.metal_fragment import k_from_16
@@ -47,6 +50,15 @@ def k_from_offset(x: torch.Tensor, y: torch.Tensor, k0: int) -> torch.Tensor:
             acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, tile_n])
         out[tile_m, tile_n] = acc
     return out
+
+
+def _lowering(msl: str) -> str:
+    """The lowering whose code the MSL holds."""
+    if "matmul2d_descriptor" in msl:
+        return "mpp"
+    if "simdgroup_matrix" in msl:
+        return "fragment"
+    return "scalar"
 
 
 @helion.kernel(backend="metal", static_shapes=True)
@@ -180,8 +192,8 @@ def scalar_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros([tile_m, tile_n], dtype=torch.float16)
         for tile_k in hl.tile(k):
-            acc = acc + hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], out_dtype=F32).to(
-                torch.float16
+            acc = acc + hl.dot(
+                x[tile_m, tile_k], y[tile_k, tile_n], out_dtype=torch.float16
             )
         out[tile_m, tile_n] = acc
     return out
@@ -356,6 +368,66 @@ class TestFragmentConfig(unittest.TestCase):
                 )
                 spec.normalize(old)
                 self.assertNotIn("range_num_stages", old.config)
+
+    def test_fallback(self) -> None:
+        """A config without ``metal_matmul`` takes the first lowering that
+        compiles it: MPP's, then fragments' on one SIMD group, then the
+        scalar contraction's, from the config as given.  One that names a
+        lowering keeps it and fails with that lowering's error, as the
+        search's drawn configs do."""
+        h = torch.float16
+        deep = (torch.randn(32, 1024, dtype=h), torch.randn(1024, 32, dtype=h))
+        wide = (torch.randn(16, 128, dtype=h), torch.randn(128, 512, dtype=h))
+        for args, config, expected in (
+            (deep, helion.Config(block_sizes=[16, 16, 64]), "mpp"),
+            # N = 512, past an MPP op's 256: fragments take it.
+            (wide, helion.Config(block_sizes=[16, 512, 32]), "fragment"),
+            # K = 512, past an MPP op's 256 and the 16 steps a fragment run
+            # unrolls.
+            (deep, helion.Config(block_sizes=[16, 16, 512]), "scalar"),
+            # One thread, which neither cooperative lowering runs on.
+            (
+                deep,
+                helion.Config(block_sizes=[16, 16, 64], num_threads=[1, 1, 1]),
+                "scalar",
+            ),
+        ):
+            with self.subTest(config=config):
+                msl = render_msl(addmm_k_loop, args, config)
+                self.assertEqual(_lowering(msl), expected)
+        # The scalar fallback keeps the config's threads, not the fragment
+        # pass's one SIMD group.
+        config = helion.Config(
+            block_sizes=[16, 16, 512], num_threads=[16, 16, 1], num_warps=8
+        )
+        msl = render_msl(addmm_k_loop, deep, config)
+        self.assertEqual(_lowering(msl), "scalar")
+        self.assertIn("required_threads_per_threadgroup(16, 16, 1)", msl)
+        for config, message in (
+            (
+                helion.Config(block_sizes=[16, 16, 512], metal_matmul="mpp"),
+                "one op covers M, N <= 256 and K <= 256",
+            ),
+            (
+                helion.Config(
+                    block_sizes=[16, 16, 64], num_threads=[1, 1, 1], metal_matmul="mpp"
+                ),
+                "it needs whole 32-thread SIMD groups",
+            ),
+        ):
+            with (
+                self.subTest(config=config),
+                self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)),
+            ):
+                render_msl(addmm_k_loop, deep, config)
+        # Every lowering refusing: the scalar contraction's error, caused by
+        # MPP's.
+        int8 = torch.int8
+        args = (torch.ones(16, 64, dtype=int8), torch.ones(64, 16, dtype=h))
+        with self.assertRaises(exc.BackendUnsupported) as caught:
+            addmm_k_loop.bind(args).to_code(helion.Config(block_sizes=[16, 16, 16]))
+        self.assertIn("on the scalar contraction", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, exc.BackendUnsupported)
 
     def test_threads(self) -> None:
         """The search gives a matmul config a threadgroup its matmuls run
