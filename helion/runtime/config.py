@@ -383,7 +383,15 @@ class Config(Mapping[str, object]):
                 keeps its masks.  Each value is computed as before, from the same
                 elements in the same order; like ``cute_uniform_lane_compares``
                 its only possible numeric effect is FMA contraction where
-                per-lane selects kept products unfused.  Off by default;
+                per-lane selects kept products unfused.  In a nest that
+                ``cute_vloop_sink`` interchanged, whose lanes load predicated
+                packets already, the complete tiles load them unpredicated
+                (under the same cache hints) and drop the selects of every
+                mask that the loop's bounds, the launch shape and the
+                launch's block grid imply (the grid where it is exact: static,
+                or over input sizes the bound kernel is specialized on), the
+                kernel's own index masks included; tiles that divide the
+                extent are unmasked without a split.  Off by default;
                 offered to the autotuner on kernels with an ``hl.tile`` loop
                 over a static extent that loads a float tensor along its tile
                 and no matmul, and elsewhere rejected (an explicit False is

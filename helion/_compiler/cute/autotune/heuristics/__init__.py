@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from ....autotuner_heuristics.registry import AutotunerHeuristicType
     from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
@@ -512,21 +513,28 @@ def _register_knob_witnesses(
     *,
     key: str,
     mechanism: str,
-    carries: Callable[[Config], bool],
-) -> None:
+    carries: Callable[[Config], bool] = lambda seed: True,
+    candidates: Sequence[Config] | None = None,
+    dependencies: tuple[CoverageDependency, ...] = (),
+) -> bool:
     """Cover the boolean knob ``key``, off by default, with a knob-on witness
-    for each of the first compiler seeds that ``carries`` admits, at most
-    ``MAX_COMPILER_COVERAGE_CONFIGS``.  Each carrier is the seed as the
-    search canonicalizes it, kept only when its witness transfers strictly.
+    for each of the first ``candidates`` that ``carries`` admits, at most
+    ``MAX_COMPILER_COVERAGE_CONFIGS``, and say whether any was registered.
+    The candidates are the compiler seeds as the search canonicalizes them
+    unless given (carriers that hold the values ``dependencies`` names, of
+    groups registered earlier); each is kept only when its witness transfers
+    strictly.
     """
     spec = env.config_spec
     # A knob the search surface does not offer here (``cute_flat_fields``)
     # takes no witnesses: none would transfer.
     if key not in spec._flat_fields():
-        return
+        return False
     generation = spec.create_config_generation()
+    if candidates is None:
+        candidates = [seed for _flat, seed in generation.seed_flat_config_pairs()]
     carriers: list[Config] = []
-    for _flat, seed in generation.seed_flat_config_pairs():
+    for seed in candidates:
         if not carries(seed):
             continue
         try:
@@ -547,8 +555,10 @@ def _register_knob_witnesses(
                 domain=(False, True),
                 legacy=False,
                 witnesses=tuple(CoverageWitness(seed, True) for seed in carriers),
+                dependencies=dependencies,
             )
         )
+    return bool(carriers)
 
 
 def register_pair_lane_math_coverage(env: CompileEnvironment) -> None:
@@ -903,8 +913,9 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
 
     register_mxfp8_epilogue_coverage(env)
     register_bool_byte_packets_coverage(env)
-    register_tail_peel_coverage(env)
+    # Before the tail peel's: its witnesses of sunk nests ride on these.
     register_defer_tile_reduce_coverage(env)
+    register_tail_peel_coverage(env)
 
 
 def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:
@@ -971,10 +982,38 @@ def register_tail_peel_coverage(env: CompileEnvironment) -> None:
     there are one wide has no packet to load, and one that spreads the tile
     over more than a warp reduces it through shared memory, which keeps the
     loop whole; none of them carries a witness.
+
+    Where ``cute_defer_tile_reduce`` has witnesses (a loop that adds its
+    tile's sum to a carried value), the knob is covered on those instead, the
+    deferred combine on: the split column reduction's sunk nests load every
+    lane in predicated packets, which the complete tiles then load
+    unpredicated, with no reduce left in the loop to keep it whole.  A field
+    has one coverage group and a group's carriers share its dependencies, so
+    such a kernel's one-warp seeds carry no witness of their own; they carry
+    them again where none of the deferred witnesses takes the knob.
     """
     spec = env.config_spec
     blocks = spec.cute_tail_peel_blocks
     if not blocks:
+        return
+    deferred = next(
+        (
+            group
+            for group in spec.compiler_coverage_groups
+            if group.key == "cute_defer_tile_reduce"
+        ),
+        None,
+    )
+    if deferred is not None and _register_knob_witnesses(
+        env,
+        key="cute_tail_peel",
+        mechanism="cute.tail_peel",
+        candidates=[
+            Config.from_dict(witness.carrier.config | {deferred.key: True})
+            for witness in deferred.witnesses
+        ],
+        dependencies=(CoverageDependency(deferred.mechanism, deferred.key, True),),
+    ):
         return
 
     def carries(seed: Config) -> bool:
