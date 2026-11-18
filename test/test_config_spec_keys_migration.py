@@ -203,6 +203,7 @@ _BASE_VALID_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cross_loop_tmem_prefetch
     worker_registers
 """
 
@@ -368,6 +369,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     tcgen05_warp_spec_scheduler_warps tcgen05_warp_spec_store_warps waves_per_eu
     xcd_remap
     cute_dot_fragment_mma cute_dot_ring_mma cute_dot_ring_split cute_dot_ring_stages cute_flash_gated_row_warps cute_pdl_spread cute_split_k_atomic_epilogue tcgen05_epi_round_subtiles cute_privatize_atomics
+    cross_loop_tmem_prefetch
     worker_registers
 """
 
@@ -606,9 +608,11 @@ _BASE_TRITON_ACCEPTED = """
 
 # The same census for ``GluonBackend``: Triton's keys but the ones Gluon
 # ignores (``maxnreg``, ``range_flattens``, ``range_multi_buffers``), and its
-# own: ``worker_registers`` (a hand override the search never proposes).
+# own: ``cross_loop_tmem_prefetch`` and ``worker_registers`` (hand overrides
+# the search never proposes).
 _BASE_GLUON_ACCEPTED = """
     advanced_controls_file atomic_indexing block_sizes cross_loop_pipeline
+    cross_loop_tmem_prefetch
     epilogue_subtile flatten_loops indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders num_sm_multiplier num_stages num_warps
     pallas_internal_scratch pid_type prefetch_indexing range_num_stages
