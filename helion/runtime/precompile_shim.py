@@ -141,20 +141,37 @@ def make_precompiler(
         def finish_it(in_child_process: bool = True) -> bool:
             """Compile the kernel into the cache, raising the compile's error:
             it returns True only, as the cache-hit sentinel
-            ``already_compiled`` does."""
+            ``already_compiled`` does.  A kernel another thread cached
+            meanwhile stays; one marked failed raises as a cached failure
+            does (``cached_compile_failure_error``)."""
             compiled_kernel = None
             try:
                 src = fn.ASTSource(fn, signature, constexprs, attrs)
-                # here we update the cache so if this is called in the parent we skip a extra compile
-                kernel_cache[key] = compiled_kernel = fn.compile(
+                compiled_kernel = fn.compile(
                     src, target=target, options=options.__dict__
                 )
-                _set_helion_compilation_success(compiled_kernel, True)
                 if not in_child_process:
+                    # Loaded before it is published: a patched launch that
+                    # finds it reads its function handle.
                     compiled_kernel._init_handles()
+                _set_helion_compilation_success(compiled_kernel, True)
+                # here we update the cache so if this is called in the parent
+                # we skip a extra compile.  A kernel another thread cached in
+                # the meantime stays, with its status: a launch in clusters,
+                # of a resident cohort or of a cooperative grid may have
+                # patched it to launch next (helion.runtime.triton.launcher's
+                # _patched_launch_lock).
+                cached = kernel_cache.setdefault(key, compiled_kernel)
+                if cached is not compiled_kernel:
+                    if not _get_helion_compilation_success(cached):
+                        raise cached_compile_failure_error()
+                    return True
             except Exception:
                 if not in_child_process and compiled_kernel is not None:
                     _set_helion_compilation_success(compiled_kernel, False)
+                    # Later lookups find it failed (``already_compiled_fail``);
+                    # a kernel another thread cached stays.
+                    kernel_cache.setdefault(key, compiled_kernel)
                 # The precompile child reports the error and its
                 # classification to the parent in its result file
                 # (precompile_future._run_kernel_in_subprocess_fork); the
@@ -167,6 +184,15 @@ def make_precompiler(
         return finish_it
 
     return _make_precompiler
+
+
+def cached_compile_failure_error() -> RuntimeError:
+    """Why a kernel an earlier compile in this process cached but could not
+    load (``already_compiled_fail``) fails again: the precompile phase and the
+    in-process compile report the same error."""
+    return RuntimeError(
+        "an earlier compile of this kernel in this process could not load it"
+    )
 
 
 def already_compiled() -> bool:

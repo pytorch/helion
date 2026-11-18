@@ -2110,6 +2110,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
     def test_opaque_tile_body_can_be_outlined_without_rewriting(self) -> None:
         device_function = object.__new__(DeviceFunction)
         device_function.ring = None
+        device_function.dsmem = {}
         device_function.arguments = []
         device_function.wrapper_only_params = []
         device_function.preamble = []

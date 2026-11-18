@@ -37,6 +37,7 @@ from .._utils import prev_power_of_2
 from .._utils import widest_halvable
 from ..exc import InvalidConfig
 from ..runtime.config import _copy_config_structure
+from ..runtime.triton.launcher import MAX_CLUSTER_SIZE
 from ..runtime.triton.launcher import get_num_xcd
 from .block_id_sequence import BlockIdSequence
 from .block_id_sequence import _BlockIdItem
@@ -654,6 +655,111 @@ class AccumulatorFact(NamedTuple):
     itemsize: int
 
 
+# A dsmem transport's limits (``cross_loop_dsmem``): rank 0's shared memory
+# opens with a header (the flag, 8 bytes, then one barrier an entry), and every
+# entry's slab together takes at most ``MAX_CLUSTER_SLAB`` bytes after it,
+# leaving the rest of what a CTA may take (227 KB on sm_100) to the kernel's
+# dynamic shared memory (past 48 KB a static array needs a ptxas of CUDA 13,
+# which Triton uses for sm_100 and up); clusters of at most
+# ``MAX_CLUSTER_SIZE`` (the launcher's portable limit), one size for every
+# entry.
+CLUSTER_SMEM_HEADER = 128
+MAX_DSMEM_ENTRIES = (CLUSTER_SMEM_HEADER - 8) // 8
+
+
+def cluster_barrier_offset(entry: int) -> int:
+    """The byte offset of the ``entry``-th entry's barrier in the header,
+    after the launch flag's 8 bytes (``cluster_entry`` arms them)."""
+    return 8 + 8 * entry
+
+
+MAX_CLUSTER_SLAB = 96 * 1024
+
+
+class DsmemLayout:
+    """Rank 0's shared memory for the ``cross_loop_dsmem`` entries taken so
+    far, in candidate order: the header, then each entry's slab, 16-byte
+    aligned.  Normalize and codegen pack entries with it alike."""
+
+    def __init__(self) -> None:
+        self.size: int | None = None
+        self.entries = 0
+        self.offset = CLUSTER_SMEM_HEADER
+
+    def refusal(self, cluster: int, nbytes: int) -> str | None:
+        """The limit one more entry (``nbytes`` of slab in clusters of
+        ``cluster``) breaks, or None."""
+        end = self._buffer() + nbytes - CLUSTER_SMEM_HEADER
+        if not 2 <= cluster <= MAX_CLUSTER_SIZE:
+            return f"clusters of {cluster} (2 to {MAX_CLUSTER_SIZE})"
+        if self.entries >= MAX_DSMEM_ENTRIES:
+            return f"more than {MAX_DSMEM_ENTRIES} entries"
+        if cluster != (self.size or cluster):
+            return f"clusters of {cluster}, unlike an earlier entry's"
+        if end > MAX_CLUSTER_SLAB:
+            return f"slabs of {end} bytes (at most {MAX_CLUSTER_SLAB})"
+        return None
+
+    def take(self, cluster: int, nbytes: int) -> tuple[int, int]:
+        """Take one more entry: the offsets of its slab and its barrier."""
+        buffer, barrier = self._buffer(), cluster_barrier_offset(self.entries)
+        self.size, self.entries, self.offset = (
+            cluster,
+            self.entries + 1,
+            buffer + nbytes,
+        )
+        return buffer, barrier
+
+    def _buffer(self) -> int:
+        return (self.offset + 15) // 16 * 16
+
+
+class DsmemSlabFacts(NamedTuple):
+    """A dsmem candidate's slab under a config (``cross_loop_dsmem``): the
+    factors of its elements (the ranges its load reads) and of one producer
+    task's tile (the ranges its store writes), each an integer, a tunable
+    expression (``ConfigValueExpression``) or ``("block", i)``, the config's
+    ``block_sizes[i]``.  Its 32-bit elements make ``4 * numel`` bytes, in
+    clusters of ``numel // tile``.  ``carried`` is False for a candidate that
+    breaks a rule under every config."""
+
+    numel: tuple[object, ...]
+    tile: tuple[object, ...]
+    carried: bool = True
+
+    def evaluate(self, config: dict[str, object]) -> tuple[int, int] | None:
+        """``(cluster size, slab bytes)`` under ``config``, or None when a
+        factor has no integer value there."""
+        block_sizes = config.get("block_sizes")
+
+        def product(factors: tuple[object, ...]) -> int | None:
+            total = 1
+            for factor in factors:
+                if isinstance(factor, tuple):
+                    index = factor[1]
+                    value = (
+                        block_sizes[index]
+                        if isinstance(block_sizes, list) and index < len(block_sizes)
+                        else None
+                    )
+                elif isinstance(factor, int):
+                    value = factor
+                else:
+                    try:
+                        value = factor.evaluate(config)  # pyrefly: ignore [missing-attribute]
+                    except (KeyError, TypeError):
+                        return None
+                if not isinstance(value, int) or value < 1:
+                    return None
+                total *= value
+            return total
+
+        numel, tile = product(self.numel), product(self.tile)
+        if numel is None or tile is None or numel % tile:
+            return None
+        return numel // tile, 4 * numel
+
+
 class PointwiseElementwiseFact(NamedTuple):
     """Workload facts for a PURE elementwise/pointwise kernel — DEFINED by the absence of any
     reduction/matmul/accumulator fact (the disjointness rule): if one of those fired, the kernel
@@ -806,6 +912,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
         "cross_loop_tmem_prefetch",
+        "cross_loop_dsmem",
         "cross_loop_dry_passes",
         "cross_loop_inband_protocol",
         "worker_registers",
@@ -1143,6 +1250,13 @@ class ConfigSpec:
         self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
             BlockIdSequence()
         )
+        # One entry per allocation a launch cluster may carry between roots
+        # (TileDependencyGraph.dsmem_candidate_ids, sorted); True carries it so.
+        self.cross_loop_dsmem = ListOf(BooleanFragment(), length=0)
+        # Each candidate's slab facts (``cross_loop_dsmem.dsmem_slab_facts``;
+        # None: codegen alone checks it), which ``normalize`` holds to the
+        # limits that need no more than the config.
+        self.cross_loop_dsmem_slabs: tuple[DsmemSlabFacts | None, ...] = ()
         # One entry per root waiting on an earlier root after the first root
         # whose producers lie two levels deep
         # (TileDependencyGraph.dry_pass_candidate_roots); True runs that root's
@@ -2159,6 +2273,39 @@ class ConfigSpec:
             new_num_threads[i] = fit_thread_count(num_thread, clamped[nt_spec.block_id])
         config["num_threads"] = new_num_threads
 
+    def _normalize_dsmem(self, config: dict[str, object]) -> None:
+        """Turn off the ``cross_loop_dsmem`` entries whose slabs break a limit
+        of the config alone (clusters of 2 to ``MAX_CLUSTER_SIZE``, one size
+        for every entry, ``MAX_DSMEM_ENTRIES`` entries, ``MAX_CLUSTER_SLAB``
+        bytes of slabs), in candidate order as codegen takes them, so they
+        never regenerate the kernel.  A candidate without slab facts keeps
+        its entry for codegen to check."""
+        flags = list(cast("list[bool]", config["cross_loop_dsmem"]))
+        # Set together from the candidates (``lower_to_device_ir``).
+        assert len(self.cross_loop_dsmem_slabs) == len(flags)
+        layout = DsmemLayout()
+        for index, (enabled, facts) in enumerate(
+            zip(flags, self.cross_loop_dsmem_slabs, strict=True)
+        ):
+            if not enabled:
+                continue
+            if facts is not None and not facts.carried:
+                flags[index] = False
+                continue
+            slab = None if facts is None else facts.evaluate(config)
+            if slab is None:
+                # Codegen checks its slab; it still takes an entry, and the
+                # count's limit needs no slab.
+                if layout.entries >= MAX_DSMEM_ENTRIES:
+                    flags[index] = False
+                else:
+                    layout.entries += 1
+            elif layout.refusal(*slab) is None:
+                layout.take(*slab)
+            else:
+                flags[index] = False
+        config["cross_loop_dsmem"] = flags
+
     def normalize(
         self,
         config: helion.Config | dict[str, object],
@@ -2412,6 +2559,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "cross_loop_tmem_prefetch",
+            "cross_loop_dsmem",
             "cross_loop_dry_passes",
             "load_eviction_policies",
             "load_cache_modifiers",
@@ -2439,6 +2587,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_dsmem",
             "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
@@ -2497,6 +2646,12 @@ class ConfigSpec:
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
         for key, flags, entry, valid in (
+            (
+                "cross_loop_dsmem",
+                self.cross_loop_dsmem,
+                "one bool per cluster candidate",
+                lambda value: type(value) is bool,
+            ),
             (
                 "cross_loop_dry_passes",
                 self.cross_loop_dry_passes,
@@ -2584,16 +2739,22 @@ class ConfigSpec:
                         "inband scatters need cross_loop_pipeline='static', or "
                         "'dynamic' with a ring (claimed roots)"
                     )
-            # Only workers that own their tasks read a dry pass entry: the
-            # barrier pipeline and dynamic packets (no ring) keep one tune point.
-            if "cross_loop_dry_passes" in config and (
-                config["cross_loop_pipeline"] == "barrier"
-                or (
-                    config["cross_loop_pipeline"] == "dynamic"
-                    and not ring_depth(config, self.backend_name)
-                )
+            # Only workers that own their tasks read a dry pass entry or carry
+            # a dsmem transport (cross_loop_dsmem's C2): the barrier pipeline
+            # and dynamic packets (no ring) keep one tune point.
+            if config["cross_loop_pipeline"] == "barrier" or (
+                config["cross_loop_pipeline"] == "dynamic"
+                and not ring_depth(config, self.backend_name)
             ):
-                config["cross_loop_dry_passes"] = self.cross_loop_dry_passes.default()
+                for key, flags in (
+                    ("cross_loop_dry_passes", self.cross_loop_dry_passes),
+                    ("cross_loop_dsmem", self.cross_loop_dsmem),
+                ):
+                    if key in config:
+                        config[key] = flags.default()
+        dsmem = config.get("cross_loop_dsmem")
+        if isinstance(dsmem, list) and any(dsmem):
+            self._normalize_dsmem(config)
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (
@@ -3327,6 +3488,7 @@ class ConfigSpec:
         fields.update(
             (key, flags)
             for key, flags in (
+                ("cross_loop_dsmem", self.cross_loop_dsmem),
                 ("cross_loop_dry_passes", self.cross_loop_dry_passes),
                 ("cross_loop_inband_protocol", self.cross_loop_inband_protocol),
             )
@@ -3648,6 +3810,7 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_dsmem",
             "cross_loop_dry_passes",
             "load_eviction_policies",
             "load_cache_modifiers",

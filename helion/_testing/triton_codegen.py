@@ -91,8 +91,9 @@ def gluon_cpu_codegen() -> Generator[None, None, None]:
     148-SM sm100 target: kernels trace on ``cuda:0`` as on the GPU
     (``cute_codegen.cuda_metadata_trace``, so kernels with cross-loop
     dependencies bind), the Gluon, warp-specialization and tensor-descriptor
-    probes report support, the ring lowering sees 2048 thread slots a SM, and
-    initializing CUDA fails the test."""
+    probes report support, the ring lowering sees 2048 thread slots a SM, the
+    dsmem transports' residency probe sees every SM in clusters of any size
+    (``_cluster_capacity``), and initializing CUDA fails the test."""
     device = SimpleNamespace(max_threads_per_multi_processor=2048)
     with ExitStack() as stack:
         stack.enter_context(cuda_metadata_trace())
@@ -104,7 +105,20 @@ def gluon_cpu_codegen() -> Generator[None, None, None]:
             ("helion.autotuner.config_spec.num_compute_units", 148),
         ):
             stack.enter_context(patch(name, return_value=value))
+        stack.enter_context(
+            patch(
+                "helion._compiler.cross_loop_dsmem.get_cluster_capacity",
+                side_effect=_cluster_capacity,
+            )
+        )
         yield
+
+
+def _cluster_capacity(device: object, cluster_size: int) -> int:
+    """A model of ``launcher.get_cluster_capacity`` on a 148-SM GPU whose GPCs
+    all divide into clusters of any size (the driver's answer is smaller on
+    real parts: a GPC's leftover SMs stay idle)."""
+    return 148 // cluster_size * cluster_size
 
 
 def interpret_triton_selection(

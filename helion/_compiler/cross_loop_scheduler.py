@@ -3314,7 +3314,8 @@ def build_static_pipeline_plan(
         order.tasks_by_ordinal.target_domain for order in root_task_orders
     )
     # Local counters order same-rank dependencies only, each peer_counter
-    # dependency gets a direct peer edge, and inband data carries its readiness.
+    # dependency gets a direct peer edge, and inband and cluster data carry
+    # their readiness.
     transports = {
         (edge.producer_root, edge.consumer_root, dependency_graph.transport(dependency))
         for edge in dependency_graph.edges
@@ -3336,7 +3337,7 @@ def build_static_pipeline_plan(
     cross_rank_roots = frozenset(
         root
         for producer, consumer, transport in transports
-        if transport != "counter"
+        if transport not in ("counter", "cluster")
         for root in (producer, consumer)
     ) | {
         access.root
