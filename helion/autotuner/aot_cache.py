@@ -96,9 +96,13 @@ AOTMode = Literal["collect", "measure", "evaluate", "compile", "disabled"]
 
 
 def _config_uses_tensor_descriptor(config: Config) -> bool:
-    return indexing_uses_tensor_descriptor(
-        config.indexing
-    ) or indexing_uses_tensor_descriptor(config.atomic_indexing)
+    # A prefetch's box form reads a tensor map, which needs an aligned base too.
+    return any(
+        map(
+            indexing_uses_tensor_descriptor,
+            (config.indexing, config.atomic_indexing, config.prefetch_indexing),
+        )
+    )
 
 
 def get_aot_mode() -> AOTMode:

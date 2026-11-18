@@ -1001,6 +1001,14 @@ class Backend(abc.ABC):
 
         return VALID_CROSS_LOOP_PIPELINES
 
+    def prefetch_box_possible(
+        self, tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+    ) -> bool:
+        """Whether ``hl.prefetch(tensor, index)`` lowers to TMA box prefetches
+        from a host-built tensor map under some config (``prefetch_indexing``
+        "tensor_descriptor"): the bound kernel then keys the base's alignment."""
+        return False
+
     # -- indexing, fake tensors and block-size constraints ---------------------
 
     def supports_block_ptr_indexing(self) -> bool:

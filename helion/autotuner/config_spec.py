@@ -795,8 +795,8 @@ def _get_backend_tunable_keys() -> frozenset[str]:
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # Generic keys whose support is gated per backend (``supports_config_key``)
 # rather than declared by one backend's surface: the Triton host descriptor and
-# cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap, and the
-# cross-loop pipeline and Gluon ring knobs.
+# cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap, the
+# cross-loop pipeline and Gluon ring knobs, and the prefetch forms.
 _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
@@ -804,6 +804,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
+        "prefetch_indexing",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -1168,6 +1169,10 @@ class ConfigSpec:
         )
         self.atomic_indexing = ListOf(
             EnumFragment(choices=self.valid_atomic_indexing_types()),
+            length=0,
+        )
+        self.prefetch_indexing = ListOf(
+            EnumFragment(choices=self.valid_prefetch_indexing_types()),
             length=0,
         )
         self.pallas_load_buffer_count = ListOf(
@@ -1752,6 +1757,10 @@ class ConfigSpec:
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
 
+    def valid_prefetch_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        """Prefetches lower as pointers or as TMA boxes (tensor_descriptor)."""
+        return self.valid_atomic_indexing_types()
+
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
         self.loop_orders._remove_duplicates()
@@ -1921,6 +1930,12 @@ class ConfigSpec:
                 and self.device.type == "cuda"
                 and self.target_device_capability is not None
                 and self.target_device_capability >= (9, 0)
+                and self.backend.supports_config_key(key)
+            )
+        if key == "prefetch_indexing":
+            # Prefetches lower only to PTX (``CompileEnvironment.ptx_capability``).
+            return (
+                self.target_device_capability is not None
                 and self.backend.supports_config_key(key)
             )
         if (
@@ -2342,6 +2357,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
         ):
             value = config.get(name)
             if name == "load_eviction_policies" and value == "":
@@ -2358,6 +2374,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
             "pallas_load_buffer_count",
             "pid_type",
             "num_sm_multiplier",
@@ -2367,6 +2384,9 @@ class ConfigSpec:
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
+        if self.prefetch_indexing.length == 0:
+            # No prefetch here can take the box form: the entry is unused.
+            config.pop("prefetch_indexing", None)
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
@@ -2412,6 +2432,11 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if (
+            self.supports_config_key("prefetch_indexing")
+            and self.prefetch_indexing.length > 0
+        ):
+            config.setdefault("prefetch_indexing", self.prefetch_indexing.default())
         if config.get("host_tensor_descriptors"):
             indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
             uses_tensor_descriptor = any(
@@ -3140,6 +3165,11 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if (
+            self.supports_config_key("prefetch_indexing")
+            and self.prefetch_indexing.length > 0
+        ):
+            fields["prefetch_indexing"] = self.prefetch_indexing
         if self.supports_config_key("host_tensor_descriptors") and (
             self.indexing.length > 0 or self.atomic_indexing.length > 0
         ):
@@ -3506,6 +3536,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
             "pallas_load_buffer_count",
         ):
             if not config.get(name):

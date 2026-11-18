@@ -3049,6 +3049,7 @@ class Kernel(Generic[_R]):
             {
                 "indexing",
                 "atomic_indexing",
+                "prefetch_indexing",
                 "load_eviction_policies",
             }
         )
@@ -4601,14 +4602,31 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
             tensor_descriptor_alignment_guards.items(),
             key=lambda item: repr(item[0]),
         ):
-            if not guard_is_active(guard):
-                continue
-            # Prepared metadata guards do not cover base pointers.
-            extractors.append(
-                _TensorDescriptorAlignmentExtractor(
-                    make_extractor(source), guard.requires_zero_storage_offset
+            # Prepared metadata guards do not cover base pointers.  A guard only
+            # a prefetch registered keys its base alone (below).
+            active = bool(
+                guard.memory_op_indices or guard.atomic_op_indices
+            ) and guard_is_active(guard)
+            if active:
+                extractors.append(
+                    _TensorDescriptorAlignmentExtractor(
+                        make_extractor(source), guard.requires_zero_storage_offset
+                    )
+                )
+            # A prefetch needs only the base aligned (bound_prefetch_alignments),
+            # whatever storage offset a descriptor sharing the guard requires, and
+            # only when a candidate config gives some prefetch the box form.
+            prefetch = guard.prefetch and (
+                candidates is None
+                or any(
+                    indexing_uses_tensor_descriptor(config.prefetch_indexing)
+                    for config, _memory_ops in candidates
                 )
             )
+            if prefetch and (not active or guard.requires_zero_storage_offset):
+                extractors.append(
+                    _TensorDescriptorAlignmentExtractor(make_extractor(source), False)
+                )
 
         for key, specialization in sorted(
             self.env.runtime_input_specializations.items(),
