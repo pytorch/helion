@@ -17,6 +17,7 @@ from helion._compiler.kernel_compiler import KernelCompiler
 from helion._compiler.variable_origin import ArgumentOrigin
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.binding_observation import assert_scalar_addition
 from helion._testing.binding_observation import observe_compiled_binding
 from helion.autotuner import BooleanFragment
@@ -29,7 +30,10 @@ import helion.language as hl
 from helion.runtime.kernel import BoundKernel
 from helion.runtime.settings import default_autotuner_fn
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 FRAGMENT = BooleanFragment()
 SAVED_TUPLE = (FRAGMENT,)
 SAVED_LIST = [FRAGMENT]

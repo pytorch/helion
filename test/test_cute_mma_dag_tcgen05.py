@@ -11,7 +11,6 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
-import os
 import random
 import re
 from typing import TYPE_CHECKING
@@ -86,6 +85,7 @@ from helion._compiler.cute import cute_mma_dag_tcgen05_regions as regions
 from helion._compiler.cute.autotune.mma_dag_surface import enable_cute_mma_dag_search
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_mma_dag import DETERMINISM_LAUNCHES
 from helion._testing.cute_mma_dag import LAUNCHES
 from helion._testing.cute_mma_dag import assert_close
@@ -106,10 +106,7 @@ if TYPE_CHECKING:
 
 pytestmark = [
     pytest.mark.cpu_only,
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="codegen pins and search-surface checks need the compiled path",
-    ),
+    skipIfRefEagerMark("codegen pins and search-surface checks need the compiled path"),
     # The B200 model with tcgen05 MMA support, CUDA hidden, the inputs traced
     # as ``cuda:0`` tensors of a 148-SM device, and the reduction SMEM budget.
     pytest.mark.cpu_render(

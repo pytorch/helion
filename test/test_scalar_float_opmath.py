@@ -21,6 +21,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfRocm
 from helion._testing import skipIfXPU
 import helion.language as hl
@@ -138,6 +139,7 @@ def _scalar_arith_reference(x: torch.Tensor, scale: float) -> torch.Tensor:
 @onlyBackends(["triton", "cute"])
 class TestScalarFloatOpmath(TestCase):
     @onlyBackends(["triton"])
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_integer_fill_preserves_python_scalar_conversion(self) -> None:
         # Fractional truncation, bool truth conversion, float32 precision, and
         # float64 integer precision each need a distinct boundary witness.
@@ -162,6 +164,7 @@ class TestScalarFloatOpmath(TestCase):
                 )
 
     @onlyBackends(["triton"])
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_integer_fill_runtime_scalar(self) -> None:
         out = torch.empty(33, device=DEVICE, dtype=torch.int32)
         bound = runtime_integer_fill.bind((out, 0.5))

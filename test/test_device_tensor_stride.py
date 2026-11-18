@@ -10,10 +10,14 @@ from torch._inductor.codecache import PyCodeCache
 import helion
 from helion._compiler.variable_origin import TensorStrideOrigin
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 import helion.language as hl
 from helion.runtime.kernel import _make_prepared_arg_guard
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 
 def test_repeated_host_created_stride_uses_one_symbol_during_both_passes():

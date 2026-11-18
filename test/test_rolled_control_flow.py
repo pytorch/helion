@@ -20,6 +20,7 @@ from helion._compiler.device_ir import RootGraphInfo
 from helion._compiler.device_ir import control_flow_child_graph_ids
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.rolled_control_flow import carried_reduction
 from helion._testing.rolled_control_flow import else_only_carried_reduction
@@ -51,6 +52,7 @@ def _reachable(
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_else_only_sweep_keeps_both_branch_edges_consistent(tmp_path, record_property):
     with cpu_render_target():
         bound = cpu_bind(else_only_carried_reduction, (torch.empty(2, 2, 128),))
@@ -105,6 +107,7 @@ def test_else_only_sweep_keeps_both_branch_edges_consistent(tmp_path, record_pro
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("conditional", (False, True))
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_rolled_child_uses_caller_sweep_and_keeps_standalone_entry(conditional):
     with cpu_render_target():
         bound = cpu_bind(carried_reduction, (torch.empty(2, 2, 128), conditional))
@@ -146,6 +149,7 @@ def test_rolled_child_uses_caller_sweep_and_keeps_standalone_entry(conditional):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_independent_rolled_axes_keep_separate_child_contexts():
     with cpu_render_target():
         bound = cpu_bind(

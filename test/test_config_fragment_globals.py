@@ -18,6 +18,7 @@ from torch.utils._pytree import tree_leaves
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import IdentityFragment
 from helion._testing.tunable_fragments import host_assignment_values
@@ -446,6 +447,7 @@ def closure_fragment():
 
 @pytest.mark.parametrize("kind", ["global", "inline", "module"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_preconstructed_fragment_preserves_choices_and_codegen(kind):
     kernel = {
         "global": global_fragment,
@@ -477,6 +479,7 @@ def test_kernel_closure_remains_unsupported():
 
 @pytest.mark.parametrize("helper", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_inline_custom_fragment_preserves_uncopyable_search_state(helper):
     kernel = helper_inline_fragment if helper else inline_custom_fragment
     with cpu_render_target():
@@ -488,6 +491,7 @@ def test_inline_custom_fragment_preserves_uncopyable_search_state(helper):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_shared_custom_fragment_retains_original_object():
     fragment = _CopyableFragment()
     with cpu_render_target():
@@ -501,6 +505,7 @@ def test_shared_custom_fragment_retains_original_object():
 @pytest.mark.parametrize("state_kind", ["module", "lock"])
 @pytest.mark.parametrize("form", ["annotated", "wrapped"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_uncopyable_shared_fragment_retains_opaque_state(state_kind, form):
     fragment = IdentityFragment()
     fragment.search_state = random if state_kind == "module" else threading.Lock()
@@ -525,6 +530,7 @@ def test_uncopyable_shared_fragment_retains_opaque_state(state_kind, form):
 
 @pytest.mark.parametrize("value,zero", [(3, 0), (3.5, 0.0), (True, False)])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_symbolic_numeric_fragment_arguments_warn_and_render(value, zero):
     with (
         cpu_render_target(),
@@ -543,6 +549,7 @@ def test_symbolic_numeric_fragment_arguments_warn_and_render(value, zero):
 
 @pytest.mark.parametrize("value", [3, 3.5, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_numeric_fragment_arguments_remain_supported(value):
     with cpu_render_target():
         bound = cpu_bind(constexpr_numeric_fragment, (torch.empty(37), value))
@@ -554,6 +561,7 @@ def test_constexpr_numeric_fragment_arguments_remain_supported(value):
 
 @pytest.mark.parametrize("value,zero", [(3, 0), (3.5, 0.0), (True, False)])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_helper_fragment_retains_symbolic_metadata(value, zero):
     with (
         cpu_render_target(),
@@ -573,6 +581,7 @@ def test_helper_fragment_retains_symbolic_metadata(value, zero):
 @pytest.mark.parametrize("value", [3, 3.5, True])
 @pytest.mark.parametrize("use_global", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_helper_fragment_keeps_concrete_metadata(value, use_global):
     with (
         patch.dict(helper_concrete_fragment.fn.__globals__, SCALAR=value),
@@ -585,6 +594,7 @@ def test_helper_fragment_keeps_concrete_metadata(value, use_global):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_helper_constexpr_fragment_keeps_snapshot_after_caller_mutation():
     kernel = helion.kernel(helper_constexpr_fragment.fn, autotune_effort="none")
     tensor = torch.empty(37)
@@ -616,6 +626,7 @@ def test_helper_constexpr_fragment_keeps_snapshot_after_caller_mutation():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_helper_shared_fragment_snapshots_its_domain():
     fragment = EnumFragment((2, 16))
     with (
@@ -632,6 +643,7 @@ def test_helper_shared_fragment_snapshots_its_domain():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_helper_published_allocation_still_requires_a_snapshot():
     with patch.dict(vars(tuning), CREATED=None), cpu_render_target():
         bound = cpu_bind(helper_published_fragment, (torch.empty(37),))
@@ -644,6 +656,7 @@ def test_helper_published_allocation_still_requires_a_snapshot():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_symbolic_nonfragment_callable_remains_dynamic():
     kernel = helion.kernel(ordinary_minimum.fn, autotune_effort="none")
     with cpu_render_target():
@@ -663,6 +676,7 @@ def test_symbolic_nonfragment_callable_remains_dynamic():
 @pytest.mark.parametrize("kind", ["global", "module"])
 @pytest.mark.parametrize("old,new", [(3, 5), (3.5, 5.5), (True, False), (-0.0, 0.0)])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_literal_global_numeric_metadata_is_snapshotted(kind, old, new):
     original = global_scalar_fragment if kind == "global" else module_scalar_fragment
     kernel = helion.kernel(original.fn, autotune_effort="none")
@@ -695,6 +709,7 @@ def test_literal_global_numeric_metadata_is_snapshotted(kind, old, new):
     ],
 )
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_derived_global_expression_keeps_typed_literal_snapshot(
     operation, old, new, expected_old, expected_new
 ):
@@ -727,6 +742,7 @@ def test_derived_global_expression_keeps_typed_literal_snapshot(
     [((2, 16), (4, 8)), ((2.5, 4.5), (3.5, 5.5)), ((False, True), (True, False))],
 )
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_converted_global_literal_sequence_preserves_snapshot(old, new):
     kernel = helion.kernel(converted_global_fragment.fn, autotune_effort="none")
     choices = list(old)
@@ -755,6 +771,7 @@ def test_converted_global_literal_sequence_preserves_snapshot(old, new):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_converted_nonliteral_sequence_rejects_symbolic_default():
     with (
         cpu_render_target(),
@@ -765,6 +782,7 @@ def test_converted_nonliteral_sequence_rejects_symbolic_default():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_converted_derived_global_sequence_has_concrete_domain():
     with cpu_render_target():
         bound = cpu_bind(converted_symbolic_fragment, (torch.empty(37), True))
@@ -794,6 +812,7 @@ def _persistent_key(bound, args):
     "fragment_type", [EnumFragment, IntegerFragment, PowerOfTwoFragment]
 )
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_fragment_normal_bind_and_persistent_key(form, fragment_type):
     def make_fragment():
         return (
@@ -853,6 +872,7 @@ def test_constexpr_fragment_normal_bind_and_persistent_key(form, fragment_type):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_hashable_constexpr_fragment_equality_is_unchanged():
     kernel = helion.kernel(constexpr_fragment.fn, autotune_effort="none")
     with cpu_render_target():
@@ -865,6 +885,7 @@ def test_hashable_constexpr_fragment_equality_is_unchanged():
 
 @pytest.mark.parametrize("kind", ["boolean", "threads", "block_size", "num_warps"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_other_builtin_constexpr_fragments_have_stable_value_keys(kind):
     def make():
         if kind == "boolean":
@@ -902,6 +923,7 @@ def test_other_builtin_constexpr_fragments_have_stable_value_keys(kind):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_enum_key_preserves_signed_zero():
     kernel = helion.kernel(constexpr_fragment.fn, autotune_effort="none")
     with cpu_render_target():
@@ -927,6 +949,7 @@ def test_constexpr_enum_key_preserves_signed_zero():
 
 @pytest.mark.parametrize("form", ["annotation", "wrapper"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_constexpr_enum_nan_bits_preserve_binding_and_cache_identity(form):
     original = constexpr_fragment if form == "annotation" else argument_fragment
     kernel = helion.kernel(original.fn, autotune_effort="none")
@@ -986,6 +1009,7 @@ def test_constexpr_enum_with_opaque_choices_keeps_prior_refusal(form):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("kind", ["global", "module"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_global_fragment_snapshot_preserves_bound_cache_identity(kind):
     fragment = EnumFragment((2, 16))
     original = global_fragment if kind == "global" else module_fragment
@@ -1019,6 +1043,7 @@ def test_global_fragment_snapshot_preserves_bound_cache_identity(kind):
     "fragment", [BooleanFragment(), NumThreadsFragment(128), IdentityFragment()]
 )
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_repeated_registration_preserves_builtin_snapshot_or_custom_identity(
     kind, fragment
 ):
@@ -1043,6 +1068,7 @@ def test_repeated_registration_preserves_builtin_snapshot_or_custom_identity(
 )
 @pytest.mark.parametrize("kernel", [device_fragment, device_only_fragment])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_device_registration_carries_selected_typed_value(
     fragment, values, symbolic_type, kernel
 ):
@@ -1096,6 +1122,7 @@ def test_device_registration_carries_selected_typed_value(
 @pytest.mark.parametrize("kind", ["global", "module"])
 @pytest.mark.parametrize("fragment_type", [IntegerFragment, PowerOfTwoFragment])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_global_integer_fragment_domains_have_distinct_persistent_identity(
     kind, fragment_type
 ):
@@ -1136,6 +1163,7 @@ def test_global_integer_fragment_domains_have_distinct_persistent_identity(
 
 @pytest.mark.parametrize("container", ["direct", "nested", "dataclass"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_fragment_kernel_arguments_cannot_define_tunable_domains(container):
     with cpu_render_target():
         for choices in ((2, 16), (4, 8)):
@@ -1153,6 +1181,7 @@ def test_fragment_kernel_arguments_cannot_define_tunable_domains(container):
 
 @pytest.mark.parametrize("form", ["positional", "keyword", "nested"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_dynamic_fragment_arguments_warn_without_snapshotting(form):
     with (
         cpu_render_target(),
@@ -1169,6 +1198,7 @@ def test_dynamic_fragment_arguments_warn_without_snapshotting(form):
 
 @pytest.mark.parametrize("form", ["enum", "integer"])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_symbolic_fragment_fixed_config_compatibility(form):
     with (
         cpu_render_target(),
@@ -1195,6 +1225,7 @@ def test_symbolic_fragment_fixed_config_compatibility(form):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_symbolic_fragment_warning_uses_kernel_source_per_binding():
     with cpu_render_target(), warnings.catch_warnings(record=True) as recorded:
         warnings.simplefilter("default")
@@ -1217,6 +1248,7 @@ def test_symbolic_fragment_warning_uses_kernel_source_per_binding():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_specialized_fragment_bound_remains_supported():
     with cpu_render_target():
         bound = cpu_bind(dynamic_fragment, (torch.empty(64), "specialized"))
@@ -1224,12 +1256,14 @@ def test_specialized_fragment_bound_remains_supported():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_different_fragment_definitions_still_conflict():
     with cpu_render_target(), pytest.raises(helion.exc.TunableNameConflict):
         cpu_bind(conflicting_fragments, (torch.empty(37),))
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_inline_fragment_guidance_works_with_real_bind():
     with cpu_render_target():
         bound = inline_fragment.bind((torch.empty(37),))
@@ -1239,6 +1273,7 @@ def test_inline_fragment_guidance_works_with_real_bind():
 
 @pytest.mark.parametrize("captured", [False, True])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fragment_fields_remain_runtime_data(captured):
     # These are ordinary dataclass field reads, with no tunable declaration.
     if captured:

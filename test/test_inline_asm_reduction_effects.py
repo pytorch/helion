@@ -69,6 +69,7 @@ def test_input_store_dispatches_when_destination_aliasing_changes(width):
 @skipIfRocm("PTX inline assembly requires CUDA")
 @skipIfTileIR("TileIR does not support inline_asm_elementwise")
 @pytest.mark.parametrize("replay_load", [False, True])
+@skipIfRefEager("inline_asm_elementwise has no ref-mode implementation")
 def test_opaque_write_preserves_original_and_later_reads(replay_load):
     x = torch.arange(3 * 128, dtype=torch.int32, device=DEVICE).reshape(3, 128)
     original = x.clone()
@@ -96,6 +97,7 @@ def test_opaque_write_preserves_original_and_later_reads(replay_load):
 @pytest.mark.skipif(DEVICE.type != "cuda", reason="PTX needs CUDA")
 @skipIfRocm("PTX inline assembly requires CUDA")
 @skipIfTileIR("TileIR does not support inline_asm_elementwise")
+@skipIfRefEager("inline_asm_elementwise has no ref-mode implementation")
 def test_queued_input_reload_keeps_values_from_before_the_write():
     x = torch.arange(3 * 128, dtype=torch.int32, device=DEVICE).reshape(3, 128)
     original = x.clone()

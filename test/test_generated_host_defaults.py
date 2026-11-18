@@ -19,6 +19,7 @@ from helion._testing import cpu_render_target
 from helion._testing import import_path
 from helion._testing import matchesBackends
 from helion._testing import skipIfMetal
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import load_host_function
 from helion._testing.tunable_fragments import pallas_host_observer
@@ -81,6 +82,7 @@ def _float_bits(value):
         "7ff0000000000001",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nonfinite_constexpr_host_output_preserves_bits(bits):
     value = struct.unpack("!d", bytes.fromhex(bits))[0]
     tensor = torch.ones(8)
@@ -95,6 +97,7 @@ def test_nonfinite_constexpr_host_output_preserves_bits(bits):
 
 
 @pytest.mark.parametrize("container", [tuple, list, dict])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_nonfinite_constexpr_host_output(container):
     bits = "fff8000000000042"
     nan = struct.unpack("!d", bytes.fromhex(bits))[0]
@@ -116,6 +119,7 @@ def test_nested_nonfinite_constexpr_host_output(container):
 
 
 @pytest.mark.parametrize("container", [None, tuple])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nonfinite_constexpr_cached_bind_preserves_selected_bits(container):
     kernel = helion.kernel(_return_constexpr.fn, autotune_effort="none")
     tensor = torch.ones(8)
@@ -149,12 +153,14 @@ def test_nonfinite_constexpr_cached_bind_preserves_selected_bits(container):
 
 
 @pytest.mark.parametrize("container", [set, frozenset])
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_nonfinite_constexpr_keeps_unsupported_container_refusal(container):
     with cpu_render_target(), pytest.raises(helion.exc.UnsupportedPythonType):
         cpu_bind(_return_constexpr, (torch.ones(8), container((float("nan"),))))
 
 
 @pytest.mark.parametrize("value", [-0.0, (1.5, [2, "nan"], {"x": -0.0})])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_finite_constexpr_host_literal_is_unchanged(value):
     tensor = torch.ones(8)
     with cpu_render_target():
@@ -223,6 +229,7 @@ def _torch_defaults(
 
 
 @pytest.mark.parametrize("standalone", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_generated_torch_defaults_remain_available(standalone, load_standalone):
     if standalone and matchesBackends(["metal"]):
         pytest.skip("Metal does not support dependency-free export")
@@ -272,6 +279,7 @@ def test_generated_torch_defaults_remain_available(standalone, load_standalone):
 
 
 @pytest.mark.parametrize("template", [_fragment_default, _factory_default])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_generated_module_load_does_not_evaluate_user_default_expression(template):
     tensor = torch.empty(17)
     defaults = template.fn.__defaults__
@@ -288,6 +296,7 @@ def test_generated_module_load_does_not_evaluate_user_default_expression(templat
         entry(tensor)
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_compiled_public_calls_keep_evaluated_default_identity():
     kernel = helion.kernel(_factory_default.fn, autotune_effort="none")
     tensor = torch.empty(17)
@@ -317,6 +326,7 @@ def test_compiled_public_calls_keep_evaluated_default_identity():
         assert len(DEFAULT_CALLS) == calls
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_shared_code_cache_does_not_share_mutable_default_objects():
     first_default, second_default = [2, 16], [2, 16]
     tensor = torch.empty(17)
@@ -347,6 +357,7 @@ def test_shared_code_cache_does_not_share_mutable_default_objects():
 
 
 @skipIfMetal("Metal does not support dependency-free export")
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_standalone_keeps_typed_scalar_and_signed_zero_defaults(load_standalone):
     original = _positional_default.fn
     fn = FunctionType(
@@ -379,6 +390,7 @@ def test_standalone_keeps_typed_scalar_and_signed_zero_defaults(load_standalone)
 
 
 @pytest.mark.parametrize("mode", ["removed", "extra", "removed_extra"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_generated_parameter_changes_preserve_trailing_default_alignment(mode):
     tensor = torch.empty(17)
     with cpu_render_target():
@@ -413,6 +425,7 @@ def test_generated_parameter_changes_preserve_trailing_default_alignment(mode):
             assert entry(tensor) is None
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_positional_only_literal_defaults_remain_available_in_generated_code():
     tensor = torch.empty(17)
     with cpu_render_target():
@@ -455,6 +468,7 @@ def _complex_default(x, unused: hl.constexpr = 1 + 2j):
     return x
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_raw_source_preserves_recursive_immutable_tuple_default():
     tensor = torch.empty(17)
     with cpu_render_target():
@@ -467,6 +481,7 @@ def test_raw_source_preserves_recursive_immutable_tuple_default():
 
 
 @pytest.mark.parametrize("value", [1 + 2j, complex(-0.0, -0.0)])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_raw_source_preserves_complex_literal_default(value):
     tensor = torch.empty(17)
     original = _complex_default.fn
@@ -511,6 +526,7 @@ def _default_float_bits(value):
 )
 @pytest.mark.parametrize("form", ["float", "tuple", "complex"])
 @pytest.mark.parametrize("standalone", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_raw_nonfinite_defaults_preserve_bits(bits, form, standalone, load_standalone):
     if standalone and matchesBackends(["metal"]):
         pytest.skip("Metal does not support dependency-free export")
@@ -556,6 +572,7 @@ def _float_unpack(x, value: hl.constexpr = 0.0):
     return x, value
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nonfinite_literal_import_does_not_shadow_kernel_name():
     value = struct.unpack("!d", bytes.fromhex("7ff8000000000042"))[0]
     original = _float_unpack.fn
@@ -572,6 +589,7 @@ def test_nonfinite_literal_import_does_not_shadow_kernel_name():
         assert _float_bits(entry.__defaults__[0]) == _float_bits(value)
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_tuple_with_mutable_element_remains_explicit_in_raw_source():
     tensor = torch.empty(17)
     original = _tuple_default.fn
@@ -594,6 +612,7 @@ def _callable_default(x, epilogue=lambda value: value + 1):
     return x
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_normalized_arguments_keep_callable_default_for_raw_entry():
     tensor = torch.empty(17)
     kernel = helion.kernel(_callable_default.fn, autotune_effort="none")
@@ -612,6 +631,7 @@ def test_normalized_arguments_keep_callable_default_for_raw_entry():
         assert entry(*args, _launcher=lambda *a, **kw: None) is tensor
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_direct_search_callable_default_reaches_reloaded_host():
     tensor = torch.empty(17)
     kernel = helion.kernel(_callable_default.fn, autotune_effort="none")

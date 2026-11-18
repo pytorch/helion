@@ -17,6 +17,7 @@ from helion._compiler.cute.runtime_hooks import register_compiled
 from helion._compiler.cute.state import cute_env_state
 from helion._testing import matchesBackends
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.external import _ExternalKernelAdapter
@@ -79,6 +80,7 @@ def assert_exact(actual, expected):
 
 
 @pytest.mark.parametrize("first,second", [(-0.0, 0.0), (1, 1.0), (1, True)])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_real_compile_cache_distinguishes_publicly_equal_configs(bound, first, second):
     kernel, render = bound
     left, right = config(first), config(second)
@@ -101,6 +103,7 @@ def test_real_compile_cache_distinguishes_publicly_equal_configs(bound, first, s
         assert_exact(kernel.backend_cache_key(right), second)
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_primed_render_and_parent_rerender_keep_exact_config_identity(bound):
     kernel, render = bound
     negative, positive = config(-0.0), config(0.0)
@@ -122,6 +125,7 @@ def test_primed_render_and_parent_rerender_keep_exact_config_identity(bound):
     assert render.call_count == 2
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_compile_cache_ignores_tunable_keyword_order():
     kernel = cpu_bind(_field_order_probe, (torch.empty(32),))
 
@@ -143,6 +147,7 @@ def test_compile_cache_ignores_tunable_keyword_order():
         assert render.call_count == 1
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_cached_paths_and_eviction_do_not_alias(bound):
     kernel, _ = bound
     negative, positive = config(-0.0), config(0.0)
@@ -160,6 +165,7 @@ def test_cached_paths_and_eviction_do_not_alias(bound):
 
 
 @onlyBackends(["cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_codegen_and_compilation_hooks_share_exact_metadata_keys(bound):
     kernel, _ = bound
     negative, positive = config(-0.0), config(0.0)
@@ -338,6 +344,7 @@ def test_minimize_preserves_selected_scalar_identity(default, selected):
 @pytest.mark.parametrize(
     "construction", ["minimal", "defaults", "reordered", "unflattened", "partial"]
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_backend_finalization_uses_the_minimized_winner(bound, construction):
     kernel, _ = bound
     default, winner = config(-0.0), config(0.0)
@@ -404,6 +411,7 @@ def test_backend_finalization_uses_the_minimized_winner(bound, construction):
 
 
 @onlyBackends(["cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_unlaunched_minimized_wrapper_does_not_hide_compiled_winner(bound):
     kernel, render = bound
 

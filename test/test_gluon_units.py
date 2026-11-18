@@ -22,6 +22,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 import helion
 from helion._compat import gluon_api_available
 from helion._testing import TestCase
+from helion._testing import skipIfRefEager
 from helion._testing.distributed_kernels import TAGGED_RING
 from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion._testing.gluon_kernels import dot_mm
@@ -186,6 +187,7 @@ def _two_pairs(x: torch.Tensor, w1: torch.Tensor, w3: torch.Tensor) -> torch.Ten
 
 
 class TestAccumulatorRings(TestCase):
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_a_dot_takes_a_ring_without_a_live_accumulator(self) -> None:
         """Two K loops of a task, one after the other, with two same-shape dots
         each, when tensor memory holds only two rings: the first loop's dots
@@ -209,6 +211,7 @@ class TestAccumulatorRings(TestCase):
             claims, ["_helion_acc0", "_helion_acc1", "_helion_acc0", "_helion_acc1"]
         )
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_dots_of_one_loop_share_no_accumulator_ring(self) -> None:
         """Two dots of one K loop whose accumulator rings tensor memory cannot
         both hold do not share one (both accumulators are live through the
@@ -253,6 +256,7 @@ class TestTmemPrefetch(TestCase):
     def _ring(bound: BoundKernel, **extra: object) -> helion.Config:
         return helion.Config(**gluon_tail_ring_config(bound, **extra))
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_a_tail_streams_a_k_loops_last_steps(self) -> None:
         """The K loop behind its task's gate, its weight (operand A) streamed
         ungated, is a candidate; the key is a hand-set override (no search
@@ -312,6 +316,7 @@ class TestTmemPrefetch(TestCase):
         self.assertTrue(puts)
         self.assertTrue(any("HEAD=" in line for line in puts))
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_loops_that_take_no_tail(self) -> None:
         """A 64-row weight tile and one of 256-byte rows (two swizzle units a
         row) take no tail, nor a loop under cross_loop_pipeline="barrier" (its
@@ -422,6 +427,7 @@ class TestTmemPrefetch(TestCase):
                     self._ring(bound, num_stages=1, cross_loop_tmem_prefetch=[True])
                 )
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_block_scales_take_from_the_tails_budget(self) -> None:
         """An nvfp4 dot in the K loop's task keeps its block scales in tensor
         memory beside the two accumulator rings (2 x 64 columns): the scales'
@@ -444,6 +450,7 @@ class TestTmemPrefetch(TestCase):
         self.assertEqual(code.count("tail_fill("), 1)
         self.assertIn("tail_buffers(w_ring_desc, 10, 128, 64)", code)
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_tails_share_a_buffer_per_tile_shape(self) -> None:
         """Two tasks' K loops of one tile shape fill one buffer (14 of 16 steps
         each, beside the accumulator ring they share), with more tasks than
@@ -497,6 +504,7 @@ class TestTmemPrefetch(TestCase):
 
 
 class TestRingTimeline(TestCase):
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_entry_clock_joins_the_launch_state(self) -> None:
         """A timeline keeps a ring megakernel with peer launch state: only its
         entry clock joins the launch state's function, ahead of every epoch
@@ -623,6 +631,7 @@ class TestWorkerRegisters(TestCase):
             ):
                 spec.normalize({"worker_registers": wrong})
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_worker_registers_reach_their_partitions(self) -> None:
         """``worker_registers`` sets the workers' budgets, one per worker in the
         order the ring makes them (producers, then the MMA side), packed into
@@ -832,6 +841,7 @@ class TestPartitionWaits(TestCase):
 
 
 class TestBarrierMode(TestCase):
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_other_roots_writes_stay_plain_loads(self) -> None:
         """Barrier mode orders the roots by a grid barrier only the body runs,
         with no dependency waits a producer could keep: the first root's

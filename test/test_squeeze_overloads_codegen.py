@@ -11,6 +11,7 @@ import helion
 from helion._compiler.aten_lowering import squeeze_lowering
 from helion._compiler.backend_registry import get_backend_class
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.squeeze_overloads import squeeze_overloads
@@ -38,6 +39,7 @@ def test_squeeze_routing_keeps_existing_backend_scope() -> None:
 
 
 @pytest.mark.parametrize("mode", [0, 1, 2, 3])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_squeeze_overloads_use_traced_shape(mode: int) -> None:
     with cpu_render_target():
         bound = cpu_bind(squeeze_overloads, (torch.randn(7, 13), mode))

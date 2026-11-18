@@ -12,6 +12,7 @@ from torch.utils._pytree import register_pytree_node
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEager
 from helion._testing.binding_observation import assert_scalar_addition
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tunable_fragments import load_host_function
@@ -48,6 +49,7 @@ def _metadata_identity(x, marker):
 
 
 @pytest.mark.parametrize("private_bank", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_tensor_free_record_preserves_generated_host_identity(private_bank):
     original = (torch.ones(8), _METADATA_ANCHOR)
     cloned = (
@@ -136,6 +138,7 @@ def _container_identity(x, left, right):
 
 
 @pytest.mark.parametrize("alias", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_container_identity_baseline_matches_compiled_branch(monkeypatch, alias):
     x = torch.arange(4, dtype=torch.float32)
     left = [x]
@@ -177,6 +180,7 @@ def _mutate_record(marker, direct, record, tail):
 
 
 @pytest.mark.parametrize("alias", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_dataclass_baseline_is_private_and_reports_original_leaf_indices(
     monkeypatch, alias
 ):
