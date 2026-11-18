@@ -403,6 +403,10 @@ def _root_task_orders(
     return tuple(result)
 
 
+# The acquire poll of a dependency counter (``_wait_for_counter``'s spin load).
+_COUNTER_POLL_ASM = "ld.acquire.gpu.global.u32 $0, [$1];"
+
+
 def _wait_for_counter(
     *,
     device_function: DeviceFunction,
@@ -426,7 +430,7 @@ def _wait_for_counter(
     device_function.spin_ends.add(sync)
     load = (
         "tl.inline_asm_elementwise("
-        "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
+        f"asm={_COUNTER_POLL_ASM!r}, "
         "constraints='=r,l', "
         f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
     )
@@ -738,14 +742,39 @@ def _named_allocations(statement: ast.AST, allocations: dict[str, int]) -> set[i
     return {allocations[n] for n in _all_names([statement]) if n in allocations}
 
 
+def _reload_unmet(load: ast.stmt, loop: ast.stmt) -> ast.stmt:
+    """``_wait_for_counter``'s spin load again, issued only while the value it
+    holds is not the spin's target (one predicated acquire load: a guard on the
+    wait's own value would leave a partition that drops the wait reading it)."""
+    assert isinstance(load, ast.Assign) and isinstance(load.value, ast.Call)
+    assert isinstance(loop, ast.While) and isinstance(loop.test, ast.Compare)
+    assert len(loop.test.comparators) == 1
+    (value,) = _stored_names([load])
+    (args,) = [k.value for k in load.value.keywords if k.arg == "args"]
+    assert isinstance(args, ast.List) and len(args.elts) == 1
+    counter = ast.unparse(args.elts[0])
+    target = ast.unparse(loop.test.comparators[0])
+    return statement_from_string(
+        f"{value} = tl.inline_asm_elementwise("
+        "asm='{ .reg .pred p; setp.ne.u32 p, $1, $2; mov.u32 $0, $1; "
+        "@p ld.acquire.gpu.global.u32 $0, [$3]; }', constraints='=r,r,r,l', "
+        f"args=[{value}, tl.cast({target}, tl.uint32), {counter}], dtype=tl.uint32, "
+        "is_pure=False, pack=1)"
+    )
+
+
 def _batch_waits(
     device_function: DeviceFunction, body: list[ast.stmt]
 ) -> list[ast.stmt]:
-    """``body`` with each run of adjacent dependency spins polled together:
-    every counter's first load ahead of any spin (and adjacent wait-only
-    guards of one test merged), so waits already met cost one memory round
-    trip between them rather than one each.  Each spin still precedes the
-    reads after the run."""
+    """``body`` with its dependency spins polled together: each spin's first
+    load moves up to the first spin of its group (the spins at this level, or
+    in wait-only guards of one test, whose counters nothing between them
+    assigns), and after each spin the group's later counters still unmet are
+    reloaded together, so waits met while another spun cost one memory round
+    trip between them rather than one each (adjacent wait-only guards of one
+    test are merged).  Each spin stays where it was: it still precedes the
+    reads it orders, and the statements between spins (e.g. scoped loads of
+    what an earlier wait ordered) keep their place."""
     waits = device_function.sync_names("wait")
 
     def asm(statement: ast.stmt) -> str:
@@ -755,27 +784,35 @@ def _batch_waits(
         text = next((k.value for k in call.keywords if k.arg == "asm"), None)
         return cast("str", text.value) if isinstance(text, ast.Constant) else ""
 
-    def spin(index: int) -> int:
+    def spin(statements: list[ast.stmt], index: int) -> int:
         """The length of the spin at ``index`` (``_wait_for_counter``'s load,
         while loop, warp sync and optional fence), else 0."""
-        if index + 2 >= len(body):
+        if index + 2 >= len(statements):
             return 0
-        load, loop, sync = body[index : index + 3]
+        load, loop, sync = statements[index : index + 3]
         target = _stored_names([load])
         if not (
             isinstance(load, ast.Assign)
             and len(target) == 1
             and target <= waits
-            and "ld.acquire" in asm(load)
+            and asm(load) == _COUNTER_POLL_ASM
             and isinstance(loop, ast.While)
             and _all_names([loop.test]) & target
             and "bar.warp.sync" in asm(sync)
         ):
             return 0
-        fence = index + 3 < len(body) and asm(body[index + 3]).startswith(
+        fence = index + 3 < len(statements) and asm(statements[index + 3]).startswith(
             "fence.proxy.async.global; mov"
         )
         return 3 + fence
+
+    def run(statements: list[ast.stmt], index: int) -> list[list[ast.stmt]]:
+        """The spins of the run of adjacent spins at ``index``."""
+        spins: list[list[ast.stmt]] = []
+        while length := spin(statements, index):
+            spins.append(statements[index : index + length])
+            index += length
+        return spins
 
     def guard(statement: ast.stmt) -> ast.If | None:
         """A guard holding spins only, whose test they do not feed and whose
@@ -793,21 +830,20 @@ def _batch_waits(
             return None
         return statement
 
-    kept: list[ast.stmt] = []
+    # The body as spin runs (their guard's test, or None), each with the group
+    # of runs it polls with, and the other statements in between.
+    items: list[ast.stmt | tuple[ast.expr | None, list[list[ast.stmt]], int]] = []
+    groups: list[list[list[list[ast.stmt]]]] = []  # a group's runs
+    open_groups: dict[str, int] = {}  # a test's (or "") group still open
+    assigned: dict[int, set[str]] = {}  # names assigned since a group's first run
     index = 0
     while index < len(body):
-        if length := spin(index):
-            spins: list[list[ast.stmt]] = []
-            while length:
-                spins.append(body[index : index + length])
-                index += length
-                length = spin(index)
-            kept += [s[0] for s in spins]
-            kept += [s[1] for s in spins]
-            kept += [t for s in spins for t in s[2:]]
-            continue
         statement = body[index]
-        if (first := guard(statement)) is not None:
+        test: ast.expr | None = None
+        spins = run(body, index)
+        if spins:
+            index += sum(len(s) for s in spins)
+        elif (first := guard(statement)) is not None:
             merged = list(first.body)
             while (
                 index + 1 < len(body)
@@ -816,14 +852,80 @@ def _batch_waits(
             ):
                 merged += other.body
                 index += 1
-            statement = create(
-                ast.If,
-                test=first.test,
-                body=_batch_waits(device_function, merged),
-                orelse=[],
-            )
-        kept.append(statement)
-        index += 1
+            index += 1
+            spins = run(merged, 0)
+            if sum(len(s) for s in spins) != len(merged):
+                items.append(
+                    create(
+                        ast.If,
+                        test=first.test,
+                        body=_batch_waits(device_function, merged),
+                        orelse=[],
+                    )
+                )
+                for names in assigned.values():
+                    names |= _stored_names(merged)
+                continue
+            test = first.test
+        else:
+            items.append(statement)
+            for names in assigned.values():
+                names |= _stored_names([statement])
+            index += 1
+            continue
+        key = "" if test is None else ast.dump(test)
+        group = open_groups.get(key)
+        # A counter, target or guard input a statement since the group's first
+        # run assigns cannot be polled there: this run starts a new group.
+        reads = {
+            name
+            for s in spins
+            for name in _all_names([s[0].value, s[1].test])  # pyrefly: ignore [missing-attribute]
+        } - _stored_names([s[0] for s in spins])
+        if test is not None:
+            reads |= _all_names([test])
+        if group is None or reads & assigned[group]:
+            group = len(groups)
+            groups.append([])
+            open_groups[key] = group
+            assigned[group] = set()
+        groups[group].append(spins)
+        items.append((test, spins, group))
+
+    kept: list[ast.stmt] = []
+    for item in items:
+        if isinstance(item, ast.stmt):
+            kept.append(item)
+            continue
+        test, spins, group = item
+        later = [s for r in groups[group] for s in r]
+        position = later.index(spins[0])
+        first = groups[group][0] is spins
+        polled: list[ast.stmt] = []
+        if first:
+            polled += [s[0] for s in later]
+            # The later runs read their first loads: defined on every path (a
+            # guard false here is false there too, and a dry pass later wraps
+            # unguarded runs in guards of their own).
+            kept += [
+                statement_from_string(f"{name} = tl.full([], 0, tl.uint32)")
+                for s in later[len(spins) :]
+                for name in _stored_names([s[0]])
+            ]
+        for offset, current in enumerate(spins):
+            polled.append(current[1])
+            # Once this spin ends, the later counters' first loads may be
+            # stale (each met while this one spun): reload every unmet one
+            # together, so the group ends one round trip after its last
+            # counter is met instead of one per later spin.
+            polled += [
+                _reload_unmet(s[0], s[1]) for s in later[position + offset + 1 :]
+            ]
+        polled += [t for s in spins for t in s[2:]]
+        if test is None:
+            kept += polled
+        else:
+            kept.append(create(ast.If, test=test, body=polled, orelse=[]))
     return kept
 
 
@@ -833,12 +935,25 @@ def _scope_wait(
     covered: frozenset[int],
     state: frozenset[str],
     allocations: dict[str, int],
+    renames: Mapping[str, str],
 ) -> None:
     """Insert ``wait`` before the first statement of ``body`` that may touch
     what it orders: one naming a tensor of ``covered`` (allocations) or the
     schedule's ``state``, assigning what the wait reads, or making a call other
-    than a pure op or a load from a tensor argument plus pure index math."""
-    reads = _all_names(wait)
+    than a pure op or a load from a tensor argument plus pure index math.  The
+    independent statements after that one move ahead of the wait too (in
+    program order) unless they depend on a statement staying behind it: read or
+    assign a name it assigns, assign a name it reads, or load after one with an
+    effect besides loads (a store, an atomic, a barrier).  So a task's loads of
+    what the wait does not order issue before the spin wherever the source has
+    them.  Names compare as ``renames`` (``DeviceFunction.variable_renames``)
+    will emit them: the value a loop leaves is assigned under its own name
+    until the final rename merges it with the loop's variable."""
+
+    def names(nodes: Iterable[ast.AST]) -> set[str]:
+        return {renames.get(name, name) for name in _all_names(nodes)}
+
+    reads = names(wait)
 
     def independent_call(call: ast.Call) -> bool:
         if not _is_tl_call(call, frozenset({"load"})):
@@ -855,7 +970,7 @@ def _scope_wait(
         )
 
     def independent(statement: ast.stmt) -> bool:
-        assigned = _stored_names([statement])
+        assigned = _stored_names([statement], renames)
         return not (
             _named_allocations(statement, allocations) & covered
             or _all_names([statement]) & state
@@ -867,7 +982,38 @@ def _scope_wait(
         )
 
     index = next((i for i, s in enumerate(body) if not independent(s)), len(body))
-    body[index:index] = wait
+    ahead: list[ast.stmt] = []
+    behind: list[ast.stmt] = []
+    # What the wait and the statements behind it assign and name, and whether
+    # one of them has an effect besides loads (a store, an atomic, a barrier):
+    # then no later load moves above it (distinct arguments may alias).
+    assigned, named = _stored_names(wait, renames), set(reads)
+    effects = False
+    for statement in body[index:]:
+        calls = [c for c in ast.walk(statement) if isinstance(c, ast.Call)]
+        effect = any(
+            not _is_load(c)
+            and (
+                _effect_kind(c) != "pure"
+                or _is_tl_call(c, frozenset({"debug_barrier"}))
+            )
+            for c in calls
+        )
+        if (
+            isinstance(statement, (ast.Assign, ast.AugAssign, ast.Expr))
+            and not effect
+            and independent(statement)
+            and not names([statement]) & assigned
+            and not _stored_names([statement], renames) & named
+            and not (effects and any(_is_load(c) for c in calls))
+        ):
+            ahead.append(statement)
+            continue
+        behind.append(statement)
+        assigned |= _stored_names([statement], renames)
+        named |= names([statement])
+        effects |= effect
+    body[index:] = [*ahead, *wait, *behind]
 
 
 def _bound_wait(device_function: DeviceFunction, call: str) -> ast.stmt:
@@ -4919,6 +5065,7 @@ def emit_cross_loop_schedule(
                     covered,
                     state_names,
                     argument_allocations,
+                    device_function.variable_renames(),
                 )
         if guard_first_waits:
             guard = _write_guard(tile_body)

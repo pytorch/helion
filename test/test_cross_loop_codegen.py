@@ -1566,7 +1566,9 @@ class TestCrossLoopCodegenHelpers(TestCase):
 
         def placed(source: str) -> int:
             body = ast.parse(source).body
-            _scope_wait(body, wait, frozenset({1}), frozenset({"state"}), allocations)
+            _scope_wait(
+                body, wait, frozenset({1}), frozenset({"state"}), allocations, {}
+            )
             return next(i for i, s in enumerate(body) if s is wait[0])
 
         # Index math and loads of uncovered tensors pass the wait; a covered
@@ -1595,9 +1597,75 @@ class TestCrossLoopCodegenHelpers(TestCase):
         # Nothing touches what it orders: the wait still runs, last.
         self.assertEqual(placed("i = pid * 4"), 1)
 
-    def test_batch_waits_polls_adjacent_spins_together(self) -> None:
-        """Adjacent spins issue every first load before any spin loop, and
-        adjacent wait-only guards of one test merge; anything else splits."""
+    @pytest.mark.cpu_only
+    def test_scope_wait_moves_later_independent_statements_ahead(self) -> None:
+        """Independent statements after the first one the wait orders move ahead
+        of it, in order, unless they depend on a statement staying behind it."""
+        wait = ast.parse(
+            "w = tl.inline_asm_elementwise(asm='x', constraints='=r,l', "
+            "args=[state + key], dtype=tl.uint32, is_pure=False, pack=1)"
+        ).body
+        allocations = {"a": 1, "b": 2, "c": 3, "f": 4}
+
+        def order(source: str) -> list[str]:
+            body = ast.parse(source).body
+            _scope_wait(
+                body,
+                wait,
+                frozenset({1}),
+                frozenset({"state"}),
+                allocations,
+                {"acc_1": "acc"},
+            )
+            return [
+                "WAIT" if s is wait[0] else ast.unparse(s).split(" ")[0] for s in body
+            ]
+
+        # A load of an uncovered tensor and its index math pass the wait.
+        self.assertEqual(
+            order("x = tl.load(a + 0)\ni = pid * 4\ny = tl.load(b + i)"),
+            ["i", "y", "WAIT", "x"],
+        )
+        # Reading a value loaded behind the wait (RAW) keeps a load behind it.
+        self.assertEqual(
+            order("x = tl.load(a + 0)\ny = tl.load(b + x)"), ["WAIT", "x", "y"]
+        )
+        # Overwriting a name a statement behind the wait reads (WAR) stays too.
+        self.assertEqual(
+            order("x = tl.load(a + i)\ni = 3\ny = tl.load(b + 1)"),
+            ["y", "WAIT", "x", "i"],
+        )
+        # No load passes a store, an atomic or a barrier behind the wait (other
+        # arguments may alias, an acquire orders every later load); index math
+        # still does, and a barrier never moves.
+        for effect in (
+            "tl.store(c + 0, x)",
+            "v = tl.atomic_add(f + 0, 0, sem='acquire')",
+            "tl.debug_barrier()",
+        ):
+            self.assertEqual(
+                order(f"x = tl.load(a + 0)\n{effect}\ny = tl.load(b + 1)\nj = pid * 2"),
+                ["j", "WAIT", "x", effect.split(" ")[0], "y"],
+                effect,
+            )
+        # A name assigned in a loop behind the wait keeps its later readers.
+        self.assertEqual(
+            order("for k in range(2):\n    acc += tl.load(a + k)\nacc += 1"),
+            ["WAIT", "for", "acc"],
+        )
+        # Also under another name the final rename merges with it: the value a
+        # loop leaves (acc_1 is emitted as acc).
+        self.assertEqual(
+            order("for k in range(2):\n    s = tl.load(a + k)\nacc_1 = s\nt = acc + 1"),
+            ["WAIT", "for", "acc_1", "t"],
+        )
+
+    @pytest.mark.cpu_only
+    def test_batch_waits_polls_a_blocks_spins_together(self) -> None:
+        """A block's spins issue every first load at the first spin and reload
+        the later unmet counters after each spin; a statement assigning a
+        later counter or target starts a new group, and adjacent wait-only
+        guards of one test merge."""
 
         def spin(name: str, counter: str, fence: bool = True) -> str:
             load = (
@@ -1637,6 +1705,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
                 "a",
                 "b",
                 "while a != t:",
+                "b",  # reloaded while unmet
                 "while b != t:",
                 "a_sync",
                 "a_fence",
@@ -1644,9 +1713,19 @@ class TestCrossLoopCodegenHelpers(TestCase):
                 "x",
             ],
         )
-        # A statement between two spins keeps them apart.
+        # A statement between two spins keeps its place after the first spin,
+        # the second spin after it; the second counter polls with the first
+        # (its name defined ahead for a dry pass that guards the runs apart).
         self.assertEqual(
-            batched(f"{spin('a', 's')}\ny = 1\n{spin('b', 's')}")[:3],
+            batched(f"{spin('a', 's')}\ny = tl.load(q)\n{spin('b', 's + 32')}"),
+            [
+                *["b", "a", "b", "while a != t:", "b", "a_sync", "a_fence", "y"],
+                *["while b != t:", "b_sync", "b_fence"],
+            ],
+        )
+        # One assigning the second spin's target starts a new group.
+        self.assertEqual(
+            batched(f"{spin('a', 's')}\nt = 1\n{spin('b', 's + 32')}")[:3],
             ["a", "while a != t:", "a_sync"],
         )
         guarded = [
@@ -1658,9 +1737,16 @@ class TestCrossLoopCodegenHelpers(TestCase):
         self.assertEqual(len(out), 1)
         assert isinstance(out[0], ast.If)
         self.assertEqual(
-            [ast.unparse(s).split(" = ")[0].split("\n")[0] for s in out[0].body][:4],
-            ["a", "b", "while a != t:", "while b != t:"],
+            [ast.unparse(s).split(" = ")[0].split("\n")[0] for s in out[0].body][:5],
+            ["a", "b", "while a != t:", "b", "while b != t:"],
         )
+        # Reassigning a guard's input between two guards starts a new group.
+        out = cross_loop_codegen._batch_waits(
+            cast("Any", df),
+            ast.parse("\n".join([guarded[0], "pid = 1", guarded[1]])).body,
+        )
+        assert isinstance(out[0], ast.If)
+        self.assertNotIn("b", [ast.unparse(s).split(" = ")[0] for s in out[0].body])
         # A guard whose test reads what the first body assigns does not merge.
         feeding = [guarded[0], guarded[1].replace("pid == 0", "a == 0")]
         out = cross_loop_codegen._batch_waits(
