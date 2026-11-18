@@ -26,6 +26,7 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.backend_registry import get_backend
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.packet_flush_names import PACKET_FLUSH_STREAMING
 from helion._compiler.cute.packet_flush_names import streaming_store_rendered
@@ -337,6 +338,16 @@ def test_the_default_backend_prefers_nothing() -> None:
         is fastest
     )
     assert search.kernel.renders == []
+    # Nor does it change which finalists run the final selection's rounds: a
+    # promoted default defends its title on the CuTe backend alone. A search
+    # asks the backend of its config spec, which these doubles do not have.
+    assert not TritonBackend.default_defends_final_selection()
+    search.config_spec = SimpleNamespace(backend=get_backend("triton"))
+    assert not search._default_defends_final_selection()
+    assert CuteBackend.default_defends_final_selection()
+    cute = _search("cute", [fastest])
+    cute.config_spec = SimpleNamespace(backend=get_backend("cute"))
+    assert cute._default_defends_final_selection()
 
 
 def test_a_preferred_finalist_within_tolerance_wins_the_tie() -> None:
@@ -400,6 +411,47 @@ def test_a_preferred_finalist_within_tolerance_wins_the_tie() -> None:
             )
             is spread_on
         )
+
+
+def test_the_tie_key_orders_equal_readings_of_one_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With rotating input banks two finalists can read the same median
+    # across the rounds, and the final selection passes the mean of their
+    # rounds as a tie key. It decides among finalists the backend ranks
+    # alike, as it does for the fastest finalist: without it the first of
+    # them in the shortlist wins whatever its rounds read.
+    fastest = _member(3.640, block_sizes=[32])
+    first_on = _member(3.650, _ENTRY, block_sizes=[64], cute_pdl=True)
+    second_on = _member(3.650, _GUARD, block_sizes=[128], cute_pdl=True)
+    slower_on = _member(3.651, _ENTRY, block_sizes=[256], cute_pdl=True)
+    spread_on = _member(
+        3.655, _SPREAD, block_sizes=[4], cute_pdl=True, cute_pdl_spread=True
+    )
+    means = {
+        id(fastest): 3.640,
+        id(first_on): 3.652,
+        id(second_on): 3.648,
+        # Lower means than the winner's, behind a higher reading and behind
+        # a better rank.
+        id(slower_on): 3.600,
+        id(spread_on): 3.700,
+    }
+
+    def chosen(live: list[SimpleNamespace], *, tie: bool) -> SimpleNamespace:
+        search = _search("cute", live)
+        key = {"tie": lambda member: means[id(member)]} if tie else {}
+        return search._prefer_backend_preference_within_tolerance(fastest, live, **key)
+
+    monkeypatch.delenv(_ENV, raising=False)
+    live = [fastest, first_on, second_on]
+    assert chosen(live, tie=False) is first_on
+    assert chosen(live, tie=True) is second_on
+    assert chosen([fastest, second_on, first_on], tie=True) is second_on
+    # The key breaks ties only: a lower reading still comes before it, and
+    # the backend's rank before the reading.
+    assert chosen([fastest, slower_on, first_on, second_on], tie=True) is second_on
+    assert chosen([*live, slower_on, spread_on], tie=True) is spread_on
 
 
 def test_a_family_that_owns_its_release_stays_a_plain_tie() -> None:

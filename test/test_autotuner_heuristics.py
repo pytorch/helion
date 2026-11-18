@@ -1138,6 +1138,49 @@ class TestAutotunerHeuristic(TestCase):
         self.assertEqual(len(messages), 1)
         self.assertIn("Failed to transfer compiler seed config 1", messages[0])
 
+    @pytest.mark.cpu_only
+    def test_compiler_and_user_seeds_share_one_transfer(self) -> None:
+        spec = ConfigSpec(backend=TritonBackend())
+        spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))
+        good = helion.Config(block_sizes=[64])
+        # A value normalization rejects, and the structure of another layout
+        # (``flatten`` checks the number of per-block values).
+        bad = [
+            helion.Config(block_sizes=["invalid"]),
+            helion.Config(block_sizes=[8, 8]),
+        ]
+        spec.compiler_seed_configs = [*bad, good]
+        config_gen = spec.create_config_generation()
+        for seed in bad:
+            self.assertIsNone(config_gen.transfer_seed(seed))
+        messages: list[str] = []
+        pairs = config_gen.seed_flat_config_pairs(messages.append)
+        self.assertEqual(pairs, [config_gen.transfer_seed(good)])
+        self.assertEqual(
+            [message.split(":")[0] for message in messages],
+            [f"Failed to transfer compiler seed config {i}" for i in (1, 2)],
+        )
+        # A user's seeds take the same transfer.
+        messages.clear()
+        user_pairs = config_gen.user_seed_flat_config_pairs(
+            [*bad, good], messages.append
+        )
+        self.assertEqual(user_pairs, pairs)
+        self.assertEqual(
+            [message.split(":")[0] for message in messages],
+            [f"Failed to transfer autotune seed config {i}" for i in (1, 2)],
+        )
+        # Whatever else the transfer raises for a seed skips that seed too,
+        # as both lists always did.
+        for error in (KeyError("slot"), TypeError("slot"), ValueError("slot")):
+            messages.clear()
+            with patch.object(config_gen, "flatten", side_effect=error):
+                self.assertEqual(config_gen.seed_flat_config_pairs(messages.append), [])
+                self.assertEqual(
+                    config_gen.user_seed_flat_config_pairs([good], messages.append), []
+                )
+            self.assertEqual(len(messages), 4)
+
     def test_execution_default_is_separate_from_autotune_reference(self) -> None:
         spec = ConfigSpec(backend=TritonBackend())
         spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=1024))

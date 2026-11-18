@@ -164,6 +164,15 @@ class ConfigGeneration:
         # silently retry; exposing the count lets the search-space logger report
         # explored-invalid alongside explored-valid.
         self.invalid_config_count: int = 0
+        # Whether the user of the search that owns this generation filters
+        # its candidates (``Settings.autotune_config_filter``); set by such
+        # a search (``PopulationBasedSearch``). Which seeds start that
+        # search is the filter's answer when they are benchmarked, and the
+        # filter may keep state, so it is not asked earlier: a backend that
+        # leaves random draws out of the initial population behind its seeds
+        # (``ConfigGenerationExtension.admits_random_initial_flat``) keeps
+        # every draw there.
+        self.search_filters_configs: bool = False
 
     @functools.cached_property
     def overridden_flat_indices(self) -> set[int]:
@@ -216,7 +225,7 @@ class ConfigGeneration:
         if not self.config_spec.compiler_coverage_groups:
             return self
         self.config_spec.validate_compiler_coverage_groups()
-        return ConfigGeneration(
+        view = ConfigGeneration(
             self.config_spec,
             overrides=_copy_config_structure(self._override_values),
             _flash_pipeline_family_override=self._flash_pipeline_family_override,
@@ -226,6 +235,9 @@ class ConfigGeneration:
             _field_view=MappingProxyType(self._copy_field_view(self._flat_fields())),
             _initial_sampling=True,
         )
+        # The view draws the starting points of the same search.
+        view.search_filters_configs = self.search_filters_configs
+        return view
 
     @functools.cached_property
     def _compiler_coverage_sampler(self) -> ConfigGeneration | None:
@@ -816,6 +828,31 @@ class ConfigGeneration:
         """
         return self._fragment_default_flat()
 
+    def transfer_seed(
+        self,
+        config: Config,
+        *,
+        log_func: Callable[[str], None] | None = None,
+        label: str = "seed config",
+    ) -> tuple[FlatConfig, Config] | None:
+        """``config`` as this generation searches it: the flat row a search
+        starts from and the normalized config that row decodes to, under the
+        fixed overrides; ``None`` for a seed the generation cannot transfer,
+        which ``log_func`` is told about as ``label``.
+
+        The compiler's seeds, the user's seeds, the seeds a caller gives a
+        search as its best available ones and a promoted default that
+        defends its title in the final selection
+        (``PopulationBasedSearch._resolve_defending_default``) share this
+        transfer, so that default resolves to the config of the seed it is.
+        """
+        try:
+            return self.canonicalize_flat(self.flatten(config))
+        except (InvalidConfig, ValueError, TypeError, KeyError, AssertionError) as e:
+            if log_func is not None:
+                log_func(f"Failed to transfer {label}: {e}")
+            return None
+
     def seed_flat_config_pairs(
         self,
         log_func: Callable[[str], None] | None = None,
@@ -829,18 +866,12 @@ class ConfigGeneration:
         result: list[tuple[FlatConfig, Config]] = []
         seen: MutableSet[Config] = ConfigSet()
         for i, config in enumerate(self.config_spec.compiler_seed_configs):
-            try:
-                flat, normalized = self.canonicalize_flat(self.flatten(config))
-            except (
-                InvalidConfig,
-                ValueError,
-                TypeError,
-                KeyError,
-                AssertionError,
-            ) as e:
-                if log_func is not None:
-                    log_func(f"Failed to transfer compiler seed config {i + 1}: {e}")
+            pair = self.transfer_seed(
+                config, log_func=log_func, label=f"compiler seed config {i + 1}"
+            )
+            if pair is None:
                 continue
+            flat, normalized = pair
             if normalized in seen:
                 continue
             seen.add(normalized)
@@ -856,18 +887,12 @@ class ConfigGeneration:
         result: list[tuple[FlatConfig, Config]] = []
         seen: MutableSet[Config] = ConfigSet()
         for i, config in enumerate(user_seed_configs):
-            try:
-                flat, normalized = self.canonicalize_flat(self.flatten(config))
-            except (
-                InvalidConfig,
-                ValueError,
-                TypeError,
-                KeyError,
-                AssertionError,
-            ) as e:
-                if log_func is not None:
-                    log_func(f"Failed to transfer autotune seed config {i + 1}: {e}")
+            pair = self.transfer_seed(
+                config, log_func=log_func, label=f"autotune seed config {i + 1}"
+            )
+            if pair is None:
                 continue
+            flat, normalized = pair
             if normalized in seen:
                 continue
             seen.add(normalized)
@@ -972,7 +997,17 @@ class ConfigGeneration:
         *,
         user_seed_configs: Sequence[Config] = (),
         log_func: Callable[[str], None] | None = None,
+        keep_every_draw: bool = False,
     ) -> list[FlatConfig]:
+        """The starting points of a search: the default, the seeds, then
+        random draws up to ``n`` configs.
+
+        A backend may decline draws for the starting points of an iterative
+        search (``ConfigGenerationExtension.admits_random_initial_flat``),
+        and the result is then shorter than ``n``. ``keep_every_draw`` pads
+        with every draw instead: for a caller whose draws are the candidates
+        it asked for, not padding beside the seeds (``random_population``).
+        """
         if n <= 0:
             return [self.default_flat()]
         structural = self.extension.initial_population_flats(
@@ -997,12 +1032,26 @@ class ConfigGeneration:
                 return result[:n]
         priors_present = bool(self._config_value_priors)
         for j in range(n - len(result)):
-            result.append(
+            flat = (
                 self.biased_random_flat()
                 if priors_present and j % 2 == 0
                 else self.random_flat()
             )
+            # A backend may decline draws its seeds leave no chance
+            # (``ConfigGenerationExtension.admits_random_initial_flat``).
+            if keep_every_draw or self.extension.admits_random_initial_flat(flat):
+                result.append(flat)
         return result
+
+    def random_initial_flats(self, n: int) -> list[FlatConfig]:
+        """``n`` random draws to pad the starting points of an iterative
+        search, less the draws the backend declines
+        (``ConfigGenerationExtension.admits_random_initial_flat``). As in
+        ``random_population_flat``, a declined draw is not replaced."""
+        draws = (self.random_flat() for _ in range(n))
+        return [
+            flat for flat in draws if self.extension.admits_random_initial_flat(flat)
+        ]
 
     def random_population(
         self,
@@ -1011,16 +1060,31 @@ class ConfigGeneration:
         user_seed_configs: Sequence[Config] = (),
         log_func: Callable[[str], None] | None = None,
     ) -> list[Config]:
+        """``n`` candidates for a search that times this population and
+        nothing else (``RandomSearch``): the default, the seeds and random
+        draws.
+
+        The draws are what such a search asked for, so none is declined the
+        way the starting points of an iterative search are trimmed
+        (``random_population_flat``): a request for 1,000 candidates gets
+        1,000, short only of the draws that do not normalize after 64
+        retries."""
         result: list[Config] = []
         attempts = 0
         if not self.config_spec.cute_flash_search_enabled:
             flat_population = self.random_population_flat(
-                n, user_seed_configs=user_seed_configs, log_func=log_func
+                n,
+                user_seed_configs=user_seed_configs,
+                log_func=log_func,
+                keep_every_draw=True,
             )
         else:
             try:
                 flat_population = self.random_population_flat(
-                    n, user_seed_configs=user_seed_configs, log_func=log_func
+                    n,
+                    user_seed_configs=user_seed_configs,
+                    log_func=log_func,
+                    keep_every_draw=True,
                 )
             except InvalidConfig:
                 flat_population = []

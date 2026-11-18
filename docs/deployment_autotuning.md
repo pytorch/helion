@@ -173,8 +173,22 @@ flash pipeline family), the best shortlisted config of up to two families
 the ranking would drop, each within 1.25x of the best reading, joins the
 shortlist and the survivors of the screen, so the steady windows, which
 run at the sustained power-capped clock, see every body in contention and
-not only the one the search's boost-clock windows preferred. Set
-`HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0` to fall back to the cheaper
+not only the one the search's boost-clock windows preferred. On the CuTe
+backend the code a kernel runs without autotuning, when a compiler seed was
+promoted to its default config, runs the rounds as well whatever its screen
+reading, under the default's config or, where a search does not time
+repeats of generated code (see below), under whichever config with that
+code is among the finalists, so the code of the returned config was timed
+against it in the same windows. The final selection's table marks that
+finalist with `D`, and its rows in the autotune metrics carry
+`defending_default`. That does not cover a default whose code
+is no live finalist (it was not shortlisted, or its timing failed before
+the rounds), or one whose config the search never compiled
+(`autotune_config_filter` dropped or rewrote it, the budget ran out before
+it, its compile failed, or the search's population never held it), where
+the search cannot tell which finalist has the default's code. That rule is
+part of no cache identity: a result cached before it is returned as it is.
+Set `HELION_AUTOTUNE_FINAL_SELECTION_ROUNDS=0` to fall back to the cheaper
 single-pass final verification; under `HELION_AUTOTUNE_BUDGET_SECONDS` the
 search stops early enough for the phase (its estimate plus one generation
 of overrun, together at most a quarter of the budget but never less than
@@ -227,7 +241,52 @@ not make those failed candidates eligible for selection.
 `HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS=N`) uses independent, alias-preserving
 argument banks in the isolated CUDA benchmark worker. The default is one bank.
 For multiple banks, every sample times a complete cycle and reports milliseconds
-per call. `HELION_BENCHMARK_CUDAGRAPH=1` is required.
+per call. `HELION_BENCHMARK_CUDAGRAPH=1` is required. Event times of a captured
+cycle sit on the device timer's grid (about 2 us per replay on a B200), so a
+bank-cycle reading is a mean instead of the window's median: of the samples
+that did not stall (a replay that read more than a quarter above the window's
+median is left out, in a window of any length), without their lowest and
+highest tenth (fewer than ten samples are averaged whole). The final selection
+breaks ties between the medians of its rounds by the mean of the rounds. A
+cycle that reads less than four timer steps per replay is read low, at most
+its median: there a sample one step above the median counts as stalled.
+
+A search over bank cycles also keeps the windows of its search phases at the
+candidates' length. When it re-times the configs near its best (after the
+initial population, in every generation and polish round), each of them is
+timed in two more 50 ms windows, one in each of two sweeps over those configs,
+and reads the median of the two and the reading it had: one of the three that
+sits apart does not become the config's reading. The second sweep runs in
+reverse order, so a config's two windows are taken at different places of the
+two sweeps and what a place in a sweep does to a window reaches one of them,
+not both. A one-bank search times one 200 ms window per config instead and
+reads that. A bank cycle is a burst of back-to-back launches, and a burst of
+200 ms outlasts the fast state of a power-limited GPU. Measured on a B200 with
+a paged attention kernel: the driver's software power cap engages 50-75 ms
+into a continuous burst and the SM clock falls from 1965 MHz to 1220-1590 MHz,
+a second, deeper level follows after about 400 ms, and the cap clears
+0.2-0.4 s after the burst ends. Re-timing windows of 50, 100, 150 and 200 ms
+read 1.002, 1.028, 1.061 and 1.083 times the candidates' readings of the same
+configs, and one config's consecutive 200 ms re-timings sat 3-6% apart, so
+the paths of a search started from, and moved by, readings the candidates'
+windows did not repeat. The 50 ms window has no margin: on a kernel of 28 us
+whose windows carry data the cap begins 45-50 ms into a burst, and its
+re-timing windows read 0.4-1.0% above the readings they repeat. Single windows
+also read high, which is what the median of three readings is for: in 140
+sweeps of 14 searches, 6.5% of the windows read more than 1% above the reading
+they repeat, most of them one window at a time, while the medians of the
+sweeps stayed within 0.15% of those readings. Two windows take about what the
+long one did (18.1 s against 17.2 s for a sweep of 46 configs). A sweep whose
+windows read 2% or more from the readings they repeat is reported in the
+autotune log; at debug level every sweep is, with the share of configs whose
+two windows sit more than 1% apart and each config's raw windows (a config's
+`rebenchmark` row in the trace holds the reading it takes).
+
+That timing policy has a version in the cache identity of every search with
+more than one bank, on every backend: results such searches cached under an
+earlier rule (the window's median, or the single long re-timing window) are
+searched again once, AOT tuning data collected with banks needs regenerating,
+and one-bank identities do not change.
 
 With `HELION_AUTOTUNE_L2_FLUSH=replay`, each complete cycle starts after an L2
 clear. To measure a resident cycle instead, set `HELION_AUTOTUNE_L2_FLUSH=0`,
@@ -490,6 +549,24 @@ Related settings for `from_best_available` (see {doc}`api/settings`):
 |---------|---------------------|---------|-------------|
 | `autotune_best_available_max_configs` | `HELION_BEST_AVAILABLE_MAX_CONFIGS` | 20 | Maximum cached configs to seed |
 | `autotune_best_available_max_cache_scan` | `HELION_BEST_AVAILABLE_MAX_CACHE_SCAN` | 500 | Maximum cache files to scan |
+
+A backend can decline the random draws that pad the initial population of
+an iterative search, under either strategy: the draws behind the seeds, the
+refill after a rejected initial config, and the pads of pattern search and
+differential evolution behind the best available configs
+(`ConfigGenerationExtension.admits_random_initial_flat`; the default admits
+every draw). A declined draw is not replaced, so the initial population can
+come out smaller than the effort profile asks for. Only the CuTe backend
+declines any: for a folded-storage attention kernel that starts from at
+least 16 seeds on an attention schedule, it declines the draws that render
+the generic lowering, which read 2.6-46 ms per call on a B200 where the
+seeds read 25-430 us and so cannot win. A search with an
+`autotune_config_filter` keeps every draw: a seed that the filter drops or
+rewrites starts no search, and the filter is asked about the seeds only
+when they are benchmarked. The fragment default, the
+seeds and the compiler-coverage witnesses are not draws and stay; every
+candidate of `RandomSearch`, and of the fallback for a search whose seeds all
+failed, stays as well.
 
 ### Autotune budget
 

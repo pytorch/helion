@@ -436,7 +436,7 @@ class PatternSearch(PopulationBasedSearch):
                 return ordered
             if self.best_available_pad_random:
                 n_random = max(0, self.initial_population - len(pop))
-                pop.extend(config_gen.random_flat() for _ in range(n_random))
+                pop.extend(config_gen.random_initial_flats(n_random))
             return pop
         population = config_gen.random_population_flat(
             self.initial_population,
@@ -458,8 +458,10 @@ class PatternSearch(PopulationBasedSearch):
         self.pin_finalist_configs(pinned_seed_configs)
         if self.config_gen.config_spec.cute_flash_search_enabled:
             return population
+        # The pre-screen's refill replaces the candidates it rejects and no
+        # more: the slots of the draws the backend declined above stay empty.
         return self._replace_backend_rejected_initial_configs(
-            population, self.initial_population
+            population, len(population)
         )
 
     def _random_fallback_population_target(self) -> int | None:

@@ -537,6 +537,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             result = gen.differential_mutation(base, a, b, c, crossover_rate=0.9)
             self.assertEqual(result[key_idx], base[key_idx])
 
+    @pytest.mark.cpu_only
     def test_initial_population_refills_backend_rejections(self):
         configs = {value: helion.Config(block_sizes=[value]) for value in range(1, 7)}
         backend = SimpleNamespace(
@@ -549,6 +550,7 @@ class TestAutotunerSearch(AutotunerTestCase):
             invalid_config_count=0,
             canonicalize_flat=lambda flat: (flat, configs[flat[0]]),
             random_flat=Mock(side_effect=([3], [4], [5], [6])),
+            extension=SimpleNamespace(admits_random_initial_flat=lambda flat: True),
         )
         search = PopulationBasedSearch.__new__(PopulationBasedSearch)
         search.config_spec = config_gen.config_spec
@@ -561,6 +563,106 @@ class TestAutotunerSearch(AutotunerTestCase):
 
         self.assertEqual(population, [[2], [4], [6]])
         self.assertEqual(config_gen.random_flat.call_count, 4)
+
+    @pytest.mark.cpu_only
+    def test_refill_of_a_rejected_seed_leaves_declined_slots_empty(self):
+        """A backend that declines random starting points leaves their slots
+        empty, so the first pass returns fewer rows than the population
+        asked for. When the pre-screen then rejects one of those rows, the
+        refill replaces that row and nothing else: it does not draw again
+        for the slots the first pass left empty, and the log counts only
+        the rejected row's slot when its replacement is declined too."""
+        configs = {value: helion.Config(block_sizes=[value]) for value in range(1, 9)}
+        backend = SimpleNamespace(
+            autotune_config_is_viable=lambda _spec, config: (
+                config.config["block_sizes"][0] % 2 == 0
+            )
+        )
+
+        def population(draws):
+            config_gen = SimpleNamespace(
+                config_spec=SimpleNamespace(
+                    backend=backend, cute_flash_search_enabled=False
+                ),
+                invalid_config_count=0,
+                # Six rows asked for: the default, one seed, and four draws
+                # the backend declined.
+                random_population_flat=Mock(return_value=[[1], [2]]),
+                user_seed_flat_config_pairs=lambda seeds: [],
+                seed_flat_config_pairs=list,
+                default_flat=lambda: [2],
+                unflatten=lambda flat: configs[flat[0]],
+                canonicalize_flat=lambda flat: (flat, configs[flat[0]]),
+                random_flat=Mock(side_effect=draws),
+                extension=SimpleNamespace(
+                    admits_random_initial_flat=lambda flat: flat[0] <= 4
+                ),
+            )
+            search = PatternSearch.__new__(PatternSearch)
+            search.config_spec = config_gen.config_spec
+            search.config_gen = config_gen
+            search.initial_population = 6
+            search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
+            search._autotune_seed_configs = list
+            search.pin_finalist_configs = Mock()
+            search.log = Mock()
+            result = search._generate_initial_population_base()
+            config_gen.random_population_flat.assert_called_once()
+            self.assertEqual(config_gen.random_population_flat.call_args.args, (6,))
+            logged = [call.args[0] for call in search.log.call_args_list]
+            return result, config_gen.random_flat.call_count, logged
+
+        # The rejected row [1] is replaced by the first viable draw.
+        result, draws, logged = population([[3], [4], [5], [6], [7], [8]])
+        self.assertEqual(result, [[2], [4]])
+        self.assertEqual(draws, 2)
+        self.assertFalse([line for line in logged if line.startswith("Left ")])
+        # A declined replacement leaves that one slot empty.
+        result, draws, logged = population([[5], [6], [7], [8]])
+        self.assertEqual(result, [[2]])
+        self.assertEqual(draws, 1)
+        (left,) = [line for line in logged if line.startswith("Left ")]
+        self.assertEqual(
+            left,
+            "Left 1 initial population slots empty: the backend declines "
+            "those random draws.",
+        )
+
+    @pytest.mark.cpu_only
+    def test_filtered_search_tells_its_generation_and_asks_its_filter_nothing(self):
+        """Which seeds ``autotune_config_filter`` leaves is the filter's
+        answer when they are benchmarked. A search with a filter tells its
+        generation only that it has one
+        (``ConfigGeneration.search_filters_configs``), where a backend that
+        declines random draws behind its seeds keeps every draw, and does
+        not call the filter to say so; a search without a filter sets
+        nothing."""
+
+        def search_with(config_filter):
+            kernel = mock_kernel(
+                Settings(
+                    autotune_log_level=logging.CRITICAL,
+                    autotune_config_filter=config_filter,
+                )
+            )
+            return PopulationBasedSearch(cast("_AutotunableKernel", kernel), ())
+
+        unfiltered = search_with(None)
+        self.assertFalse(hasattr(unfiltered.config_gen, "search_filters_configs"))
+
+        config_filter = Mock(side_effect=lambda config: config)
+        search = search_with(config_filter)
+        self.assertIs(search.config_gen.search_filters_configs, True)
+        config_filter.assert_not_called()
+
+    @pytest.mark.cpu_only
+    def test_stand_in_kernel_has_no_default_to_defend(self):
+        """The stand-in kernel of the autotuner tests (``mock_kernel``) has
+        no promoted compiler default, on a backend that has none defend the
+        final selection: a search on it resolves no defending default."""
+        kernel = mock_kernel(Settings(autotune_log_level=logging.CRITICAL))
+        search = PopulationBasedSearch(cast("_AutotunableKernel", kernel), ())
+        self.assertIsNone(search._resolve_defending_default())
 
     def test_population_adopts_config_filter_replacement(self):
         args = (

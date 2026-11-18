@@ -186,7 +186,7 @@ class DifferentialEvolutionSearch(PopulationBasedSearch):
             if self.best_available_pad_random:
                 target = self.population_size * 2
                 n_random = max(0, target - len(pop))
-                pop.extend(self.config_gen.random_flat() for _ in range(n_random))
+                pop.extend(self.config_gen.random_initial_flats(n_random))
                 return pop[:target]
             return pop
 

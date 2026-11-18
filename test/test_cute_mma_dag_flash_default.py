@@ -36,6 +36,10 @@ def test_fused_flash_retains_its_default_with_mma_dag_admission(
         )
         spec = bound.config_spec
         assert spec.cute_flash_search_enabled
+        # No seed is promoted on a flash kernel, also where a heuristic that
+        # promotes its seed admits it: the final selection's cache policy,
+        # which keys flash searches, says so of a defending default.
+        assert spec.compiler_default_config is None
         assert spec.cute_mma_dag is not None
         assert spec.cute_mma_dag_facts is not None
         assert "warp" in spec.cute_mma_dag.choices

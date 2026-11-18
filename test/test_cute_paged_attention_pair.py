@@ -29,11 +29,54 @@ from helion._testing.cute_paged_attention_schedule import paged_attention_args
 from helion._testing.cute_paged_base2 import base2_attention_fixture
 from helion._testing.cute_paged_reference import reference_attention_fixture
 from helion._testing.cute_paged_v_lag import without_paired_head
+from helion.autotuner.base_search import PopulationBasedSearch
 
 if TYPE_CHECKING:
     from helion.runtime.kernel import Kernel
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_promoted_default_is_resolved_as_the_seed_a_search_times():
+    # The CuTe backend has a promoted default run the final selection's
+    # rounds. The search finds its finalist by transferring the default the
+    # way it transfers the compiler seed it is, under its fixed overrides.
+    args = (*paged_attention_args(rows=40), None, True)
+    with cpu_render_target(fake_device_sm_count=148):
+        bound = cpu_bind(paged_online_attention, args)
+        spec = bound.config_spec
+        assert spec.compiler_default_config == spec.compiler_seed_configs[0]
+        assert bound.host_function is not None
+        with bound.env, bound.host_function:
+            for overrides, policy in (
+                (None, (True, True, "loader_tail")),
+                # The opt-out declines the default's dependent launch, in the
+                # seed and in the default alike.
+                ({"cute_pdl": False}, (False, False, "auto")),
+                # The paired schedule cannot run under this override: its
+                # default is not in the search and defends nothing.
+                ({"cute_min_blocks_per_mp": 0}, None),
+            ):
+                search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+                search.settings = bound.settings
+                search.config_spec = spec
+                search.config_gen = spec.create_config_generation(overrides=overrides)
+                resolved = search._resolve_defending_default()
+                seeds = search.config_gen.seed_flat_config_pairs()
+                if policy is None:
+                    assert resolved is None
+                    assert all(
+                        config.get("cute_mma_dag_pass_warps") != "attention_paired"
+                        for _flat, config in seeds
+                    )
+                    continue
+                assert resolved == seeds[0][1]
+                assert resolved.get("cute_mma_dag_pass_warps") == "attention_paired"
+                assert (
+                    resolved.get("cute_pdl", False),
+                    resolved.get("cute_pdl_capture_overlap", False),
+                    resolved.get("cute_pdl_release", "auto"),
+                ) == policy
 
 
 @pytest.mark.parametrize(

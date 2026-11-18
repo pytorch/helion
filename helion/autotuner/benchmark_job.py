@@ -20,6 +20,7 @@ from .benchmark_worker import PHASE_COMPILED
 from .benchmark_worker import PhasedJob
 from .benchmarking import KernelTraceUnreadable
 from .benchmarking import _resolve_l2_flush_mode
+from .benchmarking import central_mean
 from .benchmarking import check_prelude_regime
 from .benchmarking import do_bench
 from .benchmarking import do_bench_cuda_graph
@@ -221,21 +222,28 @@ class BenchmarkJob(PhasedJob):
                     synchronize_device()
                     if report_phase is not None:
                         report_phase(PHASE_COMPILED)
-                    # return_mode="median" guarantees a float return.
                     if self.input_banks > 1:
                         # Event nodes time exactly one complete bank cycle
                         # inside the graph, excluding host dispatch and any
                         # flush/primer. (check_input_bank_mode admits only the
                         # replay and off regimes here, never ``kernel``.)
-                        result = do_bench_cuda_graph(
-                            benchmark_fn,
-                            return_mode="median",
-                            warmup=self.warmup,
-                            rep=self.rep,
-                            fixed_repetitions=self.fixed_repetitions,
-                            pre_warmed=True,
-                            l2_flush_mode=bank_flush_mode,
-                            pre_timing=pre_timing,
+                        # Those times sit on the device timer's grid, which
+                        # the mean of the central samples resolves and their
+                        # median does not (``central_mean``).
+                        result = central_mean(
+                            cast(
+                                "list[float]",
+                                do_bench_cuda_graph(
+                                    benchmark_fn,
+                                    return_mode="all",
+                                    warmup=self.warmup,
+                                    rep=self.rep,
+                                    fixed_repetitions=self.fixed_repetitions,
+                                    pre_warmed=True,
+                                    l2_flush_mode=bank_flush_mode,
+                                    pre_timing=pre_timing,
+                                ),
+                            )
                         )
                     else:
                         kernel_window = (
@@ -270,6 +278,7 @@ class BenchmarkJob(PhasedJob):
                                     f"the benchmark worker cannot read the "
                                     f"CUDA activity trace: {reason}"
                                 )
+                        # return_mode="median" guarantees a float return.
                         result = bench(
                             benchmark_fn,
                             return_mode="median",
