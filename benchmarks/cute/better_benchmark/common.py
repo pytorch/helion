@@ -345,6 +345,68 @@ def autotune_record(
     return record
 
 
+# The variable that gives a search its random seed. A campaign gives every
+# autotune job one (``campaign.job_env``), and ``autotune.py`` records it with
+# the rest of the job's HELION_* environment (the record's ``env``).
+SEED_VARIABLE = "HELION_AUTOTUNE_RANDOM_SEED"
+# The variable through which ``campaign.py --seeds-from`` tells an autotune
+# job the run that its seed was taken from, which ``autotune.py`` records as
+# ``seed_from``.
+SEED_FROM = "BB_SEED_FROM"
+# What ``campaign.py --configs-from`` has copied into a run, in its run
+# directory (see the comment at ``campaign.COPIED_CONFIGS``).
+COPIED_CONFIGS = "configs_copied.json"
+
+
+def holds_copy(entry: dict[str, Any] | None, digest: str) -> bool:
+    """Whether a record of a run with the SHA-256 ``digest`` is a copy that
+    ``campaign.py --configs-from`` made, by the record's entry in the run's
+    ``COPIED_CONFIGS`` (None: it has none): the copy the entry names
+    (``sha256``), or the one that copy was to replace (``replaces``), which
+    the run still holds when the campaign died between writing the entry
+    and making the copy."""
+    return entry is not None and digest in (entry["sha256"], entry.get("replaces"))
+
+
+def record_seed(record: dict[str, Any]) -> int | None:
+    """The random seed that the search of an autotune record was given
+    (``SEED_VARIABLE`` in the record's ``env``); None when the record names
+    none, or a blank one, which Helion takes for none: a search that is
+    given no seed draws one from the clock."""
+    seed = (record.get("env") or {}).get(SEED_VARIABLE)
+    return int(seed) if seed is not None and seed.strip() else None
+
+
+def standing_seed(
+    run_dir: Path, repro_id: str, shape: str, backend: str
+) -> tuple[int | None, str | None]:
+    """The seed of the search whose autotune record stands in the run
+    ``run_dir`` for one port; or None, with why the run names none.
+
+    The record that stands is the ok one in the run's ``configs``, whichever
+    attempt or run made it: the first clean attempt, the cleanest one kept
+    after contaminated attempts (the campaign keeps that attempt's record as
+    it is, where the job's last ``job_start`` event names another seed), or
+    a record ``plan_run.py`` reused from an earlier run. Each carries the
+    seed of its own search in ``env`` (``record_seed``). A provisional
+    record stands in for an autotune that has not run, so it is no search of
+    this run to repeat, and a record that names no seed is of a search that
+    was given none (``autotune.py`` run by hand)."""
+    path = config_record_path(run_dir / "configs", repro_id, shape, backend)
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, "no autotune record"
+    if record.get("status") != "ok":
+        return None, "its autotune record is not ok"
+    if record.get("provisional"):
+        return None, "its autotune record is provisional: not a search of that run"
+    seed = record_seed(record)
+    if seed is None:
+        return None, "its autotune record names no seed"
+    return seed, None
+
+
 def load_autotuned_port(
     configs_dir: Path, repro_id: str, shape: str, backend: str
 ) -> tuple[types.ModuleType, dict[str, Any]]:

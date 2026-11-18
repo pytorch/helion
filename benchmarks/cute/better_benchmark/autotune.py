@@ -6,8 +6,10 @@ records each kernel's winning ``@helion.kernel(...)`` decorator. The record is
 checked by rebuilding the kernels from those decorators and comparing their
 generated code and outputs, which is how ``bench.py`` pins them later.
 
-Run it through ``campaign.py``, which gives every job a fresh process, a fresh
-random seed and private cache directories; standalone::
+Run it through ``campaign.py``, which gives every job a fresh process, a
+random seed (a fresh one, or with ``--seeds-from`` the one another run's
+autotune of the port had: the record's ``seed_from`` names that run), private
+cache directories and a file for the search's per-config log; standalone::
 
     python benchmarks/cute/better_benchmark/autotune.py \\
         var_mean_004f9a9ea198 --backend cute --output /tmp/cfg.json
@@ -54,17 +56,29 @@ def check(
         record.setdefault("eager_allclose_warnings", []).append(str(error)[:1000])
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    shape = args.shape or common.default_shape(args.repro_id)
+def new_record(repro_id: str, shape: str, backend: str) -> dict[str, Any]:
+    """The record of an autotune as it starts: its port, the job's HELION_*
+    environment (``env``: the search's random seed among it, which
+    ``common.record_seed`` reads back, and the file of its per-config log)
+    and, under ``campaign.py --seeds-from``, the run whose autotune of this
+    port had that seed (``seed_from``, from ``common.SEED_FROM``)."""
     record: dict[str, Any] = {
-        "repro": args.repro_id,
+        "repro": repro_id,
         "shape": shape,
-        "backend": args.backend,
+        "backend": backend,
         "status": "error",
         "env": {k: v for k, v in os.environ.items() if k.startswith("HELION_")},
         "gpu": common.gpu_info(),
         "versions": common.versions(),
     }
+    if common.SEED_FROM in os.environ:
+        record["seed_from"] = os.environ[common.SEED_FROM]
+    return record
+
+
+def run(args: argparse.Namespace) -> dict[str, Any]:
+    shape = args.shape or common.default_shape(args.repro_id)
+    record = new_record(args.repro_id, shape, args.backend)
     started = time.monotonic()
     try:
         torch.cuda.set_device(0)

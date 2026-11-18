@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import contextlib
 import gc
 import hashlib
@@ -9,6 +10,7 @@ import math
 import operator
 import os
 import pathlib
+from pathlib import Path
 import re
 import secrets
 import signal
@@ -23,6 +25,7 @@ from typing import cast
 import warnings
 
 from benchmarks.cute.better_benchmark import audit_activity
+from benchmarks.cute.better_benchmark import autotune
 from benchmarks.cute.better_benchmark import bench
 from benchmarks.cute.better_benchmark import campaign
 from benchmarks.cute.better_benchmark import common
@@ -43,7 +46,6 @@ import helion.runtime
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
 
 pytestmark = pytest.mark.cpu_only
 
@@ -1703,7 +1705,9 @@ def test_board_claims_are_renewed_every_third_of_the_ttl() -> None:
 # (``BB_STUB_PLAN``: {record name: [max SM per attempt]}; a negative share
 # leaves every sample unknown, and None fails the attempt without a record).
 # With ``BB_STUB_LEAVE`` it leaves a worker behind in a session of its own and
-# writes its pid there.
+# writes its pid there. Like autotune.py it records its HELION_* environment
+# and the run its seed was taken from, and like the autotuner it appends to
+# the CSV file of ``HELION_AUTOTUNE_LOG`` (here: its attempt).
 _STUB_JOB = """
 import json, os, subprocess, sys
 from pathlib import Path
@@ -1726,6 +1730,7 @@ record = {
     "gpu": os.environ["CUDA_VISIBLE_DEVICES"],
     "autotune_s": 1.0,
     "impls": {},
+    "env": {k: v for k, v in os.environ.items() if k.startswith("HELION_")},
     "foreign_gpu_activity": {
         "interval_s": 1.0,
         "samples": 9,
@@ -1733,6 +1738,13 @@ record = {
         "processes": {"eve:7": {"max_sm": sm, "active_s": float(attempt)}},
     },
 }
+if "BB_SEED_FROM" in os.environ:
+    record["seed_from"] = os.environ["BB_SEED_FROM"]
+if "HELION_AUTOTUNE_LOG" in os.environ:
+    search = Path(os.environ["HELION_AUTOTUNE_LOG"]).with_suffix(".csv")
+    search.parent.mkdir(parents=True, exist_ok=True)
+    with search.open("a") as rows:
+        rows.write(f"attempt {attempt}\\n")
 if sm < 0:
     # The sampling failed throughout: no sample read the GPU.
     record["foreign_gpu_activity"].update(unknown_samples=9, processes={})
@@ -2935,6 +2947,350 @@ def test_configs_from_knows_its_copies_wherever_a_copy_died(
                     assert manifest[name]["sha256"] == hashlib.sha256(copy).hexdigest()
 
 
+_SEED = common.SEED_VARIABLE
+
+
+def test_a_runs_seed_for_a_port_is_the_one_its_standing_record_names(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "before"
+
+    def seed_of(index: int, *started: int, **fields: object) -> tuple[object, object]:
+        """The seed the run names for a port whose campaign job started
+        with the seeds ``started`` and left a record with ``fields`` (none
+        without them)."""
+        repro = f"sum_00000000000{index}"
+        if fields:
+            _toy_tuned(run, repro, "s1", "cute", **fields)
+        run.mkdir(exist_ok=True)
+        with (run / "campaign.jsonl").open("a") as log:
+            for seed in started:
+                start = {"job": f"autotune:{repro}__s1__cute", "seed": seed}
+                log.write(json.dumps({"kind": "job_start", **start}) + "\n")
+        return common.standing_seed(run, repro, "s1", "cute")
+
+    # The seed is in the record's environment, whichever of the job's
+    # attempts made it: here the second of three, the cleanest, which the
+    # campaign kept when the last one was contaminated too.
+    configs = run / "configs"
+    attempts = [
+        str(configs / f"sum_000000000001__s1__cute.json.attempt{k}") for k in (1, 2, 3)
+    ]
+    kept = {"contaminated": True, "contaminated_attempts": attempts}
+    assert seed_of(1, 7, 11, 9, env={_SEED: "11"}, **kept) == (11, None)
+    # So is a reused record's: its own search's, in the run it came from.
+    assert seed_of(2, env={_SEED: "22"}, reused_from="run3/x.json") == (22, None)
+    # No search of this run to repeat: no record, a failed autotune, a
+    # provisional record, a search that was given no seed (autotune.py by
+    # hand) or a record without its environment, whatever seed the campaign
+    # started the job with.
+    assert seed_of(3, 33) == (None, "no autotune record")
+    assert seed_of(4, 44, env={_SEED: "44"}, status="error") == (
+        None,
+        "its autotune record is not ok",
+    )
+    found = seed_of(5, env={_SEED: "55"}, provisional=True, reused_from="run3/y.json")
+    assert found[0] is None and "provisional" in str(found[1])
+    no_seed = (None, "its autotune record names no seed")
+    assert seed_of(6, 66, env={"HELION_FORCE_AUTOTUNE": "1"}) == no_seed
+    assert seed_of(7, 77, 77, autotune_s=2.0) == no_seed
+    # A blank seed is none to Helion, which then draws one from the clock,
+    # and a padded one is the number.
+    assert seed_of(8, env={_SEED: ""}) == no_seed
+    assert seed_of(9, env={_SEED: "   "}) == no_seed
+    assert seed_of(9, env={_SEED: " 99 "}) == (99, None)
+
+
+def test_an_autotune_record_names_its_seed_and_the_run_it_was_taken_from(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The GPU's and the packages' identities are other tests'.
+    monkeypatch.setattr(common, "gpu_info", dict)
+    monkeypatch.setattr(common, "versions", dict)
+    # The job as a campaign starts it on a fresh seed: its record holds the
+    # HELION_* environment, the seed and the search log's file among it,
+    # and nothing says the seed is another run's.
+    monkeypatch.delenv(common.SEED_FROM, raising=False)
+    monkeypatch.setenv(_SEED, "1234")
+    monkeypatch.setenv("HELION_AUTOTUNE_LOG", "/run/logs/search/x/search")
+    point = ("sum_000000000001", "s1", "cute")
+    record = autotune.new_record(*point)
+    assert (record["repro"], record["shape"], record["backend"]) == point
+    assert record["env"][_SEED] == "1234" and common.record_seed(record) == 1234
+    assert record["env"]["HELION_AUTOTUNE_LOG"] == "/run/logs/search/x/search"
+    assert all(name.startswith("HELION_") for name in record["env"])
+    assert "seed_from" not in record
+    # With --seeds-from the campaign tells the job where the seed is from.
+    monkeypatch.setenv(common.SEED_FROM, "/runs/before")
+    assert autotune.new_record(*point) == {**record, "seed_from": "/runs/before"}
+
+    # An autotune that fails, here for want of a device, records them too.
+    def no_device(index: int) -> None:
+        raise RuntimeError("no device for this test")
+
+    monkeypatch.setattr(torch.cuda, "set_device", no_device)
+    job = argparse.Namespace(repro_id=point[0], shape="s1", backend="cute")
+    failed = autotune.run(job)
+    assert failed["status"] == "error" and "no device for this test" in failed["error"]
+    assert failed["env"] == record["env"] and failed["seed_from"] == "/runs/before"
+
+
+def _seeded_and_queued(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+    kernels: list[dict[str, str]],
+    *flags: str,
+    backends: str = "cute,triton",
+) -> tuple[dict[str, int], dict[str, str], object]:
+    """Start a campaign in ``tmp_path / "run"`` on the seeds of the run
+    ``source``, stopped before a job starts: the seeds it took and the
+    autotunes it left on a fresh seed (by repro digit and backend, from its
+    ``seeds_from`` event) and the number of jobs it queued."""
+    events = _stopped_campaign(
+        tmp_path, monkeypatch, kernels, backends, "--seeds-from", str(source), *flags
+    )
+    assert [event["kind"] for event in events] == [
+        "seeds_from",
+        "campaign_start",
+        "campaign_end",
+    ]
+    assert set(events[0]) == {"kind", "source", "seeds", "fresh", "time"}
+    assert events[0]["source"] == str(source)
+
+    def short(jobs: dict[str, object]) -> dict[str, object]:
+        return {
+            "".join((key.split("__")[0][-1], *key.rsplit("__", 1)[1:])): value
+            for key, value in jobs.items()
+        }
+
+    seeds, fresh = short(events[0]["seeds"]), short(events[0]["fresh"])
+    return (
+        cast("dict[str, int]", seeds),
+        cast("dict[str, str]", fresh),
+        events[1]["jobs"],
+    )
+
+
+def test_a_campaign_takes_another_runs_seeds_for_the_autotunes_it_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The run before: the first point's records name their seeds (the
+    # Triton one is reused, from the run before that), the second's CuTe
+    # record is provisional, and the third has no ok record.
+    before, run = tmp_path / "before", tmp_path / "run"
+    kernels = [{"repro": f"sum_00000000000{i}", "shape": f"s{i}"} for i in (1, 2, 3)]
+    one, two, three = (k["repro"] for k in kernels)
+    earlier = {"env": {_SEED: "102"}, "reused_from": "run3/configs/x.json"}
+    _toy_tuned(before, one, "s1", "cute", env={_SEED: "101"})
+    _toy_tuned(before, one, "s1", "triton", **earlier)
+    _toy_tuned(before, two, "s2", "cute", env={_SEED: "201"}, provisional=True)
+    _toy_tuned(before, two, "s2", "triton", env={_SEED: "202"})
+    _toy_tuned(before, three, "s3", "triton", env={_SEED: "302"}, status="error")
+    # Refused before anything is made: a run's configs for the run, a run
+    # that names no seed for any selected autotune, benches only.
+    for flags, message in (
+        (["--seeds-from", str(before / "configs")], "RUN, not RUN/configs"),
+        (
+            ["--seeds-from", str(before), "--only", three],
+            (
+                "names no seed for any of the 2 selected autotunes "
+                f"(autotune:{three}__s3__cute: no autotune record, say)"
+            ),
+        ),
+        (["--seeds-from", str(before), "--phases", "bench"], "--phases autotune"),
+    ):
+        with pytest.raises(SystemExit):
+            _stub_campaign(
+                tmp_path,
+                monkeypatch,
+                {},
+                *flags,
+                kernels=kernels,
+                backends="cute,triton",
+            )
+        assert message in capsys.readouterr().err
+    assert not run.exists()
+    # This run as plan_run.py leaves it: the first point's Triton record
+    # reused, which is no job, and the second's provisional, whose autotune
+    # is still to run.
+    _toy_tuned(run, one, "s1", "triton", **earlier)
+    _toy_tuned(run, two, "s2", "triton", env={_SEED: "9"}, provisional=True)
+    fresh = {
+        "2cute": "its autotune record is provisional: not a search of that run",
+        "3cute": "no autotune record",
+        "3triton": "its autotune record is not ok",
+    }
+    # Each autotune to run takes the seed of the other run's record of its
+    # port; the reused record's takes none, and a restart takes them again.
+    for _ in range(2):
+        queued = _seeded_and_queued(tmp_path, monkeypatch, before, kernels)
+        assert queued == ({"1cute": 101, "2triton": 202}, fresh, 8)
+    assert _seeded_and_queued(
+        tmp_path, monkeypatch, before, kernels, "--only", one, two, backends="cute"
+    ) == ({"1cute": 101}, {"2cute": fresh["2cute"]}, 4)
+    # Run again, the reused record's port searches from its record's seed.
+    assert _seeded_and_queued(tmp_path, monkeypatch, before, kernels, "--retune") == (
+        {"1cute": 101, "1triton": 102, "2triton": 202},
+        fresh,
+        9,
+    )
+    # A run's own records move aside as its jobs start.
+    with pytest.raises(SystemExit):
+        _seeded_and_queued(tmp_path, monkeypatch, run, kernels)
+    assert "names this run" in capsys.readouterr().err
+    # A job is told of a seed's source and of a search log only by its own
+    # campaign.
+    monkeypatch.setenv(common.SEED_FROM, "another campaign's")
+    monkeypatch.setenv("HELION_AUTOTUNE_LOG", "the caller's")
+    env = campaign.job_env("0", tmp_path, 7, "marker")
+    assert env[_SEED] == "7" and not {common.SEED_FROM, "HELION_AUTOTUNE_LOG"} & set(
+        env
+    )
+    env = campaign.job_env("0", tmp_path, 7, "marker", "run9", tmp_path / "search")
+    assert env[common.SEED_FROM] == "run9"
+    assert env["HELION_AUTOTUNE_LOG"] == str(tmp_path / "search")
+
+
+@pytest.mark.slow
+@_requires_proc
+def test_a_paired_autotune_searches_from_its_seed_on_every_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The run before names a seed for the first point only. Both points'
+    # autotunes are contaminated once and run again.
+    before = tmp_path / "before"
+    kernels = [{"repro": f"sum_00000000000{i}", "shape": "s1"} for i in (1, 2)]
+    _toy_tuned(before, "sum_000000000001", "s1", "triton", env={_SEED: "1234"})
+    names = [f"{k['repro']}__s1__triton" for k in kernels]
+    plan = {f"{name}.json": [83, 0] for name in names}
+    drawn = itertools.count(1)
+    monkeypatch.setattr(campaign.secrets, "randbits", lambda bits: next(drawn))
+    flags = ("--seeds-from", str(before))
+    run, events = _stub_campaign(tmp_path, monkeypatch, plan, *flags, kernels=kernels)
+
+    def starts(events: list[dict[str, object]], name: str) -> list[object]:
+        return [
+            (event["seed"], event.get("seed_from"))
+            for event in events
+            if event["kind"] == "job_start" and event["job"] == f"autotune:{name}"
+        ]
+
+    # The paired job has the other run's seed on both attempts, and its
+    # event, its log and each attempt's record say where it is from; the
+    # other draws a seed per attempt, and nothing calls it paired.
+    assert starts(events, names[0]) == [(1234, str(before))] * 2
+    fresh = starts(events, names[1])
+    assert len({seed for seed, _ in fresh}) == 2 and {s for _, s in fresh} == {None}
+    # A bench is no search: each start draws a seed, which nothing calls
+    # another run's, and has no search log.
+    benches = [
+        event
+        for event in events
+        if event["kind"] == "job_start" and str(event["job"]).startswith("bench:")
+    ]
+    assert len({event["seed"] for event in benches} - {1234}) == len(benches) == 2
+    assert not any({"seed_from", "search_log"} & set(event) for event in benches)
+    configs = run / "configs"
+    for suffix in ("", ".attempt1"):
+        record = json.loads((configs / f"{names[0]}.json{suffix}").read_text())
+        assert record["env"][_SEED] == "1234" and record["seed_from"] == str(before)
+        log = run / "logs" / "autotune" / f"{names[0]}.log{suffix}"
+        assert f" seed=1234 seed_from={before}\n" in log.read_text()
+        assert "seed_from" not in (configs / f"{names[1]}.json{suffix}").read_text()
+    # Each attempt keeps the log of its own search, in the file that its
+    # start's event names for the job.
+    search = run / "logs" / "search"
+    logged = {
+        (event["job"], event["search_log"])
+        for event in events
+        if event["kind"] == "job_start" and "search_log" in event
+    }
+    assert logged == {
+        (f"autotune:{name}", str(search / name / "search")) for name in names
+    }
+    rows = {path.parent.name: path.read_text() for path in search.rglob("*.csv")}
+    assert rows == {
+        **dict.fromkeys(names, "attempt 2\n"),
+        **{f"{name}.attempt1": "attempt 1\n" for name in names},
+    }
+    assert record["env"]["HELION_AUTOTUNE_LOG"] == str(search / names[0] / "search")
+    # Run again without search logs, it searches from that seed again. The
+    # search logs of the run before move aside with its record; those of a
+    # start that left no record go, as its log does (the autotuner would
+    # append the next search to them).
+    (configs / f"{names[1]}.json").unlink()
+    flags = (*flags, "--retune", "--no-search-logs")
+    run, events = _stub_campaign(tmp_path, monkeypatch, {}, *flags, kernels=kernels)
+    assert starts(events, names[0]) == [(1234, str(before))]
+    assert not any("search_log" in event for event in events)
+    record = json.loads((configs / f"{names[0]}.json").read_text())
+    assert record["env"][_SEED] == "1234" and "HELION_AUTOTUNE_LOG" not in record["env"]
+    assert sorted(path.name for path in search.iterdir()) == [
+        f"{names[0]}.attempt1",
+        f"{names[0]}.prev",
+        f"{names[1]}.attempt1",
+    ]
+    assert (search / f"{names[0]}.prev" / "search.csv").read_text() == "attempt 2\n"
+
+
+@pytest.mark.slow
+@_requires_proc
+def test_the_files_a_job_sets_aside_under_one_name_are_one_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An autotune that runs eight times: the campaign's k-th start draws the
+    # seed k, which its log's header names, and the stub job writes k to its
+    # record and to its search log.
+    name = "sum_000000000001__s1__triton"
+    logs = tmp_path / "run" / "logs"
+    record = tmp_path / "run" / "configs" / f"{name}.json.prev"
+    log = logs / "autotune" / f"{name}.log.prev"
+    rows = logs / "search" / f"{name}.prev" / "search.csv"
+    drawn = itertools.count(1)
+    monkeypatch.setattr(campaign.secrets, "randbits", lambda bits: next(drawn))
+    # Its sixth start is contaminated and the seventh, the retry, fails
+    # without a record, so the sixth's record is kept for the job while its
+    # log and search logs stay the attempt's.
+    plan = {f"{name}.json": [0, 0, 0, 0, 0, 83, None, 0]}
+    seed = re.compile(r" seed=(\d+)$", re.MULTILINE)
+    # After each campaign, the start whose record, log and search logs are
+    # the job's .prev ones (None: no such file). They are the previous
+    # run's, each of them or none: an older run's do not stay where the
+    # previous one kept no search logs (the fourth start) or left its log
+    # and search logs with an attempt (the sixth).
+    for flags, previous in (
+        ((), (None, None, None)),
+        (("--retune",), (1, 1, 1)),
+        (("--retune",), (2, 2, 2)),
+        (("--retune", "--no-search-logs"), (3, 3, 3)),
+        (("--retune",), (4, 4, None)),
+        (("--retune",), (5, 5, 5)),
+        (("--retune",), (6, None, None)),
+    ):
+        _stub_campaign(tmp_path, monkeypatch, plan, "--phases", "autotune", *flags)
+        assert previous == (
+            json.loads(record.read_text())["attempt"] if record.exists() else None,
+            int(cast("re.Match[str]", seed.search(log.read_text()))[1])
+            if log.exists()
+            else None,
+            int(rows.read_text().split()[1]) if rows.exists() else None,
+        )
+    kept = json.loads(record.read_text())
+    assert kept["contaminated"] and len(kept["contaminated_attempts"]) == 1
+    assert sorted(path.name for path in (logs / "search").iterdir()) == [
+        name,
+        f"{name}.attempt1",
+    ]
+    assert sorted(path.name for path in (logs / "autotune").iterdir()) == [
+        f"{name}.log",
+        f"{name}.log.attempt1",
+        f"{name}.log.attempt2",
+    ]
+
+
 def _toy_kernels(backend: str, version: int = 1) -> dict[str, dict[str, str]]:
     """The kernels of a toy autotune record."""
     return {
@@ -3145,6 +3501,124 @@ def test_the_final_tables_count_only_clean_sampled_records(
     found = json.loads((run / "report.json").read_text())
     every = found["aggregates"]["cold_us"]["all kernels"]
     assert every["kernels"] == 4 and every["triton_vs_inductor_kernels"] == 5
+
+
+def test_the_report_says_which_autotunes_searched_from_the_baselines_seeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, before, third = (tmp_path / name for name in ("after", "before", "third"))
+
+    def tuned(
+        where: Path, index: int, backend: str, seed: int | None, **fields: object
+    ) -> str:
+        repro = f"sum_00000000000{index}"
+        env = {} if seed is None else {_SEED: str(seed)}
+        _toy_tuned(where, repro, "s1", backend, env=env, **fields)
+        return f"{repro}__s1__{backend}"
+
+    _toy_bench(run, "sum_000000000001", "s1", {"inductor": 100.0, "helion_cute": 50.0})
+    # The baseline's seeds; it has autotuned the fourth port again since
+    # this run took its seed, and has no record of the sixth and seventh.
+    for index, seed in enumerate((10, 20, 30, 41, 50), 1):
+        tuned(before, index, "cute", seed)
+    reused = {
+        "reused_from": str(before / "configs" / "sum_000000000001__s1__triton.json")
+    }
+    tuned(before, 1, "triton", 11)
+    tuned(before, 3, "triton", 31)
+    paired = [
+        # Given the baseline's seed, or the seed that both runs took from a
+        # third: the records name one seed either way.
+        tuned(run, 1, "cute", 10, seed_from=str(before)),
+        tuned(run, 2, "cute", 20, seed_from=str(third)),
+        tuned(run, 3, "triton", 31, seed_from=str(before)),
+    ]
+    unpaired = {
+        tuned(run, 3, "cute", 99): "a seed of its own",
+        tuned(run, 4, "cute", 40, seed_from=str(before)): (
+            "a seed taken from before, which names another now"
+        ),
+        tuned(run, 5, "cute", 55, seed_from=str(third)): "a seed taken from third",
+        tuned(run, 6, "cute", 60, seed_from=str(before)): (
+            "a seed taken from before, which names none now (no autotune record)"
+        ),
+        # A search that was given no seed (autotune.py by hand) drew its own:
+        # no seed on either side is not the same seed.
+        tuned(run, 7, "cute", None): "a seed of its own",
+    }
+    # No searches of this run: a record reused from the baseline, which has
+    # its seed, a provisional one, and a copy that --configs-from made of the
+    # baseline's (until an autotune of this run replaces the copy).
+    tuned(run, 1, "triton", 11, **reused)
+    tuned(run, 2, "triton", 21, provisional=True, **reused)
+    copy = run / "configs" / f"{tuned(run, 5, 'triton', 51)}.json"
+    digests = [hashlib.sha256(copy.read_bytes()).hexdigest(), "an earlier copy's"]
+    tuned(before, 5, "triton", 51)
+    argv = ["report.py", str(run), "--selection", str(tmp_path / "none.json")]
+
+    def report_on(*flags: str) -> tuple[dict[str, object], str]:
+        monkeypatch.setattr(sys, "argv", [*argv, *flags])
+        report.main()
+        found = json.loads((run / "report.json").read_text())
+        return found, (run / "report.md").read_text()
+
+    def copied(**entry: str) -> None:
+        manifest = {copy.name: {"source": "before", **entry}}
+        (run / campaign.COPIED_CONFIGS).write_text(json.dumps(manifest))
+
+    copied(sha256=digests[1])
+    found, text = report_on("--baseline", str(before))
+    assert found["seed_pairing"]["paired"] == sorted([*paired, copy.stem])
+    assert "cute 2 of 7, triton 2 of 2." in text
+    # The record is a copy by the digest of the copy that was made, and by
+    # that of the copy it was to replace (the campaign died before it did).
+    for entry in (
+        {"sha256": digests[0]},
+        {"sha256": digests[1], "replaces": digests[0]},
+    ):
+        copied(**entry)
+        found, text = report_on("--baseline", str(before))
+        assert found["seed_pairing"] == {
+            "baseline": str(before),
+            "paired": paired,
+            "unpaired": unpaired,
+        }
+    assert (
+        "Autotune seeds: 3 of the 8 autotunes this run made searched from the "
+        "seed of before's autotune of the same port (`campaign.py --seeds-from`): "
+        "cute 2 of 7, triton 1 of 1."
+    ) in text
+    own = [name for name, why in unpaired.items() if why == "a seed of its own"]
+    assert f"\n- a seed of its own: 2 ({', '.join(own)})\n" in text
+    # Paired by seed is not yet the same initial population: the note says so.
+    same_space = "only where both trees build the same search space for a port"
+    assert same_space in text
+    for name, why in unpaired.items():
+        assert name in own or f"\n- {why}: 1 ({name})\n" in text
+    # Against a run whose seeds it shares nowhere (it has no records), and
+    # without a baseline.
+    found, text = report_on("--baseline", str(third))
+    assert found["seed_pairing"]["paired"] == []
+    assert (
+        "Autotune seeds: none of the 8 autotunes this run made searched from the "
+        "seed of third's autotune of the same port"
+    ) in text
+    assert (
+        "Their seeds:\n\n- a seed of its own: 2\n"
+        "- a seed taken from before: 4\n"
+        "- a seed taken from third, which names none now (no autotune record): 2\n"
+    ) in text
+    assert same_space not in text
+    found, text = report_on()
+    assert "seed_pairing" not in found and "Autotune seeds" not in text
+    # A run of copies alone (--configs-from) made no autotune.
+    for path in (run / "configs").iterdir():
+        if path != copy:
+            path.unlink()
+    found, text = report_on("--baseline", str(before))
+    assert found["seed_pairing"]["paired"] == []
+    assert found["seed_pairing"]["unpaired"] == {}
+    assert "Autotune seeds: this run made no autotune of its own" in text
 
 
 def _add_fields(run: Path, repro: str, shape: str, **fields: object) -> None:
@@ -3573,7 +4047,29 @@ def test_a_restart_keeps_the_cleanest_attempt_once_the_retries_are_spent(
             sampled = _toy_activity(sm)
             sampled["processes"] = {"eve:7": {"max_sm": sm, "active_s": seconds}}
             path.write_text(json.dumps({**record, "foreign_gpu_activity": sampled}))
+        # The campaign that runs with fewer retries now had been stopped
+        # while the job ran a third time: what that start left of itself,
+        # its log and search logs, is no file of the attempt that is kept,
+        # and goes aside as the next attempt's. The one that stopped before
+        # keeping the cleanest had started the job no further time, so
+        # nothing is set aside for it.
+        left = "a start that was stopped\n" if where == "fewer" else None
+        logs = tmp_path / where / "run" / "logs"
+        log = logs / "autotune" / f"{Path(name).stem}.log"
+        search = logs / "search" / Path(name).stem / "search.csv"
+        if left is not None:
+            for path in (log, search):
+                path.parent.mkdir(parents=True)
+                path.write_text(left)
         _, events = _stub_campaign(tmp_path / where, monkeypatch, {}, *flags)
+        aside = f".attempt{len(attempts) + 1}"
+        assert not log.exists() and not search.parent.exists()
+        set_aside = (
+            log.with_name(log.name + aside),
+            search.parent.with_name(search.parent.name + aside) / "search.csv",
+        )
+        found = [p.read_text() if p.exists() else None for p in set_aside]
+        assert found == [left, left]
         started = [e["job"] for e in events if e["kind"] == "job_start"]
         assert started == ["bench:sum_000000000001__s1"]
         kept = json.loads((configs / name).read_text())
@@ -3584,6 +4080,111 @@ def test_a_restart_keeps_the_cleanest_attempt_once_the_retries_are_spent(
             (e["action"], e["gpu"]) for e in events if e["kind"] == "job_contaminated"
         ]
         assert settled == [("kept_cleanest", None)]
+        # A campaign stopped between the two steps repeats them when it
+        # starts again, and what it set aside the first time stays (the
+        # bench runs again for the record that was kept anew).
+        (configs / name).unlink()
+        _, events = _stub_campaign(tmp_path / where, monkeypatch, {}, *flags)
+        assert [e["job"] for e in events if e["kind"] == "job_start"] == started
+        assert json.loads((configs / name).read_text())["contaminated"] is True
+        found = [p.read_text() if p.exists() else None for p in set_aside]
+        assert found == [left, left]
+
+
+def _stop_once_moved(monkeypatch: pytest.MonkeyPatch, moved: Path) -> None:
+    """Have ``Path.replace`` send this process SIGTERM right after it has
+    moved the file ``moved``, while ``monkeypatch`` holds."""
+    replace = pathlib.Path.replace
+
+    def stopped_after(path: Path, target: Path) -> Path:
+        result = replace(path, target)
+        if path == moved:
+            os.kill(os.getpid(), signal.SIGTERM)
+        return result
+
+    monkeypatch.setattr(pathlib.Path, "replace", stopped_after)
+
+
+def test_a_stop_signal_at_startup_waits_for_a_jobs_files_as_well(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A stopped campaign left a contaminated bench record unsettled, with
+    # its log. The next campaign sets both aside while it queues its jobs,
+    # and is told to stop when the log has moved and the record has not.
+    kernels = [{"repro": "sum_000000000001", "shape": "s1"}]
+    run, name = tmp_path / "run", "sum_000000000001__s1"
+    _toy_tuned(run, "sum_000000000001", "s1", "triton")
+    times = {"inductor": 2.0, "helion_triton": 1.0}
+    _toy_bench(run, "sum_000000000001", "s1", times, max_sm=83)
+    record = run / "bench" / f"{name}.json"
+    log = run / "logs" / "bench" / f"{name}.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("the contaminated bench\n")
+    # A signal that the campaign does not handle yet reaches this handler.
+    unhandled: list[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, frame: unhandled.append(1))
+    monkeypatch.setattr(campaign, "_deferred_stop", None)
+    try:
+        with monkeypatch.context() as patched:
+            _stop_once_moved(patched, log)
+            with pytest.raises(campaign.Interrupted):
+                _stub_campaign(
+                    tmp_path, patched, {}, "--phases", "bench", kernels=kernels
+                )
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    assert unhandled == []
+    # The campaign stopped before it had a job to start, with both files of
+    # the attempt set aside.
+    assert "campaign_start" not in (run / "campaign.jsonl").read_text()
+    assert not record.exists() and not log.exists()
+    assert record.with_name(f"{record.name}.attempt1").exists()
+    kept_log = log.with_name(f"{log.name}.attempt1")
+    assert kept_log.read_text() == "the contaminated bench\n"
+
+
+def test_a_stop_signal_waits_until_a_jobs_files_have_moved_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A finished autotune with its log and search logs. A campaign runs it
+    # again and is told to stop just as it has moved the log aside.
+    kernels = [{"repro": "sum_000000000001", "shape": "s1"}]
+    run, name = tmp_path / "run", "sum_000000000001__s1__triton"
+    _toy_tuned(run, "sum_000000000001", "s1", "triton")
+    log = run / "logs" / "autotune" / f"{name}.log"
+    search = run / "logs" / "search" / name / "search.csv"
+    for path in (log, search):
+        path.parent.mkdir(parents=True)
+        path.write_text("the first search\n")
+    monkeypatch.setattr(campaign, "_deferred_stop", None)
+    with monkeypatch.context() as patched:
+        _stop_once_moved(patched, log)
+        with pytest.raises(campaign.Interrupted):
+            _stub_campaign(
+                tmp_path,
+                patched,
+                {},
+                "--retune",
+                "--phases",
+                "autotune",
+                kernels=kernels,
+            )
+    # It stopped before the job started, and with the record and the search
+    # logs moved as well: the three are still one start's.
+    events = (run / "campaign.jsonl").read_text()
+    assert "job_start" not in events and "campaign_end" in events
+    kept = [
+        run / "configs" / f"{name}.json.prev",
+        log.with_name(f"{log.name}.prev"),
+        search.parent.with_name(f"{name}.prev") / "search.csv",
+    ]
+    assert all(path.exists() for path in kept)
+    assert not (run / "configs" / f"{name}.json").exists()
+    assert not log.exists() and not search.parent.exists()
+    # The campaign that starts next leaves them as they are.
+    monkeypatch.setattr(campaign, "_deferred_stop", None)
+    _stopped_campaign(tmp_path, monkeypatch, kernels, "triton", "--phases", "autotune")
+    assert [path.read_text() for path in kept[1:]] == ["the first search\n"] * 2
 
 
 def test_ports_timed_on_provisional_configs_show_but_do_not_count(

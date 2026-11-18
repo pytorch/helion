@@ -4,30 +4,43 @@
 Every job runs in a fresh process on one GPU, one job per GPU at a time. A
 GPU waits while another account's processes compute on it or a process of
 this account that the campaign did not start runs there; other accounts'
-idle resident processes do not hold it up. GPUs come from the machine's GPU
-board or from the command line:
+idle resident processes do not hold it up. GPUs come from the command line
+or from the machine's GPU board:
 
+- ``--gpus``: GPUs you hold on the board, by number. The campaign renews no
+  claims in this mode, so hold these for its whole run by starting it under
+  ``scripts/gpu_board.py run --gpus 0,1 -- python campaign.py --gpus 0,1
+  ...``, which renews its claim for as long as the command runs, however long
+  that is: the claim's ``--ttl`` (one hour unless given) is only how long it
+  can outlive a ``run`` that was killed. ``run`` does not wait for the GPUs:
+  it exits when one of them is busy, claimed or holds another account's idle
+  processes, before the campaign starts. This is the mode for a machine where
+  other accounts' jobs come and go without claims on the board: the campaign
+  runs on the GPUs named and on no other.
 - ``--board-gpus N``: claim free GPUs with ``scripts/gpu_board.py pick``
   while jobs can start and fewer than N are held (never shared GPUs:
   autotuning and timing need idle ones), renew the claims every third of
   ``--board-ttl`` while running, and hand a GPU back whenever no job can
   start on it, such as while the remaining benches wait for autotunes
-  running elsewhere. ``gpu_board.py renew`` extends every claim of the
-  board session, the campaign's and any other the session holds (run the
-  campaign under a ``GPU_BOARD_SESSION`` of its own to keep others out).
-  The campaign does not read board messages; stop it to give back GPUs it
-  is using.
-- ``--gpus``: GPUs you hold on the board. The campaign renews no claims in
-  this mode, so hold these for its whole run, for example by starting it
-  under ``scripts/gpu_board.py run --gpus 0,1 --ttl 2h -- python
-  campaign.py --gpus 0,1 ...``, which renews its claim while the command
-  runs.
+  running elsewhere. ``pick`` takes any GPU that is free when it asks,
+  whichever account uses it otherwise: one that another account's jobs
+  come back to contaminates the jobs the campaign runs there, and nothing
+  here keeps the campaign to a set of GPUs. ``gpu_board.py renew`` extends
+  every claim of the board session, the campaign's and any other the
+  session holds (run the campaign under a ``GPU_BOARD_SESSION`` of its own
+  to keep others out). The campaign does not read board messages; stop it
+  to give back GPUs it is using.
 
 The jobs:
 
 - ``autotune``: a cold full autotune (``HELION_AUTOTUNE_EFFORT=full``, forced,
-  fresh random seed, private cache directories) of one port on one backend,
-  written to ``<run>/configs/<repro>__<shape>__<backend>.json``.
+  a fresh random seed or, with ``--seeds-from``, another run's, private cache
+  directories) of one port on one backend, written to
+  ``<run>/configs/<repro>__<shape>__<backend>.json``. The autotuner logs
+  every config it benchmarks to
+  ``<run>/logs/search/<repro>__<shape>__<backend>/search.csv`` (``SEARCH_LOG``;
+  ``--no-search-logs`` keeps none), so a campaign's searches can be analysed
+  afterwards without replaying them.
 - ``bench``: ``bench.py`` for one (repro, shape) once its autotunes have
   finished, whether or not they succeeded (a backend without a usable
   autotune record fails on its own; the other implementations are timed),
@@ -47,12 +60,19 @@ autotune's for long enough: ``common.foreign_activity``), or whose
 activity samples do not cover it (``common.activity_coverage_issue``: the
 sampling failed or stalled), runs again, up to ``--retry-contaminated`` more
 times, on another GPU when one is free. Each such attempt's record stays as
-``<record>.attempt<k>``, and its log as ``<log>.attempt<k>``. The first clean,
+``<record>.attempt<k>``, its log as ``<log>.attempt<k>`` and its search logs
+as ``<run>/logs/search/<record name>.attempt<k>``. The first clean,
 covered attempt's record is the job's, listing the attempts before it
 (``contaminated_attempts``); if every attempt was contaminated or not covered,
 or a retry fails (times out, crashes), the best (a covered one first, then by
 ``common.contamination_rank``) is kept with that list and ``contaminated:
-true``, and reports leave it out.
+true``, and reports leave it out. The record kept is a copy of that
+attempt's: its log and search logs stay under the attempt's names (the
+``job_contaminated`` event names the attempt as ``kept``). A record and a
+``job_start`` event name the files the job wrote while it ran (``log``,
+``search_log``, the record's ``env.HELION_AUTOTUNE_LOG``), not where they
+are once the job is set aside: add the record's suffix (``.attempt<k>``,
+``.prev``) to the log and to the search logs' directory.
 
 Finished jobs are skipped when the campaign is restarted, so it can be
 interrupted and resumed; ``--retune``/``--rebench`` redo them, and a point is
@@ -64,15 +84,16 @@ pinned to), so it also holds for a record that was copied, removed or dated
 oddly, and for a bench that left out a port of ``--backends`` which the
 benches now time and the point has an ok autotune record of (it ran with
 other ``--bench-impls``). Starting a job moves its previous record to
-``<record>.prev`` (and its
-log to ``<log>.prev``), so a rerun that fails, times out or is stopped leaves
-no record that passes for finished (or that a bench would pin). A restart
-resumes a job the campaign stopped between contaminated attempts with the
-attempts so far (the ``.attempt<k>`` files newer than its ``.prev``; of a
-bench, those timed on the autotune records its point has now), and
-settles a record the campaign stopped before settling, the last allowed
-attempt's included; a job without a record whose attempts have spent the
-retries keeps the cleanest of them.
+``<record>.prev`` (and its log and search logs to ``<log>.prev`` and
+``<search logs>.prev``; where the previous run left none, as with
+``--no-search-logs``, an older ``.prev`` of them goes, since it is not that
+record's), so a rerun that fails, times out or is stopped leaves no record
+that passes for finished (or that a bench would pin). A restart resumes a job
+the campaign stopped between contaminated attempts with the attempts so far
+(the ``.attempt<k>`` files newer than its ``.prev``; of a bench, those timed
+on the autotune records its point has now), and settles a record the campaign
+stopped before settling, the last allowed attempt's included; a job without a
+record whose attempts have spent the retries keeps the cleanest of them.
 However the campaign stops (done, an error, SIGINT, SIGTERM or SIGHUP), it
 kills its running jobs -- each job's processes, found by parent pid (the
 autotuner's workers start sessions of their own) and by a marker in their
@@ -82,10 +103,12 @@ its board claims; only SIGKILL leaves jobs behind. A job whose leader exits
 on its own has what is left of it killed the same way before its cache
 directory goes.
 A stop signal that arrives while a job is being started or a GPU claimed
-takes effect once the job or claim is recorded. A board failure (an error
-from ``pick``, a failed ``renew`` or ``release``) stops the campaign; a
-SECURITY ALERT from the board stops it with exit status 4 and leaves the
-claims to expire.
+takes effect once the job or claim is recorded, and one that arrives while a
+job's record, log and search logs are set aside once all of them have moved
+(also as the campaign starts, when it settles what a stopped one left). A
+board failure (an error from ``pick``, a failed ``renew`` or ``release``)
+stops the campaign; a SECURITY ALERT from the board stops it with exit status
+4 and leaves the claims to expire.
 
 ``--configs-from DIR`` benches the picks of a finished run again without
 autotuning anything: it copies the autotune records of the selected points
@@ -100,11 +123,13 @@ those the option has made DIR's. With ``--rotate-inputs N`` the benches also
 time every implementation on N private input sets of its own (``bench.py``'s
 ``rot_us``); together they add that timing to a run's picks::
 
-    python benchmarks/cute/better_benchmark/campaign.py \\
+    scripts/gpu_board.py run --gpus 0,1 \\
+        --purpose "better-benchmark rot_us" -- \\
+        python benchmarks/cute/better_benchmark/campaign.py \\
         --selection benchmarks/cute/better_benchmark/selection.json \\
         --run-dir artifacts/bb-sweep-rot \\
         --configs-from artifacts/bb-sweep/configs --phases bench \\
-        --rotate-inputs 8 --board-gpus 2
+        --rotate-inputs 8 --gpus 0,1
 
 Started again, it copies the picks this run lacks and those that differ from
 the copy it made of them (a pick DIR's run has autotuned again since, or
@@ -135,11 +160,47 @@ another N than their records have, or where the pass on N sets failed, it
 starts nothing for them and names them in a ``rotate_inputs_not_added``
 event (``--rebench`` runs them again).
 
-Example::
+``--seeds-from RUN`` pairs this run's searches with another run's, for a
+before/after comparison of two trees. On a large kernel the pick of a cold
+autotune follows the initial population its random seed draws: one seed
+starts the searches of two trees from the same population and ends them at
+the same level of pick, where searches from different seeds ended 4 to 10%
+apart (the README has the measurements). That holds where both trees build
+the same search space for the port: the seed draws the population from that
+space, so a tree that adds or changes a tunable, a seed config or the way the
+population is drawn starts from another one on the same seed. With the option
+each autotune takes the seed of the autotune record that stands in
+``RUN/configs`` for the same (repro, shape, backend)
+(``common.standing_seed``): the seed in that record's ``env``, whichever
+attempt made it (the first clean one, or the cleanest kept after contaminated
+attempts) and whichever run (one that ``plan_run.py`` reused names its own
+search's). The job searches from that seed on every start: a rerun after a
+contaminated attempt and a restart of a stopped campaign with the same
+arguments repeat it, where a job otherwise draws a fresh seed each time. Its
+autotune record (``seed_from``) and its ``job_start`` event name RUN, and the
+``seeds_from`` event lists the seeds of the autotunes the campaign is to run
+and, as ``fresh``, the ones left on a fresh seed, with why RUN names none (no
+ok record there; a provisional one, which is no search of that run; a search
+that was given no seed). Autotunes the campaign does not run take none:
+finished ones, and those whose records ``plan_run.py`` reused. The campaign
+stops before changing anything when RUN names no seed for any selected
+autotune (another directory than a run's, say). ``report.py --baseline RUN``
+says how many of this run's autotunes searched from RUN's seeds::
 
-    python benchmarks/cute/better_benchmark/campaign.py \\
+    scripts/gpu_board.py run --gpus 0,1,2,3 \\
+        --purpose "better-benchmark campaign" -- \\
+        python benchmarks/cute/better_benchmark/campaign.py \\
         --selection benchmarks/cute/better_benchmark/selection.json \\
-        --run-dir artifacts/bb-sweep --board-gpus 4
+        --run-dir artifacts/bb-after --seeds-from artifacts/bb-before \\
+        --gpus 0,1,2,3
+
+Example, on GPUs 0 to 3 held on the board for the whole run::
+
+    scripts/gpu_board.py run --gpus 0,1,2,3 \\
+        --purpose "better-benchmark campaign" -- \\
+        python benchmarks/cute/better_benchmark/campaign.py \\
+        --selection benchmarks/cute/better_benchmark/selection.json \\
+        --run-dir artifacts/bb-sweep --gpus 0,1,2,3
 """
 
 from __future__ import annotations
@@ -285,6 +346,16 @@ def busy_uuids() -> set[str] | None:
     return busy
 
 
+# The base name of the files that the autotuner logs an autotune job's
+# searches to (``HELION_AUTOTUNE_LOG``), in a directory of the job's own
+# (``<run>/logs/search/<record name>``). The autotuner replaces the name's
+# suffix: ``search.csv`` (two rows per benchmarked config, ``started`` and
+# its outcome, in the order they happened: ``config_id``, ``generation``,
+# ``status``, ``perf_ms``, ``compile_time_s`` and the config, under the
+# ``run_id`` of the kernel's search), ``search.log`` (the search's messages,
+# which the job's log has too) and, where a search records the digests of
+# the code its configs generate, ``search.sources.csv``.
+SEARCH_LOG = "search"
 BOARD = REPO_ROOT / "scripts" / "gpu_board.py"
 
 
@@ -498,17 +569,32 @@ def kill_job(
     return True
 
 
-def job_env(gpu: str, cache: Path, seed: int, marker: str) -> dict[str, str]:
+def job_env(
+    gpu: str,
+    cache: Path,
+    seed: int,
+    marker: str,
+    seed_from: str | None = None,
+    search_log: Path | None = None,
+) -> dict[str, str]:
+    """The environment of a job on ``gpu`` with the random seed ``seed``;
+    ``seed_from`` names the run that ``--seeds-from`` took it from (for the
+    autotune record), ``search_log`` the base path of the files the
+    autotuner logs its searches to (``HELION_AUTOTUNE_LOG``)."""
     # Do not inherit an unrelated experiment's search budget, forced config
-    # or backend; optional package paths still work.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("HELION_")}
+    # or backend, nor another campaign's word on the seed; optional package
+    # paths still work.
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("HELION_") and k != common.SEED_FROM
+    }
     env.update(
         # The board and nvidia-smi number GPUs in PCI bus order.
         CUDA_DEVICE_ORDER="PCI_BUS_ID",
         CUDA_VISIBLE_DEVICES=gpu,
         HELION_AUTOTUNE_EFFORT="full",
         HELION_FORCE_AUTOTUNE="1",
-        HELION_AUTOTUNE_RANDOM_SEED=str(seed),
         HELION_CACHE_DIR=str(cache / "helion"),
         TRITON_CACHE_DIR=str(cache / "triton"),
         TORCHINDUCTOR_CACHE_DIR=str(cache / "inductor"),
@@ -516,7 +602,12 @@ def job_env(gpu: str, cache: Path, seed: int, marker: str) -> dict[str, str]:
         CUDA_CACHE_PATH=str(cache / "cuda"),
         PYTHONPATH=os.pathsep.join([str(REPO_ROOT), env.get("PYTHONPATH", "")]),
     )
+    env[common.SEED_VARIABLE] = str(seed)
     env[common.JOB_MARKER] = marker
+    if seed_from is not None:
+        env[common.SEED_FROM] = seed_from
+    if search_log is not None:
+        env["HELION_AUTOTUNE_LOG"] = str(search_log)
     return env
 
 
@@ -530,7 +621,7 @@ def job_env(gpu: str, cache: Path, seed: int, marker: str) -> dict[str, str]:
 # a copy that was not made, or of one that was removed (the campaign died
 # before the entry went): the entries of the selected records are then
 # those of the copies the run holds (``ConfigCopies.entries``).
-COPIED_CONFIGS = "configs_copied.json"
+COPIED_CONFIGS = common.COPIED_CONFIGS
 
 
 class ConfigCopies(NamedTuple):
@@ -587,7 +678,7 @@ def config_copies(
                     else None
                 )
             continue
-        if entry is None or digest not in (entry["sha256"], entry.get("replaces")):
+        if not common.holds_copy(entry, digest):
             found.own.append(name)
         elif data is None:
             found.remove.append(name)
@@ -641,6 +732,22 @@ def main() -> None:
         help="copy the selected points' autotune records from DIR, another "
         "run's configs, into this run and bench on them (needs --phases "
         "bench: nothing is autotuned)",
+    )
+    parser.add_argument(
+        "--seeds-from",
+        type=Path,
+        default=None,
+        metavar="RUN",
+        help="give each autotune the random seed that RUN's autotune of the "
+        "same port had (the record standing in RUN/configs names it), on "
+        "every attempt; a port RUN names no seed for gets a fresh one",
+    )
+    parser.add_argument(
+        "--search-logs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep the autotuner's per-config log of every search "
+        "(HELION_AUTOTUNE_LOG) under <run>/logs/search",
     )
     parser.add_argument(
         "--rotate-inputs",
@@ -743,6 +850,45 @@ def main() -> None:
                 "run's picks in a run directory of their own (--run-dir)"
             )
         replaced = [name for name in copies.copy if (configs_dir / name).exists()]
+    # --seeds-from: the seed of each selected autotune that the other run
+    # names one for, by job key; for the rest, why it names none
+    # (common.standing_seed). Checked before the run directory is made, too.
+    seeds: dict[str, int] = {}
+    unseeded: dict[str, str] = {}
+    seeds_dir = None if args.seeds_from is None else args.seeds_from.resolve()
+    if seeds_dir is not None:
+        if "autotune" not in phases:
+            parser.error("--seeds-from gives autotunes their seeds: --phases autotune")
+        if seeds_dir == run_dir:
+            # A job that starts again moves its record aside, so a restart
+            # would no longer find the seed of a job that was running.
+            parser.error("--seeds-from names this run: take another run's seeds")
+        if not (seeds_dir / "configs").is_dir():
+            parser.error(
+                f"--seeds-from {args.seeds_from} has no configs directory: give "
+                "a run directory (RUN, not RUN/configs)"
+            )
+        for e in entries:
+            for backend in backends:
+                key = Job("autotune", e["repro"], e["shape"], backend).key
+                seed, why = common.standing_seed(
+                    seeds_dir, e["repro"], e["shape"], backend
+                )
+                if seed is None:
+                    assert why is not None
+                    unseeded[key] = why
+                else:
+                    seeds[key] = seed
+        if not seeds:
+            # Another run directory than the one meant, or its configs: every
+            # autotune would search from a fresh seed, as without the option.
+            reason = next(
+                (f" ({key}: {why}, say)" for key, why in unseeded.items()), ""
+            )
+            parser.error(
+                f"--seeds-from {args.seeds_from} names no seed for any of the "
+                f"{len(unseeded)} selected autotunes{reason}"
+            )
     if args.rotate_inputs < 0 or args.rotate_inputs == 1:
         parser.error(f"--rotate-inputs {args.rotate_inputs}: at least 2 input sets")
     bench_dir = run_dir / "bench"
@@ -760,16 +906,40 @@ def main() -> None:
         return common.bench_record_path(bench_dir, job.repro, job.shape)
 
     def set_aside(job: Job, suffix: str) -> Path:
-        """Move a job's record to ``<record><suffix>`` and its log along to
-        ``<log><suffix>`` (each attempt keeps both, where it has them); the
-        record's new path."""
+        """Move a job's record to ``<record><suffix>``, its log along to
+        ``<log><suffix>`` and an autotune's search logs to
+        ``<directory><suffix>`` (each attempt keeps them all, where it has
+        them); the record's new path.
+
+        The log and the search logs that had those names go, also where the
+        job has none to put there (a start with ``--no-search-logs``, a
+        record that ``plan_run.py`` wrote or that was kept as the cleanest
+        attempt's), so the files of one suffix are one start's. They are
+        those of the run before the previous one (``.prev``) or of a retry
+        that failed without a record, which left its ``.attempt<k>`` to the
+        next attempt.
+
+        A stop signal waits until all of them have moved: a campaign stopped
+        after the log and before the record would, when it starts again,
+        find the record in place, set the job aside once more and remove
+        the log that had just been kept."""
         out = record_path(job)
         log = log_path(job)
-        if log.exists():
-            log.replace(log.with_name(f"{log.name}{suffix}"))
         kept = out.with_name(f"{out.name}{suffix}")
-        if out.exists():
-            out.replace(kept)
+        with stop_signals_deferred():
+            kept_log = log.with_name(f"{log.name}{suffix}")
+            kept_log.unlink(missing_ok=True)
+            if log.exists():
+                log.replace(kept_log)
+            if job.kind == "autotune":
+                search = search_dir(job)
+                kept_search = search.with_name(f"{search.name}{suffix}")
+                if kept_search.exists():
+                    shutil.rmtree(kept_search)
+                if search.exists():
+                    search.replace(kept_search)
+            if out.exists():
+                out.replace(kept)
         return kept
 
     def next_attempt(job: Job) -> str:
@@ -783,6 +953,12 @@ def main() -> None:
 
     def log_path(job: Job) -> Path:
         return logs_dir / job.kind / f"{record_path(job).stem}.log"
+
+    def search_dir(job: Job) -> Path:
+        """The directory of an autotune job's search logs (``--search-logs``):
+        the autotuner appends every search of the job to the ``search.*``
+        files there (``SEARCH_LOG``)."""
+        return logs_dir / "search" / record_path(job).stem
 
     def read(path: Path) -> dict[str, Any] | None:
         try:
@@ -942,6 +1118,15 @@ def main() -> None:
                 job.attempt > args.retry_contaminated + 1
                 and read(record_path(job)) is None
             ):
+                # What a start that the campaign stopped left of itself (its
+                # log, its search logs) is that start's, not the kept
+                # attempt's: it goes aside like a retry that failed. Only
+                # where there is something: a campaign stopped right after
+                # this step repeats it, and must keep what it set aside.
+                if log_path(job).exists() or (
+                    job.kind == "autotune" and search_dir(job).exists()
+                ):
+                    set_aside(job, next_attempt(job))
                 event(
                     kind="job_contaminated",
                     job=job.key,
@@ -1013,6 +1198,10 @@ def main() -> None:
             bench_impls=(bench_impls or "").split(","),
         )
 
+    # From here on a stop signal raises Interrupted, and waits where it is
+    # deferred: queueing the jobs already sets files aside (set_aside).
+    for signum in STOP_SIGNALS:
+        signal.signal(signum, _raise_interrupted)
     # Finished benches that --rotate-inputs does not run again, though their
     # records lack the timing on that many sets: they have none, one on
     # another count of sets, or a pass on that count that failed.
@@ -1058,6 +1247,19 @@ def main() -> None:
             "leaves this run as it is",
         )
 
+    if seeds_dir is not None:
+        # Which of the autotunes to run search from the other run's seeds,
+        # and which from a fresh one, the other run naming none. Autotunes
+        # that do not run (finished ones, records plan_run.py reused) take
+        # none.
+        queued = [job.key for job in pending if job.kind == "autotune"]
+        event(
+            kind="seeds_from",
+            source=str(seeds_dir),
+            seeds={key: seeds[key] for key in queued if key in seeds},
+            fresh={key: unseeded[key] for key in queued if key in unseeded},
+        )
+
     # Autotunes this campaign does not run count as finished (whether they
     # succeeded or not), so their benches can start.
     done: dict[str, bool] = {}
@@ -1084,13 +1286,25 @@ def main() -> None:
         return all(dep in done for dep in job.deps)
 
     def launch(job: Job, gpu: str) -> None:
-        seed = secrets.randbits(31)
+        # The other run's seed (--seeds-from) on every start of the job, a
+        # rerun after a contaminated attempt and a restart included: only
+        # then is the search the one that run's pick came from. Any other
+        # job draws a fresh seed each time.
+        taken = seeds.get(job.key)
+        seed = secrets.randbits(31) if taken is None else taken
+        seed_from = None if taken is None else str(seeds_dir)
         marker = secrets.token_hex(8)
         fields: dict[str, Any] = {}
+        if seed_from is not None:
+            fields["seed_from"] = seed_from
+        search_log = None
         out = record_path(job)
         log = log_path(job)
         if job.kind == "autotune":
             assert job.backend is not None
+            if args.search_logs:
+                search_log = search_dir(job) / SEARCH_LOG
+                fields["search_log"] = str(search_log)
             cmd = [
                 sys.executable,
                 str(PACKAGE_DIR / "autotune.py"),
@@ -1124,16 +1338,23 @@ def main() -> None:
         # the superseded config. Its log goes along.
         if out.exists():
             set_aside(job, ".prev")
+        if job.kind == "autotune":
+            # The search logs of a start that left no record (stopped,
+            # killed): the autotuner appends to the files it finds, and this
+            # start's log replaces that one's as well.
+            if search_dir(job).exists():
+                shutil.rmtree(search_dir(job))
         # The cleanup finds the job's process, cache and log through
         # ``running``: no signal between creating them and recording them.
         with stop_signals_deferred():
             cache = Path(tempfile.mkdtemp(prefix=f"bbjob-{job.repro[:20]}-"))
             handle = log.open("w")
-            handle.write(f"# {' '.join(cmd)}\n# gpu={gpu} seed={seed}\n")
+            source = "" if seed_from is None else f" seed_from={seed_from}"
+            handle.write(f"# {' '.join(cmd)}\n# gpu={gpu} seed={seed}{source}\n")
             handle.flush()
             proc = subprocess.Popen(
                 cmd,
-                env=job_env(gpu, cache, seed, marker),
+                env=job_env(gpu, cache, seed, marker, seed_from, search_log),
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 cwd=REPO_ROOT,
@@ -1321,8 +1542,6 @@ def main() -> None:
         return problems
 
     event(kind="campaign_start", jobs=len(pending), gpus=gpus, run_dir=str(run_dir))
-    for signum in STOP_SIGNALS:
-        signal.signal(signum, _raise_interrupted)
     error: BaseException | None = None
     try:
         schedule()
