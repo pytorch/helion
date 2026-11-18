@@ -1916,13 +1916,18 @@ class ConfigSpec:
         if key == "reduction_fusion":
             return self.backend.supports_config_key(key)
         if key == "host_tensor_descriptors":
-            return (
-                self.device is not None
-                and self.device.type == "cuda"
-                and self.target_device_capability is not None
-                and self.target_device_capability >= (9, 0)
-                and self.backend.supports_config_key(key)
-            )
+            if self.device is None:
+                return False
+            if self.device.type == "cuda":
+                return (
+                    self.target_device_capability is not None
+                    and self.target_device_capability >= (9, 0)
+                    and self.backend.supports_config_key(key)
+                )
+            # The Intel XPU launcher decomposes host TensorDescriptor
+            # arguments into base pointer, shape and strides, so no TMA
+            # hardware (and no capability floor) is needed.
+            return self.device.type == "xpu" and self.backend.supports_config_key(key)
         if (
             key == "cross_loop_pipeline"
             and self.device is not None

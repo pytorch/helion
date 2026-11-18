@@ -521,7 +521,13 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(result, x)
-        self.assertNotIn("_helion_tensor_descriptor(", code)
+        if DEVICE.type == "xpu":
+            # The 256-element box cap is a CUDA TMA limit; XPU descriptors
+            # decompose into plain loads, so the 512-wide box stays legal
+            # and the descriptor path is kept.
+            self.assertIn("_helion_tensor_descriptor(", code)
+        else:
+            self.assertNotIn("_helion_tensor_descriptor(", code)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_multiple_tensor_indices_fall_back(self):
@@ -2149,6 +2155,7 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
                     self.assert_tensor_descriptor_not_used_for(code, tensor_name)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfXPU("range_warp_specializes has no slots on XPU")
     @skipIfCudaCapabilityLessThan(
         (10, 0), reason="range_warp_specialize is offered from Blackwell on"
     )

@@ -635,7 +635,8 @@ _BASE_PALLAS_ACCEPTED = """
 
 # The keys ``TritonBackend.supports_config_key`` decides by the device the
 # row runs on: ``host_tensor_descriptors`` needs a CUDA device of capability
-# >= 9.0, ``cross_loop_pipeline`` is off on ROCm, ``waves_per_eu`` /
+# >= 9.0 or an XPU device (whose launcher decomposes the host descriptor),
+# ``cross_loop_pipeline`` is off on ROCm, ``waves_per_eu`` /
 # ``matrix_instr_nonkdim`` / ``xcd_remap`` are AMD tunables accepted only
 # there, and the MTIA tunables only on MTIA.
 _DEVICE_DECIDED_KEYS = frozenset(

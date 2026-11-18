@@ -1282,7 +1282,7 @@ class TestConfigAPI(TestCase):
             )
             self.assertFalse(spec.supports_config_key("cross_loop_pipeline"))
 
-    def test_host_tensor_descriptors_require_cuda_host_support(self) -> None:
+    def test_host_tensor_descriptors_require_device_host_support(self) -> None:
         with patch(
             "helion._compat.supports_host_tensor_descriptor",
             return_value=True,
@@ -1299,7 +1299,7 @@ class TestConfigAPI(TestCase):
                 num_sm=1,
             )
             self.assertTrue(cuda_spec.supports_config_key("host_tensor_descriptors"))
-            self.assertFalse(xpu_spec.supports_config_key("host_tensor_descriptors"))
+            self.assertTrue(xpu_spec.supports_config_key("host_tensor_descriptors"))
             pre_hopper_spec = ConfigSpec(
                 backend=TritonBackend(),
                 device=torch.device("cuda"),
@@ -1309,6 +1309,12 @@ class TestConfigAPI(TestCase):
             self.assertFalse(
                 pre_hopper_spec.supports_config_key("host_tensor_descriptors")
             )
+            cpu_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("cpu"),
+                num_sm=1,
+            )
+            self.assertFalse(cpu_spec.supports_config_key("host_tensor_descriptors"))
 
         with patch(
             "helion._compat.supports_host_tensor_descriptor",
@@ -1321,6 +1327,12 @@ class TestConfigAPI(TestCase):
                 target_device_capability=(9, 0),
             )
             self.assertFalse(cuda_spec.supports_config_key("host_tensor_descriptors"))
+            xpu_spec = ConfigSpec(
+                backend=TritonBackend(),
+                device=torch.device("xpu"),
+                num_sm=1,
+            )
+            self.assertFalse(xpu_spec.supports_config_key("host_tensor_descriptors"))
 
     def test_host_tensor_descriptors_autotune_and_normalize(self) -> None:
         with patch(
