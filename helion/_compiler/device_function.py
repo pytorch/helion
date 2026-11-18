@@ -2125,6 +2125,10 @@ class DeviceFunction:
         tls.functions.pop()
 
     @staticmethod
+    def has_current() -> bool:
+        return bool(getattr(tls, "functions", None))
+
+    @staticmethod
     def current() -> DeviceFunction:
         try:
             return tls.functions[-1]

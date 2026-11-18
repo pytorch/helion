@@ -65,7 +65,10 @@ class TestCapabilityHooks(unittest.TestCase):
                     backend.lowers_integer_powers, codegen_name in ("triton", "cute")
                 )
                 self.assertEqual(backend.requires_proved_integer_powers, name == "cute")
-                self.assertEqual(backend.tracks_statement_owners(), name == "cute")
+                self.assertEqual(
+                    backend.tracks_statement_owners(),
+                    codegen_name in ("triton", "cute"),
+                )
                 self.assertEqual(
                     backend.canonicalizes_reduction_loop_blocks(), name == "cute"
                 )

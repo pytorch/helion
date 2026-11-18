@@ -533,7 +533,9 @@ def _captured_value(node: torch.fx.Node) -> tuple[torch.fx.Node, object] | None:
         return (value, None) if isinstance(value, torch.fx.Node) else None
     if node.op != "placeholder":
         return None
-    for info in [info for infos in _device_ir_graphs() for info in infos]:
+    if (infos := _graph_infos(node)) is None:
+        return None
+    for info in infos:
         if (
             info.graph is not node.graph
             or not isinstance(info, NodeArgsGraphInfo)
@@ -644,10 +646,12 @@ def _device_ir_graphs() -> list[Sequence[GraphInfo]]:
 
     if lowering := getattr(tls, "device_irs", None):
         return [lowering[-1].graphs]
-    return [
-        DeviceFunction.current().codegen.codegen_graphs,
-        HostFunction.current().device_ir.graphs,
-    ]
+    result: list[Sequence[GraphInfo]] = []
+    if DeviceFunction.has_current():
+        result.append(DeviceFunction.current().codegen.codegen_graphs)
+    if HostFunction.has_current():
+        result.append(HostFunction.current().device_ir.graphs)
+    return result
 
 
 def _if_result_source(
@@ -879,6 +883,38 @@ def _is_scalar_integer_tensor_index(index: torch.Tensor) -> bool:
     return index.ndim == 0 and index.dtype in (torch.int32, torch.int64)
 
 
+def _unwrap_subgraph_placeholder(node: object) -> object:
+    """Unwrap loop-invariant or branch subgraph captures to their outer FX node."""
+    from ..language import _tracing_ops
+
+    def strip_alias(value: object) -> object:
+        while (
+            isinstance(value, torch.fx.Node)
+            and value.op == "call_function"
+            and value.target
+            in (
+                _tracing_ops._new_var,
+                torch.ops.aten.alias.default,
+            )
+        ):
+            value = value.args[0]
+        return value
+
+    seen: set[torch.fx.Node] = set()
+    while isinstance(node, torch.fx.Node) and node not in seen:
+        seen.add(node)
+        node = strip_alias(node)
+        if not isinstance(node, torch.fx.Node):
+            break
+        if (captured := _captured_value(node)) is not None:
+            outer, update = captured
+            if update is None or strip_alias(update) is node:
+                node = outer
+                continue
+        break
+    return node
+
+
 def _contiguous_integer_tensor_index(
     index: torch.Tensor, node: object
 ) -> _ContiguousIntegerTensorIndex | None:
@@ -902,6 +938,7 @@ def _contiguous_integer_tensor_index(
         return False
 
     def visit(value: object) -> tuple[tuple[int, object], ...] | None:
+        value = _unwrap_subgraph_placeholder(value)
         if not isinstance(value, torch.fx.Node):
             return None
         if value.target is torch.ops.prims.iota.default:
@@ -975,6 +1012,55 @@ def _contiguous_integer_tensor_index_at(
     return _contiguous_integer_tensor_index(index, indices[position])
 
 
+def _resolve_node_ast(state: CodegenState, value: torch.fx.Node) -> ast.AST | None:
+    """Resolve an FX node (unwrapping invariant subgraph placeholders) to its AST."""
+    unwrapped = _unwrap_subgraph_placeholder(value)
+    target = unwrapped if isinstance(unwrapped, torch.fx.Node) else value
+    raw_target = state.env.get(target)
+    if isinstance(raw_target, ast.AST):
+        result: ast.AST = raw_target
+    else:
+        outer_result: ast.AST | None = None
+        found, recorded = state.codegen.codegen_result_for_node(target)
+        if found and isinstance(recorded, ast.AST):
+            outer_result = recorded
+        elif target.op == "placeholder":
+            owned = state.codegen.statements_owned_by_node(target)
+            if (
+                owned
+                and isinstance(assign := owned[-1][1], ast.Assign)
+                and len(assign.targets) == 1
+                and isinstance(assigned_name := assign.targets[0], ast.Name)
+            ):
+                outer_result = expr_from_string(assigned_name.id)
+
+        if outer_result is not None:
+            active_stmt_ids = {id(stmts) for stmts in state.codegen.statements_stack}
+            pending = [target]
+            seen: set[torch.fx.Node] = set()
+            while pending:
+                curr = pending.pop()
+                if curr in seen:
+                    continue
+                seen.add(curr)
+                owned = state.codegen.statements_owned_by_node(curr)
+                if owned:
+                    if not any(id(body) in active_stmt_ids for body, _ in owned):
+                        return None
+                else:
+                    pending.extend(curr.all_input_nodes)
+            result = outer_result
+        elif isinstance(raw_value := state.env.get(value), ast.AST):
+            result = raw_value
+        else:
+            return None
+
+    fake = target.meta.get("val")
+    if isinstance(fake, torch.Tensor) and fake.ndim == 0:
+        return _scalar_tensor_index_ast(state, fake, result)
+    return result
+
+
 def _contiguous_integer_tensor_index_base(
     state: CodegenState, info: _ContiguousIntegerTensorIndex
 ) -> ast.AST | None:
@@ -986,13 +1072,7 @@ def _contiguous_integer_tensor_index_base(
         if isinstance(value, torch.SymInt):
             return expr_from_string(state.device_function.literal_expr(value))
         if isinstance(value, torch.fx.Node):
-            result = state.env.get(value)
-            if not isinstance(result, ast.AST):
-                return None
-            fake = value.meta.get("val")
-            if isinstance(fake, torch.Tensor) and fake.ndim == 0:
-                return _scalar_tensor_index_ast(state, fake, result)
-            return result
+            return _resolve_node_ast(state, value)
         return None
 
     result: ast.AST = ast.Constant(value=0)
