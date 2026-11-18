@@ -42,6 +42,7 @@ from ..runtime.config import _copy_config_structure
 from ..runtime.config_cache import ConfigCache
 from ..runtime.config_cache import ConfigSet
 from ..runtime.config_cache import _stored_config
+from ..runtime.settings import _env_get_bool
 from ..runtime.settings import _env_get_int
 from ..runtime.settings import _env_get_optional_int
 from ..runtime.structural_policy import StructuralConfig
@@ -62,11 +63,13 @@ from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
 from .benchmark_provider import _unset_fn
 from .benchmark_worker import BenchmarkWorkerUnkillable
+from .benchmarking import _BENCHMARK_CUDAGRAPH_ENV
 from .benchmarking import _FINAL_L2_FLUSH_ENV
 from .benchmarking import _L2_FLUSH_ENV
 from .benchmarking import _TARGET_REGIME_ENV
 from .benchmarking import MirroredBenchmarkTrace
 from .benchmarking import _mirrored_bench_call_layout
+from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import clear_jit_fast_path_caches
 from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
@@ -1695,6 +1698,11 @@ class PopulationMember:
         flat_values (FlatConfig): The flat representation of the configuration values.
         config (Config): The full configuration object.
         compile_time (float | None): The compilation time for this configuration.
+        timer_readings_from (int): The index in ``perfs`` of the first reading
+            the member took itself. Above 0 for a config settled with a copy
+            of an earlier candidate's reading in a search that reads its
+            candidates from the trace: the copy and a later reading are not
+            two readings of one config (``pattern_search.rereading_spread``).
     """
 
     fn: Callable[..., object]
@@ -1714,6 +1722,7 @@ class PopulationMember:
         "unknown",
     ] = "unknown"
     compile_time: float | None = None
+    timer_readings_from: int = 0
 
     @property
     def perf(self) -> float:
@@ -2014,6 +2023,24 @@ class PopulationBasedSearch(BaseSearch):
     # for callers that stub them and read the phase from here.
     _benchmarking_initial_population: bool = False
 
+    # ``Backend.autotune_short_kernel_below_us`` of the kernel's backend, read
+    # at construction: a search whose initial population's best config reads
+    # below this many microseconds times every later candidate from the CUDA
+    # activity trace (``_settle_candidate_timer``). ``None``: the backend
+    # names no bound, and the event timer reads every kernel. An algorithm
+    # that reads no initial population (``benchmark_initial_population``; the
+    # LLM-guided search times every batch as it comes) never reaches that
+    # choice and keeps the event timer whatever the bound.
+    short_kernel_below_us: float | None = None
+    # Whether this search settled on the trace timer: its candidates and
+    # re-timings are then kernel durations from the trace, a pattern search
+    # counts steps within their repeatability as ties
+    # (``PatternSearch._reading_tolerance``), and the early stop of a
+    # differential-evolution search counts a move of the best within it as
+    # no improvement (``DifferentialEvolutionSearch._stop_tolerance``).
+    traces_candidates: bool = False
+    _candidate_timer_settled: bool = False
+
     def __init__(
         self,
         kernel: _AutotunableKernel,
@@ -2061,6 +2088,9 @@ class PopulationBasedSearch(BaseSearch):
         )
         self._compiler_refinement_keys = (
             self.config_spec.search_surface.compiler_refinement_keys
+        )
+        self.short_kernel_below_us = (
+            self.config_spec.backend.autotune_short_kernel_below_us(self.config_spec)
         )
 
     def _prepare(self) -> None:
@@ -2223,7 +2253,8 @@ class PopulationBasedSearch(BaseSearch):
         ``kernel`` and ``call`` reserve a second column for each other
         without asking the worker whether it can trace (``_traceable``: the
         probe is a profiling session in the worker that times the search, so
-        only the selection itself asks).
+        only the selection itself and the timer choice of a search that
+        would move, ``_settle_candidate_timer``, ask).
         """
         policy = self.final_selection
         assert policy is not None
@@ -2701,7 +2732,10 @@ class PopulationBasedSearch(BaseSearch):
         ``random_fallback_target``) ``to_check`` is the initial population and
         is benchmarked through :meth:`benchmark_initial_population` (budget
         share, the drop of never-attempted configs, the summary line, the
-        random fallback when a target is given).
+        random fallback when a target is given, and the search's choice of
+        its candidates' timer, which can read the members again, drop the
+        ones the trace timer cannot read and leave one whose re-timing
+        failed with an infinite reading).
 
         Args:
             to_check: A list of flat configurations to benchmark.
@@ -2712,8 +2746,10 @@ class PopulationBasedSearch(BaseSearch):
             For an ordinary batch, one population member per entry in
             ``to_check`` in order.  For the initial population, the members
             that were attempted (never-attempted configs are dropped, random
-            fallback members appended), followed by the invalid entries; the
-            positions no longer correspond to ``to_check``.
+            fallback members appended, and configs that a search settling on
+            the trace timer could not read there are dropped), followed by
+            the invalid entries; the positions no longer correspond to
+            ``to_check``.
         """
         initial_population = (
             self._benchmarking_initial_population or random_fallback_target is not None
@@ -3052,6 +3088,11 @@ class PopulationBasedSearch(BaseSearch):
             member.fn = result.fn
             member.status = result.status
             member.compile_time = result.compile_time
+            if self.traces_candidates and member.status == "deduplicated":
+                # Settled with a copy of its kernel's reading: no reading of
+                # this member's own, and no pair with the first one it takes
+                # (``rereading_spread``).
+                member.timer_readings_from = len(member.perfs)
         self._settle_benchmarked_members(members, members)
         repairs = self.benchmark_provider.take_effective_source_repairs()
         if repairs:
@@ -3242,6 +3283,16 @@ class PopulationBasedSearch(BaseSearch):
         from ``members`` and ``visited`` rather than kept as failures, and
         the outcome is summarized in one log line whatever
         ``autotune_ignore_errors`` says.
+
+        Once the population has a reading, the search chooses the timer of
+        its candidates (``_settle_candidate_timer``). A search that settles
+        on the CUDA activity trace reads every member with a reading once
+        more there, which replaces the member's CUDA-event readings, and
+        drops from ``members`` and ``visited`` the configs whose kernel the
+        trace read in neither of two passes: a caller that kept its own
+        list of the population holds configs that are no longer in it. A
+        member whose re-timing there leaves a sticky device error reads
+        infinite afterwards, whichever timer the search goes on with.
         """
         self._benchmark_initial_batch(
             members,
@@ -3252,6 +3303,7 @@ class PopulationBasedSearch(BaseSearch):
         if random_fallback_target is None or any(
             math.isfinite(member.perf) for member in members
         ):
+            self._settle_candidate_timer(members, visited)
             return members
         compile_error = self.benchmark_provider.take_no_viable_config_error()
         seen = (
@@ -3287,7 +3339,395 @@ class PopulationBasedSearch(BaseSearch):
             visited=visited,
         )
         members.extend(fallback)
+        self._settle_candidate_timer(members, visited)
         return members
+
+    def _settle_candidate_timer(
+        self,
+        members: list[PopulationMember],
+        visited: MutableSet[Config] | None = None,
+    ) -> None:
+        """Choose, once per search, the timer that reads its candidates,
+        after the initial population ``members`` was benchmarked.
+
+        The initial population is timed with CUDA events, as every search's
+        was: one event pair around each flushed launch, which reads the
+        kernel plus the launch latency in the event clock's steps. When the
+        backend names a bound (``Backend.autotune_short_kernel_below_us``)
+        and the best of those readings is below it, the kernel's configs
+        differ by less than that timer resolves, and every reading from here
+        on (each candidate, each re-timing) is a kernel duration from the
+        CUDA activity trace in the benchmark worker instead
+        (``LocalBenchmarkProvider.trace_search_candidates``).
+
+        The choice is the search's, made once, rather than each reading's:
+        the trace leaves the launch latency out (4-5 us on a B200), so a
+        launch near the bound that picked its timer by its own reading read
+        on two scales from call to call (59 or 64 us for one config). A
+        search stays on one timer for all its candidates, short or long.
+        The initial population moves with it: every member with a reading
+        is read once more, on the trace (``_read_on_settled_timer``), before
+        anything compares it with a traced candidate, and a member the trace
+        cannot read leaves ``members`` and ``visited``. It keeps the events
+        when the best reading is at or above the bound, for a ratio
+        objective, in another L2 regime than the per-call flush, under
+        ``HELION_BENCHMARK_CUDAGRAPH=1`` (``do_bench`` then times a
+        candidate's graph replay and traces nothing), when the population
+        was not timed in the benchmark worker, when that worker cannot time
+        the re-timings from the trace (``_kernel_timer_usable``: a
+        wall-clock worker, a process group, a build without CUDA activity,
+        another tool holding the activity API, and ``autotune_benchmark_fn``,
+        under which the re-timings run the user's function in this
+        process), inside ``find_handoff`` (its session ranks its shortlist
+        by, and returns, the readings of every batch it observed, the
+        initial population's among them), once ``autotune_budget_seconds``
+        is used up (the search then times no further candidate) or when it
+        runs out before the population has moved, and when the trace reads
+        none of the population's kernels (``_read_on_settled_timer``).
+
+        Whether the worker can trace is asked last, of a search that would
+        move otherwise. The first answer runs a profiling session in the
+        worker, as every traced window does, and a session leaves the
+        activity API attached to that process, which slows its later
+        launches (``kernel_timer_available``). A search that keeps the
+        events for another reason asks nothing of the worker and is timed
+        as before. One that keeps them after a session (a worker whose
+        trace does not work, a trace that reads none of the population, a
+        budget that runs out during the move) gets a new worker process
+        first (``LocalBenchmarkProvider.restart_profiled_benchmark_worker``):
+        its later candidates are then read by CUDA events as its initial
+        population was, not above it (by about 3 us on a B200).
+
+        Source aliases do not move the choice. An alias carries its
+        kernel's reading and none of its own, so the best reading is a timed
+        kernel's; and it runs no job, so whether the worker's process is up
+        after the last candidate is not asked
+        (``LocalBenchmarkProvider.benchmark_worker_started``): a population
+        whose last timed kernel ran into the timeout and whose remaining
+        candidates repeat earlier code settles as any other.
+        """
+        if (
+            self.short_kernel_below_us is None
+            or self._candidate_timer_settled
+            or not math.isfinite(self.best_perf_so_far)
+        ):
+            return
+        self._candidate_timer_settled = True
+        provider = self.benchmark_provider
+        if (
+            self.performance_unit != "ms"
+            or not self.best_perf_so_far * 1000.0 < self.short_kernel_below_us
+            or _resolve_l2_flush_mode(None) != "call"
+            # every candidate would be a graph replay, which is not traced
+            or _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False)
+            or not isinstance(provider, LocalBenchmarkProvider)
+            or not provider.benchmark_worker_started()
+            # a handoff session ranks and returns every reading it observed
+            # (``HandoffPoint.measurements``), which none can read again
+            or _active_handoff.get() is not None
+            # reading the population again is timing work, which the budget
+            # covers; a search that is over it times no further candidate
+            or self._autotune_budget_exceeded()
+        ):
+            return
+        # Asked last: the first answer runs a profiling session in the
+        # worker (``worker_kernel_timer_available``), which leaves the
+        # activity API attached there, and a search that keeps the events
+        # for a reason above goes on timing in that worker. (Also False
+        # under ``autotune_benchmark_fn``: the re-timings would run the
+        # user's function in this process, on its own scale.)
+        if not self._kernel_timer_usable():
+            # the initial population was read before the probe's session,
+            # where it ran one
+            provider.restart_profiled_benchmark_worker()
+            return
+        best_us = self.best_perf_so_far * 1000.0
+        provider.trace_search_candidates = True
+        self.traces_candidates = True
+        # reading the population again stops when the budget runs out
+        with provider.isolated_timings_within_budget():
+            moved = self._read_on_settled_timer(members, visited)
+        if not moved:
+            provider.trace_search_candidates = False
+            self.traces_candidates = False
+            # the event readings the search keeps were taken before the
+            # sessions of the probe and of the windows just tried
+            provider.restart_profiled_benchmark_worker()
+            reason = (
+                "the autotune budget ran out before the CUDA activity trace "
+                "had read every initial config"
+                if self._autotune_budget_exceeded()
+                else "the CUDA activity trace read none of the initial configs"
+            )
+            self.log(
+                f"The best initial config reads {best_us:.1f} us (under "
+                f"{self.short_kernel_below_us:g} us), but {reason}: timing "
+                "this search's candidates with CUDA events"
+            )
+            return
+        self.log(
+            f"The best initial config reads {best_us:.1f} us "
+            f"(under {self.short_kernel_below_us:g} us): timing this search's "
+            "candidates by their kernels' durations in the CUDA activity trace"
+        )
+
+    def _read_on_settled_timer(
+        self,
+        members: list[PopulationMember],
+        visited: MutableSet[Config] | None = None,
+    ) -> bool:
+        """Move the initial population ``members`` to the trace timer the
+        search is settling on; ``False`` when the trace read none of them
+        (or none of them has a reading to move) and when the autotune budget
+        ran out before the move was through, so the search stays on the
+        events.
+
+        Their readings so far are CUDA-event readings, 4-5 us above what the
+        trace reads for the same kernel on a B200. A search re-times only
+        the members within its re-timing threshold of the best
+        (``should_rebenchmark``), and none at an effort whose threshold is
+        below 1, so without this the other members kept their event
+        readings: a path started from one compared it with traced
+        neighbours, a search without a verification pass (differential
+        evolution) compared event-read parents with traced children, and a
+        surrogate was fit on labels of both scales. Every member with a
+        finite reading is read here, whatever the threshold, one timing per
+        kernel (``_rebenchmark_kernels``), a population with a single such
+        kernel included (``allow_single``), and a member whose reading fails
+        (a timeout, a window whose trace cannot be read:
+        ``benchmarking.KernelTraceUnreadable``) is read a second time.
+
+        Under ``autotune_budget_seconds`` the two passes are timing work
+        the budget covers, as it covers the candidates'. The caller runs
+        them where the provider asks the budget hook before each kernel
+        (``LocalBenchmarkProvider.isolated_timings_within_budget``), and
+        the second pass is not started once the budget is used up: a
+        failed reading can cost a whole benchmark timeout, and so would
+        its repeat. When the budget is used up and a member is still
+        without a trace reading, the move is undone (``_hold_readings``):
+        every member holds its event readings again, the best reading and
+        the final selection's history are as they were, and the search
+        stays on the events like one whose budget ran out before the move.
+        Moving with the members read so far would keep whichever configs
+        came first in the population and drop the others, the fastest by
+        events possibly among them, and a search over its budget times no
+        candidate to make up for them. A search without a budget reads
+        every kernel as described above.
+
+        A re-timing that leaves a sticky device error in the worker is a
+        failure of the kernel, not a reading of the trace. Its member reads
+        infinite from there on (``_resolve_isolated_rebenchmark_results``),
+        as after a verification that failed, on whichever timer the search
+        goes on with: it is not read a second time, it is no reading that
+        a population moves with, and it stays where the search keeps the
+        events, also in a move that is undone (``_hold_readings``).
+
+        Where no member has a trace reading after both passes, the trace
+        does not read this kernel's windows (calls that launch no kernel,
+        say), every later candidate would fail the same way, and the search
+        keeps the events and every reading it has. Otherwise this is the one
+        place where the search changes timers, and nothing keeps an event
+        reading past it (``_move_search_state_to_trace``): a member the
+        trace read holds trace readings only, one whose re-timing failed
+        holds that failure alone, and one it did not read has no reading in
+        this search and leaves the population.
+        """
+        read = [
+            member for member in members if member.perfs and math.isfinite(member.perf)
+        ]
+        kernels = {id(member): self._kernel_holder(member, read) for member in read}
+        events = {
+            id(member): len(member.perfs) for member in (*read, *kernels.values())
+        }
+        # (a re-timing also gives the population's aliases their kernels'
+        # readings: ``_rebenchmark_kernels``)
+        undo = self._hold_readings((*read, *kernels.values(), *self.population))
+
+        def unread() -> list[PopulationMember]:
+            # Asked of the kernel: a source alias is read when the member
+            # that holds its kernel has a new reading, which the alias then
+            # takes (its own list does not say: it gains nothing where that
+            # reading equals the one it holds).
+            return [
+                member
+                for member in read
+                if len(kernels[id(member)].perfs) == events[id(kernels[id(member)])]
+            ]
+
+        def traced() -> bool:
+            # Whether the trace read a kernel: it has a new reading, and
+            # that is a duration (a re-timing that failed leaves an infinite
+            # one).
+            return any(
+                len(kernel.perfs) > events[id(kernel)] and math.isfinite(kernel.perf)
+                for kernel in kernels.values()
+            )
+
+        self._rebenchmark_kernels(
+            read, desc="Reading the initial population on the trace", allow_single=True
+        )
+        if unread() and not self._autotune_budget_exceeded():
+            self._rebenchmark_kernels(
+                unread(),
+                desc="Reading the initial population on the trace again",
+                allow_single=True,
+            )
+        if not traced():
+            return False
+        if unread() and self._autotune_budget_exceeded():
+            undo()
+            return False
+        self._move_search_state_to_trace(
+            read, unread(), kernels, events, members, visited
+        )
+        return True
+
+    def _reading_registries(self) -> list[MutableMapping[Config, PopulationMember]]:
+        """The mappings that hold snapshots of members with their readings:
+        the final selection's history, its pins and, where the search has
+        one, the refinement registry."""
+        registries = [self._benchmarked_members, self._pinned_finalist_members]
+        terminal_members = getattr(self, "_terminal_refinement_members", None)
+        if terminal_members is not None:
+            registries.append(terminal_members)
+        return registries
+
+    def _hold_readings(self, members: Iterable[PopulationMember]) -> Callable[[], None]:
+        """A function that puts the search's readings back as they are now,
+        after re-timings of ``members``: each member's readings, the best
+        reading, and the entries of the final selection's history, its pins
+        and the refinement registry (``_reading_registries``; an entry is a
+        snapshot that a re-timing replaces and never edits, so the items of
+        the mappings are all there is to keep).
+
+        A failure is not taken back. A member that one of those re-timings
+        left at an infinite reading (its kernel left a sticky device error
+        in the worker: ``_resolve_isolated_rebenchmark_results``) holds that
+        reading again after the ones it had, and the mappings are refreshed
+        for it as the re-timing refreshed them: what a failed re-timing
+        leaves in a search that never changed timers. With its earlier
+        readings alone the config would rank, and could be returned, as if
+        it had not failed."""
+        counts = [
+            (member, len(member.perfs))
+            for member in {id(member): member for member in members}.values()
+        ]
+        best = self.best_perf_so_far
+        entries = [
+            (registry, [*registry.items()]) for registry in self._reading_registries()
+        ]
+
+        def undo() -> None:
+            failed = [
+                member
+                for member, count in counts
+                if len(member.perfs) > count and not math.isfinite(member.perf)
+            ]
+            for member, count in counts:
+                del member.perfs[count:]
+            self.best_perf_so_far = best
+            for registry, items in entries:
+                registry.clear()
+                registry.update(items)
+            for member in failed:
+                member.perfs.append(inf)
+            self._refresh_benchmarked_members_after_rebenchmark(failed)
+
+        return undo
+
+    def _move_search_state_to_trace(
+        self,
+        read: Sequence[PopulationMember],
+        unread: Sequence[PopulationMember],
+        kernels: Mapping[int, PopulationMember],
+        events: Mapping[int, int],
+        members: list[PopulationMember],
+        visited: MutableSet[Config] | None,
+    ) -> None:
+        """Leave no CUDA-event reading in the search's state, after the
+        members ``read`` of the initial population ``members`` were read on
+        the trace (``_read_on_settled_timer``; ``kernels[id(member)]`` is
+        the member that holds a member's kernel, ``events[id(member)]`` the
+        number of event readings a member holds, ``unread`` the members
+        whose kernel the trace read in neither pass).
+
+        - A member the trace read keeps its trace readings only, so
+          whatever ranks it from here on (a comparison, the final
+          selection's low-water reading, the spread of re-readings) sees
+          one timer.  A source alias of a kernel the trace read holds that
+          kernel's trace reading, whatever it held before.  A member whose
+          re-timing failed is among them with that failure, an infinite
+          reading, alone: it stays a member, ranks last and takes no entry
+          in the history.
+        - An unread member has no reading in this search. With its event
+          reading, 4-5 us above the readings it would be compared with, a
+          kernel that is in fact the fastest would lose to slower traced
+          ones, and nothing would read it again (it is outside every
+          re-timing threshold). It leaves ``members`` and ``visited``, as a
+          config the initial population never attempted does
+          (``_benchmark_initial_batch``): it starts no path, is no parent,
+          no surrogate row and no finalist, and the search may come back to
+          its config, which is then timed on the trace like any candidate.
+        - The final selection's history, its pins and the refinement
+          registry were filled, and the history was trimmed to its top k,
+          by event readings: the entries of every member that had one go,
+          and the members the trace read are recorded again, so the trim
+          ranks them by their trace readings.
+        - ``best_perf_so_far``, which the re-timing threshold is taken
+          from, is the best trace reading.
+        - The provider's record of each kernel's reading, which settles
+          later configs with the same generated source, takes the trace
+          reading (``LocalBenchmarkProvider.refresh_source_reading``) or,
+          for an unread kernel, is dropped (``forget_source_reading``), so
+          the next config with that code is timed.
+        - What the algorithm keeps besides its members goes
+          (``_discard_event_readings``).
+        """
+        unread_ids = {id(member) for member in unread}
+        traced = [member for member in read if id(member) not in unread_ids]
+        for member in traced:
+            kernel = kernels[id(member)]
+            if kernel is member:
+                del member.perfs[: events[id(member)]]
+                member.timer_readings_from = 0
+            else:
+                # a copy of its kernel's trace reading, none of its own
+                member.perfs[:] = [kernel.perf]
+                member.timer_readings_from = 1
+        members[:] = [member for member in members if id(member) not in unread_ids]
+        registries = self._reading_registries()
+        for member in read:
+            for registry in registries:
+                registry.pop(member.config, None)
+        for member in unread:
+            if visited is not None:
+                visited.discard(member.config)
+            if self._kernels.get(id(member.fn)) is member:
+                del self._kernels[id(member.fn)]
+        for member in traced:
+            if not self._is_source_alias(member):
+                self._record_benchmarked_member(member)
+        self.best_perf_so_far = min((member.perf for member in traced), default=inf)
+        provider = self.benchmark_provider
+        if isinstance(provider, LocalBenchmarkProvider):
+            for member in traced:
+                provider.refresh_source_reading(member.fn, member.perf)
+            for member in unread:
+                provider.forget_source_reading(member.fn)
+        if unread:
+            self.log.warning(
+                f"The CUDA activity trace read {len(unread)} of the initial "
+                "configs in neither of two passes: this search reads its "
+                "candidates from the trace, so they leave its initial "
+                f"population (the first: {unread[0].config})"
+            )
+        self._discard_event_readings()
+
+    def _discard_event_readings(self) -> None:
+        """Called once, when the search has moved its members' readings to
+        the trace timer (``_read_on_settled_timer``): an algorithm drops the
+        readings it holds outside its members, which were taken with CUDA
+        events and cannot be read again."""
 
     def _apply_effective_source_repairs(
         self,
@@ -3603,8 +4043,6 @@ class PopulationBasedSearch(BaseSearch):
         )
 
     def _final_rebenchmark_use_isolated(self) -> bool:
-        from ..runtime.settings import _env_get_bool
-
         if self._input_bank_count > 1:
             return True
 
@@ -5067,6 +5505,7 @@ class PopulationBasedSearch(BaseSearch):
         confirm_suspicious: bool = True,
         use_interleaved: bool = True,
         candidate_private_args: bool = False,
+        allow_single: bool = False,
     ) -> None:
         """
         Re-benchmark a list of population members to avoid outliers.
@@ -5076,9 +5515,19 @@ class PopulationBasedSearch(BaseSearch):
             desc: Description for the progress bar.
             candidate_private_args: Use a fresh worker process per candidate;
                 when unavailable, keep argument storage private in-process.
+            allow_single: Re-time a single member too. A re-timing compares
+                members, so one member alone needs none (the default); a
+                pass that moves the readings to another timer
+                (``_read_on_settled_timer``) reads every member.
         """
-        if len(members) < 2:
+        if len(members) < (1 if allow_single else 2):
             return
+        # A search that reads its candidates from the trace re-times in the
+        # benchmark worker whatever the caller asks: the in-process timers
+        # read with CUDA events, on another scale than the members' readings
+        # (the single-pass final verification asks for them under
+        # ``HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED=0``).
+        use_isolated = use_isolated or self.traces_candidates
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             provider_timings = self.benchmark_provider.rebenchmark(
                 [member.config for member in members],
@@ -5130,6 +5579,17 @@ class PopulationBasedSearch(BaseSearch):
                     new_timings,
                     failure_statuses=failure_statuses,
                     trace_results=isolated_results,
+                )
+                return
+            if self.traces_candidates:
+                # The search reads from the trace in the benchmark worker,
+                # which cannot time these members now: the in-process timers
+                # read with CUDA events, on another scale than the readings
+                # the members have, so they keep those.
+                self.log.warning(
+                    f"{desc}: the benchmark worker cannot time the "
+                    f"{len(members)} configs; this search reads its candidates "
+                    "from the CUDA activity trace, so they keep their readings"
                 )
                 return
             if candidate_private_args and dist.is_initialized():
@@ -5792,10 +6252,15 @@ class PopulationBasedSearch(BaseSearch):
         )
 
     def _rebenchmark_kernels(
-        self, members: Sequence[PopulationMember], *, desc: str = "Rebenchmarking"
+        self,
+        members: Sequence[PopulationMember],
+        *,
+        desc: str = "Rebenchmarking",
+        allow_single: bool = False,
     ) -> None:
         """Re-benchmark ``members`` with one timing per kernel, and keep one
-        reading per kernel.
+        reading per kernel (``rebenchmark`` says what ``allow_single`` is
+        for).
 
         Every re-timing of a search phase comes through here.  A source
         alias is its kernel under another config: the member that holds the
@@ -5812,9 +6277,11 @@ class PopulationBasedSearch(BaseSearch):
         member is timed, as before.
         """
         if not self._collapses_source_aliases():
-            self.rebenchmark([*members], desc=desc)
+            self.rebenchmark([*members], desc=desc, allow_single=allow_single)
             return
-        self.rebenchmark(self._kernels_of(members), desc=desc)
+        self.rebenchmark(
+            self._kernels_of(members), desc=desc, allow_single=allow_single
+        )
         self._follow_kernel_readings((*members, *self.population), members)
 
     def _follow_kernel_readings(
@@ -5979,6 +6446,7 @@ class PopulationBasedSearch(BaseSearch):
             config=minimal_config,
             status=current.status,
             compile_time=current.compile_time,
+            timer_readings_from=current.timer_readings_from,
         )
         self._selected_member = current
         self.log(f"Finishing phase complete: final config={current.config}")

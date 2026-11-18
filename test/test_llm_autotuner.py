@@ -8,6 +8,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -15,6 +16,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
@@ -22,6 +24,7 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.llm.prompting import build_author_seed_section
 from helion.autotuner.llm.prompting import build_compiler_analysis_section
 from helion.autotuner.llm.workload import compute_workload_hints
+from helion.autotuner.llm_seeded_lfbo import LLMSeededSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
@@ -406,6 +409,9 @@ class TestLLMGuidedSearch(TestCase):
         )
         search._benchmark_provider_cls = FakeBenchmarkProvider
         search._default_config_dict = dict(default_config)
+        # A bound below which a search that reads an initial population
+        # chooses the timer of its candidates (CuTe names one, Triton none).
+        search.short_kernel_below_us = 64.0
 
         def sparse_config(cfg: helion.Config) -> dict[str, object]:
             return {
@@ -710,6 +716,11 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(search.best.perf, 2.5)
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))
+        # Every round's batch is timed as it comes: the loop reads no
+        # initial population, so it never reaches the timer choice
+        # (``_settle_candidate_timer``) and its readings stay on one timer.
+        self.assertFalse(search._candidate_timer_settled)
+        self.assertFalse(search.traces_candidates)
 
     def test_initial_llm_response_propagates_failure(self):
         """Round 0 LLM future failures are not silently swallowed."""
@@ -1850,6 +1861,36 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(
             search.hybrid_stage_breakdown["second_stage_configs_tested"], 11
         )
+
+    @pytest.mark.cpu_only
+    def test_hybrid_best_is_the_second_stages_once_it_reads_the_trace(self):
+        """The LLM stage reads with CUDA events, and a second stage that
+        moved to the CUDA activity trace reads every config (the seed
+        again) without the launch latency those carry.  The hybrid's best
+        is then the second stage's, not the lower of two numbers on
+        different scales, and the stage summary says which timer the second
+        stage's objective is on.  With both stages on the events the lower
+        reading is the best, as before."""
+        for traced, best in ((True, 0.0080), (False, 0.0076)):
+            with self.subTest(traced=traced):
+                llm_stage = SimpleNamespace(
+                    best_perf_so_far=0.0076, _autotune_metrics=AutotuneMetrics()
+                )
+                second_stage = PopulationBasedSearch.__new__(PopulationBasedSearch)
+                second_stage.best_perf_so_far = 0.0080
+                second_stage._autotune_metrics = AutotuneMetrics()
+                second_stage.traces_candidates = traced
+                hybrid = LLMSeededSearch.__new__(LLMSeededSearch)
+                hybrid._autotune_metrics = AutotuneMetrics()
+                hybrid.second_stage_algorithm = "LFBOTreeSearch"
+                hybrid._finalize_stage_metrics(
+                    llm_stage, helion.Config(num_warps=4), 1.0, second_stage, 2.0
+                )
+                self.assertEqual(hybrid.best_perf_so_far, best)
+                breakdown = hybrid.hybrid_stage_breakdown
+                self.assertIs(breakdown["second_stage_traced"], traced)
+                self.assertEqual(breakdown["llm_seed_objective"], 0.0076)
+                self.assertEqual(breakdown["second_stage_objective"], 0.0080)
 
     @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_hybrid_loop_with_mocked_stages(self):

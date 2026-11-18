@@ -364,6 +364,10 @@ class LLMSeededSearch(BaseSearch):
         llm_perf = self._finite_perf(llm_search)
         second_stage_perf = self._finite_perf(second_stage_search)
         performance_unit = self.performance_unit
+        second_stage_traced = (
+            isinstance(second_stage_search, PopulationBasedSearch)
+            and second_stage_search.traces_candidates
+        )
 
         self.hybrid_stage_breakdown = {
             "used_llm_seed": llm_seed_config is not None,
@@ -384,6 +388,9 @@ class LLMSeededSearch(BaseSearch):
             ),
             "second_stage_time_s": second_stage_wall_time,
             "second_stage_configs_tested": second_stage_tested,
+            # the second stage's objective is a kernel duration from the CUDA
+            # activity trace; the LLM stage's is always a CUDA-event reading
+            "second_stage_traced": second_stage_traced,
         }
 
         # Aggregate metrics from both stages
@@ -395,9 +402,19 @@ class LLMSeededSearch(BaseSearch):
                 + getattr(second_stage_metrics, field),
             )
 
+        # A second stage that moved to the trace timer
+        # (``PopulationBasedSearch.traces_candidates``) timed the seed again
+        # and reads every config without the launch latency the LLM stage's
+        # CUDA-event readings carry: the best of the two stages is then the
+        # second stage's, not the lower number.
+        stages = (
+            (second_stage_search,)
+            if second_stage_traced
+            else (llm_search, second_stage_search)
+        )
         candidate_best = [
             stage.best_perf_so_far
-            for stage in (llm_search, second_stage_search)
+            for stage in stages
             if stage is not None and math.isfinite(stage.best_perf_so_far)
         ]
         self.best_perf_so_far = min(candidate_best) if candidate_best else math.inf

@@ -164,7 +164,11 @@ class LFBOPatternSearch(PatternSearch):
         max_generations: Maximum number of search iterations per copy.
             Default from PATTERN_SEARCH_DEFAULTS.
         min_improvement_delta: Early stopping threshold. Search stops if the relative
-            improvement abs(best/current - 1) < min_improvement_delta.
+            improvement abs(best/current - 1) < min_improvement_delta. A search
+            that times its candidates from the CUDA activity trace stops on the
+            larger of this and what its readings repeat to
+            (``PatternSearch._reading_tolerance``), so 0 no longer takes every
+            step there.
             Default: 0.001 (0.1% improvement threshold).
         frac_selected: Fraction of generated neighbors to actually benchmark, after
             filtering by classifier score. Range: (0, 1]. Lower values reduce benchmarking
@@ -481,6 +485,42 @@ class LFBOPatternSearch(PatternSearch):
         if self.train_configs is not None:
             return ()
         return [member for member in self._train_members if member is not None]
+
+    def _discard_event_readings(self) -> None:
+        """Drop the training rows that hold a reading no member stands
+        behind (``seed_training_data``: an earlier stage's readings, such as
+        the LLM stage's of the LLM-seeded hybrid).
+
+        They were read with CUDA events, 4-5 us above what the trace reads
+        for the same kernel on a B200, and have no member that could be read
+        again (``_sync_training_labels`` moves the rows of live members).
+        Left in, the quantile split would put the region the earlier stage
+        explored on the slow side of every traced label.  A seeded row that
+        records a failure stays: a config that fails is a negative for the
+        classifier whichever timer would have read it.
+        """
+        kept = [
+            index
+            for index, member in enumerate(self._train_members)
+            if member is not None or not math.isfinite(self.train_y[index])
+        ]
+        dropped = len(self._train_members) - len(kept)
+        if not dropped:
+            return
+        self.train_x = [self.train_x[index] for index in kept]
+        self.train_y = [self.train_y[index] for index in kept]
+        self._train_members = [self._train_members[index] for index in kept]
+        if self.train_configs is not None:
+            self.train_configs = [self.train_configs[index] for index in kept]
+        if self.train_source_hashes is not None:
+            self.train_source_hashes = [
+                self.train_source_hashes[index] for index in kept
+            ]
+        self.log(
+            f"Dropped {dropped} seeded surrogate training rows: they were "
+            "timed with CUDA events and this search reads its candidates "
+            "from the CUDA activity trace"
+        )
 
     def _sync_training_labels(self) -> None:
         """Refresh train_y from live members so rebenchmarked timings (which
@@ -935,16 +975,16 @@ class LFBOPatternSearch(PatternSearch):
         for at most ``polish_patience`` consecutive rounds without a reading
         below the descent's lowest.
 
-        What counts as an improvement is one rule for both: a step of at
-        least ``min_improvement_delta`` from the incumbent's reading
-        (``_reads_level``).  Who ends the descent depends on the aliases.
-        Without the drop a
-        round without an improvement ends it (``_check_early_stopping``).
-        With the drop such a round moves to new code that reads level
-        instead, and the descent ends when there is none or when the patience
-        runs out: a tie alone never ends it, and each level move goes to code
-        no earlier round timed, so the walk is the patience long at most
-        beyond its last new lowest reading.
+        What counts as an improvement is one rule for both: a step beyond
+        the tie tolerance at the incumbent's reading (``_reading_tolerance``:
+        ``min_improvement_delta``, or what the readings of a trace-timed
+        search repeat to).  Who ends the descent depends on the aliases.
+        Without the drop a round without an improvement ends it
+        (``_check_early_stopping``).  With the drop such a round moves to
+        new code that reads level instead, and the descent ends when there
+        is none or when the patience runs out: a tie alone never ends it,
+        and each level move goes to code no earlier round timed, so the walk
+        is the patience long at most beyond its last new lowest reading.
         """
         rounds = self.polish_rounds
         if rounds <= 0 or self.config_spec.cute_flash_search_enabled:
@@ -1018,8 +1058,8 @@ class LFBOPatternSearch(PatternSearch):
 
     def _improves_on(self, perf: float, reference: float) -> bool:
         """Whether ``perf`` reads below ``reference`` by more than a tie
-        (``_reads_level``): by at least ``min_improvement_delta``, by
-        anything when that is 0."""
+        (``_reads_level``): by at least the tolerance at ``reference``
+        (``_reading_tolerance``), by anything when that is 0."""
         return perf < reference and not self._reads_level(perf, reference)
 
     def _polish_level_step(
@@ -1028,23 +1068,27 @@ class LFBOPatternSearch(PatternSearch):
         """The lowest-reading new kernel that reads level with ``current``.
 
         A round of the polish descent ended without an improvement: its best
-        is the incumbent, or new code less than ``min_improvement_delta``
-        below it.  Either way new code may read level with the incumbent
-        (``_reads_level``), which says the search timer cannot tell the two
-        apart, not that they are equally fast (a small kernel's readings sit
-        on the timer's steps, so a whole neighborhood ties, and no timer
-        repeats to the last digit).  With the aliases dropped that code is
-        new, and the descent crosses the plateau to it instead of ending
-        there; without the drop it would circle through copies of one
-        kernel, which is what kept the descent going by chance.  One rule
-        for a tie and for a step below the delta in either direction, so a
-        neighbor that reads slightly better never ends a descent that a tie
-        would have continued.
+        is the incumbent, or new code less than the tie tolerance
+        (``_reading_tolerance``) below it.  Either way new code may read
+        level with the incumbent (``_reads_level``), which says the search
+        timer cannot tell the two apart, not that they are equally fast (a
+        small kernel's readings sit on the timer's steps, so a whole
+        neighborhood ties, and no timer repeats to the last digit).  With
+        the aliases dropped that code is new, and the descent crosses the
+        plateau to it instead of ending there; without the drop it would
+        circle through copies of one kernel, which is what kept the descent
+        going by chance.  One rule for a tie and for a step below the
+        tolerance in either direction, so a neighbor that reads slightly
+        better never ends a descent that a tie would have continued.
         """
+        # One tolerance for the round: the reference is the incumbent's
+        # reading for every new member, and the tolerance of a trace-timed
+        # search is a statistic of the whole population.
+        tolerance = self._reading_tolerance(current.perf)
         level = [
             member
             for member in new_members
-            if self._reads_level(member.perf, current.perf)
+            if self._reads_level(member.perf, current.perf, tolerance)
         ]
         return min(level, key=performance) if level else None
 
@@ -2980,7 +3024,11 @@ class LFBOTreeSearch(LFBOPatternSearch):
         max_generations: Maximum number of search iterations per copy.
             Default from PATTERN_SEARCH_DEFAULTS.
         min_improvement_delta: Early stopping threshold. Search stops if the relative
-            improvement abs(best/current - 1) < min_improvement_delta.
+            improvement abs(best/current - 1) < min_improvement_delta. A search
+            that times its candidates from the CUDA activity trace stops on the
+            larger of this and what its readings repeat to
+            (``PatternSearch._reading_tolerance``), so 0 no longer takes every
+            step there.
             Default: 0.001 (0.1% improvement threshold).
         frac_selected: Fraction of generated neighbors to actually benchmark, after
             filtering by classifier score. Range: (0, 1]. Lower values reduce benchmarking

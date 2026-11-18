@@ -12,7 +12,10 @@ once however many configs of the kernel a population holds, and every other
 config of the kernel has its reading.
 
 The second section covers the config such a search returns
-(``Backend.simplified_selected_config``).
+(``Backend.simplified_selected_config``).  The last section covers the drop
+together with the search's timer (``PopulationBasedSearch.traces_candidates``):
+what a tie is follows the timer, and who ends the polish descent follows the
+drop.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.benchmark_provider import BenchmarkProvider
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
+from helion.autotuner.benchmarking import KERNEL_TRACE_TICK_US
 from helion.autotuner.handoff import _active_handoff
 from helion.autotuner.llm_search import LLMGuidedSearch
 from helion.autotuner.logger import AutotuneLogEntry
@@ -189,10 +193,12 @@ def test_multi_shape_provider_reports_no_aliases() -> None:
 
 
 def _polish_search(*, collapse: bool, settles: bool = True) -> LFBOTreeSearch:
-    search = object.__new__(LFBOTreeSearch)
-    search.polish_rounds = 10
-    search.config_spec = _spec(collapse=collapse)  # type: ignore[assignment]
+    search = cast(
+        "LFBOTreeSearch",
+        _holding_search(collapse=collapse, search_type=LFBOTreeSearch),
+    )
     search.benchmark_provider = _provider(settles=settles)  # type: ignore[assignment]
+    search.polish_rounds = 10
     search.min_improvement_delta = 0.001
     search.log = Mock()
     search._budgeted_range = lambda *args: iter(range(*args))  # type: ignore[method-assign]
@@ -1340,9 +1346,10 @@ def test_a_repaired_failure_trains_the_surrogate_with_its_kernels_reading(
     assert {config.num_warps for config in search._benchmarked_members} == {3}
 
 
+@pytest.mark.parametrize("traces", [False, True], ids=["events", "trace"])
 @pytest.mark.parametrize("search_type", [PatternSearch, LFBOTreeSearch])
 def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
-    search_type: type[PatternSearch], monkeypatch: pytest.MonkeyPatch
+    search_type: type[PatternSearch], traces: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A whole search over a stand-in space, with the real generation loop,
     path generators, polish descent, settling and re-timing.  A config is
@@ -1356,19 +1363,58 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
       row the surrogate trains on;
     - the final selection's history holds a kernel once;
     - no two paths start from one kernel.
+
+    On the trace timer (kernels of 10-16 us, which CUDA events read 4.6 us
+    longer; the surrogate also starts with rows an earlier stage read with
+    events) the search settles on the trace after its initial population,
+    and from then on nothing it compares is an event reading: no member of
+    the population, no alias settled later with the provider's record of
+    its kernel, no row the surrogate trains on.  That includes the fastest
+    kernel of the space, which is in the initial population and whose
+    traced windows give no reading there: it leaves the population instead
+    of keeping its event reading, and the search times it on the trace when
+    a path reaches its code again.
     """
+    monkeypatch.delenv("HELION_AUTOTUNE_L2_FLUSH", raising=False)
+    monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
     noise = random.Random(0)
     fns: dict[int, Callable[[], None]] = {}
     first_readings: dict[int, float] = {}
     members: dict[tuple[int, int], PopulationMember] = {}
     # the member each kernel was timed under: the one that holds it
     timed_under: dict[int, PopulationMember] = {}
+    provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+    provider._benchmark_worker = Mock()
+    provider.settles_source_aliases = lambda: True  # type: ignore[method-assign]
+    provider.take_effective_source_repairs = list  # type: ignore[method-assign]
+    # the provider's record of a kernel's reading settles its later aliases
+    provider.refresh_source_reading = lambda fn, perf: first_readings.update(  # type: ignore[method-assign]
+        {code_of(fn): perf}
+    )
+
+    def forget(fn: object) -> None:
+        # (a config the search comes back to is a new member, as
+        # ``make_unbenchmarked`` makes one)
+        for flat in [flat for flat, member in members.items() if member.fn is fn]:
+            del members[flat]
+        code = code_of(fn)
+        del fns[code], first_readings[code], timed_under[code]
+
+    provider.forget_source_reading = forget  # type: ignore[method-assign]
+    event_readings: set[float] = set()
+    # The first member that holds the fastest kernel (code 6), in a search
+    # that moves to the trace: its traced windows give no reading.
+    unreadable: list[PopulationMember] = []
 
     def code_of(fn: object) -> int:
         return next(code for code, held in fns.items() if held is fn)
 
     def reading(fn: object) -> float:
-        return (10.0 + abs(code_of(fn) - 6)) * noise.uniform(0.97, 1.03)
+        kernel_ms = (10.0 + abs(code_of(fn) - 6)) / 1000 * noise.uniform(0.97, 1.03)
+        if provider.trace_search_candidates:
+            return kernel_ms
+        event_readings.add(kernel_ms + 0.0046)
+        return kernel_ms + 0.0046
 
     def make(flat: tuple[int, int]) -> PopulationMember:
         if flat not in members:
@@ -1389,7 +1435,12 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
             if not alias:
                 fns[code] = lambda: None
                 timed_under[code] = members[code, config.num_warps]
+                if code == 6 and traces and not provider.trace_search_candidates:
+                    unreadable.append(timed_under[code])
                 first_readings[code] = reading(fns[code])
+                search.best_perf_so_far = min(
+                    search.best_perf_so_far, first_readings[code]
+                )
             results.append(
                 SimpleNamespace(
                     config=config,
@@ -1405,20 +1456,27 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
         "PatternSearch", _holding_search(collapse=True, search_type=search_type)
     )
 
+    # set once the search has chosen its timer and moved its readings
+    settled: list[bool] = []
+
     def consistent() -> None:
         for member in search.population:
             if member.perfs:
                 assert member.perf == timed_under[code_of(member.fn)].perf, member
+                if search.traces_candidates and settled:
+                    assert member.perf not in event_readings, member
         history = [*search._benchmarked_members.values()]
         assert len({id(member.fn) for member in history}) == len(history)
 
     def rebenchmark(timed: list[PopulationMember], **kwargs: object) -> None:
-        # (as the real one: a single member is left as it is)
-        if len(timed) < 2:
+        # (as the real one: a single member is re-timed only on request)
+        if len(timed) < (1 if kwargs.get("allow_single") else 2):
             return
         assert len({id(member.fn) for member in timed}) == len(timed)
         assert all(member is timed_under[code_of(member.fn)] for member in timed)
         for member in timed:
+            if any(member is unread for unread in unreadable):
+                continue
             member.perfs.append(reading(member.fn))
             search.best_perf_so_far = min(search.best_perf_so_far, member.perf)
         search._refresh_benchmarked_members_after_rebenchmark(timed)
@@ -1446,7 +1504,10 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
         search._sync_training_labels()  # type: ignore[attr-defined]
         rows = zip(search._train_members, search.train_y, strict=True)  # type: ignore[attr-defined]
         for member, label in rows:
-            assert label == timed_under[code_of(member.fn)].perf
+            if member is not None:
+                assert label == timed_under[code_of(member.fn)].perf
+            if search.traces_candidates:
+                assert label not in event_readings, member
 
     search.initial_population_strategy = InitialPopulationStrategy.FROM_RANDOM
     search.copies = 3
@@ -1454,7 +1515,13 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
     search.min_improvement_delta = 0.001
     search.compile_timeout_lower_bound = 0.0
     search.compile_timeout_quantile = 0.0
-    search.settings = SimpleNamespace(get_rebenchmark_threshold=lambda: 1.5)  # type: ignore[assignment]
+    search.settings = SimpleNamespace(  # type: ignore[assignment]
+        get_rebenchmark_threshold=lambda: 1.5,
+        autotune_budget_seconds=None,
+        autotune_benchmark_fn=None,
+    )
+    search.short_kernel_below_us = 64.0 if traces else None
+    search._kernel_timer_usable = lambda: True  # type: ignore[method-assign]
     search.best_perf_so_far = float("inf")
     search.log = Mock()
     search.log.autotune_tracing.return_value = nullcontext()
@@ -1468,22 +1535,35 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
     )
     search._autotune_metrics = AutotuneMetrics()
     search._benchmarking_initial_population = False
-    search.benchmark_provider = _provider(take_effective_source_repairs=list)  # type: ignore[assignment]
+    search.benchmark_provider = provider
     # LFBO only:
     search.similarity_penalty = 1.0  # type: ignore[attr-defined]
     search.patience = 0  # type: ignore[attr-defined]
     search.frac_selected = 1.0  # type: ignore[attr-defined]
     search.polish_rounds = 4  # type: ignore[attr-defined]
-    search.train_x, search.train_y, search._train_members = [], [], []  # type: ignore[attr-defined]
+    # (rows of an earlier stage, read with CUDA events: ``seed_training_data``)
+    event_readings.update({0.0171, 0.0182})
+    search.train_x = [(11, 0), (10, 0)]  # type: ignore[attr-defined]
+    search.train_y = [0.0171, 0.0182]  # type: ignore[attr-defined]
+    search._train_members = [None, None]  # type: ignore[attr-defined]
     search.train_configs = None  # type: ignore[attr-defined]
     stubs = {
         # the seed (2, 0), the default (2, 1) that repeats its code, others
-        "_generate_initial_population_flat": lambda: [(2, 0), (2, 1), (9, 0), (2, 2)],
+        "_generate_initial_population_flat": lambda: [
+            (2, 0),
+            (2, 1),
+            (9, 0),
+            (2, 2),
+            (6, 0),
+        ],
         "make_unbenchmarked": make,
         "_generate_neighbors": lambda base, **kwargs: neighbors(base),
         "benchmark_batch": benchmark_batch,
         "benchmark_initial_population": lambda population, **kwargs: (
-            search.benchmark_population(population)
+            search.benchmark_population(population),
+            search._settle_candidate_timer(population, kwargs["visited"]),
+            settled.append(True),
+            consistent(),
         ),
         "benchmark_population": checked(search.benchmark_population),
         "rebenchmark": rebenchmark,
@@ -1520,8 +1600,23 @@ def test_a_search_keeps_one_holder_and_one_reading_per_kernel(
 
     search._autotune()
 
-    # Two paths, not three: the seed and the default are one kernel.
-    assert sorted(start.flat_values for start in starts) == [(2, 0), (9, 0)]
+    # One path per kernel: the seed and the default are one kernel, and the
+    # kernel the trace could not read starts none.
+    assert sorted(start.flat_values for start in starts) == (
+        [(2, 0), (9, 0)] if traces else [(2, 0), (6, 0), (9, 0)]
+    )
+    assert search.traces_candidates is traces
+    if traces:
+        # It left the population with its event reading and was timed again,
+        # on the trace, under the config a path reached its code with.
+        (unread,) = unreadable
+        assert len(unread.perfs) == 1
+        assert unread not in search.population
+        assert timed_under[6] is not unread
+        assert timed_under[6].perf not in event_readings
+    if search_type is LFBOTreeSearch:
+        seeded = search._train_members.count(None)  # type: ignore[attr-defined]
+        assert seeded == (0 if traces else 2)
     # The search timed 12 kernels at most and met repeats of them.
     assert len(members) > len(fns) > 4
 
@@ -2246,3 +2341,263 @@ def test_autotune_returns_the_simplified_selection() -> None:
     assert returned is simpler
     simplify.assert_called_once_with(selected)
     finalize.assert_called_once_with(simpler)
+
+
+# --- The alias drop composed with the search's timer -------------------------
+#
+# A search either reads its candidates with CUDA events and counts a step
+# under ``min_improvement_delta`` (0.1% here) as a tie, or settled on the
+# trace timer (``traces_candidates``) and counts a step within what those
+# readings repeat to: here one and a half ticks of the trace's 32 ns clock,
+# 1.5% of the 3.2 us incumbent the tests start from.
+
+# One tick of the trace's clock in the search's unit (ms).
+_TICK = KERNEL_TRACE_TICK_US / 1000.0
+
+
+def _timed_polish_search(*, traces: bool, collapse: bool = True) -> LFBOTreeSearch:
+    search = _polish_search(collapse=collapse)
+    search.traces_candidates = traces
+    return search
+
+
+# Both timers on each side of both tolerances: two ticks (2%) and one tick
+# (1%) below a 100-tick incumbent, one and two ticks above it.
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+@pytest.mark.parametrize("ticks", [98, 99, 101, 102])
+def test_polish_level_rule_follows_the_search_timer(ticks: int, traces: bool) -> None:
+    """One definition of an improvement for the stop rule and the level
+    move.  On the event timer a one-tick step is beyond the 0.1% delta: an
+    improvement below the incumbent, no move above it.  On the trace timer
+    it is a tie in either direction, logged as one, and the descent crosses
+    it as a level move; two ticks are an improvement or no move on both."""
+    search = _timed_polish_search(traces=traces)
+    start = _member(100 * _TICK, 1)
+    near = _member(None, 2)
+    slower = _member(None, 3)
+    beyond = _member(None, 4)
+
+    incumbents, messages = _descend(
+        search,
+        start,
+        [
+            (start, [(slower, 110 * _TICK), (near, ticks * _TICK)]),
+            (near, [(beyond, 50 * _TICK)]),
+        ],
+    )
+
+    tie = traces and ticks in (99, 101)
+    moves = ticks < 100 or tie
+    assert incumbents == ([start, near, beyond] if moves else [start])
+    round_1 = next(m for m in messages if m.startswith("Polish round 1"))
+    assert round_1.endswith("(level with the incumbent: new code)") is tie
+    # The stop rule logs the tie it found below the incumbent; the level
+    # move then crosses it.
+    assert any("is a tie" in message for message in messages) is (tie and ticks == 99)
+
+
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+def test_level_rule_and_stop_rule_share_the_timers_tolerance(traces: bool) -> None:
+    """New code reads level with the incumbent exactly where the stop rule
+    counts the step to it as no improvement, on either timer: both read the
+    tolerance at the incumbent's reading.  Checked every hundredth of a tick
+    from three ticks below a 100-tick incumbent to three above it, across
+    both tolerances."""
+    search = _timed_polish_search(traces=traces)
+    search.population = []
+    current = _member(100 * _TICK, 1)
+    for hundredths in range(9700, 10301):
+        candidate = _member(hundredths / 100 * _TICK, 2)
+        if candidate.perf != current.perf:
+            assert search._reads_level(candidate.perf, current.perf) is (
+                search._check_early_stopping(candidate, current)
+            ), hundredths
+
+
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+def test_level_move_reads_the_populations_spread_once_a_round(traces: bool) -> None:
+    """The level move asks about every new kernel of a round against one
+    reference, the incumbent's reading.  On the trace timer the tolerance
+    at that reading takes the spread of the whole population's re-readings:
+    it is computed once for the round, not once per neighbor.  On the event
+    timer the tolerance is the fixed delta and the spread is never taken."""
+    search = _timed_polish_search(traces=traces)
+    current = _member(100 * _TICK, 1)
+    new = [_member((100 + index % 3) * _TICK, 2 + index) for index in range(20)]
+    search.population = [current, *new]
+    with patch(
+        "helion.autotuner.pattern_search.rereading_spread", return_value=0.0
+    ) as spread:
+        level = search._polish_level_step(new, current)
+    assert level is new[0]
+    assert spread.call_count == (1 if traces else 0)
+
+
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+def test_polish_patience_counts_trace_ties_as_no_new_low(traces: bool) -> None:
+    """Every round's new kernel reads one tick below its incumbent.  The
+    event timer takes each as an improvement and a new lowest reading, so
+    the descent runs on; the trace timer takes each as a tie, the descent
+    crosses it as a level move, and three such rounds use up the patience:
+    a tie alone ends nothing, the patience does."""
+    search = _timed_polish_search(traces=traces)
+    members, rounds = _chain([ticks * _TICK for ticks in (100, 99, 98, 97, 96, 95)])
+
+    incumbents, messages = _descend(search, members[0], rounds)
+
+    if traces:
+        assert incumbents == members[:3]
+        assert messages[-1] == "Polish stops: 3 rounds without a reading below 0.0031"
+        assert sum("level with the incumbent" in m for m in messages) == 3
+    else:
+        assert incumbents == members
+        assert messages[-1] == "Polish round 6: no unvisited neighbors"
+        assert not any("level with the incumbent" in m for m in messages)
+
+
+def test_polish_patience_restarts_beyond_the_trace_tolerance() -> None:
+    """Two tied rounds, a step of two ticks (beyond the tolerance: a new
+    lowest reading), then three more tied rounds."""
+    search = _timed_polish_search(traces=True)
+    members, rounds = _chain(
+        [ticks * _TICK for ticks in (100, 99, 98, 96, 95, 94, 93, 92)]
+    )
+
+    incumbents, messages = _descend(search, members[0], rounds)
+
+    assert incumbents == members[:6]
+    # (the mark follows the incumbents' own readings down to 94 ticks)
+    assert messages[-1] == "Polish stops: 3 rounds without a reading below 0.0030"
+    round_3 = next(m for m in messages if m.startswith("Polish round 3"))
+    assert "level with the incumbent" not in round_3
+
+
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+def test_a_tie_ends_the_polish_only_where_aliases_stay(traces: bool) -> None:
+    """Without the alias drop the stop rule owns the descent on either
+    timer: a one-tick step ends a trace-timed polish at once (a tie) and
+    moves an event-timed one, with no level move and no patience."""
+    search = _timed_polish_search(traces=traces, collapse=False)
+    search.polish_patience = 1
+    members, rounds = _chain([ticks * _TICK for ticks in (100, 99, 98, 97)])
+
+    incumbents, messages = _descend(search, members[0], rounds)
+
+    assert incumbents == (members[:1] if traces else members)
+    assert not any("level with the incumbent" in m for m in messages)
+    assert not any(m.startswith("Polish stops") for m in messages)
+
+
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+def test_tie_tolerance_counts_kernels_not_aliases(traces: bool) -> None:
+    """The spread of a trace-timed search's re-readings is taken over its
+    kernels: aliases that follow their kernels' re-readings neither supply
+    the sixteen re-read members the spread needs nor repeat one kernel's
+    step into it.  An event-timed search keeps the fixed delta."""
+    search = _timed_polish_search(traces=traces)
+    # Ten kernels re-read 0.8% apart, each with an alias that follows it.
+    kernels = [_member(100 * _TICK, index) for index in range(10)]
+    aliases = []
+    for index, kernel in enumerate(kernels):
+        kernel.perfs.append(kernel.perf * (1.0 + 0.008 * (index % 5 - 2)))
+        alias = _member(100 * _TICK, 100 + index, "deduplicated")
+        alias.fn = kernel.fn
+        alias.perfs.append(kernel.perf)
+        aliases.append(alias)
+    search.population = [*kernels, *aliases]
+
+    # Ten kernels are too few for a spread: the tick floor alone.
+    expected = 1.5 / 100 if traces else 0.001
+    assert search._reading_tolerance(100 * _TICK) == pytest.approx(expected)
+    if traces:
+        # Where aliases are kernels of their own, the twenty members count.
+        search.config_spec = _spec(collapse=False)  # type: ignore[assignment]
+        assert search._reading_tolerance(100 * _TICK) > 0.02
+
+
+def test_settling_on_the_trace_times_each_initial_kernel_once() -> None:
+    """The read of the initial population on the trace
+    (``_read_on_settled_timer``) times one member per kernel, the member
+    that is no alias wherever the aliases come: an alias the population
+    keeps takes its kernel's trace reading, the final selection's history
+    moves to the trace with the kernel, a member without a reading is left
+    out, and no member that was read keeps its event reading (an alias
+    holds a copy of its kernel's trace reading, which is no reading of its
+    own)."""
+    search = _pinning_search(collapse=True)
+    kernel = _member(0.0164, 1)
+    alias = _member(0.0164, 2, "deduplicated")
+    alias.fn = kernel.fn
+    far = _member(0.0900, 3)
+    failed = _member(float("inf"), 4, "error")
+    search.best_perf_so_far = kernel.perf
+    timed: list[tuple[list[PopulationMember], object]] = []
+
+    def rebenchmark(members: list[PopulationMember], **kwargs: object) -> None:
+        timed.append((list(members), kwargs.get("allow_single")))
+        for member in members:
+            member.perfs.append(member.perf - 0.0046)
+        # as ``rebenchmark`` does for the members it timed
+        search._refresh_benchmarked_members_after_rebenchmark(members)
+
+    members = [alias, kernel, far, failed]
+    with (
+        patch.object(search, "rebenchmark", side_effect=rebenchmark),
+        patch.object(search, "_final_rebenchmark_top_k", return_value=8),
+    ):
+        search._record_benchmarked_member(kernel)
+        assert search._read_on_settled_timer(members) is True
+
+    # one pass, which reads a single kernel too
+    assert timed == [([kernel, far], True)]
+    assert kernel.perfs == alias.perfs == [0.0164 - 0.0046]
+    assert search.best_perf_so_far == kernel.perf
+    assert far.perfs == [0.0900 - 0.0046]
+    assert failed.perfs == [float("inf")]
+    assert [member.timer_readings_from for member in members] == [1, 0, 0, 0]
+    # The history is recorded again from the trace readings: one entry per
+    # kernel that was read (the alias has none), each with its trace reading.
+    history = {
+        entry.config.num_warps: entry.perfs
+        for entry in search._benchmarked_members.values()
+    }
+    assert history == {1: kernel.perfs, 3: far.perfs}
+
+
+@pytest.mark.parametrize("traces", [True, False], ids=["trace", "events"])
+def test_a_copied_reading_is_no_reading_of_the_members_own(traces: bool) -> None:
+    """A search that keeps its aliases (flash) re-times them.  The reading an
+    alias enters with is the provider's copy of its kernel's first reading,
+    an event reading for a kernel of the initial population: in a search
+    that settled on the trace it and the alias's first own reading are not
+    two readings on one timer, so the alias's own readings start after it."""
+    search = object.__new__(PopulationBasedSearch)
+    search.config_spec = _spec(collapse=False)  # type: ignore[assignment]
+    search.config_gen = SimpleNamespace(flatten=lambda config: [config.num_warps])  # type: ignore[assignment]
+    search._benchmarking_initial_population = False
+    search.benchmark_provider = SimpleNamespace(  # type: ignore[assignment]
+        take_effective_source_repairs=list
+    )
+    search.traces_candidates = traces
+    fresh = _member(None, 2)
+    alias = _member(None, 3)
+    results = [
+        SimpleNamespace(
+            config=fresh.config, perf=0.0118, fn=fresh.fn, status="ok", compile_time=1.0
+        ),
+        SimpleNamespace(
+            config=alias.config,
+            perf=0.0164,
+            fn=fresh.fn,
+            status="deduplicated",
+            compile_time=None,
+        ),
+    ]
+    with (
+        patch.object(search, "benchmark_batch", return_value=results),
+        patch.object(search, "_record_benchmarked_member"),
+    ):
+        search.benchmark_population([fresh, alias])
+
+    assert fresh.timer_readings_from == 0
+    assert alias.timer_readings_from == (1 if traces else 0)

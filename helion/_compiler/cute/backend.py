@@ -2895,6 +2895,25 @@ class CuteBackend(Backend):
         # keeps a slow seed inside the timeout.
         return True
 
+    def autotune_short_kernel_below_us(self, config_spec: ConfigSpec) -> float | None:
+        # A row-reduction or pointwise kernel of 3-30 us has dozens of
+        # configs within a few percent of each other. The search's event
+        # timer reads them in steps of about 2 us, launch latency included
+        # (every finalist of a 13 us LayerNorm read 16.4 us while the final
+        # selection's trace separated them over 12.8-14.0 us), so the search
+        # walked over ties and the final selection picked among a random
+        # handful of them. A search whose best initial config reads below
+        # 64 us, where an event step is over 3% of a reading, reads its
+        # candidates' kernel durations from the trace, the timer of this
+        # backend's final selection (``default_final_selection_regime``).
+        # Not the flash search: its terminal refinement re-times members
+        # with mirrored wall-clock sweeps in this process
+        # (``mirrored_rebenchmark``) and ranks its history by the latest
+        # reading, so its candidates stay on one scale with those sweeps.
+        if config_spec.cute_flash_search_enabled:
+            return None
+        return 64.0
+
     def supports_parallel_render(self) -> bool:
         # Code generation only reads the device facts the render pool
         # captures (the MMA-support probe's current device, device properties
