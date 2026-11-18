@@ -84,6 +84,7 @@ from .logger import AutotuneLogEntry
 from .logger import capture_output
 from .logger import classify_triton_exception
 from .logger import format_triton_compile_failure
+from .logger import log_candidate_compile_failure
 from .logger import log_generated_triton_code_debug
 from .logger import match_unrecoverable_runtime_error
 from .logger import maybe_dump_triton_failure
@@ -2728,16 +2729,14 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     maybe_dump_triton_failure(
                         self.kernel, config, e, captured_output=captured[0] or None
                     )
-                    if not self.settings.autotune_ignore_errors:
-                        action = self.config_spec.backend.classify_autotune_exception(
-                            e
-                        ) or classify_triton_exception(e)
-                        log = self.log.debug if action == "debug" else self.log.warning
-                        log(
-                            "Skipping config that failed to compile: "
-                            f"{self.kernel.format_kernel_decorator(config, self.settings)}",
-                            exc_info=True,
-                        )
+                    log_candidate_compile_failure(
+                        self.log,
+                        self.settings,
+                        self.config_spec.backend,
+                        e,
+                        "Skipping config that failed to compile: "
+                        f"{self.kernel.format_kernel_decorator(config, self.settings)}",
+                    )
                     if first_error["value"] is None:
                         first_error["value"] = e
                     if no_viable_config:

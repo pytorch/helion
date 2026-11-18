@@ -183,10 +183,32 @@ def test_trace_serializes_nonfinite_and_dtype_configs(tmp_path: Path) -> None:
         {"dtype": "torch.float32"},
     ]
     assert len({row["config_id"] for row in trials}) == len(configs)
-    assert (
-        next(row for row in rows if row["event"] == "selected")["config_id"]
-        == trials[0]["config_id"]
-    )
+    selected = next(row for row in rows if row["event"] == "selected")
+    assert selected["config_id"] == trials[0]["config_id"]
+    assert "measured_config_id" not in selected
+
+
+def test_trace_selected_event_names_the_measured_config(tmp_path: Path) -> None:
+    """A search can return a config no trial carried: a simpler config of
+    the kernel it measured.  The event then names the measured config too,
+    the one whose trial rows hold the timings."""
+    base = tmp_path / "simplified"
+    log = AutotuningLogger(Settings(autotune_log=str(base), autotune_log_details=True))
+    measured = Config(block_sizes=[32], load_eviction_policies=["last"])
+    returned = Config(block_sizes=[32], load_eviction_policies=[""])
+    with log.autotune_tracing("LFBOTreeSearch"):
+        config_id = log.register_config(measured)
+        assert config_id is not None
+        log.record_autotune_entry(
+            AutotuneLogEntry(0, "ok", 1.0, None, config_id, measured)
+        )
+        log.record_selected_config(returned, measured_as=measured)
+    rows = _rows(base.with_suffix(".trace.jsonl"))
+    (trial,) = [row for row in rows if row["event"] == "trial"]
+    (selected,) = [row for row in rows if row["event"] == "selected"]
+    assert selected["config_id"] != trial["config_id"]
+    assert selected["measured_config_id"] == trial["config_id"]
+    assert selected["config"] == returned.config
 
 
 @pytest.mark.parametrize("suffix", [".trace.jsonl", ".csv", ".log", ".meta.jsonl"])
@@ -220,7 +242,9 @@ def test_logging_io_failure_does_not_abort_search(
                 raise RuntimeError("actual search failure")
             return winner
 
-    search = SimpleNamespace(log=log, _autotune_with_logging=tune)
+    search = SimpleNamespace(
+        log=log, _autotune_with_logging=tune, _selected_config_measured_as=None
+    )
     with (
         patch.object(path_type, "open", open_file),
         patch("helion.autotuner.logger.logging.FileHandler", file_handler),
@@ -266,7 +290,9 @@ def test_logging_serialization_failure_is_nonfatal(
             log.record_autotune_entry(_entry(log, 1.0))
             return winner
 
-    search = SimpleNamespace(log=log, _autotune_with_logging=tune)
+    search = SimpleNamespace(
+        log=log, _autotune_with_logging=tune, _selected_config_measured_as=None
+    )
     with patch(
         "helion.autotuner.logger.json.dumps",
         side_effect=TypeError("unserializable logging payload"),
@@ -625,7 +651,11 @@ def test_trace_records_returned_config_independently_of_historical_best(
         log.record_autotune_entry(_entry(log, 0.5))
         return returned_config
 
-    search = SimpleNamespace(log=log, _autotune_with_logging=autotune_with_logging)
+    search = SimpleNamespace(
+        log=log,
+        _autotune_with_logging=autotune_with_logging,
+        _selected_config_measured_as=None,
+    )
     assert BaseSearch.autotune(search, skip_cache=True) == returned_config
     rows = _rows(path)
     selected = [row for row in rows if row["event"] == "selected"]
