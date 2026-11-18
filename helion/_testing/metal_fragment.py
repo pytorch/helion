@@ -1,7 +1,7 @@
 """Kernels the Metal fragment-matmul tests share: the GPU module
 (``test/test_metal_fragment_mma.py``) runs them and the CPU-only ones
-(``test/test_metal_fragment_config.py``, ``test/test_metal_fragment_split.py``)
-read their config specs, code and MSL."""
+(``test/test_metal_fragment_config.py``, ``test/test_metal_fragment_split.py``,
+``test/test_metal_fragment_rows.py``) read their config specs, code and MSL."""
 
 from __future__ import annotations
 
@@ -159,11 +159,11 @@ def filled(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def nvfp4_cpu_args() -> tuple[torch.Tensor, ...]:
-    """CPU arguments for ``nvfp4_rows`` (8 rows, K 256, N 48), for the
-    tests that read only its config spec and code."""
+def nvfp4_cpu_args(rows: int = 8) -> tuple[torch.Tensor, ...]:
+    """CPU arguments for ``nvfp4_rows`` (``rows`` rows, K 256, N 48), for
+    the tests that read only its config spec and code."""
     return (
-        torch.randn(8, 256).to(torch.bfloat16),
+        torch.randn(rows, 256).to(torch.bfloat16),
         torch.randint(-(2**31), 2**31 - 1, (48, 32), dtype=torch.int32),
         torch.randint(0, 0x60, (48, 16), dtype=torch.uint8),
     )

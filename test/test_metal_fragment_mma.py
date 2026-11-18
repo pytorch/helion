@@ -319,6 +319,27 @@ class TestFragmentMma(unittest.TestCase):
         self.assertIn("constant float _helion_table_0[16] = {", msl)
         self.assertNotIn("_helion_table_1", msl)
 
+    def test_rows_past_end(self) -> None:
+        """Rows past M's end and columns past N's read at their tile's first
+        and are never stored (``test_metal_fragment_rows``): computed
+        operands with tails along M, N and K, also split over two SIMD
+        groups, and 4 rows of a dequantizing matmul's 8-row tile."""
+        x = torch.randn(13, 40, device=DEVICE)
+        y = torch.randn(40, 20, device=DEVICE)
+        ref = x.half().cpu().double()[:, 16:] @ y.half().cpu().double()[16:]
+        for num_warps in (1, 2):
+            with self.subTest(num_warps=num_warps):
+                config = fragment_config([16, 16, 16], num_warps=num_warps)
+                out, msl = _run(k_from_16, (x, y), config)
+                self._close(out, ref)
+                self.assertIn("_clamped_indices_0", msl)
+        (xq, wq, s), ref = _quantized("nvfp4", 8, 48, 256)
+        out, msl = _run(
+            nvfp4_rows, (xq[:4], wq, s), fragment_config([8, 16, 64], [1, 1, 512])
+        )
+        self._close(out, ref[:4])
+        self.assertRegex(msl, r"\? \(offset_\d+ \+ _e_m\) : offset_\d+\)")
+
     def test_nvfp4(self) -> None:
         """nvfp4 codes through half bits and a bitcast (view(dtype)), E4M3
         scales, at 8 rows and at one (decode)."""
@@ -418,9 +439,10 @@ class TestFragmentMma(unittest.TestCase):
         )
 
     def test_views(self) -> None:
-        """Both operands views, masked at the tensors' extents (M = 13, N =
-        20, K = 40 in tiles of 16), with a stored epilogue reading a bias,
-        also over one row; and a view of a transposed tensor."""
+        """Both operands views with tails along M, N and K (M = 13, N = 20,
+        K = 40 in tiles of 16), clamped past M's and N's extents and masked
+        past K's, with a stored epilogue reading a bias, also over one row;
+        and a view of a transposed tensor."""
         x = torch.randn(13, 40, device=DEVICE, dtype=torch.float16)
         y = torch.randn(40, 20, device=DEVICE, dtype=torch.float16)
         bias = torch.randn(20, device=DEVICE)
