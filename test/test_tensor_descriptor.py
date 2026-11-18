@@ -594,6 +594,46 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         torch.testing.assert_close(result, x[16:32, 8:24])
         self.assertEqual(code.count(get_tensor_descriptor_fn_name()), 2)
 
+    @skipUnlessTensorDescriptor("TensorDescriptor support is required")
+    def test_tensor_descriptor_nested_loop_cross_scope_indices(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            config=helion.Config(
+                indexing=["pointer", "tensor_descriptor", "tensor_descriptor"],
+            ),
+        )
+        def accumulate_shifted_blocks(
+            x: torch.Tensor, bounds: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([32, 16], dtype=x.dtype, device=x.device)
+            for worker in hl.grid(1):
+                base_r = bounds[worker]
+                for step in hl.grid(2):
+                    row_index = base_r + hl.arange(16)
+                    col_index = hl.arange(16)
+                    acc = hl.zeros([16, 16], dtype=torch.float32)
+                    for k_tile in hl.tile(32, block_size=16):
+                        blk = hl.load(x, [row_index, k_tile])
+                        acc = acc + blk
+                    hl.store(
+                        out,
+                        [step * 16 + hl.arange(16), col_index],
+                        acc.to(out.dtype),
+                    )
+                    base_r = base_r + 16
+            return out
+
+        x = torch.randn([40, 32], device=DEVICE, dtype=torch.float32)
+        bounds = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(accumulate_shifted_blocks, (x, bounds))
+
+        expected = torch.empty([32, 16], device=DEVICE, dtype=torch.float32)
+        expected[:16] = x[4:20, :16] + x[4:20, 16:32]
+        expected[16:] = x[20:36, :16] + x[20:36, 16:32]
+        torch.testing.assert_close(result, expected)
+        self.assertEqual(code.count(get_tensor_descriptor_fn_name()), 2)
+
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_scaled_subtraction_falls_back(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
