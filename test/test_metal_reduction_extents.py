@@ -236,3 +236,85 @@ def test_grid_lane_loop_reduction_rejected(
         match=re.escape(f"{op} reduction over an axis strided by a tile lane loop"),
     ):
         bound.to_code(helion.Config(block_sizes=[64], num_threads=[16]))
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def row_sums_where_positive(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """A K loop's row sums under an if on a per-element predicate."""
+    m, k = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for _g in hl.grid(1):
+        for tile_m in hl.tile(m):
+            acc = hl.zeros([tile_m], dtype=torch.float32)
+            if c[tile_m] > 0:
+                for tile_k in hl.tile(k):
+                    acc = acc + x[tile_m, tile_k].sum(1)
+            out[tile_m] = acc
+    return out
+
+
+def test_collective_under_a_per_element_predicate_rejected() -> None:
+    """A reduction whose block spans threads combines through a threadgroup
+    collective, whose barriers every thread must reach; under an if on a
+    predicate over M with M's rows on threads, some threads skip them, so
+    it is refused.  With K on one thread it combines in registers, and with
+    M's rows on one thread's lanes every thread tests the same element, so
+    both lower."""
+    bound = cpu_bind(row_sums_where_positive, (torch.randn(16, 64), torch.randn(16)))
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match=re.escape("a reduction across threads (a threadgroup collective) under"),
+    ):
+        bound.to_code(helion.Config(block_sizes=[16, 64], num_threads=[16, 64]))
+    for num_threads in ([16, 1], [1, 64]):
+        bound.to_code(helion.Config(block_sizes=[16, 64], num_threads=num_threads))
+
+
+@helion.kernel(backend="metal")
+def row_sum_where(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """A row sum over a ':' dim under an if on a per-row predicate."""
+    m, _ = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        value = hl.zeros([tile_m], dtype=torch.float32)
+        if c[tile_m] > 0:
+            value = x[tile_m, :].sum(1)
+        out[tile_m] = value
+    return out
+
+
+@helion.kernel(backend="metal")
+def row_sum_if(x: torch.Tensor, flag: torch.Tensor) -> torch.Tensor:
+    """A row sum over a ':' dim under an if on a scalar predicate."""
+    m, _ = x.size()
+    out = torch.zeros([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        value = hl.zeros([tile_m], dtype=torch.float32)
+        if flag[0] > 0:
+            value = x[tile_m, :].sum(1)
+        out[tile_m] = value
+    return out
+
+
+def test_rolled_reduction_under_an_if_rejected() -> None:
+    """A rolled reduction's loop wraps the if and its result is combined
+    after the loop, where the if's body can't read it: refused at every
+    config, on a per-row predicate (with M on threads, on one thread's
+    lanes, at one row) and on a scalar one, which the persistent form
+    lowers."""
+    match = re.escape("a rolled reduction (reduction_loops) under an if")
+    x = torch.randn(16, 256)
+    per_row = cpu_bind(row_sum_where, (x, torch.randn(16)))
+    scalar = cpu_bind(row_sum_if, (x, torch.randn(1)))
+    for bound, config in (
+        (per_row, helion.Config(block_sizes=[16], reduction_loops=[64])),
+        (
+            per_row,
+            helion.Config(block_sizes=[16], reduction_loops=[64], num_threads=[1]),
+        ),
+        (per_row, helion.Config(block_sizes=[1], reduction_loops=[64])),
+        (scalar, helion.Config(block_sizes=[16], reduction_loops=[64])),
+    ):
+        with pytest.raises(exc.BackendUnsupported, match=match):
+            bound.to_code(config)
+    scalar.to_code(helion.Config(block_sizes=[16], reduction_loops=[None]))
