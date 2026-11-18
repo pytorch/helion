@@ -190,6 +190,7 @@ from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
+from .cute_row_packets import row_packet_seed_configs
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_simt_mma import CuteSimtMmaHeuristic
@@ -497,6 +498,11 @@ def postprocess_seed_configs(
         env.config_spec.autotuner_heuristics.append(
             CutePointwiseMinBlocksHeuristic.name
         )
+    # The row-packet families, after every older family.
+    for family, row_seeds in row_packet_seed_configs(env, device_ir):
+        if row_seeds:
+            configs.extend(row_seeds)
+            env.config_spec.autotuner_heuristics.append(family)
     return configs
 
 

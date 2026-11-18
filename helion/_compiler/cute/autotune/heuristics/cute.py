@@ -820,6 +820,21 @@ def _cute_seed_vec_width(
     )
 
 
+def _has_one_sized_reduction_loop(spec: ConfigSpec) -> bool:
+    """One reduction loop that carries a sized reduction, and no matmul.
+
+    The loop must carry a reduction: a pointwise kernel's rollable full
+    slice (rope's half dim) registers a reduction loop too, and one row per
+    CTA is the wrong family for it."""
+    if len(spec.reduction_loops) != 1 or spec.matmul_facts:
+        return False
+    fact = spec.reduction_kernel_fact
+    return fact is not None and any(
+        descriptor.category in SIZED_REDUCTION_CATEGORIES
+        for descriptor in fact.reductions
+    )
+
+
 def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
     """A row reduction whose rows are indexed by several tile axes.
 
@@ -830,18 +845,7 @@ def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
     canonical form.  CuTe-only: the Triton heuristics keep the shared gate.
     """
     spec = env.config_spec
-    if len(spec.block_sizes) < 2 or len(spec.reduction_loops) != 1:
-        return False
-    if spec.matmul_facts:
-        return False
-    # The loop must carry a reduction: a pointwise kernel's rollable full
-    # slice (rope's half dim) registers a reduction loop too, and one row
-    # per CTA is the wrong family for it.
-    fact = spec.reduction_kernel_fact
-    if fact is None or not any(
-        descriptor.category in SIZED_REDUCTION_CATEGORIES
-        for descriptor in fact.reductions
-    ):
+    if len(spec.block_sizes) < 2 or not _has_one_sized_reduction_loop(spec):
         return False
     return all(
         max(bs_spec.min_size, bs_spec.autotuner_min) <= 1
@@ -1222,28 +1226,61 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         for rows in cls.WARP_ROWS_PER_CTA:
             if not _block_size_value_reachable(spec, row_index, rows):
                 continue
-            block_sizes = [1] * len(spec.block_sizes)
-            block_sizes[row_index] = rows
-            seed: dict[str, Any] = {
-                "block_sizes": block_sizes,
-                "num_threads": _seq_config_list(
-                    spec.num_threads, {row_block: rows, block_id: 32}
-                ),
-                "reduction_loops": [extent],
-                "cute_vector_widths": _seq_config_list(
-                    spec.cute_vector_widths, {block_id: vec}
-                ),
-                **cls._row_reload_entries(spec, block_id),
-            }
-            if block_id in spec.cute_lane_layouts.valid_block_ids():
-                seed["cute_lane_layouts"] = _seq_config_list(
-                    spec.cute_lane_layouts, {block_id: "strided"}
-                )
+            seed = cls.rolled_rows_seed(
+                spec,
+                row_index=row_index,
+                block_id=block_id,
+                extent=extent,
+                rows=rows,
+                threads=32,
+                vec=vec,
+            )
             try:
                 seeds.append(Config(**seed))
             except Exception:
                 continue
         return seeds
+
+    @classmethod
+    def rolled_rows_seed(
+        cls,
+        spec: ConfigSpec,
+        *,
+        row_index: int,
+        block_id: int,
+        extent: int,
+        rows: int,
+        threads: int,
+        vec: int,
+        slice_threads: Mapping[int, int] | None = None,
+        slice_widths: Mapping[int, int] | None = None,
+    ) -> dict[str, Any]:
+        """The config values of the warp rows' form: ``rows`` rows per CTA on
+        the tile axis ``row_index`` with as many threads on it, ``threads``
+        threads and ``vec``-wide packets on the reduced row ``block_id``, the
+        row of ``extent`` elements one rolled trip, strided lanes and
+        register-prefetch reloads.  ``slice_threads`` and ``slice_widths`` add
+        thread counts and vector widths for other blocks."""
+        block_sizes = [1] * len(spec.block_sizes)
+        block_sizes[row_index] = rows
+        row_block = spec.block_sizes[row_index].block_id
+        seed: dict[str, Any] = {
+            "block_sizes": block_sizes,
+            "num_threads": _seq_config_list(
+                spec.num_threads,
+                {row_block: rows, block_id: threads, **(slice_threads or {})},
+            ),
+            "reduction_loops": [extent],
+            "cute_vector_widths": _seq_config_list(
+                spec.cute_vector_widths, {block_id: vec, **(slice_widths or {})}
+            ),
+            **cls._row_reload_entries(spec, block_id),
+        }
+        if block_id in spec.cute_lane_layouts.valid_block_ids():
+            seed["cute_lane_layouts"] = _seq_config_list(
+                spec.cute_lane_layouts, {block_id: "strided"}
+            )
+        return seed
 
     @classmethod
     def _row_reload_entries(cls, spec: ConfigSpec, block_id: int) -> dict[str, Any]:
@@ -1745,13 +1782,11 @@ def _cute_tile_vector_axis(
     return (outer_block_id, block_id, vec, extent) if vec > 1 else None
 
 
-def _stride_one_accesses(
+def _memory_accesses(
     device_ir: DeviceIR,
-) -> Iterator[tuple[torch.Tensor, int, list[object]] | None]:
-    """Each load and store of ``device_ir`` as ``(tensor, its stride-1 dim,
-    the subscripts of its dims)``, ``None`` for one whose tensor or indices
-    are not plain.  An operand with no stride-1 dim (a broadcast, stride 0
-    everywhere) sets no lane axis and is skipped."""
+) -> Iterator[tuple[torch.Tensor, list[object]] | None]:
+    """Each load and store of ``device_ir`` as ``(tensor, the subscripts of
+    its dims)``, ``None`` for one whose tensor or indices are not plain."""
     for graph_info in device_ir.graphs:
         for node in graph_info.graph.nodes:
             if node.op != "call_function" or node.target not in (
@@ -1771,16 +1806,45 @@ def _stride_one_accesses(
             ):
                 yield None
                 continue
-            stride1 = next(
-                (
-                    dim
-                    for dim in range(fake.ndim)
-                    if isinstance(fake.stride(dim), int) and fake.stride(dim) == 1
-                ),
-                None,
-            )
-            if stride1 is not None:
-                yield fake, stride1, [idx for idx in index_list if idx is not None]
+            yield fake, [idx for idx in index_list if idx is not None]
+
+
+def _stride_one_accesses(
+    device_ir: DeviceIR,
+) -> Iterator[tuple[torch.Tensor, int, list[object]] | None]:
+    """Each load and store of ``device_ir`` (``_memory_accesses``) as
+    ``(tensor, its stride-1 dim, the subscripts of its dims)``, ``None`` for
+    one whose tensor or indices are not plain.  An operand with no stride-1
+    dim (a broadcast, stride 0 everywhere) sets no lane axis and is
+    skipped."""
+    for access in _memory_accesses(device_ir):
+        if access is None:
+            yield None
+            continue
+        fake, subscripts = access
+        stride1 = next(
+            (
+                dim
+                for dim in range(fake.ndim)
+                if isinstance(fake.stride(dim), int) and fake.stride(dim) == 1
+            ),
+            None,
+        )
+        if stride1 is not None:
+            yield fake, stride1, subscripts
+
+
+def _reduction_blocks_of_extent(
+    env: CompileEnvironment, size: int | torch.SymInt
+) -> list[int]:
+    """The reduction blocks whose one extent is ``size``."""
+    return [
+        info.block_id
+        for info in env.block_sizes
+        if info.reduction
+        and isinstance(info.size, (int, torch.SymInt))
+        and env.known_equal(info.size, size)
+    ]
 
 
 def _slice_reduction_blocks(
@@ -1791,13 +1855,7 @@ def _slice_reduction_blocks(
     if not isinstance(subscript, slice) or subscript.step not in (None, 1):
         return None
     size = compute_slice_size(subscript, fake.shape[dim])
-    return size, [
-        info.block_id
-        for info in env.block_sizes
-        if info.reduction
-        and isinstance(info.size, (int, torch.SymInt))
-        and env.known_equal(info.size, size)
-    ]
+    return size, _reduction_blocks_of_extent(env, size)
 
 
 def _cute_persistent_contiguous_block(
