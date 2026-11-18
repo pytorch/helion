@@ -44,8 +44,8 @@ jobs:
           retry () {
             "$@" || (sleep 10 && "$@") || (sleep 20 && "$@") || (sleep 40 && "$@")
           }
-          retry uv pip install -U --pre nvidia-nvshmem-cu13 --index-url https://download.pytorch.org/whl/nightly/cu130
-          retry uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu130
+          retry uv pip install -U --pre nvidia-nvshmem-cu13 --index-url https://download.pytorch.org/whl/nightly/cu132
+          retry uv pip install -U --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
 
       - name: Install lint dependencies
         run: |
