@@ -243,6 +243,7 @@ def test_wrapper_cache_identity_separates_counts_roles_and_legacy_schema() -> No
     ) -> str | None:
         wrapper = {"kind": "tcgen05_ab_tma", "operand_transform": identity}
         kernel = SimpleNamespace(
+            __name__="cute_kernel",
             _helion_cute_source_hash="unchanged generated source",
             _helion_cute_wrapper_plans=[wrapper],
         )

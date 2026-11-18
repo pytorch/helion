@@ -1421,6 +1421,30 @@ class BaseSearch(BaseAutotuner):
                 f"{self._autotune_metrics.num_configs_tested} configs failed in "
                 "isolated benchmark workers."
             )
+        if self._autotune_metrics.num_worker_job_exceptions:
+            # Not configs: a re-timing that raised lost a reading of a config
+            # that was measured, and counts in no figure above.
+            retimings = self._autotune_metrics.num_isolated_rebenchmark_exceptions
+            lost = (
+                f", {retimings} of them re-timings, which gave no reading"
+                if retimings
+                else ""
+            )
+            # The count is logged either way, as the failure counts above;
+            # ``autotune_ignore_errors`` silenced the jobs' own warnings.
+            where = (
+                "autotune_ignore_errors silenced their warnings; the debug "
+                "log has every job's error."
+                if self.settings.autotune_ignore_errors
+                else "The warnings above quote each different error of a "
+                "re-timing and, up to a limit, of a candidate; the debug log "
+                "has every job's."
+            )
+            self.log.warning(
+                f"{self._autotune_metrics.num_worker_job_exceptions} benchmark "
+                "jobs raised an exception past their candidate's compile and "
+                f"first call{lost}. {where}"
+            )
         cached_path = self.kernel.get_cached_path(best)
         if cached_path is not None and is_master_rank():
             self.log(f"Code of selected kernel: {cached_path}")

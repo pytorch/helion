@@ -110,9 +110,11 @@ from .host_wrappers.recurrences import validate_gdn_recurrence_launch_args
 from .launch_caches import (
     DYNAMIC_TENSORMAP_WORKSPACE_CACHE_LIMIT as _TCGEN05_DYNAMIC_TENSORMAP_WORKSPACE_CACHE_LIMIT,
 )
+from .launch_caches import FASTPATH_ATTRIBUTE as _FASTPATH_ATTRIBUTE
 from .launch_caches import (
     GROUPED_STATIC_METADATA_CACHE_LIMIT as _TCGEN05_GROUPED_STATIC_METADATA_CACHE_LIMIT,
 )
+from .launch_caches import LAST_LAUNCH_CACHE_ATTRIBUTE as _LAST_LAUNCH_CACHE_ATTRIBUTE
 from .launch_caches import LAUNCH_ARG_CACHE_LIMIT as _CUTE_LAUNCH_ARG_CACHE_LIMIT
 from .launch_caches import (
     MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT as _MMA_DAG_FIXUP_WORKSPACE_CACHE_LIMIT,
@@ -3446,7 +3448,7 @@ def _cute_maybe_build_fastpath(
     issued and the state stays unset; the next eager launch that misses the
     last-launch cache (same-pointer calls keep hitting it) builds it.
     """
-    if getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None) is not None:
+    if getattr(cast("Any", cute_kernel), _FASTPATH_ATTRIBUTE, None) is not None:
         return
     if torch.cuda.is_current_stream_capturing():
         return
@@ -3460,9 +3462,7 @@ def _cute_maybe_build_fastpath(
         compiled,
         signature=signature,
     )
-    cast("Any", cute_kernel)._helion_cute_fastpath = (
-        state if state is not None else False
-    )
+    setattr(cute_kernel, _FASTPATH_ATTRIBUTE, state if state is not None else False)
 
 
 def _cute_build_fast_relaunch(
@@ -3712,7 +3712,7 @@ def _cute_last_launch_cache_entry(
     block: tuple[int, int, int],
     compile_options: str | None,
 ) -> _CuteLastLaunchCacheEntry | None:
-    entry = getattr(cast("Any", cute_kernel), "_helion_cute_last_launch_cache", None)
+    entry = getattr(cast("Any", cute_kernel), _LAST_LAUNCH_CACHE_ATTRIBUTE, None)
     if not isinstance(entry, _CuteLastLaunchCacheEntry):
         return None
     if not entry.arg_guard.matches(cute_kernel, args, grid):
@@ -3754,11 +3754,15 @@ def _set_cute_last_launch_cache_entry(
         args,
         getattr(cast("Any", cute_kernel), "_helion_cute_cluster_shape", None),
     )[0]
-    cast("Any", cute_kernel)._helion_cute_last_launch_cache = _CuteLastLaunchCacheEntry(
-        arg_guard=arg_guard,
-        compiled_discriminator=compiled_discriminator,
-        launch=launch,
-        compiled=compiled,
+    setattr(
+        cute_kernel,
+        _LAST_LAUNCH_CACHE_ATTRIBUTE,
+        _CuteLastLaunchCacheEntry(
+            arg_guard=arg_guard,
+            compiled_discriminator=compiled_discriminator,
+            launch=launch,
+            compiled=compiled,
+        ),
     )
 
 
@@ -3784,7 +3788,7 @@ def _default_cute_launcher_untracked(
 ) -> object:
     # The relaunch of a kernel launched before, compared as the host code
     # spells the launch (every tensor and scalar argument still guarded).
-    fastpath = getattr(cute_kernel, "_helion_cute_fastpath", None)
+    fastpath = getattr(cute_kernel, _FASTPATH_ATTRIBUTE, None)
     if fastpath.__class__ is _CuteFastRelaunch:
         hit, result = fastpath.try_launch_raw(args, grid, kwargs)
         if hit:
@@ -3807,7 +3811,7 @@ def _cute_record_raw_launch(
     when this call's normalized grid, block and options are the fastpath's:
     a concurrent first launch with another grid must not leave its spelling
     on a fastpath pinned to a different one."""
-    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    fastpath = getattr(cast("Any", cute_kernel), _FASTPATH_ATTRIBUTE, None)
     if (
         fastpath.__class__ is _CuteFastRelaunch
         and fastpath.raw_grid is None
@@ -3857,7 +3861,7 @@ def _default_cute_launcher_normalized(
     # DSL's per-call marshalling entirely (fresh output allocations change
     # tensor pointers on every call in real workloads, so pointer-keyed
     # caching alone still pays the full marshalling cost each time).
-    fastpath = getattr(cast("Any", cute_kernel), "_helion_cute_fastpath", None)
+    fastpath = getattr(cast("Any", cute_kernel), _FASTPATH_ATTRIBUTE, None)
     if isinstance(fastpath, _CuteFastRelaunch):
         hit, result = fastpath.try_launch(
             args_tuple, grid_xyz, block_xyz, cute_compile_options

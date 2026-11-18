@@ -770,20 +770,14 @@ def _make_batched_cudagraph_replay(
             fn()
         torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
-    prior_stream = torch.cuda.current_stream()
     outputs: list[object] = []
-    try:
-        with cute_cuda_graph() as graph:
-            for _ in range(calls):
-                clear_cache()
-                if fn is not None:
-                    output = fn()
-                    if keep_outputs:
-                        outputs.append(output)
-    except Exception:
-        # An invalidated capture leaves the capture stream current.
-        torch.cuda.set_stream(prior_stream)
-        raise
+    with cute_cuda_graph() as graph:
+        for _ in range(calls):
+            clear_cache()
+            if fn is not None:
+                output = fn()
+                if keep_outputs:
+                    outputs.append(output)
     torch.cuda.synchronize()
 
     def replay() -> None:
@@ -900,12 +894,10 @@ def _maybe_cudagraph_replay(
         _log.debug("Skipping CUDA graph benchmarking: %s", reason)
         return fn
 
-    prior_stream = torch.cuda.current_stream()
     try:
         return _make_cudagraph_replay(fn)
     except Exception:
         _log.debug("CUDA graph benchmark capture failed; falling back", exc_info=True)
-        torch.cuda.set_stream(prior_stream)
         return fn
 
 
@@ -2619,6 +2611,9 @@ def do_bench_cuda_graph(
     _priming_output = None
     _output = None
     try:
+        # A capture that raises leaves this thread's stream as it was
+        # (``cute_cuda_graph``): a benchmark worker runs its later jobs on
+        # its own stream, not on this job's.
         with cute_cuda_graph(stream=stream) as graph:
             if reset is not None:
                 reset()

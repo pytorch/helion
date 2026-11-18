@@ -26,6 +26,7 @@ from helion._compiler.compile_environment import CompileEnvironment
 from helion._compiler.cute.autotune.heuristics.cute_split_k_workspace import (
     CuteSplitKWorkspaceHeuristic,
 )
+from helion._compiler.cute.pdl_release import generic_release_rendered
 from helion._compiler.cute.split_k_workspace import analyze_split_k_workspace
 from helion._compiler.cute.split_k_workspace import atomic_epilogue_geometry
 from helion._compiler.cute.split_k_workspace import plain_store_chunk
@@ -1866,6 +1867,10 @@ def test_atomic_epilogue_emits_one_producer_and_a_fill_kernel(with_bias: bool) -
     assert "_helion_zero_fill_split_k._helion_cute_use_pdl = True" in source
     fill = _kernel_source(source, "_helion_zero_fill_split_k")
     assert fill.index("griddepcontrol_wait()") < fill.index("launch_dependents()")
+    # The fill kernel is the host module's only kernel (the producer is a
+    # kernel of the embedded module) and waits and releases at entry: it
+    # does not read as the early release of a kernel on the generic path.
+    assert not generic_release_rendered(source)
     assert "'epilogue': 'atomic'" in source
     call = next(line for line in host.splitlines() if "_native_partition_gemm(" in line)
     positional = call.split("(", 1)[1].rsplit(", _launcher=", 1)[0].split(", ")

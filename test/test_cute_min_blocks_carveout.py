@@ -38,7 +38,8 @@ def _kernel(**attributes: object) -> SimpleNamespace:
     module statements and the standalone emitters (row_resident_codegen,
     row_matrix_transport_codegen, packed_operand_codegen) assign them."""
     return SimpleNamespace(
-        **{f"_helion_cute_{name}": value for name, value in attributes.items()}
+        __name__="cute_kernel",
+        **{f"_helion_cute_{name}": value for name, value in attributes.items()},
     )
 
 

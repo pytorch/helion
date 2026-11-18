@@ -174,7 +174,9 @@ def test_sdk_captured_override_preserves_unrelated_options(
 
 
 def test_pipeline_changes_disk_key_without_changing_kernel():
-    kernel = SimpleNamespace(_helion_cute_source_hash="same-source")
+    kernel = SimpleNamespace(
+        __name__="cute_kernel", _helion_cute_source_hash="same-source"
+    )
     keys = [
         disk_cache_key(kernel, (), (32, 1, 1), (), None, option)
         for option in (None, "--opt-level 2")

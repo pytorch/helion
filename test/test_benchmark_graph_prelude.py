@@ -9,6 +9,7 @@ import torch
 
 from helion.autotuner import benchmarking
 import helion.runtime as runtime
+from helion.runtime.cute import launch_caches
 
 pytestmark = pytest.mark.cpu_only
 
@@ -43,6 +44,7 @@ def mock_graph_timer(monkeypatch):
             torch.cuda, "stream", lambda stream: contextlib.nullcontext()
         )
         monkeypatch.setattr(torch.cuda, "current_stream", Stream)
+        monkeypatch.setattr(torch.cuda, "set_stream", lambda stream: None)
         monkeypatch.setattr(torch.cuda, "Event", Event)
         monkeypatch.setattr(runtime, "cute_cuda_graph", capture)
 
@@ -141,6 +143,79 @@ def test_graph_timer_rejects_per_call_bank_flush_before_capture(monkeypatch):
     monkeypatch.setattr(benchmarking, "steady_graph_dispatch", lambda: None)
     with pytest.raises(ValueError, match="replay or off"):
         benchmarking.do_bench_cuda_graph(lambda: None, l2_flush_mode="call")
+
+
+@pytest.mark.parametrize("fails", ["begin", "body", "end", "interrupted end"])
+def test_capture_that_raises_leaves_the_callers_stream_current(
+    monkeypatch, mock_graph_timer, fails
+):
+    """``torch.cuda.graph`` enters its capture stream ahead of the capture's
+    begin and skips its stream exit when the begin or the end raises (an
+    invalidated capture). ``cute_cuda_graph`` puts the caller's stream back,
+    so the timer that captures through it leaves it current: a benchmark
+    worker would otherwise run every later job on the failed job's stream.
+    That holds for whatever is raised, an interrupt of the end included."""
+    current = ["caller's"]
+    raised = KeyboardInterrupt if fails == "interrupted end" else RuntimeError
+
+    class Graph:
+        def reset(self):
+            pass
+
+    class TorchGraph:
+        def __init__(self, graph, *, stream, **options):
+            self.stream = stream
+
+        def __enter__(self):
+            current.append(self.stream)
+            if fails == "begin":
+                raise RuntimeError("capture_begin failed")
+
+        def __exit__(self, *exc_info):
+            if fails in ("end", "interrupted end"):
+                raise raised("operation failed due to a previous error during capture")
+            # the capture ended: the capture stream's context exits
+            current.pop()
+
+    def fn():
+        if fails == "body" and len(current) > 1:
+            raise RuntimeError("the captured call failed")
+
+    mock_graph_timer(launch_caches.cute_cuda_graph, lambda: None, lambda: None)
+    monkeypatch.setattr(launch_caches, "CuteCUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "graph", TorchGraph)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current[-1])
+    monkeypatch.setattr(torch.cuda, "set_stream", current.append)
+    with pytest.raises(raised, match="capture|captured call"):
+        benchmarking.do_bench_cuda_graph(
+            fn, pre_warmed=True, l2_flush_mode="off", fixed_repetitions=1
+        )
+    assert current[-1] == "caller's"
+    assert launch_caches.ACTIVE_CUDA_GRAPH.get() is None
+
+
+def test_capture_whose_stream_read_raises_marks_no_graph_as_captured(monkeypatch):
+    """``cute_cuda_graph`` reads the caller's stream, to put it back after a
+    capture that raises, before it names its graph as the one being
+    captured: where that read raises (an interrupt, a broken device) no
+    capture began, and no later launch of the context may read as inside
+    one."""
+
+    class Graph:
+        pass
+
+    def current_stream():
+        raise RuntimeError("the device is gone")
+
+    monkeypatch.setattr(launch_caches, "CuteCUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    assert launch_caches.ACTIVE_CUDA_GRAPH.get() is None
+    with (
+        pytest.raises(RuntimeError, match="the device is gone"),
+        launch_caches.cute_cuda_graph(),
+    ):
+        raise AssertionError("the capture's body must not run")
+    assert launch_caches.ACTIVE_CUDA_GRAPH.get() is None
 
 
 @pytest.mark.parametrize(

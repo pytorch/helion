@@ -27,7 +27,10 @@ def common_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _ordinary_key() -> str | None:
-    kernel = SimpleNamespace(_helion_cute_source_hash="unchanged generated import")
+    kernel = SimpleNamespace(
+        __name__="cute_kernel",
+        _helion_cute_source_hash="unchanged generated import",
+    )
     return launcher._cute_disk_cache_key(kernel, (), (128, 1, 1), (), None, None)
 
 
@@ -62,6 +65,7 @@ def test_unrelated_helper_does_not_change_ordinary_kernel_key(
 
 def _called_helper_key(namespace: dict[str, object]) -> str | None:
     kernel = SimpleNamespace(
+        __name__="cute_kernel",
         _helion_cute_source_hash="unchanged generated source",
         __wrapped__=SimpleNamespace(__globals__=namespace),
     )
