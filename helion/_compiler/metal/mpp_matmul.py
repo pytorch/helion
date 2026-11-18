@@ -203,7 +203,8 @@ _BATCHED = (
 _IOTA = torch.ops.prims.iota.default
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _INT_DTYPES = (torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64)
-_WRITES = (
+#: The ops that write a tensor: stores and atomics.
+WRITES = (
     store,
     atomic_ops.atomic_add,
     atomic_ops.atomic_xchg,
@@ -436,6 +437,9 @@ class MppPlan:
     wide: dict[int, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The lowering of every group when the config asks for fragments.
     fragment: FragmentLowering | None = None
+    #: The SIMD groups that split each fragment group's K loop (``num_warps``,
+    #: ``fragment_mma``), each running the tile's 32-thread layout.
+    split: int = 1
 
 
 def _node(value: object) -> Node:
@@ -990,7 +994,7 @@ def _plan_matmuls(
             plan.by_vec[vec] = group
     if plan.by_matmul:
         plan.written = {
-            storage_key(n) for gi in live for n in gi.graph.nodes if n.target in _WRITES
+            storage_key(n) for gi in live for n in gi.graph.nodes if n.target in WRITES
         }
         _link_element_staging(plan)
         _order_memory(plan, live, known)
@@ -2324,7 +2328,7 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: Graphs) -> None:
     written = plan.written
     for g in live:
         for n in g.graph.nodes:
-            if n.target is load or n.target in _WRITES:
+            if n.target is load or n.target in WRITES:
                 accesses.setdefault(storage_key(n), []).append(n)
     for group in plan.by_matmul.values():
         _prune_derived(group)
@@ -2568,15 +2572,26 @@ def _forward_slice(starts: list[Node], graphs: Graphs) -> list[Node]:
 
 
 def check_mpp_launch(plan: MppPlan, block_dims: Sequence[int]) -> None:
-    """Every thread joins each MPP op, whose scope is the launch's SIMD groups."""
+    """Every thread joins each MPP op, whose scope is the launch's SIMD
+    groups.  A fragment group's tile takes one SIMD group's 32 threads,
+    ``block_dims``, which each of the ``split`` SIMD groups of the launch
+    runs."""
     if not plan.by_matmul:
         return
     threads = math.prod(block_dims)
-    if threads != 32 and plan.fragment is not None:
-        raise metal_unsupported(
-            f"a fragment matmul (metal_matmul='fragment') in a threadgroup of "
-            f"{threads} threads; it runs on one 32-thread SIMD group (num_warps=1)"
-        )
+    if plan.fragment is not None:
+        if threads != 32:
+            raise metal_unsupported(
+                f"a fragment matmul (metal_matmul='fragment') whose tile takes "
+                f"{threads} threads; it runs on a 32-thread SIMD group (change "
+                "num_threads or the block sizes)"
+            )
+        if plan.split > 32:
+            raise metal_unsupported(
+                f"a fragment K loop split over {plan.split} SIMD groups (num_warps); "
+                "a threadgroup holds at most 32"
+            )
+        return
     if threads > 1024 or threads % 32:
         raise metal_unsupported(
             f"a cooperative MPP matmul in a threadgroup of {threads} threads; it "
