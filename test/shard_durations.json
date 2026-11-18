@@ -111,7 +111,7 @@
  "test/test_cute_flash_alignment.py": 44.4,
  "test/test_cute_flash_alt.py": 40.7,
  "test/test_cute_flash_bias_stage.py": 5.9,
- "test/test_cute_flash_bwd_flex_gpu.py": 267.7,
+ "test/test_cute_flash_bwd_flex_gpu.py": 939.6,
  "test/test_cute_flash_bwd_match.py": 5.1,
  "test/test_cute_flash_bwd_row_mma.py": 20.0,
  "test/test_cute_flash_early_prologue_loads.py": 2.5,
