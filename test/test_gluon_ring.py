@@ -1972,6 +1972,9 @@ class TestGluonRing(TestCase):
             code = bound.to_triton_code(config)
         self.assertIn("helion_dist_utils._group_claim(", code)
         self.assertNotIn("helion_dist_utils._claim(", code)
+        # The scaling root's tickets have no weight step: the claiming producer
+        # binds the ticket after one only once its worker took it.
+        self.assertIn("_helion_ring.task_pace(", code)
         # 64 row keys of 4 matmul tasks: the scaling root lags a wave of the
         # workers' claims, the second matmul at most every key before it.
         match = re.search(r"_group_claim\([^,]+, (\d+),", code)  # the workers

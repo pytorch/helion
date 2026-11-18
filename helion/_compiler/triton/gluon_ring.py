@@ -724,6 +724,17 @@ def task_put(tasks, full, empty, step, S: gl.constexpr, ticket):
     return ticket
 
 
+@gluon.jit
+def task_pace(empty, step, S: gl.constexpr, idle):
+    """The claiming partition's side, before its next claim: once it issued no
+    ring step for the ticket before (``idle``: a light root's task), wait until
+    every consumer took that ticket, so its worker binds the next one only as it
+    starts this one."""
+    if idle:
+        before = step - 1
+        mbarrier.wait(empty.index(before % S), (before // S) & 1)
+
+
 # ---- the lowering ------------------------------------------------------------
 
 _DEPTH = "_helion_ring_S"
@@ -876,6 +887,8 @@ _TASKS, _TASK_FULL, _TASK_EMPTY, _TASK_STEP = (
     f"_helion_task{k}" for k in ("s", "_full", "_empty", "_step")
 )
 _TASK_DEPTH = "_helion_task_S"
+# The claiming producer's ring steps when it put its last ticket (``task_pace``).
+_TASK_MARK = "_helion_task_mark"
 
 
 def _acc(index: int) -> tuple[str, ...]:
@@ -1754,6 +1767,16 @@ class RingLowering:
                     pace,
                     df.sync_names("wait"),
                     _any(ahead),
+                )
+            if body_slice.claims is not None and body_slice.puts:
+                stepped = _all_names(partition_body)
+                partition_body = _paced_claims(
+                    partition_body,
+                    [
+                        _channel("step", c)
+                        for c in ids
+                        if _channel("step", c) in stepped
+                    ],
                 )
             # Warps: producers 2, an MMA side storing scales 4, scalar-only 1.
             stores = body_slice.puts is None and self.mma_tensors
@@ -2712,6 +2735,52 @@ def _any(tests: list[ast.expr]) -> ast.expr:
     return (
         create(ast.BoolOp, op=ast.Or(), values=tests) if tests else ast.Constant(False)
     )
+
+
+def _paced_claims(body: list[ast.stmt], steps: list[str]) -> list[ast.stmt]:
+    """The claiming weight producer's task loops: each claim after a ticket it
+    issued no ring step for paces on that ticket (``task_pace``).  Claimed ahead,
+    a run of light tickets would queue on one worker, each behind the last, while
+    other workers take the tickets after them."""
+    if not steps:
+        return body
+    total = " + ".join(steps)
+
+    def paced(block: list[ast.stmt]) -> list[ast.stmt]:
+        out: list[ast.stmt] = []
+        for st in block:
+            loop_body = st.body if isinstance(st, ast.While) else []
+            claims = [
+                s
+                for s in loop_body
+                if isinstance(s, ast.Assign) and _ring_call(s, "task_put") is not None
+            ]
+            if isinstance(st, ast.While) and claims:
+                loop: list[ast.stmt] = []
+                for s in st.body:
+                    if s in claims:
+                        loop.append(
+                            statement_from_string(
+                                f"{ALIAS}.task_pace({_TASK_EMPTY}, {_TASK_STEP}, "
+                                f"{_TASK_DEPTH}, {total} == {_TASK_MARK})"
+                            )
+                        )
+                    loop.append(s)
+                    if s in claims:
+                        loop.append(statement_from_string(f"{_TASK_MARK} = {total}"))
+                out.extend(
+                    [
+                        statement_from_string(f"{_TASK_MARK} = {total}"),
+                        create(ast.While, test=st.test, body=loop, orelse=[]),
+                    ]
+                )
+            elif (nested := _rebuilt(st, paced)) is not None:
+                out.append(nested)
+            else:
+                out.append(st)
+        return out
+
+    return paced(body)
 
 
 def _paced_fill(
