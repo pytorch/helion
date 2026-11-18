@@ -849,6 +849,107 @@ def _is_row_reduction_over_tiles(env: CompileEnvironment) -> bool:
     )
 
 
+def _row_tile_groups(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> list[list[int]] | None:
+    """The block sizes that tile the rows of the kernel's reduction loop, or
+    ``None`` when the row heuristics' layouts do not fit the kernel.  One
+    list per root loop over the rows (one for loops that share their block
+    sizes), as block ids from the outermost tile axis to the innermost.
+
+    The row heuristics seed layouts of one row: rows per CTA on the block
+    sizes, and threads, packets and loop trips on the loop's block.
+    ``is_canonical_row_reduction`` and ``_is_row_reduction_over_tiles`` count
+    block sizes and reduction loops, which two kinds of kernel pass whose
+    rows the layouts do not fit:
+
+    * A kernel that reduces a second block (a half row ``x[tile, :half]``
+      beside the whole row, the rows of a second tensor of another width).
+      A graph rolls one reduction dim
+      (``DeviceIR.register_rollable_reductions``), so the second block has no
+      loop and stays persistent beside the row, where the lowering refuses
+      the row layouts: it finds no single owner for the stores that follow
+      the second reduction and no schedule for a reduction nested in the
+      row's lanes.
+    * A kernel with a block size that is no tile axis of the rows: an
+      ``hl.tile`` device loop nested in the row loop, the tile of a root
+      loop that neither reduces nor sweeps the rows, a registered block size
+      that a second loop uses over another extent.  The seeds set every
+      block size to one "row" per CTA.  So every block size is a tile axis
+      of a root loop over the rows, one that reduces rows of that width or
+      sweeps them (the graphs that roll the row's block:
+      ``DeviceIR.rolled_reductions``), and two such loops share no block
+      size unless they have the same ones in the same order.  A loop over
+      the rows may have none (an ``hl.grid`` loop, whose rows no block size
+      counts), and several may each have their own (a q and a k
+      normalization in two root loops: one row per CTA is one row of
+      either).
+
+    A list comes in its root loop's order, which is not the order the block
+    sizes were registered in: ``hl.tile([b, m], block_size=[None, size])``
+    registers the inner axis' block size first.
+    """
+    spec = env.config_spec
+    grid = spec.kernel_grid_fact
+    fact = spec.reduction_kernel_fact
+    reductions = fact.reductions if fact is not None else ()
+    row = spec.reduction_loops[0].block_id
+    if grid is None or any(descriptor.block_id != row for descriptor in reductions):
+        return None
+    block_sizes = spec.block_sizes.valid_block_ids()
+    if any(
+        not isinstance(env.block_sizes[block_id].size, (int, torch.SymInt))
+        for block_id in block_sizes
+    ):
+        return None
+    # The root loops over the rows: those that reduce them and those that
+    # sweep them.
+    row_roots = {
+        grid.root_id_for_graph(descriptor.graph_id) for descriptor in reductions
+    } | {
+        grid.root_id_for_graph(rolled.original_graph_id)
+        for rolled in device_ir.rolled_reductions
+        if rolled.used_rdim and row in rolled.rolled_block_ids
+    }
+    # The block sizes among the axes of each, in loop order: one list for
+    # loops that have the same ones.
+    groups: list[list[int]] = []
+    for root in grid.roots:
+        axes = [block_id for block_id in root.block_ids if block_id in block_sizes]
+        if root.root_graph_id in row_roots and axes and axes not in groups:
+            groups.append(axes)
+    # Every block size once: lists that share one without being equal
+    # repeat it.  A graph outside every root loop has no axes to read.
+    if not row_roots <= {root.root_graph_id for root in grid.roots} or sorted(
+        block_id for axes in groups for block_id in axes
+    ) != sorted(block_sizes):
+        return None
+    return groups
+
+
+def _row_tile_axes(env: CompileEnvironment, device_ir: DeviceIR) -> list[int] | None:
+    """The tile axes of the rows, outermost first, when the row loops that
+    have block sizes all have the same ones (``_row_tile_groups``), else
+    ``None``.  The layouts that put several rows in a CTA read it: they give
+    the innermost of these axes their rows, which is one axis only here."""
+    groups = _row_tile_groups(env, device_ir)
+    return groups[0] if groups is not None and len(groups) == 1 else None
+
+
+def _is_sole_row_reduction(env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+    """Whether the kernel's reduction loop walks the one block it reduces,
+    in rows that every block size tiles (``_row_tile_groups``)."""
+    return _row_tile_groups(env, device_ir) is not None
+
+
+def _is_canonical_sole_row_reduction(
+    env: CompileEnvironment, device_ir: DeviceIR
+) -> bool:
+    """``is_canonical_row_reduction`` on a kernel whose rows the row layouts
+    fit (``_is_sole_row_reduction``)."""
+    return is_canonical_row_reduction(env) and _is_sole_row_reduction(env, device_ir)
+
+
 class CuteReductionTileHeuristic(AutotunerHeuristic):
     """Seed config for canonical reduction kernels (RMS norm, softmax, etc.).
 
@@ -881,7 +982,9 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return is_canonical_row_reduction(env) or _is_row_reduction_over_tiles(env)
+        return (
+            is_canonical_row_reduction(env) or _is_row_reduction_over_tiles(env)
+        ) and _is_sole_row_reduction(env, device_ir)
 
     @classmethod
     def get_seed_config(
@@ -1089,10 +1192,13 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         block_id = rl_spec.block_id
         extent = _cute_static_block_extent(env, block_id)
-        if extent is None or not spec.block_sizes:
+        axes = _row_tile_axes(env, device_ir)
+        if extent is None or not axes:
             return []
-        row_index = len(spec.block_sizes) - 1
-        row_block = spec.block_sizes[row_index].block_id
+        # The innermost tile axis of the rows, which need not be the last
+        # block size registered.
+        row_block = axes[-1]
+        row_index = spec.block_sizes.block_id_to_index(row_block)
         if (
             extent > cls.WARP_ROWS_MAX_EXTENT
             or block_id not in spec.num_threads.valid_block_ids()
@@ -5592,7 +5698,7 @@ class CuteReductionWideChunkHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not is_canonical_row_reduction(env):
+        if not _is_canonical_sole_row_reduction(env, device_ir):
             return False
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
@@ -5643,7 +5749,7 @@ class CuteRolledRowLadderHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        return is_canonical_row_reduction(env)
+        return _is_canonical_sole_row_reduction(env, device_ir)
 
     @classmethod
     def get_seed_config(
@@ -5730,7 +5836,9 @@ class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
         # more candidate.  No reduction is required: a row-store sweep
         # without one (a cross-entropy backward whose one-hot sum is folded
         # away, ``out[tile, :] = f(x[tile, :])``) is the same loads-bound
-        # walk.
+        # walk.  For the same reason a kernel whose rows the layout does not
+        # fit (``_row_tile_groups``) stays eligible, for the knob alone
+        # (``get_seed_config``).
         if not is_canonical_row_reduction(env):
             return False
         spec = env.config_spec
@@ -5743,6 +5851,16 @@ class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
     def get_seed_config(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> Config | None:
+        if not _is_sole_row_reduction(env, device_ir):
+            # The lowering refuses the row layout beside a second reduced
+            # block, and a block size off the row tiles is no row axis.  The
+            # seed keeps the knob on the default layout: the search surface
+            # opens ``cute_lane_unroll`` on a seed that sets it
+            # (``cute_flat_fields``), so declining would close the knob on
+            # these kernels.  Where the default layout forms no lane loop
+            # that takes the unroll, normalization sets it back to 1 and the
+            # candidate is the default config.
+            return Config(cute_lane_unroll=cls.UNROLL)
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         rdim_id = rl_spec.block_id
@@ -5777,6 +5895,9 @@ class CuteRolledRowLoadsFirstHeuristic(AutotunerHeuristic):
         seed = cls.get_seed_config(env, device_ir)
         if seed is None:
             return []
+        if not _is_sole_row_reduction(env, device_ir):
+            # The knob alone: no chunk to peel.
+            return [seed]
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
         extent = env.specialize_expr(env.block_sizes[rl_spec.block_id].numel)
@@ -6667,7 +6788,7 @@ class CuteRolledClusterLadderHeuristic(AutotunerHeuristic):
 
     @classmethod
     def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
-        if not is_canonical_row_reduction(env):
+        if not _is_canonical_sole_row_reduction(env, device_ir):
             return False
         spec = env.config_spec
         rl_spec = cast("ReductionLoopSpec", spec.reduction_loops[0])
@@ -6813,7 +6934,7 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config]:
-        if not is_canonical_row_reduction(env):
+        if not _is_canonical_sole_row_reduction(env, device_ir):
             return []
         spec = env.config_spec
         reduction = cast("ReductionLoopSpec", spec.reduction_loops[0])
@@ -6867,7 +6988,12 @@ class CuteMaskedRolledClusterHeuristic(AutotunerHeuristic):
                                 spec.cute_lane_layouts,
                                 {reduction.block_id: "strided"},
                             ),
-                            "cute_reduction_reloads": ["register"],
+                            # One entry per block with a reload slot: a
+                            # slice swept beside the row has one too.
+                            "cute_reduction_reloads": _seq_config_list(
+                                spec.cute_reduction_reloads,
+                                {reduction.block_id: "register"},
+                            ),
                             "cute_cluster_n": cluster,
                             "cute_cluster_warp_online": online_pair,
                             "cute_scalar_epilogue": scalar_row,
