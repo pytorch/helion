@@ -303,6 +303,136 @@ def _family_search(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("collapse", [True, False])
+@pytest.mark.parametrize("best", ["kernel", "alias", "minimized", "minimized_ok"])
+def test_final_selection_holds_each_kernel_once(collapse: bool, best: str) -> None:
+    """A population can end with a source alias beside its kernel (an initial
+    population keeps its aliases, as do the differential-evolution and
+    LLM-guided searches).  Where the search counts an alias as its kernel
+    (``Backend.collapses_generated_source_aliases``) the final selection
+    times the kernel once.  The search's best stands for its kernel under
+    its own config: a member of the population that is an alias, or the
+    config the finishing phase ended on after it reset settings the code
+    does not depend on (a member with the kernel's function that is in no
+    collection, with the status of the member the phase started from:
+    ``"deduplicated"`` or ``"ok"``), is the kernel's entry, and a win
+    returns that config, not the one the kernel was first timed under."""
+    kernel = _member(32, 1.0)
+    rival = _member(64, 1.1)
+    alias = _member(128, 1.0)
+    alias.fn = kernel.fn
+    alias.status = "deduplicated"
+    minimized = _member(256, 1.0)
+    minimized.fn = kernel.fn
+    minimized.status = "ok" if best == "minimized_ok" else "deduplicated"
+    policy = FinalSelectionConfig(
+        top_k=4, rounds=2, screen_rep_ms=0, thermal_warmup_ms=0
+    )
+    search = _make_search([kernel, rival], policy=policy)
+    search.config_spec.backend = SimpleNamespace(
+        default_final_selection_regime=lambda: None,
+        collapses_generated_source_aliases=lambda config_spec: collapse,
+    )
+    search.benchmark_provider.settles_source_aliases = lambda: True
+    search._kernels = {}
+    search.population = [alias, kernel, rival]
+    incumbent = {"kernel": kernel, "alias": alias}.get(best, minimized)
+    measurer = _FakeMeasurer(lambda member, _n: member.perf)
+    with (
+        patch.dict(os.environ, _SHORTLIST_ALL),
+        patch.object(search, "_final_selection_measurer", new=measurer),
+    ):
+        selected = search.final_rebenchmark_best(incumbent)
+
+    if collapse:
+        assert sorted(measurer.finalists, key=id) == sorted([incumbent, rival], key=id)
+        assert selected is incumbent
+    else:
+        assert sorted(measurer.finalists, key=id) == sorted(
+            {id(m): m for m in (kernel, rival, alias, incumbent)}.values(), key=id
+        )
+
+
+@pytest.mark.cpu_only
+def test_final_selection_holds_a_kernel_that_is_not_the_best_once() -> None:
+    """The rule is per kernel, not only for the search's best: a population
+    that still holds an alias of another kernel (a rival and a second config
+    of its code) gives the final selection that kernel once, under the
+    config that holds it."""
+    kernel = _member(32, 1.0)
+    rival = _member(64, 1.1)
+    rival_alias = _member(128, 1.1)
+    rival_alias.fn = rival.fn
+    rival_alias.status = "deduplicated"
+    policy = FinalSelectionConfig(
+        top_k=4, rounds=2, screen_rep_ms=0, thermal_warmup_ms=0
+    )
+    search = _make_search([kernel, rival], policy=policy)
+    search.config_spec.backend = SimpleNamespace(
+        default_final_selection_regime=lambda: None,
+        collapses_generated_source_aliases=lambda config_spec: True,
+    )
+    search.benchmark_provider.settles_source_aliases = lambda: True
+    search._kernels = {}
+    search.population = [rival_alias, kernel, rival]
+    measurer = _FakeMeasurer(lambda member, _n: member.perf)
+    with (
+        patch.dict(os.environ, _SHORTLIST_ALL),
+        patch.object(search, "_final_selection_measurer", new=measurer),
+    ):
+        selected = search.final_rebenchmark_best(kernel)
+
+    assert sorted(measurer.finalists, key=id) == sorted([kernel, rival], key=id)
+    assert selected is kernel
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("best", ["kernel", "alias", "minimized"])
+def test_a_pinned_kernel_keeps_its_pin_under_the_config_that_stands_for_it(
+    best: str,
+) -> None:
+    """A pinned config (a compiler seed, the default) wins a tie within the
+    pinned tolerance.  Where the search's best is another config of the
+    pinned kernel and stands for it in the final selection, the pin passes
+    to that config: the kernel reads 1.000 against a rival's 0.995 and wins
+    under whichever of its configs is the entry, as it does under the
+    pinned config itself."""
+    kernel = _member(32, 1.0)
+    rival = _member(64, 1.1)
+    alias = _member(128, 1.0)
+    alias.fn = kernel.fn
+    alias.status = "deduplicated"
+    minimized = _member(256, 1.0)
+    minimized.fn = kernel.fn
+    policy = FinalSelectionConfig(top_k=4, rounds=1, screen_rep_ms=0)
+    search = _make_search([kernel, rival], policy=policy, pinned=[kernel])
+    search.config_spec.backend = SimpleNamespace(
+        default_final_selection_regime=lambda: None,
+        collapses_generated_source_aliases=lambda config_spec: True,
+    )
+    search.benchmark_provider.settles_source_aliases = lambda: True
+    search._kernels = {}
+    search.population = [alias, kernel, rival]
+    incumbent = {"kernel": kernel, "alias": alias, "minimized": minimized}[best]
+    readings = {id(kernel.fn): 1.000, id(rival.fn): 0.995}
+    measurer = _FakeMeasurer(lambda member, _n: readings[id(member.fn)])
+    with (
+        patch.object(search, "_final_selection_measurer", new=measurer),
+        patch.dict(
+            os.environ,
+            {
+                **_SHORTLIST_ALL,
+                "HELION_AUTOTUNE_FINAL_REBENCHMARK_PINNED_TOLERANCE": "0.01",
+            },
+        ),
+    ):
+        selected = search.final_rebenchmark_best(incumbent)
+
+    assert sorted(measurer.finalists, key=id) == sorted([incumbent, rival], key=id)
+    assert selected is incumbent
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("missing", [None, "timeout"])
 def test_final_selection_retains_raw_missing_readings(
     tmp_path: Path, missing: Literal["timeout"] | None

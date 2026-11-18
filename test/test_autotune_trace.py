@@ -482,6 +482,7 @@ def test_multi_shape_rebenchmark_traces_only_fresh_results(
     metrics = AutotuneMetrics()
     provider = object.__new__(MultiShapeBenchmarkProvider)
     provider.log = log
+    provider.children = []
     provider.args = SimpleNamespace(relative_to=relative_to, aggregation="max")
     provider._autotune_metrics = metrics
     provider.budget_exceeded_fn = Mock(return_value=False)

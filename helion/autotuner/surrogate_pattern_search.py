@@ -49,6 +49,7 @@ _FLASH_TERMINAL_MEASUREMENT_POLICY = "mirrored_rotating_batched_wall_v2"
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import MutableMapping
@@ -191,6 +192,14 @@ class LFBOPatternSearch(PatternSearch):
     # Keep old serialized/test-created search state usable; normal construction
     # replaces this with a per-instance list for CuTe flash.
     train_source_hashes: list[str | None] | None = None
+
+    # Where the backend drops source aliases, the polish descent also moves
+    # to new code the timer cannot tell from the incumbent; it ends after this
+    # many consecutive rounds without a reading below its lowest (by more
+    # than a tie: ``_reads_level``).  The cost dial of that walk:
+    # ``polish_rounds`` lifts the bound.  Not a constructor knob: those are
+    # part of the flash cache key, and flash has no polish.
+    polish_patience: int = 3
 
     # Written by ``FlashStructuralQualification`` (absent until it ran); read
     # by ``_select_starting_paths`` and the lane helpers through ``getattr``.
@@ -459,15 +468,45 @@ class LFBOPatternSearch(PatternSearch):
             ):
                 self.train_y[index] = math.inf
 
+    def _members_kept_by_algorithm(self) -> Iterable[PopulationMember]:
+        """The members behind the surrogate's rows, outside flash.
+
+        A generation's failures leave the population, but their rows stay
+        and are labelled from the members (``_sync_training_labels``): a
+        config that failed, say with a timeout, and whose generated source a
+        later config times is repaired here as it is in the population, so
+        its row stops saying that the code fails.  The flash search repairs
+        its rows by config (``_apply_effective_source_repairs``).
+        """
+        if self.train_configs is not None:
+            return ()
+        return [member for member in self._train_members if member is not None]
+
     def _sync_training_labels(self) -> None:
         """Refresh train_y from live members so rebenchmarked timings (which
         replace noisy one-shot measurements) are what the surrogate learns
-        from. Rows without a live member keep their recorded label."""
+        from. Rows without a live member keep their recorded label. The row
+        of a source alias takes the reading of the member that holds its
+        kernel (``_kernel_holder``): a generation drops its aliases from the
+        population, so no re-timing reaches them, and one kernel has one
+        label.
+
+        A flash search keeps failures in its labels that its members do not
+        show (``_invalidate_rebenchmark_training_targets``) and repairs its
+        rows by config, so there a label that is not finite stays.  Elsewhere
+        a label is its member's kernel's reading in both directions: the row
+        of a member that failed and was repaired since (a later config timed
+        its generated source) takes the reading it has now.
+        """
+        flash_labels = self.train_configs is not None
         for index, member in enumerate(self._train_members):
             if member is None or index >= len(self.train_y):
                 continue
-            if member.perfs and math.isfinite(self.train_y[index]):
-                self.train_y[index] = member.perf
+            kernel = self._kernel_holder(member)
+            if kernel.perfs and not (
+                flash_labels and not math.isfinite(self.train_y[index])
+            ):
+                self.train_y[index] = kernel.perf
 
     def _fit_surrogate(self) -> None:
         self._sync_training_labels()
@@ -850,6 +889,12 @@ class LFBOPatternSearch(PatternSearch):
                 self.benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
+                # A neighbor that repeats earlier code is not a new member
+                # (it still trains the surrogate below, with that code's
+                # reading).
+                self.population = self._without_source_aliases(
+                    self.population, unbenchmarked
+                )
             # higher-accuracy rebenchmark
             self.rebenchmark_population(
                 self.population, desc=f"Generation {generation}: verifying top configs"
@@ -883,11 +928,34 @@ class LFBOPatternSearch(PatternSearch):
         and move to the best neighbor until a round fails to improve, up to
         ``polish_rounds`` rounds. Recovers local wins the surrogate's
         selection fraction skipped, at a bounded extra eval cost.
+
+        Where the backend drops source aliases, a neighbor that repeats
+        earlier code is not a candidate, and the descent also moves to new
+        code that reads level with the incumbent (``_polish_level_step``),
+        for at most ``polish_patience`` consecutive rounds without a reading
+        below the descent's lowest.
+
+        What counts as an improvement is one rule for both: a step of at
+        least ``min_improvement_delta`` from the incumbent's reading
+        (``_reads_level``).  Who ends the descent depends on the aliases.
+        Without the drop a
+        round without an improvement ends it (``_check_early_stopping``).
+        With the drop such a round moves to new code that reads level
+        instead, and the descent ends when there is none or when the patience
+        runs out: a tie alone never ends it, and each level move goes to code
+        no earlier round timed, so the walk is the patience long at most
+        beyond its last new lowest reading.
         """
         rounds = self.polish_rounds
         if rounds <= 0 or self.config_spec.cute_flash_search_enabled:
             return
+        collapse = self._collapses_source_aliases()
         current = self.best
+        # With aliases dropped: the lowest reading an incumbent of the descent
+        # had while it was the incumbent, and the rounds since a step last
+        # read below it.
+        low_water = current.perf
+        stale_rounds = 0
         for round_num in self._budgeted_range(1, rounds + 1):
             candidates = [current]
             for flat_config in PatternSearch._generate_neighbors(
@@ -902,18 +970,83 @@ class LFBOPatternSearch(PatternSearch):
                 break
             self.set_generation(self._autotune_metrics.num_generations + 1)
             self.benchmark_population(candidates[1:], desc=f"Polish round {round_num}")
+            neighbors = len(candidates) - 1
+            # A neighbor that repeats earlier code (a setting the incumbent's
+            # code does not depend on) is no step: among many timings of one
+            # kernel some always read below the incumbent's.
+            candidates = self._without_source_aliases(candidates, candidates[1:])
+            aliases = neighbors - (len(candidates) - 1)
             self.rebenchmark_population(
                 candidates, desc=f"Polish round {round_num}: verifying"
             )
             self.population.extend(candidates[1:])
             best = min(candidates, key=performance)
+            stop = self._check_early_stopping(best, current)
+            level_move = False
+            if stop and collapse:
+                level = self._polish_level_step(candidates[1:], current)
+                if level is not None:
+                    best = level
+                    stop = False
+                    level_move = True
             self.log(
-                f"Polish round {round_num}: {len(candidates) - 1} neighbors, "
-                f"best {self.format_performance(best.perf)}"
+                f"Polish round {round_num}: {neighbors} neighbors"
+                + (f" ({aliases} repeat earlier code)" if aliases else "")
+                + f", best {self.format_performance(best.perf)}"
+                + (" (level with the incumbent: new code)" if level_move else "")
             )
-            if self._check_early_stopping(best, current):
+            if stop:
                 break
+            if collapse:
+                # A step counts once it reads below everything the descent
+                # stood on, this round's reading of the incumbent included:
+                # that reading moves between rounds, so a step from it, or a
+                # level step at a lower one, can be the timer's noise.
+                low_water = min(low_water, current.perf)
+                if self._improves_on(best.perf, low_water):
+                    low_water = best.perf
+                    stale_rounds = 0
+                else:
+                    stale_rounds += 1
+                    if stale_rounds >= self.polish_patience:
+                        self.log(
+                            f"Polish stops: {stale_rounds} rounds without a "
+                            f"reading below {self.format_performance(low_water)}"
+                        )
+                        break
             current = best
+
+    def _improves_on(self, perf: float, reference: float) -> bool:
+        """Whether ``perf`` reads below ``reference`` by more than a tie
+        (``_reads_level``): by at least ``min_improvement_delta``, by
+        anything when that is 0."""
+        return perf < reference and not self._reads_level(perf, reference)
+
+    def _polish_level_step(
+        self, new_members: Sequence[PopulationMember], current: PopulationMember
+    ) -> PopulationMember | None:
+        """The lowest-reading new kernel that reads level with ``current``.
+
+        A round of the polish descent ended without an improvement: its best
+        is the incumbent, or new code less than ``min_improvement_delta``
+        below it.  Either way new code may read level with the incumbent
+        (``_reads_level``), which says the search timer cannot tell the two
+        apart, not that they are equally fast (a small kernel's readings sit
+        on the timer's steps, so a whole neighborhood ties, and no timer
+        repeats to the last digit).  With the aliases dropped that code is
+        new, and the descent crosses the plateau to it instead of ending
+        there; without the drop it would circle through copies of one
+        kernel, which is what kept the descent going by chance.  One rule
+        for a tie and for a step below the delta in either direction, so a
+        neighbor that reads slightly better never ends a descent that a tie
+        would have continued.
+        """
+        level = [
+            member
+            for member in new_members
+            if self._reads_level(member.perf, current.perf)
+        ]
+        return min(level, key=performance) if level else None
 
     def _flash_generation(
         self, generation: ConfigGeneration | None = None
@@ -1354,9 +1487,14 @@ class LFBOPatternSearch(PatternSearch):
     ) -> list[tuple[PopulationMember, tuple[tuple[str, object], ...]]]:
         """Select starts and structural values each qualification path must retain."""
         if not self.config_spec.cute_flash_search_enabled:
+            # One path per kernel: an initial population keeps its source
+            # aliases, and after the verification an alias reads what its
+            # kernel reads, so the two would sort side by side.
             return [
                 (member, ())
-                for member in self.population[: self.copies]
+                for member in self._one_member_per_kernel(self.population)[
+                    : self.copies
+                ]
                 if math.isfinite(member.perf)
             ]
         eligible = [member for member in self.population if math.isfinite(member.perf)]
@@ -2777,6 +2915,8 @@ class LFBOPatternSearch(PatternSearch):
                 self.log(f"Copy {copy_idx} finish because of no candidates")
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
+            # A neighbor that repeats earlier code is no step for this path.
+            candidates = self._without_source_aliases(candidates, candidates[1:])
             best = min(candidates, key=performance)
             if not disable_early_stopping and self._check_early_stopping(best, current):
                 if patience > 0:

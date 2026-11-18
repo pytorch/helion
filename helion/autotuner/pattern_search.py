@@ -391,7 +391,8 @@ class PatternSearch(PopulationBasedSearch):
         self.capture_compiler_seed_members(self.population)
         self.population.sort(key=performance)
         starting_points = []
-        for member in self.population[: self.copies]:
+        # One path per kernel: an initial population keeps its source aliases.
+        for member in self._one_member_per_kernel(self.population)[: self.copies]:
             if math.isfinite(member.perf):  # filter failed compiles
                 starting_points.append(member)
         self.log(
@@ -431,6 +432,10 @@ class PatternSearch(PopulationBasedSearch):
                 self.benchmark_population(
                     unbenchmarked, desc=f"Generation {generation}:"
                 )
+                # A neighbor that repeats earlier code is not a new member.
+                self.population = self._without_source_aliases(
+                    self.population, unbenchmarked
+                )
             # higher-accuracy rebenchmark
             self.rebenchmark_population(
                 self.population, desc=f"Generation {generation}: verifying top configs"
@@ -460,7 +465,9 @@ class PatternSearch(PopulationBasedSearch):
             if len(candidates) <= 1:
                 return  # no new candidates, stop searching
             yield candidates  # yield new population to benchmark in parallel
-            # update search copy and check early stopping criteria
+            # update search copy and check early stopping criteria; a neighbor
+            # that repeats earlier code is no step for this path
+            candidates = self._without_source_aliases(candidates, candidates[1:])
             best = min(candidates, key=performance)
             if self._check_early_stopping(best, current):
                 return
@@ -480,13 +487,30 @@ class PatternSearch(PopulationBasedSearch):
         """
         if best is current:
             return True  # no improvement, stop searching
-        # Stop if the relative improvement is smaller than a user-specified delta
-        return bool(
+        # Stop if the relative improvement is smaller than a user-specified
+        # delta. (A search without one takes every step, and a reading of
+        # zero has no relative step.)
+        return (
             self.min_improvement_delta > 0.0
-            and math.isfinite(best.perf)
-            and math.isfinite(current.perf)
             and current.perf != 0.0
-            and abs(best.perf / current.perf - 1.0) < self.min_improvement_delta
+            and self._reads_level(best.perf, current.perf)
+        )
+
+    def _reads_level(self, perf: float, reference: float) -> bool:
+        """Whether a reading of ``perf`` is a tie with ``reference``: equal
+        to it, or within ``min_improvement_delta`` of it in either
+        direction.  It is the step ``_check_early_stopping`` does not count
+        as an improvement and the one the polish descent crosses to new
+        code: one definition of an improvement for the search paths and for
+        the polish descent, its level moves and its patience included."""
+        if not math.isfinite(perf) or not math.isfinite(reference):
+            return False
+        if perf == reference:
+            return True
+        return (
+            self.min_improvement_delta > 0.0
+            and reference != 0.0
+            and abs(perf / reference - 1.0) < self.min_improvement_delta
         )
 
     def shrink_neighbors(self, neighbors: list[FlatConfig]) -> list[FlatConfig]:

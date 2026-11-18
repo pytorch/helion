@@ -1340,6 +1340,22 @@ class Backend(abc.ABC):
         """
         return False
 
+    def collapses_generated_source_aliases(self, config_spec: ConfigSpec) -> bool:
+        """Whether a search counts a source alias as the candidate it repeats.
+
+        A source alias is a candidate whose generated source an earlier
+        candidate of the run already produced (its result has the status
+        ``"deduplicated"``, so this needs
+        ``should_deduplicate_generated_sources``): a config that differs from
+        the earlier one only in settings the code does not depend on.  With
+        this hook a population search treats it as another config of the
+        kernel it repeats instead of a candidate of its own, wherever its
+        benchmark provider reports aliases; what follows from that is
+        described at ``PopulationBasedSearch._collapses_source_aliases``.
+        Off by default, which leaves every alias a candidate of its own.
+        """
+        return False
+
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
 
