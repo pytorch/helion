@@ -363,34 +363,43 @@ def _padded_iota_dims_once(
     return memo[key]
 
 
-def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
-    """For each tensor index of the load ``node``, by its position in the
-    subscript, the load's dim each of the index's dims runs along (None: none),
-    as ``SubscriptIndexing.compute_shape`` lays them out (through the same
-    helpers); None when they do not add up to the load's rank.
-
-    ``hl.load(x, [i, hl.arange(200)])`` has one dim, along which the range
-    runs; ``x[tile, rows, :]`` has three, the second ``rows``'.
-    """
-    index = node.args[1]
-    val = node.meta.get("val")
-    if not isinstance(index, (list, tuple)) or not isinstance(val, torch.Tensor):
-        return None
+def subscript_index_axes(
+    index: Sequence[object],
+    fx_node: torch.fx.Node | None = None,
+) -> tuple[dict[int, list[int | None]], int] | None:
+    """For each tensor index in ``index``, by its subscript position, return
+    the output axis each of its dims runs along (None: none) and the total
+    output rank laid out by ``SubscriptIndexing.compute_shape``."""
     env = CompileEnvironment.current()
     fake = [
         item.meta.get("val") if isinstance(item, torch.fx.Node) else item
         for item in index
     ]
+    tile_positions = {
+        position
+        for position, k in enumerate(fake)
+        if fx_node is not None
+        and _get_tile_with_offset_info(k, fx_node, position) is not None
+    }
+    broadcast = env.should_broadcast_tensor_indexers(fake)
+    if broadcast and any(
+        position in tile_positions and isinstance(k, torch.Tensor)
+        for position, k in enumerate(fake)
+    ):
+        return None
     tensors = [
-        (position, k) for position, k in enumerate(fake) if isinstance(k, torch.Tensor)
+        (position, k)
+        for position, k in enumerate(fake)
+        if position not in tile_positions and isinstance(k, torch.Tensor)
     ]
     axes: dict[int, list[int | None]] = {
         position: [None] * k.ndim for position, k in tensors
     }
-    broadcast = env.should_broadcast_tensor_indexers(fake)
     rank = 0
     for position, k in enumerate(fake):
-        if isinstance(k, torch.Tensor):
+        if position in tile_positions:
+            rank += 1
+        elif isinstance(k, torch.Tensor):
             if not broadcast:
                 for dim in env.tensor_indexer_dim_sources(k):
                     if dim is not None:
@@ -405,6 +414,25 @@ def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
                     rank += 1
         elif k is None or isinstance(k, slice) or is_block_size_index(k):
             rank += 1
+    return axes, rank
+
+
+def load_index_axes(node: torch.fx.Node) -> dict[int, list[int | None]] | None:
+    """For each tensor index of the load ``node``, by its position in the
+    subscript, the load's dim each of the index's dims runs along (None: none),
+    as ``SubscriptIndexing.compute_shape`` lays them out (through the same
+    helpers); None when they do not add up to the load's rank.
+
+    ``hl.load(x, [i, hl.arange(200)])`` has one dim, along which the range
+    runs; ``x[tile, rows, :]`` has three, the second ``rows``'.
+    """
+    index = node.args[1]
+    val = node.meta.get("val")
+    if not isinstance(index, (list, tuple)) or not isinstance(val, torch.Tensor):
+        return None
+    if (resolved := subscript_index_axes(index)) is None:
+        return None
+    axes, rank = resolved
     return axes if rank == val.ndim else None
 
 
@@ -1952,14 +1980,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
                     if not _scalar_symint_can_codegen_as_scalar(k):
                         return False
             elif isinstance(k, torch.Tensor):
-                if not CompileEnvironment.current().backend.host_tensor_descriptors(
-                    config
-                ):
-                    # Device-produced descriptor coordinates are part of the
-                    # host-descriptor feature; keep the legacy device-created
-                    # descriptor path unchanged.
-                    return False
                 if _is_scalar_integer_tensor_index(k):
+                    if not CompileEnvironment.current().backend.host_tensor_descriptors(
+                        config
+                    ):
+                        # Device-produced scalar descriptor coordinates are part
+                        # of the host-descriptor feature.
+                        return False
                     descriptor_block_shape.append(1)
                     continue
                 info = _contiguous_integer_tensor_index_at(state, k, i)
@@ -3145,7 +3172,7 @@ class BlockedSubscriptIndexing:
         if env.index_dtype == torch.int64 and not allow_descriptor_coordinates:
             return False
         input_sizes = collections.deque(fake_tensor.size())
-        contiguous_tensor_indices = 0
+        contiguous_positions: list[int] = []
         for position, k in enumerate(index):
             input_size = 1 if k is None else input_sizes.popleft()
             # Check for tile+offset tensor first before other checks
@@ -3190,6 +3217,13 @@ class BlockedSubscriptIndexing:
                     and (
                         state.fx_node is None
                         or state.fx_node.meta.get("masked_value") in (None, 0)
+                        or (
+                            (
+                                (bid := env.resolve_block_id(k.size(0))) is None
+                                or state.codegen.mask_var(bid) is None
+                            )
+                            and _padded_iota_mask(state, position) is None
+                        )
                     )
                 )
                 if (
@@ -3198,14 +3232,26 @@ class BlockedSubscriptIndexing:
                 ):
                     return False
                 if contiguous:
-                    contiguous_tensor_indices += 1
-                    if contiguous_tensor_indices > 1:
-                        # A future Cartesian-product proof can admit multiple
-                        # vector coordinates. The routed-descriptor path needs
-                        # only one, so keep this first version conservative.
-                        return False
+                    contiguous_positions.append(position)
         output_shape = SubscriptIndexing.compute_shape(fake_tensor, index, state)
-        return len(output_shape) != 0
+        if not output_shape:
+            return False
+        if contiguous_positions:
+            # Contiguous 1-D tensor coordinates form a rectangular descriptor
+            # block when each maps to its own output axis. Axes are assigned
+            # in tensor-dimension order; a shared axis indicates broadcasting
+            # such as ``[scalar_0d, row_1d, col_1d]``.
+            resolved_axes = subscript_index_axes(index, state.fx_node)
+            if resolved_axes is None or resolved_axes[1] != len(output_shape):
+                return False
+            index_axes = resolved_axes[0]
+            seen_axes: set[int] = set()
+            for pos in contiguous_positions:
+                axis = index_axes[pos][0]
+                if axis is None or axis in seen_axes:
+                    return False
+                seen_axes.add(axis)
+        return True
 
     def validate(self) -> None:
         n = self.ndim
@@ -3313,11 +3359,18 @@ class BlockedSubscriptIndexing:
                     base = _contiguous_integer_tensor_index_base(state, info)
                     if base is None:
                         raise exc.InvalidIndexingType(k)
-                    res.offsets.append(
-                        state.device_function.literal_expr(base.value)
-                        if isinstance(base, ast.Constant)
-                        else state.codegen.lift(base, prefix="index").id
-                    )
+                    if isinstance(base, ast.Constant):
+                        res.offsets.append(
+                            state.device_function.literal_expr(base.value)
+                        )
+                    else:
+                        if not CompileEnvironment.current().backend.host_tensor_descriptors(
+                            DeviceFunction.current().config
+                        ):
+                            base = expr_from_string(
+                                "tl.cast({base}, tl.int32)", base=base
+                            )
+                        res.offsets.append(state.codegen.lift(base, prefix="index").id)
                     block_size = _resolve_configured_extent(
                         info.extent, state.device_function.config
                     )
