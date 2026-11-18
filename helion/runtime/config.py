@@ -184,6 +184,7 @@ class Config(Mapping[str, object]):
         cute_bool_byte_packets: bool | None = None,
         cute_uniform_lane_compares: bool | None = None,
         cute_tail_peel: bool | None = None,
+        cute_defer_tile_reduce: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
@@ -387,6 +388,34 @@ class Config(Mapping[str, object]):
                 over a static extent that loads a float tensor along its tile
                 and no matmul, and elsewhere rejected (an explicit False is
                 dropped).
+            cute_defer_tile_reduce: Combine a carried tile sum across the
+                threads once, after its ``hl.tile`` loop, instead of once per
+                tile: in ``for tile in hl.tile(n): acc = acc + x[tile].sum(0)``
+                each thread keeps the partial sum of its own elements through
+                the whole loop, and the warp shuffles (or the shared-memory
+                round) that combine the threads run once after it.  This
+                changes the summation order: per-thread partial sums accumulate
+                across the tiles before the single cross-thread combine, the
+                order TorchInductor's looped split reductions use, where the
+                knob-off code adds each tile's combined sum to the carried
+                value.  The result differs by the rounding of another
+                summation order, for which no bound independent of the length
+                holds: each order's rounding error is at most ``n - 1`` unit
+                roundoffs times the sum of the addends' magnitudes for ``n``
+                addends (to first order), so the two results can differ by
+                up to twice that, more the more elements are summed and by
+                far more than the last bits where the addends cancel.  Only
+                fp32 and fp64 sums added to a carried value of their own
+                dtype are deferred; integer and half-precision sums stay per
+                tile.  Off by default; offered to the autotuner on kernels
+                with an ``hl.tile`` loop whose reductions over its tile are
+                all such sums, each read only by its carried add, the carried
+                value read nowhere else in the loop, and no matmul, and
+                elsewhere rejected (an explicit False is dropped).  Where the
+                config puts one thread on the tile (nothing to combine),
+                gives each thread one element of the tile (as many threads as
+                the tile is long) or folds the tile's lanes as vector lanes,
+                the knob leaves the code as it is.
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -589,6 +618,7 @@ class Config(Mapping[str, object]):
             "cute_bool_byte_packets": cute_bool_byte_packets,
             "cute_uniform_lane_compares": cute_uniform_lane_compares,
             "cute_tail_peel": cute_tail_peel,
+            "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,

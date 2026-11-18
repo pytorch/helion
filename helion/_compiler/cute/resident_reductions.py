@@ -24,6 +24,7 @@ from .interchanged_store_dce import _known_statements
 from .interchanged_store_dce import _known_subscript
 from .interchanged_store_dce import _live_in
 from .interchanged_store_dce import _single_store
+from .lane_loops.markers import HELION_FINALIZED
 from .lane_loops.markers import _ascending_lane_loop_form
 from .lane_loops.markers import _is_lane_reduce_marker_assign
 from .lane_loops.markers import _LaneReduceMarker
@@ -755,7 +756,7 @@ def _plan(
     if not markers or any(
         marker.reduction_type != "sum"
         or marker.identity_expr != "cutlass.Float32(0)"
-        or marker.wrap_template != "cutlass.Float32(__HELION_FINALIZED__)"
+        or marker.wrap_template != f"cutlass.Float32({HELION_FINALIZED})"
         or marker.threads_in_group != layout.threads
         or marker.group_pre != 1
         or marker.group_span not in (0, layout.threads)
