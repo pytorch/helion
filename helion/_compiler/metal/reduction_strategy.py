@@ -39,6 +39,7 @@ from ..reduction_strategy import BlockReductionStrategy
 from ..reduction_strategy import LoopedReductionStrategy
 from ..reduction_strategy import PersistentReductionStrategy
 from ..reduction_strategy import reduction_acc_dtype
+from ..tile_strategy import DeviceLoopState
 from ..tile_strategy import LoopDimInfo
 from ..tile_strategy import PersistentReductionState
 from .backend import MetalBackend
@@ -85,6 +86,22 @@ def check_collective_reached(state: CodegenState, block_id: int) -> None:
         "a reduction across threads (a threadgroup collective)",
         threaded,
     )
+
+
+def _mask_surplus_threads(
+    strategy: MetalPersistentReductionStrategy | MetalLoopedReductionStrategy,
+) -> None:
+    """Give ``strategy`` a bounds mask when the launch runs its thread axis
+    wider than its threads (a wider root beside it), which a reduction
+    with a full extent otherwise leaves unmasked."""
+    if (
+        strategy._mask_var is None
+        and strategy._thread_count > 0
+        and strategy.fn.tile_strategy.has_surplus_threads_for_strategy(strategy)
+    ):
+        strategy._mask_var = strategy.fn.new_var(
+            f"mask_{strategy.block_index}", dce=True
+        )
 
 
 class MetalPersistentReductionStrategy(PersistentReductionStrategy):
@@ -267,6 +284,10 @@ class MetalPersistentReductionStrategy(PersistentReductionStrategy):
     def _codegen_thread_index(
         self, state: CodegenState, block_size_var: str, numel: sympy.Expr
     ) -> None:
+        # The launch runs the axis wider than these threads (a wider root
+        # beside this one): the surplus threads' indices run past the dim, so
+        # their loads read nothing and their values drop out.
+        _mask_surplus_threads(self)
         current_grid = state.codegen.current_grid_state
         lane_var = self._lane_var
         if lane_var is None or current_grid is None:
@@ -512,6 +533,13 @@ class MetalLoopedReductionStrategy(LoopedReductionStrategy):
     loop, so the if's body would read it inside the loop, before it is
     declared: invalid MSL, on any predicate.  The persistent form
     (``reduction_loops=None``) lowers it."""
+
+    def codegen_device_loop(self, state: CodegenState) -> DeviceLoopState:
+        # As in the persistent strategy: the surplus threads' indices run
+        # past each chunk, and past the dim in the last; the bounds mask keeps
+        # their loads in bounds, and the collective drops their values.
+        _mask_surplus_threads(self)
+        return super().codegen_device_loop(state)
 
     def codegen_reduction(
         self,

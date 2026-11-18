@@ -119,6 +119,43 @@ def test_configured_broadcast_reduction_folds_lanes(block_size: int) -> None:
     assert ("_metal_lane_fold(" in code) == (block_size > 128)
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def row_sums_of_two_widths(
+    x: torch.Tensor, w: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row sums of 16 and of 64 columns, in two roots sharing a launch."""
+    out_x = torch.empty([x.size(0)], dtype=x.dtype, device=x.device)
+    out_w = torch.empty([w.size(0)], dtype=w.dtype, device=w.device)
+    for tm in hl.tile(x.size(0)):
+        out_x[tm] = x[tm, :].sum(-1)
+    for tm in hl.tile(w.size(0)):
+        out_w[tm] = w[tm, :].sum(-1)
+    return out_x, out_w
+
+
+def test_reduction_beside_a_wider_one_masks_its_surplus_threads() -> None:
+    """The launch spreads the 64 columns' reduction over 64 threads, so the
+    16 columns' runs on 64 too: past 16 its index runs into the next rows
+    (past the end of ``x`` for the last), and its loads stay masked."""
+    args = (torch.randn(64, 16), torch.randn(64, 64))
+    code = row_sums_of_two_widths.bind(args).to_code(
+        helion.Config(block_sizes=[1, 1], num_warps=32)
+    )
+    assert re.search(r"mask_\d+ = indices_\d+ < 16", code), code
+
+
+def test_rolled_reduction_beside_a_wider_one_masks_its_surplus_threads() -> None:
+    """Rolled in chunks of 16, the 128 columns' reduction runs on the 64
+    threads the wider root's launch spreads: past 16 a thread's index runs
+    into the next chunk, and in the last chunk past the row (past the end of
+    ``x`` for the last row), so its loads stay masked."""
+    args = (torch.randn(64, 128), torch.randn(64, 64))
+    code = row_sums_of_two_widths.bind(args).to_code(
+        helion.Config(block_sizes=[1, 1], reduction_loops=[16, None], num_warps=32)
+    )
+    assert re.search(r"mask_\d+ = rindex_\d+ < 128", code), code
+
+
 @dataclass
 class _Pointer:
     tensor: torch.Tensor
