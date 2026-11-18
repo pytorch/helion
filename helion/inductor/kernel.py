@@ -22,6 +22,7 @@ from torch._inductor.ir import IRNode
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -50,6 +51,14 @@ TileShape = tuple[str | int, ...]
 TILE_NAMES = {"z0_": "tile_z", "y": "tile_y", "x": "tile_x", "r0_": "tile_r"}
 TILE_AXES = {name: axis for axis, name in TILE_NAMES.items()}
 ARG_REDUCTIONS = OrderedSet(["argmax", "argmin"])
+# The torch function that reduces a block for each plain reduction type.
+REDUCTION_FUNCTIONS = {
+    "sum": "sum",
+    "prod": "prod",
+    "max": "amax",
+    "min": "amin",
+    "any": "any",
+}
 REDUCTIONS = OrderedSet(
     [
         "sum",
@@ -63,6 +72,20 @@ REDUCTIONS = OrderedSet(
         *ARG_REDUCTIONS,
     ]
 )
+
+
+def names_row_dim(rnumel: sympy.Expr) -> bool:
+    """Whether HelionKernel.row_dim() can name the dim of a row of `rnumel`
+    elements, so that its reduction can be persistent. Not for a row of fewer
+    than 16 that is not a power of two: Helion sizes a factory's dim of under
+    16 by its value, so hl.zeros([tile_x, 12]).size(1) is 12 rather than the
+    reduction dim of in0[tile_x, :], and hl.arange(12) beside the slice fails
+    with "Attempting to broadcast a dimension of length 12". Such a row keeps
+    a loop over tile_r, of one block."""
+    if not rnumel.is_Integer:
+        return False
+    size = int(rnumel)
+    return size >= 16 or size == next_power_of_2(size)
 
 
 def accumulator_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -184,7 +207,7 @@ class HelionCSEProxy(CSEProxy):
             # the same: bf16 and fp16 values are exact in fp32 and tf32, and the
             # dot accumulates in fp32 either way.
             return x
-        if not (kernel.in_loop and x in kernel.dot_results):
+        if not (kernel.rolled and x in kernel.dot_results):
             return self._default("to_dtype", (x, dtype), kwargs)
         # A bf16 matmul output saved for backward is rounded between the dot and
         # its reduction. Emitted in the K loop, the rounding reads the running sum
@@ -198,6 +221,9 @@ class HelionCSEProxy(CSEProxy):
         # After the loop it rounds the final sum once, as eager does. Only in the
         # K loop: an epilogue's cast, as in (a @ b).to(torch.int32) + 1, is already
         # after the loop, and in the stores it would follow the + 1 that reads it.
+        # So would the epilogue of a K in one block (a persistent reduction),
+        # which has no loop: silu(a @ b) would read tmp3 before
+        #     tmp3 = tmp2.to(torch.float32)
         with kernel.swap_buffers(kernel.stores, kernel.stores, kernel.stores):
             value = self._default("to_dtype", (x, dtype), kwargs)
         # So that tmp5 = tmp4.to(torch.float32) follows tmp4 out of the loop.
@@ -209,9 +235,10 @@ class HelionCSEProxy(CSEProxy):
 
 class HelionKernel(SIMDKernel[CSEVariable]):
     """A Helion kernel: pointwise range trees become one hl.tile loop and the
-    reduction range tree an inner hl.tile loop. Loads and stores subscript
-    tensors by tile, e.g. in0[tile_y, tile_r]; Helion picks block sizes and
-    masks partial tiles."""
+    reduction range tree an inner hl.tile loop, or, in a persistent reduction
+    (should_use_persistent_reduction()), one block of the whole row. Loads and
+    stores subscript tensors by tile, e.g. in0[tile_y, tile_r], or in0[tile_y, :]
+    for the whole row; Helion picks block sizes and masks partial tiles."""
 
     overrides = HelionOverrides  # type: ignore[assignment]
 
@@ -242,6 +269,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.has_fp32_dot = False
         # Whether the kernel draws random numbers; see rand().
         self.uses_rand = False
+        # Whether a persistent reduction names the row's dim rdim; see row_dim().
+        self.uses_rdim = False
         # Dot accumulators and the casts of them that run after the K loop.
         self.dot_results: OrderedSet[CSEVariable] = OrderedSet()
         # Values stored outside the current reduction loop; see disable_reduction().
@@ -259,12 +288,80 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         return self
 
     @property
-    def in_loop(self) -> bool:
+    def in_reduction(self) -> bool:
+        """Whether codegen is in the reduction, not in a DisableReduction part of
+        the node schedule."""
         return self.inside_reduction and self.features.is_reduction()
+
+    @property
+    def rolled(self) -> bool:
+        """Whether codegen is in a loop over tile_r: in the reduction, and not
+        a persistent one."""
+        return self.in_reduction and not self.persistent_reduction
+
+    def should_use_persistent_reduction(self) -> bool:
+        """Whether the reduction reads each row as one block (a persistent
+        reduction) instead of in a loop over tile_r. e / e.sum(-1, keepdim=True)
+        with e = torch.exp(x - x.amax(-1, keepdim=True)) * 2 and x [64, 300]:
+            for tile_x in hl.tile(64):
+                tmp0 = in0[tile_x, :]
+                tmp1 = torch.amax(tmp0, -1)
+                ...
+                tmp4 = torch.exp(tmp3)
+                ...
+                tmp7 = torch.sum(tmp6, -1)
+                ...
+                out0[tile_x, :] = tmp9
+        reads x once and computes the exp once, where three loops over tile_r
+        read x in each and compute the exp in the last two. Helion can still roll
+        the row into a loop (Config.reduction_loops)."""
+        # A row that row_dim() cannot name keeps its loop, whatever the
+        # InductorChoices class in use decides.
+        return (
+            self.inside_reduction
+            and names_row_dim(self.features.reduction_numel)
+            and V.choices.should_use_persistent_reduction(
+                self.features.with_tiling_scores(self.tiling_scores),
+                self.cooperative_reduction,
+            )
+        )
+
+    def dim_code(self, dim: object) -> str:
+        """A dim of a value's shape, as code: in a persistent reduction tile_r
+        is no loop variable but the whole row (row_dim())."""
+        if self.persistent_reduction and str(dim) == "tile_r":
+            return self.row_dim()
+        return str(dim)
+
+    def row_dim(self) -> str:
+        """The dim of a whole row, as code, in a persistent reduction: R itself
+        if a power of two, else rdim, the dim of a factory of that size beside
+        a tile (see codegen_kernel()), as with R = 100:
+            rdim = hl.zeros([tile_x, 100]).size(1)
+            tmp1 = tmp0.reshape([tile_x, 1]).expand(tile_x, rdim)
+        The dim of a full slice of 100 elements, as in in0[tile_x, :], is the
+        reduction dim Helion pads to 128 lanes, which a factory beside a tile
+        shares, but not the literal 100: .expand(tile_x, 100) fails with "The
+        size of tensor a (u1) must match the size of tensor b (100)", and so
+        does hl.arange(100) beside the slice. A power of two is a dim of its own
+        size in both."""
+        size = self.numels["r0_"]
+        if size == next_power_of_2(size):
+            return str(size)
+        self.uses_rdim = True
+        return "rdim"
+
+    def dims_code(self, shape: Iterable[object]) -> str:
+        return ", ".join(map(self.dim_code, shape))
+
+    def coordinate(self, tile: str) -> str:
+        """A subscript's coordinate for `tile`: `:`, the whole row, for tile_r in
+        a persistent reduction, e.g. in0[tile_x, :]."""
+        return ":" if self.persistent_reduction and tile == "tile_r" else tile
 
     def create_cse_var(self, *args: Any, **kwargs: Any) -> CSEVariable:  # noqa: ANN401
         var = super().create_cse_var(*args, **kwargs)
-        if not self.in_loop:
+        if not self.in_reduction:
             self.outer_vars.add(var)
         return var
 
@@ -304,12 +401,18 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def index_tensor(self, axis: str, scope: Sequence[str]) -> str:
         name = f"{TILE_NAMES[axis]}.index"
+        if axis == "r0_" and self.persistent_reduction:
+            # The whole row's indices, e.g. for a flat index:
+            #     in1[1024*tile_x.index.reshape([tile_x, 1]) + hl.arange(1024)]
+            name = f"hl.arange({self.row_dim()})"
         axes = scope[scope.index(axis) :]
         if len(axes) == 1:
             return name
         # reshape() rather than slicing: Helion's tcgen05 store path proves the
         # layout of a store subscript only through reshape, +, *, // and %.
-        shape = ", ".join(TILE_NAMES[a] if a == axis else "1" for a in axes)
+        shape = ", ".join(
+            self.dim_code(TILE_NAMES[a]) if a == axis else "1" for a in axes
+        )
         return f"{name}.reshape([{shape}])"
 
     def align(self, value: CSEVariable, target: TileShape) -> str:
@@ -325,7 +428,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         aligned = scope_shape(present, target_axes)
         if aligned == shape:
             return str(value)
-        return f"{value}.reshape([{', '.join(map(str, aligned))}])"
+        return f"{value}.reshape([{self.dims_code(aligned)}])"
 
     def align_args(self, args: tuple[Any, ...]) -> tuple[Any, ...]:
         """The values among an op's `args`, reshaped to broadcast against each
@@ -343,7 +446,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             shape = scope_shape(axes, scope)
             if shape == tuple(arg.shape or ()):
                 return arg
-            line = f"{arg}.reshape([{', '.join(map(str, shape))}])"
+            line = f"{arg}.reshape([{self.dims_code(shape)}])"
             return self.cse.generate(self.compute, line, dtype=arg.dtype, shape=shape)
 
         return tuple(map(align, args))
@@ -485,10 +588,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
                 )
                 tiles = tuple(TILE_NAMES[dim] for dim in dims if dim is not None)
                 arg = self.tensor_arg(operand, output=output)
-                return arg, list(tiles) or ["()"], tiles
+                return arg, [*map(self.coordinate, tiles)] or ["()"], tiles
         if (view := self.tiled_view(buffer, index, axes)) is not None:
             tiles = tuple(TILE_NAMES[axis] for axis in axes)
-            return self.tensor_arg(view, output=output), list(tiles) or ["()"], tiles
+            coordinates = [*map(self.coordinate, tiles)] or ["()"]
+            return self.tensor_arg(view, output=output), coordinates, tiles
         return self.flat_subscript(buffer, index, axes, output=output)
 
     def flat_subscript(
@@ -512,6 +616,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         def ctx() -> Iterator[None]:
             with outside:
                 yield
+            if self.persistent_reduction:
+                # No loop: the CSE store cache keeps the values stored outside
+                # the reduction.
+                return
             # Back in a reduction loop: values stored outside it are read
             # from outer_stores instead of the CSE store cache.
             for name, value in [*self.cse.store_cache.items()]:
@@ -524,7 +632,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     def codegen_body(self) -> None:
         if not (self.compute or self.stores):
             return
-        if self.in_loop:
+        # A persistent reduction has no loop: one body, so that a value stored
+        # and read again in the kernel comes from the CSE store cache, and a
+        # buffer only the kernel reads is not written (remove_kernel_local_buffers()).
+        if self.rolled:
             self.body.writeline(f"for tile_r in hl.tile({self.numels['r0_']}):")
             with self.body.indent():
                 self.body.splice(self.compute)
@@ -574,6 +685,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             sizes = sizes if len(self.outer_axes) == 1 else f"[{sizes}]"
             code.writeline(f"for {tiles} in hl.tile({sizes}):")
             with code.indent():
+                if self.uses_rdim:
+                    tile = TILE_NAMES[self.outer_axes[-1]]
+                    size = self.numels["r0_"]
+                    code.writeline(f"rdim = hl.zeros([{tile}, {size}]).size(1)")
                 code.splice(self.body)
         return re.sub(r"__arg\d+__", lambda ref: names[ref[0]], code.getvalue())
 
@@ -670,7 +785,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             # Helion masks only lanes past the tile range; the body of
             # ops.masked() must not read where its mask is false.
             mask = self.align(mask, shape)
-            indices = "" if coordinates == ["()"] else subscript
+            indices = "" if coordinates == ["()"] else self.index_list(coordinates)
             line = f"hl.load({arg.ref}, [{indices}], extra_mask={mask}){cast_suffix}"
         return self.cse.generate(self.loads, line, dtype=dtype, shape=shape)
 
@@ -699,18 +814,27 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         arg, coordinates, shape = self.subscript(buffer, index, axes, output=True)
         dtype = buffer.get_dtype()
         cast_suffix = "" if value.dtype == dtype else f".to({dtype})"
-        buffer_code = self.compute if self.in_loop else self.stores
+        buffer_code = self.compute if self.in_reduction else self.stores
         value_code = f"{self.align(value, shape)}{cast_suffix}"
         if mode == "atomic_add":
             # index_put(out, (i,), x, accumulate=True) with i = arange(4) // 2
             # adds x[0] and x[1] to out[0]:
             #     hl.atomic_add(out0, [(tile_x.index // 2)], tmp0)
-            index_list = "" if coordinates == ["()"] else ", ".join(coordinates)
+            index_list = "" if coordinates == ["()"] else self.index_list(coordinates)
             line = f"hl.atomic_add({arg.ref}, [{index_list}], {value_code})"
         else:
             line = f"{arg.ref}[{', '.join(coordinates)}] = {value_code}"
         # DeferredLine, so that remove_kernel_local_buffers() can drop it.
         buffer_code.writeline(DeferredLine(name, line))
+
+    @staticmethod
+    def index_list(coordinates: Sequence[str]) -> str:
+        """`coordinates` as the index list of hl.load or hl.atomic_add, where the
+        whole row is slice(None): a masked load through its buffer's own layout
+        in a persistent reduction is
+            tmp0 = hl.load(in0, [tile_x, slice(None)], extra_mask=tmp3)
+        where hl.load(in0, [tile_x, :], extra_mask=tmp3) is a SyntaxError."""
+        return ", ".join("slice(None)" if c == ":" else c for c in coordinates)
 
     def index_expr(self, expr: sympy.Expr, dtype: torch.dtype) -> CSEVariable:
         index = self.tile_index(expr)
@@ -772,7 +896,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # hl.full([tile_x], 0, dtype=torch.int32) for the index 0.
         if OrderedSet(self.index_axes(index)) >= OrderedSet(scope):
             return expr
-        tiles = ", ".join(TILE_NAMES[axis] for axis in scope)
+        tiles = self.dims_code(TILE_NAMES[axis] for axis in scope)
         if not index.free_symbols:
             dtype = torch.int64 if widen else torch.int32
             return f"hl.full([{tiles}], {expr}, dtype={dtype})"
@@ -904,7 +1028,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         tiles = tuple(TILE_NAMES[axis] for axis in axes)
         if tuple(value.shape or ()) == tiles:
             return value
-        line = f"{self.align(value, tiles)}.expand({', '.join(tiles)})"
+        line = f"{self.align(value, tiles)}.expand({self.dims_code(tiles)})"
         return self.cse.generate(self.compute, line, dtype=value.dtype, shape=tiles)
 
     def reduction(
@@ -953,16 +1077,16 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             result = self.welford(reduction_type, values, acc_dtype)
         elif reduction_type == "online_softmax_reduce":
             result = self.online_softmax_reduce(values, acc_dtype)
+        elif self.persistent_reduction:
+            # The row is one block, whose reduction is the result,
+            #     tmp1 = torch.sum(tmp0, -1)
+            # rather than acc = hl.zeros([tile_x], ...) and acc = acc + tmp1.
+            fn = REDUCTION_FUNCTIONS[reduction_type]
+            result = self.reduce_block_value(fn, values[0], acc_dtype)
         else:
             acc = self.reduction_accumulator(reduction_type, src_dtype, acc_dtype)
-            fn = {
-                "sum": "sum",
-                "prod": "prod",
-                "max": "amax",
-                "min": "amin",
-                "any": "any",
-            }
-            part, _ = self.reduce_block(fn[reduction_type], values[0], acc_dtype)
+            fn = REDUCTION_FUNCTIONS[reduction_type]
+            part, _ = self.reduce_block(fn, values[0], acc_dtype)
             block = {
                 "sum": f"{acc} + {part}",
                 "prod": f"{acc} * {part}",
@@ -984,7 +1108,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return value
         axes = tile_axes(value.shape)
         shape = self.value_shape([*axes, "r0_"])
-        line = f"{self.align(value, shape)}.expand({', '.join(map(str, shape))})"
+        line = f"{self.align(value, shape)}.expand({self.dims_code(shape)})"
         return self.cse.generate(self.compute, line, dtype=value.dtype, shape=shape)
 
     def reduce_block(
@@ -1012,7 +1136,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         part = f"torch.{fn}({', '.join(args)})"
         aligned = scope_shape(kept, self.outer_axes)
         if aligned != self.value_shape(kept):
-            part = f"{part}.reshape([{', '.join(map(str, aligned))}])"
+            part = f"{part}.reshape([{self.dims_code(aligned)}])"
         return part, aligned
 
     def reduce_block_value(
@@ -1051,9 +1175,7 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         ops = V.ops
         index = ops.index_expr(self.symbols["r0_"], torch.int64)
         largest = reduction_type.startswith("argmax")
-        acc = self.reduction_accumulator(reduction_type, dtype, dtype)
         index_max = torch.iinfo(torch.int64).max
-        acc_index = self.accumulator(index_max, torch.int64)
         block = self.reduce_block_value("amax" if largest else "amin", value, dtype)
         hit = ops.eq(value, block)
         floating = dtype.is_floating_point
@@ -1063,6 +1185,12 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         first = self.reduce_block_value(
             "amin", ops.where(hit, index, sentinel), torch.int64
         )
+        if self.persistent_reduction:
+            # The row is one block: its first index of the max is the argmax,
+            # with no accumulators acc and acc1 to fold it into.
+            return first
+        acc = self.reduction_accumulator(reduction_type, dtype, dtype)
+        acc_index = self.accumulator(index_max, torch.int64)
         larger = ops.gt(block, acc) if largest else ops.lt(block, acc)
         equal = ops.eq(block, acc)
         if floating:
@@ -1115,14 +1243,19 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         value, *weight = values
         neg_inf = ops.constant(float("-inf"), dtype)
         zero = ops.constant(0.0, dtype)
-        acc_max = self.accumulator(float("-inf"), dtype)
-        acc_sum = self.accumulator(0, dtype)
         block_max = self.reduce_block_value("amax", value, dtype)
         exp = ops.exp(ops.sub(value, block_max))
         term = ops.where(
             ops.eq(value, neg_inf), zero, ops.mul(weight[0], exp) if weight else exp
         )
         block_sum = self.reduce_block_value("sum", term, dtype)
+        if self.persistent_reduction:
+            # The row is one block: its max and sum are the result, with the
+            # sum nan for a row of only -inf, as below.
+            nan = ops.constant(float("nan"), dtype)
+            return block_max, ops.where(ops.eq(block_max, neg_inf), nan, block_sum)
+        acc_max = self.accumulator(float("-inf"), dtype)
+        acc_sum = self.accumulator(0, dtype)
         new_max = ops.maximum(acc_max, block_max)
         scale = ops.exp(ops.neg(ops.abs(ops.sub(acc_max, block_max))))
         one = ops.constant(1.0, dtype)
@@ -1192,9 +1325,6 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         and 124.7 in blocks of 16."""
         ops = V.ops
         zero = ops.constant(0.0, dtype)
-        acc_mean = self.accumulator(0, dtype)
-        acc_m2 = self.accumulator(0, dtype)
-        acc_weight = self.accumulator(0, dtype)
 
         def finite_or_zero(value: CSEVariable) -> CSEVariable:
             isinf, isnan = ops.isinf(value), ops.isnan(value)
@@ -1205,9 +1335,16 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # each value's term of m2 given its deviation from the block's mean.
         if reduction_type == "welford_reduce":
             (value,) = values
-            # Helion masks the lanes past the end of R, so this counts the others.
-            one = self.over_tile_r(ops.constant(1.0, dtype))
-            weight = self.reduce_block_value("sum", one, dtype)
+            if self.persistent_reduction:
+                # The row is one block of R values: hl.full([], 300.0, ...),
+                # rather than the sum of hl.full([], 1.0, ...).expand(rdim),
+                # which would name the row's dim (row_dim()).
+                weight = ops.constant(float(self.numels["r0_"]), dtype)
+            else:
+                # Helion masks the lanes past the end of R, so this counts the
+                # others.
+                one = self.over_tile_r(ops.constant(1.0, dtype))
+                weight = self.reduce_block_value("sum", one, dtype)
             fraction = ops.truediv(ops.constant(1.0, dtype), weight)
             empty = None
 
@@ -1246,6 +1383,14 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         dev = ops.sub(value, mean)
         dev = ops.sub(dev, weighted_mean(dev))
         m2 = self.reduce_block_value("sum", spread(dev), dtype)
+        if self.persistent_reduction:
+            # The row is one block, so its mean, m2 and weight are the result, a
+            # two-pass variance as in Triton's persistent reductions, with no
+            # accumulators to combine them into.
+            return mean, m2, weight
+        acc_mean = self.accumulator(0, dtype)
+        acc_m2 = self.accumulator(0, dtype)
+        acc_weight = self.accumulator(0, dtype)
         # Triton's welford_combine of the accumulators and the block, with 0 for
         # the difference of two equal means, as inf - inf is nan, and for the
         # share of a new_weight of 0: a split's chunk past the end of R, as in

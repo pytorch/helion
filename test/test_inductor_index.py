@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 
 import pytest
 import sympy
 import torch
+from torch._inductor.codegen.common import CSEVariable
 from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
 from torch._inductor.graph import GraphLowering
+from torch._inductor.ir import FixedLayout
+from torch._inductor.ir import InputBuffer
 from torch._inductor.utils import sympy_index_symbol
 from torch._inductor.virtualized import V
 from torch.utils._sympy.functions import ModularIndexing
+from torch.utils._sympy.value_ranges import ValueRanges
 
 from helion._compat import requires_torch_version
 from helion._testing import TestCase
@@ -69,6 +74,38 @@ class TestIndexWidening(TestCase):
                     kernel.index_tensor_expr(index, ["x"]),
                     "((tile_x.index.to(torch.int64) + 4*tmp0) % 100)",
                 )
+
+
+class TestPersistentLoad(TestCase):
+    def test_masked_load_through_layout(self):
+        # In a persistent reduction a masked load through its buffer's own
+        # layout lists the whole row as slice(None), as [tile_x, :] is a
+        # SyntaxError in hl.load's index list (HelionKernel.index_list()).
+        # Inductor's cat and pad index their inputs through Identity(), e.g.
+        # F.pad(x[:32], (0, 0, 0, 32)) reads x at r0_1 + 32*Identity(x0), which
+        # matches no layout and reads through a flat view, so this emits such a
+        # load directly.
+        layout = FixedLayout(torch.device("cuda"), torch.float32, [64, 300], [300, 1])
+        graph = GraphLowering(torch.fx.symbolic_trace(lambda x: x + 1))
+        graph.name_to_buffer["buf0"] = InputBuffer(name="buf0", layout=layout)
+        mask = CSEVariable("mask", ValueRanges.unknown(), torch.bool, ("tile_x",))
+        interpreter = SimpleNamespace(current_node=None)
+        with V.set_graph_handler(graph), V.set_interpreter_handler(interpreter):
+            reduction = SIMDKernelFeatures([], sympy.Integer(64), sympy.Integer(300))
+            kernel = HelionKernel(
+                {"x": 64, "r0_": 300},
+                features=reduction,
+                override_persistent_reduction=True,
+            )
+            with V.set_kernel_handler(kernel):
+                kernel.load_masks.append(mask)
+                x, r = kernel.symbols["x"], kernel.symbols["r0_"]
+                kernel.load("buf0", 300 * x + r)
+        self.assertEqual(
+            kernel.compute.getvalue(),
+            "tmp0 = hl.load(__arg0__, [tile_x, slice(None)],"
+            " extra_mask=mask.reshape([tile_x, 1]))\n",
+        )
 
 
 if __name__ == "__main__":
