@@ -16,6 +16,7 @@ from torch._inductor.test_case import TestCase
 from torch._inductor.utils import fresh_cache
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
+import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
 import torch.utils._pytree as pytree
@@ -54,6 +55,20 @@ needs_native_matmul = unittest.skipUnless(
 
 def randn(*shape, dtype=torch.bfloat16):
     return torch.randn(shape, device=DEVICE, dtype=dtype)
+
+
+# For the tests of a loop over tile_r, its accumulators and their combine across
+# blocks: by default a row of up to 1024 elements is one block, a persistent
+# reduction (HelionChoices.should_use_persistent_reduction()).
+looped = config.patch({"triton.persistent_reductions": False})
+
+
+class PersistentChoices(InductorChoices):
+    """Choices that make every reduction persistent."""
+
+    @staticmethod
+    def should_use_persistent_reduction(features, cooperative_reduction):
+        return True
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True, torch_compile_fusion=True)
@@ -237,6 +252,19 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, in2: torch.Tensor, out0: torch.
 
     def test_bmm_epilogue(self):
         self.check_bmm_epilogue("triton")
+
+    def test_persistent_dot(self):
+        # A K of 32 is one block: torch.addmm over in0[tile_y, :] and
+        # in1[:, tile_x], with no loop over tile_r. As in
+        # test_saved_bf16_output, the bf16 product is saved and rounded, here
+        # before the epilogue that reads it.
+        fn = lambda a, b: torch.nn.functional.silu(a @ b)  # noqa: E731
+        a, b = randn(64, 32), randn(32, 48).requires_grad_()
+        (source,) = self.compile(fn, a, b, expected=fn(a, b), tol=2e-2)
+        self.assertNotIn("for tile_r", source)
+        self.assertIn("tmp0 = in0[tile_y, :]", source)
+        self.assertIn("tmp1 = in1[:, tile_x]", source)
+        self.assertIn("acc = torch.addmm(acc, tmp0, tmp1)", source)
 
     def test_saved_bf16_output(self):
         # silu's backward reads a @ b, so the bf16 product is saved and rounded.
@@ -487,6 +515,7 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(torch.exp, x, tol=1e-4, backend="cute")
         self.assertIn('backend="cute"', source)
 
+    @looped
     def test_arg_reduction(self):
         # arg_reduce()'s combine emits isnan, logical_and/or/not and an int64
         # where, which backend_ops() does not see in the node's body.
@@ -496,6 +525,7 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(fn, x, backend="cute")
         self.assertIn("torch.any(", source)
 
+    @looped
     def test_online_softmax(self):
         # online_softmax_reduce()'s combine emits exp, abs, neg, maximum and
         # where, which backend_ops() does not see in the node's body.
@@ -504,12 +534,25 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(fn, x, tol=1e-4, backend="cute")
         self.assertIn("torch.maximum(acc, ", source)
 
+    @looped
     def test_welford(self):
         # welford() emits eq, where, truediv, isinf, isnan and logical_or, and
         # the block's weight sums hl.full([], 1.0).expand(tile_r).
         x = torch.randn(64, 1000, device=DEVICE)
         (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, backend="cute")
         self.assertIn(".expand(tile_r)", source)
+
+    def test_persistent_reduction(self):
+        # Rows of 300 in one block: softmax, argmax over hl.arange(rdim) and
+        # var_mean.
+        x = torch.randn(64, 300, device=DEVICE)
+
+        def fn(x):
+            return torch.softmax(x, -1), torch.argmax(x, -1), torch.var_mean(x, -1)
+
+        sources = self.compile(fn, x, tol=1e-4, backend="cute")
+        self.assertNotIn("for tile_r", "\n".join(sources))
+        self.assertIn("hl.arange(rdim)", "\n".join(sources))
 
     def test_rand(self):
         # Stock Inductor's numbers, bit for bit: CuTe's default Philox4 stream
@@ -619,6 +662,7 @@ class TestInductorBackend(InductorBackendTestCase):
         self.assertIn("tl.full([], 0.1, tl.float32)", code)
 
     @parametrize("case", ["online_softmax_off", "pattern_matcher_off", "integer"])
+    @looped
     def test_softmax(self, case):
         # Without online softmax (turned off, or with Inductor's pattern
         # rewrites turned off, or for an integer x, whose exps
@@ -642,6 +686,7 @@ class TestInductorBackend(InductorBackendTestCase):
             (source,) = self.compile(fn, x, tol=1e-4)
         self.assertIn("acc1 = acc1 + torch.sum(", source)
 
+    @looped
     def test_online_softmax(self):
         # helion.inductor's post-grad pass rewrites softmax to
         # prepare_softmax_online, as Inductor's does for Triton only: one pass
@@ -703,6 +748,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
 """,
         )
 
+    @looped
     def test_online_softmax_sum(self):
         # The bare sum of a row of only -inf is nan, as in eager:
         # exp(-inf - -inf). Its -inf terms are 0, and the sum is nan where the
@@ -726,6 +772,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
             self.compile(lambda x: torch.softmax(x, -1), x, tol=1e-4)
 
     @parametrize("case", ["split", "neg_inf_row", "log_softmax"])
+    @looped
     def test_online_softmax_cases(self, case):
         # split: the second kernel of a split reduction reduces the first's
         # (max, sum) pairs, and the first reduces blocks of the -inf half, and
@@ -755,6 +802,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         (source,) = self.compile(fn, torch.randn(64, 100, device=DEVICE))
         self.assertRegex(self.code, rf"aten\.{op}\.\w+\(")
 
+    @looped
     def test_reduction_source(self):
         (source,) = self.compile(
             lambda x, b: (x * 2).sum(-1) + b,
@@ -784,7 +832,103 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
 """,
         )
 
+    def test_persistent_reduction_source(self):
+        # A row of up to 1024 elements is one block, as in Triton's persistent
+        # reductions: x is read once, and exp(x - max) computed once for both
+        # the sum and the output. In a loop over tile_r, three loops read x and
+        # the last two compute the exp.
+        def fn(x):
+            e = torch.exp(x - x.amax(-1, keepdim=True)) * 2
+            return e / e.sum(-1, keepdim=True)
+
+        (source,) = self.compile(fn, torch.randn(64, 300, device=DEVICE))
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x in hl.tile(64):
+        tmp0 = in0[tile_x, :]
+        tmp1 = torch.amax(tmp0, -1)
+        tmp2 = tmp1.reshape([tile_x, 1])
+        tmp3 = tmp0 - tmp2
+        tmp4 = torch.exp(tmp3)
+        tmp5 = hl.full([], 2.0, dtype=torch.float32)
+        tmp6 = tmp4 * tmp5
+        tmp7 = torch.sum(tmp6, -1)
+        tmp8 = tmp7.reshape([tile_x, 1])
+        tmp9 = tmp6 / tmp8
+        out0[tile_x, :] = tmp9
+""",
+        )
+
+    @parametrize(
+        "case",
+        ["argmax", "pow2", "few", "welford", "neg_inf_row", "broadcast", "pad"],
+    )
+    def test_persistent_reduction(self, case):
+        # argmax: the row's indices are hl.arange(rdim), with rdim the dim of
+        # a factory of 300 elements beside tile_x, which is the reduction dim
+        # of in0[tile_x, :] (HelionKernel.row_dim()); a NaN, ties and a row of
+        # -inf as in test_arg_reduction. pow2: a row of 128 is a dim of its
+        # own size. few: a row of 12, not a power of two, keeps a loop of one
+        # block, even under choices that make every reduction persistent
+        # (names_row_dim()). welford: test_welford_extremes' rows in one block
+        # each, whose weight is R.
+        # neg_inf_row: softmax of a row of -inf is nan, as in eager. broadcast:
+        # the max over a broadcast dim of z, all -0.0, is -0.0. pad: rows of
+        # 304 whose last 4 the mask (hl.arange(rdim) < 300) takes from the pad.
+        x = torch.randn(64, 300, device=DEVICE)
+        fn = lambda x: (torch.argmax(x, -1), torch.argmin(x, -1))  # noqa: E731
+        expected = None
+        if case == "argmax":
+            x[3, 10] = x[3, 250] = x[5, 200] = float("nan")
+            x[2] = float("-inf")
+            x[7, 50:] = 1.0
+        elif case == "pow2":
+            x = torch.randn(64, 128, device=DEVICE)
+        elif case == "few":
+            x = torch.randn(64, 12, device=DEVICE)
+            self.enterContext(V.set_choices_handler(PersistentChoices()))
+        elif case == "welford":
+            x = torch.randn(6, 963, device=DEVICE)
+            x[1], x[2, 480:] = float("inf"), float("inf")
+            x[3], x[4], x[5] = 2e19, 100553424.0, 0.0
+            x[5, ::2] = 1e38
+            fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
+            var, mean = torch.var_mean(x, -1)
+            mean[1:3] = float("inf")
+            expected = (var, mean)
+        elif case == "neg_inf_row":
+            x[1] = float("-inf")
+            fn = lambda x: torch.softmax(x, -1)  # noqa: E731
+        elif case == "broadcast":
+            x = torch.full((64, 1), -0.0, device=DEVICE)
+            fn = lambda z: torch.signbit(torch.amax(z.expand(64, 300), -1))  # noqa: E731
+        elif case == "pad":
+            fn = lambda x: torch.softmax(F.pad(x, (0, 4), value=-1.0), -1)  # noqa: E731
+        (source,) = self.compile(fn, x, expected=expected, tol=1e-4)
+        # One block per row: no loop, and no accumulators across blocks.
+        self.assertEqual("for tile_r" in source, case == "few")
+        self.assertEqual("acc" in source, case == "few")
+        line = {
+            "argmax": "rdim = hl.zeros([tile_x, 300]).size(1)",
+            "pow2": "hl.arange(128)",
+            "few": "for tile_r in hl.tile(12):",
+            "welford": "hl.full([], 963.0, dtype=torch.float32)",
+            "neg_inf_row": "tmp0 = in0[tile_x, :]",
+            "broadcast": ".expand(tile_x, rdim)",
+            "pad": "[300*tile_x.index.reshape([tile_x, 1]) + (hl.arange(rdim))]",
+        }[case]
+        self.assertIn(line, source)
+        self.assertEqual("rdim" in source, case in ("argmax", "broadcast", "pad"))
+
     @parametrize("op", ["sum", "prod"])
+    @looped
     def test_integer_reduction(self, op):
         # -1 and 1, so that the product is rarely 0 and does not overflow.
         x = torch.randint(0, 2, (64, 100), device=DEVICE, dtype=torch.int32) * 2 - 1
@@ -811,6 +955,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         "case",
         ["argmax", "min_dim", "max_dim", "nan", "ties", "int", "neg_inf", "flat"],
     )
+    @looped
     def test_arg_reduction(self, case):
         # min_dim: torch.min(x, -1) with a NaN, an amin and an argmin; nan:
         # torch.argmax picks the first NaN; ties: argmin's first index; int: no
@@ -840,6 +985,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         (source,) = self.compile(fn, x)
         self.assertIn("torch.amin(", source)
 
+    @looped
     def test_welford(self):
         (source,) = self.compile(
             lambda x: torch.var_mean(x, -1), torch.randn(64, 100, device=DEVICE)
@@ -965,6 +1111,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         self.assertEqual(len(self.compile(fn, x, expected=expected, tol=2e-2)), 1)
 
     @parametrize("case", ["rows", "split", "split_empty"])
+    @looped
     def test_welford_extremes(self, case):
         # Blocks of tile_r pinned to 64, or 1 for split_empty (by default one
         # block covers a row). rows, R = 963, whose last block has 3 lanes:
@@ -1167,6 +1314,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         with config.patch(assert_indirect_indexing=case == "check_bounds"):
             self.assertUnsupported(case, fn, *args)
 
+    @looped
     def test_any(self):
         x = torch.randn(64, 100, device=DEVICE)
         (source,) = self.compile(lambda x: torch.any(x > 2.0, -1), x)
@@ -1312,6 +1460,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         with config.patch(patches):
             self.assertUnsupported(names, fn, *args)
 
+    @looped
     def test_broadcast_reduction(self):
         # The max over a broadcast dim of z, all -0.0, is -0.0, as in eager.
         z = torch.full((64, 1), -0.0, device=DEVICE)
@@ -1320,6 +1469,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertIn(".expand(tile_x, tile_r)", source)
 
     @config.patch({"triton.codegen_upcast_to_fp32": False})
+    @looped
     def test_reduction_low_precision(self):
         # A bf16 value sums into an fp32 accumulator, as in Triton kernels.
         (source,) = self.compile(lambda x: x.sum(-1), randn(64, 1000))
