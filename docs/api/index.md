@@ -84,6 +84,7 @@ backend_api
    atomic_min
    atomic_cas
    device_print
+   device_assert
    stacktensor_like
    zeros
    full

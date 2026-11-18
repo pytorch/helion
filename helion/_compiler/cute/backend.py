@@ -4482,6 +4482,11 @@ class CuteBackend(Backend):
             compile_options = config_compile_options(
                 config, ptxas_options=ptxas_options
             )
+            if CompileEnvironment.current().has_device_assert:
+                # The DSL drops cute.testing.assert_ unless compiled with it:
+                #     _launcher(_helion_k, (32,), x, out, block=(32, 1, 1),
+                #               cute_compile_options='--enable-assertions')
+                compile_options = f"{compile_options} --enable-assertions".strip()
             if compile_options:
                 launcher_args.append(f"cute_compile_options={compile_options!r}")
             return launcher_args

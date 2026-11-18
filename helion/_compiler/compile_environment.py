@@ -1037,6 +1037,10 @@ class CompileEnvironment:
 
         # TODO(hinriksnaer): tracing flag, not env config. move to CompilerState?
         self.has_barrier: bool = False
+        # Whether the kernel calls hl.device_assert, whose check the backends
+        # compile in only when the launch asks for it (Triton's debug mode,
+        # CuTe's --enable-assertions).
+        self.has_device_assert: bool = False
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []

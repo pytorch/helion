@@ -3358,6 +3358,11 @@ class CuteCollectiveMatmulHeuristic(AutotunerHeuristic):
         # native-MMA seeds instead of measuring the requested collective.
         if spec.tcgen05.search_enabled or spec.cute_flash_search_enabled:
             return []
+        # The collective MMA refuses a region with an hl.device_assert
+        # ("unclassified effects in the row-loop region"): every seed would
+        # fail at code generation.
+        if env.has_device_assert:
+            return []
         axes, sites = cls._placements(env, device_ir)
         if not axes:
             return []

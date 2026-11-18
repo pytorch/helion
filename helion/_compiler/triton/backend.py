@@ -840,7 +840,28 @@ class TritonBackend(Backend):
                 "_minimum_resident_programs="
                 f"{device_fn.triton_minimum_resident_programs}"
             )
-        out.extend(self.launcher_keyword_args(config, has_barrier=has_barrier))
+        keyword_args = self.launcher_keyword_args(config, has_barrier=has_barrier)
+        if env.has_device_assert:
+            # Triton compiles tl.device_assert to nothing outside debug mode:
+            #     _launcher(_helion_k, (4,), x, out, debug=True,
+            #               sanitize_overflow=False, num_warps=4, num_stages=1)
+            # Debug mode alone would also trap an int32 add, sub or mul that
+            # wraps, as torch's do: x * 1103515245 fails with "int32 overflow
+            # detected for operation mul".  Inductor compiles its kernels with
+            # that sanitizer off too; a Triton build without the option, which
+            # rejects the keyword, has no sanitizer to turn off.  A
+            # _triton_config_debug tunable's debug=False would repeat the
+            # keyword, a SyntaxError: these win.
+            out.append("debug=True")
+            supported = _compat.supported_launch_options()
+            if supported is None or "sanitize_overflow" in supported:
+                out.append("sanitize_overflow=False")
+            keyword_args = [
+                arg
+                for arg in keyword_args
+                if arg.partition("=")[0] not in ("debug", "sanitize_overflow")
+            ]
+        out.extend(keyword_args)
         return out
 
     def pdl_capability(self, env: CompileEnvironment) -> tuple[int, int] | None:
@@ -854,7 +875,10 @@ class TritonBackend(Backend):
 
     @staticmethod
     def reserved_launch_param_names() -> frozenset[str]:
-        return frozenset({"grid", "warmup", "num_warps", "num_stages"})
+        # debug and sanitize_overflow: hl.device_assert's launch options.
+        return frozenset(
+            {"grid", "warmup", "num_warps", "num_stages", "debug", "sanitize_overflow"}
+        )
 
 
 class GluonBackend(TritonBackend):
