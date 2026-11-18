@@ -96,6 +96,7 @@ from .mpp_matmul import block_id_of
 from .mpp_matmul import call_name
 from .mpp_matmul import current_plan
 from .mpp_matmul import group_sides
+from .mpp_matmul import is_tile_product
 from .mpp_matmul import matmul_operands
 from .mpp_matmul import metal_unsupported
 from .mpp_matmul import names_read
@@ -171,7 +172,10 @@ class _OperandRecomputable(Recomputable):
 
 def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     """Raise ``BackendUnsupported`` unless the fragment run lowers the group:
-    a K loop's matmul whose K is a block, with no batch, whose result is
+    a matmul with no batch whose K is a block, accumulated across its K
+    loop, a per-K-tile product, or one run over a ``:`` K whose extent fits
+    a fragment K tile (:func:`k_tile_refusal`; a config can't change it, so
+    the search offers fragments only when it fits), whose result is
     read only by element loops (stores and in-place updates, no Scalar read
     and no staged vector), whose computed operands a lane recomputes at any
     element: from loads, iotas, tile indices, constants, 0-d values and
@@ -184,8 +188,6 @@ def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None
             f"metal_matmul='fragment' can't lower {what}; use metal_matmul='mpp'"
         )
 
-    if not group.levels:
-        refuse("a matmul over a ':' K, or one K tile's product with no acc")
     if not group.lhs.dtype.is_floating_point:
         # MSL's is_simdgroup_matrix_element: half, bfloat and float only.
         refuse(f"{group.lhs.dtype} operands, which simdgroup_matrix can't hold")
@@ -193,6 +195,10 @@ def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None
         refuse("a matmul over a K held as per-thread parts")
     if group.batch_block is not None:
         refuse("a batched matmul")
+    if not group.levels and not is_tile_product(group):
+        k = _whole_k_tile(group.k_block)
+        if k is not None and (why := k_tile_refusal(k)) is not None:
+            refuse(f"a matmul over a ':' K: {why}")
     if group.mats:
         refuse("a matmul whose result is read in the Scalar layout")
     if any(g is group for g in plan.by_vec.values()):
@@ -256,6 +262,10 @@ def split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
         )
     loops: dict[Node, list[MppGroup]] = {}
     for group in plan.by_matmul.values():
+        if not group.levels:
+            # One run over the whole K, or over one K tile from zeros: no K
+            # loop of its own to split.
+            return "a matmul over a ':' K or one K tile's product"
         if group.seed is None or group.seed.target is not full:
             return "an accumulator starts from a tile"
         if group.update or group.upd is not None:
@@ -301,20 +311,44 @@ def transposed(group: MppGroup) -> bool:
 MAX_STEPS = 16
 
 
+def k_tile_refusal(k: int) -> str | None:
+    """Why a fragment run can't take a K tile of ``k``, or None when it can:
+    whole 8-deep MMA steps, at most :data:`MAX_STEPS` of them."""
+    if k % 8:
+        return f"a fragment matmul K tile of {k}: K must be a multiple of 8"
+    if k // 8 > MAX_STEPS:
+        return (
+            f"a fragment matmul K tile of {k}: its {k // 8} MMA steps are "
+            f"unrolled (max {MAX_STEPS})"
+        )
+    return None
+
+
+def _whole_k_tile(block: int) -> int | None:
+    """The K tile of a run over the ``:`` K of ``block`` when no config
+    changes it: the extent a persistent reduction dim takes
+    (``ReductionLoopBlockSizeSource``), or None when ``reduction_loops`` can
+    roll the dim or it takes a tiled axis's size."""
+    env = CompileEnvironment.current()
+    if (
+        block in env.config_spec.reduction_loops.valid_block_ids()
+        or env.registered_extent_owner(block) is not None
+    ):
+        return None
+    return env.backend.static_rdim_size(max(1, env.block_sizes[block].size_hint()))
+
+
 def fragment_grid(group: MppGroup, m: int, n: int, k: int) -> tuple[int, int, int]:
     """The accumulator's ``(rows, cols, transposed)``: its 8x8 fragments
     over the op's M and N (N and M when transposed), for an op of ``m`` x
     ``n`` over a K tile of ``k``.  A wide tile keeps many fragments live in
     each lane; that is slower, not wrong, and the autotuner times it."""
-    if m % 8 or n % 8 or k % 8:
+    if m % 8 or n % 8:
         raise metal_unsupported(
-            f"a fragment matmul tile {m}x{n}x{k}: M, N and K must be multiples of 8"
+            f"a fragment matmul tile {m}x{n}x{k}: M and N must be multiples of 8"
         )
-    if k // 8 > MAX_STEPS:
-        raise metal_unsupported(
-            f"a fragment matmul K tile of {k}: its {k // 8} MMA steps are "
-            f"unrolled (max {MAX_STEPS}); use a smaller K block"
-        )
+    if (why := k_tile_refusal(k)) is not None:
+        raise metal_unsupported(f"{why}; use a smaller K block")
     if transposed(group):
         return n // 8, m // 8, 1
     return m // 8, n // 8, 0
@@ -941,6 +975,11 @@ def _copies(pad: str, count: int, lines: list[str]) -> list[str]:
     return out
 
 
+#: The element ``_fi`` of a lane's fragments, after an array of them: the
+#: lane holds two elements of each 8x8 fragment.
+FRAGMENT_SLOT = "[_fi >> 1].thread_elements()[_fi & 1]"
+
+
 def fragment_elements(
     coop: str,
     root: str,
@@ -957,7 +996,7 @@ def fragment_elements(
     row, col = _element_names(flipped)
     block_m, block_n = state.coop_tile[root]
     inner = pad + "    "
-    element = f"{coop}[_fi >> 1].thread_elements()[_fi & 1]"
+    element = f"{coop}{FRAGMENT_SLOT}"
     lines = [
         f"{inner}int {row} = 8 * ((_fi >> 1) / {cols}) + _fm;",
         f"{inner}int {col} = 8 * ((_fi >> 1) % {cols}) + _fn + (_fi & 1);",
@@ -994,6 +1033,14 @@ def emit_fragment_acc(
     seed = ast.literal_eval(call.args[ACC_SEED])
     state.declare(name)
     state.coop[name] = name
+    state.coop_group[name] = (
+        ast.literal_eval(call.args[0]),
+        ast.literal_eval(call.args[4]),
+    )
+    if _keyword(call, "fold") is not None:
+        # A fold's update reads its product's element at the same slot: both
+        # are float fragments of one grid, whose lane layout is fixed.
+        state.coop_fold.add(name)
     state.coop_tile[name] = (block_m, block_n)
     state.fragments[name] = (rows, cols, flipped)
     # The fragments cover the op's M and N, which are cut to the loops'
@@ -1149,7 +1196,7 @@ def emit_fragment_run(
             f"{inner}simdgroup_float8x8 _frag_b[{cols}];",
         ]
         for side, (loop, array, count, decls) in enumerate(sides):
-            state.put = f"{array}[_fi >> 1].thread_elements()[_fi & 1]"
+            state.put = f"{array}{FRAGMENT_SLOT}"
             for i in range(2 * count):
                 lines = [
                     f"{inner}{{",

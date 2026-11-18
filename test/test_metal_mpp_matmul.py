@@ -35,6 +35,7 @@ from helion._compiler.metal.staged_matmul_heuristic import MetalStagedMatmulHeur
 from helion._testing import import_example
 from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
+from helion._testing.metal_fragment import fragment_config
 from helion._testing.metal_staged import dequant_args
 from helion._testing.metal_staged import dequant_mm
 import helion.language as hl
@@ -10251,6 +10252,17 @@ class TestMppTileProducts(_MppCase):
         self.assertNotIn("_mpp_mat", msl)
         _close(out, _mm(x, y))
 
+    def test_fragments(self) -> None:
+        """On simdgroup fragments each K tile's product is one run from
+        zeroed fragments, and acc + mm a fold of it, updated at each lane's
+        own fragment elements; K = 72 ends in a partial tile."""
+        x, y = self.x, self.y
+        out, code, msl = _run(root_mm_plus, (x, y), fragment_config([16, 16, 16]))
+        self.assertEqual(code.count("fold=True"), 1)
+        self.assertIn("simdgroup_multiply_accumulate", msl)
+        self.assertNotIn("_mpp_mat", msl)
+        _close(out, _mm(x, y))
+
     def test_batched(self) -> None:
         """A batched product takes no fold (a batch block): each K tile's
         product is read through its materialization."""
@@ -10525,6 +10537,13 @@ class TestMppFold(_MppCase):
             {"matmul2d_descriptor(8, 16"},
         )
         _close(out, ref[:4])
+        # On simdgroup fragments: both are float fragments of one grid.
+        for config in (fragment_config([16, 16]), fragment_config([32, 16])):
+            with self.subTest(config=config):
+                out, code, msl = _run(fold_scaled, (x, y, s), config)
+                self._folded(code, msl)
+                self.assertIn("simdgroup_multiply_accumulate", msl)
+                _close(out, ref)
 
     def test_int_carry(self) -> None:
         x = torch.randint(-128, 128, (40, 96), dtype=torch.int8, device=DEVICE)

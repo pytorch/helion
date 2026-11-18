@@ -55,11 +55,12 @@ class MetalKernelFacts:
     """What ``MetalBackend.register_search_surface`` found in the kernel
     (``ConfigSpec.backend_facts``)."""
 
-    #: Whether the kernel has K-loop matmuls that lower on fragments
-    #: (``fragment_mma``'s ``check_fragment_group``): all of its aten
-    #: matmuls, and its whole-K ``hl.dot`` calls when the fragment rules take
-    #: every one of them (``mpp_matmul._takes_dots``); else the dots keep the
-    #: scalar contraction.
+    #: Whether the kernel's matmuls lower on fragments (``fragment_mma``'s
+    #: ``check_fragment_group``: K-loop accumulators, whole-K matmuls and
+    #: per-K-tile products): all of its aten matmuls, and its ``hl.dot``
+    #: calls when the fragment rules take every one of them
+    #: (``mpp_matmul._takes_dots``); else the dots keep the scalar
+    #: contraction.
     fragment_matmuls: bool = False
     #: Whether the kernel has matmuls, which the scalar contraction lowers
     #: under ``metal_matmul="scalar"``.
@@ -113,7 +114,7 @@ def metal_matmul(config: Mapping[str, object]) -> object:
 
 
 def lowers_on_fragments(config_spec: ConfigSpec) -> bool:
-    """Whether the kernel's K-loop matmuls lower on fragments
+    """Whether the kernel's matmuls lower on fragments
     (``MetalKernelFacts.fragment_matmuls``)."""
     return kernel_facts(config_spec).fragment_matmuls
 

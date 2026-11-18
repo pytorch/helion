@@ -1049,7 +1049,7 @@ def _plan_matmuls(
             plan.by_seed[group.seed] = group
         for vec in group.vecs:
             plan.by_vec[vec] = group
-        if tile_product and fragment is None:
+        if tile_product:
             products.append(group)
     # Folds are optional, so they are planned once every group has claimed its
     # storage: a fold takes only storage that no group's op updates, whatever
@@ -3717,16 +3717,15 @@ def _codegen_matmul(
     group = current_plan().by_matmul[node]
     _check_threads(cg, group)
     _check_batch(cg, group)
-    lowering = current_plan().fragment
-    if lowering is not None:
-        assert isinstance(acc, ast.Name)
-        return lowering.codegen_run(cg, group, acc, values)
     if acc is None:
         # A matmul with no acc writes a fresh cooperative tensor: zeros, then
         # the op accumulates the product into them.
         assert group.seed is None
         acc = cg.lift(_acc_expr(cg, group, "0.0", None), prefix="_mpp_c")
     assert isinstance(acc, ast.Name)
+    lowering = current_plan().fragment
+    if lowering is not None:
+        return lowering.codegen_run(cg, group, acc, values)
     tiles: list[int] = []
     tile_dims: list[str] = []
     parts: list[list[str]] = []

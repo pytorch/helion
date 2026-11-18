@@ -668,7 +668,7 @@ class MetalBackend(Backend):
         MPP or fragments (``MetalKernelFacts.thread_loops``: the search fits
         its configs' threads to whole SIMD groups,
         ``search_surface.fit_threads``), from the planner's trials, and
-        whether its K-loop matmuls lower on fragments too
+        whether its matmuls lower on fragments too
         (``search_surface.lowers_on_fragments``, which exposes
         ``metal_matmul`` to the search): the planner's fragment trial on
         copies of the graphs, with no block spread over threads.  Then the
@@ -775,6 +775,10 @@ class MetalBackend(Backend):
         if plan is None:
             return
         blocks = tuple(sorted({group.k_block for group in plan.by_matmul.values()}))
+        # A K loop loads its runs' operands a tile ahead only for a carried
+        # accumulator's run: a run per K tile (a per-K-tile product)
+        # declares its fragments in the loop body (``prefetch_loads``).
+        carried = {g.k_block for g in plan.by_matmul.values() if g.levels}
         if blocks:
             # The nodes the matmuls compute from, where fragment elements
             # would read tables.
@@ -796,7 +800,7 @@ class MetalBackend(Backend):
             # checks under the slot).
             bounds = _loop_bounds(device_ir)
             for block in blocks:
-                if block in bounds and loads_ahead(*bounds[block]):
+                if block in carried and block in bounds and loads_ahead(*bounds[block]):
                     stages.append(FragmentNumStagesSpec([block]))
 
     def default_num_sm_multiplier(self) -> int:

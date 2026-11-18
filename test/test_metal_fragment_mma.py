@@ -518,8 +518,8 @@ class TestFragmentMma(unittest.TestCase):
 
     def test_dots(self) -> None:
         """hl.dot is admitted by the fragment rules: one row of a computed lhs
-        lowers on fragments, and a ':' K, which fragments refuse, keeps the
-        scalar contraction."""
+        lowers on fragments, and so does a ':' K, one run from zeroed
+        fragments."""
         x = torch.randn(16, 32, device=DEVICE, dtype=torch.float16)
         y = torch.randn(32, 16, device=DEVICE, dtype=torch.float16)
         xd, yd = x.cpu().double(), y.cpu().double()
@@ -528,7 +528,7 @@ class TestFragmentMma(unittest.TestCase):
         self._assert_fragments(msl, transposed=False)
         out, msl = _run(whole_k_dot, (x, y), fragment_config([16, 16]))
         self._close(out, xd @ yd)
-        self.assertNotIn("simdgroup_multiply_accumulate", msl)
+        self.assertIn("simdgroup_multiply_accumulate", msl)
 
     def test_two_groups(self) -> None:
         """Two fragment groups in one K loop share the lane preamble, each

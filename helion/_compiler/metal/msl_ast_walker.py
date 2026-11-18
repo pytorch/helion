@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 from typing import Iterator
 
 from ... import exc
+from .fragment_mma import FRAGMENT_SLOT
 from .fragment_mma import SIMDGROUP
 from .fragment_mma import EarlyLoad
 from .fragment_mma import FragmentElement
@@ -665,7 +666,9 @@ def _emit_for(
             # A fold's update reads its product's element at its own slot: the
             # two tensors hold the same element at each index
             # (``mpp_matmul._plan_fold``).  Only an unrolled loop has a slot
-            # index; every update loop is unrolled (``elementize``).
+            # index: an MPP update loop is unrolled (``elementize``), and a
+            # fragment element loop always is (``fragment_elements``), its
+            # slot ``_fi``.
             gid = state.coop_group[root][0]
             products = {
                 r
@@ -673,13 +676,22 @@ def _emit_for(
                 if g == gid and r not in state.coop_fold
             }
             product_names = {name for name, r in state.coop.items() if r in products}
-            reads = {
-                n.id for s in stmt.body for n in ast.walk(s) if isinstance(n, ast.Name)
+            if root in state.fragments:
+                slot = FRAGMENT_SLOT
+            else:
+                reads = {
+                    n.id
+                    for s in stmt.body
+                    for n in ast.walk(s)
+                    if isinstance(n, ast.Name)
+                }
+                assert unroll or not reads & product_names, (
+                    "a fold's element loop that reads its product is not unrolled"
+                )
+                slot = "[_ei]"
+            element_subs |= {
+                name: f"{state.coop[name]}{slot}" for name in product_names
             }
-            assert unroll or not reads & product_names, (
-                "a fold's element loop that reads its product is not unrolled"
-            )
-            element_subs |= {name: f"{state.coop[name]}[_ei]" for name in product_names}
         fenced = len(it.args) > 1 and ast.literal_eval(it.args[1])
         if fenced:
             # The loop reads a staged vector's tile: after its staging writes.
