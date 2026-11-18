@@ -41,6 +41,8 @@ from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
 from .distributed_ops import tagged_store_codegen
+from .dsmem import dsmem_load_codegen
+from .dsmem import dsmem_store_codegen
 from .prefetch import TENSOR_MAP_ACQUIRE_ASM
 from .prefetch import prefetch_asm
 from .prefetch import tensor_prefetch_asm
@@ -107,8 +109,11 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
-        codegen_store = tagged_store_codegen(
-            state, inband_store_codegen(state, strategy.codegen_store)
+        codegen_store = dsmem_store_codegen(
+            state,
+            tagged_store_codegen(
+                state, inband_store_codegen(state, strategy.codegen_store)
+            ),
         )
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -208,7 +213,9 @@ def _(state: CodegenState) -> ast.AST | SharedValue:
         device_fn.device_memory_op_index += 1
         strategy = device_fn.get_indexing_strategy(indexing_idx)
 
-        codegen_load = inband_load_codegen(state, strategy.codegen_load)
+        codegen_load = dsmem_load_codegen(
+            state, inband_load_codegen(state, strategy.codegen_load)
+        )
         # A ring slot replaces a plain load (not an in-band poll or a fusion).
         if (
             device_fn.ring is not None
