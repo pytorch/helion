@@ -692,7 +692,7 @@ def check_free_lanes(
 
     owned: set[Node] = set()
     staged: set[int] = set()
-    for group in mpp_plan.by_matmul.values():
+    for group in mpp_plan.groups():
         _acc, lhs, rhs = matmul_operands(group.matmul)
         for node, operand, blocks in (
             (lhs, group.lhs, (group.m_block, group.k_block)),

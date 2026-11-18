@@ -80,6 +80,9 @@ class EmitState:
     coop_tile: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The cooperative roots whose descriptor rounds a size-1 dim up.
     coop_rounded: set[str] = dataclasses.field(default_factory=set)
+    #: The folds' roots (``mpp_matmul._plan_fold``): their update loops read
+    #: the product's tensor, of the same group, at the same index.
+    coop_fold: set[str] = dataclasses.field(default_factory=set)
     #: Each MPP root's op M and N, which bound its elements per thread.
     coop_dims: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: Each fragment group's accumulator root to its fragment grid ``(rows,
@@ -399,6 +402,8 @@ def _emit_coop_acc(
     state.declare(name)
     state.coop[name] = name
     state.coop_group[name] = (gid, dtypes)
+    if any(k.arg == "fold" for k in call.keywords):
+        state.coop_fold.add(name)
 
 
 def _coop_elements(coop: str, pad: str, block_m: int, block_n: int) -> list[str]:
@@ -656,6 +661,25 @@ def _emit_for(
             **{name: element for name, r in state.coop.items() if r == root},
         }
         unroll = any(k.arg == "unroll" for k in it.keywords)
+        if root in state.coop_fold:
+            # A fold's update reads its product's element at its own slot: the
+            # two tensors hold the same element at each index
+            # (``mpp_matmul._plan_fold``).  Only an unrolled loop has a slot
+            # index; every update loop is unrolled (``elementize``).
+            gid = state.coop_group[root][0]
+            products = {
+                r
+                for r, (g, _) in state.coop_group.items()
+                if g == gid and r not in state.coop_fold
+            }
+            product_names = {name for name, r in state.coop.items() if r in products}
+            reads = {
+                n.id for s in stmt.body for n in ast.walk(s) if isinstance(n, ast.Name)
+            }
+            assert unroll or not reads & product_names, (
+                "a fold's element loop that reads its product is not unrolled"
+            )
+            element_subs |= {name: f"{state.coop[name]}[_ei]" for name in product_names}
         fenced = len(it.args) > 1 and ast.literal_eval(it.args[1])
         if fenced:
             # The loop reads a staged vector's tile: after its staging writes.
@@ -780,7 +804,8 @@ def _unrolled_elements(
     the tensor's iterator does neither, which costs as much again as the op
     on a 64x64x32 int8 tile (measured on an M4).  A remainder loop covers
     the slots past the bound, if a layout has more, so the bound only
-    affects speed."""
+    affects speed.  Each slot is the index ``_ei`` (``mpp_matmul._plan_fold``
+    reads a fold's product at it)."""
     tm, tn = state.coop_dims[root]
     threads = "(_TG_SIZE_X * _TG_SIZE_Y * _TG_SIZE_Z)"
     share = f"(({tm * tn}u + {threads} - 1) / {threads})"

@@ -4,12 +4,14 @@ A matmul that updates its K loop's own carry, a ``torch.addmm``, a
 ``torch.baddbmm`` or an ``hl.dot``, keeps that carry in MPP's layout, as one
 ``cooperative_tensor``, across the loop.  A matmul over a ``:`` K, with an
 acc or without one (``torch.mm``, ``torch.bmm``, ``hl.dot``), is one op over
-the whole K, its result a cooperative value too.  An ``hl.dot`` over a K
-held as per-thread parts (``factored_dims``) has no other lowering; the
-kernel's other ``hl.dot`` calls reach the planner only when it can lower every
-one of them (:func:`_dot_admissible`), and keep the scalar contraction
-(``matmul_ops``) otherwise.  A batched matmul is one rank-2 op on
-the matrices of its batch tile's one index:
+the whole K, its result a cooperative value too; so is a per-K-tile product,
+a matmul without an acc argument at the top level of the loop over its tiled
+K, one op per K tile.  An ``hl.dot`` over a K held as per-thread parts
+(``factored_dims``) has no other lowering; the kernel's other ``hl.dot``
+calls reach the planner only when it can lower every one of them
+(:func:`_dot_admissible`), and keep the scalar contraction (``matmul_ops``)
+otherwise.  A batched matmul is one rank-2 op on the matrices of its batch
+tile's one index:
 
 - :func:`plan_mpp_matmuls` (``MetalBackend.pre_codegen``) admits each such
   matmul and raises ``BackendUnsupported`` for every form it can't lower.
@@ -38,9 +40,13 @@ the matrices of its batch tile's one index:
   threads (:class:`_Replicas`);
 - an element-wise update of the K loop's carry before the op
   (``acc * alpha``) runs in place on the cooperative tensor in an element
-  loop (``_mpp_upd``); an operand of it that no element can recompute, or
-  such a row or column vector read by a stored epilogue (``acc / l_i``), is
-  staged into a threadgroup tile (``_mpp_vec``);
+  loop (``_mpp_upd``); so does a carry that each K tile's product updates
+  element-wise (``acc = acc + d * scale``, ``d`` a per-K-tile product), held
+  as a second destination tensor of the product's op and type, whose loop
+  reads the product at the same index (:func:`_plan_fold`); an operand of
+  it that no element can recompute, or such a row or column vector read by
+  a stored epilogue (``acc / l_i``), is staged into a threadgroup tile
+  (``_mpp_vec``);
 - a staged operand its outermost loop doesn't change is staged once, before
   that loop (``_mpp_hoist``); a bfloat operand staged inside a loop from
   values the loop doesn't reload goes into a float32 tile, each float ->
@@ -138,6 +144,8 @@ ACC = "_helion_mpp_acc"
 #: Position of ``_helion_mpp_acc``'s seed argument: the name of its staged seed tile,
 #: as a string, or None (``_acc_expr``).
 ACC_SEED = 13
+#: Position of its constant fill.
+ACC_FILL = 7
 RUN = "_helion_mpp_run"
 ELEMENTS = "_helion_mpp_elements"
 #: A fragment group's op over one K tile (``fragment_mma``): a loop over the
@@ -404,10 +412,17 @@ class MppGroup:
     #: Values staged as other groups' operands from this group's element
     #: loop, each to those matmuls (:func:`_link_element_staging`).
     stage_uses: dict[Node, set[Node]] = dataclasses.field(default_factory=dict)
+    #: A per-tile product's fold: the group of the K loop carry that each
+    #: tile's product updates element-wise.
+    fold: MppGroup | None = None
+    #: A fold's product group, whose op's layout it takes and whose result
+    #: its update reads at each element.
+    product: MppGroup | None = None
 
     @property
     def acc_dtype(self) -> torch.dtype:
-        """The cooperative tensor's dtype: float32, or int32 for int8 operands."""
+        """The cooperative tensor's dtype: float32, or int32 for int8 operands
+        (a fold's too: its carry has its product's dtype)."""
         return acc_dtype(self.lhs.dtype)
 
 
@@ -448,6 +463,16 @@ class MppPlan:
     #: The SIMD groups that split each fragment group's K loop (``num_warps``,
     #: ``fragment_mma``), each running the tile's 32-thread layout.
     split: int = 1
+
+    def groups(self) -> list[MppGroup]:
+        """Every group that holds a cooperative tensor: each matmul's, and
+        each per-tile product's fold (:func:`_plan_fold`)."""
+        out: list[MppGroup] = []
+        for group in self.by_matmul.values():
+            out.append(group)
+            if group.fold is not None:
+                out.append(group.fold)
+        return out
 
 
 def _node(value: object) -> Node:
@@ -919,7 +944,7 @@ def plan_mpp_matmuls(
     ]
     # Decided for the whole kernel: a cooperative group changes its staging,
     # thread checks and lane splitting, so one hl.dot the planner can't take
-    # keeps every whole-K one on the scalar contraction (matmul_ops).
+    # keeps every other one on the scalar contraction (matmul_ops).
     dot_ks = scalar_contraction_blocks(graphs)
     take_dots = (
         bool(dots)
@@ -950,8 +975,12 @@ def _plan_matmuls(
 
     plan = MppPlan(fragment=fragment)
     taken: set[Node] = set()
+    products: list[MppGroup] = []
     live = live_graphs(graphs)
     known = Graphs(graphs)
+    plan.written = {
+        storage_key(n) for gi in live for n in gi.graph.nodes if n.target in WRITES
+    }
     # Collected first: planning inserts conversion nodes into these graphs.
     matmuls = [
         (g, n)
@@ -966,17 +995,32 @@ def _plan_matmuls(
         elif matmul.target is dot:
             if matmul.args[2] is None:
                 raise metal_unsupported(
-                    "an hl.dot over a K held as per-thread parts with no acc"
+                    "an hl.dot over a K held as per-thread parts without an acc "
+                    "argument"
                 )
             if not _exact_out(matmul):
                 raise metal_unsupported(
                     f"an hl.dot over per-thread parts with out_dtype={matmul.args[3]}"
                 )
         k_block = _full_k(matmul)
-        if k_block is None and _MATMULS[matmul.target][0] is None:
-            # Over a tiled K, a matmul with no acc gives each K tile's product
-            # alone; its codegen rejects it, after the loads' own lowerings.
-            continue
+        tile_product = False
+        if k_block is None and matmul_operands(matmul)[0] is None:
+            # Over a tiled K, a matmul without an acc argument gives each K
+            # tile's product alone: one op over the tile, at the top level of
+            # a loop over its K alone.  Elsewhere (under an if, in an inner
+            # loop, K tiled with another block or by the grid) an aten one is
+            # rejected at its codegen, after the loads' own lowerings; an
+            # hl.dot there is refused here, so that _takes_dots keeps every
+            # dot of the kernel on the scalar contraction.
+            k_block = _tile_product_k(g, matmul)
+            if k_block is None:
+                if matmul.target is dot:
+                    raise metal_unsupported(
+                        "a per-K-tile hl.dot (without an acc argument) not at the "
+                        "top level of a loop over its K alone"
+                    )
+                continue
+            tile_product = True
         if k_block is not None:
             group = _plan_full_k(len(plan.by_matmul), matmul, k_block, known)
         elif not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
@@ -1000,14 +1044,22 @@ def _plan_matmuls(
             plan.by_seed[group.seed] = group
         for vec in group.vecs:
             plan.by_vec[vec] = group
+        if tile_product and fragment is None:
+            products.append(group)
+    # Folds are optional, so they are planned once every group has claimed its
+    # storage: a fold takes only storage that no group's op updates, whatever
+    # the order of the loops.
+    for group in products:
+        fold = _plan_fold(group, known, taken, plan.written)
+        if fold is not None:
+            taken |= fold.old | fold.cur
+            assert fold.seed is not None
+            plan.by_seed[fold.seed] = fold
     if plan.by_matmul:
-        plan.written = {
-            storage_key(n) for gi in live for n in gi.graph.nodes if n.target in WRITES
-        }
         _link_element_staging(plan)
         _order_memory(plan, live, known)
         _unlink_dropped(plan)
-        for group in plan.by_matmul.values():
+        for group in plan.groups():
             _stage_epilogue_vecs(group, plan, known)
             _finalize(group, plan, known)
             if fragment is not None:
@@ -1114,7 +1166,7 @@ def _takes_dots(
     threaded: set[int],
     fragment: FragmentLowering | None = None,
 ) -> bool:
-    """Whether the planner takes the kernel's whole-K ``hl.dot`` calls: it
+    """Whether the planner takes the kernel's ``hl.dot`` calls: it
     plans a copy of the graphs with them, with ``fragment``'s lowering when
     given, without a rejection, no operand MPP stages lies over an M or N
     tile that every config makes 1, which codegen rejects, and each operand
@@ -1172,11 +1224,12 @@ def _static_tile(block: int) -> int | None:
 
 
 def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
-    """Whether an ``hl.dot`` over a whole K may go to the planner: no product
-    rounded to another ``out_dtype``, each dim whose tile no config changes
-    within one op, and with no acc only over a ``:`` K.  An operand computed
-    from a matmul's result and the planner's own rejections are
-    :func:`_takes_dots`'s."""
+    """Whether an ``hl.dot`` may go to the planner: no product rounded to
+    another ``out_dtype``, each dim whose tile no config changes within one
+    op, and a per-K-tile product (without an acc argument, over a tiled K)
+    only from int8 operands.  An operand computed from a matmul's result and
+    the planner's own rejections (a per-K-tile product not at the top level
+    of its K loop) are :func:`_takes_dots`'s."""
     lhs, rhs, acc = matmul.args[:3]
     # The result takes the acc's dtype, so a float32 acc can still carry a
     # product rounded to another out_dtype.
@@ -1206,7 +1259,12 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
             continue
         if not low <= tile <= high:
             return False
-    return acc is not None or _full_k(matmul) is not None
+    # A float per-K-tile product keeps the scalar contraction, which lowers
+    # it at every config; MPP's op limits (a K tile of at most 256, a
+    # threadgroup of whole SIMD groups) would fail some that compile there.
+    # An int8 one (grouped quantization, what MPP's int8 rate is for) takes
+    # MPP with those limits, as any matmul with an acc does.
+    return acc is not None or _full_k(matmul) is not None or lval.dtype == torch.int8
 
 
 def _matmul_derived(node: Node, graphs: Graphs) -> bool:
@@ -1368,27 +1426,9 @@ def _update_chain(
         for p in graph.find_nodes(op="placeholder")
         if (c := _carry(p, loop)) is not None and c.args[1] == slots[0]
     ]
-    cone: set[Node] = set()
-    work = [acc]
-    while work:
-        n = work.pop()
-        if n in cone:
-            continue
-        cone.add(n)
-        work += n.all_input_nodes
     carry = set(_aliases(placeholder))
-    reads = set(carry)
-    chain: list[Node] = []
-    for n in graph.nodes:
-        # A shape read (sym_size) carries no value of the carry.
-        if (
-            n in cone
-            and n not in carry
-            and n.target is not torch.ops.aten.sym_size.int
-            and reads & set(n.all_input_nodes)
-        ):
-            reads.add(n)
-            chain.append(n)
+    reads = _reached(graph, _cone(acc), carry)
+    chain = [n for n in graph.nodes if n in reads and n not in carry]
     if acc not in reads:
         # Read only through a shape (``c[tm, tn]`` in the loop reads tm's
         # size from the carry): not a value of the carry.
@@ -1526,6 +1566,18 @@ def _exact_out(matmul: Node) -> bool:
     return out_dtype in (None, acc_dtype(lhs.meta["val"].dtype))
 
 
+def _tile_product_k(graph: GraphInfo, matmul: Node) -> int | None:
+    """The block of a tiled K whose loop body *graph* holds the matmul: the
+    graph of a loop over that block alone.  None elsewhere."""
+    from ..device_ir import ForLoopGraphInfo
+
+    _, lhs, _ = matmul_operands(matmul)
+    block = block_id_of(lhs.meta["val"].size(-1))
+    if isinstance(graph, ForLoopGraphInfo) and graph.block_ids == [block]:
+        return block
+    return None
+
+
 def _full_k(matmul: Node) -> int | None:
     """The block of the matmul's K when K is a ``:`` slice: a reduction
     dimension, which no loop iterates."""
@@ -1539,7 +1591,8 @@ def _full_k(matmul: Node) -> int | None:
 def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGroup:
     """A matmul over a ``:`` K: one op over the whole K, seeded by a constant
     fill or a Scalar value of the op's own graph, or, with no acc, by zeros
-    the op emits itself."""
+    the op emits itself.  Also a matmul with no acc in the loop over its
+    tiled K (:func:`_tile_product_k`): one op per K tile, from zeros."""
     acc, lhs, rhs = matmul_operands(matmul)
     m, n, kdim, batch = _mnk(matmul, k_block)
     seed = acc
@@ -1578,6 +1631,187 @@ def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGro
     group.recomputable = Recomputable(group, graphs)
     _classify_uses(group, graphs)
     return group
+
+
+def _plan_fold(
+    product: MppGroup,
+    graphs: Graphs,
+    taken: set[Node],
+    written: set[StorageWeakRef],
+) -> MppGroup | None:
+    """Keep the K loop carry that each K tile's product updates element-wise
+    (``acc = acc + d * scale``) in the product op's layout: a second
+    destination tensor of the same op and type, which an element loop over
+    it updates after each op, reading the product at the same index.  Two
+    destination tensors of one op, descriptor, scope and element type hold
+    the same element at each index.  Without it the product is read in the
+    Scalar layout, through a materialization per K tile, as a carry of
+    another dtype is: MPP's layout is implementation defined and depends on
+    the destination type (``MPPTensorOpsMatMul2d.h``), and it has no
+    float32 destination for int8 operands.
+
+    Returns the fold's group, or None, with the graph untouched, when:
+
+    - the product is batched;
+    - it updates no carry so, or more than one;
+    - the carry's dtype is not the op's (float32, or int32 for int8
+      operands), or the carry is not over the product's M and N;
+    - the carry's levels don't resolve (``_levels``: it is not given back
+      by the loop, or has no merge after it), or its seed is not a constant
+      fill;
+    - the update reads a value no element can recompute, a load of a
+      tensor the kernel writes, or a value that is, or is computed from,
+      the carry's storage by another name;
+    - the update's nodes would merge positions (``positional_rebind``);
+    - another group already holds the carry's storage.
+
+    The carry then stays in the Scalar layout.  The caller plans only a
+    per-tile product, in the body of a loop over its K alone
+    (:func:`_tile_product_k`), with no per-thread K parts."""
+    matmul = product.matmul
+    graph = matmul.graph
+    loop = graphs.owner(matmul)
+    assert loop is not None and _tracing_ops.is_for_loop_target(loop.target)
+    assert product.k_factor == 1
+    if product.batch_block is not None:
+        return None
+    (output,) = graph.find_nodes(op="output")
+    outs = _seq(output.args[0])
+    found: list[tuple[Node, Node, Node, list[Node]]] = []
+    for placeholder in graph.find_nodes(op="placeholder"):
+        carry = _carry(placeholder, loop)
+        if carry is None:
+            continue
+        slot = carry.args[1]
+        assert isinstance(slot, int)
+        new = outs[slot]
+        if not isinstance(new, Node):
+            continue
+        chain = _fold_chain(new, set(_aliases(placeholder)), product.cur)
+        if chain is not None:
+            found.append((placeholder, carry, new, chain))
+    if len(found) != 1:
+        return None
+    ((placeholder, carry, new, chain),) = found
+    val = placeholder.meta["val"]
+    # Two destination tensors of one op share a layout when their element
+    # types are one; MPP's layout is implementation defined, and depends on
+    # the destination type too.
+    if not (
+        isinstance(val, torch.Tensor)
+        and val.dtype == product.acc_dtype
+        and tuple(block_id_of(s) for s in val.size())
+        == (product.m_block, product.n_block)
+    ):
+        return None
+    try:
+        levels = _levels(placeholder, loop, carry, new, graphs)
+    except exc.BackendUnsupported:
+        return None
+    seed = graphs.origin(levels[-1].arg)
+    fill = seed.args[1] if seed.target is full else None
+    if not (isinstance(fill, (int, float)) and math.isfinite(fill)):
+        return None
+    fold = MppGroup(
+        product.gid,
+        matmul,
+        seed,
+        product.m_block,
+        product.n_block,
+        product.k_block,
+        product.lhs,
+        product.rhs,
+        levels=levels,
+        product=product,
+    )
+    storage = {
+        *_aliases(placeholder),
+        *_aliases(seed),
+        *(a for level in levels for a in _aliases(level.placeholder)),
+        *(a for level in levels for a in (level.exit, *_aliases(level.phi))),
+    }
+    fold.recomputable = recomputable = Recomputable(fold, graphs)
+    coop = set(chain) | set(_aliases(placeholder)) | product.cur
+    inputs = [a for n in chain for a in n.all_input_nodes if a not in coop]
+    if not all(map(recomputable, inputs)):
+        return None
+    reruns = [n for a in inputs for n in recomputable.nodes(a)]
+    # A value the update reads that is, or is computed from, the carry's
+    # storage by another name (acc = seed, then acc + d * (seed * 2)) reads
+    # the cooperative tensor the update writes in place.
+    if any(n in storage or graphs.origin(n) in storage for n in (*inputs, *reruns)):
+        return None
+    # The element loop re-runs them on the thread MPP gives each element,
+    # which no barrier orders after another thread's write.
+    if any(n.target is load and storage_key(n) in written for n in reruns):
+        return None
+    try:
+        positional_rebind.check_positional_merges(chain + reruns, _REBIND)
+    except exc.BackendUnsupported:
+        return None
+    if storage & taken:
+        return None
+    upd = _insert(_mpp_upd, new, args=(placeholder, new))
+    for user in list(new.users):
+        if user is not upd:
+            user.replace_input_with(new, upd)
+    fold.upd = upd
+    fold.update = chain
+    _storage(fold, None, upd)
+    fold.plumbing.add((placeholder, upd))
+    _classify_uses(fold, graphs)
+    product.derived -= set(chain)
+    product.fold = fold
+    return fold
+
+
+def _cone(node: Node) -> set[Node]:
+    """``node`` and every node it reads, transitively."""
+    cone: set[Node] = set()
+    work = [node]
+    while work:
+        n = work.pop()
+        if n not in cone:
+            cone.add(n)
+            work += n.all_input_nodes
+    return cone
+
+
+def _reached(graph: Graph, cone: set[Node], sources: set[Node]) -> set[Node]:
+    """``sources`` and the nodes of ``cone`` (in ``graph``) on a path from one
+    of them: each reads a source or a node reached so.  A shape read
+    (``sym_size``) carries no value, so it reaches nothing."""
+    reached = set(sources)
+    for n in graph.nodes:
+        if (
+            n in cone
+            and n not in reached
+            and n.target is not torch.ops.aten.sym_size.int
+            and reached & set(n.all_input_nodes)
+        ):
+            reached.add(n)
+    return reached
+
+
+def _fold_chain(new: Node, carry: set[Node], product: set[Node]) -> list[Node] | None:
+    """The nodes, in graph order, on a path from the carry (``carry``, its
+    placeholder and copies) or the product (``product``, the op's result and
+    copies) to ``new``, the carry's next value, when ``new`` reads both and
+    each is element-wise and feeds only the chain; None otherwise."""
+    cone = _cone(new)
+    reach_carry = _reached(new.graph, cone, carry)
+    reach_product = _reached(new.graph, cone, product)
+    if new not in reach_carry or new not in reach_product:
+        return None
+    reached = (reach_carry | reach_product) - carry - product
+    chain = [n for n in new.graph.nodes if n in reached]
+    members = set(chain)
+    for n in chain:
+        if not (n.target is _tracing_ops._new_var or _pointwise(n)):
+            return None
+        if n is not new and any(u not in members for u in n.users):
+            return None
+    return chain
 
 
 def _hoist_invariant(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
@@ -2075,18 +2309,20 @@ def _aliases(node: Node) -> list[Node]:
     return out
 
 
-def _storage(group: MppGroup, acc: Node | None) -> None:
+def _storage(group: MppGroup, acc: Node | None, result: Node | None = None) -> None:
     """Sort the values that hold the cooperative storage into ``old`` (the
     seed and each level's input, which the op updates in place) and ``cur``
-    (the op's result and each level's exit), and record the uses that only
-    pass the storage along."""
+    (the op's result, or a fold's ``result``, and each level's exit), and
+    record the uses that only pass the storage along."""
     plumbing = group.plumbing
+    if result is None:
+        result = group.matmul
     if acc is not None:
         plumbing.add((acc, group.matmul))
     if group.levels:
-        (output,) = group.matmul.graph.find_nodes(op="output")
-        plumbing.add((group.matmul, output))
-    group.cur |= set(_aliases(group.matmul))
+        (output,) = result.graph.find_nodes(op="output")
+        plumbing.add((result, output))
+    group.cur |= set(_aliases(result))
     for i, level in enumerate(group.levels):
         group.old |= set(_aliases(level.placeholder))
         plumbing |= {(level.arg, level.owner), (level.arg, level.phi)}
@@ -2354,7 +2590,7 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: Graphs) -> None:
         for n in g.graph.nodes:
             if n.target is load or n.target in WRITES:
                 accesses.setdefault(storage_key(n), []).append(n)
-    for group in plan.by_matmul.values():
+    for group in plan.groups():
         _prune_derived(group)
         recomputable = group.recomputable
         derived_loads = [
@@ -2390,6 +2626,10 @@ def _order_memory(plan: MppPlan, live: list[GraphInfo], graphs: Graphs) -> None:
                     "tensor the kernel writes, which its element loop would re-run "
                     "on another thread than the one that wrote it"
                 )
+        if group.product is not None:
+            # A fold has no op of its own: its product's operands are checked
+            # with the product.
+            continue
         _, lhs, rhs = matmul_operands(group.matmul)
         for operand, node in ((group.lhs, lhs), (group.rhs, rhs)):
             view = operand.view
@@ -2426,7 +2666,7 @@ def _fence(plan: MppPlan, group: MppGroup, ld: Node) -> None:
     after this threadgroup's earlier device writes.  The Scalar threads that
     stage the operand are not the ones that wrote its elements, and Metal
     orders device memory between threads only at a barrier, which every
-    thread reaches in the op's own graph (:func:`_check_uniform`)."""
+    thread reaches in the op's own graph (:func:`check_uniform`)."""
     if ld.graph is not group.matmul.graph:
         raise metal_unsupported(
             f"a staged MPP operand computed from {ld.name}, a load of a tensor the "
@@ -2442,13 +2682,16 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     # After ``_order_memory``, so an operand it demotes to staged is checked.
     # A fragment group's operands never reach threadgroup memory: each lane
     # computes its own elements at the op.
-    if plan.fragment is None:
+    if plan.fragment is None and group.product is None:
         _hoist_invariant(group, plan, graphs)
         _stage_in_float(group, plan, graphs)
     coop = group.cur | group.derived
     # The update's nodes read the carry where the update's element loop
-    # runs them, before the op.
+    # runs them, before the op; a fold's element loop computes the folded
+    # nodes from this group's result.
     keep = coop | set(group.stores) | set(group.update)
+    if group.fold is not None:
+        keep |= set(group.fold.update)
     recomputable = group.recomputable
     readers: list[tuple[Node, Node]] = []
     for node in sorted(group.old | group.cur, key=lambda n: n.name):
@@ -2507,6 +2750,13 @@ def _update_reruns(group: MppGroup) -> list[Node]:
         for a in u.all_input_nodes
         for n in group.recomputable.nodes(a)
     ]
+
+
+def is_tile_product(group: MppGroup) -> bool:
+    """Whether ``group`` is a per-K-tile product: an op over one K tile of
+    its loop, from zeros, as :func:`_tile_product_k` plans it (a whole-K op
+    has a ``:`` K, an accumulator's op levels)."""
+    return not group.levels and _full_k(group.matmul) is None
 
 
 def check_uniform(
@@ -2865,6 +3115,9 @@ def _acc_expr(
         dtype_str(group.acc_dtype),
     )
     staged = [int(o.staged) for o in (group.lhs, group.rhs)]
+    if group.product is not None:
+        # A fold's tensor: the walker reads its product's at the same index.
+        keywords += ", fold=True"
     return expr_from_string(
         f"{ACC}({group.gid}, {m}, {n}, {k}, {dtypes!r}, "
         f"{int(_transposed(group.lhs))}, {int(_transposed(group.rhs))}, "
@@ -2889,15 +3142,19 @@ def op_dims(group: MppGroup, block_m: int, block_n: int) -> tuple[int, int]:
     block, still holds every row the op reads.  MPP needs one of M and N a
     multiple of 16: a dim this rule changed takes the extra 8, and two
     unchanged blocks are left to the caller's check.  A fragment group's op
-    is a grid of 8x8 fragments, which needs no such multiple.
+    is a grid of 8x8 fragments, which needs no such multiple.  A per-tile
+    product and its fold are one op, whose layout both tensors share
+    (:func:`_plan_fold`), so a materialization of either keeps both blocks.
     """
     env = CompileEnvironment.current()
+    product = group.product or group
+    mats = product.mats or (product.fold is not None and product.fold.mats)
     dims = []
     for block, size in ((group.m_block, block_m), (group.n_block, block_n)):
         extent = env.block_sizes[block].size
         if size == 1:
             size = 8
-        elif isinstance(extent, int) and not group.mats:
+        elif isinstance(extent, int) and not mats:
             # A zero-trip loop still gets an op MPP accepts.
             size = min(size, -(-max(extent, 1) // 8) * 8)
         dims.append(size)
@@ -3574,12 +3831,16 @@ def _codegen_aten_matmul(ctx: LoweringContext, node: Node) -> object:
     assert isinstance(cg, GenerateAST)
     acc, lhs, rhs = matmul_operands(node)
     if not planned(node):
-        # The planner plans every matmul with an acc, or raises.
+        # The planner plans every matmul with an acc, and each one without
+        # over a ':' K or at the top level of a loop over its K alone, or
+        # raises.
         assert acc is None
         raise metal_unsupported(
-            "a matmul with no acc over a tiled K, whose result is each K tile's "
-            "product alone; accumulate it with torch.addmm(acc, a, b), or take K "
-            "whole with a ':' slice"
+            "a per-K-tile matmul (without an acc argument, over a tiled K) not "
+            "at the top level of a loop over its K alone: under an if, in an "
+            "inner loop, or with K tiled beside another block or by the grid; "
+            "accumulate it with torch.addmm(acc, a, b), take K whole with a "
+            "':' slice, or move it to the top level of a loop over K alone"
         )
     return _codegen_matmul(
         cg, node, None if acc is None else ctx.env[acc], (ctx.env[lhs], ctx.env[rhs])
@@ -3994,6 +4255,25 @@ def elementize(
     scan(body)
     if not groups:
         return body
+    # Each fold's tensor (``_plan_fold``) to its product's, the other
+    # tensor of its group: the fold's update reads both at each element.
+    folds: dict[str, str] = {}
+    for root, call in groups.items():
+        if any(k.arg == "fold" for k in call.keywords):
+            gid = ast.literal_eval(call.args[0])
+            (folds[root],) = [
+                r
+                for r, c in groups.items()
+                if r != root and ast.literal_eval(c.args[0]) == gid
+            ]
+            # One op: the same descriptor, element types and thread binding,
+            # so the same layout; only the fill and the seed differ.
+            other = groups[folds[root]]
+            assert all(
+                ast.dump(a) == ast.dump(b)
+                for i, (a, b) in enumerate(zip(call.args, other.args, strict=True))
+                if i not in (ACC_FILL, ACC_SEED)
+            ), (ast.unparse(call), ast.unparse(other))
     # A staged vector's tile is written before the element loop that reads
     # it (an update's or a store's) and read only inside it, with a barrier
     # on each side, so its reads exchange nothing at the loop and are re-run
@@ -4081,6 +4361,8 @@ def elementize(
                 if not isinstance(s, (ast.For, ast.If))
                 else set()
             )
+            # A fold's update reads its product's elements at its own.
+            roots -= {folds[r] for r in roots if r in folds}
             if len(roots) > 1:
                 raise metal_unsupported(
                     "an element-wise op on two cooperative MPP results"
