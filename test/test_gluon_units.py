@@ -13,16 +13,18 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
 from helion._compat import gluon_api_available
 from helion._testing import TestCase
 from helion._testing.distributed_kernels import TAGGED_RING
+from helion._testing.distributed_kernels import fake_group as fake_group
+from helion._testing.distributed_kernels import scatter_ring_kernel
 from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion._testing.gluon_kernels import dot_mm
 from helion._testing.gluon_kernels import mm_then_mm
@@ -43,7 +45,10 @@ if _get_backend() != "triton" or not gluon_api_available():
         "the gluon backend's units run in the triton lane on Triton >= 3.8"
     )
 
+from helion._compiler import loop_dependency_checker
 from helion._compiler.cross_loop_codegen import TaggedPeerFallback
+from helion._compiler.cross_loop_codegen import _allocation
+from helion._compiler.cross_loop_codegen import _argument_allocations
 from helion._compiler.device_function import SyncRole
 from helion._compiler.triton import gluon_ops
 from helion._compiler.triton import gluon_pipeline
@@ -496,16 +501,13 @@ class TestTmemPrefetch(TestCase):
         self.assertLess(gated.rindex("ring_skip("), gated.index("ld.acquire"))
 
 
+@pytest.mark.usefixtures("fake_group")
 class TestRingTimeline(TestCase):
     def test_entry_clock_joins_the_launch_state(self) -> None:
         """A timeline keeps a ring megakernel with peer launch state: only its
         entry clock joins the launch state's function, ahead of every epoch
         read (the peer launch state's too); the entry stamps stay in the body,
         and the in-band poll's spin ends a wait (its ready stamp follows)."""
-        if dist.is_initialized():
-            self.skipTest("needs exclusive control of the process group")
-        dist.init_process_group(backend="fake", store=FakeStore(), rank=0, world_size=4)
-        self.addCleanup(dist.destroy_process_group)
         world, m, k, n = 4, 128, 64, 128
         bf16 = torch.bfloat16
         args = (
@@ -546,6 +548,47 @@ class TestRingTimeline(TestCase):
         lines = [line for line in code.splitlines() if "# src[" not in line]
         (ready,) = [i for i, line in enumerate(lines) if "* 4 + 2)" in line]
         self.assertRegex(lines[ready - 1], r"inband_word\w*, .* = tl\.inline_asm")
+
+
+@pytest.mark.usefixtures("fake_group")
+class TestInbandHold(TestCase):
+    """Where the in-band scatter hold runs in a ring megakernel: the wait for
+    every rank to start this launch before a scatter may overwrite rows the
+    last launch read unwritten (test_cross_loop_scheduler has the static
+    case)."""
+
+    def test_hold_waits_in_the_storing_partition(self) -> None:
+        """In a ring megakernel only the partition that issues the scatter
+        stores waits for the hold; the gated producer of the scattered rows'
+        operand waits only for that operand."""
+        args = (
+            torch.zeros(512, 128, dtype=torch.bfloat16),
+            torch.zeros(4, 128, 256, dtype=torch.bfloat16),
+            torch.zeros(256, 128, dtype=torch.bfloat16),
+            torch.zeros(4, 128, dtype=torch.int32),
+            torch.zeros(1, dtype=torch.int32),
+            dist.group.WORLD.group_name,
+        )
+        scatter_ring_kernel.reset()
+        with gluon_cpu_codegen():
+            bound = scatter_ring_kernel.bind(args)
+            config = bound.config_spec.default_config().config
+            config.pop("range_warp_specializes")
+            code = bound.to_triton_code(
+                helion.Config(**{**config, **TAGGED_RING, "block_sizes": [64, 64]})
+            )
+        name = "_helion_scatter_ring_kernel"
+        holds = {
+            function.group(1): function.group(2).count("_hold_after_fallback(")
+            for function in re.finditer(
+                rf"^def {name}(_\w+)?\((.*?)(?=^def |\Z)",
+                code,
+                re.MULTILINE | re.DOTALL,
+            )
+        }
+        self.assertIn("_producer1", holds)
+        self.assertEqual({part for part, n in holds.items() if n}, {"_body"}, holds)
+        self.assertEqual(holds["_body"], 1)
 
 
 class TestWorkerRegisters(TestCase):
@@ -796,11 +839,68 @@ class TestFirstWaits(TestCase):
         self.assertEqual(skipped, {"b", "f"})
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def _rereads_last_iteration(x: torch.Tensor, scratch: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        for tile_n in hl.tile(n):
+            # The first 16 columns, which the first iteration stores.
+            first = scratch[tile_m, 0:16].sum(-1, keepdim=True)
+            out[tile_m, tile_n] = first + x[tile_m, tile_n]
+            scratch[tile_m, tile_n] = x[tile_m, tile_n]
+    return out
+
+
 class TestPartitionWaits(TestCase):
+    def test_a_first_access_barrier_fence_covers_what_it_orders(self) -> None:
+        """The barrier before a loop's first access of ``scratch`` (a load the
+        previous iteration's later store reaches) is emitted before any access
+        registers ``scratch``'s or ``x``'s argument; its fence still orders
+        reads of ``scratch`` only, so a partition reading ``x`` alone drops
+        it."""
+        x, scratch = torch.randn(32, 64), torch.zeros(32, 64)
+        emitted: list[tuple[object, str]] = []
+        emit = loop_dependency_checker.emit_intra_loop_raw_barrier
+
+        def spy(state: object, read: object = None) -> None:
+            roles = state.device_function.sync_roles  # pyrefly: ignore
+            before = set(roles)
+            emit(state, read)  # pyrefly: ignore
+            # The load's barrier (the store's orders what other threads read).
+            if state.fx_node.target is hl.load:  # pyrefly: ignore
+                emitted.extend((state.device_function, n) for n in set(roles) - before)  # pyrefly: ignore
+
+        with gluon_cpu_codegen():
+            bound = _rereads_last_iteration.bind((x, scratch))
+            config = bound.config_spec.default_config()
+            config.config.update(block_sizes=[16, 16], indexing="tensor_descriptor")
+            with patch.object(
+                loop_dependency_checker, "emit_intra_loop_raw_barrier", spy
+            ):
+                bound.to_triton_code(config)
+        ((function, fence),) = [
+            (function, name)
+            for function, name in emitted
+            if function.sync_roles[name].kind == "wait"  # pyrefly: ignore
+        ]
+        wait = ast.parse(f"{fence} = 0").body[0]
+        host = bound.host_function
+        fakes = {
+            origin.host_str(): fake for fake, origin in host.tensor_to_origin.items()
+        }
+        with bound.env, host:
+            named = frozenset(_argument_allocations(function).values())  # pyrefly: ignore
+            scratch_reads = frozenset([_allocation(fakes["scratch"])])
+            x_reads = frozenset([_allocation(fakes["x"])])
+            self.assertTrue(gluon_ring._orders(function, wait, scratch_reads, named))  # pyrefly: ignore
+            self.assertFalse(gluon_ring._orders(function, wait, x_reads, named))  # pyrefly: ignore
+
     def test_partitions_keep_only_waits_ordering_their_reads(self) -> None:
         """A partition keeps a wait only if it orders a read the partition makes;
         a wait also ordering its root's barrier publication stays in the body,
-        which makes every publication; an unannotated wait orders everything."""
+        which makes every publication; an unannotated wait, or one covering an
+        allocation no tensor argument names, orders everything."""
 
         class Function:
             def __init__(self) -> None:
@@ -810,6 +910,7 @@ class TestPartitionWaits(TestCase):
                         "wait", covers=frozenset([1]), publication=True
                     ),
                     "unknown": SyncRole("wait"),
+                    "unnamed": SyncRole("wait", covers=frozenset([3])),
                 }
 
             def sync_names(self, *kinds: str) -> set[str]:
@@ -817,7 +918,9 @@ class TestPartitionWaits(TestCase):
 
         def orders(name: str, reads: frozenset[int], publishes: bool) -> bool:
             wait = ast.parse(f"{name} = 0").body[0]
-            return gluon_ring._orders(Function(), wait, reads, publishes)  # pyrefly: ignore
+            # The tensor arguments name allocations 1 and 2.
+            named = frozenset([1, 2])
+            return gluon_ring._orders(Function(), wait, reads, named, publishes)  # pyrefly: ignore
 
         # The weight producer (reads 2) drops both covered waits ...
         self.assertFalse(orders("reads", frozenset([2]), False))
@@ -829,6 +932,7 @@ class TestPartitionWaits(TestCase):
         self.assertFalse(orders("reads", frozenset(), True))
         self.assertTrue(orders("publishes", frozenset(), True))
         self.assertTrue(orders("unknown", frozenset([2]), False))
+        self.assertTrue(orders("unnamed", frozenset([2]), False))
 
 
 class TestBarrierMode(TestCase):
@@ -910,6 +1014,181 @@ class TestPacedFill(TestCase):
         self.assertEqual(run(body), [body])
         # No put (a claimer): unchanged.
         self.assertEqual(run("w = 0"), ["w = 0"])
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _mm_after_wait(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    hl.pdl_wait(independent=(x, y))
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    backend="gluon",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _mm_then_repoint(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    hl.pdl_wait(independent=x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    # After the launch, which read x's memory: y stays dependent.
+    x.set_(y)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    backend="gluon",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _mm_repointed_in_branch(
+    w: torch.Tensor, x: torch.Tensor, y: torch.Tensor, flag: bool
+) -> torch.Tensor:
+    if flag:
+        w.set_(x)
+    else:
+        w.set_(y)
+    m, k = w.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=w.device)
+    hl.pdl_wait(independent=w)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    backend="gluon",
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _mm_beside_a_named_slice(
+    a: torch.Tensor, x: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    a.set_(y[:32, :])
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    hl.pdl_wait(independent=(a, x))
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], y[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    return out
+
+
+def _filling_producer(
+    kernel: helion.Kernel, args: tuple[object, ...], fill: str
+) -> str:
+    """The source of the one ``_producer`` function holding ``fill`` in
+    ``kernel``'s ring (``_RING`` at 128 x 64 x 64, its K loop
+    warp-specialized), generated on CPU."""
+    config = {
+        **_RING,
+        "block_sizes": [128, 64, 64],
+        "range_warp_specializes": [None, True],
+    }
+    with gluon_cpu_codegen():
+        code = kernel.bind(args).to_triton_code(helion.Config(**config))
+    (producer,) = [
+        source
+        for fn in ast.parse(code).body
+        if isinstance(fn, ast.FunctionDef)
+        and "_producer" in fn.name
+        and fill in (source := ast.unparse(fn))
+    ]
+    return producer
+
+
+class TestPastIndependent(TestCase):
+    def test_fills_of_independent_tensors_pass_the_grid_wait(self) -> None:
+        """A producer's fills of tensors the previous grid does not write move
+        ahead of its launch-state read, and the pure statements using what the
+        read defines move with it. The first other statement ends the pass: a
+        fill of another tensor, a fill using what the read defines, or an
+        effect using it."""
+        read = "epoch, = _k_launch(w, kv, state)"
+
+        def put(desc: str, coord: str = "0") -> str:
+            return (
+                f"_helion_ring.ring_put(b, f, e, s, 2, {desc}, ({coord},), True, 8, 0)"
+            )
+
+        def run(*statements: str) -> list[str]:
+            body = [ast.parse(st).body[0] for st in statements]
+            out = gluon_ring._past_independent(
+                body, frozenset(["w"]), frozenset(["w", "kv"])
+            )
+            return [ast.unparse(st) for st in out]
+
+        uses = "n = epoch + 1"
+        self.assertEqual(
+            run(read, uses, put("w"), put("kv"), put("w")),
+            [put("w"), read, uses, put("kv"), put("w")],
+        )
+        for after in (
+            [put("w", "epoch")],
+            [uses, put("w", "n")],
+            ["tl.store(state, epoch)", put("w")],
+        ):
+            with self.subTest(after=after):
+                self.assertEqual(run(read, *after), [read, *after])
+
+    def test_a_single_root_ring_fills_before_its_grid_wait(self) -> None:
+        """Without launch state the producer's fills of independent tensors
+        precede its ``gdc_wait``."""
+        x = torch.empty([256, 512], dtype=torch.bfloat16)
+        y = torch.empty([512, 128], dtype=torch.bfloat16)
+        producer = _filling_producer(_mm_after_wait, (x, y), "ring_put(")
+        self.assertLess(producer.index("ring_put("), producer.index("gdc_wait()"))
+
+    def test_independent_fills_follow_the_launch_storage(self) -> None:
+        """Independent fills are those of what the launch reads: host code
+        after it moving x onto y leaves y's fills behind the grid wait."""
+        x = torch.empty([256, 512], dtype=torch.bfloat16)
+        y = torch.empty([512, 128], dtype=torch.bfloat16)
+        producer = _filling_producer(_mm_then_repoint, (x, y), "ring_put(")
+        self.assertIn("y_ring_desc, (", producer)
+        self.assertLess(producer.index("gdc_wait()"), producer.index("ring_put("))
+
+    def test_independent_fills_are_of_named_tensors(self) -> None:
+        """Only a named tensor's own fills pass the grid wait: y shares its
+        storage with a, a slice of y named independent, but its other rows
+        are not named, so y's fills stay behind the wait."""
+        a = torch.empty([1], dtype=torch.bfloat16)
+        x = torch.empty([256, 512], dtype=torch.bfloat16)
+        y = torch.empty([512, 128], dtype=torch.bfloat16)
+        producer = _filling_producer(
+            _mm_beside_a_named_slice, (a, x, y), "y_ring_desc, ("
+        )
+        self.assertLess(producer.index("gdc_wait()"), producer.index("y_ring_desc, ("))
+
+    def test_independent_fills_need_one_launch_storage(self) -> None:
+        """A host branch moving w onto x or y may launch w as x, with y still
+        written by the previous grid: no fill passes the grid wait."""
+        w, x, y = (torch.empty([256, 256], dtype=torch.bfloat16) for _ in range(3))
+        producer = _filling_producer(
+            _mm_repointed_in_branch, (w, x, y, False), "ring_put("
+        )
+        self.assertLess(producer.index("gdc_wait()"), producer.index("ring_put("))
 
 
 class TestTlNamespace(TestCase):

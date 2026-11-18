@@ -57,14 +57,17 @@ from ..cross_loop_codegen import _all_names
 from ..cross_loop_codegen import _allocation
 from ..cross_loop_codegen import _argument_allocations
 from ..cross_loop_codegen import _effect_kind
+from ..cross_loop_codegen import _host_tensor
 from ..cross_loop_codegen import _is_load
 from ..cross_loop_codegen import _is_tl_call
 from ..cross_loop_codegen import _may_write
 from ..cross_loop_codegen import _named_allocations
+from ..cross_loop_codegen import _one_launch_storage
 from ..cross_loop_codegen import _stored_names
 from ..cross_loop_codegen import _written_allocations
 from ..cross_loop_codegen import peer_state
 from ..device_function import RingFallback
+from ..device_function import TensorArg
 from ..device_ir import ForLoopGraphInfo
 from ..device_ir import ReductionLoopGraphInfo
 from ..device_ir import control_flow_parent_entries
@@ -86,6 +89,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Set as AbstractSet
 
     from ...runtime.config import Config
     from ..device_function import DeviceBodyContext
@@ -1706,6 +1710,23 @@ class RingLowering:
         for fn in functions:
             dead_assignment_elimination(cast("list[ast.AST]", fn.body), df.dce_vars)
             _first_waits(fn.body)
+        # A producer issues its fills of the tensors the previous grid does not
+        # write (``hl.pdl_wait(independent=...)``) before its grid wait: the
+        # arguments that are one of them, on one storage on every path to the
+        # launch, whatever host code after it repoints.
+        named = CompileEnvironment.current().pdl_independent
+        tensors = frozenset(
+            argument.name
+            for argument in df.arguments
+            if isinstance(argument, TensorArg)
+        )
+        independent = frozenset(
+            argument.name
+            for argument in df.arguments
+            if isinstance(argument, TensorArg)
+            and _host_tensor(argument.fake_value) in named
+            and _one_launch_storage(argument.fake_value)
+        )
         if launch_state is not None:
             launch, finish, launch_names, read_names = launch_state
             # Each partition reads the launch state in place of its grid wait.
@@ -1718,10 +1739,19 @@ class RingLowering:
                     fn.body.insert(0, statement_from_string(read))
                 else:
                     fn.body[at] = statement_from_string(read)
+                    if fn is not body and independent:
+                        fn.body[at:] = _past_independent(
+                            fn.body[at:], independent, tensors
+                        )
             # The body hands the state it read to the kernel's rewrite.
             body.body.append(
                 statement_from_string(f"return {', '.join(launch_names)},")
             )
+        elif independent:
+            for fn in partitions:
+                at = next((i for i, st in enumerate(fn.body) if _is_gdc_wait(st)), None)
+                if at is not None:
+                    fn.body[at:] = _past_independent(fn.body[at:], independent, tensors)
         used = _all_names([st for fn in functions for st in fn.body])
         paces = [p for c in ids if (p := _channel("pace", c)) in used]
         extra = [
@@ -2127,15 +2157,19 @@ def _orders(
     device_function: DeviceFunction,
     statement: ast.stmt,
     accesses: frozenset[int] | None,
+    named: AbstractSet[int],
     publishes: bool = False,
 ) -> bool:
     """Whether a dependency wait orders an access of ``accesses`` (None: any) or,
-    for the body (``publishes``), a barrier publication."""
+    for the body (``publishes``), a barrier publication.  A wait covering an
+    allocation no tensor argument names (``named``: the arguments'
+    allocations) orders every access (``_covering``)."""
     roles = device_function.sync_roles
     return any(
         accesses is None
-        or (role := roles[name]).covers is None
-        or role.covers & accesses  # pyrefly: ignore [unsupported-operation]
+        or (covers := (role := roles[name]).covers) is None
+        or not covers <= named
+        or covers & accesses
         or (publishes and role.publication)
         for name in _all_names([statement]) & device_function.sync_names("wait")
     )
@@ -2147,6 +2181,7 @@ def _without_waits(
     """The body without the waits ordering none of the accesses that may follow
     (``after``: those past this block) nor a barrier publication."""
     allocations = _argument_allocations(df)
+    named = frozenset(allocations.values())
     waits = df.sync_names("wait")
     later = [after]  # later[i]: the allocations body[i:] (or ``after``) access
     for statement in reversed(body):
@@ -2155,7 +2190,7 @@ def _without_waits(
     kept: list[ast.stmt] = []
     for index, statement in enumerate(body):
         if _is_wait(statement, waits) and not isinstance(statement, ast.If):
-            if _orders(df, statement, later[index + 1], publishes=True):
+            if _orders(df, statement, later[index + 1], named, publishes=True):
                 kept.append(statement)
         else:
             # A loop's next iterations follow the waits in its body.
@@ -2265,6 +2300,56 @@ def _launch_state(
     return launch_fn, finish, names, read
 
 
+# The ring operations a partition may issue before its grid wait (on tensors
+# ``hl.pdl_wait(independent=...)`` names).
+_PRE_WAIT_RING_OPS = frozenset(
+    ["ring_put", "ring_put_paced", "ring_pace_flush", "ring_skip"]
+)
+
+
+def _past_independent(
+    body: list[ast.stmt], independent: frozenset[str], tensors: frozenset[str]
+) -> list[ast.stmt]:
+    """``body`` (a partition's statements from its grid wait or launch-state
+    read on, which waits for the previous grid) with the read, and the pure
+    statements after it that use what it read, moved past the statements that
+    touch only tensor arguments the previous grid does not write
+    (``independent``, of the kernel's ``tensors``): a producer's ring fill of
+    weights then issues while that grid finishes.  The moved and the
+    passed statements each keep their order; the first statement that is
+    neither ends the pass."""
+
+    def calls(statement: ast.stmt) -> list[ast.Call]:
+        return [c for c in ast.walk(statement) if isinstance(c, ast.Call)]
+
+    def passable(statement: ast.stmt) -> bool:
+        return _all_names([statement]) & tensors <= independent and all(
+            _effect_kind(call) == "pure"
+            or _is_tl_call(call, _PRE_WAIT_RING_OPS, _MODULES)
+            for call in calls(statement)
+        )
+
+    read, *rest = body
+    moved, passed = [read], []
+    defined = _stored_names([read])
+    touched = _names(read)  # the names the moved statements read or write
+    for index, statement in enumerate(rest):
+        names = _names(statement)
+        if names & defined:
+            # What uses the read follows it; only pure statements may move
+            # past the passed ones (an effect keeps its place in the order).
+            if not all(_effect_kind(call) == "pure" for call in calls(statement)):
+                return [*passed, *moved, *rest[index:]]
+            moved.append(statement)
+            defined |= _stored_names([statement])
+            touched |= names
+        elif passable(statement) and not _stored_names([statement]) & touched:
+            passed.append(statement)
+        else:
+            return [*passed, *moved, *rest[index:]]
+    return [*passed, *moved]
+
+
 def _function(
     name: str, args: ast.arguments, body: list[ast.stmt], decorator: str = "gluon.jit"
 ) -> ast.FunctionDef:
@@ -2354,6 +2439,8 @@ class _Slice:
         self.weights = not gated and bool(puts)
         # The allocations whose reads' waits a gated producer keeps (None: all).
         self.reads: frozenset[int] | None = None
+        # The allocations the tensor arguments name (``_orders``).
+        self.named = frozenset(_argument_allocations(device_function).values())
         self.mma = mma or set()
         self.claims = claims
         self.scheduled = set(device_function.sync_roles)
@@ -2379,7 +2466,7 @@ class _Slice:
                 and later
                 and not isinstance(statement, ast.If)
                 and _is_wait(statement, self.waits)
-                and _orders(self.device_function, statement, self.reads)
+                and _orders(self.device_function, statement, self.reads, self.named)
             ):
                 live |= _names(statement) - _stored_names([statement])
                 kept.append(_scalar_form(statement, self.device_function.sync_roles))

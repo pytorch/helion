@@ -1612,6 +1612,15 @@ class CuteBackend(Backend):
         return False
 
     @property
+    def intra_loop_barriers_carry_iterations(self) -> bool:
+        # The thread-barrier pass checks every access pair across consecutive
+        # iterations too and closes the body where they meet
+        # (``lane_loops/barriers.py``), with the lane loops' own refusals.  It
+        # does not take an access through device pointers (``cute.make_ptr``)
+        # to reach other storage, so the walk still carries such loops.
+        return False
+
+    @property
     def lowers_chunk_unbind(self) -> bool:
         return True
 

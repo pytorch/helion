@@ -47,7 +47,9 @@ from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
 from helion._testing.distributed_kernels import TAGGED_RING
+from helion._testing.distributed_kernels import pipelined_allreduce_kernel
 from helion._testing.distributed_kernels import remote_views as _remote_views
+from helion._testing.distributed_kernels import scatter_after_local_kernel
 from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
@@ -263,39 +265,6 @@ def diagonal_store_kernel(
         symm[tile_i, tile_i] = x[tile_i, tile_j]
     for tile in hl.tile(symm.size()):
         out[tile] = peers[0][tile] + peers[1][tile]
-    return out
-
-
-@helion.kernel(autotune_effort="none", static_shapes=True)
-def pipelined_allreduce_kernel(
-    symm: torch.Tensor,
-    x: torch.Tensor,
-    group_name: hl.ProcessGroupName,
-    variant: hl.constexpr,
-    world: hl.constexpr,
-) -> torch.Tensor:
-    peers = _remote_views(symm, group_name)
-    out = torch.empty_like(x)
-    for tile in hl.tile(x.size(0)):
-        if variant == "constant":
-            symm[tile] = hl.full([tile], 1.0, dtype=x.dtype)
-        else:
-            symm[tile] = x[tile]
-        if variant == "R1":
-            symm[tile] = x[tile] + 0
-    for tile in hl.tile(x.size(0)):
-        acc = hl.zeros([tile], dtype=x.dtype)
-        for r in hl.static_range(world):
-            acc = acc + peers[r][tile]
-        out[tile] = acc
-        if variant == "print":
-            print("acc", acc)
-        if variant == "loop":
-            for inner in hl.tile(tile.begin, tile.end, block_size=64):
-                part = hl.zeros([inner], dtype=x.dtype)
-                for r in hl.static_range(world):
-                    part = part + peers[r][inner]
-                out[inner] = part
     return out
 
 
@@ -811,6 +780,21 @@ class TestDistributed(TestCase, MultiProcessTestCase):
     @skip_if_lt_x_gpu(4)
     @parametrize("dtype", (torch.bfloat16, torch.float32))
     def test_inband_scatter_reads_unwritten_rows(self, dtype: torch.dtype) -> None:
+        self._check_inband_scatter_reads_unwritten_rows(scatter_exchange_kernel, dtype)
+
+    @pytest.mark.slow
+    @skipIfNotCUDA()
+    @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
+    @skip_if_lt_x_gpu(4)
+    def test_inband_scatter_after_a_local_root_reads_unwritten_rows(self) -> None:
+        # The launch hold waits in the scatter root's block, after a local root.
+        self._check_inband_scatter_reads_unwritten_rows(
+            scatter_after_local_kernel, torch.float32, scale=2
+        )
+
+    def _check_inband_scatter_reads_unwritten_rows(
+        self, kernel: helion.Kernel, dtype: torch.dtype, scale: int = 1
+    ) -> None:
         self._init_process()
         group = dist.group.WORLD
         world, tasks, lanes, cols = self.world_size, 4, 8, 64
@@ -827,7 +811,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         rows = torch.empty(tasks, lanes, device=self.device, dtype=torch.int32)
         count = torch.empty(1, device=self.device, dtype=torch.int32)
         args = (symm, x, rows, count, group.group_name)
-        bound = scatter_exchange_kernel.bind(args)
+        bound = kernel.bind(args)
         for step in range(6):
             generator = torch.Generator().manual_seed(step)
             plans = []
@@ -841,7 +825,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 values = ((index * (r + 1) + 3 * step) % 128).float()
                 for t in range(live):
                     written = row[t] >= 0
-                    mirror[r, row[t][written].long()] = values[t][written]
+                    mirror[r, row[t][written].long()] = scale * values[t][written]
                 plans.append((values, row, live))
             values, row, live = plans[self.rank]
             torch.cuda._sleep(100_000 * ((self.rank + step) % world))

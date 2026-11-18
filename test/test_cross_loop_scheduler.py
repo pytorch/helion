@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import itertools
+import re
 from types import SimpleNamespace
 from typing import Any
 from typing import Literal
@@ -44,6 +45,13 @@ from helion._compiler.tile_dependency import coordinate_axis_symbol
 from helion._compiler.tile_dependency import instantiate_coordinate_domains
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import TestCase
+from helion._testing import skipIfRefEager
+from helion._testing import skipIfTileIR
+from helion._testing import skipUnlessBackends
+from helion._testing.cute_codegen import cuda_metadata_trace
+from helion._testing.distributed_kernels import fake_group as fake_group
+from helion._testing.distributed_kernels import pipelined_allreduce_kernel
+from helion._testing.distributed_kernels import scatter_after_local_kernel
 
 pytestmark = pytest.mark.cpu_only
 
@@ -125,6 +133,114 @@ def test_integer_fill_dry_pass_keeps_the_bound_available() -> None:
             guards,
         )
         assert not cross_loop_codegen._dry_pass_binds(result, guards, set())
+
+
+def test_dry_fold_keeps_only_blocks_a_later_root_shares_workers_with() -> None:
+    """A block among a fold's roots stays in its loop (first trip) only if it
+    shares workers with a later root or kept block; one sharing workers only
+    with an earlier root moves after the loop, behind that root's live run."""
+    members: dict[int, frozenset[int] | None] = {
+        0: frozenset({5}),
+        1: frozenset({2}),  # shares workers with root 4
+        2: frozenset({0, 1}),  # root
+        3: frozenset({0}),  # shares workers with root 2 only
+        4: frozenset({2, 3}),  # root
+    }
+    kept = cross_loop_codegen._dry_fold_kept(
+        [0, 1, 2, 3, 4], {2, 4}, members, frozenset(range(8))
+    )
+    assert kept == {1}
+    # A block without members runs on every worker.
+    members[0] = None
+    assert cross_loop_codegen._dry_fold_kept(
+        [0, 1, 2, 3, 4], {2, 4}, members, frozenset(range(8))
+    ) == {0, 1}
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not support barrier operations")
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+def test_root_levels_count_a_cross_rank_dependency_twice(fake_group: str) -> None:
+    """Another rank's publication is a hop of its own: the static dry pass
+    anchor rule reads a root that waits on one as two levels deeper."""
+    symm, x = torch.zeros(2, 4000, dtype=torch.bfloat16)
+    pipelined_allreduce_kernel.reset()
+    with cuda_metadata_trace():
+        bound = pipelined_allreduce_kernel.bind((symm, x, fake_group, "inband", 4))
+    graph = bound.host_function.device_ir.tile_dependency_graph
+    assert graph.root_producers == {1: frozenset({0})}
+    assert graph.root_levels == {0: 0, 1: 2}
+
+
+@skipUnlessBackends(["triton"])
+@skipIfTileIR("TileIR does not support barrier operations")
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+def test_hold_waits_before_the_first_scatter(fake_group: str) -> None:
+    """The in-band scatter hold runs where the first scatter store's block
+    starts: the roots before it write no scatter row, so their loads issue
+    without it.  The launch is announced and the hold flag read before the
+    first root's tasks."""
+    args = (
+        torch.zeros(32, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 8, 64, dtype=torch.bfloat16),
+        torch.zeros(4, 8, dtype=torch.int32),
+        torch.zeros(1, dtype=torch.int32),
+        fake_group,
+    )
+    scatter_after_local_kernel.reset()
+    with cuda_metadata_trace():
+        code = scatter_after_local_kernel.bind(args).to_triton_code()
+    assert code.count("_hold_after_fallback(") == 1
+    body = code[code.index("def _helion_scatter_after_local_kernel(") :]
+    # The task loops of roots 0 (local) and 1 (the scatter), in order.
+    local, scatter = (
+        m.start() for m in itertools.islice(re.finditer("for virtual_pid in", body), 2)
+    )
+    assert body.index("tile_dependency_peer_held = ") < local
+    announce = re.search(r"tile_dependency_every_rank(_\d+)? = ", body)
+    assert announce is not None
+    assert announce.start() < local
+    hold = body.index("_hold_after_fallback(tile_dependency_peer_state")
+    assert local < hold < scatter
+
+
+def test_dry_fold_checks_each_block_a_dry_root_now_precedes() -> None:
+    """A dry root's bindings cross its fold when a block that now runs after
+    it, but ran before it, reads them: a kept block from the root's own anchor
+    on (first trip) or another root of the fold (its live run, second trip).
+    A store in an earlier block hides no such read, and kept blocks before
+    the root's anchor run before its dry pass."""
+    parse = lambda source: ast.parse(source).body  # noqa: E731
+    blocks = {
+        10: parse("x = 1\nv = u"),  # anchor of root 13, kept
+        11: parse("pass"),  # anchor of root 14, kept
+        12: parse("y = x"),  # kept, after root 14's anchor
+        13: parse("w = z"),  # root
+        14: parse("x = 99\nz = 5\nu = 7"),  # root
+    }
+    fold = cross_loop_codegen._DryFold(
+        live="live",
+        anchors={13: 10, 14: 11},
+        rewritten={13: blocks[13], 14: blocks[14]},
+        helper_bodies={},
+    )
+    region = [10, 11, 12, 13, 14]
+    first_trip = lambda body: ast.If(  # noqa: E731
+        test=ast.parse("trip == 0", mode="eval").body, body=body, orelse=[]
+    )
+    loop_body = [
+        *blocks[13],
+        first_trip(blocks[10]),
+        *blocks[14],
+        first_trip([*blocks[11], *blocks[12]]),
+    ]
+    crossing = cross_loop_codegen._dry_fold_crossing(
+        fold, region, {10, 11, 12}, blocks, loop_body, parse("u = 0"), [], {}
+    )
+    # x: block 12 reads it after root 14's anchor (block 10's store does not
+    # hide the read); z: root 13's live run reads it on the second trip; u:
+    # block 10 reads it before root 14's dry pass, so it does not cross.
+    assert crossing == {"x", "z"}
 
 
 def _domain(
@@ -452,6 +568,7 @@ def _access(
 def _dependency_graph(
     root_axes: list[list[int]],
     *accesses: TileAccess,
+    root_phases: tuple[int, ...] | None = None,
 ) -> TileDependencyGraph:
     return build_tile_dependency_graph(
         tuple(
@@ -459,6 +576,7 @@ def _dependency_graph(
             for index, access in enumerate(accesses)
         ),
         root_axes,
+        root_phases=root_phases,
     )
 
 
@@ -1502,6 +1620,40 @@ class TestCrossLoopScheduler(TestCase):
         assert frontier is not None
         self.assertEqual(frontier.target_domain, plan.wave_domain)
         self.assertEqual(frontier.prefix_before(3), 1)
+
+    def test_hint_load_orders_no_later_write(self) -> None:
+        def edges(*accesses: TileAccess) -> set[tuple[int, int, str]]:
+            graph = _dependency_graph([[10], [20]], *accesses)
+            return {
+                (edge.producer_root, edge.consumer_root, dependency.kind.value)
+                for edge in graph.edges
+                for dependency in edge.access_dependencies
+            }
+
+        load = _access(root=0, kind="load", block_id=10)
+        store = _access(root=1, kind="store", block_id=20)
+        self.assertEqual(edges(load, store), {(0, 1, "write_after_read")})
+        # A prefetch-only root's load: the later store need not wait for it ...
+        hint = dataclasses.replace(load, hint=True)
+        self.assertEqual(edges(hint, store), set())
+        # ... but it still waits for an earlier store.
+        self.assertEqual(
+            edges(
+                _access(root=0, kind="store", block_id=10),
+                dataclasses.replace(
+                    _access(root=1, kind="load", block_id=20), hint=True
+                ),
+            ),
+            {(0, 1, "read_after_write")},
+        )
+        # A phase boundary orders the two anyway: no hint dependency is lost.
+        graph = _dependency_graph([[10], [20]], hint, store, root_phases=(0, 1))
+        self.assertEqual(graph.edges, ())
+        self.assertEqual(graph.unordered_hint_reads, frozenset())
+        self.assertEqual(
+            _dependency_graph([[10], [20]], hint, store).unordered_hint_reads,
+            {(0, 0)},
+        )
 
     def test_exact_dependency_builds_one_counter_event(self) -> None:
         graph = _dependency_graph(

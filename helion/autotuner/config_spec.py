@@ -801,6 +801,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
         "cross_loop_tmem_prefetch",
+        "cross_loop_dry_passes",
         "worker_registers",
         "load_cache_modifiers",
         "store_cache_modifiers",
@@ -1136,6 +1137,13 @@ class ConfigSpec:
         self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
             BlockIdSequence()
         )
+        # One entry per root waiting on an earlier root after the first root
+        # whose producers lie two levels deep
+        # (TileDependencyGraph.dry_pass_candidate_roots); True runs that root's
+        # tasks once dry, earlier, in an idle window of its workers (workers
+        # that own their tasks: not the barrier pipeline nor packet dispatch;
+        # ``static_dry_passes`` in cross_loop_codegen).
+        self.cross_loop_dry_passes = ListOf(BooleanFragment(), length=0)
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Keep alternative pid types searchable when an ordered reference uses flat.
@@ -1207,6 +1215,11 @@ class ConfigSpec:
         # Whether a cross-rank dependency transports a scatter in band: its
         # guard-skipped tasks need static or claimed (gluon ring) roots.
         self.inband_scatter: bool = False
+        # Set when a later write overlaps a load of a prefetch-only root that
+        # it no longer waits for: if that leaves no dependency (no
+        # cross_loop_pipeline), a config saved before still loads (normalize
+        # ignores the key).
+        self.cross_loop_pipeline_retired: bool = False
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
@@ -2226,6 +2239,23 @@ class ConfigSpec:
         ):
             if _fix_invalid:
                 config.pop("cross_loop_pipeline", None)
+            elif self.cross_loop_pipeline_retired:
+                pipeline = config.pop("cross_loop_pipeline")
+                # Without the pipeline, cross_loop_tmem_prefetch has no
+                # candidates either (the other pipeline keys are dropped where
+                # they are normalized).
+                dropped = ""
+                if self.supports_config_key("cross_loop_tmem_prefetch") and (
+                    config.pop("cross_loop_tmem_prefetch", None) is not None
+                ):
+                    dropped = " and its cross_loop_tmem_prefetch"
+                log.warning(
+                    "Ignoring cross_loop_pipeline=%r%s: this kernel no longer "
+                    "has cross-loop dependencies (its prefetch-only roots' loads "
+                    "order no later write)",
+                    pipeline,
+                    dropped,
+                )
             else:
                 raise InvalidConfig(
                     "cross_loop_pipeline is available only for kernels "
@@ -2371,6 +2401,7 @@ class ConfigSpec:
             "range_flattens",
             "static_ranges",
             "cross_loop_tmem_prefetch",
+            "cross_loop_dry_passes",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
@@ -2452,6 +2483,30 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
+        for key, flags, entry in (
+            (
+                "cross_loop_dry_passes",
+                self.cross_loop_dry_passes,
+                "dry-pass candidate root",
+            ),
+        ):
+            if not (self.supports_config_key(key) and flags.length > 0):
+                config.pop(key, None)
+                continue
+            values = config.setdefault(key, flags.default())
+            if (
+                not isinstance(values, (list, tuple))
+                or len(values) != flags.length
+                or any(type(value) is not bool for value in values)
+            ):
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} must be a list of one bool per {entry} "
+                        f"(expected {flags.length}, got {values!r})"
+                    )
+                config[key] = flags.default()
+            else:
+                config[key] = list(values)
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
@@ -2509,6 +2564,16 @@ class ConfigSpec:
                         "inband scatters need cross_loop_pipeline='static', or "
                         "'dynamic' with a ring (claimed roots)"
                     )
+            # Only workers that own their tasks read a dry pass entry: the
+            # barrier pipeline and dynamic packets (no ring) keep one tune point.
+            if "cross_loop_dry_passes" in config and (
+                config["cross_loop_pipeline"] == "barrier"
+                or (
+                    config["cross_loop_pipeline"] == "dynamic"
+                    and not ring_depth(config, self.backend_name)
+                )
+            ):
+                config["cross_loop_dry_passes"] = self.cross_loop_dry_passes.default()
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (
@@ -3239,6 +3304,11 @@ class ConfigSpec:
             and self.store_cache_modifiers.length > 0
         ):
             fields["store_cache_modifiers"] = self.store_cache_modifiers
+        fields.update(
+            (key, flags)
+            for key, flags in (("cross_loop_dry_passes", self.cross_loop_dry_passes),)
+            if self.supports_config_key(key) and flags.length > 0
+        )
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -3555,6 +3625,7 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_dry_passes",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
@@ -4228,9 +4299,11 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
     # Set by ``lower_to_device_ir`` (``intra_loop_raw_reread_block_ids``) for
-    # a loop whose region stores and then re-reads the same storage: Triton's
-    # warp specialization splits such a body across partitions and the
-    # re-read observes stale memory.  The slot stays, so the config shape
+    # a loop whose region stores and then re-reads the same storage (also in a
+    # later iteration), or with ``Backend.intra_loop_barriers_order_reads``
+    # reads or stores and then overwrites it: Triton's warp specialization
+    # splits such a body across partitions and the barrier between the two
+    # accesses no longer orders them.  The slot stays, so the config shape
     # does not depend on the analysis, but its value is pinned to None.
     pinned: bool = False
 

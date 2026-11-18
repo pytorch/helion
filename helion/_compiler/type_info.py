@@ -65,6 +65,7 @@ from .compile_environment import _ContainerIdentity
 from .compile_environment import _symint_expr
 from .compile_environment import _symint_free_symbols
 from .compile_environment import compute_symbolic_min_max
+from .compile_environment import modeling_layout
 from .compile_environment import warning
 from .container_identity import record_opaque_container_result
 from .device_function import contains_only_block_size_symbols
@@ -1198,6 +1199,10 @@ class TensorType(TypeInfo):
     ) -> TypeInfo:
         if origin.is_host():
             warning(exc.TensorOperationInWrapper)
+            # The host code writes it (``check_pdl_independent``).
+            CompileEnvironment.current().host_written_storages[
+                self.fake_value.untyped_storage()
+            ] = None
         else:
             lhs_shape = self._device_indexing_size(key)
             lhs_rank = len(lhs_shape)
@@ -1263,7 +1268,7 @@ class TensorType(TypeInfo):
                         result = self.fake_value[example]
                         geometry = host_subscript_geometry(self.fake_value, index)
                         if geometry is not None:
-                            with torch.no_grad():
+                            with torch.no_grad(), modeling_layout():
                                 result = torch.as_strided(result, *geometry)
                         # Advanced indexing can allocate instead of sharing the
                         # source storage, so its result needs the same provenance.
@@ -3592,4 +3597,25 @@ class BarrierResultType(LiteralType):
 
 
 class PdlResultType(LiteralType):
-    """Marker type returned by the hl.pdl_* ops; the value names the op."""
+    """Marker type returned by the hl.pdl_* ops; the value names the op, and
+    ``independent`` holds the elements of the ``independent`` argument
+    ``hl.pdl_wait`` was bound to, as the call bound them (host code after it
+    may mutate a list), or None when not given.  ``independent_exact`` is
+    False when those are not known exactly: a filtered comprehension's, or a
+    ``*`` or ``**`` expansion of such contents."""
+
+    def __init__(
+        self, origin: Origin, value: object, independent: TypeInfo | None = None
+    ) -> None:
+        super().__init__(origin, value)
+        self.independent: list[TypeInfo] | None = (
+            None
+            if independent is None
+            else independent.unpack()
+            if isinstance(independent, SequenceType)
+            else [independent]
+        )
+        self.independent_exact = not (
+            isinstance(independent, CollectionType)
+            and independent.contains_approximate_contents()
+        )

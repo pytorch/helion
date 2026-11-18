@@ -17,6 +17,7 @@ from helion._testing import RefEagerTestDisabled
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import prefetch_kernels
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRocm
@@ -95,6 +96,47 @@ def independent_roots(
         hl.prefetch(tmp, [tile])
         out[tile] = y[tile] * 2
     return tmp, out
+
+
+hint_read_roots = helion.kernel(autotune_effort="none", static_shapes=True)(
+    prefetch_kernels.hint_read_roots
+)
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def live_hint_roots(
+    x: torch.Tensor, flags: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    """A prefetch-only root whose tasks run while a count of ``flags`` allows,
+    which a later root rewrites (and a third reads)."""
+    out = torch.empty_like(flags)
+    for tile in hl.tile(flags.size(0), block_size=1):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile.begin < live:
+            hl.prefetch(x, [tile.begin, slice(None)])
+    for tile in hl.tile(flags.size(0), block_size=16):
+        flags[tile] = z[tile]
+    for tile in hl.tile(flags.size(0), block_size=16):
+        out[tile] = flags[tile] + 1
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def settled_hint_roots(
+    x: torch.Tensor, flags: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    """``live_hint_roots`` whose ``flags`` an earlier root writes and no later
+    root rewrites."""
+    out = torch.empty_like(flags)
+    for tile in hl.tile(flags.size(0), block_size=16):
+        flags[tile] = z[tile]
+    for tile in hl.tile(flags.size(0), block_size=1):
+        live = torch.sum((flags[:] > 0).to(torch.int32))
+        if tile.begin < live:
+            hl.prefetch(x, [tile.begin, slice(None)])
+    for tile in hl.tile(flags.size(0), block_size=16):
+        out[tile] = z[tile] + 1
+    return out
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True)
@@ -573,6 +615,56 @@ class TestPrefetch(RefEagerTestDisabled, TestCase):
         torch.testing.assert_close(out, y * 2 + x + 1)
         self.assertEqual(len(_prefetch_lines(code)), 1)
         self.assertIn("tile_dependency", code)
+
+    def test_prefetch_only_root_runs_without_pipeline(self) -> None:
+        # The later root rewrites ``ids`` without waiting for the prefetch-only
+        # root's loads (test_prefetch_hints), so nothing is scheduled.
+        x = torch.randn(64, 256, device=DEVICE)
+        ids = torch.arange(32, device=DEVICE, dtype=torch.int32)
+        z = torch.full_like(ids, 7)
+        # A config saved while the rewrite still waited still loads.
+        config = helion.Config(cross_loop_pipeline="static")
+        spec = hint_read_roots.bind((x, ids, z)).config_spec
+        self.assertTrue(spec.cross_loop_pipeline_retired)
+        spec.normalize(config)
+        self.assertNotIn("cross_loop_pipeline", config)
+        code, out = code_and_output(
+            hint_read_roots,
+            (x, ids, z),
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+        )
+        torch.testing.assert_close(out, z)
+        self.assertNotIn("tile_dependency", code)
+
+    def test_hint_loads_hoist_no_task_count(self) -> None:
+        # The prefetch-only root's count may read the rewrite: each task
+        # computes it, none is hoisted for the workers to disagree on.
+        x = torch.randn(64, 256, device=DEVICE)
+        flags = torch.ones(32, device=DEVICE, dtype=torch.int32)
+        z = torch.full_like(flags, 3)
+        code, out = code_and_output(
+            live_hint_roots,
+            (x, flags, z),
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            cross_loop_pipeline="static",
+        )
+        torch.testing.assert_close(out, z + 1)
+        self.assertNotIn("live_tasks", code)
+        # Its third root still waits for the rewrite: a saved pipeline stays.
+        spec = live_hint_roots.bind((x, flags, z)).config_spec
+        self.assertFalse(spec.cross_loop_pipeline_retired)
+        # Nothing rewrites a count an earlier root wrote: it is hoisted.
+        code, out = code_and_output(
+            settled_hint_roots,
+            (x, torch.zeros_like(flags), z),
+            pid_type="persistent_blocked",
+            num_sm_multiplier=1,
+            cross_loop_pipeline="static",
+        )
+        torch.testing.assert_close(out, z + 1)
+        self.assertIn("live_tasks", code)
 
 
 if __name__ == "__main__":

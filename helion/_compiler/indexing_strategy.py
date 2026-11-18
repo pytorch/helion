@@ -29,6 +29,8 @@ from .compile_environment import warning
 from .device_function import DeviceFunction
 from .dtype_utils import cast_ast
 from .host_function import HostFunction
+from .loop_dependency_checker import TMA_STORE_META
+from .loop_dependency_checker import drained_store_through_pointers
 from .utils import compute_slice_size
 from .variable_origin import BlockSizeOrigin
 from .variable_origin import GridOrigin
@@ -2046,8 +2048,13 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         extra_mask: ast.AST | None,
         cache_modifier: ast.AST | None,
     ) -> ast.AST:
-        if extra_mask is not None or not self.is_supported(
-            state, fake_tensor, subscript, for_store=True
+        if (
+            extra_mask is not None
+            or not self.is_supported(state, fake_tensor, subscript, for_store=True)
+            or (
+                state.fx_node is not None
+                and drained_store_through_pointers(state.fx_node, state.device_function)
+            )
         ):
             return PointerIndexingStrategy().codegen_store(
                 state, fake_tensor, subscript, value, extra_mask, cache_modifier
@@ -2062,6 +2069,9 @@ class TensorDescriptorIndexingStrategy(IndexingStrategy):
         state.device_function.note_tma_store(
             warp_specialized=_in_warp_specialized_loop(state)
         )
+        if state.fx_node is not None:
+            # A later store this one may race with drains it first.
+            state.fx_node.meta[TMA_STORE_META] = True
 
         # Apply permutation to the value being stored if needed
         desc_arg = indexing.tensor_descriptor_arg(state)

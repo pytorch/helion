@@ -475,5 +475,6 @@
  "test/test_unroll_tuples.py": 18.0,
  "test/test_var_mean.py": 36.7,
  "test/test_views.py": 25.5,
+ "test/test_write_after_read_barriers.py": 0.1,
  "test/test_zero_size.py": 0.5
 }

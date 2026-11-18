@@ -37,6 +37,7 @@ from .compile_environment import LoopSpecBlockSizeSource
 from .fx_side_effects import is_impure_node
 from .indexing_strategy import subscript_tile_info
 from .inductor_lowering import APIFuncLowering
+from .loop_dependency_checker import record_own_reads
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -88,6 +89,7 @@ def apply_epilogue_subtiling(
         )
     env = CompileEnvironment.current()
     changed = False
+    record_own_reads(graph)
 
     for candidate in _iter_eligible_epilogue_chains(
         graph, env, split_factor, descriptor_output_nodes, configured_extents

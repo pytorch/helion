@@ -448,6 +448,12 @@ def prefetch(
     ``hl.prefetch``, in code order; the key exists when some prefetch of the
     kernel can take the ``"tensor_descriptor"`` form).
 
+    In a top-level loop whose only effects are prefetches, later loops' stores
+    need not wait for its loads, so the values that compute a prefetch's index
+    or guard may come from such a store, and from different stores for
+    different loads (or elements): keep every value those loads can see a
+    valid index, or take the index and its guard from one element of one load.
+
     On NVIDIA GPUs (Triton and Gluon backends), in the ``"pointer"`` form
     (the default), when the last index is a full slice or a tile of a
     stride-1 dim and there is no ``extra_mask``, each element of the leading

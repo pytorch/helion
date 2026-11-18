@@ -38,6 +38,7 @@ from torch.fx.experimental.symbolic_shapes import ShapeEnv
 from torch.fx.experimental.symbolic_shapes import StatelessSymbolicContext
 from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils import _pytree as pytree
+from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import ValueRanges
@@ -716,6 +717,144 @@ class _GuardedShapeEnv(ShapeEnv):
         self.axioms = _GuardAxioms(self)
 
 
+# The ops that give a tensor any offset, sizes or strides in its storage, so
+# that it may address memory past the view it was (``as_strided`` counts its
+# offset from the storage's start).
+_RESTRIDING_OPS = frozenset(
+    {
+        torch.ops.aten.as_strided.default,
+        torch.ops.aten.as_strided_.default,
+        torch.ops.aten.resize_.default,
+        torch.ops.aten.resize_as_.default,
+        torch.ops.aten.set_.source_Storage,
+        torch.ops.aten.set_.source_Storage_storage_offset,
+        torch.ops.aten.set_.source_Tensor_storage_offset,
+    }
+)
+# The ops that may move a tensor onto another storage.
+_MOVING_OPS = frozenset(
+    {
+        torch.ops.aten.set_.source_Tensor,
+        torch.ops.aten.set_.source_Storage,
+        torch.ops.aten.set_.source_Storage_storage_offset,
+        torch.ops.aten.set_.source_Tensor_storage_offset,
+    }
+)
+# True while Helion itself re-strides a fake tensor to model a layout.
+_modeling_layout = contextvars.ContextVar("_modeling_layout", default=False)
+
+
+@contextlib.contextmanager
+def modeling_layout() -> typing.Iterator[None]:
+    """Mark the ops run inside as Helion's model of a layout, not host code
+    (``_HostWriteCapture``)."""
+    token = _modeling_layout.set(True)
+    try:
+        yield
+    finally:
+        _modeling_layout.reset(token)
+
+
+def _layout(tensor: torch.Tensor) -> tuple[int | torch.SymInt, ...]:
+    """``tensor``'s sizes, strides and storage offset."""
+    return (*tensor.size(), *tensor.stride(), tensor.storage_offset())
+
+
+class _HostWriteCapture(TorchDispatchMode):
+    """Record the storage of every tensor an op a host call runs writes in
+    place: each argument its schema marks written (``x.add_(1)``, ``copy_``,
+    ``out=``), also through a view or inside a helper, and every tensor a
+    higher-order op (``torch.cond``) is given, which carries no schema and may
+    mutate its inputs.  The storage is taken at the write: a later ``set_``
+    may point the tensor elsewhere.  The fake tensors' version counters would
+    say the same, but inference tensors keep none.  Also record, in
+    ``restrided``, the storage of each tensor an op gives any offset, sizes or
+    strides (``_RESTRIDING_OPS``) or resizes in place (any op an argument of
+    which changes layout but for a permutation, ``out=`` too), but where
+    Helion models a layout (``modeling_layout``), and in ``moved``, each
+    storage a ``set_`` moves a tensor onto, with the one it left: also inside
+    a helper, on a tensor the call is not given.
+    ``track_runtime_layout_mutations`` records the arguments' other in-place
+    re-strides and their moves by ``.data``."""
+
+    supports_higher_order_operators = True
+
+    @classmethod
+    def ignore_compile_internals(cls) -> bool:
+        # Dynamo compiles a higher-order op's eager call (``torch.cond``);
+        # under a mode it does not ignore, it skips that frame for good, and
+        # the next eager call of the op fails.  The compiled op still
+        # dispatches here.
+        return True
+
+    def __init__(
+        self,
+        written: dict[torch.UntypedStorage, None],
+        restrided: set[torch.UntypedStorage],
+        moved: dict[torch.UntypedStorage, dict[torch.UntypedStorage, None]],
+        keeps_addresses: typing.Callable[
+            [tuple[int | torch.SymInt, ...], torch.Tensor], bool
+        ],
+    ) -> None:
+        super().__init__()
+        self.written = written
+        self.restrided = restrided
+        self.moved = moved
+        self.keeps_addresses = keeps_addresses
+
+    def __torch_dispatch__(
+        self,
+        func: torch._ops.OpOverload | torch._ops.HigherOrderOperator,
+        types: tuple[type, ...],
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        kwargs = kwargs or {}
+        if isinstance(func, torch._ops.HigherOrderOperator):
+            written = [(args, kwargs)]
+        elif torch.Tag.inplace_view in func.tags:
+            # set_, as_strided_, t_, resize_: metadata only, no element written.
+            written = []
+        else:
+            written = [
+                args[index] if index < len(args) else kwargs.get(argument.name)
+                for index, argument in enumerate(func._schema.arguments)
+                if argument.alias_info is not None and argument.alias_info.is_write
+            ]
+        self.written.update(
+            dict.fromkeys(
+                leaf.untyped_storage()
+                for leaf in pytree.tree_leaves(written)
+                if isinstance(leaf, torch.Tensor)
+            )
+        )
+        moving = args[0] if func in _MOVING_OPS else None
+        assert moving is None or isinstance(moving, torch.Tensor)
+        left = None if moving is None else moving.untyped_storage()
+        layouts = [
+            (leaf, leaf.untyped_storage(), _layout(leaf))
+            for leaf in pytree.tree_leaves((args, kwargs))
+            if isinstance(leaf, torch.Tensor)
+        ]
+        result = func(*args, **kwargs)
+        if not _modeling_layout.get():
+            for tensor, storage, layout in layouts:
+                if tensor.untyped_storage() is storage and not self.keeps_addresses(
+                    layout, tensor
+                ):
+                    # Resized in place, also below the op (``out=``).
+                    self.restrided.add(storage)
+        if moving is not None and (onto := moving.untyped_storage()) is not left:
+            assert left is not None
+            self.moved.setdefault(onto, {})[left] = None
+        if func in _RESTRIDING_OPS and not _modeling_layout.get():
+            # The view as_strided returns, or the tensor resized in place.
+            target = result if isinstance(result, torch.Tensor) else args[0]
+            assert isinstance(target, torch.Tensor)
+            self.restrided.add(target.untyped_storage())
+        return result
+
+
 class CompileEnvironment:
     """
     Global state for the duration of a compilation.
@@ -791,7 +930,50 @@ class CompileEnvironment:
         # its base is allocator-aligned, so a static storage offset decides the
         # base alignment of any view of it.
         self._fresh_allocation_storages: set[torch.UntypedStorage] = set()
+        # Every storage ever recorded fresh: an opaque host call drops the
+        # facts about its layout and contents, not that it is its own memory.
+        self._allocated_storages: set[torch.UntypedStorage] = set()
         self._zero_filled_allocation_storages: set[torch.UntypedStorage] = set()
+        # The storage of each tensor the host code writes in place, taken at
+        # the write (``_HostWriteCapture``, a host subscript store or
+        # augmented assignment): a set, ordered so that a check names the same
+        # tensor first on every run.
+        self.host_written_storages: dict[torch.UntypedStorage, None] = {}
+        # Whether host calls run under ``_HostWriteCapture``: only in a kernel
+        # whose body passes ``hl.pdl_wait`` an argument, as ``independent=``
+        # alone reads what it records (``propagate_types``).
+        self.captures_host_writes = False
+        # The storage of each tensor host code gives any offset, sizes or
+        # strides (``_HostWriteCapture``): what it addresses may reach past the
+        # argument it was taken from.
+        self.host_restrided_storages: set[torch.UntypedStorage] = set()
+        # The storages host calls moved each tensor off (``.data =``, ``set_``),
+        # in order: the device code a launch runs before such a call reads and
+        # writes the old one.
+        self.former_storages: dict[torch.Tensor, list[torch.UntypedStorage]] = {}
+        # Each storage host code moved a tensor onto, with each it moved one
+        # off: a move that does not happen leaves it there, so what host code
+        # takes from the tensor afterwards may be the old memory
+        # (``check_pdl_independent``).
+        self.storages_moved_onto: dict[
+            torch.UntypedStorage, dict[torch.UntypedStorage, None]
+        ] = {}
+        # How many of those moves came before the kernel launch, or None
+        # before the first grid loop (``storages_until_launch``).  The kernel
+        # launches after the last top-level grid loop: host code between grid
+        # loops runs before it.
+        self.former_storages_at_launch: dict[torch.Tensor, int] | None = None
+        # The top-level grid loops type propagation has passed.
+        self.grid_loops_seen = 0
+        # The storage of each tensor an opaque host call before the launch was
+        # given or its view base has, and each one a host join among them may
+        # be: through it (a view's ``_base``, a join's owner) the call may have
+        # moved a tensor of that storage off and back, which leaves no record
+        # (``check_pdl_independent``).  Set once type propagation knows which
+        # grid loop is the last (``opaque_calls``).
+        self.opaque_call_storages: set[torch.UntypedStorage] = set()
+        # Those storages of each opaque host call, by the grid loops before it.
+        self.opaque_calls: list[tuple[int, set[torch.UntypedStorage]]] = []
         # A host control-flow join has synthetic fake storage, not a runtime
         # allocation. Retain original storage separately from watched Tensor
         # owners: a view keeps its storage when its former owner calls set_.
@@ -1046,6 +1228,12 @@ class CompileEnvironment:
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []
+        # The root a trigger between top-level loops precedes (it also stays in
+        # ``pdl_exit``, where a kernel that cannot place it runs it).
+        self.pdl_trigger_root: int | None = None
+        # The tensors ``hl.pdl_wait(independent=...)`` names, each with the
+        # host expression that names it.
+        self.pdl_independent: dict[torch.Tensor, str] = {}
         # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
         self.prefetch_code: bool = False
 
@@ -1664,7 +1852,27 @@ class CompileEnvironment:
         Only an independently recorded factory allocation or guarded input
         source can establish disjointness for that origin.
         """
-        storage = tensor.untyped_storage()
+        return self.storage_provenance(tensor.untyped_storage())
+
+    def storages_until_launch(self, tensor: torch.Tensor) -> list[torch.UntypedStorage]:
+        """The storages ``tensor`` may have when the kernel launches: the one
+        it had there (last; host code after the launch may move it off), and
+        each one host code moved it off before that.  Any such move may not
+        happen at run time: type propagation runs each arm of a host branch on
+        one fake, and a helper or a later operand may skip one."""
+        moved = self.former_storages.get(tensor, [])
+        before = (
+            len(moved)
+            if self.former_storages_at_launch is None
+            else self.former_storages_at_launch.get(tensor, 0)
+        )
+        launch = moved[before] if before < len(moved) else tensor.untyped_storage()
+        return [*moved[:before], launch]
+
+    def storage_provenance(
+        self, storage: torch.UntypedStorage
+    ) -> tuple[tuple[torch.UntypedStorage, bool], ...] | None:
+        """``tensor_storage_provenance`` of a storage."""
         origins = self._joined_tensor_storage_origins.get(storage, (storage,))
         if storage in self._invalidated_storage_provenance or any(
             origin in self._invalidated_storage_provenance for origin in origins
@@ -1719,6 +1927,18 @@ class CompileEnvironment:
         self._fresh_allocation_storages.difference_update(invalid)
         self._zero_filled_allocation_storages.difference_update(invalid)
         self._symbolically_exact_layout_storages.difference_update(invalid)
+
+    def storage_is_allocation(self, storage: torch.UntypedStorage) -> bool:
+        """Whether host code freshly allocated ``storage`` (a factory or a
+        proven non-aliasing op), even if an opaque call since dropped the facts
+        about it. A conditional copy (``contiguous``, ``reshape``) is none: at
+        run time it may return its input."""
+        return storage in self._allocated_storages
+
+    def storage_is_join(self, storage: torch.UntypedStorage) -> bool:
+        """Whether ``storage`` is the synthetic storage of a host control-flow
+        join (``register_tensor_storage_join``), not a runtime allocation."""
+        return storage in self._joined_tensor_storage_origins
 
     def register_tensor_storage_join(
         self, result: torch.Tensor, branches: typing.Sequence[torch.Tensor]
@@ -1788,6 +2008,7 @@ class CompileEnvironment:
         ):
             return
         self._fresh_allocation_storages.add(replacement_storage)
+        self._allocated_storages.add(replacement_storage)
         if original_storage in self._zero_filled_allocation_storages:
             self._zero_filled_allocation_storages.add(replacement_storage)
 
@@ -1813,7 +2034,7 @@ class CompileEnvironment:
             tensor.ndim == 1 and isinstance(tensor.size(0), int) and tensor.size(0) > 1
         ):
             if tensor.ndim:
-                with torch.no_grad():
+                with torch.no_grad(), modeling_layout():
                     result.as_strided_(result.size(), (1,), result.storage_offset())
             return True
         if (
@@ -1827,7 +2048,7 @@ class CompileEnvironment:
             if _guard_canonical_layout(
                 self, tensor, require_input=False, coalesce_degenerate=True
             ) == (2,):
-                with torch.no_grad():
+                with torch.no_grad(), modeling_layout():
                     result.as_strided_(result.size(), (1,), result.storage_offset())
                 return True
         if self.tensor_has_runtime_layout(tensor):
@@ -1861,7 +2082,7 @@ class CompileEnvironment:
             size if extent_class in (None, 2) else extent_class
             for size, extent_class in zip(result.size(), classes, strict=True)
         )
-        with torch.no_grad():
+        with torch.no_grad(), modeling_layout():
             result.as_strided_(shape, tuple(reversed(strides)), result.storage_offset())
         return True
 
@@ -1934,8 +2155,43 @@ class CompileEnvironment:
         )
         for stride in strides:
             symbols.update(_symint_free_symbols(stride))
-        with torch.no_grad():
+        with torch.no_grad(), modeling_layout():
             tensor.as_strided_(shape, strides, tensor.storage_offset())
+
+    def _reachable_storages(self, tensor: torch.Tensor) -> list[torch.UntypedStorage]:
+        """The storages a call given ``tensor`` reaches: its own, and its view
+        base's (``_base``, kept when ``set_`` moves the view off it)."""
+        storages = [tensor.untyped_storage()]
+        base = tensor._base
+        while base is not None:
+            storages.append(base.untyped_storage())
+            base = base._base
+        return storages
+
+    def _join_alternatives(
+        self, storages: typing.Iterable[torch.UntypedStorage]
+    ) -> set[torch.UntypedStorage]:
+        """``storages`` and each storage a host join among them may be at run
+        time: its origins and its owners', through nested joins."""
+        found = set(storages)
+        pending = list(found)
+        while pending:
+            storage = pending.pop()
+            if storage not in self._joined_tensor_storage_origins:
+                continue
+            related = set(self._joined_tensor_storage_origins[storage])
+            for owner, original in self._joined_tensor_storage_owners[storage]:
+                related.update((original, owner.untyped_storage()))
+            pending.extend(related - found)
+            found |= related
+        return found
+
+    def _same_view(self, a: torch.Tensor, b: torch.Tensor) -> bool:
+        """Whether ``a`` and ``b`` have the same offset, sizes and strides."""
+        left, right = _layout(a), _layout(b)
+        return len(left) == len(right) and all(
+            itertools.starmap(self.known_equal, zip(left, right, strict=True))
+        )
 
     @contextlib.contextmanager
     def track_runtime_layout_mutations(
@@ -1949,7 +2205,23 @@ class CompileEnvironment:
         # rewrite the earlier allocation's extent to the final Tensor state.
         # Repeated inference of the same loop site still needs stable symbols.
         mutation_site = tuple(ExtendedAST.current())
+        tensors = [
+            value
+            for value in pytree.tree_leaves(inputs)
+            if isinstance(value, torch.Tensor)
+        ]
         if opaque:
+            # Taken before the call drops the joins' records.
+            self.opaque_calls.append(
+                (
+                    self.grid_loops_seen,
+                    self._join_alternatives(
+                        storage
+                        for value in tensors
+                        for storage in self._reachable_storages(value)
+                    ),
+                )
+            )
             # Python can replace .data and restore it without changing the
             # Tensor version. Its captures/record fields can reach owners not
             # present in the arguments, even before any join exists. Factories
@@ -1967,27 +2239,55 @@ class CompileEnvironment:
                 for owner, original in owners:
                     known.update((original, owner.untyped_storage()))
             self._invalidate_tensor_storage_provenance(known)
-        tensors = [
-            value
-            for value in pytree.tree_leaves(inputs)
-            if isinstance(value, torch.Tensor)
-        ]
         storage_before = [(value, value.untyped_storage()) for value in tensors]
         before = [
             (
                 value,
                 value.untyped_storage(),
                 tuple(value.size()),
-                (*value.size(), *value.stride(), value.storage_offset()),
+                _layout(value),
             )
             for value in tensors
         ]
-        yield
+        capture = self.captures_host_writes
+        # A nested host call runs under this call's capture.
+        self.captures_host_writes = False
+        try:
+            with (
+                _HostWriteCapture(
+                    self.host_written_storages,
+                    self.host_restrided_storages,
+                    self.storages_moved_onto,
+                    self._metadata_permutation_preserves_storage,
+                )
+                if capture
+                else contextlib.nullcontext()
+            ):
+                yield
+        finally:
+            self.captures_host_writes = capture
+
+        def note_restrided(value: torch.Tensor) -> None:
+            # Unless it now is another argument's view (``set_`` with a
+            # tensor), it may reach past the memory it was an argument's.
+            storage = value.untyped_storage()
+            if not any(
+                other is not value
+                and other.untyped_storage() is storage
+                and self._same_view(other, value)
+                for other in tensors
+            ):
+                self.host_restrided_storages.add(storage)
+
         changed = set()
         for value, storage in storage_before:
             current_storage = value.untyped_storage()
             if current_storage is not storage:
                 changed.update((storage, current_storage))
+                self.former_storages.setdefault(value, []).append(storage)
+                self.storages_moved_onto.setdefault(current_storage, {})[storage] = None
+                # Moved onto a storage (``set_`` with a storage).
+                note_restrided(value)
         if changed:
             self._invalidate_tensor_storage_provenance(changed)
         # Native value writes do not change storage. Opaque calls were already
@@ -1995,7 +2295,7 @@ class CompileEnvironment:
         # are needed for the remaining storage watches.
         self._invalidate_mutated_tensor_storage_joins()
         for value, storage, original_shape, metadata in before:
-            current = (*value.size(), *value.stride(), value.storage_offset())
+            current = _layout(value)
             if (
                 value.untyped_storage() is not storage
                 or len(metadata) != len(current)
@@ -2009,6 +2309,10 @@ class CompileEnvironment:
                     # restrided views. A pure dimension permutation preserves
                     # the actual address set, even for zero/singleton sizes.
                     self._invalidate_tensor_storage_provenance((storage,))
+                    if value.untyped_storage() is storage:
+                        # Re-strided in place (``resize_as_``, an ``out=``
+                        # resize, ``set_`` within its storage).
+                        note_restrided(value)
                 # Only the selected Tensor itself shares its owners' metadata;
                 # an actual view merely shares storage. Upward propagation then
                 # refreshes every selection that may name a changed owner,
@@ -2125,9 +2429,10 @@ class CompileEnvironment:
             changed = True
         if not changed:
             return tensor
-        result = torch.as_strided(
-            tensor, tensor.size(), strides, tensor.storage_offset()
-        )
+        with modeling_layout():
+            result = torch.as_strided(
+                tensor, tensor.size(), strides, tensor.storage_offset()
+            )
         if tensor in self._joined_tensor_metadata_owners:
             # This is an internal representation change, not a runtime view.
             self._joined_tensor_metadata_owners[result] = (
@@ -2176,6 +2481,7 @@ class CompileEnvironment:
         if result_storage in argument_storages:
             return
         self._fresh_allocation_storages.add(result_storage)
+        self._allocated_storages.add(result_storage)
         if _factory_fills_positive_zero(factory, args, kwargs):
             self._zero_filled_allocation_storages.add(result_storage)
         is_exact = False
@@ -2225,6 +2531,7 @@ class CompileEnvironment:
         ):
             return
         self._fresh_allocation_storages.add(result.untyped_storage())
+        self._allocated_storages.add(result.untyped_storage())
 
     def runtime_value_for_tensor(self, fake_tensor: torch.Tensor) -> object | None:
         """Replay a traced tensor's input source against the current real arguments."""

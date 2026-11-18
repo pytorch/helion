@@ -1434,14 +1434,22 @@ def _register_tile_lane_split_orders_memory(
     in-place recurrent step) and needs none.
     """
     graphs = device_ir.graphs
-    if intra_loop_raw_reread_block_ids(
-        graphs, device_ir.root_ids, device_ir.grid_block_ids
-    ):
-        return True
-    shared: set[int] = set()
-    for root_id in device_ir.root_ids:
-        reads, writes = graph_memory_access_storage_ids(graphs, root_id)
-        shared |= reads & writes
+    host_function = device_ir.host_function
+    assert host_function is not None
+    # The walks below tell the ops whose inputs name the kernel's memory by
+    # those inputs' host origins (``opaque_access_target``).
+    with host_function:
+        if intra_loop_raw_reread_block_ids(
+            graphs,
+            device_ir.root_ids,
+            device_ir.grid_block_ids,
+            carries=env.backend.intra_loop_barriers_carry_iterations,
+        ):
+            return True
+        shared: set[int] = set()
+        for root_id in device_ir.root_ids:
+            reads, writes = graph_memory_access_storage_ids(graphs, root_id)
+            shared |= reads & writes
     if not shared:
         return False
     for info in graphs:

@@ -10,6 +10,7 @@ import types
 from typing import TYPE_CHECKING
 from typing import NoReturn
 from typing import Protocol
+from typing import cast
 
 import sympy
 import torch
@@ -77,6 +78,7 @@ from .variable_origin import SourceOrigin
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Mapping
 
     from .host_function import HostFunction
 
@@ -966,6 +968,10 @@ class TypePropagation(ast.NodeVisitor):
             result = self._call_nested_function(func, args, kwargs)  # pyrefly: ignore [bad-argument-type]
         else:
             result = func.propagate_call(tuple(args), kwargs, self.origin())  # pyrefly: ignore [bad-argument-type]
+        if approximate_expansion and isinstance(result, PdlResultType):
+            # Representative arguments cannot prove which tensors
+            # ``hl.pdl_wait(independent=...)`` names.
+            result.independent_exact = False
         if (
             approximate_expansion
             and not isinstance(result, CollectionType)
@@ -1227,14 +1233,10 @@ class TypePropagation(ast.NodeVisitor):
             and self._contains_matmul(node.value)
         ):
             warning(exc.TiledKMatmulAccumulationWarning)
+        target = node.target.copy(ctx=ast.Load())
         try:
             type_info = self.visit(
-                create(
-                    ast.BinOp,
-                    left=node.target.copy(ctx=ast.Load()),
-                    op=node.op,
-                    right=node.value,
-                )
+                create(ast.BinOp, left=target, op=node.op, right=node.value)
             )
         except exc.TorchOpTracingError as e:
             # Check if this is a shape mismatch when modifying a host variable in device loop
@@ -1246,6 +1248,14 @@ class TypePropagation(ast.NodeVisitor):
             ):
                 raise exc.CannotModifyHostVariableOnDevice(node.target.id) from e
             raise
+        if self.device_loop_depth == 0 and isinstance(
+            written := target._type_info, TensorType
+        ):
+            # Python runs a tensor's augmented assignment in place, whatever
+            # holds the tensor (a local, a list): ``check_pdl_independent``.
+            CompileEnvironment.current().host_written_storages[
+                written.fake_value.untyped_storage()
+            ] = None
         self._assign(node.target, type_info)
         return NoType(origin=self.origin())
 
@@ -1668,11 +1678,13 @@ def _count_dims_in_subscript(elts: list[ast.expr]) -> int:
     )
 
 
-def _is_barrier_stmt(statement: ast.stmt) -> bool:
+def _is_op_stmt(statement: ast.stmt, result_types: tuple[type[TypeInfo], ...]) -> bool:
+    """Whether ``statement`` is a bare call of an op returning one of
+    ``result_types`` (e.g. ``hl.barrier()``)."""
     if isinstance(statement, ast.Expr):
         value = statement.value
         type_info = getattr(value, "_type_info", None)
-        return isinstance(type_info, BarrierResultType)
+        return isinstance(type_info, result_types)
     return False
 
 
@@ -1691,7 +1703,8 @@ def _create_type_propagation(func: HostFunction) -> TypePropagation:
 
 
 def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
-    """Raise if non-barrier host statements appear between top-level for-loops."""
+    """Raise if host statements other than barriers and PDL ops (which
+    ``_place_pdl_ops`` places) appear between top-level for-loops."""
     seen_loop = False
     host_stmt_after_loop = False
     for stmt in body:
@@ -1700,19 +1713,25 @@ def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
                 # TODO(oulgen): This check is too coarse, refine it.
                 raise exc.TopLevelStatementBetweenLoops
             seen_loop = True
-        elif seen_loop and not _is_barrier_stmt(stmt):
+        elif seen_loop and not _is_op_stmt(stmt, (BarrierResultType, PdlResultType)):
             host_stmt_after_loop = True
 
 
 def _place_pdl_ops(body: list[ast.stmt]) -> None:
     """Run top level hl.pdl_* ops at entry if they precede the loops, else at
-    exit; hl.prefetch_code() marks the kernel (entry only)."""
+    exit; hl.prefetch_code() marks the kernel (entry only).  A trigger between
+    grid loops also records the root of the next one (``pdl_trigger_root``),
+    where a persistent megakernel places it instead of at exit."""
     env = CompileEnvironment.current()
+    roots = [
+        (index, stmt._root_id)
+        for index, stmt in enumerate(body)
+        if isinstance(stmt, ExtendedAST) and stmt._loop_type == LoopType.GRID
+    ]
     seen_loop = False
-    for stmt in body:
-        if isinstance(stmt, ast.For):
-            seen_loop = True
-            continue
+    waits = 0
+    trigger_root = None
+    for index, stmt in enumerate(body):
         ops = [
             node
             for node in ast.walk(stmt)
@@ -1720,15 +1739,35 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
             and isinstance(node, ExtendedAST)
             and isinstance(node._type_info, PdlResultType)
         ]
+        # A nested op (under a host if or inside a loop) would silently not run.
+        if ops and (not isinstance(stmt, ast.Expr) or ops != [stmt.value]):
+            raise exc.PdlPlacement
+        if isinstance(stmt, ast.For):
+            # A host loop is no root: an op after it still runs at entry.
+            seen_loop = seen_loop or any(at == index for at, _ in roots)
+            continue
         if not ops:
             continue
-        # A nested op (e.g. under a host if) would silently not run.
-        if not isinstance(stmt, ast.Expr) or ops != [stmt.value]:
-            raise exc.PdlPlacement
         op = ops[0]._type_info
         assert isinstance(op, PdlResultType) and isinstance(op.value, str)
         if seen_loop and op.value in ("wait", "prefetch_code"):
             raise exc.PdlPlacement
+        if op.value == "wait":
+            waits += 1
+            if independent := _pdl_independent(op):
+                if not env.captures_host_writes:
+                    # Called through a local, it left host writes unrecorded.
+                    raise exc.PdlIndependentArgument(
+                        "call hl.pdl_wait through a global or a module to pass it"
+                    )
+                env.pdl_independent = independent
+        later = next((root for at, root in roots if at > index), None)
+        between = op.value == "launch_dependents" and seen_loop and later is not None
+        if between:
+            # Checked on every target: what compiles here compiles anywhere.
+            if trigger_root is not None:
+                raise exc.PdlPlacement
+            trigger_root = later
         if op.value == "prefetch_code":
             # The cubin pass resolves sm_90+ relocations (``.rela.nv.global.init``;
             # older targets emit ``.rel``): elsewhere the kernel is not marked.
@@ -1740,15 +1779,97 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
         if capability is not None and capability >= (9, 0):
             (env.pdl_exit if seen_loop else env.pdl_entry).append(op.value)
             env.config_spec.has_explicit_pdl = True
+            if between:
+                env.pdl_trigger_root = trigger_root
+    if env.pdl_independent and waits > 1:
+        raise exc.PdlIndependentArgument("only a kernel's one hl.pdl_wait() takes it")
+
+
+def _passes_pdl_wait_arguments(stmt: ast.stmt, scope: Mapping[str, object]) -> bool:
+    """Whether ``stmt``, a statement of the kernel's body (where a PDL op
+    sits), calls ``hl.pdl_wait`` with any argument: through a global or a
+    module's attribute naming it in ``scope``, the kernel's globals, or a
+    callee named ``pdl_wait`` that does not resolve so."""
+    if not (isinstance(stmt, ast.Expr) and isinstance(call := stmt.value, ast.Call)):
+        return False
+    if not (call.args or call.keywords):
+        return False
+
+    def resolve(node: ast.expr) -> object:
+        if isinstance(node, ast.Name):
+            return scope.get(node.id, _UNRESOLVED)
+        if isinstance(node, ast.Attribute):
+            owner = resolve(node.value)
+            if isinstance(owner, types.ModuleType):
+                return getattr(owner, node.attr, _UNRESOLVED)
+        return _UNRESOLVED
+
+    callee = resolve(call.func)
+    if callee is not _UNRESOLVED:
+        return callee is language_module.pdl_wait
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr == "pdl_wait"
+    return isinstance(func, ast.Name) and func.id == "pdl_wait"
+
+
+_UNRESOLVED = object()
+
+
+def _pdl_independent(op: PdlResultType) -> dict[torch.Tensor, str]:
+    """The tensors ``hl.pdl_wait(independent=...)`` names: kernel arguments
+    (or tensors held in one), each with the host expression naming it."""
+    # The argument as the call bound it, also through ``*`` or ``**``.
+    elements = op.independent
+    if elements is None:
+        return {}
+    if not op.independent_exact:
+        # A filtered comprehension may name none of its representative
+        # elements at run time.
+        raise exc.PdlIndependentArgument(
+            "independent holds tensors that are not known exactly"
+        )
+    # An argument's own fake (``CompileEnvironment.input_sources``): a view of
+    # one (``x.T``, also bound to a host local first) is not one.
+    input_sources = CompileEnvironment.current().input_sources
+    if not all(
+        isinstance(element, TensorType) and element.fake_value in input_sources
+        for element in elements
+    ):
+        raise exc.PdlIndependentArgument(
+            "independent holds a value that is not a tensor argument of the "
+            "kernel (or held in one)"
+        )
+    return {
+        cast("TensorType", element).fake_value: element.origin.host_str()
+        for element in elements
+    }
 
 
 def propagate_types(func: HostFunction) -> None:
     # Lock needed since patch.object(torch.SymInt.__index__, ...) is not thread safe
     with compile_lock, func, enable_python_dispatcher():
         prop = _create_type_propagation(func)
+        env = CompileEnvironment.current()
+        env.captures_host_writes = any(
+            _passes_pdl_wait_arguments(stmt, func.fn.__globals__) for stmt in func.body
+        )
         for stmt in func.body:
             prop.visit(stmt)
-        env = CompileEnvironment.current()
+            if isinstance(stmt, ExtendedAST) and stmt._loop_type == LoopType.GRID:
+                # The kernel launches after the last grid loop: later moves
+                # leave what it reads and writes on the old storage.
+                env.grid_loops_seen += 1
+                env.former_storages_at_launch = {
+                    tensor: len(moved) for tensor, moved in env.former_storages.items()
+                }
+        # Opaque host calls before the last grid loop run before the launch.
+        env.opaque_call_storages = {
+            storage
+            for loops_before, storages in env.opaque_calls
+            if loops_before < env.grid_loops_seen
+            for storage in storages
+        }
         env.inline_config_symbols = frozenset(
             symbol
             for symbol in env.config_value_expressions

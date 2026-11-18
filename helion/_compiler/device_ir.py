@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from .cute.execution_plans import CuTeGridExecutionPlan
     from .device_function import DeviceFunction
     from .device_ir_analysis import DeviceIRAnalysis
+    from .loop_dependency_checker import Barrier
     from .tile_dependency import TaskFamily
     from .tile_dependency import TileDependencyGraph
 
@@ -410,11 +411,16 @@ class NodeArgsGraphInfo(GraphInfo):
 @dataclasses.dataclass
 class ForLoopGraphInfo(NodeArgsGraphInfo):
     block_ids: list[int]
-    # Precomputed by GenerateAST._compute_inter_loop_barriers: True iff a
-    # tl.debug_barrier() must be emitted immediately before this for-loop's
-    # outer prefix to make global writes from the previous sibling for-loop
-    # in this scope visible.  Not copied across graph copies; recomputed.
-    needs_barrier_before: bool = False
+    # Precomputed by GenerateAST._compute_inter_loop_barriers: the barrier
+    # that must be emitted immediately before this for-loop's outer prefix to
+    # make global writes from the previous sibling for-loop in this scope
+    # visible, or its reads and stores done before this loop overwrites them
+    # (``Barrier.READS`` after plain loads and stores alone), or None.  Not
+    # copied across graph copies; recomputed.
+    needs_barrier_before: Barrier | None = None
+    # The earlier sibling loops' stores that barrier orders before this loop
+    # overwrites them (``Barrier.statements``).
+    barrier_orders_stores: frozenset[torch.fx.Node] = frozenset()
 
     @property
     def name(self) -> str:
@@ -458,6 +464,7 @@ class ForLoopGraphInfo(NodeArgsGraphInfo):
             with state.codegen.add_device_loop(
                 device_loop,
                 needs_barrier_before=self.needs_barrier_before,
+                barrier_orders_stores=self.barrier_orders_stores,
             ):
                 outputs = [
                     *codegen_call_with_graph(
@@ -4531,14 +4538,17 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
         if warp_specialize_specs:
             from .loop_dependency_checker import intra_loop_raw_reread_block_ids
 
-            # A loop that stores and then re-reads the same storage cannot be
-            # warp-specialized (see intra_loop_raw_reread_block_ids); its
-            # slot stays in the config space pinned to None.
+            # A loop that stores and then re-reads the same storage (or reads
+            # and then overwrites it) cannot be warp-specialized (see
+            # intra_loop_raw_reread_block_ids); its slot stays in the config
+            # space pinned to None.
             reread_block_ids = intra_loop_raw_reread_block_ids(
                 device_ir.graphs,
                 device_ir.root_ids,
                 device_ir.grid_block_ids,
                 atomics=backend.intra_loop_barriers_order_atomics,
+                carries=backend.intra_loop_barriers_carry_iterations,
+                reads=backend.intra_loop_barriers_order_reads,
             )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
@@ -4648,6 +4658,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 device_ir.tile_dependency_graph,
                 source_phase_starts,
             )
+            # Dropped hint edges were the kernel's only dependencies.
+            config_spec.cross_loop_pipeline_retired = (
+                bool(device_ir.tile_dependency_graph.unordered_hint_reads)
+                and not device_ir.implicit_dependency_starts
+            )
             if device_ir.implicit_dependency_starts and not (
                 env.backend.lower_dependency_phases_as_ordered_launches(func, device_ir)
             ):
@@ -4699,6 +4714,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         config_spec.cross_loop_tmem_prefetch.append(
                             CrossLoopTmemPrefetchSpec(block_ids)
                         )
+                if config_spec.supports_config_key("cross_loop_dry_passes"):
+                    config_spec.cross_loop_dry_passes.length = len(
+                        graph.dry_pass_candidate_roots
+                    )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(

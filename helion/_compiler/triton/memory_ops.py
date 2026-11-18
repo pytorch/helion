@@ -37,6 +37,7 @@ from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _has_active_codegen_block
 from ..indexing_strategy import _resolve_codegen_block_id
 from ..indexing_strategy import is_block_size_index
+from ..loop_dependency_checker import TMA_STORE_META
 from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
@@ -65,7 +66,21 @@ _EVICTION_POLICY_MAP = {
 
 @_decorators.codegen(store, "triton")
 def _(state: CodegenState) -> ast.AST:
+    # A load or a store of this tensor earlier in the same loop body or in an
+    # earlier iteration, or through device pointers, followed by this store
+    # is a cross-thread write-after-read or write-after-write on global
+    # memory; emit a barrier so every thread has read and stored before the
+    # overwrite (see mark_intra_loop_raw_barriers).
+    from ..loop_dependency_checker import emit_intra_loop_raw_barrier
+    from ..loop_dependency_checker import emit_intra_loop_store_drain
+
     tensor = state.proxy_arg(0)
+    emit_intra_loop_raw_barrier(
+        state, tensor if isinstance(tensor, torch.Tensor) else None
+    )
+    if state.fx_node is not None:
+        # Lowered, and not through TMA unless the TMA store says so.
+        state.fx_node.meta[TMA_STORE_META] = False
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     value = state.ast_arg(2)
@@ -97,8 +112,23 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
+        def drained_store(
+            state: CodegenState,
+            fake_tensor: torch.Tensor,
+            subscript: list[object],
+            value: ast.AST,
+            extra_mask: ast.AST | None,
+            cache_modifier: ast.AST | None,
+        ) -> ast.AST:
+            # A TMA store re-storing its own tile drains the one before.
+            result = strategy.codegen_store(
+                state, fake_tensor, subscript, value, extra_mask, cache_modifier
+            )
+            emit_intra_loop_store_drain(state)
+            return result
+
         codegen_store = tagged_store_codegen(
-            state, inband_store_codegen(state, strategy.codegen_store)
+            state, inband_store_codegen(state, drained_store)
         )
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
@@ -140,15 +170,16 @@ def _(state: CodegenState) -> ast.AST:
 
 @_decorators.codegen(load, "triton")
 def _(state: CodegenState) -> ast.AST | SharedValue:
-    # A store or an atomic to this tensor earlier in the same loop body followed
-    # by this load is a cross-thread read-after-write on global memory; emit a
-    # barrier so the write is visible before the read (see
-    # mark_intra_loop_raw_barriers).
+    # A store or an atomic that may reach this load, earlier in the same loop
+    # body or in an earlier iteration, or through device pointers, is a
+    # cross-thread read-after-write on global memory; emit a barrier so the
+    # write is visible before the read (see mark_intra_loop_raw_barriers).
     from ..loop_dependency_checker import emit_intra_loop_raw_barrier
 
-    emit_intra_loop_raw_barrier(state)
-
     tensor = state.proxy_arg(0)
+    emit_intra_loop_raw_barrier(
+        state, tensor if isinstance(tensor, torch.Tensor) else None
+    )
     subscript = state.proxy_arg(1)
     assert isinstance(subscript, (list, tuple))
     ast_subscript = state.ast_args[1]

@@ -4609,6 +4609,9 @@ class TileAccess:
     # writes; None is this rank's own copy.
     owner_rank: int | None = None
     dtype: torch.dtype | None = None
+    # A prefetch-only root's load (its values only steer prefetches): it waits
+    # for earlier writes, but no later write waits for it.
+    hint: bool = False
 
     def __post_init__(self) -> None:
         """Canonicalize layout values once at the dependency-analysis boundary."""
@@ -4736,6 +4739,9 @@ class TileDependencyGraph:
     tagged_candidate_ids: frozenset[int] = frozenset()
     # The candidates this config enables: their dependency is "tagged".
     tagged_allocation_ids: frozenset[int] = frozenset()
+    # (root, allocation id) of each hint load (``TileAccess.hint``) that a
+    # later write in its phase overlaps: without hints that write would wait.
+    unordered_hint_reads: frozenset[tuple[int, int]] = frozenset()
 
     def __post_init__(self) -> None:
         if tuple(site.site_id for site in self.execution_sites) != tuple(
@@ -4883,6 +4889,63 @@ class TileDependencyGraph:
         if allocation_id not in self.inband_allocation_ids:
             return None
         return _scatter_position(self.inband_store(allocation_id))
+
+    @property
+    def root_producers(self) -> dict[int, frozenset[int]]:
+        """The earlier roots each root waits on (roots without one omitted)."""
+        producers: dict[int, set[int]] = {}
+        for edge in self.edges:
+            if edge.producer_root < edge.consumer_root:
+                producers.setdefault(edge.consumer_root, set()).add(edge.producer_root)
+        return {root: frozenset(roots) for root, roots in producers.items()}
+
+    @property
+    def root_levels(self) -> dict[int, int]:
+        """Each root's depth in the root dependency DAG, a measure of how long
+        its dependency wait lasts: 0 without a producer root, else the deepest
+        producer's level plus one, or plus two over a dependency that crosses
+        ranks (another rank's publication is a hop of its own)."""
+        steps: dict[int, dict[int, int]] = {}
+        for edge in self.edges:
+            if edge.producer_root < edge.consumer_root:
+                crosses = any(
+                    self.transport(dependency) != "counter"
+                    for dependency in edge.access_dependencies
+                )
+                into = steps.setdefault(edge.consumer_root, {})
+                into[edge.producer_root] = max(
+                    into.get(edge.producer_root, 1), 2 if crosses else 1
+                )
+        levels: dict[int, int] = {}
+        for root in range(len(self.task_families)):
+            levels[root] = max(
+                (levels[p] + step for p, step in steps.get(root, {}).items()),
+                default=0,
+            )
+        return levels
+
+    @property
+    def dry_pass_candidate_roots(self) -> tuple[int, ...]:
+        """Roots that wait on an earlier root of the launch and follow a root
+        whose producers lie at least two levels deep (one
+        ``cross_loop_dry_passes`` entry each, in this order): a dry pass runs
+        in the wait of an earlier block whose producers lie two levels deeper
+        than what its workers ran before it, so no root of a shallower graph
+        can take one. Only workers that own their tasks read the entries (the
+        static pipeline, and the dynamic one on a Gluon ring, whose workers
+        claim tasks root by root; not the barrier pipeline nor packet
+        dispatch), and only for single-wave roots on static workers; codegen
+        checks the rest for a config (``static_dry_passes``)."""
+        producers = self.root_producers
+        levels = self.root_levels
+        deep = [
+            root
+            for root, roots in producers.items()
+            if max(levels[p] for p in roots) >= 2
+        ]
+        if not deep:
+            return ()
+        return tuple(root for root in sorted(producers) if root > min(deep))
 
     def crosses_ranks(self) -> bool:
         """Whether any dependency needs a cross-rank transport."""
@@ -6839,6 +6902,8 @@ def build_tile_dependency_graph(
     dependencies_by_edge: dict[tuple[int, int, int], set[AccessDependency]] = {}
     reaching_writes: dict[int, list[_ReachingAccess]] = {}
     reaching_reads: dict[int, list[_ReachingAccess]] = {}
+    hint_reads: dict[int, list[_ReachingAccess]] = {}
+    unordered_hint_reads: set[tuple[int, int]] = set()
 
     def record(
         producer: _ReachingAccess,
@@ -6865,7 +6930,7 @@ def build_tile_dependency_graph(
         phase = root_phases[consumer_root]
         if phase != current_phase:
             # A phase barrier orders this rank's roots, not other ranks'.
-            for reaching in (reaching_writes, reaching_reads):
+            for reaching in (reaching_writes, reaching_reads, hint_reads):
                 for allocation_id in reaching.keys() - symmetric_allocation_ids:
                     del reaching[allocation_id]
             current_phase = phase
@@ -6921,6 +6986,11 @@ def build_tile_dependency_graph(
                             consumer,
                             TileDependencyKind.WRITE_AFTER_READ,
                         )
+                unordered_hint_reads.update(
+                    (hint.root, allocation_id)
+                    for hint in hint_reads.get(allocation_id, ())
+                    if allocation_regions_may_overlap(hint.region, consumer.region)
+                )
 
         for allocation_id in reads.keys() | writes.keys():
             consumer_writes = writes.get(allocation_id, ())
@@ -6934,7 +7004,11 @@ def build_tile_dependency_graph(
                 reaching_reads[allocation_id] = _subtract_reaching_accesses(
                     reaching_reads.get(allocation_id, []), consumer_writes
                 )
-            consumer_reads = reads.get(allocation_id, ())
+            consumer_reads = [
+                c for c in reads.get(allocation_id, ()) if not c.access.hint
+            ]
+            if hints := [c for c in reads.get(allocation_id, ()) if c.access.hint]:
+                hint_reads.setdefault(allocation_id, []).extend(hints)
             if consumer_reads:
                 reaching_reads.setdefault(allocation_id, []).extend(
                     _ReachingAccess(consumer.root, consumer.access, residual)
@@ -7097,6 +7171,7 @@ def build_tile_dependency_graph(
             for allocation_id, failure in tagged_failures.items()
             if failure is None
         ),
+        unordered_hint_reads=frozenset(unordered_hint_reads),
     )
 
 

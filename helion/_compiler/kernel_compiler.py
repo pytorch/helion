@@ -12,6 +12,7 @@ import torch
 from .. import exc
 from .._compile_time import measure
 from . import ast_extension
+from .cross_loop_codegen import check_pdl_independent
 from .host_function import HostFunction
 from .host_function import KernelDefinition
 from .tensor_utils import patch_tensor_factories
@@ -179,6 +180,8 @@ class KernelCompiler:
             factory_padding,
         ):
             hf.device_ir = lower_to_device_ir(hf)
+        if self.env.pdl_independent:
+            check_pdl_independent()
 
     @contextlib.contextmanager
     def _compilation_context(self) -> typing.Generator[None, None, None]:

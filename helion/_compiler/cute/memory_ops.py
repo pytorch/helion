@@ -6895,12 +6895,14 @@ def _cute_value_reaches_beyond_matmul_epilogue(
 
 @_decorators.codegen(load, "cute")
 def _(state: CodegenState) -> object:
-    # A store to this tensor earlier in the same loop body followed by this
-    # load is a cross-thread read-after-write on global memory; emit a CTA
-    # barrier so the store is visible before the read.  Marked loads sit in
+    # A store that may reach this load, earlier in the same loop body or in an
+    # earlier iteration, or through device pointers, is a cross-thread
+    # read-after-write on global memory; emit a CTA barrier so the store is
+    # visible before the read.  Marked loads sit in
     # uniform control flow (mark_intra_loop_raw_barriers skips divergent
     # branches for cute; masks are ternary expressions and loop trip counts
     # are uniform), so the convergent barrier is legal here.
+    from ..loop_dependency_checker import INTRA_LOOP_RAW_BARRIER_FLUSHES_META
     from ..loop_dependency_checker import INTRA_LOOP_RAW_BARRIER_META
 
     if state.fx_node is not None and state.fx_node.meta.get(
@@ -6908,9 +6910,13 @@ def _(state: CodegenState) -> object:
     ):
         barrier = statement_from_string("cute.arch.sync_threads()")
         loaded = state.proxy_arg(0)
-        if isinstance(loaded, torch.Tensor):
+        flushed = state.fx_node.meta[INTRA_LOOP_RAW_BARRIER_FLUSHES_META]
+        if isinstance(loaded, torch.Tensor) and not any(
+            tensor is None for tensor in flushed
+        ):
             # The tensor whose stores it orders
-            # (``HELION_RAW_BARRIER_TENSORS_ATTR``).
+            # (``HELION_RAW_BARRIER_TENSORS_ATTR``); one that flushes a store
+            # through device pointers orders stores no tensor names.
             setattr(
                 barrier,
                 HELION_RAW_BARRIER_TENSORS_ATTR,
