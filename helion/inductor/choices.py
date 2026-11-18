@@ -12,6 +12,7 @@ from .scheduling import numerics_modes
 from .scheduling import python_wrapper
 
 if TYPE_CHECKING:
+    from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import IRNode
 
 
@@ -68,6 +69,22 @@ class HelionChoices(InductorChoices):
             # InductorChoices' default declines dims of size 1 too: Inductor's
             # native matmul does not take them yet. The sizes are static here.
             and min(int(n) for n in (*mat1.get_size()[-2:], mat2.get_size()[-1])) > 1
+        )
+
+    @staticmethod
+    def should_use_persistent_reduction(
+        features: SIMDKernelFeatures, cooperative_reduction: bool
+    ) -> bool:
+        """Whether a reduction kernel reads each row as one block, as
+        HelionKernel.should_use_persistent_reduction() asks: the hook for a rule
+        of Helion's own, e.g. one that leaves a long row to
+        Config.reduction_loops. For now Triton's rule (an inner reduction of up
+        to 1024 elements, another of up to 64). HelionChoices handles every
+        backend, so such a rule checks cuda_backend, as use_native_matmul()
+        does. The kernel keeps a row it cannot write as one block in a loop,
+        whatever this says (names_row_dim())."""
+        return InductorChoices.should_use_persistent_reduction(
+            features, cooperative_reduction
         )
 
     def uuid(self) -> None:
