@@ -409,7 +409,7 @@ def test_warp_rows_take_the_innermost_tile_axis() -> None:
             {1, 2},
             True,
             {
-                "cute_reduction_tile": (2, 1),
+                "cute_reduction_tile": (3, 2),
                 "cute_reduction_wide_chunk": (1, 0),
                 "cute_rolled_row_ladder": (1, 1),
                 "cute_rolled_cluster_ladder": (1, 1),

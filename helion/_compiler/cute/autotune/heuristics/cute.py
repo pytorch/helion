@@ -780,6 +780,12 @@ class CuteAsyncStateLoadHeuristic(AutotunerHeuristic):
         return Config.from_dict(values)
 
 
+def _loads_32_byte_packets(spec: ConfigSpec) -> bool:
+    """Whether the target loads a 32-byte packet in one instruction (sm_100
+    and later); an unknown target does not."""
+    return (spec.target_device_capability or (0, 0)) >= (10, 0)
+
+
 def _cute_static_block_extent(env: CompileEnvironment, block_id: int) -> int | None:
     size = env.block_sizes[block_id].size
     if not isinstance(size, (int, torch.SymInt)):
@@ -1174,6 +1180,43 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             return None
         return Config.from_dict(deepcopy(rolled.config) | {"reduction_loops": [None]})
 
+    @classmethod
+    def one_packet_rolled_row_seed_config(
+        cls, env: CompileEnvironment, rolled: Config
+    ) -> Config | None:
+        """The rolled row with one 32-byte packet per thread instead of two
+        16-byte ones.
+
+        ``rolled``, the two-packet rolled row
+        (``two_packet_rolled_row_seed_config``), keeps its threads, chunk and
+        register reloads; the vector width doubles where the target loads 32
+        bytes (sm_100).  That moves elements between threads: a thread of
+        the two-packet row loads two V-wide packets ``threads * V`` elements
+        apart, one in each half of the trip, and here it loads the ``2 * V``
+        adjacent elements of one packet, so the threads cover the trip in a
+        single run.  The search rarely takes that step itself:
+        the two-packet row ties or loses to the scalar narrow chunk, so its
+        path ends before the width is drawn.  A pooled LayerNorm over fp32
+        rows of 768 (96 threads, one trip) read 2.62 us in this form against
+        2.78 for the two-packet row and 2.72-2.75 for the scalar picks of
+        three cold searches (B200, kernel alone with a cold L2).
+        """
+        spec = env.config_spec
+        if not _loads_32_byte_packets(spec):
+            return None
+        block_id = cast("ReductionLoopSpec", spec.reduction_loops[0]).block_id
+        vec = cls.ROLLED_ROW_PACKETS_PER_THREAD * spec.cute_vector_widths.config_get(
+            cast("list[int]", rolled.config["cute_vector_widths"]), block_id, 1
+        )
+        return Config.from_dict(
+            deepcopy(rolled.config)
+            | {
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {block_id: vec}
+                )
+            }
+        )
+
     WARP_ROWS_PER_CTA = (2, 4)
     WARP_ROWS_MAX_EXTENT = 4096
 
@@ -1302,9 +1345,7 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
             return None
         seeds = [primary]
         for packet_bytes in (16, 32):
-            if packet_bytes == 32 and not (
-                (env.config_spec.target_device_capability or (0, 0)) >= (10, 0)
-            ):
+            if packet_bytes == 32 and not _loads_32_byte_packets(env.config_spec):
                 continue
             alternate = cls.multiwarp_vector_row_seed_config(
                 env, device_ir, packet_bytes=packet_bytes
@@ -1329,6 +1370,13 @@ class CuteReductionTileHeuristic(AutotunerHeuristic):
                 )
             if persistent not in seeds:
                 seeds.append(persistent)
+        one_packet = (
+            None
+            if rolled is None
+            else cls.one_packet_rolled_row_seed_config(env, rolled)
+        )
+        if one_packet is not None and one_packet not in seeds:
+            seeds.append(one_packet)
         for warp_rows in cls.warp_rows_seed_configs(env, device_ir):
             if warp_rows not in seeds:
                 seeds.append(warp_rows)
@@ -5350,7 +5398,11 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
     ``WHOLE_CHUNK_ROWS`` rows also gets a seed that covers it in one chunk,
     and a seed whose chunk is longer than the reduction runs it in one pass
     of a clamped chunk; a grid of too few CTAs gets a narrower tile with up
-    to 1024 threads per CTA (``_narrow_tile_shape``).
+    to 1024 threads per CTA (``_narrow_tile_shape``).  A 16-bit input whose
+    rows start on L2 lines also gets line-per-warp twins: a warp along the
+    tile at the packet that makes it read one line of a row
+    (``_line_warp_shapes``).  The input is the matched load's
+    (``strided_reduction``): the first one, where a kernel reduces several.
 
     Disjoint from ``CuteColumnReductionHeuristic`` (a serial device-loop
     reduction, no reduction loops) and from ``CuteRegisterTileHeuristic``:
@@ -5456,6 +5508,97 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
             reduction_threads * cls.NARROW_UNROLL,
             cls.NARROW_UNROLL,
         )
+
+    @staticmethod
+    def _strides_multiple_of(
+        env: CompileEnvironment, source: torch.Tensor, elements: int
+    ) -> bool:
+        """Whether every dimension of ``source`` steps by one element or by
+        a whole number of ``elements``."""
+        return all(
+            source.stride(dim) == 1
+            or env.specialized_multiple(source.stride(dim), elements)
+            for dim in range(source.ndim)
+        )
+
+    @classmethod
+    def _line_warp_shapes(
+        cls,
+        env: CompileEnvironment,
+        source: torch.Tensor,
+        vec: int,
+        rows: tuple[int, int, int],
+        one_chunk: tuple[int, int, int] | None,
+        whole: int,
+    ) -> list[tuple[int, int, int, int, int]]:
+        """Twins of the 16-byte shapes with one L2 line of a row per warp.
+
+        The packet is the line's share of a warp's thread
+        (``STREAM_LINE_BYTES / WARP_THREADS``: 4 bytes, two elements of a
+        16-bit input) and the tile is that warp, so the block width scales
+        with the packet (64 columns) and every warp instruction reads exactly
+        one line of one row.  The rows keep the geometry of the 16-byte shapes
+        with 16 reduction threads: ``rows`` (the measured 16-thread
+        shape's reduction threads, chunk and unroll) and ``one_chunk`` (the
+        one-chunk seed's, when the reduction has it), so the lane trips follow
+        from the reduction's length as theirs do.  TorchInductor lays out its
+        looped reduction of such an input the same way (two elements a thread,
+        a warp a row's line).  ``(tile threads, reduction threads, rows per
+        chunk, lane unroll, vector width)``, none when
+
+        - the line's share is no narrower than ``vec`` or under two elements
+          (fp32: one element, which nothing sinks); or
+        - the rows of ``source`` start inside a line (a stride that is not a
+          whole number of lines): a warp's 128 bytes then straddle two lines,
+          each shared with the neighboring CTA's warp, which is not the
+          layout above.  A rule from that geometry, not a measured loss: no
+          such input was timed with a twin.
+
+        Both read ``source`` alone, the input of the first load the reduction
+        matches (``strided_reduction``), as the seeds' packet width does
+        (``_plan``).  So the order of a kernel's loads counts: one that
+        streams a second input whose rows start inside a line keeps its
+        twins, without a hint on that input (below), and gets none when that
+        input's load comes first.
+
+        A reduction too short for a twin's rows gets none: ``whole``, the
+        power of two the chunk is clamped to, holds fewer rows than the
+        twin's reduction threads times its unroll (under 33 rows for the
+        16-thread shape), so what would run is not the twin's shape but a
+        narrower packet of a clamped seed already listed.  The caller drops
+        a twin wider than the tile's block sizes reach.  The eviction hints
+        are the policy helper's at the twin's own block width: a streamed
+        input whose one-line rows do not own their line
+        (``_rows_own_their_lines``) or that is loaded twice gets none, and
+        the twin is seeded without it.
+
+        Measured on B200 with a cold L2 on bf16 [128, 196, 768] token sums
+        (two streamed inputs): 15.2-15.7 us with 16 reduction threads at
+        every chunk from 16 to 256 rows, against 16.4 us for the 16-byte
+        configs three cold searches ended on and 15.9-16.2 us for Inductor's
+        kernel; 18.5 to 19.4 us with 8 reduction threads, 18.3 without the
+        evict-first policy.  A search that starts from the 16-byte seeds
+        rarely gets there: from its 16.9 us incumbent of 8 reduction threads,
+        one such search read 23.9 us with the packet alone narrowed to 8
+        bytes and 37.0 us at 4, since the block width (and there the
+        reduction threads) have to change with it.  A twin seeded without a
+        hint can win too: a cold search of the per-chunk Welford partials of
+        a bf16 BatchNorm input, which load their input twice, ended in this
+        layout (3.04 us in its final selection against 3.46 us for the
+        16-byte pick of a search without the twin).
+        """
+        itemsize = source.dtype.itemsize
+        line_vec = cls.STREAM_LINE_BYTES // (WARP_THREADS * itemsize)
+        line_elements = cls.STREAM_LINE_BYTES // itemsize
+        if not (
+            2 <= line_vec < vec and cls._strides_multiple_of(env, source, line_elements)
+        ):
+            return []
+        return [
+            (WARP_THREADS, reduction_threads, chunk, unroll, line_vec)
+            for reduction_threads, chunk, unroll in filter(None, (rows, one_chunk))
+            if min(chunk, whole) >= reduction_threads * unroll
+        ]
 
     @classmethod
     def _match(
@@ -5570,11 +5713,7 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         vec = full
         while vec >= 2 and not (
             env.specialized_multiple(env.block_sizes[tile_block_id].numel, vec)
-            and all(
-                source.stride(dim) == 1
-                or env.specialized_multiple(source.stride(dim), vec)
-                for dim in range(source.ndim)
-            )
+            and cls._strides_multiple_of(env, source, vec)
         ):
             vec //= 2
         if vec < 2:
@@ -5621,7 +5760,10 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         # [128, 324, 1536] (channels-last BatchNorm-ReLU pool and spatial
         # mean), where 8 reduction threads with an 8-deep unroll keep the
         # most 16-byte loads in flight per thread.
-        measured = [(16, 8, 128, 8), (32, 8, 64, 8), (16, 16, 128, 4)]
+        # The last one's rows (16 reduction threads, 128-row chunks, a
+        # 4-deep unroll) are also the line-per-warp twins'.
+        sixteen_thread_rows = (16, 128, 4)
+        measured = [(16, 8, 128, 8), (32, 8, 64, 8), (16, *sixteen_thread_rows)]
         # The 128-row-chunk shape the one-chunk seed extends.
         base_index = 0
         if widen > 1:
@@ -5663,18 +5805,22 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
         # token sums: 25.4 us with 16 reduction threads, 26.4 with 8, against
         # 30.9 us for the first seed's 128-row chunks, on B200 with a cold
         # L2).  The unroll sets the thread count: 16 rows a thread.
-        if base[2] < whole <= cls.WHOLE_CHUNK_ROWS:
-            shapes.append(
-                (
-                    base[0],
-                    whole // cls.WHOLE_CHUNK_UNROLL,
-                    whole,
-                    cls.WHOLE_CHUNK_UNROLL,
-                )
-            )
+        one_chunk = (
+            (whole // cls.WHOLE_CHUNK_UNROLL, whole, cls.WHOLE_CHUNK_UNROLL)
+            if base[2] < whole <= cls.WHOLE_CHUNK_ROWS
+            else None
+        )
+        if one_chunk is not None:
+            shapes.append((base[0], *one_chunk))
+        packet_shapes = [
+            *((*shape, vec) for shape in shapes),
+            *cls._line_warp_shapes(
+                env, source, vec, sixteen_thread_rows, one_chunk, whole
+            ),
+        ]
         hint_streams = spec.supports_config_key("load_eviction_policies")
-        for tile_threads, reduction_threads, chunk, unroll in shapes:
-            columns = tile_threads * vec
+        for tile_threads, reduction_threads, chunk, unroll, packet in packet_shapes:
+            columns = tile_threads * packet
             # A chunk that reaches the reduction's length (a measured shape's
             # over at most 128 rows, the narrow seed's over up to 1024) is
             # clamped to the reduction's power of two: the seed runs the
@@ -5711,7 +5857,7 @@ class CuteStridedReductionHeuristic(AutotunerHeuristic):
                     },
                 ),
                 "cute_vector_widths": _seq_config_list(
-                    spec.cute_vector_widths, {tile_block_id: vec}
+                    spec.cute_vector_widths, {tile_block_id: packet}
                 ),
                 "reduction_loops": [chunk],
                 "cute_vloop_sink": True,
