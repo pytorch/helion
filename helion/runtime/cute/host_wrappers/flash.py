@@ -49,6 +49,43 @@ def flex_rank4_layout(
     )
 
 
+def flex_walk_q_coords(
+    ctx: HostWrapperContext, coords: Sequence[tuple[str, int]]
+) -> list[str]:
+    """Lines spanning the flex backward's Q-side TMA coordinate tensors
+    (``(name, mode of the Q sequence)`` pairs) over the rows its walk visits
+    (the plan's ``flex_walk_q_rows``; none when the walk stays inside the
+    sequence).
+
+    The walk visits every 128-row tile of every listed BlockMask block, so
+    past a ragged or short sequence (and a 256-row block's padded tile) its
+    tile and dQ-box indices reach beyond the sequence's own tile count. CuTe
+    divides a mode no longer than the tile into one tile of stride 0, so on a
+    Q sequence of at most 128 rows (32 for the dQ drain's boxes) those indices
+    wrapped to the first tile: the padded Q tile reloaded rows 0-127 and
+    added their dK / dV terms again, and the dQ boxes past a 32-row sequence
+    reduce-added into its rows. The coordinates are only coordinates (the
+    descriptors keep the real extents), so the spanned ones past the
+    sequence zero-fill on load and clip on store.
+
+    The mode's stride is set to the sequence's coordinate basis ``E(1)``
+    rather than kept: every one of these maps puts the contiguous head dim
+    at coordinate 0 and the sequence at coordinate 1, and a one-row
+    sequence's size-1 mode came with stride 0 too."""
+    rows = ctx.plan_optional_int("flex_walk_q_rows")
+    if rows is None:
+        return []
+    lines = []
+    for name, mode in coords:
+        shape = f"(*{name}.shape[:{mode}], {rows}, *{name}.shape[{mode + 1}:])"
+        stride = f"(*{name}.stride[:{mode}], cute.E(1), *{name}.stride[{mode + 1}:])"
+        lines.append(
+            f"{name} = cute.make_tensor({name}.iterator, "
+            f"cute.make_layout({shape}, stride={stride}))"
+        )
+    return lines
+
+
 def emit_small_biased_attention(
     ctx: HostWrapperContext, plan: dict[str, object]
 ) -> None:
@@ -895,6 +932,18 @@ def _emit_flash_bwd_flex_two_cta(
         "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
         "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (128, 64))",
     ]
+    # Q-side maps from make_tiled_tma_atom: head dim at E(0), sequence at
+    # E(1), the basis flex_walk_q_coords gives the spanned mode.
+    fbwd_lines += flex_walk_q_coords(
+        ctx,
+        (
+            ("_fbwd_mQt", 0),
+            ("_fbwd_mdOtN", 0),
+            ("_fbwd_mdOtT", 1),
+            ("_fbwd_mQtT", 1),
+            ("_fbwd_mDQt", 0),
+        ),
+    )
     ctx.body.extend(f"    {line}" for line in fbwd_lines)
     ctx.call_args.extend(
         [
@@ -1153,6 +1202,20 @@ def _emit_flash_bwd_flex_pair(ctx: HostWrapperContext, plan: dict[str, object]) 
         "_fbwd_tma_dv, _fbwd_mdVt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdV, cute.select(_fbwd_epil, mode=[0, 1]), (64, 64))",
         "_fbwd_tma_dk, _fbwd_mdKt = cute.nvgpu.cpasync.make_tiled_tma_atom(cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(), _fbwd_mdK, cute.select(_fbwd_epil, mode=[0, 1]), (64, 64))",
     ]
+    # Q-side maps from make_tiled_tma_atom: head dim at E(0), sequence at
+    # E(1), the basis flex_walk_q_coords gives the spanned mode.
+    fbwd_lines += flex_walk_q_coords(
+        ctx,
+        (
+            ("_fbwd_mQt", 0),
+            ("_fbwd_mdOtN", 0),
+            ("_fbwd_mdOtT", 1),
+            ("_fbwd_mQtT", 1),
+            ("_fbwd_mQa", 0),
+            ("_fbwd_mdOa", 0),
+            ("_fbwd_mDQt", 0),
+        ),
+    )
     ctx.body.extend(f"    {line}" for line in fbwd_lines)
     from ...._compiler.cute.cute_flash_bwd_flex_pair import (
         _FLASH_BWD_FLEX_PAIR_KERNEL_PARAMS,
@@ -1321,6 +1384,11 @@ def _emit_flash_bwd(ctx: HostWrapperContext, plan: dict[str, object]) -> None:
             fbwd_lines.append(
                 f"_fbwd_dskts_mma_x = {bw}.make_trivial_tiled_mma({dtype}, {dtype}, {majk}, {majmn}, cutlass.Float32, {cg1}, (128, {hd}), cute.nvgpu.tcgen05.OperandSource.TMEM)"
             )
+    # Q-side maps from make_tiled_tma_atom: head dim at E(0), sequence at
+    # E(1), the basis flex_walk_q_coords gives the spanned mode.
+    fbwd_lines += flex_walk_q_coords(
+        ctx, (("_fbwd_mQt", 0), ("_fbwd_mdOt", 0), ("_fbwd_mDQt", 0))
+    )
     aug_stages = ctx.plan_optional_int("flex_aug_stages") or 0
     if aug_stages:
         # The flex walk's statistics slices: one (128 x 16) B-operand

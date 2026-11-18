@@ -1007,6 +1007,22 @@ def test_head_dim_192_persistent_tile_boundary_order() -> None:
     assert "storage.sV.get_tensor(_fbwd_epil" not in code
 
 
+def test_block_mask_for_a_longer_q_sequence_declines() -> None:
+    """A BlockMask built for 256 Q rows over a 128-row sequence lists a Q
+    block past M: the walk sizes its step table (and its Q coordinate maps)
+    from M, so that block's steps would overrun it. The backward declines
+    such tables (PyTorch's flex_attention rejects the mask too); the mask
+    built for the sequence still matches."""
+    t = _tensors(q_seq=128, kv_seq=256)
+    longer = create_block_mask(
+        _causal, None, None, 256, 256, device=str(_CPU), BLOCK_SIZE=128
+    )
+    reasons: list[str] = []
+    assert _match(_bind(_args(t, None, block_mask=longer)), reasons) is None
+    assert any("lists more Q blocks than M has" in r for r in reasons), reasons
+    assert _match(_bind(_args(t, _causal))) is not None
+
+
 def test_q_block_256_pads_the_step_table() -> None:
     # Ragged M with 256-row Q blocks: the last block's second 128-row tile
     # lies past M; the table and the hook bounds cover it.
@@ -1017,6 +1033,36 @@ def test_q_block_256_pads_the_step_table() -> None:
     assert plan.walk.q_block == 256
     assert plan.num_q_tiles == 3 and plan.num_q_tiles_padded == 4
     assert plan.max_steps == plan.group * 4
+
+
+def test_walk_past_the_q_sequence_spans_the_coordinate_tensors() -> None:
+    """A walk whose Q tiles reach past the sequence (here a 128-row sequence
+    under 256-row blocks) records the rows it spans, and the launcher spans
+    the Q / dO / dQ TMA coordinate tensors over them (a single-tile mode
+    divides into stride 0, wrapping the padded tile onto the first), the
+    sequence mode's stride set to its coordinate basis (a one-row
+    sequence's came as 0 too); a walk inside the sequence keeps the plain
+    maps."""
+    t = _tensors(q_seq=128, kv_seq=256)
+    wrapper = _wrapper_plan(_render(_bind(_args(t, _causal, block_size=(256, 128)))))
+    assert wrapper["flex_walk_q_rows"] == 256
+    host = _host_lines(wrapper)
+    one_row = _host_lines(
+        _wrapper_plan(_render(_bind(_args(_tensors(q_seq=1), _causal))))
+    )
+    for name in ("_fbwd_mQt", "_fbwd_mdOt", "_fbwd_mDQt"):
+        stride = f"stride=(*{name}.stride[:0], cute.E(1), *{name}.stride[1:])"
+        assert (
+            f"{name} = cute.make_tensor({name}.iterator, cute.make_layout("
+            f"(*{name}.shape[:0], 256, *{name}.shape[1:]), {stride}))"
+        ) in host
+        assert (
+            f"{name} = cute.make_tensor({name}.iterator, cute.make_layout("
+            f"(*{name}.shape[:0], 128, *{name}.shape[1:]), {stride}))"
+        ) in one_row
+    aligned = _wrapper_plan(_render(_bind(_args(_tensors(), _causal))))
+    assert "flex_walk_q_rows" not in aligned
+    assert "_fbwd_mQt = cute.make_tensor(" not in _host_lines(aligned)
 
 
 # -- the step table: one table per walk, or chunks of it ---------------------
@@ -1675,10 +1721,9 @@ def test_two_cta_table_chunks_the_walk() -> None:
         r"for fbwd_wb in cutlass\.range\(0, 51, 512, unroll=1\):",
         code,
     )
-    # The bitmaps hold the 512 Q blocks plus a sentinel for the blocks a
-    # BlockMask built for a longer Q lists past the sequence (17 words each,
-    # 51 in all); every index into them is clamped to the sentinel, so such
-    # entries never reach the mbarrier words after the bitmaps.
+    # The bitmaps hold the 512 Q blocks plus a sentinel (17 words each, 51 in
+    # all); every index into them is clamped to the sentinel, a guard behind
+    # the matcher's decline of tables wider than the sequence's Q blocks.
     assert "storage.sBits.get_tensor(cute.make_layout(51))" in code
     assert (
         "fbwd_x = cutlass.min(cutlass.Int32(_fbwd_full_idx[fbwd_tb, fbwd_th, fbwd_pt0, fbwd_j]), cutlass.Int32(512))"

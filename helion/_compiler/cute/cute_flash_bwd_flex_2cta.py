@@ -209,13 +209,11 @@ def _q_blocks(plan: FlexBwdPlan) -> int:
 
 def _bits_words(plan: FlexBwdPlan) -> int:
     """Words of one membership bitmap: one bit per Q block of a head plus a
-    sentinel bit for the blocks past the sequence. A BlockMask built for a
-    longer Q than the kernel's (legal in FlexAttention) lists blocks beyond
-    ``_q_blocks``; every bitmap index is clamped to the sentinel
-    (``_bit_index``), so such entries never touch the mbarrier words that
-    follow the bitmaps in the shared storage. They still walk as steps: the
-    TMA loads of their Q / dO zero-fill and their dQ store is clipped, as in
-    the 1-CTA kernel."""
+    sentinel bit. ``match_flex_attention_bwd`` declines index tables listing
+    more Q blocks than the sequence has (a BlockMask built for a longer Q),
+    so no index passes ``_q_blocks``; the clamp to the sentinel
+    (``_bit_index``) is a guard that keeps any such index off the mbarrier
+    words that follow the bitmaps in the shared storage."""
     return (_q_blocks(plan) + 1 + 31) // 32
 
 
@@ -1210,8 +1208,8 @@ def _walk_stride(plan: FlexBwdPlan, args: dict[str, TensorArg]) -> int:
     """Entries of one CTA's region of the walk scratch: both tiles' lists of
     every q head of the group end to end (the step table's bound of the
     merged walk, ``2 * max_steps``), over the wider of the kernel's Q blocks
-    and the index tables' (a BlockMask built for a longer Q lists blocks past
-    the sequence; they walk as steps that touch no valid row)."""
+    and the index tables' (equal, as ``match_flex_attention_bwd`` declines
+    wider tables; the ``max`` is a guard)."""
     walk = plan.walk
     width = max(
         _q_blocks(plan),
