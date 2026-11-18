@@ -1108,6 +1108,25 @@ class ConfigSpec:
         # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
         # any (``tail_peel_blocks``).
         self.cute_tail_peel_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: the blocks of the device loops that store
+        # along their tile into the last dimension of a packet-dtype tensor
+        # of two or more dimensions, none in a kernel with a matmul;
+        # ``cute_store_packet_tiers`` is tunable when there are any
+        # (``store_tier_blocks``).
+        self.cute_store_tier_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: for each of those blocks, the most vector
+        # lanes with which its loops still store packets under the layout of
+        # the tensors they store (16: any width; 0: none).  Config
+        # normalization reads ``cute_store_packet_tiers`` off where no packet
+        # is stored; the search space does not depend on it
+        # (``store_packet_lane_limits``).
+        self.cute_store_tier_packet_lanes: dict[int, int] = {}
+        # Set by DeviceIR analysis: for each of those blocks, a number of
+        # elements every packet its loops store starts a multiple of from
+        # its tensor's base (1: not known).  Vector lanes that divide it
+        # need no alignment guard, so ``cute_store_packet_tiers`` reads off
+        # there too (``aligned_row_multiples``).
+        self.cute_store_tier_row_multiples: dict[int, int] = {}
         # Set by DeviceIR analysis: the blocks of the device loops whose
         # reductions over their own tile are all fp32 or fp64 sums added to
         # a value the loop carries, none in a kernel with a matmul;

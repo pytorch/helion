@@ -741,16 +741,18 @@ def _peel_vector_tails(s: _DeviceBodyState) -> None:
 def _vectorize_affine_tile_lanes(s: _DeviceBodyState) -> None:
     from ..affine_vector_io import vectorize_affine_tile_lanes
 
+    store_tiers = bool(s.ctx.config.get("cute_store_packet_tiers", False))
     if s.bounded_cache_request is not None:
         s.kernel_body = vectorize_affine_tile_lanes(
             s.kernel_body,
             s.fn,
             s.ctx.constexpr_values,
             private_fragments=s.private_fragments,
+            store_tiers=store_tiers,
         )
     else:
         s.kernel_body = vectorize_affine_tile_lanes(
-            s.kernel_body, s.fn, s.ctx.constexpr_values
+            s.kernel_body, s.fn, s.ctx.constexpr_values, store_tiers=store_tiers
         )
 
 
@@ -1431,6 +1433,10 @@ def _lower_philox_packets(s: _DeviceBodyState) -> None:
 
     fn = s.fn
     constexpr_values = s.ctx.constexpr_values
+    # A packet's stores are packed by this call of the affine vectorizer
+    # (the ``vectorize_affine_tile_lanes`` pass declines a lane loop with a
+    # random call), so it takes ``cute_store_packet_tiers`` as that pass does.
+    store_tiers = bool(s.ctx.config.get("cute_store_packet_tiers", False))
     s.kernel_body = lower_philox_packets(
         s.kernel_body,
         seed_exprs=fn.cute_state.explicit_rng_seed_exprs,
@@ -1442,6 +1448,7 @@ def _lower_philox_packets(s: _DeviceBodyState) -> None:
             constexpr_values,
             register_accesses=frozenset({ast.dump(read, include_attributes=False)}),
             integer_names=known,
+            store_tiers=store_tiers,
         ),
     )
 

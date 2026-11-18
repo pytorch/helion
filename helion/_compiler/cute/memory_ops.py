@@ -451,12 +451,20 @@ def tensor_proven_base_alignment(
     env: CompileEnvironment,
     tensor: torch.Tensor,
     candidates: tuple[int, ...] = (16, 8, 4),
+    *,
+    input_aligned: Callable[
+        [CompileEnvironment, torch.Tensor, int], bool
+    ] = tensor_has_specialized_base_alignment,
 ) -> int | None:
     """The widest of ``candidates`` (bytes, widest first) that ``tensor``'s
     data pointer is proven aligned to, or None: the residue of its offset
     into storage no input owns (a fresh allocation, 16-byte aligned), or of
     its offset from an input viewing the same storage whose base alignment
-    the cache key backs (``tensor_has_specialized_base_alignment``)."""
+    the cache key backs (``tensor_has_specialized_base_alignment``).
+
+    ``input_aligned`` reads an input's base instead, for a caller ahead of
+    the binding, which has not recorded the residues yet
+    (``flat_gather_lane.base_aligned_for_seed``, as the seeds read it)."""
     inputs = list(env.input_sources)
     storage = id(tensor.untyped_storage())
     owned = any(id(source.untyped_storage()) == storage for source in inputs)
@@ -466,7 +474,7 @@ def tensor_proven_base_alignment(
             return alignment
         if any(
             id(source.untyped_storage()) == storage
-            and tensor_has_specialized_base_alignment(env, source, alignment)
+            and input_aligned(env, source, alignment)
             and statically_known_true(
                 (offset - source.storage_offset() * source.element_size()) % alignment
                 == 0

@@ -347,6 +347,7 @@
  "test/test_cute_staged_store_cuda.py": 47.8,
  "test/test_cute_standalone.py": 7.1,
  "test/test_cute_static_indexing_gpu.py": 4.7,
+ "test/test_cute_store_packet_tiers_cuda.py": 8.7,
  "test/test_cute_streaming_loads.py": 0.9,
  "test/test_cute_surplus_thread_reductions.py": 1.8,
  "test/test_cute_tail_peel_cuda.py": 14.0,

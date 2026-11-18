@@ -270,6 +270,31 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         if config_spec.matmul_facts
         else tail_peel_blocks(device_ir, config_spec)
     )
+    # A device loop that stores along its tile into the last dimension of a
+    # packet-dtype tensor of two or more dimensions: narrower store packets
+    # where a row's alignment fails at run time are tunable
+    # (``cute_store_packet_tiers``).  The packets the stored tensors' layout
+    # leaves, and the lanes it aligns every row to, are recorded beside the
+    # blocks, for the config normalization.
+    from .store_packet_layout import aligned_row_multiples
+    from .store_packet_layout import store_packet_lane_limits
+    from .store_tier_blocks import store_tier_blocks
+
+    config_spec.cute_store_tier_blocks = (
+        frozenset()
+        if config_spec.matmul_facts
+        else store_tier_blocks(device_ir, config_spec)
+    )
+    config_spec.cute_store_tier_packet_lanes = (
+        {}
+        if config_spec.matmul_facts
+        else store_packet_lane_limits(device_ir, config_spec)
+    )
+    config_spec.cute_store_tier_row_multiples = (
+        {}
+        if config_spec.matmul_facts
+        else aligned_row_multiples(device_ir, config_spec)
+    )
     # A device loop whose reductions over its own tile are all sums added to
     # a value it carries: combining the sums' threads once after the loop is
     # tunable (``cute_defer_tile_reduce``), not in a kernel with a matmul.

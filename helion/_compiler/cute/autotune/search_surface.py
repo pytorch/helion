@@ -2117,10 +2117,12 @@ def _normalize_cute_lane_knobs(
     nothing takes them: ``cute_unpadded_rows`` applies to a persistent row it
     runs unpadded, ``cute_lane_unroll`` to the lane loops of a sunk vector
     nest or, without sinking, to the lane loops the config forms
-    (``cute/unroll_lane_loads.py``) and ``cute_bool_byte_packets`` to a bool
+    (``cute/unroll_lane_loads.py``), ``cute_bool_byte_packets`` to a bool
     row a looped reduction, or a persistent vector row without a
     ``reduction_loops`` slot, loads at a byte packet's width
-    (``_rolls_a_byte_packet_row``); each is off when the config has none.
+    (``_rolls_a_byte_packet_row``) and ``cute_store_packet_tiers`` to a
+    device loop that stores along its tile in lanes wide enough to split
+    (``_stores_a_splittable_packet``); each is off when the config has none.
     A threaded ``cute_reduction_sequence`` (``reload``, ``resident``) runs
     ``scalar`` where no tile of the config can hold its lanes
     (``_cute_sequence_tile_holds_warp_lanes``).  On a row under a device
@@ -2160,6 +2162,10 @@ def _normalize_cute_lane_knobs(
         config_spec, config
     ):
         config["cute_reduction_sequence"] = "scalar"
+    if config.get(
+        "cute_store_packet_tiers"
+    ) is True and not _stores_a_splittable_packet(config_spec, config):
+        config["cute_store_packet_tiers"] = False
 
 
 def _normalize_cute_carry_row_tile_vector(
@@ -2225,6 +2231,71 @@ def _cute_sequence_tile_holds_warp_lanes(
     )
 
 
+# The narrowest packet ``affine_vector_io`` stores holds two elements
+# (``_Vectorizer._tiers``), so lanes of fewer than four have no tier below
+# their own packet.
+_CUTE_STORE_TIER_MIN_LANES = 4
+
+
+def _cute_tile_vector_lanes(
+    config_spec: ConfigSpec, config: Mapping[str, object], block_id: int
+) -> int:
+    """The elements per vector lane the tile axis ``block_id`` runs with
+    under the normalized ``config``: its ``cute_vector_widths`` entry where
+    the axis has a per-thread lane loop (``_cute_tile_lane_loop``) whose
+    elements per thread the width divides, the condition the tile strategy
+    builds a V-loop on; otherwise 1, the scalar lanes it falls back to."""
+    lanes = _cute_tile_lane_loop(config_spec, config, block_id)
+    width = config_spec.cute_vector_widths.config_get(
+        _as_sequence(config.get("cute_vector_widths")), block_id, 1
+    )
+    if lanes and isinstance(width, int) and lanes % width == 0:
+        return width
+    return 1
+
+
+def _splittable_store_tier_blocks(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> list[int]:
+    """The blocks of the device loops that store along their tile
+    (``cute_store_tier_blocks``) to which ``config`` gives vector lanes of
+    at least ``_CUTE_STORE_TIER_MIN_LANES`` elements that their stores take
+    as packets under a guard: where ``cute_store_packet_tiers`` has a
+    narrower packet to fall back to.
+
+    The lanes are the ones the config forms (``_cute_tile_vector_lanes``),
+    not the requested ``cute_vector_widths`` entry: a tile without a lane
+    loop, or with a width that does not divide each thread's elements, runs
+    scalar lanes and stores no packet.  The stored tensors' layout bounds
+    them (``cute_store_tier_packet_lanes``): an output view whose last
+    dimension is not unit-stride, or whose base is off the packet's
+    boundary, stores scalars at every width, with or without the knob.
+    And lanes that every row is aligned to
+    (``cute_store_tier_row_multiples``: a row stride that is a multiple of
+    them) store their whole packet unguarded: ``affine_vector_io`` emits
+    no guard to hang a tier on."""
+    limits = config_spec.cute_store_tier_packet_lanes
+    multiples = config_spec.cute_store_tier_row_multiples
+    blocks = []
+    for block_id in sorted(config_spec.cute_store_tier_blocks):
+        lanes = _cute_tile_vector_lanes(config_spec, config, block_id)
+        if (
+            _CUTE_STORE_TIER_MIN_LANES <= lanes <= limits.get(block_id, 0)
+            and multiples.get(block_id, 1) % lanes != 0
+        ):
+            blocks.append(block_id)
+    return blocks
+
+
+def _stores_a_splittable_packet(
+    config_spec: ConfigSpec, config: Mapping[str, object]
+) -> bool:
+    """Whether ``config`` gives some device loop lanes whose store packets
+    ``cute_store_packet_tiers`` can split
+    (``_splittable_store_tier_blocks``); the knob reads off otherwise."""
+    return bool(_splittable_store_tier_blocks(config_spec, config))
+
+
 def _rolls_a_byte_packet_row(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> bool:
@@ -2248,23 +2319,36 @@ def _rolls_a_byte_packet_row(
     )
 
 
+def _cute_tile_lane_loop(
+    config_spec: ConfigSpec, config: Mapping[str, object], block_id: int
+) -> int:
+    """The lanes per thread of the per-thread lane loop the tile axis
+    ``block_id`` gets under the normalized ``config``, 0 where it gets none:
+    an explicit thread count below its static block size that divides it
+    (the condition ``PerThreadNDTileStrategy`` allocates a lane variable on)
+    walks ``block size / threads`` lanes per thread."""
+    nt = config_spec.num_threads.config_get(
+        cast("list[int]", config.get("num_threads", []) or []), block_id, 0
+    )
+    bs = config_spec.block_sizes.config_get(
+        cast("list[int]", config.get("block_sizes", []) or []), block_id, 1
+    )
+    if isinstance(nt, int) and isinstance(bs, int) and 0 < nt < bs and bs % nt == 0:
+        return bs // nt
+    return 0
+
+
 def _cute_tile_lane_loops(
     config_spec: ConfigSpec, config: Mapping[str, object]
 ) -> list[int]:
     """The lanes of each per-thread lane loop the tile axes of the normalized
-    ``config`` get: a tile axis (of the grid or of a device loop) with an
-    explicit thread count below its static block size that divides it (the
-    condition ``PerThreadNDTileStrategy`` allocates a lane variable on)
-    walks ``block size / threads`` lanes per thread."""
-    nt_list = cast("list[int]", config.get("num_threads", []) or [])
-    bs_list = cast("list[int]", config.get("block_sizes", []) or [])
-    lanes: list[int] = []
-    for block_id in config_spec.num_threads.valid_block_ids():
-        nt = config_spec.num_threads.config_get(nt_list, block_id, 0)
-        bs = config_spec.block_sizes.config_get(bs_list, block_id, 1)
-        if isinstance(nt, int) and isinstance(bs, int) and 0 < nt < bs and bs % nt == 0:
-            lanes.append(bs // nt)
-    return lanes
+    ``config`` get (``_cute_tile_lane_loop``), of the grid or of a device
+    loop."""
+    return [
+        lanes
+        for block_id in config_spec.num_threads.valid_block_ids()
+        if (lanes := _cute_tile_lane_loop(config_spec, config, block_id))
+    ]
 
 
 def _cute_config_forms_lane_loop(
@@ -3137,6 +3221,19 @@ def normalize_knobs(
         requirement=(
             "an fp32 torch.maximum or torch.minimum of two tensors, in a "
             "pointwise kernel (no reduction, matmul or atomic)"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
+        "cute_store_packet_tiers",
+        enabled=bool(config_spec.cute_store_tier_blocks),
+        requirement=(
+            "a one-axis hl.tile loop inside the kernel's outer hl.tile loop "
+            "that stores along its tile into the last dimension of a "
+            "float16, bfloat16, float32, int32 or uint32 tensor of two or "
+            "more dimensions, in a kernel without a matmul"
         ),
         fix_invalid=fix_invalid,
         fill=False,
@@ -4508,6 +4605,18 @@ def cute_flat_fields(
             # compares and a select; the same values but for the sign of a
             # zero where zeros of both signs meet.
             fields["cute_fmnmx_extrema"] = BooleanFragment()
+        if config_spec.cute_store_tier_blocks:
+            # A lane loop's stores in narrower packets where a row fails the
+            # full packet's alignment guard, instead of the scalar loop;
+            # bitwise identical.  A config whose lanes are too narrow to
+            # split, whose stored tensors take no packet of them or whose
+            # rows are all aligned to them reads the knob off
+            # (``_normalize_cute_lane_knobs``); where the lowering proves
+            # every store's alignment some other way the code is unchanged
+            # (``affine_vector_io``).  Its coverage group
+            # (``register_store_packet_tiers_coverage``) keeps it off in the
+            # random initial population and on in witnesses it changes.
+            fields["cute_store_packet_tiers"] = BooleanFragment()
         if config_spec.cute_carried_tile_sum_blocks:
             # A carried tile sum's threads combined once after the device
             # loop instead of once per tile; changes the summation order
