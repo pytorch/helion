@@ -257,7 +257,10 @@ if triton_is_available():
             or hasattr(triton.language, "_experimental_make_tensor_descriptor")
         ):
             return False
-        if torch.xpu.is_available():
+        # The Intel XPU fork's launcher accepts host TensorDescriptor kernel
+        # arguments, decomposing them into base pointer, shape and strides
+        # (it has no TMA hardware to encode a TensorMap for), from v3.5.0 on.
+        if torch.xpu.is_available() and get_triton_version() < version.parse("3.5"):
             return False
         try:
             module = importlib.import_module("triton.tools.tensor_descriptor")

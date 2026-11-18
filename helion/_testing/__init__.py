@@ -927,9 +927,11 @@ def skipUnlessHostTensorDescriptor(reason: str) -> Callable[[Callable], Callable
     """Skip test unless Triton's host tensor descriptor API is supported."""
     return skipIfFn(
         lambda: (
-            not is_cuda()
+            not (is_cuda() or is_xpu())
             or not supports_host_tensor_descriptor()
-            or (target_device_capability() or (0, 0)) < (9, 0)
+            # XPU decomposes host descriptors in its launcher; the TMA
+            # hardware that needs Hopper only exists on CUDA.
+            or (is_cuda() and (target_device_capability() or (0, 0)) < (9, 0))
         ),
         reason,
     )
