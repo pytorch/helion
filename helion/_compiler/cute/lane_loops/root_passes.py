@@ -234,6 +234,14 @@ def sink_root_vector_loops(codegen: GenerateAST) -> None:
             ),
             stores=cute_state.lanes.vloop_sink_stores,
             wide_packet_hints=codegen.device_function.config.cute_wide_packet_hints,
+            # The static block sizes: the chunk-base proofs read their
+            # factors.
+            constexpr_values={
+                name: value
+                for name in codegen.device_function._constexpr_args
+                if (value := codegen.device_function.resolved_int_constexpr(name))
+                is not None
+            },
         )
         cute_state.lanes.vloop_sink_unrolled = unrolled
     if not fired and cute_state.lanes.vloop_sink_shaped_code:

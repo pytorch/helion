@@ -3884,6 +3884,8 @@ def _(state: CodegenState) -> ast.AST:
         from .device_state import CuteVloopStoreFact
 
         pointer, wrapper, _whole_chunks = flat_gather
+        # As for the load below: the knob respelled the address.
+        state.device_function.cute_state.lanes.vloop_sink_shaped_code = True
         store_expr = f"({pointer}).store({{value}})"
         state.device_function.cute_state.lanes.vloop_sink_stores[pointer] = (
             CuteVloopStoreFact(
@@ -7358,6 +7360,11 @@ def _(state: CodegenState) -> object:
             from .device_state import CuteVloopLoadFact
 
             pointer, wrapper, whole_chunks = flat_gather
+            # The knob respelled the address: should the sink widen nothing
+            # after all, the kernel is regenerated with it off
+            # (``VloopSinkNotApplied``), so the knob alone never changes the
+            # code and a config that sinks nothing is its knob-off twin.
+            state.device_function.cute_state.lanes.vloop_sink_shaped_code = True
             load_expr = _cute_scalar_load_through_pointer(
                 pointer, tensor.dtype, eviction_suffix
             )

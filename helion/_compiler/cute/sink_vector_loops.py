@@ -63,6 +63,15 @@ lane order inside its segment's V-loop.  A chunk straddling a jagged tile's
 extent loads under the extent mask evaluated at the chunk base when the load
 fact proves every aligned chunk inside the tensor, keeping the per-lane
 selects.
+
+A V-loop the pass declined is tried once more on a copy the lane-invariance
+proof has rewritten (``lane_invariant_division.uniform_load_predicates``):
+its lane quotients divide the chunk base, in whatever statement they stand,
+and the masks of its recorded loads compare the chunk base, each where that
+is proved the same value for every lane.  A mask that is one value per
+vector only by that proof then sinks like any other: a gather under a window
+mask, ``(i // d) % s + k`` in range, and as well a plain tile load under
+``(i // d) % 2 == 0``, with ``d`` a multiple of V.
 """
 
 from __future__ import annotations
@@ -99,6 +108,7 @@ from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_CARRIER
 from .emitters.lane_packets import _CUTE_VECTOR_UNROLL_DTYPES
 from .emitters.lane_packets import _cute_unroll_vec_elem_type
 from .emitters.lane_packets import _cute_unroll_vec_load_expr
+from .lane_invariant_division import uniform_load_predicates
 from .packet_access import match_packet_access
 from .packet_access import render_masked_packet_load
 from .persistent_branch_vec import _LOAD_MARKER
@@ -765,14 +775,13 @@ class _Sinker:
         return ast.unparse(definition.value) == expected
 
     def _sinkable_load(self, node: ast.AST) -> CuteVloopLoadFact | None:
-        """The load fact when ``node`` is a scalar load this pass may widen."""
-        if not isinstance(node, ast.Call):
+        """The load fact when ``node`` is a scalar load this pass may widen:
+        one recorded for this V-loop's lane that reads its index."""
+        recorded = _recorded_load(node, self.loads)
+        if recorded is None:
             return None
-        pointer = _scalar_load_pointer(node)
-        if pointer is None:
-            return None
-        fact = self.loads.get(ast.unparse(pointer))
-        if fact is None or fact.vec_lane_var != self.vec_var:
+        pointer, fact = recorded
+        if fact.vec_lane_var != self.vec_var:
             return None
         if self.fact.index_var not in _names_read(pointer):
             return None
@@ -2214,6 +2223,21 @@ def _scalar_load_pointer(call: ast.Call) -> ast.expr | None:
     return None
 
 
+def _recorded_load(
+    node: ast.AST, loads: Mapping[str, CuteVloopLoadFact]
+) -> tuple[ast.expr, CuteVloopLoadFact] | None:
+    """``(pointer, fact)`` when ``node`` is a scalar load with a fact
+    recorded for the sink.  The facts are keyed by the pointer's source as
+    the sinker reads it, with the loop-carried aliases merged."""
+    if not isinstance(node, ast.Call):
+        return None
+    pointer = _scalar_load_pointer(node)
+    if pointer is None:
+        return None
+    fact = loads.get(ast.unparse(pointer))
+    return None if fact is None else (pointer, fact)
+
+
 def _pointer_root(node: ast.expr) -> str | None:
     """Tensor name of a ``T.iterator + ...`` pointer sum."""
     while isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
@@ -2433,9 +2457,20 @@ def sink_grid_vector_loops(
     proven_disjoint_tensor_pairs: Collection[frozenset[str]] = (),
     stores: Mapping[str, CuteVloopStoreFact] | None = None,
     wide_packet_hints: bool = False,
+    constexpr_values: Mapping[str, int] | None = None,
 ) -> tuple[list[ast.AST], bool, bool]:
     """Sink every recorded grid V-loop that encloses a vectorizable serial
     reduction nest; bodies outside the proven forms are left untouched.
+
+    A V-loop the pass declines is tried once more on its copy from
+    ``uniform_load_predicates`` (over ``constexpr_values``, the static values
+    of the body's constexpr names), when that proof changed a statement of
+    it: a lane quotient that divides the chunk base, wherever it stands, or
+    the predicate of a recorded load that compares the chunk base.  Any
+    declined V-loop qualifies, whichever loads it holds: a gather under a
+    window mask and a tile load under a mask over ``index // d`` (``d`` a
+    multiple of the width) then load as predicated packets.  A V-loop that
+    sinks as it is keeps its code.
 
     ``tensor_dtypes`` maps every kernel tensor argument to its dtype: a
     subscript of one of these names is a memory read.
@@ -2480,7 +2515,13 @@ def sink_grid_vector_loops(
         )
     )
 
-    def visit(stmts: list[ast.AST]) -> list[ast.AST]:
+    # The V-loops (by ``id``) the first walk declined.  They stay in the body
+    # as they were, so the second walk finds them by identity.
+    declined: set[int] = set()
+
+    def visit(
+        stmts: list[ast.AST], uniform: Mapping[int, ast.For] | None
+    ) -> list[ast.AST]:
         nonlocal fired, unrolled
         result: list[ast.AST] = []
         for stmt in stmts:
@@ -2492,37 +2533,89 @@ def sink_grid_vector_loops(
                 and constexpr[1] == fact.vec_width
                 and isinstance(stmt, ast.For)
             ):
-                sinker = _Sinker(
-                    stmt,
-                    fact,
-                    loads,
-                    rename_groups,
-                    new_var,
-                    lane_unroll,
-                    tensor_dtypes,
-                    proven_disjoint_tensor_pairs,
-                    stores,
-                    wide_packets,
-                    trace_lists,
-                )
-                try:
-                    replacement = sinker.run()
-                except _Unsupported:
-                    replacement = None
-                if replacement is not None:
-                    _reuse_sibling_packets(replacement, cacheable, new_var)
-                    result.extend(replacement)
-                    fired = True
-                    unrolled = unrolled or sinker.lane_loops_unrolled > 0
-                    continue
+                # The second walk tries the V-loops the first declined, on
+                # the copies the lane-invariance proof rewrote.
+                vloop = stmt if uniform is None else uniform.get(id(stmt))
+                if vloop is not None:
+                    sinker = _Sinker(
+                        vloop,
+                        fact,
+                        loads,
+                        rename_groups,
+                        new_var,
+                        lane_unroll,
+                        tensor_dtypes,
+                        proven_disjoint_tensor_pairs,
+                        stores,
+                        wide_packets,
+                        trace_lists,
+                    )
+                    try:
+                        replacement = sinker.run()
+                    except _Unsupported:
+                        replacement = None
+                    if replacement is not None:
+                        _reuse_sibling_packets(replacement, cacheable, new_var)
+                        result.extend(replacement)
+                        fired = True
+                        unrolled = unrolled or sinker.lane_loops_unrolled > 0
+                        continue
+                    declined.add(id(stmt))
             for field in ("body", "orelse"):
                 inner = getattr(stmt, field, None)
                 if isinstance(inner, list) and inner:
-                    setattr(stmt, field, visit(inner))
+                    setattr(stmt, field, visit(inner, uniform))
             result.append(stmt)
         return result
 
-    return visit(body), fired, unrolled
+    result = visit(body, None)
+    if declined and loads:
+        # Only the loops the first walk declined: a loop it sank left its
+        # per-lane loops behind, and those keep the code it gave them.
+        uniform = {
+            loop: copy
+            for loop, copy in uniform_load_predicates(
+                cast("list[ast.stmt]", result),
+                constexpr_values=constexpr_values or {},
+                rename_groups=rename_groups,
+                load_predicate=partial(
+                    _guards_recorded_load, loads=loads, rename_groups=rename_groups
+                ),
+            ).items()
+            if loop in declined
+        }
+        if uniform:
+            result = visit(result, uniform)
+    return result, fired, unrolled
+
+
+# The names a literal fill reads: the constructors of ``cutlass.Float32(0)``
+# and ``float('-inf')``.
+_FILL_CONSTRUCTORS = frozenset({"cutlass", "float"})
+
+
+def _guards_recorded_load(
+    select: ast.IfExp,
+    *,
+    loads: Mapping[str, CuteVloopLoadFact],
+    rename_groups: dict[str, str],
+) -> bool:
+    """Whether ``select`` is the predicate of a load recorded for the sink
+    and of nothing else: ``load if predicate else fill``, its body that load
+    itself and its fill a literal (``cutlass.BFloat16(0)``), so the select
+    guards no arithmetic.
+
+    The lookup is ``_Sinker._sinkable_load``'s (``_recorded_load``), without
+    its two tests of one V-loop (the fact's lane, the pointer's index): this
+    predicate runs for every V-loop of the body at once and only says where
+    the proof may compare a chunk base, an exact rewrite that moves no
+    arithmetic under any recorded load; which loads a V-loop widens stays
+    the sinker's decision on the retry."""
+    if _names_read(select.orelse) - _FILL_CONSTRUCTORS:
+        return False
+    renamed = _clone(select.body)
+    ast_rename(renamed, rename_groups)
+    return _recorded_load(renamed, loads) is not None
 
 
 class VloopSinkNotApplied(exc.Base):
