@@ -27,6 +27,8 @@ from .math_templates import nan_extremum_expr
 from .state import cute_codegen_state
 
 if TYPE_CHECKING:
+    from torch.fx import Node
+
     from ..device_ir import DeviceIR
     from ..inductor_lowering import GenerateASTFromInductor
 
@@ -227,17 +229,22 @@ def _nan_extremum(
     )
 
 
+def is_fp32_extremum(node: Node) -> bool:
+    """Whether ``node`` is a traced fp32 ``torch.maximum`` / ``minimum``."""
+    return (
+        node.op == "call_function"
+        and node.target in _TRACED_EXTREMA
+        and isinstance(value := node.meta.get("val"), torch.Tensor)
+        and value.dtype is torch.float32
+    )
+
+
 def has_fp32_extrema(device_ir: DeviceIR) -> bool:
     """Whether the kernel traces an fp32 ``torch.maximum`` / ``minimum``:
     what offers ``cute_fmnmx_extrema`` to the autotuner.  Structure only, no
     extents."""
     return any(
-        node.op == "call_function"
-        and node.target in _TRACED_EXTREMA
-        and isinstance(value := node.meta.get("val"), torch.Tensor)
-        and value.dtype is torch.float32
-        for info in device_ir.graphs
-        for node in info.graph.nodes
+        is_fp32_extremum(node) for info in device_ir.graphs for node in info.graph.nodes
     )
 
 

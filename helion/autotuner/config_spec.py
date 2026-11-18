@@ -1127,6 +1127,23 @@ class ConfigSpec:
         # need no alignment guard, so ``cute_store_packet_tiers`` reads off
         # there too (``aligned_row_multiples``).
         self.cute_store_tier_row_multiples: dict[int, int] = {}
+        # Set by DeviceIR analysis: the names (``MemoryOpFact.tensor_name``)
+        # of the stored tensors whose base is on no 16-byte boundary, none in
+        # a kernel with a matmul.  Config normalization reads
+        # ``cute_store_policy`` as the default where every packet the policy
+        # applies to would go to one of them (``unaligned_store_tensors``).
+        self.cute_unaligned_store_tensors: frozenset[str] = frozenset()
+        # Set by DeviceIR analysis: ``(MemoryOpFact.tensor_name, subscript
+        # position)`` of the store subscripts that are slices, none in a
+        # kernel with a matmul.  The same normalization reads a slice's
+        # lanes off the blocks that are not tiles (``sliced_store_dims``).
+        self.cute_sliced_store_dims: frozenset[tuple[str, int]] = frozenset()
+        # Set by DeviceIR analysis: whether a store has a ``None`` subscript,
+        # never in a kernel with a matmul.  The positions of that store's
+        # ``MemoryOpFact`` are then off its tensor's dims, and the same
+        # normalization leaves ``cute_store_policy`` alone
+        # (``new_axis_stores``).
+        self.cute_new_axis_stores = False
         # Set by DeviceIR analysis: the blocks of the device loops whose
         # reductions over their own tile are all fp32 or fp64 sums added to
         # a value the loop carries, none in a kernel with a matmul;

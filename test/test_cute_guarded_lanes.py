@@ -16,6 +16,7 @@ import torch
 
 import helion
 from helion import exc
+from helion._compiler.cute.autotune.search_surface import extremum_packet_loads
 from helion._compiler.cute.emitters import lane_packets
 from helion._compiler.cute.guarded_lanes import guard_lanes
 from helion._testing import skipUnlessBackends
@@ -24,6 +25,7 @@ from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.guarded_lane_kernels import flags_reread_after_a_store
 from helion._testing.guarded_lane_kernels import padded_and_transposed
 from helion._testing.guarded_lane_kernels import padded_sum
+from helion._testing.guarded_lane_kernels import pooled_max
 from helion._testing.guarded_lane_kernels import sorted_kept_rows
 from helion._testing.guarded_lane_kernels import window_max
 from helion._testing.unfold_kernels import sliding_windows
@@ -1189,6 +1191,102 @@ def _plane_window_max(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _row_and_every_other_max(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # y: [P, H, W], read by rows; x: [P, H, 2 * W], read at every other
+    # column: one load takes the row's tile, the other gathers along it.
+    planes, height, width = y.shape
+    out = torch.empty_like(y)
+    for tile_p, tile_h, tile_w in hl.tile([planes, height, width]):
+        plane = tile_p.index[:, None, None]
+        row = tile_h.index[None, :, None]
+        col = (tile_w.index * 2)[None, None, :]
+        out[tile_p, tile_h, tile_w] = torch.maximum(
+            y[tile_p, tile_h, tile_w], x[plane, row, col]
+        )
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _pooled_mean_leaky(x: torch.Tensor) -> torch.Tensor:
+    # 3x3 average pooling, stride 2, of a [H, W, C] activation and a leaky
+    # ReLU written as a maximum: a lane adds its nine packets up, and the
+    # extremum's operands are computed values.
+    height, width, channels = x.shape
+    out_h = (height - 3) // 2 + 1
+    out_w = (width - 3) // 2 + 1
+    out = torch.empty([out_h, out_w, channels], dtype=x.dtype, device=x.device)
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        row = (tile_h.index * 2)[:, None]
+        col = (tile_w.index * 2)[None, :]
+        total = x[row, col, tile_c].to(torch.float32)
+        for offset in hl.static_range(1, 9):
+            tap = x[row + offset // 3, col + offset % 3, tile_c]
+            total = total + tap.to(torch.float32)
+        mean = total * (1.0 / 9.0)
+        out[tile_h, tile_w, tile_c] = torch.maximum(mean, mean * 0.1).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _two_row_maxima(x: torch.Tensor) -> torch.Tensor:
+    # The sum of the maxima of two neighbouring 1x5 windows of a [H, W, C]
+    # activation: ten packet loads per lane, five to each extremum.
+    height, width, channels = x.shape
+    out_w = (width - 10) // 2 + 1
+    out = torch.empty([height, out_w, channels], dtype=x.dtype, device=x.device)
+    for tile_h, tile_w, tile_c in hl.tile([height, out_w, channels]):
+        row = tile_h.index[:, None]
+        col = (tile_w.index * 2)[None, :]
+        left = x[row, col, tile_c].to(torch.float32)
+        right = x[row, col + 5, tile_c].to(torch.float32)
+        for offset in hl.static_range(1, 5):
+            left = torch.maximum(left, x[row, col + offset, tile_c].to(torch.float32))
+            right = torch.maximum(
+                right, x[row, col + 5 + offset, tile_c].to(torch.float32)
+            )
+        out[tile_h, tile_w, tile_c] = (left + right).to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _row_maxima_floored(x: torch.Tensor, floor: torch.Tensor) -> torch.Tensor:
+    # The maxima of the 1x7 windows of a [H, W, C] activation and of a floor
+    # per output pixel: eight loads to one extremum, seven of them packets
+    # (the floor is one value for all of a pixel's channels).
+    height, width, channels = x.shape
+    out_w = (width - 7) // 2 + 1
+    out = torch.empty([height, out_w, channels], dtype=x.dtype, device=x.device)
+    for tile_h, tile_w, tile_c in hl.tile([height, out_w, channels]):
+        row = tile_h.index[:, None]
+        col = (tile_w.index * 2)[None, :]
+        best = x[row, col, tile_c].to(torch.float32)
+        for offset in hl.static_range(1, 7):
+            best = torch.maximum(best, x[row, col + offset, tile_c].to(torch.float32))
+        low = floor[tile_h.index[:, None, None], tile_w.index[None, :, None]]
+        best = torch.maximum(best, low.to(torch.float32))
+        out[tile_h, tile_w, tile_c] = best.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _tap_floor(x: torch.Tensor, floor: torch.Tensor) -> torch.Tensor:
+    # One strided tap of a [H, W, C] activation against a per-channel floor:
+    # two packet loads per lane, the floor's through a broadcast view.
+    height, width, channels = x.shape
+    out = torch.empty(
+        [height // 2, width // 2, channels], dtype=x.dtype, device=x.device
+    )
+    for tile_h, tile_w, tile_c in hl.tile([height // 2, width // 2, channels]):
+        row = (tile_h.index * 2)[:, None]
+        col = (tile_w.index * 2)[None, :]
+        value = x[row, col, tile_c].to(torch.float32)
+        out[tile_h, tile_w, tile_c] = torch.maximum(
+            value, floor[tile_c].to(torch.float32)[None, None, :]
+        ).to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _transposed_kept_rows(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
     # The loads take packets along the columns of x, which the store lays
@@ -1209,18 +1307,39 @@ def _packet_tile_seeds(spec: object) -> list[dict[str, object]]:
     ]
 
 
+def _folded_packets(bound: object) -> int:
+    """The packets one fp32 extremum of ``bound`` folds along its last tile."""
+    return extremum_packet_loads(
+        bound.host_function.device_ir,  # type: ignore[attr-defined]
+        bound.config_spec.block_sizes[-1].block_id,  # type: ignore[attr-defined]
+    )
+
+
+def _folded_packets_and_minimums(
+    kernel: object, args: tuple[object, ...]
+) -> tuple[int, list[object]]:
+    """``_folded_packets`` of ``kernel`` bound to ``args``, and the
+    ``cute_min_blocks_per_mp`` each of its packet tile seeds names."""
+    bound = cpu_bind(kernel, args)
+    return _folded_packets(bound), [
+        seed.get("cute_min_blocks_per_mp")
+        for seed in _packet_tile_seeds(bound.config_spec)
+    ]
+
+
 def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
     """A window over a channels-last activation: 64 channels are eight
     16-byte packets, so a CTA of 128 threads takes 4 x 4 pixels of them (a
     warp holds four pixels' whole rows), in storage order; the sibling takes
-    16 pixels of one image row."""
+    16 pixels of one image row.  The window's four packets are too few for
+    a twin with a CTAs-per-SM minimum (the test below)."""
     kernel = helion.kernel(
         window_max.fn, backend="cute", static_shapes=True, autotune_effort="full"
     )
     with mock_cuda_unavailable():
-        spec = cpu_bind(
-            kernel, (torch.zeros([146, 146, 64], dtype=torch.bfloat16),)
-        ).config_spec
+        bound = cpu_bind(kernel, (torch.zeros([146, 146, 64], dtype=torch.bfloat16),))
+        spec = bound.config_spec
+        assert _folded_packets(bound) == 4
         seeds = _packet_tile_seeds(spec)
         assert [
             (seed["block_sizes"], seed["num_threads"], "load_eviction_policies" in seed)
@@ -1234,6 +1353,7 @@ def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
             assert seed["loop_orders"] == [[2, 1, 0]]
             assert seed["cute_vector_widths"] == [1, 1, 8]
             assert seed["cute_fmnmx_extrema"] is True
+            assert "cute_min_blocks_per_mp" not in seed
             # The seed is a config of the search space as it stands.
             normalized = dict(seed)
             spec.normalize(normalized)
@@ -1255,6 +1375,81 @@ def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
         ).config_spec
         assert "cute_guarded_lanes" in spec._flat_fields()
         assert _packet_tile_seeds(spec) == []
+        # One gathering load is enough: the lane it shares with a load of
+        # the row's own tile reads that row element by element too.
+        spec = cpu_bind(
+            _row_and_every_other_max,
+            (
+                torch.zeros([8, 16, 128], dtype=torch.bfloat16),
+                torch.zeros([8, 16, 64], dtype=torch.bfloat16),
+            ),
+        ).config_spec
+        assert "cute_guarded_lanes" in spec._flat_fields()
+        assert _packet_tile_seeds(spec) == []
+
+
+def test_packet_tile_seeds_name_a_cta_minimum_where_an_extremum_folds_eight_packets() -> (
+    None
+):
+    """Where one fp32 extremum folds eight or more of a lane's packets (the
+    nine taps of a 3x3 max pooling) the first packet tile is seeded once
+    more with ``cute_min_blocks_per_mp``: last, after the seeds a kernel has
+    without it, and the option changes the launch alone, not the kernel's
+    text.  Seven packets get no twin (``_packet_tile_seeds`` says where the
+    count comes from), and neither do packets that reach the extremum
+    through other arithmetic or a view, ten packets that two extrema fold
+    five apiece, nor seven packets folded with a load that is not one."""
+    kernel = helion.kernel(
+        pooled_max.fn, backend="cute", static_shapes=True, autotune_effort="full"
+    )
+    x = torch.zeros([35, 39, 64], dtype=torch.bfloat16)
+    with mock_cuda_unavailable():
+        bound = cpu_bind(kernel, (x, 3, 3))
+        spec = bound.config_spec
+        assert _folded_packets(bound) == 9
+        seeds = _packet_tile_seeds(spec)
+        assert [
+            (seed["block_sizes"], seed.get("cute_min_blocks_per_mp")) for seed in seeds
+        ] == [
+            ([4, 4, 64], None),
+            ([4, 4, 64], None),
+            ([1, 16, 64], None),
+            ([4, 4, 64], 1),
+        ]
+        twin = dict(seeds[-1])
+        del twin["cute_min_blocks_per_mp"]
+        assert twin == seeds[0]
+        # A value of the option's search choices: the search moves both ways.
+        assert spec._flat_fields()["cute_min_blocks_per_mp"].choices[:2] == (0, 1)
+        with_minimum = bound.to_code(helion.Config.from_dict(seeds[-1]))
+        attribute = "_helion_pooled_max._helion_cute_min_blocks_per_mp = 1"
+        assert with_minimum.count(attribute) == 1
+        assert bound.to_code(helion.Config.from_dict(seeds[0])).splitlines() == [
+            line for line in with_minimum.splitlines() if line != attribute
+        ]
+
+        # Eight packets (a 2x4 window) get the twin, seven (1x7) do not.
+        assert _folded_packets_and_minimums(kernel, (x, 2, 4)) == (
+            8,
+            [None, None, None, 1],
+        )
+        assert _folded_packets_and_minimums(kernel, (x, 1, 7)) == (7, [None] * 3)
+        # Nine packets a lane adds up before its one extremum.
+        assert _folded_packets_and_minimums(_pooled_mean_leaky, (x,)) == (
+            0,
+            [None] * 3,
+        )
+        # Ten packets, five to each of two extrema.
+        assert _folded_packets_and_minimums(_two_row_maxima, (x,)) == (5, [None] * 3)
+        # Eight loads to one extremum, one of them not a packet.
+        pixel_floor = torch.zeros([35, 17], dtype=torch.bfloat16)
+        assert _folded_packets_and_minimums(_row_maxima_floored, (x, pixel_floor)) == (
+            7,
+            [None] * 3,
+        )
+        # Two packets, one of them behind a broadcast view.
+        floor = torch.zeros([64], dtype=torch.bfloat16)
+        assert _folded_packets_and_minimums(_tap_floor, (x, floor)) == (1, [None] * 3)
 
 
 def _witness_carriers(spec: object, key: str) -> list[tuple[object, object]]:

@@ -86,6 +86,7 @@ from ..emitters.lane_packets import _CUTE_BYTE_PACKET_WIDTHS
 from ..fragment_mma_dot import FRAGMENT_MMA_K_THREADS
 from ..fragment_mma_dot import FRAGMENT_MMA_KEY
 from ..fragment_mma_dot import FRAGMENT_MMA_ROW_THREADS
+from ..packet_store_policy import store_policy_reaches_a_packet
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
@@ -201,12 +202,16 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    from torch.fx import Node
+
     from ....autotuner.block_id_sequence import BlockIdSequence
     from ....autotuner.config_generation import ConfigGeneration
     from ....autotuner.config_spec import BlockSizeSpec
     from ....autotuner.config_spec import ConfigSpec
     from ....autotuner.config_spec import MatmulFact
+    from ....autotuner.config_spec import MemoryOpFact
     from ....runtime.config import Config
+    from ...device_ir import DeviceIR
     from ..loop_nesting import TileLoopPath
 
 
@@ -1435,6 +1440,28 @@ def fmnmx_extrema_offered(config_spec: ConfigSpec) -> bool:
     return config_spec.cute_fmnmx_extrema_sites and bool(config_spec.pointwise_facts)
 
 
+def _reads_packets(access: MemoryOpFact, packet_block: int) -> bool | None:
+    """How a load reads ``packet_block``'s axis: True for the block's tile
+    itself at the load's stride-1 position (the threads of a vector lane
+    there load packets), False for a load that does not index the axis, and
+    None for one that gathers along it (a window over the contiguous dim, a
+    scaled coordinate), which reads scalars, one per lane."""
+    direct = False
+    for block, affine, stride, scale in zip(
+        access.subscript_block_ids,
+        access.subscript_affine_block_ids,
+        access.subscript_strides,
+        access.subscript_index_scales,
+        strict=False,
+    ):
+        if packet_block not in (block, affine):
+            continue
+        if block != packet_block or stride != 1 or scale != 1:
+            return None
+        direct = True
+    return direct
+
+
 def loads_take_packets(config_spec: ConfigSpec, packet_block: int) -> bool:
     """Whether the loads along ``packet_block`` read its tile itself at their
     stride-1 position, so the threads of a vector lane there load packets: a
@@ -1444,19 +1471,48 @@ def loads_take_packets(config_spec: ConfigSpec, packet_block: int) -> bool:
     for access in config_spec.memory_op_facts:
         if access.kind != "load":
             continue
-        for block, affine, stride, scale in zip(
-            access.subscript_block_ids,
-            access.subscript_affine_block_ids,
-            access.subscript_strides,
-            access.subscript_index_scales,
-            strict=False,
-        ):
-            if packet_block not in (block, affine):
-                continue
-            if block != packet_block or stride != 1 or scale != 1:
-                return False
-            direct = True
+        reads = _reads_packets(access, packet_block)
+        if reads is None:
+            return False
+        direct = direct or reads
     return direct
+
+
+def extremum_packet_loads(device_ir: DeviceIR, packet_block: int) -> int:
+    """The most packet loads along ``packet_block`` (``loads_take_packets``)
+    that one fp32 extremum fold joins: a tree of ``torch.maximum`` /
+    ``minimum`` whose leaves are the loads themselves, through dtype casts at
+    most (the nine taps of a 3x3 max pooling: 9).  A load whose value
+    reaches an extremum through other arithmetic is not one of its packets:
+    the taps an average pooling adds up before a leaky ReLU count 0.
+    Structure only, no extents."""
+    from ....language.memory_ops import load as language_load
+    from ...device_ir import MEMORY_OP_FACT_META
+    from ..handler_ops import is_fp32_extremum
+
+    cast_target = torch.ops.prims.convert_element_type.default
+    most = 0
+    for info in device_ir.graphs:
+        # Per node, the packet loads it is an extremum fold (or a cast) of.
+        folded: dict[Node, frozenset[Node]] = {}
+        for node in info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target is language_load:
+                if any(
+                    _reads_packets(fact, packet_block)
+                    for fact in node.meta.get(MEMORY_OP_FACT_META, ())
+                ):
+                    folded[node] = frozenset((node,))
+            elif node.target is cast_target:
+                if (source := node.args[0]) in folded:
+                    folded[node] = folded[source]
+            elif is_fp32_extremum(node):
+                folded[node] = frozenset().union(
+                    *(folded.get(operand, ()) for operand in node.all_input_nodes)
+                )
+                most = max(most, len(folded[node]))
+    return most
 
 
 def packet_tile_storage_order(
@@ -2120,9 +2176,14 @@ def _normalize_cute_lane_knobs(
     (``cute/unroll_lane_loads.py``), ``cute_bool_byte_packets`` to a bool
     row a looped reduction, or a persistent vector row without a
     ``reduction_loops`` slot, loads at a byte packet's width
-    (``_rolls_a_byte_packet_row``) and ``cute_store_packet_tiers`` to a
+    (``_rolls_a_byte_packet_row``), ``cute_store_packet_tiers`` to a
     device loop that stores along its tile in lanes wide enough to split
-    (``_stores_a_splittable_packet``); each is off when the config has none.
+    (``_stores_a_splittable_packet``) and ``cute_store_policy`` to the stores
+    with 16 bytes of vector lanes or more
+    (``packet_store_policy.store_policy_reaches_a_packet``); each is off, or
+    the default policy, when the config has none.  A search then no longer
+    carries a policy through the configs it changes nothing in, to meet it
+    on the first packet store a mutation forms.
     A threaded ``cute_reduction_sequence`` (``reload``, ``resident``) runs
     ``scalar`` where no tile of the config can hold its lanes
     (``_cute_sequence_tile_holds_warp_lanes``).  On a row under a device
@@ -2166,6 +2227,12 @@ def _normalize_cute_lane_knobs(
         "cute_store_packet_tiers"
     ) is True and not _stores_a_splittable_packet(config_spec, config):
         config["cute_store_packet_tiers"] = False
+    if config.get(
+        "cute_store_policy", "default"
+    ) != "default" and not store_policy_reaches_a_packet(
+        config_spec, _as_sequence(config.get("cute_vector_widths"))
+    ):
+        config["cute_store_policy"] = "default"
 
 
 def _normalize_cute_carry_row_tile_vector(
