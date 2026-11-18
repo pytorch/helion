@@ -270,25 +270,6 @@ def _staged_operands(
     return tuple(operands.items())
 
 
-def _staged_strided_copies(plans: Sequence[dict[str, object]]) -> frozenset[int]:
-    """Staged operands copied with their strides (``empty_strided`` + ``copy_``)
-    rather than cloned: the MXFP8 TMA scale factors and TMA output."""
-    indices: set[int] = set()
-    for plan in plans:
-        if plan.get("kind") != "block_scaled_mma" or plan.get("format") != "mxfp8":
-            continue
-        if plan.get("sf_tma") is True:
-            for key in ("lhs_scale_idx", "rhs_scale_idx"):
-                index = plan.get(key)
-                if isinstance(index, int):
-                    indices.add(index)
-        if plan.get("tma_output") is True:
-            index = plan.get("out_idx")
-            if isinstance(index, int):
-                indices.add(index)
-    return frozenset(indices)
-
-
 def _singleton(
     plans: Sequence[dict[str, object]], kind: str, message: str
 ) -> dict[str, object] | None:
@@ -314,7 +295,6 @@ class CuteLaunchDescriptor:
     alias_plan: dict[str, object] | None
     plans_bake_tensor_shapes: bool
     staged_operands: tuple[tuple[int, bool], ...]
-    staged_strided_copies: frozenset[int]
     fastpath_excluded: bool
 
     @staticmethod
@@ -365,7 +345,6 @@ class CuteLaunchDescriptor:
                 and any(not wrapper_plan_bakes_tensor_shapes(plan) for plan in plans)
             ),
             staged_operands=_staged_operands(plans),
-            staged_strided_copies=_staged_strided_copies(plans),
             fastpath_excluded=any(
                 plan.get("kind") in FASTPATH_EXCLUDED_KINDS for plan in plans
             ),
