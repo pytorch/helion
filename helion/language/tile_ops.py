@@ -64,7 +64,9 @@ def _(tile: torch.SymInt) -> torch.Tensor:
     _disable_flatten_get_tile(tile)
     env = CompileEnvironment.current()
     base = torch.empty([tile], dtype=env.index_dtype, device=env.device)
-    return env.new_index_result(base, [tile])
+    result = env.new_index_result(base, [tile])
+    env.tile_index_values[result] = True
+    return result
 
 
 @_decorators.codegen(tile_index, "common")

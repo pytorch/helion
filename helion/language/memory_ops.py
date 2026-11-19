@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import logging
 from typing import TYPE_CHECKING
 
@@ -15,7 +16,6 @@ from . import _decorators
 from .stack_tensor import StackTensor
 
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Sequence
 
     from .._compiler.inductor_lowering import CodegenState
@@ -120,18 +120,23 @@ def _record_pad_info(
 
 def _ref_masked_slice_indices(
     tensor: torch.Tensor, indices: list[object]
-) -> list[object]:
-    """Include sliced axes in Cartesian indexing and mask broadcasting."""
+) -> tuple[torch.Tensor, list[object]]:
+    """Represent sliced and inserted axes as Cartesian index tensors."""
     index_dtype = next(
         (index.dtype for index in indices if isinstance(index, torch.Tensor)),
         torch.int64,
     )
-    return [
-        torch.arange(tensor.size(dim), device=tensor.device, dtype=index_dtype)[index]
-        if isinstance(index, slice)
-        else index
-        for dim, index in enumerate(indices)
-    ]
+    result: list[object] = []
+    for dim, index in enumerate(indices):
+        if index is None:
+            tensor = tensor.unsqueeze(dim)
+            index = slice(None)
+        if isinstance(index, slice):
+            index = torch.arange(
+                tensor.size(dim), device=tensor.device, dtype=index_dtype
+            )[index]
+        result.append(index)
+    return tensor, result
 
 
 # TODO(joydddd): Add support for stack tensor in ref mode.
@@ -152,7 +157,7 @@ def _(
     # Normalize indices and identify tensor indices
     indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
     if extra_mask is not None:
-        indices = _ref_masked_slice_indices(tensor, indices)
+        tensor, indices = _ref_masked_slice_indices(tensor, indices)
     tensor_idx_positions = [
         i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
     ]
@@ -235,6 +240,11 @@ def load(
     based on the hl.tile range. It also accepts an optional
     `eviction_policy` which is forwarded to the underlying Triton `tl.load`
     call to control the cache eviction behavior (e.g., "evict_last").
+    For a load of ``tile.index``, the indexed coordinates and the mask
+    are broadcast together; masked positions contain zero. In compiled
+    kernels, aligned dimensions must be provably equal or one of them
+    must be provably size one. Choosing the same block size for two
+    independent tile axes does not make them equal during shape inference.
 
     Args:
         tensor: The tensor / stack tensor to load from
@@ -275,6 +285,8 @@ def _(
     if isinstance(tensor, torch.Tensor):
         target_shape = SubscriptIndexing.compute_shape(tensor, index)
         env = CompileEnvironment.current()
+        if extra_mask is not None and tensor in env.tile_index_values:
+            target_shape = _tile_index_mask_shape(target_shape, extra_mask.shape)
         env.backend.process_fake_tensor_load(tensor, index)
         return env.new_index_result(tensor, target_shape)
     if isinstance(tensor, tuple):
@@ -287,14 +299,49 @@ def _(
     raise NotImplementedError(f"Unsupported tensor type: {type(tensor)}")
 
 
+def _tile_index_mask_shape(
+    indexed_shape: list[int | torch.SymInt], mask_shape: torch.Size
+) -> list[int | torch.SymInt]:
+    """Infer the result of the select before downstream operations see the load."""
+    env = CompileEnvironment.current()
+    rank = max(len(indexed_shape), len(mask_shape))
+    indexed_dims = [1] * (rank - len(indexed_shape)) + indexed_shape
+    mask_dims = [1] * (rank - len(mask_shape)) + list(mask_shape)
+    result: list[int | torch.SymInt] = []
+    for indexed_dim, mask_dim in zip(indexed_dims, mask_dims, strict=True):
+        if env.known_equal(mask_dim, 1) or env.known_equal(indexed_dim, mask_dim):
+            result.append(indexed_dim)
+        elif env.known_equal(indexed_dim, 1):
+            result.append(mask_dim)
+        else:
+            raise exc.ShapeMismatch(
+                f"tile.index load {indexed_shape}", f"extra_mask {mask_shape}"
+            )
+    return result
+
+
+def _mask_tile_index_load(
+    state: CodegenState, value: ast.AST, extra_mask: ast.AST | None
+) -> ast.AST:
+    if extra_mask is None:
+        return value
+    result = state.fake_value
+    assert isinstance(result, torch.Tensor)
+    backend = CompileEnvironment.current().backend
+    zero = backend.cast_expr("0", backend.dtype_str(result.dtype))
+    return expr_from_string(
+        backend.where_expr("{mask}", "{value}", zero), mask=extra_mask, value=value
+    )
+
+
 def _maybe_materialize_tile_index_load(
     state: CodegenState,
     tensor: torch.Tensor,
     subscript: list[object] | tuple[object, ...],
 ) -> ast.AST | None:
     """If this load is on a ``tile.index`` value (e.g. ``tile_m.index[:, None]``),
-    emit the inline ``indices_<bid>[<sub>]`` expression and return it.
-    Returns ``None`` otherwise.
+    emit the inline ``indices_<bid>[<sub>]`` expression, with masked lanes
+    set to zero. Return ``None`` for other tensor sources.
 
     ``tile.index`` tensors are synthesized inside the kernel — they aren't
     registered in ``tensor_to_origin`` — so the regular load path's
@@ -324,7 +371,11 @@ def _maybe_materialize_tile_index_load(
             parts.append(":")
         else:
             raise AssertionError(f"Unexpected index type in tile_index load: {idx}")
-    return expr_from_string(f"{base_var}[{', '.join(parts)}]")
+    extra_mask = state.ast_args[2]
+    assert isinstance(extra_mask, (type(None), ast.AST))
+    return _mask_tile_index_load(
+        state, expr_from_string(f"{base_var}[{', '.join(parts)}]"), extra_mask
+    )
 
 
 @_decorators.get_masked_value(load)
@@ -343,9 +394,8 @@ def _(
     from ..runtime.ref_mode import device_load
     from .ref_tile import RefTile
 
+    indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
     if extra_mask is None:
-        # Convert RefTiles to indices
-        indices = [idx.index if isinstance(idx, RefTile) else idx for idx in index]
         # Use meshgrid for Cartesian product when we have multiple tensor indices
         tensor_idxs = [
             i for i, idx in enumerate(indices) if isinstance(idx, torch.Tensor)
@@ -361,12 +411,15 @@ def _(
             tensor[tuple(indices)]
         )
 
-    # Create zero result matching mask shape
-    result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
+    if all(idx is None or isinstance(idx, slice) for idx in indices):
+        # Basic slices are already in bounds and keep their inserted axes.
+        # Applying the mask directly avoids the advanced-index validity terms
+        # that would align a sliced dimension with the wrong newaxis.
+        loaded = tensor[tuple(indices)]  # pyrefly: ignore[bad-argument-type, bad-index]
+        return torch.where(extra_mask, loaded, loaded.new_zeros(()))
 
-    index = _ref_masked_slice_indices(
-        tensor, [idx.index if isinstance(idx, RefTile) else idx for idx in index]
-    )
+    result = torch.zeros(extra_mask.shape, dtype=tensor.dtype, device=tensor.device)
+    tensor, index = _ref_masked_slice_indices(tensor, indices)
     # Process indices: clamp tensor indices
     orig_indices, safe_indices, is_tensor_mask = [], [], []
     for i, idx in enumerate(index):

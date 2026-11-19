@@ -906,6 +906,14 @@ class TypeInfo:
     def debug_annotations(self) -> list[str]:
         return [f"{self!s} {self.origin!r}"]
 
+    def merge_expression(self, other: TypeInfo) -> TypeInfo:
+        """Reconcile repeated visits to the same source expression.
+
+        Unlike a control-flow join, this can preserve expression-specific
+        information, such as whether a placeholder came from ``tile.index``.
+        """
+        return self.merge(other)
+
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         """Combine two types at a join point in control flow."""
         if isinstance(other, NoType) or self == other:
@@ -1282,6 +1290,14 @@ class TensorType(TypeInfo):
         )
 
         return TensorType(origin, new_fake)
+
+    def merge_expression(self, other: TypeInfo) -> TypeInfo:
+        merged = self.merge(other)
+        if isinstance(other, TensorType) and isinstance(merged, TensorType):
+            tile_indices = CompileEnvironment.current().tile_index_values
+            if self.fake_value in tile_indices and other.fake_value in tile_indices:
+                tile_indices[merged.fake_value] = True
+        return merged
 
     def merge(self, other: TypeInfo, var_name: str | None = None) -> TypeInfo:
         if isinstance(other, TensorType):

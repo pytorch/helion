@@ -6,6 +6,7 @@ import math
 import unittest
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -42,6 +43,46 @@ class TestRefEagerMisc(TestCase):
                 expected[:3, 0, :] = x[:3, 1, :] + 1
                 result = fn.bind((x,)).run_ref(x)
                 torch.testing.assert_close(result, expected)
+
+    @pytest.mark.cpu_only
+    def test_masked_basic_slice_preserves_dtype(self) -> None:
+        @helion.kernel(static_shapes=True, ref_mode=helion.RefMode.EAGER)
+        def fn(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
+            return hl.load(x, [slice(None), None], extra_mask=keep)
+
+        keep = torch.tensor([[True, False], [False, True]])
+        for dtype in (torch.bool, torch.float16):
+            with self.subTest(dtype=dtype):
+                x = torch.ones(2, dtype=dtype)
+                expected = torch.tensor([[1, 0], [0, 1]], dtype=dtype)
+                torch.testing.assert_close(fn(x, keep), expected)
+
+    @pytest.mark.cpu_only
+    def test_masked_slice_and_tile_with_inserted_axis(self):
+        @helion.kernel(static_shapes=True, ref_mode=helion.RefMode.EAGER)
+        def fn(
+            x: torch.Tensor, axis: hl.constexpr
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            loaded = torch.empty_like(x)
+            stored = torch.full_like(x, -7)
+            for tile in hl.tile(x.size(0)):
+                keep = (x[tile, :] % 2 == 0).unsqueeze(axis)
+                if axis == 0:
+                    index = [None, tile, slice(None)]
+                else:
+                    index = [tile, None, slice(None)]
+                values = hl.load(x, index, extra_mask=keep)
+                loaded[tile, :] = values.squeeze(axis)
+                hl.store(stored, index, values + 1, extra_mask=keep)
+            return loaded, stored
+
+        x = torch.arange(15).reshape(5, 3)
+        keep = x % 2 == 0
+        for axis in (0, 1):
+            with self.subTest(axis=axis):
+                loaded, stored = fn(x, axis)
+                torch.testing.assert_close(loaded, torch.where(keep, x, 0))
+                torch.testing.assert_close(stored, torch.where(keep, x + 1, -7))
 
     def test_context_entry_failure_releases_context(self):
         @helion.kernel(ref_mode=helion.RefMode.EAGER)
