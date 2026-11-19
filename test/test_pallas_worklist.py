@@ -3913,6 +3913,38 @@ class TestCompactWindowSpec(unittest.TestCase):
             stored.extend(range(lo, lo + size))
         self.assertEqual(stored, list(range(rows)))
 
+    def test_sublane_tile_windows_cover_the_rows(self):
+        """Windows sliced in whole sublane tiles hold each work item's rows, and
+        the output windows write every row once."""
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _compact_aligned_window_block_spec
+
+        rows, block, sublane = 64, 32, 16
+        # fill_owner_tiles' work items for owners of 5, 40, 16 and 3 rows.
+        starts = jnp.asarray([0, 5, 32, 45, 61], jnp.int32)
+        extents = jnp.asarray([5, 27, 13, 16, 3], jnp.int32)
+        num_work = jnp.asarray([5], jnp.int32)
+        t = torch.zeros(rows, 8)
+        load = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, None, 2
+        )
+        store = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, num_work, 2
+        )
+        stored = []
+        for wid in range(5):
+            start = int(starts[wid])
+            end = start + int(extents[wid])
+            window = load.index_map(wid)[0]
+            lo, size = int(window.start) * sublane, int(window.size) * sublane
+            self.assertLessEqual(lo, start)
+            self.assertGreaterEqual(lo + size, end)
+            window = store.index_map(wid)[0]
+            lo, size = int(window.start) * sublane, int(window.size) * sublane
+            stored.extend(range(lo, lo + size))
+        self.assertEqual(stored, list(range(rows)))
+
 
 @onlyBackends(["pallas"])
 class TestZeroRowResidentPadding(unittest.TestCase):
