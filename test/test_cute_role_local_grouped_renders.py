@@ -62,6 +62,7 @@ from helion._compiler.cute.tcgen05_constants import (
 from helion._testing import import_example
 from helion._testing import matchesBackends
 from helion._testing import onlyBackends
+from helion._testing import skipUnlessTcgen05RuntimeNPtx
 
 grouped_gemm_jagged = import_example("grouped_gemm").grouped_gemm_jagged
 
@@ -196,6 +197,7 @@ class TestRoleLocalGroupedRenders(RenderPins):
         )
 
     # F5: the selected N,M worklist consumers.
+    @skipUnlessTcgen05RuntimeNPtx
     def test_f5_runtime_tile_table(self) -> None:
         code = _render(
             _selected_kernel, _worklist_args(), _selected_config(runtime_direct=True)
@@ -218,6 +220,7 @@ class TestRoleLocalGroupedRenders(RenderPins):
             absent=(RUNTIME_DIRECT_LINEAR_INDEX, PANEL_LOCAL_INDEX),
         )
 
+    @skipUnlessTcgen05RuntimeNPtx
     def test_f5_runtime_clc(self) -> None:
         code = _render(
             _selected_kernel,

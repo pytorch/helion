@@ -1483,12 +1483,18 @@ def import_example(name: str) -> types.ModuleType:
 
 
 def import_path(filename: Path) -> types.ModuleType:
+    # Compare the unresolved paths as well: a build can link the examples into
+    # a tree of symlinks (fbcode's pars), where the resolved file lies outside
+    # the resolved EXAMPLES_DIR.
+    for path, examples_dir in (
+        (Path(os.path.abspath(filename)), Path(os.path.abspath(EXAMPLES_DIR))),
+        (filename.resolve(), EXAMPLES_DIR.resolve()),
+    ):
+        if path.is_relative_to(examples_dir):
+            # One module per example everywhere; see ``import_example``.
+            relative = path.relative_to(examples_dir).with_suffix("")
+            return import_example(".".join(relative.parts))
     filename = filename.resolve()
-    examples_dir = EXAMPLES_DIR.resolve()
-    if filename.is_relative_to(examples_dir):
-        # One module per example everywhere; see ``import_example``.
-        relative = filename.relative_to(examples_dir).with_suffix("")
-        return import_example(".".join(relative.parts))
     module_name = f"{__name__}.{filename.stem}"
     if module_name not in sys.modules:
         # pyrefly: ignore [implicit-import]
