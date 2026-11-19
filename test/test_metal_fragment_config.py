@@ -232,16 +232,17 @@ class TestFragmentConfig(unittest.TestCase):
                 )
 
     def test_search(self) -> None:
-        """The search tries ``metal_matmul`` where both lowerings apply, from
-        fragment seeds beside the MPP default, which leaves the key out, and
-        ``metal_tabulate_max_entries`` at the caps that admit the kernel's
+        """The search tries ``metal_matmul`` over every lowering that applies,
+        from fragment seeds beside the MPP default, which leaves the key out,
+        and ``metal_tabulate_max_entries`` at the caps that admit the kernel's
         tables, on one SIMD group and on four splitting the K loop
         (``num_warps``, which the search keeps); a matmul the fragment run
-        can't lower, and a kernel with none, have neither field."""
+        can't lower searches MPP and the scalar contraction, without tables,
+        and a kernel with no matmul has neither field."""
         spec = nvfp4_rows.bind(nvfp4_cpu_args()).config_spec
         field = spec._flat_fields()["metal_matmul"]
         assert isinstance(field, EnumFragment)
-        self.assertEqual(field.choices, ("mpp", "fragment"))
+        self.assertEqual(field.choices, ("mpp", "fragment", "scalar"))
         self.assertNotIn("metal_matmul", spec.default_config().config)
         tables = spec._flat_fields()["metal_tabulate_max_entries"]
         assert isinstance(tables, EnumFragment)
@@ -335,11 +336,18 @@ class TestFragmentConfig(unittest.TestCase):
         self.assertEqual(tables.choices, (0, 256))
         x = torch.randn(16, 32, dtype=torch.float16)
         y = torch.randn(32, 16, dtype=torch.float16)
-        for kernel, kernel_args in ((centered, (x, y)), (add, (x, x))):
+        for kernel, kernel_args, choices in (
+            (centered, (x, y), ("mpp", "scalar")),
+            (add, (x, x), None),
+        ):
             with self.subTest(kernel=kernel.name):
                 spec = kernel.bind(kernel_args).config_spec
                 fields = spec._flat_fields()
-                self.assertNotIn("metal_matmul", fields)
+                field = fields.get("metal_matmul")
+                self.assertEqual(
+                    None if field is None else getattr(field, "choices", None),
+                    choices,
+                )
                 self.assertNotIn("metal_tabulate_max_entries", fields)
                 self.assertEqual(len(spec.range_num_stages), 0)
                 # A config with range_num_stages loads as before: without it.
@@ -476,7 +484,7 @@ class TestFragmentConfig(unittest.TestCase):
         configs = [gen.unflatten(list(flat)) for flat in candidates]
         self.assertGreater(len(configs), 40)
         refused = []
-        compiled = {"fragment": 0, "mpp": 0}
+        compiled = {"fragment": 0, "mpp": 0, "scalar": 0}
         for config in configs:
             try:
                 bound.to_code(config)

@@ -27,11 +27,13 @@ if TYPE_CHECKING:
     from ...autotuner.config_fragment import ConfigSpecFragment
     from ...autotuner.config_spec import ConfigSpec
 
-#: How a K-loop matmul is lowered: on MPP's ``matmul2d`` (the default; a
-#: config without the key means it), or on 8x8 simdgroup-matrix fragments
-#: built in registers (``fragment_mma``).
+#: How a kernel's matmuls are lowered: on MPP's ``matmul2d`` (the default; a
+#: config without the key means it), on 8x8 simdgroup-matrix fragments built
+#: in registers (``fragment_mma``), or on the scalar contraction, each
+#: thread forming the products at its own M, K and N and K's reduction
+#: summing them (``matmul_ops``).
 METAL_MATMUL = "metal_matmul"
-METAL_MATMUL_CHOICES = ("mpp", "fragment")
+METAL_MATMUL_CHOICES = ("mpp", "fragment", "scalar")
 
 
 #: The most entries of a ``constant`` table a fragment element reads a value
@@ -53,6 +55,9 @@ class MetalKernelFacts:
     #: every one of them (``mpp_matmul._takes_dots``); else the dots keep the
     #: scalar contraction.
     fragment_matmuls: bool = False
+    #: Whether the kernel has matmuls, which the scalar contraction lowers
+    #: under ``metal_matmul="scalar"``.
+    scalar_matmuls: bool = False
     #: The sizes of the tables those matmuls' fragment elements would read
     #: (``tabulate.table_sizes``).
     table_sizes: frozenset[int] = frozenset()
@@ -105,6 +110,22 @@ def lowers_on_fragments(config_spec: ConfigSpec) -> bool:
     """Whether the kernel's K-loop matmuls lower on fragments
     (``MetalKernelFacts.fragment_matmuls``)."""
     return kernel_facts(config_spec).fragment_matmuls
+
+
+def matmul_choices(config_spec: ConfigSpec) -> tuple[str, ...]:
+    """The ``metal_matmul`` values that lower the kernel's matmuls: MPP's,
+    fragments' where they apply (:func:`lowers_on_fragments`) and the scalar
+    contraction's where the kernel has matmuls."""
+    facts = kernel_facts(config_spec)
+    return tuple(
+        choice
+        for choice, applies in zip(
+            METAL_MATMUL_CHOICES,
+            (True, facts.fragment_matmuls, facts.scalar_matmuls),
+            strict=True,
+        )
+        if applies
+    )
 
 
 def fragment_tiles(config_spec: ConfigSpec, config: Mapping[str, object]) -> bool:
@@ -216,6 +237,9 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     K tiles past ``MAX_STEPS`` are left as they are: codegen refuses them,
     which costs a codegen rather than a compile.  So is a wide MPP tile at
     too few SIMD groups, which needs ``num_warps`` raised."""
+    if metal_matmul(config) == "scalar":
+        # The scalar contraction runs on any threadgroup.
+        return
     facts = kernel_facts(config_spec)
     spec = config_spec.num_threads
     blocks = config["block_sizes"]
@@ -287,15 +311,17 @@ class MetalSearchSurface(BackendSearchSurface):
     config_keys = frozenset({METAL_MATMUL, METAL_TABULATE})
 
     def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
-        """``metal_matmul`` where both lowerings apply: a kernel whose K-loop
-        matmuls lower on fragments too; ``metal_tabulate_max_entries`` where
-        its fragment elements would read a table."""
-        if not lowers_on_fragments(config_spec):
+        """``metal_matmul`` where more than one lowering applies
+        (:func:`matmul_choices`); ``metal_tabulate_max_entries`` where the
+        kernel's fragment elements would read a table."""
+        choices = matmul_choices(config_spec)
+        if len(choices) == 1:
             return {}
-        fields: dict[str, ConfigSpecFragment] = {
-            METAL_MATMUL: EnumFragment(METAL_MATMUL_CHOICES)
-        }
-        if len(tables := _table_choices(config_spec)) > 1:
+        fields: dict[str, ConfigSpecFragment] = {METAL_MATMUL: EnumFragment(choices)}
+        if (
+            lowers_on_fragments(config_spec)
+            and len(tables := _table_choices(config_spec)) > 1
+        ):
             fields[METAL_TABULATE] = EnumFragment(tables)
         return fields
 
@@ -314,17 +340,18 @@ class MetalSearchSurface(BackendSearchSurface):
             config.config.pop("range_num_stages", None)
 
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
-        """Both lowerings in the initial population: the default is MPP's, so
-        seed fragment configs, one per table cap that changes the code (the
-        key left out at 0), each with and without loading its K loops'
-        operands a tile ahead where it can (``range_num_stages`` slots), on
-        one SIMD group per threadgroup and, where its K loops split, on
-        :data:`SPLIT_SEED` SIMD groups splitting them."""
+        """Fragment configs in the initial population beside MPP's default,
+        one per table cap that changes the code (the key left out at 0), each
+        with and without loading its K loops' operands a tile ahead where it
+        can (``range_num_stages`` slots), on one SIMD group per threadgroup
+        and, where its K loops split, on :data:`SPLIT_SEED` SIMD groups
+        splitting them.  The scalar contraction needs no seed: the search
+        draws it from ``metal_matmul`` as it draws the others."""
         if not lowers_on_fragments(config_spec):
             return []
+        seeds = []
         slots = len(config_spec.range_num_stages)
         splits = (1, SPLIT_SEED) if kernel_facts(config_spec).fragment_splits else (1,)
-        seeds = []
         for num_warps in splits:
             for cap in _table_choices(config_spec):
                 for stages in (0, 2) if slots else (0,):

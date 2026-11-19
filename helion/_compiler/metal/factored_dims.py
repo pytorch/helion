@@ -19,11 +19,11 @@ Sources:
   ``match_cute_stack_reshape_rhs`` form.
 
 The consumers are a store at a factored iota over the same block and
-factor, one store per part (:func:`factored_store`), and a matmul the MPP
-planner lowers (``mpp_matmul``), which reads a widened slice as a device
-view or stages the parts.  Every producer rejects any other consumer; any
-other matmul gets its own message, since lowering one over parts belongs to
-the MPP lowering.
+factor, one store per part (:func:`factored_store`), and a matmul over K
+held as parts: one the MPP planner lowers (``mpp_matmul``), which reads a
+widened slice as a device view or stages the parts, or the scalar
+contraction (``matmul_ops``), which sums each thread's parts' products.
+Every producer rejects any other consumer.
 """
 
 from __future__ import annotations
@@ -61,11 +61,6 @@ if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
 
 _VIEW_TARGETS = (torch.ops.aten.view.default, torch.ops.aten.reshape.default)
-
-_MATMUL_OVER_PARTS = (
-    "a matmul over a dim held as per-thread parts (a widened hl.arange() slice "
-    "or a merged torch.stack) that the cooperative MPP lowering doesn't admit"
-)
 
 
 def _unsupported(message: str) -> exc.BackendUnsupported:
@@ -114,8 +109,8 @@ def factored_size(size: object) -> tuple[int, int] | None:
 
 
 def _check_value_users(node: Node, what: str) -> None:
-    """Only a store that takes *node* as its value, or a matmul the MPP
-    planner lowers, may consume parts."""
+    """Only a store that takes *node* as its value, or a matmul, may consume
+    parts."""
     from .mpp_matmul import planned
 
     for user in node.users:
@@ -126,14 +121,11 @@ def _check_value_users(node: Node, what: str) -> None:
             and node not in _flat(user.args[1])
         ):
             continue
-        if planned(user):
+        if planned(user) or user.target in MATMUL_LHS:
+            # A matmul the planner doesn't take sums the parts' products on
+            # the scalar contraction (``matmul_ops.scalar_contraction``).
             continue
         shape = list(node.meta["val"].shape)
-        if user.target in MATMUL_LHS:
-            raise _unsupported(
-                f"{_MATMUL_OVER_PARTS}; {what} {node.name} of shape {shape} feeds "
-                f"{user.name}"
-            )
         raise _unsupported(
             f"{what} {node.name} of shape {shape}, which Metal holds as per-thread "
             f"parts, feeds {user.name}; only a store at a widened hl.arange() "

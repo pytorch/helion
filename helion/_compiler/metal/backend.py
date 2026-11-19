@@ -194,7 +194,9 @@ def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
         assert isinstance(env.backend, MetalBackend)
         scalar_dots = env.backend._scalar_contraction_blocks
     else:
-        scalar_dots = scalar_contraction_blocks(device_ir.graphs, live=False)
+        scalar_dots = scalar_contraction_blocks(
+            device_ir.graphs, live=False, config=config
+        )
     indexed = indexed_reduction_blocks(device_ir)
     contracted: set[int] | None = None
     # A literal-size root tile has no num_threads: it runs one thread per
@@ -245,23 +247,34 @@ def blocks_reduced_after_loop(device_ir: DeviceIR) -> set[int]:
     return out
 
 
-def scalar_contraction_blocks(graphs: list[GraphInfo], live: bool = True) -> set[int]:
+def scalar_contraction_blocks(
+    graphs: list[GraphInfo], live: bool = True, config: Config | None = None
+) -> set[int]:
     """K blocks of the live hl.dot ops whose K is not held as per-thread
     parts: those the scalar contraction lowers (``matmul_ops``) and the
     whole-K ones ``plan_mpp_matmuls`` takes, whose ``:`` M or N admission
-    counts on the lane floor's threads for these blocks.  An aten matmul
-    lowers through MPP or is rejected.  ``live=False`` scans every graph (no
+    counts on the lane floor's threads for these blocks; and under a
+    ``config`` with ``metal_matmul="scalar"`` the aten matmuls', which lower
+    on the scalar contraction too.  ``live=False`` scans every graph (no
     compiling function to tell live ones), which can only add blocks."""
     from ...language.matmul_ops import dot
     from ..compile_environment import CompileEnvironment
     from .factored_dims import factored_size
     from .free_arange import live_graphs
+    from .mpp_matmul import ATEN_MATMULS
+    from .mpp_matmul import matmul_operands
+    from .search_surface import metal_matmul
 
     env = CompileEnvironment.current()
     out: set[int] = set()
+    aten = config is not None and metal_matmul(config) == "scalar"
     for info in live_graphs(graphs) if live else graphs:
-        for node in info.graph.find_nodes(op="call_function", target=dot):
-            k = node.args[0].meta["val"].size(-1)
+        for node in info.graph.nodes:
+            if node.target is not dot and not (
+                aten and node.op == "call_function" and node.target in ATEN_MATMULS
+            ):
+                continue
+            k = matmul_operands(node)[1].meta["val"].size(-1)
             if factored_size(k) is None:
                 block_id = env.resolve_block_id(k)
                 if block_id is not None:
@@ -703,7 +716,8 @@ class MetalBackend(Backend):
         # The MPP matmuls that stage an operand per K tile, which the staged
         # matmul heuristic seeds tall tiles for.
         launch_facts = MetalKernelFacts(
-            staged_matmuls=() if mpp is None else _staged_matmuls(mpp)
+            scalar_matmuls=True,
+            staged_matmuls=() if mpp is None else _staged_matmuls(mpp),
         )
         reductions = any(
             info.reduction for info in CompileEnvironment.current().block_sizes
@@ -754,8 +768,7 @@ class MetalBackend(Backend):
                         blocks_reduced_after_loop(device_ir) & tunable
                     ),
                 )
-        if launch_facts != MetalKernelFacts():
-            config_spec.backend_facts = launch_facts
+        config_spec.backend_facts = launch_facts
         if plan is None:
             return
         blocks = tuple(sorted({group.k_block for group in plan.by_matmul.values()}))
@@ -848,6 +861,7 @@ class MetalBackend(Backend):
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .literal_dims import reject_literal_dims
+        from .mpp_matmul import MppPlan
         from .mpp_matmul import metal_unsupported
         from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
@@ -867,11 +881,15 @@ class MetalBackend(Backend):
             for block in range(len(CompileEnvironment.current().block_sizes))
             if (tile_strategy.thread_extent_for_block_id(block) or 1) > 1
         }
-        self.mpp_plan = plan_mpp_matmuls(
-            graphs,
-            threaded,
-            FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
-        )
+        if metal_matmul(config) == "scalar":
+            # Every matmul lowers on the scalar contraction (matmul_ops).
+            self.mpp_plan = MppPlan()
+        else:
+            self.mpp_plan = plan_mpp_matmuls(
+                graphs,
+                threaded,
+                FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
+            )
         split = fragment_split(CompileEnvironment.current().config_spec, config)
         if split > 1 and self.mpp_plan.by_matmul:
             refusal = split_refusal(self.mpp_plan, graphs)
@@ -1367,7 +1385,7 @@ class MetalBackend(Backend):
         self._uniform_extent = None
         self._literal_tile_limit = None
         self._scalar_contraction_blocks = scalar_contraction_blocks(
-            fn.codegen.codegen_graphs
+            fn.codegen.codegen_graphs, config=config
         )
         self._thread_budget = threadgroup_budget(config)
         self._num_warps = int(config.num_warps)

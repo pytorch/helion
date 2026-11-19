@@ -1,16 +1,18 @@
-"""Metal-backend codegen for ``hl.dot`` outside an MPP region.
+"""Metal-backend codegen for a matmul on the scalar contraction.
 
 ``dot(a, b)[m, n] = sum_k f32(a[m, k]) * f32(b[k, n])``, or the same sum in
 int32 for int8 operands, wrapping like ``tl.dot``'s int32 accumulator.  Each
-thread forms the product at its own ``(m, k, n)``, and K's own reduction
-strategy combines it, the way the scalar path lowers
-``(a[:, :, None] * b[None]).sum(1)``.
-Helion masks every ``hl.dot`` operand to 0 past each block's extent
+thread forms the product at its own ``(m, k, n)`` (and batch index), and K's
+own reduction strategy combines it, the way the scalar path lowers
+``(a[:, :, None] * b[None]).sum(1)``.  A K held as per-thread parts
+(``factored_dims``) sums each thread's parts' products first.
+Helion masks every matmul operand to 0 past each block's extent
 (``_mask_to``), so a K tail or a surplus K thread adds nothing.
 
-An ``hl.dot`` the MPP planner admits (a K loop's, a K held as per-thread
-parts, or every whole-K ``hl.dot`` of a kernel where each is admissible) is
-forwarded to ``mpp_matmul.codegen_dot_metal``.
+Every matmul of a ``metal_matmul="scalar"`` config lowers here: ``hl.dot``
+and the aten matmuls (``mpp_matmul._codegen_aten_matmul``).  Under the other
+choices, a matmul the MPP planner admits (``mpp_matmul.plan_mpp_matmuls``) is
+forwarded to ``mpp_matmul.codegen_dot_metal``, and one it leaves lowers here.
 """
 
 from __future__ import annotations
@@ -73,15 +75,25 @@ def _dim_block(size: int | torch.SymInt) -> int | None:
 
 @_decorators.codegen(dot, "metal")
 def _(state: CodegenState) -> ast.AST:
-    # Imported here: reduction_strategy imports device_ir, which needs the
-    # helion package that is still initializing when this module registers.
-    from ..reduction_strategy import LoopedReductionStrategy
     from .mpp_matmul import codegen_dot_metal
     from .mpp_matmul import planned
-    from .reduction_strategy import MetalPersistentReductionStrategy
 
     if planned(state.fx_node):
         return codegen_dot_metal(state)
+    return scalar_contraction(state)
+
+
+def scalar_contraction(state: CodegenState) -> ast.AST:
+    """The scalar contraction of ``state``'s matmul, whose args are
+    ``hl.dot``'s: lhs, rhs, acc (None for none) and out_dtype (None for
+    none).  An aten matmul the MPP planner doesn't take lowers here too
+    (``mpp_matmul._codegen_aten_matmul``)."""
+    # Imported here: reduction_strategy imports device_ir, which needs the
+    # helion package that is still initializing when this module registers.
+    from ..reduction_strategy import LoopedReductionStrategy
+    from .factored_dims import FactoredValue
+    from .reduction_strategy import MetalPersistentReductionStrategy
+
     env = CompileEnvironment.current()
     backend = env.backend
     lhs, rhs, acc, out_dtype = state.proxy_args
@@ -91,8 +103,11 @@ def _(state: CodegenState) -> ast.AST:
     assert out_dtype is None or isinstance(out_dtype, torch.dtype)
     assert state.fx_node is not None
     out = state.fx_node.meta["val"]
-    if lhs.ndim != 2 or rhs.ndim != 2:
-        raise _unsupported("batched (3-D) hl.dot outside an MPP region")
+    if lhs.ndim != rhs.ndim or lhs.ndim not in (2, 3):
+        raise _unsupported(
+            f"a matmul of a {lhs.ndim}-D lhs and a {rhs.ndim}-D rhs on the scalar "
+            "contraction; both must be 2-D, or both 3-D with one batch block"
+        )
     if all(t.dtype in _FLOAT_DTYPES for t in (lhs, rhs, out)):
         compute = torch.float32
     elif lhs.dtype == rhs.dtype == torch.int8 and out.dtype == torch.int32:
@@ -101,42 +116,84 @@ def _(state: CodegenState) -> ast.AST:
         compute = torch.int32
     else:
         raise _unsupported(
-            f"hl.dot of {lhs.dtype} x {rhs.dtype} -> {out.dtype} outside an MPP "
-            "region; only float16, bfloat16 and float32, or int8 to int32, are "
-            "supported"
-        )
-    if acc is not None and out_dtype is not None and out_dtype != acc.dtype:
-        # Triton rounds the product sum to out_dtype before adding acc.
-        raise _unsupported(
-            f"hl.dot with out_dtype={out_dtype} and a {acc.dtype} acc outside an "
-            "MPP region; pass an out_dtype equal to the acc's dtype"
+            f"a matmul of {lhs.dtype} x {rhs.dtype} -> {out.dtype} on the scalar "
+            "contraction; only float16, bfloat16 and float32, or int8 to int32, "
+            "are supported"
         )
 
     shapes = f"{list(lhs.shape)} x {list(rhs.shape)}"
-    m_block, k_block, rhs_k_block, n_block = map(
-        _dim_block, (lhs.size(0), lhs.size(1), rhs.size(0), rhs.size(1))
-    )
+    lhs_ast, rhs_ast = state.ast_args[0], state.ast_args[1]
+    factored = [isinstance(a, FactoredValue) for a in (lhs_ast, rhs_ast)]
+    if any(factored):
+        # A K of length c * block, held as c per-thread parts
+        # (``factored_dims``): each thread sums its parts' products, and K's
+        # reduction combines the threads.
+        for side, value, k_dim in (
+            ("lhs", lhs_ast, lhs.ndim - 1),
+            ("rhs", rhs_ast, rhs.ndim - 2),
+        ):
+            if isinstance(value, FactoredValue) and value.dim != k_dim:
+                raise _unsupported(
+                    f"a matmul of {shapes} whose {side} holds its dim {value.dim}, "
+                    "not K, as per-thread parts; only a K held as parts lowers "
+                    "on the scalar contraction"
+                )
+        if not (
+            isinstance(lhs_ast, FactoredValue)
+            and isinstance(rhs_ast, FactoredValue)
+            and (lhs_ast.block_id, lhs_ast.factor) == (rhs_ast.block_id, rhs_ast.factor)
+        ):
+            raise _unsupported(
+                f"a matmul of {shapes} whose K only one operand holds as "
+                "per-thread parts, or the two hold differently"
+            )
+        k_block = rhs_k_block = lhs_ast.block_id
+        lhs_fake, rhs_fake = lhs_ast.part_fake, rhs_ast.part_fake
+        terms = [
+            expr_from_string(
+                "{lhs} * {rhs}",
+                lhs=backend.cast_ast(lp, compute),
+                rhs=backend.cast_ast(rp, compute),
+            )
+            for lp, rp in zip(lhs_ast.parts, rhs_ast.parts, strict=True)
+        ]
+        result = terms[0]
+        for term in terms[1:]:
+            result = expr_from_string("{a} + {b}", a=result, b=term)
+    else:
+        k_block, rhs_k_block = map(_dim_block, (lhs.size(-1), rhs.size(-2)))
+        lhs_fake, rhs_fake = lhs, rhs
+        result = expr_from_string(
+            "{lhs} * {rhs}",
+            lhs=backend.cast_ast(state.ast_arg(0), compute),
+            rhs=backend.cast_ast(state.ast_arg(1), compute),
+        )
+    m_block, n_block = map(_dim_block, (lhs.size(-2), rhs.size(-1)))
+    batch: list[int | None] = []
+    if lhs.ndim == 3:
+        lhs_b, rhs_b = map(_dim_block, (lhs.size(0), rhs.size(0)))
+        if lhs_b != rhs_b:
+            raise _unsupported(
+                f"a matmul of {shapes} whose operands' batch dims are different "
+                "blocks; index both with the same tile or slice"
+            )
+        batch.append(lhs_b)
     # Raw ids, not canonical ones: a tile aliased to another block's size is
     # still its own loop with its own index.
     if rhs_k_block != k_block:
         raise _unsupported(
-            f"hl.dot of {shapes} contracts lhs and rhs over different blocks "
+            f"a matmul of {shapes} contracts lhs and rhs over different blocks "
             "(e.g. a `:` slice against a tile of the same extent); index both "
             "operands' K with the same tile or slice"
         )
-    blocks = [b for b in (m_block, k_block, n_block) if b is not None]
+    blocks = [b for b in (*batch, m_block, k_block, n_block) if b is not None]
     if len(set(blocks)) != len(blocks):
         raise _unsupported(
-            f"hl.dot of {shapes} indexes two of M, K, N with one block "
+            f"a matmul of {shapes} indexes two of its dims with one block "
             "(equal-sized `:` slices share a block); a Metal thread holds one "
             "index per block, so it would only cover their diagonal"
         )
 
-    result = expr_from_string(
-        "{lhs} * {rhs}",
-        lhs=backend.cast_ast(state.ast_arg(0), compute),
-        rhs=backend.cast_ast(state.ast_arg(1), compute),
-    )
     if k_block is not None:
         if env.block_sizes[k_block].reduction:
             strategy = state.device_function.tile_strategy.get_reduction_strategy(
@@ -156,11 +213,22 @@ def _(state: CodegenState) -> ast.AST:
             # would keep one lane's partial.
             strategy.fold_lanes()
         product = state.codegen.lift(result, dce=True, prefix="dot_product").id
-        fake_product = lhs.to(compute).unsqueeze(-1) * rhs.to(compute).unsqueeze(-3)
+        fake_product = lhs_fake.to(compute).unsqueeze(-1) * rhs_fake.to(
+            compute
+        ).unsqueeze(-3)
+        k_dim = fake_product.ndim - 2
         result = strategy.codegen_reduction(
-            state, product, "sum", 1, fake_product, fake_product.sum(1, dtype=compute)
+            state,
+            product,
+            "sum",
+            k_dim,
+            fake_product,
+            fake_product.sum(k_dim, dtype=compute),
         )
     if acc is not None:
+        if out_dtype is not None and out_dtype != acc.dtype:
+            # Triton rounds the product sum to out_dtype before adding acc.
+            result = backend.cast_ast(backend.cast_ast(result, out_dtype), compute)
         result = expr_from_string(
             "{acc} + {result}",
             acc=backend.cast_ast(state.ast_arg(2), compute),
