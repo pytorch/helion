@@ -17,6 +17,7 @@ import helion
 from helion import exc
 from helion._compiler.metal.fragment_mma import _max_offset
 from helion._compiler.metal.search_surface import kernel_facts
+from helion._compiler.metal.search_surface import matmul_choices
 from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import addmm_k_loop
@@ -570,6 +571,35 @@ class TestFragmentConfig(unittest.TestCase):
         self.assertEqual(refused, [])
         self.assertTrue(all(compiled.values()), compiled)
 
+    def test_whole_k(self) -> None:
+        """A matmul over a ':' K is one fragment run from zeroed
+        accumulators, which no K loop carries, so SIMD groups don't split
+        it (``split_refusal``)."""
+        x = torch.randn(16, 32, dtype=torch.float16)
+        y = torch.randn(32, 16, dtype=torch.float16)
+        msl = render_msl(whole_k, (x, y), fragment_config([16, 16]))
+        self.assertEqual(_lowering(msl), "fragment")
+        bound = whole_k.bind((x, y))
+        self.assertFalse(kernel_facts(bound.config_spec).fragment_splits)
+
+    def test_whole_k_extent(self) -> None:
+        """A ':' K is one fragment K tile, which no config changes: past the
+        unrolled steps' bound the search offers no fragment configs, and an
+        explicit one raises at codegen."""
+        for k, fits in ((64, True), (1024, False)):
+            x, y = torch.randn(16, k), torch.randn(k, 16)
+            choices = matmul_choices(whole_k.bind((x, y)).config_spec)
+            self.assertEqual("fragment" in choices, fits, choices)
+            if fits:
+                msl = render_msl(whole_k, (x, y), fragment_config([16, 16]))
+                self.assertEqual(_lowering(msl), "fragment")
+            else:
+                with self.assertRaisesRegex(
+                    exc.BackendUnsupported,
+                    f"{REFUSED} a matmul over a ':' K: .* 128 MMA steps",
+                ):
+                    render_msl(whole_k, (x, y), fragment_config([16, 16]))
+
     def test_rejects(self) -> None:
         """Forms the fragment run can't lower raise at codegen rather than
         miscompile."""
@@ -589,12 +619,6 @@ class TestFragmentConfig(unittest.TestCase):
                 (x, y),
                 fragment_config([16, 16]),
                 "result is read in the Scalar layout",
-            ),
-            (
-                whole_k,
-                (x, y),
-                fragment_config([16, 16]),
-                f"{REFUSED} a matmul over a ':' K",
             ),
             (
                 overwritten,
