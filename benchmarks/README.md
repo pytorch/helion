@@ -28,6 +28,19 @@ python benchmarks/run.py --metrics speedup --kernel <kernel_name>
 
 CUDA graph benchmarking reduces kernel launch overhead and provides timing that better represents deployment scenarios where cuda graph is used.
 
+### TPU / Pallas Benchmarking
+
+`benchmarks/run_tpu.py` runs registered Helion examples on TPU with the Pallas
+backend (`--list-kernels` lists supported kernels). Pass `--device-time` to
+report the on-device time per call in µs (without host synchronization
+overhead), and `--config` to pin a `helion.Config` JSON object or a per-shape
+config map instead of autotuning:
+
+```bash
+HELION_BACKEND=pallas python benchmarks/run_tpu.py --kernel gemm --device-time \
+  --config '{"block_sizes": [256, 256, 256]}'
+```
+
 ### Comparing the example catalogue
 
 `benchmarks/cute/compare_example_backends.py` compares the non-distributed
