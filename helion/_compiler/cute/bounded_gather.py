@@ -296,6 +296,24 @@ def indexed_load_shapes(
     return result_by_index
 
 
+# The integer dtypes integer_bounds reasons about.
+_BOUNDED_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+
+# clamp_min / clamp_max (with the bound positional) are the form tracing with
+# the decompositions leaves for a clamp; for integers they are maximum /
+# minimum.
+_LOWER_CLAMPS = (
+    torch.ops.aten.maximum.default,
+    torch.ops.aten.clamp_min.default,
+    torch.ops.aten.clamp_min.Tensor,
+)
+_UPPER_CLAMPS = (
+    torch.ops.aten.minimum.default,
+    torch.ops.aten.clamp_max.default,
+    torch.ops.aten.clamp_max.Tensor,
+)
+
+
 def integer_bounds(
     node: object, *, captured_bounds: dict[Node, tuple[int, int]] | None = None
 ) -> tuple[int, int] | None:
@@ -316,13 +334,7 @@ def integer_bounds(
         if value in memo:
             return memo[value]
         fake = value.meta.get("val")
-        if not isinstance(fake, torch.Tensor) or fake.dtype not in (
-            torch.int8,
-            torch.int16,
-            torch.int32,
-            torch.int64,
-            torch.uint8,
-        ):
+        if not isinstance(fake, torch.Tensor) or fake.dtype not in _BOUNDED_DTYPES:
             return None
         visiting.add(value)
         result = calculate(value)
@@ -381,20 +393,11 @@ def integer_bounds(
             if left is not None and right is not None:
                 return min(left[0], right[0]), max(left[1], right[1])
             return None
-        if target in (
-            torch.ops.aten.clamp.default,
-            torch.ops.aten.clamp.Tensor,
-            torch.ops.aten.clamp_min.default,
-            torch.ops.aten.clamp_min.Tensor,
-            torch.ops.aten.clamp_max.default,
-            torch.ops.aten.clamp_max.Tensor,
-        ):
-            return clamp_bounds(value)
         if len(args) < 2:
             return None
         left, right = bounds(args[0]), bounds(args[1])
 
-        # Unknown tensor values retain their full signed integer range. Bounds
+        # Unknown tensor values retain their dtype's full range. Bounds
         # narrowed by explicit clamps/remainders are still independently proved.
         def full_range(
             arg: object, known: tuple[int, int] | None
@@ -403,16 +406,23 @@ def integer_bounds(
                 return known
             if isinstance(arg, Node):
                 fake = arg.meta.get("val")
-                if isinstance(fake, torch.Tensor) and fake.dtype in (
-                    torch.int32,
-                    torch.int64,
-                ):
+                if isinstance(fake, torch.Tensor) and fake.dtype in _BOUNDED_DTYPES:
                     limits = torch.iinfo(fake.dtype)
                     return limits.min, limits.max
             return None
 
-        if target in (torch.ops.aten.minimum.default, torch.ops.aten.maximum.default):
+        if target in _LOWER_CLAMPS or target in _UPPER_CLAMPS:
             left, right = full_range(args[0], left), full_range(args[1], right)
+        # An operand outside the node's dtype proves nothing: arithmetic wraps
+        # it (a Python int or a 0-dim tensor of a wider dtype; eager int32
+        # q // 4294967297 divides by 1), and a clamp's scalar bound is
+        # rejected or saturated instead.
+        limits = torch.iinfo(value.meta["val"].dtype)
+        if any(
+            known is not None and not limits.min <= known[0] <= known[1] <= limits.max
+            for known in (left, right)
+        ):
+            return None
         if target in (torch.ops.aten.remainder.Tensor, torch.ops.aten.remainder.Scalar):
             if right is not None and right[0] == right[1] and right[0] > 0:
                 return 0, right[0] - 1
@@ -438,9 +448,9 @@ def integer_bounds(
         if target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
             products = a * c, a * d, b * c, b * d
             return min(products), max(products)
-        if target is torch.ops.aten.minimum.default:
+        if target in _UPPER_CLAMPS:
             return min(a, c), min(b, d)
-        if target is torch.ops.aten.maximum.default:
+        if target in _LOWER_CLAMPS:
             return max(a, c), max(b, d)
         if target in (
             torch.ops.aten.bitwise_and.Tensor,
@@ -460,55 +470,13 @@ def integer_bounds(
             if a >= 0 and c >= 0:
                 return 0, (1 << max(b, d).bit_length()) - 1
             return None
-        if (
-            target
-            in (
-                torch.ops.aten.div.Tensor_mode,
-                torch.ops.aten.div.Scalar_mode,
-            )
-            and value.kwargs.get("rounding_mode") in ("floor", "trunc")
-        ) or target in (
-            torch.ops.aten.floor_divide.default,
-            torch.ops.aten.floor_divide.Scalar,
-        ):
+        if target in (
+            torch.ops.aten.div.Tensor_mode,
+            torch.ops.aten.div.Scalar_mode,
+        ) and value.kwargs.get("rounding_mode") in ("floor", "trunc"):
             if a >= 0 and c == d and c > 0:
                 return a // c, b // c
         return None
-
-    def clamp_bounds(value: Node) -> tuple[int, int] | None:
-        # clamp(x, lo, hi) is min(max(x, lo), hi), so hi when hi < lo; an
-        # unknown x keeps its dtype's full range.
-        args = value.args
-        if value.target in (torch.ops.aten.clamp.default, torch.ops.aten.clamp.Tensor):
-            low = args[1] if len(args) > 1 else value.kwargs.get("min")
-            high = args[2] if len(args) > 2 else value.kwargs.get("max")
-        elif value.target in (
-            torch.ops.aten.clamp_min.default,
-            torch.ops.aten.clamp_min.Tensor,
-        ):
-            low, high = args[1], None
-        else:
-            low, high = None, args[1]
-        x = bounds(args[0])
-        if x is None:
-            fake = args[0].meta.get("val") if isinstance(args[0], Node) else None
-            if not isinstance(fake, torch.Tensor) or fake.dtype not in (
-                torch.int32,
-                torch.int64,
-            ):
-                return None
-            limits = torch.iinfo(fake.dtype)
-            x = limits.min, limits.max
-        lo, hi = x
-        if low is not None:
-            if (low_bounds := bounds(low)) is None:
-                return None
-            lo, hi = max(lo, low_bounds[0]), max(hi, low_bounds[1])
-        if high is not None:
-            if (high_bounds := bounds(high)) is None:
-                return None
-            lo, hi = min(lo, high_bounds[0]), min(hi, high_bounds[1])
-        return lo, hi
 
     return bounds(node)
 
