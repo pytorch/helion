@@ -858,6 +858,47 @@ def _xsa_baseline(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Te
     return ref_xsa(q, k, v)
 
 
+def _grouped_gemm_moe_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    # (G, M, K, N): first 3 are Qwen3-30B-A3B per-core MoE shapes (TP=8),
+    # followed by Qwen3-30B M=1024 down, Qwen3-235B-A22B per-core shapes,
+    # 8 large groups, and 16 whole experts per core.
+    configs = [
+        (128, 128, 2048, 256),
+        (128, 1024, 2048, 256),
+        (128, 128, 128, 2048),
+        (128, 1024, 128, 2048),
+        (128, 512, 4096, 512),
+        (128, 2048, 256, 4096),
+        (8, 8192, 2048, 256),
+        (16, 2048, 2048, 1536),
+        (16, 2048, 1536, 4096),
+    ]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
+    out: list[tuple[str, tuple[Any, ...]]] = []
+    for g, m, k, n in configs:
+        gen = torch.Generator().manual_seed(0)
+        group_ids = torch.randint(g, (m,), generator=gen)
+        sizes = torch.bincount(group_ids, minlength=g)
+        offsets = torch.zeros(g + 1, dtype=torch.int32)
+        offsets[1:] = torch.cumsum(sizes, 0)
+        a = torch.randn(m, k, generator=gen).to(device=DEVICE, dtype=torch.bfloat16)
+        b = (torch.randn(g, k, n, generator=gen) / k**0.5).to(
+            device=DEVICE, dtype=torch.bfloat16
+        )
+        out.append((f"[{g},{m},{k},{n}]", (a, b, offsets.to(DEVICE))))
+    return out
+
+
+def _grouped_gemm_moe_baseline(
+    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    ref = import_example("grouped_gemm")._reference_grouped_gemm_moe
+    return ref(a, b, offsets)
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -1088,6 +1129,16 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _xsa_baseline,
         _xsa_shapes,
         None,
+    ),
+    # _reference_grouped_gemm_moe slices per group using group_offsets.tolist(),
+    # which cannot trace under torch.compile(fullgraph=True).
+    "grouped_gemm_moe": (
+        "grouped_gemm",
+        "grouped_gemm_jagged_moe",
+        _grouped_gemm_moe_baseline,
+        _grouped_gemm_moe_shapes,
+        None,
+        False,  # torch_compile_compatible
     ),
 }
 
