@@ -486,6 +486,7 @@ class PallasBackend(Backend):
             "loop_orders",
             "flatten_loops",
             "pallas_worklist_grouping",
+            "pallas_worklist_bucket_rows",
             "pallas_loop_type",
             "pallas_emit_pipeline_group_size",
             "pallas_use_low_level_scheduler",
@@ -2140,6 +2141,7 @@ class PallasBackend(Backend):
         env.compact_worklist_block = 1
         env.compact_worklist_ordered_block = 1
         env.compact_worklist_sublane = 1
+        env.compact_worklist_bucket_rows = 0
         env.compact_worklist_offset_params = []
 
         if grouping in (1, 2):
@@ -2232,6 +2234,11 @@ class PallasBackend(Backend):
                     f"compact_worklist: block {env.compact_worklist_block} is not "
                     f"a multiple of the sublane {env.compact_worklist_sublane}."
                 )
+            env.compact_worklist_bucket_rows = self._compact_worklist_bucket_rows(
+                cast("int", config.get("pallas_worklist_bucket_rows", 0)),
+                env.compact_worklist_block,
+                env.compact_worklist_sublane,
+            )
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
 
         if config.get("pallas_loop_type", "unroll") == "unroll" and (
@@ -2257,6 +2264,31 @@ class PallasBackend(Backend):
                 )
             env.compact_worklist_resident_prep_hoists = admission.prep_hoists
             env.compact_worklist_resident_cache_decision = admission.decision
+
+    _MAX_COMPACT_ROW_BUCKETS = 16
+
+    @classmethod
+    def _compact_worklist_bucket_rows(
+        cls, bucket: int, block: int, sublane: int
+    ) -> int:
+        """Validated ``pallas_worklist_bucket_rows``; 0 when it buckets nothing.
+
+        Each branch slices whole sublane tiles of the work item's window, so
+        the bucket must be a multiple of the sublane and divide the block.
+        """
+        if bucket == 0 or bucket >= block:
+            return 0
+        if bucket % sublane or block % bucket:
+            raise exc.InvalidConfig(
+                f"compact_worklist: bucket rows {bucket} must be a multiple of the "
+                f"sublane {sublane} and divide the block {block}."
+            )
+        if block // bucket > cls._MAX_COMPACT_ROW_BUCKETS:
+            raise exc.InvalidConfig(
+                f"compact_worklist: bucket rows {bucket} split block {block} into "
+                f"more than {cls._MAX_COMPACT_ROW_BUCKETS} row buckets."
+            )
+        return bucket
 
     def _compact_worklist_upper(
         self, plan: CompactWorklistPlan, config: Config, host_fn: HostFunction
