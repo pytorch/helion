@@ -370,6 +370,59 @@ class TestPallasLoadBufferCountConfig(TestCase):
             )
 
 
+class TestPallasWorklistBufferCountConfig(TestCase):
+    @staticmethod
+    def _config_spec(num_tensors: int) -> ConfigSpec:
+        spec = ConfigSpec(backend=PallasBackend())
+        spec.pallas_worklist_buffer_count.length = num_tensors
+        return spec
+
+    def test_kept_only_with_a_compact_worklist(self) -> None:
+        spec = self._config_spec(3)
+        self.assertEqual(spec.pallas_worklist_buffer_count.default(), [2, 2, 2])
+        for grouping in (1, 2):
+            with self.subTest(grouping=grouping):
+                config = helion.Config(
+                    pallas_worklist_grouping=grouping,
+                    pallas_worklist_buffer_count=[3, 4, 2],
+                )
+                spec.normalize(config)
+                self.assertEqual(config.pallas_worklist_buffer_count, [3, 4, 2])
+        config = helion.Config(pallas_worklist_grouping=1)
+        spec.normalize(config)
+        self.assertNotIn("pallas_worklist_buffer_count", config)
+        for config in (
+            helion.Config(pallas_worklist_buffer_count=[3, 4, 2]),
+            helion.Config(
+                pallas_worklist_grouping=0, pallas_worklist_buffer_count=[3, 4, 2]
+            ),
+        ):
+            with self.subTest(config=config):
+                spec.normalize(config)
+                self.assertNotIn("pallas_worklist_buffer_count", config)
+
+    def test_rejects_invalid_explicit_lists(self) -> None:
+        spec = self._config_spec(2)
+        for value in ((2, 3), [3], [2, True], [1, 2], [9, 2]):
+            with self.subTest(value=value), self.assertRaises(exc.InvalidConfig):
+                spec.normalize(
+                    helion.Config.from_dict(
+                        {
+                            "pallas_worklist_grouping": 1,
+                            "pallas_worklist_buffer_count": value,
+                        }
+                    )
+                )
+
+    def test_accepts_counts_up_to_8(self) -> None:
+        spec = self._config_spec(2)
+        config = helion.Config(
+            pallas_worklist_grouping=1, pallas_worklist_buffer_count=[8, 5]
+        )
+        spec.normalize(config)
+        self.assertEqual(config.pallas_worklist_buffer_count, [8, 5])
+
+
 def _count_columns_then_sum_rows(
     x: torch.Tensor, pos: torch.Tensor, y: torch.Tensor, z: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

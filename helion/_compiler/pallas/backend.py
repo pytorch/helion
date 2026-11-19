@@ -491,6 +491,7 @@ class PallasBackend(Backend):
             "pallas_use_low_level_scheduler",
             "pallas_fold_dot_lhs_cast",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
             "pallas_indirect_access_mode",
             "pallas_pre_broadcast",
             "pallas_internal_scratch",
@@ -1899,6 +1900,9 @@ class PallasBackend(Backend):
             and sorted_args is not None
         ):
             launcher_args.extend(self._compact_worklist_launcher_args(sorted_args))
+            buffer_counts = self._compact_buffer_counts(sorted_args, config)
+            if buffer_counts:
+                launcher_args.append(f"_compact_buffer_counts={buffer_counts!r}")
 
         return launcher_args
 
@@ -2026,6 +2030,30 @@ class PallasBackend(Backend):
         else:
             args.insert(0, "_compact_build_worklist=_build_worklist")
         return args
+
+    def _compact_buffer_counts(
+        self, sorted_args: list[Argument], config: Config
+    ) -> dict[int, int]:
+        """Launcher arg index -> non-default buffer count for compact-worklist inputs."""
+        from ..device_function import TensorArg
+        from ..device_ir import LiftGraphArgs
+        from ..host_function import HostFunction
+
+        counts = cast("list[int]", config.get("pallas_worklist_buffer_count") or [])
+        # Slots of pallas_worklist_buffer_count: the kernel's tensor arguments,
+        # as counted in device_ir.
+        params = dict(HostFunction.current().params.arguments)
+        graph_args = LiftGraphArgs(params).get_graph_args()
+        inputs = [arg for arg in graph_args if isinstance(arg, torch.Tensor)]
+        slot_of = {id(tensor): slot for slot, tensor in enumerate(inputs)}
+        result: dict[int, int] = {}
+        for i, arg in enumerate(sorted_args):
+            if not isinstance(arg, TensorArg):
+                continue
+            slot = slot_of.get(id(arg.fake_value))
+            if slot is not None and slot < len(counts) and counts[slot] != 2:
+                result[i] = counts[slot]
+        return result
 
     def build_launcher_name(self, config: Config) -> str:
         """Return the single Pallas launcher name.

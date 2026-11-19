@@ -4709,6 +4709,11 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 isinstance(arg, torch.Tensor)
                 for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
             )
+        if config_spec.supports_config_key("pallas_worklist_buffer_count"):
+            config_spec.pallas_worklist_buffer_count.length = sum(
+                isinstance(arg, torch.Tensor)
+                for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
+            )
         if config_spec.supports_config_key("pallas_indirect_access_mode"):
             from .pallas.tensorcore_plan import indirect_access_modes
 

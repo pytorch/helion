@@ -811,6 +811,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "pallas_use_low_level_scheduler",
         "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
+        "pallas_worklist_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "xcd_remap",
@@ -1184,6 +1185,10 @@ class ConfigSpec:
         )
         self.pallas_load_buffer_count = ListOf(
             IntegerFragment(1, 2, 1),
+            length=0,
+        )
+        self.pallas_worklist_buffer_count = ListOf(
+            IntegerFragment(2, 8, 2),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -2400,6 +2405,7 @@ class ConfigSpec:
             "atomic_indexing",
             "prefetch_indexing",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -2593,6 +2599,29 @@ class ConfigSpec:
                 config.pop("pallas_load_buffer_count")
         else:
             config.pop("pallas_load_buffer_count", None)
+        if (
+            self.supports_config_key("pallas_worklist_buffer_count")
+            and config.get("pallas_worklist_grouping") in (1, 2)
+            and "pallas_worklist_buffer_count" in config
+        ):
+            values = config["pallas_worklist_buffer_count"]
+            expected = self.pallas_worklist_buffer_count.length
+            if (
+                not isinstance(values, list)
+                or len(values) != expected
+                or any(
+                    type(value) is not int or not 2 <= value <= 8 for value in values
+                )
+            ):
+                raise InvalidConfig(
+                    "pallas_worklist_buffer_count must be a list containing one "
+                    "buffer count (2 to 8) per input tensor "
+                    f"(expected {expected}, got {values!r})"
+                )
+            if expected == 0:
+                config.pop("pallas_worklist_buffer_count")
+        else:
+            config.pop("pallas_worklist_buffer_count", None)
         if (
             self.supports_config_key("pallas_pre_broadcast")
             and self.has_pallas_inner_loops
@@ -3269,6 +3298,13 @@ class ConfigSpec:
                     fields["pallas_worklist_grouping"] = EnumFragment(
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )
+                    if (
+                        self.supports_config_key("pallas_worklist_buffer_count")
+                        and self.pallas_worklist_buffer_count.length > 0
+                    ):
+                        fields["pallas_worklist_buffer_count"] = (
+                            self.pallas_worklist_buffer_count
+                        )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_emit_pipeline_group_size"):
                 fields["pallas_emit_pipeline_group_size"] = PowerOfTwoFragment(1, 16, 1)
@@ -3562,6 +3598,7 @@ class ConfigSpec:
             "atomic_indexing",
             "prefetch_indexing",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
         ):
             if not config.get(name):
                 config.pop(name, None)

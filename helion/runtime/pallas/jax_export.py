@@ -376,6 +376,7 @@ def default_pallas_jax_launcher(
             "fill_worklist": compact_fill_worklist,
             "upper": kwargs.get("_compact_upper", 0),
             "sublane": kwargs.get("_compact_sublane", 0),
+            "buffer_counts": kwargs.get("_compact_buffer_counts"),
             "offset_arg_indices": kwargs.get("_compact_offset_arg_indices") or [],
             "metadata_fields": kwargs.get("_compact_metadata_fields") or [],
             "owner_ref_pos": kwargs.get("_compact_owner_ref_pos", 0),

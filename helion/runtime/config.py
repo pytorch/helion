@@ -154,6 +154,7 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         pallas_load_buffer_count: list[int] | None = None,
+        pallas_worklist_buffer_count: list[int] | None = None,
         load_eviction_policies: (
             EvictionPolicyLiteral | list[EvictionPolicyLiteral] | None
         ) = None,
@@ -230,6 +231,10 @@ class Config(Mapping[str, object]):
             pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
                 each input tensor. Tensors without an existing DMA route use the
                 ordinary path.
+            pallas_worklist_buffer_count: Pallas-only pipeline buffer count (2 to
+                8) for each input tensor of a compact-worklist kernel
+                (``pallas_worklist_grouping`` 1 or 2). Inputs the worklist
+                pipeline does not prefetch (e.g. SMEM offsets) ignore it.
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
                 Valid values are "", "first", and "last". CuTe also supports
@@ -604,6 +609,7 @@ class Config(Mapping[str, object]):
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "pallas_load_buffer_count": pallas_load_buffer_count,
+            "pallas_worklist_buffer_count": pallas_worklist_buffer_count,
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
@@ -902,6 +908,10 @@ class Config(Mapping[str, object]):
     @property
     def pallas_load_buffer_count(self) -> list[int]:
         return cast("list[int]", self.config.get("pallas_load_buffer_count", []))
+
+    @property
+    def pallas_worklist_buffer_count(self) -> list[int]:
+        return cast("list[int]", self.config.get("pallas_worklist_buffer_count", []))
 
     @property
     def load_eviction_policies(
