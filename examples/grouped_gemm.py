@@ -4,8 +4,8 @@ Grouped GEMM Example
 
 This example demonstrates grouped matrix multiplication (GEMM) where multiple
 input matrices ``A_i`` (with potentially different numbers of rows ``M_i``)
-are multiplied against a single shared weight matrix ``B``. The results are
-concatenated in the original group order.
+are multiplied against a shared weight matrix ``B`` (or one per group). The
+results are concatenated in the original group order.
 
 Key ideas used in this implementation:
 
@@ -18,7 +18,7 @@ Key ideas used in this implementation:
 - Use data-dependent tiling over the concatenated row dimension to efficiently
   support jagged group sizes (different ``M_i`` per group) without padding.
 
-Three kernels are provided:
+Four kernels are provided:
 
 1) ``grouped_gemm_jagged`` - a simple kernel that iterates groups and tiles
    dynamically.
@@ -29,6 +29,9 @@ Three kernels are provided:
 3) ``grouped_gemm_shared_weight`` - the shared-weight product as one static
    tile space over the packed rows, with persistence left to the autotuner
    (the plain GEMM formulation, which gets the autotuner's GEMM search).
+
+4) ``grouped_gemm_jagged_moe`` - the simple kernel with one weight matrix per
+   group, ``B[g]``, as in a Mixture-of-Experts layer.
 """
 
 # %%
@@ -38,6 +41,7 @@ Three kernels are provided:
 # %%
 from __future__ import annotations
 
+import itertools
 from typing import Callable
 
 import torch
@@ -285,6 +289,58 @@ def grouped_gemm_shared_weight(
 
 
 # %%
+# Grouped GEMM Kernel - One Weight Matrix per Group
+# -------------------------------------------------
+
+
+# %%
+@helion.kernel(static_shapes=True)
+def grouped_gemm_jagged_moe(
+    A_packed: torch.Tensor,
+    B: torch.Tensor,
+    group_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Grouped GEMM with one weight matrix per group, as in a Mixture-of-Experts
+    layer, where the rows routed to expert ``g`` are multiplied by ``B[g]``.
+
+    Args:
+        A_packed: Rows of all groups, sorted by group, shape ``[total_M, K]``.
+        B: Per-group weight matrices, shape ``[G, K, N]``.
+        group_offsets: Row offsets delimiting each group within ``A_packed``,
+            shape ``[G+1]``, with ``group_offsets[G] == total_M``.
+
+    Returns:
+        Output tensor of shape ``[total_M, N]`` whose rows
+        ``group_offsets[g]:group_offsets[g+1]`` hold ``A_g @ B[g]``.
+    """
+    total_M, K = A_packed.shape
+    G, K2, N = B.shape
+    assert K == K2, "K dimension mismatch between A_packed and B"
+
+    out = torch.empty(
+        total_M,
+        N,
+        dtype=torch.promote_types(A_packed.dtype, B.dtype),
+        device=A_packed.device,
+    )
+
+    for g in hl.grid(G):
+        start = group_offsets[g]
+        end = group_offsets[g + 1]
+        for tile_m in hl.tile(start, end):
+            for tile_n in hl.tile(N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(K):
+                    acc = torch.addmm(
+                        acc, A_packed[tile_m, tile_k], B[g, tile_k, tile_n]
+                    )
+                out[tile_m, tile_n] = acc.to(out.dtype)
+
+    return out
+
+
+# %%
 # Data Preparation Utilities
 # --------------------------
 
@@ -385,6 +441,17 @@ def _reference_grouped_gemm(
     return torch.cat(outs, dim=0)
 
 
+def _reference_grouped_gemm_moe(
+    A_packed: torch.Tensor, B: torch.Tensor, group_offsets: torch.Tensor
+) -> torch.Tensor:
+    offsets = group_offsets.tolist()
+    outs = [
+        A_packed[start:end] @ B[g]
+        for g, (start, end) in enumerate(itertools.pairwise(offsets))
+    ]
+    return torch.cat(outs, dim=0)
+
+
 def grouped_gemm_jagged_example(
     group_A: list[torch.Tensor], group_B: list[torch.Tensor]
 ) -> torch.Tensor:
@@ -452,6 +519,17 @@ def main() -> None:
         atol=1e-2,
     )
     print("✓ Persistent kernel passed")
+
+    A_packed, _, group_offsets = _pack_group_inputs(group_A, group_B)
+    B = torch.randn(G, K, N, device=device, dtype=dtype)
+    run_example(
+        grouped_gemm_jagged_moe,
+        _reference_grouped_gemm_moe,
+        (A_packed, B, group_offsets),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+    print("✓ Per-group-weights kernel passed")
 
     print("\nAll tests passed!")
 
