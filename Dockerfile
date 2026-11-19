@@ -47,7 +47,7 @@ RUN git clone --depth 1 https://github.com/Dao-AILab/quack.git /workspace/quack
 
 RUN python -m pip install \
         --pre \
-        --index-url https://download.pytorch.org/whl/nightly/cu130 \
+        --index-url https://download.pytorch.org/whl/nightly/cu132 \
         --extra-index-url https://pypi.org/simple \
         torch \
         triton && \
