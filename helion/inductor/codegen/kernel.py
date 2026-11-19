@@ -31,7 +31,7 @@ from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
 
-from . import config as helion_config
+from .. import config as helion_config
 from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import upcast_compute_type

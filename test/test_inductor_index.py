@@ -22,7 +22,7 @@ from helion._testing import TestCase
 if not requires_torch_version("2.16"):
     pytest.skip("helion.inductor needs torch 2.16", allow_module_level=True)
 
-from helion.inductor.kernel import HelionKernel
+from helion.inductor.codegen.kernel import HelionKernel
 
 pytestmark = pytest.mark.cpu_only
 

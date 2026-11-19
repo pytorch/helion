@@ -6,7 +6,6 @@ from typing import Any
 from typing import cast
 
 import sympy
-import torch
 from torch._inductor import config
 from torch._inductor.codegen.common import BackendFeature
 from torch._inductor.codegen.simd import SIMDScheduling
@@ -18,9 +17,11 @@ from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.functions import Where
 
-from .._compiler._inductor.template_buffer import HelionTemplateBuffer
-from .._compiler.backend_registry import get_backend
-from . import config as helion_config
+from ..._compiler._inductor.template_buffer import HelionTemplateBuffer
+from ..._compiler.backend_registry import get_backend
+from .. import config as helion_config
+from ..support import numerics_modes
+from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
 from .kernel import HelionKernel
@@ -29,6 +30,7 @@ from .overrides import HelionOverrides
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import torch
     from torch._inductor.codegen.multi_kernel import MultiKernel
     from torch._inductor.codegen.simd import SIMDKernel
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
@@ -86,7 +88,6 @@ HELION_OPS = (
     | INHERITED_OPS
     | OrderedSet(["store_reduction", "indirect_indexing", "output"])
 )
-MATMUL_DTYPES = OrderedSet([torch.float16, torch.bfloat16, torch.float32])
 
 
 @functools.cache
@@ -109,31 +110,6 @@ def backend_ops(backend: str) -> OrderedSet[str]:
     return HELION_OPS - OrderedSet(
         name for name in torch_calls if getattr(cls, name) is getattr(OpsHandler, name)
     )
-
-
-def python_wrapper() -> bool:
-    return not (V.graph.cpp_wrapper or V.graph.fx_wrapper)
-
-
-# Inductor's numerics modes, which Helion kernels do not implement yet.
-NUMERICS_MODES = (
-    "strict_reduction",
-    "batch_invariant",
-    "deterministic",
-    "eager_numerics.division_rounding",
-    "eager_numerics.disable_ftz",
-    "eager_numerics.use_pytorch_libdevice",
-    "emulate_precision_casts",
-)
-
-
-def numerics_modes() -> list[str]:
-    """The NUMERICS_MODES that are on."""
-    return [
-        mode
-        for mode in NUMERICS_MODES
-        if functools.reduce(getattr, mode.split("."), config)
-    ]
 
 
 def has_dot(node: BaseSchedulerNode) -> bool:
