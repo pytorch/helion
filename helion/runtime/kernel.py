@@ -439,6 +439,9 @@ _TensorMetadataPathStep = (
 )
 
 
+_untyped_storage = torch.Tensor.untyped_storage
+
+
 def _mapping_metadata_sort_key(key: object) -> tuple[str, str, str]:
     key_type = type(key)
     return key_type.__module__, key_type.__qualname__, repr(key)
@@ -489,8 +492,11 @@ def _input_tensor_metadata(values: Sequence[object]) -> tuple[Hashable, ...]:
     )
 
 
-def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
-    """Return a canonical key only when tensor arguments alias."""
+def _input_tensor_aliases(
+    values: Sequence[object], *, by_storage: bool = False
+) -> tuple[Hashable, ...] | None:
+    """Return a canonical key only when tensor arguments alias
+    (``_tensor_aliases``)."""
     # Eager dispatch normally receives a flat argument list. Only structured
     # inputs need the deterministic recursive walk and its metadata paths.
     tensors: list[torch.Tensor] = []
@@ -504,7 +510,7 @@ def _input_tensor_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
         ):
             tensors = [tensor for _path, tensor in _walk_input_tensors(values)]
             break
-    return _tensor_aliases(tensors)
+    return _tensor_aliases(tensors, by_storage=by_storage)
 
 
 def _input_fragment_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
@@ -592,8 +598,188 @@ def _input_fragment_aliases(values: Sequence[object]) -> tuple[int, ...] | None:
     return tuple(partition)
 
 
-def _tensor_aliases(tensors: Sequence[torch.Tensor]) -> tuple[int, ...] | None:
-    """Canonical alias partition of ``tensors``; None when all are distinct."""
+# A view's bytes: per dimension, largest stride first, its size and stride
+# in bytes, and its element size.
+_ByteLayout = tuple[tuple[tuple[int, int], ...], int]
+
+
+def _bytes_meet(offset: int, first: _ByteLayout, second: _ByteLayout) -> bool:
+    """Whether two views of one storage may share a byte, ``second`` starting
+    ``offset`` bytes after ``first``.  Where their outer dimensions step by
+    one stride and each step's row is narrower than it, only the rows whose
+    spans meet are compared, dimension by dimension, so the column slices of
+    ``qkv.split(..., dim=-1)`` are apart."""
+    (first_dims, first_item), (second_dims, second_item) = first, second
+    first_width = first_item + sum((n - 1) * stride for n, stride in first_dims)
+    second_width = second_item + sum((n - 1) * stride for n, stride in second_dims)
+    if offset >= first_width or offset + second_width <= 0:
+        return False
+    if first_dims and first_dims[0][0] == 1:
+        return _bytes_meet(offset, (first_dims[1:], first_item), second)
+    if second_dims and second_dims[0][0] == 1:
+        return _bytes_meet(offset, first, (second_dims[1:], second_item))
+    if not first_dims or not second_dims or first_dims[0][1] != second_dims[0][1]:
+        return True
+    (first_rows, row), (second_rows, _) = first_dims[0], second_dims[0]
+    first_row = first_width - (first_rows - 1) * row
+    second_row = second_width - (second_rows - 1) * row
+    if row <= 0 or first_row > row or second_row > row:
+        return True
+    # Row ``i`` of ``first`` against row ``i - k`` of ``second``.
+    low = max(1 - second_rows, (offset - first_row) // row + 1)
+    high = min(first_rows - 1, -(-(offset + second_row) // row) - 1)
+    return any(
+        _bytes_meet(
+            offset - k * row,
+            (first_dims[1:], first_item),
+            (second_dims[1:], second_item),
+        )
+        for k in range(low, high + 1)
+    )
+
+
+def _byte_layout(tensor: torch.Tensor) -> _ByteLayout:
+    # The bytes a view covers do not depend on the order of its dimensions.
+    item = tensor.element_size()
+    dims = sorted(
+        zip(tensor.size(), tensor.stride(), strict=True), key=lambda dim: -dim[1]
+    )
+    return tuple((size, stride * item) for size, stride in dims), item
+
+
+def _overlap_classes(tensors: Sequence[torch.Tensor]) -> list[int]:
+    """The overlap class of each eager tensor: tensors that may share a byte
+    of one storage (``_bytes_meet``), directly or through others, share
+    one."""
+    spans: list[tuple[object, int, int]] = []
+    for tensor in tensors:
+        if tensor.is_contiguous():
+            width = tensor.nbytes
+        else:
+            dims, item = _byte_layout(tensor)
+            width = (tensor.numel() != 0) * (item + sum((n - 1) * s for n, s in dims))
+        spans.append((_untyped_storage(tensor), tensor.data_ptr(), width))
+    classes = list(range(len(tensors)))
+    for i, (storage, start, width) in enumerate(spans):
+        for j, (other_storage, other_start, other_width) in enumerate(spans[:i]):
+            if (
+                other_storage is storage
+                and start < other_start + other_width
+                and other_start < start + width
+                and _bytes_meet(
+                    start - other_start,
+                    _byte_layout(tensors[j]),
+                    _byte_layout(tensors[i]),
+                )
+            ):
+                old, new = classes[i], classes[j]
+                classes = [new if c == old else c for c in classes]
+    return classes
+
+
+# Overlap partitions by everything they depend on: the identity partition,
+# which tensors share a storage at which offsets, and the sizes, strides and
+# element sizes.  Cleared when full.
+_OVERLAP_PARTITIONS: dict[Hashable, tuple[Hashable, ...] | None] = {}
+_OVERLAP_PARTITIONS_LIMIT = 1024
+
+
+def _overlap_aliases(tensors: Sequence[torch.Tensor]) -> tuple[Hashable, ...] | None:
+    """Canonical partition of eager ``tensors`` by runtime overlap; None when
+    none overlap.
+
+    Each tensor maps to its (overlap class, tensor class) pair, so a view of
+    another argument's elements keys apart from distinct tensors and from
+    the same tensor passed twice.  Where tensors overlap only by identity,
+    the key is the identity partition (``_tensor_aliases``); disjoint slices
+    of one storage key as distinct tensors.
+    """
+    if len(tensors) < 2:
+        return None
+    # Storages hash by identity; ``id()`` would fire an audit event per call
+    # once any audit hook is installed (importing inductor installs one).
+    storages = len(set(map(_untyped_storage, tensors)))
+    if storages == len(tensors):
+        return None
+    identity = cast("tuple[int, ...] | None", _tensor_aliases(tensors))
+    if identity is not None and max(identity) + 1 == storages:
+        # Each shared storage is one tensor passed more than once.
+        return identity
+    if any(isinstance(tensor, FakeTensor) for tensor in tensors):
+        # Fake tensors have no addresses; their bindings merge the storages
+        # of one tensor passed twice alone (``_input_storage_aliases``).
+        return identity
+    layout = (
+        identity,
+        _storage_layout(tensors),
+        tuple(
+            (tensor.size(), tensor.stride(), tensor.element_size())
+            for tensor in tensors
+        ),
+    )
+    try:
+        return _OVERLAP_PARTITIONS[layout]
+    except KeyError:
+        pass
+    first: dict[int, int] = {}
+    aliases = tuple(
+        (first.setdefault(overlap, len(first)), index)
+        for overlap, index in zip(
+            _overlap_classes(tensors), identity or range(len(tensors)), strict=True
+        )
+    )
+    distinct = all(overlap == index for overlap, index in aliases)
+    partition = identity if distinct else aliases
+    if len(_OVERLAP_PARTITIONS) >= _OVERLAP_PARTITIONS_LIMIT:
+        _OVERLAP_PARTITIONS.clear()
+    _OVERLAP_PARTITIONS[layout] = partition
+    return partition
+
+
+def _input_storage_aliases(
+    args: Sequence[object], fake_args: Sequence[object]
+) -> dict[int, int]:
+    """The fake storage id of each tensor argument that overlaps an earlier
+    one, mapped to the earliest one's
+    (``CompileEnvironment.input_storage_aliases``), from the partition the
+    cache key holds (``_overlap_aliases``)."""
+    partition = _input_tensor_aliases(args, by_storage=True)
+    if partition is None:
+        return {}
+    fakes: list[torch.Tensor | None] = []
+    for arg, fake_arg in zip(args, fake_args, strict=True):
+        # ``to_fake`` keeps each container's type, so a tensor's path names
+        # its fake.  An argument it lifts to a function (an object with an
+        # ``fn`` attribute) has none: its tensors merge with nothing.
+        fake_paths = dict(_walk_input_tensors(fake_arg))
+        fakes.extend(fake_paths.get(path) for path, _tensor in _walk_input_tensors(arg))
+    first: dict[Hashable, int] = {}
+    aliases: dict[int, int] = {}
+    for entry, fake in zip(partition, fakes, strict=True):
+        if fake is None:
+            continue
+        # An overlapping view's entry is (overlap class, tensor class).
+        overlap = entry[0] if isinstance(entry, tuple) else entry
+        storage = id(fake.untyped_storage())
+        canonical = first.setdefault(overlap, storage)
+        if canonical != storage:
+            aliases[storage] = canonical
+    return aliases
+
+
+def _tensor_aliases(
+    tensors: Sequence[torch.Tensor], *, by_storage: bool = False
+) -> tuple[Hashable, ...] | None:
+    """Canonical alias partition of ``tensors``; None when all are distinct.
+
+    By tensor identity, or ``by_storage`` by runtime overlap
+    (``_overlap_aliases``) for a kernel whose barrier walks order overlapping
+    arguments (``Backend.orders_overlapping_inputs``).  Dynamo traces each
+    ``untyped_storage()`` as a fresh value, so while it traces, the overlap
+    partition falls back to identity.
+    """
+    if by_storage and not torch.compiler.is_compiling():
+        return _overlap_aliases(tensors)
     if len(tensors) < 2:
         return None
     # Identity comparisons only: ``id()`` fires an audit event per call once
@@ -1054,6 +1240,76 @@ def _build_prepared_fact_guard(
         return None
 
 
+def _is_input_path(prefix: str) -> bool:
+    """Whether the guard path ``prefix`` reaches a value the cache key walks,
+    not one a function argument's closure holds."""
+    return ".__closure__" not in prefix
+
+
+def _storage_layout(tensors: Sequence[torch.Tensor]) -> tuple[Hashable, ...]:
+    """Which of ``tensors`` share a storage, and each one's offset in it: with
+    the dtypes, sizes and strides the guard pins, all their overlap depends
+    on.  Storages hash by identity (see ``_overlap_aliases``)."""
+    storages: dict[object, int] = {}
+    return tuple(
+        (
+            storages.setdefault(_untyped_storage(tensor), len(storages)),
+            tensor.storage_offset(),
+        )
+        for tensor in tensors
+    )
+
+
+def _append_tensor_alias_checks(
+    kernel: Kernel,
+    checks: list[str],
+    namespace: dict[str, object],
+    tensor_paths: list[tuple[str, weakref.ReferenceType[torch.Tensor]]],
+    identity_checks: list[tuple[str, bool]],
+) -> None:
+    """Check that a call's tensors alias as the prepared call's did: by
+    identity, or where the kernel keys by overlap
+    (``Kernel._keys_storage_aliases``) by the overlap partition of the
+    tensors the key walks."""
+    inputs = [(prefix, ref) for prefix, ref in tensor_paths if _is_input_path(prefix)]
+    # (Stand-in kernels of the tests pass one tensor and carry no flag.)
+    if len(inputs) < 2 or not kernel._keys_storage_aliases:
+        checks.extend(check for check, _function in identity_checks)
+        return
+    tensors = [cast("torch.Tensor", ref()) for _prefix, ref in inputs]
+    tensor_aliases = _overlap_aliases(tensors)
+    # The overlap partition implies the other identity relations.
+    checks.extend(
+        check for check, open_ in identity_checks if open_ or tensor_aliases is not None
+    )
+    distinct = [
+        (prefix, tensor)
+        for index, ((prefix, _ref), tensor) in enumerate(
+            zip(inputs, tensors, strict=True)
+        )
+        if all(tensor is not previous for previous in tensors[:index])
+    ]
+    if len(distinct) < 2:
+        return
+    namespace["_overlap_aliases"] = _overlap_aliases
+    namespace["_storage_layout"] = _storage_layout
+    namespace["_untyped_storage"] = _untyped_storage
+    namespace["tensor_aliases"] = tensor_aliases
+    namespace["storage_layout"] = _storage_layout([t for _p, t in distinct])
+    paths = ", ".join(prefix for prefix, _ref in inputs)
+    distinct_paths = ", ".join(prefix for prefix, _tensor in distinct)
+    # Distinct storages, the common case, need no spans, nor does the
+    # prepared call's own layout.
+    alternatives = [
+        f"_storage_layout(({distinct_paths},)) == storage_layout",
+        f"_overlap_aliases(({paths},)) == tensor_aliases",
+    ]
+    if tensor_aliases is None or isinstance(tensor_aliases[0], int):
+        storages = ", ".join(f"_untyped_storage({p})" for p, _tensor in distinct)
+        alternatives.insert(0, f"len({{{storages}}}) == {len(distinct)}")
+    checks.append(f"({' or '.join(alternatives)})")
+
+
 def _make_prepared_arg_guard(
     kernel: Kernel,
     args: tuple[object, ...],
@@ -1062,6 +1318,12 @@ def _make_prepared_arg_guard(
     checks = [f"len(args) == {len(args)}"]
     counter = itertools.count()
     tensor_paths: list[tuple[str, weakref.ReferenceType[torch.Tensor]]] = []
+    # Each tensor's identity relation to each earlier one, and whether the
+    # overlap partition leaves it open: either tensor sits in a function
+    # argument's closure, where the cache key does not look
+    # (``_walk_input_tensors``), or both are empty, so they overlap nothing.
+    # Checked after the structural checks (``_append_tensor_alias_checks``).
+    identity_checks: list[tuple[str, bool]] = []
     # Plain tensors whose dtype / device / shape / stride one C++ guard
     # (dynamo's ``TensorGuards``) checks in front of the Python checks: ~0.1
     # us per tensor against ~0.5 us for the four attribute comparisons.
@@ -1094,8 +1356,16 @@ def _make_prepared_arg_guard(
         elif value_type in (torch.Tensor, torch.nn.Parameter):
             assert isinstance(value, torch.Tensor)
             for previous_prefix, previous_tensor_ref in tensor_paths:
-                relation = "is" if previous_tensor_ref() is value else "is not"
-                checks.append(f"{prefix} {relation} {previous_prefix}")
+                previous = cast("torch.Tensor", previous_tensor_ref())
+                relation = "is" if previous is value else "is not"
+                identity_checks.append(
+                    (
+                        f"{prefix} {relation} {previous_prefix}",
+                        not _is_input_path(prefix)
+                        or not _is_input_path(previous_prefix)
+                        or value.numel() == previous.numel() == 0,
+                    )
+                )
             tensor_paths.append((prefix, weakref.ref(value)))
             static_indices = getattr(value, "_dynamo_static_indices", None)
             if value_type is torch.Tensor and static_indices is None:
@@ -1236,6 +1506,9 @@ def _make_prepared_arg_guard(
         # Break the recursive closure cycle so its temporary C++ guard inputs
         # are released even when cyclic GC is disabled or traversal raises.
         append_checks = cast("Any", None)
+    _append_tensor_alias_checks(
+        kernel, checks, namespace, tensor_paths, identity_checks
+    )
     if (fragment_aliases := _input_fragment_aliases(args)) is not None:
         namespace["_input_fragment_aliases"] = _input_fragment_aliases
         namespace["fragment_aliases"] = fragment_aliases
@@ -1598,6 +1871,11 @@ class Kernel(Generic[_R]):
         # argument. Computed once so the per-call is_distributed check stays cheap
         # on the dispatch hot path (avoids re-running inspect.signature). See #3024.
         self._declares_process_group: bool = kernel_declares_process_group(fn)
+        # The cache key holds what the bindings' code depends on: argument
+        # overlap where the barrier walks order overlapping arguments.
+        self._keys_storage_aliases: bool = get_backend(
+            self.settings.backend
+        ).orders_overlapping_inputs
         self.configs: list[Config] = [
             # pyrefly: ignore [bad-argument-type]
             Config(**config) if isinstance(config, dict) else config
@@ -2267,8 +2545,11 @@ class Kernel(Generic[_R]):
             custom_key = self._key_fn(*args) if signature is None else signature[-1]
             key.append(custom_key)
         # ``_input_tensor_aliases(args)`` without re-walking flat arguments.
+        by_storage = self._keys_storage_aliases
         tensor_aliases = (
-            _input_tensor_aliases(args) if has_container else _tensor_aliases(tensors)
+            _input_tensor_aliases(args, by_storage=by_storage)
+            if has_container
+            else _tensor_aliases(tensors, by_storage=by_storage)
         )
         if tensor_aliases is not None:
             key.append(("input_tensor_aliases", tensor_aliases))
@@ -2684,7 +2965,11 @@ class Kernel(Generic[_R]):
                 result.append(_constexpr_key(value))
             else:
                 result.append(self._specialization_key(value))
-        if (tensor_aliases := _input_tensor_aliases(args)) is not None:
+        if (
+            tensor_aliases := _input_tensor_aliases(
+                args, by_storage=self._keys_storage_aliases
+            )
+        ) is not None:
             result.append(("input_tensor_aliases", tensor_aliases))
         if (fragment_aliases := _input_fragment_aliases(args)) is not None:
             result.append(("input_fragment_aliases", fragment_aliases))
@@ -3320,6 +3605,11 @@ class Kernel(Generic[_R]):
             self._fresh_selections.clear()
             self._dispatch_cache.clear()
             self._prepared_call = None
+            # The bindings of a since-changed backend are gone; key by the
+            # current one.
+            self._keys_storage_aliases = get_backend(
+                self.settings.backend
+            ).orders_overlapping_inputs
             # Specialization extractors are discovered by tracing the host
             # function and can change after an explicit reset. Keeping the old
             # schema could hide newly discovered hl.specialize() calls.
@@ -3520,6 +3810,16 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
                     constexpr_args[name] = arg
                 else:
                     self.fake_args.append(self.env.to_fake(arg, ArgumentOrigin(name)))
+
+            # Merge where the kernel also keys by overlap; its backend may
+            # since have changed (``Kernel._keys_storage_aliases``).
+            if (
+                self.kernel._keys_storage_aliases
+                and self._env.backend.orders_overlapping_inputs
+            ):
+                self._env.input_storage_aliases = _input_storage_aliases(
+                    args, self.fake_args
+                )
 
             self._apply_mark_static(args)
             runtime_args = dict(
