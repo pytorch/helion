@@ -25,6 +25,8 @@ from .._compat import is_hip
 from .._compat import supports_tf32_precision_on_amd
 from .._compiler.backend_registry import get_backend
 from .._compiler.backend_registry import list_backends
+from .._logging._internal import LOG_ENV_VAR
+from .._logging._internal import log_entries
 from ..autotuner.effort_profile import AutotuneEffort
 from ..autotuner.effort_profile import InitialPopulation
 from ..autotuner.effort_profile import get_effort_profile
@@ -176,6 +178,14 @@ def _env_get_str_or_none(var_name: str, default: str | None) -> str | None:
     if value is None or (value := value.strip()) == "":
         return default
     return value
+
+
+def _get_megakernel_timeline() -> str | None:
+    """``HELION_LOGS=timeline``: megakernel timelines under ./helion_timeline/."""
+    entries = log_entries(os.environ.get(LOG_ENV_VAR, ""))
+    if "timeline" not in {name for name, _level in entries}:
+        return None
+    return os.path.abspath(os.path.join("helion_timeline", "timeline"))
 
 
 def _get_index_dtype() -> torch.dtype | None:
@@ -562,6 +572,9 @@ class _Settings:
     )
     print_repro: bool = dataclasses.field(
         default_factory=functools.partial(_env_get_bool, "HELION_PRINT_REPRO", False)
+    )
+    megakernel_timeline: str | None = dataclasses.field(
+        default_factory=_get_megakernel_timeline
     )
     output_origin_lines: bool = dataclasses.field(
         default_factory=functools.partial(
@@ -1060,6 +1073,21 @@ class Settings(_Settings):
         ),
         "print_output_code": "If True, print the output code of the kernel to stderr.",
         "print_repro": "If True, print Helion kernel code, config, and caller code to stderr as a standalone repro script.",
+        "megakernel_timeline": (
+            "Path prefix for megakernel timelines. When set, a megakernel "
+            "(a cross_loop_pipeline) stamps %globaltimer at each worker's entry and "
+            "exit and at each task's start, last scheduler wait and end, keeping its "
+            "last 16 launches, and at exit writes them to "
+            "<prefix>.<kernel>.<n>.rank<r>.txt (.cuda<i>.pid<p>.txt outside a process "
+            "group; python -m helion.runtime.timeline plot draws one). Stamping "
+            "adds work: compare times within a timeline. "
+            "A CUDA graph keeps only its last replay unless the kernel was launched "
+            "on the capturing stream before capture. It needs a fixed config: "
+            "autotuning a megakernel under it raises, though a cached tuned "
+            "config is used as usual. "
+            "HELION_LOGS=timeline sets it to ./helion_timeline/timeline and logs "
+            "the paths written."
+        ),
         "output_origin_lines": (
             "If True, annotate generated Triton code with source-origin comments. "
             "Set HELION_OUTPUT_ORIGIN_LINES=0 to disable."

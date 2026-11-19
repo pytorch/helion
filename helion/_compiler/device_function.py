@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from ..runtime.config import Config
     from ..runtime.config import IndexingLiteral
     from .cross_loop_codegen import PeerState
+    from .cross_loop_timeline import Timeline
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .cute.device_state import CuteDeviceFunctionState
     from .device_ir import GraphInfo
@@ -324,7 +325,8 @@ class SyncRole:
     # publications (pushes, their syncs and drains), which order no later load;
     # launch: per-launch state read at entry and rewritten at exit; claim: a
     # claimed task loop's claim; poll: in-band mailbox reads and their vote,
-    # which order only the reads of the mailbox they return.
+    # which order only the reads of the mailbox they return; stamp: a
+    # megakernel_timeline stamp, which orders nothing.
     kind: str
     # A wait's covered obligations: the allocations whose reads it orders
     # (None: every read).
@@ -522,6 +524,11 @@ class DeviceFunction:
         # A symmetric spec also appends the per-rank base pointer table.
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
+        # The megakernel_timeline stamps of a cross-loop schedule, and the names
+        # whose statement returns once a scheduler spin is done (where its
+        # ready stamps go).
+        self.timeline: Timeline | None = None
+        self.spin_ends: set[str] = set()
         # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
         # awaiting their first use, the inband accesses emitted so far, and the
         # done-word asm of each root with inband scatter stores.
