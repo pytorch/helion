@@ -4017,7 +4017,8 @@ def elementize(
                 put = ast.Expr(
                     ast.Call(ast.Name(PUT, ast.Load()), [ast.Name(new, ast.Load())], [])
                 )
-                out.append(element_loop(root, put, seen))
+                # The update runs once per iteration of its loop: unrolled.
+                out.append(element_loop(root, put, seen, unroll=True))
                 alias_stmt = ast.Assign(
                     [ast.Name(t, ast.Store())], ast.Name(carry, ast.Load())
                 )
@@ -4122,7 +4123,9 @@ def elementize(
         ordered = sorted(chosen.values(), key=lambda s: order[id(s)])
         return head + [copy.deepcopy(s) for s in ordered], ordered
 
-    def element_loop(root: str, store_stmt: ast.stmt, seen: list[ast.stmt]) -> ast.stmt:
+    def element_loop(
+        root: str, store_stmt: ast.stmt, seen: list[ast.stmt], unroll: bool = False
+    ) -> ast.stmt:
         binds = {_bind_name(b): b.elts[1] for b in _binds(groups[root])}
         last: ast.AST = store_stmt
         if isinstance(store_stmt, ast.Expr) and call_name(store_stmt.value) == PUT:
@@ -4137,9 +4140,10 @@ def elementize(
             # Barriers on each side: after the vector's staging writes, and
             # before the next writes to its tile.
             iter_args.append(ast.Constant(True))
+        keywords = [ast.keyword("unroll", ast.Constant(True))] if unroll else []
         return ast.For(
             target=ast.Name("_it", ast.Store()),
-            iter=ast.Call(ast.Name(ELEMENTS, ast.Load()), iter_args, []),
+            iter=ast.Call(ast.Name(ELEMENTS, ast.Load()), iter_args, keywords),
             body=loop_body,
             orelse=[],
         )

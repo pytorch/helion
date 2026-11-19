@@ -29,6 +29,7 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.metal import mpp_matmul
+from helion._compiler.metal import msl_ast_walker
 from helion._compiler.metal import tile_sharing
 from helion._compiler.metal.staged_matmul_heuristic import MetalStagedMatmulHeuristic
 from helion._testing import import_example
@@ -11036,10 +11037,13 @@ def upd_written_vec(
 
 #: The update's element loop writes each element back before the op runs.
 _UPDATE = r"\*_it = [A-Za-z_]\w*;[\s\S]*\.run\("
-#: A barrier right before and right after the update's element loop.
+#: A barrier right before and right after the update's element loop, which
+#: is unrolled over its slots, with a loop over any slots past them.
 _FENCED = (
-    r"threadgroup_barrier\(mem_flags::mem_threadgroup\);\n\s*for \(auto _it = "
-    r"\w+\.begin\(\)[^\n]*\{\n(?:[^\n]*\n)*?\s*\*_it = \w+;\n\s*\}\n\s*"
+    r"threadgroup_barrier\(mem_flags::mem_threadgroup\);\n\s*\{\n\s*"
+    r"constexpr ushort _mpp_slots = [^\n]*\n\s*#pragma unroll\n\s*"
+    r"for \(ushort _ei = 0; [^\n]*\{\n(?:[^\n]*\n)*?\s*\*_it = \w+;\n"
+    r"(?:[^\n]*\n)*?\s*\}\n\s*\}\n\s*"
     r"threadgroup_barrier\(mem_flags::mem_threadgroup\);"
 )
 #: Of the threads that hold a vector element, one writes it.
@@ -11105,6 +11109,25 @@ class TestMppCarryUpdate(unittest.TestCase):
 
     def _pv(self, ks: slice, v: torch.Tensor | None = None) -> torch.Tensor:
         return _d(self.p)[:, ks] @ _d(self.v if v is None else v)[ks]
+
+    def test_slots_past_the_unrolled_bound(self) -> None:
+        """The update's loop is unrolled over a bound on each thread's element
+        slots; a loop after it covers the slots past the bound.  A 16x16 op on
+        eight SIMD groups gives each thread 4 slots for its one element, so a
+        bound of 1 leaves three to that loop."""
+        p, v = self.p, self.v
+
+        def ref(block_sizes: list[int]) -> torch.Tensor:
+            acc = torch.zeros(48, 40, dtype=torch.float64)
+            for ks in _k_tiles(72, block_sizes[2]):
+                acc = acc * 0.5 + self._pv(ks)
+            return acc
+
+        with patch.object(msl_ast_walker, "_MIN_UNROLLED_ELEMENTS", 1):
+            out, _, msl = _run(inloop_const, (p, v), TILE16, module_key="slots")
+        _close(out, ref([16, 16, 16]))
+        self.assertIn(" : 1u;", msl)
+        self.assertRegex(msl, r"for \(ushort _ei = _mpp_slots; ")
 
     def test_recomputable_operands(self) -> None:
         """Constants, per-row loads and a bool mask from a load, read at each
