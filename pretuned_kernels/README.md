@@ -160,10 +160,14 @@ the shapes or target hardware differ from the included sweep, generate and
 commit an AOT heuristic for the application's target shapes and hardware.
 
 For AOT pretuned kernels, Helion's runtime looks for
-`_helion_aot_<kernel>_cuda_sm<NN>.py` next to the kernel source file.  Helion
-looks for AOT heuristic files for the current compute capability first, then
-falls back to older compatible CUDA/ROCm capabilities.  For example, on
-`sm120`, if no `sm120` heuristic exists, an `sm100` heuristic file can be used.
+`_helion_aot_<kernel>_cuda_sm<NN>.py` next to the kernel source file (on ROCm
+`_helion_aot_<kernel>_rocm_gfx<arch>.py`).  Check ROCm heuristics in under the
+base arch, e.g. `rocm_gfx950`: the runtime finds that name on any GPU of the
+arch, and `run.py` only counts that form; rename a generated file whose name
+carries target features (`rocm_gfx950:sramecc+:xnack-`).  Helion looks for AOT
+heuristic files for the current compute capability first, then falls back to
+older compatible CUDA/ROCm capabilities.  For example, on `sm120`, if no `sm120`
+heuristic exists, an `sm100` heuristic file can be used.
 
 ## Running benchmarks
 
