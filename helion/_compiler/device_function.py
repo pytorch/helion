@@ -382,6 +382,10 @@ def _selects_tma_access(config: Config) -> bool:
     Decided before codegen, since a handoff can be emitted before the access.
     Over-reports: fact slots do not always match codegen's memory-op slots.
     """
+    # mxfp8 imports the language ops, which import this module.
+    from .mxfp8 import find_packed_mxfp8_dot
+    from .mxfp8 import native_packed_mxfp8_target
+
     env = CompileEnvironment.current()
     capability = env.config_spec.target_device_capability
     if (
@@ -392,9 +396,19 @@ def _selects_tma_access(config: Config) -> bool:
         or capability < (9, 0)
     ):
         return False
-    return indexing_uses_tensor_descriptor(config.atomic_indexing) or (
-        indexing_uses_tensor_descriptor(config.indexing)
-        and any(2 <= fact.ndim <= 5 for fact in env.config_spec.memory_op_facts)
+    return (
+        indexing_uses_tensor_descriptor(config.atomic_indexing)
+        or (
+            indexing_uses_tensor_descriptor(config.indexing)
+            and any(2 <= fact.ndim <= 5 for fact in env.config_spec.memory_op_facts)
+        )
+        # The native packed MXFP8 lowering loads and stores through TMA
+        # whatever ``indexing`` says (``triton/packed_mxfp8.py``).
+        or (
+            native_packed_mxfp8_target(env)
+            and find_packed_mxfp8_dot(HostFunction.current().device_ir.graphs)
+            is not None
+        )
     )
 
 
@@ -418,7 +432,7 @@ class DeviceFunction:
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
-            tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
+            tuple[torch.Tensor, str, bool | None, bool], TensorDescriptorArg
         ] = {}
         self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
@@ -1177,6 +1191,7 @@ class DeviceFunction:
         block_size: list[int | torch.SymInt],
         *,
         ring_swizzle: bool | None = None,
+        force_host: bool = False,
     ) -> TensorDescriptorArg:
         """``ring_swizzle`` set: a Gluon host descriptor filling the ring's
         slots (``gluon_ring.ring_descriptor``), swizzled unless it holds scales."""
@@ -1186,7 +1201,11 @@ class DeviceFunction:
         # unswizzled scale slot keeps its own).
         gluon = CompileEnvironment.current().backend_name == "gluon"
         swizzle = True if gluon and ring_swizzle is None else ring_swizzle
-        key = (fake_value, block_size_expr, swizzle)
+        use_host = (
+            force_host
+            or CompileEnvironment.current().backend.host_tensor_descriptors(self.config)
+        )
+        key = (fake_value, block_size_expr, swizzle, use_host)
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(
@@ -1219,9 +1238,7 @@ class DeviceFunction:
                 permutation if permutation is not None else [*range(fake_value.ndim)]
             )
             assert descriptor_dims[-1] == stride_one_dim
-            if CompileEnvironment.current().backend.host_tensor_descriptors(
-                self.config
-            ):
+            if use_host:
                 tensor_host = origin.host_str()
                 tensor_base = env.backend.tensor_descriptor_host_base(
                     fake_value, tensor_host

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 import helion
 from helion._testing import DEVICE
@@ -17,6 +18,7 @@ from helion._testing import onlyBackends
 from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing import skipIfRefEager
+from helion.autotuner import PowerOfTwoFragment
 import helion.language as hl
 from helion.runtime.settings import _get_backend
 
@@ -106,6 +108,322 @@ def _reference_dot_scaled(
     x_factor = torch.exp2(x_scale.float() - 127).repeat_interleave(group, dim=1)
     y_factor = torch.exp2(y_scale.float() - 127).repeat_interleave(group, dim=1)
     return (x.float() * x_factor) @ (y.float() * y_factor.T)
+
+
+def _pack_e8m0_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Pack four scale bytes per MN-major int32 word."""
+    packed = F.pad(scales, (0, (-scales.shape[1]) % 4)).contiguous().view(torch.int32)
+    aligned_rows = (packed.shape[0] + 3) // 4 * 4
+    storage = torch.empty(
+        (packed.shape[1], aligned_rows), device=scales.device, dtype=torch.int32
+    )
+    result = storage.T[: packed.shape[0]]
+    result.copy_(packed)
+    return result
+
+
+def _packed_mxfp8_inputs(
+    m: int, n: int, k: int, *, scales: tuple[int, int] = (120, 136)
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    torch.manual_seed(0)
+    x = (torch.randn(m, k, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+    y = (torch.randn(n, k, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+    x_scale = torch.randint(*scales, (m, k // 32), device=DEVICE, dtype=torch.uint8)
+    y_scale = torch.randint(*scales, (n, k // 32), device=DEVICE, dtype=torch.uint8)
+    expected = _reference_dot_scaled(x, x_scale, y.T, y_scale)
+    return (x, _pack_e8m0_scales(x_scale), y, _pack_e8m0_scales(y_scale)), expected
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def _packed_mxfp8_gemm(
+    x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
+) -> torch.Tensor:
+    """``x @ y.T`` from E4M3 data and MN-major packed E8M0 scale words."""
+    m, k = x.size()
+    n, _ = y.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    flat_out = out.view(m * n)
+    block_m = hl.register_block_size(16, 128)
+    block_n = hl.register_block_size(128, 256)
+    block_groups = hl.register_block_size(4)
+    for task_m, task_n in hl.grid(
+        [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n]
+    ):
+        rows = task_m * block_m + hl.arange(block_m)
+        cols = task_n * block_n + hl.arange(block_n)
+        acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+        for groups in hl.tile(k // 32, block_size=block_groups):
+            columns = groups.begin * 32 + hl.arange(block_groups * 32)
+            lhs = hl.load(
+                x,
+                [rows, columns],
+                extra_mask=(rows[:, None] < m) & (columns[None, :] < k),
+            )
+            rhs = hl.load(
+                y,
+                [cols, columns],
+                extra_mask=(cols[:, None] < n) & (columns[None, :] < k),
+            )
+            lhs_words = hl.load(
+                x_scale, [rows, groups.index // 4], extra_mask=rows[:, None] < m
+            )
+            rhs_words = hl.load(
+                y_scale, [cols, groups.index // 4], extra_mask=cols[:, None] < n
+            )
+            shift = ((groups.index % 4) * 8)[None, :]
+            lhs_scale = ((lhs_words >> shift) & 255).to(torch.uint8)
+            rhs_scale = ((rhs_words >> shift) & 255).to(torch.uint8)
+            acc = hl.dot_scaled(
+                lhs, lhs_scale, "e4m3", rhs.T, rhs_scale, "e4m3", acc=acc
+            )
+        hl.store(
+            flat_out,
+            [rows[:, None] * n + cols[None, :]],
+            acc,
+            extra_mask=(rows[:, None] < m) & (cols[None, :] < n),
+        )
+    return out
+
+
+@helion.kernel(
+    autotune_effort="none",
+    static_shapes=True,
+    ignore_warnings=[helion.exc.TensorOperationInWrapper],
+)
+def _split_k_packed_mxfp8_gemm(
+    a: torch.Tensor, scale_a: torch.Tensor, weights: torch.Tensor, scale_b: torch.Tensor
+) -> torch.Tensor:
+    """``_packed_mxfp8_gemm`` with K split over a ``partitions`` grid axis."""
+    m, k = a.shape
+    n = weights.size(0)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
+    block_m = hl.register_block_size(16, 128)
+    block_n = hl.register_block_size(16, 256)
+    block_groups = hl.register_block_size(2, 32)
+    partitions = hl.register_tunable("partitions", PowerOfTwoFragment(1, 16, 1))
+    span = (k // 32 + partitions - 1) // partitions
+    partial = torch.empty((partitions, m, n), dtype=torch.float32, device=a.device)
+    flat_out = out.view(m * n)
+    flat_partial = partial.view(partitions * m * n)
+    for task_m, task_n, part in hl.grid(
+        [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n, partitions]
+    ):
+        rows = task_m * block_m + hl.arange(block_m)
+        cols = task_n * block_n + hl.arange(block_n)
+        acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+        end = min((part + 1) * span, k // 32)
+        for groups in hl.tile(part * span, end, block_size=block_groups):
+            columns = groups.begin * 32 + hl.arange(block_groups * 32)
+            lhs = hl.load(
+                a,
+                [rows, columns],
+                extra_mask=(rows[:, None] < m) & (columns[None, :] < end * 32),
+            )
+            rhs = hl.load(
+                weights,
+                [cols, columns],
+                extra_mask=(cols[:, None] < n) & (columns[None, :] < end * 32),
+            )
+            lhs_words = hl.load(
+                scale_a,
+                [rows, groups.index // 4],
+                extra_mask=(rows[:, None] < m) & (groups.index[None, :] < end),
+            )
+            rhs_words = hl.load(
+                scale_b,
+                [cols, groups.index // 4],
+                extra_mask=(cols[:, None] < n) & (groups.index[None, :] < end),
+            )
+            shift = ((groups.index % 4) * 8)[None, :]
+            lhs_scale = ((lhs_words >> shift) & 255).to(torch.uint8)
+            rhs_scale = ((rhs_words >> shift) & 255).to(torch.uint8)
+            acc = hl.dot_scaled(
+                lhs, lhs_scale, "e4m3", rhs.T, rhs_scale, "e4m3", acc=acc
+            )
+        if partitions == 1:
+            hl.store(
+                flat_out,
+                [rows[:, None] * n + cols[None, :]],
+                acc.to(out.dtype),
+                extra_mask=(rows[:, None] < m) & (cols[None, :] < n),
+            )
+        else:
+            hl.store(
+                flat_partial,
+                [(part * m + rows[:, None]) * n + cols[None, :]],
+                acc,
+                extra_mask=(rows[:, None] < m) & (cols[None, :] < n),
+            )
+    if partitions > 1:
+        return partial.sum(dim=0).to(torch.bfloat16)
+    return out
+
+
+@helion.kernel(
+    autotune_effort="none",
+    static_shapes=False,
+    config=helion.Config(block_sizes=[128, 128, 4], num_warps=4, num_stages=3),
+)
+def _gathered_packed_mxfp8_gemm(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    y: torch.Tensor,
+    y_scale: torch.Tensor,
+    perm: torch.Tensor,
+) -> torch.Tensor:
+    """``(x @ y.T)[perm]`` with the LHS rows gathered (MoE style)."""
+    m, k = x.size()
+    n, _ = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    block_m = hl.register_block_size(16, 128)
+    block_n = hl.register_block_size(128, 256)
+    block_groups = hl.register_block_size(4)
+    for task_m, task_n in hl.grid(
+        [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n]
+    ):
+        slots = task_m * block_m + hl.arange(block_m)
+        rows = hl.load(perm, [slots], extra_mask=slots < m)
+        cols = task_n * block_n + hl.arange(block_n)
+        acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+        for groups in hl.tile(k // 32, block_size=block_groups):
+            columns = groups.begin * 32 + hl.arange(block_groups * 32)
+            lhs = hl.load(
+                x,
+                [rows, columns],
+                extra_mask=(slots[:, None] < m) & (columns[None, :] < k),
+            )
+            rhs = hl.load(
+                y,
+                [cols, columns],
+                extra_mask=(cols[:, None] < n) & (columns[None, :] < k),
+            )
+            lhs_words = hl.load(
+                x_scale, [rows, groups.index // 4], extra_mask=slots[:, None] < m
+            )
+            rhs_words = hl.load(
+                y_scale, [cols, groups.index // 4], extra_mask=cols[:, None] < n
+            )
+            shift = ((groups.index % 4) * 8)[None, :]
+            lhs_scale = ((lhs_words >> shift) & 255).to(torch.uint8)
+            rhs_scale = ((rhs_words >> shift) & 255).to(torch.uint8)
+            acc = hl.dot_scaled(
+                lhs, lhs_scale, "e4m3", rhs.T, rhs_scale, "e4m3", acc=acc
+            )
+        hl.store(
+            out,
+            [slots, cols],
+            acc,
+            extra_mask=(slots[:, None] < m) & (cols[None, :] < n),
+        )
+    return out
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def _packed_mxfp8_gemm_with_bias_rows(
+    x: torch.Tensor,
+    x_scale: torch.Tensor,
+    y: torch.Tensor,
+    y_scale: torch.Tensor,
+    bias: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """An FP32 ``x @ y.T`` and ``bias`` broadcast over its rows, both flat."""
+    m, k = x.size()
+    n, _ = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    rows_of_bias = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    flat_out = out.view(m * n)
+    flat_bias = rows_of_bias.view(m * n)
+    block_m = hl.register_block_size(16, 128)
+    block_n = hl.register_block_size(128, 256)
+    block_groups = hl.register_block_size(4)
+    for task_m, task_n in hl.grid(
+        [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n]
+    ):
+        rows = task_m * block_m + hl.arange(block_m)
+        cols = task_n * block_n + hl.arange(block_n)
+        acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+        for groups in hl.tile(k // 32, block_size=block_groups):
+            columns = groups.begin * 32 + hl.arange(block_groups * 32)
+            lhs = hl.load(
+                x,
+                [rows, columns],
+                extra_mask=(rows[:, None] < m) & (columns[None, :] < k),
+            )
+            rhs = hl.load(
+                y,
+                [cols, columns],
+                extra_mask=(cols[:, None] < n) & (columns[None, :] < k),
+            )
+            lhs_words = hl.load(
+                x_scale, [rows, groups.index // 4], extra_mask=rows[:, None] < m
+            )
+            rhs_words = hl.load(
+                y_scale, [cols, groups.index // 4], extra_mask=cols[:, None] < n
+            )
+            shift = ((groups.index % 4) * 8)[None, :]
+            lhs_scale = ((lhs_words >> shift) & 255).to(torch.uint8)
+            rhs_scale = ((rhs_words >> shift) & 255).to(torch.uint8)
+            acc = hl.dot_scaled(
+                lhs, lhs_scale, "e4m3", rhs.T, rhs_scale, "e4m3", acc=acc
+            )
+        mask = (rows[:, None] < m) & (cols[None, :] < n)
+        flat_index = rows[:, None] * n + cols[None, :]
+        hl.store(flat_out, [flat_index], acc, extra_mask=mask)
+        hl.store(
+            flat_bias, [flat_index], hl.load(bias, [cols])[None, :], extra_mask=mask
+        )
+    return out, rows_of_bias
+
+
+@helion.kernel(autotune_effort="none", static_shapes=True)
+def _copy_then_packed_mxfp8_gemm(
+    x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
+) -> torch.Tensor:
+    """Copy ``x`` in one phase, then contract the copy after a barrier."""
+    m, k = x.size()
+    n, _ = y.size()
+    copy = torch.empty_like(x)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    block_m = hl.register_block_size(128, 128)
+    block_n = hl.register_block_size(128, 256)
+    block_groups = hl.register_block_size(4)
+    for tile_m, tile_k in hl.tile([m, k]):
+        copy[tile_m, tile_k] = x[tile_m, tile_k]
+    hl.barrier()
+    for task_m, task_n in hl.grid(
+        [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n]
+    ):
+        rows = task_m * block_m + hl.arange(block_m)
+        cols = task_n * block_n + hl.arange(block_n)
+        acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+        for groups in hl.tile(k // 32, block_size=block_groups):
+            columns = groups.begin * 32 + hl.arange(block_groups * 32)
+            lhs = hl.load(
+                copy,
+                [rows, columns],
+                extra_mask=(rows[:, None] < m) & (columns[None, :] < k),
+            )
+            rhs = hl.load(
+                y,
+                [cols, columns],
+                extra_mask=(cols[:, None] < n) & (columns[None, :] < k),
+            )
+            lhs_words = hl.load(
+                x_scale, [rows, groups.index // 4], extra_mask=rows[:, None] < m
+            )
+            rhs_words = hl.load(
+                y_scale, [cols, groups.index // 4], extra_mask=cols[:, None] < n
+            )
+            shift = ((groups.index % 4) * 8)[None, :]
+            lhs_scale = ((lhs_words >> shift) & 255).to(torch.uint8)
+            rhs_scale = ((rhs_words >> shift) & 255).to(torch.uint8)
+            acc = hl.dot_scaled(
+                lhs, lhs_scale, "e4m3", rhs.T, rhs_scale, "e4m3", acc=acc
+            )
+        hl.store(
+            out, [rows, cols], acc, extra_mask=(rows[:, None] < m) & (cols[None, :] < n)
+        )
+    return out
 
 
 @onlyBackends(["triton", "cute"])
@@ -234,6 +552,135 @@ class TestDotScaled(TestCase):
 
         code, result = code_and_output(scaled_kernel, (x, x_scale, y, y_scale))
         _assert_scaled_dot_codegen(self, code)
+        if _get_backend() == "triton":
+            self.assertNotIn("mxfp8_lhs_words", code)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_native_lowering(self):
+        """Descriptor operands, UTCCP-ordered scales and a descriptor store."""
+        args, expected = _packed_mxfp8_inputs(128, 256, 256)
+        code, result = code_and_output(_packed_mxfp8_gemm, args)
+        self.assertIn("mxfp8_lhs_words", code)
+        self.assertIn(".trans(1, 0, 3, 2, 4).trans(0, 3, 2, 1, 4)", code)
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(128)", code)
+        self.assertIn("_BLOCK_SIZE_1 = tl.constexpr(256)", code)
+        self.assertIn("_BLOCK_SIZE_2 = tl.constexpr(4)", code)
+        self.assertIn("warp_specialize=True", code)
+        self.assertIn("(x_desc.load(", code)
+        self.assertIn("(y_desc.load(", code)
+        self.assertIn("out_desc.store(", code)
+        self.assertNotIn("tl.make_tensor_descriptor", code)
+        torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_compact_swap(self):
+        """A tile of at most 32 rows is issued as the transposed MMA."""
+        args, expected = _packed_mxfp8_inputs(8, 256, 256)
+        code, result = code_and_output(_packed_mxfp8_gemm, args)
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(16)", code)
+        self.assertIn("_BLOCK_SIZE_1 = tl.constexpr(128)", code)
+        self.assertIn("tl.dot_scaled(tl.permute(", code)
+        self.assertNotIn("mxfp8_lhs_words", code)
+        torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_unaligned_output_stride(self):
+        """An output row stride that is not 16-byte aligned keeps pointer stores."""
+        args, expected = _packed_mxfp8_inputs(128, 129, 256)
+        code, result = code_and_output(_packed_mxfp8_gemm, args)
+        self.assertIn("mxfp8_lhs_words", code)
+        self.assertNotIn("out_desc.store(", code)
+        torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_split_k_alignment(self):
+        """Native loads are proved for each split, whatever its tunable is named.
+
+        K = 2560 holds 80 groups: 4 partitions of 20 groups split on whole
+        scale words and 4-group tiles, 16 partitions of 5 groups do not, and
+        8-group tiles cross the end of a 20-group partition.
+        """
+        args, expected = _packed_mxfp8_inputs(128, 256, 2560, scales=(124, 130))
+        seed = _split_k_packed_mxfp8_gemm.bind(args).config_spec.default_config()
+        self.assertEqual(seed["partitions"], 4)
+        for overrides, words, operand_descriptors in (
+            ({}, True, True),
+            ({"partitions": 16}, False, False),
+            ({"block_sizes": [128, 256, 8]}, True, False),
+        ):
+            with self.subTest(**overrides):
+                code, result = code_and_output(
+                    _split_k_packed_mxfp8_gemm, args, **{**seed.config, **overrides}
+                )
+                self.assertEqual("mxfp8_lhs_words" in code, words)
+                # Operand descriptor loads feed the dot directly.
+                self.assertEqual("(a_desc.load(" in code, operand_descriptors)
+                self.assertEqual("(weights_desc.load(" in code, operand_descriptors)
+                torch.testing.assert_close(
+                    result.float(), expected, atol=2e-2, rtol=1e-2
+                )
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_dynamic_gathered_rows(self):
+        """Gathered rows of a dynamic-shape kernel keep generic scale loads."""
+        for m in (128, 256):
+            with self.subTest(m=m):
+                args, expected = _packed_mxfp8_inputs(m, 256, 256, scales=(124, 130))
+                perm = torch.randperm(m, device=DEVICE, dtype=torch.int32)
+                code, result = code_and_output(
+                    _gathered_packed_mxfp8_gemm, (*args, perm)
+                )
+                self.assertNotIn("mxfp8_lhs_words", code)
+                torch.testing.assert_close(
+                    result, expected[perm.long()], atol=2e-2, rtol=1e-2
+                )
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_epilogue_stores(self):
+        """A broadcast row and an FP32 tile too large to stage keep pointer
+        stores, so the warp-specialized seed still fits and is correct."""
+        args, expected = _packed_mxfp8_inputs(128, 256, 256)
+        bias = torch.randn(256, device=DEVICE)
+        code, (result, rows_of_bias) = code_and_output(
+            _packed_mxfp8_gemm_with_bias_rows, (*args, bias)
+        )
+        self.assertIn("warp_specialize=True", code)
+        self.assertIn("mxfp8_lhs_words", code)
+        self.assertNotIn("_desc.store(", code)
+        torch.testing.assert_close(result, expected, atol=2e-2, rtol=1e-2)
+        torch.testing.assert_close(rows_of_bias, bias.expand(128, 256))
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_fences_tma_after_barrier(self):
+        """Descriptor loads under pointer indexing still get the async-proxy
+        fence that orders them after a barrier."""
+        args, expected = _packed_mxfp8_inputs(128, 256, 256, scales=(126, 128))
+        code, result = code_and_output(
+            _copy_then_packed_mxfp8_gemm,
+            args,
+            block_sizes=[128, 256, 4, 64, 64],
+            num_warps=4,
+            num_stages=3,
+            pid_type="persistent_blocked",
+            indexing="pointer",
+        )
+        self.assertIn("(copy_desc.load(", code)
+        self.assertIn("fence.proxy.async", code)
+        torch.testing.assert_close(result, expected, atol=2e-2, rtol=1e-2)
 
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")

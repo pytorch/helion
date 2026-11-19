@@ -12,8 +12,10 @@ from typing import cast
 
 import torch
 
+from ..._compat import get_triton_version
 from ..._utils import prev_power_of_2
 from ...autotuner.config_fragment import EnumFragment
+from ...autotuner.config_fragment import PowerOfTwoFragment
 from ...autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ...autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ...autotuner.config_spec import DotAxes
@@ -24,7 +26,10 @@ from ...autotuner.config_spec import LiveTile
 from ...autotuner.config_spec import LoopAxisFact
 from ...autotuner.config_spec import ReductionCategory
 from ...exc import InvalidConfig
+from ...language.atomic_ops import ATOMIC_OPS
 from ...runtime.config import Config
+from ..mxfp8 import find_packed_mxfp8_dot
+from ..mxfp8 import tile_load
 from .common import clamp_block_size_targets
 from .common import dedupe_configs
 from .common import matches_hardware
@@ -36,6 +41,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
+    import sympy
+
+    from ...autotuner.block_id_sequence import BlockIdSequence
     from ...autotuner.config_spec import BlockSizeSpec
     from ...autotuner.config_spec import ConfigSpec
     from ...autotuner.config_spec import MatmulFact
@@ -320,6 +328,276 @@ def _h100_build_block_sizes(
         v = min(v, bs_spec.max_size)
         out.append(v)
     return out
+
+
+def _grid_partition_tunable(env: CompileEnvironment, device_ir: DeviceIR) -> str | None:
+    """The power-of-two user tunable that sizes a root-grid axis: a split-K
+    kernel's partition count, whatever the kernel names it."""
+    keys = set()
+    for grid_ids in device_ir.grid_block_ids:
+        for block_id in grid_ids:
+            size = env.block_sizes[block_id].size
+            if not isinstance(size, torch.SymInt):
+                continue
+            expression = env.config_value_expressions.get(
+                cast("sympy.Expr", size._sympy_())
+            )
+            if (
+                expression is None
+                or expression.operation != "config"
+                or len(expression.arguments) != 1
+                or not isinstance(expression.arguments[0], str)
+            ):
+                continue
+            key = expression.arguments[0]
+            if isinstance(
+                env.config_spec.user_defined_tunables.get(key), PowerOfTwoFragment
+            ):
+                keys.add(key)
+    return keys.pop() if len(keys) == 1 else None
+
+
+def _static_loop_bounds(device_ir: DeviceIR, block_id: int) -> bool:
+    """Whether the device loop over ``block_id`` has integer begin and end."""
+    # device_ir imports the heuristic registry; import it on use.
+    from ..device_ir import control_flow_parent_entries
+    from ..device_ir import device_loop_bounds
+
+    parents = {
+        child: node
+        for child, (node, _slot) in control_flow_parent_entries(
+            device_ir.graphs
+        ).items()
+    }
+    for info in device_ir.graphs:
+        bounds = device_loop_bounds(info, parents, block_id)
+        if bounds is not None:
+            return all(type(value) is int for value in bounds)
+    return False
+
+
+def _per_block(
+    sequence: BlockIdSequence[Any], values: Mapping[int, object], default: object
+) -> list[object]:
+    """One value per entry of a per-loop config sequence, keyed by block id."""
+    result = []
+    for item in sequence:
+        matched = [values[block] for block in item.block_ids if block in values]
+        result.append(matched[0] if matched else default)
+    return result
+
+
+def _packed_mxfp8_split_k(
+    m: int,
+    n: int,
+    k: int,
+    num_sm: int,
+    choices: Collection[int],
+    *,
+    block_m: int = 128,
+    block_n: int = 256,
+    compact_swap: bool = False,
+) -> int:
+    """A split of K that fills about half an SM wave for a small output grid.
+
+    Only splits whose partitions hold whole packed scale words (a multiple
+    of 4 groups) are chosen, so the native Triton lowering still applies.
+    """
+    if k < 2048:
+        return 1
+    tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+    target_tiles = max(1, math.ceil(num_sm / 2))
+    if compact_swap and tiles >= math.ceil(num_sm / 4):
+        return 1
+    valid = sorted(
+        split
+        for split in choices
+        if type(split) is int
+        and split >= 1
+        and (k // 32) % split == 0
+        and (k // 32 // split) % 4 == 0
+    )
+    if not valid or tiles >= target_tiles:
+        return 1
+    return next(
+        (split for split in valid if tiles * split >= target_tiles),
+        valid[-1],
+    )
+
+
+class TritonB200PackedMXFP8Heuristic(AutotunerHeuristic):
+    """sm100/sm103 seed for a packed MXFP8 GEMM (``triton/packed_mxfp8.py``).
+
+    Large outputs get a persistent, warp-specialized 128x256 tile.  An output
+    of at most 32 rows gets the 16- or 32-row tile the lowering issues as a
+    transposed MMA.  When the grid is too small for the GPU, a split-K
+    partition tunable (a power-of-two user tunable sizing a grid axis) is set
+    to fill about half a wave.
+    """
+
+    name = "triton_b200_packed_mxfp8"
+    backend = "triton"
+    promote_seed_to_default = True
+    HARDWARE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
+
+    @classmethod
+    def _fact(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[MatmulFact, int, int] | None:
+        """The matmul fact with static M/N/K, the K block id and the outer
+        (persistent) grid block id."""
+        if not matches_hardware(env, cls.HARDWARE_TARGETS):
+            return None
+        dot = find_packed_mxfp8_dot(device_ir.graphs)
+        facts = env.config_spec.matmul_facts
+        grid_ids = env.config_spec.grid_block_ids
+        # A cross-thread sync cannot drain a warp-specialized TMA store
+        # (``DeviceFunction.async_store_drain``): seed plain GEMMs only.
+        if (
+            dot is None
+            or len(facts) != 1
+            or not grid_ids
+            or len(device_ir.root_ids) != 1
+            or env.has_barrier
+            or any(
+                node.target in ATOMIC_OPS
+                for graph in device_ir.graphs
+                for node in graph.graph.nodes
+            )
+        ):
+            return None
+        fact = facts[0]
+        lhs = tile_load(dot.args[0], allow_mask=True)
+        rhs_node = dot.args[3]
+        if (
+            isinstance(rhs_node, torch.fx.Node)
+            and rhs_node.target is torch.ops.aten.permute.default
+        ):
+            rhs_node = rhs_node.args[0]
+        rhs = tile_load(rhs_node, allow_mask=True)
+        scale_node = dot.args[1]
+        scale = (
+            scale_node.meta.get("val")
+            if isinstance(scale_node, torch.fx.Node)
+            else None
+        )
+        if (
+            lhs is None
+            or rhs is None
+            or not isinstance(scale, torch.Tensor)
+            or scale.ndim != 2
+            or not _is_fp8_matmul_fact(fact)
+            or fact.m_block_id is None
+            or fact.n_block_id is None
+            or "persistent_blocked" not in env.config_spec.allowed_pid_types
+        ):
+            return None
+        k_block_id = next(
+            (
+                info.block_id
+                for info in env.block_sizes
+                if env.known_equal(info.var, scale.shape[1])
+            ),
+            None,
+        )
+        outer_block_id = grid_ids[0]
+        if k_block_id is None or not all(
+            {outer_block_id, k_block_id} <= set(sequence.valid_block_ids())
+            for sequence in (
+                env.config_spec.range_warp_specialize,
+                env.config_spec.range_num_stages,
+                env.config_spec.range_multi_buffers,
+                env.config_spec.range_flattens,
+            )
+        ):
+            return None
+        fact = fact._replace(
+            k_block_id=k_block_id,
+            static_m=env.size_hint(lhs[0].shape[0]),
+            static_n=env.size_hint(rhs[0].shape[0]),
+            static_k=env.size_hint(lhs[0].shape[1]),
+        )
+        return fact, k_block_id, outer_block_id
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._fact(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        matched = cls._fact(env, device_ir)
+        if matched is None:
+            return None
+        fact, k_block_id, outer_block_id = matched
+        assert fact.static_m is not None and fact.static_n is not None
+        assert fact.static_k is not None
+        assert fact.m_block_id is not None and fact.n_block_id is not None
+        spec = env.config_spec
+        block_sizes = _h100_build_block_sizes(
+            spec, fact, 16 if fact.static_m <= 16 else 32, 128, 4
+        )
+        block_m = block_sizes[fact.m_block_id]
+        block_n = block_sizes[fact.n_block_id]
+        compact_swap = fact.static_m <= 32 and block_m in (16, 32) and block_n >= 128
+        if not compact_swap:
+            block_m, block_n = 128, 256
+            block_sizes = _h100_build_block_sizes(spec, fact, block_m, block_n, 4)
+        raw: dict[str, object] = {}
+        partition_key = _grid_partition_tunable(env, device_ir)
+        split_k = 1
+        if partition_key is not None:
+            split_k = _packed_mxfp8_split_k(
+                fact.static_m,
+                fact.static_n,
+                fact.static_k,
+                spec.num_sm,
+                cast(
+                    "Collection[int]",
+                    spec.user_defined_tunables[partition_key].search_values(),
+                ),
+                block_m=block_m,
+                block_n=block_n,
+                compact_swap=compact_swap,
+            )
+            raw[partition_key] = split_k
+        # Triton 3.8's automatic warp specialization rejects a K loop whose
+        # bounds depend on the persistent tile (a split-K partition).
+        warp_specialize = (
+            split_k == 1
+            and not compact_swap
+            and (
+                _static_loop_bounds(device_ir, k_block_id)
+                or get_triton_version().release[:2] >= (3, 9)
+            )
+        )
+        stages = 5 if compact_swap else 3
+        loops = (outer_block_id, k_block_id)
+        raw |= {
+            "block_sizes": block_sizes,
+            "num_warps": 4,
+            "num_stages": stages,
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "l2_groupings": _per_block(spec.l2_groupings, {outer_block_id: 8}, 1),
+            "range_warp_specializes": _per_block(
+                spec.range_warp_specialize,
+                {outer_block_id: warp_specialize, k_block_id: False},
+                False,
+            ),
+            "range_num_stages": _per_block(
+                spec.range_num_stages, {outer_block_id: stages, k_block_id: 0}, 0
+            ),
+            "range_multi_buffers": _per_block(
+                spec.range_multi_buffers, dict.fromkeys(loops, False), None
+            ),
+            "range_flattens": _per_block(
+                spec.range_flattens, dict.fromkeys(loops, False), None
+            ),
+        }
+        return _materialize_config(raw, config_spec=spec)
 
 
 class TritonH100MatmulHeuristic(AutotunerHeuristic):
@@ -5485,6 +5763,7 @@ TRITON_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
     TritonSkinnyGemmHeuristic,
     # The two sm100 front ends are disjoint and both provide fast
     # autotune-off defaults as well as autotuner seeds.
+    TritonB200PackedMXFP8Heuristic,
     TritonB200FormulaMatmulHeuristic,
     TritonB200MultiMatmulHeuristic,
     TritonMatmulReductionEpilogueHeuristic,

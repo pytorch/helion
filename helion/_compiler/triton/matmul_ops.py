@@ -17,8 +17,10 @@ from torch._subclasses.fake_tensor import FakeTensor
 from ...language import _decorators
 from ...language.matmul_ops import dot
 from ...language.matmul_ops import dot_scaled
+from ..ast_extension import expr_from_string
 from ..matmul_utils import _emit_tl_dot_scaled
 from ..matmul_utils import emit_tl_dot_with_padding
+from .packed_mxfp8 import packed_mxfp8_dot
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
@@ -105,6 +107,29 @@ def _(state: CodegenState) -> object:
         out_dtype = out_dtype_proxy
 
     is_acc_none = isinstance(acc_ast, ast.Constant) and acc_ast.value is None
+    acc = None if is_acc_none else acc_ast
+    packed = packed_mxfp8_dot(state)
+    if packed is not None:
+        lhs_ast = packed.lhs or lhs_ast
+        lhs_scale_ast = packed.lhs_scale or lhs_scale_ast
+        rhs_ast = packed.rhs or rhs_ast
+        rhs_scale_ast = packed.rhs_scale or rhs_scale_ast
+        if packed.swap:
+
+            def transpose(value: ast.AST) -> ast.AST:
+                return expr_from_string("tl.permute({value}, [1, 0])", value=value)
+
+            swapped = _emit_tl_dot_scaled(
+                transpose(rhs_ast),
+                rhs_scale_ast,
+                rhs_format,
+                transpose(lhs_ast),
+                lhs_scale_ast,
+                lhs_format,
+                acc=None if acc is None else transpose(acc),
+                out_dtype=out_dtype,
+            )
+            return transpose(swapped)
     return _emit_tl_dot_scaled(
         lhs_ast,
         lhs_scale_ast,
@@ -112,6 +137,6 @@ def _(state: CodegenState) -> object:
         rhs_ast,
         rhs_scale_ast,
         rhs_format,
-        acc=None if is_acc_none else acc_ast,
+        acc=acc,
         out_dtype=out_dtype,
     )
