@@ -20,6 +20,7 @@ from helion._compiler.cute.interchanged_store_dce import eliminate_interchanged_
 from helion._compiler.cute.lane_loops.markers import (
     restore_unprocessed_lane_reduce_markers,
 )
+from helion._compiler.cute.lane_loops.split import _reductions_handed_on
 from helion._compiler.cute.lane_loops.split import (
     interchange_lane_outside_serial_reductions,
 )
@@ -32,6 +33,9 @@ from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.cute_fragment_coverage import assert_fragment_norm_coverage
+from helion._testing.cute_lane_programs import Buffer
+from helion._testing.cute_lane_programs import Pointer
+from helion._testing.cute_lane_programs import run_lane_program
 import helion.language as hl
 
 pytestmark = pytest.mark.cpu_only
@@ -133,41 +137,13 @@ def _prune(
     return removed, [first, *final]
 
 
-class _Buffer:
-    def __init__(self, values: np.ndarray) -> None:
-        self.values = values.copy()
-        self.loads = 0
-        self.stores = 0
-
-    @property
-    def iterator(self) -> _Pointer:
-        return _Pointer(self, 0)
-
-
-class _Pointer:
-    def __init__(self, buffer: _Buffer, offset: int) -> None:
-        self.buffer = buffer
-        self.offset = offset
-
-    def __add__(self, offset: int) -> _Pointer:
-        return _Pointer(self.buffer, self.offset + offset)
-
-    def load(self) -> float:
-        self.buffer.loads += 1
-        return float(self.buffer.values[self.offset])
-
-    def store(self, value: float) -> None:
-        self.buffer.stores += 1
-        self.buffer.values[self.offset] = value
-
-
 def _execute(
     body: list[ast.AST],
     rows: int,
     valid_rows: int,
     valid_cols: int,
     inputs: dict[str, np.ndarray] | None = None,
-) -> dict[str, _Buffer]:
+) -> dict[str, Buffer]:
     """Lower ``body``'s lane reductions and run it on CPU buffers; ``inputs``
     replaces or adds buffers by name."""
     arrays = {
@@ -177,24 +153,22 @@ def _execute(
         "column": np.full(4, -99.0),
         **(inputs or {}),
     }
-    body = split_lane_loop_reductions(
+    return run_lane_program(
         body,
+        arrays,
+        {
+            "rows": rows,
+            "valid_rows": valid_rows,
+            "valid_cols": valid_cols,
+            "cutlass": SimpleNamespace(Float32=float, Int32=int),
+            "cute": SimpleNamespace(
+                make_rmem_tensor=lambda shape, dtype: np.zeros(shape)
+            ),
+        },
         uniform_names={*arrays, "rows", "valid_rows", "valid_cols"},
         proven_disjoint_tensor_pairs=_PAIRS,
+        filename="<interchanged>",
     )
-    body = restore_unprocessed_lane_reduce_markers(body)
-    buffers = {name: _Buffer(values) for name, values in arrays.items()}
-    namespace = {
-        **buffers,
-        "rows": rows,
-        "valid_rows": valid_rows,
-        "valid_cols": valid_cols,
-        "cutlass": SimpleNamespace(Float32=float, Int32=int),
-        "cute": SimpleNamespace(make_rmem_tensor=lambda shape, dtype: np.zeros(shape)),
-    }
-    module = ast.Module(body=cast("list[ast.stmt]", body), type_ignores=[])
-    exec(compile(ast.unparse(module), "<interchanged>", "exec"), namespace)
-    return buffers
 
 
 def _expected(
@@ -1381,13 +1355,13 @@ def _atomics(body: list[ast.AST]) -> list[ast.Call]:
     ]
 
 
-class _AtomicBuffer(_Buffer):
+class _AtomicBuffer(Buffer):
     @property
     def iterator(self) -> _AtomicPointer:
         return _AtomicPointer(self, 0)
 
 
-class _AtomicPointer(_Pointer):
+class _AtomicPointer(Pointer):
     def __add__(self, offset: int) -> _AtomicPointer:
         return _AtomicPointer(self.buffer, self.offset + offset)
 
@@ -1696,9 +1670,10 @@ for lane in range(4):
 """,
         id="two_stores",
     ),
-    # The final pass's copy of the fragment's lane-invariant allocation runs
-    # once ahead of its lane loop, so its lanes would share one fragment,
-    # which the lane split cannot lower beside the reduction.
+    # The final pass needs the fragment's element write as the first pass
+    # does, so the write would run in both nests.  (The allocation binds the
+    # fragment the lanes write: the final pass runs it in every lane, not
+    # once ahead of them.)
     pytest.param(
         """
 for lane in range(4):
@@ -2071,6 +2046,531 @@ for lane in range(4):
         interchange_lane_outside_serial_reductions(
             [loop], proven_disjoint_tensor_pairs=_PAIRS
         )
+
+
+# What the serial loop hands on reads the lanes' reduction: the column sums
+# of the centered rows, under the loop's own name and under the name a
+# pending rename merges into it, in thread-local storage, and the last row's
+# reduction, which only the statement after the loop reads.
+_HANDED_ON = [
+    pytest.param("grad_w = 0.0", "grad_w = grad_w + result", "grad_w", id="name"),
+    pytest.param("grad_w = 0.0", "summed = grad_w + result", "grad_w", id="renamed"),
+    pytest.param(
+        "acc = cute.make_rmem_tensor((1,), cutlass.Float32)\n    acc[0] = 0.0",
+        "acc[0] = acc[0] + result",
+        "acc[0]",
+        id="thread_local_storage",
+    ),
+    pytest.param("last = 0.0", "last = reduced", "last", id="after_the_loop"),
+]
+
+
+@pytest.mark.parametrize(("prefix", "update", "stored"), _HANDED_ON)
+def test_a_reduction_handed_on_through_the_serial_loop_declines_the_interchange(
+    prefix: str, update: str, stored: str
+) -> None:
+    """The first nest computes ``reduced`` from its own lane's value, which
+    only the stores the final nest writes again may read: ``result`` is
+    zero there, and so were the column sums it stored."""
+    loop = _lane_loop(
+        f"""
+for lane in range(4):
+    {prefix}
+    for row in range(rows):
+        index = row * 4 + lane
+        value = (source.iterator + index).load()
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
+        result = value - reduced
+        (output.iterator + index).store(result)
+        {update}
+    (column.iterator + lane).store({stored})
+"""
+    )
+    with pytest.raises(exc.BackendUnsupported, match="partial reduction on through"):
+        interchange_lane_outside_serial_reductions(
+            [loop],
+            proven_disjoint_tensor_pairs=_PAIRS,
+            rename_groups={"grad_w": "grad_w", "summed": "grad_w"},
+        )
+
+
+def test_a_reduction_handed_on_reaches_the_names_bound_an_iteration_later() -> None:
+    """``late`` copies ``carried`` ahead of the statement that binds it to
+    the reduction, so it holds the reduction of the iteration before: the
+    names are followed around the loop, not through one iteration only."""
+    serial_body = ast.parse(
+        """
+late = carried
+value = (source.iterator + row).load()
+reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
+carried = reduced
+"""
+    ).body
+    after = ast.parse("(column.iterator + lane).store(late)").body
+    assert _reductions_handed_on(serial_body, after, {"reduced"}, {}) == {
+        "carried",
+        "late",
+    }
+
+
+def test_a_tuple_assignment_rebinds_or_carries_as_its_names_do() -> None:
+    """``a, b = value - reduced, value`` binds both names before the store
+    reads ``a``: nothing reaches the next iteration.  An update that reads
+    its own names first (an argmax's ``best, index = ...``) carries them."""
+    marker = "reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)"
+    rebound = ast.parse(
+        f"""
+value = (source.iterator + row).load()
+{marker}
+a, b = value - reduced, value
+(output.iterator + row).store(a)
+"""
+    ).body
+    assert _reductions_handed_on(rebound, [], {"reduced"}, {}) == set()
+    carried = ast.parse(
+        f"""
+value = (source.iterator + row).load()
+{marker}
+best, index = (reduced, row) if reduced > best else (best, index)
+"""
+    ).body
+    assert _reductions_handed_on(carried, [], {"reduced"}, {}) == {"best", "index"}
+    # A tuple assignment that reads no reduction rebinds what one bound.
+    reset = ast.parse(
+        f"""
+(output.iterator + row).store(a)
+value = (source.iterator + row).load()
+{marker}
+a, b = reduced, value
+a, b = 0.0, 0.0
+"""
+    ).body
+    assert _reductions_handed_on(reset, [], {"reduced"}, {}) == set()
+
+
+@pytest.mark.parametrize(
+    ("first", "centered"),
+    [
+        ("result = 0.0", "result = value - reduced"),
+        # A tuple target rebinds its names as a single name does.
+        ("result, spare = 0.0, 1.0", "result, spare = value - reduced, value"),
+    ],
+    ids=["name", "tuple"],
+)
+def test_a_reduction_read_within_its_own_iteration_keeps_the_interchange(
+    first: str, centered: str
+) -> None:
+    """``result`` reads the reduction behind the statements that read
+    ``result``, and every iteration rebinds it first: nothing is handed on,
+    and the column sums read no reduction."""
+    loop = _lane_loop(
+        f"""
+for lane in range(4):
+    grad_w = 0.0
+    for row in range(rows):
+        {first}
+        index = row * 4 + lane
+        value = (source.iterator + index).load() + result
+        grad_w = grad_w + value
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
+        {centered}
+        (output.iterator + index).store(result)
+    (column.iterator + lane).store(grad_w)
+"""
+    )
+    body = interchange_lane_outside_serial_reductions(
+        [loop], proven_disjoint_tensor_pairs=_PAIRS
+    )
+    rows = 3
+    buffers = _execute(body, rows, rows, 4)
+    values = buffers["source"].values.reshape(rows, 4)
+    np.testing.assert_array_equal(
+        buffers["output"].values.reshape(rows, 4),
+        values - values.sum(-1, keepdims=True),
+    )
+    np.testing.assert_array_equal(buffers["column"].values, values.sum(0))
+
+
+@pytest.mark.parametrize(
+    ("update", "rename_groups"),
+    [
+        ("total = total + (source.iterator + index).load()", None),
+        # As codegen emits it: the loop's carry renames ``summed`` to
+        # ``total`` once the passes have run.
+        (
+            "summed = total + (source.iterator + index).load()",
+            {"total": "total", "summed": "total"},
+        ),
+        # The rename the other way round: the initializer binds the spelling
+        # that is renamed, so only the shared name says it is the loop's.
+        (
+            "summed = total + (source.iterator + index).load()",
+            {"total": "summed", "summed": "summed"},
+        ),
+    ],
+    ids=["name", "renamed", "initializer_renamed"],
+)
+def test_a_value_a_loop_of_the_serial_body_accumulates_starts_over_in_every_lane(
+    update: str, rename_groups: dict[str, str] | None
+) -> None:
+    """``total = 0.0`` reads no lane value, but the loop behind it adds a
+    lane's loads to ``total``: the final nest runs the initializer in every
+    lane, not once per row ahead of the lanes, where every lane after the
+    first went on from the total of the lane before it."""
+    loop = _lane_loop(
+        f"""
+for lane in range(4):
+    for row in range(rows):
+        index = row * 4 + lane
+        total = 0.0
+        for k in range(2):
+            {update}
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(total - reduced)
+"""
+    )
+    body = interchange_lane_outside_serial_reductions(
+        [loop], proven_disjoint_tensor_pairs=_PAIRS, rename_groups=rename_groups
+    )
+    final = cast("ast.For", body[-1])
+    assert ast.unparse(final.target) == "row"
+    (lanes,) = final.body
+    assert isinstance(lanes, ast.For) and ast.unparse(lanes.target) == "lane"
+    names = [ast.unparse(statement).split(" ")[0] for statement in lanes.body]
+    assert names == ["index", "total", "for", "reduced", "(output.iterator"], names
+    if rename_groups is None:
+        rows = 3
+        buffers = _execute(body, rows, rows, 4)
+        values = 2.0 * buffers["source"].values.reshape(rows, 4)
+        np.testing.assert_array_equal(
+            buffers["output"].values.reshape(rows, 4),
+            values - values.sum(-1, keepdims=True),
+        )
+
+
+# A statement the final nest runs in every lane binds a second name, which
+# holds no lane value, and another statement uses that name.
+_BOUND_BESIDE = [
+    # ``first = base + 0.0`` reads no lane value and would stay ahead of the
+    # lanes, where it read the ``base`` of the row before (row 0 the one the
+    # first nest left behind): the rows came out shifted.
+    pytest.param(
+        """
+        if rows > 0:
+            total = 0.0
+            base = row * 0.25
+        else:
+            total = 0.0
+            base = row * 0.5
+        for k in range(2):
+            total = total + (source.iterator + index).load()
+        first = base + 0.0
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(total - reduced + first)
+""",
+        None,
+        id="branch",
+    ),
+    pytest.param(
+        """
+        total, base = 0.0, row * 0.25
+        for k in range(2):
+            total = total + (source.iterator + index).load()
+        first = base + 0.0
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(total - reduced + first)
+""",
+        None,
+        id="tuple",
+    ),
+    # ``offset`` is lane-varying for the statement behind the store alone,
+    # which the final nest drops: the branch runs per lane for it, and
+    # ``base`` with it.
+    pytest.param(
+        """
+        if rows > 0:
+            offset = 0.0
+            base = row * 0.25
+        else:
+            offset = 0.0
+            base = row * 0.5
+        first = base + 0.0
+        value = (source.iterator + index).load() + offset
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(value - reduced + first)
+        offset = value
+""",
+        None,
+        id="beside_a_name_reused_for_a_lane_value",
+    ),
+    # ``scaled`` reads the complete reduction alone, which is no lane value
+    # in the final lane loop: the lane split would run ``scaled = reduced *
+    # 0.5`` once, between its passes over the lanes.
+    pytest.param(
+        """
+        total, scaled = 0.0, 1.0
+        for k in range(2):
+            total = total + (source.iterator + index).load()
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        scaled = reduced * 0.5
+        (output.iterator + index).store(total - scaled)
+""",
+        None,
+        id="beside_a_value_of_the_complete_reduction",
+    ),
+    # ``scale`` is lane-varying for ``scale = total`` alone, so everything
+    # that uses it runs per lane; the lane split, by the lane values of the
+    # final nest's own lane loop, would hoist ``scale = row * 1.0`` out of
+    # it again and leave the statement that starts the lane's ``total`` and
+    # doubles ``scale``: once more in every lane.
+    pytest.param(
+        """
+        scale = row * 1.0
+        total, scale = 0.0, scale * 2.0
+        for k in range(2):
+            total = total + (source.iterator + index).load()
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(total - reduced + scale)
+        scale = total
+""",
+        None,
+        id="lane_invariant_in_the_final_lane_loop",
+    ),
+    # The same, the loop's update spelled under its pending rename.
+    pytest.param(
+        """
+        scale = row * 1.0
+        total, scale = 0.0, scale * 2.0
+        for k in range(2):
+            summed = total + (source.iterator + index).load()
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(total - reduced + scale)
+        scale = total
+""",
+        {"total": "total", "summed": "total"},
+        id="lane_invariant_in_the_final_lane_loop_renamed",
+    ),
+]
+
+
+@pytest.mark.parametrize(("serial_body", "rename_groups"), _BOUND_BESIDE)
+def test_a_lane_invariant_value_bound_beside_a_lanes_own_declines_the_interchange(
+    serial_body: str, rename_groups: dict[str, str] | None
+) -> None:
+    loop = _lane_loop(
+        f"""
+for lane in range(4):
+    for row in range(rows):
+        index = row * 4 + lane
+{serial_body.strip(chr(10))}
+"""
+    )
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match="bind a lane-invariant value in every lane, beside a lane's own",
+    ):
+        interchange_lane_outside_serial_reductions(
+            [loop], proven_disjoint_tensor_pairs=_PAIRS, rename_groups=rename_groups
+        )
+
+
+def test_a_name_no_other_statement_uses_may_be_bound_beside_a_lanes_own() -> None:
+    """``spare`` is bound in every lane with the lane's ``total``, but no
+    other statement of the final nest reads or binds it."""
+    loop = _lane_loop(
+        """
+for lane in range(4):
+    for row in range(rows):
+        index = row * 4 + lane
+        total, spare = 0.0, 1.0
+        for k in range(2):
+            total = total + (source.iterator + index).load()
+        reduced = _helion_lane_reduce(total, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(total - reduced)
+"""
+    )
+    body = interchange_lane_outside_serial_reductions(
+        [loop], proven_disjoint_tensor_pairs=_PAIRS
+    )
+    rows = 3
+    buffers = _execute(body, rows, rows, 4)
+    values = 2.0 * buffers["source"].values.reshape(rows, 4)
+    np.testing.assert_array_equal(
+        buffers["output"].values.reshape(rows, 4),
+        values - values.sum(-1, keepdims=True),
+    )
+
+
+@pytest.mark.parametrize(
+    ("prefix", "head"),
+    [
+        # Rerun in every row, ``shift`` would read the ``scale`` of that row.
+        ("scale = 1.0\n    shift = scale + lane", "scale = scale * 2.0"),
+        # Both assignments of ``scale`` would run ahead of the rows, and so
+        # ahead of ``shift``, which reads the first.
+        ("scale = 1.0\n    shift = scale + lane\n    scale = 2.0", "pass"),
+    ],
+    ids=["serial_body", "lane_prefix"],
+)
+def test_an_assignment_ahead_of_a_prefix_statement_that_reads_its_name_declines(
+    prefix: str, head: str
+) -> None:
+    """The final nest reruns the lane prefix's per-lane statements in every
+    lane of every row, behind the statements it runs once: the lane-invariant
+    part of the prefix and, in every row, of the serial body.  One of those
+    that binds a name a per-lane prefix statement reads would reach it, where
+    the lane loop runs the prefix statement first."""
+    loop = _lane_loop(
+        f"""
+for lane in range(4):
+    {prefix}
+    for row in range(rows):
+        index = row * 4 + lane
+        {head}
+        value = (source.iterator + index).load() + shift
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(value - reduced + scale)
+"""
+    )
+    with pytest.raises(
+        exc.BackendUnsupported,
+        match="ahead of a statement of the lane prefix that uses the name it binds",
+    ):
+        interchange_lane_outside_serial_reductions(
+            [loop], proven_disjoint_tensor_pairs=_PAIRS
+        )
+
+
+@pytest.mark.parametrize(
+    "initializers",
+    [
+        "total, count = 0.0, 0.0",
+        (
+            "if rows > 0:\n        total = 0.0\n        count = 0.0\n"
+            "    else:\n        total = 0.0\n        count = 0.0"
+        ),
+    ],
+    ids=["tuple", "branch"],
+)
+def test_a_lane_value_the_final_nest_never_reads_keeps_its_statement_ahead(
+    initializers: str,
+) -> None:
+    """One statement of the lane prefix binds the lane's column sum, which
+    only the first nest and the lane suffix read, and a row counter the
+    final nest carries.  The final nest runs it once ahead of its rows:
+    rerun in the lanes for the sum's sake it would start the counter over
+    in every row."""
+    loop = _lane_loop(
+        f"""
+for lane in range(4):
+    {initializers}
+    for row in range(rows):
+        index = row * 4 + lane
+        count = count + 1.0
+        value = (source.iterator + index).load()
+        total = total + value
+        reduced = _helion_lane_reduce(value, 'sum', 0.0, threads_in_group=1)
+        (output.iterator + index).store(value - reduced + count)
+    (column.iterator + lane).store(total)
+"""
+    )
+    body = interchange_lane_outside_serial_reductions(
+        [loop], proven_disjoint_tensor_pairs=_PAIRS
+    )
+    final = cast("ast.For", body[-1])
+    assert ast.unparse(final.target) == "row"
+    assert ast.unparse(body[-2]).startswith(initializers.split(" ")[0])
+    rows = 3
+    buffers = _execute(body, rows, rows, 4)
+    values = buffers["source"].values.reshape(rows, 4)
+    np.testing.assert_array_equal(
+        buffers["output"].values.reshape(rows, 4),
+        values - values.sum(-1, keepdims=True) + np.arange(1.0, rows + 1)[:, None],
+    )
+    np.testing.assert_array_equal(buffers["column"].values, values.sum(0))
+
+
+def _center_rows_and_sum_the_centered_columns(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Each ``tile_i`` block's per-column sums of its centered rows: the sums
+    read the rows' reduction."""
+    out = torch.empty_like(x)
+    sums = torch.empty([x.size(0), x.size(2)], dtype=torch.float32, device=x.device)
+    for tile_i in hl.tile(x.size(0)):
+        acc = hl.zeros([tile_i, x.size(2)], dtype=torch.float32)
+        for tile_k in hl.tile(x.size(1)):
+            centered = x[tile_i, tile_k, :] - x[tile_i, tile_k, :].sum(-1, keepdim=True)
+            out[tile_i, tile_k, :] = centered
+            acc = acc + centered.sum(1)
+        sums[tile_i, :] = acc
+    return out, sums
+
+
+def test_column_sums_of_centered_rows_are_declined_under_a_lane_loop() -> None:
+    """Under the default config one thread walks eight of a row's 256
+    features in a lane loop around the ``tile_k`` loop.  The interchange's
+    first nest, which sums the columns, centered each row on its own lane's
+    value, so the sums it stored were those of zeros; the final nest, where
+    the rows' sums are complete, has no lane to carry the column sums in."""
+    with pytest.raises(exc.BackendUnsupported, match="partial reduction on through"):
+        _default_code(
+            _center_rows_and_sum_the_centered_columns, (torch.randn(5, 3, 256),)
+        )
+
+
+def _center_rows_summed_over_an_inner_loop(x: torch.Tensor) -> torch.Tensor:
+    """Centers each row of the sums ``x[i, k, :, :]`` takes over ``tile_j``:
+    every lane starts its sum over, ahead of the inner loop."""
+    n, m, p, hidden = x.shape
+    out = torch.empty([n, m, hidden], dtype=torch.float32, device=x.device)
+    for tile_i in hl.tile(n):
+        for tile_k in hl.tile(m):
+            total = hl.zeros([tile_i, tile_k, hidden], dtype=torch.float32)
+            for tile_j in hl.tile(p):
+                total = total + x[tile_i, tile_k, tile_j, :].sum(2)
+            out[tile_i, tile_k, :] = total - total.sum(-1, keepdim=True)
+    return out
+
+
+def test_rows_summed_over_an_inner_loop_start_over_in_every_lane() -> None:
+    """Under the default config one thread walks 32 of a row's 256 features
+    in a lane loop around the ``tile_k`` loop.  The final nest starts
+    ``total`` over in every lane of the reduction's two passes, not once per
+    row ahead of them; run there, the initializer took the reduction with it
+    and the kernel was refused ("reduction marker is nested in a different
+    lane owner")."""
+    code = _default_code(
+        _center_rows_summed_over_an_inner_loop, (torch.randn(5, 3, 4, 256),)
+    )
+    first, final = _top_loops(code)
+    assert ast.unparse(first.target).startswith("synthetic_lane"), code
+    assert ast.unparse(final.target).startswith("tile_offset"), code
+    initializer = "total = cutlass.Float32(0.0)"
+    assert initializer not in [ast.unparse(statement) for statement in final.body]
+    passes = [statement for statement in final.body if isinstance(statement, ast.For)]
+    assert len(passes) == 2, code
+    for lanes in passes:
+        assert ast.unparse(lanes.target).startswith("synthetic_lane"), code
+        assert initializer in [ast.unparse(statement) for statement in lanes.body]
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_rows_summed_over_an_inner_loop_match_eager_under_a_lane_loop() -> None:
+    x = torch.randn(5, 3, 4, 256, device=DEVICE)
+    kernel = helion.kernel(
+        _center_rows_summed_over_an_inner_loop,
+        backend="cute",
+        autotune_effort="none",
+        static_shapes=True,
+    )
+    code, out = code_and_output(kernel, (x,))
+    assert "synthetic_lane" in code, code
+    total = x.sum(2)
+    torch.testing.assert_close(
+        out, total - total.sum(-1, keepdim=True), rtol=1e-4, atol=1e-3
+    )
 
 
 def _rows_scaled_by_a_doubling_row(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

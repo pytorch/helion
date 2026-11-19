@@ -377,15 +377,17 @@ class Config(Mapping[str, object]):
                 and one warp), and without the masked loads' branches LLVM may
                 contract float multiply-adds differently, so results can differ
                 from the padded row's by more than an ulp.
-            cute_bool_byte_packets: Load a bool row that a looped reduction
-                reads along its reduction dim as byte packets: one integer of
-                2, 4 or 8 bytes per lane, each element a byte compared against
-                zero, instead of one byte load per element. The packets cost
-                fewer instructions and load requests; where a later sweep
-                reloads the row from L2, the faster first sweep can leave less
-                of it there. Results are bitwise unchanged. Off by default;
-                offered to the autotuner for kernels whose looped reduction
-                reads a bool row.
+            cute_bool_byte_packets: Load a bool row that a looped reduction,
+                or a persistent row of vectors that has no ``reduction_loops``
+                slot, reads along its reduction dim as byte packets: one
+                integer of 2, 4 or 8 bytes per lane, each element a byte
+                compared against zero, instead of one byte load per element.
+                The packets cost fewer instructions and load requests; where a
+                later sweep reloads the row from L2, the faster first sweep
+                can leave less of it there. Results are bitwise unchanged. Off
+                by default; offered to the autotuner for kernels whose looped
+                reduction, or persistent row without a ``reduction_loops``
+                slot, reads a bool row.
             cute_uniform_lane_compares: Compare a vector's lane base, once per
                 vector, instead of each lane where a lane index meets a
                 bound that is a multiple of the vector width (a chunk's tile

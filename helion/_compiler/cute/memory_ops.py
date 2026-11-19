@@ -162,16 +162,28 @@ _CUTE_BYTE_PACKED_DTYPES = frozenset({torch.uint8, torch.int8, torch.float4_e2m1
 def bool_reduction_row_blocks(
     env: CompileEnvironment, device_ir: DeviceIR, config_spec: ConfigSpec
 ) -> frozenset[int]:
-    """The reduction blocks that ``reduction_loops`` may roll (a pinned slot's
-    dim stays persistent) along which a load reads a bool tensor in its last
-    dim, which a lane's packet walks (``lane_on_stride1``): where
-    ``cute_bool_byte_packets`` can apply.  Structure only, no extents.  A dim
-    is matched by its block's size symbol."""
-    rollable = {
+    """The reduction blocks along which a load reads a bool tensor in its
+    last dim, which a lane's packet walks (``lane_on_stride1``): where
+    ``cute_bool_byte_packets`` can apply.  They are the blocks that
+    ``reduction_loops`` may roll (a pinned slot's dim stays persistent), and
+    the persistent rows without a slot there that take a vector width (a row
+    whose lanes carry values through a device loop, which runs as one vector
+    per thread).  Structure only: a dim is matched by its block's size
+    symbol, and a slot-less row also by its static extent, which is what a
+    load of a power-of-two row is traced with."""
+    rows = {
         env.block_sizes[spec.block_id].symbol(): spec.block_id
         for spec in config_spec.reduction_loops
         if not spec.pinned
     }
+    slots = set(config_spec.reduction_loops.valid_block_ids())
+    extents: dict[int, int] = {}
+    for block_id in config_spec.cute_vector_widths.valid_block_ids():
+        if block_id in config_spec.reduction_block_ids and block_id not in slots:
+            rows[env.block_sizes[block_id].symbol()] = block_id
+            numel = env.block_sizes[block_id].numel
+            if isinstance(numel, (int, sympy.Integer)):
+                extents[int(numel)] = block_id
     blocks: set[int] = set()
     for info in device_ir.graphs:
         for node in info.graph.nodes:
@@ -179,16 +191,20 @@ def bool_reduction_row_blocks(
                 continue
             source = node.args[0]
             value = node.meta.get("val")
-            if (
+            if not (
                 isinstance(source, torch.fx.Node)
                 and isinstance(tensor := source.meta.get("val"), torch.Tensor)
                 and tensor.dtype is torch.bool
                 and isinstance(value, torch.Tensor)
                 and value.ndim
-                and isinstance(size := value.shape[-1], torch.SymInt)
-                and (expr := _symint_expr(size)) in rollable
             ):
-                blocks.add(rollable[expr])
+                continue
+            size = value.shape[-1]
+            if isinstance(size, torch.SymInt):
+                if (expr := _symint_expr(size)) in rows:
+                    blocks.add(rows[expr])
+            elif size in extents:
+                blocks.add(extents[size])
     return frozenset(blocks)
 
 
@@ -6631,13 +6647,19 @@ def _cute_vector_load_ctx(
         if vec_width <= 1:
             return None
         # A looped reduction loads a bool row as byte packets under
-        # ``cute_bool_byte_packets``, at the widths one packed integer holds;
-        # other strategies, fp8 and int8 rows and wider packets keep their
-        # per-element loads.
+        # ``cute_bool_byte_packets``, at the widths one packed integer holds,
+        # and so does a persistent vector row that has no ``reduction_loops``
+        # slot to roll in (through the branch-local vectorizer's marker); a
+        # row that could roll and does not, fp8 and int8 rows and wider
+        # packets keep their per-element loads.
         byte_packets = (
             not for_store
             and tensor.dtype is torch.bool
-            and isinstance(strategy, LoopedReductionStrategy)
+            and (
+                isinstance(strategy, LoopedReductionStrategy)
+                or inner_block_id
+                not in env.config_spec.reduction_loops.valid_block_ids()
+            )
             and vec_width in _CUTE_BYTE_PACKET_WIDTHS
             and state.config.config.get("cute_bool_byte_packets") is True
         )
@@ -8155,14 +8177,28 @@ def _(state: CodegenState) -> object:
             )
     zero = _cute_scalar_storage_dtype(tensor.dtype)
     if tensor.dtype is torch.bool:
-        # A bool load is neither sortable nor a branch-vec candidate and
-        # carries no access site.regions.
-        return _cute_masked_value_expr(
+        # A bool load is not sortable and carries no access site.regions.
+        # It is a branch-vec candidate in a persistent vector row under
+        # ``cute_bool_byte_packets`` only (``_cute_vector_load_ctx``): the
+        # marker keeps the compare against zero around the byte.
+        value = _cute_masked_value_expr(
             load_expr,
             site.mask_expr,
             dtype=tensor.dtype,
             zero=zero,
             **load_placeholders,
+        )
+        if branch_vec_candidate is None:
+            return value
+        assert isinstance(value, ast.expr)
+        vec_block_id, vec_width = branch_vec_candidate
+        return _persistent_branch_vec_load_marker(
+            vec_block_id,
+            vec_width,
+            tensor.dtype,
+            eviction_suffix,
+            _cute_scalar_pointer_expr(site.tensor_name, site.index_exprs),
+            value,
         )
     if state.fx_node is not None and _cute_load_feeds_sort_or_scan(state.fx_node):
         from .indexing import CuteSortableLoad

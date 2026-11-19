@@ -488,6 +488,15 @@ _MARKER_KEYWORD_NAMES = frozenset(field.name for field in _MARKER_KEYWORD_FIELDS
 
 # On the accumulate loop the two-pass lane split builds: its ``LaneSplitRecord``.
 HELION_LANE_SPLIT_ATTR = "_helion_lane_split"
+# On a statement that hands a lane's carried value back to the serial loop
+# around its lane loop (``carried.append(value)``, built by
+# ``_lane_carry_nest``): no memory is written, and the two-pass lane split
+# runs it with the producers of its value in the accumulate pass.
+HELION_LANE_CARRY_ATTR = "_helion_lane_carry"
+# The refusal of a marker inside another lane's loop
+# (``validate_lane_reduce_owners``, the two-pass split).  The passes that
+# try such a nest first append the reason they declined it to this text.
+NESTED_OWNER_REFUSAL = "reduction marker is nested in a different lane owner"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -635,9 +644,7 @@ def validate_lane_reduce_owners(body: list[ast.AST]) -> None:
             if not owners or not all(
                 constexpr for _, constexpr in lanes[owners[-1] + 1 :]
             ):
-                raise exc.BackendUnsupported(
-                    "cute", "reduction marker is nested in a different lane owner"
-                )
+                raise exc.BackendUnsupported("cute", NESTED_OWNER_REFUSAL)
         for child in ast.iter_child_nodes(node):
             visit(child, lanes)
 

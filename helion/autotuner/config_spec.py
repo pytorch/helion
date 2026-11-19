@@ -1002,6 +1002,10 @@ class ConfigSpec:
         # blocks it runs beside: used between the path's root and its
         # innermost loop, or inside that loop.
         self.cute_tile_loop_path_reductions: dict[TileLoopPath, frozenset[int]] = {}
+        # The blocks reduced inside the innermost loop of one of those paths,
+        # as opposed to behind or around it
+        # (``innermost_loop_reduction_blocks``).
+        self.cute_innermost_loop_reduction_blocks: frozenset[int] = frozenset()
         # The static size of each block on the ``cute_tile_loop_paths`` that
         # no config tunes: a fixed ``hl.tile`` block size, or an ``hl.grid``'s
         # step (``hl.grid(0, 64, 8)`` records 8, although its loop runs one
@@ -1094,9 +1098,10 @@ class ConfigSpec:
         self.cute_strided_reduction_sites = False
         self.cute_signed_bitfield_bf16_available = False
         # Set by DeviceIR analysis: the reductions whose ``reduction_loops``
-        # slot may roll (is not pinned) along which a load reads a bool
-        # tensor, none in a kernel with a matmul; ``cute_bool_byte_packets``
-        # is tunable when there are any (``bool_reduction_row_blocks``).
+        # slot may roll (is not pinned), and the persistent rows without a
+        # slot, along which a load reads a bool tensor, none in a kernel with
+        # a matmul; ``cute_bool_byte_packets`` is tunable when there are any
+        # (``bool_reduction_row_blocks``).
         self.cute_bool_byte_packet_blocks: frozenset[int] = frozenset()
         # Set by DeviceIR analysis: the blocks of the device loops over a
         # static extent that load a float tensor along their tile, none in a
