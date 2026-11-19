@@ -2696,6 +2696,7 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
                 continue
             readers.append((node, user))
     for node, user in readers:
+        _check_read_before_the_write(group, node)
         mat = group.mats.get(node)
         if mat is None:
             mat = group.mats[node] = _insert(_mpp_mat, node)
@@ -2712,6 +2713,36 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     positional_rebind.check_positional_merges(
         _forward_slice(list(group.mats.values()), graphs), _MAT_REBIND
     )
+
+
+def _check_read_before_the_write(group: MppGroup, node: Node) -> None:
+    """Refuse a read of ``node``, a value from before the op (the seed or a
+    level's input, ``old``), that is a copy made after the loop holding the
+    op, in that loop's graph.  The read is materialized where ``node`` is
+    defined; the op updates its storage in place, one storage under every
+    alias, so there it would see the op's result (an ``hl.zeros`` that seeds
+    the K loop, and ``acc2 = zero`` after it).  A copy made ahead of the
+    loop is materialized ahead of it, holding the value.  Likewise inside
+    the loop: a copy of the carry in the op's own graph made after the
+    storage's first in-place write, the update's or else the op's, (``a =
+    a0`` after ``acc = acc * s`` or after ``acc = addmm(acc, ...)``, read
+    after the op) would see the written value, not the one it copied."""
+    if node not in group.old:
+        return
+    write = group.upd if group.upd is not None else group.matmul
+    if node.graph is write.graph and write < node:
+        raise metal_unsupported(
+            "a value an MPP K loop's accumulator holds before an op, read after "
+            "the op, which updates it in place; read the value before the op, "
+            "or copy it into a value of its own"
+        )
+    for level in group.levels:
+        if level.owner.graph is node.graph and level.owner < node:
+            raise metal_unsupported(
+                "a value an MPP K loop's accumulator starts from, read after "
+                "the loop, which updates it in place; give the loop a value of "
+                "its own, such as its own hl.zeros"
+            )
 
 
 def _stage_epilogue_vecs(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
