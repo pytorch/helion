@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 from contextlib import contextmanager
+import dataclasses
 import importlib.util
 import sys
 from types import MappingProxyType
@@ -122,8 +123,18 @@ def interpret_triton_selection(
     """
     from triton.runtime.interpreter import InterpretedFunction
     from triton.runtime.interpreter import _patch_lang
+    from triton.runtime.interpreter import interpreter_builder
     from triton.runtime.jit import JITFunction
 
+    # Compiled kernels check integer overflow only in debug mode, and the
+    # ordered images (_emit_ordered_image) rely on unsigned wraparound. The
+    # interpreter checks by default, so turn that off to run the body as
+    # compiled.
+    monkeypatch.setattr(
+        interpreter_builder,
+        "options",
+        dataclasses.replace(interpreter_builder.options, sanitize_overflow=False),
+    )
     path.write_text(source)
     spec = importlib.util.spec_from_file_location("selection_interpreter_fixture", path)
     assert spec is not None and spec.loader is not None

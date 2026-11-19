@@ -205,6 +205,10 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Every backend lowers aten.topk itself (topk_lowering). Inductor's table
+    # can decompose a small-k topk into argmax rounds and an aten.cat, which
+    # would bypass that lowering.
+    decomp_table.pop(torch.ops.aten.topk.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
     # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
