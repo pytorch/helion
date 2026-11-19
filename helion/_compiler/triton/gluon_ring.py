@@ -59,12 +59,13 @@ from ..cross_loop_codegen import _all_names
 from ..cross_loop_codegen import _allocation
 from ..cross_loop_codegen import _argument_allocations
 from ..cross_loop_codegen import _effect_kind
+from ..cross_loop_codegen import _free_reads
 from ..cross_loop_codegen import _host_tensor
 from ..cross_loop_codegen import _is_load
 from ..cross_loop_codegen import _is_tl_call
+from ..cross_loop_codegen import _launch_storages
 from ..cross_loop_codegen import _may_write
 from ..cross_loop_codegen import _named_allocations
-from ..cross_loop_codegen import _one_launch_storage
 from ..cross_loop_codegen import _stored_names
 from ..cross_loop_codegen import _written_allocations
 from ..cross_loop_codegen import peer_state
@@ -97,6 +98,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Mapping
     from collections.abc import Set as AbstractSet
 
     from ..device_function import DeviceBodyContext
@@ -473,12 +475,83 @@ def ring_pace_flush(full, pace, step, S: gl.constexpr, paced, run, K: gl.constex
 
 
 @gluon.jit
-def ring_skip(full, empty, step, S: gl.constexpr, NBYTES: gl.constexpr):
+def ring_skip(
+    full,
+    empty,
+    step,
+    S: gl.constexpr,
+    NBYTES: gl.constexpr,
+    ARRIVE: gl.constexpr = True,  # pyrefly: ignore [bad-function-definition]
+):
     """A producer's step it fills nothing of: it waits for the slot and arrives on
-    the full barrier (a producer a phase behind would alias a parity wait)."""
+    the full barrier (a producer a phase behind would alias a parity wait); not
+    ``ARRIVE`` (a filled operand's step, the body arrives) it only waits."""
     s = step % S
     mbarrier.wait(empty.index(s), ((step // S) & 1) ^ 1)
-    mbarrier.arrive(full.index(s))
+    if ARRIVE:
+        mbarrier.arrive(full.index(s))
+
+
+# A filled operand (``RingLowering._fill``): a dot's operand the body computes,
+# a slot of the dot's step that the body stores in place of a producer's TMA.
+
+
+@gluon.constexpr_function
+def _fill_layout(dtype, rows, cols):
+    """A filled slot's layout: that of a TMA slot of its box (``_ring_layout``)."""
+    return gl.NVMMASharedLayout.get_default_for([rows, cols], dtype)
+
+
+@gluon.jit
+def fill_buffer(
+    DTYPE: gl.constexpr, ROWS: gl.constexpr, COLS: gl.constexpr, S: gl.constexpr
+):
+    """``ring_buffer`` of a lane a filled operand allocates."""
+    SHAPE: gl.constexpr = [S, ROWS, COLS]  # pyrefly: ignore [bad-assignment]
+    return gl.allocate_shared_memory(DTYPE, SHAPE, _fill_layout(DTYPE, ROWS, COLS))  # pyrefly: ignore [bad-argument-count]
+
+
+@gluon.jit
+def fill_view(
+    lane,
+    DTYPE: gl.constexpr,
+    ROWS: gl.constexpr,
+    COLS: gl.constexpr,
+    BOXES: gl.constexpr,
+):
+    """``ring_view`` of a filled operand."""
+    SHAPE: gl.constexpr = [BOXES, ROWS, COLS]  # pyrefly: ignore [bad-assignment]
+    return reinterpret(lane, DTYPE, SHAPE, _fill_layout(DTYPE, ROWS, COLS))  # pyrefly: ignore [bad-argument-count]
+
+
+@gluon.jit
+def ring_fill(
+    ring,
+    full,
+    empty,
+    step,
+    S: gl.constexpr,
+    value,
+    BOX: gl.constexpr,
+    ARRIVALS: gl.constexpr,
+):
+    """The body's side of a filled operand: once the step's slot is free,
+    ``value`` into it, fenced for the MMA's reads, then its group's ``ARRIVALS``
+    on the full barrier (its producers only wait for the slot)."""
+    s = step % S
+    mbarrier.wait(empty.index(s), ((step // S) & 1) ^ 1)
+    gluon_ops.slot_store(ring_index(ring, s, S, BOX), value)  # pyrefly: ignore [bad-argument-count]
+    fence_async_shared()
+    mbarrier.arrive(full.index(s), count=ARRIVALS)
+
+
+@gluon.jit
+def ring_pass(empty, step, S: gl.constexpr):
+    """The body's step of a channel it fills an operand of, at a step it fills
+    nothing of: it waits for the slot without arriving, as the channel's
+    producers do at every step, so it stays within a phase of the MMA's frees
+    and its next ``ring_fill``'s parity wait cannot alias."""
+    mbarrier.wait(empty.index(step % S), ((step // S) & 1) ^ 1)
 
 
 # A tail (``cross_loop_tmem_prefetch``): a K loop's last steps read operand A from
@@ -838,7 +911,8 @@ def _acc(index: int) -> tuple[str, ...]:
 class _Site:
     dot: int
     group: int
-    descriptor: TensorDescriptorArg
+    # None for a filled operand (``RingLowering._fill``): the body stores it.
+    descriptor: TensorDescriptorArg | None
     # The body's name for the site's ring buffer (resolved by ``emit``).
     name: str
     nbytes: int
@@ -851,6 +925,15 @@ class _Site:
     def tile(self) -> tuple[object, ...]:
         """The slot's dtype and its box's last two dims."""
         return (self.slot_type[0], *self.slot_type[1][-2:])
+
+    @property
+    def lane_type(self) -> tuple[str, str]:
+        """The lane helpers (``ring_*`` / ``fill_*``) and their leading arguments
+        that type the slot: its descriptor, or a filled one's dtype and box."""
+        if self.descriptor is not None:
+            return "ring", self.descriptor.name
+        dtype = CompileEnvironment.current().backend.dtype_str(self.slot_type[0])
+        return "fill", ", ".join([dtype, *map(str, self.slot_type[1])])
 
 
 @dataclasses.dataclass(eq=False)
@@ -917,6 +1000,8 @@ class RingLowering:
         # Each site's last acquired slot; the tails, and the enabled loops whose
         # dot reached ``_tail`` (each takes a tail or logs why not).
         self.acquires: dict[object, str] = {}
+        # The steps of dots a register read joined (``_register_read``).
+        self.joined: set[int] = set()
         self.tails: list[_Tail] = []
         self.tail_loops: set[int] = set()
 
@@ -1031,6 +1116,8 @@ class RingLowering:
         )
         if dot is None:
             self.mma[node] = False
+        else:
+            self.joined.add(step)
         slot, descriptor = self._acquire(
             state, node, tensor, indexing, step, group, True, tagged
         )
@@ -1182,38 +1269,170 @@ class RingLowering:
             return gluon_ops.codegen_view(interp, node)
         dot_index = self.dots[node]
         self.open.pop(node, None)
+        filled = self._fill(interp, node, dot_index)
+        try:
+            return self._ring_dot(interp, node, dot_index)
+        finally:
+            env.update(filled)
+
+    def _fill(
+        self, interp: GraphInterpreter, node: torch.fx.Node, dot_index: int
+    ) -> dict[torch.fx.Node, object]:
+        """A dot that would issue from the MMA partition but for one operand the
+        body computes takes that operand as a slot of its step the body fills
+        (``ring_fill``): a member of the gating group the step lacks, for which
+        the body arrives in place of the group's producers.  Returns the binding
+        it replaced (none if the dot takes no fill)."""
+        df = self.device_function
+        cg = cast("GenerateAST", interp.cg)
+        env = cast("dict[torch.fx.Node, object]", interp.env)
+        computed = [
+            cast("torch.fx.Node", node.args[p])
+            for p in gluon_ops.operands(node.target)
+            if not isinstance(env.get(cast("torch.fx.Node", node.args[p])), SharedValue)
+        ]
+        free = {_UNGATED, _GATED} - {
+            s.group
+            for s in self.sites.values()
+            if s.dot == dot_index and s.descriptor is not None
+        }
+        if (
+            len(computed) != 1
+            or not free
+            # The body reads a joined register read's slot behind the step's
+            # full barrier, which its own fill completes.
+            or dot_index in self.joined
+            # A tail's fill steps run on the MMA channel between the body's
+            # waits (no accumulator take after them): past 2 * depth of them
+            # the body's parity wait for its slot would alias.
+            or any(cast("list[bool]", df.config.config.get(_TAIL_KEY) or []))
+            or node.target is dot_scaled
+            or not self._issuable(interp, node)
+            or not gluon_ops.tmem_dot_supported(df, node)
+            or gluon_ops.padded_k(node) is not None
+            or self._acc_key(interp, node, peek=True) is None
+        ):
+            return {}
+        # The slot holds the value before its transposes (as a TMA slot its box).
+        (operand,) = computed
+        source, orders = operand, []
+        while source.op == "call_function" and source.target in gluon_ops._TRANSPOSES:
+            orders.append(gluon_ops._permutation(source))
+            source = cast("torch.fx.Node", source.args[0])
+        root = source
+        while gluon_ops._is_view(root):
+            root = cast("torch.fx.Node", root.args[0])
+        value = cast("torch.Tensor", source.meta["val"])
+        shape = gluon_ops.concrete(value.shape)
+        if (
+            # A plain load (a view of one) is no computed operand: the pipeline
+            # stages it (an MMA reads a TMA load in place).
+            root.target is memory_ops.load
+            or len(shape) != 2
+            # (A tf32 MMA reads K-major operands only: a slot keeps the value's order.)
+            or value.element_size() > 2
+            or source not in env
+        ):
+            return {}
+        site = self.sites.get((source, node))
+        if site is None:
+            site = self.sites[(source, node)] = _Site(
+                dot_index,
+                max(free),  # gated if the step has neither
+                None,
+                f"_helion_ring_site{len(self.sites)}",
+                math.prod(shape) * value.element_size(),
+                (value.dtype, tuple(shape), True),
+            )
+        name, group = site.name, site.group
+        links = _links(dot_index, group, "full", "empty", "step", "depth")
+        cg.add_statement(
+            statement_from_string(
+                f"{ALIAS}.ring_fill({name}, {links}, {{value}}, {name}_box, "
+                f"{name}_arrivals)",
+                value=cast("ast.AST", env[source]),
+            )
+        )
+        # The MMA side's acquire (no producer puts it: no bytes link).
+        slot = df.new_var("ring_slot")
+        cg.add_statement(
+            statement_from_string(
+                f"{slot} = {ALIAS}.ring_acquire({name}, {links}, None, (), False, 0, "
+                f"{name}_box)"
+            )
+        )
+        self.acquires[(source, node)] = slot
+        result: ast.AST = expr_from_string(slot)
+        for order in reversed(orders):
+            result = gluon_ops.permute(result, order)
+        log.info(
+            "the ring: %s fills %s of %s (group %d)",
+            name,
+            source.name,
+            node.name,
+            group,
+        )
+        replaced = {operand: env[operand]}
+        env[operand] = SharedValue(result)
+        return replaced
+
+    def _issuable(self, interp: GraphInterpreter, node: torch.fx.Node) -> bool:
+        """Whether a dot reading only ring slots issues from the MMA partition: it
+        is under a warp-specialized loop, into a fresh accumulator (else the body
+        issues it)."""
+        df = self.device_function
+        return (
+            in_warp_specialized_loop(df, cast("GenerateAST", interp.cg), requested=True)
+            and gluon_ops.resident(df, node)
+            and gluon_ops.fresh_accumulator(df, node)
+        )
+
+    def _acc_key(
+        self, interp: GraphInterpreter, node: torch.fx.Node, peek: bool = False
+    ) -> tuple[tuple[int, ...], int] | None:
+        """An MMA-partition dot's accumulator ring key: one ring per dot of a task
+        (root), so the MMA stays _ACC_DEPTH tasks ahead of the body; without tensor
+        memory for another, one of the shape's it shares (``_shared_ring``).
+        ``peek``: None where that raises, and nothing recorded."""
+        root = self.tmem_root(cast("GenerateAST", interp.cg))
+        if not peek:
+            self.dot_roots[node] = root
+        shape = tuple(gluon_ops.concrete(node.meta["val"].shape)[-2:])
+        peers = [
+            n
+            for n, m in self.mma.items()
+            if m
+            and isinstance(n, torch.fx.Node)
+            and n is not node
+            and self.dot_roots.get(n) == root
+        ]
+        shapes = [tuple(gluon_ops.concrete(n.meta["val"].shape)[-2:]) for n in peers]
+        key = (shape, shapes.count(shape) + 1)
+        if key not in self.acc_rings and self._tmem_left(key[0]) < 0:
+            try:
+                return self._shared_ring(node, shape)
+            except RingFallback:
+                if peek:
+                    return None
+                raise
+        return key
+
+    def _ring_dot(
+        self, interp: GraphInterpreter, node: torch.fx.Node, dot_index: int
+    ) -> object:
+        """The tcgen05 MMA of a dot reading ring slots: from the MMA partition or
+        the body."""
+        env = cast("dict[torch.fx.Node, object]", interp.env)
         groups = sorted({s.group for s in self.sites.values() if s.dot == dot_index})
-        # A dot under a warp-specialized loop reading only ring slots into a
-        # fresh accumulator issues from the MMA partition (else from the body).
         operands = [
             cast("torch.fx.Node", node.args[i]) for i in gluon_ops.operands(node.target)
         ]
-        self.mma[node] = (
-            in_warp_specialized_loop(
-                self.device_function, cast("GenerateAST", interp.cg), requested=True
-            )
-            and all(isinstance(env.get(a), SharedValue) for a in operands)
-            and gluon_ops.resident(self.device_function, node)
-            and gluon_ops.fresh_accumulator(self.device_function, node)
+        self.mma[node] = self._issuable(interp, node) and all(
+            isinstance(env.get(a), SharedValue) for a in operands
         )
         ring = None
         if self.mma[node]:
-            # One accumulator ring per dot of a task (root), so the MMA stays
-            # _ACC_DEPTH tasks ahead of the body.
-            shape = gluon_ops.concrete(node.meta["val"].shape)[-2:]
-            self.dot_roots[node] = self.tmem_root(cast("GenerateAST", interp.cg))
-            peers = [
-                n
-                for n, m in self.mma.items()
-                if m
-                and isinstance(n, torch.fx.Node)
-                and self.dot_roots.get(n) == self.dot_roots[node]
-            ]
-            shapes = [gluon_ops.concrete(n.meta["val"].shape)[-2:] for n in peers]
-            key = (tuple(shape), shapes.count(shape))
-            if key not in self.acc_rings and self._tmem_left(key[0]) < 0:
-                # No tensor memory for another ring: share one of the shape's.
-                key = self._shared_ring(node, tuple(shape))
+            key = cast("tuple[tuple[int, ...], int]", self._acc_key(interp, node))
             self.acc_keys[node] = key
             ring = _acc(self.acc_rings.setdefault(key, len(self.acc_rings)))
             self.mma_tensors |= node.target is dot_scaled and not all(
@@ -1320,7 +1539,7 @@ class RingLowering:
             reason = "its dot issues from the body"
         elif site is None or site.dot != dot_index:
             reason = "operand A is no slot of its dot's step"
-        elif site.tagged or not site.slot_type[2] or site.descriptor.permutation:
+        elif site.tagged or not site.slot_type[2] or site.descriptor.permutation:  # pyrefly: ignore [missing-attribute]
             reason = "operand A's slot is tagged, unswizzled or permuted"
         elif [
             s for s in self.sites.values() if (s.dot, s.group) == (site.dot, site.group)
@@ -1512,6 +1731,8 @@ class RingLowering:
         buffers: list[tuple[str, str, int, int, int]] = []
         for tails in shapes.values():
             site = self.sites[tails[0].load]
+            # A kernel with a tail fills no operand (``_fill``): its slots are TMA's.
+            assert site.descriptor is not None
             dtype, rows, cols = cast("tuple[torch.dtype, int, int]", site.tile)
             tile = _tmem_columns([(rows, cols * dtype.itemsize // 4)])
             tiles = min(max(t.trip for t in tails), left // tile)
@@ -1728,15 +1949,19 @@ class RingLowering:
                 rename[_link(site.dot, site.group, link)] = _channel(
                     _DEPTH_NAME if link == "depth" else link, channel
                 )
-            group_puts.setdefault(site.group, set()).add(
-                _link(site.dot, site.group, "bytes")
-            )
+            if site.descriptor is not None:
+                # (A filled operand's group arrives from the body.)
+                group_puts.setdefault(site.group, set()).add(
+                    _link(site.dot, site.group, "bytes")
+                )
             if issuer[site.dot]:
                 mma |= {_channel("full", channel), _channel("empty", channel)}
             steps.setdefault((channel, site.dot), []).append(site)
-            # A tagged operand's bytes are stores, which its last put arrives for.
+            # A tagged or filled operand's bytes are stores, which its last put
+            # (its fill) arrives for.
             key = (site.dot, site.group)
-            expects[key] = expects.get(key, 0) + (0 if site.tagged else site.nbytes)
+            stored = site.tagged or site.descriptor is None
+            expects[key] = expects.get(key, 0) + (0 if stored else site.nbytes)
             dot_groups.setdefault(site.dot, set()).add(site.group)
             channel_groups.setdefault(issuer[site.dot], set()).add(site.group)
         # Tagged puts' geometry by box; by a group step's last box, the step's
@@ -1756,21 +1981,72 @@ class RingLowering:
                 (f"{s.name}_box", s.name, s is mine[0]) for s in mine
             ]
         # Each producer replays every step of its channel; without operands a skip.
+        # A group that only filled operands make has no producer: on a step
+        # without one, the step's first streaming producer arrives for it.
+        streamed: dict[int, set[int]] = {}
+        for site in self.sites.values():
+            if site.descriptor is not None:
+                streamed.setdefault(site.dot, set()).add(site.group)
         skips: dict[str, list[ast.stmt]] = {}
         for dot, groups in dot_groups.items():
             lead = min(groups)
             for group in channel_groups[issuer[dot]] - groups:
                 for link in ("full", "empty", "step", "depth"):
                     rename[_link(dot, group, link)] = rename[_link(dot, lead, link)]
-                group_puts[group].add(_link(dot, group, "bytes"))
+                owner = group if group in group_puts else min(streamed[dot])
+                if owner != group and owner == _GATED and tagged:
+                    # Each tagged poller would keep the stand-in arrival.
+                    raise RingFallback(
+                        "the ring: tagged pollers would each arrive for a filled "
+                        "operand's group that no producer streams"
+                    )
+                group_puts[owner].add(_link(dot, owner, "bytes"))
                 expects[(dot, group)] = 0
                 skips.setdefault(_link(dot, lead, "step"), []).append(
                     statement_from_string(
                         f"{ALIAS}.ring_skip("
                         f"{_links(dot, group, 'full', 'empty', 'step', 'depth')}, "
-                        f"{_link(dot, group, 'bytes')})"
+                        f"{_link(dot, owner, 'bytes')})"
                     )
                 )
+        # A filled step's own group's producers wait for its slot without
+        # arriving (the body arrives): each producer stays in phase.
+        for site in self.sites.values():
+            if site.descriptor is None and site.group in group_puts:
+                group_puts[site.group].add(_link(site.dot, site.group, "bytes"))
+                skips.setdefault(
+                    _link(site.dot, min(dot_groups[site.dot]), "step"), []
+                ).append(
+                    statement_from_string(
+                        f"{ALIAS}.ring_skip("
+                        f"{_links(site.dot, site.group, 'full', 'empty', 'step', 'depth')}, "
+                        f"{_link(site.dot, site.group, 'bytes')}, False)"
+                    )
+                )
+        # The body waits for a filled slot only at the steps it fills, while the
+        # channel's other dots step between them: unthrottled, it could run two
+        # phases ahead of the MMA's frees and its next fill's parity wait would
+        # alias.  At each other step of a filled channel that a fill may follow,
+        # the body waits for the slot as the producers do.
+        filled = {s.dot for s in self.sites.values() if s.descriptor is None}
+        passed = {
+            _link(dot, min(groups), "step"): dot
+            for dot, groups in dot_groups.items()
+            if dot not in filled and issuer[dot] in {issuer[d] for d in filled}
+        }
+        fills = {
+            _link(s.dot, s.group, "full")
+            for s in self.sites.values()
+            if s.descriptor is None
+        }
+        for step in _steps_a_fill_follows(body.body, set(passed), fills):
+            dot = passed[step]
+            skips.setdefault(step, []).append(
+                statement_from_string(
+                    f"{ALIAS}.ring_pass("
+                    f"{_links(dot, min(dot_groups[dot]), 'empty', 'step', 'depth')})"
+                )
+            )
         body.body = _with_skips(body.body, skips)
         buffers, views, box = self._lanes(channels.values(), steps, rename)
         # A channel a dot reads (whichever partition issues it) streams at the
@@ -1931,8 +2207,7 @@ class RingLowering:
             argument.name
             for argument in df.arguments
             if isinstance(argument, TensorArg)
-            and _host_tensor(argument.fake_value) in named
-            and _one_launch_storage(argument.fake_value)
+            and _within_independent(argument.fake_value, named)
         )
         if launch_state is not None:
             launch, finish, launch_names, read_names = launch_state
@@ -1945,10 +2220,13 @@ class RingLowering:
                 if at is None:
                     fn.body.insert(0, statement_from_string(read))
                 else:
-                    fn.body[at] = statement_from_string(read)
+                    fn.body[at] = read_statement = statement_from_string(read)
                     if fn is not body and independent:
                         fn.body[at:] = _past_independent(
                             fn.body[at:], independent, tensors
+                        )
+                        fn.body = _pre_wait_fills(
+                            fn.body, read_statement, independent, tensors
                         )
             # The cluster flag (``cross_loop_dsmem``) follows the body's read
             # of the epoch it raises.
@@ -1973,7 +2251,9 @@ class RingLowering:
             for fn in partitions:
                 at = next((i for i, st in enumerate(fn.body) if _is_gdc_wait(st)), None)
                 if at is not None:
+                    wait = fn.body[at]
                     fn.body[at:] = _past_independent(fn.body[at:], independent, tensors)
+                    fn.body = _pre_wait_fills(fn.body, wait, independent, tensors)
         used = _all_names([st for fn in functions for st in fn.body])
         paces = [p for c in ids if (p := _channel("pace", c)) in used]
         extra = [
@@ -2068,12 +2348,13 @@ class RingLowering:
         ]
         setup += [f"{b} = {ALIAS}.ring_barriers({pace})" for b in paces]
         setup += [
-            f"{b} = {ALIAS}.ring_buffer({d}, {_channel(_DEPTH_NAME, c)} * {k})"
-            for b, d, k, c, _ in buffers
+            f"{b} = {ALIAS}.{kind}_buffer({d}, {_channel(_DEPTH_NAME, c)} * {k})"
+            for b, (kind, d), k, c, _ in buffers
         ]
         setup += [
-            f"{view} = {ALIAS}.ring_view({b}, {d}, {_channel(_DEPTH_NAME, c)} * {boxes})"
-            for view, b, d, boxes, c in views
+            f"{view} = {ALIAS}.{kind}_view({b}, {d}, "
+            f"{_channel(_DEPTH_NAME, c)} * {boxes})"
+            for view, b, (kind, d), boxes, c in views
         ]
         if claims:
             # The body and every partition but the claiming one take each ticket.
@@ -2135,6 +2416,12 @@ class RingLowering:
                 *([(_TASK_DEPTH, task_depth)] if claims else []),
                 *((_link(*step, "bytes"), n) for step, n in expects.items()),
                 *box.items(),
+                # A filled operand arrives for its group's producers (each poller).
+                *(
+                    (f"{s.name}_arrivals", pollers if s.group == _GATED else 1)
+                    for s in self.sites.values()
+                    if s.descriptor is None
+                ),
             ]
         )
         prologue = [] if launch_state is None else [launch, finish]  # pyrefly: ignore [unbound-name]
@@ -2146,8 +2433,8 @@ class RingLowering:
         steps: dict[tuple[int, int], list[_Site]],
         rename: dict[str, str],
     ) -> tuple[
-        list[tuple[str, str, int, int, int]],
-        list[tuple[str, str, str, int, int]],
+        list[tuple[str, tuple[str, str], int, int, int]],
+        list[tuple[str, str, tuple[str, str], int, int]],
         dict[str, int],
     ]:
         """A slot is lanes: each step's operands, widest first, fill a lane as wide
@@ -2156,8 +2443,8 @@ class RingLowering:
         whole number of 128 bytes (its boxes).  Returns the lanes (with their boxes
         per slot, channel and bytes per slot), views (with their channel) and
         boxes; renames sites."""
-        buffers: list[tuple[str, str, int, int, int]] = []
-        views: list[tuple[str, str, str, int, int]] = []
+        buffers: list[tuple[str, tuple[str, str], int, int, int]] = []
+        views: list[tuple[str, str, tuple[str, str], int, int]] = []
         box: dict[str, int] = {}
 
         def size(site: _Site) -> int:
@@ -2178,7 +2465,7 @@ class RingLowering:
                 buffers.append(
                     (
                         buffer,
-                        widest.descriptor.name,
+                        widest.lane_type,
                         size(widest) // widest.nbytes,
                         channel,
                         size(widest),
@@ -2202,7 +2489,7 @@ class RingLowering:
                                 (
                                     rename[site.name],
                                     buffer,
-                                    site.descriptor.name,
+                                    site.lane_type,
                                     boxes,
                                     channel,
                                 )
@@ -2428,6 +2715,27 @@ def _orders(
     )
 
 
+def _body_accesses(statement: ast.stmt, allocations: dict[str, int]) -> set[int]:
+    """The allocations of the tensor arguments ``statement`` names, past the
+    descriptors and coordinates of its ``ring_acquire`` calls: a consumer's
+    acquire waits for its slot's full barrier and reads shared memory only (it
+    repeats the producer's ``ring_put`` arguments); the producer partition that
+    loads the slot keeps the waits ordering that load."""
+    skipped = {
+        id(node)
+        for call in _ring_calls(statement, "ring_acquire")
+        for name in ("desc", "coords")
+        for node in ast.walk(_arg(call, name))
+    }
+    return {
+        allocations[node.id]
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Name)
+        and node.id in allocations
+        and id(node) not in skipped
+    }
+
+
 def _without_waits(
     body: list[ast.stmt], df: DeviceFunction, after: frozenset[int]
 ) -> list[ast.stmt]:
@@ -2438,7 +2746,7 @@ def _without_waits(
     waits = df.sync_names("wait")
     later = [after]  # later[i]: the allocations body[i:] (or ``after``) access
     for statement in reversed(body):
-        later.append(later[-1] | _named_allocations(statement, allocations))
+        later.append(later[-1] | _body_accesses(statement, allocations))
     later.reverse()
     kept: list[ast.stmt] = []
     for index, statement in enumerate(body):
@@ -2553,6 +2861,57 @@ def _launch_state(
     return launch_fn, finish, names, read
 
 
+def _byte_span(tensor: torch.Tensor) -> tuple[int, int] | None:
+    """The bytes of its storage a (fake) tensor's elements span; None if empty
+    or of symbolic shape."""
+    try:
+        if tensor.numel() == 0:
+            return None
+        low = int(tensor.storage_offset())
+        high = (
+            low
+            + 1
+            + sum(
+                (int(size) - 1) * int(stride)
+                for size, stride in zip(tensor.size(), tensor.stride(), strict=True)
+            )
+        )
+    except (TypeError, ValueError, RuntimeError):
+        return None
+    return low * tensor.element_size(), high * tensor.element_size()
+
+
+def _within_independent(
+    tensor: torch.Tensor, named: Mapping[torch.Tensor, str]
+) -> bool:
+    """Whether a (fake) device tensor reads only memory of tensors
+    ``hl.pdl_wait(independent=...)`` names (``named``), on one storage on every
+    path to the launch: one of them, or a view inside a dense one's elements
+    (the same storage at the launch; ``in_proj``'s chunked view of its weight)."""
+    storages = _launch_storages(tensor)
+    if len(storages) != 1:
+        return False
+    if _host_tensor(tensor) in named:
+        return True
+    span = _byte_span(tensor)
+    if span is None:
+        return False
+    env = CompileEnvironment.current()
+    for outer in named:
+        held = env.storages_until_launch(outer)
+        bounds = _byte_span(outer)
+        if (
+            len(held) == 1
+            and held[0] is storages[0]
+            and bounds is not None
+            and bounds[1] - bounds[0] == outer.numel() * outer.element_size()
+            and bounds[0] <= span[0]
+            and span[1] <= bounds[1]
+        ):
+            return True
+    return False
+
+
 # The ring operations a partition may issue before its grid wait (on tensors
 # ``hl.pdl_wait(independent=...)`` names).
 _PRE_WAIT_RING_OPS = frozenset(
@@ -2601,6 +2960,191 @@ def _past_independent(
         else:
             return [*passed, *moved, *rest[index:]]
     return [*passed, *moved]
+
+
+def _pre_wait_fills(
+    body: list[ast.stmt],
+    read: ast.stmt,
+    independent: frozenset[str],
+    tensors: frozenset[str],
+) -> list[ast.stmt]:
+    """``body`` (a producer's statements) with each channel's first steps of
+    tensors the previous grid does not write (``independent``, of the kernel's
+    ``tensors``) also issued before ``read`` (its grid wait or launch-state
+    read), as ``_past_independent`` issues leading roots: a copy of the roots
+    after the read that step the channel (their loops, pure statements and the
+    channel's puts and skips only) counts its steps as they do, from the step
+    the statements before the read reached, and issues those that fit the
+    channel's slots (its ``pre`` counter: the first lap's slots, whose waits
+    pass at once); the roots then skip those steps' puts and skips.  A put
+    issues before the wait only with its step's group: the group's first put
+    (which expects the group's bytes) of an independent tensor, and the
+    group's other independent puts.  The copy stops at the channel's first
+    root it cannot run before the wait: a wait or another effect, a name the
+    read or a statement after it defines, one it updates, or one it stores
+    that the statements from the read on read before storing."""
+    at = next(i for i, statement in enumerate(body) if statement is read)
+    after = body[at:]
+    if any(
+        _ring_calls(statement, name)
+        for statement in after
+        for name in ("ring_put_paced", "ring_put_tagged", "ring_pace_flush")
+    ):
+        return body  # paced or tagged fills keep their order
+
+    def steps(statement: ast.stmt, full: str) -> bool:
+        return any(
+            cast("ast.Name", _arg(call, "full")).id == full
+            for name in ("ring_put", "ring_skip")
+            for call in _ring_calls(statement, name)
+        )
+
+    channels = sorted(
+        {
+            cast("ast.Name", _arg(call, "full")).id
+            for name in ("ring_put", "ring_skip")
+            for statement in after
+            for call in _ring_calls(statement, name)
+        }
+    )
+    live = _free_reads(after)
+    reached = _stored_names(body[:at])
+    copies: list[ast.stmt] = []
+    for full in channels:
+        pre, step = full.replace("_full", "_pre"), full.replace("_full", "_step")
+        depth = _beside(_name(full), _DEPTH_NAME).id
+        region: list[tuple[ast.stmt, list[ast.Call]]] = []
+        for index, statement in enumerate(after[1:], 1):
+            if not steps(statement, full):
+                continue
+            issued: list[ast.Call] = []
+            copy = _root_fills(statement, full, pre, independent, tensors, issued)
+            if copy is None:
+                break
+            reads, stores = _free_reads([copy]), _stored_names([copy]) - {pre}
+            if reads & (_stored_names(after[:index]) | stores) or stores & live:
+                break
+            guard = statement_from_string(f"if {pre} < {depth}:\n    pass")
+            cast("ast.If", guard).body = [copy]
+            region.append((guard, issued))
+        while region and not region[-1][1]:
+            region.pop()  # steps it would only count
+        if not region:
+            continue
+        start = step if step in reached else "tl.full([], 0, tl.int32)"
+        copies += [
+            statement_from_string(f"{pre} = {start}"),
+            *(guard for guard, _ in region),
+            statement_from_string(f"{pre} = tl.minimum({pre}, {depth})"),
+        ]
+        # The roots skip the steps the copy issued.
+        keep = {id(call) for _, issued in region for call in issued}
+        for block in _blocks(create(ast.Module, body=after, type_ignores=[])):
+            for i, statement in enumerate(block):
+                call = statement.value if isinstance(statement, ast.Expr) else None
+                if isinstance(call, ast.Call) and id(call) in keep:
+                    at_step = ast.unparse(_arg(call, "step"))
+                    guard = statement_from_string(f"if {pre} <= {at_step}:\n    pass")
+                    cast("ast.If", guard).body = [statement]
+                    block[i] = guard
+    return [*body[:at], *copies, *after]
+
+
+def _root_fills(
+    statement: ast.stmt,
+    full: str,
+    pre: str,
+    independent: frozenset[str],
+    tensors: frozenset[str],
+    issued: list[ast.Call],
+) -> ast.stmt | None:
+    """The ``_pre_wait_fills`` copy of a root's ``statement``: its loops, pure
+    statements and steps of the channel of ``full``, counted by ``pre`` as the
+    root counts them (puts of independent tensors, and skips, issued while
+    ``pre`` is short of the channel's depth; ``issued`` collects the root's
+    puts and skips so issued).  None if it does anything else."""
+    step = full.replace("_full", "_step")
+    hoisted = False  # the current step's group issues before the wait (every path)
+
+    def channel(call: ast.Call) -> bool:
+        return cast("ast.Name", _arg(call, "full")).id == full
+
+    def fill(call: ast.Call) -> ast.stmt:
+        issued.append(call)
+        copy = cast("ast.Call", clone_ast(call))
+        copy.args[_arg_index(copy, "step")] = _name(pre)
+        depth = ast.unparse(_arg(call, "S"))
+        guard = statement_from_string(f"if {pre} < {depth}:\n    pass")
+        cast("ast.If", guard).body = [create(ast.Expr, value=copy)]
+        return guard
+
+    def block(statements: list[ast.stmt]) -> list[ast.stmt] | None:
+        nonlocal hoisted
+        out: list[ast.stmt] = []
+        for st in statements:
+            if isinstance(st, ast.For):
+                before = hoisted
+                inner = block(st.body)
+                if inner is None or st.orelse:
+                    return None
+                hoisted = hoisted and before  # the body may not run
+                if inner:
+                    loop = cast("ast.For", clone_ast(st))
+                    loop.body = inner
+                    out.append(loop)
+                continue
+            if isinstance(st, ast.If):
+                before = hoisted
+                then = block(st.body)
+                hoisted, taken = before, hoisted
+                orelse = block(st.orelse)
+                if then is None or orelse is None:
+                    return None
+                hoisted = hoisted and taken
+                if then or orelse:
+                    branch = cast("ast.If", clone_ast(st))
+                    branch.body, branch.orelse = then or [create(ast.Pass)], orelse
+                    out.append(branch)
+                continue
+            if not isinstance(st, (ast.Assign, ast.AugAssign, ast.Expr)):
+                return None
+            calls = [c for c in ast.walk(st) if isinstance(c, ast.Call)]
+            ring = [c for c in calls if _is_tl_call(c, _PRE_WAIT_RING_OPS, _MODULES)]
+            if ring:
+                (call,) = ring
+                if not (isinstance(st, ast.Expr) and st.value is call):
+                    return None
+                if not channel(call):
+                    continue  # another channel's step: the root's own
+                if _is_tl_call(call, frozenset(["ring_skip"]), _MODULES):
+                    out.append(fill(call))
+                    continue
+                if not _is_tl_call(call, frozenset(["ring_put"]), _MODULES):
+                    return None
+                first = _arg(call, "FIRST")
+                if not isinstance(first, ast.Constant) or _keywords(call, "HEAD"):
+                    return None
+                ours = _all_names([call]) & tensors <= independent
+                if first.value:
+                    hoisted = ours
+                if hoisted and ours:
+                    out.append(fill(call))
+                continue
+            if not all(_effect_kind(c) == "pure" for c in calls):
+                return None
+            stored = _stored_names([st])
+            if stored == {step}:
+                out.append(statement_from_string(f"{pre} = {pre} + 1"))
+                hoisted = False
+            elif not any(n.startswith("_helion_ring_step") for n in stored):
+                out.append(cast("ast.stmt", clone_ast(st)))
+        return out
+
+    result = block([statement])
+    if not result:
+        return None
+    (copy,) = result
+    return copy
 
 
 def _function(
@@ -2654,7 +3198,8 @@ def _arg(call: ast.Call, name: str) -> ast.expr:
 
 def _skip(acquire: ast.Call) -> ast.Call:
     """The ``ring_skip`` of an acquire's step (from its same-named arguments)."""
-    return _call("ring_skip", [_arg(acquire, n) for n in ring_skip.arg_names])  # pyrefly: ignore [missing-attribute]
+    names = [n for n in ring_skip.arg_names if n != "ARRIVE"]  # pyrefly: ignore [missing-attribute]
+    return _call("ring_skip", [_arg(acquire, n) for n in names])
 
 
 def _ring_call(node: ast.AST, attribute: str) -> ast.Call | None:
@@ -3149,13 +3694,59 @@ def _without_mma(body: list[ast.stmt], mma: set[str]) -> list[ast.stmt]:
     return kept
 
 
+def _steps_a_fill_follows(
+    body: list[ast.stmt], steps: set[str], fills: set[str]
+) -> set[str]:
+    """The ``steps`` (step counter names) whose advance a ``ring_fill`` on one of
+    ``fills`` (full barriers) may follow: one later in the body, or in a loop
+    around both."""
+    advances: list[tuple[str, int, frozenset[int]]] = []
+    filled: list[tuple[int, frozenset[int]]] = []
+    order = itertools.count()
+
+    def visit(block: list[ast.stmt], loops: frozenset[int]) -> None:
+        for statement in block:
+            at = next(order)
+            if isinstance(statement, (ast.For, ast.While, ast.If)):
+                inner = (
+                    loops if isinstance(statement, ast.If) else loops | {id(statement)}
+                )
+                visit(statement.body, inner)
+                visit(statement.orelse, inner)
+                continue
+            if isinstance(statement, ast.Assign):
+                advances.extend(
+                    (name, at, loops) for name in _stored_names([statement]) & steps
+                )
+            if any(
+                isinstance(full := _arg(call, "full"), ast.Name) and full.id in fills
+                for call in _ring_calls(statement, "ring_fill")
+            ):
+                filled.append((at, loops))
+
+    visit(body, frozenset())
+    return {
+        name
+        for name, at, loops in advances
+        if any(later > at or loops & around for later, around in filled)
+    }
+
+
 def _with_skips(
-    body: list[ast.stmt], skips: dict[str, list[ast.stmt]]
+    body: list[ast.stmt],
+    skips: dict[str, list[ast.stmt]],
+    seen: set[int] | None = None,
 ) -> list[ast.stmt]:
-    """The body with each step's skips before its count advances."""
+    """The body with each step's skips before its count advances (once in a
+    compound statement several blocks share, as barrier mode's phase loops
+    share the roots' statements)."""
+    seen = set() if seen is None else seen
     kept: list[ast.stmt] = []
     for statement in body:
-        _rebuilt(statement, functools.partial(_with_skips, skips=skips), copy=False)
+        if id(statement) not in seen:
+            seen.add(id(statement))
+            block = functools.partial(_with_skips, skips=skips, seen=seen)
+            _rebuilt(statement, block, copy=False)
         for name in (
             _stored_names([statement]) if isinstance(statement, ast.Assign) else ()
         ):

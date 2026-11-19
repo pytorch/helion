@@ -26,14 +26,19 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessGluon
+from helion._testing.gluon_kernels import filled_beside_two_dots
 from helion._testing.gluon_kernels import mm_then_mm
+from helion._testing.gluon_kernels import mm_then_scaled_mm
 from helion._testing.gluon_kernels import scale_then_nested_wx
+from helion._testing.gluon_kernels import scale_then_normed_wx
 from helion._testing.gluon_kernels import scale_then_two_wx
+from helion._testing.gluon_kernels import scale_then_viewed_wx
 from helion._testing.gluon_kernels import scale_then_wx
 from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
 from helion._testing.gluon_kernels import scale_then_wx_and_nvfp4
 from helion._testing.gluon_kernels import split_k_gemv
 from helion._testing.gluon_kernels import split_k_parts
+from helion._testing.gluon_kernels import wx_then_scaled_vx
 from helion._testing.timeline_checks import check_written
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as RING
 from helion._testing.triton_codegen import gluon_tail_ring_config
@@ -788,6 +793,10 @@ def ring_mm_in_dry_loop(
     return e, m, side
 
 
+def _as_tuple(result: object) -> tuple[object, ...]:
+    return result if isinstance(result, tuple) else (result,)
+
+
 def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]:
     """``run`` on each input back to back in a CUDA graph, so that each launch
     overlaps the last (PDL)."""
@@ -847,6 +856,56 @@ if gluon_api_available():
         tl.store(values + offsets, value, mask=mask)
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def _wx_then_scaled_vx_after_wait(
+    x: torch.Tensor, w: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """``wx_then_scaled_vx`` behind ``hl.pdl_wait(independent=(w, v))``: the
+    weight producer's early steps hold its skips for the filled group."""
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    hl.pdl_wait(independent=(w, v))
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc)
+        acc2 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            a = (x[tile_m, tile_k].to(torch.float32) * 2).to(x.dtype)
+            acc2 = hl.dot(v[tile_n, tile_k], a.T, acc=acc2)
+        out[tile_n, tile_m] = acc + acc2
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _ww_then_wy(
+    x: torch.Tensor, a: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A root of independent tensors only (``_past_independent`` moves it
+    before the grid wait), then one of a weight times what the kernel writes:
+    the second root's early steps count on from the first's."""
+    m, k = x.size()
+    n = w1.size(0)
+    y = torch.empty_like(x)
+    out1 = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    out2 = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    hl.pdl_wait(independent=(w1, w2, a))
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w1[tile_n, tile_k], a[tile_m, tile_k].T, acc=acc)
+        out1[tile_n, tile_m] = acc
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w2[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc)
+        out2[tile_n, tile_m] = acc
+    return out1, out2
+
+
 class TestGluonRing(TestCase):
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
@@ -903,6 +962,109 @@ class TestGluonRing(TestCase):
         for got, args in zip(replayed, inputs, strict=True):
             for result, expected in zip(got, static(*args), strict=True):
                 torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_first_weight_slots_fill_before_the_grid_wait(self) -> None:
+        """``_pre_wait_fills``: behind ``hl.pdl_wait(independent=w)`` the
+        producer issues the dot's first fills of a view of w before its grid
+        wait, past the first root (whose x fills follow the wait), in the
+        dynamic schedule (a launch-state read) and the single-loop one; the
+        dot then skips those steps' puts. Back-to-back launches (PDL) stay
+        exact."""
+        x = torch.randn([128, 512], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([256, 512], device=DEVICE, dtype=torch.bfloat16)
+        bound = scale_then_viewed_wx.bind((x, w))
+        slots = len(bound.config_spec.range_warp_specialize)
+        base = {
+            "block_sizes": [64, 64, 128, 64, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+        }
+        static = bound.compile_config(
+            helion.Config(**base, cross_loop_pipeline="static")
+        )
+        for pipeline in ("dynamic", None):
+            ring = {
+                **base,
+                "num_stages": 2,
+                "range_warp_specializes": [None] * (slots - 1) + [True],
+                **({"cross_loop_pipeline": pipeline} if pipeline else {}),
+            }
+            with self.subTest(cross_loop_pipeline=pipeline):
+                code, out = code_and_output(scale_then_viewed_wx, (x, w), **ring)
+                torch.testing.assert_close(out, static(x, w), atol=0, rtol=0)
+                (producer,) = [
+                    f
+                    for n, f in _functions(code).items()
+                    if "_producer" in n and "wv_ring_desc, (" in f
+                ]
+                wait = producer.index("_launch(" if pipeline else "gdc_wait()")
+                self.assertLess(producer.index("wv_ring_desc, ("), wait)
+                self.assertNotIn("x_ring_desc, (", producer[:wait])
+                self.assertIn("if _helion_ring_pre", producer[wait:])
+                inputs = [(x + launch, w) for launch in range(4)]
+                replayed = _replay(bound.compile_config(helion.Config(**ring)), inputs)
+                for got, args in zip(replayed, inputs, strict=True):
+                    torch.testing.assert_close(got, static(*args), atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_early_steps_follow_earlier_steps_and_skips(self) -> None:
+        """``_pre_wait_fills`` beside steps already taken: a root moved before
+        the grid wait (the copy counts on from its steps) and a producer's
+        skips for a filled group (issued once). Exact, back to back too."""
+        x = torch.randn([128, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        cases = [
+            (_wx_then_scaled_vx_after_wait, (x, w, w.clone()), [128, 32, 64, 64], None),
+            (
+                _ww_then_wy,
+                (x, x.clone(), w, w.clone()),
+                [128, 32, 64, 64, 64, 128, 32, 64],
+                "dynamic",
+            ),
+        ]
+        for kernel, args, block_sizes, pipeline in cases:
+            bound = kernel.bind(args)
+            slots = len(bound.config_spec.range_warp_specialize)
+            base = {
+                "block_sizes": block_sizes,
+                "pid_type": "persistent_blocked",
+                "num_sm_multiplier": 1,
+                "num_warps": 4,
+                "indexing": "tensor_descriptor",
+            }
+            pipelined = {"cross_loop_pipeline": pipeline} if pipeline else {}
+            static = bound.compile_config(
+                helion.Config(
+                    **base, **({"cross_loop_pipeline": "static"} if pipeline else {})
+                )
+            )
+            ring = {
+                **base,
+                "num_stages": 2,
+                "range_warp_specializes": [True] * slots,
+                **pipelined,
+            }
+            with self.subTest(kernel=kernel.name):
+                code, results = code_and_output(kernel, args, **ring)
+                self.assertIn("_helion_ring_pre", code)
+                for got, expected in zip(
+                    results if isinstance(results, tuple) else (results,),
+                    _as_tuple(static(*args)),
+                    strict=True,
+                ):
+                    torch.testing.assert_close(got, expected, atol=0, rtol=0)
+                inputs = [(args[0] + launch, *args[1:]) for launch in range(4)]
+                replayed = _replay(bound.compile_config(helion.Config(**ring)), inputs)
+                for got, args_i in zip(replayed, inputs, strict=True):
+                    for r, e in zip(
+                        _as_tuple(got), _as_tuple(static(*args_i)), strict=True
+                    ):
+                        torch.testing.assert_close(r, e, atol=0, rtol=0)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
@@ -1232,6 +1394,107 @@ class TestGluonRing(TestCase):
                 self.assertRegex(code, r"stage\([^()]*, tmem_mma, tmem_count, 1\)")
                 self.assertRegex(code, r"tmem_dot\([^\n]*, tmem_mma\)")
                 self.assertEqual("native_kernel(maxnreg=" in code, ctas > 1)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_filled_operand(self) -> None:
+        """An activation the body computes each K step (the first root's output
+        times a vector, in the weight's dtype) fills its slot of the dot's step:
+        the dot issues from the MMA partition, bitwise as the body's MMA of the
+        staged activation (the loop not warp-specialized), across overlapping
+        (PDL) launches."""
+        x = torch.randn([64, 1024], device=DEVICE, dtype=torch.bfloat16)
+        g = torch.rand([1024], device=DEVICE, dtype=torch.bfloat16) + 0.5
+        for dtype in (torch.float8_e4m3fn, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                w = torch.randn([256, 1024], device=DEVICE).to(dtype)
+                bound = scale_then_normed_wx.bind((x, g, w))
+                ring = gluon_tail_ring_config(bound)
+                code, out = code_and_output(scale_then_normed_wx, (x, g, w), **ring)
+                self.assertIn("_helion_ring.ring_fill(", code)
+                self.assertIn("def _helion_scale_then_normed_wx_mma(", code)
+                self.assertNotIn("_helion_gluon.stage(", code)
+                flags = [None] * len(ring["range_warp_specializes"])
+                staged = bound.compile_config(
+                    helion.Config(**{**ring, "range_warp_specializes": flags})
+                )
+                torch.testing.assert_close(out, staged(x, g, w), atol=0, rtol=0)
+                a = (2 * x.float() * g.float()).to(dtype).float()
+                torch.testing.assert_close(out, w.float() @ a.T, atol=1e-2, rtol=1e-3)
+                inputs = [(x + launch, g, w) for launch in range(4)]
+                filled = bound.compile_config(helion.Config(**ring))
+                for got, args in zip(_replay(filled, inputs), inputs, strict=True):
+                    torch.testing.assert_close(got, staged(*args), atol=0, rtol=0)
+        # A filled group no producer streams: the weight producer arrives for it.
+        w = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        bound = wx_then_scaled_vx.bind((x, w, w))
+        slots = len(bound.config_spec.range_warp_specialize)
+        config = {**RING, "block_sizes": [128, 32, 64, 64]}
+        code, out = code_and_output(
+            wx_then_scaled_vx,
+            (x, w, w),
+            range_warp_specializes=[True] * slots,
+            **config,
+        )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        self.assertNotIn("def _helion_wx_then_scaled_vx_producer1(", code)
+        staged = bound.compile_config(helion.Config(**config))(x, w, w)
+        torch.testing.assert_close(out, staged, atol=0, rtol=0)
+        # Barrier mode (its phase loops share the roots' statements): one
+        # arrival a step for the filled group.
+        x = torch.randn([128, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 128], device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn([128, 128], device=DEVICE, dtype=torch.bfloat16)
+        base = {**RING, "block_sizes": [128, 128, 64, 128, 64, 64], "num_warps": 4}
+        _, expected = code_and_output(
+            mm_then_scaled_mm, (x, w, v), cross_loop_pipeline="static", **base
+        )
+        slots = len(mm_then_scaled_mm.bind((x, w, v)).config_spec.range_warp_specialize)
+        code, out = code_and_output(
+            mm_then_scaled_mm,
+            (x, w, v),
+            range_warp_specializes=[True] * slots,
+            cross_loop_pipeline="barrier",
+            **base,
+        )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_filled_operand_between_other_steps(self) -> None:
+        """Two plain dots step the MMA channel between the body's fills, at a
+        depth of two: the body waits for the slot of each step it passes
+        (``ring_pass``), so it stays within a phase of the MMA's frees; without
+        those waits its fill's parity wait aliases and it overwrites a slot the
+        MMA still reads."""
+        x, y, z = (
+            torch.randn([64, 4096], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        v, w, u = (
+            torch.randn([1024, 4096], device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        args = (x, y, z, v, w, u)
+        bound = filled_beside_two_dots.bind(args)
+        slots = len(bound.config_spec.range_warp_specialize)
+        config = {**RING, "block_sizes": [128, 32, 64], "num_stages": 2}
+        code, out = code_and_output(
+            filled_beside_two_dots,
+            args,
+            range_warp_specializes=[True] * slots,
+            **config,
+        )
+        self.assertEqual(code.count("_helion_ring.ring_fill("), 1)
+        self.assertEqual(code.count("_helion_ring.ring_pass("), 2)
+        staged = bound.compile_config(helion.Config(**config))(*args)
+        torch.testing.assert_close(out, staged, atol=0, rtol=0)
+        filled = bound.compile_config(
+            helion.Config(**config, range_warp_specializes=[True] * slots)
+        )
+        for _ in range(20):
+            torch.testing.assert_close(filled(*args), staged, atol=0, rtol=0)
 
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()

@@ -32,14 +32,18 @@ from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion._testing.gluon_kernels import crossed_parts
 from helion._testing.gluon_kernels import dot_mm
 from helion._testing.gluon_kernels import mm_then_mm
+from helion._testing.gluon_kernels import mm_then_scaled_mm
 from helion._testing.gluon_kernels import nvfp4_mm
 from helion._testing.gluon_kernels import scale_then_nested_wx
+from helion._testing.gluon_kernels import scale_then_normed_wx
 from helion._testing.gluon_kernels import scale_then_two_wx
+from helion._testing.gluon_kernels import scale_then_viewed_wx
 from helion._testing.gluon_kernels import scale_then_wx
 from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
 from helion._testing.gluon_kernels import scale_then_wx_and_nvfp4
 from helion._testing.gluon_kernels import split_k_gemv
 from helion._testing.gluon_kernels import split_k_parts
+from helion._testing.gluon_kernels import wx_then_scaled_vx
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
 from helion._testing.triton_codegen import gluon_tail_ring_config
@@ -1171,6 +1175,198 @@ class TestInbandHold(TestCase):
         self.assertEqual(holds["_body"], 1)
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def _inline_scaled_wx(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Weight rows as the MMA's M over the input doubled inside the dot's step:
+    its load joins the step the weight opened."""
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], (x[tile_m, tile_k] * 2).T, acc=acc)
+        out[tile_n, tile_m] = acc
+    return out
+
+
+def _bodies(code: str) -> dict[str, str]:
+    """Each generated function's body (its signature dropped), by name."""
+    return {
+        fn.name: "\n".join(ast.unparse(st) for st in fn.body)
+        for fn in ast.parse(code).body
+        if isinstance(fn, ast.FunctionDef)
+    }
+
+
+class TestFilledOperand(TestCase):
+    def test_body_fills_a_computed_operand(self) -> None:
+        """A warp-specialized dot whose activation the body computes each K step
+        from loads ahead of the weight's (the first root's output times a
+        vector, in the weight's dtype) issues from the MMA partition: the
+        activation is a slot of the step, a member of the gated group the step
+        lacks, which the body stores and arrives for (``ring_fill``) in place
+        of the gated producer.  That producer streams the body's register read
+        of the first root's output and only waits for the dot's step's slot
+        (staying in phase) without arriving, so the step's full barrier keeps
+        its two arrivals."""
+        x = torch.empty([64, 512], dtype=torch.bfloat16)
+        g = torch.empty([512], dtype=torch.bfloat16)
+        for dtype, name in (
+            (torch.float8_e4m3fn, "float8e4nv"),
+            (torch.bfloat16, "bfloat16"),
+        ):
+            w = torch.empty([256, 512], dtype=dtype)
+            with self.subTest(dtype=dtype), gluon_cpu_codegen():
+                bound = scale_then_normed_wx.bind((x, g, w))
+                with self.assertLogs(
+                    "helion._compiler.triton.gluon_ring", "INFO"
+                ) as logs:
+                    code = bound.to_triton_code(
+                        helion.Config(**gluon_tail_ring_config(bound))
+                    )
+                self.assertRegex("\n".join(logs.output), r"fills a of acc \(group 1\)")
+                self.assertNotIn("_helion_gluon.stage(", code)
+                functions = _bodies(code)
+                prefix = "_helion_scale_then_normed_wx"
+                body, mma = functions[f"{prefix}_body"], functions[f"{prefix}_mma"]
+                fill = re.search(r"_helion_ring\.ring_fill\((\w+), (\w+), [^\n]*", body)
+                assert fill is not None
+                lane, full = fill.groups()
+                # The MMA side takes the filled slot behind the weight's wait
+                # (no producer puts it: no bytes) and issues the dot.
+                self.assertRegex(
+                    mma,
+                    rf"ring_acquire\({lane}, {full}, \w+, \w+, \w+, None, None, "
+                    r"False, 0, \w+, WAIT=False\)",
+                )
+                self.assertRegex(
+                    mma, r"tmem_dot\(ring_slot_\d+, _helion_gluon\.view_permute"
+                )
+                self.assertNotIn("ring_fill", mma)
+                self.assertIn("ring_put(", functions[f"{prefix}_producer1"])
+                for role in ("producer0", "producer1"):
+                    self.assertNotIn(lane, functions[f"{prefix}_{role}"])
+                # The gated producer passes the filled step: it waits for the
+                # slot (staying in phase) without arriving.
+                producer1 = functions[f"{prefix}_producer1"]
+                self.assertRegex(
+                    producer1, rf"ring_skip\({full}, \w+, \w+, \w+, \w+, False\)"
+                )
+                self.assertNotRegex(
+                    producer1, rf"ring_skip\({full}, \w+, \w+, \w+, \w+\)"
+                )
+                self.assertNotRegex(producer1, rf"ring_put\(\w+, {full},")
+                shell = functions[prefix]
+                self.assertIn(f"{full} = _helion_ring.ring_barriers(", shell)
+                self.assertRegex(
+                    shell, rf"{full} = _helion_ring\.ring_barriers\(\w+, 2\)"
+                )
+                self.assertRegex(
+                    shell,
+                    rf"{lane} = _helion_ring\.fill_(buffer|view)\([^\n]*tl\.{name}, 32, 64, ",
+                )
+                site = re.search(r"(_helion_ring_site\d+)_box, \1_arrivals\)", body)
+                assert site is not None
+                self.assertIn(f"{site.group(1)}_arrivals = tl.constexpr(1)", code)
+
+    def test_a_tail_takes_no_fill(self) -> None:
+        """With ``cross_loop_tmem_prefetch`` on, a tail's fill steps run on the
+        MMA channel between the body's waits (no accumulator take follows
+        them), so a body fill's parity wait could alias: the dot stays staged."""
+        x = torch.empty([64, 512], dtype=torch.bfloat16)
+        g = torch.empty([512], dtype=torch.bfloat16)
+        w = torch.empty([256, 512], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = scale_then_normed_wx.bind((x, g, w))
+            config = gluon_tail_ring_config(bound)
+            filled = bound.to_triton_code(helion.Config(**config))
+            tailed = bound.to_triton_code(
+                helion.Config(**config, cross_loop_tmem_prefetch=[True])
+            )
+        self.assertIn("_helion_ring.ring_fill(", filled)
+        self.assertNotIn("_helion_ring.ring_fill(", tailed)
+        self.assertIn("_helion_gluon.stage(", tailed)
+
+    def test_a_filled_group_without_a_producer(self) -> None:
+        """A filled operand whose gating group no producer streams (every other
+        operand is ungated) takes no producer for it: on the channel's steps
+        without a fill (the first K loop's), the weight producer arrives for
+        that group too."""
+        x = torch.empty([64, 512], dtype=torch.bfloat16)
+        w = torch.empty([256, 512], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = wx_then_scaled_vx.bind((x, w, w))
+            slots = len(bound.config_spec.range_warp_specialize)
+            code = bound.to_triton_code(
+                helion.Config(
+                    **_RING,
+                    block_sizes=[128, 32, 64, 64],
+                    range_warp_specializes=[True] * slots,
+                )
+            )
+        functions = _bodies(code)
+        prefix = "_helion_wx_then_scaled_vx"
+        self.assertNotIn(f"{prefix}_producer1", functions)
+        fill = re.search(
+            r"_helion_ring\.ring_fill\(\w+, (\w+), ", functions[f"{prefix}_body"]
+        )
+        assert fill is not None
+        (full,) = fill.groups()
+        producer = functions[f"{prefix}_producer0"]
+        self.assertRegex(producer, rf"ring_skip\({full}, \w+, \w+, \w+, \w+\)")
+        self.assertNotIn(", False)", producer)
+        self.assertRegex(
+            functions[prefix], rf"{full} = _helion_ring\.ring_barriers\(\w+, 2\)"
+        )
+        self.assertIn("def _helion_wx_then_scaled_vx_mma(", code)
+        self.assertNotIn("_helion_gluon.stage(", code)
+
+    def test_barrier_mode_skips_once_a_step(self) -> None:
+        """Under barrier mode (phase loops sharing the roots' statements) a
+        filled operand of the second root (the first root's output, a plain
+        load there, doubled) gets the weight producer's arrival once on each
+        of the first root's steps."""
+        x = torch.empty([128, 1024], dtype=torch.bfloat16)
+        w = torch.empty([1024, 128], dtype=torch.bfloat16)
+        v = torch.empty([128, 128], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = mm_then_scaled_mm.bind((x, w, v))
+            slots = len(bound.config_spec.range_warp_specialize)
+            code = bound.to_triton_code(
+                helion.Config(
+                    **_RING,
+                    block_sizes=[128, 128, 64, 128, 64, 64],
+                    num_warps=4,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline="barrier",
+                )
+            )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        self.assertNotIn("def _helion_mm_then_scaled_mm_producer1(", code)
+        self.assertIn("ring_skip(", code)
+        self.assertNotRegex(code, r"ring_skip\([^\n]*\n *_helion_ring\.ring_skip\(")
+
+    def test_a_joined_register_operand_stays_staged(self) -> None:
+        """An activation computed from a load inside the step the weight opened
+        joins that step, whose full barrier the body then waits for before it
+        could fill: the dot keeps the body's staged MMA."""
+        x = torch.empty([64, 512], dtype=torch.bfloat16)
+        w = torch.empty([256, 512], dtype=torch.bfloat16)
+        config = {
+            **_RING,
+            "block_sizes": [128, 32, 64],
+            "range_warp_specializes": [None, True],
+        }
+        with gluon_cpu_codegen():
+            code = _inline_scaled_wx.bind((x, w)).to_triton_code(
+                helion.Config(**config)
+            )
+        self.assertNotIn("_helion_ring.ring_fill(", code)
+        self.assertIn("_helion_gluon.stage(", code)
+        self.assertRegex(code, r"_helion_ring\.ring_read\([^\n]*, False\)")
+
+
 class TestWorkerRegisters(TestCase):
     def test_workers_shrink_only_for_a_body_below_the_cap(self) -> None:
 
@@ -1432,6 +1628,47 @@ def _rereads_last_iteration(x: torch.Tensor, scratch: torch.Tensor) -> torch.Ten
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def _wx_plus_scaled_bias(
+    x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """The first root's output read only in the second root's epilogue, through a
+    register-read ring slot."""
+    m, k = x.size()
+    n = w.size(0)
+    c = torch.empty_like(b)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([n, m]):
+        c[tile_r, tile_c] = b[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc)
+        out[tile_n, tile_m] = acc + c[tile_n, tile_m].to(torch.float32)
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def _wx_plus_masked_scaled_bias(
+    x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """``_wx_plus_scaled_bias`` with the bias read by a masked load (no ring
+    slot)."""
+    m, k = x.size()
+    n = w.size(0)
+    c = torch.empty_like(b)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([n, m]):
+        c[tile_r, tile_c] = b[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc)
+        bias = hl.load(c, [tile_n, tile_m], extra_mask=(tile_m.index < m)[None, :])
+        out[tile_n, tile_m] = acc + bias.to(torch.float32)
+    return out
+
+
 class TestPartitionWaits(TestCase):
     def test_a_first_access_barrier_fence_covers_what_it_orders(self) -> None:
         """The barrier before a loop's first access of ``scratch`` (a load the
@@ -1475,6 +1712,94 @@ class TestPartitionWaits(TestCase):
             x_reads = frozenset([_allocation(fakes["x"])])
             self.assertTrue(gluon_ring._orders(function, wait, scratch_reads, named))  # pyrefly: ignore
             self.assertFalse(gluon_ring._orders(function, wait, x_reads, named))  # pyrefly: ignore
+
+    def test_body_drops_waits_its_ring_acquires_cover(self) -> None:
+        """A consumer's ``ring_acquire`` repeats the producer's ``ring_put``
+        arguments (the slot's descriptor and coordinates) but reads shared memory
+        only: a wait ordering nothing else the body reads is dropped (the producer
+        loading the slot keeps it); a wait also ordering the root's barrier
+        publication, or a plain load of the same allocation, keeps it."""
+
+        class Function:
+            def __init__(self) -> None:
+                self.sync_roles = {
+                    "reads": SyncRole("wait", covers=frozenset([1])),
+                    "publishes": SyncRole(
+                        "wait", covers=frozenset([1]), publication=True
+                    ),
+                }
+
+            def sync_names(self, *kinds: str) -> set[str]:
+                return {n for n, r in self.sync_roles.items() if r.kind in kinds}
+
+        def kept(wait: str, plain_load: bool = False) -> bool:
+            body = ast.parse(
+                f"{wait} = 0\n"
+                "slot = _helion_ring.ring_acquire(buf, full, empty, step, S, "
+                "c_ring_desc, (tl.cast(o, tl.int32),), True, nbytes, box)\n"
+                "v = _helion_ring.ring_read(slot, empty, step, S, True)\n"
+                + ("u = tl.load(c + o)\n" if plain_load else "")
+                + "tl.store(out + o, v)\n"
+            ).body
+            # c_ring_desc and c name allocation 1, out allocation 2.
+            names = {"c_ring_desc": 1, "c": 1, "out": 2}
+            with patch.object(gluon_ring, "_argument_allocations", return_value=names):
+                result = gluon_ring._without_waits(body, Function(), frozenset())  # pyrefly: ignore
+            return any(
+                isinstance(st, ast.Assign) and wait in gluon_ring._stored_names([st])
+                for st in result
+            )
+
+        self.assertFalse(kept("reads"))
+        self.assertTrue(kept("publishes"))
+        self.assertTrue(kept("reads", plain_load=True))
+
+    def test_ring_register_read_needs_no_body_wait(self) -> None:
+        """The second root reads the first root's output only through a
+        register-read ring slot: the producer streaming that slot waits for the
+        first root, the body (whose acquire names the slot's descriptor) does not.
+        Read by a plain (masked) load, the body keeps its wait."""
+        x = torch.empty([64, 1024], dtype=torch.bfloat16)
+        w = torch.empty([256, 1024], dtype=torch.bfloat16)
+        b = torch.empty([256, 64], dtype=torch.bfloat16)
+        spin = "while tile_dependency_readiness_wait"
+        for kernel in (_wx_plus_scaled_bias, _wx_plus_masked_scaled_bias):
+            with self.subTest(kernel=kernel.name), gluon_cpu_codegen():
+                bound = kernel.bind((x, w, b))
+                slots = len(bound.config_spec.range_warp_specialize)
+                code = bound.to_triton_code(
+                    helion.Config(
+                        **_RING,
+                        block_sizes=[128, 64, 128, 64, 64],
+                        range_warp_specializes=[None] * (slots - 1) + [True],
+                        cross_loop_pipeline="static",
+                        num_warps=4,
+                    )
+                )
+                functions = {
+                    chunk.split("(", 1)[0]: chunk for chunk in code.split("\ndef ")[1:]
+                }
+                body = functions[f"_helion_{kernel.name}_body"]
+                # c's descriptors: the first root stores through one, the second
+                # root's read (a ring slot or a plain load) goes through another.
+                (read,) = {
+                    d
+                    for d in re.findall(r"\b(c_\w*desc\w*)\b", body)
+                    if "store_tensor_descriptor(" + d not in body
+                }
+                if kernel is _wx_plus_masked_scaled_bias:
+                    self.assertIn(f"tl.load_tensor_descriptor({read}", body)
+                    self.assertIn(spin, body)
+                else:
+                    self.assertRegex(body, rf"ring_acquire\([^\n]*\b{read}\b")
+                    self.assertNotIn(spin, body)
+                    (streaming,) = [
+                        f
+                        for name, f in functions.items()
+                        if "_producer" in name
+                        and re.search(rf"ring_put\([^\n]*\b{read}\b", f)
+                    ]
+                    self.assertIn(spin, streaming)
 
     def test_partitions_keep_only_waits_ordering_their_reads(self) -> None:
         """A partition keeps a wait only if it orders a read the partition makes;
@@ -1742,12 +2067,16 @@ class TestPastIndependent(TestCase):
 
     def test_independent_fills_follow_the_launch_storage(self) -> None:
         """Independent fills are those of what the launch reads: host code
-        after it moving x onto y leaves y's fills behind the grid wait."""
+        after it moving x onto y leaves y's fills behind the grid wait (x's
+        first slots fill before it, ``_pre_wait_fills``)."""
         x = torch.empty([256, 512], dtype=torch.bfloat16)
         y = torch.empty([512, 128], dtype=torch.bfloat16)
         producer = _filling_producer(_mm_then_repoint, (x, y), "ring_put(")
         self.assertIn("y_ring_desc, (", producer)
-        self.assertLess(producer.index("gdc_wait()"), producer.index("ring_put("))
+        # x's fills lead their steps' groups: their first slots fill early.
+        wait = producer.index("gdc_wait()")
+        self.assertLess(producer.index("x_ring_desc, ("), wait)
+        self.assertNotIn("y_ring_desc, (", producer[:wait])
 
     def test_independent_fills_are_of_named_tensors(self) -> None:
         """Only a named tensor's own fills pass the grid wait: y shares its
@@ -1769,6 +2098,193 @@ class TestPastIndependent(TestCase):
             _mm_repointed_in_branch, (w, x, y, False), "ring_put("
         )
         self.assertLess(producer.index("gdc_wait()"), producer.index("ring_put("))
+
+
+class TestPreWaitFills(TestCase):
+    """``_pre_wait_fills``: a channel's first steps of independent tensors
+    issue before the producer's grid wait, also past roots that wait for it."""
+
+    READ = "epoch, = _k_launch(w, x, state)"
+
+    @staticmethod
+    def put(channel: int, desc: str, first: bool = True, coord: str = "i") -> str:
+        return (
+            f"_helion_ring.ring_put(b, _helion_ring_full{channel}, "
+            f"_helion_ring_empty{channel}, _helion_ring_step{channel}, "
+            f"_helion_ring_S{channel}, {desc}, ({coord},), {first}, 8, 0)"
+        )
+
+    @staticmethod
+    def step(channel: int) -> str:
+        return f"_helion_ring_step{channel} = _helion_ring_step{channel} + 1"
+
+    def fills(self, *roots: str, before: tuple[str, ...] = ()) -> str:
+        body = [ast.parse(st).body[0] for st in before]
+        read = ast.parse(self.READ).body[0]
+        body += [read, *(ast.parse(root).body[0] for root in roots)]
+        out = gluon_ring._pre_wait_fills(
+            body, read, frozenset(["w", "v"]), frozenset(["w", "v", "x"])
+        )
+        return "\n".join(ast.unparse(st) for st in out)
+
+    def loop(self, *lines: str) -> str:
+        return "for i in tl.range(0, 4):\n" + "".join(f"    {ln}\n" for ln in lines)
+
+    def test_independent_steps_issue_before_the_read(self) -> None:
+        """Channel 1's weight steps issue before the read, counted by ``pre``
+        and capped by the channel's depth; the root's puts of those steps
+        then skip. Channel 0's steps (of x, written by the previous grid)
+        stay."""
+        out = self.fills(
+            self.loop(self.put(0, "x"), self.step(0), self.put(1, "w"), self.step(1))
+        )
+        pre, root = out.split(self.READ)
+        self.assertIn("_helion_ring_pre1 = tl.full([], 0, tl.int32)", pre)
+        self.assertIn("if _helion_ring_pre1 < _helion_ring_S1:", pre)
+        self.assertIn("_helion_ring_pre1, _helion_ring_S1, w,", pre)
+        self.assertIn(
+            "_helion_ring_pre1 = tl.minimum(_helion_ring_pre1, _helion_ring_S1)", pre
+        )
+        self.assertNotIn(", x,", pre)
+        self.assertNotIn("_helion_ring_pre0", out)
+        self.assertIn("if _helion_ring_pre1 <= _helion_ring_step1:", root)
+
+    def test_the_copy_counts_every_step_of_the_channel(self) -> None:
+        """Steps of the channel not issued early (x's) still count, so the
+        copy's step numbers are the root's."""
+        out = self.fills(
+            self.loop(self.put(0, "x"), self.step(0), self.put(0, "w"), self.step(0))
+        )
+        pre = out.split(self.READ)[0]
+        self.assertEqual(pre.count("_helion_ring_pre0 = _helion_ring_pre0 + 1"), 2)
+        self.assertEqual(pre.count(", w,"), 1)
+
+    def test_a_group_issues_with_its_first_put(self) -> None:
+        """A step's group whose first put (which expects the group's bytes) is
+        of x keeps its put of w behind the wait; a group led by w takes its
+        other independent puts along."""
+        out = self.fills(
+            self.loop(self.put(1, "x"), self.put(1, "w", first=False), self.step(1))
+        )
+        self.assertNotIn("_helion_ring_pre1", out)
+        out = self.fills(
+            self.loop(
+                self.put(1, "w"),
+                self.put(1, "v", first=False),
+                self.put(1, "x", first=False),
+                self.step(1),
+            )
+        )
+        pre = out.split(self.READ)[0]
+        self.assertIn(", w,", pre)
+        self.assertIn(", v,", pre)
+        self.assertNotIn(", x,", pre)
+
+    def test_the_copy_stops_at_a_root_it_cannot_run_early(self) -> None:
+        """A root that polls, or reads what the read defines, ends the copy:
+        neither it nor later roots issue early."""
+        poll = (
+            "flag = tl.inline_asm_elementwise(asm='ld.acquire.gpu.global.u32 $0, "
+            "[$1];', constraints='=r,l', args=[state], dtype=tl.uint32, "
+            "is_pure=False, pack=1)"
+        )
+        later = self.loop(self.put(1, "w"), self.step(1))
+        for root in (
+            self.loop(poll, self.put(1, "w"), self.step(1)),
+            self.loop(self.put(1, "w", coord="epoch"), self.step(1)),
+        ):
+            with self.subTest(root=root):
+                self.assertNotIn("_helion_ring_pre1", self.fills(root, later))
+        # A root of other channels only is passed over.
+        out = self.fills(self.loop(self.put(0, "x"), self.step(0)), later)
+        self.assertIn("_helion_ring_pre1", out.split(self.READ)[0])
+
+    def test_the_count_starts_where_the_moved_roots_left_it(self) -> None:
+        """A root ``_past_independent`` moved before the read stepped the
+        channel: the copy counts on from its step, not from 0."""
+        init = "_helion_ring_step1 = tl.full([], 0, tl.int32)"
+        moved = self.loop(self.put(1, "w"), self.step(1))
+        out = self.fills(
+            self.loop(self.put(1, "v"), self.step(1)), before=(init, moved)
+        )
+        self.assertIn("_helion_ring_pre1 = _helion_ring_step1", out.split(self.READ)[0])
+
+    def test_skips_issue_once(self) -> None:
+        """A skip the copy issues is skipped by its root too."""
+        skip = (
+            "_helion_ring.ring_skip(_helion_ring_full1, _helion_ring_empty1, "
+            "_helion_ring_step1, _helion_ring_S1, 8)"
+        )
+        pre, root = self.fills(self.loop(self.put(1, "w"), skip, self.step(1))).split(
+            self.READ
+        )
+        self.assertIn("_helion_ring_empty1, _helion_ring_pre1,", pre)
+        self.assertEqual(root.count("if _helion_ring_pre1 <= _helion_ring_step1:"), 2)
+
+    def test_a_root_updating_an_outer_name_stays(self) -> None:
+        """A root that updates a name defined before the read would update it
+        twice: it is not copied."""
+        root = self.loop("n = n + 1", self.put(1, "w", coord="n"), self.step(1))
+        self.assertNotIn("_helion_ring_pre1", self.fills(root, before=("n = 0",)))
+
+    def test_a_group_led_by_x_on_some_path_stays(self) -> None:
+        """A group whose first put is of x on one path keeps its other puts
+        behind the wait on every path."""
+        branch = f"if c:\n    {self.put(1, 'x')}\nelse:\n    {self.put(1, 'w')}"
+        root = "for i in tl.range(0, 4):\n" + "".join(
+            f"    {ln}\n"
+            for ln in [*branch.split("\n"), self.put(1, "v", first=False), self.step(1)]
+        )
+        pre = self.fills(root).split(self.READ)[0]
+        self.assertIn(", w,", pre)
+        self.assertNotIn(", v,", pre)
+
+    def test_the_copy_counts_through_roots_it_issues_nothing_of(self) -> None:
+        """A root of x only (on the channel) is counted, and the next root's
+        weight steps issue; trailing roots it would only count are dropped."""
+        out = self.fills(
+            self.loop(self.put(1, "x"), self.step(1)),
+            self.loop(self.put(1, "w"), self.step(1)),
+            self.loop(self.put(1, "x"), self.step(1)),
+        )
+        pre = out.split(self.READ)[0]
+        self.assertEqual(pre.count("_helion_ring_pre1 = _helion_ring_pre1 + 1"), 2)
+        self.assertIn(", w,", pre)
+        self.assertNotIn(", x,", pre)
+
+    def test_paced_fills_keep_their_order(self) -> None:
+        """A producer whose first fill is paced (``ring_put_paced``) is left as
+        it is."""
+        paced = self.put(1, "w").replace("ring_put(", "ring_put_paced(")
+        out = self.fills(
+            self.loop(paced, self.step(1)), self.loop(self.put(1, "w"), self.step(1))
+        )
+        self.assertNotIn("_helion_ring_pre1", out)
+
+    def test_a_view_of_an_independent_weight_fills_early(self) -> None:
+        """``hl.pdl_wait(independent=w)``: the dot's fills of a view of w
+        (``wv``) issue before the grid wait, past the first root, which fills
+        x; the dot's own puts of those steps then skip."""
+        x = torch.empty([128, 512], dtype=torch.bfloat16)
+        w = torch.empty([256, 512], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = scale_then_viewed_wx.bind((x, w))
+            slots = len(bound.config_spec.range_warp_specialize)
+            config = {
+                **_RING,
+                "block_sizes": [64, 64, 128, 64, 64],
+                "range_warp_specializes": [None] * (slots - 1) + [True],
+            }
+            code = bound.to_triton_code(helion.Config(**config))
+        (producer,) = [
+            ast.unparse(fn)
+            for fn in ast.parse(code).body
+            if isinstance(fn, ast.FunctionDef) and fn.name.endswith("_producer0")
+        ]
+        wait = producer.index("gdc_wait()")
+        self.assertLess(producer.index("wv_ring_desc, ("), wait)
+        self.assertLess(wait, producer.index("x_ring_desc, ("))
+        self.assertIn("if _helion_ring_pre0 <= _helion_ring_step0:", producer[wait:])
 
 
 class TestTlNamespace(TestCase):

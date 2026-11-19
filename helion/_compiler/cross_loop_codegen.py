@@ -663,6 +663,68 @@ def _may_write(call: ast.Call) -> bool:
     return not _is_load(call) and _effect_kind(call) != "pure"
 
 
+def _publication_split(
+    body: list[ast.stmt], shared: frozenset[int], allocations: dict[str, int]
+) -> int:
+    """Where a task whose body is ``body`` may publish its completion: before its
+    trailing statements that touch no allocation in ``shared`` (what another root
+    of the launch accesses in order with this one) and whose only effects are
+    plain stores to tensor arguments (outputs read after the launch), when they
+    store anything; ``len(body)`` otherwise.  The release then waits only on the
+    writes other roots read."""
+
+    def plain_address(address: ast.expr) -> bool:
+        """An address naming a tensor argument plus pure index math (no pointer
+        loaded from a table)."""
+        return bool(_named_allocations(address, allocations)) and all(
+            _effect_kind(c) == "pure"
+            and not (
+                isinstance(c.func, ast.Attribute) and c.func.attr == "pointer_type"
+            )
+            for c in ast.walk(address)
+            if isinstance(c, ast.Call)
+        )
+
+    split = len(body)
+    stores = False
+    for index in range(len(body) - 1, -1, -1):
+        statement = body[index]
+        loaded = _loaded_allocations([statement], allocations)
+        # Every load must name the tensor argument it reads (a device-side
+        # descriptor names none) and no allocation another root orders.
+        if (
+            loaded is None
+            or loaded & shared
+            or _named_allocations(statement, allocations) & shared
+        ):
+            break
+        calls = [n for n in ast.walk(statement) if isinstance(n, ast.Call)]
+        # A volatile load reads what another program writes during the launch
+        # (a flag or an in-band word): it stays ahead of the release.
+        if any(
+            _is_load(call)
+            and any(
+                k.arg == "volatile"
+                and not (isinstance(k.value, ast.Constant) and not k.value.value)
+                for k in call.keywords
+            )
+            for call in calls
+        ) or not all(
+            _is_load(call)
+            or (
+                _is_tl_call(call, frozenset({"store"}))
+                and bool(call.args)
+                and plain_address(call.args[0])
+            )
+            or not _may_write(call)
+            for call in calls
+        ):
+            break
+        stores |= any(_is_tl_call(call, frozenset({"store"})) for call in calls)
+        split = index
+    return split if stores else len(body)
+
+
 def _allocation(tensor: torch.Tensor) -> int:
     """The allocation a (fake) tensor views: a peer view stands for its owner's."""
     return _storage_allocation(_host_tensor(tensor).untyped_storage())
@@ -3542,6 +3604,14 @@ def emit_cross_loop_schedule(
     # later wait ordering no more is redundant.
     kernel_barrier_waits: dict[int, list[tuple[frozenset[int] | None, bool]]] = {}
     root_barrier_reachability = _root_barrier_reachability(root_barrier_edges)
+    # Per consumer root: the dependencies its readiness counters' waits order.
+    counter_ordered_dependencies: dict[int, frozenset[int]] = {}
+    for plan in all_readiness_counter_plans:
+        for consumer in plan.consumers:
+            counter_ordered_dependencies[consumer.consumer_root] = (
+                counter_ordered_dependencies.get(consumer.consumer_root, frozenset())
+                | {obligation[0] for obligation in consumer.covered_obligations}
+            )
 
     def barrier_covers(root: int, producer: int) -> tuple[frozenset[int] | None, bool]:
         """The allocations whose reads ``root``'s wait on ``producer``'s barrier
@@ -3550,11 +3620,15 @@ def emit_cross_loop_schedule(
         assert dependency_graph is not None
         # The barrier orders root's edges from producer and (barrier edges
         # being transitively reduced) from every root producer's barrier waits
-        # for; one with an allocation unknown to the partitions orders every
-        # access, as does one no edge explains.  In a root publishing a barrier
-        # it also orders that publication: its waiters rely on it transitively
-        # (without ring partitions, which keep waits by what they order, it
-        # orders every access, so that later waits on producer are redundant).
+        # for, except the dependencies a readiness counter of root orders: the
+        # counter's own wait precedes those reads, so the barrier's need not
+        # (a read of an earlier root's output ordered by a counter runs ahead
+        # of a later root's barrier).  One with an allocation unknown to the
+        # partitions orders every access, as does one no edge explains.  In a
+        # root publishing a barrier it also orders that publication: its
+        # waiters rely on it transitively (without ring partitions, which keep
+        # waits by what they order, it orders every access, so that later
+        # waits on producer are redundant).
         sources = {producer} | {
             source for source, target in root_barrier_reachability if target == producer
         }
@@ -3563,10 +3637,13 @@ def emit_cross_loop_schedule(
             for edge in dependency_graph.edges
             if edge.producer_root in sources and edge.consumer_root == root
         ]
+        counter_ordered = counter_ordered_dependencies.get(root, frozenset())
         covered = frozenset(
             access_allocations[dependency.consumer_access_id]
             for edge in edges
             for dependency in edge.access_dependencies
+            if edge.producer_root == producer
+            or dependency.dependency_id not in counter_ordered
         )
         publication = root in root_barrier_indices
         if (
@@ -3725,6 +3802,14 @@ def emit_cross_loop_schedule(
     # The allocation of each access (the device IR's view), and of each tensor
     # argument, for guard-first waits.
     access_allocations = _access_allocations()
+    # The allocations each root accesses in order with another root (its side of
+    # every dependency it produces): its completion must follow those accesses.
+    ordered_allocations: dict[int, set[int]] = {}
+    for edge in dependency_graph.edges:
+        ordered_allocations.setdefault(edge.producer_root, set()).update(
+            access_allocations[dependency.producer_access_id]
+            for dependency in edge.access_dependencies
+        )
     argument_allocations = _argument_allocations(device_function)
     dependencies_by_id = {
         dependency.dependency_id: dependency
@@ -4764,6 +4849,38 @@ def emit_cross_loop_schedule(
         body = case_bodies[root] if extent is None else extent.body
         return root in kernel_scope_roots and _write_guard(body) is not None
 
+    # The workers each resident root's tasks run on, as the static placement lowers
+    # them (``static_members``: None where unknown); empty under packet dispatch.
+    members: dict[int, frozenset[int] | None] = {}
+    dependency_pairs = frozenset(
+        (edge.producer_root, edge.consumer_root) for edge in dependency_graph.edges
+    )
+
+    def completion_rank(root: int, ranks: dict[int, int]) -> int:
+        """Where ``root``'s tasks complete in the static schedule's order: one past
+        the latest earlier root it follows, through a dependency or by sharing a
+        worker (which runs the earlier root's tasks first).  Roots on disjoint
+        workers with no dependency between them run concurrently and tie.  A root
+        whose workers are unknown (not yet lowered, a continuation root, a
+        cluster's or shifted lanes, packet dispatch: no ``members`` set) shares
+        every worker.  ``ranks`` memoizes one caller's ranks (``members`` grows as
+        roots are lowered)."""
+        if root not in ranks:
+
+            def shares(earlier: int) -> bool:
+                mine, theirs = members.get(root), members.get(earlier)
+                return mine is None or theirs is None or bool(mine & theirs)
+
+            ranks[root] = max(
+                (
+                    completion_rank(earlier, ranks) + 1
+                    for earlier in range(root)
+                    if (earlier, root) in dependency_pairs or shares(earlier)
+                ),
+                default=0,
+            )
+        return ranks[root]
+
     def scheduled_root_task_body(
         root: int,
         root_local_pid_task: str,
@@ -4772,14 +4889,17 @@ def emit_cross_loop_schedule(
         *,
         force_noinline: bool = False,
         invariant_waits: list[ast.stmt] | None = None,
-        barrier_waits: Sequence[tuple[list[ast.stmt], frozenset[int]]] = (),
+        barrier_waits: Sequence[
+            tuple[list[ast.stmt], frozenset[int], frozenset[int]]
+        ] = (),
         root_arrival: _Arrival | None = None,
     ) -> list[ast.stmt]:
         """One task of ``root``; waits whose counter is the same for every task
         go to ``invariant_waits`` when given (the caller waits once).
-        ``barrier_waits``: root-barrier waits and the allocations they cover,
-        placed like the covered readiness waits.  ``root_arrival``: the
-        worker's root-barrier arrival, made with its last task's arrivals."""
+        ``barrier_waits``: root-barrier waits, the allocations they cover and
+        their producer roots, placed like the covered readiness waits.
+        ``root_arrival``: the worker's root-barrier arrival, made with its last
+        task's arrivals."""
         body: list[ast.stmt] = []
         if root in dsmem_producers:
             # Before any send, rank 0's barriers are this launch's.
@@ -4839,10 +4959,13 @@ def emit_cross_loop_schedule(
                 )
             )
         )
-        guard_first_waits: list[tuple[list[ast.stmt], frozenset[int]]] = []
+        # (wait, covered allocations, the producer roots it waits for)
+        guard_first_waits: list[
+            tuple[list[ast.stmt], frozenset[int], frozenset[int]]
+        ] = []
         # Waits that order only covered tensors move to the task's first
         # access of them, so its independent loads issue before the spin.
-        scoped_waits: list[tuple[list[ast.stmt], frozenset[int]]] = []
+        scoped_waits: list[tuple[list[ast.stmt], frozenset[int], frozenset[int]]] = []
         guard_first_index = len(body)
         guard_first_allocations: set[int] = set()
         for (
@@ -4921,11 +5044,15 @@ def emit_cross_loop_schedule(
                         orelse=[],
                     )
                 ]
+            producers = frozenset(
+                producer.producer_root
+                for producer in incoming_readiness_counter.producers
+            )
             if guard_first:
-                guard_first_waits.append((wait, covered))
+                guard_first_waits.append((wait, covered, producers))
                 guard_first_allocations.update(covered)
             elif covered and not token_waits:
-                scoped_waits.append((wait, covered))
+                scoped_waits.append((wait, covered, producers))
             else:
                 body.extend(wait)
         peer_counter_spins, peer_tokens = peer_counter_waits(
@@ -4986,30 +5113,52 @@ def emit_cross_loop_schedule(
         scoped_waits.extend(barrier_waits)
         if guard_first_waits and _write_guard(tile_body) is None:
             # No guard to follow: covered waits are scoped like any root's.
-            scoped_waits.extend((w, c) for w, c in guard_first_waits if c)
-            guard_first_waits = [(w, c) for w, c in guard_first_waits if not c]
+            scoped_waits.extend((w, c, p) for w, c, p in guard_first_waits if c)
+            guard_first_waits = [(w, c, p) for w, c, p in guard_first_waits if not c]
         state_names = frozenset(n for n in (state_arg, epoch_var) if n is not None)
         # A guarded kernel-scope root and an allocation no argument names keep
         # their waits at task entry.
         relaxed = guarded_kernel_scope_root(root)
         arguments = set(argument_allocations.values())
-        for wait, covered in scoped_waits:
+        for wait, covered, _ in scoped_waits:
             if relaxed or covered - arguments:
                 body.extend(wait)
-            else:
-                _scope_wait(
-                    tile_body,
-                    wait,
-                    covered,
-                    state_names,
-                    argument_allocations,
-                )
+        # A scoped wait lands ahead of what an earlier-scoped one hoisted (the
+        # other producers' loads): scoping the latest-completing producers first
+        # (``completion_rank``: the static schedule's order, not root order, as
+        # packed roots on disjoint workers run concurrently) leaves the waits in
+        # their expected completion order. Each wait still sits right before its
+        # first covered access, so an earlier producer's loads issue while the
+        # task spins on a later one. The waits commute (a launch's counters only
+        # grow); ties keep their source order.
+        scoped = [
+            (wait, covered, producers)
+            for wait, covered, producers in scoped_waits
+            if not (relaxed or covered - arguments)
+        ]
+        ranks: dict[int, int] = {}
+        for wait, covered, _ in sorted(
+            scoped,
+            key=lambda scoped_wait: max(
+                completion_rank(producer, ranks) for producer in scoped_wait[2]
+            ),
+            reverse=True,
+        ):
+            _scope_wait(
+                tile_body,
+                wait,
+                covered,
+                state_names,
+                argument_allocations,
+            )
         if guard_first_waits:
             guard = _write_guard(tile_body)
             reads = (
                 None if guard is None else _guard_reads(tile_body, argument_allocations)
             )
-            entry = [statement for wait, _ in guard_first_waits for statement in wait]
+            entry = [
+                statement for wait, _, _ in guard_first_waits for statement in wait
+            ]
             if reads is not None and not reads & guard_first_allocations:
                 assert guard is not None
                 guard.body[:0] = entry
@@ -5021,18 +5170,6 @@ def emit_cross_loop_schedule(
             timeline.ready(root, root_local_pid_task, tile_body)
             timeline.ready(root, root_local_pid_task, body)
         task_body_head = body
-        if root in kernel_scope_roots:
-            body.extend(tile_body)
-        else:
-            body.append(
-                _outline_cross_loop_region(
-                    device_function,
-                    name_hint=f"tile_dependency_root_{root}",
-                    body=tile_body,
-                    extra_argument_names=extra_argument_names,
-                    noinline=force_noinline,
-                )
-            )
         peer_counter_adds = peer_counter_publications(
             root,
             scheduled_coordinates,
@@ -5053,6 +5190,45 @@ def emit_cross_loop_schedule(
             and arrives_unreleased(root)
             else None
         )
+        arrivals = [
+            *(
+                part
+                for plan, producer in producer_counters
+                for part in emit_readiness_arrivals_from_producer(
+                    plan, producer, scheduled_coordinates
+                )
+            ),
+            *([] if root_arrival is None else [root_arrival]),
+        ]
+        # The task publishes ahead of its trailing stores that no other root
+        # orders against (a local completion: no peer counters).
+        publish_at = (
+            _publication_split(
+                tile_body,
+                frozenset(ordered_allocations.get(root, ())),
+                argument_allocations,
+            )
+            if arrivals and guard is None and not peer_counter_adds
+            else len(tile_body)
+        )
+        published = publish_at < len(tile_body)
+        if published:
+            tile_body[publish_at:publish_at] = [
+                *_release_sync(device_function),
+                *_emit_arrivals(device_function, arrivals, "release"),
+            ]
+        if root in kernel_scope_roots:
+            body.extend(tile_body)
+        else:
+            body.append(
+                _outline_cross_loop_region(
+                    device_function,
+                    name_hint=f"tile_dependency_root_{root}",
+                    body=tile_body,
+                    extra_argument_names=extra_argument_names,
+                    noinline=force_noinline,
+                )
+            )
         if guard is not None:
             # A task whose guard fails writes nothing: its arrivals need no
             # release (which would wait on every outstanding write).  (A task
@@ -5070,24 +5246,10 @@ def emit_cross_loop_schedule(
                 "relaxed",
             )
             body = guard.body
-        if producer_counters or peer_counter_adds or root_arrival is not None:
-            body.extend(_release_sync(device_function))
-        body.extend(
-            _emit_arrivals(
-                device_function,
-                [
-                    *(
-                        part
-                        for plan, producer in producer_counters
-                        for part in emit_readiness_arrivals_from_producer(
-                            plan, producer, scheduled_coordinates
-                        )
-                    ),
-                    *([] if root_arrival is None else [root_arrival]),
-                ],
-                "release",
-            )
-        )
+        if not published:
+            if producer_counters or peer_counter_adds or root_arrival is not None:
+                body.extend(_release_sync(device_function))
+            body.extend(_emit_arrivals(device_function, arrivals, "release"))
         body.extend(peer_counter_adds)
         if guard is not None:
             body = task_body_head
@@ -5508,7 +5670,7 @@ def emit_cross_loop_schedule(
             }
         )
         barrier_waits: list[ast.stmt] = []
-        task_barriers: list[tuple[list[ast.stmt], frozenset[int]]] = []
+        task_barriers: list[tuple[list[ast.stmt], frozenset[int], frozenset[int]]] = []
         # Producers whose barrier a worker with no task here still waits for.
         no_task_producers: list[int] = []
         # Triton pipelines a multi-stage task loop, issuing a task's loads
@@ -5549,7 +5711,7 @@ def emit_cross_loop_schedule(
                 body=[*wait, *fence],
                 orelse=[],
             )
-            task_barriers.append(([first_wait], covered))
+            task_barriers.append(([first_wait], covered, frozenset({producer})))
             if extent is not None:
                 no_task_producers.append(producer)
         # A worker's root-barrier arrival rides its last task's arrivals: one
@@ -6006,7 +6168,6 @@ def emit_cross_loop_schedule(
     if not uses_packet_dispatch:
         assert state_arg is not None
         blocks: dict[int, list[ast.stmt]] = {}
-        members: dict[int, frozenset[int] | None] = {}
         resident_roots = static_pipeline_plan.resident_roots
         # A continuation root's tasks run in the block of whichever producer
         # arrives last.

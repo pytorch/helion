@@ -929,6 +929,15 @@ def stage(
     return smem
 
 
+@gl_builtin
+def slot_store(slot, x, _semantic: Any = None):
+    """A body value into the shared-memory ``slot`` (``gluon_ring.ring_fill``),
+    its registers settled as ``stage`` settles them."""
+    shape = [int(d) for d in x.type.shape]
+    t = _semantic.settle(x, gluon_layout.default_layout(shape, _semantic._warps()))
+    slot.store(t, _semantic=_semantic)
+
+
 @gluon.constexpr_function
 def _k_major(dtype: Any) -> bool:
     """Whether tcgen05 reads ``dtype`` operands K-major only (Triton's MMAv5 rule:
