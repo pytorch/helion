@@ -2450,7 +2450,7 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
             if a not in coop:
                 rerun += recomputable.nodes(a)
     rerun += _update_reruns(group)
-    _check_uniform(group.matmul, graphs)
+    check_uniform(group.matmul, graphs, "a cooperative MPP op")
     positional_rebind.check_positional_merges(rerun, _REBIND)
     positional_rebind.check_positional_merges(
         _forward_slice(list(group.mats.values()), graphs), _MAT_REBIND
@@ -2485,32 +2485,58 @@ def _update_reruns(group: MppGroup) -> list[Node]:
     ]
 
 
-def _check_uniform(node: Node, graphs: Graphs) -> None:
-    """Every thread of the threadgroup reaches ``node``: no enclosing if or
-    while tests a per-element predicate.  A cooperative op, and the barriers of a
-    staged tile or a materialization, need all of them.  Checking the op covers
-    its group's seed and materializations, which sit in the graphs of its
-    levels, each the op's graph or one enclosing it."""
+def check_uniform(
+    node: Node,
+    graphs: Graphs,
+    what: str,
+    threaded: Callable[[int], bool] | None = None,
+) -> None:
+    """Every thread of the threadgroup reaches ``node``, ``what``: no
+    enclosing if or while tests a per-element predicate.  A cooperative op,
+    the barriers of a staged tile or a materialization, and a reduction's
+    threadgroup collective need all of them.  Checking an op covers its
+    group's seed and materializations, which sit in the graphs of its
+    levels, each the op's graph or one enclosing it.  Given ``threaded``,
+    whether a block's tile spreads over threads, a predicate over blocks
+    that don't (a block walked in lanes) is the same on every thread, so
+    every thread takes the same branch."""
+
+    def varies(val: object) -> bool:
+        if not isinstance(val, torch.Tensor) or val.ndim == 0:
+            return False
+        if threaded is None:
+            return True
+        return any(
+            (block := block_id_of(size)) is None or threaded(block)
+            for size in val.size()
+            if not (isinstance(size, int) and size == 1)
+        )
+
     while True:
         gid = graphs.graph_id[node.graph]
         if gid in graphs.owners:
             node = graphs.owners[gid][0]
+            test = node.args[0] if node.target is _tracing_ops._if else None
             per_element = (
                 node.target is _tracing_ops._if
                 and graphs.if_branch(node.args[1])[0].predicate_is_tensor
+                and (
+                    threaded is None
+                    or not isinstance(test, Node)
+                    or varies(test.meta.get("val"))
+                )
             )
         elif gid in graphs.whiles:
             node = graphs.whiles[gid]
             (output,) = graphs.info(node.args[0]).graph.find_nodes(op="output")
             (test,) = _seq(output.args[0])
-            val = test.meta.get("val") if isinstance(test, Node) else None
-            per_element = isinstance(val, torch.Tensor) and val.ndim > 0
+            per_element = isinstance(test, Node) and varies(test.meta.get("val"))
         else:
             return
         if per_element:
             raise metal_unsupported(
-                "a cooperative MPP op under an if or a while on a per-element "
-                "predicate; every thread of the threadgroup must reach it"
+                f"{what} under an if or a while on a per-element predicate; "
+                "every thread of the threadgroup must reach it"
             )
 
 

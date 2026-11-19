@@ -1116,6 +1116,7 @@ class MetalBackend(Backend):
         from ..reduction_strategy import PersistentReductionStrategy
         from ..reduction_strategy import ReductionStrategy
         from .padded_twin import padded_twin_owner
+        from .reduction_strategy import MetalLoopedReductionStrategy
         from .reduction_strategy import MetalPaddedTwinStrategy
         from .reduction_strategy import MetalPersistentReductionStrategy
 
@@ -1154,7 +1155,7 @@ class MetalBackend(Backend):
             )
             if 1 < span < reduction_loop:
                 reduction_loop = span
-            strategy = super().create_reduction_strategy(fn, block_id, reduction_loop)
+            strategy = MetalLoopedReductionStrategy(fn, block_id, reduction_loop)
         # Narrow for the type checker as CuTe does: only reduction strategies
         # carry a thread count; anything else counts zero and returns below.
         span = (
