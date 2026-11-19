@@ -3497,7 +3497,27 @@ def _eval_binary(op: ast.operator, left: object, right: object) -> object:
     return result
 
 
+def _symbool_operand_guards(
+    left: object, right: object
+) -> contextlib.AbstractContextManager[None]:
+    """Suppress shape guards for an operation between a SymBool and a tensor.
+
+    The tensor op converts the SymBool with ``bool()``, which guards on its
+    hint (and specializes a tunable it depends on). Neither the traced op,
+    which keeps the symbol, nor the result's dtype and shape depend on that
+    value."""
+    for scalar, other in ((left, right), (right, left)):
+        if isinstance(scalar, torch.SymBool) and isinstance(other, torch.Tensor):
+            return CompileEnvironment.current().shape_env.suppress_guards()
+    return contextlib.nullcontext()
+
+
 def _eval_binary_impl(op: ast.operator, left: object, right: object) -> object:
+    with _symbool_operand_guards(left, right):
+        return _eval_binary_op(op, left, right)
+
+
+def _eval_binary_op(op: ast.operator, left: object, right: object) -> object:
     if isinstance(op, ast.Add):
         # pyrefly: ignore [unsupported-operation]
         return left + right
@@ -3552,6 +3572,11 @@ def _eval_compare(op: ast.cmpop, left: object, right: object) -> object:
 
 
 def _eval_compare_impl(op: ast.cmpop, left: object, right: object) -> object:
+    with _symbool_operand_guards(left, right):
+        return _eval_compare_op(op, left, right)
+
+
+def _eval_compare_op(op: ast.cmpop, left: object, right: object) -> object:
     if isinstance(op, ast.Eq):
         return left == right
     if isinstance(op, ast.NotEq):
