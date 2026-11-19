@@ -934,8 +934,10 @@ class CompileEnvironment:
         # guard fact so it keys every bound kernel.
         self.singleton_vars: set[sympy.Symbol] = set()
         # Input sizes code generation relied on being equal (a block store
-        # bounded by its tensor covering the tile's loop) only at this
-        # binding's values; like a guard, each keys the bound kernel.
+        # bounded by its tensor covering the tile's loop), or on having their
+        # values (a block size it reads as an integer, ``from_config_int``),
+        # only at this binding's values; like a guard, each keys the bound
+        # kernel.
         self.keyed_size_equalities: set[tuple[sympy.Symbol, sympy.Expr]] = set()
         self.specialized_strides: set[TensorPropertySource] = set()
         # Config-backed values created by hl.register_tunable().
@@ -4482,6 +4484,64 @@ class BlockSizeInfo:
         val = self.from_config(config)
         assert val is not None
         return val
+
+    def from_config_int(self, config: Config, *, key: bool = True) -> int:
+        """The block's size under ``config`` as an integer, for code that
+        needs one at compile time (task counts, module constexprs).
+
+        A size the config fixes (a tunable, or a host helper over tunables
+        such as ``block_k = next_power_of_2(cdiv(k, split_k))``) takes the
+        value ``config_value`` gives it: its symbol is unbacked, with torch's
+        fallback hint, and ``int()`` would pin it to that hint for every
+        later config of the bound kernel.  Symbols ``hl.specialize`` keyed
+        count as their values, and so do module-global ints and closure
+        captures, as constants: the bound kernel does not rebind when one of
+        those changes.  A size over input sizes takes their values, and the
+        binding keys on each input size it reads; ``key=False``, for a
+        heuristic whose answer need not hold for every call, keys nothing.
+        Raises InvalidConfig for a size over a scalar argument, which the
+        bound kernel does not key (``hl.specialize`` it), and for a size with
+        no value at compile time (a config value beside a dynamic size)."""
+        env = CompileEnvironment.current()
+        size = self.from_config_assert(config)
+        if isinstance(size, int):
+            return size
+        # hl.specialize keys its symbols' values, so they are constants here.
+        expr = env.specialize_expr(typing.cast("sympy.Expr", size._sympy_()))
+        sources = env.shape_env.var_to_sources
+        unbacked = free_unbacked_symbols(expr)
+        if any(
+            _is_supported_tensor_input_source(source)
+            for symbol in unbacked
+            for source in sources.get(symbol, ())
+        ):
+            raise exc.InvalidConfig(
+                f"block {self.block_id}'s size {expr} reads a scalar argument, "
+                "whose value the bound kernel does not key; hl.specialize it"
+            )
+        # The other sourced unbacked symbols are module-global ints and
+        # closure captures, constants of the kernel's definition.
+        hints = shape_env_var_hints(env.shape_env)
+        expr = expr.xreplace(
+            {symbol: hints[symbol] for symbol in unbacked if sources.get(symbol)}
+        )
+        value = env.config_value(expr, config)
+        if value is not None:
+            return value
+        if free_unbacked_symbols(expr):
+            raise exc.InvalidConfig(
+                f"block {self.block_id}'s size {expr} has no value at compile "
+                "time, as when a config value meets a dynamic size; use "
+                "static_shapes=True or hl.specialize the size"
+            )
+        if key:
+            # Each input size the block reads keys the binding, through the
+            # symbol that stands for it where torch merged two sizes.
+            for symbol in env.shape_env.replace(expr).free_symbols:
+                symbol = typing.cast("sympy.Symbol", symbol)
+                value = shape_env_size_hint(env.shape_env, symbol)
+                env.keyed_size_equalities.add((symbol, sympy.Integer(value)))
+        return int(shape_env_size_hint(env.shape_env, expr))
 
     def is_flattened(self, config: Config) -> bool:
         spec = CompileEnvironment.current().config_spec

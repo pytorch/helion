@@ -55,7 +55,7 @@ def test_an_outlined_helpers_constexprs_are_declared_in_order() -> None:
         backend_name="triton",
         backend=TritonBackend(),
         block_sizes=[
-            SimpleNamespace(from_config_assert=lambda _config: 16) for _ in range(9)
+            SimpleNamespace(from_config_int=lambda _config: 16) for _ in range(9)
         ],
     )
     with mock.patch.object(CompileEnvironment, "current", return_value=environment):

@@ -2158,19 +2158,17 @@ class PallasBackend(Backend):
 
         # Compact-axis tile block size (NOT max(block_sizes): a distinct larger
         # ordered block would undersize the worklist metadata).
-        compact_block = env.block_sizes[plan.compact_axis.block_id].from_config(config)
-        assert compact_block is not None, "compact tile has no block size"
-        env.compact_worklist_block = int(compact_block)
+        env.compact_worklist_block = env.block_sizes[
+            plan.compact_axis.block_id
+        ].from_config_int(config)
         # Ordered (reduction) tile block -- resident caching uses this compile-side to
         # choose a block-aligned physical window (it can differ from the compact
         # block, e.g. compact_block != ordered_block).
         env.compact_worklist_ordered_block = 1
         if plan.ordered_axis is not None:
-            ordered_block = env.block_sizes[plan.ordered_axis.block_id].from_config(
-                config
-            )
-            if ordered_block is not None:
-                env.compact_worklist_ordered_block = int(ordered_block)
+            ordered = env.block_sizes[plan.ordered_axis.block_id]
+            if ordered.from_config(config) is not None:
+                env.compact_worklist_ordered_block = ordered.from_config_int(config)
         env.compact_worklist_upper = self._compact_worklist_upper(plan, config, host_fn)
 
         if config.get("pallas_loop_type", "unroll") == "unroll" and (
