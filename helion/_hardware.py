@@ -5,6 +5,8 @@ import functools
 
 import torch
 
+from ._compat import amd_base_arch
+
 # Linear compute-capability fallback lists (newest to oldest). ``sm103`` is not
 # a safe generic fallback for arbitrary future CUDA architectures, so it stays
 # outside this chain: an exact sm103 target still falls back to sm100 through
@@ -40,9 +42,10 @@ class HardwareInfo:
 
     Attributes:
         device_kind: Device type ('cuda', 'rocm', 'xpu')
-        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a')
-        runtime_version: Runtime version (e.g., '12.4', 'gfx90a')
-        compute_capability: Compute capability for heuristics (e.g., 'sm90', 'gfx90a')
+        hardware_name: Device name (e.g., 'NVIDIA H100', 'gfx90a:sramecc+:xnack-')
+        runtime_version: Runtime version (e.g., CUDA '12.4', HIP '7.2.53211')
+        compute_capability: Compute capability for heuristics (e.g., 'sm90', 'gfx90a';
+            ROCm's base arch, without target features)
     """
 
     device_kind: str
@@ -73,9 +76,17 @@ class HardwareInfo:
 
         try:
             current_idx = arch_list.index(self.compute_capability)
-            return arch_list[current_idx:]
+            compatible = arch_list[current_idx:]
         except ValueError:
-            return [self.compute_capability, *arch_list]
+            compatible = [self.compute_capability, *arch_list]
+        # ROCm heuristics were once named after the full arch with its target
+        # features ("gfx942:sramecc+:xnack-"): keep loading those, after a
+        # heuristic regenerated under the base arch.
+        if self.device_kind == "rocm" and self.hardware_name.startswith(
+            f"{self.compute_capability}:"
+        ):
+            compatible.insert(1, self.hardware_name)
+        return compatible
 
 
 @functools.cache
@@ -110,11 +121,14 @@ def get_hardware_info(device: torch.device | None = None) -> HardwareInfo:
                 )
 
             if torch.version.hip is not None:
+                # gcnArchName carries target features ("gfx942:sramecc+:xnack-").
+                # The name keeps them for cache identity; heuristics, their files
+                # and the older-arch fallback use the base arch.
                 return HardwareInfo(
                     device_kind="rocm",
                     hardware_name=props.gcnArchName,
                     runtime_version=torch.version.hip,
-                    compute_capability=props.gcnArchName,
+                    compute_capability=amd_base_arch(props.gcnArchName),
                 )
         if device.type == "xpu":
             props = torch.xpu.get_device_properties(device)

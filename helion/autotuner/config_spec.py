@@ -20,6 +20,7 @@ from torch._inductor.runtime.runtime_utils import next_power_of_2
 import torch.distributed as dist
 
 from .._compat import _regs_per_block
+from .._compat import amd_base_arch
 from .._compat import device_num_sm
 from .._compat import get_triton_version
 from .._compat import num_compute_units
@@ -2056,7 +2057,7 @@ class ConfigSpec:
             return
         properties = torch.cuda.get_device_properties(self.device)
         arch = properties.gcnArchName  # pyrefly: ignore [missing-attribute]
-        if arch.split(":")[0] != "gfx950":
+        if amd_base_arch(arch) != "gfx950":
             return
 
         block_sizes = cast("list[int]", config["block_sizes"])

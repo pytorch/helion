@@ -569,15 +569,20 @@ def _is_amd_cdna() -> bool:
     return match is not None and int(match.group(1), 16) >= 0x908
 
 
+def amd_base_arch(arch_name: str) -> str:
+    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
+    return arch_name.split(":")[0]
+
+
 @functools.cache
 def _amd_base_arch() -> str | None:
-    """Base AMD GPU architecture, e.g. "gfx942" from "gfx942:sramecc+:xnack-"."""
+    """Base architecture of the current AMD GPU (see ``amd_base_arch``)."""
     try:
         props = torch.cuda.get_device_properties(torch.cuda.current_device())
         arch = getattr(props, "gcnArchName", None)
     except Exception:
         return None
-    return None if arch is None else arch.split(":")[0]
+    return None if arch is None else amd_base_arch(arch)
 
 
 def device_num_sm(device: torch.device | int | None = None) -> int:
