@@ -559,7 +559,14 @@ def task_put(tasks, full, empty, step, S: gl.constexpr, ticket):
 
 # ---- the lowering ------------------------------------------------------------
 
-_DEPTH = "_helion_ring_S"
+_DEPTH_NAME = "S"  # a channel's depth: _channel(_DEPTH_NAME, c)
+# A channel whose steps the body only reads into registers frees each slot as soon
+# as the read lands (no asynchronous MMA holds it): it gives up slots first when
+# the ring outgrows the shared memory (``_channel_depths``), down to two, which
+# keep its next copy in flight.
+_MIN_REGISTER_DEPTH = 2
+# A slot's full and empty mbarriers.
+_SLOT_BARRIER_BYTES = 16
 _TAIL_KEY = "cross_loop_tmem_prefetch"
 # Gating groups, one producer each: weights stream ungated; activations earlier
 # roots write stream after the body's waits.
@@ -579,6 +586,29 @@ def _tmem_columns(tiles: list[tuple[int, int]]) -> int:
     return sum(c * -(-r // 128) for r, c in tiles if r > 64) + sum(
         -(-n // 2) * c for c, n in halves.items()
     )
+
+
+def _channel_depths(
+    depth: int, slots: dict[int, int], dotted: set[int], budget: int
+) -> dict[int, int]:
+    """Each channel's depth: ``depth`` (``num_stages``) unless the ring (``slots``
+    bytes a slot of each channel, and its barriers) would exceed ``budget`` bytes.
+    A channel a dot reads keeps ``depth``: its MMA holds each slot until it
+    completes.  One the body only reads into registers frees each slot once the
+    read lands: while the ring exceeds the budget, the widest of them gives up a
+    slot, down to ``_MIN_REGISTER_DEPTH``.  Past that the ring is what the config
+    asks for (Triton then rejects it as out of resources)."""
+    depths = dict.fromkeys(slots, depth)
+    floor = min(depth, _MIN_REGISTER_DEPTH)
+
+    def ring() -> int:
+        return sum(d * (slots[c] + _SLOT_BARRIER_BYTES) for c, d in depths.items())
+
+    while ring() > budget and (
+        shrinkable := [c for c in depths if c not in dotted and depths[c] > floor]
+    ):
+        depths[max(shrinkable, key=lambda c: (slots[c], -c))] -= 1
+    return depths
 
 
 # Calls of a dot's MMA side: on its channels, and on its accumulator ring.
@@ -771,12 +801,13 @@ def _poller_registers(
 
 
 def _channel(name: str, channel: int) -> str:
-    """A channel's ``full`` / ``empty`` / ``step`` (or ``pace`` / ``paced`` / ``run``)."""
+    """A channel's ``full`` / ``empty`` / ``step`` / depth ``S`` (or ``pace`` /
+    ``paced`` / ``run``)."""
     return f"_helion_ring_{name}{channel}"
 
 
 def _beside(full: ast.expr, name: str) -> ast.Name:
-    """The ``_channel`` ``name`` (``pace``, ``paced``, ``run``) beside ``full``."""
+    """The ``_channel`` ``name`` (``pace``, ``paced``, ``run``, ``S``) beside ``full``."""
     assert isinstance(full, ast.Name) and full.id.startswith(_channel("full", 0)[:-1])
     return create(ast.Name, id=full.id.replace("_full", f"_{name}"), ctx=ast.Load())
 
@@ -860,10 +891,25 @@ class RingLowering:
         self.acc_keys: dict[torch.fx.Node, tuple[tuple[int, ...], int]] = {}
         # The MMA partition stores scales from registers (4-warp layouts).
         self.mma_tensors = False
-        # Tensor memory of the dots outside the ring, (rows, columns) each, and
-        # at most what the block scales take (only tails count it).
-        self.tmem: list[tuple[int, int]] = []
-        self.scale_tmem: list[tuple[int, int]] = []
+        # Tensor memory of the dots outside the ring, (rows, columns) each, and at
+        # most what the block scales take (only the tails count those), by root
+        # (``tmem_root``): each root's allocations live in its own code only, so
+        # Triton's liveness-based allocator gives one root's columns to another's,
+        # beside the accumulator rings every root keeps.
+        self.tmem: dict[int | None, list[tuple[int, int]]] = {}
+        self.scale_tmem: dict[int | None, list[tuple[int, int]]] = {}
+        # The block-scale buffers a channel's scaled dots share by channel step
+        # (``gluon_ops.slot_scales``), by (issuing partition = channel, scale
+        # position, dtype, ``gluon_ops.scale_storage``): [name, rows, columns'
+        # bytes] of the first shape (a shape of the same storage views them), each
+        # dot's (root, the tensor memory of scales it would allocate itself) and
+        # the channel's depth link (a dot reads it: ``depth`` slots).
+        # The ring allocates them for the whole kernel beside the accumulator
+        # rings, which take tensor memory first (every root's charge, not one
+        # root's): ``scale_buffers`` each, a buffer per slot unless tensor memory
+        # runs short (``_emit_scale_buffers``).
+        self.scale_slots: dict[tuple[bool, int, torch.dtype, int], list[Any]] = {}
+        self.scale_buffers = 0
         # An operand of several dots (each acquires its own slot), by name.
         self.deferred: dict[
             str, tuple[torch.fx.Node, torch.Tensor, BlockedSubscriptIndexing, int, bool]
@@ -992,7 +1038,8 @@ class RingLowering:
         links = _links(step, group, "empty", "step")
         state.add_statement(
             statement_from_string(
-                f"{value} = {ALIAS}.ring_read({slot}, {links}, {_DEPTH}, {dot is None})"
+                f"{value} = {ALIAS}.ring_read({slot}, {links}, "
+                f"{_link(step, group, 'depth')}, {dot is None})"
             )
         )
         if dot is None:
@@ -1108,7 +1155,7 @@ class RingLowering:
         state.add_statement(
             statement_from_string(
                 f"{slot} = {ALIAS}.ring_acquire({site.name}, "
-                f"{_links(step, group, 'full', 'empty', 'step')}, {_DEPTH}, "
+                f"{_links(step, group, 'full', 'empty', 'step', 'depth')}, "
                 f"{descriptor.name}, ({coords}), {site is first}, "
                 f"{_link(step, group, 'bytes')}, {site.name}_box"
                 f"{'' if tagged is None else f', {tagged[0]}'})"
@@ -1154,8 +1201,7 @@ class RingLowering:
             # One accumulator ring per dot of a task (root), so the MMA stays
             # _ACC_DEPTH tasks ahead of the body.
             shape = gluon_ops.concrete(node.meta["val"].shape)[-2:]
-            root = cast("GenerateAST", interp.cg).current_root_graph_info
-            self.dot_roots[node] = None if root is None else root.graph_id
+            self.dot_roots[node] = self.tmem_root(cast("GenerateAST", interp.cg))
             peers = [
                 n
                 for n, m in self.mma.items()
@@ -1174,10 +1220,34 @@ class RingLowering:
                 gluon_ops.copied_scale(node, i) for i in gluon_ops._SCALES[dot_scaled]
             )
         # The step's groups share its channel's slot: one commit frees it.
-        empty, step = (_link(dot_index, groups[0], name) for name in ("empty", "step"))
+        empty, step, depth = (
+            _link(dot_index, groups[0], name) for name in ("empty", "step", "depth")
+        )
         if (tail := self._tail(interp, node, dot_index)) is not None:
             self.tails.append(tail)
-        return gluon_ops.codegen_tmem_dot(interp, node, (empty, step, _DEPTH), ring)
+        # A scaled dot's block scales: its channel's buffers, which every scaled
+        # dot of the channel uses by channel step.
+        slots = []
+        for position, (dtype, rows, cols) in enumerate(gluon_ops.scale_tiles(node)):
+            storage = gluon_ops.scale_storage(rows, cols)
+            buffers = self.scale_slots.setdefault(
+                (self.mma[node], position, dtype, storage),
+                [f"_helion_scales{len(self.scale_slots)}", rows, cols, [], depth],
+            )
+            buffers[3].append(
+                (
+                    self.tmem_root(cast("GenerateAST", interp.cg)),
+                    (128, gluon_ops.scale_columns(rows, cols)),
+                )
+            )
+            slots.append(buffers[0])
+        return gluon_ops.codegen_tmem_dot(
+            interp,
+            node,
+            (empty, step, depth),
+            ring,
+            (slots[0], slots[1]) if slots else None,
+        )
 
     def _shared_ring(
         self, node: torch.fx.Node, shape: tuple[int, ...]
@@ -1287,12 +1357,61 @@ class RingLowering:
             block_id,
         )
 
+    @staticmethod
+    def tmem_root(cg: GenerateAST) -> int | None:
+        """The root whose code ``cg`` generates (its graph): the key of the
+        tensor-memory ledgers (``tmem``, ``scale_tmem``)."""
+        root = cg.current_root_graph_info
+        return None if root is None else root.graph_id
+
     def _tmem_left(self, *rings: tuple[int, ...]) -> int:
-        """Tensor-memory columns the accumulator rings (and ``rings`` more) and the
-        other dots' tensor memory leave."""
+        """Tensor-memory columns of a CTA (``_tmem_share``) the accumulator rings
+        (and ``rings`` more), the channels' block-scale buffers and the root
+        taking the most beside them leave: its other dots' tensor memory and the
+        block scales they allocate."""
         shapes = [*(shape for shape, _ in self.acc_rings), *rings]
-        acc = [(m, n * _ACC_DEPTH) for m, n in shapes]
-        return _TMEM_COLUMNS - _tmem_columns([*acc, *self.tmem])
+        acc = [
+            *((m, n * _ACC_DEPTH) for m, n in shapes),
+            *(
+                (128, gluon_ops.scale_columns(rows, cols))
+                for _, rows, cols, *_ in self.scale_slots.values()
+                for _ in range(self.scale_buffers)
+            ),
+        ]
+        roots = self.tmem.keys() | self.scale_tmem.keys()
+        return self._tmem_share() - max(
+            (
+                _tmem_columns(
+                    [*acc, *self.tmem.get(root, ()), *self.scale_tmem.get(root, ())]
+                )
+                for root in roots
+            ),
+            default=_tmem_columns(acc),
+        )
+
+    def _shared_budget(self, slots: dict[int, int], dotted: set[int]) -> int:
+        """Shared-memory bytes a CTA's ring may take: the CTA's share (the opt-in
+        limit; with ``num_sm_multiplier`` CTAs a SM, their share of the SM less the
+        1 KB the driver reserves each) less what Triton stages beside it for the
+        body's layout conversions: at most an fp32 accumulator tile (the epilogue
+        term of the Triton heuristics' shared-memory model, ``_smem_bytes``) or a
+        slot of a channel the body reads into registers."""
+        props = torch.cuda.get_device_properties(CompileEnvironment.current().device)
+        ctas = self.device_function.config.num_sm_multiplier
+        share = min(
+            props.shared_memory_per_block_optin,  # pyrefly: ignore [missing-attribute]
+            props.shared_memory_per_multiprocessor // ctas - 1024,
+        )
+        tiles = [
+            *(shape for shape, _ in self.acc_rings),
+            *(tile for tiles in self.tmem.values() for tile in tiles),
+        ]
+        reserve = max(
+            [_B200.EPILOGUE_ACC_ITEMSIZE * m * n for m, n in tiles]
+            + [nbytes for c, nbytes in slots.items() if c not in dotted],
+            default=0,
+        )
+        return share - reserve
 
     def _take_deferred(
         self, interp: GraphInterpreter, node: torch.fx.Node
@@ -1340,6 +1459,34 @@ class RingLowering:
             return None
         return _GATED
 
+    def _tmem_share(self) -> int:
+        """Tensor-memory columns of a CTA: a power of two, ``num_sm_multiplier``
+        CTAs a SM."""
+        ctas = self.device_function.config.num_sm_multiplier
+        return 1 << ((_TMEM_COLUMNS // ctas).bit_length() - 1)
+
+    def _emit_scale_buffers(self) -> None:
+        """Give each channel's block scales a buffer per slot (``depth``) if the
+        tensor memory the accumulator rings and the roots leave a CTA holds them
+        (ahead of the tails); else its scaled dots allocate their own scales,
+        each root's, and wait for their MMAs (the partitions bind the
+        ``slot_scales`` names to ``None``)."""
+        if not self.scale_slots:
+            return
+        self.scale_buffers = self.depth
+        if self._tmem_left() >= 0:
+            return
+        self.scale_buffers = 0
+        for _, _, _, dots, _ in self.scale_slots.values():
+            for root, tile in dots:
+                self.scale_tmem.setdefault(root, []).append(tile)
+        log.info(
+            "gluon ring: no tensor memory for a block-scale buffer per slot; "
+            "scaled dots allocate their own and wait for their MMAs"
+        )
+        if self._tmem_left() < 0:
+            raise RingFallback("the ring: no tensor memory for its block scales")
+
     # -- tails: a K loop's last steps' operand A in tensor memory
 
     def _emit_tails(
@@ -1358,11 +1505,7 @@ class RingLowering:
                 block_id not in self.tail_loops
             ):
                 _turn_away(block_id, "its dot reads no ring slot")
-        # A CTA's allocation is a power of two columns.
-        ctas = self.device_function.config.num_sm_multiplier
-        share = 1 << ((_TMEM_COLUMNS // ctas).bit_length() - 1)
-        left = self._tmem_left() - _tmem_columns(self.scale_tmem)
-        left -= _TMEM_COLUMNS - share
+        left = self._tmem_left()
         shapes: dict[tuple[object, ...], list[_Tail]] = {}
         for tail in self.tails:
             shapes.setdefault(self.sites[tail.load].tile, []).append(tail)
@@ -1473,7 +1616,9 @@ class RingLowering:
                 },
             ),
         )
-        empty, counter = (_link(fill, site.group, n) for n in ("empty", "step"))
+        empty, counter, depth = (
+            _link(fill, site.group, n) for n in ("empty", "step", "depth")
+        )
         filling = create(
             ast.For,
             target=create(ast.Name, id=var, ctx=ast.Store()),
@@ -1482,7 +1627,7 @@ class RingLowering:
                 *(cast("ast.stmt", clone_ast(st)) for st in coordinates),
                 step,
                 statement_from_string(
-                    f"{ALIAS}.tail_fill({slot}, {empty}, {counter}, {_DEPTH}, "
+                    f"{ALIAS}.tail_fill({slot}, {empty}, {counter}, {depth}, "
                     f"{buffer}, {index})"
                 ),
                 statement_from_string(f"{counter} = {counter} + 1"),
@@ -1564,6 +1709,7 @@ class RingLowering:
         """The partitions and the ring kernel launching them."""
         name, arguments = body.name, [a.arg for a in body.args.args]
         df = self.device_function
+        self._emit_scale_buffers()
         tails = self._emit_tails(body)
         # A channel carries the steps of one issuing partition; a group without
         # operands in a step arrives from its skip.
@@ -1578,8 +1724,10 @@ class RingLowering:
         channel_groups: dict[bool, set[int]] = {}
         for site in self.sites.values():
             channel = channels.setdefault(issuer[site.dot], len(channels))
-            for link in ("full", "empty", "step"):
-                rename[_link(site.dot, site.group, link)] = _channel(link, channel)
+            for link in ("full", "empty", "step", "depth"):
+                rename[_link(site.dot, site.group, link)] = _channel(
+                    _DEPTH_NAME if link == "depth" else link, channel
+                )
             group_puts.setdefault(site.group, set()).add(
                 _link(site.dot, site.group, "bytes")
             )
@@ -1612,18 +1760,42 @@ class RingLowering:
         for dot, groups in dot_groups.items():
             lead = min(groups)
             for group in channel_groups[issuer[dot]] - groups:
-                for link in ("full", "empty", "step"):
+                for link in ("full", "empty", "step", "depth"):
                     rename[_link(dot, group, link)] = rename[_link(dot, lead, link)]
                 group_puts[group].add(_link(dot, group, "bytes"))
                 expects[(dot, group)] = 0
                 skips.setdefault(_link(dot, lead, "step"), []).append(
                     statement_from_string(
-                        f"{ALIAS}.ring_skip({_links(dot, group, 'full', 'empty', 'step')}, "
-                        f"{_DEPTH}, {_link(dot, group, 'bytes')})"
+                        f"{ALIAS}.ring_skip("
+                        f"{_links(dot, group, 'full', 'empty', 'step', 'depth')}, "
+                        f"{_link(dot, group, 'bytes')})"
                     )
                 )
         body.body = _with_skips(body.body, skips)
         buffers, views, box = self._lanes(channels.values(), steps, rename)
+        # A channel a dot reads (whichever partition issues it) streams at the
+        # configured depth; one the body only reads into registers gives up slots
+        # while the ring outgrows the CTA's shared memory (``_channel_depths``).
+        nodes = {index: node for node, index in self.dots.items()}
+        dotted = {
+            c
+            for c, step in steps
+            if isinstance(node := nodes[step], _Tail) or gluon_ops.is_dot(node)
+        }
+        slots = dict.fromkeys(channels.values(), 0)
+        for *_, c, nbytes in buffers:
+            slots[c] += nbytes
+        budget = self._shared_budget(slots, dotted)
+        depths = _channel_depths(self.depth, slots, dotted, budget)
+        if any(d < self.depth for d in depths.values()):
+            log.info(
+                "gluon ring: register-read channels shallower to fit %d B: "
+                "depths %s (slots %s B, %s read by dots)",
+                budget,
+                depths,
+                slots,
+                sorted(dotted),
+            )
         ast_rename(body, rename)
         # The completing put reads each tagged operand's slot (after renames).
         for boxes in group_boxes.values():
@@ -1648,9 +1820,16 @@ class RingLowering:
         slices = [(f"producer{group}", s) for group, s in producers.items()]
         pollers = 1
         if tagged and _GATED in producers:
-            # More pollers of the gated group's tagged steps; each arrives on
-            # every step.
-            pollers = min(_TAGGED_POLLERS, self.depth)
+            # More pollers of the gated group's tagged steps (at most one a slot
+            # of their channels); each arrives on every step.
+            pollers = min(
+                _TAGGED_POLLERS,
+                *(
+                    depths[channels[i]]
+                    for i, g in channel_groups.items()
+                    if _GATED in g
+                ),
+            )
             producers[_GATED].owner = (0, pollers)
             slices += [
                 (
@@ -1727,6 +1906,14 @@ class RingLowering:
                     )
         body.body = _without_waits(_without_mma(body.body, mma), df, frozenset())
         functions = [body, *partitions]
+        # Scale buffers the ring holds are arguments; else ``None``.
+        scale_slots = [b[0] for b in self.scale_slots.values()]
+        if not self.scale_buffers:
+            for fn in functions:
+                fn.body[:0] = [
+                    statement_from_string(f"{b} = None") for b in scale_slots
+                ]
+            scale_slots = []
         for fn in functions:
             dead_assignment_elimination(cast("list[ast.AST]", fn.body), df.dce_vars)
             _first_waits(fn.body)
@@ -1793,10 +1980,11 @@ class RingLowering:
             *(_channel("full", c) for c in ids),
             *(_channel("empty", c) for c in ids),
             *paces,
-            *(buffer for buffer, _, _ in buffers),
+            *(buffer for buffer, *_ in buffers),
             *(view for view, *_ in views),
             *(n for acc in accs for n in acc[:3]),
             *(tail[0] for tail in tails),
+            *scale_slots,
             *([_TASKS, _TASK_FULL, _TASK_EMPTY] if claims else []),
         ]
         shell_arguments = cast("ast.arguments", clone_ast(body.args))
@@ -1871,18 +2059,21 @@ class RingLowering:
             # Every group (and poller) of a channel arrives on each full phase.
             arrivals = len(groups) + (pollers - 1) * (_GATED in groups)
             setup.append(
-                f"{_channel('full', c)} = {ALIAS}.ring_barriers({_DEPTH}, {arrivals})"
+                f"{_channel('full', c)} = "
+                f"{ALIAS}.ring_barriers({_channel(_DEPTH_NAME, c)}, {arrivals})"
             )
         setup += [
-            f"{_channel('empty', c)} = {ALIAS}.ring_barriers({_DEPTH})" for c in ids
+            f"{_channel('empty', c)} = {ALIAS}.ring_barriers({_channel(_DEPTH_NAME, c)})"
+            for c in ids
         ]
         setup += [f"{b} = {ALIAS}.ring_barriers({pace})" for b in paces]
         setup += [
-            f"{b} = {ALIAS}.ring_buffer({d}, {_DEPTH} * {k})" for b, d, k in buffers
+            f"{b} = {ALIAS}.ring_buffer({d}, {_channel(_DEPTH_NAME, c)} * {k})"
+            for b, d, k, c, _ in buffers
         ]
         setup += [
-            f"{view} = {ALIAS}.ring_view({b}, {d}, {_DEPTH} * {boxes})"
-            for view, b, d, boxes in views
+            f"{view} = {ALIAS}.ring_view({b}, {d}, {_channel(_DEPTH_NAME, c)} * {boxes})"
+            for view, b, d, boxes, c in views
         ]
         if claims:
             # The body and every partition but the claiming one take each ticket.
@@ -1899,6 +2090,13 @@ class RingLowering:
         setup += [
             f"{b} = {ALIAS}.tail_buffers({d}, {n}, {rows}, {cols})"
             for b, d, n, rows, cols in tails
+        ]
+        dtype_str = CompileEnvironment.current().backend.dtype_str
+        setup += [
+            f"{b} = {gluon_ops.ALIAS}.slot_scales({dtype_str(d)}, {rows}, {cols}, "
+            f"{rename.get(link, link)})"
+            for (_, _, d, _), (b, rows, cols, _, link) in self.scale_slots.items()
+            if self.scale_buffers
         ]
         warps = ", ".join(str(w) for w, _ in workers)
         specialize = (
@@ -1933,7 +2131,7 @@ class RingLowering:
         df.codegen.module_statements.extend(
             statement_from_string(f"{constant} = tl.constexpr({value})")
             for constant, value in [
-                (_DEPTH, self.depth),
+                *((_channel(_DEPTH_NAME, c), depth) for c, depth in depths.items()),
                 *([(_TASK_DEPTH, task_depth)] if claims else []),
                 *((_link(*step, "bytes"), n) for step, n in expects.items()),
                 *box.items(),
@@ -1948,15 +2146,18 @@ class RingLowering:
         steps: dict[tuple[int, int], list[_Site]],
         rename: dict[str, str],
     ) -> tuple[
-        list[tuple[str, str, int]], list[tuple[str, str, str, int]], dict[str, int]
+        list[tuple[str, str, int, int, int]],
+        list[tuple[str, str, str, int, int]],
+        dict[str, int],
     ]:
         """A slot is lanes: each step's operands, widest first, fill a lane as wide
         as the widest operand left, at whole-box offsets; the widest allocates it,
         the others view it.  A TMA copy lands 128-byte aligned: an operand takes a
         whole number of 128 bytes (its boxes).  Returns the lanes (with their boxes
-        per slot), views and boxes; renames sites."""
-        buffers: list[tuple[str, str, int]] = []
-        views: list[tuple[str, str, str, int]] = []
+        per slot, channel and bytes per slot), views (with their channel) and
+        boxes; renames sites."""
+        buffers: list[tuple[str, str, int, int, int]] = []
+        views: list[tuple[str, str, str, int, int]] = []
         box: dict[str, int] = {}
 
         def size(site: _Site) -> int:
@@ -1975,7 +2176,13 @@ class RingLowering:
                 )
                 buffer = f"_helion_ring_buf{len(buffers)}"
                 buffers.append(
-                    (buffer, widest.descriptor.name, size(widest) // widest.nbytes)
+                    (
+                        buffer,
+                        widest.descriptor.name,
+                        size(widest) // widest.nbytes,
+                        channel,
+                        size(widest),
+                    )
                 )
                 for sites in left:
                     used = 0
@@ -1992,7 +2199,13 @@ class RingLowering:
                             rename[site.name] = f"_helion_ring_view{len(views)}"
                             boxes = size(widest) // site.nbytes
                             views.append(
-                                (rename[site.name], buffer, site.descriptor.name, boxes)
+                                (
+                                    rename[site.name],
+                                    buffer,
+                                    site.descriptor.name,
+                                    boxes,
+                                    channel,
+                                )
                             )
         return buffers, views, box
 
@@ -2860,7 +3073,8 @@ def _paced_fill(
         run, paced_ = _beside(full, "run").id, _beside(full, "paced").id
         return statement_from_string(
             f"{run} = {ALIAS}.ring_pace_flush({ast.unparse(full)}, "
-            f"{_beside(full, 'pace').id}, {_beside(full, 'step').id}, {_DEPTH}, "
+            f"{_beside(full, 'pace').id}, {_beside(full, 'step').id}, "
+            f"{_beside(full, _DEPTH_NAME).id}, "
             f"{paced_}, {run}, {K})"
         )
 

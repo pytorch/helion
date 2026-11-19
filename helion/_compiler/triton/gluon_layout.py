@@ -195,6 +195,9 @@ class HelionGluonSemantic(GluonSemantic):
         self.generator = generator
         self.meta = _STATE
         self.depth = 0
+        # The auto operands the op being traced (``_wrap``) consumed: its own,
+        # which ``_consume`` hands it back unchanged.
+        self.operands: frozenset[int] = frozenset()
         self.popularity = _POPULARITY  # values produced per concrete layout
         self.workers: list[list[Any]] = []  # warp_specialize partitions' arguments
 
@@ -321,8 +324,9 @@ class HelionGluonSemantic(GluonSemantic):
 
     def _call(self, name: str, args: Any, kwargs: Any, idx: int = 0) -> Any:
         """Re-emit op ``name`` (output ``idx``) as the one consumer of its operands."""
-        # Consumed auto operands replay in turn.
-        args, kwargs = self._consume((args, kwargs))
+        # Consumed auto operands replay in turn (the traced op's too: the copy
+        # is another consumer of them).
+        args, kwargs = self._consume((args, kwargs), fresh=True)
         self.depth += 1
         try:
             out = getattr(self, name)(*args, **kwargs)
@@ -345,11 +349,18 @@ class HelionGluonSemantic(GluonSemantic):
             ]
         return budget >= 0
 
-    def _consume(self, obj: Any) -> Any:
-        """Give each auto value in ``obj`` this op as its one consumer."""
+    def _consume(self, obj: Any, fresh: bool = False) -> Any:
+        """Give each auto value in ``obj`` this op as its one consumer.  An operand
+        the op being traced consumed already (``operands``) is the op's own: it
+        comes back unchanged, so an override may consume what ``_wrap`` gave it
+        (consumed again, one that cannot replay would convert to auto, leaving
+        the original without a layout), unless ``fresh`` (a re-emitted op: another
+        consumer)."""
 
         def one(x: Any) -> Any:
             if not _is_auto(x):
+                return x
+            if not fresh and x.handle.id() in self.operands:
                 return x
             if self._m(x).consumed:
                 x = self._again(x)
@@ -758,12 +769,9 @@ class HelionGluonSemantic(GluonSemantic):
         lay = (
             blocked[0] if blocked else default_layout(_shape(inputs[0]), self._warps())
         )
-        inputs = [
-            x
-            if not _is_auto(x) and x.type.layout == lay
-            else self.convert_layout(self._consume(x), lay)
-            for x in inputs
-        ]
+        # The operands are already this op's (``_wrap`` consumed them): consumed again, one
+        # that cannot replay would convert to auto, leaving the original without a layout.
+        inputs = [self.convert_layout(x, lay) for x in inputs]
         return super().associative_scan(inputs, axis, region_builder_fn, reverse)
 
     def _anchors(self, ptr: Any) -> bool:
@@ -1027,13 +1035,18 @@ def _wrap(name: str) -> None:
         if fold and (out := self._fold_splats(name, args, kwargs)) is not None:
             return out
         outer = self.depth == 0
+        operands = self.operands
         if outer:
             args, kwargs = self._consume((args, kwargs))
+            self.operands = frozenset(
+                x.handle.id() for x in tree_leaves((args, kwargs)) if _is_auto(x)
+            )
         self.depth += 1
         try:
             out = orig(self, *args, **kwargs)
         finally:
             self.depth -= 1
+            self.operands = operands
         if name in _WRITE_OPS:
             _wrote()
         if outer:  # an op returning an operand unchanged did not use it

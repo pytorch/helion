@@ -1008,10 +1008,10 @@ class TestTmemPrefetch(TestCase):
 
     def test_block_scales_take_from_the_tails_budget(self) -> None:
         """An nvfp4 dot in the K loop's task keeps its block scales in tensor
-        memory beside the two accumulator rings (2 x 64 columns): the scales'
-        48 columns (a_scale's two [128, 16] buffers of 16, b_scale's two
-        [32, 16] ones of 8: Triton spreads each over all 128 lanes) leave 336,
-        10 tiles of 32 (12 without them)."""
+        memory beside the two accumulator rings (2 x 64 columns): a buffer per
+        ring slot of each (``slot_scales``), 96 columns (four slots of a_scale's
+        [128, 16] of 16 and b_scale's [32, 16] of 8: Triton spreads each over all
+        128 lanes), leave 288, 9 tiles of 32 (12 without them)."""
         x = torch.empty([32, 1024], dtype=torch.bfloat16)
         w = torch.empty([256, 1024], dtype=torch.bfloat16)
         a = torch.empty([256, 256], dtype=torch.uint8)
@@ -1026,7 +1026,8 @@ class TestTmemPrefetch(TestCase):
             )
         self.assertIn("_helion_gluon.tmem_dot_scaled(", code)
         self.assertEqual(code.count("tail_fill("), 1)
-        self.assertIn("tail_buffers(w_ring_desc, 10, 128, 64)", code)
+        self.assertEqual(code.count("slot_scales("), 2)
+        self.assertIn("tail_buffers(w_ring_desc, 9, 128, 64)", code)
 
     def test_tails_share_a_buffer_per_tile_shape(self) -> None:
         """Two tasks' K loops of one tile shape fill one buffer (14 of 16 steps

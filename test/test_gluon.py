@@ -377,6 +377,15 @@ def scan_pair(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def log_cumsum(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty_like(x)
+    for tile in hl.tile(n):
+        out[tile] = torch.cumsum(torch.log(x[tile]), 0)
+    return out
+
+
 def _asm(
     kernel: object, args: tuple[torch.Tensor, ...], **config: object
 ) -> tuple[dict[str, str], torch.Tensor]:
@@ -763,6 +772,47 @@ class TestGluon(TestCase):
         idx = torch.arange(32, device=DEVICE, dtype=torch.int32)
         _, out = code_and_output(scan_pair, (x, idx), block_sizes=[32, 32])
         torch.testing.assert_close(out, torch.cummax(x, 0).values)
+
+    def test_scan_of_unreplayable_auto_value(self) -> None:
+        # A tile smaller than the warps keeps an auto layout, and a log (no
+        # recipe) cannot replay: the scan lays out that value itself.
+        x = torch.rand(64, device=DEVICE) + 0.5
+        _, out = code_and_output(log_cumsum, (x,), block_sizes=[16], num_warps=4)
+        expected = torch.log(x).view(4, 16).cumsum(1).view(-1)
+        torch.testing.assert_close(out, expected)
+
+    def test_an_op_consumes_its_operands_once(self) -> None:
+        """An override consuming an operand ``_wrap`` gave its op gets it back
+        unchanged (consumed again, one that cannot replay would leave its layout
+        to a copy); a re-emitted op (``_call``) is another consumer and takes a
+        copy, as does any op of a value another op consumed (CPU only)."""
+        import types
+        from unittest import mock
+
+        from helion._compiler.triton import gluon_layout
+
+        class Auto:
+            def __init__(self, i: int) -> None:
+                self.handle = types.SimpleNamespace(id=lambda: i)
+
+        copies: list[object] = []
+
+        def again(x: object) -> Auto:
+            copies.append(x)
+            return Auto(100 + len(copies))
+
+        sem = types.SimpleNamespace(meta={}, operands=frozenset([1]), _again=again)
+        sem._m = types.MethodType(gluon_layout.HelionGluonSemantic._m, sem)
+        consume = types.MethodType(gluon_layout.HelionGluonSemantic._consume, sem)
+        own, other = Auto(1), Auto(2)
+        for x in (own, other):
+            sem._m(x).consumed = True
+        with mock.patch.object(gluon_layout, "_is_auto", lambda x: isinstance(x, Auto)):
+            self.assertIs(consume([own])[0], own)
+            self.assertEqual(copies, [])
+            self.assertIsNot(consume([own], fresh=True)[0], own)
+            self.assertIsNot(consume([other])[0], other)
+        self.assertEqual(copies, [own, other])
 
 
 if __name__ == "__main__":
