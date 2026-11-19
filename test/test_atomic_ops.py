@@ -3874,7 +3874,11 @@ def _local_histogram_consumer_negative(x, mode: hl.constexpr):
             value = hl.zeros([17], dtype=x.dtype)
             for _iteration in range(2):
                 hl.atomic_add(histogram, [indices], x[row, :])
-                value = hl.cumsum(histogram, dim=0)
+                value = hl.cumsum(
+                    histogram,
+                    dim=0,
+                    dtype=None if x.dtype.is_floating_point else x.dtype,
+                )
         elif mode == "loop_allocation":
             value = hl.zeros([17], dtype=x.dtype)
             for _iteration in range(2):

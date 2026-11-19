@@ -266,62 +266,76 @@ def _(
     )
 
 
+def _scan_input(input_tensor: torch.Tensor, dtype: torch.dtype | None) -> torch.Tensor:
+    if dtype is None:
+        dtype = input_tensor.dtype
+        if not dtype.is_floating_point and not dtype.is_complex:
+            dtype = torch.int64
+    return input_tensor if input_tensor.dtype == dtype else input_tensor.to(dtype)
+
+
 @_decorators.device_func_replacement(torch.cumsum)
-def cumsum(input_tensor: torch.Tensor, dim: int, reverse: bool = False) -> torch.Tensor:
+def cumsum(
+    input_tensor: torch.Tensor,
+    dim: int,
+    reverse: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """
     Compute the cumulative sum along a specified dimension.
 
-    Equivalent to ``hl.associative_scan(torch.add, input_tensor, dim, reverse)``.
+    Matches :func:`torch.cumsum`, with optional reverse order.
 
     Args:
         input_tensor: Input tensor to compute cumulative sum
         dim: The dimension along which to compute cumulative sum
         reverse: If True, performs the cumsum in reverse order
+        dtype: Cast the input to this dtype before scanning. By default,
+            integer and boolean inputs are promoted to ``torch.int64``;
+            floating-point and complex inputs keep their dtype.
 
     Returns:
-        torch.Tensor: Tensor with same shape as input containing cumulative sum
+        torch.Tensor: Tensor with the same shape as the input, in the scan dtype
 
     See Also:
         - :func:`~helion.language.associative_scan`: For custom scan operations
         - :func:`~helion.language.cumprod`: For cumulative product
         - :func:`~helion.language.reduce`: For dimension-reducing operations
-
-    Note:
-        - Output has same shape as input
-        - Reverse=True computes cumsum from right to left
-        - Equivalent to torch.cumsum
     """
-    return associative_scan(torch.add, input_tensor, dim, reverse)
+    return associative_scan(torch.add, _scan_input(input_tensor, dtype), dim, reverse)
 
 
 @_decorators.device_func_replacement(torch.cumprod)
 def cumprod(
-    input_tensor: torch.Tensor, dim: int, reverse: bool = False
+    input_tensor: torch.Tensor,
+    dim: int,
+    reverse: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
     Compute the cumulative product along a specified dimension.
 
-    Equivalent to ``hl.associative_scan(torch.mul, input_tensor, dim, reverse)``.
+    Matches :func:`torch.cumprod`, with optional reverse order.
 
     Args:
         input_tensor: Input tensor to compute cumulative product
         dim: The dimension along which to compute cumulative product
         reverse: If True, performs the cumprod in reverse order
+        dtype: Cast the input to this dtype before scanning. By default,
+            integer and boolean inputs are promoted to ``torch.int64``;
+            floating-point and complex inputs keep their dtype.
 
     Returns:
-        torch.Tensor: Tensor with same shape as input containing cumulative product
+        torch.Tensor: Tensor with the same shape as the input, in the scan dtype
 
     See Also:
         - :func:`~helion.language.associative_scan`: For custom scan operations
         - :func:`~helion.language.cumsum`: For cumulative sum
         - :func:`~helion.language.reduce`: For dimension-reducing operations
-
-    Note:
-        - Output has same shape as input
-        - Reverse=True computes cumprod from right to left
-        - Equivalent to torch.cumprod
     """
-    return associative_scan(torch.mul, input_tensor, dim, reverse)
+    return associative_scan(torch.mul, _scan_input(input_tensor, dtype), dim, reverse)
 
 
 @_decorators.api()
