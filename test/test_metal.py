@@ -39,6 +39,7 @@ from helion._compiler.metal.row_reduction_heuristic import MetalRowReductionHeur
 from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
+from helion._testing import skipUnlessBackends
 from helion._testing.metal import addmm_k_loop
 from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
@@ -65,9 +66,11 @@ if sys.platform == "darwin":
     from helion._compiler.metal.metal_jit import _MetalKernel
 
 # Metal runs on macOS only: CI's Linux jobs skip the whole file.
-pytestmark = pytest.mark.skipif(
-    sys.platform != "darwin", reason="Metal tests require macOS"
-)
+# Metal kernels on macOS only: other backends' lanes on a Mac skip the module.
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "darwin", reason="Metal tests require macOS"),
+    skipUnlessBackends(["metal"]),
+]
 
 _requires_darwin = unittest.skipIf(
     sys.platform != "darwin", "Metal tests require macOS"
@@ -820,9 +823,17 @@ class TestMetalMathOps(unittest.TestCase):
 
     def test_float_floor_division(self) -> None:
         """Including the corners Inductor's lowering special-cases: an
-        infinite dividend or divisor, a zero divisor, and NaN."""
-        x = torch.randn(1024, device=DEVICE) * 10
-        y = torch.randn(1024, device=DEVICE)
+        infinite dividend or divisor, a zero divisor, and NaN.  The other
+        inputs are x = (q + j / 8) * y with y = m / 4: every operand is exact
+        in float32 and each quotient lies at least 1/8 from an integer, so
+        both sides floor it alike (random floats put one of 1024 quotients
+        within rounding of an integer in 1 of 60 seeds)."""
+        torch.manual_seed(0)
+        sign = torch.randint(0, 2, (1024,), device=DEVICE) * 2 - 1
+        y = (torch.randint(1, 17, (1024,), device=DEVICE) * sign).float() / 4
+        q = torch.randint(-40, 41, (1024,), device=DEVICE).float()
+        j = torch.randint(1, 8, (1024,), device=DEVICE).float()
+        x = (q + j / 8) * y
         inf, nan = float("inf"), float("nan")
         x[:6] = torch.tensor([inf, -inf, 1.0, -1.0, 3.0, nan])
         y[:6] = torch.tensor([2.0, 3.0, inf, inf, 0.0, 1.0])
@@ -2441,9 +2452,14 @@ class TestMetalScalarDot(unittest.TestCase):
 
     def test_acc_with_other_out_dtype(self) -> None:
         """The product sum is rounded to out_dtype, then added to the acc in
-        the acc's dtype, as Triton does."""
-        x = torch.randn(16, 32, device=DEVICE)
-        y = torch.randn(32, 16, device=DEVICE)
+        the acc's dtype, as Triton does.  The comparison is exact, so the
+        inputs are multiples of 1/8 in [-1, 1]: every product and partial sum
+        is exact in float32, and both sides round the same value to
+        bfloat16 (random floats put a float32 sum, in a different order than
+        the float64 reference's, a bfloat16 step apart in 2 of 60 seeds)."""
+        torch.manual_seed(0)
+        x = torch.randint(-8, 9, (16, 32), device=DEVICE).float() / 8
+        y = torch.randint(-8, 9, (32, 16), device=DEVICE).float() / 8
         out, _ = self._run(dot_acc_bf16_out, (x, y))
         ref = (x.cpu().double() @ y.cpu().double()).float().bfloat16().float()
         torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
@@ -8407,9 +8423,18 @@ class TestMetalLaneFold(unittest.TestCase):
     @_full_threadgroup
     def test_dot_k_beside_a_fold(self) -> None:
         """A row sum folds d's lanes from strategy creation, and the dot over
-        d asks for the fold again."""
-        q = torch.randn(32, 40, device=DEVICE)
-        kt = torch.randn(40, 64, device=DEVICE)
+        d asks for the fold again.
+
+        The kernel rounds its float32 sum of products to bfloat16, the
+        reference a float64 one: where an element lies near a rounding
+        boundary the two land one bfloat16 step apart, past the tolerance
+        (about one draw in 30 of random inputs, so the result depended on the
+        RNG state earlier tests left).  Inputs that are multiples of 1/8 make
+        every product and sum exact in float32, so both round the same
+        value."""
+        torch.manual_seed(0)
+        q = torch.randint(-8, 9, (32, 40), device=DEVICE).float() / 8
+        kt = torch.randint(-8, 9, (40, 64), device=DEVICE).float() / 8
         v = torch.randn(64, 40, device=DEVICE)
         config = helion.Config(block_sizes=[16, 16], num_threads=[4, 16])
         out, _ = self._run(dot_chained_minus_rowsum_bf16, config, (q, kt, v), 3)
