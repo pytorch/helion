@@ -292,6 +292,28 @@ def scale_then_mm(
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def mm_then_scale(
+    x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A dot, then a root of its output: the next launch starts once a worker
+    reaches the second root."""
+    m, k = x.size()
+    _, n = w.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    y = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    hl.pdl_wait()
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        out[tile_m, tile_n] = acc
+    hl.pdl_launch_dependents()
+    for tile_r, tile_c in hl.tile([m, n]):
+        y[tile_r, tile_c] = out[tile_r, tile_c] * 2 + b[tile_r, tile_c]
+    return out, y
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def scale_boxprefetch_mm(
     x: torch.Tensor, w: torch.Tensor, wp: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -509,6 +531,45 @@ def scale_by_last_row(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def ring_mm_in_dry_loop(
+    x: torch.Tensor, xm: torch.Tensor, wm: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A chain of narrow roots (p, q, then e after d) with a ring matmul root
+    between e's anchor and e on e's workers: e's dry-pass loop runs the matmul
+    (a ring root takes its ring step and accumulators from the kernel scope)."""
+    batch, width = x.size()
+    rows, k = xm.size()
+    n = wm.size(1)
+    a = torch.empty_like(x)
+    p = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    q = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    d = torch.empty_like(x)
+    m = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+    side = torch.empty((batch, 8), dtype=torch.float32, device=x.device)
+    e = torch.empty((batch, 4), dtype=torch.float32, device=x.device)
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        a[tile_batch, tile_width] = x[tile_batch, tile_width] + 1
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        p[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        q[row, col] = torch.sum(p[row, :], dim=-1)[:, None]
+    for tile_batch, tile_width in hl.tile([batch, width]):
+        d[tile_batch, tile_width] = (
+            a[tile_batch, tile_width] * torch.sum(q[tile_batch, :], dim=-1)[:, None]
+        )
+    for tile_m, tile_n in hl.tile([rows, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(xm[tile_m, tile_k], wm[tile_k, tile_n], acc=acc)
+        m[tile_m, tile_n] = acc
+    for row, col in hl.tile([batch, 8], block_size=[1, 1]):
+        side[row, col] = torch.sum(a[row, :], dim=-1)[:, None]
+    for row, col in hl.tile([batch, 4], block_size=[1, 1]):
+        e[row, col] = torch.sum(d[row, :], dim=-1)[:, None]
+    return e, m, side
+
+
 def _replay(run: object, inputs: list[tuple[torch.Tensor, ...]]) -> list[object]:
     """``run`` on each input back to back in a CUDA graph, so that each launch
     overlaps the last (PDL)."""
@@ -526,6 +587,53 @@ def _functions(code: str) -> dict[str, str]:
 
 
 class TestGluonRing(TestCase):
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_trigger_between_roots_in_a_ring(self) -> None:
+        """The trigger between the loops runs in the body before the second
+        root's tasks, after its own wait. Back-to-back launches (PDL) stay
+        exact."""
+        x = torch.randn([256, 1024], device=DEVICE, dtype=torch.bfloat16)
+        w = torch.randn([1024, 256], device=DEVICE, dtype=torch.bfloat16)
+        b = torch.randn([256, 256], device=DEVICE, dtype=torch.float32)
+        base = {
+            "block_sizes": [128, 64, 64, 128, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+        }
+        bound = mm_then_scale.bind((x, w, b))
+        slots = len(bound.config_spec.range_warp_specialize)
+        ring = {
+            **base,
+            "num_stages": 2,
+            "cross_loop_pipeline": "static",
+            "range_warp_specializes": [None] * (slots - 1) + [True],
+        }
+        code, results = code_and_output(mm_then_scale, (x, w, b), **ring)
+        static = bound.compile_config(
+            helion.Config(**base, cross_loop_pipeline="static")
+        )
+        for result, expected in zip(results, static(x, w, b), strict=True):
+            torch.testing.assert_close(result, expected, atol=0, rtol=0)
+        functions = _functions(code)
+        # Only the body triggers.
+        for name, function in functions.items():
+            if "_producer" in name:
+                self.assertNotIn("gdc_launch_dependents", function)
+        body = functions["_helion_mm_then_scale_body"]
+        trigger = body.index("gdc_launch_dependents()")
+        self.assertLess(body.index("_launch("), trigger)
+        self.assertLess(body.index("x_ring_desc, ("), trigger)
+        self.assertLess(trigger, body.index("b_ring_desc, ("))
+        self.assertEqual(code.count("gdc_launch_dependents()"), 1)
+        inputs = [(x + launch, w, b) for launch in range(4)]
+        replayed = _replay(bound.compile_config(helion.Config(**ring)), inputs)
+        for got, args in zip(replayed, inputs, strict=True):
+            for result, expected in zip(got, static(*args), strict=True):
+                torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
     @skipIfRefEager("checks generated code")
     @skipUnlessGluon()
     def test_dot(self) -> None:

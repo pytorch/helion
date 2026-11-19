@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterable
     from collections.abc import Iterator
+    from collections.abc import Set as AbstractSet
 
     from ...runtime.config import Config
     from ..device_function import DeviceBodyContext
@@ -2127,15 +2128,19 @@ def _orders(
     device_function: DeviceFunction,
     statement: ast.stmt,
     accesses: frozenset[int] | None,
+    named: AbstractSet[int],
     publishes: bool = False,
 ) -> bool:
     """Whether a dependency wait orders an access of ``accesses`` (None: any) or,
-    for the body (``publishes``), a barrier publication."""
+    for the body (``publishes``), a barrier publication.  A wait covering an
+    allocation no tensor argument names (``named``: the arguments'
+    allocations) orders every access (``_covering``)."""
     roles = device_function.sync_roles
     return any(
         accesses is None
-        or (role := roles[name]).covers is None
-        or role.covers & accesses  # pyrefly: ignore [unsupported-operation]
+        or (covers := (role := roles[name]).covers) is None
+        or not covers <= named
+        or covers & accesses
         or (publishes and role.publication)
         for name in _all_names([statement]) & device_function.sync_names("wait")
     )
@@ -2147,6 +2152,7 @@ def _without_waits(
     """The body without the waits ordering none of the accesses that may follow
     (``after``: those past this block) nor a barrier publication."""
     allocations = _argument_allocations(df)
+    named = frozenset(allocations.values())
     waits = df.sync_names("wait")
     later = [after]  # later[i]: the allocations body[i:] (or ``after``) access
     for statement in reversed(body):
@@ -2155,7 +2161,7 @@ def _without_waits(
     kept: list[ast.stmt] = []
     for index, statement in enumerate(body):
         if _is_wait(statement, waits) and not isinstance(statement, ast.If):
-            if _orders(df, statement, later[index + 1], publishes=True):
+            if _orders(df, statement, later[index + 1], named, publishes=True):
                 kept.append(statement)
         else:
             # A loop's next iterations follow the waits in its body.
@@ -2354,6 +2360,8 @@ class _Slice:
         self.weights = not gated and bool(puts)
         # The allocations whose reads' waits a gated producer keeps (None: all).
         self.reads: frozenset[int] | None = None
+        # The allocations the tensor arguments name (``_orders``).
+        self.named = frozenset(_argument_allocations(device_function).values())
         self.mma = mma or set()
         self.claims = claims
         self.scheduled = set(device_function.sync_roles)
@@ -2379,7 +2387,7 @@ class _Slice:
                 and later
                 and not isinstance(statement, ast.If)
                 and _is_wait(statement, self.waits)
-                and _orders(self.device_function, statement, self.reads)
+                and _orders(self.device_function, statement, self.reads, self.named)
             ):
                 live |= _names(statement) - _stored_names([statement])
                 kept.append(_scalar_form(statement, self.device_function.sync_roles))

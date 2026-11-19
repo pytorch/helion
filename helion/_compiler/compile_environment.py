@@ -1052,6 +1052,9 @@ class CompileEnvironment:
         # hl.pdl_* ops in source order, run at kernel entry or exit.
         self.pdl_entry: list[str] = []
         self.pdl_exit: list[str] = []
+        # The root a trigger between top-level loops precedes (it also stays in
+        # ``pdl_exit``, where a kernel that cannot place it runs it).
+        self.pdl_trigger_root: int | None = None
         # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
         self.prefetch_code: bool = False
 

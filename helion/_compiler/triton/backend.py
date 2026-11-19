@@ -148,6 +148,15 @@ class TritonBackend(Backend):
     def orders_overlapping_inputs(self) -> bool:
         return True
 
+    @property
+    def intra_loop_barriers_order_reads(self) -> bool:
+        return True
+
+    @property
+    def intra_loop_barriers_order_flat_loads(self) -> bool:
+        # The packed-load codegen places the barrier (``quantized_ops.py``).
+        return True
+
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
         # Triton branches are uniform per program, so the barrier is always
         # placeable.
@@ -1049,6 +1058,22 @@ class TileIRBackend(TritonBackend):
         return False
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
+        return False
+
+    @property
+    def intra_loop_barriers_order_reads(self) -> bool:
+        # No barrier walk runs here: the write hazards would only pin loops
+        # out of ``range_warp_specialize``.
+        return False
+
+    @property
+    def intra_loop_barriers_carry_iterations(self) -> bool:
+        # Likewise for the hazards carried across iterations.
+        return False
+
+    @property
+    def intra_loop_barriers_order_flat_loads(self) -> bool:
+        # And for the packed quantized loads.
         return False
 
     @property

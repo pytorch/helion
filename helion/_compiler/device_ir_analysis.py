@@ -229,6 +229,17 @@ TENSOR_ROUTING_OPS = (
     hl.prefetch,
 )
 
+# Ops that keep a prefetching root's loads ordered although they touch no
+# memory: any loop (conservatively: its loads may decide the trip count), a
+# print or breakpoint that shows them.
+_HINT_BREAKING_OPS = (
+    _tracing_ops._for_loop,
+    _tracing_ops._for_loop_step,
+    _tracing_ops._while_loop,
+    hl.device_print,
+    hl.breakpoint,
+)
+
 
 def _may_access_memory_unseen(node: torch.fx.Node, state: CompilerState) -> bool:
     """Whether a side-effecting Helion op or an op on symmetric memory hides accesses."""
@@ -1763,9 +1774,10 @@ class DeviceIRAnalysis:
         """Record allocation-coordinate accesses used for cross-root scheduling."""
         from ..language import memory_ops
         from ..language.atomic_ops import ATOMIC_OPS
-        from ..language.quantized_ops import load_bfloat16_x16_to_float16
-        from ..language.quantized_ops import load_float4_e2m1fn_x16_to_float16
+        from ..language.reduce_ops import _reduce
+        from ..language.scan_ops import _associative_scan
         from .device_ir import memory_op_slots
+        from .loop_dependency_checker import flat_offset_loads
         from .tile_dependency import TileAccess
         from .tile_dependency import owner_roots_by_graph_id
 
@@ -1773,9 +1785,79 @@ class DeviceIRAnalysis:
             return ()
         # Loads of the tensor they are passed at flat offsets (a footprint of
         # the whole tensor), not memory ops of the indexing config.
-        flat_loads = (load_float4_e2m1fn_x16_to_float16, load_bfloat16_x16_to_float16)
+        flat_loads = flat_offset_loads()
 
         graph_owners = owner_roots_by_graph_id(device_ir)
+
+        def owners_of(graph_id: int) -> tuple[int, ...]:
+            return graph_owners[graph_id] if graph_id < len(graph_owners) else ()
+
+        # A root whose only effects are prefetches warms caches and nothing
+        # else: when its loads only steer prefetch addresses (a newer value
+        # warms another line and changes no result), later writes need not
+        # wait for them (``TileAccess.hint``).  So a root with a loop, a print
+        # or an effect is no such root, nor one where a loaded value reaches a
+        # load's operands (an index, a mask: a stale or newer value could make
+        # it read out of bounds) or a load sits in a branch (its condition may
+        # be such a value).
+        prefetching = {
+            root
+            for graph_analysis in self.graphs
+            if any(
+                node.op == "call_function" and node.target is memory_ops.prefetch
+                for node in graph_analysis.nodes
+            )
+            for root in owners_of(graph_analysis.graph_id)
+        }
+        combine_callers = {
+            node.args[0]: graph_analysis.graph_id
+            for graph_analysis in self.graphs
+            for node in graph_analysis.nodes
+            if node.op == "call_function"
+            and node.target in (_reduce, _associative_scan)
+        }
+
+        def hint_owners_of(graph_id: int) -> tuple[int, ...]:
+            # A reduction's or scan's combine function is a graph no loop
+            # owns: it runs in the roots that call it.
+            while graph_id in combine_callers:
+                graph_id = combine_callers[graph_id]
+            return owners_of(graph_id)
+
+        effectful: set[int] = set()
+        if prefetching:
+            for graph_analysis in self.graphs:
+                owners = hint_owners_of(graph_analysis.graph_id)
+                if not prefetching.intersection(owners):
+                    continue
+                for node in graph_analysis.nodes:
+                    if node.op == "call_function" and (
+                        node.target in _HINT_BREAKING_OPS
+                        or _may_access_memory_unseen(node, host.compiler_state)
+                    ):
+                        effectful.update(owners)
+                        break
+
+        def steers_only(root: int) -> bool:
+            top = device_ir.root_ids[root]
+            loaded: set[torch.fx.Node] = set()
+            for graph_analysis in self.graphs:
+                graph_id = graph_analysis.graph_id
+                if root not in hint_owners_of(graph_id):
+                    continue
+                for node in graph_analysis.nodes:
+                    if node.op != "call_function":
+                        continue
+                    reads = node.all_input_nodes
+                    if node.target is memory_ops.load or node.target in flat_loads:
+                        if graph_id != top or not loaded.isdisjoint(reads):
+                            return False
+                        loaded.add(node)
+                    elif graph_id == top and not loaded.isdisjoint(reads):
+                        loaded.add(node)
+            return True
+
+        hint_roots = {root for root in prefetching - effectful if steers_only(root)}
         allocation_ids: dict[torch.UntypedStorage, int] = {}
         accesses: list[TileAccess] = []
         # The indexing slot of each load and store: codegen numbers them in
@@ -1916,11 +1998,7 @@ class DeviceIRAnalysis:
                     and len(node.args) > (2 if is_load else 3)
                     and node.args[2 if is_load else 3] is not None
                 )
-                owner_roots = (
-                    graph_owners[graph_analysis.graph_id]
-                    if graph_analysis.graph_id < len(graph_owners)
-                    else ()
-                )
+                owner_roots = owners_of(graph_analysis.graph_id)
                 if owner_roots:
                     node.meta[TILE_ACCESS_META] = tuple(
                         range(len(accesses), len(accesses) + len(owner_roots))
@@ -1955,6 +2033,7 @@ class DeviceIRAnalysis:
                             layout_is_symbolically_exact=layout_is_symbolically_exact,
                             graph_node_index=graph_node_index,
                             affine_subscript_ranges=affine_subscript_ranges,
+                            hint=is_load and owner_root in hint_roots,
                         )
                     )
 

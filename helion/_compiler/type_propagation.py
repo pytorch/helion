@@ -1668,11 +1668,13 @@ def _count_dims_in_subscript(elts: list[ast.expr]) -> int:
     )
 
 
-def _is_barrier_stmt(statement: ast.stmt) -> bool:
+def _is_op_stmt(statement: ast.stmt, result_types: tuple[type[TypeInfo], ...]) -> bool:
+    """Whether ``statement`` is a bare call of an op returning one of
+    ``result_types`` (e.g. ``hl.barrier()``)."""
     if isinstance(statement, ast.Expr):
         value = statement.value
         type_info = getattr(value, "_type_info", None)
-        return isinstance(type_info, BarrierResultType)
+        return isinstance(type_info, result_types)
     return False
 
 
@@ -1691,7 +1693,8 @@ def _create_type_propagation(func: HostFunction) -> TypePropagation:
 
 
 def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
-    """Raise if non-barrier host statements appear between top-level for-loops."""
+    """Raise if host statements other than barriers and PDL ops (which
+    ``_place_pdl_ops`` places) appear between top-level for-loops."""
     seen_loop = False
     host_stmt_after_loop = False
     for stmt in body:
@@ -1700,19 +1703,24 @@ def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
                 # TODO(oulgen): This check is too coarse, refine it.
                 raise exc.TopLevelStatementBetweenLoops
             seen_loop = True
-        elif seen_loop and not _is_barrier_stmt(stmt):
+        elif seen_loop and not _is_op_stmt(stmt, (BarrierResultType, PdlResultType)):
             host_stmt_after_loop = True
 
 
 def _place_pdl_ops(body: list[ast.stmt]) -> None:
     """Run top level hl.pdl_* ops at entry if they precede the loops, else at
-    exit; hl.prefetch_code() marks the kernel (entry only)."""
+    exit; hl.prefetch_code() marks the kernel (entry only).  A trigger between
+    grid loops also records the root of the next one (``pdl_trigger_root``),
+    where a persistent megakernel places it instead of at exit."""
     env = CompileEnvironment.current()
+    roots = [
+        (index, stmt._root_id)
+        for index, stmt in enumerate(body)
+        if isinstance(stmt, ExtendedAST) and stmt._loop_type == LoopType.GRID
+    ]
     seen_loop = False
-    for stmt in body:
-        if isinstance(stmt, ast.For):
-            seen_loop = True
-            continue
+    trigger_root = None
+    for index, stmt in enumerate(body):
         ops = [
             node
             for node in ast.walk(stmt)
@@ -1720,15 +1728,26 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
             and isinstance(node, ExtendedAST)
             and isinstance(node._type_info, PdlResultType)
         ]
+        # A nested op (under a host if or inside a loop) would silently not run.
+        if ops and (not isinstance(stmt, ast.Expr) or ops != [stmt.value]):
+            raise exc.PdlPlacement
+        if isinstance(stmt, ast.For):
+            # A host loop is no root: an op after it still runs at entry.
+            seen_loop = seen_loop or any(at == index for at, _ in roots)
+            continue
         if not ops:
             continue
-        # A nested op (e.g. under a host if) would silently not run.
-        if not isinstance(stmt, ast.Expr) or ops != [stmt.value]:
-            raise exc.PdlPlacement
         op = ops[0]._type_info
         assert isinstance(op, PdlResultType) and isinstance(op.value, str)
         if seen_loop and op.value in ("wait", "prefetch_code"):
             raise exc.PdlPlacement
+        later = next((root for at, root in roots if at > index), None)
+        between = op.value == "launch_dependents" and seen_loop and later is not None
+        if between:
+            # Checked on every target: what compiles here compiles anywhere.
+            if trigger_root is not None:
+                raise exc.PdlPlacement
+            trigger_root = later
         if op.value == "prefetch_code":
             # The cubin pass resolves sm_90+ relocations (``.rela.nv.global.init``;
             # older targets emit ``.rel``): elsewhere the kernel is not marked.
@@ -1740,6 +1759,8 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
         if capability is not None and capability >= (9, 0):
             (env.pdl_exit if seen_loop else env.pdl_entry).append(op.value)
             env.config_spec.has_explicit_pdl = True
+            if between:
+                env.pdl_trigger_root = trigger_root
 
 
 def propagate_types(func: HostFunction) -> None:

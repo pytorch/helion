@@ -1214,6 +1214,11 @@ class ConfigSpec:
         # Whether a cross-rank dependency transports a scatter in band: its
         # guard-skipped tasks need static or claimed (gluon ring) roots.
         self.inband_scatter: bool = False
+        # Set when a later write overlaps a load of a prefetch-only root that
+        # it no longer waits for: if that leaves no dependency (no
+        # cross_loop_pipeline), a config saved before still loads (normalize
+        # ignores the key).
+        self.cross_loop_pipeline_retired: bool = False
         # Whether the kernel runs several phases in one persistent launch
         # (``hl.barrier()`` or an implicit cross-root dependency).
         self.multi_phase: bool = False
@@ -2233,6 +2238,23 @@ class ConfigSpec:
         ):
             if _fix_invalid:
                 config.pop("cross_loop_pipeline", None)
+            elif self.cross_loop_pipeline_retired:
+                pipeline = config.pop("cross_loop_pipeline")
+                # Without the pipeline, cross_loop_tmem_prefetch has no
+                # candidates either (the other pipeline keys are dropped where
+                # they are normalized).
+                dropped = ""
+                if self.supports_config_key("cross_loop_tmem_prefetch") and (
+                    config.pop("cross_loop_tmem_prefetch", None) is not None
+                ):
+                    dropped = " and its cross_loop_tmem_prefetch"
+                log.warning(
+                    "Ignoring cross_loop_pipeline=%r%s: this kernel no longer "
+                    "has cross-loop dependencies (its prefetch-only roots' loads "
+                    "order no later write)",
+                    pipeline,
+                    dropped,
+                )
             else:
                 raise InvalidConfig(
                     "cross_loop_pipeline is available only for kernels "
@@ -4286,9 +4308,11 @@ class RangeUnrollFactorSpec(_OptionalIntSpec):
 
 class RangeWarpSpecializeSpec(_OptionalBoolSpec):
     # Set by ``lower_to_device_ir`` (``intra_loop_raw_reread_block_ids``) for
-    # a loop whose region stores and then re-reads the same storage: Triton's
-    # warp specialization splits such a body across partitions and the
-    # re-read observes stale memory.  The slot stays, so the config shape
+    # a loop whose region stores and then re-reads the same storage (also in a
+    # later iteration), or with ``Backend.intra_loop_barriers_order_reads``
+    # reads or stores and then overwrites it: Triton's warp specialization
+    # splits such a body across partitions and the barrier between the two
+    # accesses no longer orders them.  The slot stays, so the config shape
     # does not depend on the analysis, but its value is pinned to None.
     pinned: bool = False
 
