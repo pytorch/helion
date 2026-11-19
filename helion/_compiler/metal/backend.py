@@ -348,13 +348,17 @@ def _loop_bounds(device_ir: DeviceIR) -> dict[int, tuple[object, object]]:
 def _staged_matmuls(plan: MppPlan) -> tuple[tuple[int, int, int], ...]:
     """``MetalKernelFacts.staged_matmuls``: the MPP plan's K-loop groups
     with one operand staged per K tile beside a device view."""
+    from .mpp_matmul import is_tile_product
+
     found = []
     for group in plan.by_matmul.values():
         per_tile = [
             op.staged and op.hoist is None and op.elements is None
             for op in (group.lhs, group.rhs)
         ]
-        if not group.levels or per_tile.count(True) != 1:
+        # A per-K-tile product's op runs once per K tile as an
+        # accumulator's does, staging its operand per tile the same way.
+        if not (group.levels or is_tile_product(group)) or per_tile.count(True) != 1:
             continue
         if per_tile[1] and group.lhs.view is not None:
             found.append((group.m_block, group.n_block, group.k_block))

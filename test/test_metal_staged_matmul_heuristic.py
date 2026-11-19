@@ -42,6 +42,29 @@ def dequant_lhs(wq: torch.Tensor, s: torch.Tensor, y: torch.Tensor) -> torch.Ten
 
 
 @helion.kernel(**S)
+def w4a8_group_products(
+    xq: torch.Tensor, wq: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """W4A8's per-K-tile int8 products, each scaled into a float carry
+    (int32 products, so read through their materialization, no fold), with
+    the 4-bit weights unpacked into a staged int8 rhs."""
+    m, k = xq.size()
+    n = wq.size(1)
+    out = torch.empty([m, n], dtype=F32, device=xq.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k, block_size=32):
+            byte = wq[tile_k.index // 2, tile_n].to(torch.int32)
+            nib = (byte >> ((tile_k.index % 2) * 4)[:, None]) & 0xF
+            d = hl.dot(
+                xq[tile_m, tile_k], (nib - 8).to(torch.int8), out_dtype=torch.int32
+            )
+            acc = acc + d.to(F32) * s[tile_k.begin // 32, tile_n]
+        out[tile_m, tile_n] = acc
+    return out
+
+
+@helion.kernel(**S)
 def dequant_gate_up(
     x: torch.Tensor,
     wq: torch.Tensor,
@@ -115,6 +138,18 @@ class TestStagedMatmulSeeds(unittest.TestCase):
         ]
         self.assertEqual(planted, expected)
         self.assertEqual(spec.default_config().config["block_sizes"], [16, 16, 16])
+
+    def test_per_tile_product(self) -> None:
+        """A per-K-tile product stages its operand per K tile as an
+        accumulator's op does, whether or not a fold keeps its carry: W4A8's
+        float carry of int32 products has none."""
+        args = (
+            torch.randint(-127, 128, (64, 256), dtype=torch.int8),
+            torch.randint(0, 256, (128, 512), dtype=torch.uint8),
+            torch.rand(8, 512),
+        )
+        spec = w4a8_group_products.bind(args).config_spec
+        self.assertEqual(kernel_facts(spec).staged_matmuls, ((0, 1, 2),))
 
     def test_tall_block_follows_the_extent(self) -> None:
         """40 rows take a 64-row block at 2 SIMD groups; a staged lhs makes
