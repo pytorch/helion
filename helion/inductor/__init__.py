@@ -14,7 +14,13 @@ with Halide.
 Helion compiles and autotunes each kernel on its first call; its errors are not
 caught, so they fail the compile or that call. Needs the Inductor of torch 2.16
 (nightly), and for matmuls InductorChoices.use_native_matmul
-(pytorch/pytorch#204025)."""
+(pytorch/pytorch#204025).
+
+The package follows Inductor's stages: fx_passes/ rewrites the post-grad FX
+graph (HelionPostGradPass), choices.py holds the heuristics Inductor asks while
+lowering, fusing and generating code (HelionChoices), and codegen/ turns the
+fused nodes into Helion kernels (HelionScheduling, HelionKernel,
+HelionOverrides)."""
 
 from __future__ import annotations
 
@@ -38,12 +44,12 @@ from torch._inductor.codegen import common
 
 from . import config
 from .choices import HelionChoices
-from .kernel import HelionKernel
-from .overrides import HelionOverrides
-from .overrides import HelionPrinter
-from .passes import HelionPostGradPass
-from .scheduling import HelionScheduling
-from .scheduling import Unsupported
+from .codegen.kernel import HelionKernel
+from .codegen.overrides import HelionOverrides
+from .codegen.overrides import HelionPrinter
+from .codegen.scheduling import HelionScheduling
+from .codegen.scheduling import Unsupported
+from .fx_passes.post_grad import HelionPostGradPass
 
 __all__ = [
     "HelionChoices",

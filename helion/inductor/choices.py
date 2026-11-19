@@ -7,9 +7,9 @@ from torch._inductor import config as inductor_config
 from torch._inductor.choices import InductorChoices
 
 from . import config
-from .scheduling import MATMUL_DTYPES
-from .scheduling import numerics_modes
-from .scheduling import python_wrapper
+from .support import MATMUL_DTYPES
+from .support import numerics_modes
+from .support import python_wrapper
 
 if TYPE_CHECKING:
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures

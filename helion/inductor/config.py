@@ -43,9 +43,16 @@ autotune_effort: Literal["none", "quick", "full"] = _env_get_literal(
 fast_math: bool = False
 
 
+def _source_files() -> list[pathlib.Path]:
+    """Every module of helion.inductor, those in codegen/ and fx_passes/
+    included: a glob of the package's top level alone would leave
+    codegen/kernel.py out of the cache key, and a graph compiled before a change
+    to it would keep the output code the old one generated."""
+    return sorted(pathlib.Path(__file__).parent.rglob("*.py"))
+
+
 def _hash_sources() -> str:
-    package = pathlib.Path(__file__).parent
-    files = sorted(package.glob("*.py"))
+    files = _source_files()
     return hashlib.sha256(b"".join(path.read_bytes() for path in files)).hexdigest()
 
 
