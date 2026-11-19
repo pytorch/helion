@@ -1170,6 +1170,44 @@ class TestPallasJaggedCarryRejects(TestCase):
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedAutotuneViability(TestCase):
+    """``autotune_config_is_viable`` filters out candidate configs whose grid
+    size or static loop trip counts exceed compile-time caps (e.g. >16 steps
+    for ``unroll``, >64 stages for the low-level ``emit_pipeline`` scheduler).
+
+    On ``jagged_dense_bmm`` (``hl.grid`` over groups, data-dependent row tile
+    ``hl.tile(s, e)`` with fallback ``size_hint=8192``, and static ``K=4096``,
+    ``D=128`` tiles), untuned ``hl.grid`` axes must not ``KeyError`` when
+    counting grid programs, and the row tile's ``8192`` placeholder must not
+    trip the inner-loop step caps while static ``K``/``D`` tiles still do.
+    """
+
+    def test_grid_and_jagged_rows(self) -> None:
+        args = _inputs([0, 13, 25], 128, 4096, torch.bfloat16)
+        spec = jagged_dense_bmm.bind(args).config_spec
+
+        def viable(
+            block_sizes: list[int], loop_type: str, *, low_level: bool = False
+        ) -> bool:
+            config = helion.Config(
+                block_sizes=block_sizes,
+                pallas_loop_type=loop_type,
+                pallas_use_low_level_scheduler=low_level,
+            )
+            return spec.backend.autotune_config_is_viable(spec, config)
+
+        # block_sizes = [st, kt, dt] with K = 4096, D = 128:
+        # - hl.grid has no BlockSizeSpec (previously raised KeyError).
+        self.assertTrue(viable([16, 128, 128], "fori_loop"))
+        # - kt takes 4096 / 128 = 32 <= 64 stages; st's 8192 hint is ignored.
+        self.assertTrue(viable([16, 128, 128], "emit_pipeline", low_level=True))
+        # - kt takes 4096 / 256 = 16 <= 16 unroll steps; 4096 / 128 = 32 > 16.
+        self.assertTrue(viable([16, 256, 128], "unroll"))
+        self.assertFalse(viable([16, 128, 128], "unroll"))
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasPartialSlice(TestCase):
     """Static bounded slices (``[:n]`` / ``[n:]``) on untiled dims."""
 
