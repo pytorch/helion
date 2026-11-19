@@ -2583,50 +2583,6 @@ def if_else_cvt(
 
 
 @helion.kernel(**S)
-def while_before_cvt(
-    x: torch.Tensor, y: torch.Tensor, d: torch.Tensor, cnt: torch.Tensor
-) -> torch.Tensor:
-    """A conversion inside a while loop before the K loop."""
-    m, k = x.shape
-    _, n = y.shape
-    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
-    for tm, tn in hl.tile([m, n]):
-        ef = hl.zeros([tm], dtype=torch.float32)
-        i = cnt[0]
-        while i > 0:
-            ef = ef + torch.exp(d[tm] - 1.0).to(x.dtype).to(torch.float32)
-            i = i - 1
-        acc = hl.zeros([tm, tn], dtype=torch.float32)
-        for tk in hl.tile(k):
-            a = (ef[:, None] + hl.zeros([tm, tk], dtype=torch.float32)).to(x.dtype)
-            acc = torch.addmm(acc, a, y[tk, tn])
-        out[tm, tn] = acc
-    return out
-
-
-@helion.kernel(**S)
-def while_pre_cvt(
-    x: torch.Tensor, y: torch.Tensor, d: torch.Tensor, cnt: torch.Tensor
-) -> torch.Tensor:
-    """The K loop inside a while loop, from a conversion before both."""
-    m, k = x.shape
-    _, n = y.shape
-    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
-    for tm, tn in hl.tile([m, n]):
-        eb = torch.exp(d[tm] - 1.0).to(x.dtype)
-        i = cnt[0]
-        while i > 0:
-            acc = hl.zeros([tm, tn], dtype=torch.float32)
-            for tk in hl.tile(k):
-                z = hl.zeros([tm, tk], dtype=torch.float32)
-                a = (eb.to(torch.float32)[:, None] + z).to(x.dtype)
-                acc = torch.addmm(acc, a, y[tk, tn])
-            out[tm, tn] = acc
-            i = i - 1
-    return out
-
-
-@helion.kernel(**S)
 def maxdim_pre(x: torch.Tensor, y: torch.Tensor, d2: torch.Tensor) -> torch.Tensor:
     """A row maximum by ``torch.max`` over a dim, a node with two outputs."""
     m, k = x.shape
@@ -3060,8 +3016,8 @@ def mat_carry_cvt_rev(
 
 
 _NOT_RELOADED = (
-    "a bfloat MPP operand staged inside a while loop, or over a K held as "
-    "per-thread parts, from a value the loop does not reload every iteration"
+    "a bfloat MPP operand staged over a K held as per-thread parts, from a "
+    "value the loop does not reload every iteration"
 )
 #: 64 lane copies of the staging writes in a K loop.
 JAM64 = helion.Config(block_sizes=[128, 16, 16], num_threads=[2, 2, 8])
@@ -3896,24 +3852,6 @@ def tif_all(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
                 for tk in hl.tile(k):
                     acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
                 out[tm, tn] = acc
-    return out
-
-
-@helion.kernel(**S)
-def while_tensor(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    """The K loop in a while on a per-element condition."""
-    m, k = x.size()
-    _, n = y.size()
-    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
-    for _g in hl.grid(1):
-        for tm, tn in hl.tile([m, n]):
-            v = c[tm, tn]
-            while v > 0:
-                acc = hl.zeros([tm, tn], dtype=torch.float32)
-                for tk in hl.tile(k):
-                    acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
-                out[tm, tn] = acc
-                v = v - 1.0
     return out
 
 
@@ -5558,8 +5496,9 @@ class TestMppFloatStagingRejects(_FloatStagingCase):
 
     def test_not_followed(self) -> None:
         """A value made by a for loop before the K loop or inside it, with or
-        without a conversion, by an if, by a while loop, entering a while
-        loop, or by a node with two outputs."""
+        without a conversion, by an if, or by a node with two outputs.  (A
+        while loop's are refused before the planner sees them, as a device
+        while: test_metal_reduction_extents.py::test_device_while_refused.)"""
         x, y, d = self.x, self.y, self.d
         one = torch.tensor([1], device=DEVICE, dtype=torch.int32)
         c = torch.zeros(1, device=DEVICE)
@@ -5568,8 +5507,6 @@ class TestMppFloatStagingRejects(_FloatStagingCase):
             (inner_loop_cvt, (x, y, d, c), "the output of _for_loop"),
             (loop_pre_nocvt, (x, y, d, c), "the output of _for_loop"),
             (if_else_cvt, (x, y, d, one), "the output of _if"),
-            (while_before_cvt, (x, y, d, one), "the output of _while_loop"),
-            (while_pre_cvt, (x, y, d, one), "a while loop's input"),
         ):
             self._rejects_at(kernel, args, (None,), f"from {source}, {_NOT_FOLLOWED}")
         self._rejects_at(
@@ -6159,9 +6096,11 @@ class TestMppConversionRejects(_MppCase):
 
     def test_divergent_control_flow(self) -> None:
         """A cooperative op needs every thread, so it may not sit under a
-        per-element if or while."""
-        msg = "under an if or a while on a per-element predicate"
-        for kernel in (tif_k, tif_all, while_tensor):
+        per-element if.  (One under a while is refused before the planner
+        sees it, as a device while: test_metal_reduction_extents.py::
+        test_device_while_refused.)"""
+        msg = "under an if on a per-element predicate"
+        for kernel in (tif_k, tif_all):
             self._rejects(kernel, (self.x, self.y, self.c), TILE16, msg)
 
     def test_levels(self) -> None:
@@ -8758,20 +8697,6 @@ def load_in_if(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(**S)
-def while_staged(x: torch.Tensor, y: torch.Tensor, cnt: torch.Tensor) -> torch.Tensor:
-    m, _ = x.shape
-    n, _ = y.shape
-    out = torch.zeros([m, n], dtype=torch.float32, device=x.device)
-    for tm, tn in hl.tile([m, n]):
-        i = cnt[0]
-        while i > 0:
-            acc = hl.zeros([tm, tn], dtype=torch.float32)
-            out[tm, tn] = out[tm, tn] + torch.addmm(acc, x[tm, :] * 0.5, y[tn, :].T)
-            i = i - 1
-    return out
-
-
-@helion.kernel(**S)
 def kb_colon_n_lhs(x: torch.Tensor, y: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
     """Every K iteration stages ``d[tm]`` broadcast over the K tile."""
     m, k = x.shape
@@ -9477,12 +9402,14 @@ class TestMppColonSlicesRejects(_MppCase):
         torch.manual_seed(0)
 
     def test_staged_in_loop(self) -> None:
-        """A bfloat operand of an op over a ':' K staged inside a for or
-        while loop from a value the loop doesn't reload, and not staged
-        before the loop: computed in bfloat from a carry or a loop offset, in
-        a loop that runs in another loop, or inside a while loop.  Each
-        config but those of ``nest_colon`` and ``while_staged`` is one where
-        the form, admitted with its bfloat math, miscompiled."""
+        """A bfloat operand of an op over a ':' K staged inside a for loop
+        from a value the loop doesn't reload, and not staged before the loop:
+        computed in bfloat from a carry or a loop offset, or in a loop that
+        runs in another loop.  Each config but that of ``nest_colon`` is one
+        where the form, admitted with its bfloat math, miscompiled.  (One
+        staged inside a while loop is refused before the planner sees it, as
+        a device while: test_metal_reduction_extents.py::
+        test_device_while_refused.)"""
         bf = torch.bfloat16
         q = torch.randn(48, 128, device=DEVICE, dtype=bf)
         k = torch.randn(40, 128, device=DEVICE, dtype=bf)
@@ -9493,14 +9420,6 @@ class TestMppColonSlicesRejects(_MppCase):
             (nest_colon, (q, k), (None,), "mul.Tensor"),
         ):
             self._rejects_at(kernel, args, configs, f"{_COMPUTED} {op} that")
-        x = torch.randn(48, 64, device=DEVICE, dtype=bf)
-        y = torch.randn(40, 64, device=DEVICE, dtype=bf)
-        self._rejects_at(
-            while_staged,
-            (x, y, torch.tensor([2], device=DEVICE, dtype=torch.int32)),
-            (None,),
-            _NOT_RELOADED,
-        )
 
     def test_flattened_tile(self) -> None:
         """A single root ``hl.tile`` with no device loop inside as M: its

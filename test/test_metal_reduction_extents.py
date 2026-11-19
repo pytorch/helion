@@ -318,3 +318,29 @@ def test_rolled_reduction_under_an_if_rejected() -> None:
         with pytest.raises(exc.BackendUnsupported, match=match):
             bound.to_code(config)
     scalar.to_code(helion.Config(block_sizes=[16], reduction_loops=[None]))
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def row_sums_while(x: torch.Tensor, n: torch.Tensor) -> torch.Tensor:
+    """``n[0]`` times each row's sum, in a device while on a scalar."""
+    out = torch.zeros([x.size(0)], dtype=x.dtype, device=x.device)
+    for t in hl.tile(x.size(0)):
+        c = hl.load(n, [0])
+        total = hl.zeros([t], dtype=x.dtype)
+        i = torch.zeros([], device=x.device, dtype=torch.int32)
+        while i < c:
+            total = total + x[t, :].sum(-1)
+            i = i + 1
+        out[t] = total
+    return out
+
+
+def test_device_while_refused() -> None:
+    """Metal emits no ``while``: a device while is refused when its device
+    IR is built, at bind time, before any config (the fallback's and the
+    autotuner's included).  The refusal reads no config, so one bind covers
+    every layout; it used to reach the MSL emitter's refusal at the first
+    launch, or an MPP planner refusal of its own."""
+    args = (torch.randn(8, 64), torch.tensor([3], dtype=torch.int32))
+    with pytest.raises(exc.BackendUnsupported, match="a device while loop"):
+        cpu_bind(row_sums_while, args)

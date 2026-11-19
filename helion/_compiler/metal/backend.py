@@ -230,6 +230,27 @@ def _lane_floor(config: Config, device_ir: DeviceIR | None = None) -> int:
     return floor
 
 
+def reject_device_whiles(graphs: Sequence[GraphInfo]) -> None:
+    """Raise ``BackendUnsupported`` for a device ``while`` (``_while_loop``).
+
+    Metal's MSL emitter has no ``while`` statement (``msl_ast_walker`` refuses
+    one when it generates MSL, at the first launch), so the refusal lands as
+    soon as the device IR is built (``rewrite_device_ir``, before Metal's
+    rewrites), where every config sees it, the autotuner and
+    ``MatmulFallback`` included.  No Metal pass after it models a device
+    ``while``."""
+    from ...language._tracing_ops import _while_loop
+
+    for info in graphs:
+        for node in info.graph.find_nodes(op="call_function", target=_while_loop):
+            raise exc.BackendUnsupported(
+                "metal",
+                f"a device while loop ({node.name}): Metal's MSL lowering emits "
+                "no while statement; use a for loop over a bound (hl.tile or "
+                "hl.grid) with an if on the condition",
+            )
+
+
 def blocks_reduced_after_loop(device_ir: DeviceIR) -> set[int]:
     """Tile blocks a reduction contracts outside the loop that walks them."""
     from ..device_ir import ForLoopGraphInfo
@@ -837,6 +858,9 @@ class MetalBackend(Backend):
         device_ir: DeviceIR,
         analysis: DeviceIRAnalysis | None = None,
     ) -> None:
+        if stage is DeviceIRStage.BEFORE_GRAPH_LOWERINGS:
+            # First: no Metal pass models a device while.
+            reject_device_whiles(device_ir.graphs)
         if stage is DeviceIRStage.AFTER_ANALYSIS:
             # Imported here: the backend registry imports this module while
             # compile_environment loads, and grid_budget imports

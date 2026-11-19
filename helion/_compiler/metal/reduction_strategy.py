@@ -68,8 +68,8 @@ if TYPE_CHECKING:
 def check_collective_reached(state: CodegenState, block_id: int) -> None:
     """A reduction over ``block_id`` that combines across threads runs a
     threadgroup collective, whose barriers every thread of the threadgroup
-    must reach: raise ``BackendUnsupported`` for one under an if or a while
-    on a predicate that differs between threads (over a block whose tile
+    must reach: raise ``BackendUnsupported`` for one under an if on a
+    predicate that differs between threads (over a block whose tile
     spreads over threads), where threads would diverge at a barrier.  One
     whose block takes one thread combines in registers."""
     tile_strategy = state.device_function.tile_strategy

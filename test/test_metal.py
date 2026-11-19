@@ -6492,13 +6492,16 @@ class TestMetalPermute(unittest.TestCase):
             (rebound_carry, (x,)),
             (rebound_stepped_carry, (x,)),
             (rebound_second_carry, (x,)),
-            (rebound_while_carry, (x, limit)),
             (rebound_branch_carry, (x, limit)),
         ):
             with self.subTest(kernel=kernel.fn.__name__):
                 self._assert_rejected(
                     kernel, args, config, "support: a control-flow carry"
                 )
+        # A device while is refused when the kernel is bound, before its
+        # carry is looked at.
+        with self.assertRaisesRegex(exc.BackendUnsupported, "a device while loop"):
+            rebound_while_carry.bind((x, limit)).to_code(config)
 
     def test_transposed_mpp_result_store(self) -> None:
         """A K loop's result stored through the ``[tn, tm]`` index of its

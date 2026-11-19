@@ -507,9 +507,9 @@ class Graphs:
     def __init__(self, graphs: list[GraphInfo]) -> None:
         self.graph_id = {g.graph: g.graph_id for g in graphs}
         self.infos = {g.graph_id: g for g in graphs}
-        #: Each while loop's condition and body graphs, to the loop.
-        self.whiles: dict[object, Node] = {}
-        #: Each control-flow graph's owner node and the arguments it passes in.
+        #: Each control-flow graph's owner node and the arguments it passes in
+        #: (a for loop's body, an if's branches: no device while reaches the
+        #: planner, ``backend.reject_device_whiles``).
         self.owners: dict[object, tuple[Node, Sequence[object]]] = {}
         for g in graphs:
             for n in g.graph.nodes:
@@ -518,8 +518,6 @@ class Graphs:
                 elif n.target is _tracing_ops._if:
                     self.owners[n.args[1]] = (n, _seq(n.args[3]))
                     self.owners[n.args[2]] = (n, _seq(n.args[4]))
-                elif n.target is _tracing_ops._while_loop:
-                    self.whiles[n.args[0]] = self.whiles[n.args[1]] = n
 
     def info(self, gid: object) -> GraphInfo:
         """The graph a control-flow node's graph-id argument names."""
@@ -544,10 +542,9 @@ class Graphs:
         """Whether ``graph`` is ``outer`` or runs inside control flow in it."""
         while graph is not outer:
             gid = self.graph_id[graph]
-            node = self.owners[gid][0] if gid in self.owners else self.whiles.get(gid)
-            if node is None:
+            if gid not in self.owners:
                 return False
-            graph = node.graph
+            graph = self.owners[gid][0].graph
         return True
 
     def outer(self, placeholder: Node) -> object:
@@ -843,8 +840,6 @@ def _nested_loads(node: Node, graphs: Graphs) -> list[Node]:
         ids = [node.args[0]]
     elif node.target is _tracing_ops._if:
         ids = [node.args[1], node.args[2]]
-    elif node.target is _tracing_ops._while_loop:
-        ids = [*node.args[:2], *node.args[3:4]]
     else:
         return []
     out: list[Node] = []
@@ -1901,8 +1896,8 @@ def _invariant_cone(
 
 
 _NOT_RELOADED = (
-    "a bfloat MPP operand staged inside a while loop, or over a K held as "
-    "per-thread parts, from a value the loop does not reload every iteration, "
+    "a bfloat MPP operand staged over a K held as per-thread parts, from a "
+    "value the loop does not reload every iteration, "
     "which Metal miscompiles; compute it from loads inside the loop, or use "
     "float16"
 )
@@ -1917,11 +1912,10 @@ def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     float32 tile of the operand's bfloat values, with every conversion
     rounded in integer arithmetic (:func:`_round_conversions`), stays exact
     too, and MPP multiplies it by the other operand's bfloat handle.  The
-    operand of a while loop, or over a factored K, is rejected."""
+    operand over a factored K is rejected."""
     loop = _enclosing_loop(group.matmul.graph, graphs)
     if loop is None:
         return
-    in_for = _tracing_ops.is_for_loop_target(loop.target)
     _, lhs, rhs = matmul_operands(group.matmul)
     for node, operand in ((lhs, group.lhs), (rhs, group.rhs)):
         if (
@@ -1929,15 +1923,12 @@ def _stage_in_float(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
             or operand.hoist is not None
             or operand.elements is not None
             or operand.dtype != torch.bfloat16
-            or (
-                in_for
-                and _reloaded(
-                    node, cast("ForLoopGraphInfo", graphs.info(loop.args[0])), graphs
-                )
+            or _reloaded(
+                node, cast("ForLoopGraphInfo", graphs.info(loop.args[0])), graphs
             )
         ):
             continue
-        if not in_for or group.k_factor != 1:
+        if group.k_factor != 1:
             raise metal_unsupported(_NOT_RELOADED)
         _round_conversions(group.matmul, node, plan, graphs)
         operand.float_tile = True
@@ -1990,10 +1981,10 @@ def _round_conversions(matmul: Node, node: Node, plan: MppPlan, graphs: Graphs) 
     value (:func:`_op_value`), and must see every producer of the value: a
     placeholder leads to the value its for loop or if passes in, a carry to
     its seed and its update, and an input that is neither a tensor nor a
-    scalar (a loop's, an if's or a multi-output node's result), or a while
-    loop's placeholder, raises.  Of the bfloat values it reaches, only a
-    conversion in ``matmul``'s graph and not through a carry is rounded;
-    data moves pass, and every other bfloat value raises.  A float value is
+    scalar (a loop's, an if's or a multi-output node's result) raises.  Of
+    the bfloat values it reaches, only a conversion in ``matmul``'s graph and
+    not through a carry is rounded; data moves pass, and every other bfloat
+    value raises.  A float value is
     computed in float, from its bfloat inputs promoted exactly.
 
     The copy covers every node on a path from a rounded conversion to
@@ -2013,8 +2004,9 @@ def _round_conversions(matmul: Node, node: Node, plan: MppPlan, graphs: Graphs) 
         n, via_carry = item
         if n.op == "placeholder":
             owner = graphs.owner(n)
-            if owner is None:
-                raise _not_followed("a while loop's input")
+            # Every placeholder of a graph under codegen has an owner: no
+            # device while reaches here (``backend.reject_device_whiles``).
+            assert owner is not None, n
             if (
                 _tracing_ops.is_for_loop_target(owner.target)
                 and _carry(n, owner) is not None
@@ -2077,11 +2069,9 @@ def _round_conversions(matmul: Node, node: Node, plan: MppPlan, graphs: Graphs) 
 
 
 def _enclosing_loop(graph: Graph, graphs: Graphs) -> Node | None:
-    """The innermost for or while loop *graph* runs in, or None."""
+    """The innermost for loop *graph* runs in, or None."""
     while True:
         gid = graphs.graph_id[graph]
-        if gid in graphs.whiles:
-            return graphs.whiles[gid]
         if gid not in graphs.owners:
             return None
         owner = graphs.owners[gid][0]
@@ -2766,7 +2756,7 @@ def check_uniform(
     threaded: Callable[[int], bool] | None = None,
 ) -> None:
     """Every thread of the threadgroup reaches ``node``, ``what``: no
-    enclosing if or while tests a per-element predicate.  A cooperative op,
+    enclosing if tests a per-element predicate.  A cooperative op,
     the barriers of a staged tile or a materialization, and a reduction's
     threadgroup collective need all of them.  Checking an op covers its
     group's seed and materializations, which sit in the graphs of its
@@ -2800,16 +2790,11 @@ def check_uniform(
                     or varies(test.meta.get("val"))
                 )
             )
-        elif gid in graphs.whiles:
-            node = graphs.whiles[gid]
-            (output,) = graphs.info(node.args[0]).graph.find_nodes(op="output")
-            (test,) = _seq(output.args[0])
-            per_element = isinstance(test, Node) and varies(test.meta.get("val"))
         else:
             return
         if per_element:
             raise metal_unsupported(
-                f"{what} under an if or a while on a per-element predicate; "
+                f"{what} under an if on a per-element predicate; "
                 "every thread of the threadgroup must reach it"
             )
 
