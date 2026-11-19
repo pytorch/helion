@@ -1059,6 +1059,16 @@ def test_q_block_256_pads_the_step_table() -> None:
     assert plan.max_steps == plan.group * 4
 
 
+def test_bound_under_the_profiler_matches() -> None:
+    """Bound inside a torch.profiler context, whose compile suppresses the
+    shape env's guards, the backward still matches: the BlockMask's block
+    sizes, ``hl.specialize``-d scalar arguments, still fold into the table
+    column index as the literal ``n_begin // 128``."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        bound = _bind(_args(_tensors(), _causal))
+    _match_or_fail(bound)
+
+
 def test_walk_past_the_q_sequence_spans_the_coordinate_tensors() -> None:
     """A walk whose Q tiles reach past the sequence (here a 128-row sequence
     under 256-row blocks) records the rows it spans, and the launcher spans
