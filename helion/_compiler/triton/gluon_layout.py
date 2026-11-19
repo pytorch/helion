@@ -21,11 +21,11 @@ import dataclasses
 import functools
 import itertools
 import math
+from typing import TYPE_CHECKING
 from typing import Any
 
 from torch.utils._pytree import tree_leaves
 from torch.utils._pytree import tree_map
-from triton._utils import apply_with_path
 from triton._utils import get_iterable_path
 from triton.compiler import code_generator
 from triton.experimental import gluon
@@ -35,7 +35,25 @@ from triton.experimental.gluon.language._layouts import SliceLayout
 from triton.experimental.gluon.language._semantic import GluonSemantic
 import triton.language as tl
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 _MAX_DIV = 1 << 62
+
+
+def _apply_with_path(
+    value: Any, fn: Callable[[tuple[int, ...], Any], None], path: tuple[int, ...] = ()
+) -> None:
+    """Call ``fn(path, leaf)`` for each leaf of nested (Triton) tuples.
+
+    ``triton._utils.apply_with_path``, which some Triton 3.9 builds (fbtriton)
+    do not have.
+    """
+    if isinstance(value, (list, tuple, tl.core.tuple, tl.core.tuple_type)):
+        for idx, item in enumerate(value):
+            _apply_with_path(item, fn, (*path, idx))
+    else:
+        fn(path, value)
 
 
 def _pow2_div(v: int) -> int:
@@ -1295,7 +1313,7 @@ def _note_arguments(
                 div = specs.get("tt.divisibility", 1)
                 _STATE[value.handle.id()] = _Meta(ai=_AI((1,), (div,), (1,)))
 
-        apply_with_path(prototype.arg_types, one)
+        _apply_with_path(prototype.arg_types, one)
         return values
 
     prototype.deserialize = note
