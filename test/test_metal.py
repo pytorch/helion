@@ -1377,6 +1377,7 @@ class TestMetalMatmul(unittest.TestCase):
         from helion._compiler.metal.metal_jit import _raise_if_mpp_unsupported_device
 
         with (
+            patch.object(torch.backends.mps, "is_available", return_value=True),
             patch.object(
                 torch._C,
                 "_mps_get_name",

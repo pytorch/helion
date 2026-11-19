@@ -604,6 +604,8 @@ def _threadgroup_buffers(
 
 
 def _raise_if_mpp_unsupported_device() -> None:
+    if not torch.backends.mps.is_available():
+        return
     device_name = torch._C._mps_get_name()  # type: ignore[attr-defined]
     if "paravirtual" in device_name.lower():
         raise exc.BackendUnsupported(
