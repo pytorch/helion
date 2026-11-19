@@ -8,7 +8,9 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch._inductor.decomposition import select_decomp_table
 from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from test.cute_population_contracts import _target
@@ -22,6 +24,7 @@ from helion._compat import supports_tensor_descriptor
 from helion._compat import use_tileir_tunables
 from helion._compiler.cute.backend import CuteBackend
 from helion._compiler.cute.backend import validate_thread_axis_accesses
+from helion._compiler.cute.bounded_gather import integer_bounds
 from helion._testing import DEVICE
 from helion._testing import HALF_DTYPE
 from helion._testing import RefEagerTestBase
@@ -6287,6 +6290,21 @@ def _bounded_gather_codegen(kernel, args):
     return bound, source
 
 
+def _wide_divisor() -> torch.Tensor:
+    """A 0-dim int64 divisor int32 cannot hold (it wraps to 1)."""
+    return torch.full((), 4294967297, dtype=torch.int64)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _clamped_index_gather(x: torch.Tensor, low: hl.constexpr, high: hl.constexpr):
+    """Gathers each row at ``lane + 3`` clamped into ``[low, high]``."""
+    out = torch.empty_like(x)
+    for row in hl.grid(x.size(0)):
+        index = (hl.arange(x.size(1)).long() + 3).clamp(low, high)
+        out[row, :] = torch.gather(x[row, :], -1, index)
+    return out
+
+
 @onlyBackends(["cute"])
 class TestCuteBoundedGatherCPU(TestCase):
     def test_logical_exchange_maps_and_exact_float_payloads(self):
@@ -6339,8 +6357,6 @@ class TestCuteBoundedGatherCPU(TestCase):
                 )
 
     def test_all_exchange_index_range_proofs(self):
-        from helion._compiler.cute.bounded_gather import integer_bounds
-
         graph = torch.fx.Graph()
         fake = torch.empty(1024, dtype=torch.int64)
 
@@ -6482,8 +6498,6 @@ class TestCuteBoundedGatherCPU(TestCase):
                 _bounded_gather_codegen(_bounded_gather_bad, (torch.ones(2, 17), mode))
 
     def test_integer_range_wrap_and_modulo_proofs(self):
-        from helion._compiler.cute.bounded_gather import integer_bounds
-
         for dtype in (torch.int32, torch.int64):
             graph = torch.fx.Graph()
             raw = graph.placeholder("raw")
@@ -6499,6 +6513,75 @@ class TestCuteBoundedGatherCPU(TestCase):
             shift = graph.call_function(torch.ops.aten.sub.Scalar, (modulo, 1))
             shift.meta["val"] = torch.empty(17, dtype=dtype)
             self.assertEqual(integer_bounds(shift), (-1, 15))
+
+    @pytest.mark.cpu_only
+    def test_integer_range_clamp_alpha_and_wrapping_scalar_proofs(self):
+        """The forms tracing with the decompositions leaves: clamp_min /
+        clamp_max for a clamp (``hi`` wins when ``hi < lo``, as in
+        torch.clamp; an unknown value keeps its dtype's range, int16 too),
+        sub.Scalar with its alpha positional, add.Tensor with a keyword
+        alpha; and a divisor int32 cannot hold, a Python int or a
+        0-dim int64 tensor, which eager wraps (int32 q // 4294967297 divides
+        by 1), so it proves nothing (a clamp above it keeps the dtype's
+        range)."""
+        int32_max = torch.iinfo(torch.int32).max
+        cases = [
+            (lambda q, kv, raw: (q - kv).clamp(0, 255), (0, 255)),
+            (lambda q, kv, raw: (q - kv).clamp(0, -1), (-1, -1)),
+            (lambda q, kv, raw: raw.clamp(min=3), (3, int32_max)),
+            (lambda q, kv, raw: raw.to(torch.int16).clamp(min=3), (3, 32767)),
+            (lambda q, kv, raw: q.clamp(max=100), (0, 100)),
+            (lambda q, kv, raw: torch.clamp(q - kv, q, kv), (0, 4095)),
+            (lambda q, kv, raw: torch.ops.aten.sub.Scalar(q, 1, 3), (-3, 4092)),
+            (lambda q, kv, raw: torch.add(q, kv, alpha=-1), (-4095, 4095)),
+            (lambda q, kv, raw: kv // 64, (0, 63)),
+            (
+                lambda q, kv, raw: torch.div(q, 4294967297, rounding_mode="floor"),
+                None,
+            ),
+            (lambda q, kv, raw: q // _wide_divisor(), None),
+            # 128 wraps to -128 in int8, so the remainder is not in [0, 127].
+            (lambda q, kv, raw: raw.to(torch.int8) % 128, None),
+            # Unproved, the quotient keeps int32's range under the clamp.
+            (
+                lambda q, kv, raw: (q // _wide_divisor()).clamp(min=0),
+                (0, int32_max),
+            ),
+        ]
+        for fn, expected in cases:
+            # Three distinct 1-D tensors: make_fx gives one placeholder to a
+            # tensor passed twice, and a 0-dim int32 operand would let the
+            # 0-dim int64 divisor promote the result.
+            gm = make_fx(fn, decomposition_table=select_decomp_table())(
+                *(torch.full((4,), i, dtype=torch.int32) for i in range(3))
+            )
+            q, kv, _ = gm.graph.find_nodes(op="placeholder")
+            index = gm.graph.output_node().args[0]
+            with self.subTest(index=index.format_node()):
+                self.assertEqual(
+                    integer_bounds(
+                        index, captured_bounds={q: (0, 4095), kv: (0, 4095)}
+                    ),
+                    expected,
+                )
+
+    @pytest.mark.cpu_only
+    def test_clamped_index_takes_the_bounded_gather(self):
+        """A gather index clamped into the row is proved bounded, also with
+        hi < lo, where the clamp gives hi everywhere: the gather takes the
+        bounded-gather fragment."""
+        from test.test_atomic_ops import _simulate_register_load_program
+
+        x = torch.arange(128).reshape(2, 64).int()
+        for low, high in ((0, 63), (0, 2), (5, 2)):
+            with self.subTest(low=low, high=high):
+                _bound, code = _bounded_gather_codegen(
+                    _clamped_index_gather, (x, low, high)
+                )
+                out = torch.empty_like(x)
+                _simulate_register_load_program(code, x, 128, host_tensors={"out": out})
+                index = (torch.arange(64) + 3).clamp(low, high)
+                torch.testing.assert_close(out, x[:, index], rtol=0, atol=0)
 
     def test_strided_inputs_and_empty_or_unproved_domains(self):
         from test.test_atomic_ops import _simulate_register_load_program
@@ -7230,7 +7313,6 @@ class TestCuteInlineAsmGatherCPU(TestCase):
 
         import sympy
 
-        from helion._compiler.cute.bounded_gather import integer_bounds
         from helion._compiler.cute.computed_fragment import _fragment_logical_shape
         from helion.language import creation_ops
         from helion.language import inline_asm_ops

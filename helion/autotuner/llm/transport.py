@@ -48,6 +48,16 @@ _ANTHROPIC_MODEL_VERSION_RE = re.compile(
 # Models that accept OpenAI's `xhigh` effort. Others reject it, so "max" only
 # maps to "xhigh" here; elsewhere "max" → "high".
 _OPENAI_XHIGH_MODELS = frozenset({"gpt-5.1-codex-max", "gpt-5.4", "gpt-5.5"})
+# Reasoning tokens reserved on top of the visible-output budget, by OpenAI effort.
+# The Responses API counts reasoning against `max_output_tokens`, so a budget
+# sized for the JSON alone runs out mid-answer at higher efforts (the analog of
+# Anthropic's thinking budget below). It is a cap, not a spend.
+_OPENAI_REASONING_TOKENS_BY_EFFORT = {
+    "low": 8192,
+    "medium": 16384,
+    "high": 32768,
+    "xhigh": 65536,
+}
 
 _PROVIDER_ALIASES = {
     "anthropic": "anthropic",
@@ -236,6 +246,18 @@ def _extract_text_content_items(content: object) -> list[str]:
 
 def extract_openai_response_text(response: dict[str, object]) -> str:
     """Extract concatenated text from an OpenAI Responses payload."""
+    if response.get("status") == "incomplete":
+        # The text was cut off (e.g. at max_output_tokens) and cannot parse.
+        details = response.get("incomplete_details")
+        hint = (
+            " Reasoning counts against max_output_tokens; an effort level"
+            " (HELION_LLM_EFFORT_LEVEL) adds a reserve for it, larger at higher"
+            " levels."
+            if isinstance(details, dict)
+            and details.get("reason") == "max_output_tokens"
+            else ""
+        )
+        raise RuntimeError(f"Incomplete OpenAI response: {details}.{hint}")
     output = response.get("output")
     if isinstance(output, list):
         texts: list[str] = []
@@ -272,6 +294,7 @@ def _openai_payload(
     }
     if (effort := _openai_effort_level(effort_level, model)) is not None:
         payload["reasoning"] = {"effort": effort}
+        payload["max_output_tokens"] += _OPENAI_REASONING_TOKENS_BY_EFFORT[effort]
     if system_prompt:
         payload["instructions"] = system_prompt
     return payload

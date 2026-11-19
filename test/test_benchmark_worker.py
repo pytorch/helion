@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import linecache
+import logging
 import math
 import multiprocessing as mp
 from multiprocessing import connection as mp_connection
@@ -33,6 +34,7 @@ import pytest
 import torch
 
 import helion
+from helion import exc
 from helion._testing import DEVICE
 from helion._testing import RefEagerTestDisabled
 from helion._testing import import_path
@@ -60,10 +62,12 @@ from helion.autotuner.benchmark_worker import BenchmarkTimeout
 from helion.autotuner.benchmark_worker import BenchmarkWorker
 from helion.autotuner.benchmark_worker import BenchmarkWorkerDied
 from helion.autotuner.benchmark_worker import BenchmarkWorkerUnkillable
+from helion.autotuner.benchmarking import KernelTraceUnreadable
 from helion.autotuner.benchmarking import _estimate_runtime_and_warmup
 from helion.autotuner.benchmarking import do_bench
 from helion.autotuner.benchmarking import do_bench_generic
 from helion.autotuner.kernel_args import load_trusted_kernel_args
+from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.logger import match_device_out_of_memory
 from helion.autotuner.metrics import AutotuneMetrics
 from helion.autotuner.precompile_future import SerializedCompiledFunction
@@ -148,6 +152,14 @@ class _RaiseRuntimeError:
 
     def __call__(self) -> object:
         raise RuntimeError(self.message)
+
+
+@dataclasses.dataclass
+class _RaiseKernelTraceUnreadable:
+    message: str
+
+    def __call__(self) -> object:
+        raise KernelTraceUnreadable(self.message)
 
 
 @dataclasses.dataclass
@@ -1500,6 +1512,389 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
         self.assertTrue(job.probe_long_kernel)
         self.assertEqual(provider._benchmark_worker.run.call_args.kwargs["timeout"], 17)
 
+    @staticmethod
+    def _job_recording_provider() -> LocalBenchmarkProvider:
+        """A provider whose worker is a mock: ``run`` records the job."""
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_timeout=17)
+        provider.mutated_arg_indices = []
+        provider.config_spec = SimpleNamespace(cute_flash_search_enabled=True)
+        provider._precompile_args_path = "/tmp/args.pt"
+        provider._benchmark_worker = Mock()
+        provider._benchmark_worker.run.return_value = 1.25
+        provider._subprocess_benchmark_uses_wall_clock = lambda: False
+        provider._subprocess_benchmark_enabled = lambda: True
+        return provider
+
+    @staticmethod
+    def _retiming_search(
+        provider: LocalBenchmarkProvider, *, collapse: bool = False
+    ) -> PopulationBasedSearch:
+        """A bare search that re-times members through ``provider``'s worker
+        and reads its candidates on the timer the provider's jobs follow;
+        with ``collapse`` its backend drops the source aliases its provider
+        reports."""
+        settings = Settings(
+            autotune_log_level=logging.CRITICAL,
+            autotune_suspicious_rebenchmark_ratio=0,
+        )
+        search = PopulationBasedSearch.__new__(PopulationBasedSearch)
+        search.settings = settings
+        search.log = AutotuningLogger(settings)
+        search.best_perf_so_far = 0.012
+        search.kernel = SimpleNamespace(env=SimpleNamespace(process_group_name=None))
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                collapses_generated_source_aliases=lambda config_spec: collapse
+            )
+        )
+        provider.settles_source_aliases = lambda: collapse
+        search.benchmark_provider = provider
+        search.population = []
+        search.traces_candidates = provider.trace_search_candidates
+        return search
+
+    @staticmethod
+    def _two_members() -> list[PopulationMember]:
+        return [
+            PopulationMember(lambda: None, [perf], (), helion.Config())
+            for perf in (0.012, 0.013)
+        ]
+
+    @pytest.mark.cpu_only
+    def test_search_jobs_follow_the_searchs_timer(self) -> None:
+        """A candidate or re-timing of the search (no regime named) is
+        traced once the search settled on the trace timer
+        (``trace_search_candidates``); the final selection's windows, which
+        name their regime, and every job of a search on the event timer are
+        not."""
+        provider = self._job_recording_provider()
+
+        def job(**kwargs: object) -> BenchmarkJob:
+            with patch(
+                "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                return_value=cast("SerializedCompiledFunction", object()),
+            ):
+                provider._run_subprocess_benchmark_job(
+                    cast("CompiledConfig", object()),
+                    warmup=1,
+                    rep=50,
+                    **kwargs,  # pyrefly: ignore[bad-argument-type]
+                )
+            return provider._benchmark_worker.run.call_args.args[0]
+
+        self.assertFalse(job().trace_kernel_durations)
+        provider.trace_search_candidates = True
+        self.assertTrue(job().trace_kernel_durations)
+        self.assertFalse(job(l2_flush_mode="kernel").trace_kernel_durations)
+        self.assertFalse(job(l2_flush_mode="call").trace_kernel_durations)
+
+    @pytest.mark.cpu_only
+    def test_a_profiled_worker_gets_a_new_process_once(self) -> None:
+        """A profiling session leaves the activity API attached to the
+        worker's process, where CUDA events read every later launch longer.
+        The provider notes each session it asks of the worker (the trace
+        probe, a traced window of the search, a ``kernel`` window of the
+        final selection; not a job timed with CUDA events or by wall-clock),
+        and ``restart_profiled_benchmark_worker`` shuts that process down
+        once: the worker stays, for the next job to start its process, and
+        so does the probe's answer.  A worker that ran no session keeps its
+        process."""
+
+        def after_job(
+            traced: bool = False, wall_clock: bool = False, **kwargs: object
+        ) -> LocalBenchmarkProvider:
+            provider = self._job_recording_provider()
+            provider.trace_search_candidates = traced
+            provider._subprocess_benchmark_uses_wall_clock = lambda: wall_clock
+            with patch(
+                "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                return_value=cast("SerializedCompiledFunction", object()),
+            ):
+                provider._run_subprocess_benchmark_job(
+                    cast("CompiledConfig", object()),
+                    warmup=1,
+                    rep=50,
+                    **kwargs,  # pyrefly: ignore[bad-argument-type]
+                )
+            return provider
+
+        for provider in (
+            after_job(),
+            after_job(l2_flush_mode="call"),
+            after_job(traced=True, wall_clock=True),
+            after_job(wall_clock=True, l2_flush_mode="kernel"),
+        ):
+            self.assertFalse(provider.worker_profiled)
+            provider.restart_profiled_benchmark_worker()
+            provider._benchmark_worker.shutdown.assert_not_called()
+
+        for provider in (after_job(traced=True), after_job(l2_flush_mode="kernel")):
+            self.assertTrue(provider.worker_profiled)
+            provider.restart_profiled_benchmark_worker()
+            provider.restart_profiled_benchmark_worker()
+            provider._benchmark_worker.shutdown.assert_called_once_with()
+            self.assertFalse(provider.worker_profiled)
+            self.assertTrue(provider.benchmark_worker_started())
+
+        # the probe, whatever it answers; its answer outlives the process
+        for reason in (None, "the CUDA activity trace is held by another tool"):
+            provider = self._job_recording_provider()
+            provider.args = ()
+            provider.log = Mock()
+            provider._worker_kernel_timer = None
+            provider._benchmark_worker.run.return_value = reason
+            self.assertEqual(provider.worker_kernel_timer_available(), reason is None)
+            self.assertTrue(provider.worker_profiled)
+            provider.restart_profiled_benchmark_worker()
+            provider._benchmark_worker.shutdown.assert_called_once_with()
+            self.assertEqual(provider.worker_kernel_timer_available(), reason is None)
+            provider._benchmark_worker.run.assert_called_once()
+            self.assertFalse(provider.worker_profiled)
+
+        # no worker to restart: only the note goes
+        provider = self._job_recording_provider()
+        provider._benchmark_worker = None
+        provider.worker_profiled = True
+        provider.restart_profiled_benchmark_worker()
+        self.assertFalse(provider.worker_profiled)
+
+    @pytest.mark.slow
+    def test_a_restarted_worker_runs_the_next_job_in_a_new_process(self) -> None:
+        """``restart_profiled_benchmark_worker`` on a real worker: the
+        process that ran the session exits, the next job starts another
+        one, and a worker that was not profiled since keeps it."""
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        worker = provider._benchmark_worker = BenchmarkWorker()
+        try:
+            first_pid = worker.run(_ReturnPid(), timeout=30.0)
+            provider.worker_profiled = True
+            provider.restart_profiled_benchmark_worker()
+            self.assertFalse(worker.alive())
+            self.assertTrue(provider.benchmark_worker_started())
+            second_pid = worker.run(_ReturnPid(), timeout=30.0)
+            self.assertNotEqual(second_pid, first_pid)
+            provider.restart_profiled_benchmark_worker()
+            self.assertEqual(worker.run(_ReturnPid(), timeout=30.0), second_pid)
+        finally:
+            worker.shutdown()
+
+    @pytest.mark.cpu_only
+    def test_search_retimings_follow_the_searchs_timer(self) -> None:
+        """The re-timing after a generation (``PopulationBasedSearch.rebenchmark``
+        through ``benchmark_isolated``) names no regime: its jobs are traced
+        like the candidates' when the search settled on the trace timer, so a
+        member's two readings are on one scale. A final-selection window
+        through the same method names its regime and is not."""
+        provider = self._job_recording_provider()
+        provider.trace_search_candidates = True
+        search = self._retiming_search(provider)
+        members = self._two_members()
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            search.rebenchmark(members)
+            jobs = [
+                call.args[0] for call in provider._benchmark_worker.run.call_args_list
+            ]
+            self.assertEqual(len(jobs), 2)
+            self.assertTrue(all(job.trace_kernel_durations for job in jobs))
+            self.assertEqual([member.perfs[-1] for member in members], [1.25, 1.25])
+            provider.benchmark_isolated(
+                [members[0].fn], warmup=500, rep=500, l2_flush_mode="kernel"
+            )
+        final = provider._benchmark_worker.run.call_args.args[0]
+        self.assertEqual(final.l2_flush_mode, "kernel")
+        self.assertFalse(final.trace_kernel_durations)
+
+    @pytest.mark.cpu_only
+    def test_search_retimings_time_a_kernel_once(self) -> None:
+        """Where the backend drops source aliases, the verification after a
+        generation sends one job per kernel, traced or not as the search's
+        timer says: a source alias in the population (an initial population
+        keeps its own) is neither timed nor traced again, and takes its
+        kernel's reading. Without the drop every member is a job."""
+        for traces, collapse in (
+            (True, True),
+            (False, True),
+            (True, False),
+        ):
+            with self.subTest(traces=traces, collapse=collapse):
+                provider = self._job_recording_provider()
+                provider.trace_search_candidates = traces
+                search = self._retiming_search(provider, collapse=collapse)
+                kernel, other = self._two_members()
+                alias = PopulationMember(
+                    kernel.fn, [0.012], (), helion.Config(), status="deduplicated"
+                )
+                provider._benchmark_worker.run.side_effect = [1.25, 1.5, 1.75]
+                with patch(
+                    "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                    return_value=cast("SerializedCompiledFunction", object()),
+                ):
+                    search.rebenchmark_population([kernel, alias, other])
+                jobs = [
+                    call.args[0]
+                    for call in provider._benchmark_worker.run.call_args_list
+                ]
+                self.assertEqual(len(jobs), 2 if collapse else 3)
+                self.assertTrue(
+                    all(job.trace_kernel_durations is traces for job in jobs)
+                )
+                self.assertEqual(
+                    [member.perfs[-1] for member in (kernel, alias, other)],
+                    [1.25, 1.25, 1.5] if collapse else [1.25, 1.5, 1.75],
+                )
+
+    @pytest.mark.cpu_only
+    def test_an_unreadable_trace_window_is_no_reading(self) -> None:
+        """A window the worker was to read from the trace and could not
+        (``KernelTraceUnreadable``) is not timed with CUDA events, whose
+        readings sit on another scale than the search's. A member the
+        search re-times keeps the reading it had and takes none; a new
+        candidate has no reading and counts as a job that failed in the
+        worker, not as a config that does not compile."""
+        provider = self._job_recording_provider()
+        provider.trace_search_candidates = True
+        provider.log = Mock()
+        provider._benchmark_worker.run.side_effect = KernelTraceUnreadable(
+            "kernel timer could not split 0 trace events into 12 flushed calls"
+        )
+        search = self._retiming_search(provider)
+        members = self._two_members()
+        with patch(
+            "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+            return_value=cast("SerializedCompiledFunction", object()),
+        ):
+            search.rebenchmark(members)
+            self.assertEqual(provider._benchmark_worker.run.call_count, 2)
+            self.assertEqual([member.perfs for member in members], [[0.012], [0.013]])
+            self.assertEqual(provider.log.warning.call_count, 2)
+            self.assertIn("could not split", provider.log.warning.call_args.args[0])
+
+            provider.config_spec.compiler_seed_timeout_retry_repetitions = None
+            provider._autotune_metrics = AutotuneMetrics()
+            provider._worker_failure_config_ids = []
+            provider._worker_compile_timeout = lambda: 17.0
+            provider.budget_exceeded_fn = lambda: False
+            result = provider._benchmark_function_subprocess(
+                Config(), cast("CompiledConfig", object())
+            )
+        self.assertEqual(result, math.inf)
+        self.assertEqual(provider._last_benchmark_failure_status, "error")
+        self.assertEqual(provider._autotune_metrics.num_worker_failures, 1)
+        self.assertEqual(provider._autotune_metrics.num_compile_failures, 0)
+        self.assertIn("No reading of", provider.log.warning.call_args.args[0])
+
+    @pytest.mark.cpu_only
+    def test_a_traced_search_takes_no_in_process_reading(self) -> None:
+        """A search that settled on the trace reads every candidate and
+        every re-timing in the benchmark worker.  Where the worker cannot
+        take a job (a wrapper that does not cross the process boundary, a
+        worker that was disabled) the search timed with CUDA events falls
+        back to the in-process timers; the traced one takes no reading
+        there, because an event reading sits on another scale than its
+        other readings: a new candidate counts as a failed job, and
+        re-timed members keep the readings they have."""
+        for traces in (True, False):
+            with self.subTest(traces=traces):
+                provider = self._job_recording_provider()
+                provider.trace_search_candidates = traces
+                provider.log = Mock()
+                provider._autotune_metrics = AutotuneMetrics()
+                provider._worker_failure_config_ids = []
+                # (the in-process path is the one that refuses input banks)
+                provider._input_bank_count = 2
+                with patch.object(
+                    provider, "_benchmark_function_subprocess", return_value=None
+                ):
+                    if traces:
+                        result = provider._benchmark_function(
+                            Config(), cast("CompiledConfig", object())
+                        )
+                        self.assertEqual(result, math.inf)
+                        self.assertEqual(
+                            provider._autotune_metrics.num_worker_failures, 1
+                        )
+                        self.assertIn(
+                            "No reading of", provider.log.warning.call_args.args[0]
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            exc.InvalidAPIUsage, "in-process benchmarking"
+                        ):
+                            provider._benchmark_function(
+                                Config(), cast("CompiledConfig", object())
+                            )
+
+                search = self._retiming_search(provider)
+                search.log = Mock()
+                search._input_bank_count = 2
+                members = self._two_members()
+                with patch.object(
+                    search, "_isolated_rebenchmark_results", return_value=None
+                ):
+                    if traces:
+                        search.rebenchmark(members)
+                        self.assertIn(
+                            "keep their readings", search.log.warning.call_args.args[0]
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            exc.InvalidAPIUsage, "isolated rebenchmarking"
+                        ):
+                            search.rebenchmark(members)
+                self.assertEqual(
+                    [member.perfs for member in members], [[0.012], [0.013]]
+                )
+
+    @pytest.mark.cpu_only
+    def test_a_traced_search_retimes_in_the_worker_whatever_the_caller_asks(
+        self,
+    ) -> None:
+        """The single-pass final verification asks for the in-process
+        interleaved timer under ``HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED=0``
+        (``rebenchmark(use_isolated=False)``).  That timer reads with CUDA
+        events: in a search that settled on the trace it would put the
+        finalists it re-reads on another scale than a finalist whose
+        re-reading fails and keeps its trace reading.  A traced search sends
+        the jobs to the worker, traced; a search on the event timer takes
+        the in-process path it was asked for."""
+        for traces in (True, False):
+            with self.subTest(traces=traces):
+                provider = self._job_recording_provider()
+                provider.trace_search_candidates = traces
+                search = self._retiming_search(provider)
+                # (the in-process path is the one that refuses input banks)
+                search._input_bank_count = 2
+                members = self._two_members()
+                with patch(
+                    "helion.autotuner.benchmark_provider._serialize_compiled_fn",
+                    return_value=cast("SerializedCompiledFunction", object()),
+                ):
+                    if traces:
+                        search.rebenchmark(
+                            members, use_isolated=False, use_interleaved=True
+                        )
+                        jobs = [
+                            call.args[0]
+                            for call in provider._benchmark_worker.run.call_args_list
+                        ]
+                        self.assertEqual(len(jobs), 2)
+                        self.assertTrue(all(job.trace_kernel_durations for job in jobs))
+                        self.assertEqual(
+                            [member.perfs[-1] for member in members], [1.25, 1.25]
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            exc.InvalidAPIUsage, "isolated rebenchmarking"
+                        ):
+                            search.rebenchmark(
+                                members, use_isolated=False, use_interleaved=True
+                            )
+                        provider._benchmark_worker.run.assert_not_called()
+
     def test_long_kernel_probe_uses_search_or_backend_policy(self) -> None:
         # The probe applies to flash searches on both timer paths: the
         # event-timed do_bench now short-circuits its estimate loop the same
@@ -2389,6 +2784,25 @@ class TestBenchmarkWorkerFailureModes(unittest.TestCase):
             worker.shutdown()
 
     @pytest.mark.slow
+    def test_unreadable_trace_error_reaches_the_parent_as_itself(self) -> None:
+        # The provider tells a window the trace could not read from a config
+        # that does not run by the error's type: it crosses the process
+        # boundary as itself, and the worker lives on for the next job.
+        worker = BenchmarkWorker()
+        try:
+            first_pid = worker.run(_ReturnPid(), timeout=30.0)
+            with self.assertRaises(KernelTraceUnreadable) as ctx:
+                worker.run(
+                    _RaiseKernelTraceUnreadable("kernel timer could not split"),
+                    timeout=30.0,
+                )
+            self.assertIn("could not split", str(ctx.exception))
+            self.assertTrue(worker.alive())
+            self.assertEqual(worker.run(_ReturnPid(), timeout=30.0), first_pid)
+        finally:
+            worker.shutdown()
+
+    @pytest.mark.slow
     def test_out_of_memory_after_successful_jobs_retries_on_a_fresh_worker(
         self,
     ) -> None:
@@ -2554,6 +2968,62 @@ class TestSuspiciousRebenchmark(unittest.TestCase):
         self.assertEqual(
             provider._autotune_metrics.num_isolated_rebenchmark_timeouts, 1
         )
+
+    def test_isolated_timings_stop_at_the_budget_only_where_asked(self) -> None:
+        """A verification's re-timings are not cut by the autotune budget:
+        ``benchmark_isolated`` does not ask the budget hook.  Inside
+        ``isolated_timings_within_budget`` (the pass that moves a whole
+        initial population to another timer) it asks before each function
+        and times none after the budget ran out; those come back as
+        ``None``, a timing that was not taken.  A hook that never says stop
+        (no ``autotune_budget_seconds``) leaves the pass as it is."""
+        provider = LocalBenchmarkProvider.__new__(LocalBenchmarkProvider)
+        provider.settings = Settings(autotune_benchmark_subprocess=True)
+        provider.log = Mock()
+        provider._autotune_metrics = AutotuneMetrics()
+        fns = [cast("CompiledConfig", object()) for _ in range(3)]
+        jobs: list[object] = []
+
+        def job(fn: object, **kwargs: object) -> float:
+            jobs.append(fn)
+            return 1.0 + len(jobs)
+
+        def timings() -> list[object] | None:
+            jobs.clear()
+            return provider.benchmark_isolated(list(fns), warmup=1, rep=100)
+
+        with (
+            patch.object(provider, "_subprocess_benchmark_enabled", return_value=True),
+            patch.object(provider, "_run_subprocess_benchmark_job", side_effect=job),
+        ):
+            # no budget: the default hook, inside the block and outside it
+            self.assertEqual(timings(), [2.0, 3.0, 4.0])
+            with provider.isolated_timings_within_budget():
+                self.assertEqual(timings(), [2.0, 3.0, 4.0])
+
+            # a budget that is used up after the first job
+            asked: list[int] = []
+
+            def used_up() -> bool:
+                asked.append(len(jobs))
+                return len(jobs) >= 1
+
+            provider.set_budget_exceeded_fn(used_up)
+            self.assertEqual(timings(), [2.0, 3.0, 4.0])
+            self.assertEqual(asked, [])
+            with provider.isolated_timings_within_budget():
+                self.assertEqual(timings(), [2.0, None, None])
+                self.assertEqual(jobs, fns[:1])
+                # asked before each function, also the ones it skipped
+                self.assertEqual(asked, [0, 1, 1])
+            # the block is over: timings are whole again, also after an error
+            self.assertEqual(timings(), [2.0, 3.0, 4.0])
+            with (
+                self.assertRaisesRegex(RuntimeError, "stop"),
+                provider.isolated_timings_within_budget(),
+            ):
+                raise RuntimeError("stop")
+            self.assertFalse(provider._isolated_timings_budgeted)
 
     def test_effective_source_quarantine_removes_cached_results_and_repairs(
         self,

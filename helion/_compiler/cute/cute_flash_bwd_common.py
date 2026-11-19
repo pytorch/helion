@@ -146,12 +146,93 @@ def hook_chunk_prefix(
     return "\n".join(lines) + "\n"
 
 
+class FbwdTailClear(NamedTuple):
+    """The clear of a flex backward step's P entries past the sequences
+    (``fbwd_tail_clear``), as DSL expressions: ``tile_pred`` (a warp-uniform
+    ``Boolean``) holds on the steps whose tile reaches past a sequence, the
+    only ones that run the clear; ``row_ok`` (``Boolean``, None when no row
+    can lie past its sequence) whether the thread's row lies inside it, and
+    ``lane_limit`` (``Int32``) the count of the tile's columns inside the
+    lanes' sequence."""
+
+    tile_pred: str
+    row_ok: str | None
+    lane_limit: str
+
+    def chunk_limit(self, col0: str) -> str:
+        """The in-sequence lane count of a chunk of consecutive columns from
+        the tile column ``col0`` (0 on a row past its sequence)."""
+        lanes = f"{self.lane_limit} - cutlass.Int32({col0})"
+        if self.row_ok is None:
+            return lanes
+        return (
+            f"cutlass.Int32(cutlass.select_({self.row_ok}, {lanes}, cutlass.Int32(0)))"
+        )
+
+
+def fbwd_tail_clear(
+    *,
+    row_tile_expr: str,
+    row_seq: int,
+    row_past: bool,
+    lane_tile_expr: str,
+    lane_seq: int,
+    lane_past: bool,
+) -> FbwdTailClear | None:
+    """The tail clear of a frame whose thread row is ``row_tile_expr * 128 +
+    fbwd_thr_row`` and whose lanes are the columns of the 128-wide tile
+    ``lane_tile_expr``: a row at or past ``row_seq`` keeps no lane and a
+    lane at or past ``lane_seq`` is dropped. ``row_past`` / ``lane_past``:
+    whether a visited tile reaches past that sequence (only the tiles from
+    ``seq // 128`` on can); None when neither does."""
+    if not (row_past or lane_past):
+        return None
+    preds: list[str] = []
+    row_ok: str | None = None
+    lane_limit = "cutlass.Int32(128)"
+    if lane_past:
+        preds.append(
+            f"(cutlass.Int32({lane_tile_expr}) >= cutlass.Int32({lane_seq // 128}))"
+        )
+        lane_limit = (
+            f"(cutlass.Int32({lane_seq}) - cutlass.Int32({lane_tile_expr}) * "
+            "cutlass.Int32(128))"
+        )
+    if row_past:
+        preds.append(
+            f"(cutlass.Int32({row_tile_expr}) >= cutlass.Int32({row_seq // 128}))"
+        )
+        row_ok = (
+            f"cutlass.Int32({row_tile_expr}) * cutlass.Int32(128) + "
+            f"cutlass.Int32(fbwd_thr_row) < cutlass.Int32({row_seq})"
+        )
+    return FbwdTailClear(" | ".join(preds), row_ok, lane_limit)
+
+
+def fbwd_zero_past_lines(
+    ind: str, frg: str, col0: str, tail: FbwdTailClear | None
+) -> str:
+    """After a pass over the 32-column chunk ``frg`` of P (its columns
+    consecutive from the tile column ``col0``), its entries past the
+    sequences = 0 on the steps whose tile reaches past them; empty when
+    ``tail`` is None. Once per chunk, after its sub-chunk loop, behind a
+    warp-uniform branch: the steps inside the sequences skip it."""
+    if tail is None:
+        return ""
+    return (
+        f"{ind}if {tail.tile_pred}:\n"
+        f"{ind}    _helion_flash_rt.fbwd_zero_past({frg}, {tail.chunk_limit(col0)})\n"
+    )
+
+
 def hook_jacobian_lines(*, h: int, hook_cols: int, jac_body: str | None) -> str:
     """The Jacobian hook's pass over one 32-column dS chunk ``fbwd_ch`` of a
     compute warpgroup (the 1-CTA and 2-CTA flex kernels): per
     ``hook_cols``-column sub-chunk, the chunk index and the pre-hook score /
-    coordinate views ``jac_body`` reads, then dS *= the rendered Jacobian.
-    Empty without a Jacobian region (``jac_body`` None)."""
+    coordinate views ``jac_body`` reads, then dS *= the rendered Jacobian,
+    with dS = 0 where P (``tLDrS``) is 0 or subnormal: at masked entries,
+    and past the sequences, where P is cleared, whatever the Jacobian of
+    those entries' scores. Empty without a Jacobian region (``jac_body`` None)."""
     if jac_body is None:
         return ""
     subs = 32 // hook_cols
@@ -162,7 +243,7 @@ def hook_jacobian_lines(*, h: int, hook_cols: int, jac_body: str | None) -> str:
         f"                    fbwd_cchunk = cute.logical_divide(tLDcS[None, None, fbwd_ch], {hook_cols})[None, fbwd_sub]\n"
         + indent_lines(jac_body, 20)
         + f"                    fbwd_ds_sub = cute.make_tensor(tLDrdP.iterator + fbwd_sub * {hook_cols}, cute.make_layout({hook_cols}))\n"
-        f"                    _helion_flash_rt.fbwd_mul_pairs_packed(fbwd_ds_sub, fbwd_spre, fbwd_ch * 32 + fbwd_sub * {hook_cols}, {hook_cols})\n"
+        f"                    _helion_flash_rt.fbwd_mul_jacobian_packed(fbwd_ds_sub, fbwd_spre, tLDrS, fbwd_ch * 32 + fbwd_sub * {hook_cols}, {hook_cols})\n"
     )
 
 
@@ -830,13 +911,19 @@ def fbwd_p_pass(
     *,
     h: int,
     lse_prescaled: bool,
+    tail: FbwdTailClear | None,
     lse_in_mma: bool = False,
 ) -> str:
     """The P pass of compute warpgroup ``h`` over its two 32-column chunks
     (the 1-CTA and 2-CTA flex kernels): the chunk's LSE values -- the staged
     row, or zeros when the S MMA already subtracted the LSE (``lse_in_mma``)
-    -- then the sub-chunk loop. A natural-log LSE (the in-body form) goes to
-    the exp2 base with the no-visible-key rows (lse == -inf) mapped to 0; the
+    -- then the sub-chunk loop, then the clear of the chunk's entries past
+    the sequences (``tail``, ``fbwd_tail_clear``; None when every visited
+    tile lies inside them): P = 0 there, so dS = P (dP - delta) = 0. Those
+    entries' operands are zero-filled, but their exp2 can overflow (a
+    coordinate-dependent score_mod, or the score 0 against an LSE below the
+    fp32 exp range). A natural-log LSE (the in-body form) goes to the exp2
+    base with the no-visible-key rows (lse == -inf) mapped to 0; the
     preprocess kernel's ``lse2`` arrives converted (``lse_prescaled``)."""
     if lse_in_mma:
         lse = f"{ind}    fbwd_lse_frg.fill(cutlass.Float32(0.0))\n"
@@ -852,6 +939,12 @@ def fbwd_p_pass(
         f"{ind}    fbwd_lse_frg = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float32)\n"
         + lse
         + fbwd_p_sub_loop(ind + "    ", hook, spec)
+        + fbwd_zero_past_lines(
+            ind + "    ",
+            "cute.make_tensor(tLDrS[None, None, fbwd_ch].iterator, cute.make_layout(32))",
+            "tLDcS[None, None, fbwd_ch][0][1]",
+            tail,
+        )
     )
 
 

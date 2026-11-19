@@ -253,6 +253,14 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
         if config_spec.matmul_facts
         else tail_peel_blocks(device_ir, config_spec)
     )
+    # A device loop whose reductions over its own tile are all sums added to
+    # a value it carries: combining the sums' threads once after the loop is
+    # tunable (``cute_defer_tile_reduce``), not in a kernel with a matmul.
+    from .lane_loops.defer_tile_reductions import carried_tile_sum_blocks
+
+    config_spec.cute_carried_tile_sum_blocks = (
+        frozenset() if config_spec.matmul_facts else carried_tile_sum_blocks(device_ir)
+    )
     # A max, a min or an ``any`` whose warp reduction ``redux.sync`` takes on
     # this target: ``cute_warp_fp32_redux`` is tunable.
     from .native_warp_reduction import has_native_redux_reduction

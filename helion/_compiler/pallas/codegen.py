@@ -291,9 +291,12 @@ def _load_mask_expr(
     Only applies to dimensions that are ds-padded (the ref is padded to a
     multiple of block_size).  Grid/tile dimensions where BlockSpecs size the
     ref to the actual remainder are not masked — a block-sized mask would
-    cause a shape mismatch against the smaller ref.
+    cause a shape mismatch against the smaller ref. Nor is a compact-worklist
+    row tile whose unowned rows can never reach a store
+    (``ordered_carry.unowned_rows_never_stored``).
     """
     from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.pallas.ordered_carry import unowned_rows_never_stored
     from helion._compiler.pallas.plan_tiling import ArbitraryIndexPattern
     from helion._compiler.pallas.plan_tiling import TileBeginWithOffsetPattern
     from helion._compiler.pallas.plan_tiling import TileIndexWithOffsetPattern
@@ -336,6 +339,7 @@ def _load_mask_expr(
                 block_id not in deferred
                 and (not isinstance(dim_size, int) or dim_size > 1)
                 and _tile_needs_mask(state, block_id, tensor, tensor_dim)
+                and not unowned_rows_never_stored(state, block_id)
             ):
                 mask_var = state.codegen.mask_var(block_id)
                 if mask_var is not None:

@@ -44,8 +44,26 @@ it gives
 - the same per family;
 - a row per kernel, next to the ``--baseline`` run's Helion+CuTe speedup.
 
+With ``--baseline`` it also says how many of the run's own autotunes
+searched from the random seed of the baseline's autotune of the same port
+(``campaign.py --seeds-from``; ``seed_pairing``) and names the others: a
+cold search's pick follows its seed, so a port's before and after compare
+the two trees alone only where both searched from one seed (and, since the
+seed draws from the tree's search space, only where the two trees build the
+same one for the port, which the seeds do not tell).
+
 It also lists the records whose numerics gate fell back from the float64
 reference to the eager one (``common.AnchoredGate``'s ``ref_fallback``).
+
+When bench records carry ``rot_us`` (``bench.py --rotate-inputs``: the cold
+timer on private input sets, one per call, which hinted loads cannot keep in
+L2), the ``cold_us`` section gains two aggregate rows, the geomean speedup
+of Helion+CuTe over Inductor by ``rot_us`` over the kernels that have it
+counted for both (with their number) and the ``cold_us`` geomean of those
+same kernels, and a ``cute/ind rot`` column per kernel; a last section says
+which records were timed that way, why the others were not, and that the two
+speedups bracket the hint-free one only where the CuTe config has no such
+hints (``ROTATION_CAVEAT``). Every other number is computed as without them.
 
 ``--rebalance`` recomputes every ``cold_us`` and ``bb_us``, the baseline
 run's included, from the recorded rounds by ``bench.py``'s current rule, the
@@ -64,6 +82,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -85,6 +104,16 @@ PORTS = {"helion_cute": "cute", "helion_triton": "triton"}
 # T5's relative-position-bias backward, the selection's longest kernel under
 # Inductor by far: it dominates any time-weighted total.
 OUTLIERS = ["sum_sum_sum_d2c97d17f3dc"]
+# How to read the rot_us speedup beside the cold_us one, said in the report
+# of a run that has it (the measurements are in the README's Timers section).
+ROTATION_CAVEAT = (
+    "Loads with an `L2::evict_last` hint, which Inductor emits by policy and a "
+    "CuTe search can pick (`l2_last`), bias both timers: `cold_us` reads a "
+    "hinted kernel partly warm, `rot_us` reads it slower than the same kernel "
+    "without its hints. The two speedups bracket the hint-free one only where "
+    "the CuTe config has no such hints; where it has, both can lean the same "
+    "way and their agreement settles nothing (README, Timers)."
+)
 
 
 def geomean(values: list[float]) -> float | None:
@@ -162,15 +191,7 @@ def timed_record_issue(
     autotune that runs after the bench (phase 2 of a run on provisional
     configs) moves that record aside while it runs and replaces it if it
     succeeds."""
-    kernels = (config or {}).get("kernels", {})
-    if "autotune_code_sha256" in info:
-        same = info["autotune_code_sha256"] == {
-            name: k["code_sha256"] for name, k in kernels.items()
-        }
-    else:
-        same = info.get("decorators") == {
-            name: k["decorator"] for name, k in kernels.items()
-        }
+    same = common.timed_kernels_held(info, config)
     if config is not None and same and not config.get("provisional"):
         return None
     if info.get("autotune_provisional"):
@@ -281,10 +302,12 @@ def aggregate(
     rows: list[dict[str, Any]],
     weights: dict[tuple[str, str], float],
     baseline: dict[tuple[str, str], float],
+    rotating: dict[tuple[str, str], float] | None = None,
 ) -> dict[str, Any]:
     """The aggregates over ``rows`` (see the module docstring); ``weights``
     and ``baseline`` map (repro, shape) to the model share and to the
-    baseline run's Helion+CuTe speedup over Inductor."""
+    baseline run's Helion+CuTe speedup over Inductor, ``rotating`` (None
+    when no record has one) to this run's by ``rot_us``."""
     timed = [
         (row, value)
         for row in rows
@@ -336,6 +359,17 @@ def aggregate(
         "baseline": geomean([before for before, _ in same]),
         "this_run": geomean([after for _, after in same]),
     }
+    if rotating is not None:
+        both = [
+            (value, rotating[row["repro"], row["shape"]])
+            for row, value in timed
+            if (row["repro"], row["shape"]) in rotating
+        ]
+        out["rot_us"] = {
+            "kernels": len(both),
+            "cute_vs_inductor": geomean([rotated for _, rotated in both]),
+            "same_kernels_by_this_timer": geomean([value for value, _ in both]),
+        }
     return out
 
 
@@ -375,6 +409,108 @@ def baseline_speedups(
         if (speedup := ratio(row, "helion_cute", "inductor")) is not None:
             out[row["repro"], row["shape"]] = speedup
     return out
+
+
+def seed_pairing(run_dir: Path, baseline: Path) -> dict[str, Any]:
+    """Which of the autotunes the run ``run_dir`` made searched from the
+    random seed of the ``baseline`` run's autotune of the same port, as
+    ``campaign.py --seeds-from`` has them do: ``paired``, by record name,
+    and for the others (``unpaired``) where their seed came from (the
+    record's ``seed_from``, the run ``--seeds-from`` took it from). The
+    run's ok records that are no search of its own stay out: those
+    ``plan_run.py`` took from earlier runs, reused or provisional
+    (``reused_from``), and the copies ``campaign.py --configs-from`` made
+    (``common.holds_copy``, by the run's ``common.COPIED_CONFIGS``). It goes
+    by the seeds the records of the two runs name (``common.record_seed``,
+    ``common.standing_seed``), so two runs that took their seeds from a
+    third are paired as well, and a baseline whose port was autotuned again
+    since is not."""
+    manifest = run_dir / common.COPIED_CONFIGS
+    copied = json.loads(manifest.read_text()) if manifest.exists() else {}
+    paired: list[str] = []
+    unpaired: dict[str, str] = {}
+    for path, rec in ok_records(run_dir, "configs").items():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if rec.get("reused_from") or common.holds_copy(copied.get(path.name), digest):
+            continue
+        name = path.stem
+        seed = common.record_seed(rec)
+        before, why = common.standing_seed(
+            baseline, rec["repro"], rec["shape"], rec["backend"]
+        )
+        source = rec.get("seed_from")
+        if seed is not None and seed == before:
+            paired.append(name)
+        elif source is None:
+            unpaired[name] = "a seed of its own"
+        elif Path(source).resolve() != baseline.resolve():
+            unpaired[name] = f"a seed taken from {Path(source).name}"
+        else:
+            now = "another now" if before is not None else f"none now ({why})"
+            unpaired[name] = f"a seed taken from {baseline.name}, which names {now}"
+    return {"baseline": str(baseline), "paired": paired, "unpaired": unpaired}
+
+
+def seed_pairing_lines(pairing: dict[str, Any], baseline_name: str) -> list[str]:
+    """The report's paragraph on ``seed_pairing``: how many of the run's
+    autotunes searched from the baseline's seeds, and where the seeds of the
+    others came from (with their names where some are paired: the
+    exceptions of a paired run)."""
+    paired, unpaired = pairing["paired"], pairing["unpaired"]
+    total = len(paired) + len(unpaired)
+    if not total:
+        return [
+            (
+                "Autotune seeds: this run made no autotune of its own (its "
+                "autotune records are other runs')."
+            ),
+            "",
+        ]
+    made = f"the {total} autotune{'' if total == 1 else 's'} this run made"
+    how = (
+        f"searched from the seed of {baseline_name}'s autotune of the same port "
+        "(`campaign.py --seeds-from`)"
+    )
+    caveat = (
+        "against that run also compares two random seeds, which a cold "
+        "search's pick follows"
+    )
+    if paired:
+        backends = sorted({name.rsplit("__", 1)[1] for name in (*paired, *unpaired)})
+        counts = ", ".join(
+            f"{backend} {sum(name.endswith(f'__{backend}') for name in paired)} of "
+            f"{sum(name.endswith(f'__{backend}') for name in (*paired, *unpaired))}"
+            for backend in backends
+        )
+        summary = (
+            f"Autotune seeds: {len(paired)} of {made} {how}: {counts}. A "
+            f"kernel's speedup {caveat}, where its port searched from another:"
+        )
+    else:
+        summary = (
+            f"Autotune seeds: none of {made} {how}, so each kernel's speedup "
+            f"{caveat}. Their seeds:"
+        )
+    others: dict[str, list[str]] = collections.defaultdict(list)
+    for name, why in sorted(unpaired.items()):
+        others[why].append(name)
+    lines = [summary, ""]
+    lines += [
+        f"- {why}: {len(names)}" + (f" ({', '.join(names)})" if paired else "")
+        for why, names in sorted(others.items())
+    ]
+    if not unpaired:
+        lines.append("- none")
+    if paired:
+        lines += [
+            "",
+            (
+                "The same seed draws the same initial population only where both "
+                "trees build the same search space for a port; generation 0 of "
+                "the two runs' `logs/search/*/search.csv` shows whether they did."
+            ),
+        ]
+    return [*lines, ""]
 
 
 def aggregate_lines(
@@ -419,6 +555,19 @@ def aggregate_lines(
             lambda a: times(a["cute_vs_oracle"], a["cute_vs_oracle_kernels"]),
         ),
     ]
+    if any("rot_us" in a for a in columns.values()):
+        entries += [
+            (
+                "Helion+CuTe vs Inductor by rot_us, private inputs, geomean (kernels)",
+                lambda a: times(
+                    a["rot_us"]["cute_vs_inductor"], a["rot_us"]["kernels"]
+                ),
+            ),
+            (
+                "the same kernels by cold_us, geomean",
+                lambda a: times(a["rot_us"]["same_kernels_by_this_timer"]),
+            ),
+        ]
     if baseline_name is not None:
         entries.append(
             (
@@ -499,6 +648,24 @@ def main() -> None:
         ]
         for metric in ("cold_us", "bb_us")
     }
+    # rot_us, where bench.py --rotate-inputs timed it: its rows, and each
+    # kernel's Helion+CuTe speedup over Inductor where both count.
+    rotated = [
+        r for r in records if any("rot_us" in info for info in r["impls"].values())
+    ]
+    rotating: dict[tuple[str, str], float] | None = None
+    if rotated:
+        rows["rot_us"] = [
+            summarize(
+                r, "rot_us", tuned[r["repro"], r["shape"]], args.include_unsampled
+            )
+            for r in rotated
+        ]
+        rotating = {
+            (row["repro"], row["shape"]): value
+            for row in rows["rot_us"]
+            if (value := ratio(row, "helion_cute", "inductor")) is not None
+        }
     weights = {}
     if args.selection.exists():
         weights = {
@@ -570,7 +737,12 @@ def main() -> None:
             ),
             "",
         ]
-    baseline_name = None if args.baseline is None else args.baseline.name
+    baseline_name = None
+    pairing = None
+    if args.baseline is not None:
+        baseline_name = args.baseline.name
+        pairing = seed_pairing(args.run_dir, args.baseline)
+        lines += seed_pairing_lines(pairing, baseline_name)
     aggregates: dict[str, dict[str, Any]] = {}
     families: dict[str, dict[str, dict[str, Any]]] = {}
     for metric in ("cold_us", "bb_us"):
@@ -581,17 +753,20 @@ def main() -> None:
             else baseline_speedups(args.baseline, metric, args.rebalance)
         )
         without = [r for r in table if r["repro"] not in args.without]
-        columns = {"all kernels": aggregate(table, weights, baseline)}
+        # rot_us cross-checks the cold timer.
+        check = rotating if metric == "cold_us" else None
+        columns = {"all kernels": aggregate(table, weights, baseline, check)}
         if len(without) < len(table):
             columns[f"without {', '.join(args.without)}"] = aggregate(
-                without, weights, baseline
+                without, weights, baseline, check
             )
         aggregates[metric] = columns
         members: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
         for r in table:
             members[r["family"]].append(r)
         families[metric] = {
-            name: aggregate(group, weights, baseline) for name, group in members.items()
+            name: aggregate(group, weights, baseline, check)
+            for name, group in members.items()
         }
         lines += [f"## {metric}", "", *aggregate_lines(columns, baseline_name), ""]
         lines += [
@@ -612,14 +787,23 @@ def main() -> None:
                 f" | {fmt(agg['triton_vs_inductor'], '.3f')} ({agg['triton_vs_inductor_kernels']}) |"
             )
         baseline_column = f" | {baseline_name} cute/ind" if baseline_name else ""
+        # Each kernel's speedup by rot_us, as timed (the aggregates count it
+        # under the conditions of the cold_us one beside it).
+        by_rot = (
+            {(r["repro"], r["shape"]): r["cute_vs_inductor"] for r in rows["rot_us"]}
+            if check is not None
+            else None
+        )
+        rot_column = "" if by_rot is None else " | cute/ind rot"
         lines += [
             "",
             (
                 "| repro | shape | MB | inductor | helion-cute | cute/ind"
-                f"{baseline_column} | helion-triton | triton/ind | oracle | memcopy"
-                " | ind %SOL | cute %SOL | numerics | left out of the aggregates |"
+                f"{rot_column}{baseline_column} | helion-triton | triton/ind | oracle"
+                " | memcopy | ind %SOL | cute %SOL | numerics"
+                " | left out of the aggregates |"
             ),
-            f"|{'---|' * (15 if baseline_name else 14)}",
+            f"|{'---|' * (14 + bool(rot_column) + bool(baseline_column))}",
         ]
         for r in sorted(table, key=lambda r: r["cute_vs_inductor"] or 0):
             num = ",".join(f"{k.split('_')[-1]}={v}" for k, v in r["numerics"].items())
@@ -631,10 +815,15 @@ def main() -> None:
             left_out = "; ".join(
                 f"{kind} {issue.split(':')[0]}" for kind, issue in r["issues"].items()
             )
+            rot = (
+                ""
+                if by_rot is None
+                else f" | {fmt(by_rot.get((r['repro'], r['shape'])), '.3f')}"
+            )
             lines.append(
                 f"| {r['repro']} | {r['shape']} | {fmt((r['total_bytes'] or 0) / 1e6, '.1f')}"
                 f" | {fmt(r['inductor'])} | {fmt(r['helion_cute'])}"
-                f" | {fmt(r['cute_vs_inductor'], '.3f')}{before}"
+                f" | {fmt(r['cute_vs_inductor'], '.3f')}{rot}{before}"
                 f" | {fmt(r['helion_triton'])} | {fmt(r['triton_vs_inductor'], '.3f')}"
                 f" | {fmt(r['oracle'])} | {fmt(r['memcopy'])}"
                 f" | {fmt(100 * r['inductor_of_sol'] if r.get('inductor_of_sol') else None, '.0f')}"
@@ -696,6 +885,36 @@ def main() -> None:
     if not eager_reference:
         lines.append("- none")
     lines.append("")
+    # What bench.py --rotate-inputs decided for each record it ran on.
+    rotation = {
+        f"{rec['repro']}__{rec['shape']}": rec["rotate_inputs"]
+        for rec in records
+        if "rotate_inputs" in rec
+    }
+    if rotation:
+        timed = [d for d in rotation.values() if d.get("status") == "ok"]
+        sets = sorted({d["sets"] for d in timed})
+        lines += [
+            "## Rotating inputs (rot_us)",
+            "",
+            (
+                f"`bench.py --rotate-inputs` timed {len(timed)} of {len(rotation)} "
+                f"records on private input sets ({', '.join(map(str, sets)) or '-'} "
+                "per implementation), one per call of a flushed batch; not timed:"
+            ),
+            "",
+        ]
+        # A skipped record gives its reason, a failed pass its exception.
+        left = {
+            name: d.get("skipped")
+            or f"failed: {(d.get('error') or '?').strip().splitlines()[-1]}"
+            for name, d in rotation.items()
+            if d.get("status") != "ok"
+        }
+        lines += [f"- {name}: {why}" for name, why in sorted(left.items())]
+        if not left:
+            lines.append("- none")
+        lines += ["", ROTATION_CAVEAT, ""]
     if args.goal is not None:
         shapes = []
         for r in rows[args.metric]:
@@ -729,6 +948,10 @@ def main() -> None:
         "uncovered": uncovered,
         "eager_reference": eager_reference,
     }
+    if rotation:
+        report["rotate_inputs"] = rotation
+    if pairing is not None:
+        report["seed_pairing"] = pairing
     (args.run_dir / "report.json").write_text(json.dumps(report, indent=1) + "\n")
     (args.run_dir / "report.md").write_text("\n".join(lines) + "\n")
     sys.stdout.write("\n".join(lines) + "\n")

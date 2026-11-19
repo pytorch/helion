@@ -786,14 +786,32 @@ def _cute_staged_plan_operands(
     return cute_launch_descriptor(cute_kernel).staged_operands
 
 
+def _aligned_copy(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` in a fresh allocation (at least 16-byte aligned) with its
+    strides, which the kernel may have been compiled for (a non-dense view's
+    row stride, a broadcast's zero strides): a broadcast dimension is copied
+    once and expanded again."""
+    once = tensor[
+        tuple(
+            slice(0, 1) if stride == 0 and size > 1 else slice(None)
+            for size, stride in zip(tensor.size(), tensor.stride(), strict=True)
+        )
+    ]
+    copy = torch.empty_strided(
+        once.size(), once.stride(), dtype=tensor.dtype, device=tensor.device
+    )
+    copy.copy_(once)
+    return copy.expand(tensor.size())
+
+
 def _cute_stage_under_aligned_operands(
     cute_kernel: object, args: tuple[object, ...]
 ) -> tuple[tuple[object, ...], list[tuple[torch.Tensor, torch.Tensor]]] | None:
     """Replace under-aligned staged operands by 16-byte-aligned copies.
 
-    Returns the launch arguments with each such operand cloned (a fresh
-    allocation is at least 16-byte aligned) and the (destination, copy) pairs
-    to write back after the launch, or None when every operand is aligned.
+    Returns the launch arguments with each such operand replaced by
+    ``_aligned_copy`` and the (destination, copy) pairs to write back after
+    the launch, or None when every operand is aligned.
     """
     staged: list[object] | None = None
     copy_backs: list[tuple[torch.Tensor, torch.Tensor]] = []
@@ -807,16 +825,7 @@ def _cute_stage_under_aligned_operands(
             continue
         if staged is None:
             staged = list(args)
-        if index in descriptor.staged_strided_copies:
-            copy = torch.empty_strided(
-                tensor.size(),
-                tensor.stride(),
-                dtype=tensor.dtype,
-                device=tensor.device,
-            )
-            copy.copy_(tensor)
-        else:
-            copy = tensor.clone()
+        copy = _aligned_copy(tensor)
         staged[index] = copy
         if is_output:
             copy_backs.append((tensor, copy))

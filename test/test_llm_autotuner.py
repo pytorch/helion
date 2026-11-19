@@ -8,6 +8,7 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 import helion
@@ -15,6 +16,7 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import import_path
 from helion._testing import onlyBackends
+from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.config_fragment import IntegerFragment
 from helion.autotuner.config_fragment import ListOf
 from helion.autotuner.config_fragment import PowerOfTwoFragment
@@ -22,6 +24,7 @@ from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.llm.prompting import build_author_seed_section
 from helion.autotuner.llm.prompting import build_compiler_analysis_section
 from helion.autotuner.llm.workload import compute_workload_hints
+from helion.autotuner.llm_seeded_lfbo import LLMSeededSearch
 from helion.autotuner.logger import AutotuneLogEntry
 from helion.autotuner.logger import AutotuningLogger
 from helion.autotuner.metrics import AutotuneMetrics
@@ -306,6 +309,10 @@ class TestLLMGuidedSearch(TestCase):
         search._compiler_seed_members = []
         search._benchmarked_members = {}
         search._pinned_finalist_members = {}
+        # (a search that keeps its aliases records a repaired member)
+        search.config_spec.backend = SimpleNamespace(
+            collapses_generated_source_aliases=lambda config_spec: False
+        )
         search._latest_results_by_config_key = {
             search._config_key(failed_config): failed_result
         }
@@ -370,6 +377,9 @@ class TestLLMGuidedSearch(TestCase):
             def take_effective_source_repairs(self):
                 return {}
 
+            def settles_source_aliases(self) -> bool:
+                return False
+
             def set_config_roles(self, roles) -> None:
                 pass
 
@@ -399,6 +409,9 @@ class TestLLMGuidedSearch(TestCase):
         )
         search._benchmark_provider_cls = FakeBenchmarkProvider
         search._default_config_dict = dict(default_config)
+        # A bound below which a search that reads an initial population
+        # chooses the timer of its candidates (CuTe names one, Triton none).
+        search.short_kernel_below_us = 64.0
 
         def sparse_config(cfg: helion.Config) -> dict[str, object]:
             return {
@@ -703,6 +716,11 @@ class TestLLMGuidedSearch(TestCase):
         self.assertEqual(search.best.perf, 2.5)
         self.assertEqual(dict(best), dict(round1_cfg))
         self.assertEqual(dict(search.best.config), dict(round1_cfg))
+        # Every round's batch is timed as it comes: the loop reads no
+        # initial population, so it never reaches the timer choice
+        # (``_settle_candidate_timer``) and its readings stay on one timer.
+        self.assertFalse(search._candidate_timer_settled)
+        self.assertFalse(search.traces_candidates)
 
     def test_initial_llm_response_propagates_failure(self):
         """Round 0 LLM future failures are not silently swallowed."""
@@ -1223,6 +1241,9 @@ class TestLLMTransport(TestCase):
                 effort_level="max",
             )
         self.assertEqual(captured["payload"]["reasoning"], {"effort": "xhigh"})
+        # Responses counts reasoning against max_output_tokens, so the request
+        # reserves the xhigh reasoning budget (65536) + visible output (512).
+        self.assertEqual(captured["payload"]["max_output_tokens"], 66048)
 
         # Older OpenAI models without xhigh support fall back to "high" for the
         # provider-neutral "max" knob.
@@ -1242,6 +1263,7 @@ class TestLLMTransport(TestCase):
                 effort_level="max",
             )
         self.assertEqual(captured["payload"]["reasoning"], {"effort": "high"})
+        self.assertEqual(captured["payload"]["max_output_tokens"], 33280)
 
         # Modern Claude models (Opus 4.5+, Sonnet 4.6+) use adaptive thinking;
         # the model self-picks its budget so no budget_tokens is sent. Required on
@@ -1290,6 +1312,40 @@ class TestLLMTransport(TestCase):
         )
         self.assertEqual(captured["payload"]["max_tokens"], 8704)
         self.assertNotIn("output_config", captured["payload"])
+
+    def test_incomplete_openai_response_raises(self):
+        """A Responses payload cut off at max_output_tokens raises instead of
+        returning text that cannot parse."""
+        from helion.autotuner.llm.transport import call_provider
+        from helion.autotuner.llm.transport import extract_openai_response_text
+
+        response = {
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"content": [{"type": "text", "text": '{"configs": [{'}]}],
+        }
+        with (
+            patch("helion.autotuner.llm.transport._post_json", return_value=response),
+            self.assertRaisesRegex(
+                RuntimeError, "Incomplete.*max_output_tokens.*HELION_LLM_EFFORT_LEVEL"
+            ),
+        ):
+            call_provider(
+                "openai_responses",
+                model="gpt-5.5",
+                api_base="https://api.openai.com",
+                api_key="openai-test-key",
+                messages=[{"role": "user", "content": "suggest configs"}],
+                max_output_tokens=512,
+                request_timeout_s=120.0,
+                effort_level="high",
+            )
+        # Other reasons get no token-budget hint.
+        filtered = {**response, "incomplete_details": {"reason": "content_filter"}}
+        with self.assertRaises(RuntimeError) as raised:
+            extract_openai_response_text(filtered)
+        self.assertIn("content_filter", str(raised.exception))
+        self.assertNotIn("HELION_LLM_EFFORT_LEVEL", str(raised.exception))
 
     def test_transport_fast_mode_payload_and_headers(self):
         """Fast mode sets the Anthropic beta header + speed body field, and is
@@ -1673,6 +1729,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 pass
 
         class FakeLLMSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
                 self.args = args
@@ -1696,6 +1756,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 return Config(num_warps=4)
 
         class FakeLFBOSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(
                 self,
                 kernel,
@@ -1763,9 +1827,16 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
             search._benchmark_provider_cls = FakeBenchmarkProvider
             search._prepare()
             self.assertIsInstance(search.benchmark_provider, FakeBenchmarkProvider)
+            # (stage 2 returns a simpler config of the kernel it measured)
+            measured = Config(num_warps=8, num_stages=2)
+            FakeLFBOSearch._selected_config_measured_as = measured
             best = search._autotune()
 
         self.assertEqual(best["num_warps"], 8)
+        # The hybrid's own "selected" record names the config stage 2 timed.
+        self.assertIs(search._selected_config_measured_as, measured)
+        # The LLM stage's config only seeds stage 2: it is not simplified.
+        self.assertIs(llm_instances[0]._simplifies_selected_config, False)
         self.assertEqual(llm_instances[0].kwargs["max_rounds"], 2)
         self.assertTrue(llm_instances[0].skip_cache)
         self.assertEqual(
@@ -1790,6 +1861,36 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
         self.assertEqual(
             search.hybrid_stage_breakdown["second_stage_configs_tested"], 11
         )
+
+    @pytest.mark.cpu_only
+    def test_hybrid_best_is_the_second_stages_once_it_reads_the_trace(self):
+        """The LLM stage reads with CUDA events, and a second stage that
+        moved to the CUDA activity trace reads every config (the seed
+        again) without the launch latency those carry.  The hybrid's best
+        is then the second stage's, not the lower of two numbers on
+        different scales, and the stage summary says which timer the second
+        stage's objective is on.  With both stages on the events the lower
+        reading is the best, as before."""
+        for traced, best in ((True, 0.0080), (False, 0.0076)):
+            with self.subTest(traced=traced):
+                llm_stage = SimpleNamespace(
+                    best_perf_so_far=0.0076, _autotune_metrics=AutotuneMetrics()
+                )
+                second_stage = PopulationBasedSearch.__new__(PopulationBasedSearch)
+                second_stage.best_perf_so_far = 0.0080
+                second_stage._autotune_metrics = AutotuneMetrics()
+                second_stage.traces_candidates = traced
+                hybrid = LLMSeededSearch.__new__(LLMSeededSearch)
+                hybrid._autotune_metrics = AutotuneMetrics()
+                hybrid.second_stage_algorithm = "LFBOTreeSearch"
+                hybrid._finalize_stage_metrics(
+                    llm_stage, helion.Config(num_warps=4), 1.0, second_stage, 2.0
+                )
+                self.assertEqual(hybrid.best_perf_so_far, best)
+                breakdown = hybrid.hybrid_stage_breakdown
+                self.assertIs(breakdown["second_stage_traced"], traced)
+                self.assertEqual(breakdown["llm_seed_objective"], 0.0076)
+                self.assertEqual(breakdown["second_stage_objective"], 0.0080)
 
     @onlyBackends(["triton", "cute"])
     def test_autotune_runs_full_hybrid_loop_with_mocked_stages(self):
@@ -1834,6 +1935,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 return []
 
         class FakeLLMSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kernel = kernel
                 self.args = args
@@ -1855,6 +1960,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 return Config(num_warps=4)
 
         class FakeLFBOSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(
                 self,
                 kernel,
@@ -1964,6 +2073,10 @@ class TestLLMSeededLFBOTreeSearch(TestCase):
                 raise AssertionError("LLM seed stage should be skipped")
 
         class FakeLFBOSearch:
+            # (the config a stage's kernel was measured under, when it returns
+            # a simpler one)
+            _selected_config_measured_as: Config | None = None
+
             def __init__(self, kernel, args, **kwargs) -> None:
                 self.kwargs = kwargs
                 self.best_perf_so_far = 0.4

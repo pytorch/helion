@@ -296,6 +296,24 @@ def indexed_load_shapes(
     return result_by_index
 
 
+# The integer dtypes integer_bounds reasons about.
+_BOUNDED_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
+
+# clamp_min / clamp_max (with the bound positional) are the form tracing with
+# the decompositions leaves for a clamp; for integers they are maximum /
+# minimum.
+_LOWER_CLAMPS = (
+    torch.ops.aten.maximum.default,
+    torch.ops.aten.clamp_min.default,
+    torch.ops.aten.clamp_min.Tensor,
+)
+_UPPER_CLAMPS = (
+    torch.ops.aten.minimum.default,
+    torch.ops.aten.clamp_max.default,
+    torch.ops.aten.clamp_max.Tensor,
+)
+
+
 def integer_bounds(
     node: object, *, captured_bounds: dict[Node, tuple[int, int]] | None = None
 ) -> tuple[int, int] | None:
@@ -316,13 +334,7 @@ def integer_bounds(
         if value in memo:
             return memo[value]
         fake = value.meta.get("val")
-        if not isinstance(fake, torch.Tensor) or fake.dtype not in (
-            torch.int8,
-            torch.int16,
-            torch.int32,
-            torch.int64,
-            torch.uint8,
-        ):
+        if not isinstance(fake, torch.Tensor) or fake.dtype not in _BOUNDED_DTYPES:
             return None
         visiting.add(value)
         result = calculate(value)
@@ -385,7 +397,7 @@ def integer_bounds(
             return None
         left, right = bounds(args[0]), bounds(args[1])
 
-        # Unknown tensor values retain their full signed integer range. Bounds
+        # Unknown tensor values retain their dtype's full range. Bounds
         # narrowed by explicit clamps/remainders are still independently proved.
         def full_range(
             arg: object, known: tuple[int, int] | None
@@ -394,16 +406,23 @@ def integer_bounds(
                 return known
             if isinstance(arg, Node):
                 fake = arg.meta.get("val")
-                if isinstance(fake, torch.Tensor) and fake.dtype in (
-                    torch.int32,
-                    torch.int64,
-                ):
+                if isinstance(fake, torch.Tensor) and fake.dtype in _BOUNDED_DTYPES:
                     limits = torch.iinfo(fake.dtype)
                     return limits.min, limits.max
             return None
 
-        if target in (torch.ops.aten.minimum.default, torch.ops.aten.maximum.default):
+        if target in _LOWER_CLAMPS or target in _UPPER_CLAMPS:
             left, right = full_range(args[0], left), full_range(args[1], right)
+        # An operand outside the node's dtype proves nothing: arithmetic wraps
+        # it (a Python int or a 0-dim tensor of a wider dtype; eager int32
+        # q // 4294967297 divides by 1), and a clamp's scalar bound is
+        # rejected or saturated instead.
+        limits = torch.iinfo(value.meta["val"].dtype)
+        if any(
+            known is not None and not limits.min <= known[0] <= known[1] <= limits.max
+            for known in (left, right)
+        ):
+            return None
         if target in (torch.ops.aten.remainder.Tensor, torch.ops.aten.remainder.Scalar):
             if right is not None and right[0] == right[1] and right[0] > 0:
                 return 0, right[0] - 1
@@ -412,20 +431,26 @@ def integer_bounds(
             return None
         a, b = left
         c, d = right
-        if target in (torch.ops.aten.add.Tensor, torch.ops.aten.add.Scalar):
-            if value.kwargs.get("alpha", 1) != 1:
+        if target in (
+            torch.ops.aten.add.Tensor,
+            torch.ops.aten.add.Scalar,
+            torch.ops.aten.sub.Tensor,
+            torch.ops.aten.sub.Scalar,
+        ):
+            # The Scalar overloads take alpha positionally.
+            alpha = args[2] if len(args) > 2 else value.kwargs.get("alpha", 1)
+            if type(alpha) is not int:
                 return None
-            return a + c, b + d
-        if target in (torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar):
-            if value.kwargs.get("alpha", 1) != 1:
-                return None
-            return a - d, b - c
+            if target in (torch.ops.aten.sub.Tensor, torch.ops.aten.sub.Scalar):
+                alpha = -alpha
+            scaled = alpha * c, alpha * d
+            return a + min(scaled), b + max(scaled)
         if target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
             products = a * c, a * d, b * c, b * d
             return min(products), max(products)
-        if target is torch.ops.aten.minimum.default:
+        if target in _UPPER_CLAMPS:
             return min(a, c), min(b, d)
-        if target is torch.ops.aten.maximum.default:
+        if target in _LOWER_CLAMPS:
             return max(a, c), max(b, d)
         if target in (
             torch.ops.aten.bitwise_and.Tensor,

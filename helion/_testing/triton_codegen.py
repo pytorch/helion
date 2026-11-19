@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 from contextlib import contextmanager
+import dataclasses
 import importlib.util
 import sys
 from types import MappingProxyType
@@ -20,6 +21,8 @@ if TYPE_CHECKING:
     from collections.abc import Generator
     from collections.abc import Mapping
     from pathlib import Path
+
+    from ..runtime.kernel import BoundKernel
 
 
 @pytest.fixture
@@ -61,6 +64,28 @@ GLUON_RING_CONFIG: Mapping[str, object] = MappingProxyType(
 )
 
 
+def gluon_tail_ring_config(
+    bound: BoundKernel, *, task_loop: int = -1, **extra: object
+) -> dict[str, object]:
+    """The ring config of the ``cross_loop_tmem_prefetch`` tests (their
+    ``scale_then_*`` kernels): the ``task_loop``-th
+    warp-specializable loop warp-specialized, 128-row weight tiles over K steps
+    of 64, a four-stage ring; ``extra`` overrides."""
+    slots: list[bool | None] = [None] * len(bound.config_spec.range_warp_specialize)
+    slots[task_loop] = True
+    block_sizes = [32, 64, 128, 32, 64]
+    block_sizes += [64] * (len(bound.config_spec.block_sizes) - len(block_sizes))
+    return {
+        **GLUON_RING_CONFIG,
+        "block_sizes": block_sizes,
+        "range_warp_specializes": slots,
+        "cross_loop_pipeline": "static",
+        "num_warps": 4,
+        "num_stages": 4,
+        **extra,
+    }
+
+
 @contextmanager
 def gluon_cpu_codegen() -> Generator[None, None, None]:
     """Generate Gluon (``backend="gluon"``) source in a CPU-only process for a
@@ -98,8 +123,18 @@ def interpret_triton_selection(
     """
     from triton.runtime.interpreter import InterpretedFunction
     from triton.runtime.interpreter import _patch_lang
+    from triton.runtime.interpreter import interpreter_builder
     from triton.runtime.jit import JITFunction
 
+    # Compiled kernels check integer overflow only in debug mode, and the
+    # ordered images (_emit_ordered_image) rely on unsigned wraparound. The
+    # interpreter checks by default, so turn that off to run the body as
+    # compiled.
+    monkeypatch.setattr(
+        interpreter_builder,
+        "options",
+        dataclasses.replace(interpreter_builder.options, sanitize_overflow=False),
+    )
     path.write_text(source)
     spec = importlib.util.spec_from_file_location("selection_interpreter_fixture", path)
     assert spec is not None and spec.loader is not None

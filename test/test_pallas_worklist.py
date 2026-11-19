@@ -744,6 +744,77 @@ def _four_dim_non_ordered_permute_kernel(q, k, q_offsets):
     return out
 
 
+# A grouped GEMM, out[s:e] = lhs[s:e] @ rhs[g] per group: both inner tile loops
+# have static bounds.
+@helion.kernel(backend="pallas", static_shapes=True)
+def _grouped_gemm_kernel(lhs, rhs, offsets):
+    M, K = lhs.size()
+    G, _, N = rhs.size()
+    out = torch.empty(M, N, dtype=lhs.dtype, device=lhs.device)
+    for g in hl.grid(G):
+        s = offsets[g]
+        e = offsets[g + 1]
+        for tile_m in hl.tile(s, e):
+            for tile_n in hl.tile(0, N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(0, K):
+                    acc = acc + torch.matmul(
+                        lhs[tile_m, tile_k], rhs[g, tile_k, tile_n]
+                    )
+                out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+# ``_grouped_gemm_kernel`` accumulating through ``hl.dot(acc=...)``.
+@helion.kernel(backend="pallas", static_shapes=True)
+def _grouped_gemm_dot_kernel(lhs, rhs, offsets):
+    M, K = lhs.size()
+    G, _, N = rhs.size()
+    out = torch.empty(M, N, dtype=lhs.dtype, device=lhs.device)
+    for g in hl.grid(G):
+        s = offsets[g]
+        e = offsets[g + 1]
+        for tile_m in hl.tile(s, e):
+            for tile_n in hl.tile(0, N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(0, K):
+                    acc = hl.dot(lhs[tile_m, tile_k], rhs[g, tile_k, tile_n], acc=acc)
+                out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+# ``_grouped_gemm_kernel`` minus each tile's column sums. The sums mix the rows
+# of a tile, so its loads keep the row mask. What a tile sums depends on how the
+# rows are tiled (block size, sublane-aligned work items), so there is no single
+# eager reference and only the generated code is checked.
+@helion.kernel(backend="pallas", static_shapes=True)
+def _grouped_gemm_centered_kernel(lhs, rhs, offsets):
+    M, K = lhs.size()
+    G, _, N = rhs.size()
+    out = torch.empty(M, N, dtype=lhs.dtype, device=lhs.device)
+    for g in hl.grid(G):
+        s = offsets[g]
+        e = offsets[g + 1]
+        for tile_m in hl.tile(s, e):
+            for tile_n in hl.tile(0, N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(0, K):
+                    acc = acc + torch.matmul(
+                        lhs[tile_m, tile_k], rhs[g, tile_k, tile_n]
+                    )
+                out[tile_m, tile_n] = (acc - acc.sum(0, keepdim=True)).to(out.dtype)
+    return out
+
+
+def _eager_grouped_gemm(lhs, rhs, offsets):
+    """Rows ``[0, offsets[-1])`` of the grouped GEMM (later rows are undefined)."""
+    out = torch.empty(int(offsets[-1]), rhs.shape[2], dtype=lhs.dtype)
+    for g in range(rhs.shape[0]):
+        s, e = int(offsets[g]), int(offsets[g + 1])
+        out[s:e] = (lhs[s:e].float() @ rhs[g].float()).to(lhs.dtype)
+    return out
+
+
 def _offsets(lengths):
     lengths = torch.tensor(lengths, dtype=torch.int32)
     return torch.cat(
@@ -752,12 +823,17 @@ def _offsets(lengths):
 
 
 def _worklist_config(
-    block_sizes: list[int], *, loop_type: str = "unroll", grouping: int = 1
+    block_sizes: list[int],
+    *,
+    loop_type: str = "unroll",
+    grouping: int = 1,
+    bucket_rows: int = 0,
 ) -> helion.Config:
     return helion.Config(
         block_sizes=block_sizes,
         pallas_loop_type=loop_type,
         pallas_worklist_grouping=grouping,
+        **({"pallas_worklist_bucket_rows": bucket_rows} if bucket_rows else {}),
     )
 
 
@@ -1093,6 +1169,9 @@ class TestDetectAndGating(unittest.TestCase):
         choices = loop_type_field.choices
         self.assertEqual(choices, ("fori_loop", "emit_pipeline", "unroll"))
         self.assertEqual(grouping_field.choices, (0, 1, 2))
+        bucket_field = fields["pallas_worklist_bucket_rows"]
+        self.assertIsInstance(bucket_field, EnumFragment)
+        self.assertEqual(bucket_field.choices, (0, 16, 32, 64))
         self.assertEqual(list(bk.env.config_spec.grid_block_ids), [0])
 
     def test_gating_absent_for_non_jagged(self):
@@ -1101,6 +1180,7 @@ class TestDetectAndGating(unittest.TestCase):
         # No inner Pallas loops -> no pallas_loop_type field at all.
         self.assertNotIn("pallas_loop_type", fields)
         self.assertNotIn("pallas_worklist_grouping", fields)
+        self.assertNotIn("pallas_worklist_bucket_rows", fields)
 
     def test_clean_region_is_not_an_autotuner_field(self):
         offsets = _offsets([16, 16, 16, 16])
@@ -1635,6 +1715,382 @@ class TestWorklistConfig(unittest.TestCase):
                     pallas_worklist_grouping=0,
                 )
             )
+
+
+@onlyBackends(["pallas"])
+class TestStaticInnerLoopWorklist(unittest.TestCase):
+    """A compact tile holding only static inner loops (a grouped GEMM).
+
+    With ``pallas_worklist_grouping=1`` and ``pallas_loop_type='unroll'`` the
+    kernel fills its worklist in SMEM (``_fill_worklist``) and the launcher
+    slices the compact tensors at sublane-aligned rows. Runs on CPU:
+    ``kernel.bind`` traces with fake tensors.
+    """
+
+    def _bound(self, dtype=torch.bfloat16, kernel=_grouped_gemm_kernel):
+        offsets = _offsets([5, 0, 20, 7])
+        args = (
+            torch.randn(int(offsets[-1]), 128, dtype=dtype),
+            torch.randn(4, 128, 256, dtype=dtype),
+            offsets,
+        )
+        return kernel.bind(args)
+
+    def test_detects_static_inner_loops(self):
+        bound = self._bound()
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertTrue(plan.static_inner_loops)
+        self.assertIsNone(plan.ordered_axis)
+        # The owner count comes from rhs.size() and folds to a literal.
+        self.assertEqual(plan.num_owners_expr, "4")
+
+        # No inner loop, or an ordered (jagged) one, does not set static_inner_loops.
+        qo = _offsets([16, 16])
+        lq = int(qo[-1])
+        q = torch.randn(lq, 2, 8)
+        kv = torch.randn(2, 16, 2, 8)
+        jagged = torch.randn(lq, 2, 8)
+        for kernel, args in (
+            (_dense_kv_kernel, (q, kv, kv, qo)),
+            (_fully_jagged_kernel, (q, jagged, jagged, qo, qo)),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__):
+                other = kernel.bind(args)
+                with other.env:
+                    plan = detect_compact_worklist_plan(other.host_function)
+                self.assertFalse(plan.static_inner_loops)
+
+    def test_worklist_is_filled_in_kernel(self):
+        bound = self._bound()
+        config = _worklist_config([32, 256, 128])
+        code = bound.to_triton_code(config)
+        self.assertIn("def _fill_worklist(", code)
+        self.assertIn("_compact_fill_worklist=_fill_worklist", code)
+        self.assertNotIn("_compact_build_worklist=", code)
+        # bf16 rows tile in 16-row sublane groups.
+        self.assertIn("_compact_sublane=16", code)
+        self.assertIn(
+            "from helion.runtime.pallas.compact_worklist import fill_owner_tiles", code
+        )
+        ast.parse(code)
+        free = bound.to_code(
+            config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+        self.assertIn("def fill_owner_tiles(", free)
+        self.assertNotIn("import helion", free)
+        ast.parse(free)
+
+        # Other loop types keep the per-owner grid; grouping=2 is rejected.
+        for loop_type in ("fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                other = bound.to_triton_code(
+                    _worklist_config([32, 256, 128], loop_type=loop_type)
+                )
+                self.assertIn("_launcher(_helion__grouped_gemm_kernel, (4,),", other)
+                self.assertNotIn("_compact_", other)
+        with self.assertRaisesRegex(
+            exc.InvalidConfig, "requires static inner-loop bounds"
+        ):
+            bound.to_triton_code(_worklist_config([32, 256, 128], grouping=2))
+
+    def test_sublane_follows_the_dtype(self):
+        code = self._bound(torch.float32).to_triton_code(
+            _worklist_config([32, 256, 128])
+        )
+        self.assertIn("_compact_sublane=8", code)
+
+    def test_block_must_be_a_multiple_of_the_sublane(self):
+        with self.assertRaisesRegex(exc.InvalidConfig, "multiple of the sublane 16"):
+            self._bound().to_triton_code(_worklist_config([8, 256, 128]))
+
+    def test_buffer_counts_reach_the_launcher(self):
+        bound = self._bound()
+        config = helion.Config(
+            block_sizes=[32, 256, 128],
+            pallas_loop_type="unroll",
+            pallas_worklist_grouping=1,
+            pallas_worklist_buffer_count=[3, 4, 2],
+        )
+        code = bound.to_triton_code(config)
+        args, kwargs = self._launcher_call(code)
+        self.assertEqual(
+            ast.literal_eval(kwargs["_compact_buffer_counts"]),
+            {args.index("lhs"): 3, args.index("rhs"): 4},
+        )
+        default = bound.to_triton_code(_worklist_config([32, 256, 128]))
+        self.assertNotIn("_compact_buffer_counts", default)
+
+    def test_row_buckets_add_a_body_per_bucket(self):
+        bound = self._bound()
+        code = bound.to_triton_code(_worklist_config([64, 256, 128], bucket_rows=16))
+        self.assertIn("lax.switch(", code)
+        # No bucket, or one of the whole block, keeps the single body.
+        for bucket in (0, 64):
+            with self.subTest(bucket=bucket):
+                other = bound.to_triton_code(
+                    _worklist_config([64, 256, 128], bucket_rows=bucket)
+                )
+                self.assertNotIn("lax.switch(", other)
+
+    def test_row_buckets_must_tile_the_block_in_sublanes(self):
+        bound = self._bound()
+        for bucket in (8, 48):
+            with (
+                self.subTest(bucket=bucket),
+                self.assertRaisesRegex(
+                    exc.InvalidConfig,
+                    "must be a multiple of the sublane 16 and divide the block 64",
+                ),
+            ):
+                bound.to_triton_code(
+                    _worklist_config([64, 256, 128], bucket_rows=bucket)
+                )
+
+    @staticmethod
+    def _device_function(code):
+        """Source of the generated device function (``_helion_*``)."""
+        (fn,) = [
+            node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        ]
+        return ast.unparse(fn)
+
+    def test_compact_window_carry_needs_no_row_offset(self):
+        # A compact window holds a single work item, so its carry store does not
+        # compare the tile's row offset with the work item's bounds.
+        bound = self._bound()
+        for block in (16, 32):
+            with self.subTest(block=block):
+                code = self._device_function(
+                    bound.to_triton_code(_worklist_config([block, 256, 128]))
+                )
+                self.assertNotIn("offset_1", code)
+
+    @staticmethod
+    def _launcher_call(code):
+        """The tensor args (as source) and keywords of the ``_launcher`` call."""
+        (call,) = [
+            node
+            for node in ast.walk(ast.parse(code))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_launcher"
+        ]
+        args = [ast.unparse(arg) for arg in call.args[2:]]  # after kernel, grid
+        return args, {kw.arg: kw.value for kw in call.keywords}
+
+    @staticmethod
+    def _lhs_load(code):
+        (line,) = [
+            line.strip()
+            for line in code.splitlines()
+            if line.strip().startswith("load = lhs")
+        ]
+        return line
+
+    def test_row_local_tiles_load_unowned_rows_unmasked(self):
+        # Each output row reads only the same lhs row, and the carry store keeps
+        # only the owned rows (``jnp.where``), so the rows a tile does not own
+        # need not be zeroed on load.
+        for kernel in (_grouped_gemm_kernel, _grouped_gemm_dot_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                code = self._bound(kernel=kernel).to_triton_code(
+                    _worklist_config([32, 256, 128])
+                )
+                self.assertNotIn("mask", self._lhs_load(code))
+                self.assertIn("jnp.where(mask_", code)
+
+        # Row-mixing ops (column sum) or non-worklist carry stores keep the
+        # load mask.
+        for kernel, loop_type in (
+            (_grouped_gemm_centered_kernel, "unroll"),
+            (_grouped_gemm_kernel, "fori_loop"),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__, loop_type=loop_type):
+                code = self._bound(kernel=kernel).to_triton_code(
+                    _worklist_config([32, 256, 128], loop_type=loop_type)
+                )
+                self.assertIn("* mask_", self._lhs_load(code))
+
+
+@skipUnlessPallas("compact worklist numerics need Pallas TPU")
+class TestStaticInnerLoopNumerics(unittest.TestCase):
+    """The in-kernel worklist's grouped GEMM matches eager.
+
+    Compares rows ``[0, offsets[-1])`` only: later rows are undefined. A
+    single K tile keeps the kernel's per-tile bf16 matmul rounding equal to
+    the reference's.
+    """
+
+    def _check(
+        self,
+        lengths,
+        *,
+        extra_rows=0,
+        extra_fill=None,
+        buffer_counts=None,
+        kernel=_grouped_gemm_kernel,
+        blocks=(16, 32),
+        bucket_rows=0,
+    ):
+        offsets = _offsets(lengths)
+        total = int(offsets[-1])
+        torch.manual_seed(0)
+        lhs = torch.randn(total + extra_rows, 128, dtype=torch.bfloat16)
+        if extra_fill is not None:
+            lhs[total:] = extra_fill
+        rhs = torch.randn(len(lengths), 128, 256, dtype=torch.bfloat16)
+        ref = _eager_grouped_gemm(lhs, rhs, offsets)
+        args = (lhs.to(DEVICE), rhs.to(DEVICE), offsets.to(DEVICE))
+        for block in blocks:
+            with self.subTest(block=block):
+                config = dict(
+                    _worklist_config([block, 256, 128], bucket_rows=bucket_rows)
+                )
+                if buffer_counts is not None:
+                    config["pallas_worklist_buffer_count"] = buffer_counts
+                code, out = code_and_output(kernel, args, **config)
+                self.assertIn("_compact_fill_worklist=_fill_worklist", code)
+                self.assertNotIn("mask", TestStaticInnerLoopWorklist._lhs_load(code))
+                self.assertEqual("lax.switch(" in code, 0 < bucket_rows < block)
+                torch.testing.assert_close(out[:total].cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    def test_empty_owners(self):
+        # Empty owners first, between others and last, at unaligned rows.
+        self._check([0, 21, 0, 0, 11, 0])
+
+    def test_owners_straddle_sublane_and_block_boundaries(self):
+        self._check([5, 40, 3, 30, 70])
+
+    def test_owners_inside_one_sublane_tile(self):
+        self._check([1, 2, 3, 1])
+
+    def test_rows_past_the_last_offset(self):
+        self._check([5, 0, 20, 7], extra_rows=19)
+
+    def test_unowned_nan_rows_stay_out(self):
+        # The last owner ends mid-sublane, so its last tile reads (unmasked)
+        # NaN rows past the last offset; they must not reach the owned rows.
+        for kernel in (_grouped_gemm_kernel, _grouped_gemm_dot_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check(
+                    [5, 0, 20, 9],
+                    extra_rows=19,
+                    extra_fill=float("nan"),
+                    kernel=kernel,
+                )
+
+    def test_buffer_counts(self):
+        self._check([5, 40, 3, 30, 70], buffer_counts=[3, 4, 2])
+
+    def test_row_buckets(self):
+        # Work items of 1..block live rows, starting at aligned and unaligned
+        # rows, run every branch: tiny owners inside one sublane tile, owners
+        # straddling bucket and block boundaries, empty owners, an owner of
+        # several full blocks.
+        for lengths in (
+            [5, 40, 3, 30, 70],
+            [0, 21, 0, 0, 11, 0],
+            [1, 2, 3, 1],
+            [150, 3, 64, 17],
+        ):
+            with self.subTest(lengths=lengths):
+                self._check(lengths, blocks=(32, 64, 128), bucket_rows=16)
+        self._check([150, 3, 64, 17], blocks=(128,), bucket_rows=32)
+
+    def test_row_buckets_keep_unowned_nan_rows_out(self):
+        for kernel in (_grouped_gemm_kernel, _grouped_gemm_dot_kernel):
+            with self.subTest(kernel=kernel.fn.__name__):
+                self._check(
+                    [5, 0, 20, 9],
+                    extra_rows=19,
+                    extra_fill=float("nan"),
+                    kernel=kernel,
+                    blocks=(64,),
+                    bucket_rows=16,
+                )
+
+
+@skipUnlessPallas("fill_owner_tiles writes SMEM refs inside a Pallas kernel")
+class TestFillOwnerTiles(unittest.TestCase):
+    """The in-kernel worklist splits each owner at sublane-aligned rows."""
+
+    @staticmethod
+    def _reference(lengths, block, sublane):
+        tiles = []
+        base = 0
+        for owner, length in enumerate(lengths):
+            end = base + length
+            if length:
+                for tile in range(base - base % sublane, end, block):
+                    start = max(tile, base)
+                    tiles.append((owner, start, min(tile + block, end) - start))
+            base = end
+        return tiles
+
+    @staticmethod
+    def _fill(lengths, block, sublane):
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        from helion.runtime.pallas.compact_worklist import aligned_upper_bound
+        from helion.runtime.pallas.compact_worklist import fill_owner_tiles
+
+        owners = len(lengths)
+        upper = aligned_upper_bound(sum(lengths), owners, block, sublane)
+
+        def kernel(offsets_ref, num_work_ref, owner_ref, start_ref, extent_ref):
+            def owner_tiles(owner, num_work):
+                base = offsets_ref[owner]
+                length = offsets_ref[owner + 1] - base
+                return fill_owner_tiles(
+                    num_work,
+                    owner,
+                    base,
+                    length,
+                    block,
+                    sublane,
+                    owner_ref,
+                    start_ref,
+                    extent_ref,
+                )
+
+            num_work_ref[0] = jax.lax.fori_loop(0, owners, owner_tiles, jnp.int32(0))
+
+        smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+        table = jax.ShapeDtypeStruct((upper,), jnp.int32)
+        num_work, owner, start, extent = pl.pallas_call(
+            kernel,
+            out_shape=(jax.ShapeDtypeStruct((1,), jnp.int32), table, table, table),
+            in_specs=[smem],
+            out_specs=(smem, smem, smem, smem),
+            interpret=is_pallas_interpret(),
+        )(jnp.asarray(_offsets(lengths).numpy()))
+        tiles = [
+            (int(owner[i]), int(start[i]), int(extent[i]))
+            for i in range(int(num_work[0]))
+        ]
+        return tiles, upper
+
+    def test_matches_reference(self):
+        mixed = [0, 5, 0, 40, 3, 0, 100]
+        for lengths, block, sublane in (
+            (mixed, 16, 16),
+            (mixed, 32, 16),
+            ([7, 13, 9], 8, 8),
+            ([0, 0, 0], 32, 16),
+        ):
+            with self.subTest(lengths=lengths, block=block, sublane=sublane):
+                tiles, upper = self._fill(lengths, block, sublane)
+                self.assertEqual(tiles, self._reference(lengths, block, sublane))
+                self.assertLessEqual(len(tiles), upper)
+                for _owner, start, extent in tiles:
+                    # Each tile fits the aligned window the kernel reads.
+                    end = start + extent
+                    window = -(-end // sublane) * sublane - (start - start % sublane)
+                    self.assertLessEqual(window, block)
 
 
 @onlyBackends(["pallas"])
@@ -3420,6 +3876,74 @@ class TestCompactWindowSpec(unittest.TestCase):
         sliced = spec.index_map(0)[0]
         self.assertEqual(int(sliced.start), 1000)
         self.assertEqual(int(sliced.size), window)
+
+    def test_aligned_windows_tile_the_rows(self):
+        """In-kernel worklist windows start on a sublane row and hold the
+        tile in at most one block. Output windows end at the tile's last
+        full sublane tile (the ordered carry writes the partial one with the
+        next work item), except the last, so the write-backs are disjoint and
+        cover every row once."""
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _compact_aligned_window_block_spec
+
+        rows, block, sublane = 61, 32, 16
+        # fill_owner_tiles' work items for owners of 5, 40 and 16 rows.
+        starts = jnp.asarray([0, 5, 32, 45], jnp.int32)
+        extents = jnp.asarray([5, 27, 13, 16], jnp.int32)
+        num_work = jnp.asarray([4], jnp.int32)
+        t = torch.zeros(rows, 8)
+        load = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, None, 2
+        )
+        store = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, num_work, 2
+        )
+        stored = []
+        for wid in range(4):
+            start = int(starts[wid])
+            end = start + int(extents[wid])
+            window = load.index_map(wid)[0]
+            lo, size = int(window.start), int(window.size)
+            self.assertEqual(lo, start - start % sublane)
+            self.assertEqual(lo + size, min(-(-end // sublane) * sublane, rows))
+            self.assertLessEqual(size, block)
+            window = store.index_map(wid)[0]
+            lo, size = int(window.start), int(window.size)
+            stored.extend(range(lo, lo + size))
+        self.assertEqual(stored, list(range(rows)))
+
+    def test_sublane_tile_windows_cover_the_rows(self):
+        """Windows sliced in whole sublane tiles hold each work item's rows, and
+        the output windows write every row once."""
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _compact_aligned_window_block_spec
+
+        rows, block, sublane = 64, 32, 16
+        # fill_owner_tiles' work items for owners of 5, 40, 16 and 3 rows.
+        starts = jnp.asarray([0, 5, 32, 45, 61], jnp.int32)
+        extents = jnp.asarray([5, 27, 13, 16, 3], jnp.int32)
+        num_work = jnp.asarray([5], jnp.int32)
+        t = torch.zeros(rows, 8)
+        load = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, None, 2
+        )
+        store = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, num_work, 2
+        )
+        stored = []
+        for wid in range(5):
+            start = int(starts[wid])
+            end = start + int(extents[wid])
+            window = load.index_map(wid)[0]
+            lo, size = int(window.start) * sublane, int(window.size) * sublane
+            self.assertLessEqual(lo, start)
+            self.assertGreaterEqual(lo + size, end)
+            window = store.index_map(wid)[0]
+            lo, size = int(window.start) * sublane, int(window.size) * sublane
+            stored.extend(range(lo, lo + size))
+        self.assertEqual(stored, list(range(rows)))
 
 
 @onlyBackends(["pallas"])

@@ -42,6 +42,7 @@ from ..autotuner.config_fragment import ConfigSpecFragment
 from ..autotuner.config_spec import FULL_EXTENT_CATEGORIES
 from ..autotuner.config_spec import SIZED_REDUCTION_CATEGORIES
 from ..autotuner.config_spec import VALID_CROSS_LOOP_PIPELINES
+from ..autotuner.config_spec import CrossLoopTmemPrefetchSpec
 from ..autotuner.config_spec import MatmulWithReductionEpilogueFact
 from ..autotuner.config_spec import ReductionCategory
 from ..autotuner.config_spec import ReductionDescriptor
@@ -204,6 +205,10 @@ def _get_custom_decomp_table() -> dict[torch._ops.OpOverload, Callable[..., obje
     # figure out the right Triton implementation for aten.cat. As a workaround, we disable
     # the decomp for aten.stack and implement aten.stack in Triton (codegen_stack) instead.
     decomp_table.pop(torch.ops.aten.stack.default, None)
+    # Every backend lowers aten.topk itself (topk_lowering). Inductor's table
+    # can decompose a small-k topk into argmax rounds and an aten.cat, which
+    # would bypass that lowering.
+    decomp_table.pop(torch.ops.aten.topk.default, None)
     # Override lerp.Scalar to avoid data-dependent guard on the weight parameter.
     decomp_table[torch.ops.aten.lerp.Scalar] = _lerp_scalar_decomp
     # Map F.gelu(x, approximate="tanh") to a single _gelu_tanh_approx FX
@@ -4260,7 +4265,71 @@ def _register_atomic_tunables(atomic_count: int) -> None:
     )
 
 
-def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
+def _number_prefetches(device_ir: DeviceIR) -> list[torch.fx.Node]:
+    """Give each prefetch its ``prefetch_indexing`` slot
+    (``memory_ops.PREFETCH_SLOT_META``), one per ``hl.prefetch`` in code
+    generation order, and return them in slot order.  It runs before
+    reduction rolling copies the nodes (copies keep their meta), so every
+    lowering of a prefetch reads its slot."""
+    from ..language import memory_ops
+
+    prefetches = list(
+        dict.fromkeys(
+            node
+            for _graph_id, node in codegen_node_order(
+                device_ir.graphs, device_ir.root_ids, unreached=False
+            )
+            if node.op == "call_function" and node.target is memory_ops.prefetch
+        )
+    )
+    for slot, node in enumerate(prefetches):
+        node.meta[memory_ops.PREFETCH_SLOT_META] = slot
+    return prefetches
+
+
+def _register_prefetch_tunables(
+    prefetches: list[torch.fx.Node], box_possible: list[torch.fx.Node]
+) -> None:
+    """Register the prefetch_indexing tunable, one entry per prefetch, when
+    some prefetch can take the box form (``Backend.prefetch_box_possible``):
+    for the others "tensor_descriptor" compiles what "pointer" does."""
+    if not box_possible:
+        return
+
+    from ..autotuner.config_fragment import EnumFragment
+    from ..autotuner.config_fragment import ListOf
+
+    env = CompileEnvironment.current()
+    env.config_spec.prefetch_indexing = ListOf(
+        EnumFragment(choices=env.config_spec.valid_prefetch_indexing_types()),
+        length=len(prefetches),
+    )
+
+
+def _box_possible_prefetches(prefetches: list[torch.fx.Node]) -> list[torch.fx.Node]:
+    """The prefetches some config can give the box form
+    (``Backend.prefetch_box_possible``)."""
+    env = CompileEnvironment.current()
+
+    def value(arg: object) -> object:
+        return arg.meta.get("val") if isinstance(arg, torch.fx.Node) else arg
+
+    result = []
+    for node in prefetches:
+        tensor, index, extra_mask = node.args
+        tensor = value(tensor)
+        assert isinstance(tensor, torch.Tensor)
+        assert isinstance(index, (list, tuple))
+        if env.backend.prefetch_box_possible(
+            tensor, [value(i) for i in index], extra_mask is not None
+        ):
+            result.append(node)
+    return result
+
+
+def _register_tensor_descriptor_layout_guards(
+    device_ir: DeviceIR, box_prefetches: list[torch.fx.Node]
+) -> None:
     env = CompileEnvironment.current()
 
     from .._compat import supports_tensor_descriptor
@@ -4290,6 +4359,13 @@ def _register_tensor_descriptor_layout_guards(device_ir: DeviceIR) -> None:
                 return True
         return False
 
+    # A box-form prefetch (``prefetch_indexing``) keys the kernel on its base's
+    # alignment (a misaligned base keeps the pointer form); its map needs
+    # nothing else.
+    for node in box_prefetches:
+        tensor = tensor_arg_value(node.args[0])
+        assert isinstance(tensor, torch.Tensor)
+        env.register_prefetch_alignment_guard(tensor)
     # The slots of the configs that roll no reduction; one that rolls can
     # reorder them (``BoundKernel`` maps them through
     # ``DeviceIR.config_memory_op_fact_pairs``).
@@ -4511,6 +4587,7 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             for block_id in unused_rdims:
                 block = CompileEnvironment.current().block_sizes[block_id]
                 block.retire_reduction()
+        prefetches = _number_prefetches(device_ir)
         device_ir.register_rollable_reductions()
         backend.register_search_surface(device_ir, config_spec)
         if len(device_ir.root_ids) > 1 and not backend.roots_fissioned(
@@ -4621,9 +4698,19 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                         f"{allowed}",
                     )
                 config_spec.enable_cross_loop_pipeline(choices=choices)
+                if config_spec.supports_config_key("cross_loop_tmem_prefetch"):
+                    for block_ids in env.backend.tmem_prefetch_candidates(device_ir):
+                        config_spec.cross_loop_tmem_prefetch.append(
+                            CrossLoopTmemPrefetchSpec(block_ids)
+                        )
         config_spec.multi_phase = len(device_ir.phases) > 1
         if config_spec.supports_config_key("pallas_load_buffer_count"):
             config_spec.pallas_load_buffer_count.length = sum(
+                isinstance(arg, torch.Tensor)
+                for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
+            )
+        if config_spec.supports_config_key("pallas_worklist_buffer_count"):
+            config_spec.pallas_worklist_buffer_count.length = sum(
                 isinstance(arg, torch.Tensor)
                 for arg in LiftGraphArgs(dict(func.params.arguments)).get_graph_args()
             )
@@ -4641,7 +4728,9 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             [f.indexing_index for f in memory_op_facts if f.kind == "store"],
         )
         _register_atomic_tunables(_count_device_atomics(device_ir))
-        _register_tensor_descriptor_layout_guards(device_ir)
+        box_prefetches = _box_possible_prefetches(prefetches)
+        _register_prefetch_tunables(prefetches, box_prefetches)
+        _register_tensor_descriptor_layout_guards(device_ir, box_prefetches)
 
         # Accumulator facts are a standalone, reduction-agnostic fact layer (any heuristic
         # may read them), so build them independently of the reduction facts. Must run

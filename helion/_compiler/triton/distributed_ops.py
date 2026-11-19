@@ -25,6 +25,7 @@ from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
 from ..cross_loop_codegen import TaggedPeerFallback
+from ..cross_loop_codegen import cta_threads
 from ..cross_loop_codegen import peer_state
 from ..cross_loop_codegen import tagged_allocations
 from ..device_function import SyncRole
@@ -1209,9 +1210,7 @@ def tagged_tile(
             scale = access.subscript_index_scales[dim]
             offset = cast("int", access.subscript_offsets[dim])
             scalar = access.subscript_is_scalar[dim]
-            block = env.size_hint(
-                env.block_sizes[block_id].from_config_assert(state.config)
-            )
+            block = env.block_sizes[block_id].from_config_int(state.config)
             # A tile steps through the dimension from 0 and tiles it exactly.
             if not scalar and (scale != 1 or offset or shape[dim] % block):
                 raise fallback(f"{access.tensor_name}: a tile not tiling its dim")
@@ -1317,7 +1316,7 @@ def _record_scatter(
     task = root.task(
         {
             block_id: f"{state.codegen.offset_var(block_id)} // "
-            f"{env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))}"
+            f"{env.block_sizes[block_id].from_config_int(state.config)}"
             for block_id in root.axis_order
         }
     )
@@ -1391,15 +1390,14 @@ def _poll_pack(
     for size in output_size:
         block_id = None if isinstance(size, int) else env.resolve_block_id(size)
         if block_id is not None:
-            # A global block size is a SymInt; read its hint, as int() would pin it.
-            size = env.size_hint(
-                env.block_sizes[block_id].from_config_assert(state.config)
-            )
+            # A global block size is a SymInt; from_config_int reads a size
+            # the config fixes without pinning it.
+            size = env.block_sizes[block_id].from_config_int(state.config)
         if not isinstance(size, int):
             return 1
         numel *= size
     numel //= lanes
-    threads = 32 * state.config.num_warps
+    threads = cta_threads(state.device_function)
     return 4 if numel >= 4 * threads else 2 if numel >= 2 * threads else 1
 
 
@@ -1427,7 +1425,7 @@ def _word_poll(
     assert graph is not None
 
     def block_size(block_id: int) -> int:
-        return env.size_hint(env.block_sizes[block_id].from_config_assert(state.config))
+        return env.block_sizes[block_id].from_config_int(state.config)
 
     tile_strategy = state.tile_strategy
     dims = tile_strategy.shape_dims(output_size)
@@ -1563,7 +1561,7 @@ def inband_load_codegen(state: CodegenState, codegen_load: LoadCodegen) -> LoadC
             group = shape if words is None else words[2]
             pack = _poll_pack(state, output_size, 1 if words is None else lanes)
             if not _in_warp_specialized_loop(state):
-                threads = 32 * state.config.num_warps
+                threads = cta_threads(device_function)
         else:
             group = "scalar"
         fallback = None
@@ -1785,6 +1783,8 @@ def flush_inband_polls(cg: CodegenInterface, node: torch.fx.Node) -> None:
         words = [poll.word for poll in group]
         for word in words:
             device_function.sync_roles[word] = SyncRole("poll")
+        # The poll's spin ends a wait (a timeline's ready stamp follows it).
+        device_function.spin_ends.update(words)
         asm, constraints = _poll_asm(len(words), group[0].pack)
         cg.add_statement(
             _inline_asm(

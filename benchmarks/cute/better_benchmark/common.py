@@ -110,6 +110,19 @@ def bench_record_path(bench_dir: Path, repro_id: str, shape: str) -> Path:
     return bench_dir / f"{repro_id}__{shape}.json"
 
 
+# The implementations ``bench.py`` times, in the order of a forward round (its
+# ``--impls``). ``helion_<backend>`` is the Helion port pinned to that
+# backend's autotune record.
+ALL_IMPLS = (
+    "inductor",
+    "inductor_cd",
+    "oracle",
+    "helion_triton",
+    "helion_cute",
+    "memcopy",
+)
+
+
 def repro_dir(repro_id: str) -> Path:
     path = bb_path() / "repros" / "canonical" / repro_id
     if not (path / "repro.py").exists():
@@ -173,6 +186,20 @@ def make_inputs(repro_id: str, shape: str, seed: int = 0) -> list[Any]:
         raise KeyError(f"{repro_id} has no shape point {shape}; have {list(configs)}")
     seed_everything(seed)
     return repro_harness.make_inputs_from_config(configs[shape])
+
+
+def input_bytes(inputs: Sequence[Any]) -> int:
+    """The device memory behind one input set: the bytes of the distinct
+    storages of its tensors (views of one buffer count it once, whatever
+    part of it they show)."""
+    import torch
+
+    storages = {}
+    for value in inputs:
+        if isinstance(value, torch.Tensor):
+            storage = value.untyped_storage()
+            storages[storage.data_ptr()] = storage.nbytes()
+    return sum(storages.values())
 
 
 def compile_policy(repro_id: str, shape: str) -> dict[str, Any]:
@@ -306,17 +333,95 @@ def load_port(
     return module
 
 
-def load_autotuned_port(
+def autotune_record(
     configs_dir: Path, repro_id: str, shape: str, backend: str
-) -> tuple[types.ModuleType, dict[str, Any]]:
-    """The port with every kernel pinned to the decorator its autotune
-    record (``autotune.py``'s, which must be ok) holds, and the record."""
+) -> dict[str, Any]:
+    """The record of one port's autotune (``autotune.py``'s), which must be
+    ok: what a bench pins the port to."""
     path = config_record_path(configs_dir, repro_id, shape, backend)
     record = json.loads(path.read_text())
     if record.get("status") != "ok":
         raise RuntimeError(f"autotune record {path} is not ok")
-    pinned = {name: kernel["decorator"] for name, kernel in record["kernels"].items()}
+    return record
+
+
+# The variable that gives a search its random seed. A campaign gives every
+# autotune job one (``campaign.job_env``), and ``autotune.py`` records it with
+# the rest of the job's HELION_* environment (the record's ``env``).
+SEED_VARIABLE = "HELION_AUTOTUNE_RANDOM_SEED"
+# The variable through which ``campaign.py --seeds-from`` tells an autotune
+# job the run that its seed was taken from, which ``autotune.py`` records as
+# ``seed_from``.
+SEED_FROM = "BB_SEED_FROM"
+# What ``campaign.py --configs-from`` has copied into a run, in its run
+# directory (see the comment at ``campaign.COPIED_CONFIGS``).
+COPIED_CONFIGS = "configs_copied.json"
+
+
+def holds_copy(entry: dict[str, Any] | None, digest: str) -> bool:
+    """Whether a record of a run with the SHA-256 ``digest`` is a copy that
+    ``campaign.py --configs-from`` made, by the record's entry in the run's
+    ``COPIED_CONFIGS`` (None: it has none): the copy the entry names
+    (``sha256``), or the one that copy was to replace (``replaces``), which
+    the run still holds when the campaign died between writing the entry
+    and making the copy."""
+    return entry is not None and digest in (entry["sha256"], entry.get("replaces"))
+
+
+def record_seed(record: dict[str, Any]) -> int | None:
+    """The random seed that the search of an autotune record was given
+    (``SEED_VARIABLE`` in the record's ``env``); None when the record names
+    none, or a blank one, which Helion takes for none: a search that is
+    given no seed draws one from the clock."""
+    seed = (record.get("env") or {}).get(SEED_VARIABLE)
+    return int(seed) if seed is not None and seed.strip() else None
+
+
+def standing_seed(
+    run_dir: Path, repro_id: str, shape: str, backend: str
+) -> tuple[int | None, str | None]:
+    """The seed of the search whose autotune record stands in the run
+    ``run_dir`` for one port; or None, with why the run names none.
+
+    The record that stands is the ok one in the run's ``configs``, whichever
+    attempt or run made it: the first clean attempt, the cleanest one kept
+    after contaminated attempts (the campaign keeps that attempt's record as
+    it is, where the job's last ``job_start`` event names another seed), or
+    a record ``plan_run.py`` reused from an earlier run. Each carries the
+    seed of its own search in ``env`` (``record_seed``). A provisional
+    record stands in for an autotune that has not run, so it is no search of
+    this run to repeat, and a record that names no seed is of a search that
+    was given none (``autotune.py`` run by hand)."""
+    path = config_record_path(run_dir / "configs", repro_id, shape, backend)
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None, "no autotune record"
+    if record.get("status") != "ok":
+        return None, "its autotune record is not ok"
+    if record.get("provisional"):
+        return None, "its autotune record is provisional: not a search of that run"
+    seed = record_seed(record)
+    if seed is None:
+        return None, "its autotune record names no seed"
+    return seed, None
+
+
+def load_autotuned_port(
+    configs_dir: Path, repro_id: str, shape: str, backend: str
+) -> tuple[types.ModuleType, dict[str, Any]]:
+    """The port with every kernel pinned to the decorator its autotune
+    record (``autotune_record``) holds, and the record."""
+    record = autotune_record(configs_dir, repro_id, shape, backend)
+    pinned = per_kernel(record["kernels"], "decorator")
     return load_port(repro_id, backend, pinned=pinned), record
+
+
+def per_kernel(kernels: dict[str, dict[str, Any]], field: str) -> dict[str, Any]:
+    """``field`` of each kernel of an autotune record (its ``kernels``), by
+    the kernel's name: ``decorator``, what the kernel is pinned to, or
+    ``code_sha256``, the digest of the code it then generates."""
+    return {name: kernel[field] for name, kernel in kernels.items()}
 
 
 def timed_record_fields(tuned: dict[str, Any]) -> dict[str, Any]:
@@ -326,12 +431,39 @@ def timed_record_fields(tuned: dict[str, Any]) -> dict[str, Any]:
     bench replaces the record, and ``report.py`` counts the timing only while
     the record holds the same kernels."""
     return {
-        "autotune_code_sha256": {
-            name: kernel["code_sha256"] for name, kernel in tuned["kernels"].items()
-        },
+        "autotune_code_sha256": per_kernel(tuned["kernels"], "code_sha256"),
         "autotune_provisional": bool(tuned.get("provisional")),
         "autotune_reused_from": tuned.get("reused_from"),
     }
+
+
+def timed_kernels_held(info: dict[str, Any], tuned: dict[str, Any] | None) -> bool:
+    """Whether the autotune record ``tuned`` (None: the point has no ok one)
+    holds the kernels that a port's entry in a bench record, ``info``, was
+    timed on: by their code digests (``timed_record_fields``), or, for an
+    entry made before ``bench.py`` recorded those, by their decorators."""
+    kernels = (tuned or {}).get("kernels", {})
+    if "autotune_code_sha256" in info:
+        return info["autotune_code_sha256"] == per_kernel(kernels, "code_sha256")
+    return info.get("decorators") == per_kernel(kernels, "decorator")
+
+
+def timed_on_record(info: dict[str, Any], tuned: dict[str, Any] | None) -> bool:
+    """Whether a port's entry in a bench record, ``info``, is of the autotune
+    record ``tuned`` (None: the point has no ok one), so that a bench of the
+    point now would pin what that one pinned: the same kernels
+    (``timed_kernels_held``), provisional or not as ``tuned`` is (an entry
+    made before ``bench.py`` recorded that is told by its kernels alone).
+    ``bench.py`` names the record before it loads the port, so an entry that
+    names none found no ok record, and is of ``tuned`` only when there is
+    still none."""
+    named = "autotune_code_sha256" in info or "decorators" in info
+    if tuned is None or not named:
+        return tuned is None and not named
+    return timed_kernels_held(info, tuned) and (
+        "autotune_provisional" not in info
+        or info["autotune_provisional"] == bool(tuned.get("provisional"))
+    )
 
 
 def port_kernels(module: types.ModuleType) -> dict[str, Any]:

@@ -382,6 +382,15 @@ class Backend(abc.ABC):
         write and then read the same tensor (``needs_barrier_before``)."""
         return False
 
+    @property
+    def orders_overlapping_inputs(self) -> bool:
+        """Whether the barrier walks order accesses through tensor arguments
+        that overlap at runtime as accesses of one storage
+        (``CompileEnvironment.input_storage_aliases``), so the cache key
+        partitions tensor arguments by overlap rather than by identity
+        (``_overlap_aliases``)."""
+        return False
+
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
         """Whether a load that reads a tensor an earlier store of the same
         body wrote can be preceded by a barrier; ``in_divergent_control_flow``
@@ -1001,6 +1010,24 @@ class Backend(abc.ABC):
 
         return VALID_CROSS_LOOP_PIPELINES
 
+    def tmem_prefetch_candidates(self, device_ir: DeviceIR) -> list[list[int]]:
+        """The block ids of each K loop ``cross_loop_tmem_prefetch`` may stream
+        into tensor memory (one config entry each), from the device IR and its
+        tile dependency graph.
+
+        Consulted only when the backend supports the
+        ``cross_loop_tmem_prefetch`` config key.
+        """
+        return []
+
+    def prefetch_box_possible(
+        self, tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+    ) -> bool:
+        """Whether ``hl.prefetch(tensor, index)`` lowers to TMA box prefetches
+        from a host-built tensor map under some config (``prefetch_indexing``
+        "tensor_descriptor"): the bound kernel then keys the base's alignment."""
+        return False
+
     # -- indexing, fake tensors and block-size constraints ---------------------
 
     def supports_block_ptr_indexing(self) -> bool:
@@ -1197,6 +1224,35 @@ class Backend(abc.ABC):
         """
         return False
 
+    def autotune_short_kernel_below_us(self, config_spec: ConfigSpec) -> float | None:
+        """Opt the autotuner's search into resolving short kernels.
+
+        The search times a candidate with a CUDA event pair around one
+        flushed launch, which reads in the event clock's steps (about 2 us
+        on a B200) and includes the launch latency, so configs of a kernel
+        of a few tens of microseconds read alike. A population search that
+        reads an initial population (the pattern, LFBO and
+        differential-evolution searches; not the LLM-guided search, which
+        times every batch as it comes and keeps the event timer) and whose
+        initial population's best config reads below the returned number of
+        microseconds reads that population once more and times every later
+        candidate in the benchmark worker from the CUDA activity trace
+        instead, as ``default_final_selection_regime``'s ``kernel`` does for
+        finalists (``PopulationBasedSearch._settle_candidate_timer``), and
+        its pattern search paths count a step smaller than the repeatability
+        of those readings as a tie (``PatternSearch._reading_tolerance``), as
+        the early stop of a differential-evolution search counts such a move
+        of its best reading as no improvement
+        (``DifferentialEvolutionSearch._stop_tolerance``). A
+        search whose best initial reading is at or above it, and every
+        search with ``None``, keeps the event timer and the fixed
+        ``min_improvement_delta``. A backend answers ``None`` for a search
+        that re-times its members with another timer than the benchmark
+        worker's (CuTe: the flash search, whose terminal refinement compares
+        members by mirrored wall-clock sweeps in this process).
+        """
+        return None
+
     def get_interleaved_bench(
         self,
     ) -> Callable[..., list[float]] | None:
@@ -1339,6 +1395,51 @@ class Backend(abc.ABC):
         search domain.
         """
         return False
+
+    def collapses_generated_source_aliases(self, config_spec: ConfigSpec) -> bool:
+        """Whether a search counts a source alias as the candidate it repeats.
+
+        A source alias is a candidate whose generated source an earlier
+        candidate of the run already produced (its result has the status
+        ``"deduplicated"``, so this needs
+        ``should_deduplicate_generated_sources``): a config that differs from
+        the earlier one only in settings the code does not depend on.  With
+        this hook a population search treats it as another config of the
+        kernel it repeats instead of a candidate of its own, wherever its
+        benchmark provider reports aliases; what follows from that is
+        described at ``PopulationBasedSearch._collapses_source_aliases``.
+        Off by default, which leaves every alias a candidate of its own.
+        """
+        return False
+
+    def simplified_selected_config(
+        self,
+        config_spec: ConfigSpec,
+        config: Config,
+        same_source: Callable[[Config], bool],
+    ) -> Config:
+        """A simpler config with the generated source of the selected one.
+
+        Called once after a search that drops source aliases
+        (``collapses_generated_source_aliases``) has selected ``config``.
+        Such a search times a kernel under the first config that produced
+        it, which may carry settings the code does not depend on.
+        ``same_source(candidate)`` says whether ``candidate`` may stand for
+        the selection: it passes the search's config filters as it is and
+        renders to the generated source of the kernel the search measured
+        (``False`` also once the autotune budget is used up, and for a
+        render that fails).  A backend resets settings of its choice that
+        can be inert and keeps each reset ``same_source`` accepts, so the
+        returned config, and a pin made from it, does not carry those
+        settings where the code does not depend on them.  It returns
+        ``config`` or a config ``same_source`` accepted: the search takes no
+        other.  It is no minimal config: a setting the backend does not try
+        stays as selected, whether the code depends on it or not (CuTe tries
+        ``load_eviction_policies`` only: each try is a render in the
+        autotuning process, and those policies are the setting a selection
+        most often carries without effect).  The default returns ``config``.
+        """
+        return config
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         """Classify an exception that occurred during autotuning.
@@ -1769,6 +1870,13 @@ class Backend(abc.ABC):
     ) -> ast.Module | None:
         """Optionally specialize standalone launch code for the bound workload."""
         return None
+
+    def standalone_entry_args(
+        self, bound: BoundKernel[Any], args: Sequence[object]
+    ) -> tuple[object, ...]:
+        """The arguments of a call of ``bound`` (``args``) that the entry point
+        of its standalone export takes. Default: all of them."""
+        return tuple(args)
 
     def capture_jax_launch_metadata(
         self, bound: BoundKernel[Any], config: Config | dict[str, object]
@@ -2868,14 +2976,9 @@ class Backend(abc.ABC):
             self, bound_kernel.settings.autotune_precompile
         )
 
-        if bound_kernel.settings.autotune_effort == "none" and (
-            force or not bound_kernel.kernel.configs
-        ):
-            return bound_kernel.config_spec.default_config()
+        if (config := bound_kernel._fixed_config(force=force)) is not None:
+            return config
         if not force and bound_kernel.kernel.configs:
-            if len(bound_kernel.kernel.configs) == 1:
-                (config,) = bound_kernel.kernel.configs
-                return config
             # We have finite predetermined configs, no need to precompile
             bound_kernel.settings.autotune_precompile = None
 

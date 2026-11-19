@@ -1192,7 +1192,14 @@ class LoopedReductionStrategy(ReductionStrategy):
             if _override is not None:
                 self._thread_count = _override
         self.block_size = block_size
-        self._loop_block_size = block_size
+        # A trip spans its threads, one element each at least.  A chunk that
+        # is not a power of two runs on the next power of two of threads when
+        # its thread count is left automatic (768 elements on 1024 threads):
+        # rolled by the chunk, the threads past it would take the next trip's
+        # elements a second time, or elements past the extent in the last
+        # trip.  It rolls by the threads instead, as the chunk of that many
+        # elements, with the bounds mask wherever that leaves a partial trip.
+        self._loop_block_size = max(block_size, thread_count)
         self._cute_reduction_lane_var: str | None = None
         self._cute_reduction_lane_extent = 1
         self._cute_reduction_vec_width = 1

@@ -719,6 +719,7 @@ def _peel_vector_tails(s: _DeviceBodyState) -> None:
     from ..peel_vector_tails import tensor_facts
     from ..smem_footprint import persistent_loop
 
+    grid = s.ctx.block_grid_dims
     s.kernel_body = peel_vector_tails(
         s.kernel_body,
         s.ctx.constexpr_values,
@@ -726,6 +727,14 @@ def _peel_vector_tails(s: _DeviceBodyState) -> None:
         tensor_facts=tensor_facts(s.fn),
         new_var=s.ctx.new_var,
         persistent_loop=persistent_loop(s.fn.pid),
+        # The launch's block grid where every extent is proven: a static
+        # flat launch's, or an XYZ launch's, whose extents are static or
+        # input sizes the cache key fixes (``_block_grid_dims``).
+        block_grid_dims=(
+            cast("tuple[int, int, int]", grid)
+            if s.ctx.exact_grid and None not in grid
+            else None
+        ),
     )
 
 

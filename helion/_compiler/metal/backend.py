@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
 from typing import Sequence
+from typing import cast
 
 import sympy
 import torch
@@ -93,24 +94,38 @@ def threadgroup_budget(config: Config, device_ir: DeviceIR | None = None) -> int
     """The threads a launch may use: ``num_warps`` SIMD groups, at most
     Metal's 1024, and at least what the reduction dims' lane forms need
     (``_lane_floor``).  Every block that takes a thread axis gets its threads
-    within it; lanes walk the rest of its extent."""
-    budget = min(MAX_THREADS_PER_THREADGROUP, SIMD_WIDTH * int(config.num_warps))
+    within it; lanes walk the rest of its extent.  A fragment config's tiles
+    take one SIMD group whatever its ``num_warps``, whose SIMD groups split
+    its K loops (``search_surface.tile_warps``)."""
+    # Imported here: the backend registry imports this module while
+    # compile_environment loads, and search_surface imports
+    # autotuner.config_spec, which reaches the registry again.
+    from ..compile_environment import CompileEnvironment
+    from .search_surface import tile_warps
+
+    warps = tile_warps(CompileEnvironment.current().config_spec, config)
+    budget = min(MAX_THREADS_PER_THREADGROUP, SIMD_WIDTH * warps)
     return max(budget, min(MAX_THREADS_PER_THREADGROUP, _lane_floor(config, device_ir)))
 
 
 def budget_note() -> str:
     """Suffix for a rejection that depends on the launch size: the budget the
-    config's num_warps gave the kernel, when it is below Metal's 1024."""
+    config's num_warps gave the kernel, when it is below Metal's 1024, or
+    that a fragment config's tiles take one SIMD group, which no num_warps
+    changes."""
     from ..compile_environment import CompileEnvironment
 
     backend = CompileEnvironment.current().backend
     assert isinstance(backend, MetalBackend)
-    if backend._thread_budget >= MAX_THREADS_PER_THREADGROUP:
+    budget = backend._thread_budget
+    if budget >= MAX_THREADS_PER_THREADGROUP:
         return ""
-    return (
-        f" (threadgroup budget {backend._thread_budget} threads from "
-        f"num_warps={backend._num_warps})"
-    )
+    if backend._fragment_tiles:
+        return (
+            f" (threadgroup budget {budget} threads: a fragment config's tiles "
+            "take one SIMD group)"
+        )
+    return f" (threadgroup budget {budget} threads from num_warps={backend._num_warps})"
 
 
 def indexed_reduction_blocks(device_ir: DeviceIR) -> set[int]:
@@ -290,6 +305,68 @@ def _config_fixed_scalars() -> set[str]:
     }
 
 
+def _loop_bounds(device_ir: DeviceIR) -> dict[int, tuple[object, object]]:
+    """Each device loop block's ``(begin, end)`` as the kernel's ``_for_loop``
+    calls pass them: an int, a node or an expression for a value known only
+    at runtime.  An end ``hl.specialize`` pins is its value.  A block two calls loop
+    over with different bounds has none."""
+    # Local imports: language, compile_environment and device_ir import
+    # this module (through the backends) as they load.
+    from ...language import _tracing_ops
+    from ..compile_environment import CompileEnvironment
+    from ..device_ir import ForLoopGraphInfo
+
+    env = CompileEnvironment.current()
+    loops = {
+        info.graph_id: info
+        for info in device_ir.graphs
+        if isinstance(info, ForLoopGraphInfo)
+    }
+    bounds: dict[int, tuple[object, object]] = {}
+    ambiguous: set[int] = set()
+    for info in device_ir.graphs:
+        for node in info.graph.nodes:
+            if node.op != "call_function" or node.target not in (
+                _tracing_ops._for_loop,
+                _tracing_ops._for_loop_step,
+            ):
+                continue
+            begins, ends = node.args[1], node.args[2]
+            assert isinstance(begins, list) and isinstance(ends, list)
+            for block, begin, end in zip(
+                loops[node.args[0]].block_ids, begins, ends, strict=True
+            ):
+                if isinstance(begin, torch.SymInt):
+                    begin = begin._sympy_()
+                if isinstance(end, torch.SymInt):
+                    end = env.specialize_expr(cast("sympy.Expr", end._sympy_()))
+                if bounds.setdefault(block, (begin, end)) != (begin, end):
+                    ambiguous.add(block)
+    return {block: b for block, b in bounds.items() if block not in ambiguous}
+
+
+def _staged_matmuls(plan: MppPlan) -> tuple[tuple[int, int, int], ...]:
+    """``MetalKernelFacts.staged_matmuls``: the MPP plan's K-loop groups
+    with one operand staged per K tile beside a device view."""
+    from .mpp_matmul import is_tile_product
+
+    found = []
+    for group in plan.by_matmul.values():
+        per_tile = [
+            op.staged and op.hoist is None and op.elements is None
+            for op in (group.lhs, group.rhs)
+        ]
+        # A per-K-tile product's op runs once per K tile as an
+        # accumulator's does, staging its operand per tile the same way.
+        if not (group.levels or is_tile_product(group)) or per_tile.count(True) != 1:
+            continue
+        if per_tile[1] and group.lhs.view is not None:
+            found.append((group.m_block, group.n_block, group.k_block))
+        elif per_tile[0] and group.rhs.view is not None:
+            found.append((group.n_block, group.m_block, group.k_block))
+    return tuple(found)
+
+
 class MetalBackend(Backend):
     """Metal Shading Language (MSL) code generation backend for macOS."""
 
@@ -297,8 +374,9 @@ class MetalBackend(Backend):
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         from .row_reduction_heuristic import MetalRowReductionHeuristic
+        from .staged_matmul_heuristic import MetalStagedMatmulHeuristic
 
-        return (MetalRowReductionHeuristic,)
+        return (MetalRowReductionHeuristic, MetalStagedMatmulHeuristic)
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
@@ -327,6 +405,7 @@ class MetalBackend(Backend):
             "reduction_fusion",
             "pid_type",
             "num_sm_multiplier",
+            "range_num_stages",
         }
     )
 
@@ -343,10 +422,13 @@ class MetalBackend(Backend):
         # by ``create_loop_strategy`` because strategies of the next config
         # are built, and may read ``force_tile_mask``, before it runs.
         self._uniform_extent: int | None = None
-        # The config's ``threadgroup_budget``, set by ``create_loop_strategy``
-        # for the reduction strategies built after the loop strategies.
+        # The config's ``threadgroup_budget``, its num_warps and whether its
+        # tiles take one SIMD group (``search_surface.fragment_tiles``), set
+        # by ``create_loop_strategy`` for the reduction strategies built after
+        # the loop strategies.
         self._thread_budget = MAX_THREADS_PER_THREADGROUP
         self._num_warps = MAX_THREADS_PER_THREADGROUP // SIMD_WIDTH
+        self._fragment_tiles = False
         self._scalar_contraction_blocks: set[int] = set()
         # Threads left for the current loop's literal-size tiles when the
         # kernel's tiles overflow the budget (_serialize_nested_auto_tiles).
@@ -573,17 +655,33 @@ class MetalBackend(Backend):
         whether its K-loop matmuls lower on fragments too
         (``search_surface.lowers_on_fragments``, which exposes
         ``metal_matmul`` to the search): the planner's fragment trial on
-        copies of the graphs, with no block spread over threads."""
+        copies of the graphs, with no block spread over threads.  Then the
+        sizes of the tables its fragment elements would read
+        (``metal_tabulate_max_entries``), whether SIMD groups can split its
+        fragment K loops (``num_warps``), a ``range_num_stages`` slot per
+        K loop, for loading its runs' operands a tile ahead, and the blocks
+        of the matmuls that stage an operand per K tile
+        (``MetalKernelFacts.staged_matmuls``, which the staged-matmul seeds
+        read)."""
         from ..compile_environment import CompileEnvironment
         from ..compile_environment import FixedBlockSizeSource
         from ..device_ir import ForLoopGraphInfo
         from ..host_function import HostFunction
         from .fragment_mma import FRAGMENT_LOWERING
+        from .fragment_mma import loads_ahead
+        from .fragment_mma import split_refusal
         from .free_arange import free_arange_blocks
         from .mpp_matmul import has_matmuls
         from .mpp_matmul import plan_mpp_matmuls
+        from .search_surface import FragmentNumStagesSpec
         from .search_surface import MetalKernelFacts
+        from .tabulate import table_sizes
 
+        # Metal reads range_num_stages on fragment K loops only, so it keeps
+        # their slots alone (Triton's ``tl.range`` hook adds one per loop when
+        # triton imports).
+        stages = config_spec.range_num_stages
+        stages.clear()
         if not has_matmuls(device_ir.graphs):
             return
         # The planner reads the kernel's roots and grids through its
@@ -595,14 +693,18 @@ class MetalBackend(Backend):
                 mpp = plan_mpp_matmuls([i.copy() for i in device_ir.graphs], set())
             except exc.BackendUnsupported:
                 mpp = None
+            fragment_graphs = [i.copy() for i in device_ir.graphs]
             try:
-                plan = plan_mpp_matmuls(
-                    [i.copy() for i in device_ir.graphs], set(), FRAGMENT_LOWERING
-                )
+                plan = plan_mpp_matmuls(fragment_graphs, set(), FRAGMENT_LOWERING)
             except exc.BackendUnsupported:
                 plan = None
+            splits = plan is not None and split_refusal(plan, fragment_graphs) is None
             free = free_arange_blocks()
-        launch_facts = MetalKernelFacts()
+        # The MPP matmuls that stage an operand per K tile, which the staged
+        # matmul heuristic seeds tall tiles for.
+        launch_facts = MetalKernelFacts(
+            staged_matmuls=() if mpp is None else _staged_matmuls(mpp)
+        )
         reductions = any(
             info.reduction for info in CompileEnvironment.current().block_sizes
         )
@@ -644,21 +746,42 @@ class MetalBackend(Backend):
             # cases of one launch, each with its own tiles, and sibling loops
             # don't nest, so those kernels get no fit (follow-up).
             if any(loops) and len(device_ir.grid_block_ids) == 1 and len(loops) <= 2:
-                launch_facts = MetalKernelFacts(
+                launch_facts = dataclasses.replace(
+                    launch_facts,
                     thread_loops=tuple(loops),
                     literal_threads=tuple(literals),
                     reduced_after_loop=frozenset(
                         blocks_reduced_after_loop(device_ir) & tunable
                     ),
                 )
-                config_spec.backend_facts = launch_facts
+        if launch_facts != MetalKernelFacts():
+            config_spec.backend_facts = launch_facts
         if plan is None:
             return
         blocks = tuple(sorted({group.k_block for group in plan.by_matmul.values()}))
         if blocks:
+            # The nodes the matmuls compute from, where fragment elements
+            # would read tables.
+            inputs: set[torch.fx.Node] = set()
+            todo = [group.matmul for group in plan.by_matmul.values()]
+            while todo:
+                for node in todo.pop().all_input_nodes:
+                    if node not in inputs:
+                        inputs.add(node)
+                        todo.append(node)
             config_spec.backend_facts = dataclasses.replace(
-                launch_facts, fragment_matmuls=True
+                launch_facts,
+                fragment_matmuls=True,
+                table_sizes=frozenset(table_sizes(inputs)),
+                fragment_splits=splits,
             )
+            # A slot per K loop that can load a tile ahead: known bounds it
+            # runs between (``fragment_mma.loads_ahead``, which codegen
+            # checks under the slot).
+            bounds = _loop_bounds(device_ir)
+            for block in blocks:
+                if block in bounds and loads_ahead(*bounds[block]):
+                    stages.append(FragmentNumStagesSpec([block]))
 
     def default_num_sm_multiplier(self) -> int:
         # A threadgroup doesn't fill an Apple GPU core.  On an M4 Pro (16
@@ -721,13 +844,16 @@ class MetalBackend(Backend):
     ) -> None:
         from ..compile_environment import CompileEnvironment
         from .fragment_mma import FRAGMENT_LOWERING
+        from .fragment_mma import split_refusal
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .literal_dims import reject_literal_dims
+        from .mpp_matmul import metal_unsupported
         from .mpp_matmul import plan_mpp_matmuls
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
+        from .search_surface import fragment_split
         from .search_surface import metal_matmul
 
         reject_positional_rebinds(graphs)
@@ -746,7 +872,18 @@ class MetalBackend(Backend):
             threaded,
             FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
         )
-        check_free_lanes(self.free_arange_plan, self.mpp_plan, graphs)
+        split = fragment_split(CompileEnvironment.current().config_spec, config)
+        if split > 1 and self.mpp_plan.by_matmul:
+            refusal = split_refusal(self.mpp_plan, graphs)
+            if refusal is not None:
+                raise metal_unsupported(
+                    f"a fragment K loop split over {split} SIMD groups "
+                    f"(num_warps={split}): {refusal}; use num_warps=1"
+                )
+            self.mpp_plan.split = split
+        check_free_lanes(
+            self.free_arange_plan, self.mpp_plan, graphs, self._fragment_tiles
+        )
         self._uniform_extent = self._uniform_thread_extent(tile_strategy)
 
     def _uniform_thread_extent(self, tile_strategy: TileStrategyDispatch) -> int | None:
@@ -983,6 +1120,7 @@ class MetalBackend(Backend):
         from ..reduction_strategy import PersistentReductionStrategy
         from ..reduction_strategy import ReductionStrategy
         from .padded_twin import padded_twin_owner
+        from .reduction_strategy import MetalLoopedReductionStrategy
         from .reduction_strategy import MetalPaddedTwinStrategy
         from .reduction_strategy import MetalPersistentReductionStrategy
 
@@ -1021,7 +1159,7 @@ class MetalBackend(Backend):
             )
             if 1 < span < reduction_loop:
                 reduction_loop = span
-            strategy = super().create_reduction_strategy(fn, block_id, reduction_loop)
+            strategy = MetalLoopedReductionStrategy(fn, block_id, reduction_loop)
         # Narrow for the type checker as CuTe does: only reduction strategies
         # carry a thread count; anything else counts zero and returns below.
         span = (
@@ -1172,9 +1310,13 @@ class MetalBackend(Backend):
                 f"{self._uniform_extent}, but the kernel launches {dims}"
             )
         check_free_arange_launch(self.free_arange_plan, self._tid_axes, dims)
+        split = 1
         if self.mpp_plan is not None:
             check_mpp_launch(self.mpp_plan, dims)
-        return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2]})"]
+            split = self.mpp_plan.split
+        # The SIMD groups that split fragment K loops each run the tiles'
+        # threads: the launch stacks them along z.
+        return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2] * split})"]
 
     def build_launcher_args(
         self,
@@ -1218,6 +1360,10 @@ class MetalBackend(Backend):
         threads explicitly is rejected.  Users hitting that rejection should
         lower ``num_threads`` or ``block_sizes``.
         """
+        # Imported here for the cycle ``threadgroup_budget`` names.
+        from ..compile_environment import CompileEnvironment
+        from .search_surface import fragment_tiles
+
         self._uniform_extent = None
         self._literal_tile_limit = None
         self._scalar_contraction_blocks = scalar_contraction_blocks(
@@ -1225,6 +1371,9 @@ class MetalBackend(Backend):
         )
         self._thread_budget = threadgroup_budget(config)
         self._num_warps = int(config.num_warps)
+        self._fragment_tiles = fragment_tiles(
+            CompileEnvironment.current().config_spec, config
+        )
         config = self._config_with_divisible_thread_counts(config)
         # Cap tile thread counts so the reduction axes and free hl.arange axes
         # still fit alongside them.

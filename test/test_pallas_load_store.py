@@ -167,7 +167,7 @@ class TestPallasJaggedCarrySimple(TestCase):
         code, out = _run(
             seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
         )
-        self.assertIn("pl.program_id(0) != 0", code)
+        self.assertIn("pl.program_id(0) == 0", code)
         torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
 
     @parametrize("kernel", _BMM_KERNELS)
@@ -425,7 +425,8 @@ class TestPallasJaggedCarryBmm(TestCase):
         "offsets",
         [
             [0, 0, 16],  # leading empty
-            [0, 5, 5, 16],  # interior empty
+            [5, 5, 13, 16],  # leading empty at unaligned non-zero offset
+            [0, 5, 5, 5, 20],  # interior and repeated empties at an unaligned row
             [0, 16, 16],  # trailing empty
         ],
     )
@@ -436,10 +437,62 @@ class TestPallasJaggedCarryBmm(TestCase):
     ) -> None:
         # Zero-length groups (s == e) iterate no tiles; carry threads the neighbours.
         seq_offsets, jagged, dense = _inputs(offsets, 128, 128, dtype)
-        _code, out = _run(
+        code, out = _run(
             seq_offsets, jagged, dense, [16, 128, 128], loop_type, kernel=kernel
         )
-        torch.testing.assert_close(out, _ref_jagged_bmm(seq_offsets, jagged, dense))
+        self.assertIn("jnp.where(e > s, ", code)
+        ref = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        torch.testing.assert_close(out[offsets[0] :], ref[offsets[0] :])
+
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_pad_rows_zeroed(self, loop_type: str) -> None:
+        # Unowned rows in a non-empty group's S-aligned window ([offs[0] - offs[0] % S,
+        # offs[0])) are zeroed, while an empty group ([5, 5]) writes nothing.
+        @helion.kernel(backend="pallas")
+        def jagged_bmm_into(
+            seq_offsets: torch.Tensor,
+            jagged: torch.Tensor,
+            dense: torch.Tensor,
+            out: torch.Tensor,
+        ) -> torch.Tensor:
+            B, D, K = dense.shape
+            for g in hl.grid(B):
+                s = seq_offsets[g]
+                e = seq_offsets[g + 1]
+                for st, kt in hl.tile((s, 0), (e, K)):
+                    acc = hl.zeros([st, kt], dtype=torch.float32)
+                    for dt in hl.tile(0, D):
+                        acc = acc + torch.matmul(jagged[st, dt], dense[g, dt, kt])
+                    out[st, kt] = acc.to(out.dtype)
+            return out
+
+        seq_offsets, jagged, dense = _inputs(
+            [5, 5, 13, 61, 192], 128, 128, torch.bfloat16
+        )
+        out = torch.full(
+            (jagged.shape[0], dense.shape[2]),
+            7,
+            dtype=torch.bfloat16,
+            device=DEVICE,
+        )
+        _code, res = code_and_output(
+            jagged_bmm_into,
+            (seq_offsets, jagged, dense, out),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        ref = _ref_jagged_bmm(seq_offsets, jagged, dense)
+        torch.testing.assert_close(res[:5], torch.zeros_like(res[:5]))
+        empty_offsets = torch.tensor([5, 5], dtype=torch.int32, device=DEVICE)
+        empty_out = torch.full_like(out[:32], 7)
+        _code, empty_res = code_and_output(
+            jagged_bmm_into,
+            (empty_offsets, jagged[:32], dense[:1], empty_out),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(empty_res, torch.full_like(empty_res, 7))
+        torch.testing.assert_close(res[5:], ref[5:])
 
     @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
     def test_elementwise_map_axis(self, loop_type: str) -> None:
@@ -1170,6 +1223,44 @@ class TestPallasJaggedCarryRejects(TestCase):
 
 @onlyBackends(["pallas"])
 @skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasJaggedAutotuneViability(TestCase):
+    """``autotune_config_is_viable`` filters out candidate configs whose grid
+    size or static loop trip counts exceed compile-time caps (e.g. >16 steps
+    for ``unroll``, >64 stages for the low-level ``emit_pipeline`` scheduler).
+
+    On ``jagged_dense_bmm`` (``hl.grid`` over groups, data-dependent row tile
+    ``hl.tile(s, e)`` with fallback ``size_hint=8192``, and static ``K=4096``,
+    ``D=128`` tiles), untuned ``hl.grid`` axes must not ``KeyError`` when
+    counting grid programs, and the row tile's ``8192`` placeholder must not
+    trip the inner-loop step caps while static ``K``/``D`` tiles still do.
+    """
+
+    def test_grid_and_jagged_rows(self) -> None:
+        args = _inputs([0, 13, 25], 128, 4096, torch.bfloat16)
+        spec = jagged_dense_bmm.bind(args).config_spec
+
+        def viable(
+            block_sizes: list[int], loop_type: str, *, low_level: bool = False
+        ) -> bool:
+            config = helion.Config(
+                block_sizes=block_sizes,
+                pallas_loop_type=loop_type,
+                pallas_use_low_level_scheduler=low_level,
+            )
+            return spec.backend.autotune_config_is_viable(spec, config)
+
+        # block_sizes = [st, kt, dt] with K = 4096, D = 128:
+        # - hl.grid has no BlockSizeSpec (previously raised KeyError).
+        self.assertTrue(viable([16, 128, 128], "fori_loop"))
+        # - kt takes 4096 / 128 = 32 <= 64 stages; st's 8192 hint is ignored.
+        self.assertTrue(viable([16, 128, 128], "emit_pipeline", low_level=True))
+        # - kt takes 4096 / 256 = 16 <= 16 unroll steps; 4096 / 128 = 32 > 16.
+        self.assertTrue(viable([16, 256, 128], "unroll"))
+        self.assertFalse(viable([16, 128, 128], "unroll"))
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
 class TestPallasPartialSlice(TestCase):
     """Static bounded slices (``[:n]`` / ``[n:]``) on untiled dims."""
 
@@ -1471,6 +1562,87 @@ class TestPallasClampedRefs(TestCase):
         torch.testing.assert_close(out, torch.cat([x, y], dim=1))
 
 
+# out = (x @ w[:, :half]) * (x @ w[:, half:]): the inner loop loads w at two
+# column windows, w[k, n] and w[k, n.index + half].
+@helion.kernel(backend="pallas")
+def gate_up_product(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    half = w.shape[1] // 2
+    out = torch.empty((M, half), dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, half]):
+        gate = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        up = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            a = x[tile_m, tile_k]
+            gate = gate + torch.matmul(a, w[tile_k, tile_n])
+            up = up + torch.matmul(a, w[tile_k, tile_n.index + half])
+        out[tile_m, tile_n] = (gate * up).to(out.dtype)
+    return out
+
+
+# gate_up_product with the offset window, w[k, n.index + half], loaded first.
+@helion.kernel(backend="pallas")
+def up_gate_product(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    half = w.shape[1] // 2
+    out = torch.empty((M, half), dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, half]):
+        gate = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        up = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            a = x[tile_m, tile_k]
+            up = up + torch.matmul(a, w[tile_k, tile_n.index + half])
+            gate = gate + torch.matmul(a, w[tile_k, tile_n])
+        out[tile_m, tile_n] = (gate * up).to(out.dtype)
+    return out
+
+
+# out = x @ w plus row 1 of each k tile of w: the inner loop loads w at its
+# tile and at row tile_k.begin + 1, which lies inside that tile.
+@helion.kernel(backend="pallas")
+def matmul_plus_tile_row(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    M, K = x.shape
+    N = w.shape[1]
+    out = torch.empty((M, N), dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([M, N]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K):
+            acc = acc + torch.matmul(x[tile_m, tile_k], w[tile_k, tile_n])
+            acc = acc + w[tile_k.begin + 1, tile_n][None, :]
+        out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+@onlyBackends(["pallas"])
+@skipUnlessPallas("JAX/Pallas TPU not available")
+class TestPallasInnerLoopWindows(TestCase):
+    """One tensor accessed at several windows inside an inner loop."""
+
+    @parametrize("kernel", [gate_up_product, up_gate_product])
+    @parametrize("loop_type", _LOOP_TYPES_XFAIL_INTERPRET)
+    def test_tile_and_offset_tile_windows(self, kernel, loop_type: str) -> None:
+        torch.manual_seed(0)
+        x = torch.randint(-2, 3, (64, 256)).to(DEVICE, torch.float32)
+        w = torch.randint(-2, 3, (256, 512)).to(DEVICE, torch.float32)
+        _code, out = code_and_output(
+            kernel, (x, w), block_sizes=[32, 128, 128], pallas_loop_type=loop_type
+        )
+        torch.testing.assert_close(out, (x @ w[:, :256]) * (x @ w[:, 256:]))
+
+    @parametrize("loop_type", _LOOP_TYPES)
+    def test_tile_and_in_tile_row_share_window(self, loop_type: str) -> None:
+        torch.manual_seed(0)
+        x = torch.randint(-2, 3, (64, 256)).to(DEVICE, torch.float32)
+        w = torch.randint(-2, 3, (256, 256)).to(DEVICE, torch.float32)
+        _code, out = code_and_output(
+            matmul_plus_tile_row,
+            (x, w),
+            block_sizes=[32, 128, 128],
+            pallas_loop_type=loop_type,
+        )
+        torch.testing.assert_close(out, x @ w + w[1::128].sum(0))
+
+
 instantiate_parametrized_tests(TestPallasJaggedCarrySimple)
 instantiate_parametrized_tests(TestPallasJaggedCarryBmm)
 instantiate_parametrized_tests(TestPallasMultipleOfPromises)
@@ -1478,3 +1650,4 @@ instantiate_parametrized_tests(TestPallasJaggedIndexing)
 instantiate_parametrized_tests(TestPallasJaggedReductions)
 instantiate_parametrized_tests(TestPallasJaggedCarryRejects)
 instantiate_parametrized_tests(TestPallasVmemScalarLoad)
+instantiate_parametrized_tests(TestPallasInnerLoopWindows)

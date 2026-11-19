@@ -27,13 +27,21 @@ from collections import Counter
 import contextlib
 import copy
 import dataclasses
+from typing import TYPE_CHECKING
 from typing import Iterator
 
 from ... import exc
+from .fragment_mma import SIMDGROUP
+from .fragment_mma import EarlyLoad
+from .fragment_mma import FragmentElement
 from .fragment_mma import emit_fragment_acc
 from .fragment_mma import emit_fragment_run
+from .fragment_mma import emit_split_combine
 from .fragment_mma import fragment_elements
 from .fragment_mma import is_fragment_acc
+from .fragment_mma import prefetch_loads
+from .fragment_mma import split_range
+from .fragment_mma import split_runs
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
@@ -42,6 +50,9 @@ from .mpp_matmul import FRAG_RUN
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclasses.dataclass
@@ -60,21 +71,52 @@ class EmitState:
     _enclosing: list[set[str]] = dataclasses.field(default_factory=list)
     #: Each MPP cooperative tensor's name, or a reference alias's, to its root.
     coop: dict[str, str] = dataclasses.field(default_factory=dict)
-    #: Each cooperative root's MPP group id and its lhs and rhs element types.
-    coop_group: dict[str, tuple[int, tuple[str, str]]] = dataclasses.field(
+    #: Each cooperative root's MPP group id and its lhs, rhs and acc element
+    #: types.
+    coop_group: dict[str, tuple[int, tuple[str, str, str]]] = dataclasses.field(
         default_factory=dict
     )
     #: Each cooperative root's M and N blocks.
     coop_tile: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: The cooperative roots whose descriptor rounds a size-1 dim up.
     coop_rounded: set[str] = dataclasses.field(default_factory=set)
+    #: The folds' roots (``mpp_matmul._plan_fold``): their update loops read
+    #: the product's tensor, of the same group, at the same index.
+    coop_fold: set[str] = dataclasses.field(default_factory=set)
+    #: Each MPP root's op M and N, which bound its elements per thread.
+    coop_dims: dict[str, tuple[int, int]] = dataclasses.field(default_factory=dict)
     #: Each fragment group's accumulator root to its fragment grid ``(rows,
     #: cols, transposed)`` (``fragment_mma``).
     fragments: dict[str, tuple[int, int, int]] = dataclasses.field(default_factory=dict)
-    #: The kernel's names that are integer constants, which a fragment run
-    #: folds its elements' index arithmetic over (``fragment_mma``'s
-    #: ``kernel_constants``).
-    constants: dict[str, int] = dataclasses.field(default_factory=dict)
+    #: The kernel's names that are constants, which a fragment run folds its
+    #: elements' index arithmetic over and tabulates their decodes with
+    #: (``fragment_mma``'s ``kernel_constants``).
+    constants: dict[str, int | float] = dataclasses.field(default_factory=dict)
+    #: Each ``constant`` table (``tabulate``) by its element type and
+    #: entries, to its name; the kernel's source declares them.
+    tables: dict[tuple[str, tuple[str, ...]], str] = dataclasses.field(
+        default_factory=dict
+    )
+    #: Each fragment run's K offset, the loads its K loop issues a tile
+    #: early, to the registers holding them, and the elements built to find
+    #: them (``fragment_mma``'s ``prefetch_loads``), by the run's loop.
+    prefetch: dict[
+        ast.For,
+        tuple[
+            str,
+            dict[EarlyLoad, str],
+            dict[tuple[int, int, int], FragmentElement],
+        ],
+    ] = dataclasses.field(default_factory=dict)
+    #: How many prefetch registers the kernel has named, which keeps their
+    #: names unique.
+    early_count: int = 0
+    #: The SIMD groups that split each fragment K loop (``fragment_mma``),
+    #: the offsets of the split loops being emitted, and the float slots
+    #: their combines pass accumulators through.
+    split: int = 1
+    split_loops: list[str] = dataclasses.field(default_factory=list)
+    split_slots: int = 0
     #: The element an element loop's ``_helion_mpp_put`` writes.
     put: str = "*_it"
 
@@ -127,12 +169,15 @@ def _emit_tl_store(
     parts: list[str],
     indent: int,
     subs: dict[str, str] | None = None,
+    split: int = 1,
 ) -> None:
     """Emit MSL for ``tl.store(ptr + offset, val, mask)``.
 
     Dereferences the pointer expression: ``*(ptr + offset) = val``.
     All three positional args (ptr, val, mask) are always present —
-    PointerIndexingStrategy emits them positionally.
+    PointerIndexingStrategy emits them positionally.  When ``split`` SIMD
+    groups split the fragment K loops, the first writes and the others,
+    which run the same code, don't (``fragment_mma``).
     """
     pad = " " * indent
     access = _ptr_access_expr(node.args[0], subs=subs)
@@ -143,6 +188,8 @@ def _emit_tl_store(
         # None mask = no masking
         if not (isinstance(mask_node, ast.Constant) and mask_node.value is None):
             mask = _ast_expr_to_msl(mask_node, subs=subs)
+    if split > 1:
+        mask = f"{SIMDGROUP} == 0" + ("" if mask is None else f" && ({mask})")
     if mask is not None:
         parts.extend(
             (
@@ -210,7 +257,7 @@ def _emit_stmts(
             # tl.store(ptr + offset, val, mask) → if (mask) { *(ptr+offset) = val; }
             if _is_tl_store_call(call):
                 assert isinstance(call, ast.Call)
-                _emit_tl_store(call, parts, indent=indent, subs=subs)
+                _emit_tl_store(call, parts, indent, subs, state.split)
             elif _is_call_to(call, LANE_PUT):
                 assert isinstance(call, ast.Call)
                 array, lane, value = (_ast_expr_to_msl(a, subs=subs) for a in call.args)
@@ -307,6 +354,7 @@ def _emit_coop_acc(
     if (block_m, block_n) != (tm, tn):
         state.coop_rounded.add(name)
     state.coop_tile[name] = (block_m, block_n)
+    state.coop_dims[name] = (tm, tn)
     lhs_extents = f"{tm}, {tk}" if lhs_t else f"{tk}, {tm}"
     rhs_extents = f"{tk}, {tn}" if rhs_t else f"{tn}, {tk}"
     scope = "(_TG_SIZE_X * _TG_SIZE_Y * _TG_SIZE_Z) / 32"
@@ -314,7 +362,7 @@ def _emit_coop_acc(
     desc = f"_mpp_desc_{gid}"
     lhs_space = "threadgroup" if lhs_staged else "device"
     rhs_space = "threadgroup" if rhs_staged else "device"
-    lhs_dtype, rhs_dtype = dtypes
+    lhs_dtype, rhs_dtype, acc_dtype = dtypes
     lhs = f"tensor<{lhs_space} {lhs_dtype}, extents<int32_t, {lhs_extents}>, tensor_inline>"
     rhs = f"tensor<{rhs_space} {rhs_dtype}, extents<int32_t, {rhs_extents}>, tensor_inline>"
     parts.extend(
@@ -326,14 +374,15 @@ def _emit_coop_acc(
             f"{pad}matmul2d<{desc}, execution_simdgroups<{scope}>> _mpp_op_{gid};",
             (
                 f"{pad}auto {name} = _mpp_op_{gid}.get_destination_cooperative_tensor<"
-                f"{lhs}, {rhs}, float>();"
+                f"{lhs}, {rhs}, {acc_dtype}>();"
             ),
         ]
     )
     if seed is None:
+        value = f"{float(fill)!r}f" if acc_dtype == "float" else repr(int(fill))
         parts.append(
             f"{pad}for (auto _it = {name}.begin(); _it != {name}.end(); _it++) "
-            f"*_it = {float(fill)!r}f;"
+            f"*_it = {value};"
         )
     else:
         # The staged seed (``mpp_matmul``'s ``_mpp_coop``): every thread's
@@ -353,6 +402,8 @@ def _emit_coop_acc(
     state.declare(name)
     state.coop[name] = name
     state.coop_group[name] = (gid, dtypes)
+    if any(k.arg == "fold" for k in call.keywords):
+        state.coop_fold.add(name)
 
 
 def _coop_elements(coop: str, pad: str, block_m: int, block_n: int) -> list[str]:
@@ -451,7 +502,7 @@ def _coop_view(
         decls.append(f"long {xv} = (long)({idx});")
         live.append(f"0 <= {xv} && {xv} < (long)({size})")
         terms.append(f"{xv} * {stride}")
-    base = f"{ptr} + ({' + '.join(terms)})"
+    base = _typed(f"{ptr} + ({' + '.join(terms)})", "device", dtype)
     # Handle dims are innermost first.
     if strides[1] == "1":
         dims, handle_strides = f"{extents[1]}, {extents[0]}", f"1, {strides[0]}"
@@ -464,6 +515,14 @@ def _coop_view(
         f"metal::array<int32_t, 2>({{{handle_strides}}}));"
     )
     return decls, live, handle
+
+
+def _typed(pointer: str, space: str, dtype: str) -> str:
+    """*pointer* as a pointer to the op's element type: an int8 tensor's
+    ``char`` pointer cast to ``int8_t``, which MSL keeps distinct."""
+    if dtype == "int8_t":
+        return f"({space} int8_t*)({pointer})"
+    return pointer
 
 
 def _staged_view(
@@ -485,7 +544,8 @@ def _staged_view(
     rows, cols = blocks
     return (
         f"auto {var} = tensor<threadgroup {dtype}, dextents<int32_t, 2>, tensor_inline>("
-        f"{_ast_expr_to_msl(args[0])}, dextents<int32_t, 2>({extent(args[6], cols)}, "
+        f"{_typed(_ast_expr_to_msl(args[0]), 'threadgroup', dtype)}, "
+        f"dextents<int32_t, 2>({extent(args[6], cols)}, "
         f"{extent(args[2], rows)}), metal::array<int32_t, 2>({{1, {cols}}}));"
     )
 
@@ -563,8 +623,12 @@ def _emit_for(
       _it != coop.end(); _it++)`` with the tensor's names substituted by
       ``(*_it)`` in the body, or a fragment group's unrolled loop over the
       elements each lane holds (``fragment_mma.fragment_elements``)
-    - ``_helion_mpp_fragments(acc, steps, facts)`` → a fragment group's op
-      over one K tile (``fragment_mma.emit_fragment_run``)
+    - ``_helion_mpp_fragments(acc, steps, facts, tables, k_step, split)`` → a
+      fragment group's op over one K tile (``fragment_mma.emit_fragment_run``)
+
+    A range loop whose fragment runs SIMD groups split runs each from its
+    own tile over every ``split``-th one (``fragment_mma.split_range``),
+    then adds their accumulators (``fragment_mma.emit_split_combine``).
     """
     pad = " " * indent
     it = stmt.iter
@@ -596,6 +660,26 @@ def _emit_for(
             **(subs or {}),
             **{name: element for name, r in state.coop.items() if r == root},
         }
+        unroll = any(k.arg == "unroll" for k in it.keywords)
+        if root in state.coop_fold:
+            # A fold's update reads its product's element at its own slot: the
+            # two tensors hold the same element at each index
+            # (``mpp_matmul._plan_fold``).  Only an unrolled loop has a slot
+            # index; every update loop is unrolled (``elementize``).
+            gid = state.coop_group[root][0]
+            products = {
+                r
+                for r, (g, _) in state.coop_group.items()
+                if g == gid and r not in state.coop_fold
+            }
+            product_names = {name for name, r in state.coop.items() if r in products}
+            reads = {
+                n.id for s in stmt.body for n in ast.walk(s) if isinstance(n, ast.Name)
+            }
+            assert unroll or not reads & product_names, (
+                "a fold's element loop that reads its product is not unrolled"
+            )
+            element_subs |= {name: f"{state.coop[name]}[_ei]" for name in product_names}
         fenced = len(it.args) > 1 and ast.literal_eval(it.args[1])
         if fenced:
             # The loop reads a staged vector's tile: after its staging writes.
@@ -611,22 +695,15 @@ def _emit_for(
 
         if root in state.fragments:
             parts.extend(fragment_elements(coop, root, pad, state, body))
+        elif unroll:
+            parts.extend(_unrolled_elements(coop, root, pad, state, body))
         else:
-            # A cooperative tensor's multidimensional index is (column, row).
-            parts.extend(
-                (
-                    f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{",
-                    f"{pad}    if (!{coop}.is_valid_element(_it)) continue;",
-                    f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
-                    f"{pad}    int _e_n = (int)_md[0];",
-                    f"{pad}    int _e_m = (int)_md[1];",
-                )
+            parts.append(
+                f"{pad}for (auto _it = {coop}.begin(); _it != {coop}.end(); _it++) {{"
             )
-            if root in state.coop_rounded:
-                block_m, block_n = state.coop_tile[root]
-                parts.append(
-                    f"{pad}    if (_e_m >= {block_m} || _e_n >= {block_n}) continue;"
-                )
+            parts.extend(
+                _element_head(coop, root, pad, state, f"!{coop}.is_valid_element(_it)")
+            )
             parts.extend(body(indent + 4))
             parts.append(f"{pad}}}")
         if fenced:
@@ -667,13 +744,98 @@ def _emit_for(
         end = _ast_expr_to_msl(args[1], subs=subs)
         step = _ast_expr_to_msl(args[2], subs=subs)
 
+    runs = split_runs(stmt.body, loop_var)
+    if runs:
+        start, step = split_range(start, step, state.split)
+        state.split_loops.append(loop_var)
+    before, top = prefetch_loads(stmt.body, loop_var, end, pad, state)
+    parts += before
     parts.append(
         f"{pad}for (int {loop_var} = {start}; {loop_var} < {end}; {loop_var} += {step}) {{"
     )
+    parts += top
     with state.block_scope():
         state.declare(loop_var)
         _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
+    if runs:
+        state.split_loops.pop()
+        emit_split_combine(runs, parts, pad, state)
+
+
+def _element_head(
+    coop: str, root: str, pad: str, state: EmitState, skip: str
+) -> list[str]:
+    """The head of an element loop's body: skip the element when ``skip``
+    holds or it lies past a rounded block, else bind its row and column to
+    ``_e_m`` and ``_e_n``.  A cooperative tensor's multidimensional index is
+    (column, row)."""
+    lines = [
+        f"{pad}    if ({skip}) continue;",
+        f"{pad}    auto _md = {coop}.get_multidimensional_index(_it);",
+        f"{pad}    int _e_n = (int)_md[0];",
+        f"{pad}    int _e_m = (int)_md[1];",
+    ]
+    if root in state.coop_rounded:
+        block_m, block_n = state.coop_tile[root]
+        lines.append(f"{pad}    if (_e_m >= {block_m} || _e_n >= {block_n}) continue;")
+    return lines
+
+
+#: The fewest elements per thread an unrolled element loop covers: an op on a
+#: small tile gives each thread more element slots than its share of the tile
+#: (4 for 16x16 on eight SIMD groups, measured on an M4).
+_MIN_UNROLLED_ELEMENTS = 8
+
+
+def _unrolled_elements(
+    coop: str,
+    root: str,
+    pad: str,
+    state: EmitState,
+    body: Callable[[int], list[str]],
+) -> list[str]:
+    """An element loop that runs once per iteration of an enclosing loop (an
+    accumulator's update), unrolled over a compile-time bound on the
+    thread's element slots: the op's tile over the threadgroup's threads,
+    at least ``_MIN_UNROLLED_ELEMENTS``.  Unrolled, every slot index is a
+    constant, so each element stays in its register and the compiler hoists
+    the slot's validity and position out of the enclosing loop; a loop over
+    the tensor's iterator does neither, which costs as much again as the op
+    on a 64x64x32 int8 tile (measured on an M4).  A remainder loop covers
+    the slots past the bound, if a layout has more, so the bound only
+    affects speed.  Each slot is the index ``_ei`` (``mpp_matmul._plan_fold``
+    reads a fold's product at it)."""
+    tm, tn = state.coop_dims[root]
+    threads = "(_TG_SIZE_X * _TG_SIZE_Y * _TG_SIZE_Z)"
+    share = f"(({tm * tn}u + {threads} - 1) / {threads})"
+    least = f"{_MIN_UNROLLED_ELEMENTS}u"
+    lines = [
+        f"{pad}{{",
+        f"{pad}constexpr ushort _mpp_slots = {share} > {least} ? {share} : {least};",
+    ]
+    for head, skip in (
+        (
+            [
+                f"{pad}#pragma unroll",
+                f"{pad}for (ushort _ei = 0; _ei < _mpp_slots; _ei++) {{",
+            ],
+            f"_ei >= {coop}.get_capacity() || !{coop}.is_valid_element(_it)",
+        ),
+        (
+            [
+                f"{pad}for (ushort _ei = _mpp_slots; _ei < {coop}.get_capacity(); _ei++) {{"
+            ],
+            f"!{coop}.is_valid_element(_it)",
+        ),
+    ):
+        lines.extend(head)
+        lines.append(f"{pad}    auto _it = {coop}.begin() + _ei;")
+        lines.extend(_element_head(coop, root, pad, state, skip))
+        lines.extend(body(len(pad) + 4))
+        lines.append(f"{pad}}}")
+    lines.append(f"{pad}}}")
+    return lines
 
 
 def _ptr_access_expr(ptr_node: ast.AST, subs: dict[str, str] | None = None) -> str:

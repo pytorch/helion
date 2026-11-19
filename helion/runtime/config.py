@@ -154,6 +154,8 @@ class Config(Mapping[str, object]):
         range_flattens: list[bool | None] | None = None,
         static_ranges: list[bool] | None = None,
         pallas_load_buffer_count: list[int] | None = None,
+        pallas_worklist_buffer_count: list[int] | None = None,
+        pallas_worklist_bucket_rows: int | None = None,
         load_eviction_policies: (
             EvictionPolicyLiteral | list[EvictionPolicyLiteral] | None
         ) = None,
@@ -184,6 +186,7 @@ class Config(Mapping[str, object]):
         cute_bool_byte_packets: bool | None = None,
         cute_uniform_lane_compares: bool | None = None,
         cute_tail_peel: bool | None = None,
+        cute_defer_tile_reduce: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
@@ -203,6 +206,7 @@ class Config(Mapping[str, object]):
         host_tensor_descriptors: bool | None = None,
         indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         atomic_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
+        prefetch_indexing: IndexingLiteral | list[IndexingLiteral] | None = None,
         advanced_controls_file: str | None = None,
         epilogue_subtile: int | None = None,
         xcd_remap: bool | None = None,
@@ -228,6 +232,17 @@ class Config(Mapping[str, object]):
             pallas_load_buffer_count: Pallas-only load buffer count (1 or 2) for
                 each input tensor. Tensors without an existing DMA route use the
                 ordinary path.
+            pallas_worklist_buffer_count: Pallas-only pipeline buffer count (2 to
+                8) for each input tensor of a compact-worklist kernel
+                (``pallas_worklist_grouping`` 1 or 2). Inputs the worklist
+                pipeline does not prefetch (e.g. SMEM offsets) ignore it.
+            pallas_worklist_bucket_rows: Pallas-only row bucket of a
+                compact-worklist kernel whose compact tile holds only static
+                inner loops (``pallas_worklist_grouping`` 1). A positive value
+                smaller than the compact block runs each work item's body on
+                its live rows rounded up to a multiple of it instead of the
+                whole block.
+                0 (the default) runs the whole block.
             load_eviction_policies: Eviction policies for load operations. A single
                 value applies to every load; a list specifies one value per load.
                 Valid values are "", "first", and "last". CuTe also supports
@@ -382,11 +397,47 @@ class Config(Mapping[str, object]):
                 keeps its masks.  Each value is computed as before, from the same
                 elements in the same order; like ``cute_uniform_lane_compares``
                 its only possible numeric effect is FMA contraction where
-                per-lane selects kept products unfused.  Off by default;
+                per-lane selects kept products unfused.  In a nest that
+                ``cute_vloop_sink`` interchanged, whose lanes load predicated
+                packets already, the complete tiles load them unpredicated
+                (under the same cache hints) and drop the selects of every
+                mask that the loop's bounds, the launch shape and the
+                launch's block grid imply (the grid where it is exact: static,
+                or over input sizes the bound kernel is specialized on), the
+                kernel's own index masks included; tiles that divide the
+                extent are unmasked without a split.  Off by default;
                 offered to the autotuner on kernels with an ``hl.tile`` loop
                 over a static extent that loads a float tensor along its tile
                 and no matmul, and elsewhere rejected (an explicit False is
                 dropped).
+            cute_defer_tile_reduce: Combine a carried tile sum across the
+                threads once, after its ``hl.tile`` loop, instead of once per
+                tile: in ``for tile in hl.tile(n): acc = acc + x[tile].sum(0)``
+                each thread keeps the partial sum of its own elements through
+                the whole loop, and the warp shuffles (or the shared-memory
+                round) that combine the threads run once after it.  This
+                changes the summation order: per-thread partial sums accumulate
+                across the tiles before the single cross-thread combine, the
+                order TorchInductor's looped split reductions use, where the
+                knob-off code adds each tile's combined sum to the carried
+                value.  The result differs by the rounding of another
+                summation order, for which no bound independent of the length
+                holds: each order's rounding error is at most ``n - 1`` unit
+                roundoffs times the sum of the addends' magnitudes for ``n``
+                addends (to first order), so the two results can differ by
+                up to twice that, more the more elements are summed and by
+                far more than the last bits where the addends cancel.  Only
+                fp32 and fp64 sums added to a carried value of their own
+                dtype are deferred; integer and half-precision sums stay per
+                tile.  Off by default; offered to the autotuner on kernels
+                with an ``hl.tile`` loop whose reductions over its tile are
+                all such sums, each read only by its carried add, the carried
+                value read nowhere else in the loop, and no matmul, and
+                elsewhere rejected (an explicit False is dropped).  Where the
+                config puts one thread on the tile (nothing to combine),
+                gives each thread one element of the tile (as many threads as
+                the tile is long) or folds the tile's lanes as vector lanes,
+                the knob leaves the code as it is.
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -532,6 +583,11 @@ class Config(Mapping[str, object]):
             atomic_indexing: Indexing strategy for atomic operations (e.g., hl.atomic_add).
                 Same format as ``indexing`` (a single string or a list per atomic op).
                 Defaults to "pointer" when omitted.
+            prefetch_indexing: Form of each ``hl.prefetch`` on NVIDIA targets of the
+                Triton and Gluon backends. Same format as ``atomic_indexing`` (a single
+                string or a list per prefetch). "pointer" (the default) issues bulk or
+                per-element L2 prefetches; "tensor_descriptor" issues TMA box prefetches
+                from a host-built tensor map where a box can describe the subscript.
             advanced_controls_file: Path to a PTXAS control file applied during compilation, or empty string for none.
             epilogue_subtile: Split factor for the epilogue (post-matmul pointwise + store) along
                 the N dimension. None = disabled (default), valid values are 2 or 4.
@@ -561,6 +617,8 @@ class Config(Mapping[str, object]):
             "range_flattens": range_flattens,
             "static_ranges": static_ranges,
             "pallas_load_buffer_count": pallas_load_buffer_count,
+            "pallas_worklist_buffer_count": pallas_worklist_buffer_count,
+            "pallas_worklist_bucket_rows": pallas_worklist_bucket_rows,
             "load_eviction_policies": load_eviction_policies,
             "load_cache_modifiers": load_cache_modifiers,
             "store_cache_modifiers": store_cache_modifiers,
@@ -589,6 +647,7 @@ class Config(Mapping[str, object]):
             "cute_bool_byte_packets": cute_bool_byte_packets,
             "cute_uniform_lane_compares": cute_uniform_lane_compares,
             "cute_tail_peel": cute_tail_peel,
+            "cute_defer_tile_reduce": cute_defer_tile_reduce,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,
@@ -603,6 +662,7 @@ class Config(Mapping[str, object]):
             "num_stages": num_stages,
             "indexing": indexing,
             "atomic_indexing": atomic_indexing,
+            "prefetch_indexing": prefetch_indexing,
             "pid_type": pid_type,
             "cross_loop_pipeline": cross_loop_pipeline,
             "num_sm_multiplier": num_sm_multiplier,
@@ -859,6 +919,14 @@ class Config(Mapping[str, object]):
         return cast("list[int]", self.config.get("pallas_load_buffer_count", []))
 
     @property
+    def pallas_worklist_buffer_count(self) -> list[int]:
+        return cast("list[int]", self.config.get("pallas_worklist_buffer_count", []))
+
+    @property
+    def pallas_worklist_bucket_rows(self) -> int:
+        return cast("int", self.config.get("pallas_worklist_bucket_rows", 0))
+
+    @property
     def load_eviction_policies(
         self,
     ) -> EvictionPolicyLiteral | list[EvictionPolicyLiteral]:
@@ -966,6 +1034,13 @@ class Config(Mapping[str, object]):
         return cast(
             "IndexingLiteral | list[IndexingLiteral]",
             self.config.get("atomic_indexing", []),
+        )
+
+    @property
+    def prefetch_indexing(self) -> IndexingLiteral | list[IndexingLiteral]:
+        return cast(
+            "IndexingLiteral | list[IndexingLiteral]",
+            self.config.get("prefetch_indexing", []),
         )
 
     @property

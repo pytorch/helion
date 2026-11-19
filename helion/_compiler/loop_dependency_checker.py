@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    import torch
     from torch.fx import Node
     from torch.fx.node import Argument
 
@@ -190,6 +191,19 @@ def _is_fresh_allocation(call: ast.Call) -> bool:
     return func.attr in _FRESH_TENSOR_METHODS
 
 
+def _storage_id(tensor: torch.Tensor) -> int:
+    """The ``id`` of ``tensor``'s untyped storage, where tensor arguments that
+    overlap at runtime count as one storage
+    (``CompileEnvironment.input_storage_aliases``).  (A test may run a walk
+    outside of a compile.)"""
+    from .compile_environment import CompileEnvironment
+
+    storage = id(tensor.untyped_storage())
+    if CompileEnvironment.has_current():
+        return CompileEnvironment.current().input_storage_aliases.get(storage, storage)
+    return storage
+
+
 def _storage_ids(graphs: Sequence[GraphInfo], graph_id: int, obj: object) -> set[int]:
     import torch
 
@@ -204,7 +218,7 @@ def _storage_ids(graphs: Sequence[GraphInfo], graph_id: int, obj: object) -> set
         return set()
     graph_info = graphs[graph_id]
     value = obj.meta.get("val")
-    result = {id(value.untyped_storage())} if isinstance(value, torch.Tensor) else set()
+    result = {_storage_id(value)} if isinstance(value, torch.Tensor) else set()
     if (
         obj.op == "placeholder"
         and obj.graph is graph_info.graph

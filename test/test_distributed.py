@@ -46,6 +46,9 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipIfXPU
+from helion._testing.distributed_kernels import TAGGED_RING
+from helion._testing.distributed_kernels import remote_views as _remote_views
+from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion.autotuner import search_algorithms
 from helion.autotuner.effort_profile import _PROFILES
 from helion.autotuner.effort_profile import AutotuneEffortProfile
@@ -108,12 +111,6 @@ def one_shot_allreduce_kernel(
 
         out[tile_n] = acc
     return out
-
-
-def _remote_views(
-    t: torch.Tensor, group_name: hl.constexpr
-) -> tuple[torch.Tensor, ...]:
-    return torch.ops.symm_mem.get_remote_tensors(t, group_name)
 
 
 def _with_pipeline(
@@ -421,55 +418,6 @@ def scatter_matmul_exchange_kernel(
             total = total + peer[tile_m, tile_c].to(torch.float32)
         out[tile_m, tile_c] = total
     return out
-
-
-@helion.kernel(autotune_effort="none", static_shapes=True, backend="gluon")
-def tagged_ring_exchange_kernel(
-    z: torch.Tensor,
-    symm: torch.Tensor,
-    x: torch.Tensor,
-    w: torch.Tensor,
-    s: torch.Tensor,
-    group_name: hl.ProcessGroupName,
-    rank: hl.constexpr,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    z_peers = _remote_views(z, group_name)
-    peers = _remote_views(symm, group_name)
-    out = torch.empty([z.size(0), w.size(1)], dtype=torch.float32, device=z.device)
-    total = torch.empty_like(s)
-    k = x.size(1)
-    # Every rank pushes its columns of z to every rank's copy.
-    for tile_m in hl.tile(x.size(0)):
-        rows = x[tile_m, :]
-        for z_peer in z_peers:
-            z_peer[tile_m, rank * k + hl.arange(k)] = rows
-    # An inband exchange every rank polls in full: the mirrors' parity credit.
-    for tile in hl.tile(s.size(0)):
-        symm[tile] = s[tile]
-    for tile in hl.tile(s.size(0)):
-        acc = hl.zeros([tile], dtype=s.dtype)
-        for peer in peers:
-            acc = acc + peer[tile]
-        total[tile] = acc
-    # A consumer whose K loop reads its own copy of z through the ring.
-    for tile_m, tile_n in hl.tile([z.size(0), w.size(1)]):
-        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
-        for tile_k in hl.tile(z.size(1)):
-            acc = hl.dot(z[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
-        out[tile_m, tile_n] = acc
-    return out, total
-
-
-# A ring configuration of tagged_ring_exchange_kernel: z is an MMA operand the
-# gated producer fills.
-TAGGED_RING = {
-    "block_sizes": [64, 64, 64, 128, 64, 64],
-    "indexing": "tensor_descriptor",
-    "pid_type": "persistent_blocked",
-    "num_sm_multiplier": 1,
-    "num_stages": 2,
-    "num_warps": 4,
-}
 
 
 @helion.kernel(autotune_effort="none", static_shapes=True, backend="gluon")
@@ -931,11 +879,19 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         args = (symm, x, w, rows, count, group.group_name)
         bound = scatter_matmul_exchange_kernel.bind(args)
         config = bound.config_spec.default_config().config
-        ws = {"block_sizes": [32], "range_warp_specializes": [None, True, None]}
+        # num_warps below 4, which the warp-specialized loop raises.
+        ws = {
+            "block_sizes": [32],
+            "num_warps": 2,
+            "range_warp_specializes": [None, True, None],
+        }
         bound.set_config(helion.Config(**{**config, **ws}))
         code = bound.to_triton_code()
         self.assertIn("warp_specialize=True", code)
         self.assertIn("_scatter_cover(", code)
+        # The loop raises the launch to 4 warps; the poll barriers count them all.
+        self.assertIn("num_warps=4", code)
+        self.assertIn("bar.red.or.pred q, 0, 128, p", code)
         written = torch.zeros(tasks * lanes, 1, device=self.device, dtype=torch.bool)
         written[rows[0][rows[0] >= 0].long()] = True
         # Each written element sums k // 2 ones; unwritten rows keep rank + 1.

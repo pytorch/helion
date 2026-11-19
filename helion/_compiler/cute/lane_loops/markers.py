@@ -7,7 +7,8 @@ iterates the per-thread elements of a lane-distributed block; the reduction
 strategies emit a ``_helion_lane_reduce(...)`` marker inside it and the lane
 split (``split.py``) lowers the marker into the two-pass accumulate /
 finalize / consume structure.  This module owns the loop constructors, the
-marker expression and its parser (``_LaneReduceMarker``), the finalize
+marker expression and its parser (``_LaneReduceMarker``), the record of what
+the split emitted for a loop's markers (``LaneSplitRecord``), the finalize
 emitters (warp / grouped / two-stage combines) and the validators that reject
 an owned marker without a proved lowering.
 """
@@ -249,6 +250,8 @@ def _is_constexpr_lane_iter(loop: ast.For) -> bool:
 # The marker never reaches the emitted kernel — the post-pass strips every
 # marker it processes.
 _HELION_LANE_REDUCE_MARKER = "_helion_lane_reduce"
+# Stands for the finalized reduction in a marker's ``wrap_template``.
+HELION_FINALIZED = "__HELION_FINALIZED__"
 HELION_VECTOR_REDUCTION_OWNER_ATTR = "_helion_vector_reduction_owner"
 _CUTE_UNIFORM_GLOBAL_NAMES = frozenset(
     {
@@ -331,9 +334,9 @@ class _LaneReduceMarker:
     reduction_type: str
     identity_expr: str
     threads_in_group: int
-    # The original RHS expression with the marker call replaced by the string
-    # ``{finalized}``; ``finalize_expr(x)`` substitutes ``x`` to re-apply any
-    # surrounding dtype cast / reshape to the finalized reduced scalar.
+    # The original RHS expression with the marker call replaced by the name
+    # ``HELION_FINALIZED``; ``finalize_expr(x)`` substitutes ``x`` to re-apply
+    # any surrounding dtype cast / reshape to the finalized reduced scalar.
     wrap_template: str
     # Optional strided grouped reduction (the reduction's live thread axis
     # shares a warp / CTA with an unrelated sibling axis). When ``group_span``
@@ -374,7 +377,7 @@ class _LaneReduceMarker:
     shared_lane_expr: str = ""
 
     def finalize_expr(self, reduced: str) -> str:
-        return self.wrap_template.replace("__HELION_FINALIZED__", f"({reduced})")
+        return self.wrap_template.replace(HELION_FINALIZED, f"({reduced})")
 
     def to_call(self) -> str:
         """The marker call: ``threads_in_group`` always, the other keyword
@@ -456,6 +459,23 @@ _MARKER_KEYWORD_FIELDS = tuple(
 )
 _MARKER_KEYWORD_NAMES = frozenset(field.name for field in _MARKER_KEYWORD_FIELDS)
 
+# On the accumulate loop the two-pass lane split builds: its ``LaneSplitRecord``.
+HELION_LANE_SPLIT_ATTR = "_helion_lane_split"
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneSplitRecord:
+    """What the two-pass split of one lane loop emitted around the accumulate
+    loop that carries this record: per marker the accumulator it folds, and
+    the statements that reset the accumulators (before the loop) and combine
+    them across the threads into the markers' results (after it).  The split
+    writes it and ``defer_tile_reductions`` reads it."""
+
+    markers: tuple[_LaneReduceMarker, ...]
+    accumulators: tuple[str, ...]
+    resets: tuple[ast.AST, ...]
+    finalize: tuple[ast.AST, ...]
+
 
 def set_marker_owner(call: ast.Call, owner_lane: str) -> None:
     """Bind ``call`` (a marker) to the serial lane ``owner_lane``."""
@@ -523,7 +543,7 @@ class _ReplaceLaneReduceCall(ast.NodeTransformer):
             and node.func.id == _HELION_LANE_REDUCE_MARKER
         ):
             return ast.copy_location(
-                create(ast.Name, id="__HELION_FINALIZED__", ctx=ast.Load()), node
+                create(ast.Name, id=HELION_FINALIZED, ctx=ast.Load()), node
             )
         return node
 

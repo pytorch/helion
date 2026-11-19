@@ -21,12 +21,14 @@ from .._hardware import get_hardware_info
 from ..language.constexpr import ConstExpr
 from .accuracy import effective_fp8_accuracy
 from .accuracy import is_fp8_dtype
+from .accuracy import keyable_accuracy_check
 from .accuracy import same_values
 from .benchmark_provider import _materialize_multi_shape_config
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmarking import do_bench_generic
 from .benchmarking import synchronize_device
 from .handoff_agent import HandoffAgentResult
+from .handoff_agent import HandoffRequest
 from .handoff_agent import run_agent_rounds
 from .handoff_evaluation import HandoffEvaluation
 from .handoff_evaluation import _alias_signature
@@ -39,7 +41,6 @@ from .handoff_prompt import build_handoff_prompt
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from ..runtime.settings import Settings
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
     from .handoff import HandoffCandidate
     from .handoff import HandoffMeasurement
     from .handoff import HandoffPoint
+    from .handoff_agent import SourceAgent
     from .logger import AutotuningLogger
 
 
@@ -55,9 +57,10 @@ if TYPE_CHECKING:
 class HandoffBundle:
     """An editable native-source workspace, independent of its original kernel.
 
-    Construct with an existing directory to reopen a saved bundle. Agent adapters
-    receive this object and return complete replacement files keyed by their
-    relative source paths; they need no Helion configuration or BoundKernel.
+    Construct with an existing directory to reopen a saved bundle. Source agents
+    receive a :class:`HandoffRequest` and return complete replacement files keyed
+    by their relative source paths; they need no Helion configuration or
+    BoundKernel.
     """
 
     directory: Path
@@ -92,14 +95,14 @@ class HandoffBundle:
 
     def run_agent(
         self,
-        agent: Callable[[HandoffBundle], Mapping[str, str]],
+        agent: SourceAgent,
         *,
         repetitions: int = 5,
         timeout: float = 120,
     ) -> HandoffEvaluation:
         """Apply one agent proposal and evaluate it; round selection is separate."""
         paths = set(self.sources)
-        replacements = agent(self)
+        replacements = agent(HandoffRequest(self.prompt, self.sources, None, math.inf))
         if not replacements or not replacements.keys() <= paths:
             raise ValueError(
                 "Agent must replace one or more existing native source files"
@@ -117,7 +120,7 @@ class HandoffBundle:
 
     def run_agent_rounds(
         self,
-        agent: Callable[[HandoffBundle], Mapping[str, str]] | None = None,
+        agent: SourceAgent,
         *,
         budget_seconds: float,
         repetitions: int = 5,
@@ -126,11 +129,10 @@ class HandoffBundle:
     ) -> HandoffAgentResult:
         """Run bounded proposals, retaining only validated, noise-separated gains.
 
-        Set a wall-clock budget. By default, one continuous agent CLI session
-        submits candidates and receives feedback until it exits or time runs out.
-        An explicit synchronous callback must honor
-        the monotonic deadline exposed in its prompt.
-        Sources, feedback, and decisions are saved under ``agent_runs/``.
+        Set a wall-clock budget. ``agent`` receives a :class:`HandoffRequest`
+        per round and returns replacement sources, or ``None`` to stop; see
+        :func:`~helion.autotuner.handoff_agent.run_agent_rounds`. Sources,
+        feedback, and decisions are saved under ``agent_runs/``.
         """
         return run_agent_rounds(
             self,
@@ -235,6 +237,38 @@ def _tolerances(
     return atol if atol is not None else 0.01, rtol if rtol is not None else 0.01
 
 
+def _accuracy(
+    settings: Settings,
+    output: object,
+    inputs: Sequence[object],
+    post_args: Sequence[object],
+) -> dict[str, object]:
+    """The case's accuracy rule, as autotuning applied it: an ``AccuracyCheck``'s
+    tolerances, or the ``autotune_baseline_*`` settings (``_tolerances``).
+
+    ``atol_scale`` is the check's per-tensor atol scaling (None, "rms" or
+    "peak"); ``scale_atol`` repeats ``atol_scale == "rms"`` for evaluators
+    that predate ``atol_scale``. They cannot apply "peak", so a bundle with a
+    "peak" case is schema version 2, which they refuse.
+    """
+    check = keyable_accuracy_check(settings)
+    if check is not None:
+        atol, rtol = float(check.atol), float(check.rtol)
+        atol_scale = check.atol_scale
+        fp8_accuracy = check.effective_fp8_accuracy
+    else:
+        atol, rtol = _tolerances(settings, output, inputs, post_args)
+        atol_scale = "rms" if settings.autotune_baseline_atol is None else None
+        fp8_accuracy = effective_fp8_accuracy(settings)
+    return {
+        "atol": atol,
+        "rtol": rtol,
+        "atol_scale": atol_scale,
+        "scale_atol": atol_scale == "rms",
+        "fp8_accuracy": fp8_accuracy,
+    }
+
+
 def _dependencies(source: str) -> list[str]:
     roots: set[str] = set()
     for node in ast.walk(ast.parse(source)):
@@ -289,8 +323,9 @@ def build_handoff(
 
     CUDA bundles default to GPU-only graph timing; ``timing`` can explicitly
     select a native policy. Autotuning retains its own timing policy.
-    Custom accuracy/arbitrary benchmark callbacks and distributed workloads are
-    unsupported. Unsupported standalone export paths raise the backend's error.
+    An ``AccuracyCheck`` carries into the bundle; arbitrary accuracy or
+    benchmark callbacks and distributed workloads are unsupported.
+    Unsupported standalone export paths raise the backend's error.
     The resulting bundle contains no BoundKernel or search object.
     """
     # Runtime imports avoid the kernel -> autotuner package import cycle.
@@ -312,9 +347,13 @@ def build_handoff(
             )
         if bound.env.process_group_name is not None:
             raise NotImplementedError("Distributed handoff evaluation is not supported")
-        if bound.settings.autotune_baseline_accuracy_check_fn is not None:
+        if (
+            bound.settings.autotune_baseline_accuracy_check_fn is not None
+            and keyable_accuracy_check(bound.settings) is None
+        ):
             raise NotImplementedError(
-                "Handoff does not support custom accuracy callbacks"
+                "Handoff supports an exact AccuracyCheck, not a subclass or "
+                "other accuracy callback"
             )
         if bound.settings.autotune_benchmark_fn is not None:
             raise NotImplementedError(
@@ -342,9 +381,21 @@ def build_handoff(
         case_timing = timing or default_timing
         case_dir = directory / f"case_{index}"
         case_dir.mkdir()
-        source = bound.to_code(
-            config, options=OutputCodeOptions(allow_helion_deps=False)
-        )
+        # Export for this case's arguments, defaults it omits included: bools
+        # and floats key one bound kernel for every value, and the export
+        # follows the case's.
+        with bound.env.use_runtime_arg_values(
+            dict(
+                zip(
+                    bound.kernel.signature.parameters,
+                    bound.kernel.normalize_args(*args),
+                    strict=False,
+                )
+            )
+        ):
+            source = bound.to_code(
+                config, options=OutputCodeOptions(allow_helion_deps=False)
+            )
         (case_dir / "kernel.py").write_text(source)
         (case_dir / "original.py").write_text(source)
         inputs = tuple(
@@ -355,24 +406,28 @@ def build_handoff(
             )
         )
         inputs = _clone_inputs(inputs)
-        _save_inputs(inputs, case_dir / "inputs.pt")
+        # Save and compare only the arguments the standalone entry point takes;
+        # it may omit ones the backend compiles in (CuTe: score/mask mods).
+        entry_inputs = bound.env.backend.standalone_entry_args(bound, inputs)
+        _save_inputs(entry_inputs, case_dir / "inputs.pt")
         reference = reference_fn or bound.settings.autotune_baseline_fn
         reference_kind = (
             "reference_fn" if reference_fn is not None else "autotune_baseline_fn"
         )
         post_args = _clone_inputs(inputs)
+        entry_post_args = bound.env.backend.standalone_entry_args(bound, post_args)
         with _device_context(inputs), torch.no_grad():
             output = bound.compile_config(config)(*post_args)
             synchronize_device()
-            alias_signature = _alias_signature((output, post_args))
+            alias_signature = _alias_signature((output, entry_post_args))
             if reference is None:
                 reference_kind = "confirmed_original"
             else:
                 reference_args = _clone_inputs(inputs)
                 output = reference(*reference_args)
                 synchronize_device()
-        _save_inputs((output, post_args), case_dir / "reference.pt")
-        atol, rtol = _tolerances(bound.settings, output, inputs, post_args)
+        _save_inputs((output, entry_post_args), case_dir / "reference.pt")
+        accuracy = _accuracy(bound.settings, output, entry_inputs, entry_post_args)
         case_metadata.append(
             {
                 "source": f"case_{index}/kernel.py",
@@ -386,22 +441,23 @@ def build_handoff(
                         "runtime_version": torch.__version__,
                     }
                 ),
-                "input_metadata": _input_metadata(inputs),
+                "input_metadata": _input_metadata(entry_inputs),
                 "dependencies": _dependencies(source),
                 "static_shapes": bound.settings.static_shapes,
                 "reference_kind": reference_kind,
                 "alias_signature": alias_signature,
                 "timing": case_timing,
-                "atol": atol,
-                "rtol": rtol,
-                "scale_atol": bound.settings.autotune_baseline_atol is None,
-                "fp8_accuracy": effective_fp8_accuracy(bound.settings),
+                **accuracy,
                 "inputs": f"case_{index}/inputs.pt",
                 "reference": f"case_{index}/reference.pt",
             }
         )
     manifest = {
-        "schema_version": 1,
+        # Version 2 marks "peak" tolerances, which version-1 evaluators would
+        # misread as unscaled ones.
+        "schema_version": 2
+        if any(case["atol_scale"] == "peak" for case in case_metadata)
+        else 1,
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "objective": {
             "aggregation": multi.aggregation if multi else "geomean",

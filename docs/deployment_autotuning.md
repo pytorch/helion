@@ -171,6 +171,20 @@ of overrun, together at most a quarter of the budget but never less than
 the phase's smallest plan) and the phase is sized to the time left (see
 [Settings](api/settings.md)).
 
+On the CuTe backend many configs generate the same code: they differ only
+in settings the code does not depend on.  A CuTe search does not time a
+candidate whose generated code an earlier candidate of the search already
+produced: the repeat takes the earlier candidate's reading.  Outside the
+flash search, which keeps its own policy for such repeats, a repeat is
+also not recorded for the shortlist, in the initial population as in every
+later batch, and a seed or default config that is one passes its place
+among the finalists to the config that holds its kernel, so the finalists
+are distinct kernels.  Two kinds of search keep every config a candidate of
+its own, re-timed and shortlisted as one: a search over several argument
+sets (a repeat there only saves the first timing of a shape whose code it
+repeats), and a search in a process where `torch.distributed` is
+initialized, which times every config.
+
 An explicit benchmark error or timeout during the primary thermal warmup,
 screen or steady rounds makes that finalist ineligible for fallback, even if
 it had a finite search measurement. If no eligible configuration remains,

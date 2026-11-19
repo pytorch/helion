@@ -27,6 +27,7 @@ from torch.testing._internal.common_distributed import TEST_SKIPS
 from torch.testing._internal.common_distributed import MultiProcessTestCase
 
 import helion
+from helion import _compat
 import helion.language as hl
 
 _TORCH_TPU_RUNNER_ARG = "--torch-tpu-runner"
@@ -73,6 +74,13 @@ _REMOTE_SLOT = 1
 _PIPELINE_STEPS = 4
 _GATHER_ROWS = 8
 _HBM_TILE = 8
+
+
+def _clear_compat_caches() -> None:
+    """Forget the answers of helion._compat's cached probes."""
+    for probe in vars(_compat).values():
+        if hasattr(probe, "cache_clear"):
+            probe.cache_clear()
 
 
 def _rank_values(rank: int, width: int = _WIDTH) -> np.ndarray:
@@ -1185,6 +1193,10 @@ if not _IS_TORCH_TPU_RUNNER:
             # Plain functions avoid mock call histories retaining tensor inputs.
             # Do not modify process-wide fatal-signal handlers in this CPU test.
             with contextlib.ExitStack() as stack:
+                # The run patches torch.cuda.is_available, which some of
+                # helion._compat's cached probes read (tensor descriptors, for
+                # one): forget their answers once the patches are gone.
+                stack.callback(_clear_compat_caches)
                 for context in (
                     patch.dict(os.environ),
                     patch.object(case, "test_one_shot_remote_copy", run_body),

@@ -3,9 +3,11 @@ helion/_compiler/backend.py."""
 
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import functools
+import inspect
 import math
 import os
 import sys
@@ -24,10 +26,10 @@ from ..backend import BackendState
 from ..backend import HandlerOpOverrides
 from ..backend import LauncherInfo
 from ..backend import log
+from ..output_code_utils import private_module_statements
 from .spin_loops import pin_spin_loops_of
 
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Generator
 
     from torch._inductor.ops_handler import OpsHandler
@@ -41,6 +43,7 @@ if TYPE_CHECKING:
     from ..device_function import Argument
     from ..device_function import DeviceBodyContext
     from ..device_function import DeviceFunction
+    from ..device_ir import DeviceIR
     from ..emitter_protocols import RetryPolicy
     from ..inductor_lowering import GenerateASTFromInductor
     from ..inductor_lowering import GraphInterpreter
@@ -97,6 +100,13 @@ class TritonBackend(Backend):
         # Triton >= 3.9 removed block pointers (triton-lang/triton#10833).
         return supports_block_ptr()
 
+    def prefetch_box_possible(
+        self, tensor: torch.Tensor, index: Sequence[object], has_extra_mask: bool
+    ) -> bool:
+        from .memory_ops import tensor_prefetch_possible
+
+        return tensor_prefetch_possible(tensor, index, has_extra_mask)
+
     @property
     def name(self) -> str:
         return "triton"
@@ -132,6 +142,10 @@ class TritonBackend(Backend):
 
     @property
     def supports_inter_loop_barriers(self) -> bool:
+        return True
+
+    @property
+    def orders_overlapping_inputs(self) -> bool:
         return True
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:
@@ -226,6 +240,10 @@ class TritonBackend(Backend):
             return self.uses_triton_compiler and not _compat.is_hip()
         if key in ("load_cache_modifiers", "store_cache_modifiers"):
             return True
+        if key == "prefetch_indexing":
+            # Its prefetches are PTX; HIP drops them (ConfigSpec also needs a
+            # CUDA target: CompileEnvironment.ptx_capability).
+            return self.uses_triton_compiler and not _compat.is_hip()
         if key == "waves_per_eu":
             return _compat.is_hip()
         if key == "matrix_instr_nonkdim":
@@ -499,6 +517,23 @@ class TritonBackend(Backend):
     def default_launcher_name(self) -> str:
         return "_default_launcher"
 
+    def embedded_helper_source(self, body: str) -> str:
+        """Inline ``tensor_maps`` (tensor-form ``hl.prefetch``), in a private
+        scope, when ``body`` builds its maps."""
+        if "helion_tensor_maps." not in body:
+            return ""
+        from ...runtime.triton import tensor_maps
+
+        statements = [
+            *private_module_statements(
+                inspect.getsource(tensor_maps),
+                "_make_helion_tensor_maps",
+                ["prefetch_map"],
+            ),
+            *ast.parse("helion_tensor_maps = _make_helion_tensor_maps()").body,
+        ]
+        return ast.unparse(ast.Module(body=statements, type_ignores=[]))
+
     @property
     def dependency_free_launcher_info(self) -> LauncherInfo:
         # get_num_sm / get_num_xcd / set_triton_allocator are launcher functions
@@ -528,6 +563,7 @@ class TritonBackend(Backend):
             "_helion_tensor_descriptor": "from triton.tools.tensor_descriptor import TensorDescriptor as _helion_tensor_descriptor",
             "helion_dist_utils": "from helion.runtime.triton import dist_utils as helion_dist_utils",
             "helion_prefetch_code": "from helion.runtime.triton import prefetch_code as helion_prefetch_code",
+            "helion_tensor_maps": "from helion.runtime.triton import tensor_maps as helion_tensor_maps",
             "helion_triton_helpers": "from helion.runtime.triton import helpers as helion_triton_helpers",
             "nvshmem": "import torch.distributed._symmetric_memory._nvshmem_triton as nvshmem",
             "requires_nvshmem": "from torch.distributed._symmetric_memory._nvshmem_triton import requires_nvshmem",
@@ -781,6 +817,9 @@ class TritonBackend(Backend):
                 )
             )
             out.append(f"_persistent_state_specs=({specs},)")
+            if device_fn.timeline is not None:
+                timeline = (device_fn.timeline.slot, device_fn.timeline.meta)
+                out.append(f"_timeline={timeline!r}")
             if any(spec[3] for spec in device_fn.triton_persistent_state_specs):
                 process_group_name = CompileEnvironment.current().process_group_name
                 if process_group_name is None:
@@ -855,10 +894,15 @@ class GluonBackend(TritonBackend):
     _IGNORED_KEYS = frozenset(["maxnreg", "range_flattens", "range_multi_buffers"])
 
     def supports_config_key(self, key: str) -> bool:
-        # ``worker_registers``: the ring's worker budgets by hand (``gluon_ring``).
-        if key == "worker_registers":
+        # Keys only the ring lowering implements (``gluon_ring``).
+        if key in ("cross_loop_tmem_prefetch", "worker_registers"):
             return True
         return key not in self._IGNORED_KEYS and super().supports_config_key(key)
+
+    def tmem_prefetch_candidates(self, device_ir: DeviceIR) -> list[list[int]]:
+        from .gluon_ring import tmem_prefetch_candidates
+
+        return tmem_prefetch_candidates(device_ir)
 
     def supports_block_ptr_indexing(self) -> bool:
         return False
@@ -997,6 +1041,11 @@ class TileIRBackend(TritonBackend):
     def supports_inter_loop_barriers(self) -> bool:
         # ``tl.debug_barrier()`` lowers to ``ttg.barrier``, which the TileIR
         # pass pipeline does not legalize.
+        return False
+
+    @property
+    def orders_overlapping_inputs(self) -> bool:
+        # No barrier walk runs here.
         return False
 
     def supports_intra_loop_barriers(self, *, in_divergent_control_flow: bool) -> bool:

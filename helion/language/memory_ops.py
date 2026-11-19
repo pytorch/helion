@@ -443,11 +443,41 @@ def prefetch(
     :func:`load` it takes no ``indexing``, eviction-policy or cache-modifier
     config slot, so adding one leaves every load's tunables where they were.
 
-    On NVIDIA GPUs (Triton backend), when the last index is a full slice or a
-    tile of a stride-1 dim and there is no ``extra_mask``, each element of the
-    leading indices issues one ``cp.async.bulk.prefetch.L2`` covering its row
-    segment (sm_90+).  Any other prefetch issues ``prefetch.global.L2`` per
-    element (one 128-byte line each).  Other targets drop it.
+    On the Triton and Gluon backends compiling for NVIDIA GPUs (PTX) its form
+    is its entry in the ``prefetch_indexing`` config key (one per
+    ``hl.prefetch``, in code order; the key exists when some prefetch of the
+    kernel can take the ``"tensor_descriptor"`` form).
+
+    On NVIDIA GPUs (Triton and Gluon backends), in the ``"pointer"`` form
+    (the default), when the last index is a full slice or a tile of a
+    stride-1 dim and there is no ``extra_mask``, each element of the leading
+    indices issues one ``cp.async.bulk.prefetch.L2`` covering its row segment
+    (sm_90+).  Any other prefetch issues ``prefetch.global.L2`` per element
+    (one 128-byte line each).
+
+    In the ``"tensor_descriptor"`` form (sm_90+), it is
+    ``cp.async.bulk.prefetch.tensor`` of the TMA box the subscript describes,
+    issued by one lane of one warp from a tensor map the host builds: extent 1
+    at a scalar index, the block size at a tile (a reduction's chunk at a
+    rolled full slice), the full extent at the other full slices; a box dim
+    longer than 256 elements, or a box over 96 KB, is covered by consecutive
+    boxes (at most 16).  It needs what a bulk prefetch needs (above), static
+    sizes and strides a TMA descriptor accepts, box rows of a multiple of 16
+    bytes, index kinds a box describes (scalars, tiles, full slices), a
+    tensor that is a kernel input or a view at its start (not one host code
+    allocates), and PyTorch's native CUDA caching allocator (not
+    cudaMallocAsync); otherwise the prefetch keeps the pointer form, as it
+    does for a call whose tensor has no 16-byte aligned base.  Each distinct
+    tensor (address, shape, strides) and box gets its own 128-byte map,
+    encoded on the launch path; past a per-device cap on the maps no CUDA
+    graph captured, an eager call drops them.  The form suits tensors whose address
+    stays fixed across calls, such as weights.  The autotuner searches
+    ``prefetch_indexing``, and its benchmarks reuse one set of inputs, so
+    they do not see the map a tensor whose address changes every call (an
+    activation) builds each call: give such a prefetch "pointer" in a fixed
+    config.
+
+    Other targets drop it.
 
     Args:
         tensor: The tensor to prefetch from
@@ -471,6 +501,11 @@ def _(
         raise NotImplementedError(f"Cannot prefetch from type: {type(tensor)}")
     index = Tile._tiles_to_sizes_for_index(index)
     return (tensor, normalize_index_slices(tensor.shape, index), extra_mask)
+
+
+# The node meta key of a prefetch's ``prefetch_indexing`` slot
+# (``device_ir._number_prefetches``).
+PREFETCH_SLOT_META = "prefetch_slot"
 
 
 def prefetch_is_bulk(
@@ -505,7 +540,8 @@ def _(
     extra_mask: torch.Tensor | None = None,
 ) -> None:
     # Allocate the reduction dims of full slices as ``hl.load`` does, except
-    # a bulk prefetch's row segment, which its byte count covers.
+    # a bulk prefetch's row segment, which its byte count covers (the tensor
+    # form's box spans it too).
     if prefetch_is_bulk(tensor, index, extra_mask is not None):
         index = [*index[:-1], 0]
     SubscriptIndexing.compute_shape(tensor, index)

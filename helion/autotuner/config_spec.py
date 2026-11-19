@@ -773,6 +773,7 @@ _BASE_BACKEND_TUNABLE_KEYS: frozenset[str] = frozenset(
         "num_ctas",
         "occupancy",
         "pallas_worklist_grouping",
+        "pallas_worklist_bucket_rows",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
@@ -795,20 +796,23 @@ def _get_backend_tunable_keys() -> frozenset[str]:
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # Generic keys whose support is gated per backend (``supports_config_key``)
 # rather than declared by one backend's surface: the Triton host descriptor and
-# cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap, and the
-# cross-loop pipeline and Gluon ring knobs.
+# cache-modifier knobs, the Pallas loop knobs, the AMD XCD remap, the
+# cross-loop pipeline and Gluon ring knobs, and the prefetch forms.
 _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
+        "cross_loop_tmem_prefetch",
         "worker_registers",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
+        "prefetch_indexing",
         "pallas_loop_type",
         "pallas_emit_pipeline_group_size",
         "pallas_use_low_level_scheduler",
         "pallas_fold_dot_lhs_cast",
         "pallas_load_buffer_count",
+        "pallas_worklist_buffer_count",
         "pallas_indirect_access_mode",
         "pallas_pre_broadcast",
         "xcd_remap",
@@ -846,6 +850,7 @@ GENERIC_KEYS: frozenset[str] = frozenset(
 AUTOTUNED_PALLAS_LOOP_TYPES = ("emit_pipeline", "unroll", "fori_loop")
 VALID_PALLAS_LOOP_TYPES = AUTOTUNED_PALLAS_LOOP_TYPES
 VALID_PALLAS_WORKLIST_GROUPINGS = (0, 1, 2)
+AUTOTUNED_PALLAS_WORKLIST_BUCKET_ROWS = (0, 16, 32, 64)
 VALID_PID_TYPES = (
     "flat",
     "xyz",
@@ -1049,9 +1054,7 @@ class ConfigSpec:
         self.flatten_loops: BlockIdSequence[FlattenLoopSpec] = BlockIdSequence()
         self.reduction_loops: BlockIdSequence[ReductionLoopSpec] = BlockIdSequence()
         self.reduction_fusion_available: bool = False
-        self.cute_vector_widths: BlockIdSequence[CuteVectorWidthSpec] = (
-            BlockIdSequence()
-        )
+        self.cute_vector_widths: BlockIdSequence[VectorWidthSpec] = BlockIdSequence()
         self.cute_lane_layouts: BlockIdSequence[CuteLaneLayoutSpec] = BlockIdSequence()
         self.cute_reduction_reloads: BlockIdSequence[CuteReductionReloadSpec] = (
             BlockIdSequence()
@@ -1089,6 +1092,12 @@ class ConfigSpec:
         # kernel with a matmul; ``cute_tail_peel`` is tunable when there are
         # any (``tail_peel_blocks``).
         self.cute_tail_peel_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: the blocks of the device loops whose
+        # reductions over their own tile are all fp32 or fp64 sums added to
+        # a value the loop carries, none in a kernel with a matmul;
+        # ``cute_defer_tile_reduce`` is tunable when there are any
+        # (``carried_tile_sum_blocks``).
+        self.cute_carried_tile_sum_blocks: frozenset[int] = frozenset()
         # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
         # fp32 quotient whose divisor is a scalar or a broadcast row value
         # (``hoist_loop_invariant_recip``'s exact hoist can apply), so
@@ -1124,6 +1133,12 @@ class ConfigSpec:
         )
         self.range_flattens: BlockIdSequence[RangeFlattenSpec] = BlockIdSequence()
         self.static_ranges: BlockIdSequence[StaticRangeSpec] = BlockIdSequence()
+        # The cross-loop K loops whose ungated weight stream may prefetch into
+        # tensor memory ahead of their task's dependency wait (``gluon_ring``):
+        # a hand-set override the search never proposes.
+        self.cross_loop_tmem_prefetch: BlockIdSequence[CrossLoopTmemPrefetchSpec] = (
+            BlockIdSequence()
+        )
 
         self.allowed_pid_types: tuple[PidTypeLiteral, ...] = tuple(VALID_PID_TYPES)
         # Keep alternative pid types searchable when an ordered reference uses flat.
@@ -1166,8 +1181,16 @@ class ConfigSpec:
             EnumFragment(choices=self.valid_atomic_indexing_types()),
             length=0,
         )
+        self.prefetch_indexing = ListOf(
+            EnumFragment(choices=self.valid_prefetch_indexing_types()),
+            length=0,
+        )
         self.pallas_load_buffer_count = ListOf(
             IntegerFragment(1, 2, 1),
+            length=0,
+        )
+        self.pallas_worklist_buffer_count = ListOf(
+            IntegerFragment(2, 8, 2),
             length=0,
         )
         self.epilogue_subtile_candidate_enabled: bool = False
@@ -1577,10 +1600,29 @@ class ConfigSpec:
         # kernels on cute once device-IR analysis proves the fact.
         self.cute_reflatten_candidates: list[FlattenLoopSpec] = []
         self.backend_tunable_fragments = self.backend.tunable_fragments()
-        unknown_tunables = set(self.backend_tunable_fragments) - BACKEND_TUNABLE_KEYS
+        # A backend may give a fragment to any of its own surface's keys
+        # (built-in or plugin) except Helion's gated generic ones;
+        # _surface_key_fragments adds those to the search.
+        unknown_tunables = (
+            set(self.backend_tunable_fragments)
+            - BACKEND_TUNABLE_KEYS
+            - self._own_surface_keys()
+        )
         if unknown_tunables:
             raise RuntimeError(
                 f"Backend {self.backend_name!r} returned unknown tunables: {sorted(unknown_tunables)!r}"
+            )
+        unsupported = sorted(
+            key
+            for key in self._surface_key_fragments()
+            if not self.backend.supports_config_key(key)
+        )
+        if unsupported:
+            raise RuntimeError(
+                f"Backend {self.backend_name!r} gives fragments to its surface keys "
+                f"{unsupported!r} but its supports_config_key rejects them here; "
+                "return a fragment only for a key it supports (an override must "
+                "defer to super() for its surface keys)"
             )
 
     def rollable_reduction_block_ids(self) -> set[int]:
@@ -1728,6 +1770,10 @@ class ConfigSpec:
         if supports_tensor_descriptor():
             return ("pointer", "tensor_descriptor")
         return ("pointer",)
+
+    def valid_prefetch_indexing_types(self) -> tuple[IndexingLiteral, ...]:
+        """Prefetches lower as pointers or as TMA boxes (tensor_descriptor)."""
+        return self.valid_atomic_indexing_types()
 
     def _remove_duplicates(self) -> None:
         self.num_threads._remove_duplicates()
@@ -1900,6 +1946,12 @@ class ConfigSpec:
                 and self.target_device_capability >= (9, 0)
                 and self.backend.supports_config_key(key)
             )
+        if key == "prefetch_indexing":
+            # Prefetches lower only to PTX (``CompileEnvironment.ptx_capability``).
+            return (
+                self.target_device_capability is not None
+                and self.backend.supports_config_key(key)
+            )
         if (
             key == "cross_loop_pipeline"
             and self.device is not None
@@ -1917,6 +1969,16 @@ class ConfigSpec:
                 f"cross_loop_pipeline is not supported by backend {self.backend_name!r}"
             )
         self.cross_loop_pipeline = EnumFragment(choices)
+
+    @property
+    def offers_megakernel(self) -> bool:
+        """Whether some config compiles this kernel as a megakernel: it has
+        cross-loop dependencies and its backend lowers a pipeline other than
+        root barriers between separate phases."""
+        fragment = self.cross_loop_pipeline
+        return fragment is not None and any(
+            choice != "barrier" for choice in fragment.choices
+        )
 
     @property
     def cute_l2_evict_last_store_policy_supported(self) -> bool:
@@ -2217,6 +2279,7 @@ class ConfigSpec:
             ("range_multi_buffers", self.range_multi_buffers, True),
             ("range_flattens", self.range_flattens, True),
             ("static_ranges", self.static_ranges, True),
+            ("cross_loop_tmem_prefetch", self.cross_loop_tmem_prefetch, True),
         ]:
             if not self.supports_config_key(name):
                 if name in config:
@@ -2314,15 +2377,22 @@ class ConfigSpec:
             "range_multi_buffers",
             "range_flattens",
             "static_ranges",
+            "cross_loop_tmem_prefetch",
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
         ):
             value = config.get(name)
             if name == "load_eviction_policies" and value == "":
                 continue
+            # A hand-set override only (never searched): all off is no entry.
+            if name == "cross_loop_tmem_prefetch" and not any(
+                cast("list[bool]", value or [])
+            ):
+                value = None
             if not value:
                 config.pop(name, None)
 
@@ -2335,7 +2405,9 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
             "pid_type",
             "num_sm_multiplier",
             "maxnreg",
@@ -2344,6 +2416,9 @@ class ConfigSpec:
         ):
             if not self.supports_config_key(name):
                 config.pop(name, None)
+        if self.prefetch_indexing.length == 0:
+            # No prefetch here can take the box form: the entry is unused.
+            config.pop("prefetch_indexing", None)
 
         if self.supports_config_key("num_warps"):
             config.setdefault("num_warps", DEFAULT_NUM_WARPS)
@@ -2389,6 +2464,11 @@ class ConfigSpec:
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
             config.setdefault("atomic_indexing", self.atomic_indexing.default())
+        if (
+            self.supports_config_key("prefetch_indexing")
+            and self.prefetch_indexing.length > 0
+        ):
+            config.setdefault("prefetch_indexing", self.prefetch_indexing.default())
         if config.get("host_tensor_descriptors"):
             indexing_values = (config.get("indexing"), config.get("atomic_indexing"))
             uses_tensor_descriptor = any(
@@ -2521,6 +2601,42 @@ class ConfigSpec:
                 config.pop("pallas_load_buffer_count")
         else:
             config.pop("pallas_load_buffer_count", None)
+        if (
+            self.supports_config_key("pallas_worklist_buffer_count")
+            and config.get("pallas_worklist_grouping") in (1, 2)
+            and "pallas_worklist_buffer_count" in config
+        ):
+            values = config["pallas_worklist_buffer_count"]
+            expected = self.pallas_worklist_buffer_count.length
+            if (
+                not isinstance(values, list)
+                or len(values) != expected
+                or any(
+                    type(value) is not int or not 2 <= value <= 8 for value in values
+                )
+            ):
+                raise InvalidConfig(
+                    "pallas_worklist_buffer_count must be a list containing one "
+                    "buffer count (2 to 8) per input tensor "
+                    f"(expected {expected}, got {values!r})"
+                )
+            if expected == 0:
+                config.pop("pallas_worklist_buffer_count")
+        else:
+            config.pop("pallas_worklist_buffer_count", None)
+        if (
+            self.supports_config_key("pallas_worklist_bucket_rows")
+            and config.get("pallas_worklist_grouping") == 1
+            and "pallas_worklist_bucket_rows" in config
+        ):
+            value = config["pallas_worklist_bucket_rows"]
+            if type(value) is not int or value < 0:
+                raise InvalidConfig(
+                    "pallas_worklist_bucket_rows must be a non-negative int "
+                    f"(0 for no row buckets), got {value!r}"
+                )
+        else:
+            config.pop("pallas_worklist_bucket_rows", None)
         if (
             self.supports_config_key("pallas_pre_broadcast")
             and self.has_pallas_inner_loops
@@ -3038,6 +3154,25 @@ class ConfigSpec:
                     num_items=0,
                 )
 
+    def _own_surface_keys(self) -> frozenset[str]:
+        """Surface config keys the backend may give fragments to: not the gated
+        generic keys (e.g. ``xcd_remap``), whose fields Helion builds itself."""
+        return self.search_surface.config_keys - _BACKEND_GATED_GENERIC_KEYS
+
+    def _surface_key_fragments(self) -> dict[str, ConfigSpecFragment]:
+        """Fragments the backend returns for its own surface's config keys.
+
+        The generic table already holds every ``tunable_fragments`` entry; a
+        surface's own ``fields()`` table gets these added, replacing its
+        fragment for the same key so the search and ``normalize``'s defaults
+        agree."""
+        own_keys = self._own_surface_keys()
+        return {
+            key: fragment
+            for key, fragment in self.backend_tunable_fragments.items()
+            if key in own_keys
+        }
+
     def _flat_fields(
         self,
     ) -> dict[str, BlockIdSequence[Any] | ConfigSpecFragment]:
@@ -3055,7 +3190,7 @@ class ConfigSpec:
             self, flash_pipeline_family=_flash_pipeline_family_override
         )
         if surface_fields is not None:
-            return surface_fields
+            return {**surface_fields, **self._surface_key_fragments()}
         fields: dict[str, BlockIdSequence[Any] | ConfigSpecFragment] = {
             "block_sizes": self.block_sizes,
         }
@@ -3098,6 +3233,11 @@ class ConfigSpec:
             fields["indexing"] = self.indexing
         if self.supports_config_key("atomic_indexing"):
             fields["atomic_indexing"] = self.atomic_indexing
+        if (
+            self.supports_config_key("prefetch_indexing")
+            and self.prefetch_indexing.length > 0
+        ):
+            fields["prefetch_indexing"] = self.prefetch_indexing
         if self.supports_config_key("host_tensor_descriptors") and (
             self.indexing.length > 0 or self.atomic_indexing.length > 0
         ):
@@ -3173,6 +3313,17 @@ class ConfigSpec:
                     fields["pallas_worklist_grouping"] = EnumFragment(
                         choices=VALID_PALLAS_WORKLIST_GROUPINGS
                     )
+                    if self.supports_config_key("pallas_worklist_bucket_rows"):
+                        fields["pallas_worklist_bucket_rows"] = EnumFragment(
+                            choices=AUTOTUNED_PALLAS_WORKLIST_BUCKET_ROWS
+                        )
+                    if (
+                        self.supports_config_key("pallas_worklist_buffer_count")
+                        and self.pallas_worklist_buffer_count.length > 0
+                    ):
+                        fields["pallas_worklist_buffer_count"] = (
+                            self.pallas_worklist_buffer_count
+                        )
             fields["pallas_loop_type"] = EnumFragment(choices=choices)
             if self.supports_config_key("pallas_emit_pipeline_group_size"):
                 fields["pallas_emit_pipeline_group_size"] = PowerOfTwoFragment(1, 16, 1)
@@ -3464,7 +3615,9 @@ class ConfigSpec:
             "store_cache_modifiers",
             "indexing",
             "atomic_indexing",
+            "prefetch_indexing",
             "pallas_load_buffer_count",
+            "pallas_worklist_buffer_count",
         ):
             if not config.get(name):
                 config.pop(name, None)
@@ -3533,6 +3686,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         min_size: int = 1,
         max_size: int | None = None,
         bounded_by_block_id: int | None = None,
+        data_dependent: bool = False,
     ) -> None:
         super().__init__([block_id])
         self.size_hint = size_hint
@@ -3577,6 +3731,7 @@ class BlockSizeSpec(_PowerOfTwoBlockIdItem):
         # raised this block's, ``None`` where it did not
         # (``drop_occupancy_floor``).
         self.occupancy_floor: tuple[int, int] | None = None
+        self.data_dependent: bool = data_dependent
         if self.max_size < self.min_size:
             self.max_size = self.min_size
         assert self.min_size <= self.max_size
@@ -4056,10 +4211,10 @@ class CuteLaneLayoutSpec(_BlockIdItem):
         return "blocked"
 
 
-class CuteVectorWidthSpec(_BlockIdItem):
-    """Per-reduction-block vector load width for the CuTe backend.
+class VectorWidthSpec(_BlockIdItem):
+    """Per-reduction-block vector load width (the ``cute_vector_widths`` key).
 
-    V=1 disables vectorization (scalar loads). V=2/4/8/16 emits
+    V=1 disables vectorization (scalar loads). On CuTe, V=2/4/8/16 emits
     ``cute.arch.load(..., ir.VectorType.get([V], elem_dtype.mlir_type))``
     for the inner reduction load. SM100+ also admits 32-byte vectors.
     A persistent reduction row whose threads each hold a multiple of V
@@ -4092,6 +4247,11 @@ class CuteVectorWidthSpec(_BlockIdItem):
 
     def _fill_missing(self) -> int:
         return 1
+
+
+# Older name; CuTe code still uses it. Not public API (helion.backend_api
+# exports VectorWidthSpec).
+CuteVectorWidthSpec = VectorWidthSpec
 
 
 class _OptionalIntSpec(_BlockIdItem):
@@ -4171,7 +4331,7 @@ class RangeFlattenSpec(_OptionalBoolSpec):
     pass
 
 
-class StaticRangeSpec(_BlockIdItem):
+class _BoolSpec(_BlockIdItem):
     def _fragment(self, base: ConfigSpec) -> BooleanFragment:
         return BooleanFragment()
 
@@ -4183,6 +4343,15 @@ class StaticRangeSpec(_BlockIdItem):
     def _fill_missing(self) -> bool:
         """Provide a value when not provided by the user."""
         return False
+
+
+class StaticRangeSpec(_BoolSpec):
+    pass
+
+
+class CrossLoopTmemPrefetchSpec(_BoolSpec):
+    """A candidate K loop (``Backend.tmem_prefetch_candidates``): True streams
+    the last steps' weight tiles into the tensor memory its accumulators leave."""
 
 
 def _product(seq: Sequence[int]) -> int:

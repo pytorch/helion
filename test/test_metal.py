@@ -14,6 +14,9 @@ from unittest.mock import patch
 import pytest
 import torch
 from torch._inductor.codecache import PyCodeCache
+import torch._inductor.codegen.mps as inductor_mps
+from torch._inductor.utils import fresh_cache
+from torch._inductor.utils import run_and_get_code
 import torch.nn.functional as F
 
 import helion
@@ -1374,6 +1377,7 @@ class TestMetalMatmul(unittest.TestCase):
         from helion._compiler.metal.metal_jit import _raise_if_mpp_unsupported_device
 
         with (
+            patch.object(torch.backends.mps, "is_available", return_value=True),
             patch.object(
                 torch._C,
                 "_mps_get_name",
@@ -2085,6 +2089,25 @@ def dot_acc_bf16_out(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(backend="metal", static_shapes=True, autotune_effort="none")
+def int8_group_dots(
+    a: torch.Tensor, b: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Each K tile's exact int8 product, rescaled per tile into a float acc:
+    a W4A8 matmul's inner step.  K tiles of 8, under the 16 an MPP op
+    needs, keep it on the scalar path."""
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k, block_size=8):
+            d = hl.dot(a[tm, tk], b[tk, tn], out_dtype=torch.int32)
+            acc = acc + d.to(torch.float32) * scale[tk.begin // 8]
+        out[tm, tn] = acc
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Tests - scalar hl.dot (outside an MPP region)
 # ---------------------------------------------------------------------------
@@ -2128,6 +2151,24 @@ class TestMetalScalarDot(unittest.TestCase):
         torch.testing.assert_close(
             out, _matmul_reference(x + 1, y + 1).to(DEVICE), rtol=1e-4, atol=1e-4
         )
+
+    def test_int8_products_sum_in_int32(self) -> None:
+        """int8 x int8 products sum exactly in int32 per K tile."""
+        # The full int8 range: a tile sum reaches 8 * 2**14, past int16.
+        a = torch.randint(-128, 128, (16, 32), dtype=torch.int8)
+        b = torch.randint(-128, 128, (32, 64), dtype=torch.int8)
+        a[0], b[:, 0] = -128, -128
+        # Power-of-two scales keep every float sum exact (|sum| < 2**24).
+        scale = torch.tensor([0.5, 0.25, 2.0, 1.0])
+        out, code = self._run(
+            int8_group_dots, tuple(t.to(DEVICE) for t in (a, b, scale))
+        )
+        self.assertIn("lane_sum = int(0)", code)
+        tiles = torch.einsum(
+            "mgk,gkn->mgn", a.view(16, 4, 8).double(), b.view(4, 8, 64).double()
+        )
+        ref = (tiles * scale.double()[None, :, None]).sum(1)
+        torch.testing.assert_close(out.cpu().double(), ref, rtol=0, atol=0)
 
     def test_full_slice_k_bf16(self) -> None:
         x = torch.randn(32, 256, device=DEVICE, dtype=torch.bfloat16)
@@ -2345,11 +2386,21 @@ class TestMetalScalarDot(unittest.TestCase):
         with self.assertRaisesRegex(exc.BackendUnsupported, "batched"):
             dot_batched.bind((x, y)).to_code(helion.Config(block_sizes=[1, 16, 16]))
 
-    def test_int8_rejected(self) -> None:
-        x = torch.randint(-8, 8, (16, 32), device=DEVICE, dtype=torch.int8)
-        y = torch.randint(-8, 8, (32, 16), device=DEVICE, dtype=torch.int8)
+    def test_int8_whole_k(self) -> None:
+        """int8 operands contract in int32 (stored here into an int8 out,
+        with products small enough to fit it).  A ':' K of 8, under the 16
+        an MPP op needs, keeps it on the scalar path."""
+        x = torch.randint(-1, 2, (16, 8), dtype=torch.int8)
+        y = torch.randint(-1, 2, (8, 16), dtype=torch.int8)
+        out, code = self._run(matmul_full_k, (x.to(DEVICE), y.to(DEVICE)))
+        self.assertNotIn("long", code)
+        torch.testing.assert_close(out.cpu(), (x.int() @ y.int()).to(torch.int8))
+
+    def test_int8_by_float_rejected(self) -> None:
+        x = torch.ones(16, 32, dtype=torch.int8, device=DEVICE)
+        y = torch.ones(32, 16, dtype=torch.float16, device=DEVICE)
         with self.assertRaisesRegex(
-            exc.BackendUnsupported, "only float16, bfloat16 and float32"
+            exc.BackendUnsupported, "or int8 to int32, are supported"
         ):
             _default_code(matmul_full_k, (x, y))
 
@@ -15799,6 +15850,88 @@ class TestMetalIntTrueDiv(unittest.TestCase):
         code = int_arg_truediv.bind((x, 4)).to_code(helion.Config(block_sizes=[16, 16]))
         quotient = code.index("truediv = static_cast(float, n) / 3")
         self.assertLess(quotient, code.index("for lane_0 in range("))
+
+
+# ---------------------------------------------------------------------------
+# Tests – torch.compile
+# ---------------------------------------------------------------------------
+
+
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def compiled_add_one(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1
+    return out
+
+
+# Only ever called under torch.compile, so its config is chosen while Inductor
+# lowers it.
+@helion.kernel(
+    backend="metal",
+    configs=[
+        helion.Config(block_sizes=[16, 64], num_warps=2),
+        helion.Config(block_sizes=[32, 32], num_warps=4),
+    ],
+)
+def compiled_scale_rows(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    m, n = x.size()
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile([m, n]):
+        out[tm, tn] = x[tm, tn] * s[tm, None]
+    return out
+
+
+# Without the emit_kernel_override hook, Inductor parses every MPS template's
+# source as its own Metal kernel, which a Helion kernel's is not.  The check
+# looks for a call of the hook anywhere in the MPS codegen module's source, so
+# it holds wherever in that module PyTorch calls it.  The PyTorch change that
+# adds the call has not landed, so there is no version to check yet; once it
+# lands, its version replaces this check, which would miss a call made from
+# another module.
+@_requires_darwin
+@unittest.skipUnless(
+    re.search(r"\.emit_kernel_override\(", inspect.getsource(inductor_mps)) is not None,
+    "this PyTorch's MPS Inductor cannot emit Helion templates (its MPS codegen "
+    "never calls emit_kernel_override)",
+)
+class TestMetalTorchCompile(unittest.TestCase):
+    """Helion Metal kernels called from inside a torch.compile'd function."""
+
+    def setUp(self) -> None:
+        torch._dynamo.reset()
+        # Earlier calls must not leave a bound kernel with a config behind.
+        compiled_add_one.reset()
+        compiled_scale_rows.reset()
+
+    def test_kernel_runs_inside_compiled_function(self) -> None:
+        def fn(x: torch.Tensor) -> torch.Tensor:
+            return compiled_add_one(x * 2) - 3
+
+        x = torch.randn(4096, device=DEVICE)
+        with fresh_cache():
+            result, (code,) = run_and_get_code(torch.compile(fn, fullgraph=True), x)
+        torch.testing.assert_close(result, x * 2 + 1 - 3)
+        self.assertIn("@metal_jit", code)
+        # The module imports what the Metal backend needs, not Triton's table.
+        self.assertNotRegex(code, r"(?m)^import triton\b")
+
+    def test_config_is_chosen_while_compiling(self) -> None:
+        def fn(x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+            return compiled_scale_rows(torch.sin(x), s) + 1
+
+        # Which binding gets the config is the point, not the search, so the
+        # search is stubbed to pick the first config.
+        def first_config(backend, bound_kernel, args, *, force=True, **kwargs):
+            return bound_kernel.kernel.configs[0]
+
+        x = torch.randn(256, 512, device=DEVICE)
+        s = torch.randn(256, device=DEVICE)
+        with fresh_cache(), patch.object(MetalBackend, "autotune", first_config):
+            result = torch.compile(fn, fullgraph=True)(x, s)
+        torch.testing.assert_close(result, torch.sin(x) * s[:, None] + 1)
+        (bound,) = compiled_scale_rows._bound_kernels.values()
+        self.assertIsNotNone(bound._config)
 
 
 if __name__ == "__main__":

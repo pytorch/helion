@@ -320,6 +320,11 @@ class TestAutotunerRebenchmark(AutotunerTestCase):
         search.kernel.format_kernel_decorator.return_value = "@helion.kernel(...)"
         search.kernel.get_cached_path.return_value = None
         search.args = ()
+        search.config_spec = SimpleNamespace(
+            backend=SimpleNamespace(
+                collapses_generated_source_aliases=lambda config_spec: False
+            )
+        )
         search._autotune_metrics = AutotuneMetrics()
         search._search_space_tracker = None
         search.benchmark_provider = Mock()

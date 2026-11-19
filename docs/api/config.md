@@ -174,6 +174,21 @@ settings between configurations.
       When using a list, provide one strategy for each load and store operation in the order
       they appear in the kernel. The indexing list is ordered as:
       ``[load1, load2, ..., loadN, store1, store2, ..., storeM]``
+
+.. autoattribute:: Config.prefetch_indexing
+
+   Form of each ``hl.prefetch``, in the same formats as ``indexing`` (a single string, or a
+   list with one entry per prefetch in code order). The key exists on the Triton and Gluon
+   backends compiling for NVIDIA (PTX) targets, for kernels where some prefetch can take the
+   ``"tensor_descriptor"`` form; the prefetches of other kernels there lower in the pointer
+   form, and other targets drop prefetches.
+
+   - ``"pointer"`` (default): one bulk L2 prefetch per row segment, else a per-element prefetch
+   - ``"tensor_descriptor"``: TMA box prefetches of the tile the subscript describes, from a
+     tensor map the host builds (requires Hopper+ GPU); a prefetch keeps the pointer form when a
+     box cannot describe it (a gather, an extra mask, box rows not a multiple of 16 bytes), when
+     its tensor is not a kernel input or a view at its start (one host code allocates), under the
+     cudaMallocAsync allocator, and for a call whose tensor has no 16-byte aligned base
 ```
 
 ### Epilogue Optimization

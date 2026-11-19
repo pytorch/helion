@@ -2676,6 +2676,18 @@ def normalize_knobs(
         fix_invalid=fix_invalid,
         fill=False,
     )
+    _normalize_gated_boolean(
+        config,
+        "cute_defer_tile_reduce",
+        enabled=bool(config_spec.cute_carried_tile_sum_blocks),
+        requirement=(
+            "an hl.tile loop whose reductions over its tile are fp32 or fp64 "
+            "sums, each added to a value of its dtype that the loop carries "
+            "and reads nowhere else, in a kernel without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
     _normalize_cute_wide_packet_hints(config, fix_invalid=fix_invalid)
     _normalize_cute_pdl(config_spec, config, fix_invalid=fix_invalid)
     _normalize_cute_dot_fragment_mma(config_spec, config, fix_invalid=fix_invalid)
@@ -3902,11 +3914,22 @@ def cute_flat_fields(
             fields["cute_bool_byte_packets"] = BooleanFragment()
         if config_spec.cute_tail_peel_blocks:
             # A device loop's complete tiles apart from its partial last tile,
-            # their lanes loaded in packets; bitwise identical but for FMA
-            # contraction.  Where the shape or the config leaves nothing to
-            # split (no partial tile, no aligned packet, a shared-memory
-            # reduce in the loop) the loop stays whole (``peel_vector_tails``).
+            # their lanes loaded in packets (a sunk nest's predicated packets
+            # unpredicated); bitwise identical but for FMA contraction.  Where
+            # the shape or the config leaves nothing to gain (no aligned
+            # packet and no proven predicate, a shared-memory reduce in a loop
+            # with a partial tile) the loop stays whole (``peel_vector_tails``).
             fields["cute_tail_peel"] = BooleanFragment()
+        if config_spec.cute_carried_tile_sum_blocks:
+            # A carried tile sum's threads combined once after the device
+            # loop instead of once per tile; changes the summation order
+            # (off by default).  Offered where the pass can move every tile
+            # reduction of a loop (``carried_tile_sum_blocks``; none in a
+            # kernel with a matmul).  Where the config gives the pass nothing
+            # to move (one thread on the tile, one element of it per thread,
+            # vector lanes along it) the code stays as it is
+            # (``defer_tile_reductions``).
+            fields["cute_defer_tile_reduce"] = BooleanFragment()
         if config_spec.cute_exact_division_sites and not config_spec.matmul_facts:
             # How fp32 quotients and square roots are lowered; bitwise
             # identical forms, see ``_normalize_cute_exact_div_form``.

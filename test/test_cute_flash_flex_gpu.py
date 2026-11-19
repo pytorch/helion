@@ -759,6 +759,105 @@ def test_cooperative_loads_of_the_spatial_vector_table_are_bitwise(
     assert torch.equal(lse, lse_ref)
 
 
+def _inside_storage(values: torch.Tensor, offset: int) -> torch.Tensor:
+    """``values`` copied into a view starting ``offset`` elements into its
+    storage, so its base is only ``offset * itemsize`` bytes past an aligned
+    allocation."""
+    flat = torch.zeros(
+        values.numel() + offset, dtype=values.dtype, device=values.device
+    )
+    view = flat[offset:].view(values.shape)
+    view.copy_(values)
+    return view
+
+
+@skipIfNotCUDA()
+@pytest.mark.parametrize(
+    ("form", "offset"),
+    [
+        ("vector", 1),
+        ("vector", 4),
+        ("window", 1),
+        ("coop", 1),
+        ("coop", 2),
+        ("coop_int16", 1),
+    ],
+    ids=["vector_2B", "vector_8B", "window_4B", "coop_4B", "coop_8B", "coop_2B"],
+)
+def test_tables_starting_inside_their_storage(form: str, offset: int) -> None:
+    """A score_mod table that is a view starting inside its storage: its base
+    is 2, 4 or 8 bytes aligned, not 16.  The launcher passes the pointer
+    with that alignment (the compiled kernel is keyed on it) and the hook's
+    vector forms -- the per-lane vector of an fp16 column table, the
+    diagonal window of an fp32 relative-position table, the warp-cooperative
+    copies of an int32 (or int16) row table -- read the table in the pieces
+    its base allows (single elements, or two 4-lane halves of an 8-lane fp16
+    vector at 8 bytes; 4- or 8-byte ``cp.async.ca`` copies, or below 4 bytes
+    loads and shared stores, for the cooperative copies).  They used to
+    issue the 16-byte vector (or ``cp.async.cg``) anyway: a misaligned-address
+    fault."""
+    batch, heads, seq = 1, 2, 256
+    overrides: dict[str, object] = {}
+    if form.startswith("coop"):
+        batch, heads, seq = 2, 4, 1024
+        overrides = {
+            **WIDE_OVER_Q,
+            **UNROLLED,
+            cute_flash.FLASH_FLEX_COALESCE_KEY: 128,
+        }
+    q, k, v = _qkv(batch, heads, seq, seq)
+    torch.manual_seed(5)
+    if form == "vector":
+        table = _inside_storage(
+            torch.randn(seq, device=DEVICE, dtype=torch.float16), offset
+        )
+
+        def helion_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return score + hl.load(table, [kv_idx])
+
+        def ref_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return score + table[kv_idx]
+
+        call = "_cute_flex_load_vec("
+    elif form == "window":
+        table = _inside_storage(torch.randn(2 * seq, device=DEVICE), offset)
+
+        # A literal offset (a closure int would be a host scalar), so the
+        # renderer proves the index inside the table: the window form.
+        def helion_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return score + hl.load(table, [q_idx - kv_idx + 255])
+
+        def ref_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return score + table[q_idx - kv_idx + 255]
+
+        call = "_cute_flex_load_window("
+    else:
+        dtype = torch.int16 if form == "coop_int16" else torch.int32
+        dist = _inside_storage(
+            torch.randint(0, 7, (batch, seq, seq), device=DEVICE, dtype=dtype),
+            offset,
+        )
+        bias = torch.randn(heads, 7, device=DEVICE)
+
+        def helion_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            return score + hl.load(bias, [h, hl.load(dist, [b, q_idx, kv_idx])])
+
+        def ref_mod(score: Any, b: Any, h: Any, q_idx: Any, kv_idx: Any) -> Any:
+            # (Eager indexes with no int16 tensor.)
+            return score + bias[h, dist[b, q_idx, kv_idx].int()]
+
+        call = "_cute_flex_coop_issue("
+    block_mask = create_block_mask(
+        _causal, batch, heads, seq, seq, device=DEVICE, BLOCK_SIZE=(128, 128)
+    )
+    args = _flex_args(q, k, v, helion_mod, block_mask)
+    fn, _ = _compile_flex(args, overrides, expect_in_code=call)
+    out, lse = fn(*args)
+    torch.cuda.synchronize()
+    out_ref, lse_ref = _reference(q, k, v, ref_mod, block_mask)
+    _assert_close_to_reference(out, lse, out_ref, lse_ref)
+
+
 @skipIfNotCUDA()
 @_MULTI_COMPILE_TIMEOUT
 @pytest.mark.parametrize(

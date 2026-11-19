@@ -43,6 +43,7 @@ from helion._compile_time import get_total_time as _get_compile_total_time
 from helion._compile_time import reset as _reset_compile_time
 from helion._testing import DEVICE
 from helion._testing import run_example
+from helion.runtime.config import Config
 from helion.runtime.kernel import Kernel as _HelionKernel
 
 if TYPE_CHECKING:
@@ -857,6 +858,47 @@ def _xsa_baseline(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Te
     return ref_xsa(q, k, v)
 
 
+def _grouped_gemm_moe_shapes(
+    num_shapes: int | None = None,
+) -> list[tuple[str, tuple[Any, ...]]]:
+    # (G, M, K, N): first 3 are Qwen3-30B-A3B per-core MoE shapes (TP=8),
+    # followed by Qwen3-30B M=1024 down, Qwen3-235B-A22B per-core shapes,
+    # 8 large groups, and 16 whole experts per core.
+    configs = [
+        (128, 128, 2048, 256),
+        (128, 1024, 2048, 256),
+        (128, 128, 128, 2048),
+        (128, 1024, 128, 2048),
+        (128, 512, 4096, 512),
+        (128, 2048, 256, 4096),
+        (8, 8192, 2048, 256),
+        (16, 2048, 2048, 1536),
+        (16, 2048, 1536, 4096),
+    ]
+    if num_shapes is not None:
+        configs = configs[:num_shapes]
+    out: list[tuple[str, tuple[Any, ...]]] = []
+    for g, m, k, n in configs:
+        gen = torch.Generator().manual_seed(0)
+        group_ids = torch.randint(g, (m,), generator=gen)
+        sizes = torch.bincount(group_ids, minlength=g)
+        offsets = torch.zeros(g + 1, dtype=torch.int32)
+        offsets[1:] = torch.cumsum(sizes, 0)
+        a = torch.randn(m, k, generator=gen).to(device=DEVICE, dtype=torch.bfloat16)
+        b = (torch.randn(g, k, n, generator=gen) / k**0.5).to(
+            device=DEVICE, dtype=torch.bfloat16
+        )
+        out.append((f"[{g},{m},{k},{n}]", (a, b, offsets.to(DEVICE))))
+    return out
+
+
+def _grouped_gemm_moe_baseline(
+    a: torch.Tensor, b: torch.Tensor, offsets: torch.Tensor
+) -> torch.Tensor:
+    ref = import_example("grouped_gemm")._reference_grouped_gemm_moe
+    return ref(a, b, offsets)
+
+
 # Kernel mappings for TPU/Pallas benchmarks.
 # Format: kernel_name -> (module_file, kernel_fn_name, baseline_fn, shapes_fn,
 #                         max_mismatch_pct)
@@ -1088,6 +1130,16 @@ KERNEL_MAPPINGS: dict[str, KernelMapping] = {
         _xsa_shapes,
         None,
     ),
+    # _reference_grouped_gemm_moe slices per group using group_offsets.tolist(),
+    # which cannot trace under torch.compile(fullgraph=True).
+    "grouped_gemm_moe": (
+        "grouped_gemm",
+        "grouped_gemm_jagged_moe",
+        _grouped_gemm_moe_baseline,
+        _grouped_gemm_moe_shapes,
+        None,
+        False,  # torch_compile_compatible
+    ),
 }
 
 
@@ -1096,6 +1148,7 @@ class ShapeResult:
     shape: str
     passed: bool
     kernel_time_ms: float = 0.0
+    device_time_us: float = 0.0
     baseline_time_ms: float = 0.0
     compile_baseline_time_ms: float = 0.0
     speedup: float = 0.0  # Helion vs default torch (kDefault).
@@ -1136,6 +1189,75 @@ def import_example(module_file: str) -> types.ModuleType:
 KERNEL_TIMEOUT = int(os.environ.get("HELION_BENCHMARK_KERNEL_TIMEOUT", "1200"))
 NUM_SHAPES: int | None = None  # Set from CLI; None means all shapes
 SHAPE_INDEX: int | None = None  # Set from CLI; restricts the kernel to one shape
+DEVICE_TIME: bool = False  # Set from CLI; report on-device µs per call
+DEVICE_TIME_REPEATS: int = 3
+PINNED_CONFIG: str | None = None  # Set from CLI; JSON Config dict or {shape: dict}
+
+
+def _resolve_pinned_config(spec: str | None, shape_label: str) -> Config | None:
+    """Parse ``--config``: a JSON ``helion.Config`` or a ``{shape: config}`` map."""
+    if spec is None:
+        return None
+    parsed = json.loads(spec)
+    if not isinstance(parsed, dict):
+        raise ValueError("--config must decode to a JSON object")
+    if shape_label in parsed and isinstance(parsed[shape_label], dict):
+        parsed = parsed[shape_label]
+    elif parsed and all(isinstance(v, dict) for v in parsed.values()):
+        raise KeyError(f"Shape {shape_label!r} not found in --config map")
+    return Config(**parsed)
+
+
+def _measure_device_time_us(
+    kernel_fn: Callable[..., Any],
+    baseline_fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    *,
+    max_mismatch_pct: float | None,
+    repeats: int,
+) -> float:
+    """Check accuracy against ``baseline_fn`` and return median on-device µs."""
+    import math
+    import statistics
+
+    from helion._testing import _as_tensors
+    from helion._testing import _clone_args
+    from helion._testing import assert_close_with_mismatch_tolerance
+    from helion.autotuner.benchmarking import _pallas_device_micros_for_fn
+
+    expected = _as_tensors(baseline_fn(*args))
+    cloned_args = _clone_args(args, process_group_name=None)
+    actual = _as_tensors(kernel_fn(*cloned_args))
+    if max_mismatch_pct is None or max_mismatch_pct < 1.0:
+        assert len(actual) == len(expected)
+        for r, e in zip(actual, expected, strict=True):
+            if max_mismatch_pct is not None:
+                assert_close_with_mismatch_tolerance(
+                    r.to(torch.float32),
+                    e.to(torch.float32),
+                    atol=1e-1,
+                    rtol=1e-2,
+                    max_mismatch_pct=max_mismatch_pct,
+                )
+            else:
+                torch.testing.assert_close(
+                    r.to(torch.float32),
+                    e.to(torch.float32),
+                    rtol=1e-2,
+                    atol=1e-1,
+                )
+
+    bench_args = _clone_args(args, process_group_name=None)
+    samples = [
+        _pallas_device_micros_for_fn(
+            lambda: kernel_fn(*bench_args), n_calls=100, n_warmup=5
+        )
+        for _ in range(repeats)
+    ]
+    median_us = statistics.median(samples)
+    if not math.isfinite(median_us):
+        raise RuntimeError("no on-device time was recorded for the kernel")
+    return median_us
 
 
 class _KernelTimeout(Exception):
@@ -1211,6 +1333,10 @@ def _run_one_shape_via_subprocess(name: str, shape_index: int | None) -> KernelR
             cmd += ["--num-shapes", str(NUM_SHAPES)]
         if shape_index is not None:
             cmd += ["--shape-index", str(shape_index)]
+        if DEVICE_TIME:
+            cmd += ["--device-time", "--device-time-repeats", str(DEVICE_TIME_REPEATS)]
+        if PINNED_CONFIG is not None:
+            cmd += ["--config", PINNED_CONFIG]
         # Parent-side hard cap. The child also installs SIGALRM at KERNEL_TIMEOUT;
         # the extra slack covers child startup + autotune ramp-up + SIGALRM cleanup.
         # If the child wedges before its own alarm fires (e.g., stuck on a TPU
@@ -1412,14 +1538,39 @@ def run_kernel_inner(name: str) -> KernelResult:
                 # capable runners would short-circuit autotune on the second
                 # nightly and the captured helion_compile_time_s would
                 # collapse to a cache-hit cost.
+                pinned_cfg = _resolve_pinned_config(PINNED_CONFIG, label)
                 for attr_name in dir(mod):
                     attr = getattr(mod, attr_name)
                     if isinstance(attr, _HelionKernel):
                         attr.reset()
-                        if os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
+                        if pinned_cfg is not None:
+                            attr.settings.force_autotune = False
+                            attr.settings.static_shapes = True
+                            attr.configs = [pinned_cfg]
+                        elif os.environ.get("HELION_AUTOTUNE_EFFORT", "") != "none":
                             if not attr.configs:
                                 attr.settings.force_autotune = True
                             attr.settings.static_shapes = True
+
+                kernel_fn_timed = _wrap_first_call_compile_time(kernel_fn, ct_holder)
+                if DEVICE_TIME:
+                    device_us = _measure_device_time_us(
+                        kernel_fn_timed,
+                        baseline_fn,
+                        args,
+                        max_mismatch_pct=max_mismatch_pct,
+                        repeats=DEVICE_TIME_REPEATS,
+                    )
+                    compile_time_s = ct_holder[0] if ct_holder else 0.0
+                    shape_results.append(
+                        ShapeResult(
+                            shape=label,
+                            passed=True,
+                            device_time_us=device_us,
+                            compile_time_s=compile_time_s,
+                        )
+                    )
+                    continue
 
                 # Build baselines dict. "torch" is the default kDefault path
                 # (lazy-eager); "torch_compile" runs the same baseline through
@@ -1449,7 +1600,6 @@ def run_kernel_inner(name: str) -> KernelResult:
                 # and bench loop, slightly inflating the reported value.
                 # Returns 0.0 unless HELION_MEASURE_COMPILE_TIME=1 is set
                 # (then the tracker is a no-op anyway).
-                kernel_fn_timed = _wrap_first_call_compile_time(kernel_fn, ct_holder)
                 timings = run_example(
                     kernel_fn_timed,
                     baselines,
@@ -1578,6 +1728,13 @@ def write_results_json(output: str, results: list[KernelResult]) -> None:
             shapes,
             [sr.kernel_time_ms for sr in result.shape_results],
         )
+        if any(sr.device_time_us > 0 for sr in result.shape_results):
+            add_metric(
+                result.name,
+                "helion_device_latency_us",
+                shapes,
+                [sr.device_time_us for sr in result.shape_results],
+            )
         add_metric(
             result.name,
             "helion_speedup",
@@ -1659,6 +1816,29 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--device-time",
+        action="store_true",
+        help=(
+            "Report on-device kernel time per call (µs) instead of "
+            "host-synchronized wall-clock time (ms)."
+        ),
+    )
+    parser.add_argument(
+        "--device-time-repeats",
+        type=int,
+        default=3,
+        help="100-call device-time measurements per shape (median, default: 3).",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help=(
+            "JSON helion.Config object, or a {shape: config} map, to benchmark "
+            "a fixed config without autotuning."
+        ),
+    )
+    parser.add_argument(
         "--intermediate-result",
         type=str,
         default=None,
@@ -1669,9 +1849,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    global NUM_SHAPES, SHAPE_INDEX
+    global NUM_SHAPES, SHAPE_INDEX, DEVICE_TIME, DEVICE_TIME_REPEATS, PINNED_CONFIG
     NUM_SHAPES = args.num_shapes
     SHAPE_INDEX = args.shape_index
+    DEVICE_TIME = args.device_time
+    DEVICE_TIME_REPEATS = args.device_time_repeats
+    PINNED_CONFIG = args.config
 
     if args.list_kernels:
         for name in KERNEL_MAPPINGS:
@@ -1725,21 +1908,36 @@ def main() -> None:
     # Summary table. "Speedup" = Helion vs default torch (kDefault).
     # "vs default" next to torch.compile = how much faster compile is than
     # default torch (1.0x means no win, 2.0x means compile is 2x faster).
-    width = 100
+    width = 72 if args.device_time else 100
     print(f"\n{'=' * width}", file=sys.stderr)
     print("Summary", file=sys.stderr)
     print(f"{'=' * width}", file=sys.stderr)
-    print(
-        f"{'Kernel':<22} {'Shape':<16} {'Status':<8} "
-        f"{'Helion (ms)':<14} {'Torch (ms)':<14} {'Speedup':<10} "
-        f"{'Torch.compile (ms)':<20} {'vs default':<10}",
-        file=sys.stderr,
-    )
+    if args.device_time:
+        print(
+            f"{'Kernel':<22} {'Shape':<22} {'Status':<8} {'Device (µs)':<14}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"{'Kernel':<22} {'Shape':<16} {'Status':<8} "
+            f"{'Helion (ms)':<14} {'Torch (ms)':<14} {'Speedup':<10} "
+            f"{'Torch.compile (ms)':<20} {'vs default':<10}",
+            file=sys.stderr,
+        )
     print(f"{'-' * width}", file=sys.stderr)
     for result in results:
         if result.shape_results:
             for sr in result.shape_results:
                 status = "PASS" if sr.passed else "FAIL"
+                if args.device_time:
+                    dev_str = (
+                        f"{sr.device_time_us:.1f}" if sr.device_time_us > 0 else "-"
+                    )
+                    print(
+                        f"{result.name:<22} {sr.shape:<22} {status:<8} {dev_str:<14}",
+                        file=sys.stderr,
+                    )
+                    continue
                 kernel_str = (
                     f"{sr.kernel_time_ms:.4f}" if sr.kernel_time_ms > 0 else "-"
                 )

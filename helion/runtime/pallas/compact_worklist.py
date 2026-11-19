@@ -17,6 +17,9 @@ total_repeat_length=UPPER)`` + ``num_work = cnt.sum()`` fed to ``grid=``): the
 metadata arrays have the static shape ``UPPER`` so every BlockSpec ``index_map``
 is in-bounds by construction, while only the first ``num_work`` grid points run,
 so the padded ``[num_work, UPPER)`` tail never executes.
+
+:func:`fill_owner_tiles` and :func:`aligned_upper_bound` support building the
+worklist inside the Pallas kernel on SMEM refs so no XLA op runs before launch.
 """
 
 from __future__ import annotations
@@ -73,6 +76,58 @@ def packed_upper_bound(total_compact: int, num_owners: int, block: int) -> int:
     ``num_work``.
     """
     return -(-total_compact // block) + num_owners - 1
+
+
+def aligned_upper_bound(
+    total_compact: int, num_owners: int, block: int, sublane: int
+) -> int:
+    """Static bound on the work items :func:`fill_owner_tiles` produces.
+
+    Same contract as :func:`packed_upper_bound` (packed ranges, ``total_compact
+    >= sum(lengths)``). Tiles start at the owner base rounded down to a
+    ``sublane`` boundary, so a non-empty owner covers at most
+    ``length + sublane - 1`` rows.
+    """
+    return packed_upper_bound(
+        total_compact + num_owners * (sublane - 1), num_owners, block
+    )
+
+
+def fill_owner_tiles(
+    num_work: Array,
+    owner: Array,
+    base: Array,
+    length: Array,
+    block: int,
+    sublane: int,
+    owner_ref: object,
+    start_ref: object,
+    extent_ref: object,
+) -> Array:
+    """Append one owner's tiles to in-kernel worklist tables; return the count.
+
+    Splits ``[base, base + length)`` at ``(base - base % sublane) + j * block``
+    (with ``block`` a multiple of ``sublane``) so each tile's ``sublane``-aligned
+    window spans at most ``block`` rows. An empty owner adds no tile.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    aligned_base = base - base % sublane
+    end = base + length
+    count = jnp.where(length > 0, (end - aligned_base + block - 1) // block, 0)
+
+    def tile(j: Array, carry: int) -> int:
+        aligned_start = aligned_base + j * block
+        start = jnp.maximum(aligned_start, base)
+        stop = jnp.minimum(aligned_start + block, end)
+        owner_ref[num_work + j] = owner  # type: ignore[index]
+        start_ref[num_work + j] = start  # type: ignore[index]
+        extent_ref[num_work + j] = stop - start  # type: ignore[index]
+        return carry
+
+    jax.lax.fori_loop(0, count, tile, 0)
+    return num_work + count
 
 
 def flatten_worklist(

@@ -24,6 +24,9 @@ from .ast_extension import create
 from .ast_extension import expr_from_string
 from .ast_extension import statement_from_string
 from .compile_environment import CompileEnvironment
+from .cross_loop_report import RootNames
+from .cross_loop_report import log_root_barriers
+from .cross_loop_report import log_schedule
 from .cross_loop_scheduler import CrossLoopDispatchMode
 from .cross_loop_scheduler import ReadinessConsumer
 from .cross_loop_scheduler import ReadinessCounterPlan
@@ -31,6 +34,7 @@ from .cross_loop_scheduler import ReadinessProducer
 from .cross_loop_scheduler import _root_barrier_reachability
 from .cross_loop_scheduler import build_static_pipeline_plan
 from .cross_loop_scheduler import nested_wait_placement
+from .cross_loop_timeline import Timeline
 from .device_function import SyncRole
 from .device_function import TensorArg
 from .device_function import TensorDescriptorArg
@@ -265,14 +269,8 @@ def _static_case_axes(
             numel = env.specialize_expr(numel)
             if numel.is_number:
                 numel = int(numel)
-        try:
-            block = int(
-                env.block_sizes[info.block_id].from_config_assert(
-                    device_function.config
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            return None
+        # A block with no size here raises InvalidConfig, which says why.
+        block = env.block_sizes[info.block_id].from_config_int(device_function.config)
         result.append((numel, block))
     return result
 
@@ -317,13 +315,13 @@ def _static_block_axis_geometry(
     # No static extent (data-dependent bounds, reused block sizes): no geometry.
     if not isinstance(info.size, (int, torch.SymInt)):
         return None
+    numel_expr = info.numel
+    if not numel_expr.is_number:
+        return None
+    numel = int(numel_expr)
     try:
-        numel_expr = info.numel
-        if not numel_expr.is_number:
-            return None
-        numel = int(numel_expr)
-        block = int(info.from_config_assert(device_function.config))
-    except (KeyError, TypeError, ValueError):
+        block = info.from_config_int(device_function.config)
+    except exc.InvalidConfig:
         return None
     return (numel + block - 1) // block, block
 
@@ -412,6 +410,7 @@ def _wait_for_counter(
     device_function.sync_roles[sync] = SyncRole(
         "wait", scalar=statement_from_string(scalar)
     )
+    device_function.spin_ends.add(sync)
     load = (
         "tl.inline_asm_elementwise("
         "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
@@ -863,11 +862,25 @@ def _bound_wait(device_function: DeviceFunction, call: str) -> ast.stmt:
     (as every scheduler wait is) so that later lowerings recognize it."""
     token = device_function.new_var("tile_dependency_wait", dce=False)
     device_function.sync_roles[token] = SyncRole("wait")
+    device_function.spin_ends.add(token)
     return statement_from_string(f"{token} = {call}")
 
 
+def cta_threads(device_function: DeviceFunction) -> int:
+    """The threads that run code outside warp-specialized partitions: the warps
+    the launch's ``num_warps`` requests (the default warpgroup), which is more
+    than the config's ``num_warps`` when the backend raises it (Triton launches
+    at least four warps for a warp-specialized loop). Worker warps of a
+    partitioned loop are not counted: Triton's default-warpgroup barriers
+    leave them out too. A count-carrying barrier over other threads would mix
+    counts on one barrier with Triton's own (undefined: hangs, illegal
+    instructions)."""
+    env = CompileEnvironment.current()
+    return 32 * env.backend.effective_num_warps(device_function.config)
+
+
 def _publication_sync(device_function: DeviceFunction) -> ast.stmt:
-    if cast("int", device_function.config.get("num_warps", 1)) != 1:
+    if cta_threads(device_function) != 32:
         return statement_from_string("tl.debug_barrier()")
     sync = device_function.new_var("tile_dependency_publication_sync", dce=False)
     device_function.sync_roles[sync] = SyncRole("release")
@@ -1208,7 +1221,7 @@ def peer_state(device_function: DeviceFunction) -> PeerState | None:
     config = device_function.config
 
     def block_size(block_id: int) -> int:
-        return env.size_hint(env.block_sizes[block_id].from_config_assert(config))
+        return env.block_sizes[block_id].from_config_int(config)
 
     mailboxes: dict[int, tuple[int, int, int, bool]] = {}
     words = 0
@@ -2404,6 +2417,10 @@ def emit_cross_loop_schedule(
         prove_nonnegative=CompileEnvironment.current().known_nonnegative,
         cross_loop_dispatch_mode=dispatch_mode,
     )
+    device_ir = HostFunction.current().device_ir
+    log_root_barriers(
+        static_pipeline_plan, dependency_graph, device_ir, device_function.name
+    )
     # StaticPipelinePlan accepts only a fixed physical task universe.  Convert
     # task-family offsets only after that invariant has been established.
     case_offsets: list[int] = []
@@ -2451,6 +2468,15 @@ def emit_cross_loop_schedule(
         packet_ranges.append((root, packet_begin, packet_count))
     if packet_count <= 0:
         raise AssertionError("dynamic packet stream requires at least one task")
+    # Dynamic dispatch launches a program per resident task.
+    launched_programs = packet_count if uses_packet_dispatch else launch_worker_count
+    log_schedule(
+        static_pipeline_plan,
+        dependency_graph,
+        device_ir,
+        device_function.name,
+        launched_programs,
+    )
 
     # Static ownership requires every worker to be simultaneously resident.
     # Dynamic packets rely on monotone admission and exact readiness instead.
@@ -2546,6 +2572,36 @@ def emit_cross_loop_schedule(
     root_barrier_counter_arg = state_section(root_barrier_state_offset)
     claim_counter_arg = state_section(claim_state_offset)
 
+    timeline_prefix = CompileEnvironment.current().settings.megakernel_timeline
+    if timeline_prefix is not None:
+
+        def register_timeline(numel: str) -> tuple[str, int]:
+            buffer = _register_cross_loop_state(
+                device_function,
+                name_hint="tile_dependency_timeline",
+                numel=numel,
+                dtype=torch.int64,
+            )
+            # The slot of the state just registered.
+            return buffer, len(device_function.triton_persistent_state_specs) - 1
+
+        names = RootNames(device_ir, dependency_graph)
+        device_function.timeline = Timeline.create(
+            device_function,
+            prefix=timeline_prefix,
+            workers=launched_programs,
+            dispatch=dispatch_mode,
+            roots={
+                root: (
+                    static_pipeline_plan.execution_orders[root].task_count,
+                    names.root(root),
+                )
+                for root in range(len(static_pipeline_plan.execution_orders))
+            },
+            register=register_timeline,
+        )
+    timeline = device_function.timeline
+
     # peer_counter: one uint64 slot per publishing root plus a done slot, on
     # every rank. Targets use a uint64 epoch so they never wrap.
     peer_edges = static_pipeline_plan.peer_edges
@@ -2586,7 +2642,7 @@ def emit_cross_loop_schedule(
         ]
 
     lanes = 1 << (world_size - 1).bit_length()
-    threads = 32 * device_function.config.num_warps
+    threads = cta_threads(device_function)
 
     def peer_publications(root: int) -> list[ast.stmt]:
         if peer is None:
@@ -2693,6 +2749,7 @@ def emit_cross_loop_schedule(
                 )
                 tokens.append(token)
                 device_function.sync_roles[token] = SyncRole("wait", zero=True)
+                device_function.spin_ends.add(token)
         return statements, tokens
 
     dispatch_ticket: str | None = None
@@ -2701,7 +2758,9 @@ def emit_cross_loop_schedule(
     if not uses_packet_dispatch:
         assert state_arg is not None
         result: list[ast.stmt] = [
-            statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1")
+            *([] if timeline is None else [timeline.clock()]),
+            statement_from_string(f"{epoch_var} = tl.load({state_arg} + {worker}) + 1"),
+            *([] if timeline is None else timeline.setup(epoch_var, worker)),
         ]
         device_function.sync_roles[epoch_var] = SyncRole("launch")
         if peer is not None:
@@ -2762,6 +2821,7 @@ def emit_cross_loop_schedule(
         )
         period = f"tl.cast({packet_count}, tl.uint64)"
         result = [
+            *([] if timeline is None else [timeline.clock()]),
             statement_from_string(
                 f"{raw_dispatch_ticket} = tl.atomic_add("
                 f"{dispatch_ticket_arg}, 1, sem='relaxed', scope='gpu')"
@@ -2774,6 +2834,7 @@ def emit_cross_loop_schedule(
                 f"{epoch_var} = tl.cast("
                 f"{raw_dispatch_ticket} // {period} + 1, tl.uint32)"
             ),
+            *([] if timeline is None else timeline.setup(epoch_var, worker)),
         ]
         if peer is not None:
             result.append(
@@ -3834,10 +3895,16 @@ def emit_cross_loop_schedule(
             device_function, consumer_parts, "release"
         )
 
-        last_arrival_body = [*device_function.async_load_fence(), consumer_call]
+        consumer_body: list[ast.stmt] = [consumer_call]
         if consumer_publications:
-            last_arrival_body.extend(_release_sync(device_function))
-            last_arrival_body.extend(consumer_publications)
+            consumer_body.extend(_release_sync(device_function))
+            consumer_body.extend(consumer_publications)
+        if timeline is not None:
+            # Its publications (and the continuations they complete) included.
+            consumer_body = timeline.task(
+                continuation_root, consumer_body_pid, epoch_var, worker, consumer_body
+            )
+        last_arrival_body = [*device_function.async_load_fence(), *consumer_body]
         expected_arrivals = plan.uniform_arrival_count()
         if expected_arrivals is None:
             raise AssertionError(
@@ -4106,6 +4173,7 @@ def emit_cross_loop_schedule(
                     )
                 ]
                 readiness_tokens.append(token)
+                device_function.spin_ends.add(token)
                 if not total:
                     body.append(statement_from_string(f"{token} = 0"))
             else:
@@ -4224,6 +4292,9 @@ def emit_cross_loop_schedule(
                 body[guard_first_index:guard_first_index] = entry
         tile_body[:] = _batch_waits(device_function, tile_body)
         body[:] = _batch_waits(device_function, body)
+        if timeline is not None:
+            timeline.ready(root, root_local_pid_task, tile_body)
+            timeline.ready(root, root_local_pid_task, body)
         task_body_head = body
         if root in kernel_scope_roots:
             body.extend(tile_body)
@@ -4706,16 +4777,19 @@ def emit_cross_loop_schedule(
             and root not in deferred_last_task
             else None
         )
+        local_task = f"({strategy.virtual_pid_var}) - {segment_begin}"
         task_body = task_prologue + scheduled_root_task_body(
             root,
-            f"({strategy.virtual_pid_var}) - {segment_begin}",
-            f"{case_offsets[root]} + (({strategy.virtual_pid_var}) - {segment_begin})",
+            local_task,
+            f"{case_offsets[root]} + ({local_task})",
             task_arguments,
             # A hoisted wait would precede the deferred release it may need.
             invariant_waits=None if root in deferred_releases else invariant_waits,
             barrier_waits=task_barriers,
             root_arrival=root_arrival,
         )
+        if timeline is not None:
+            task_body = timeline.task(root, local_task, epoch_var, worker, task_body)
         if root in settled_extents:
             # The extent's hoisted loads read what these waits protect (every
             # worker here has a static task).
@@ -4896,6 +4970,8 @@ def emit_cross_loop_schedule(
             )
         result.extend(writes)
         device_function.launch_writes.extend(writes)
+        if timeline is not None:
+            result.extend(timeline.exit(worker))
     else:
         assert dispatch_ticket is not None
         dispatch: list[ast.stmt] = []
@@ -4908,6 +4984,8 @@ def emit_cross_loop_schedule(
                 prefix="tile_dependency_root_barrier_wait",
             )
             task_body.extend(peer_waits(root))
+            if timeline is not None:
+                timeline.ready(root, local_task, task_body)
             folded = folds_root_arrival(root)
             task_body.extend(
                 scheduled_root_task_body(
@@ -4928,6 +5006,10 @@ def emit_cross_loop_schedule(
                     root_barrier_publication(root, synced=bool(publications))
                 )
             task_body.extend(publications)
+            if timeline is not None:
+                task_body = timeline.task(
+                    root, local_task, epoch_var, worker, task_body
+                )
             # Kernel-scoped tensor-memory roots get no dry pass: tl.range fails to
             # compile around dot_scaled, and the while-loop form is slower.
             if waits_on_dependency(root) and root not in kernel_scope_roots:
@@ -5012,6 +5094,8 @@ def emit_cross_loop_schedule(
                 )
             )
         result.extend(dispatch)
+        if timeline is not None:
+            result.extend(timeline.exit(worker))
     if (
         tuple(_ast_fingerprint(body) for body in case_bodies)
         != opaque_case_fingerprints

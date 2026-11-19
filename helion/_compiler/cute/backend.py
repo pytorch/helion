@@ -1508,6 +1508,20 @@ class CuteBackend(Backend):
 
         return build_standalone_code(bound, import_lines, body_root)
 
+    def standalone_entry_args(
+        self, bound: BoundKernel[Any], args: Sequence[object]
+    ) -> tuple[object, ...]:
+        """Callable arguments (score/mask mods) are compiled into the kernel,
+        so the standalone entry point omits them (:func:`omitted_parameters`)."""
+        from .standalone import omitted_parameters
+
+        omitted = omitted_parameters(bound)
+        return tuple(
+            arg
+            for name, arg in zip(bound.kernel.signature.parameters, args, strict=False)
+            if name not in omitted
+        )
+
     def collective_owns_tile(self, fn: DeviceFunction, block_id: int) -> bool:
         from ..compile_environment import CompileEnvironment
         from .grouped_row_union import physical_schedule
@@ -2881,6 +2895,25 @@ class CuteBackend(Backend):
         # keeps a slow seed inside the timeout.
         return True
 
+    def autotune_short_kernel_below_us(self, config_spec: ConfigSpec) -> float | None:
+        # A row-reduction or pointwise kernel of 3-30 us has dozens of
+        # configs within a few percent of each other. The search's event
+        # timer reads them in steps of about 2 us, launch latency included
+        # (every finalist of a 13 us LayerNorm read 16.4 us while the final
+        # selection's trace separated them over 12.8-14.0 us), so the search
+        # walked over ties and the final selection picked among a random
+        # handful of them. A search whose best initial config reads below
+        # 64 us, where an event step is over 3% of a reading, reads its
+        # candidates' kernel durations from the trace, the timer of this
+        # backend's final selection (``default_final_selection_regime``).
+        # Not the flash search: its terminal refinement re-times members
+        # with mirrored wall-clock sweeps in this process
+        # (``mirrored_rebenchmark``) and ranks its history by the latest
+        # reading, so its candidates stay on one scale with those sweeps.
+        if config_spec.cute_flash_search_enabled:
+            return None
+        return 64.0
+
     def supports_parallel_render(self) -> bool:
         # Code generation only reads the device facts the render pool
         # captures (the MMA-support probe's current device, device properties
@@ -3042,7 +3075,58 @@ class CuteBackend(Backend):
         return source_hash if isinstance(source_hash, str) else None
 
     def should_deduplicate_generated_sources(self, config_spec: ConfigSpec) -> bool:
-        return config_spec.cute_flash_search_enabled
+        # A candidate is its generated module (``BenchmarkJob`` takes the
+        # source and the arguments, never the config), so two configs with one
+        # source are one kernel.  Many are: a ``load_eviction_policies`` slot
+        # whose load the layout serves from registers, an L2 policy on a
+        # packet width without a hinted load, a knob of a pass the config
+        # leaves off.
+        return True
+
+    def collapses_generated_source_aliases(self, config_spec: ConfigSpec) -> bool:
+        # The flash search runs its own alias policy (structural lanes,
+        # source quarantine); every other search drops the aliases.
+        return not config_spec.cute_flash_search_enabled
+
+    def simplified_selected_config(
+        self,
+        config_spec: ConfigSpec,
+        config: Config,
+        same_source: Callable[[Config], bool],
+    ) -> Config:
+        # A ``load_eviction_policies`` slot is dead when the selected layout
+        # serves its load from registers, or when its packet width has no
+        # hinted load: the policy leaves no trace in the code.  Which slots
+        # those are is decided by the lane passes after codegen, so it is
+        # read off renders: every policy reset at once first (one render when
+        # all are dead), else slot by slot, keeping each reset that leaves
+        # the source as it is.  What is returned is a config ``same_source``
+        # accepted, as it was asked about, or ``config`` itself.
+        policies = config.config.get("load_eviction_policies")
+        if not isinstance(policies, list) or not any(policies):
+            return config
+
+        def with_policies(values: list[object]) -> Config:
+            return config.from_dict(
+                {**config.config, "load_eviction_policies": [*values]}
+            )
+
+        cleared = with_policies([""] * len(policies))
+        if same_source(cleared):
+            return cleared
+        accepted = config
+        live = list(policies)
+        for index, policy in enumerate(policies):
+            trial = [*live]
+            trial[index] = ""
+            # ``cleared`` is answered: the last set policy stays.
+            if policy == "" or not any(trial):
+                continue
+            candidate = with_policies(trial)
+            if same_source(candidate):
+                live = trial
+                accepted = candidate
+        return accepted
 
     def classify_autotune_exception(self, err: BaseException) -> str | None:
         # Exceptions raised from inside the cute/cutlass DSL during compile or

@@ -15,6 +15,7 @@ from .accuracy import assert_close
 from .accuracy import poison_cached_device_memory
 from .benchmark_worker import PHASE_COMPILED
 from .benchmark_worker import PhasedJob
+from .benchmarking import KernelTraceUnreadable
 from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import do_bench
 from .benchmarking import do_bench_cuda_graph
@@ -86,6 +87,13 @@ class BenchmarkJob(PhasedJob):
     # final selection names its own regime (``final_selection_l2_flush_mode``).
     l2_flush_mode: str | None = None
     input_banks: int = 1
+    # Time the window from the CUDA activity trace (``do_bench``'s
+    # ``trace_kernel_durations``): the candidates and re-timings of a search
+    # that settled on the trace timer, a seed's retry with fixed repetitions
+    # included. False keeps the event timer. A window the worker cannot read
+    # from the trace raises ``KernelTraceUnreadable`` rather than be timed
+    # with CUDA events.
+    trace_kernel_durations: bool = False
 
     def __call__(self, report_phase: Callable[[str], None] | None = None) -> float:
         # Subprocess inherits parent stderr; capture so Triton runtime
@@ -116,7 +124,13 @@ class BenchmarkJob(PhasedJob):
                         raise InputBankMemoryError(
                             "optional finalist input copies exceed device memory"
                         ) from error
-                bench = do_bench_generic if self.use_wall_clock else do_bench
+                bench: Callable[..., float | tuple[float, ...]] = (
+                    do_bench_generic if self.use_wall_clock else do_bench
+                )
+                # (the wall-clock timer has no trace path)
+                traced = self.trace_kernel_durations and not self.use_wall_clock
+                if traced:
+                    bench = functools.partial(do_bench, trace_kernel_durations=True)
                 # The worker warmed the current device before this job; the
                 # kernel's graphs, its warm call (or bank warm-up), the
                 # synchronization after it and the timers (which flush, mark
@@ -162,16 +176,33 @@ class BenchmarkJob(PhasedJob):
                             pre_timing=pre_timing,
                         )
                     else:
-                        if self.l2_flush_mode == "kernel" and not self.use_wall_clock:
+                        kernel_window = (
+                            self.l2_flush_mode == "kernel" and not self.use_wall_clock
+                        )
+                        if kernel_window or traced:
                             reason = kernel_timer_unready_reason()
                             if reason is not None:
-                                # The parent labelled this window ``kernel``
-                                # (``LocalBenchmarkProvider.worker_kernel_timer_available``):
-                                # a reading timed with CUDA events instead
-                                # must not pass as one.
-                                raise RuntimeError(
-                                    f"the kernel trace timer is unavailable in "
-                                    f"the benchmark worker: {reason}"
+                                if kernel_window:
+                                    # The parent labelled this window
+                                    # ``kernel``
+                                    # (``LocalBenchmarkProvider.worker_kernel_timer_available``):
+                                    # a reading timed with CUDA events
+                                    # instead must not pass as one.
+                                    raise RuntimeError(
+                                        f"the kernel trace timer is unavailable "
+                                        f"in the benchmark worker: {reason}"
+                                    )
+                                # The search reads its candidates from the
+                                # trace (it asked this worker's probe before
+                                # it settled on it): ``do_bench`` would time
+                                # this window with CUDA events, a reading on
+                                # another scale than the ones it is compared
+                                # with. A worker that lost the trace since
+                                # (respawned beside a tool that holds the
+                                # activity API) gives no reading instead.
+                                raise KernelTraceUnreadable(
+                                    f"the benchmark worker cannot read the "
+                                    f"CUDA activity trace: {reason}"
                                 )
                         result = bench(
                             benchmark_fn,
@@ -192,7 +223,8 @@ class BenchmarkJob(PhasedJob):
 class KernelTimerProbeJob:
     """Why the benchmark worker cannot time ``kernel`` windows from the trace
     on ``device``, ``None`` when it can: the profiling session runs in the
-    worker, which keeps the learned footprint for the windows that follow."""
+    worker, which keeps the learned footprint for the windows that follow in
+    that process (a new process learns it in its first such window)."""
 
     device: int | None = None
 

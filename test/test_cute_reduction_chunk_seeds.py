@@ -17,14 +17,16 @@ from helion._compiler.cute.autotune.heuristics.cute import (
 )
 from helion._compiler.cute.autotune.heuristics.cute import CuteRolledRowLadderHeuristic
 from helion._compiler.cute.backend import CuteBackend
-from helion._compiler.flydsl.backend import FlyDSLBackend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion.autotuner.config_spec import BlockSizeSpec
 from helion.autotuner.config_spec import ConfigSpec
 from helion.autotuner.config_spec import CuteLaneLayoutSpec
 from helion.autotuner.config_spec import CuteVectorWidthSpec
+from helion.autotuner.config_spec import KernelGridFact
 from helion.autotuner.config_spec import NumThreadsSpec
 from helion.autotuner.config_spec import ReductionLoopSpec
+from helion.autotuner.config_spec import RootGridFact
 from helion.language._tracing_ops import _host_tensor
 
 pytestmark = pytest.mark.cpu_only
@@ -32,7 +34,9 @@ pytestmark = pytest.mark.cpu_only
 
 def _row_env(spec: ConfigSpec) -> MagicMock:
     # These fixtures model static row axes, including the logical extent
-    # that distinguishes a row tile from a registered configuration knob.
+    # that distinguishes a row tile from a registered configuration knob,
+    # and one root loop (graph 0) over the row tile, block 0.
+    spec.kernel_grid_fact = KernelGridFact((RootGridFact(0, (0,)),), ((0, 0),))
     env = MagicMock(
         config_spec=spec,
         block_sizes={
@@ -48,6 +52,17 @@ def _row_env(spec: ConfigSpec) -> MagicMock:
     env.shape_env.replace.side_effect = lambda value: value
     env.specialize_expr.side_effect = lambda value: value
     return env
+
+
+def _row_device_ir(graph: torch.fx.Graph | None = None) -> MagicMock:
+    # Graph 0, ``graph``, is the body of the root loop over the row tile
+    # (``_row_env``) and rolls the row, block 1.
+    return MagicMock(
+        graphs=[SimpleNamespace(graph=graph or torch.fx.Graph())],
+        rolled_reductions=[
+            SimpleNamespace(rolled_block_ids=[1], original_graph_id=0, used_rdim=True)
+        ],
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -98,7 +113,7 @@ def test_reduction_chunks_survive_seed_transfer(
         graph.call_function(_host_tensor, ("x",)).meta["val"] = torch.empty(
             (rows, columns), dtype=dtype, device=DEVICE
         )
-    device_ir = MagicMock(graphs=[SimpleNamespace(graph=graph)])
+    device_ir = _row_device_ir(graph)
 
     assert heuristic.is_eligible(env, device_ir)
     seed = heuristic.get_seed_config(env, device_ir)
@@ -135,9 +150,24 @@ def test_wide_chunk_eligibility_uses_rounded_capped_chunk(
     spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=columns))
     spec.max_reduction_loop = max_chunk
     assert (
-        CuteReductionWideChunkHeuristic.is_eligible(_row_env(spec), MagicMock())
+        CuteReductionWideChunkHeuristic.is_eligible(_row_env(spec), _row_device_ir())
         is eligible
     )
+
+
+def test_row_rolled_outside_every_root_loop_gets_no_row_layout() -> None:
+    spec = ConfigSpec(backend=CuteBackend())
+    spec.block_sizes.append(BlockSizeSpec(block_id=0, size_hint=16))
+    spec.reduction_loops.append(ReductionLoopSpec(block_id=1, size_hint=4096))
+    env = _row_env(spec)
+    device_ir = _row_device_ir()
+    assert CuteReductionWideChunkHeuristic.is_eligible(env, device_ir)
+    # A second graph rolls the row, and no root loop of the grid fact owns
+    # it: the tile axes of its rows are unknown.
+    device_ir.rolled_reductions.append(
+        SimpleNamespace(rolled_block_ids=[1], original_graph_id=5, used_rdim=True)
+    )
+    assert not CuteReductionWideChunkHeuristic.is_eligible(env, device_ir)
 
 
 @pytest.mark.parametrize(
@@ -218,6 +248,19 @@ def test_indexed_reduction_keeps_warp_cap_without_backend_loop_cap(
     assert config.reduction_loops == [32]
 
 
+class _CappedReductionBackend(TritonBackend):
+    # A non-CuTe backend with its own reduction thread and loop caps.
+    @property
+    def name(self) -> str:
+        return "_test_capped_reduction"
+
+    def max_reduction_threads(self) -> int | None:
+        return 64
+
+    def max_reduction_loop(self) -> int | None:
+        return 8192
+
+
 @pytest.mark.parametrize(
     ("chunk", "expected_seed", "expected_direct"),
     [
@@ -231,7 +274,7 @@ def test_other_backend_reduction_seed_policy_is_preserved(
     expected_seed: int | None,
     expected_direct: int,
 ) -> None:
-    spec = ConfigSpec(backend=FlyDSLBackend())
+    spec = ConfigSpec(backend=_CappedReductionBackend())
     spec.reduction_loops.append(ReductionLoopSpec(block_id=0, size_hint=32768))
     seed = Config(reduction_loops=[chunk])
     spec.compiler_seed_configs = [seed]

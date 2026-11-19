@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import os
+import tempfile
 import textwrap
 from types import SimpleNamespace
 from typing import Any
@@ -51,8 +53,10 @@ from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfTileIR
 from helion._testing import skipUnlessTensorDescriptor
+from helion._testing.timeline_checks import check_written
 from helion.autotuner.benchmark_provider import _triton_compile
 import helion.language as hl
+from helion.runtime import timeline
 from helion.runtime.triton.launcher import compile_only_launch_args
 
 
@@ -243,6 +247,17 @@ def readiness_counter_chain(x: torch.Tensor) -> torch.Tensor:
         reduced[final_column] = torch.sum(partial[final_row, final_column], dim=0)
     for output_index in hl.tile(1, block_size=1):
         out[output_index] = torch.sum(reduced[:], dim=-1)
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def single_root_add(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size()):
+        out[tile] = x[tile] + 1
     return out
 
 
@@ -552,8 +567,11 @@ def nested_two_axis_consumer(x: torch.Tensor) -> torch.Tensor:
     tmp = torch.empty_like(x)
     out = torch.empty_like(x)
 
+    # root: producer
+    # (a label may sit above other comment lines)
     for producer_row, producer_column in hl.tile([rows, columns]):
         tmp[producer_row, producer_column] = x[producer_row, producer_column] + 1
+    # A plain comment names nothing.
     for _consumer in hl.tile(1, block_size=1):
         for consumer_row, consumer_column in hl.tile(
             [rows, columns], block_size=[8, 8]
@@ -2854,17 +2872,43 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
         for pipeline in ("static", "dynamic"):
             with self.subTest(pipeline=pipeline):
-                for launch in range(2):
-                    code, out = code_and_output(
-                        nested_two_axis_consumer,
-                        (x + launch,),
-                        block_sizes=[8, 8],
-                        pid_type="persistent_blocked",
-                        cross_loop_pipeline=pipeline,
-                        num_sm_multiplier=1,
-                        num_warps=1,
+                with self.assertLogs("helion.megakernel", "INFO") as logs:
+                    for launch in range(2):
+                        code, out = code_and_output(
+                            nested_two_axis_consumer,
+                            (x + launch,),
+                            block_sizes=[8, 8],
+                            pid_type="persistent_blocked",
+                            cross_loop_pipeline=pipeline,
+                            num_sm_multiplier=1,
+                            num_warps=1,
+                        )
+                        torch.testing.assert_close(out, ((x + launch) + 1) * 2)
+                report = "\n".join(logs.output)
+                # The barrier, the store and load it orders, and why.
+                self.assertIn("waits for every task of root 0", report)
+                self.assertIn("tmp stored at line", report)
+                self.assertIn("tmp loaded at line", report)
+                self.assertIn("the nested loop's wait has no supported counter", report)
+                self.assertIn("root 0 -> root 1 (tmp): root barrier", report)
+                # A `# root:` comment above a root's loop labels it.
+                self.assertIn("root 0 · producer [lines:", report)
+                self.assertIn("root 1 [lines:", report)
+                # The schedule names the programs the launch runs (dynamic: a
+                # program per task).
+                launch = next(
+                    node
+                    for node in ast.walk(ast.parse(code))
+                    if isinstance(node, ast.Call) and _call_name(node) == "_launcher"
+                )
+                grid = launch.args[1]
+                assert isinstance(grid, ast.Tuple)
+                if pipeline == "dynamic":
+                    self.assertIn(
+                        f"roots on {ast.unparse(grid.elts[0])} programs, dynamic "
+                        "dispatch (a program per task)",
+                        report,
                     )
-                    torch.testing.assert_close(out, ((x + launch) + 1) * 2)
                 self.assertNotIn("tile_dependency_nested_loop_wait", code)
                 self.assertIn("tile_dependency_root_barrier_wait", code)
                 self.assertEqual(
@@ -2979,6 +3023,87 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                     "tile_dependency_raw_dispatch_ticket" in code,
                     pipeline == "dynamic",
                 )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_megakernel_timeline_records_every_task(self) -> None:
+        x = torch.arange(8 * 4, device=DEVICE, dtype=torch.float32).reshape(8, 4)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(timeline._buffers, clear=True),
+        ):
+            for pipeline in ("static", "dynamic"):
+                kernel = helion.kernel(
+                    readiness_counter_chain.fn,
+                    static_shapes=True,
+                    autotune_effort="none",
+                    megakernel_timeline=os.path.join(directory, pipeline),
+                )
+                for launch in range(3):
+                    code, out = code_and_output(
+                        kernel,
+                        (x + launch,),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                    torch.testing.assert_close(
+                        out, torch.sum(x + launch + 1).reshape(1)
+                    )
+                # Root 3 waits for the chain: a ready stamp (a task word's
+                # third) follows its spin.
+                self.assertRegex(code, r"\* 4 \+ 2\), tl\.inline_asm_elementwise\(")
+            # A config that compiles no megakernel records nothing, and says so.
+            with self.assertLogs("helion.runtime.timeline", "INFO"):
+                code, _ = code_and_output(
+                    kernel,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="barrier",
+                )
+            self.assertNotIn("tile_dependency_timeline", code)
+            # A kernel without cross-loop dependencies has nothing to record.
+            ordinary = helion.kernel(
+                single_root_add.fn,
+                static_shapes=True,
+                autotune_effort="none",
+                megakernel_timeline=os.path.join(directory, "ordinary"),
+            )
+            with self.assertNoLogs("helion.runtime.timeline", "INFO"):
+                code, out = code_and_output(ordinary, (x,))
+            torch.testing.assert_close(out, x + 1)
+            written = check_written(self, launches=3)
+            self.assertEqual(
+                [os.path.basename(path) for path, _ in written],
+                [
+                    f"{pipeline}.readiness_counter_chain.0."
+                    f"cuda{x.device.index or 0}.pid{os.getpid()}.txt"
+                    for pipeline in ("dynamic", "static")
+                ],
+            )
+            for _path, recorded in written:
+                tasks = sum(count for count, _name in recorded.roots.values())
+                self.assertEqual(tasks, 32 + 16 + 4 + 1)
+                for launch in recorded.launches:
+                    # Root 3 waits for root 2: it is ready no earlier than root
+                    # 2's tasks start (an unstamped ready would read as its start).
+                    self.assertGreaterEqual(
+                        min(t.ready for t in launch.tasks if t.root == 3),
+                        max(t.start for t in launch.tasks if t.root == 2),
+                    )
+                    # Roots 1 and 2 run as continuations, each inside the task
+                    # whose arrival completed it.
+                    for child, parent in ((1, 0), (2, 1)):
+                        for task in (t for t in launch.tasks if t.root == child):
+                            self.assertTrue(
+                                any(
+                                    p.worker == task.worker
+                                    and p.start <= task.start <= task.end <= p.end
+                                    for p in launch.tasks
+                                    if p.root == parent
+                                )
+                            )
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")

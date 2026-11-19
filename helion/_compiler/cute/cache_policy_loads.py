@@ -352,6 +352,18 @@ class CachePolicy:
             return "cs"
         return ""
 
+    @classmethod
+    def from_masked_priority(cls, priority: str) -> CachePolicy:
+        """The hint a predicated packet load carries as its priority argument
+        (``masked_priority`` inverted)."""
+        if not priority:
+            return cls.NONE
+        if priority == "cs":
+            return cls(streaming=True)
+        if priority == _NC_L2_FIRST_POLICY or priority in _L2_HELPER_POLICIES:
+            return cls(l2_helper=priority)
+        return cls(l1_priority=priority)
+
     @property
     def scalar_policy(self) -> str | None:
         """The ``_cute_scalar_policy_load`` policy name of this hint

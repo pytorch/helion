@@ -14,7 +14,6 @@ import math
 import os
 from pathlib import Path
 import re
-import shutil
 import sys
 import tempfile
 import threading
@@ -44,6 +43,7 @@ from helion._dist_utils import is_master_rank
 if TYPE_CHECKING:
     from _csv import Writer as CsvWriter
 
+    from .._compiler.backend import Backend
     from ..runtime.config import Config
     from ..runtime.settings import Settings
     from .base_search import _AutotunableKernel
@@ -229,13 +229,24 @@ class AutotuningLogger:
         return self._trace_sink is not None
 
     @_logging_errors()
-    def record_selected_config(self, config: Config) -> None:
+    def record_selected_config(
+        self, config: Config, *, measured_as: Config | None = None
+    ) -> None:
+        """Record the config the search returns.  ``measured_as`` is the
+        config its kernel was timed under where that is another one (a
+        search can return a simpler config of the measured kernel): the
+        event then carries its id as ``measured_config_id``, the id of the
+        kernel's trial rows."""
         if self._trace_sink is not None:
+            fields: dict[str, object] = {}
+            if measured_as is not None:
+                fields["measured_config_id"] = canonical_config_id(measured_as)
             self._trace_sink.record(
                 "selected",
                 self._trace_algorithm,
                 config_id=canonical_config_id(config),
                 config=config.config,
+                **fields,
             )
 
     @_logging_errors()
@@ -270,19 +281,6 @@ class AutotuningLogger:
         """Record native-source progress separately from configuration timings."""
         if self._trace_sink is not None:
             self._trace_sink.record(event, "native_source", **fields)
-
-    @_logging_errors()
-    def record_handoff_chat(self, transcript: Path, session_id: str) -> Path | None:
-        """Save each full agent conversation beside the autotune log files."""
-        filename = self._settings.autotune_log
-        if not filename:
-            return None
-        path = (
-            Path(filename).with_suffix(f".handoff.{session_id}.chat.jsonl").absolute()
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(transcript, path)
-        return path
 
     @_logging_errors()
     def record_handoff_measurement(
@@ -981,6 +979,25 @@ def match_device_out_of_memory(err: BaseException) -> bool:
     return isinstance(err, CudaOOMError) or bool(
         _DEVICE_OUT_OF_MEMORY_RE.search(str(err))
     )
+
+
+def log_candidate_compile_failure(
+    log: AutotuningLogger,
+    settings: Settings,
+    backend: Backend,
+    error: BaseException,
+    message: str,
+) -> None:
+    """Log that a candidate config failed to compile, by the autotuner's
+    policy for such failures: nothing under ``autotune_ignore_errors``, a
+    debug line where the backend (or the Triton classification) expects the
+    failure, else a warning; both with the traceback."""
+    if settings.autotune_ignore_errors:
+        return
+    action = backend.classify_autotune_exception(error) or classify_triton_exception(
+        error
+    )
+    (log.debug if action == "debug" else log.warning)(message, exc_info=True)
 
 
 def classify_triton_exception(err: BaseException) -> Literal["raise", "warn", "debug"]:

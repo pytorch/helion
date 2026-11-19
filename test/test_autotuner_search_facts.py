@@ -14,6 +14,8 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.backend import Backend
+from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import skipIfRefEager
@@ -407,3 +409,27 @@ def test_cute_backend_probes_long_kernels_before_timing() -> None:
 
     backend = CuteBackend.__new__(CuteBackend)
     assert backend.probe_long_autotune_kernels(SimpleNamespace()) is True  # pyrefly: ignore[bad-argument-type]
+
+
+@pytest.mark.cpu_only
+def test_only_the_cute_backend_resolves_short_kernels() -> None:
+    """Only the CuTe backend names a short-kernel bound: a search of it
+    whose initial population's best config reads under 64 us times every
+    later candidate from the trace and counts steps within those readings'
+    repeatability as ties; every other backend keeps the event timer and
+    the fixed step rule.  So does the CuTe flash search, whose terminal
+    refinement re-times members with wall-clock sweeps in the autotuning
+    process: the backend names no bound for it."""
+    plain = SimpleNamespace(cute_flash_search_enabled=False)
+    flash = SimpleNamespace(cute_flash_search_enabled=True)
+    assert Backend.autotune_short_kernel_below_us(SimpleNamespace(), plain) is None  # pyrefly: ignore[bad-argument-type]
+    assert (
+        TritonBackend.autotune_short_kernel_below_us
+        is Backend.autotune_short_kernel_below_us
+    )
+    pytest.importorskip("cutlass")
+    from helion._compiler.cute.backend import CuteBackend
+
+    backend = CuteBackend.__new__(CuteBackend)
+    assert backend.autotune_short_kernel_below_us(plain) == 64.0  # pyrefly: ignore[bad-argument-type]
+    assert backend.autotune_short_kernel_below_us(flash) is None  # pyrefly: ignore[bad-argument-type]

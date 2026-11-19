@@ -8,8 +8,11 @@ from __future__ import annotations
 import dataclasses
 import math
 from typing import TYPE_CHECKING
+from typing import cast
 
 from ...autotuner.config_fragment import EnumFragment
+from ...autotuner.config_spec import DEFAULT_NUM_WARPS
+from ...autotuner.config_spec import RangeNumStagesSpec
 from ...autotuner.search_surface import BackendSearchSurface
 from ...exc import InvalidConfig
 from ...runtime.config import Config
@@ -31,6 +34,14 @@ METAL_MATMUL = "metal_matmul"
 METAL_MATMUL_CHOICES = ("mpp", "fragment")
 
 
+#: The most entries of a ``constant`` table a fragment element reads a value
+#: computed from a small bit field from (``tabulate``), 0 for none: the
+#: default.  A table replaces the field's decode with a load, which pays for
+#: a 4-bit field's decode but not always for a byte's.
+METAL_TABULATE = "metal_tabulate_max_entries"
+METAL_TABULATE_CHOICES = (0, 16, 256)
+
+
 @dataclasses.dataclass(frozen=True)
 class MetalKernelFacts:
     """What ``MetalBackend.register_search_surface`` found in the kernel
@@ -42,6 +53,12 @@ class MetalKernelFacts:
     #: every one of them (``mpp_matmul._takes_dots``); else the dots keep the
     #: scalar contraction.
     fragment_matmuls: bool = False
+    #: The sizes of the tables those matmuls' fragment elements would read
+    #: (``tabulate.table_sizes``).
+    table_sizes: frozenset[int] = frozenset()
+    #: Whether SIMD groups can split those matmuls' K loops
+    #: (``fragment_mma.split_refusal``): a fragment config's ``num_warps``.
+    fragment_splits: bool = False
     #: The tunable tiles of each device loop, the grid's first (empty when it
     #: has none), when the kernel's matmuls lower on MPP's cooperative ops or
     #: on fragments, whose launches take whole SIMD groups (:func:`fit_threads`),
@@ -54,6 +71,12 @@ class MetalKernelFacts:
     #: Those tiles a reduction contracts after their loop, which shrink to
     #: one thread (``blocks_reduced_after_loop``).
     reduced_after_loop: frozenset[int] = frozenset()
+    #: The K-loop MPP matmuls that stage one operand per K tile (a value the
+    #: Scalar layout computes, a dequantized weight) beside a device view:
+    #: ``(tall, narrow, k)`` blocks, the view's side (whose threads share
+    #: the staged tile), the staged operand's other side, and K
+    #: (``staged_matmul_heuristic``).
+    staged_matmuls: tuple[tuple[int, int, int], ...] = ()
 
 
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
@@ -64,6 +87,13 @@ def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
         return MetalKernelFacts()
     assert isinstance(facts, MetalKernelFacts)
     return facts
+
+
+def metal_tabulate_max_entries(config: Mapping[str, object]) -> int:
+    """The config's ``metal_tabulate_max_entries``, 0 when it has none."""
+    value = config.get(METAL_TABULATE, METAL_TABULATE_CHOICES[0])
+    assert isinstance(value, int)
+    return value
 
 
 def metal_matmul(config: Mapping[str, object]) -> object:
@@ -77,10 +107,95 @@ def lowers_on_fragments(config_spec: ConfigSpec) -> bool:
     return kernel_facts(config_spec).fragment_matmuls
 
 
+def fragment_tiles(config_spec: ConfigSpec, config: Mapping[str, object]) -> bool:
+    """Whether a config's tiles run on one SIMD group's 32 threads: a
+    fragment config of a kernel whose matmuls lower on fragments, whose
+    ``num_warps`` SIMD groups each run the tiles, splitting its K loops
+    (:func:`fragment_split`)."""
+    return metal_matmul(config) == "fragment" and lowers_on_fragments(config_spec)
+
+
+def fragment_split(config_spec: ConfigSpec, config: Mapping[str, object]) -> int:
+    """The SIMD groups that split each K loop of a kernel's fragment runs
+    (``fragment_mma``): a fragment config's ``num_warps`` where the tiles
+    take one SIMD group (:func:`fragment_tiles`), else 1.  Each runs the
+    tiles on every ``num_warps``-th K tile."""
+    if not fragment_tiles(config_spec, config):
+        return 1
+    return int(cast("int", config.get("num_warps", 1)))
+
+
+def tile_warps(config_spec: ConfigSpec, config: Mapping[str, object]) -> int:
+    """The SIMD groups whose threads a launch lays the tiles out over:
+    ``num_warps``, or one where the tiles take one SIMD group
+    (:func:`fragment_tiles`)."""
+    if fragment_tiles(config_spec, config):
+        return 1
+    return int(cast("int", config.get("num_warps", DEFAULT_NUM_WARPS)))
+
+
+def _table_choices(config_spec: ConfigSpec) -> tuple[int, ...]:
+    """The ``metal_tabulate_max_entries`` that generate different code for
+    the kernel: 0, and each cap that admits a table a smaller one doesn't."""
+    sizes = kernel_facts(config_spec).table_sizes
+    choices = [0]
+    for cap in METAL_TABULATE_CHOICES[1:]:
+        if any(choices[-1] < size <= cap for size in sizes):
+            choices.append(cap)
+    return tuple(choices)
+
+
+#: The ``num_warps`` of the split fragment seeds: SIMD groups splitting a K
+#: loop pay off where few threadgroups run, as a few-row matmul with few
+#: output columns has; the search moves it from there.
+SPLIT_SEED = 4
+
+#: The ``range_num_stages`` a loop over fragment runs takes: 0 and 1 load
+#: each K tile's operands in its iteration, 2 one tile ahead
+#: (``fragment_mma.prefetch_loads``).
+FRAGMENT_STAGES = (0, 1, 2)
+
+
+class FragmentNumStagesSpec(RangeNumStagesSpec):
+    """``range_num_stages`` of a K loop over fragment runs, with Triton's
+    meaning: 2 stages issue the next tile's loads before this tile's work.
+    The search tries 0 and 2 (1 is 0's code).  Registered after
+    ``CompileEnvironment._pin_range_num_stages_for_aliasing``, it is never
+    pinned: a fragment run never loads a tensor the kernel writes from a view
+    (the planner stages such a view, and ``check_fragment_group`` refuses a
+    staged operand's loads of one), so no load it moves can alias a store."""
+
+    # An enum where Triton's slot is an integer range: 1 would repeat 0.
+    # pyrefly: ignore [bad-override]
+    def _fragment(self, base: ConfigSpec) -> EnumFragment:
+        return EnumFragment((0, 2))
+
+    def _normalize(self, name: str, value: object) -> int:
+        value = super()._normalize(name, value)
+        if value not in FRAGMENT_STAGES:
+            raise InvalidConfig(
+                f"{name} must be one of {FRAGMENT_STAGES} on a Metal fragment "
+                f"K loop, got {value!r}"
+            )
+        return value
+
+
+def fragment_stages(
+    config_spec: ConfigSpec, config: Mapping[str, object], block: int
+) -> int:
+    """The config's ``range_num_stages`` for the loop over ``block``."""
+    values = config.get("range_num_stages", [])
+    assert isinstance(values, list)
+    stages = config_spec.range_num_stages.config_get(values, block, 0)
+    assert isinstance(stages, int)
+    return stages
+
+
 def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
-    """Give a matmul config a threadgroup its matmuls run on: exactly one
-    SIMD group for a fragment run, whole SIMD groups and at most
-    ``MAX_THREADS_PER_THREADGROUP`` for MPP's cooperative ops
+    """Give a matmul config a threadgroup its matmuls run on: tiles over
+    exactly one SIMD group for a fragment run, which each of the
+    ``num_warps`` SIMD groups splitting its K loop runs, whole SIMD groups
+    and at most ``MAX_THREADS_PER_THREADGROUP`` for MPP's cooperative ops
     (``mpp_matmul.check_mpp_launch``).
 
     ``num_warps`` alone doesn't give it: ``num_threads`` sets the
@@ -89,13 +204,14 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     2048 under any ``num_warps``, and ``[2, 2, 1]`` 4.  A config whose counts
     launch a threadgroup its matmuls take keeps them.  Another's are made
     explicit, each at most its block, and fitted to the budget,
-    ``min(1024, 32 * num_warps)``: its explicit counts kept (the widest
-    halved while they pass the budget), the auto ones filling what is left
-    in block order, and the smallest count below its block grown while the
-    threadgroup falls short.  All explicit, the counts launch as given.  A
-    config with every count on auto, as the default config has, is left as
-    it is.  Literal-size tiles (a fixed ``block_size=``) have no count and
-    take one thread per element first; the counts fit what they leave.
+    ``min(1024, 32 * num_warps)`` (32 for a fragment run): its explicit
+    counts kept (the widest halved while they pass the budget), the auto
+    ones filling what is left in block order, and the smallest count below
+    its block grown while the threadgroup falls short.  All explicit, the
+    counts launch as given.  A config with every count on auto, as the
+    default config has, is left as it is.  Literal-size tiles (a fixed
+    ``block_size=``) have no count and take one thread per element first;
+    the counts fit what they leave.
 
     K tiles past ``MAX_STEPS`` are left as they are: codegen refuses them,
     which costs a codegen rather than a compile.  So is a wide MPP tile at
@@ -105,9 +221,7 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     blocks = config["block_sizes"]
     # Normalization leaves out counts that are all auto.
     threads = config.get("num_threads", [0] * len(spec))
-    num_warps = config["num_warps"]
     assert isinstance(blocks, list) and isinstance(threads, list)
-    assert isinstance(num_warps, int)
     if not any(t > 0 for t in threads):
         # Every count on auto, as in the default config: left as it is.
         return
@@ -118,7 +232,9 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
         else int(config_spec.block_sizes.config_get(blocks, item.block_ids[0], 1))
         for item in spec
     ]
-    budget = min(MAX_THREADS_PER_THREADGROUP, SIMD_WIDTH * num_warps)
+    budget = min(
+        MAX_THREADS_PER_THREADGROUP, SIMD_WIDTH * tile_warps(config_spec, config)
+    )
     # Literal-size tiles take their threads first, one per element.
     literal = math.prod(facts.literal_threads)
     launch = literal * math.prod(
@@ -168,50 +284,117 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
 
 
 class MetalSearchSurface(BackendSearchSurface):
-    config_keys = frozenset({METAL_MATMUL})
+    config_keys = frozenset({METAL_MATMUL, METAL_TABULATE})
 
     def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
         """``metal_matmul`` where both lowerings apply: a kernel whose K-loop
-        matmuls lower on fragments too."""
+        matmuls lower on fragments too; ``metal_tabulate_max_entries`` where
+        its fragment elements would read a table."""
         if not lowers_on_fragments(config_spec):
             return {}
-        return {METAL_MATMUL: EnumFragment(METAL_MATMUL_CHOICES)}
+        fields: dict[str, ConfigSpecFragment] = {
+            METAL_MATMUL: EnumFragment(METAL_MATMUL_CHOICES)
+        }
+        if len(tables := _table_choices(config_spec)) > 1:
+            fields[METAL_TABULATE] = EnumFragment(tables)
+        return fields
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
-        """The default config leaves ``metal_matmul`` out, as before it was
-        searched: a config without it means MPP."""
+        """The default config leaves ``metal_matmul``,
+        ``metal_tabulate_max_entries`` and unstaged ``range_num_stages`` out,
+        as before they were searched: a config without them means MPP, no
+        tables and no prefetch."""
         if metal_matmul(config.config) == METAL_MATMUL_CHOICES[0]:
             config.config.pop(METAL_MATMUL, None)
+        if metal_tabulate_max_entries(config.config) == 0:
+            config.config.pop(METAL_TABULATE, None)
+        stages = config.config.get("range_num_stages", [])
+        assert isinstance(stages, list)
+        if not any(stages):
+            config.config.pop("range_num_stages", None)
 
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
         """Both lowerings in the initial population: the default is MPP's, so
-        seed a fragment config (one SIMD group per threadgroup, which the
-        fragment run takes)."""
+        seed fragment configs, one per table cap that changes the code (the
+        key left out at 0), each with and without loading its K loops'
+        operands a tile ahead where it can (``range_num_stages`` slots), on
+        one SIMD group per threadgroup and, where its K loops split, on
+        :data:`SPLIT_SEED` SIMD groups splitting them."""
         if not lowers_on_fragments(config_spec):
             return []
-        return [Config(metal_matmul="fragment", num_warps=1)]
+        slots = len(config_spec.range_num_stages)
+        splits = (1, SPLIT_SEED) if kernel_facts(config_spec).fragment_splits else (1,)
+        seeds = []
+        for num_warps in splits:
+            for cap in _table_choices(config_spec):
+                for stages in (0, 2) if slots else (0,):
+                    seed = Config(metal_matmul="fragment", num_warps=num_warps)
+                    if cap:
+                        seed.config[METAL_TABULATE] = cap
+                    if stages:
+                        seed.config["range_num_stages"] = [stages] * slots
+                    seeds.append(seed)
+        return seeds
 
     def normalize_knobs(
         self, config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
     ) -> None:
-        if metal_matmul(config) not in METAL_MATMUL_CHOICES:
+        for key, choices in (
+            (METAL_MATMUL, METAL_MATMUL_CHOICES),
+            (METAL_TABULATE, METAL_TABULATE_CHOICES),
+        ):
+            if key not in config:
+                continue
+            value = config[key]
+            # By type too: 16.0 == 16, and False == 0.
+            if value in choices and type(value) is type(choices[0]):
+                continue
             if not fix_invalid:
                 raise InvalidConfig(
-                    f"{METAL_MATMUL} must be one of {METAL_MATMUL_CHOICES}, got "
-                    f"{config[METAL_MATMUL]!r}"
+                    f"{key} must be one of {choices}, got {config[key]!r}"
                 )
-            del config[METAL_MATMUL]
+            del config[key]
+        if metal_matmul(config) != "fragment":
+            # Tables are read by fragment elements only.
+            config.pop(METAL_TABULATE, None)
         if metal_matmul(config) == "fragment" and (
-            fix_invalid or "num_warps" not in config
+            "num_warps" not in config
+            or (fix_invalid and not kernel_facts(config_spec).fragment_splits)
         ):
-            # A limit of the fragment lowering, not a choice: a run's
-            # accumulator fragments live in one SIMD group's lanes, so it
-            # takes one SIMD group per threadgroup, and the search's fragment
-            # configs at other num_warps couldn't compile.  A config that
-            # leaves num_warps out gets 1 rather than the default; one that
-            # sets another value still fails, saying why.  Splitting K over
-            # the SIMD groups of a threadgroup would lift the limit.
+            # A fragment config's num_warps is the SIMD groups that split
+            # its K loops (``fragment_split``).  One that leaves it out gets
+            # 1, as fragment configs ran before K loops split, rather than
+            # the default.  Where the K loops can't split
+            # (``fragment_mma.split_refusal``) the search's fragment configs
+            # take 1, and a config setting another value fails, saying why.
             config["num_warps"] = 1
+
+    def normalize_before_sequences(
+        self, config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+    ) -> None:
+        """Metal reads ``range_num_stages`` on fragment runs only, one entry
+        per K loop that can load a tile ahead.  Before it took the key, a
+        Metal config's ``range_num_stages`` (a Triton config's per-loop
+        stages, pasted or cached) was dropped as a key of another backend; a
+        config that doesn't lower on fragments still drops it, so it keeps
+        loading whatever its length and values.  A fragment config, new with
+        the key, must give one entry per such loop: the search's repairs
+        drop a wrong length, and a user's config is refused."""
+        stages = config.get("range_num_stages")
+        if stages is None:
+            return
+        if metal_matmul(config) != "fragment":
+            del config["range_num_stages"]
+            return
+        slots = len(config_spec.range_num_stages)
+        if isinstance(stages, list) and len(stages) == slots:
+            return
+        if not fix_invalid:
+            raise InvalidConfig(
+                f"range_num_stages must have one entry per Metal fragment K loop "
+                f"that can load a tile ahead ({slots}), got {stages!r}"
+            )
+        del config["range_num_stages"]
 
     def normalize_finalize(
         self,
@@ -221,6 +404,11 @@ class MetalSearchSurface(BackendSearchSurface):
         fix_invalid: bool,
         provided_keys: set[str],
     ) -> None:
+        if not config_spec.range_num_stages:
+            # A kernel without fragment K loops keeps its configs as they
+            # were before Metal took the key: the sequence pass gives it an
+            # empty range_num_stages, which this drops.
+            config.pop("range_num_stages", None)
         if fix_invalid and kernel_facts(config_spec).thread_loops:
             fit_threads(config_spec, config)
 

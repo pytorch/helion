@@ -9,6 +9,7 @@ import itertools
 import math
 import threading
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import NamedTuple
 from typing import Protocol
 from typing import TypeVar
@@ -54,7 +55,9 @@ from .variable_origin import TileExtentOrigin
 
 if TYPE_CHECKING:
     from ..runtime.config import Config
+    from ..runtime.config import IndexingLiteral
     from .cross_loop_codegen import PeerState
+    from .cross_loop_timeline import Timeline
     from .cute.bounded_cache_codegen import BoundedCacheRequest
     from .cute.device_state import CuteDeviceFunctionState
     from .device_ir import GraphInfo
@@ -134,8 +137,9 @@ class DeviceBodyContext:
     integer value of every constexpr name) to the post-rename stage, and
     ``pass_context`` the backend's frozen facts (opaque to core).
     ``body_start`` is the index of the first statement of the traced device
-    body; the statements before it are the argument preambles (and the entry
-    markers when the backend ``places_pdl_markers``).
+    body; the statements before it are the entry markers when the backend
+    ``places_pdl_markers``, then the ``scalar_arg_preamble`` statements, then
+    the device function's own preamble (e.g. persistent program-id setup).
     """
 
     device_function: DeviceFunction
@@ -321,7 +325,8 @@ class SyncRole:
     # publications (pushes, their syncs and drains), which order no later load;
     # launch: per-launch state read at entry and rewritten at exit; claim: a
     # claimed task loop's claim; poll: in-band mailbox reads and their vote,
-    # which order only the reads of the mailbox they return.
+    # which order only the reads of the mailbox they return; stamp: a
+    # megakernel_timeline stamp, which orders nothing.
     kind: str
     # A wait's covered obligations: the allocations whose reads it orders
     # (None: every read).
@@ -415,6 +420,7 @@ class DeviceFunction:
         self._tensor_descriptor_args: dict[
             tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
         ] = {}
+        self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
         self._constexpr_exprs: set[sympy.Expr] = set()
         self._constexpr_args: dict[str, ConstExprArg] = {}
@@ -518,6 +524,11 @@ class DeviceFunction:
         # A symmetric spec also appends the per-rank base pointer table.
         self.triton_persistent_state_args: list[str] = []
         self.triton_persistent_state_specs: list[tuple[str, str, str, bool]] = []
+        # The megakernel_timeline stamps of a cross-loop schedule, and the names
+        # whose statement returns once a scheduler spin is done (where its
+        # ready stamps go).
+        self.timeline: Timeline | None = None
+        self.spin_ends: set[str] = set()
         # Cross-rank transport state (cross_loop_codegen.peer_state), the polls
         # awaiting their first use, the inband accesses emitted so far, and the
         # done-word asm of each root with inband scatter stores.
@@ -554,10 +565,9 @@ class DeviceFunction:
 
             if ring_depth(config, env.backend_name):
                 self.ring = RingLowering(self)
-        # FlyDSL: (tensor_name, is_vec, is_rolled_col) → loop-invariant buffer/
-        # div/copy-atom setup, memoized per generated function so load and store
-        # reuse the same lifted AST vars.
-        self._flydsl_setup: dict[tuple[object, ...], dict[str, int | str]] = {}
+        # Per-backend codegen state for this function, keyed by backend name
+        # (covered by helion.backend_api; see docs/api/backend_api.md).
+        self.backend_codegen_state: dict[str, Any] = {}
         # Pallas: id(fake_tensor) → [DimensionTiling], recorded during `plan_tiling`
         self.pallas_tensor_dim_tilings: dict[int, list[DimensionTiling]] = {}
         # Pallas: tensor dimensions selected by scalar metadata indexed by one
@@ -608,6 +618,9 @@ class DeviceFunction:
         # One scratch per output buffer (a tile may feed several stores),
         # allocated at the store.
         self.carry_scratch: dict[CarryScratchKey, str] = {}
+        # Pallas: jagged row block_id -> whether loads may leave its unowned
+        # rows unmasked (``ordered_carry.unowned_rows_never_stored``).
+        self.unmasked_row_tiles: dict[int, bool] = {}
 
     def mark_pallas_remote_copy_operand(self, tensor: torch.Tensor) -> None:
         self.pallas_remote_copy_tensor_ids.add(id(tensor))
@@ -694,6 +707,28 @@ class DeviceFunction:
             self.atomic_indexing_strategies.append(strategy)
 
         return self.atomic_indexing_strategies[index]
+
+    def prefetch_indexing(self, index: int) -> IndexingLiteral:
+        """The form ``prefetch_indexing`` gives the prefetch in slot ``index``:
+        a single string applies to every prefetch; omitted, "pointer"."""
+        config = self.config.prefetch_indexing
+        if isinstance(config, str):
+            form = config
+        elif not config:
+            return "pointer"
+        else:
+            assert index < len(config), (
+                f"Prefetch operation {index} exceeds prefetch_indexing config "
+                f"length {len(config)}. Please specify prefetch_indexing for all "
+                "prefetches."
+            )
+            form = config[index]
+        if form not in ("pointer", "tensor_descriptor"):
+            raise RuntimeError(
+                f"Invalid prefetch_indexing: {form!r}, "
+                "must be one of 'pointer', 'tensor_descriptor'"
+            )
+        return form
 
     def has_rng_ops(self) -> bool:
         """Check if this kernel uses any RNG operations."""
@@ -1334,7 +1369,8 @@ class DeviceFunction:
         self._constexpr_host_defs.add(name)
 
     def host_constexpr_def(self, name: str, host_expr: str) -> str:
-        """Define a host-only constant once (launch-grid inputs, not kernel args).
+        """Define a host-only value once: a launch-grid input, or an object a
+        kernel argument reads (it stays bound until the launch is submitted).
 
         Returns ``name``; the definition is appended to the host statements
         the first time it is requested for this function.
@@ -1839,9 +1875,9 @@ class DeviceFunction:
             if not suffix.isdigit():
                 continue
             block_id = int(suffix)
-            self.triton_outlined_helper_constexprs[name] = int(
-                environment.block_sizes[block_id].from_config_assert(self.config)
-            )
+            self.triton_outlined_helper_constexprs[name] = environment.block_sizes[
+                block_id
+            ].from_config_int(self.config)
         argument_names = [
             argument.name
             for argument in self.arguments

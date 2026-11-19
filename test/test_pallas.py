@@ -5051,7 +5051,10 @@ class TestPallas(TestCase):
         self.assertEqual(code.count("((2,), None, 'dma_semaphore')"), 2)
         torch.testing.assert_close(result, expected, rtol=1e-4, atol=1e-4)
 
-    @xfailIfPallas("Pipeline + scalar access codegen not yet supported")
+    @xfailIfPallasInterpret(
+        "emit_pipeline closure-reading an outer BlockSpec ref is unsupported "
+        "in JAX Pallas interpret mode"
+    )
     def test_pipeline_tensor_with_scalar_access(self) -> None:
         """A pipeline tensor with scalar access should keep HBM, not be overridden to SMEM."""
         args = (
@@ -7317,7 +7320,6 @@ class TestPallas(TestCase):
         self.assertIn(nested_update, code)
         self.assertLess(code.index(load), code.index(nested_update))
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
         outer_in_inner = self._dma_buffer_offset_nested_tile_kernel()
@@ -9085,6 +9087,30 @@ class TestPallasJaxFn(TestCase):
         x = jnp.zeros((128, 128), dtype=jnp.float32)
         result = jax.block_until_ready(f(x))
         self.assertTrue(bool(jnp.all(result == 1.0)))
+
+    def test_jax_fn_slices_ds_padded_output(self) -> None:
+        """An output-only tensor padded for dynamic row slices returns its unpadded shape."""
+        jax, jnp = self._import_jax()
+
+        @helion.kernel(
+            backend="pallas",
+            static_shapes=True,
+            config=helion.Config(block_sizes=[16, 128], pallas_loop_type="fori_loop"),
+        )
+        def add_one_per_group(x: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(x.size(0), x.size(1), dtype=x.dtype, device=x.device)
+            for g in hl.grid(offsets.size(0) - 1):
+                for tile_m in hl.tile(offsets[g], offsets[g + 1]):
+                    for tile_n in hl.tile(x.size(1)):
+                        out[tile_m, tile_n] = x[tile_m, tile_n] + 1.0
+            return out
+
+        f = jax.jit(add_one_per_group.jax_fn)
+        x = jnp.arange(40 * 128, dtype=jnp.float32).reshape(40, 128)
+        offsets = jnp.asarray([0, 5, 5, 23, 40], dtype=jnp.int32)
+        result = jax.block_until_ready(f(x, offsets))
+        self.assertEqual(result.shape, x.shape)
+        self.assertTrue(bool(jnp.all(result == x + 1.0)))
 
     def test_jax_standalone_captures_inplace_scratch_and_output_only(self) -> None:
         """Metadata capture mirrors the launcher's output-only return contract."""

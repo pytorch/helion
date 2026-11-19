@@ -190,6 +190,7 @@ from .cute_register_subblocks import CuteRegisterSubblocksHeuristic
 from .cute_resident_reductions import CuteResidentReductionHeuristic
 from .cute_resident_sequence import CuteResidentSequenceHeuristic
 from .cute_rolled_cluster_packet import CuteRolledClusterPacketHeuristic
+from .cute_row_packets import row_packet_seed_configs
 from .cute_row_resident import register_row_resident_coverage
 from .cute_signed_bitfield import add_signed_bitfield_seeds
 from .cute_simt_mma import CuteSimtMmaHeuristic
@@ -207,6 +208,9 @@ from .cute_warp_atomic import CuteWarpAtomicHeuristic
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
+    from collections.abc import Iterator
+    from collections.abc import Sequence
 
     from ....autotuner_heuristics.registry import AutotunerHeuristicType
     from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
@@ -494,6 +498,11 @@ def postprocess_seed_configs(
         env.config_spec.autotuner_heuristics.append(
             CutePointwiseMinBlocksHeuristic.name
         )
+    # The row-packet families, after every older family.
+    for family, row_seeds in row_packet_seed_configs(env, device_ir):
+        if row_seeds:
+            configs.extend(row_seeds)
+            env.config_spec.autotuner_heuristics.append(family)
     return configs
 
 
@@ -510,21 +519,28 @@ def _register_knob_witnesses(
     *,
     key: str,
     mechanism: str,
-    carries: Callable[[Config], bool],
-) -> None:
+    carries: Callable[[Config], bool] = lambda seed: True,
+    candidates: Sequence[Config] | None = None,
+    dependencies: tuple[CoverageDependency, ...] = (),
+) -> bool:
     """Cover the boolean knob ``key``, off by default, with a knob-on witness
-    for each of the first compiler seeds that ``carries`` admits, at most
-    ``MAX_COMPILER_COVERAGE_CONFIGS``.  Each carrier is the seed as the
-    search canonicalizes it, kept only when its witness transfers strictly.
+    for each of the first ``candidates`` that ``carries`` admits, at most
+    ``MAX_COMPILER_COVERAGE_CONFIGS``, and say whether any was registered.
+    The candidates are the compiler seeds as the search canonicalizes them
+    unless given (carriers that hold the values ``dependencies`` names, of
+    groups registered earlier); each is kept only when its witness transfers
+    strictly.
     """
     spec = env.config_spec
     # A knob the search surface does not offer here (``cute_flat_fields``)
     # takes no witnesses: none would transfer.
     if key not in spec._flat_fields():
-        return
+        return False
     generation = spec.create_config_generation()
+    if candidates is None:
+        candidates = [seed for _flat, seed in generation.seed_flat_config_pairs()]
     carriers: list[Config] = []
-    for _flat, seed in generation.seed_flat_config_pairs():
+    for seed in candidates:
         if not carries(seed):
             continue
         try:
@@ -545,8 +561,10 @@ def _register_knob_witnesses(
                 domain=(False, True),
                 legacy=False,
                 witnesses=tuple(CoverageWitness(seed, True) for seed in carriers),
+                dependencies=dependencies,
             )
         )
+    return bool(carriers)
 
 
 def register_pair_lane_math_coverage(env: CompileEnvironment) -> None:
@@ -901,6 +919,8 @@ def register_coverage_groups(env: CompileEnvironment, device_ir: DeviceIR) -> No
 
     register_mxfp8_epilogue_coverage(env)
     register_bool_byte_packets_coverage(env)
+    # Before the tail peel's: its witnesses of sunk nests ride on these.
+    register_defer_tile_reduce_coverage(env)
     register_tail_peel_coverage(env)
 
 
@@ -927,6 +947,33 @@ def register_bool_byte_packets_coverage(env: CompileEnvironment) -> None:
     )
 
 
+def _block_layouts(
+    env: CompileEnvironment, config: Config, blocks: Iterable[int]
+) -> Iterator[tuple[object, object, object, object]]:
+    """``(extent, tile, thread count, vector width)`` of each of ``blocks``
+    under ``config``, as the witness rules of the knobs below read a device
+    loop's layout; nothing for a config without per-block lists of the three.
+    An entry the config does not hold is ``None`` for the tile, 0 for the
+    count and 1 for the width."""
+    spec = env.config_spec
+    sizes = config.config.get("block_sizes")
+    threads = config.config.get("num_threads")
+    widths = config.config.get("cute_vector_widths")
+    if not (
+        isinstance(sizes, (list, tuple))
+        and isinstance(threads, (list, tuple))
+        and isinstance(widths, (list, tuple))
+    ):
+        return
+    for block_id in blocks:
+        yield (
+            env.block_sizes[block_id].size,
+            spec.block_sizes.config_get(list(sizes), block_id, None),
+            spec.num_threads.config_get(list(threads), block_id, 0),
+            spec.cute_vector_widths.config_get(list(widths), block_id, 1),
+        )
+
+
 def register_tail_peel_coverage(env: CompileEnvironment) -> None:
     """Cover ``cute_tail_peel`` on the first compiler seeds that run a device
     loop the pass may split (``cute_tail_peel_blocks``) over several tiles, the
@@ -941,38 +988,96 @@ def register_tail_peel_coverage(env: CompileEnvironment) -> None:
     there are one wide has no packet to load, and one that spreads the tile
     over more than a warp reduces it through shared memory, which keeps the
     loop whole; none of them carries a witness.
+
+    Where ``cute_defer_tile_reduce`` has witnesses (a loop that adds its
+    tile's sum to a carried value), the knob is covered on those instead, the
+    deferred combine on: the split column reduction's sunk nests load every
+    lane in predicated packets, which the complete tiles then load
+    unpredicated, with no reduce left in the loop to keep it whole.  A field
+    has one coverage group and a group's carriers share its dependencies, so
+    such a kernel's one-warp seeds carry no witness of their own; they carry
+    them again where none of the deferred witnesses takes the knob.
     """
     spec = env.config_spec
     blocks = spec.cute_tail_peel_blocks
     if not blocks:
         return
+    deferred = next(
+        (
+            group
+            for group in spec.compiler_coverage_groups
+            if group.key == "cute_defer_tile_reduce"
+        ),
+        None,
+    )
+    if deferred is not None and _register_knob_witnesses(
+        env,
+        key="cute_tail_peel",
+        mechanism="cute.tail_peel",
+        candidates=[
+            Config.from_dict(witness.carrier.config | {deferred.key: True})
+            for witness in deferred.witnesses
+        ],
+        dependencies=(CoverageDependency(deferred.mechanism, deferred.key, True),),
+    ):
+        return
 
     def carries(seed: Config) -> bool:
-        widths = seed.config.get("cute_vector_widths")
-        sizes = seed.config.get("block_sizes")
-        threads = seed.config.get("num_threads")
-        if not (
-            isinstance(widths, (list, tuple))
-            and isinstance(sizes, (list, tuple))
-            and isinstance(threads, (list, tuple))
-        ):
-            return False
-        for block_id in blocks:
-            extent = env.block_sizes[block_id].size
-            tile = spec.block_sizes.config_get(list(sizes), block_id, None)
-            count = spec.num_threads.config_get(list(threads), block_id, 0)
-            if (
-                spec.cute_vector_widths.config_get(list(widths), block_id, 1) >= 2
-                and isinstance(count, int)
-                and 0 < count <= 32
-                and isinstance(extent, int)
-                and isinstance(tile, int)
-                and tile < extent
-                and extent % tile != 0
-            ):
-                return True
-        return False
+        return any(
+            isinstance(width, int)
+            and width >= 2
+            and isinstance(count, int)
+            and 0 < count <= 32
+            and isinstance(extent, int)
+            and isinstance(tile, int)
+            and tile < extent
+            and extent % tile != 0
+            for extent, tile, count, width in _block_layouts(env, seed, blocks)
+        )
 
     _register_knob_witnesses(
         env, key="cute_tail_peel", mechanism="cute.tail_peel", carries=carries
+    )
+
+
+def walks_a_deferrable_tile_sum(env: CompileEnvironment, config: Config) -> bool:
+    """Whether ``config`` runs a device loop that adds a sum over its tile to
+    a carried value (``cute_carried_tile_sum_blocks``) over several tiles,
+    with several threads on the tile, each with several of its elements, and
+    scalar lanes along it: where ``cute_defer_tile_reduce`` saves
+    cross-thread combines.  A tile that covers the loop's extent combines
+    once already.  The knob leaves the code as it is for a single thread on
+    the tile, which has nothing to combine, for a thread with one element of
+    the tile, which has no lane loop for the split to record, and for vector
+    lanes along the tile, which a lane split the pass does not read folds
+    (``defer_tile_reductions``)."""
+    return any(
+        isinstance(count, int)
+        and count > 1
+        and isinstance(tile, int)
+        and tile > count
+        and not (isinstance(extent, int) and tile >= extent)
+        and width == 1
+        for extent, tile, count, width in _block_layouts(
+            env, config, env.config_spec.cute_carried_tile_sum_blocks
+        )
+    )
+
+
+def register_defer_tile_reduce_coverage(env: CompileEnvironment) -> None:
+    """Cover ``cute_defer_tile_reduce`` on the first compiler seeds that walk
+    a deferrable tile sum (``walks_a_deferrable_tile_sum``).
+
+    The knob is off by default, so every seed renders as before.  A witness
+    keeps each thread's partial sum through the loop and combines the threads
+    once after it instead of once per tile (a change of summation order); it
+    is an extra candidate, measured like any other.
+    """
+    if not env.config_spec.cute_carried_tile_sum_blocks:
+        return
+    _register_knob_witnesses(
+        env,
+        key="cute_defer_tile_reduce",
+        mechanism="cute.defer_tile_reduce",
+        carries=lambda seed: walks_a_deferrable_tile_sum(env, seed),
     )

@@ -26,6 +26,7 @@ from .ast_read_writes import dead_assignment_elimination
 from .ast_read_writes import dead_expression_elimination
 from .ast_read_writes import definitely_does_not_have_side_effects
 from .compile_environment import CompileEnvironment
+from .cross_loop_report import log_once
 from .device_function import DeviceFunction
 from .emitter_protocols import KernelTransforms
 from .helper_function import CodegenInterface
@@ -266,6 +267,8 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         # lives on the pass rather than on the transform so the register-tile
         # retry in ``generate_ast`` emits every placeholder again.
         self.prologue_first_indexing: dict[str, str] = {}
+        # The statement blocks each fused input's placeholder was emitted in.
+        self.prologue_blocks: dict[str, list[list[ast.AST]]] = {}
         self._statement_owner_fx_node: Node | None = None
         self._codegen_results_by_owner_node_id: dict[int, object] = {}
         self.resident_prep_lowering_stack: list[
@@ -1331,12 +1334,10 @@ class GenerateAST(NodeVisitor, CodegenInterface):
         return not any(kw.arg == "device" for kw in node.keywords)
 
     def _inject_device_kwarg(self, node: ast.Call) -> ast.Call:
-        for name, val in self.host_function.params.arguments.items():
-            if isinstance(val, torch.Tensor):
-                device_expr = expr_from_string(f"{name}.device")
-                new_kw = create(ast.keyword, arg="device", value=device_expr)
-                node.keywords = [*node.keywords, new_kw]
-                return node
+        if (name := self.host_function.first_tensor_param()) is not None:
+            device_expr = expr_from_string(f"{name}.device")
+            new_kw = create(ast.keyword, arg="device", value=device_expr)
+            node.keywords = [*node.keywords, new_kw]
         return node
 
     def host_dead_code_elimination(
@@ -1401,18 +1402,31 @@ if __name__ == "__main__":
 
 
 def _maybe_emit_compact_worklist_builder(codegen: GenerateAST) -> None:
-    """Emit the module-level jnp ``_build_worklist`` for a compact-worklist kernel."""
+    """Emit the module-level worklist builder for a compact-worklist kernel.
+
+    The jnp ``_build_worklist`` runs as XLA ops before the launch; a plan with
+    static inner loops instead gets ``_fill_worklist``, which the launcher runs
+    inside the kernel on SMEM refs.
+    """
     env = CompileEnvironment.current()
     plan = env.compact_worklist_plan
     if plan is None:
         return
     from .pallas.compact_worklist import render_build_worklist
+    from .pallas.compact_worklist import render_fill_worklist
 
-    source, offset_params = render_build_worklist(
-        plan,
-        block_expr=str(env.compact_worklist_block),
-        upper_expr=str(env.compact_worklist_upper),
-    )
+    if plan.static_inner_loops:
+        source, offset_params = render_fill_worklist(
+            plan,
+            block=env.compact_worklist_block,
+            sublane=env.compact_worklist_sublane,
+        )
+    else:
+        source, offset_params = render_build_worklist(
+            plan,
+            block_expr=str(env.compact_worklist_block),
+            upper_expr=str(env.compact_worklist_upper),
+        )
     env.compact_worklist_offset_params = offset_params
     codegen.module_statements.append(statement_from_string(source))
 
@@ -1555,6 +1569,20 @@ def _generate_ast(
                         raise
                     raise failure from error
             env.backend.after_device_codegen(codegen, func, config)
+            if (
+                env.settings.megakernel_timeline is not None
+                and codegen.device_function.timeline is None
+                and env.config_spec.offers_megakernel
+            ):
+                # Kernels no config compiles as a megakernel record nothing.
+                pipeline = config.config.get("cross_loop_pipeline", "barrier")
+                log_once(
+                    f"megakernel_timeline is set, but {func.name} compiles no "
+                    f"megakernel with this config (cross_loop_pipeline={pipeline!r}): "
+                    "nothing is recorded",
+                    logging.getLogger("helion.runtime.timeline"),
+                    logging.WARNING,
+                )
             try:
                 if _bounded_cache_request is None:
                     kernel_def = codegen.device_function.codegen_function_def()

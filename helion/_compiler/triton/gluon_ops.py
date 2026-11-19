@@ -782,13 +782,37 @@ def acc_take(buffers, full, empty, tile):
 
 @gluon.jit
 def tmem_dot(
-    a, b, tm, fresh, done, count, S: gl.constexpr, SYNC: gl.constexpr, own=None
+    a,
+    b,
+    tm,
+    fresh,
+    done,
+    count,
+    S: gl.constexpr,
+    SYNC: gl.constexpr,
+    own=None,
+    TAIL=None,
+    TAIL_INDEX=0,
 ):
     """``tm += a @ b`` (``=`` while ``fresh``), arriving on ``done[count % S]``
     and on ``own`` (its restages' barrier beside a ring channel's); with
-    ``SYNC`` it waits for the MMA."""
+    ``SYNC`` it waits for the MMA.  A tail step (``TAIL_INDEX`` >= 0) reads A
+    from that tile of tensor memory ``TAIL`` (``gluon_ring.tail_fill``)."""
     s = count % S
-    if own is None:
+    if TAIL is not None:
+        # (A tail's dot issues from the MMA partition: no restage barrier.)
+        gl.static_assert(own is None)
+        if TAIL_INDEX >= 0:
+            tcgen05_mma(
+                TAIL.index(TAIL_INDEX),
+                b,
+                tm,
+                use_acc=fresh == 0,
+                mbarriers=[done.index(s)],
+            )
+        else:
+            tcgen05_mma(a, b, tm, use_acc=fresh == 0, mbarriers=[done.index(s)])
+    elif own is None:
         tcgen05_mma(a, b, tm, use_acc=fresh == 0, mbarriers=[done.index(s)])
     else:
         tcgen05_mma(
@@ -962,6 +986,28 @@ def operands(target: object) -> tuple[int, ...]:
 
 def is_scale(dot_node: torch.fx.Node, position: int) -> bool:
     return position in _SCALES.get(dot_node.target, ())
+
+
+def _scale_tmem(
+    dot_node: torch.fx.Node, in_smem: dict[int, bool]
+) -> list[tuple[int, int]]:
+    """The tensor memory ``tmem_dot_scaled`` may take for a dot's block scales,
+    as (rows, 32-bit columns): a buffer per scale (``_scales``: at least 32
+    rows), and for one stored from registers an alternate (which it takes only
+    when pipelined).  Triton 3.8 lays a buffer of 8-bit scales
+    (``TensorMemoryScalesLayout``) over all 128 lanes (each warp's 32 lanes
+    hold the same rows), two columns per 64 rows and 4 scales a row, at
+    4-column offsets: [128, 16] takes 16 columns, [32, 16] 8."""
+    tiles = []
+    for position in _SCALES.get(dot_node.target, ()):
+        rows, cols = concrete(
+            cast("torch.fx.Node", dot_node.args[position]).meta["val"].shape
+        )[-2:]
+        columns = 2 * -(-max(rows, 64) // 64) * -(-cols // 4)
+        tile = (128, 4 * -(-columns // 4))
+        copied = in_smem[position] and copied_scale(dot_node, position)
+        tiles += [tile] * (1 if copied else 2)
+    return tiles
 
 
 def copied_scale(dot_node: torch.fx.Node, position: int) -> bool:
@@ -1369,8 +1415,11 @@ def codegen_tmem_dot(
                 k_pad,
                 own if lazy else (),
             )
-    if ring is None and device_function.ring is not None:
-        device_function.ring.tmem.append((M, N))  # beside the ring's: its ledger
+    if device_function.ring is not None:
+        # Beside the ring's accumulators: its ledger.
+        if ring is None:
+            device_function.ring.tmem.append((M, N))
+        device_function.ring.scale_tmem.extend(_scale_tmem(node, in_smem))
     # Else an operand staged from registers waits for its MMA right away.
     sync = not lazy and not (in_smem[a_pos] and in_smem[b_pos])
     acc_node = _accumulator(node)

@@ -19,6 +19,7 @@ from .tile_dependency import DependencyObligation
 from .tile_dependency import Incidence
 from .tile_dependency import KeyPartition
 from .tile_dependency import TileDependencyGraph
+from .tile_dependency import TileDependencyRelation
 from .tile_dependency import consumer_to_preceding_site_relation
 from .tile_dependency import coordinate_axis_symbol
 from .tile_dependency import instantiate_symbolic_dependencies
@@ -26,6 +27,8 @@ from .tile_dependency import nested_logical_axes
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterable
+    from collections.abc import Mapping
 
     _StaticProducerResolver = Callable[
         [tuple["ReadinessProducer", ...]], tuple[tuple[int, Incidence], ...] | None
@@ -39,6 +42,11 @@ ObligationsByRootPair = tuple[
 # per task, in launch-wide ticket order.
 CrossLoopDispatchMode = Literal["static", "claimed", "dynamic"]
 _MAX_SYMBOLIC_RELATION_WORK = 2_000_000
+
+
+# Why an exact all-to-all dependency gets a root barrier and no counter.
+_ALL_TO_ALL = "every consumer task waits for every producer task (exact)"
+_OUT_OF_BUDGET = "the scheduler's work budget ran out"
 
 
 def _new_relation_work_budget() -> Callable[[int], bool]:
@@ -786,8 +794,10 @@ def _segmented_nested_loop_counter(
 def collect_nested_loop_scheduling_counters(
     readiness_graph: ReadinessGraph,
     charge: Callable[[int], bool],
+    skipped: dict[DependencyObligation, str] | None = None,
 ) -> tuple[ReadinessCounterPlan, ...]:
-    """Select one exact schedule-independent plan for each nested wait."""
+    """Select one exact schedule-independent plan for each nested wait; records
+    in ``skipped`` why a nested wait has none."""
     root_domains = readiness_graph.root_domains
     result: list[ReadinessCounterPlan] = []
     event_consumers = sorted(
@@ -834,6 +844,19 @@ def collect_nested_loop_scheduling_counters(
             root_domains,
         ):
             result.append(entry)
+        elif skipped is not None:
+            axes = nested_logical_axes(
+                root_domains[readiness_consumer.consumer_root],
+                readiness_consumer.keys_by_consumer.source_domain,
+            )
+            reason = (
+                _OUT_OF_BUDGET
+                if not charge(0)
+                else "the nested loop's wait has no supported counter"
+                + (" (it spans several loop axes)" if len(axes) > 1 else "")
+            )
+            for obligation in readiness_consumer.covered_obligations:
+                skipped.setdefault(obligation, reason)
     return tuple(result)
 
 
@@ -1020,6 +1043,10 @@ class StaticPipelinePlan:
     trailing_roots: frozenset[int] = frozenset()
     # Per-key cross-rank counters for the peer dependencies no edge carries.
     peer_counters: tuple[ReadinessCounterPlan, ...] = ()
+    # Why each obligation a root barrier covers has no readiness counter.
+    barrier_reasons: Mapping[DependencyObligation, str] = dataclasses.field(
+        default_factory=dict, compare=False
+    )
 
     def __post_init__(self) -> None:
         if self.dispatch_mode not in ("static", "claimed", "dynamic"):
@@ -1827,15 +1854,25 @@ def choose_readiness_counters(
     *,
     excluded_obligations: frozenset[DependencyObligation] = frozenset(),
     charge: Callable[[int], bool],
+    skipped: dict[DependencyObligation, str] | None = None,
 ) -> tuple[ReadinessCounterPlan, ...]:
-    """Select root-entry events representable by readiness counters."""
+    """Select root-entry events representable by readiness counters; records in
+    ``skipped`` why each obligation of an event it drops has none."""
     continuation_consumers = {
         (continuation.event_id, continuation.consumer_index)
         for continuation in continuations
     }
+
+    def skip(consumers: Iterable[ReadinessConsumer], reason: str) -> None:
+        if skipped is not None:
+            for consumer in consumers:
+                for obligation in consumer.covered_obligations:
+                    skipped.setdefault(obligation, reason)
+
     selected: list[ReadinessCounterPlan] = []
     for event in readiness_graph.events:
         if event.root_barrier_producer_root is not None:
+            skip(event.consumers, _ALL_TO_ALL)
             continue
         if not charge(
             1
@@ -1850,6 +1887,7 @@ def choose_readiness_counters(
                 for producer in event.producers
             )
         ):
+            skip(event.consumers, _OUT_OF_BUDGET)
             continue
         lowering_relations = (
             (event.producers, event.consumers)
@@ -1883,6 +1921,13 @@ def choose_readiness_counters(
                 if lowering_relations is not None:
                     break
         if lowering_relations is None:
+            skip(
+                event.consumers,
+                # The quotient and coarsening above charge the budget.
+                _OUT_OF_BUDGET
+                if not charge(0)
+                else "a producer publishes to no fixed number of readiness keys a task",
+            )
             continue
         for lowered_producers, lowered_consumers in _whole_axis_lowerings(
             event, lowering_relations, charge
@@ -1890,11 +1935,16 @@ def choose_readiness_counters(
             retained_consumers: list[ReadinessConsumer] = []
             continuation_consumer_indices: list[int] = []
             for readiness_consumer in lowered_consumers:
+                if readiness_consumer.consumer_site_id is not None:
+                    continue  # (a nested loop's counter)
                 if (
-                    readiness_consumer.consumer_site_id is not None
-                    or readiness_consumer.keys_by_consumer.canonical_single_valued()
+                    readiness_consumer.keys_by_consumer.canonical_single_valued()
                     is None
                 ):
+                    skip(
+                        [readiness_consumer],
+                        "a consumer task waits for several readiness keys",
+                    )
                     continue
                 remaining = (
                     readiness_consumer.covered_obligations - excluded_obligations
@@ -1937,10 +1987,12 @@ def choose_readiness_counters(
                 candidate,
                 readiness_graph.root_domains,
             ):
+                skip(retained_consumers, "its counter has no supported lowering")
                 continue
             if candidate.is_root_barrier_equivalent(
                 readiness_graph.root_domains, charge
             ):
+                skip(retained_consumers, _ALL_TO_ALL)
                 continue
             selected.append(candidate)
     selected_continuation_count = sum(
@@ -1962,8 +2014,13 @@ def _build_readiness_events(
     publishable_site_ids: frozenset[int] | None = None,
     prove_nonnegative: Callable[[sympy.Expr], bool] | None = None,
     charge: Callable[[int], bool],
+    fallback_reasons: dict[DependencyObligation, str] | None = None,
+    unkeyed: set[DependencyObligation] | None = None,
 ) -> tuple[ReadinessEvent, ...]:
-    """Build canonical readiness events from the dependency graph."""
+    """Build canonical readiness events from the dependency graph; records in
+    ``fallback_reasons`` why an obligation lost a keyed relation (for those only a
+    whole-root event covers, why they have no keyed one) and in ``unkeyed`` the
+    obligations only a whole-root event covers."""
     symbolic_dependencies = instantiate_symbolic_dependencies(
         dependency_graph,
         root_domains=root_domains,
@@ -1971,14 +2028,29 @@ def _build_readiness_events(
         prove_nonnegative=prove_nonnegative,
     )
     site_by_id = {site.site_id: site for site in dependency_graph.execution_sites}
-    exact_dependencies = tuple(
-        dependency
-        for dependency in symbolic_dependencies
-        if dependency.incidence is not None
-        and dependency.incidence.items_by_key.source_axes_affecting_targets()
-        is not None
-        and charge(1 + len(dependency.incidence.items_by_key.pieces))
-    )
+    reasons: dict[DependencyObligation, str] = {}
+    exact: list[TileDependencyRelation] = []
+    for dependency in symbolic_dependencies:
+        incidence = dependency.incidence
+        reason = dependency.failure or "no tile incidence"
+        if incidence is not None:
+            if incidence.items_by_key.source_axes_affecting_targets() is None:
+                reason = (
+                    "which producer tasks a consumer task needs is no function of "
+                    "its coordinates"
+                )
+            elif not charge(1 + len(incidence.items_by_key.pieces)):
+                reason = _OUT_OF_BUDGET
+            else:
+                exact.append(dependency)
+                continue
+        obligation = (
+            dependency.dependency_id,
+            dependency.producer_site_id,
+            dependency.consumer_site_id,
+        )
+        reasons.setdefault(obligation, reason)
+    exact_dependencies = tuple(exact)
     obligations_by_root_pair = dependency_graph.obligations_by_root_pair()
     all_obligations_by_pair = {
         pair: set(obligations) for pair, obligations in obligations_by_root_pair
@@ -2162,6 +2234,10 @@ def _build_readiness_events(
                 root_domains[dependency.producer_root]
             )
             if projected is None:
+                reasons.setdefault(
+                    obligation,
+                    "the nested producer's loop does not project onto its root's tasks",
+                )
                 continue
             root_incidence = projected
         if not consumer_is_root:
@@ -2169,6 +2245,10 @@ def _build_readiness_events(
                 root_domains[dependency.consumer_root]
             )
             if projected is None:
+                reasons.setdefault(
+                    obligation,
+                    "the nested consumer's loop does not project onto its root's tasks",
+                )
                 continue
             root_incidence = projected
         add_exact_relation(
@@ -2215,6 +2295,11 @@ def _build_readiness_events(
                 )
             )
             if key_incidence is None:
+                for obligation in obligations:
+                    reasons.setdefault(
+                        obligation,
+                        "the readiness keys do not invert to the producer's tasks",
+                    )
                 continue
             _record_readiness_event(
                 pending_events,
@@ -2497,6 +2582,22 @@ def _build_readiness_events(
         raise AssertionError(
             "readiness events must cover the dependency manifest exactly"
         )
+    if fallback_reasons is not None:
+        # Represented obligations keep why a relation of theirs was dropped
+        # (their event's counter may still fail).
+        fallback_reasons.update(reasons)
+        for obligation in manifest_obligations - represented_obligations:
+            _, producer_site_id, consumer_site_id = obligation
+            reason = reasons.get(obligation, "no keyed readiness relation")
+            for side, site_id in (
+                ("producer", producer_site_id),
+                ("consumer", consumer_site_id),
+            ):
+                if site_id is not None and site_domains[site_id] is None:
+                    reason = f"the {side}'s loop has no static extent"
+            fallback_reasons[obligation] = reason
+    if unkeyed is not None:
+        unkeyed.update(manifest_obligations - represented_obligations)
     return events
 
 
@@ -3265,17 +3366,21 @@ def build_static_pipeline_plan(
             )
         ),
     )
-    readiness_graph = ReadinessGraph(
-        root_domains,
-        _build_readiness_events(
-            dependency_graph,
-            root_domains=root_domains,
-            site_domains=site_domains,
-            publishable_site_ids=publishable_site_ids,
-            prove_nonnegative=prove_nonnegative,
-            charge=charge,
-        ),
+    fallback_reasons: dict[DependencyObligation, str] = {}
+    unkeyed: set[DependencyObligation] = set()
+    events = _build_readiness_events(
+        dependency_graph,
+        root_domains=root_domains,
+        site_domains=site_domains,
+        publishable_site_ids=publishable_site_ids,
+        prove_nonnegative=prove_nonnegative,
+        charge=charge,
+        fallback_reasons=fallback_reasons,
+        unkeyed=unkeyed,
     )
+    readiness_graph = ReadinessGraph(root_domains, events)
+    # Why the obligations of events no counter takes have none.
+    skipped: dict[DependencyObligation, str] = {}
     obligations_by_root_pair = dependency_graph.obligations_by_root_pair()
 
     def try_plan(
@@ -3311,7 +3416,7 @@ def build_static_pipeline_plan(
         return counters, barriers, try_plan(counters, barriers, dispatch_mode)
 
     nested_loop_counters = collect_nested_loop_scheduling_counters(
-        readiness_graph, charge
+        readiness_graph, charge, skipped
     )
     nested_loop_obligations = _covered_obligations(nested_loop_counters)
 
@@ -3321,9 +3426,14 @@ def build_static_pipeline_plan(
             (),
             excluded_obligations=nested_loop_obligations,
             charge=charge,
+            skipped=skipped,
         ),
         *nested_loop_counters,
     )
+    candidate_obligations = _covered_obligations(all_resident_candidate_counters)
+    # A path that failed before another covered the obligation leaves no reason.
+    for obligation in candidate_obligations:
+        skipped.pop(obligation, None)
     try:
         all_resident_counters, all_resident_barriers, all_resident_plan = finalize_plan(
             all_resident_candidate_counters
@@ -3340,6 +3450,10 @@ def build_static_pipeline_plan(
                 all_resident_barriers,
                 all_resident_plan,
             ) = finalize_plan(())
+            for obligation in candidate_obligations:
+                skipped.setdefault(
+                    obligation, "the schedule with its counter is not progress-safe"
+                )
     if all_resident_plan is None:
         raise exc.InvalidConfig(
             f"the num_sm_multiplier grid of {worker_count} workers does not "
@@ -3351,6 +3465,9 @@ def build_static_pipeline_plan(
     )
     if cheaper_counters != all_resident_plan.readiness_counters:
         with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
+            dropped = _covered_obligations(
+                all_resident_plan.readiness_counters
+            ) - _covered_obligations(cheaper_counters)
             cheaper_counters, cheaper_barriers, cheaper_plan = finalize_plan(
                 cheaper_counters
             )
@@ -3358,6 +3475,11 @@ def build_static_pipeline_plan(
                 all_resident_counters = cheaper_counters
                 all_resident_barriers = cheaper_barriers
                 all_resident_plan = cheaper_plan
+                for obligation in dropped:
+                    skipped.setdefault(
+                        obligation,
+                        "a root barrier is cheaper (its producer root fits in one wave)",
+                    )
 
     continuation_candidates = derive_final_arrival_continuations(
         readiness_graph, all_resident_counters
@@ -3426,6 +3548,12 @@ def build_static_pipeline_plan(
         if proposal is None:
             with contextlib.suppress(ValueError, exc.CrossLoopSchedulingError):
                 _, _, proposal = finalize_plan((), cross_loop_dispatch_mode)
+            for obligation in candidate_obligations:
+                skipped.setdefault(
+                    obligation,
+                    f"the {cross_loop_dispatch_mode} dispatch admits no schedule "
+                    "with its counter",
+                )
         if proposal is None:
             raise exc.InvalidConfig(
                 "the requested dynamic cross-loop pipeline does not admit a "
@@ -3433,6 +3561,14 @@ def build_static_pipeline_plan(
             )
     return dataclasses.replace(
         proposal,
+        barrier_reasons=_barrier_reasons(
+            proposal,
+            obligations_by_root_pair,
+            candidate_obligations,
+            skipped,
+            fallback_reasons,
+            frozenset(unkeyed),
+        ),
         peer_edges=peer_edges,
         # Parity and credit already keep in-band roots from reusing live buffers.
         done_roots=_unordered_reuse_roots(
@@ -3515,6 +3651,47 @@ def _keyed_peer_counters(
         ):
             result.append(plan)
     return tuple(result)
+
+
+def _barrier_reasons(
+    plan: StaticPipelinePlan,
+    obligations_by_root_pair: ObligationsByRootPair,
+    candidate_obligations: frozenset[DependencyObligation],
+    skipped: Mapping[DependencyObligation, str],
+    fallback_reasons: Mapping[DependencyObligation, str],
+    unkeyed: frozenset[DependencyObligation],
+) -> dict[DependencyObligation, str]:
+    """Why each obligation a root barrier of ``plan`` orders has no counter.  An
+    obligation a candidate counter covered with no skip recorded lost it only to
+    a barrier that orders it anyway: no cause, left out."""
+    covered = _covered_obligations(plan.readiness_counters)
+    ordered = _root_barrier_reachability(plan.root_barrier_edges)
+
+    def skip_reason(obligation: DependencyObligation) -> str | None:
+        reason = skipped.get(obligation)
+        # A whole-root event the builder made for want of a keyed relation is
+        # no exact all-to-all dependency: its fallback reason says why.
+        if reason == _ALL_TO_ALL and obligation in unkeyed:
+            return None
+        return reason
+
+    return {
+        obligation: "; ".join(
+            dict.fromkeys(
+                reason
+                for reason in (
+                    skip_reason(obligation),
+                    fallback_reasons.get(obligation),
+                )
+                if reason is not None
+            )
+        )
+        or "no readiness counter was selected"
+        for pair, obligations in obligations_by_root_pair
+        if pair in ordered
+        for obligation in obligations - covered
+        if obligation in skipped or obligation not in candidate_obligations
+    }
 
 
 def _select_root_barrier_edges(

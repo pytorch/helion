@@ -29,9 +29,13 @@ import torch
 import helion
 from helion import exc
 from helion._compiler.metal import mpp_matmul
+from helion._compiler.metal import msl_ast_walker
 from helion._compiler.metal import tile_sharing
+from helion._compiler.metal.staged_matmul_heuristic import MetalStagedMatmulHeuristic
 from helion._testing import import_example
 from helion._testing.metal import run_with_msl
+from helion._testing.metal_staged import dequant_args
+from helion._testing.metal_staged import dequant_mm
 import helion.language as hl
 
 attention = import_example("attention").attention
@@ -4250,7 +4254,7 @@ class TestMppMatmul(_MppCase):
                         rf"_helion_mpp_run\(\w+, 0, x, offset_\d+, m, m, {x.stride(0)}, ",
                     )
                     self.assertIn("spaces=[0, 1]", code)
-                    self.assertIn("('bfloat', 'bfloat')", code)
+                    self.assertIn("('bfloat', 'bfloat', 'float')", code)
 
     def test_runtime_outer_stride(self) -> None:
         """A view's batch stride left dynamic is read at run time."""
@@ -4753,10 +4757,12 @@ class TestMppStaging(_MppCase):
             else:
                 lhs = _nan_padded(a.to(DEVICE))
             with self.subTest(m=m, k=k, n=n, config=config, column_major=column_major):
-                out, _, msl = _run(int4_gemm, (lhs, _pack_int4(w).to(DEVICE)), config)
+                out, code, msl = _run(
+                    int4_gemm, (lhs, _pack_int4(w).to(DEVICE)), config
+                )
                 _close(out, (a.double() @ w.double()).to(bf16).double())
                 self._assert_staged(msl, "bfloat")
-                self.assertRegex(msl, r"_mpp_owner\w*\)\) \{ _mpp_tile")
+                _assert_one_writer(self, code, msl)
 
     def test_factored_k(self) -> None:
         """A K held as parts beyond int4_gemm: a stacked lhs, c = 3, two
@@ -5051,7 +5057,7 @@ class TestMppStagingRejects(_MppCase):
             dot_parts_noacc,
             (a, b0, b1),
             None,
-            "an hl.dot over a K held as per-thread parts with no acc",
+            "an hl.dot over a K held as per-thread parts without an acc argument",
         )
         self._rejects(
             dot_parts_out_dtype,
@@ -6535,6 +6541,21 @@ def root_mm_plus(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(**S)
+def root_mm_in_if(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A K tile's product alone, under an if inside the K loop."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            if tk.begin >= 0:
+                acc = acc + torch.mm(x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
 def root_acc_like_out(
     x: torch.Tensor, y: torch.Tensor, o: torch.Tensor
 ) -> torch.Tensor:
@@ -6732,14 +6753,13 @@ class TestMppRootAddmmRejects(_MppCase):
             None,
             "two MPP K loops whose accumulators start from one value",
         )
-        for kernel in (root_mm_overwrite, root_mm_plus):
-            self._rejects(
-                kernel,
-                (xf, yf),
-                None,
-                "a matmul with no acc over a tiled K, whose result is each K "
-                "tile's product alone",
-            )
+        self._rejects(
+            root_mm_in_if,
+            (xf, yf),
+            None,
+            "a per-K-tile matmul (without an acc argument, over a tiled K) not "
+            "at the top level of a loop over its K alone: under an if",
+        )
 
     def test_acc_dtype(self) -> None:
         for dtype in (torch.float16, torch.bfloat16):
@@ -6753,7 +6773,8 @@ class TestMppRootAddmmRejects(_MppCase):
                     root_acc_like_out,
                     args,
                     config,
-                    "a matmul whose acc is not float32",
+                    f"operands whose acc is {dtype}; MPP accumulates them in "
+                    "torch.float32",
                 )
 
     def test_k_tile(self) -> None:
@@ -10174,6 +10195,365 @@ class TestMppBatched(unittest.TestCase):
         self._check(mm2_sum, (x, y, p, q), None, ref, mat, runs=2)
 
 
+@helion.kernel(**S)
+def root_bmm_plus(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """acc + bmm per K tile: a batched per-tile product."""
+    b, m, k = x.shape
+    n = y.size(2)
+    out = torch.empty([b, m, n], dtype=torch.float32, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        for tn in hl.tile(n):
+            acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+            for tk in hl.tile(k):
+                acc = acc + torch.bmm(x[tb, tm, tk], y[tb, tk, tn])
+            out[tb, tm, tn] = acc
+    return out
+
+
+@_requires_mps
+class TestMppTileProducts(_MppCase):
+    """A matmul with no acc in the loop over its tiled K gives each K tile's
+    product alone: one op per tile, from zeros."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        self.x = torch.randn(48, 72, device=DEVICE)
+        self.y = torch.randn(72, 40, device=DEVICE)
+
+    def test_forms(self) -> None:
+        x, y = self.x, self.y
+        config = helion.Config(block_sizes=[16, 16, 16])
+        out, code, _ = _run(root_mm_overwrite, (x, y), config)
+        self._assert_mpp(code)
+        # K = 72 in tiles of 16: the last tile holds K 64 to 71.
+        _close(out, _mm(x[:, 64:], y[64:]))
+        out, code, msl = _run(root_mm_plus, (x, y), config)
+        # acc + mm: acc is a fold of each tile's product, in its layout.
+        self.assertEqual(code.count("fold=True"), 1)
+        self.assertEqual(code.count("_helion_mpp_acc("), 2)
+        self.assertNotIn("_mpp_mat", msl)
+        _close(out, _mm(x, y))
+
+    def test_batched(self) -> None:
+        """A batched product takes no fold (a batch block): each K tile's
+        product is read through its materialization."""
+        x = torch.randn(3, 48, 64, device=DEVICE)
+        y = torch.randn(3, 64, 40, device=DEVICE)
+        out, code, msl = _run(
+            root_bmm_plus, (x, y), helion.Config(block_sizes=[1, 32, 32, 32])
+        )
+        self._assert_mpp(code)
+        self.assertNotIn("fold=True", code)
+        self.assertIn("_mpp_mat", msl)
+        _close(out, _bmm(x, y))
+
+
+@helion.kernel(**S)
+def i8_int_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """int8 operands summed into an int32 acc over a K loop."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.int32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def i8_group_products(
+    x: torch.Tensor, y: torch.Tensor, s: torch.Tensor
+) -> torch.Tensor:
+    """Each 32-wide K group's exact int8 product, scaled per group and
+    column into a float acc: a W4A8 matmul's inner step."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k, block_size=32):
+            d = hl.dot(x[tm, tk], y[tk, tn], out_dtype=torch.int32)
+            acc = acc + d.to(torch.float32) * s[tk.begin // 32, tn][None, :]
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def i8_unpacked_nibbles(x: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
+    """int8 activations times 4-bit weights unpacked to int8 (element k is
+    nibble k % 2 of byte k // 2, less 8): a staged int8 operand."""
+    m, k = x.size()
+    n = wq.size(1)
+    out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.int32)
+        for tk in hl.tile(k):
+            byte = wq[tk.index // 2, tn].to(torch.int32)
+            nib = (byte >> ((tk.index % 2) * 4)[:, None]) & 0xF
+            acc = hl.dot(x[tm, tk], (nib - 8).to(torch.int8), acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@_requires_mps
+class TestMppInt8(_MppCase):
+    """int8 operands accumulate in int32 (matmul2d's int8_t x int8_t ->
+    int32_t), as device views or staged tiles, exactly; simdgroup_matrix
+    holds no integers, so the fragment lowering refuses them
+    (``fragment_mma.check_fragment_group``)."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        # The full int8 range: a 16-deep K tile sums up to 2**18 per product.
+        self.x = torch.randint(-128, 128, (40, 96), dtype=torch.int8, device=DEVICE)
+        self.y = torch.randint(-128, 128, (96, 48), dtype=torch.int8, device=DEVICE)
+
+    def _exact(self, out: torch.Tensor, ref: torch.Tensor) -> None:
+        torch.testing.assert_close(out.cpu().double(), ref, rtol=0, atol=0)
+
+    def test_int_acc(self) -> None:
+        x, y = self.x, self.y
+        for config in (None, helion.Config(block_sizes=[32, 16, 64], num_warps=4)):
+            with self.subTest(config=config):
+                out, code, msl = _run(i8_int_acc, (x, y), config)
+                self._assert_mpp(code)
+                self.assertIn("tensor<device int8_t", msl)
+                self.assertIn("int8_t, extents", msl)
+                self.assertIn(", int>()", msl)
+                self.assertEqual(out.dtype, torch.int32)
+                self._exact(out, _mm(x, y))
+
+    def test_group_products(self) -> None:
+        """Each group's product scaled into a float carry, also with M's
+        rows on lanes.  The int32 product is read through its
+        materialization: an op's destinations of two dtypes may lay out
+        differently, so the fold holds only a carry of the product's dtype
+        (``mpp_matmul._plan_fold``; TestMppFold.test_int_carry)."""
+        x, y = self.x, self.y
+        s = torch.rand(3, 48, device=DEVICE)
+        groups = torch.einsum(
+            "mgk,gkn->mgn",
+            x.cpu().double().view(40, 3, 32),
+            y.cpu().double().view(3, 32, 48),
+        )
+        ref = (groups * s.cpu().double()[:, None, :].transpose(0, 1)).sum(1)
+        for config in (None, helion.Config(block_sizes=[16, 16], num_threads=[1, 0])):
+            with self.subTest(config=config):
+                out, code, msl = _run(i8_group_products, (x, y, s), config)
+                self.assertEqual(code.count("_helion_mpp_run("), 1)
+                self.assertNotIn("fold=True", code)
+                self.assertIn("_mpp_mat", msl)
+                torch.testing.assert_close(
+                    out.cpu().double(), ref, rtol=1e-6, atol=1e-2
+                )
+
+    def test_staged_operand(self) -> None:
+        x = self.x
+        wq = torch.randint(0, 256, (48, 48), dtype=torch.uint8, device=DEVICE)
+        out, code, _ = _run(i8_unpacked_nibbles, (x, wq), None)
+        self._assert_mpp(code)
+        w = wq.cpu().int()
+        nibbles = torch.stack([w & 0xF, w >> 4], dim=1).reshape(96, 48) - 8
+        self._exact(out, x.cpu().double() @ nibbles.double())
+
+    def test_fragment_config(self) -> None:
+        """Fragments refuse int8 operands, so under a fragment config the
+        kernel's hl.dot calls keep the scalar contraction."""
+        x, y = self.x, self.y
+        config = helion.Config(block_sizes=[32, 16, 32], metal_matmul="fragment")
+        out, code, _ = _run(i8_int_acc, (x, y), config)
+        self.assertIn("dot_product", code)
+        self.assertNotIn("_helion_mpp_run(", code)
+        self._exact(out, _mm(x, y))
+
+
+@helion.kernel(**S)
+def fold_scaled(x: torch.Tensor, y: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """Each 16-deep K tile's product, scaled per tile and column, into a
+    float carry: a block-scaled matmul."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k, block_size=16):
+            scale = s[tk.begin // 16, tn][None, :]
+            acc = acc + torch.mm(x[tm, tk], y[tk, tn]) * scale
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def fold_int_carry(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """Each K tile's int8 product summed into an int32 carry."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.int32)
+        for tk in hl.tile(k):
+            acc = acc + hl.dot(x[tm, tk], y[tk, tn], out_dtype=torch.int32)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def fold_row_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The carry read in the Scalar layout after its loop: a row sum."""
+    m, k = x.size()
+    n = hl.specialize(y.size(1))
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, n], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = acc + torch.mm(x[tm, tk], y[tk, :])
+        out[tm] = acc.sum(1)
+    return out
+
+
+@helion.kernel(**S)
+def fold_loaded_seed(x: torch.Tensor, y: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """A carry seeded from a load, not a constant fill."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = c[tm, tn]
+        for tk in hl.tile(k):
+            acc = acc + torch.mm(x[tm, tk], y[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def fold_two_carries(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """One product updates two carries."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        a = hl.zeros([tm, tn], dtype=torch.float32)
+        b = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            p = torch.mm(x[tm, tk], y[tk, tn])
+            a = a + p
+            b = b + p * 2.0
+        out[tm, tn] = a + b
+    return out
+
+
+@helion.kernel(**S)
+def fold_reads_its_seed(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """A carry whose update reads a value computed from the fill it was
+    seeded from: the fill is the carry's own storage."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        seed = hl.full([tm, tn], 0.5, dtype=torch.float32)
+        acc = seed
+        for tk in hl.tile(k):
+            acc = acc + torch.mm(x[tm, tk], y[tk, tn]) * (seed * 2.0)
+        out[tm, tn] = acc
+    return out
+
+
+@_requires_mps
+class TestMppFold(_MppCase):
+    """A K loop carry that each K tile's product updates element-wise is
+    held as a second cooperative tensor of the product's op, of the carry's
+    dtype; an element loop updates it after each op, reading the product at
+    the same index, so the product needs no materialization.  A carry the
+    planner can't hold so keeps the product's materialization."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        self.x = torch.randn(48, 64, device=DEVICE)
+        self.y = torch.randn(64, 32, device=DEVICE)
+
+    def _folded(self, code: str, msl: str) -> None:
+        self.assertEqual(code.count("fold=True"), 1)
+        self.assertIn("_helion_mpp_update(", code)
+        self.assertNotIn("_mpp_mat", msl)
+
+    def _not_folded(self, code: str, msl: str) -> None:
+        self.assertNotIn("fold=True", code)
+        self.assertIn("_mpp_mat", msl)
+
+    def test_scaled_products(self) -> None:
+        x, y = self.x, self.y
+        s = torch.rand(4, 32, device=DEVICE) + 0.5
+        tiles = torch.einsum(
+            "mgk,gkn->gmn", _d(x).view(48, 4, 16), _d(y).view(4, 16, 32)
+        )
+        ref = (tiles * _d(s)[:, None, :]).sum(0)
+        for config in (
+            helion.Config(block_sizes=[16, 16]),
+            helion.Config(block_sizes=[32, 32], num_warps=4),
+            helion.Config(block_sizes=[16, 16], num_threads=[1, 0]),
+        ):
+            with self.subTest(config=config):
+                out, code, msl = _run(fold_scaled, (x, y, s), config)
+                self._folded(code, msl)
+                _close(out, ref)
+        # M = 4 cuts the op to 8 rows, the product's and the fold's alike.
+        out, code, msl = _run(
+            fold_scaled, (x[:4], y, s), helion.Config(block_sizes=[16, 16])
+        )
+        self._folded(code, msl)
+        self.assertEqual(
+            set(re.findall(r"matmul2d_descriptor\(\d+, \d+", msl)),
+            {"matmul2d_descriptor(8, 16"},
+        )
+        _close(out, ref[:4])
+
+    def test_int_carry(self) -> None:
+        x = torch.randint(-128, 128, (40, 96), dtype=torch.int8, device=DEVICE)
+        y = torch.randint(-128, 128, (96, 48), dtype=torch.int8, device=DEVICE)
+        out, code, msl = _run(
+            fold_int_carry, (x, y), helion.Config(block_sizes=[16, 16, 32])
+        )
+        self._folded(code, msl)
+        self.assertIn("int8_t, extents", msl)
+        torch.testing.assert_close(out.cpu().double(), _mm(x, y), rtol=0, atol=0)
+
+    def test_read_after_the_loop(self) -> None:
+        """A row sum after the loop reads the fold's materialization, which
+        keeps the product's op at its block too: M = 4 under a 16-row block
+        would otherwise cut the product's op to 8 rows, another layout than
+        the fold's."""
+        for m in (48, 4):
+            x, y = self.x[:m], self.y
+            with self.subTest(m=m):
+                out, code, msl = _run(
+                    fold_row_sums, (x, y), helion.Config(block_sizes=[16, 16])
+                )
+                self.assertEqual(code.count("fold=True"), 1)
+                self.assertIn("_mpp_mat", msl)
+                descriptors = re.findall(r"matmul2d_descriptor\(\d+, \d+", msl)
+                self.assertEqual(len(set(descriptors)), 1, descriptors)
+                _close(out, _mm(x, y).sum(1))
+
+    def test_kept_in_the_scalar_layout(self) -> None:
+        """A carry seeded from a load, one product that updates two carries,
+        and a carry whose update reads its seed, read the product through its
+        materialization."""
+        x, y = self.x, self.y
+        c = torch.randn(48, 32, device=DEVICE)
+        config = helion.Config(block_sizes=[16, 16, 16])
+        out, code, msl = _run(fold_loaded_seed, (x, y, c), config)
+        self._not_folded(code, msl)
+        _close(out, _d(c) + _mm(x, y))
+        out, code, msl = _run(fold_two_carries, (x, y), config)
+        self._not_folded(code, msl)
+        _close(out, _mm(x, y) * 3)
+        out, code, msl = _run(fold_reads_its_seed, (x, y), config)
+        self._not_folded(code, msl)
+        _close(out, 0.5 + _mm(x, y))
+
+
 @_requires_mps
 class TestMppBatchedRejects(_MppCase):
     """Batched forms and matmuls with no acc that stay rejected."""
@@ -10233,7 +10613,7 @@ class TestMppBatchedRejects(_MppCase):
             bmm_bf16_out,
             (x.bfloat16(), y.bfloat16()),
             (None,),
-            "a matmul whose acc is not float32",
+            "MPP accumulates them in torch.float32",
         )
         self._rejects_at(
             dot_parts_3d,
@@ -11031,10 +11411,13 @@ def upd_written_vec(
 
 #: The update's element loop writes each element back before the op runs.
 _UPDATE = r"\*_it = [A-Za-z_]\w*;[\s\S]*\.run\("
-#: A barrier right before and right after the update's element loop.
+#: A barrier right before and right after the update's element loop, which
+#: is unrolled over its slots, with a loop over any slots past them.
 _FENCED = (
-    r"threadgroup_barrier\(mem_flags::mem_threadgroup\);\n\s*for \(auto _it = "
-    r"\w+\.begin\(\)[^\n]*\{\n(?:[^\n]*\n)*?\s*\*_it = \w+;\n\s*\}\n\s*"
+    r"threadgroup_barrier\(mem_flags::mem_threadgroup\);\n\s*\{\n\s*"
+    r"constexpr ushort _mpp_slots = [^\n]*\n\s*#pragma unroll\n\s*"
+    r"for \(ushort _ei = 0; [^\n]*\{\n(?:[^\n]*\n)*?\s*\*_it = \w+;\n"
+    r"(?:[^\n]*\n)*?\s*\}\n\s*\}\n\s*"
     r"threadgroup_barrier\(mem_flags::mem_threadgroup\);"
 )
 #: Of the threads that hold a vector element, one writes it.
@@ -11100,6 +11483,25 @@ class TestMppCarryUpdate(unittest.TestCase):
 
     def _pv(self, ks: slice, v: torch.Tensor | None = None) -> torch.Tensor:
         return _d(self.p)[:, ks] @ _d(self.v if v is None else v)[ks]
+
+    def test_slots_past_the_unrolled_bound(self) -> None:
+        """The update's loop is unrolled over a bound on each thread's element
+        slots; a loop after it covers the slots past the bound.  A 16x16 op on
+        eight SIMD groups gives each thread 4 slots for its one element, so a
+        bound of 1 leaves three to that loop."""
+        p, v = self.p, self.v
+
+        def ref(block_sizes: list[int]) -> torch.Tensor:
+            acc = torch.zeros(48, 40, dtype=torch.float64)
+            for ks in _k_tiles(72, block_sizes[2]):
+                acc = acc * 0.5 + self._pv(ks)
+            return acc
+
+        with patch.object(msl_ast_walker, "_MIN_UNROLLED_ELEMENTS", 1):
+            out, _, msl = _run(inloop_const, (p, v), TILE16, module_key="slots")
+        _close(out, ref([16, 16, 16]))
+        self.assertIn(" : 1u;", msl)
+        self.assertRegex(msl, r"for \(ushort _ei = _mpp_slots; ")
 
     def test_recomputable_operands(self) -> None:
         """Constants, per-row loads and a bool mask from a load, read at each
@@ -14609,6 +15011,8 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         self._scalar(dot_colon_n_row_sums, (x, y), None, ((2 * xd) @ yd).sum(-1))
 
     def test_no_acc_over_a_tiled_k(self) -> None:
+        """A float per-K-tile hl.dot keeps the scalar contraction (MPP takes
+        int8 ones: TestMppInt8, TestMppFold)."""
         x, y = _randn(32, 64, dtype=torch.float32), _randn(64, 48, dtype=torch.float32)
         xd, yd = _cpu64(x, y)
         self._scalar(dot_no_acc_tiled_k, (x, y), None, xd[:, 48:] @ yd[48:])
@@ -16268,7 +16672,7 @@ class TestMppUniformLaunch(_MppCase):
                     self._launches(code, launch)
                     self.assertNotRegex(msl, r"\bmask_\d+")
                     self.assertNotRegex(msl, _masked_load("B"))
-                    self.assertRegex(msl, r"if \(_mpp_owner\w*\) \{ _mpp_tile\[")
+                    _assert_one_writer(self, code, msl)
                     if launch == (64, 1, 1):
                         self.assertRegex(
                             msl, r"auto b_tile = _mpp_lanes_\d+\[lane_\d+\];"
@@ -16452,6 +16856,21 @@ def two_pins(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@helion.kernel(**S)
+def scaled_k_rhs(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """A rhs computed per K tile in the K loop holding the op, which the M
+    threads share: the K tile's lane loop is split at the op."""
+    m, k = x.size()
+    n = w.size(1)
+    out = torch.empty([m, n], dtype=torch.float32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], (w[tk, tn] * 0.5).to(x.dtype))
+        out[tm, tn] = acc
+    return out
+
+
 def _spread_loops(msl: str) -> list[tuple[int, int, int, str]]:
     """Each lane loop that starts at a thread index: its thread axis, extent,
     step and body."""
@@ -16466,6 +16885,27 @@ def _spread_loops(msl: str) -> list[tuple[int, int, int, str]]:
         axis, extent, step = (int(g) for g in match.groups()[1:])
         loops.append((axis, extent, step, msl[match.end() : end]))
     return loops
+
+
+def _assert_one_writer(case: unittest.TestCase, code: str, msl: str) -> None:
+    """Each staged element has one writer: the threads that share the tile,
+    on the axes its owner test pins, deal its staging lanes out among
+    themselves when one such axis has several threads (``_Replicas.spread``),
+    and otherwise the owner test's thread writes it."""
+    owner = re.search(r"auto _mpp_owner\w* = (.*);", msl)
+    assert owner is not None, msl
+    launch = _launch(code)
+    pinned = [int(a) for a in re.findall(r"tid\[(\d)\] == 0", owner.group(1))]
+    wide = {a for a in pinned if launch[a] > 1}
+    loops = _spread_loops(msl)
+    if len(wide) == 1:
+        case.assertTrue(loops)
+        case.assertEqual({axis for axis, *_ in loops}, wide)
+        for *_, body in loops:
+            case.assertNotIn("_mpp_owner", body)
+    else:
+        case.assertFalse(loops)
+        case.assertRegex(msl, r"_mpp_owner\w*\)+ \{ _mpp_tile")
 
 
 #: A staging write that an owner test pins, in a lane loop from 0.
@@ -16554,6 +16994,22 @@ class TestMppStagingSpread(_MppCase):
                 out, code, msl = _run(gated_lhs, args, config)
                 _close(out, _mm(a, w))
                 self._spreads(code, msl, 1, 72)
+
+    def test_split_k_tile(self) -> None:
+        """A rhs staged per K tile from a split of the K tile's lane loop,
+        dealt out over the M threads (8 and 4 of them), with a K tail."""
+        h = torch.float16
+        x, w = torch.randn(70, 96, dtype=h), torch.randn(96, 40, dtype=h)
+        for config, extent in (
+            (helion.Config(block_sizes=[64, 32, 32], num_warps=2), 32),
+            (helion.Config(block_sizes=[32, 16, 64], num_warps=2), 64),
+        ):
+            with self.subTest(config=config):
+                out, code, msl = _run(
+                    scaled_k_rhs, (x.to(DEVICE), w.to(DEVICE)), config
+                )
+                _close(out, _mm(x, (w * 0.5).to(h)))
+                self._spreads(code, msl, 0, extent)
 
     def test_inside_a_lane_loop(self) -> None:
         """A staging loop nested in the M tile's lane loop: ``if_late``'s 64
@@ -17662,6 +18118,37 @@ class TestTileSharingRules(unittest.TestCase):
         tiles = [("A", "float", 512), ("B", "float", 1024), ("C", "float", 2048)]
         _, kept = _share(source, tiles)
         self.assertEqual(kept, [("A", "float", 512), ("B", "float", 2048)])
+
+
+@_requires_mps
+class TestStagedMatmulSeedsRun(unittest.TestCase):
+    def test_seeds_compile_and_match(self) -> None:
+        """Every seed compiles to an MPP run with the staging dealt over the
+        rows' threads and matches the reference, at a tail on every side."""
+        args = dequant_args(300, 80, 544, "mps")
+        x, wq, s = (t.cpu() for t in args)
+        shifts = torch.arange(8) * 4
+        nib = ((wq.long()[..., None] >> shifts) & 0xF).reshape(80, 544)
+        w = ((nib.double() - 8.0) * s.double().repeat_interleave(32, 1)).to(
+            torch.bfloat16
+        )
+        ref = x.double() @ w.double().T
+        bound = dequant_mm.bind(args)
+        assert bound.host_function is not None
+        with bound.env:
+            seeds = MetalStagedMatmulHeuristic.get_seed_configs(
+                bound.env, bound.host_function.device_ir
+            )
+        self.assertEqual(len(seeds), 4)
+        for seed in seeds:
+            with self.subTest(seed=seed):
+                out, _, msl = run_with_msl(dequant_mm, args, seed)
+                assert isinstance(out, torch.Tensor)
+                torch.testing.assert_close(
+                    out.cpu().double(), ref, rtol=2e-2, atol=2e-1
+                )
+                self.assertIn("matmul2d_descriptor(256,", msl)
+                self.assertRegex(msl, r"for \(int lane_\d+ = tid\[0\];")
 
 
 if __name__ == "__main__":

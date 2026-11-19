@@ -24,9 +24,35 @@ a multiply and add into one FMA (as under ``cute_uniform_lane_compares``).
 Unlike ``peel_partial_chunks`` (the rolled sweeps of ``cute_proven_bounds``),
 the loop body may hold warp reductions: a warp shuffle claims no resource of
 its own, so the second copy runs once more what the loop ran once per tile.
-Shared-memory reduces and allocations still keep a loop whole.  A loop is
-split only when a lane loop of its body loads under a mask against the
-loop's end and its complete tiles gain a packet.
+Shared-memory reduces and allocations still keep a loop whole.  For the sake
+of such lane loads, a loop is split only at the top level of the kernel body
+(or of its loop over a persistent launch's virtual program ids), and only
+when a lane loop of its body loads under a mask against the loop's end and
+its complete tiles gain a packet.
+
+A nest ``cute_vloop_sink`` interchanged loads its lanes in packets already,
+each under one predicate (``_cute_load_v16b_if``, zeros where it is false),
+and selects every lane's value under the kernel's own index masks and the
+tile mask.  A device loop that binds such packets is handled after the
+splits above, whatever its block and at any depth of the loops, branches
+and ``with`` blocks the bounds proof walks: the proof then also takes the
+launch's block grid where it is exact and follows proven predicates through
+the names they are bound to (``propagate_truths``).
+Where it proves a packet's predicate for the complete tiles, their copy
+loads the packet unpredicated under the same cache hint, and the selects
+the proof discharged with it are gone; the partial last tile keeps the loop
+as it was.  A loop none of whose packets is proven stays as it is, and
+tiles that divide the extent are all complete: that loop is not split, only
+unmasked, which is also how the complete tiles of a loop split for its lane
+loads lose their packet predicates.  No statement is copied twice: a loop
+nested in one that was split for its lane loads is unmasked only where its
+tiles divide its extent, never split again, and a loop around one whose
+packets were unmasked stays as it is.  The proof's facts are the loop's
+literal bounds, the launch shape, the constexpr block sizes and the block
+grid, which is the launch's own: a static flat launch's, or an XYZ launch's,
+whose extents are static or input sizes that the bound kernel's cache key
+fixes (``_block_grid_dims``).  So a mask the kernel states itself (``row <
+rows``) is discharged only where these imply it.
 """
 
 from __future__ import annotations
@@ -47,14 +73,19 @@ from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import deep_clone
 from ._ast_pass_utils import names_read
 from ._ast_pass_utils import names_written
+from .cache_policy_loads import CachePolicy
 from .literal_offset_loads import add_terms
 from .literal_offset_loads import stride_term
 from .literal_offset_loads import strip_int_cast
 from .memory_ops import tensor_proven_base_alignment
+from .packet_access import PacketAccess
 from .packet_access import call_write_roots
+from .packet_access import match_packet_access
 from .packet_access import render_packet_load
 from .peel_partial_chunks import peelable
 from .peel_partial_chunks import static_int
+from .peel_partial_chunks import static_range
+from .peel_partial_chunks import stays_whole
 from .peel_partial_chunks import with_bounds
 from .persistent_branch_vec import _binding_write_roots
 from .proven_loop_bounds import simplify_proven_loop_bounds
@@ -71,16 +102,21 @@ if TYPE_CHECKING:
 
 # The float dtypes ``tensor_facts`` gives a packet carrier.
 _PACKET_DTYPES = frozenset({torch.float16, torch.bfloat16, torch.float32})
+# Set on both copies of a loop split for its lane loads (``_split_loops``).
+_SPLIT_COPY = "_helion_tail_peel_copy"
 
 
 def tail_peel_blocks(device_ir: DeviceIR, config_spec: ConfigSpec) -> frozenset[int]:
-    """The blocks of the device loops this pass may split: a one-axis
-    ``hl.tile`` loop in a root graph (the kernel body's top level) over a
-    static extent and a block that can have vector lanes, which loads a 16-
-    or 32-bit float tensor along its tile.  Structure only: whether the last
-    tile is partial and the lanes align to a packet are facts of the shape,
-    and where they fail the pass leaves the loop whole.  A dim is matched by
-    its block's size symbol, so this needs no current host function."""
+    """The blocks whose device loops open ``cute_tail_peel`` to the search:
+    a one-axis ``hl.tile`` loop in a root graph (the kernel body's top level)
+    over a static extent and a block that can have vector lanes, which loads
+    a 16- or 32-bit float tensor along its tile.  Structure only: whether the
+    last tile is partial and the lanes align to a packet are facts of the
+    shape, and where they fail the pass leaves the loop whole.  In a kernel
+    that has such a block the pass is not limited to its loops: it also
+    unmasks the predicated packets of any device loop, whatever its block
+    (the module docstring).  A dim is matched by its block's size symbol, so
+    this needs no current host function."""
     env = CompileEnvironment.current()
     lane_blocks = set(config_spec.cute_vector_widths.valid_block_ids())
     blocks: set[int] = set()
@@ -196,6 +232,7 @@ class TensorFacts:
 
 
 _CARRIERS = {2: "cutlass.Uint16", 4: "cutlass.Uint32"}
+_CARRIER_BYTES = {carrier: itemsize for itemsize, carrier in _CARRIERS.items()}
 
 
 def tensor_facts(device_function: DeviceFunction) -> dict[str, TensorFacts]:
@@ -535,13 +572,17 @@ def peel_vector_tails(
     tensor_facts: Mapping[str, TensorFacts],
     new_var: Callable[[str], str],
     persistent_loop: str | None,
+    block_grid_dims: tuple[int, int, int] | None = None,
 ) -> list[ast.stmt]:
     """Split each qualifying device loop at the top level of ``body``, or of
     the body of its loop over a persistent launch's virtual program ids
     (whose variable is ``persistent_loop``), whose complete tiles, once
     their masks are proven, load at least one lane in packets (named by
-    ``new_var``); other loops, and ``body`` without such a loop, stay as
-    they are."""
+    ``new_var``); then run the complete tiles of each device loop that loads
+    predicated packets, at any depth, unpredicated where the masks are
+    proven given the launch's exact block grid (``block_grid_dims``, None
+    when it is not known).  Other loops, and ``body`` without such a loop,
+    stay as they are."""
     if thread_block_dims is None:
         return body
     result, proven_any = _split_loops(
@@ -553,9 +594,254 @@ def peel_vector_tails(
         new_var,
         persistent_loop,
     )
-    if not proven_any:
+    # After the splits: a loop split for its lane loads keeps the packets
+    # its complete tiles gained, and those tiles, which divide their extent,
+    # are then unmasked in place.
+    unmasker = _Unmasker(dict(constexpr_values), thread_block_dims, block_grid_dims)
+    result = unmasker.block(result, [])
+    if not (proven_any or unmasker.count):
         return body
     return with_proof_marker(result)
+
+
+def _masked_packets(node: ast.AST) -> list[tuple[ast.Assign, PacketAccess]]:
+    """The predicated packet loads ``node`` binds, with their statements."""
+    return [
+        (statement, access)
+        for statement in ast.walk(node)
+        if isinstance(statement, ast.Assign)
+        and (access := match_packet_access(statement.value)) is not None
+        and access.kind == "masked_packet"
+    ]
+
+
+def _unpredicated(access: PacketAccess) -> ast.expr | None:
+    """The plain or hinted load of a predicated 8- or 16-byte packet under
+    the same cache hint, or None when no unpredicated load carries it."""
+    arguments = access.call.args
+    priority = ""
+    if len(arguments) == 4:
+        hint = arguments[3]
+        if not (isinstance(hint, ast.Constant) and isinstance(hint.value, str)):
+            return None
+        priority = hint.value
+    if access.width is None or access.carrier not in _CARRIER_BYTES:
+        return None
+    packet_bytes = access.width * _CARRIER_BYTES[access.carrier]
+    if packet_bytes not in (8, 16):
+        return None
+    policy = CachePolicy.from_masked_priority(priority)
+    helper = policy.vector_helper(packet_bytes)
+    if policy.is_l2_marker and helper is None:
+        return None
+    return ast.parse(
+        render_packet_load(
+            ast.unparse(access.pointer),
+            access.width,
+            access.carrier,
+            helper=helper,
+            kwargs=policy.load_kwargs,
+        ),
+        mode="eval",
+    ).body
+
+
+def _blocks(statement: ast.stmt) -> tuple[str, ...]:
+    """The fields of ``statement`` that hold statements the bounds proof
+    walks: the body and the ``else`` of a loop and of a branch, the body of
+    a ``with`` block.  Any other compound statement stops the proof
+    (``supported_statements``), so nothing in it or around it is proven."""
+    if isinstance(statement, (ast.For, ast.If)):
+        return ("body", "orelse")
+    if isinstance(statement, ast.With):
+        return ("body",)
+    return ()
+
+
+def _stand_in(holder: ast.stmt, field: str, statements: list[ast.stmt]) -> ast.stmt:
+    """``holder`` for the bounds proof: clones of its header and of its
+    other statements, with ``statements`` themselves as its ``field``."""
+    lists = {
+        name: statements
+        if name == field
+        else [deep_clone(statement) for statement in getattr(holder, name)]
+        for name in _blocks(holder)
+    }
+    stand_in: ast.stmt
+    if isinstance(holder, ast.For):
+        stand_in = ast.For(
+            target=deep_clone(holder.target),
+            iter=deep_clone(holder.iter),
+            body=lists["body"],
+            orelse=lists["orelse"],
+        )
+    elif isinstance(holder, ast.If):
+        stand_in = ast.If(
+            test=deep_clone(holder.test), body=lists["body"], orelse=lists["orelse"]
+        )
+    else:
+        assert isinstance(holder, ast.With)
+        stand_in = ast.With(
+            items=[deep_clone(item) for item in holder.items], body=lists["body"]
+        )
+    return ast.fix_missing_locations(ast.copy_location(stand_in, holder))
+
+
+# Where a statement stands: each statement list around it, outermost first,
+# with the index of its statement that holds the next list and the field of
+# that statement which does (``_blocks``).
+_Enclosing = list[tuple[list[ast.stmt], int, str]]
+
+
+class _Unmasker:
+    """Run the complete tiles of device loops that load predicated packets
+    unpredicated (the module docstring's sunk nests)."""
+
+    def __init__(
+        self,
+        constexpr_values: dict[str, int],
+        thread_block_dims: tuple[int, int, int],
+        block_grid_dims: tuple[int, int, int] | None,
+    ) -> None:
+        self.constexpr_values = constexpr_values
+        self.thread_block_dims = thread_block_dims
+        self.block_grid_dims = block_grid_dims
+        # The packets unmasked so far, in split loops and in place.
+        self.count = 0
+
+    def block(
+        self,
+        statements: list[ast.stmt],
+        enclosing: _Enclosing,
+        copied: bool = False,
+    ) -> list[ast.stmt]:
+        """``statements`` with their qualifying loops replaced, those in
+        the branches and ``with`` blocks among them included; ``enclosing``
+        locates ``statements``.  ``copied``: they are in a copy of a loop
+        split for its lane loads (``_SPLIT_COPY``), whose body may not be
+        copied again."""
+        result: list[ast.stmt] = []
+        for index, statement in enumerate(statements):
+            fields = _blocks(statement)
+            if not fields or not _masked_packets(statement):
+                result.append(statement)
+                continue
+            in_copy = copied or getattr(statement, _SPLIT_COPY, False)
+            # The innermost device loop that gains a packet first: a loop
+            # that holds one this pass unmasked, whether it was split for
+            # that or unmasked in place, stays as it is.  A loop under a
+            # branch or in a ``with`` block is settled where it stands, like
+            # one directly in its enclosing loop's body.
+            before = self.count
+            for field in fields:
+                setattr(
+                    statement,
+                    field,
+                    self.block(
+                        getattr(statement, field),
+                        [*enclosing, (statements, index, field)],
+                        in_copy,
+                    ),
+                )
+            replaced = (
+                self._tiles(statement, statements, index, enclosing, split=not in_copy)
+                if isinstance(statement, ast.For) and self.count == before
+                else None
+            )
+            if replaced is None:
+                result.append(statement)
+            else:
+                result.extend(replaced)
+        return result
+
+    def _tiles(
+        self,
+        loop: ast.For,
+        statements: list[ast.stmt],
+        index: int,
+        enclosing: _Enclosing,
+        *,
+        split: bool,
+    ) -> list[ast.stmt] | None:
+        """The complete tiles of ``loop``, which is ``statements[index]``
+        under ``enclosing``, unmasked, then its partial last tile as it
+        was, or None when the loop stays as it is.  Without ``split`` only
+        a loop whose tiles are all complete is unmasked."""
+        bounds = static_range(loop, self.constexpr_values)
+        if bounds is None:
+            return None
+        start, end, step = bounds
+        full_end = end - (end - start) % step
+        if full_end <= start:
+            # No complete tile.
+            return None
+        if full_end < end and not split:
+            # The loop is, or is nested in, a copy of a loop split for its
+            # lane loads: another split would copy its body a second time.
+            return None
+        if full_end < end and stays_whole(loop.body, warp_reduces_keep_whole=False):
+            # The partial tile's copy would take the loop's shared memory
+            # again (``peel_partial_chunks``).
+            return None
+        complete = with_bounds(loop, start, full_end, mark=False)
+        self._prove(complete, statements, index, enclosing)
+        gained = 0
+        for statement, access in _masked_packets(complete):
+            predicate = access.predicate
+            if not (isinstance(predicate, ast.Constant) and predicate.value is True):
+                continue
+            load = _unpredicated(access)
+            if load is not None:
+                statement.value = load
+                gained += 1
+        if not gained:
+            return None
+        self.count += gained
+        # The partial last tile keeps the loop as it was.  Neither copy is
+        # split again: the loops nested in them gained no packet, the splits
+        # for lane loads ran before, and the loops around them stay as they
+        # are (``block``).
+        if full_end < end:
+            return [complete, with_bounds(loop, full_end, end, mark=False)]
+        return [complete]
+
+    def _prove(
+        self,
+        complete: ast.For,
+        statements: list[ast.stmt],
+        index: int,
+        enclosing: _Enclosing,
+    ) -> None:
+        """Discharge in ``complete`` the predicates the bounds proof proves
+        where the loop stands, at ``statements[index]`` under ``enclosing``.
+        The proof walks clones of the statements around it: every enclosing
+        loop, branch and ``with`` block whole (``_stand_in``), so a name a
+        loop binds again, ahead of ``complete`` or behind it, is unknown
+        where the loop reads it.  It rewrites the loops it walks in place,
+        so ``complete`` itself holds the result wherever the proof leaves it
+        among the clones (an ``if`` it resolves, ahead of the loop or around
+        it, is replaced by its body, which moves the statements after
+        it)."""
+        node: ast.stmt = complete
+        for outer_statements, outer_index, field in reversed(enclosing):
+            node = _stand_in(
+                outer_statements[outer_index],
+                field,
+                [
+                    *(deep_clone(earlier) for earlier in statements[:index]),
+                    node,
+                    *(deep_clone(later) for later in statements[index + 1 :]),
+                ],
+            )
+            statements, index = outer_statements, outer_index
+        simplify_proven_loop_bounds(
+            [*(deep_clone(earlier) for earlier in statements[:index]), node],
+            enabled=True,
+            thread_block_dims=self.thread_block_dims,
+            constexpr_values=dict(self.constexpr_values),
+            block_grid_dims=self.block_grid_dims,
+            propagate_truths=True,
+        )
 
 
 def _unknown(name: str) -> ast.stmt:
@@ -573,7 +859,8 @@ def _split_loops(
     persistent_loop: str | None,
 ) -> tuple[list[ast.stmt], bool]:
     """``body`` with its qualifying device loops split (``peel_vector_tails``),
-    ``before`` the statements that run ahead of it, and whether one was."""
+    both copies marked ``_SPLIT_COPY``, ``before`` the statements that run
+    ahead of it, and whether one was."""
     result: list[ast.stmt] = []
     proven_any = False
     for index, statement in enumerate(body):
@@ -649,6 +936,8 @@ def _split_loops(
         if not packetizer.count:
             result.append(statement)
             continue
+        for copy in (complete, partial):
+            setattr(copy, _SPLIT_COPY, True)
         result.extend((complete, partial))
         proven_any = True
     return result, proven_any

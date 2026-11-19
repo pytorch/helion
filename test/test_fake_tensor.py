@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import operator
+
 import pytest
 import torch
 from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -68,3 +70,49 @@ def test_bmm_cast_keeps_distinct_tile_axes(queries: int, keys: int) -> None:
     assert pv.m_block_id == qk.m_block_id
     assert pv.k_block_id == qk.n_block_id
     assert (pv.static_m, pv.static_n, pv.static_k) == (queries, 64, keys)
+
+
+@helion.kernel(config=helion.Config(block_sizes=[64]), static_shapes=True)
+def _tile_groups(x: torch.Tensor, group: int) -> torch.Tensor:
+    group = hl.specialize(group)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + tile.begin // group
+    return out
+
+
+@helion.kernel(config=helion.Config(block_sizes=[64]), static_shapes=True)
+def _tile_double_groups(x: torch.Tensor, group: int) -> torch.Tensor:
+    group = hl.specialize(2 * group)
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + tile.begin // group
+    return out
+
+
+@onlyBackends(["triton", "cute"])
+@skipIfRefEager("Inspects the compiled device IR, absent in ref eager mode")
+@pytest.mark.parametrize(
+    ("kernel", "group"), [(_tile_groups, 128), (_tile_double_groups, 64)]
+)
+def test_profiler_keeps_specialized_scalars_constant(
+    kernel: helion.Kernel, group: int
+) -> None:
+    """``hl.specialize`` folds an int argument into the device code as a
+    literal through the shape-env replacement its guard installs (``u0 ->
+    128``, or ``u0 -> 64`` for ``hl.specialize(2 * u0)``). Inside a
+    torch.profiler context the compile suppresses guards
+    (test_misc.py::test_profiler_does_not_concretize_block_vars), which used
+    to drop that replacement too: the device graph kept the symbol, and
+    pattern matchers expecting the literal (the CuTe flex envelopes'
+    ``m_begin // QB`` table index) declined."""
+    # Binding CPU tensors traces the kernel without launching it.
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]):
+        bound = kernel.bind((torch.randn([1024]), group))
+    divisors = [
+        node.args[1]
+        for graph in bound.host_function.device_ir.graphs
+        for node in graph.graph.nodes
+        if node.target is operator.floordiv
+    ]
+    assert divisors == [128]
