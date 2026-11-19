@@ -434,22 +434,14 @@ def emit_carry_store(
             )
         )
 
-    row_off = state.codegen.offset_var(row_block_id)
     col_off = state.codegen.offset_var(col_block_id)
     # Parenthesized: under compact_worklist the bounds are metadata expressions
     # (``begin_ref[_wid] + extent_ref[_wid]``), not names.
     begin, end = f"({rec.begin_var})", f"({rec.end_var})"
     a_start = f"({begin} - {begin} % {S})"
     a_end = f"(({end} + {S} - 1) // {S} * {S})"
-    # TODO(tcombes): assumes contiguous group offsets; a gap folds a stale carry.
-    fold_guard = f"(({row_off} == {a_start}) & ({begin} % {S} != 0))"
-    save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
     col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
-    # Group's last row block: S-aligned, within [0, block_row - S].  Read through
-    # the store's column index: the ref may hold more columns than one tile.
-    last_off = f"pl.multiple_of({a_end} - {S} - ({row_off}), {S})"
-    out_last = f"{name}[pl.ds({last_off}, {S}), {col_part}]"
 
     # Zero the over-read rows so an f(0) != 0 op (e.g. bias add) can't corrupt the
     # carried boundary; astype before reshape (Mosaic won't reshape a bool vector).
@@ -458,8 +450,17 @@ def emit_carry_store(
     assert row_mask is not None, "carry tile must be a masked jagged tile"
     owned = f"{row_mask}.astype({dtype_str})[:, None]"
     if _is_compact_aligned_load(state, row_block_id, tensor):
-        # Compact-worklist window: one tile per work item, written whole into
-        # the pipelined output block, with the carry folded into the S head rows.
+        # Compact-worklist window: one window per work item covering [a_start,
+        # a_end), written whole into the pipelined output block, with the carry
+        # folded into the S head rows. In a one-tile window (or one bucketed by
+        # S), the last sublane tile is at static offset block_row - S.
+        fold_guard = f"({begin} % {S} != 0)"
+        save_guard = f"({end} % {S} != 0)"
+        last_off = (
+            str(block_row - S)
+            if block_row == S or env.compact_worklist_bucket_rows == S
+            else f"pl.multiple_of({a_end} - {S} - {a_start}, {S})"
+        )
         head = f"{name}[pl.ds(0, {S}), {col_part}]"
         state.codegen.add_statement(
             statement_from_string(
@@ -473,6 +474,13 @@ def emit_carry_store(
             )
         )
     else:
+        row_off = state.codegen.offset_var(row_block_id)
+        # TODO(tcombes): assumes contiguous group offsets; a gap folds a stale carry.
+        fold_guard = f"(({row_off} == {a_start}) & ({begin} % {S} != 0))"
+        save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
+        # Group's last row block: S-aligned, within [0, block_row - S]. Read through
+        # the store's column index: the ref may hold more columns than one tile.
+        last_off = f"pl.multiple_of({a_end} - {S} - ({row_off}), {S})"
         # Pad the [S, block_col] carry to a full [block_row, block_col] tile
         # (carry on top, zeros below): Pallas rejects a partial write to the
         # double-buffered out.
@@ -484,6 +492,7 @@ def emit_carry_store(
                 value=value,  # pyrefly: ignore[bad-argument-type]
             )
         )
+    out_last = f"{name}[pl.ds({last_off}, {S}), {col_part}]"
     state.codegen.add_statement(
         statement_from_string(
             f"{carry_slice} = jnp.where({save_guard}, {out_last}, {carry_slice})"

@@ -1848,6 +1848,27 @@ class TestStaticInnerLoopWorklist(unittest.TestCase):
                 )
 
     @staticmethod
+    def _device_function(code):
+        """Source of the generated device function (``_helion_*``)."""
+        (fn,) = [
+            node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("_helion_")
+        ]
+        return ast.unparse(fn)
+
+    def test_compact_window_carry_needs_no_row_offset(self):
+        # A compact window holds a single work item, so its carry store does not
+        # compare the tile's row offset with the work item's bounds.
+        bound = self._bound()
+        for block in (16, 32):
+            with self.subTest(block=block):
+                code = self._device_function(
+                    bound.to_triton_code(_worklist_config([block, 256, 128]))
+                )
+                self.assertNotIn("offset_1", code)
+
+    @staticmethod
     def _launcher_call(code):
         """The tensor args (as source) and keywords of the ``_launcher`` call."""
         (call,) = [
