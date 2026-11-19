@@ -419,18 +419,21 @@ def emit_carry_store(
             scratch_type="vmem",
         )
         fn.carry_scratch[CarryScratchKey(row_block_id, name)] = carry
+        fn.preamble.append(
+            statement_from_string(
+                f"@pl.when(pl.program_id(0) == 0)\n"
+                f"def _{carry}_init():\n"
+                f"    {carry}[...] = jnp.zeros_like({carry})"
+            )
+        )
 
     row_off = state.codegen.offset_var(row_block_id)
     col_off = state.codegen.offset_var(col_block_id)
     begin, end = rec.begin_var, rec.end_var
     a_start = f"({begin} - {begin} % {S})"
     a_end = f"(({end} + {S} - 1) // {S} * {S})"
-    # Fold past the first group (program_id 0 has no predecessor) when begin is
-    # unaligned; save the last row block when end is unaligned.
     # TODO(tcombes): assumes contiguous group offsets; a gap folds a stale carry.
-    fold_guard = (
-        f"(({row_off} == {a_start}) & ({begin} % {S} != 0) & (pl.program_id(0) != 0))"
-    )
+    fold_guard = f"(({row_off} == {a_start}) & ({begin} % {S} != 0))"
     save_guard = f"(({row_off} + {block_row} >= {a_end}) & ({end} % {S} != 0))"
     col_sub = f"pl.multiple_of(({col_off}) // {block_col} * {S}, {S})"
     carry_slice = f"{carry}[pl.ds({col_sub}, {S}), :]"
