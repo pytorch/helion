@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     from ..device_ir import DeviceIR
     from ..device_ir import GraphInfo
     from ..device_ir_analysis import DeviceIRAnalysis
+    from ..emitter_protocols import RetryPolicy
     from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
     from ..reduction_strategy import BlockReductionStrategy
@@ -430,6 +431,8 @@ class MetalBackend(Backend):
         # config at a time.
         self.free_arange_plan: FreeArangePlan = {}
         self.mpp_plan: MppPlan | None = None
+        #: Whether this pass's MPP planner raised (``MatmulFallback``).
+        self.mpp_plan_refused = False
         self._tid_axes: set[int] = set()
         # Set by ``pre_codegen`` (see ``_uniform_thread_extent``), and cleared
         # by ``create_loop_strategy`` because strategies of the next config
@@ -849,6 +852,11 @@ class MetalBackend(Backend):
 
         return config_is_viable(config_spec, config, self._grid_roots)
 
+    def retry_policy(self) -> RetryPolicy:
+        from .search_surface import MatmulFallback
+
+        return MatmulFallback()
+
     def pre_codegen(
         self,
         graphs: list[GraphInfo],
@@ -885,11 +893,14 @@ class MetalBackend(Backend):
             # Every matmul lowers on the scalar contraction (matmul_ops).
             self.mpp_plan = MppPlan()
         else:
+            # MatmulFallback reads whether a failed pass's planner raised.
+            self.mpp_plan_refused = True
             self.mpp_plan = plan_mpp_matmuls(
                 graphs,
                 threaded,
                 FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
             )
+            self.mpp_plan_refused = False
         split = fragment_split(CompileEnvironment.current().config_spec, config)
         if split > 1 and self.mpp_plan.by_matmul:
             refusal = split_refusal(self.mpp_plan, graphs)

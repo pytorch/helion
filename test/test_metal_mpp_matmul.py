@@ -33,6 +33,7 @@ from helion._compiler.metal import msl_ast_walker
 from helion._compiler.metal import tile_sharing
 from helion._compiler.metal.staged_matmul_heuristic import MetalStagedMatmulHeuristic
 from helion._testing import import_example
+from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
 from helion._testing.metal_staged import dequant_args
 from helion._testing.metal_staged import dequant_mm
@@ -4180,7 +4181,7 @@ class _MppCase(unittest.TestCase):
                 self.subTest(kernel=kernel.name, config=config),
                 self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)),
             ):
-                _run(kernel, args, config)
+                _run(kernel, args, mpp_only(kernel, args, config))
 
 
 @_requires_mps
@@ -4643,7 +4644,7 @@ class TestMppMatmulRejects(_MppCase):
         with self.assertRaisesRegex(
             exc.BackendUnsupported, "an MPP view whose tile spans"
         ):
-            bound.to_code(helion.Config(block_sizes=[32, 32, 128]))
+            bound.to_code(helion.Config(block_sizes=[32, 32, 128], metal_matmul="mpp"))
 
     def test_swapped_tiles(self) -> None:
         """A store, an epilogue operand, a ``where`` or a load mask that meets
@@ -5117,11 +5118,10 @@ class TestMppStagingRejects(_MppCase):
             torch.randn(32, 32).to(f8),
             torch.randn(32, 32).to(f8),
         )
-        bound = stacked_fp8.bind(args)
         with self.assertRaisesRegex(
             exc.BackendUnsupported, "an MPP operand of dtype torch.float8_e4m3fn"
         ):
-            bound.to_code(bound.config_spec.default_config())
+            stacked_fp8.bind(args).to_code(mpp_only(stacked_fp8, args, None))
 
     def test_budget(self) -> None:
         x = torch.randn(32, 256, device=DEVICE)
@@ -7843,7 +7843,7 @@ class TestMppViewsRejects(unittest.TestCase):
                 self.subTest(kernel=kernel.name),
                 self.assertRaisesRegex(exc.BackendUnsupported, re.escape(message)),
             ):
-                _run(kernel, args, None)
+                _run(kernel, args, mpp_only(kernel, args, None))
 
     def test_staged(self) -> None:
         """A masked ``base + tile.index`` dim, an ``add`` with ``alpha``, an
@@ -15026,11 +15026,13 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         self._scalar(dot_colon_n_row_sums, (x, y), None, ((2 * xd) @ yd).sum(-1))
 
     def test_no_acc_over_a_tiled_k(self) -> None:
-        """A float per-K-tile hl.dot keeps the scalar contraction (MPP takes
-        int8 ones: TestMppInt8, TestMppFold)."""
+        """A float per-K-tile hl.dot takes MPP, as an int8 one does
+        (TestMppInt8, TestMppFold)."""
         x, y = _randn(32, 64, dtype=torch.float32), _randn(64, 48, dtype=torch.float32)
         xd, yd = _cpu64(x, y)
-        self._scalar(dot_no_acc_tiled_k, (x, y), None, xd[:, 48:] @ yd[48:])
+        out, code, _ = _run(dot_no_acc_tiled_k, (x, y), None)
+        self.assertIn("_helion_mpp_run(", code)
+        _close(out, xd[:, 48:] @ yd[48:])
 
     def test_one_inadmissible_dot_keeps_every_dot(self) -> None:
         x, y = (
@@ -15888,7 +15890,9 @@ class TestMppThreadgroupBudget(unittest.TestCase):
         bf = torch.bfloat16
         a = torch.randn(200, 64, dtype=bf)
         b = torch.randn(64, 300, dtype=bf)
-        config = helion.Config(block_sizes=[128, 128, 32], num_warps=8)
+        config = helion.Config(
+            block_sizes=[128, 128, 32], num_warps=8, metal_matmul="mpp"
+        )
         for kernel, reader in (
             (free_rows_wide_scalar_store, "store_1"),
             (free_rows_wide_staged, "a staged MPP operand"),
@@ -15911,7 +15915,7 @@ class TestMppThreadgroupBudget(unittest.TestCase):
             r"block 0 on 8 threads x 4 lanes, but _mpp_coop reads it in Scalar code",
         ):
             free_rows_seeded.bind((a, b, torch.randn(45, 40), 2, 2)).to_code(
-                helion.Config(block_sizes=[32, 32, 16], num_warps=4)
+                helion.Config(block_sizes=[32, 32, 16], num_warps=4, metal_matmul="mpp")
             )
 
     def test_former_jam_cap_rejections_compile(self) -> None:

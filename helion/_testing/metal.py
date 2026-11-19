@@ -115,3 +115,14 @@ def addmm_k_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             acc = torch.addmm(acc, x[tm, tk], y[tk, tn])
         out[tm, tn] = acc
     return out
+
+
+def mpp_only(
+    kernel: helion.Kernel, args: tuple[object, ...], config: helion.Config | None
+) -> helion.Config:
+    """``config`` (the default for None) naming MPP's lowering, which a
+    config without ``metal_matmul`` falls back from
+    (``search_surface.MatmulFallback``): its refusals raise."""
+    if config is None:
+        config = kernel.bind(args).config_spec.default_config()
+    return helion.Config.from_dict({"metal_matmul": "mpp", **config.config})

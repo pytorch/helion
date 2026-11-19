@@ -150,12 +150,16 @@ class TestMppCodegen(unittest.TestCase):
             self.assertIn("_mpp_mat", msl)
 
     def test_per_tile_dot(self) -> None:
-        """A per-K-tile hl.dot takes MPP from int8 operands; a float one
-        keeps the scalar contraction, which lowers it at every config."""
+        """A per-K-tile hl.dot takes MPP from float and int8 operands alike;
+        a config without metal_matmul that MPP can't run falls back
+        (``search_surface.MatmulFallback``): a K tile of 512 to the scalar
+        contraction."""
         config = helion.Config(block_sizes=[16, 16, 16])
-        msl = render_msl(per_tile_dot, _int8_args(), config)
-        self.assertIn("matmul2d_descriptor", msl)
-        msl = render_msl(per_tile_dot, _float_args(), config)
+        for args in (_int8_args(), _float_args()):
+            msl = render_msl(per_tile_dot, args, config)
+            self.assertIn("matmul2d_descriptor", msl)
+        deep = (torch.randn(32, 1024), torch.randn(1024, 32))
+        msl = render_msl(per_tile_dot, deep, helion.Config(block_sizes=[16, 16, 512]))
         self.assertNotIn("matmul2d_descriptor", msl)
 
 

@@ -40,6 +40,7 @@ from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
 from helion._testing.metal import addmm_k_loop
+from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
 from helion.autotuner.config_generation import ConfigGeneration
 import helion.language as hl
@@ -2446,6 +2447,25 @@ class TestMetalScalarDot(unittest.TestCase):
         out, _ = self._run(dot_acc_bf16_out, (x, y))
         ref = (x.cpu().double() @ y.cpu().double()).float().bfloat16().float()
         torch.testing.assert_close(out.cpu(), ref, rtol=0, atol=0)
+
+    def test_fallback(self) -> None:
+        """A config without ``metal_matmul`` that MPP can't run computes on
+        the lowering it falls back to: fragments for an N tile of 512, the
+        scalar contraction for a K tile of 512
+        (test_metal_fragment_config.py checks which lowering each takes)."""
+        h = torch.float16
+        for (m, k, n), block_sizes in (
+            ((16, 128, 512), [16, 512, 32]),
+            ((32, 1024, 32), [16, 16, 512]),
+        ):
+            x = torch.randn(m, k, device=DEVICE, dtype=h)
+            y = torch.randn(k, n, device=DEVICE, dtype=h)
+            with self.subTest(block_sizes=block_sizes):
+                config = helion.Config(block_sizes=block_sizes)
+                out = addmm_k_loop.bind((x, y)).compile_config(config)(x, y)
+                torch.testing.assert_close(
+                    out.cpu(), _matmul_reference(x, y), rtol=1e-3, atol=1e-2
+                )
 
     def test_scalar_choice(self) -> None:
         """``metal_matmul="scalar"`` lowers every matmul on the scalar
@@ -9698,9 +9718,16 @@ class TestMetalAutotune(unittest.TestCase):
         )
 
     def _mpp_matmul(self, bm: int, bn: int, bk: int, warps: int) -> helion.Kernel:
+        """A matmul at one MPP config, named so that MPP's refusals raise
+        rather than fall back (``search_surface.MatmulFallback``)."""
+
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[bm, bn, bk], num_warps=warps)],
+            configs=[
+                helion.Config(
+                    block_sizes=[bm, bn, bk], num_warps=warps, metal_matmul="mpp"
+                )
+            ],
         )
         def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
             m, k = x.size()
@@ -9849,7 +9876,11 @@ class TestMetalAutotune(unittest.TestCase):
 
         @helion.kernel(
             backend="metal",
-            configs=[helion.Config(block_sizes=[32, 16, 8, 16], num_warps=4)],
+            configs=[
+                helion.Config(
+                    block_sizes=[32, 16, 8, 16], num_warps=4, metal_matmul="mpp"
+                )
+            ],
         )
         def extra_grid_axis(
             a: torch.Tensor, b: torch.Tensor
@@ -9926,7 +9957,9 @@ class TestMetalAutotune(unittest.TestCase):
             helion.kernel(
                 three_axis.fn,
                 backend="metal",
-                configs=[helion.Config(block_sizes=cfg, num_warps=2)],
+                configs=[
+                    helion.Config(block_sizes=cfg, num_warps=2, metal_matmul="mpp")
+                ],
             )(a, b)
 
         ok = helion.kernel(
@@ -12197,6 +12230,7 @@ class TestMetalFreeArange(unittest.TestCase):
             mpp_free,
             (x, x),
             "free block 0 is spread over threads around a cooperative MPP matmul",
+            mpp_only(mpp_free, (x, x), None),
         )
 
     def test_store_and_mask_rebinds_reject(self) -> None:
@@ -12289,8 +12323,10 @@ class TestMetalFreeArange(unittest.TestCase):
         a = torch.randn(64, 48, device=DEVICE)
         b = torch.randn(48, 64, device=DEVICE)
         for config in (
-            helion.Config(block_sizes=[16, 16, 16]),
-            helion.Config(block_sizes=[16, 16, 4], num_threads=[0, 0, 4]),
+            helion.Config(block_sizes=[16, 16, 16], metal_matmul="mpp"),
+            helion.Config(
+                block_sizes=[16, 16, 4], num_threads=[0, 0, 4], metal_matmul="mpp"
+            ),
         ):
             with self.subTest(config=config):
                 self._assert_rejected(

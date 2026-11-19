@@ -1230,12 +1230,12 @@ def _static_tile(block: int) -> int | None:
 
 def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
     """Whether an ``hl.dot`` may go to the planner: no product rounded to
-    another ``out_dtype``, each dim whose tile no config changes within one
-    op, and a per-K-tile product (without an acc argument, over a tiled K)
-    only from int8 operands.  An operand computed from a matmul's result and
-    the planner's own rejections (a per-K-tile product not at the top level
-    of its K loop) are :func:`_takes_dots`'s."""
-    lhs, rhs, acc = matmul.args[:3]
+    another ``out_dtype``, and each dim whose tile no config changes within
+    one op.  An operand computed from a matmul's result and the planner's
+    own rejections (a per-K-tile product not at the top level of its K loop)
+    are :func:`_takes_dots`'s.  A config MPP can't run falls back to another
+    lowering when it names none (``search_surface.MatmulFallback``)."""
+    lhs, rhs = matmul.args[:2]
     # The result takes the acc's dtype, so a float32 acc can still carry a
     # product rounded to another out_dtype.
     if not _exact_out(matmul):
@@ -1264,12 +1264,7 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
             continue
         if not low <= tile <= high:
             return False
-    # A float per-K-tile product keeps the scalar contraction, which lowers
-    # it at every config; MPP's op limits (a K tile of at most 256, a
-    # threadgroup of whole SIMD groups) would fail some that compile there.
-    # An int8 one (grouped quantization, what MPP's int8 rate is for) takes
-    # MPP with those limits, as any matmul with an acc does.
-    return acc is not None or _full_k(matmul) is not None or lval.dtype == torch.int8
+    return True
 
 
 def _matmul_derived(node: Node, graphs: Graphs) -> bool:

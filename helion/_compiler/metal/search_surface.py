@@ -1,10 +1,12 @@
 """The Metal backend's autotune search surface: its backend-specific config
 keys (``BackendSearchSurface.config_keys``), the fields and seeds that put
-them in the search where a kernel's matmuls lower on fragments too, and
-their normalization."""
+them in the search where a kernel's matmuls have more than one lowering,
+their normalization, and the fallback of a config that names no lowering
+(:class:`MatmulFallback`)."""
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 from typing import TYPE_CHECKING
@@ -14,18 +16,22 @@ from ...autotuner.config_fragment import EnumFragment
 from ...autotuner.config_spec import DEFAULT_NUM_WARPS
 from ...autotuner.config_spec import RangeNumStagesSpec
 from ...autotuner.search_surface import BackendSearchSurface
+from ...exc import BackendUnsupported
 from ...exc import InvalidConfig
 from ...runtime.config import Config
 from ..backend import _largest_divisor_at_most
+from ..emitter_protocols import RetryPolicy
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
 from .thread_counts import launch_threads
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Mapping
 
     from ...autotuner.config_fragment import ConfigSpecFragment
     from ...autotuner.config_spec import ConfigSpec
+    from .backend import MetalBackend
 
 #: How a kernel's matmuls are lowered: on MPP's ``matmul2d`` (the default; a
 #: config without the key means it), on 8x8 simdgroup-matrix fragments built
@@ -126,6 +132,75 @@ def matmul_choices(config_spec: ConfigSpec) -> tuple[str, ...]:
         )
         if applies
     )
+
+
+class MatmulFallback(RetryPolicy):
+    """A config that names no ``metal_matmul`` (the default config, or one
+    written before the key was searched) takes the first lowering that
+    compiles it, in :func:`matmul_choices`' order: MPP's, fragments' on one
+    SIMD group (a fragment config's ``num_warps`` splits its K loops), then
+    the scalar contraction's.  ``generate_ast`` generates the kernel again
+    under the next one, from the config as given, when a pass whose
+    matmuls a cooperative lowering planned raises ``BackendUnsupported``;
+    the last one's error propagates, caused by the first's.  A config that
+    names a lowering keeps it and fails with its error, as the search's
+    drawn configs do: the search draws every lowering itself.  Its default
+    config, which leaves the key out, falls back like any other."""
+
+    signals = (BackendUnsupported,)
+
+    def __init__(self) -> None:
+        self._first: BaseException | None = None
+        self._config: Config | None = None
+
+    @contextlib.contextmanager
+    def scope(self) -> Iterator[None]:
+        # Each pass plans afresh; a pass that fails before planning leaves
+        # no plan and no refusal.
+        backend = _metal_backend()
+        backend.mpp_plan, backend.mpp_plan_refused = None, False
+        yield
+
+    def repair(
+        self, signal: BaseException, config: Config, *, caller_graphs: bool
+    ) -> Config | None:
+        from ..compile_environment import CompileEnvironment
+
+        backend = _metal_backend()
+        if caller_graphs or (self._first is None and METAL_MATMUL in config.config):
+            return None
+        plan, refused = backend.mpp_plan, backend.mpp_plan_refused
+        backend.mpp_plan, backend.mpp_plan_refused = None, False
+        choices = matmul_choices(CompileEnvironment.current().config_spec)
+        current = metal_matmul(config)
+        # A pass that failed before planning, or whose matmuls all took the
+        # scalar contraction, failed for a reason no other lowering changes.
+        planned = refused or (plan is not None and bool(plan.by_matmul))
+        if self._first is None:
+            if not planned:
+                return None
+            self._first, self._config = signal, config
+        index = choices.index(current) if current in choices else len(choices)
+        rest = choices[index + 1 :] if planned else ()
+        if not rest:
+            if signal is not self._first:
+                signal.__cause__ = self._first
+            return None
+        # From the config as given: a fragment pass's num_warps=1 is its own.
+        assert self._config is not None
+        fallback = {**self._config.config, METAL_MATMUL: rest[0]}
+        if rest[0] == "fragment":
+            fallback["num_warps"] = 1
+        return Config.from_dict(fallback)
+
+
+def _metal_backend() -> MetalBackend:
+    from ..compile_environment import CompileEnvironment
+    from .backend import MetalBackend
+
+    backend = CompileEnvironment.current().backend
+    assert isinstance(backend, MetalBackend)
+    return backend
 
 
 def fragment_tiles(config_spec: ConfigSpec, config: Mapping[str, object]) -> bool:
