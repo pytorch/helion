@@ -65,8 +65,12 @@ def inline_asm_elementwise(
     cost you anything if you don't use it.
 
     Args:
-        asm: assembly to run. Must match target's assembly format.
-        constraints: asm constraints in LLVM format
+        asm: assembly to run. Must match target's assembly format: PTX on
+            NVIDIA, AMDGCN on ROCm.
+        constraints: asm constraints in LLVM format. On ROCm the Triton
+            backend rejects the NVPTX register classes (``b``, ``c``, ``d``,
+            ``f``, ``h``, ``l``, ``q``) and a string with no ``=`` output
+            (such as ``+v,v``); use AMDGPU classes such as ``v``.
         args: the input tensors, whose values are passed to the asm block
         dtype: the element type(s) of the returned tensor(s)
         is_pure: if true, the compiler assumes the asm block has no side-effects
