@@ -1021,25 +1021,21 @@ def _scope_wait(
     state: frozenset[str],
     allocations: dict[str, int],
 ) -> None:
-    """Insert ``wait`` before the first statement of ``body`` that may touch
-    what it orders: one naming a tensor of ``covered`` (allocations) or the
-    schedule's ``state``, assigning what the wait reads, or making a call other
-    than a pure op or a load from a tensor argument plus pure index math."""
+    """Insert ``wait`` into ``body`` after the statements that need not follow
+    it, which keep their order.  A statement is independent of the wait unless
+    it names a tensor of ``covered`` (allocations) or the schedule's ``state``,
+    assigns what the wait reads, or makes a call other than a pure op or a load
+    through a ``_plain_address``.  Independent statements ahead of the first
+    dependent one precede the wait; a later independent assignment moves ahead
+    of it too, so its loads issue before the spin, unless a statement it would
+    pass is compound, defines a name it reads, names one it assigns, may write
+    memory it reads or orders memory (``_plain_write``)."""
     reads = _all_names(wait)
 
     def independent_call(call: ast.Call) -> bool:
         if not _is_tl_call(call, frozenset({"load"})):
             return _effect_kind(call) == "pure"
-        return bool(
-            call.args and _named_allocations(call.args[0], allocations)
-        ) and all(
-            _effect_kind(c) == "pure"
-            and not (
-                isinstance(c.func, ast.Attribute) and c.func.attr == "pointer_type"
-            )
-            for c in ast.walk(call.args[0])
-            if isinstance(c, ast.Call)
-        )
+        return bool(call.args) and _plain_address(call.args[0], allocations)
 
     def independent(statement: ast.stmt) -> bool:
         assigned = _stored_names([statement])
@@ -1053,8 +1049,75 @@ def _scope_wait(
             if isinstance(call, ast.Call)
         )
 
-    index = next((i for i, s in enumerate(body) if not independent(s)), len(body))
-    body[index:index] = wait
+    moved: list[ast.stmt] = []
+    kept: list[ast.stmt] = []
+    kept_stores: set[str] = set()
+    kept_names: set[str] = set()
+    # Allocations the kept statements may write; None: a write of unknown memory.
+    kept_writes: set[int] | None = set()
+    for statement in body:
+        names = _all_names([statement])
+        if independent(statement) and (
+            not kept
+            or (
+                isinstance(statement, ast.Assign)
+                and kept_writes is not None
+                and not names & kept_stores
+                and not _stored_names([statement]) & kept_names
+                and not _named_allocations(statement, allocations) & kept_writes
+            )
+        ):
+            moved.append(statement)
+            continue
+        kept.append(statement)
+        if not isinstance(statement, ast.Assign | ast.Expr):
+            # A loop's carried values are rebound after codegen, out of sight of
+            # its names here: nothing moves across a compound statement.
+            kept_writes = None
+            continue
+        kept_stores |= _stored_names([statement])
+        kept_names |= names
+        for call in ast.walk(statement):
+            if kept_writes is not None and isinstance(call, ast.Call):
+                written = _plain_write(call, allocations)
+                kept_writes = None if written is None else kept_writes | written
+    body[:] = [*moved, *wait, *kept]
+
+
+def _plain_address(address: ast.expr, allocations: dict[str, int]) -> bool:
+    """Whether ``address`` is a tensor argument plus pure index math: it names an
+    argument and no pointer loaded from a table (whose target no name shows)."""
+    return bool(_named_allocations(address, allocations)) and all(
+        _effect_kind(c) == "pure"
+        and not (isinstance(c.func, ast.Attribute) and c.func.attr == "pointer_type")
+        for c in ast.walk(address)
+        if isinstance(c, ast.Call)
+    )
+
+
+def _plain_write(call: ast.Call, allocations: dict[str, int]) -> set[int] | None:
+    """The allocations ``call`` may write when it orders nothing else: none for a
+    load (a volatile one is relaxed) or a pure op (a CTA barrier is one: it
+    orders only the CTA's own accesses, whose writes the caller tracks); its
+    address's for a store or relaxed atomic through a ``_plain_address``; None
+    for anything else that may write or order memory (an atomic with ordering,
+    inline asm, a helper, a store through any other address)."""
+    if not _may_write(call):
+        return set()
+    if not _is_tl_call(call, frozenset({"store", "store_tensor_descriptor"})) and not (
+        _is_tl_call(call, None)
+        and call.func.attr.startswith("atomic_")  # pyrefly: ignore [missing-attribute]
+        and any(
+            k.arg == "sem"
+            and isinstance(k.value, ast.Constant)
+            and k.value.value == "relaxed"
+            for k in call.keywords
+        )
+    ):
+        return None
+    if not (call.args and _plain_address(call.args[0], allocations)):
+        return None
+    return _named_allocations(call.args[0], allocations)
 
 
 def _bound_wait(device_function: DeviceFunction, call: str) -> ast.stmt:
@@ -3707,8 +3770,10 @@ def emit_cross_loop_schedule(
     def invariant_wait(
         root: int, plan: ReadinessCounterPlan, consumer: ReadinessConsumer
     ) -> bool:
-        """Whether ``root`` waits on ``plan`` once, before its task loop: the
-        counter is the same for every task."""
+        """Whether ``root`` may wait on ``plan`` once, before its task loop: the
+        counter is the same for every task (``static_root_body`` still scopes the
+        wait in the task when every task of an unguarded root has a worker of
+        its own)."""
         return (
             consumer.keys_by_consumer.is_total_function()
             and plan.readiness_key_domain.size == 1
@@ -5497,7 +5562,16 @@ def emit_cross_loop_schedule(
             f"{case_offsets[root]} + ({local_task})",
             task_arguments,
             # A hoisted wait would precede the deferred release it may need.
-            invariant_waits=None if root in deferred_releases else invariant_waits,
+            # When every task has a worker of its own, a worker runs at most one
+            # task: hoisting saves no repeated spin, so the wait is scoped in the
+            # task like a keyed one (the task's independent loads issue before
+            # it spins).  Not with a guarded extent: ``settled_tensors`` lets
+            # its hoisted loads read what an invariant wait orders, so the wait
+            # must precede the task loop.
+            invariant_waits=None
+            if root in deferred_releases
+            or (extent is None and active_worker_count == task_count_value)
+            else invariant_waits,
             barrier_waits=task_barriers,
             root_arrival=root_arrival,
         )

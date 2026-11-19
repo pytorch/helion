@@ -92,6 +92,38 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertIn("_helion_tensor_descriptor(", code)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    @skipIfRefEager("Test checks generated code")
+    def test_whole_tiles_short_of_dim_keep_tensor_descriptors(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            config=helion.Config(
+                block_sizes=[16, 16],
+                indexing="tensor_descriptor",
+                host_tensor_descriptors=True,
+            ),
+        )
+        def add_one_head(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+            for tile_m, tile_n in hl.tile([x.size(0) // 2, x.size(1)]):
+                out[tile_m, tile_n] = x[tile_m, tile_n] + 1
+            return out
+
+        # Whole tiles over the first half of 64 rows: no tile reaches past the
+        # loop's end, so the store keeps its tensor descriptor.  Over the first
+        # half of 40 rows the last tile (rows 16..31) is partial: a descriptor
+        # store would write rows 20..31, so it falls back to masked pointers.
+        for rows, descriptors in ((64, 2), (40, 1)):
+            x = torch.randn([rows, 32], device=DEVICE)
+            out = torch.zeros_like(x)
+            code, result = code_and_output(add_one_head, (x, out))
+            expected = torch.zeros_like(x)
+            expected[: rows // 2] = x[: rows // 2] + 1
+            torch.testing.assert_close(result, expected)
+            self.assertEqual(
+                code.count("_helion_tensor_descriptor("), descriptors, rows
+            )
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     @skipIfRefEager("Test checks bound kernel specialization cache")
     def test_host_tensor_descriptor_runtime_safety_classes(self):
         @helion.kernel(

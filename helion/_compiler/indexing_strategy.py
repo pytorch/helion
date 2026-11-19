@@ -3122,14 +3122,19 @@ class BlockedSubscriptIndexing:
         allow_descriptor_coordinates: bool = False,
         for_store: bool = False,
     ) -> bool:
-        def tile_ends_short(block_index: int, size: int | torch.SymInt) -> bool:
-            """Whether the tile's loop ends short of the dim it indexes.  The
-            block is only bounded by the dim, so a store would write past the
-            loop, and a load whose masked value matters would read data there
-            instead of 0."""
+        def tile_overruns_loop(block_index: int, size: int | torch.SymInt) -> bool:
+            """Whether a tile of the loop may reach past the loop's end into the
+            dim it indexes: the loop ends short of the dim and its tiles are not
+            all whole.  The block is only bounded by the dim, so a store would
+            write past the loop, and a load whose masked value matters would
+            read data there instead of 0."""
             loop_state = state.codegen.active_device_loops[block_index][-1]
             info = loop_state.block_id_to_info.get(block_index)
             if info is None:
+                return False
+            if state.codegen.mask_var(block_index) is None:
+                # The tile strategy proved every tile whole (the loop's extent
+                # is a multiple of the block size): it masks nothing.
                 return False
             if for_store:
                 return not info.is_end_matching_keyed(size)
@@ -3158,7 +3163,7 @@ class BlockedSubscriptIndexing:
                     state.codegen.offset_var(block_index)
                 except NotImplementedError:
                     return False
-                if tile_ends_short(block_index, input_size):
+                if tile_overruns_loop(block_index, input_size):
                     return False
             elif isinstance(k, torch.SymInt):
                 if (origin := _block_size_origin(k)) is not None:
@@ -3167,7 +3172,7 @@ class BlockedSubscriptIndexing:
                         state.codegen.offset_var(block_index)
                     except NotImplementedError:
                         return False
-                    if tile_ends_short(block_index, input_size):
+                    if tile_overruns_loop(block_index, input_size):
                         # TODO(jansel): a load could lower to block_ptr+tl.where
                         # see test/test_loops.py::TestLoops::test_data_dependent_bounds2
                         return False

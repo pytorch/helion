@@ -427,6 +427,8 @@ _INDEX_CASTS = (
     torch.ops.aten._to_copy.default,
 )
 _INDEX_DTYPES = (torch.int32, torch.int64)
+# Broadcasts of an index tensor (``x[None, :]`` may trace to unsqueeze).
+_BROADCASTS = (torch.ops.aten.unsqueeze.default, torch.ops.aten.expand.default)
 
 
 def _scalar_subscript_affine(
@@ -478,6 +480,8 @@ def _subscript_affine(
 
     Tensor chains step only through integer add/mul and value-preserving nodes;
     anything else is unknown (no block, offset ``None``), i.e. the whole dimension.
+    A broadcast tile index indexes its tile; a broadcast ``arange`` stays unknown
+    (its extent is the unbroadcast vector's).
     """
     if type(subscript) is int:
         return None, 1, subscript, True
@@ -488,6 +492,7 @@ def _subscript_affine(
         return _scalar_subscript_affine(env, host, value)
     scale = 1
     offset = 0
+    broadcast = False
     node: object = subscript
     while isinstance(node, torch.fx.Node):
         info = subscript_tile_info(env, node)
@@ -501,7 +506,12 @@ def _subscript_affine(
         args = node.args
         if target is torch.ops.prims.iota.default:
             start = node.kwargs.get("start", 0)
-            if scale == 1 and type(start) is int and node.kwargs.get("step", 1) == 1:
+            if (
+                scale == 1
+                and not broadcast
+                and type(start) is int
+                and node.kwargs.get("step", 1) == 1
+            ):
                 return None, 1, offset + start, False
             break
         if (
@@ -521,6 +531,9 @@ def _subscript_affine(
             else:
                 break
             node = operand
+        elif target in _BROADCASTS:
+            broadcast = True
+            node = args[0]
         elif (
             target is hl.tile_index
             or (target in _INDEX_CASTS and node.meta["val"].dtype in _INDEX_DTYPES)
