@@ -26,6 +26,10 @@ pytestmark = pytest.mark.cpu_only
 class _UpdateCachedArgument:
     path: str
     fail: bool
+    # The BenchmarkJob fields LocalBenchmarkProvider reads before it sends a job.
+    use_wall_clock: bool = False
+    trace_kernel_durations: bool = False
+    l2_flush_mode: str | None = None
 
     def __call__(self) -> float:
         (value,) = load_trusted_kernel_args(self.path)
