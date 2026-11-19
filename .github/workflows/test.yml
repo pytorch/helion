@@ -44,7 +44,8 @@ jobs:
           # the Triton build (fbtriton).
           # An entry with "shards": n expands into n jobs that set
           # shard-index/shard-count (HELION_TEST_SHARD=i/n in test/conftest.py).
-          PR="${{ github.event_name == 'pull_request' }}"
+          # DO NOT LAND: run main's whole matrix on this pull request too.
+          PR=false
           matrix=$(jq -c --argjson pr "$PR" '{include: [
               .include[]
               | select(($pr | not) or .pr != false)
@@ -436,7 +437,8 @@ jobs:
           fi
           # Pull requests skip the slow tier (fresh-interpreter replays, real
           # autotune searches); pushes to main run it.
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          # DO NOT LAND: run the slow tier on this pull request too.
+          if false; then
             MARK="${MARK:+($MARK) and }not slow"
           fi
           MARK_FLAGS=()
