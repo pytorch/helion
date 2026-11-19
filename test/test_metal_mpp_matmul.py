@@ -4254,7 +4254,7 @@ class TestMppMatmul(_MppCase):
                         rf"_helion_mpp_run\(\w+, 0, x, offset_\d+, m, m, {x.stride(0)}, ",
                     )
                     self.assertIn("spaces=[0, 1]", code)
-                    self.assertIn("('bfloat', 'bfloat')", code)
+                    self.assertIn("('bfloat', 'bfloat', 'float')", code)
 
     def test_runtime_outer_stride(self) -> None:
         """A view's batch stride left dynamic is read at run time."""
@@ -6759,7 +6759,8 @@ class TestMppRootAddmmRejects(_MppCase):
                     root_acc_like_out,
                     args,
                     config,
-                    "a matmul whose acc is not float32",
+                    f"operands whose acc is {dtype}; MPP accumulates them in "
+                    "torch.float32",
                 )
 
     def test_k_tile(self) -> None:
@@ -10180,6 +10181,85 @@ class TestMppBatched(unittest.TestCase):
         self._check(mm2_sum, (x, y, p, q), None, ref, mat, runs=2)
 
 
+@helion.kernel(**S)
+def i8_int_acc(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """int8 operands summed into an int32 acc over a K loop."""
+    m, k = x.size()
+    _, n = y.size()
+    out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.int32)
+        for tk in hl.tile(k):
+            acc = hl.dot(x[tm, tk], y[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@helion.kernel(**S)
+def i8_unpacked_nibbles(x: torch.Tensor, wq: torch.Tensor) -> torch.Tensor:
+    """int8 activations times 4-bit weights unpacked to int8 (element k is
+    nibble k % 2 of byte k // 2, less 8): a staged int8 operand."""
+    m, k = x.size()
+    n = wq.size(1)
+    out = torch.empty([m, n], dtype=torch.int32, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.int32)
+        for tk in hl.tile(k):
+            byte = wq[tk.index // 2, tn].to(torch.int32)
+            nib = (byte >> ((tk.index % 2) * 4)[:, None]) & 0xF
+            acc = hl.dot(x[tm, tk], (nib - 8).to(torch.int8), acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+@_requires_mps
+class TestMppInt8(_MppCase):
+    """int8 operands accumulate in int32 (matmul2d's int8_t x int8_t ->
+    int32_t), as device views or staged tiles, exactly; simdgroup_matrix
+    holds no integers, so the fragment lowering refuses them
+    (``fragment_mma.check_fragment_group``)."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+        # The full int8 range: a 16-deep K tile sums up to 2**18 per product.
+        self.x = torch.randint(-128, 128, (40, 96), dtype=torch.int8, device=DEVICE)
+        self.y = torch.randint(-128, 128, (96, 48), dtype=torch.int8, device=DEVICE)
+
+    def _exact(self, out: torch.Tensor, ref: torch.Tensor) -> None:
+        torch.testing.assert_close(out.cpu().double(), ref, rtol=0, atol=0)
+
+    def test_int_acc(self) -> None:
+        x, y = self.x, self.y
+        for config in (None, helion.Config(block_sizes=[32, 16, 64], num_warps=4)):
+            with self.subTest(config=config):
+                out, code, msl = _run(i8_int_acc, (x, y), config)
+                self._assert_mpp(code)
+                self.assertIn("tensor<device int8_t", msl)
+                self.assertIn("int8_t, extents", msl)
+                self.assertIn(", int>()", msl)
+                self.assertEqual(out.dtype, torch.int32)
+                self._exact(out, _mm(x, y))
+
+    def test_staged_operand(self) -> None:
+        x = self.x
+        wq = torch.randint(0, 256, (48, 48), dtype=torch.uint8, device=DEVICE)
+        out, code, _ = _run(i8_unpacked_nibbles, (x, wq), None)
+        self._assert_mpp(code)
+        w = wq.cpu().int()
+        nibbles = torch.stack([w & 0xF, w >> 4], dim=1).reshape(96, 48) - 8
+        self._exact(out, x.cpu().double() @ nibbles.double())
+
+    def test_fragment_config(self) -> None:
+        """Fragments refuse int8 operands, so under a fragment config the
+        kernel's hl.dot calls keep the scalar contraction."""
+        x, y = self.x, self.y
+        config = helion.Config(block_sizes=[32, 16, 32], metal_matmul="fragment")
+        out, code, _ = _run(i8_int_acc, (x, y), config)
+        self.assertIn("dot_product", code)
+        self.assertNotIn("_helion_mpp_run(", code)
+        self._exact(out, _mm(x, y))
+
+
 @_requires_mps
 class TestMppBatchedRejects(_MppCase):
     """Batched forms and matmuls with no acc that stay rejected."""
@@ -10239,7 +10319,7 @@ class TestMppBatchedRejects(_MppCase):
             bmm_bf16_out,
             (x.bfloat16(), y.bfloat16()),
             (None,),
-            "a matmul whose acc is not float32",
+            "MPP accumulates them in torch.float32",
         )
         self._rejects_at(
             dot_parts_3d,

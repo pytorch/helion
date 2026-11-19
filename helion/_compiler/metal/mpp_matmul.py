@@ -202,6 +202,9 @@ _BATCHED = (
 )
 _IOTA = torch.ops.prims.iota.default
 _DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+#: The operand dtypes of an op: float ones accumulate in float32, int8 in
+#: int32 (``matmul2d``'s ``int8_t x int8_t -> int32_t``).
+_OPERAND_DTYPES = (*_DTYPES, torch.int8)
 _INT_DTYPES = (torch.int8, torch.uint8, torch.int16, torch.int32, torch.int64)
 #: The ops that write a tensor: stores and atomics.
 WRITES = (
@@ -401,6 +404,11 @@ class MppGroup:
     #: Values staged as other groups' operands from this group's element
     #: loop, each to those matmuls (:func:`_link_element_staging`).
     stage_uses: dict[Node, set[Node]] = dataclasses.field(default_factory=dict)
+
+    @property
+    def acc_dtype(self) -> torch.dtype:
+        """The cooperative tensor's dtype: float32, or int32 for int8 operands."""
+        return acc_dtype(self.lhs.dtype)
 
 
 @dataclasses.dataclass
@@ -713,7 +721,7 @@ def _view(
     assert isinstance(tensor, torch.Tensor) and isinstance(value, torch.Tensor)
     if len(index) != tensor.ndim:
         raise _NotAView("an MPP view whose subscript does not index every tensor dim")
-    if tensor.dtype not in _DTYPES:
+    if tensor.dtype not in _OPERAND_DTYPES:
         raise metal_unsupported(f"an MPP operand of dtype {tensor.dtype}")
     positions: list[int] = []
     outer: list[tuple[int, Node | int]] = []
@@ -833,7 +841,7 @@ def _operand(
     except _NotAView:
         val = node.meta["val"]
         assert isinstance(val, torch.Tensor)
-        if val.dtype not in _DTYPES:
+        if val.dtype not in _OPERAND_DTYPES:
             raise metal_unsupported(f"an MPP operand of dtype {val.dtype}") from None
         positional_rebind.check_positional_merges(
             _producers(node, graphs), _STAGE_REBIND
@@ -960,7 +968,7 @@ def _plan_matmuls(
                 raise metal_unsupported(
                     "an hl.dot over a K held as per-thread parts with no acc"
                 )
-            if matmul.args[3] not in (None, torch.float32):
+            if not _exact_out(matmul):
                 raise metal_unsupported(
                     f"an hl.dot over per-thread parts with out_dtype={matmul.args[3]}"
                 )
@@ -1169,10 +1177,10 @@ def _dot_admissible(matmul: Node, dot_ks: set[int]) -> bool:
     within one op, and with no acc only over a ``:`` K.  An operand computed
     from a matmul's result and the planner's own rejections are
     :func:`_takes_dots`'s."""
-    lhs, rhs, acc, out_dtype = matmul.args[:4]
+    lhs, rhs, acc = matmul.args[:3]
     # The result takes the acc's dtype, so a float32 acc can still carry a
     # product rounded to another out_dtype.
-    if out_dtype not in (None, torch.float32):
+    if not _exact_out(matmul):
         return False
     lval, rval = _node(lhs).meta["val"], _node(rhs).meta["val"]
     env = CompileEnvironment.current()
@@ -1497,9 +1505,25 @@ def _mnk(matmul: Node, k_block: int) -> tuple[int, int, tuple[int, int], int | N
                 "a batched matmul whose acc's dims are not its batch, M and N "
                 "blocks in place"
             )
-    if out.dtype != torch.float32:
-        raise metal_unsupported("a matmul whose acc is not float32")
+    if out.dtype != acc_dtype(lval.dtype):
+        raise metal_unsupported(
+            f"a matmul of {lval.dtype} operands whose acc is {out.dtype}; MPP "
+            f"accumulates them in {acc_dtype(lval.dtype)}"
+        )
     return m, n, kdim, batch
+
+
+def acc_dtype(operand: torch.dtype) -> torch.dtype:
+    """The dtype an op over *operand* elements accumulates in."""
+    return torch.int32 if operand == torch.int8 else torch.float32
+
+
+def _exact_out(matmul: Node) -> bool:
+    """Whether the matmul's ``out_dtype`` is its op's accumulator dtype (or
+    unset): another would round each product."""
+    _, lhs, _ = matmul_operands(matmul)
+    out_dtype = matmul.args[3] if matmul.target is dot else None
+    return out_dtype in (None, acc_dtype(lhs.meta["val"].dtype))
 
 
 def _full_k(matmul: Node) -> int | None:
@@ -2692,8 +2716,13 @@ def _(state: CodegenState) -> ast.AST:
     cg = state.codegen
     blocks = (group.m_block, group.n_block)
     rows, cols = static_tile(cg, blocks)
-    buf = alloc_threadgroup_buffer("float", rows * cols, prefix="_mpp_seed")
-    _stage_writes(cg, buf, [state.ast_arg(0)], torch.float32, blocks, cols)
+    dtype = group.acc_dtype
+    buf = alloc_threadgroup_buffer(
+        CompileEnvironment.current().backend.dtype_str(dtype),
+        rows * cols,
+        prefix="_mpp_seed",
+    )
+    _stage_writes(cg, buf, [state.ast_arg(0)], dtype, blocks, cols)
     return _acc_expr(cg, group, None, buf)
 
 
@@ -2707,11 +2736,17 @@ def _(state: CodegenState) -> ast.AST:
     cg = state.codegen
     blocks = (group.m_block, group.n_block)
     rows, cols = static_tile(cg, blocks)
-    buf = alloc_threadgroup_buffer("float", rows * cols, prefix=MAT_TILE)
+    dtype = group.acc_dtype
+    buf = alloc_threadgroup_buffer(
+        CompileEnvironment.current().backend.dtype_str(dtype),
+        rows * cols,
+        prefix=MAT_TILE,
+    )
     coop = state.ast_arg(0)
     assert isinstance(coop, ast.Name)
     cg.add_statement(statement_from_string(f"{MAT}({coop.id}, {buf}, {cols})"))
-    return cg.lift(_tile_read(cg, buf, blocks, "0.0"), prefix="_mpp_v")
+    zero = "0.0" if dtype.is_floating_point else "0"
+    return cg.lift(_tile_read(cg, buf, blocks, zero), prefix="_mpp_v")
 
 
 @_decorators.codegen(_mpp_upd, "metal")
@@ -2818,9 +2853,16 @@ def _acc_expr(
             )
     binds = virtual_thread(cg, ((group.m_block, "_e_m"), (group.n_block, "_e_n")))
     dtype_str = CompileEnvironment.current().backend.dtype_str
-    dtypes = tuple(
-        dtype_str(torch.float32 if o.float_tile else o.dtype)
-        for o in (group.lhs, group.rhs)
+    # MSL's char is not int8_t (signed char), the only 8-bit integer type
+    # matmul2d takes; the walker casts each char pointer to it.
+    dtypes = (
+        *(
+            "int8_t"
+            if o.dtype == torch.int8
+            else dtype_str(torch.float32 if o.float_tile else o.dtype)
+            for o in (group.lhs, group.rhs)
+        ),
+        dtype_str(group.acc_dtype),
     )
     staged = [int(o.staged) for o in (group.lhs, group.rhs)]
     return expr_from_string(

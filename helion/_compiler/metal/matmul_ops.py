@@ -1,8 +1,10 @@
 """Metal-backend codegen for ``hl.dot`` outside an MPP region.
 
-``dot(a, b)[m, n] = sum_k f32(a[m, k]) * f32(b[k, n])``.  Each thread forms
-the product at its own ``(m, k, n)``, and K's own reduction strategy combines
-it, the way the scalar path lowers ``(a[:, :, None] * b[None]).sum(1)``.
+``dot(a, b)[m, n] = sum_k f32(a[m, k]) * f32(b[k, n])``, or the same sum in
+int32 for int8 operands, wrapping like ``tl.dot``'s int32 accumulator.  Each
+thread forms the product at its own ``(m, k, n)``, and K's own reduction
+strategy combines it, the way the scalar path lowers
+``(a[:, :, None] * b[None]).sum(1)``.
 Helion masks every ``hl.dot`` operand to 0 past each block's extent
 (``_mask_to``), so a K tail or a surplus K thread adds nothing.
 
@@ -91,10 +93,17 @@ def _(state: CodegenState) -> ast.AST:
     out = state.fx_node.meta["val"]
     if lhs.ndim != 2 or rhs.ndim != 2:
         raise _unsupported("batched (3-D) hl.dot outside an MPP region")
-    if any(t.dtype not in _FLOAT_DTYPES for t in (lhs, rhs, out)):
+    if all(t.dtype in _FLOAT_DTYPES for t in (lhs, rhs, out)):
+        compute = torch.float32
+    elif lhs.dtype == rhs.dtype == torch.int8 and out.dtype == torch.int32:
+        # An int8 product fits int32 exactly; the sums wrap past K ~ 2**17,
+        # as tl.dot's int32 accumulator does.
+        compute = torch.int32
+    else:
         raise _unsupported(
             f"hl.dot of {lhs.dtype} x {rhs.dtype} -> {out.dtype} outside an MPP "
-            "region; only float16, bfloat16 and float32 are supported"
+            "region; only float16, bfloat16 and float32, or int8 to int32, are "
+            "supported"
         )
     if acc is not None and out_dtype is not None and out_dtype != acc.dtype:
         # Triton rounds the product sum to out_dtype before adding acc.
@@ -123,11 +132,10 @@ def _(state: CodegenState) -> ast.AST:
             "index per block, so it would only cover their diagonal"
         )
 
-    f32 = torch.float32
     result = expr_from_string(
         "{lhs} * {rhs}",
-        lhs=backend.cast_ast(state.ast_arg(0), f32),
-        rhs=backend.cast_ast(state.ast_arg(1), f32),
+        lhs=backend.cast_ast(state.ast_arg(0), compute),
+        rhs=backend.cast_ast(state.ast_arg(1), compute),
     )
     if k_block is not None:
         if env.block_sizes[k_block].reduction:
@@ -148,14 +156,14 @@ def _(state: CodegenState) -> ast.AST:
             # would keep one lane's partial.
             strategy.fold_lanes()
         product = state.codegen.lift(result, dce=True, prefix="dot_product").id
-        fake_product = lhs.to(f32).unsqueeze(-1) * rhs.to(f32).unsqueeze(-3)
+        fake_product = lhs.to(compute).unsqueeze(-1) * rhs.to(compute).unsqueeze(-3)
         result = strategy.codegen_reduction(
-            state, product, "sum", 1, fake_product, fake_product.sum(1)
+            state, product, "sum", 1, fake_product, fake_product.sum(1, dtype=compute)
         )
     if acc is not None:
         result = expr_from_string(
             "{acc} + {result}",
-            acc=backend.cast_ast(state.ast_arg(2), f32),
+            acc=backend.cast_ast(state.ast_arg(2), compute),
             result=result,
         )
     # The node's dtype is out_dtype, or the acc's dtype when there is an acc.

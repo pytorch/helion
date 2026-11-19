@@ -71,8 +71,9 @@ class EmitState:
     _enclosing: list[set[str]] = dataclasses.field(default_factory=list)
     #: Each MPP cooperative tensor's name, or a reference alias's, to its root.
     coop: dict[str, str] = dataclasses.field(default_factory=dict)
-    #: Each cooperative root's MPP group id and its lhs and rhs element types.
-    coop_group: dict[str, tuple[int, tuple[str, str]]] = dataclasses.field(
+    #: Each cooperative root's MPP group id and its lhs, rhs and acc element
+    #: types.
+    coop_group: dict[str, tuple[int, tuple[str, str, str]]] = dataclasses.field(
         default_factory=dict
     )
     #: Each cooperative root's M and N blocks.
@@ -358,7 +359,7 @@ def _emit_coop_acc(
     desc = f"_mpp_desc_{gid}"
     lhs_space = "threadgroup" if lhs_staged else "device"
     rhs_space = "threadgroup" if rhs_staged else "device"
-    lhs_dtype, rhs_dtype = dtypes
+    lhs_dtype, rhs_dtype, acc_dtype = dtypes
     lhs = f"tensor<{lhs_space} {lhs_dtype}, extents<int32_t, {lhs_extents}>, tensor_inline>"
     rhs = f"tensor<{rhs_space} {rhs_dtype}, extents<int32_t, {rhs_extents}>, tensor_inline>"
     parts.extend(
@@ -370,14 +371,15 @@ def _emit_coop_acc(
             f"{pad}matmul2d<{desc}, execution_simdgroups<{scope}>> _mpp_op_{gid};",
             (
                 f"{pad}auto {name} = _mpp_op_{gid}.get_destination_cooperative_tensor<"
-                f"{lhs}, {rhs}, float>();"
+                f"{lhs}, {rhs}, {acc_dtype}>();"
             ),
         ]
     )
     if seed is None:
+        value = f"{float(fill)!r}f" if acc_dtype == "float" else repr(int(fill))
         parts.append(
             f"{pad}for (auto _it = {name}.begin(); _it != {name}.end(); _it++) "
-            f"*_it = {float(fill)!r}f;"
+            f"*_it = {value};"
         )
     else:
         # The staged seed (``mpp_matmul``'s ``_mpp_coop``): every thread's
@@ -495,7 +497,7 @@ def _coop_view(
         decls.append(f"long {xv} = (long)({idx});")
         live.append(f"0 <= {xv} && {xv} < (long)({size})")
         terms.append(f"{xv} * {stride}")
-    base = f"{ptr} + ({' + '.join(terms)})"
+    base = _typed(f"{ptr} + ({' + '.join(terms)})", "device", dtype)
     # Handle dims are innermost first.
     if strides[1] == "1":
         dims, handle_strides = f"{extents[1]}, {extents[0]}", f"1, {strides[0]}"
@@ -508,6 +510,14 @@ def _coop_view(
         f"metal::array<int32_t, 2>({{{handle_strides}}}));"
     )
     return decls, live, handle
+
+
+def _typed(pointer: str, space: str, dtype: str) -> str:
+    """*pointer* as a pointer to the op's element type: an int8 tensor's
+    ``char`` pointer cast to ``int8_t``, which MSL keeps distinct."""
+    if dtype == "int8_t":
+        return f"({space} int8_t*)({pointer})"
+    return pointer
 
 
 def _staged_view(
@@ -529,7 +539,8 @@ def _staged_view(
     rows, cols = blocks
     return (
         f"auto {var} = tensor<threadgroup {dtype}, dextents<int32_t, 2>, tensor_inline>("
-        f"{_ast_expr_to_msl(args[0])}, dextents<int32_t, 2>({extent(args[6], cols)}, "
+        f"{_typed(_ast_expr_to_msl(args[0]), 'threadgroup', dtype)}, "
+        f"dextents<int32_t, 2>({extent(args[6], cols)}, "
         f"{extent(args[2], rows)}), metal::array<int32_t, 2>({{1, {cols}}}));"
     )
 
