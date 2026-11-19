@@ -13,7 +13,8 @@ into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against one or more named
-reference baselines.
+reference baselines, except the Qwen3.5 TP4 verify megakernels, which have
+`check` and `bench` scripts instead (below).
 
 ## File structure
 
@@ -57,6 +58,9 @@ pretuned_kernels/
     ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE
     ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4
     ├── deepseek_v3_attention_nvfp4_tp/
+    ├── qwen3_5_moe_tp4/              # Qwen3.5-397B NVFP4 MoE (+ the next GDN mixer), TP4 verify
+    ├── qwen3_5_gdn_tp4/              # Qwen3.5 Gated-DeltaNet mixer, TP4 verify
+    ├── qwen3_5_attn_tp4/             # Qwen3.5 full-attention mixer, TP4 verify
     └── muse_spark/
 ```
 
@@ -138,6 +142,24 @@ activation scales, so the comparison is not instruction-for-instruction.
 The model-region benchmarks measure each captured implementation sequentially,
 with a fresh thermal warmup and cold-L2 samples, so one implementation's graph
 does not perturb the other's measurement.
+
+The Qwen3.5-397B-A17B TP4 speculative-verify megakernels (one request, a window
+of T <= 8 tokens; native Gluon kernels) cover a decoder layer's MoE
+(`qwen3_5_moe_tp4`), Gated-DeltaNet mixer (`qwen3_5_gdn_mixer_tp4`) and
+full-attention mixer (`qwen3_5_attn_mixer_tp4`), each ending in the
+tensor-parallel all-reduce, the residual add and the next RMSNorm, and
+`qwen3_5_layer_tp4`: a layer's MoE and the next layer's GDN mixer in one launch,
+bit-identical to the two standalone kernels. They read SGLang's served layouts
+(FlashInfer trtllm-gen NVFP4 experts, ModelOpt FP8 projections, FP8 paged KV
+cache) and run on four SM100 GPUs with NVSHMEM symmetric memory. Instead of a
+`main()`, each directory has scripts, run as `torchrun --nproc-per-node=4 -m
+pretuned_kernels.megakernels.<directory>.<script>`: `check` (the MoE against a
+PyTorch reference; the mixers against SGLang's own kernels, stage by stage),
+`bench` (the MoE) and `check --bench-only` (the mixers, beside SGLang's stock
+sequence without the all-reduce), `layer_bench --check` / `--bench` (the merged
+kernel against the two standalone ones), and, on one GPU with a fake process
+group, `compile_only` / `layer_compile` (code generation; `--warm` also
+compiles).
 
 The kernels ported from vLLM (`vllm/kernels/helion/ops`) benchmark each fused
 Helion kernel under CUDA graphs against a torch-native (unfused, eager)

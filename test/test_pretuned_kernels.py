@@ -11,6 +11,7 @@ import importlib.util
 import inspect
 import math
 import os
+import re
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessGluon
 from helion._testing import slowIfBackends
 
 if TYPE_CHECKING:
@@ -386,6 +388,112 @@ def test_deepseek_v3_tp_megakernels_compile() -> None:
         dist.destroy_process_group()
 
 
+# The tensors the Qwen3.5 TP4 megakernels stream through the Gluon ring.  Their
+# configs pick pointer or tensor-descriptor indexing by access position
+# (_POINTER_OPS), so a kernel or compiler change that renumbers the accesses
+# would silently move the ring to other tensors.
+_QWEN3_5_TP4_RING_TENSORS = {
+    "qwen3_5_moe_tp4": [
+        "activation_q",
+        "activation_scale",
+        "hidden_chunked",
+        "input_fp8_chunked",
+        "input_q_steps",
+        "input_scale_steps",
+        "router_weight_chunked",
+        "shared_act",
+        "shared_w13_chunked",
+        "shared_w2",
+        "w13_scale",
+        "w13_view",
+        "w2_rows",
+        "w2_scale_rows",
+    ],
+    "qwen3_5_gdn_mixer_tp4": [
+        "attn_fp8",
+        "ba_weight",
+        "hidden_chunked",
+        "hidden_chunked",
+        "hidden_states",
+        "ip_weight",
+        "ip_weight",
+        "norm_partial",
+        "out_proj_weight",
+        "residual",
+        "z_gate4",
+    ],
+    "qwen3_5_attn_mixer_tp4": [
+        "att_grp",
+        "attn_fp8_chunked",
+        "hidden_chunked",
+        "hidden_chunked",
+        "hidden_chunked",
+        "kv_pages",
+        "op_weight_chunked",
+        "qg_weight",
+        "qg_weight",
+    ],
+    "qwen3_5_layer_tp4": [
+        "activation_q",
+        "activation_scale",
+        "ba_weight",
+        "hidden_chunked",
+        "input_fp8_chunked",
+        "input_q_steps",
+        "input_scale_steps",
+        "mx_attn_fp8",
+        "mx_ip_input",
+        "mx_ip_input",
+        "mx_ip_weight",
+        "mx_ip_weight",
+        "out_proj_weight",
+        "output",
+        "router_weight_chunked",
+        "shared_act",
+        "shared_w13_chunked",
+        "shared_w2",
+        "w13_scale",
+        "w13_view",
+        "w2_rows",
+        "w2_scale_rows",
+    ],
+}
+
+
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.parametrize("name", sorted(_QWEN3_5_TP4_RING_TENSORS))
+def test_qwen3_5_tp4_megakernels_ring_operands(name: str) -> None:
+    # Code generation on uninitialized inputs, a fake TP4 group for the peers.
+    from pretuned_kernels.megakernels.qwen3_5_attn_tp4 import compile_only as attn
+    from pretuned_kernels.megakernels.qwen3_5_gdn_tp4 import compile_only as gdn
+    from pretuned_kernels.megakernels.qwen3_5_moe_tp4 import compile_only as moe
+    from pretuned_kernels.megakernels.qwen3_5_moe_tp4 import layer_compile
+
+    package = {
+        "qwen3_5_moe_tp4": "qwen3_5_moe_tp4",
+        "qwen3_5_layer_tp4": "qwen3_5_moe_tp4",
+        "qwen3_5_gdn_mixer_tp4": "qwen3_5_gdn_tp4",
+        "qwen3_5_attn_mixer_tp4": "qwen3_5_attn_tp4",
+    }[name]
+    module = importlib.import_module(f"pretuned_kernels.megakernels.{package}.{name}")
+    kernel = getattr(module, name)
+    with moe.fake_group() as group_name:
+        if name == "qwen3_5_layer_tp4":
+            args = layer_compile.fake_layer_args(module, DEVICE, group_name)
+        else:
+            make_args = {
+                "qwen3_5_moe_tp4": moe.moe_args,
+                "qwen3_5_gdn_mixer_tp4": gdn.mixer_args,
+                "qwen3_5_attn_mixer_tp4": attn.mixer_args,
+            }[name]
+            args = make_args(DEVICE, group_name)
+        code = kernel.bind(args).to_triton_code(kernel.configs[0])
+    ring = sorted(re.findall(r"ring_descriptor\((\w+),", code))
+    assert ring == _QWEN3_5_TP4_RING_TENSORS[name]
+
+
 @skipIfRefEager("tile dependencies are built only in compiled mode")
 @skipIfNotTriton("the TP4 megakernels are pinned to backend='triton'")
 def test_muse_spark_tp4_megakernels_compile() -> None:
@@ -612,6 +720,51 @@ def test_muse_spark_megakernels_check_on_four_ranks(name: str) -> None:
             "--nproc-per-node=4",
             str(PRETUNED_KERNELS_DIR / "megakernels" / "muse_spark" / f"{name}.py"),
             "--check",
+        ],
+        env={
+            **os.environ,
+            "PYTHONPATH": str(PRETUNED_KERNELS_DIR.parent),
+            "NVSHMEM_DISABLE_CUDA_VMM": "1",
+        },
+        check=True,
+    )
+
+
+@pytest.mark.slow
+@skipIfRefEager("Pretuned kernels use AOT; ref-eager bypasses heuristic logic.")
+@skipIfNotTriton("the gluon tests run in the triton lane")
+@skipUnlessGluon()
+@pytest.mark.timeout(1800)
+@pytest.mark.parametrize(
+    ("module", "args"),
+    [
+        ("qwen3_5_moe_tp4.check", ()),
+        ("qwen3_5_moe_tp4.layer_bench", ("--check",)),
+        ("qwen3_5_gdn_tp4.check", ()),
+        ("qwen3_5_attn_tp4.check", ()),
+    ],
+)
+def test_qwen3_5_tp4_megakernel_checks_on_four_ranks(
+    module: str, args: tuple[str, ...]
+) -> None:
+    # Each check exits non-zero when a rank fails.
+    _require_four_sm100_gpus()
+    if _under_xdist():
+        pytest.skip("four-rank runs need every local GPU")
+    if module.startswith(("qwen3_5_gdn", "qwen3_5_attn")) and not (
+        importlib.util.find_spec("sglang") and importlib.util.find_spec("flashinfer")
+    ):
+        pytest.skip("the mixer checks compare with SGLang's and FlashInfer's kernels")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc-per-node=4",
+            "-m",
+            f"pretuned_kernels.megakernels.{module}",
+            *args,
         ],
         env={
             **os.environ,
