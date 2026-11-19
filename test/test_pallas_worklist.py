@@ -3501,6 +3501,42 @@ class TestCompactWindowSpec(unittest.TestCase):
         self.assertEqual(int(sliced.start), 1000)
         self.assertEqual(int(sliced.size), window)
 
+    def test_aligned_windows_tile_the_rows(self):
+        """In-kernel worklist windows start on a sublane row and hold the
+        tile in at most one block. Output windows end at the tile's last
+        full sublane tile (the ordered carry writes the partial one with the
+        next work item), except the last, so the write-backs are disjoint and
+        cover every row once."""
+        import jax.numpy as jnp
+
+        from helion.runtime.pallas.launcher import _compact_aligned_window_block_spec
+
+        rows, block, sublane = 61, 32, 16
+        # fill_owner_tiles' work items for owners of 5, 40 and 16 rows.
+        starts = jnp.asarray([0, 5, 32, 45], jnp.int32)
+        extents = jnp.asarray([5, 27, 13, 16], jnp.int32)
+        num_work = jnp.asarray([4], jnp.int32)
+        t = torch.zeros(rows, 8)
+        load = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, None
+        )
+        store = _compact_aligned_window_block_spec(
+            t, block, sublane, starts, extents, num_work
+        )
+        stored = []
+        for wid in range(4):
+            start = int(starts[wid])
+            end = start + int(extents[wid])
+            window = load.index_map(wid)[0]
+            lo, size = int(window.start), int(window.size)
+            self.assertEqual(lo, start - start % sublane)
+            self.assertEqual(lo + size, min(-(-end // sublane) * sublane, rows))
+            self.assertLessEqual(size, block)
+            window = store.index_map(wid)[0]
+            lo, size = int(window.start), int(window.size)
+            stored.extend(range(lo, lo + size))
+        self.assertEqual(stored, list(range(rows)))
+
 
 @onlyBackends(["pallas"])
 class TestZeroRowResidentPadding(unittest.TestCase):

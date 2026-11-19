@@ -315,8 +315,8 @@ def default_pallas_jax_launcher(
     underlying ``_jax_arr`` is either a concrete JAX array or a JAX
     tracer.  This launcher pulls the JAX side out, calls the shared
     ``_pallas_compile_jit_fn`` (or the compact-worklist variant when
-    ``_compact_build_worklist`` is present) to build a fresh
-    ``pl.pallas_call``, invokes it on the JAX inputs, and re-wraps the
+    ``_compact_build_worklist`` or ``_compact_fill_worklist`` is present) to
+    build a fresh ``pl.pallas_call``, invokes it on the JAX inputs, and re-wraps the
     output(s) as ``_JaxExportTensor`` so the Helion wrapper's trailing
     reshape/view operations stay traceable.
     """
@@ -362,15 +362,20 @@ def default_pallas_jax_launcher(
     core_args = tuple(_tensor_arg_to_jax(a) for a in args)
 
     # Compact-worklist kernels are discriminated by ``_compact_build_worklist``
-    # (emitted by codegen only for that lowering). Resident caching note: on this
-    # jit path the window IS applied but the host overflow guard is NOT run (the
-    # offsets are jit tracers, so a per-source range > window C cannot be checked
-    # at trace time); the caller must ensure every ordered range <= C.
+    # or ``_compact_fill_worklist`` (emitted by codegen only for that lowering).
+    # Resident caching note: on this jit path the window IS applied but the host
+    # overflow guard is NOT run (the offsets are jit tracers, so a per-source
+    # range > window C cannot be checked at trace time); the caller must ensure
+    # every ordered range <= C.
     compact_build_worklist = kwargs.get("_compact_build_worklist")
+    compact_fill_worklist = kwargs.get("_compact_fill_worklist")
     compact: dict[str, object] | None = None
-    if compact_build_worklist is not None:
+    if compact_build_worklist is not None or compact_fill_worklist is not None:
         compact = {
             "build_worklist": compact_build_worklist,
+            "fill_worklist": compact_fill_worklist,
+            "upper": kwargs.get("_compact_upper", 0),
+            "sublane": kwargs.get("_compact_sublane", 0),
             "offset_arg_indices": kwargs.get("_compact_offset_arg_indices") or [],
             "metadata_fields": kwargs.get("_compact_metadata_fields") or [],
             "owner_ref_pos": kwargs.get("_compact_owner_ref_pos", 0),
