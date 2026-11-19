@@ -1794,6 +1794,8 @@ def _pallas_pl_kernel_jit_fn(
         def interpret_kernel_body(*refs: object) -> None:
             io_any = refs[:n_io]
             scratch_refs = refs[n_io:]
+            for out_pos, in_pos in hbm_alias_input_by_output.items():
+                pltpu.sync_copy(io_any[in_pos], io_any[n_inputs + out_pos])  # type: ignore[union-attr]
             pipe_any = [io_any[p] for p in pipe_positions]
 
             def pipeline_body(*block_refs: object) -> None:

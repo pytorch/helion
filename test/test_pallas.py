@@ -7317,7 +7317,6 @@ class TestPallas(TestCase):
         self.assertIn(nested_update, code)
         self.assertLess(code.index(load), code.index(nested_update))
 
-    @xfailIfPallasInterpret("numerical mismatch in JAX interpret mode")
     def test_dma_buffer_offset_nested_tile(self) -> None:
         """Inner loop reading outer-tiled tensor must use ':' not absolute offset."""
         outer_in_inner = self._dma_buffer_offset_nested_tile_kernel()
