@@ -612,3 +612,35 @@ def test_fresh_selection_respects_the_evaluated_custom_key():
         assert second._config["factor"] == 3
         assert tune.call_count == 2
         assert state["calls"] == 3
+
+
+@pytest.mark.parametrize(
+    ("settings", "configs", "force", "kind"),
+    [
+        ({"autotune_effort": "none"}, (), False, "default"),
+        ({"autotune_effort": "none", "force_autotune": True}, (1,), False, "default"),
+        ({}, (1,), False, "given"),
+        ({"force_autotune": True}, (1,), False, None),
+        ({}, (), False, None),
+        ({}, (1, 2), False, None),
+        # Backend.autotune's force argument, as force_autotune.
+        ({}, (1,), True, None),
+        ({"autotune_effort": "none"}, (1,), True, "default"),
+    ],
+)
+def test_fixed_config_kind(
+    settings: dict[str, object],
+    configs: tuple[int, ...],
+    force: bool,
+    kind: str | None,
+) -> None:
+    """Calls take the default config under autotune_effort="none" (without
+    configs, or when forced), the one config given (unless forced), or
+    search."""
+
+    def fn(x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    given = [helion.Config(block_sizes=[16 * c]) for c in configs]
+    kernel = helion.kernel(configs=given, **settings)(fn)
+    assert kernel._fixed_config_kind(force=force) == kind

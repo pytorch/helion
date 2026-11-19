@@ -151,7 +151,12 @@ def test_backend_disabled_handoff_supports_custom_autotuners(
         autotune_log_details=True,
         force_autotune=False,
     )
-    bound = SimpleNamespace(settings=settings, kernel=SimpleNamespace(configs=[]))
+    # No fixed config (Backend.autotune asks _fixed_config): this one searches.
+    bound = SimpleNamespace(
+        settings=settings,
+        kernel=SimpleNamespace(configs=[]),
+        _fixed_config=lambda force=False: None,
+    )
     backend = SimpleNamespace(supports_precompile=lambda: True)
     automatic = Mock(side_effect=AssertionError("handoff is disabled"))
     monkeypatch.setattr(pipeline, "autotune_with_handoff", automatic)
