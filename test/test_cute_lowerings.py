@@ -1850,7 +1850,7 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                    device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
                 ),
             ),
             patch(
@@ -1896,7 +1896,7 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                    device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
                 ),
             ),
             patch(
@@ -13577,7 +13577,7 @@ class TestCuteLowerings(unittest.TestCase):
         with patch(
             "helion._compiler.host_function.HostFunction.current",
             return_value=SimpleNamespace(
-                device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
             ),
         ):
             self.assertTrue(_loop_contains_matmul(fn, [0, 1]))
@@ -13619,7 +13619,7 @@ class TestCuteLowerings(unittest.TestCase):
             patch(
                 "helion._compiler.host_function.HostFunction.current",
                 return_value=SimpleNamespace(
-                    device_ir=SimpleNamespace(grid_block_ids=[[0, 1]])
+                    device_ir=SimpleNamespace(root_ids=[0], grid_block_ids=[[0, 1]])
                 ),
             ),
             patch(
