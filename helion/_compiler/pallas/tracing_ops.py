@@ -253,6 +253,9 @@ def _(state: CodegenState) -> object:
             assert plan is not None
             if plan.grouping == 2:
                 return _codegen_grouped_compact_tile(state)
+        elif _is_compact_static_inner_loop(state):
+            # pyrefly: ignore[bad-return]
+            return state.get_graph(state.proxy_arg(0)).codegen(state)
         return _codegen_fori_loop(state)
     if pallas_loop_type == "emit_pipeline":
         return _codegen_emit_pipeline(state)
@@ -289,6 +292,9 @@ def _(state: CodegenState) -> None:
             if plan.grouping == 2:
                 _codegen_grouped_compact_tile(state)
                 return None
+        elif _is_compact_static_inner_loop(state):
+            # pyrefly: ignore[bad-return]
+            return state.get_graph(state.proxy_arg(0)).codegen(state)
         _codegen_fori_loop(state)
         return None
     if pallas_loop_type == "emit_pipeline":
@@ -1302,6 +1308,25 @@ def _is_compact_tile_loop(state: CodegenState) -> bool:
         return False
     args = state.proxy_args[-1]
     return isinstance(args, list) and not _loop_carried_indices(state, len(args))
+
+
+def _is_compact_static_inner_loop(state: CodegenState) -> bool:
+    """True for a static loop nested in the compact tile (``plan.static_inner_loops``).
+
+    Its operands are whole VMEM blocks of the work-item pipeline (the compact
+    windows and the owner-indexed blocks), so it runs as a plain static loop
+    over them instead of streaming them with its own DMA.
+    """
+    from ..device_ir import ForLoopGraphInfo
+
+    plan = CompileEnvironment.current().compact_worklist_plan
+    if plan is None or not plan.static_inner_loops:
+        return False
+    graph_info = state.get_graph(state.proxy_arg(0))
+    return (
+        isinstance(graph_info, ForLoopGraphInfo)
+        and plan.compact_axis.block_id not in graph_info.block_ids
+    )
 
 
 @contextlib.contextmanager

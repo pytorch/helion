@@ -744,6 +744,36 @@ def _four_dim_non_ordered_permute_kernel(q, k, q_offsets):
     return out
 
 
+# A grouped GEMM, out[s:e] = lhs[s:e] @ rhs[g] per group: both inner tile loops
+# have static bounds.
+@helion.kernel(backend="pallas", static_shapes=True)
+def _grouped_gemm_kernel(lhs, rhs, offsets):
+    M, K = lhs.size()
+    G, _, N = rhs.size()
+    out = torch.empty(M, N, dtype=lhs.dtype, device=lhs.device)
+    for g in hl.grid(G):
+        s = offsets[g]
+        e = offsets[g + 1]
+        for tile_m in hl.tile(s, e):
+            for tile_n in hl.tile(0, N):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(0, K):
+                    acc = acc + torch.matmul(
+                        lhs[tile_m, tile_k], rhs[g, tile_k, tile_n]
+                    )
+                out[tile_m, tile_n] = acc.to(out.dtype)
+    return out
+
+
+def _eager_grouped_gemm(lhs, rhs, offsets):
+    """Rows ``[0, offsets[-1])`` of the grouped GEMM (later rows are undefined)."""
+    out = torch.empty(int(offsets[-1]), rhs.shape[2], dtype=lhs.dtype)
+    for g in range(rhs.shape[0]):
+        s, e = int(offsets[g]), int(offsets[g + 1])
+        out[s:e] = (lhs[s:e].float() @ rhs[g].float()).to(lhs.dtype)
+    return out
+
+
 def _offsets(lengths):
     lengths = torch.tensor(lengths, dtype=torch.int32)
     return torch.cat(
@@ -1635,6 +1665,133 @@ class TestWorklistConfig(unittest.TestCase):
                     pallas_worklist_grouping=0,
                 )
             )
+
+
+@onlyBackends(["pallas"])
+class TestStaticInnerLoopWorklist(unittest.TestCase):
+    """A compact tile holding only static inner loops (a grouped GEMM).
+
+    With ``pallas_worklist_grouping=1`` and ``pallas_loop_type='unroll'`` the
+    kernel fills its worklist in SMEM (``_fill_worklist``) and the launcher
+    slices the compact tensors at sublane-aligned rows. Runs on CPU:
+    ``kernel.bind`` traces with fake tensors.
+    """
+
+    def _bound(self, dtype=torch.bfloat16):
+        offsets = _offsets([5, 0, 20, 7])
+        args = (
+            torch.randn(int(offsets[-1]), 128, dtype=dtype),
+            torch.randn(4, 128, 256, dtype=dtype),
+            offsets,
+        )
+        return _grouped_gemm_kernel.bind(args)
+
+    def test_detects_static_inner_loops(self):
+        bound = self._bound()
+        with bound.env:
+            plan = detect_compact_worklist_plan(bound.host_function)
+        self.assertTrue(plan.static_inner_loops)
+        self.assertIsNone(plan.ordered_axis)
+        # The owner count comes from rhs.size() and folds to a literal.
+        self.assertEqual(plan.num_owners_expr, "4")
+
+        # No inner loop, or an ordered (jagged) one, does not set static_inner_loops.
+        qo = _offsets([16, 16])
+        lq = int(qo[-1])
+        q = torch.randn(lq, 2, 8)
+        kv = torch.randn(2, 16, 2, 8)
+        jagged = torch.randn(lq, 2, 8)
+        for kernel, args in (
+            (_dense_kv_kernel, (q, kv, kv, qo)),
+            (_fully_jagged_kernel, (q, jagged, jagged, qo, qo)),
+        ):
+            with self.subTest(kernel=kernel.fn.__name__):
+                other = kernel.bind(args)
+                with other.env:
+                    plan = detect_compact_worklist_plan(other.host_function)
+                self.assertFalse(plan.static_inner_loops)
+
+    def test_worklist_is_filled_in_kernel(self):
+        bound = self._bound()
+        config = _worklist_config([32, 256, 128])
+        code = bound.to_triton_code(config)
+        self.assertIn("def _fill_worklist(", code)
+        self.assertIn("_compact_fill_worklist=_fill_worklist", code)
+        self.assertNotIn("_compact_build_worklist=", code)
+        # bf16 rows tile in 16-row sublane groups.
+        self.assertIn("_compact_sublane=16", code)
+        self.assertIn(
+            "from helion.runtime.pallas.compact_worklist import fill_owner_tiles", code
+        )
+        ast.parse(code)
+        free = bound.to_code(
+            config, options=helion.OutputCodeOptions(allow_helion_deps=False)
+        )
+        self.assertIn("def fill_owner_tiles(", free)
+        self.assertNotIn("import helion", free)
+        ast.parse(free)
+
+        # Other loop types keep the per-owner grid; grouping=2 is rejected.
+        for loop_type in ("fori_loop", "emit_pipeline"):
+            with self.subTest(loop_type=loop_type):
+                other = bound.to_triton_code(
+                    _worklist_config([32, 256, 128], loop_type=loop_type)
+                )
+                self.assertIn("_launcher(_helion__grouped_gemm_kernel, (4,),", other)
+                self.assertNotIn("_compact_", other)
+        with self.assertRaisesRegex(
+            exc.InvalidConfig, "requires static inner-loop bounds"
+        ):
+            bound.to_triton_code(_worklist_config([32, 256, 128], grouping=2))
+
+    def test_sublane_follows_the_dtype(self):
+        code = self._bound(torch.float32).to_triton_code(
+            _worklist_config([32, 256, 128])
+        )
+        self.assertIn("_compact_sublane=8", code)
+
+    def test_block_must_be_a_multiple_of_the_sublane(self):
+        with self.assertRaisesRegex(exc.InvalidConfig, "multiple of the sublane 16"):
+            self._bound().to_triton_code(_worklist_config([8, 256, 128]))
+
+
+@skipUnlessPallas("compact worklist numerics need Pallas TPU")
+class TestStaticInnerLoopNumerics(unittest.TestCase):
+    """The in-kernel worklist's grouped GEMM matches eager.
+
+    Compares rows ``[0, offsets[-1])`` only: later rows are undefined. A
+    single K tile keeps the kernel's per-tile bf16 matmul rounding equal to
+    the reference's.
+    """
+
+    def _check(self, lengths, *, extra_rows=0):
+        offsets = _offsets(lengths)
+        total = int(offsets[-1])
+        torch.manual_seed(0)
+        lhs = torch.randn(total + extra_rows, 128, dtype=torch.bfloat16)
+        rhs = torch.randn(len(lengths), 128, 256, dtype=torch.bfloat16)
+        ref = _eager_grouped_gemm(lhs, rhs, offsets)
+        args = (lhs.to(DEVICE), rhs.to(DEVICE), offsets.to(DEVICE))
+        for block in (16, 32):
+            with self.subTest(block=block):
+                code, out = code_and_output(
+                    _grouped_gemm_kernel, args, **_worklist_config([block, 256, 128])
+                )
+                self.assertIn("_compact_fill_worklist=_fill_worklist", code)
+                torch.testing.assert_close(out[:total].cpu(), ref, rtol=2e-2, atol=2e-2)
+
+    def test_empty_owners(self):
+        # Empty owners first, between others and last, at unaligned rows.
+        self._check([0, 21, 0, 0, 11, 0])
+
+    def test_owners_straddle_sublane_and_block_boundaries(self):
+        self._check([5, 40, 3, 30, 70])
+
+    def test_owners_inside_one_sublane_tile(self):
+        self._check([1, 2, 3, 1])
+
+    def test_rows_past_the_last_offset(self):
+        self._check([5, 0, 20, 7], extra_rows=19)
 
 
 @skipUnlessPallas("fill_owner_tiles writes SMEM refs inside a Pallas kernel")

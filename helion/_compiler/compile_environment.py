@@ -1021,6 +1021,8 @@ class CompileEnvironment:
         # (e.g. compact_block != ordered_block); resident caching sizes its window to a
         # multiple of THIS so a single ordered tile read always fits the window.
         self.compact_worklist_ordered_block: int = 1
+        # Sublane tiling of the in-kernel worklist.
+        self.compact_worklist_sublane: int = 1
         # Offsets-tensor parameter names the generated _build_worklist takes, in
         # order (set when the builder is emitted); used by the launcher to map
         # them to host-call arg positions.

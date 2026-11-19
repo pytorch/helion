@@ -56,7 +56,7 @@ def _(state: CodegenState) -> None:
     if not isinstance(plan, (DmaScatterPlan, OneHotScatterPlan)) and (
         state.device_function.carry_tiles
     ):
-        if emit_carry_store(state, tensor, name, idx_str, value):
+        if emit_carry_store(state, tensor, name, parts, value):
             return
     value = pallas_codegen.sliced_value_for_store(
         state,
