@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 import warnings
 
+import pytest
 import torch
 from torch import Tensor
 from torch._C._distributed_c10d import _SymmetricMemory
@@ -1186,6 +1187,7 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         torch.testing.assert_close(result, expected, rtol=8e-1, atol=8e-1)
         self._cleanup_process()
 
+    @pytest.mark.slow
     @skipIfXPU("Distributed operations require CCL, not yet fully integrated")
     @skip_if_lt_x_gpu(4)
     def test_two_dim_parallel_matmul(self):
@@ -1254,12 +1256,11 @@ class TestDistributed(TestCase, MultiProcessTestCase):
         symm_mem_buf = symm_mem.empty(M_local, N, dtype=dtype, device=self.device)
         hdl = symm_mem.rendezvous(symm_mem_buf, tp_group_name)
 
-        import unittest.mock
-
+        mock_sync_seed = unittest.mock.MagicMock(wraps=sync_seed)
         with (
-            unittest.mock.patch(
-                "helion._dist_utils.sync_seed", wraps=sync_seed
-            ) as mock_sync_seed,
+            # The autotuner modules import sync_seed by name, and mock.patch
+            # only intercepts the binding it names, so spy on each module's.
+            contextlib.ExitStack() as sync_seed_spies,
             # The autotuner's compile/accuracy/timing gathers live in
             # BenchmarkProvider (moved from BaseSearch in #2029), and mock.patch
             # only intercepts the module-level binding, so spy there.
@@ -1271,6 +1272,18 @@ class TestDistributed(TestCase, MultiProcessTestCase):
                 "helion.autotuner.base_search.sync_object", wraps=sync_object
             ) as mock_sync_object,
         ):
+            # Every helion.autotuner module that imports sync_seed by name.
+            for module in (
+                "config_generation",
+                "de_surrogate_hybrid",
+                "differential_evolution",
+                "surrogate_pattern_search",
+            ):
+                sync_seed_spies.enter_context(
+                    unittest.mock.patch(
+                        f"helion.autotuner.{module}.sync_seed", mock_sync_seed
+                    )
+                )
             result = helion_fn(
                 a_local,
                 b_local,
