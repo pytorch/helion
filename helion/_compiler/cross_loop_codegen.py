@@ -2660,12 +2660,16 @@ def _effect_kind(call: ast.Call) -> str:
 
 
 def _dry_pass_call_kind(call: ast.Call, helpers: frozenset[str]) -> str:
-    """Classify a call as ``helper``, ``masked``, ``skipped``, or ``pure``."""
+    """Classify a call as ``helper``, ``masked``, ``skipped``, ``pure``, or
+    ``dry``: a code prefetch (``hl.prefetch_code``), which runs on the dry trip,
+    ahead of the code it warms, and not again on the live one."""
     func = call.func
     if isinstance(func, ast.Name):
         return "helper" if func.id in helpers else "skipped"
     if not isinstance(func, ast.Attribute):
         return "skipped"
+    if isinstance(func.value, ast.Name) and func.value.id == "helion_prefetch_code":
+        return "dry"
     if not (
         isinstance(func.value, ast.Name) and func.value.id in _DRY_PASS_PURE_MODULES
     ):
@@ -2781,6 +2785,16 @@ def _dry_pass_rewrite(
         )
         calls = [node for node in ast.walk(header) if isinstance(node, ast.Call)]
         kinds = [_dry_pass_call_kind(call, helpers) for call in calls]
+        if not compound and "dry" in kinds:
+            result.append(
+                create(
+                    ast.If,
+                    test=expr_from_string(f"not {live}"),
+                    body=[statement],
+                    orelse=[],
+                )
+            )
+            continue
         if isinstance(statement, ast.While) or "skipped" in kinds:
             # Helpers called under the guard still take the predicate.
             for node in ast.walk(statement):
@@ -2807,7 +2821,7 @@ def _dry_pass_rewrite(
                 _dry_pass_mask(call, live)
         if isinstance(statement, ast.For):
             _dry_pass_one_trip(statement.iter, live)
-        if compound:
+        if isinstance(statement, (ast.If, ast.For)):
             statement.body = _dry_pass_rewrite(statement.body, live, helpers, guards)
             statement.orelse = _dry_pass_rewrite(
                 statement.orelse, live, helpers, guards
@@ -6036,6 +6050,13 @@ def emit_cross_loop_schedule(
         assert not entry_gate or gate_root in blocks, (
             "inband scatters need a resident root"
         )
+        # hl.prefetch_code() between top-level loops runs where the kernel reaches
+        # the next one (a Gluon ring moves it into the MMA partition there; a dry
+        # pass of that root runs it on its dry trip: ``_dry_pass_call_kind``).
+        for root in CompileEnvironment.current().prefetch_code_sites:
+            if root in blocks:
+                blocks[root].insert(0, device_function.prefetch_code_statement())
+                device_function.prefetch_code_placed.add(root)
         # A trigger between loops (``hl.pdl_launch_dependents()``): each worker
         # lets the next launch start once it reaches the root's block (or the
         # first resident one after it), at kernel scope so that every worker

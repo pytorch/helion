@@ -125,9 +125,9 @@ class BarrierOnlyAllowedAtTopLevel(BaseError):
 class PdlPlacement(BaseError):
     message = (
         "PDL ops run on the host before the first top level device loop (entry) "
-        "or after the last one (exit); hl.pdl_wait() and hl.prefetch_code() only "
-        "at entry, and at most one hl.pdl_launch_dependents() between device "
-        "loops in a kernel."
+        "or after the last one (exit); hl.pdl_wait() only at entry, hl.prefetch_code() "
+        "before a top level device loop, and at most one hl.pdl_launch_dependents() "
+        "between device loops in a kernel."
     )
 
 

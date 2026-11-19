@@ -5,6 +5,7 @@ import itertools
 import os
 import re
 import tempfile
+from typing import cast
 import unittest
 from unittest import mock
 
@@ -473,6 +474,30 @@ def mm_then_scale(
     for tile_r, tile_c in hl.tile([m, n]):
         y[tile_r, tile_c] = out[tile_r, tile_c] * 2 + b[tile_r, tile_c]
     return out, y
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def mm_prefetch_mm(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two dot roots, the code prefetch between them."""
+    m, k = x.size()
+    _, n = w1.size()
+    _, p = w2.size()
+    y = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    out = torch.empty([m, p], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], w1[tile_k, tile_n], acc=acc)
+        y[tile_m, tile_n] = acc.to(torch.bfloat16)
+    hl.prefetch_code()
+    for tile_i, tile_p in hl.tile([m, p]):
+        acc2 = hl.zeros([tile_i, tile_p], dtype=torch.float32)
+        for tile_j in hl.tile(n):
+            acc2 = hl.dot(y[tile_i, tile_j], w2[tile_j, tile_p], acc=acc2)
+        out[tile_i, tile_p] = acc2
+    return y, out
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -1504,11 +1529,106 @@ class TestGluonRing(TestCase):
                     functions["_helion_scale_then_mm_mma"] if specialize else body
                 )
                 at = prefetching.index(
-                    "prefetch code here" if specialize else "prefetch_code()"
+                    "call.uni helion_prefetch_code_fn_1;"
+                    if specialize
+                    else "helion_prefetch_code.prefetch_code("
                 )
                 self.assertLess(at, prefetching.index("_launch("))
                 self.assertIn("return (tile_dependency_epoch,)", body)
                 self.assertNotIn("def _helion_scale_then_mm_claimer(", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_code_prefetch_between_roots_in_mma_partition(self) -> None:
+        """A code prefetch between two dot roots runs in the MMA partition after
+        the first root's MMAs and before the second's, and nowhere else."""
+        x = torch.randn([256, 512], device=DEVICE, dtype=torch.bfloat16)
+        w1 = torch.randn([512, 256], device=DEVICE, dtype=torch.bfloat16)
+        w2 = torch.randn([256, 128], device=DEVICE, dtype=torch.bfloat16)
+        base = {
+            "block_sizes": [128, 64, 64, 128, 64, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+        }
+        _, (y_ref, expected) = code_and_output(
+            mm_prefetch_mm, (x, w1, w2), cross_loop_pipeline="static", **base
+        )
+        slots = len(mm_prefetch_mm.bind((x, w1, w2)).config_spec.range_warp_specialize)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                code, (y, out) = code_and_output(
+                    mm_prefetch_mm,
+                    (x, w1, w2),
+                    num_stages=2,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline=pipeline,
+                    **base,
+                )
+                torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+                # The MMA partition's one warp calls the prefetch, on every 16th
+                # CTA counted from the last worker.
+                self.assertEqual(code.count("call.uni helion_prefetch_code_fn_"), 1)
+                self.assertNotIn("helion_prefetch_code.prefetch_code(", code)
+                mma = _functions(code)["_helion_mm_prefetch_mm_mma"]
+                at = mma.index("call.uni helion_prefetch_code_fn_1;")
+                self.assertLess(mma.index("tmem_dot"), at)
+                self.assertLess(at, mma.rindex("tmem_dot"))
+                self.assertIn(
+                    "(tl.num_programs(0) - 1 - tl.program_id(0)) % 16 == 0", mma
+                )
+
+    def test_code_prefetch_move_reaches_nested_sites(self) -> None:
+        """Each prefetch site moves into the MMA partition where its slice kept
+        it (the entry one at its start; one a dry-pass loop nests at its nested
+        spot), called by the partition's warps on the CTAs its call reads with;
+        the body keeps no copy.  A slice that kept none prefetches at its start
+        (CPU only)."""
+        import ast
+
+        from helion._compiler.triton import gluon_ring
+
+        def function(name: str, lines: list[str]) -> ast.FunctionDef:
+            source = "".join(f"    {line}\n" for line in lines)
+            return cast(
+                "ast.FunctionDef", ast.parse(f"def {name}():\n{source}").body[0]
+            )
+
+        sites = [
+            "helion_prefetch_code.prefetch_code(tl.program_id(0) % 16 == 0)",
+            "a = 0",
+            "for trip in tl.range(start, 2):",
+            "    if not live:",
+            "        helion_prefetch_code.prefetch_code(tl.program_id(0) == 3)",
+            "    x = 1",
+        ]
+        body, mma = function("body", sites), function("mma", sites)
+        gluon_ring._move_prefetch_code(body, [mma], [(4, False)], 0)
+        self.assertNotIn("prefetch", ast.unparse(body))
+        moved = ast.unparse(mma)
+        self.assertEqual(moved.count("call.uni helion_prefetch_code_fn_4;"), 2)
+        self.assertIn("helion_prefetch_code_fn_4", ast.unparse(mma.body[0]))
+        self.assertIn("tl.program_id(0) % 16 == 0", ast.unparse(mma.body[0]))
+        nested = moved.index("tl.program_id(0) == 3")
+        self.assertLess(moved.index("if not live"), nested)
+        self.assertLess(moved.index("call.uni", nested - 300), nested)
+        # The partition's warps all walk the lines: no first-warp guard.
+        self.assertNotIn("%tid.x", moved)
+        # A slice without them: at the partition's start.
+        body, mma = function("body", sites), function("mma", ["b = 0"])
+        gluon_ring._move_prefetch_code(body, [mma], [(1, False)], 0)
+        self.assertEqual(
+            [ast.unparse(st).count("helion_prefetch_code_fn_1") for st in mma.body],
+            [1, 1, 0],
+        )
+        # Without an MMA partition the body keeps its calls (its first warp).
+        body = function("body", sites)
+        gluon_ring._move_prefetch_code(body, [], [], None)
+        self.assertEqual(
+            ast.unparse(body).count("helion_prefetch_code.prefetch_code("), 2
+        )
 
     def _prefetch_case(self, kernel, args: tuple[object, ...]) -> str:
         """Run a prefetching ``scale_then_mm`` variant in a ring and check it

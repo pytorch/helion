@@ -1234,8 +1234,10 @@ class CompileEnvironment:
         # The tensors ``hl.pdl_wait(independent=...)`` names, each with the
         # host expression that names it.
         self.pdl_independent: dict[torch.Tensor, str] = {}
-        # hl.prefetch_code(): the kernel prefetches its native code into L2 at entry.
-        self.prefetch_code: bool = False
+        # hl.prefetch_code() calls (on targets whose code it can prefetch), in
+        # source order: None prefetches the kernel's native code into L2 at entry,
+        # a root index where the kernel reaches that top-level loop.
+        self.prefetch_code_sites: list[int | None] = []
 
     def warn_symbolic_fragment_domain(self) -> None:
         """Emit at most once per binding, subject to Python's warning filters."""

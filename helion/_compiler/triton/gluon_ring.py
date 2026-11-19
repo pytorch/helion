@@ -2773,9 +2773,11 @@ class _Slice:
             return self.assignment(statement, live)
         skip = _ring_call(statement, "ring_skip")
         # Every partition waits for the previous grid (its loop bounds may read
-        # what that grid wrote).
+        # what that grid wrote); the MMA side keeps a code prefetch between roots
+        # (``_move_prefetch_code``).
         if isinstance(statement, ast.Expr) and (
             _is_gdc_wait(statement)
+            or (self.puts is None and _is_prefetch_code(statement.value))
             or (
                 (skip and _names(_arg(skip, "NBYTES")) & self.puts)
                 if self.puts is not None
@@ -3244,29 +3246,64 @@ def _computes_tensors(body: list[ast.stmt]) -> bool:
     return False
 
 
+_is_prefetch_code = functools.partial(
+    _is_tl_call,
+    names=frozenset(["prefetch_code"]),
+    modules=("helion_prefetch_code",),
+)
+
+
 def _move_prefetch_code(
     body: ast.FunctionDef,
     partitions: list[ast.FunctionDef],
     workers: list[tuple[int, bool]],
     mma: int | None,
 ) -> None:
-    """Move the entry code prefetch into the MMA partition (``mma``), idle until operands land."""
-    is_prefetch = functools.partial(
-        _is_tl_call,
-        names=frozenset(["prefetch_code"]),
-        modules=("helion_prefetch_code",),
-    )
-    prefetch = [
-        st for st in body.body if isinstance(st, ast.Expr) and is_prefetch(st.value)
-    ]
-    if mma is None or not prefetch:
+    """Move the code prefetches into the MMA partition (``mma``), idle until
+    operands land: each where its slice kept it (the entry one at its start, one
+    between roots at its spot, possibly inside a dry-pass loop), by the
+    partition's warps, on the CTAs the call reads with
+    (``DeviceFunction.prefetch_code_statement``)."""
+    if mma is None:
         return
-    body.body = [st for st in body.body if st not in prefetch]
+    calls = _rewrite_prefetch_code(body.body, lambda call: None)
+    if not calls:
+        return
     # Imported here: importing prefetch_code installs its compiler hook.
     from ...runtime.triton.prefetch_code import prefetch_code_here
 
-    prefetch_here = prefetch_code_here(workers[mma][0])
-    partitions[mma].body.insert(0, statement_from_string(prefetch_here))
+    def here(call: ast.Call) -> ast.stmt:
+        reader = ast.unparse(call.args[0])
+        return statement_from_string(prefetch_code_here(workers[mma][0], reader))
+
+    if not _rewrite_prefetch_code(partitions[mma].body, here):
+        # A slice that kept none prefetches at its start.
+        partitions[mma].body[:0] = [here(call) for call in calls]
+
+
+def _rewrite_prefetch_code(
+    statements: list[ast.stmt], replace: Callable[[ast.Call], ast.stmt | None]
+) -> list[ast.Call]:
+    """Replace each code prefetch call under ``statements`` with ``replace`` of
+    it (dropped on None); the calls, in program order."""
+    calls: list[ast.Call] = []
+    for statement in list(statements):
+        value = statement.value if isinstance(statement, ast.Expr) else None
+        if isinstance(value, ast.Call) and _is_prefetch_code(value):
+            at = statements.index(statement)
+            calls.append(value)
+            if (new := replace(value)) is None:
+                del statements[at]
+            else:
+                statements[at] = new
+            continue
+        for field in ("body", "orelse"):
+            inner = getattr(statement, field, None)
+            if isinstance(inner, list) and inner:
+                calls += _rewrite_prefetch_code(inner, replace)
+                if not inner:
+                    inner.append(create(ast.Pass))
+    return calls
 
 
 # ---- regeneration and finalization ------------------------------------------------
