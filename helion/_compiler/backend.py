@@ -2005,9 +2005,10 @@ class Backend(abc.ABC):
         return None
 
     def tracks_statement_owners(self) -> bool:
-        """Whether ``GenerateAST`` records, per owning fx node, the statements
-        a lowering emitted (``_statements_by_owner_node_id``): the bookkeeping
-        a backend's root rewrites consult.  ``False`` by default."""
+        """Whether ``GenerateAST`` records per-FX-node lowered results and
+        emitted statements (``_codegen_results_by_owner_node_id`` and
+        ``_statements_by_owner_node_id``) for cross-scope lookup and root
+        rewrites.  ``False`` by default."""
         return False
 
     def tile_begin_expr(self, codegen: GenerateAST, block_idx: int) -> str | None:

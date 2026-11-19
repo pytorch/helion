@@ -140,6 +140,9 @@ class TritonBackend(Backend):
     def lowers_integer_powers(self) -> bool:
         return True
 
+    def tracks_statement_owners(self) -> bool:
+        return True
+
     @property
     def supports_inter_loop_barriers(self) -> bool:
         return True

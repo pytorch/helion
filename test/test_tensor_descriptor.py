@@ -524,9 +524,9 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
         self.assertNotIn("_helion_tensor_descriptor(", code)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
-    def test_host_tensor_descriptor_multiple_tensor_indices_fall_back(self):
+    def test_host_tensor_descriptor_multiple_tensor_indices(self):
         @helion.kernel(autotune_effort="none", static_shapes=True)
-        def gather_diagonal(x: torch.Tensor) -> torch.Tensor:
+        def copy_cartesian_block(x: torch.Tensor) -> torch.Tensor:
             out = torch.empty([16, 16], dtype=x.dtype, device=x.device)
             for _ in hl.tile(1, block_size=1):
                 row_index = hl.arange(16)
@@ -536,14 +536,103 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
         x = torch.randn([32, 32], device=DEVICE)
         code, result = code_and_output(
-            gather_diagonal,
+            copy_cartesian_block,
             (x,),
-            indexing=["tensor_descriptor", "pointer"],
+            indexing="tensor_descriptor",
             host_tensor_descriptors=True,
         )
 
         torch.testing.assert_close(result, x[:16, :16])
+        self.assertEqual(code.count("_helion_tensor_descriptor("), 2)
+
+    @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
+    def test_host_tensor_descriptor_non_cartesian_tensor_indices_fall_back(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def gather_diagonal(x: torch.Tensor, plane: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([16], dtype=x.dtype, device=x.device)
+            for _ in hl.tile(1, block_size=1):
+                row_index = hl.arange(16)
+                column_index = hl.arange(16)
+                out[row_index] = x[plane[()], row_index, column_index]
+            return out
+
+        x = torch.randn([4, 32, 32], device=DEVICE)
+        plane = torch.tensor(2, dtype=torch.int64, device=DEVICE)
+        code, result = code_and_output(
+            gather_diagonal,
+            (x, plane),
+            indexing=["pointer", "tensor_descriptor", "pointer"],
+            host_tensor_descriptors=True,
+        )
+
+        torch.testing.assert_close(result, x[2, :16, :16].diagonal())
         self.assertNotIn("_helion_tensor_descriptor(", code)
+
+    @skipUnlessTensorDescriptor("TensorDescriptor support is required")
+    def test_tensor_descriptor_cartesian_tensor_indices(self):
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def copy_cartesian_block(
+            x: torch.Tensor, offsets: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([16, 16], dtype=x.dtype, device=x.device)
+            for idx in hl.grid(1):
+                base_r = offsets[idx]
+                base_c = offsets[idx + 1]
+                row_index = base_r + hl.arange(16)
+                column_index = base_c + hl.arange(16)
+                out[hl.arange(16), hl.arange(16)] = x[row_index, column_index]
+            return out
+
+        x = torch.randn([32, 32], device=DEVICE, dtype=torch.float32)
+        offsets = torch.tensor([16, 8], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(
+            copy_cartesian_block,
+            (x, offsets),
+            indexing=["pointer", "pointer", "tensor_descriptor", "tensor_descriptor"],
+        )
+
+        torch.testing.assert_close(result, x[16:32, 8:24])
+        self.assertEqual(code.count(get_tensor_descriptor_fn_name()), 2)
+
+    @skipUnlessTensorDescriptor("TensorDescriptor support is required")
+    def test_tensor_descriptor_nested_loop_cross_scope_indices(self):
+        @helion.kernel(
+            autotune_effort="none",
+            static_shapes=True,
+            config=helion.Config(
+                indexing=["pointer", "tensor_descriptor", "tensor_descriptor"],
+            ),
+        )
+        def accumulate_shifted_blocks(
+            x: torch.Tensor, bounds: torch.Tensor
+        ) -> torch.Tensor:
+            out = torch.empty([32, 16], dtype=x.dtype, device=x.device)
+            for worker in hl.grid(1):
+                base_r = bounds[worker]
+                for step in hl.grid(2):
+                    row_index = base_r + hl.arange(16)
+                    col_index = hl.arange(16)
+                    acc = hl.zeros([16, 16], dtype=torch.float32)
+                    for k_tile in hl.tile(32, block_size=16):
+                        blk = hl.load(x, [row_index, k_tile])
+                        acc = acc + blk
+                    hl.store(
+                        out,
+                        [step * 16 + hl.arange(16), col_index],
+                        acc.to(out.dtype),
+                    )
+                    base_r = base_r + 16
+            return out
+
+        x = torch.randn([40, 32], device=DEVICE, dtype=torch.float32)
+        bounds = torch.tensor([4], dtype=torch.int32, device=DEVICE)
+        code, result = code_and_output(accumulate_shifted_blocks, (x, bounds))
+
+        expected = torch.empty([32, 16], device=DEVICE, dtype=torch.float32)
+        expected[:16] = x[4:20, :16] + x[4:20, 16:32]
+        expected[16:] = x[20:36, :16] + x[20:36, 16:32]
+        torch.testing.assert_close(result, expected)
+        self.assertEqual(code.count(get_tensor_descriptor_fn_name()), 2)
 
     @skipUnlessHostTensorDescriptor("Host tensor descriptor support is required")
     def test_host_tensor_descriptor_scaled_subtraction_falls_back(self):
