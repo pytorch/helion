@@ -179,6 +179,34 @@ class InductorBackendTestCase(TestCase):
         self.assertIn("out0[tile_z, tile_y, tile_x] = ", source)
 
 
+def check_mix_order_reduction(test: InductorBackendTestCase, backend: str) -> None:
+    """RMSNorm's backward, given rstd: its row reduction and the column
+    reductions of its weight's and bias's gradients over [8192, 640] are one
+    kernel, which reads x and g once (HelionScheduling.
+    codegen_mix_order_reduction()): it loops over the rows of each split of the
+    rows, and sums each column reduction's terms over them into a partial, that
+    the wrapper sums over the splits."""
+    rows, cols = 8192, 640
+    x = torch.randn(rows, cols, device=DEVICE)
+    g = torch.randn(rows, cols, device=DEVICE)
+    w = torch.randn(cols, device=DEVICE)
+    rstd = torch.rand(rows, 1, device=DEVICE) + 0.5
+
+    def fn(x, g, w, rstd):
+        gw = g * w
+        row = (gw * x).sum(-1, keepdim=True)
+        dx = gw * rstd - x * rstd.pow(3) * row / cols
+        return dx, (g * x * rstd).sum(0), g.sum(0)
+
+    (source,) = test.compile(fn, x, g, w, rstd, tol=1e-3, backend=backend)
+    test.assertRegex(source, r"for tile_y in hl.tile\(\d+\):")
+    test.assertRegex(source, r"for tile_x in hl.tile\(\d+\):")
+    test.assertIn("in0[tile_y, tile_x, :]", source)
+    test.assertIn("part1 = part1 + torch.sum(", source)
+    test.assertIn("ws[1, tile_y, :] = part1", source)
+    test.assertIn(".sum(dim=0)", test.code)
+
+
 @skipIfNotCUDA()
 @onlyBackends(["triton"])
 @needs_native_matmul
@@ -549,6 +577,9 @@ class TestInductorCute(InductorBackendTestCase):
     @needs_native_matmul
     def test_bmm_epilogue(self):
         self.check_bmm_epilogue("cute")
+
+    def test_mix_order_reduction(self):
+        check_mix_order_reduction(self, "cute")
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
@@ -1094,6 +1125,22 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
             (source,) = self.compile(fn, x)
             self.assertIn("for tile_y, tile_x in hl.tile([100, 100]):", source)
         self.assertNotRegex(source, r"tile_\w\.index[^\n]*(//|%)")
+
+    def test_mix_order_reduction(self):
+        check_mix_order_reduction(self, "triton")
+
+    def test_mix_order_reduction_off(self):
+        # config.triton.mix_order_reduction off: the column sum is a kernel of
+        # its own, as for Triton.
+        x, g = (
+            torch.randn(8192, 640, device=DEVICE),
+            torch.randn(8192, 640, device=DEVICE),
+        )
+        with config.patch({"triton.mix_order_reduction": False}):
+            sources = self.compile(
+                lambda x, g: ((g * x).sum(-1), (g * x).sum(0)), x, g, tol=1e-3
+            )
+        self.assertNotIn("ws[", "".join(sources))
 
     @parametrize("op", ["sum", "prod"])
     @looped
