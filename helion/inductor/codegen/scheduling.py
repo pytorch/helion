@@ -25,6 +25,7 @@ from ..support import numerics_modes
 from ..support import python_wrapper
 from .kernel import ARG_REDUCTIONS
 from .kernel import REDUCTIONS
+from .kernel import UNROLLED_ROW_MAX
 from .kernel import HelionKernel
 from .overrides import HelionOverrides
 from .tiling import natural_tiling
@@ -357,7 +358,31 @@ class HelionScheduling(SIMDScheduling):
         (tiling,) = kernel_args
         if not HelionKernel.supports_tiling(tiling):
             raise Unsupported(f"tiling {tiling}")
-        return [HelionKernel(*kernel_args, **kernel_kwargs)]
+        kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        if (
+            kernel.persistent_reduction
+            and not kernel.mix_order_reduction
+            and "override_persistent_reduction" not in kernel_kwargs
+            and V.graph.sizevars.statically_known_gt(
+                kernel.numels["r0_"], UNROLLED_ROW_MAX
+            )
+        ):
+            # A row past UNROLLED_ROW_MAX that the kernel names (rdim) but no
+            # input's full row does (HelionKernel.row_anchor) has a factory's
+            # dim, which Helion cannot roll: x.flip(-1).sum(-1) over rows of
+            # 100000 would read each row as one block of 131072 lanes.
+            # Emitting the body tells; such a kernel loops over the row, as
+            # Triton's rule has it.
+            self.codegen_node_schedule_with_kernel(
+                kernel_features.node_schedule, kernel
+            )
+            if kernel.uses_rdim and kernel.row_anchor is None:
+                kernel = HelionKernel(
+                    *kernel_args, **kernel_kwargs, override_persistent_reduction=False
+                )
+            else:
+                kernel = HelionKernel(*kernel_args, **kernel_kwargs)
+        return [kernel]
 
     def define_kernel(
         self, src_code: str, node_schedule: list[Any], kernel: SIMDKernel[Any]
