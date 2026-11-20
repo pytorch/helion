@@ -690,6 +690,8 @@ class PointwiseElementwiseFact(NamedTuple):
       of the same quantity. Bytes ADD across ops (so the sum sizes the byte/register budgets)
       but LANES do not (separate vector instructions over the same threads), so the max is what
       bounds a num_warps starvation cap.
+    - ``embedding_lookup_slabs``: exact (sum, max) for a direct embedding lookup.
+      The seed can use these when the extent-based estimate underfills a tile.
     """
 
     total_numel: int
@@ -700,6 +702,7 @@ class PointwiseElementwiseFact(NamedTuple):
     sfu_ops: int = 0
     gather_stride: int = 1
     max_op_slab_numel: int = 1
+    embedding_lookup_slabs: tuple[int, int] | None = None
 
 
 def shrink_block_sizes_for_numel_constraints(
