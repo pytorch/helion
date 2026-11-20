@@ -676,7 +676,8 @@ def test_fast_math_setting_selects_approximate_gate_math() -> None:
 
 def test_sigmoid_gate_computes_the_pointwise_sigmoid() -> None:
     """A ``torch.sigmoid`` gate renders the pointwise lowering's sigmoid
-    (``SIGMOID_TEMPLATE``: ``rcp.approx.ftz`` of ``ex2.approx.ftz``) in the
+    (``SIGMOID_TEMPLATE``: ``rcp.approx.ftz`` of a quarter of the
+    ``ex2.approx.ftz`` denominator, scaled back) in the
     fused body, of a score vector and of a scalar, as on the scalar path of a
     config the body declines, with and without fast_math: tuned configs must
     not change the gate's numerics."""

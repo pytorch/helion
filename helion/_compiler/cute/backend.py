@@ -3704,6 +3704,86 @@ class CuteBackend(Backend):
                 return CuteDSLOpOverrides._apply_unary_op(x, "cute.math.roundeven({x})")
 
             @staticmethod
+            # pyrefly: ignore [bad-override]
+            def fma(x: CuteDSLArg, y: CuteDSLArg, z: CuteDSLArg) -> CuteDSLArg:
+                """``x * y + z`` rounded once, for a node that computes in fp32
+                or fp64.
+
+                ``ops.fma`` is what Inductor lowers ``torch.addcmul``,
+                ``add`` with ``alpha``, ``addcdiv`` with a value and
+                ``prims.fma`` to on a CUDA device, and its Triton form is
+                ``tl.fma``.  The base ``add(mul(x, y), z)`` is a separate
+                product and sum in the source, which NVVM and ptxas contract
+                or not: where the addend is a product too (the softmax
+                backward's ``fma(-p, total, grad * p)``) they may fuse that
+                one and round this.
+
+                The dtype is the one the node computes in
+                (``division_dtype``, which is not about divisions only):
+                ``x.add_(y, alpha=2)`` with an fp32 ``x`` and an fp64 ``y``
+                is an fp64 fma whose result alone is cast to fp32.
+
+                Like integers, two forms keep the base lowering:
+
+                * a bf16 or fp16 computation.  ``cute.math.fma`` of 16-bit
+                  operands is the fp32 fma of the widened operands, and
+                  rounding that to the dtype rounds twice (Inductor's
+                  result, and eager CUDA's for ``addcmul``).  A product and
+                  sum in the dtype is contracted to one 16-bit fma, which
+                  rounds once, as ``tl.fma`` of 16-bit operands does.  Which
+                  product that fma fuses when the addend is a product too
+                  stays the assembler's choice there.
+                * ``torch.add(x, 2.5, alpha=0.3)`` in fp32, whose
+                  multiplicands are both Python scalars: their product is
+                  folded in double precision when the kernel is traced and
+                  one add remains, where the fma multiplies by ``alpha``
+                  rounded to fp32 (eager CUDA's result).  In fp64 neither
+                  scalar is rounded: it is the fma, eager's result, where
+                  the folded sum would add the rounded product.
+                """
+                from torch._inductor.virtualized import V
+
+                from ..inductor_lowering import division_dtype
+
+                node = V.current_node
+                dtype = (
+                    division_dtype(node) if isinstance(node, torch.fx.Node) else None
+                )
+                # A Python scalar as the second argument is ``add``'s
+                # ``other``, beside its scalar ``alpha``: the other nodes
+                # that reach ``ops.fma`` take tensors there.
+                if (
+                    dtype is None
+                    or dtype not in (torch.float32, torch.float64)
+                    or (
+                        dtype == torch.float32
+                        and isinstance(node.args[1], (int, float))
+                    )
+                ):
+                    # pyrefly: ignore [bad-argument-type]
+                    return CuteDSLOpOverrides.fma(x, y, z)
+                operands = [
+                    CuteDSLOpOverrides._cast_expr(
+                        CuteDSLOpOverrides._as_expr(operand), dtype
+                    )
+                    for operand in (x, y, z)
+                ]
+                if (
+                    node.target is torch.ops.prims.fma.default
+                    and isinstance(node.args[0], torch.fx.Node)
+                    and node.args[0].target is torch.ops.aten.neg.default
+                ):
+                    # ``fma(-p, t, c)`` as ``fma(p, -t, c)``, the same value
+                    # bit for bit, where ``-(-p)`` folds back to ``p``: NVVM
+                    # moves the negation of a quotient ``p = e / s`` into its
+                    # dividend, and ``(-e) / s`` no longer shares the division
+                    # with the other uses of ``p`` (the softmax backward's
+                    # ``fma(-p, total, grad * p)`` recomputes ``p``).
+                    operands[0] = f"-{operands[0]}"
+                    operands[1] = f"-{operands[1]}"
+                return f"cute.math.fma({', '.join(operands)})"
+
+            @staticmethod
             def tanh(x0: CuteDSLArg) -> CuteDSLArg:
                 return HelionCuteDSLOpOverrides._unary_math(x0, "tanh")
 
@@ -3722,19 +3802,19 @@ class CuteBackend(Backend):
                     return CuteDSLOpOverrides._apply_unary_op(
                         x, "1.0 / (1.0 + cute.math.exp(-({x})))"
                     )
-                # RCP.APPROX + EX2.APPROX, the same sequence triton's default
-                # tl.sigmoid compiles to (one MUFU.EX2 + one MUFU.RCP).  The
-                # base lowering's division (``div.full.f32``, or under
-                # ``cute_exact_division`` the IEEE one, a ~20-instruction
-                # BRANCHY SASS expansion with a BSSY/BSYNC reconvergence per
-                # element) buys no accuracy here: sigmoid's error is
-                # dominated by the shared x*log2e argument rounding, and both
-                # forms measure max 64 ulp / mean 3.5 ulp vs an fp64
-                # reference on [-87, 87] (identical distributions), with
-                # specials preserved (nan->nan, +-inf->1/0, saturation->0).
-                # Only denormal OUTPUTS differ: this form flushes them to
-                # zero, as triton kernels do by default.  fp16 sigmoid
-                # 67108864: 4943 -> 5805 GB/s (B200, cold autotune).
+                # EX2.APPROX and one MUFU.RCP of the scaled denominator, with
+                # the bits of triton's default tl.sigmoid (``ex2.approx`` and
+                # ``div.full(1, d)``) for every fp32 input: see
+                # ``SIGMOID_TEMPLATE``.  The base lowering's division
+                # (``div.full.f32``, or under ``cute_exact_division`` the
+                # IEEE one, a ~20-instruction BRANCHY SASS expansion with a
+                # BSSY/BSYNC reconvergence per element) buys no accuracy
+                # here: sigmoid's error is dominated by the shared x*log2e
+                # argument rounding, and both forms measure max 64 ulp /
+                # mean 3.5 ulp vs an fp64 reference on [-87, 87] (identical
+                # distributions), with specials preserved (nan->nan,
+                # +-inf->1/0, saturation->0) and denormal outputs kept, as
+                # triton keeps them.
                 x_cse = CuteDSLOpOverrides._get_cse_var(x)
                 if x_cse is not None:
                     x_fp32: CuteDSLArg = CuteDSLOpOverrides.to_dtype(

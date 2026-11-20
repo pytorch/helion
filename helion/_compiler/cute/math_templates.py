@@ -4,14 +4,33 @@ from __future__ import annotations
 
 import math
 
-# Sigmoid uses the default pointwise lowering's EX2.APPROX + RCP.APPROX
-# contract, independently of fast_math. Its FP32 argument rounding already
-# dominates the reciprocal error. NaNs, infinities, and saturation retain
-# their behavior; denormal outputs flush to zero, as in the pointwise path.
+# ``torch.sigmoid`` in FP32: ``1 / (1 + ex2.approx(x * -log2(e)))``, with the
+# bits of Triton's ``tl.sigmoid`` (``ex2.approx`` and ``div.full(1, d)``) for
+# every FP32 input (compared over all 2**32 of them on an sm_100 device),
+# independently of fast_math.  ``d = 1 + e`` is at least 1,
+# so the result is at most 1 and underflows for ``d`` above ``2**126``: there
+# ``div.full`` takes the reciprocal of ``d / 4`` and scales it back, and the
+# bare ``rcp.approx.ftz(d)`` returns 0 for a subnormal result (arguments in
+# about (-88.72, -87.34)).  This form scales every ``d``: ``d / 4`` is the
+# exactly rounded ``e * 0.25 + 0.25`` (one FFMA), its reciprocal is always a
+# normal number, so ``rcp.approx.ftz`` never flushes, and the final ``* 0.25``
+# is exact but for the rounding of a subnormal result.  One multiply more
+# than the bare reciprocal, no compare and no select.  ``ex2.approx.ftz``
+# differs from ``ex2.approx`` only below ``2**-126``, where ``1 + e`` is 1.
+# NaNs, infinities and saturation keep their behavior.
 # Callers compute in FP32 and retain each original result/store dtype cast.
 # This does not change the lowering of an explicit division or other math.
 # Fold the negation into log2(e) so packed FP32 epilogues avoid a separate negate.
+# The parentheses make the template one operand wherever a caller pastes it.
 SIGMOID_TEMPLATE = (
+    "(cute.math.rcp(cute.math.exp2(({x}) * -1.4426950408889634, "
+    "fastmath=True) * 0.25 + 0.25, approx=True, ftz=True) * 0.25)"
+)
+# ``1 / (1 + ex2.approx.ftz(x * -log2(e)))`` with the bare ``rcp.approx.ftz``:
+# not a sigmoid lowering (it returns 0 where the sigmoid is subnormal) but the
+# reciprocal ``div.approx.ftz`` multiplies by, for the callers that mirror a
+# ``fast_math`` quotient by ``1 + exp(-x)``.
+FAST_MATH_LOGISTIC_RECIPROCAL_TEMPLATE = (
     "cute.math.rcp(1.0 + cute.math.exp2(({x}) * "
     "-1.4426950408889634, fastmath=True), approx=True, ftz=True)"
 )

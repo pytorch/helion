@@ -12,6 +12,7 @@ fold at <= 8 warps) must match the reference.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
 from typing import Any
 
 import pytest
@@ -20,8 +21,12 @@ import torch
 import helion
 from helion._testing import DEVICE
 from helion._testing import import_example
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 import helion.language as hl
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 rms_norm_fwd = import_example("rms_norm").rms_norm_fwd
 
@@ -197,7 +202,7 @@ def test_free_arange_rows_reduce_in_separate_groups() -> None:
 
 @pytest.mark.parametrize("threads,vec", [(128, 8), (256, 4), (512, 2)])
 def test_launch_sized_reduction_matches_the_reference(threads: int, vec: int) -> None:
-    # One group spanning the CTA: the serial fold at 4 and 8 warps, the
+    # One group spanning the CTA: the serial form at 4 and 8 warps, the
     # two-stage form at 16.  Both must reduce every lane exactly once.
     code, x, weight, out, inv = _run(torch.float16, threads, vec, ["", ""])
     body = _kernel_body(code)
@@ -206,3 +211,80 @@ def test_launch_sized_reduction_matches_the_reference(threads: int, vec: int) ->
     ref_out, ref_inv = _reference(x, weight)
     torch.testing.assert_close(inv, ref_inv, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _column_sum(x: torch.Tensor) -> torch.Tensor:
+    _rows, columns = x.shape
+    out = torch.empty([columns], dtype=torch.float32, device=x.device)
+    for tile in hl.tile(columns):
+        out[tile] = torch.sum(x[:, tile], dim=0)
+    return out
+
+
+def _sum_of_equal_partials(
+    rows: int,
+    config: helion.Config,
+    call: str,
+    tree: Callable[[torch.Tensor], torch.Tensor],
+) -> None:
+    """``rows`` rows that each hold one value per column, one row per
+    reduction thread: every partial of a column is 32 times its value, and
+    the kernel's sums are ``tree`` of that partial in fp32 arithmetic.  A
+    left-to-right chain over the same partials rounds from its second add on
+    and misses that in a good part of the columns."""
+    torch.manual_seed(0)
+    value = (1.0 + torch.rand(64, device=DEVICE)) * 737.0
+    x = value.expand(rows, 64).contiguous()
+    bound = _column_sum.bind((x,))
+    assert call in _kernel_body(bound.to_code(config))
+    out = bound.compile_config(config)(x)
+    partial = value * 32.0
+    expected = tree(partial)
+    chain = partial
+    for _ in range(rows // 32 - 1):
+        chain = chain + partial
+    assert int((chain != expected).sum()) > 8
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
+@skipIfNotCUDA()
+def test_the_serial_form_sums_its_warp_partials_as_a_tree() -> None:
+    # 8 warps in one CTA: the serial form of the two-stage reduce.  A
+    # balanced tree over 8 equal partials is exact.
+    _sum_of_equal_partials(
+        256,
+        helion.Config(block_sizes=[1], reduction_loops=[256]),
+        "_cute_grouped_reduce_shared_two_stage(sum_1_acc, 'sum', cutlass.Float32(0),"
+        " looped_reduce_lane, looped_reduce_lane_in_group, looped_reduce_lane_mod_pre,"
+        " pre=1, group_span=256, group_count=1)",
+        lambda partial: partial * 8.0,
+    )
+
+
+@skipIfNotCUDA()
+def test_the_serial_form_sums_five_warp_partials_as_the_butterfly() -> None:
+    # 5 warps: ((w0 + w4) + w2) + (w1 + w3), the two-stage form's butterfly
+    # without its identity lanes.
+    _sum_of_equal_partials(
+        160,
+        helion.Config(block_sizes=[1], reduction_loops=[160], num_threads=[0, 160]),
+        "_cute_grouped_reduce_shared_two_stage(sum_1_acc, 'sum', cutlass.Float32(0),"
+        " looped_reduce_lane, looped_reduce_lane_in_group, looped_reduce_lane_mod_pre,"
+        " pre=1, group_span=160, group_count=1)",
+        lambda partial: ((partial + partial) + partial) + (partial + partial),
+    )
+
+
+@skipIfNotCUDA()
+@skipIfCudaCapabilityLessThan((9, 0))
+def test_the_cluster_exchange_sums_its_partials_as_a_tree() -> None:
+    # 2 warps in each of 4 clustered CTAs: 8 exchanged slots.
+    _sum_of_equal_partials(
+        256,
+        helion.Config(block_sizes=[1], reduction_loops=[64], cute_cluster_n=4),
+        "_cute_grouped_reduce_cluster(sum_1_acc, 'sum', cutlass.Float32(0),"
+        " looped_reduce_lane, _cluster_red_buf, _cluster_red_mbar, group_span=64,"
+        " cluster_n=4)",
+        lambda partial: partial * 8.0,
+    )

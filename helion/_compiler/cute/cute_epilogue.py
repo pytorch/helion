@@ -95,6 +95,7 @@ from .dtypes import narrow_common_dtype
 from .dtypes import round_scalar
 from .gelu_tanh_approx import FAST_MATH_UNARY_OPS
 from .gelu_tanh_approx import fast_math_unary_template
+from .math_templates import FAST_MATH_LOGISTIC_RECIPROCAL_TEMPLATE
 from .math_templates import SIGMOID_TEMPLATE
 from .math_templates import float_literal
 from .tcgen05_constants import Tcgen05RowvecAuxRow
@@ -642,6 +643,12 @@ _SILU_SIGMOID_TEMPLATE = f"(({{inner}}) * {_SIGMOID_TEMPLATE})"
 # reduced ``cute.math.exp`` as the launch divides (no
 # reciprocal-then-multiply, which rounds twice).
 _SILU_DIVISION_TEMPLATE = "(({inner}) / (1.0 + cute.math.exp(-({inner}))))"
+# ``x / (1 + exp(-x))`` under ``fast_math``: the pointwise quotient is
+# ``div.approx.ftz``, the product with ``rcp.approx.ftz`` of the
+# ``ex2.approx.ftz`` denominator (``_silu_step``).
+_SILU_FAST_DIVISION_TEMPLATE = (
+    "(({inner}) * " + FAST_MATH_LOGISTIC_RECIPROCAL_TEMPLATE.format(x="{inner}") + ")"
+)
 
 
 def _add_const_template(scalar: float) -> str:
@@ -1700,17 +1707,19 @@ def _silu_step(*, division: bool) -> _UnaryOp:
 
     Under ``fast_math`` the pointwise quotient is ``div.approx.ftz``, which
     multiplies by ``rcp.approx.ftz``, of ``exp2(-x * log2(e))`` on
-    ``ex2.approx.ftz``: the sigmoid form.  The scalar-only ``div.approx``
-    intrinsic cannot take the chain's TensorSSA; the two differ only where
-    the quotient flushes a denormal product (``|x|`` below ``2**-125``).
+    ``ex2.approx.ftz``: the product with the bare flushing reciprocal, which
+    is 0 where the sigmoid is subnormal (the sigmoid form keeps those).  The
+    scalar-only ``div.approx`` intrinsic cannot take the chain's TensorSSA;
+    the two differ only where the quotient flushes a denormal product
+    (``|x|`` below ``2**-125``).
     """
-    if division and not CompileEnvironment.current().settings.fast_math:
-        return _UnaryOp(
-            op_name="silu", template=_SILU_DIVISION_TEMPLATE, transcendental=True
-        )
-    return _UnaryOp(
-        op_name="silu", template=_SILU_SIGMOID_TEMPLATE, transcendental=True
-    )
+    if not division:
+        template = _SILU_SIGMOID_TEMPLATE
+    elif CompileEnvironment.current().settings.fast_math:
+        template = _SILU_FAST_DIVISION_TEMPLATE
+    else:
+        template = _SILU_DIVISION_TEMPLATE
+    return _UnaryOp(op_name="silu", template=template, transcendental=True)
 
 
 def _classify_silu(
@@ -1739,8 +1748,9 @@ def _classify_silu(
 
     Each form renders the pointwise lowering's math for it
     (``_silu_step``): the mul form ``x * sigmoid(x)`` with the sigmoid
-    contract, the div form the quotient of the exact ``exp`` (the
-    sigmoid form under ``fast_math``). The pattern only matches when the
+    contract, the div form the quotient of the exact ``exp`` (under
+    ``fast_math`` the product with the flushing reciprocal, as the
+    pointwise ``div.approx.ftz``). The pattern only matches when the
     inner references point at the *same* carrier FX node — divergent
     operands fall through to the generic binary classifier.
 
