@@ -21,12 +21,15 @@ from helion._testing.guarded_lane_kernels import extrema_outside_chains
 from helion._testing.guarded_lane_kernels import extrema_relu_clamp
 from helion._testing.guarded_lane_kernels import flags_reread_after_a_store
 from helion._testing.guarded_lane_kernels import masked_accumulate
+from helion._testing.guarded_lane_kernels import neighbor_max_into
+from helion._testing.guarded_lane_kernels import packet_tile_seeds
 from helion._testing.guarded_lane_kernels import padded_and_transposed
 from helion._testing.guarded_lane_kernels import padded_sum
 from helion._testing.guarded_lane_kernels import padded_sum_reference
 from helion._testing.guarded_lane_kernels import pooled_max
 from helion._testing.guarded_lane_kernels import pooled_max_reference
 from helion._testing.guarded_lane_kernels import window_max
+from helion._testing.guarded_lane_kernels import window_max_into
 from helion._testing.guarded_lane_kernels import window_max_reference
 
 # 16-byte packets along the channels, four threads on each of H and W: the
@@ -56,6 +59,26 @@ def _kernel(kernel: object, config: dict[str, object], knobs: str) -> object:
             config=helion.Config.from_dict({**config, **_KNOBS[knobs]}),
         )
     return _KERNELS[key]
+
+
+def _seed_kernel(kernel: object, seed: dict[str, object]) -> object:
+    """``kernel`` at a compiler seed as the seed is, its knobs its own,
+    built once per module."""
+    return _kernel(kernel, seed, "off")
+
+
+def _search_seeds(
+    kernel: object, args: tuple[torch.Tensor, ...]
+) -> list[dict[str, object]]:
+    """The packet tile seeds that the search of ``kernel`` at ``args`` starts
+    from."""
+    search = helion.kernel(
+        kernel.fn,  # type: ignore[attr-defined]
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+    )
+    return packet_tile_seeds(search.bind(args).config_spec)
 
 
 def _bits(value: torch.Tensor) -> torch.Tensor:
@@ -250,6 +273,61 @@ def test_window_maxima_of_views_match_eager(view: str) -> None:
     assert not x.is_contiguous() or x.storage_offset() > 0
     actual = _kernel(window_max, _PACKETS, "guarded_fmnmx")(x)  # type: ignore[operator]
     _assert_same_values(actual, window_max_reference(x), view)
+
+
+@pytest.mark.parametrize(
+    ("dims", "seed"),
+    [((1, 2, 0), 0), ((2, 1, 0), 2)],
+    ids=["channel_first", "by_columns"],
+)
+def test_window_maxima_into_another_layout_match_eager_at_their_seeds(
+    dims: tuple[int, int, int], seed: int
+) -> None:
+    """A window stored into a ``[9, 7, C]`` view of a buffer of another
+    layout (``[C, H, W]``, or ``[C, W, H]``, its planes stored column by
+    column), at the packet tile seeds the kernel's own search starts from:
+    packets along the channels on thread x, the threads behind them along
+    the buffer's stride-1 dim, a store per lane value.  The first shape into
+    the channel-first buffer and the sibling (every other thread on the
+    stride-1 dim) into the other; the tiles on H and W are partial."""
+    x = _activation((18, 14, 64), specials=True)
+    expected = window_max_reference(x)
+    assert torch.isnan(expected).any() and torch.isinf(expected).any()
+    shape = [expected.shape[dims.index(dim)] for dim in range(3)]
+    buffer = torch.zeros(shape, dtype=x.dtype, device=x.device)
+    out = buffer.permute(dims)
+    assert out.shape == expected.shape and out.stride(2) != 1
+    seeds = _search_seeds(window_max_into, (x, out))
+    assert len(seeds) == 3
+    config = seeds[seed]
+    assert config["cute_vector_widths"] == [1, 1, 8]
+    # The packet block leads the loop order, then the buffer's stride-1 dim.
+    assert config["loop_orders"][0][:2] == [2, dims.index(2)]
+    _seed_kernel(window_max_into, config)(x, out)  # type: ignore[operator]
+    _assert_same_values(out, expected, f"{dims}, seed {seed}")
+
+
+def test_neighbor_maxima_into_a_channel_first_buffer_match_eager_at_their_seed() -> (
+    None
+):
+    """Two taps a column apart, the second written as the tile's index plus
+    one, stored into a ``[9, 7, C]`` view of a ``[C, H, W]`` buffer at the
+    first packet tile seed of the kernel's own search.  The taps keep their
+    tiles in the loads' facts, so the seed is there for the two loads per
+    store, not for a computed coordinate.  Partial tiles on H and W."""
+    x = _activation((9, 8, 64), specials=True)
+    value = x.to(torch.float32)
+    expected = torch.maximum(value[:, :-1], value[:, 1:]).to(x.dtype)
+    assert torch.isnan(expected).any() and torch.isinf(expected).any()
+    buffer = torch.zeros([64, 9, 7], dtype=x.dtype, device=x.device)
+    out = buffer.permute(1, 2, 0)
+    seeds = _search_seeds(neighbor_max_into, (x, out))
+    assert len(seeds) == 3
+    config = seeds[0]
+    assert config["cute_vector_widths"] == [1, 1, 8]
+    assert config["loop_orders"] == [[2, 1, 0]]
+    _seed_kernel(neighbor_max_into, config)(x, out)  # type: ignore[operator]
+    _assert_same_values(out, expected, "neighbors")
 
 
 @pytest.mark.parametrize(

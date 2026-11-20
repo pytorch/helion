@@ -292,6 +292,7 @@
  "test/test_cute_phase_two_cta_regions_cuda.py": 55.7,
  "test/test_cute_pipeline_inner_loads.py": 1.8,
  "test/test_cute_pointwise_vec.py": 11.3,
+ "test/test_cute_predicated_element_loads_cuda.py": 76.3,
  "test/test_cute_published_scalars.py": 14.5,
  "test/test_cute_pure_lane_packets.py": 55.5,
  "test/test_cute_radix_store_gpu.py": 2.7,

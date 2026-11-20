@@ -1,6 +1,7 @@
 # pyrefly: ignore-errors
 """Element loads with a cache policy, under ``cute_scalar_load_hints`` and
-``cute_narrow_load_hints``.
+``cute_narrow_load_hints``, and predicated element loads with a masked-off
+value of their own, under ``cute_predicated_element_loads``.
 
 ``l2_policy.scalar_policy_load`` writes an L1 priority or the streaming
 operator on a 4- or 8-byte element, which is every hinted element load of a
@@ -11,6 +12,11 @@ int16) takes all six policies in the same forms.  These helpers write those
 forms; ``scalar_policy_loads.hint_element_loads`` places them, after every
 other pass, and leaves the older helper where a config without the knobs
 has it.
+
+``element_fill_load_if`` is the predicated form with the bits the element
+reads as where its predicate is false (``mov fill; @p ld.global``, what
+Triton's ``tl.load(ptr, mask, other=...)`` lowers to), with or without a
+cache policy; ``predicated_element_loads.predicate_element_loads`` places it.
 
 Called during ``@cute.kernel`` tracing (plain Python building MLIR), like
 ``l2_policy`` and ``masked_packet_load``; ``cache_policy_loads.
@@ -31,7 +37,7 @@ from .cache_hint_forms import L2_POLICY_FORMS
 if TYPE_CHECKING:
     from cutlass._mlir import ir
 
-__all__ = ["element_policy_load", "element_policy_load_if"]
+__all__ = ["element_fill_load_if", "element_policy_load", "element_policy_load_if"]
 
 # Policy -> the qualifier of its ``ld.global`` and the ``createpolicy``
 # eviction policy it passes ("" for none): the L1 priorities
@@ -68,14 +74,15 @@ _ELEMENT_TYPES = (
 )
 
 
-def _assembly(policy: str, bits: int, *, predicated: bool) -> str:
+def _assembly(policy: str, bits: int, *, predicated: bool, fill: int = 0) -> str:
     """One ``ld.global`` of a ``bits``-wide element with the cache hint of
-    ``policy`` (``_POLICY_FORMS``); an L2 family creates its policy
-    descriptor first.  ``predicated`` zeroes the result and loads under
-    ``@p`` (``$2 != 0``), the form of ``masked_packet_load``: one predicated
-    instruction, where a hinted load inside a conditional would compile to a
-    branch around it."""
-    qualifier, l2_policy = _POLICY_FORMS[policy]
+    ``policy`` (``_POLICY_FORMS``; none for the empty string); an L2 family
+    creates its policy descriptor first.  ``predicated`` sets the result to
+    the bits ``fill`` (zero unless given) and loads under ``@p``
+    (``$2 != 0``), the form of ``masked_packet_load``: one predicated
+    instruction, where a load inside a conditional would compile to a branch
+    around it."""
+    qualifier, l2_policy = _POLICY_FORMS[policy] if policy else ("", "")
     load = f"ld.global{qualifier}.b{bits} $0, [$1]"
     setup = ""
     if l2_policy:
@@ -83,9 +90,11 @@ def _assembly(policy: str, bits: int, *, predicated: bool) -> str:
         load += ", pol"
     if not predicated:
         return f"{{ {setup}{load}; }}"
+    # A zero fill is spelled as before the fill existed.
+    masked_off = f"{fill:#x}" if fill else "0"
     return (
         f"{{ .reg .pred p; {setup}setp.ne.b32 p, $2, 0; "
-        f"mov.b{max(bits, 32)} $0, 0; @p {load}; }}"
+        f"mov.b{max(bits, 32)} $0, {masked_off}; @p {load}; }}"
     )
 
 
@@ -96,12 +105,15 @@ def _load_bits(
     policy: str,
     loc: ir.Location | None,
     ip: ir.InsertionPoint | None,
+    fill: int = 0,
 ) -> cutlass.Numeric:
     """The element at ``ptr`` as ``dtype``, loaded as raw bits (no numeric
     conversion of floating point values, signed zero, NaNs or signed integer
-    high bits).  Side effects and the memory clobber keep the load ordered
-    with surrounding memory operations."""
+    high bits); the bits ``fill`` where ``predicate`` is false.  Side
+    effects and the memory clobber keep the load ordered with surrounding
+    memory operations."""
     assert dtype in _ELEMENT_TYPES, dtype
+    assert 0 <= fill < 1 << dtype.width, (dtype, fill)
     carrier, register = _CARRIERS[dtype.width // 8]
     operands = [ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)]
     constraints = f"={register},l"
@@ -114,7 +126,7 @@ def _load_bits(
     bits = llvm.inline_asm(
         carrier.mlir_type,
         operands,
-        _assembly(policy, dtype.width, predicated=predicate is not None),
+        _assembly(policy, dtype.width, predicated=predicate is not None, fill=fill),
         f"{constraints},~{{memory}}",
         has_side_effects=True,
         is_align_stack=False,
@@ -161,3 +173,22 @@ def element_policy_load_if(
     as one predicated load: the value of ``load if predicate else dtype(0)``
     without reading ``ptr`` when the predicate is false."""
     return _load_bits(ptr, predicate, dtype, policy, loc, ip)
+
+
+@dsl_user_op
+def element_fill_load_if(
+    ptr: object,
+    predicate: object,
+    dtype: type[cutlass.Numeric],
+    fill: int,
+    policy: str = "",
+    *,
+    loc: ir.Location | None = None,
+    ip: ir.InsertionPoint | None = None,
+) -> cutlass.Numeric:
+    """The element at ``ptr`` when ``predicate`` holds and the ``dtype``
+    whose bits are ``fill`` otherwise, as one predicated load (``mov fill;
+    @p ld.global``) that does not read ``ptr`` when the predicate is false;
+    with the cache hint of ``policy`` (``element_policy_load``'s, or none
+    for the empty string)."""
+    return _load_bits(ptr, predicate, dtype, policy, loc, ip, fill)

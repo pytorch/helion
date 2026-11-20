@@ -1174,6 +1174,12 @@ class ConfigSpec:
         # of two tensors (``handler_ops.has_fp32_extrema``), so
         # ``cute_fmnmx_extrema`` is tunable.
         self.cute_fmnmx_extrema_sites = False
+        # Set by DeviceIR analysis: an ``hl.load`` under an ``extra_mask``
+        # whose last subscript is a scaled or gathered coordinate that
+        # loads no packets
+        # (``predicated_element_loads.has_masked_gather_sites``), so
+        # ``cute_predicated_element_loads`` is tunable at every extent.
+        self.cute_masked_gather_sites = False
         self.cute_scaled_mma_available = False
         self.cute_mxfp8_fused_scales_available = False
         self.cute_mxfp8_sf_tma_available = False

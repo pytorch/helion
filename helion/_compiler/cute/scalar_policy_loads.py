@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from typing import cast
 
 from ._ast_pass_utils import call_path_str
+from ._ast_pass_utils import loop_target_names
 from ._ast_pass_utils import names_stored_or_deleted
 from .cache_policy_loads import LOAD_POLICY_KEYWORDS
 from .cache_policy_loads import CachePolicy
@@ -335,14 +336,7 @@ def hint_element_loads(
     rebound: set[str] = set()
     for statement in definition.body:
         rebound |= names_stored_or_deleted(statement)
-        for node in ast.walk(statement):
-            if isinstance(node, ast.For):
-                # A generated loop target may carry no Store context.
-                rebound |= {
-                    child.id
-                    for child in ast.walk(node.target)
-                    if isinstance(child, ast.Name)
-                }
+        rebound |= {name.id for name in loop_target_names(statement)}
     hint = _HintElementLoads(
         {
             name: value

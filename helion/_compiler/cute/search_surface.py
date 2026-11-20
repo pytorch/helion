@@ -193,6 +193,7 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     from .hoist_loop_invariant_recip import has_hoistable_fp32_divisions
     from .pair_lane_math import has_fp32_arithmetic
     from .pair_lane_math import has_pairable_exps_or_divisions
+    from .predicated_element_loads import has_masked_gather_sites
     from .signed_bitfield import has_signed_byte_field
     from .tile_packing import tile_pack_counts
 
@@ -214,6 +215,11 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     # form is tunable (it can lose on a memory-bound gather; on pointwise
     # kernels, ``fmnmx_extrema_offered``).
     config_spec.cute_fmnmx_extrema_sites = has_fp32_extrema(device_ir)
+    # A load under an ``extra_mask`` that gathers along its tensor's last
+    # dim and takes no packets there: its lanes are single elements under a
+    # mask at every config, so their predicated form is tunable (on
+    # pointwise kernels, ``predicated_element_loads_offered``).
+    config_spec.cute_masked_gather_sites = has_masked_gather_sites(env, device_ir)
     # Exps (sigmoids lower through one), exact divisions or fp32 products,
     # sums and differences to pair over vector lanes in Blackwell's packed
     # fp32 instructions, or half-precision maxima to fold as half2 words;

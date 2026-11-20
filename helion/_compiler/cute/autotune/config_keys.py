@@ -220,6 +220,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_tail_peel",
     "cute_guarded_lanes",
     "cute_fmnmx_extrema",
+    "cute_predicated_element_loads",
     "cute_store_packet_tiers",
     "cute_defer_tile_reduce",
     "cute_staged_store",

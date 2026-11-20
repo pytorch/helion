@@ -199,6 +199,13 @@ PACKET_LOAD_HELPERS = (
         "scalar",
         0,
     ),
+    PacketLoadHelper(
+        "_cute_element_fill_load_if",
+        "element_policy_loads",
+        "element_fill_load_if",
+        "scalar",
+        0,
+    ),
 )
 # Packet byte width -> noncoherent L2 evict-first helper.
 _CUTE_NC_L2_FIRST_HELPERS = {

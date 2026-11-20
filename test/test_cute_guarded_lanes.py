@@ -23,11 +23,14 @@ from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion._testing.guarded_lane_kernels import flags_reread_after_a_store
+from helion._testing.guarded_lane_kernels import neighbor_max_into
+from helion._testing.guarded_lane_kernels import packet_tile_seeds
 from helion._testing.guarded_lane_kernels import padded_and_transposed
 from helion._testing.guarded_lane_kernels import padded_sum
 from helion._testing.guarded_lane_kernels import pooled_max
 from helion._testing.guarded_lane_kernels import sorted_kept_rows
 from helion._testing.guarded_lane_kernels import window_max
+from helion._testing.guarded_lane_kernels import window_max_into
 from helion._testing.unfold_kernels import sliding_windows
 import helion.language as hl
 
@@ -1299,12 +1302,145 @@ def _transposed_kept_rows(x: torch.Tensor, keep: torch.Tensor) -> torch.Tensor:
     return out_t
 
 
-def _packet_tile_seeds(spec: object) -> list[dict[str, object]]:
-    return [
-        seed.config
-        for seed in spec.compiler_seed_configs  # type: ignore[attr-defined]
-        if seed.config.get("cute_guarded_lanes") is True
-    ]
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _transposed_and_spread_rows(
+    x: torch.Tensor, keep: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # ``_transposed_kept_rows`` beside a store of the rows to every other
+    # row of a second output: a computed coordinate of the row tile, but a
+    # store's.
+    rows, columns = x.shape
+    out_t = torch.empty([columns, rows], dtype=x.dtype, device=x.device)
+    spread = torch.zeros([2 * rows, columns], dtype=x.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, columns]):
+        kept = hl.load(x, [tile_r, tile_c], extra_mask=keep[tile_r][:, None])
+        out_t[tile_c, tile_r] = kept.permute(1, 0)
+        spread[tile_r.index * 2, tile_c] = kept
+    return out_t, spread
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _window_max_into_both(
+    x: torch.Tensor, out: torch.Tensor, other: torch.Tensor
+) -> None:
+    # The maxima of two taps of a [H, W, C] activation, stored into two
+    # [H // 2, W // 2, C] views.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        row = (tile_h.index * 2)[:, None]
+        col = (tile_w.index * 2)[None, :]
+        best = torch.maximum(x[row, col, tile_c], x[row + 1, col + 1, tile_c])
+        out[tile_h, tile_w, tile_c] = best
+        other[tile_h, tile_w, tile_c] = best
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _every_other_row_into(x: torch.Tensor, out: torch.Tensor) -> None:
+    # Every other row of a [2 * H, W, C] activation: one load per stored
+    # element, through a computed coordinate along H alone.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        out[tile_h, tile_w, tile_c] = x[tile_h.index * 2, tile_w, tile_c]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _shifted_floor_into(
+    x: torch.Tensor, floor: torch.Tensor, out: torch.Tensor
+) -> None:
+    # A [H, W + 1, C] activation one column over, against a per-channel
+    # floor: one load of the tiles per stored element (the tile's index plus
+    # one keeps its tile) beside a packet load along the channels alone.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        value = x[tile_h, tile_w.index + 1, tile_c].to(torch.float32)
+        out[tile_h, tile_w, tile_c] = torch.maximum(
+            value, floor[tile_c].to(torch.float32)[None, None, :]
+        ).to(out.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _both_columns_into(x: torch.Tensor, out: torch.Tensor, right: torch.Tensor) -> None:
+    # The two taps of ``neighbor_max_into``, each copied to a view of its
+    # own: two loads and two stores.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        out[tile_h, tile_w, tile_c] = x[tile_h, tile_w, tile_c]
+        right[tile_h, tile_w, tile_c] = x[tile_h, tile_w.index + 1, tile_c]
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _kept_copies_into(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    keep: torch.Tensor,
+    out: torch.Tensor,
+    spread: torch.Tensor,
+) -> None:
+    # Two copies under a row mask, the second stored to every other row of
+    # ``spread``: a store through a computed coordinate.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        mask = keep[tile_h][:, None, None]
+        out[tile_h, tile_w, tile_c] = hl.load(
+            x, [tile_h, tile_w, tile_c], extra_mask=mask
+        )
+        spread[tile_h.index * 2, tile_w, tile_c] = hl.load(
+            y, [tile_h, tile_w, tile_c], extra_mask=mask
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _kept_and_scattered_copies_into(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    keep: torch.Tensor,
+    rows: torch.Tensor,
+    out: torch.Tensor,
+    scattered: torch.Tensor,
+) -> None:
+    # ``_kept_copies_into`` with the second copy stored to the rows that
+    # ``rows`` names: a store through a loaded index.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        mask = keep[tile_h][:, None, None]
+        out[tile_h, tile_w, tile_c] = hl.load(
+            x, [tile_h, tile_w, tile_c], extra_mask=mask
+        )
+        scattered[rows[tile_h], tile_w, tile_c] = hl.load(
+            y, [tile_h, tile_w, tile_c], extra_mask=mask
+        )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _window_max_and_spread_into(
+    x: torch.Tensor, out: torch.Tensor, spread: torch.Tensor
+) -> None:
+    # The window of ``window_max_into``, stored to ``out`` and to every other
+    # row of ``spread``.
+    out_h, out_w, channels = out.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        row = (tile_h.index * 2)[:, None]
+        col = (tile_w.index * 2)[None, :]
+        best = x[row, col, tile_c].to(torch.float32)
+        for offset in hl.static_range(1, 4):
+            value = x[row + offset // 2, col + offset % 2, tile_c].to(torch.float32)
+            best = torch.maximum(best, value)
+        out[tile_h, tile_w, tile_c] = best.to(out.dtype)
+        spread[tile_h.index * 2, tile_w, tile_c] = best.to(spread.dtype)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="full")
+def _neighbor_extrema_into(
+    x: torch.Tensor, high: torch.Tensor, low: torch.Tensor
+) -> None:
+    # The two taps of ``neighbor_max_into``, their maximum and their minimum
+    # stored to a view each: a window with as many outputs as taps.
+    out_h, out_w, channels = high.shape
+    for tile_h, tile_w, tile_c in hl.tile([out_h, out_w, channels]):
+        left = x[tile_h, tile_w, tile_c].to(torch.float32)
+        right = x[tile_h, tile_w.index + 1, tile_c].to(torch.float32)
+        high[tile_h, tile_w, tile_c] = torch.maximum(left, right).to(high.dtype)
+        low[tile_h, tile_w, tile_c] = torch.minimum(left, right).to(low.dtype)
 
 
 def _folded_packets(bound: object) -> int:
@@ -1323,7 +1459,7 @@ def _folded_packets_and_minimums(
     bound = cpu_bind(kernel, args)
     return _folded_packets(bound), [
         seed.get("cute_min_blocks_per_mp")
-        for seed in _packet_tile_seeds(bound.config_spec)
+        for seed in packet_tile_seeds(bound.config_spec)
     ]
 
 
@@ -1340,7 +1476,7 @@ def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
         bound = cpu_bind(kernel, (torch.zeros([146, 146, 64], dtype=torch.bfloat16),))
         spec = bound.config_spec
         assert _folded_packets(bound) == 4
-        seeds = _packet_tile_seeds(spec)
+        seeds = packet_tile_seeds(spec)
         assert [
             (seed["block_sizes"], seed["num_threads"], "load_eviction_policies" in seed)
             for seed in seeds
@@ -1363,7 +1499,7 @@ def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
         spec = cpu_bind(
             kernel, (torch.zeros([34, 34, 192], dtype=torch.bfloat16),)
         ).config_spec
-        assert [seed["block_sizes"] for seed in _packet_tile_seeds(spec)] == [
+        assert [seed["block_sizes"] for seed in packet_tile_seeds(spec)] == [
             [4, 4, 64],
             [4, 4, 64],
             [1, 16, 64],
@@ -1374,7 +1510,7 @@ def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
             _plane_window_max, (torch.zeros([64, 56, 128], dtype=torch.bfloat16),)
         ).config_spec
         assert "cute_guarded_lanes" in spec._flat_fields()
-        assert _packet_tile_seeds(spec) == []
+        assert packet_tile_seeds(spec) == []
         # One gathering load is enough: the lane it shares with a load of
         # the row's own tile reads that row element by element too.
         spec = cpu_bind(
@@ -1385,7 +1521,7 @@ def test_packet_tile_seeds_put_the_packet_threads_on_thread_x() -> None:
             ),
         ).config_spec
         assert "cute_guarded_lanes" in spec._flat_fields()
-        assert _packet_tile_seeds(spec) == []
+        assert packet_tile_seeds(spec) == []
 
 
 def test_packet_tile_seeds_name_a_cta_minimum_where_an_extremum_folds_eight_packets() -> (
@@ -1407,7 +1543,7 @@ def test_packet_tile_seeds_name_a_cta_minimum_where_an_extremum_folds_eight_pack
         bound = cpu_bind(kernel, (x, 3, 3))
         spec = bound.config_spec
         assert _folded_packets(bound) == 9
-        seeds = _packet_tile_seeds(spec)
+        seeds = packet_tile_seeds(spec)
         assert [
             (seed["block_sizes"], seed.get("cute_min_blocks_per_mp")) for seed in seeds
         ] == [
@@ -1450,6 +1586,215 @@ def test_packet_tile_seeds_name_a_cta_minimum_where_an_extremum_folds_eight_pack
         # Two packets, one of them behind a broadcast view.
         floor = torch.zeros([64], dtype=torch.bfloat16)
         assert _folded_packets_and_minimums(_tap_floor, (x, floor)) == (1, [None] * 3)
+
+
+def test_packet_tile_seeds_follow_the_stores_of_a_window_that_changes_the_layout() -> (
+    None
+):
+    """A window over a channels-last activation stored into a view of another
+    layout: the loads take their packets along the channels, which no store
+    has at stride 1, so the tiles have no storage order that begins with the
+    packet block.  The packet tile is seeded all the same, the packet threads
+    on thread x and the other tiles behind them as the store lays them out,
+    so the threads that fill the warp run along the store's stride-1 axis:
+    the image row of a channel-first buffer (the order a channels-last
+    output has), the image column of a buffer that stores its planes column
+    by column.  The seeds are configs of the search space as it stands, and
+    the lanes keep their packets and store one element each.
+
+    No seed where the stores disagree on the layout, and none for a copy,
+    whose loads index the tiles themselves (a computed coordinate of a store
+    does not make it a window)."""
+    kernel = helion.kernel(
+        window_max_into.fn, backend="cute", static_shapes=True, autotune_effort="full"
+    )
+    bf16 = torch.bfloat16
+    x = torch.zeros([146, 146, 64], dtype=bf16)
+    channels_last = torch.zeros([73, 73, 64], dtype=bf16)
+    # [C, H, W] and [C, W, H] buffers as [H, W, C] views.
+    channel_first = torch.zeros([64, 73, 73], dtype=bf16).permute(1, 2, 0)
+    by_columns = torch.zeros([64, 73, 73], dtype=bf16).permute(2, 1, 0)
+    with mock_cuda_unavailable():
+        for out, order, sibling in (
+            (channels_last, [2, 1, 0], ([1, 16, 64], [1, 16, 8])),
+            (channel_first, [2, 1, 0], ([1, 16, 64], [1, 16, 8])),
+            (by_columns, [2, 0, 1], ([16, 1, 64], [16, 1, 8])),
+        ):
+            bound = cpu_bind(kernel, (x, out))
+            spec = bound.config_spec
+            seeds = packet_tile_seeds(spec)
+            assert [
+                (
+                    seed["block_sizes"],
+                    seed["num_threads"],
+                    "load_eviction_policies" in seed,
+                )
+                for seed in seeds
+            ] == [
+                ([4, 4, 64], [4, 4, 8], False),
+                ([4, 4, 64], [4, 4, 8], True),
+                (*sibling, False),
+            ]
+            for seed in seeds:
+                assert seed["loop_orders"] == [order]
+                assert seed["cute_vector_widths"] == [1, 1, 8]
+                assert seed["cute_fmnmx_extrema"] is True
+                normalized = dict(seed)
+                spec.normalize(normalized)
+                assert all(normalized[key] == value for key, value in seed.items())
+        # The last binding's sibling: eight packet threads on thread x and 16
+        # positions of an image column on thread y, four packets a thread
+        # and a store per lane value.
+        code = bound.to_code(helion.Config.from_dict(seeds[-1]))
+        assert "block=(8, 16, 1)" in code
+        assert code.count("_cute_load_v16b_if(x.iterator") == 4
+        assert code.count(").store(cutlass.BFloat16(") == 1
+        assert "_cute_store_u16_vec(" not in code
+
+        # Two stores, two layouts: no order to follow.
+        spec = cpu_bind(
+            _window_max_into_both, (x, channel_first, channels_last)
+        ).config_spec
+        assert "cute_guarded_lanes" in spec._flat_fields()
+        assert packet_tile_seeds(spec) == []
+        # One layout again: the seeds are back.
+        spec = cpu_bind(
+            _window_max_into_both, (x, channel_first, channel_first)
+        ).config_spec
+        assert [seed["loop_orders"] for seed in packet_tile_seeds(spec)] == [
+            [[2, 1, 0]]
+        ] * 3
+        # A transposed copy: the load reads both tiles themselves.
+        rows = (torch.zeros([64, 128], dtype=bf16), torch.zeros([64], dtype=torch.bool))
+        copy = helion.kernel(
+            _transposed_kept_rows.fn,
+            backend="cute",
+            static_shapes=True,
+            autotune_effort="full",
+        )
+        for transposed in (copy, _transposed_and_spread_rows):
+            spec = cpu_bind(transposed, rows).config_spec
+            assert "cute_guarded_lanes" in spec._flat_fields()
+            assert packet_tile_seeds(spec) == []
+
+
+def test_packet_tile_seeds_tell_a_gather_from_a_copy_by_its_loads() -> None:
+    """Which layout changes get the packet tile is read from the facts of
+    the loads and stores that run along the tiles (``gathers_for_stores``):
+    how many there are of each, and whether a load has a coordinate without
+    a tile, whichever tile a tap moves along.  Into a channel-first buffer,
+    the image row at stride 1:
+
+    - two taps a column apart, the second written as the tile's index plus
+      one, which keeps its tile in the load's fact: two loads for one store;
+    - every other row, one load whose only computed coordinate is the image
+      column's, a tile the stores do not have at stride 1.
+
+    Both are seeded as the 2x2 window is.  No seed for one load of the tiles
+    themselves per store: a shifted copy, although a second packet load
+    along the channels alone (a floor) sits beside it, and the two taps
+    copied to a view each.  The loads are counted against the stores over
+    the kernel, so the maximum and the minimum of the two taps, stored to a
+    view each, get none either: two loads for two stores."""
+    bf16 = torch.bfloat16
+    neighbors = helion.kernel(
+        neighbor_max_into.fn,
+        backend="cute",
+        static_shapes=True,
+        autotune_effort="full",
+    )
+    shifted = torch.zeros([73, 74, 64], dtype=bf16)
+
+    def channel_first() -> torch.Tensor:
+        return torch.zeros([64, 73, 73], dtype=bf16).permute(1, 2, 0)
+
+    with mock_cuda_unavailable():
+        for kernel, args in (
+            (neighbors, (shifted, channel_first())),
+            (
+                _every_other_row_into,
+                (torch.zeros([146, 73, 64], dtype=bf16), channel_first()),
+            ),
+        ):
+            spec = cpu_bind(kernel, args).config_spec
+            assert [
+                (seed["block_sizes"], seed["num_threads"], seed["loop_orders"])
+                for seed in packet_tile_seeds(spec)
+            ] == [
+                ([4, 4, 64], [4, 4, 8], [[2, 1, 0]]),
+                ([4, 4, 64], [4, 4, 8], [[2, 1, 0]]),
+                ([1, 16, 64], [1, 16, 8], [[2, 1, 0]]),
+            ]
+        # The neighbors again, into a channels-last view: the strict order.
+        spec = cpu_bind(neighbors, (shifted, torch.zeros([73, 73, 64], dtype=bf16)))
+        assert len(packet_tile_seeds(spec.config_spec)) == 3
+        for kernel, args in (
+            (
+                _shifted_floor_into,
+                (shifted, torch.zeros([64], dtype=bf16), channel_first()),
+            ),
+            (_both_columns_into, (shifted, channel_first(), channel_first())),
+            (_neighbor_extrema_into, (shifted, channel_first(), channel_first())),
+        ):
+            spec = cpu_bind(kernel, args).config_spec
+            assert "cute_guarded_lanes" in spec._flat_fields()
+            assert packet_tile_seeds(spec) == []
+
+
+def test_packet_tile_seeds_count_a_store_through_a_computed_coordinate() -> None:
+    """A store to every other row of a second output runs along the tiles as
+    the loads do, through a computed coordinate, so ``gathers_for_stores``
+    takes it for a store like the others: it counts against the loads, and
+    its layout has to be the other stores'.
+
+    - Two copies under a row mask, one of them stored that way: two loads
+      for two stores and no seed, whichever layout the second output has.
+    - A 2x2 window stored to a channel-first buffer and, that way, to a
+      second one: seeded as the window alone is where the second buffer is
+      channel-first too, and not where it is channels-last, the stores
+      having no one layout for the threads to follow.
+
+    A store through a loaded index has no affine block and is not counted:
+    the two copies with the second one scattered to the rows an index
+    tensor names read as two loads for one store and are seeded.  That is a
+    known over-seed of ``gathers_for_stores``, pinned here so that a change
+    of what it counts is a deliberate one."""
+    bf16 = torch.bfloat16
+
+    def channel_first(rows: int) -> torch.Tensor:
+        return torch.zeros([64, rows, 73], dtype=bf16).permute(1, 2, 0)
+
+    def channels_last(rows: int) -> torch.Tensor:
+        return torch.zeros([rows, 73, 64], dtype=bf16)
+
+    keep = torch.zeros([73], dtype=torch.bool)
+    with mock_cuda_unavailable():
+        for spread in (channel_first(146), channels_last(146)):
+            copies = (channels_last(73), channels_last(73), keep, channel_first(73))
+            spec = cpu_bind(_kept_copies_into, (*copies, spread)).config_spec
+            assert "cute_guarded_lanes" in spec._flat_fields()
+            assert packet_tile_seeds(spec) == []
+        # Known over-seed: the scattered store is not counted, its load is.
+        rows = torch.zeros([73], dtype=torch.int64)
+        spec = cpu_bind(
+            _kept_and_scattered_copies_into,
+            (*copies[:3], rows, channel_first(73), channel_first(73)),
+        ).config_spec
+        assert [seed["loop_orders"] for seed in packet_tile_seeds(spec)] == [
+            [[2, 1, 0]]
+        ] * 3
+        x = torch.zeros([146, 146, 64], dtype=bf16)
+        spec = cpu_bind(
+            _window_max_and_spread_into, (x, channel_first(73), channel_first(146))
+        ).config_spec
+        assert [seed["loop_orders"] for seed in packet_tile_seeds(spec)] == [
+            [[2, 1, 0]]
+        ] * 3
+        spec = cpu_bind(
+            _window_max_and_spread_into, (x, channel_first(73), channels_last(146))
+        ).config_spec
+        assert "cute_guarded_lanes" in spec._flat_fields()
+        assert packet_tile_seeds(spec) == []
 
 
 def _witness_carriers(spec: object, key: str) -> list[tuple[object, object]]:
@@ -1604,6 +1949,19 @@ def test_generated_configs_keep_the_packet_threads_on_thread_x() -> None:
         )
         assert config["loop_orders"] == [[0, 1]]
         assert config["cute_vector_widths"] == [1, 8]
+        # A window that changes the layout: its seeds put the packet threads
+        # on thread x, and the search keeps every order.
+        spec = cpu_bind(
+            window_max_into,
+            (
+                torch.zeros([146, 146, 64], dtype=torch.bfloat16),
+                torch.zeros([64, 73, 73], dtype=torch.bfloat16).permute(1, 2, 0),
+            ),
+        ).config_spec
+        for order in ([0, 1, 2], [1, 0, 2], [2, 1, 0]):
+            config = normalized(True, loop_orders=[order], cute_guarded_lanes=True)
+            assert config["loop_orders"] == [order]
+            assert config["cute_vector_widths"] == [1, 1, 8]
 
 
 def test_generated_configs_keep_an_order_the_move_could_not_launch() -> None:

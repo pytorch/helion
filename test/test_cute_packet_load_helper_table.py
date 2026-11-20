@@ -47,6 +47,8 @@ _LIBRARY_IMPORTS = (
     # the imports of every earlier render keep their order.
     "from helion._compiler.cute.element_policy_loads import element_policy_load as _cute_element_policy_load",
     "from helion._compiler.cute.element_policy_loads import element_policy_load_if as _cute_element_policy_load_if",
+    # ``cute_predicated_element_loads``: last again.
+    "from helion._compiler.cute.element_policy_loads import element_fill_load_if as _cute_element_fill_load_if",
 )
 # The literal width tables the table replaced.
 _CACHE_LOAD_HELPERS = {
