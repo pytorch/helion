@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import inspect
 import re
 import unittest
 from unittest.mock import patch
@@ -64,6 +65,25 @@ def randn(*shape, dtype=torch.bfloat16):
 # blocks: by default a row of up to 1024 elements is one block, a persistent
 # reduction (HelionChoices.should_use_persistent_reduction()).
 looped = config.patch({"triton.persistent_reductions": False})
+
+
+def pin_blocks(r_block: int):
+    """A patch of helion.kernel that pins each kernel's blocks: 1 for its outer
+    tiles and r_block for tile_r. A split's first kernel tiles its rows and
+    chunks of R,
+        for tile_y, tile_x in hl.tile([8, 64]):
+    its second kernel the rows alone."""
+    kernel = helion.kernel
+
+    def pinned(fn=None, **kwargs):
+        if fn is None:  # @helion.kernel(backend=..., ...)
+            return functools.partial(pinned, **kwargs)
+        source = inspect.getsource(fn)
+        outer = re.search(r"for (.*) in hl\.tile\(", source).group(1)
+        blocks = [1] * (outer.count(",") + 1) + [r_block]
+        return kernel(fn, config=helion.Config(block_sizes=blocks), **kwargs)
+
+    return patch("helion.kernel", pinned)
 
 
 class PersistentChoices(InductorChoices):
@@ -976,6 +996,48 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertIn(line, source)
         self.assertEqual("rdim" in source, case in ("argmax", "broadcast", "pad"))
 
+    def test_permuted_copy_and_epilogue(self):
+        # y = x.permute(0, 2, 3, 1).contiguous() and y * 2: one kernel, whose
+        # tiling is natural_tiling()'s for each node and for the pair alike
+        # (HelionScheduling.can_fuse()), writes both.
+        x = torch.randn(8, 64, 32, 32, device=DEVICE)
+
+        def fn(x):
+            y = x.permute(0, 2, 3, 1).contiguous()
+            return y, y * 2
+
+        self.assertEqual(len(self.compile(fn, x)), 1)
+
+    @parametrize("case", ["mean", "broadcast", "mask"])
+    def test_natural_tiling(self, case):
+        # Tiles over the dims the indexes divide the flat ranges by, with no
+        # // or % (natural_tiling()). mean: the mean over H and W of a
+        # channels-last x, read at 64*r + 2304*(x // 64) + x % 64 by the
+        # 1-D tiling. broadcast: w[c] beside x[n, c], read at x % 384.
+        # mask: the column and row, x % 100 and x // 100, of a causal mask.
+        if case == "mean":
+            x = torch.randn(8, 64, 6, 6, device=DEVICE)
+            x = x.to(memory_format=torch.channels_last)
+            (source,) = self.compile(lambda x: x.mean([2, 3]), x, tol=1e-4)
+            self.assertIn("for tile_y, tile_x in hl.tile([8, 64]):", source)
+            self.assertIn("in0[tile_y, tile_x, :]", source)
+        elif case == "broadcast":
+            x = torch.randn(32, 384, device=DEVICE)
+            w = torch.randn(384, device=DEVICE)
+            (source,) = self.compile(lambda x, w: x * w + 1, x, w)
+            self.assertIn("for tile_y, tile_x in hl.tile([32, 384]):", source)
+            self.assertIn("in1[tile_x]", source)
+        else:
+            x = torch.randn(100, 100, device=DEVICE)
+
+            def fn(x):
+                i = torch.arange(100, device=x.device)
+                return torch.where(i[None, :] <= i[:, None], x, 0.0)
+
+            (source,) = self.compile(fn, x)
+            self.assertIn("for tile_y, tile_x in hl.tile([100, 100]):", source)
+        self.assertNotRegex(source, r"tile_\w\.index[^\n]*(//|%)")
+
     @parametrize("op", ["sum", "prod"])
     @looped
     def test_integer_reduction(self, op):
@@ -1192,8 +1254,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         var, mean = torch.var_mean(x, -1)
         if rows:
             mean[1:3] = float("inf")
-        pinned = helion.Config(block_sizes=[1, 1 if case == "split_empty" else 64])
-        with patch("helion.kernel", functools.partial(helion.kernel, config=pinned)):
+        with pin_blocks(1 if case == "split_empty" else 64):
             fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
             sources = self.compile(fn, x, expected=(var, mean))
         self.assertEqual(len(sources), 1 if rows else 2)
@@ -1212,13 +1273,13 @@ import helion.language as hl
 
 @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
 def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
-    for tile_x in hl.tile(640):
-        tmp0 = in0[tile_x]
+    for tile_y, tile_x in hl.tile([64, 10]):
+        tmp0 = in0[tile_y, tile_x]
         tmp1 = tmp0.to(torch.int64)
-        tmp2 = in1[tmp1 + 100*(tile_x.index // 10)]
+        tmp2 = in1[tmp1 + 100*tile_y.index.reshape([tile_y, 1])]
         tmp3 = hl.full([], 2.0, dtype=torch.float32)
         tmp4 = tmp2 * tmp3
-        out0[tile_x] = tmp4
+        out0[tile_y, tile_x] = tmp4
 """,
         )
 
