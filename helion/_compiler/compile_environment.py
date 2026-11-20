@@ -42,6 +42,7 @@ from torch.utils._sympy.functions import FloorDiv
 from torch.utils._sympy.numbers import int_oo
 from torch.utils._sympy.value_ranges import ValueRanges
 from torch.utils._sympy.value_ranges import bound_sympy
+from torch.utils.weak import WeakIdKeyDictionary
 
 from .. import exc
 from .._compat import is_hip
@@ -779,6 +780,7 @@ class CompileEnvironment:
         )
         # TODO(jansel): check for guards in the shapeenv
         self.fake_mode = create_fake_tensor_mode(shape_env=self.shape_env)
+        self.tile_index_values: WeakIdKeyDictionary = WeakIdKeyDictionary()
         self.input_sources: dict[torch.Tensor, Source] = {}
         self._ambiguous_tensor_input_source_ids: set[int] = set()
         # Positive provenance for host allocations whose layout is fixed by the

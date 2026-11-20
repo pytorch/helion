@@ -1347,6 +1347,8 @@ class _PointerLoadContiguity:
                 tiles.add(n)
                 return True
             if name in ("subscript", "load"):
+                if name == "load" and n.args[2] is not None:
+                    return False
                 src = n.args[0]
                 if not isinstance(src, torch.fx.Node) or not self._is_op(
                     src, "tile_index"

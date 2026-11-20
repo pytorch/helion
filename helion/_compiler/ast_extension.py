@@ -102,7 +102,7 @@ class ExtendedAST:
 
     def update_type_info(self, type_info: TypeInfo) -> TypeInfo:
         if self._type_info is not None and type_info != self._type_info:
-            type_info = self._type_info.merge(type_info)
+            type_info = self._type_info.merge_expression(type_info)
         self._type_info = type_info
         return self._type_info
 

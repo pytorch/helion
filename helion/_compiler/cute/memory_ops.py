@@ -38,6 +38,7 @@ from ...language.atomic_ops import ATOMIC_OPS
 from ...language.creation_ops import full
 from ...language.matmul_ops import dot as hl_dot
 from ...language.matmul_ops import dot_scaled as hl_dot_scaled
+from ...language.memory_ops import _mask_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import store
 from ..ast_extension import expr_from_string
@@ -6988,7 +6989,7 @@ def _(state: CodegenState) -> object:
             raise exc.BackendUnsupported(
                 "cute", f"tile_index load index type: {type(idx)}"
             )
-        return expr_from_string(index_var)
+        return _mask_tile_index_load(state, expr_from_string(index_var), extra_mask)
 
     if _cute_load_has_placeholder_value(state):
         zero = CompileEnvironment.current().backend.dtype_str(tensor.dtype)

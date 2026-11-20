@@ -101,6 +101,114 @@ def _computed_tile_coordinates(x: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return prefix, reused
 
 
+@onlyBackends(["triton", "cute", "pallas"])
+class TestMaskedTileIndexLoad(RefEagerTestBase, TestCase):
+    def test_dynamic_scalar_and_lane_masks(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def kernel(
+            x: torch.Tensor, flag: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            scalar = torch.empty_like(x)
+            lanes = torch.empty_like(x)
+            for tile in hl.tile(x.size(0)):
+                index = tile.index
+                scalar[tile] = hl.load(index, [slice(None)], extra_mask=flag[0] > 0)
+                lanes[tile] = hl.load(index, [slice(None)], extra_mask=x[tile] > 0)
+            return scalar, lanes
+
+        pallas = _get_backend() == "pallas"
+        indices = torch.arange(256 if pallas else 100, device=DEVICE, dtype=torch.int32)
+        x = indices % 2
+        for enabled in (0, 1):
+            with self.subTest(enabled=enabled):
+                flag = torch.full((1,), enabled, device=DEVICE, dtype=x.dtype)
+                _, result = code_and_output(
+                    kernel, (x, flag), block_sizes=[128 if pallas else 32]
+                )
+                expected = indices * enabled, torch.where(x > 0, indices, 0)
+                torch.testing.assert_close(result, expected)
+
+    def test_broadcast_view_mask(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def kernel(mask: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(mask)
+            for row in hl.tile(mask.size(0)):
+                indices = hl.load(
+                    row.index, [slice(None), None], extra_mask=mask[row, None] > 0
+                )
+                out[row] = indices.squeeze(-1)
+            return out
+
+        pallas = _get_backend() == "pallas"
+        indices = torch.arange(256 if pallas else 100, device=DEVICE, dtype=torch.int32)
+        mask = indices % 2
+        _, actual = code_and_output(
+            kernel, (mask,), block_sizes=[128 if pallas else 32]
+        )
+        torch.testing.assert_close(actual, torch.where(mask > 0, indices, 0))
+
+    def test_mask_expands_tile_index_load_before_reduction(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def kernel(mask: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(mask[:, 0])
+            for row, col in hl.tile(mask.shape):
+                indices = hl.load(
+                    row.index, [slice(None), None], extra_mask=mask[row, col] > 0
+                )
+                out[row] = indices.sum(-1, dtype=torch.int32)
+            return out
+
+        pallas = _get_backend() == "pallas"
+        rows = torch.arange(16 if pallas else 17, device=DEVICE, dtype=torch.int32)
+        cols = torch.arange(128, device=DEVICE, dtype=torch.int32)
+        mask = (rows[:, None] + cols[None, :]) % 3
+        _, actual = code_and_output(
+            kernel, (mask,), block_sizes=[8 if pallas else 4, 128]
+        )
+        expected = torch.where(mask > 0, rows[:, None], 0).sum(-1, dtype=torch.int32)
+        torch.testing.assert_close(actual, expected)
+
+    def test_mask_adds_leading_axis_to_tile_index_load(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def kernel(mask: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(mask[0, :])
+            for row, col in hl.tile(mask.shape):
+                indices = hl.load(
+                    col.index, [slice(None)], extra_mask=mask[row, col] > 0
+                )
+                out[col] = indices.sum(0, dtype=torch.int32)
+            return out
+
+        rows = torch.arange(8, device=DEVICE, dtype=torch.int32)
+        cols = torch.arange(256, device=DEVICE, dtype=torch.int32)
+        mask = (rows[:, None] + cols[None, :]) % 3
+        _, actual = code_and_output(kernel, (mask,), block_sizes=[8, 128])
+        expected = torch.where(mask > 0, cols, 0).sum(0, dtype=torch.int32)
+        torch.testing.assert_close(actual, expected)
+
+    @onlyBackends(["triton"])
+    @skipIfTileIR("hint is emitted by the Triton pointer indexing strategy")
+    @skipIfRefEager("asserts on generated Triton code")
+    def test_masked_indices_do_not_prove_gather_contiguity(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def kernel(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+            out = torch.empty_like(mask, dtype=values.dtype)
+            for tile in hl.tile(mask.size(0)):
+                index = hl.load(tile.index, [slice(None)], extra_mask=mask[tile])
+                out[tile] = values[(index // 4) * 512 + index % 4]
+            return out
+
+        values = torch.arange(4096, device=DEVICE, dtype=torch.float32)
+        indices = torch.arange(32, device=DEVICE)
+        mask = indices % 2 == 1
+        code, actual = code_and_output(
+            kernel, (values, mask), block_sizes=[32], indexing="pointer"
+        )
+        self.assertNotIn("tl.max_contiguous(", code)
+        index = torch.where(mask, indices, 0)
+        torch.testing.assert_close(actual, values[(index // 4) * 512 + index % 4])
+
+
 @onlyBackends(["triton", "cute"])
 class TestIndexing(RefEagerTestBase, TestCase):
     @skipIfRefEager(
