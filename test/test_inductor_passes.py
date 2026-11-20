@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pathlib
 import unittest
 
 import pytest
@@ -13,7 +14,9 @@ from helion._testing import TestCase
 if not requires_torch_version("2.16"):
     pytest.skip("helion.inductor needs torch 2.16", allow_module_level=True)
 
-from helion.inductor.passes import HelionPostGradPass
+import helion.inductor
+from helion.inductor import config as helion_config
+from helion.inductor.fx_passes.post_grad import HelionPostGradPass
 
 pytestmark = pytest.mark.cpu_only
 
@@ -28,6 +31,26 @@ class Recorder(CustomGraphModulePass):
 
     def uuid(self) -> object:
         return self._uuid
+
+
+class TestSourceHash(TestCase):
+    def test_covers_subpackages(self):
+        # _source_hash, in Inductor's FX graph cache key, hashes every module of
+        # helion.inductor: a change to the codegen in codegen/ or to a pass in
+        # fx_passes/ misses the cache, as one to a module at the top does.
+        package = pathlib.Path(helion.inductor.__file__).parent
+        hashed = {
+            path.relative_to(package).as_posix()
+            for path in helion_config._source_files()
+        }
+        expected = {
+            "codegen/kernel.py",
+            "codegen/overrides.py",
+            "codegen/scheduling.py",
+            "fx_passes/online_softmax.py",
+            "fx_passes/post_grad.py",
+        }
+        self.assertLessEqual(expected, hashed)
 
 
 class TestPostGradPass(TestCase):
