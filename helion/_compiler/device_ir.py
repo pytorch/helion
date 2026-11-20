@@ -749,6 +749,17 @@ def device_loop_bounds(
     return value(begins[position]), value(ends[position])
 
 
+def _iter_loop_graphs(
+    device_ir: DeviceIR, graphs: Sequence[GraphInfo], block_ids: list[int]
+) -> Iterator[GraphInfo]:
+    grids = dict(zip(device_ir.root_ids, device_ir.grid_block_ids, strict=True))
+    for info in graphs:
+        if (isinstance(info, ForLoopGraphInfo) and info.block_ids == block_ids) or (
+            isinstance(info, RootGraphInfo) and grids.get(info.graph_id) == block_ids
+        ):
+            yield info
+
+
 def iter_loop_graph_nodes(
     fn: DeviceFunction, block_ids: list[int]
 ) -> Iterator[torch.fx.Node]:
@@ -758,25 +769,12 @@ def iter_loop_graph_nodes(
     ``_for_loop_step`` node is followed by the nodes of the nested for-loop
     graph it names (other nested graphs are not descended).  A graph belongs
     to the loop when it is the for-loop graph over ``block_ids`` or the root
-    graph of the phase whose grid block ids are ``block_ids``.  Reads only
-    ``fn.codegen.codegen_graphs`` and the current device IR's ``grid_block_ids``.
+    graph whose grid block ids are ``block_ids``.
     """
     from ..language._decorators import is_api_func
 
-    grid_block_ids = HostFunction.current().device_ir.grid_block_ids
     graphs = fn.codegen.codegen_graphs
     graph_by_id = {graph_info.graph_id: graph_info for graph_info in graphs}
-
-    def matches_loop(graph_info: GraphInfo) -> bool:
-        if isinstance(graph_info, ForLoopGraphInfo):
-            return graph_info.block_ids == block_ids
-        if not isinstance(graph_info, RootGraphInfo):
-            return False
-        phase_index = graph_info.phase_index
-        return (
-            0 <= phase_index < len(grid_block_ids)
-            and grid_block_ids[phase_index] == block_ids
-        )
 
     def walk(graph: torch.fx.Graph) -> Iterator[torch.fx.Node]:
         for node in graph.nodes:
@@ -791,9 +789,10 @@ def iter_loop_graph_nodes(
                     if nested is not None:
                         yield from walk(nested.graph)
 
-    for graph_info in graphs:
-        if matches_loop(graph_info):
-            yield from walk(graph_info.graph)
+    for graph_info in _iter_loop_graphs(
+        HostFunction.current().device_ir, graphs, block_ids
+    ):
+        yield from walk(graph_info.graph)
 
 
 class ReductionLoopGraphInfo(ForLoopGraphInfo):
