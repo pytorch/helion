@@ -1940,6 +1940,47 @@ class TestTileDependency(TestCase):
             (frozenset((0, 1, 2, 3)), frozenset((4, 5, 6, 7))),
         )
 
+    def test_constant_subrange_store_keeps_keyed_producers(self) -> None:
+        # Each producer writes rows [0, 16) of its slot's 32 (a one-tile axis:
+        # the same sub-range for every producer) of a strided [4, 32, 16] view
+        # (16-byte rows 128 bytes apart); a consumer reads its whole slot.  The
+        # sub-range tells no producers apart: a consumer needs exactly its
+        # slot's producers.
+        layout = {"shape": (4, 32, 16), "strides": (4096, 128, 1)}
+        plan = build_tile_dependency_graph(
+            (
+                _access(
+                    0,
+                    root=0,
+                    kind="store",
+                    **layout,
+                    block_ids=(10, 11, None),
+                    scales=(1, 1, 1),
+                    offsets=(0, 0, 0),
+                    full_slice=(False, False, True),
+                ),
+                _access(
+                    1,
+                    root=1,
+                    kind="load",
+                    **layout,
+                    block_ids=(20, None, None),
+                    scales=(1, 1, 1),
+                    offsets=(0, 0, 0),
+                    full_slice=(False, True, True),
+                ),
+            ),
+            [[10, 11], [20]],
+        )
+        root_domains = (
+            CoordinateDomain((10, 11), ((10, 4), (11, 1)), ((10, 1), (11, 16))),
+            CoordinateDomain((20,), ((20, 4),), ((20, 1),)),
+        )
+        self.assertEqual(
+            _root_producers_by_consumer(plan, root_domains),
+            tuple(frozenset((slot,)) for slot in range(4)),
+        )
+
     def test_root_relation_uses_coordinates_not_flattened_pid_runs(self) -> None:
         plan = build_tile_dependency_graph(
             (

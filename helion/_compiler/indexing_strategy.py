@@ -44,6 +44,7 @@ if TYPE_CHECKING:
     from .device_ir import GraphInfo
     from .generate_ast import GenerateAST
     from .inductor_lowering import CodegenState
+    from .tile_strategy import LoopDimInfo
 
     SymIntLike = torch.SymInt | int
     ShapeLike = Sequence[SymIntLike]
@@ -61,6 +62,61 @@ def _block_size_origin(index: object) -> BlockSizeOrigin | None:
     if origin is not None and isinstance(origin.origin, BlockSizeOrigin):
         return origin.origin
     return None
+
+
+def _static_whole_tiles(
+    state: CodegenState,
+    block_index: int,
+    info: LoopDimInfo,
+) -> tuple[int, int] | None:
+    """The static ``(begin, end)`` of the loop over ``block_index`` when its
+    extent is a multiple of its static block size (every tile whole), else
+    None."""
+    begin = info.begin_expr if info.begin_expr is not None else sympy.Integer(0)
+    end = info.end_expr
+    if end is None or not (
+        isinstance(begin, sympy.Integer) and isinstance(end, sympy.Integer)
+    ):
+        return None
+    block_size = (
+        CompileEnvironment.current()
+        .block_sizes[block_index]
+        .from_config(state.device_function.config)
+    )
+    if not isinstance(block_size, int) or block_size <= 0:
+        return None
+    if int(begin) < 0 or (int(end) - int(begin)) % block_size:
+        return None
+    return int(begin), int(end)
+
+
+def _tiles_whole_within(
+    state: CodegenState,
+    block_index: int,
+    info: LoopDimInfo,
+    size: int | torch.SymInt,
+) -> bool:
+    """Whether every tile of the loop over ``block_index`` is whole and inside
+    a dim of ``size``: the loop's static extent is a multiple of its static
+    block size and it ends at or before the dim's end.  Then no lane is masked
+    and no block crosses the loop's end, so a loop that ends short of the dim
+    neither reads past it nor writes past it."""
+    span = _static_whole_tiles(state, block_index, info)
+    return isinstance(size, int) and span is not None and span[1] <= size
+
+
+def _tiles_whole_past(
+    state: CodegenState,
+    block_index: int,
+    info: LoopDimInfo,
+    size: int | torch.SymInt,
+) -> bool:
+    """Whether every tile of the loop over ``block_index`` is whole, starting
+    inside a dim of ``size`` and ending at or past its end: the loop masks no
+    lane, so a load masks only the lanes past the dim, which a tensor
+    descriptor zero-fills."""
+    span = _static_whole_tiles(state, block_index, info)
+    return isinstance(size, int) and span is not None and span[0] < size <= span[1]
 
 
 def is_block_size_index(index: object) -> bool:
@@ -3120,6 +3176,17 @@ class BlockedSubscriptIndexing:
             loop_state = state.codegen.active_device_loops[block_index][-1]
             info = loop_state.block_id_to_info.get(block_index)
             if info is None:
+                return False
+            if _tiles_whole_within(state, block_index, info, size):
+                return False
+            if (
+                not for_store
+                and state.fx_node is not None
+                and state.fx_node.meta.get("masked_value") in (None, 0)
+                and _tiles_whole_past(state, block_index, info, size)
+            ):
+                # The loop's whole tiles run past the dim's end: a descriptor
+                # zero-fills there, the load's masked value.
                 return False
             if for_store:
                 return not info.is_end_matching_keyed(size)

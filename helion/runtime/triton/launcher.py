@@ -554,6 +554,50 @@ def _new_symmetric_state(
     return state, ptrs, handle
 
 
+# Tensor memory columns a Blackwell SM holds (128 lanes of 32-bit cells each).
+_TMEM_COLUMNS_PER_SM = 512
+# Registers a warp's allocation is rounded up to, and the most CTAs an SM holds.
+_REGISTER_ALLOCATION_UNIT = 256
+_MAX_BLOCKS_PER_SM = 32
+
+
+def _tensor_memory_blocks_per_sm(
+    properties: object,
+    *,
+    num_warps: int,
+    registers: int,
+    shared: int,
+    tmem_columns: int,
+) -> int:
+    """CTAs of a tensor-memory kernel an SM keeps resident.
+
+    The driver's occupancy query reports one CTA a SM for any kernel that
+    allocates tensor memory (``tcgen05.alloc``), but SMs co-schedule such CTAs
+    as long as their registers, threads and shared memory fit, and
+    ``tcgen05.alloc`` only waits for columns another CTA holds.  So the
+    residency of a CTA cohort that each allocates ``tmem_columns`` (rounded to a
+    power of two, at least 32, as the allocator does) is these limits' minimum
+    with the columns an SM has."""
+    threads = num_warps * 32
+    columns = max(32, 1 << (tmem_columns - 1).bit_length())
+    warp_registers = (
+        -(-registers * 32 // _REGISTER_ALLOCATION_UNIT) * _REGISTER_ALLOCATION_UNIT
+    )
+    limits = [
+        _MAX_BLOCKS_PER_SM,
+        _TMEM_COLUMNS_PER_SM // columns,
+        int(getattr(properties, "max_threads_per_multi_processor", 2048)) // threads,
+    ]
+    if warp_registers > 0:
+        regs_per_sm = int(getattr(properties, "regs_per_multiprocessor", 65536))
+        limits.append(regs_per_sm // (warp_registers * num_warps))
+    smem_per_sm = int(getattr(properties, "shared_memory_per_multiprocessor", 0))
+    if smem_per_sm > 0:
+        # The driver reserves 1 KB of shared memory a CTA.
+        limits.append(smem_per_sm // (shared + 1024))
+    return max(1, min(limits))
+
+
 def _validate_resident_program_capacity(
     compiled_kernel: object,
     args: tuple[object, ...],
@@ -604,6 +648,18 @@ def _validate_resident_program_capacity(
                 f"CUDA occupancy query failed for cross-loop kernel: {error}"
             )
         properties = torch.cuda.get_device_properties(device)
+        tmem_columns = int(getattr(metadata, "tmem_size", 0) or 0)
+        if tmem_columns > 0:
+            blocks_per_sm = max(
+                int(blocks_per_sm),
+                _tensor_memory_blocks_per_sm(
+                    properties,
+                    num_warps=num_warps,
+                    registers=int(getattr(compiled_kernel, "n_regs", 0) or 0),
+                    shared=shared,
+                    tmem_columns=tmem_columns,
+                ),
+            )
         capacity = int(blocks_per_sm) * int(properties.multi_processor_count)
         cache[key] = capacity
     if required_programs > capacity:

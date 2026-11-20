@@ -5618,6 +5618,15 @@ def _rectangular_overlap_sources(
                 and sympy.simplify(owner_end - allocation_counts[allocation_axis]) == 0
             ):
                 continue
+            if not (
+                sympy.sympify(owner_begin).free_symbols
+                or sympy.sympify(owner_end).free_symbols
+            ):
+                # Every owner covers the same sub-range of this axis (e.g. a
+                # tile narrower than the dim): it does not tell owners apart,
+                # so like a full range it bounds none of their axes (an over-
+                # approximation, which a wait may take).
+                continue
             interval = _single_axis_interval(
                 # pyrefly: ignore [bad-argument-type]
                 owner_begin,

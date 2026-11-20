@@ -1487,7 +1487,7 @@ def codegen_tmem_dot(
             f"{{b}}, {{b_scale}}, {b_format}, {tmem}, "
             f"{in_smem[a_scale] and copied_scale(node, a_scale)}, "
             f"{in_smem[b_scale] and copied_scale(node, b_scale)}, {sync}, "
-            f"{ring is not None and _scaled_dots(node.graph) == 1})",
+            f"{_pipelined_scales(node, ring, completion)})",
             a=operand_asts[a_pos],
             a_scale=operand_asts[a_scale],
             b=operand_asts[b_pos],
@@ -1523,6 +1523,23 @@ def codegen_tmem_dot(
 
 def _scaled_dots(graph: torch.fx.Graph) -> int:
     return sum(n.target is dot_scaled for n in graph.nodes)
+
+
+def _pipelined_scales(
+    node: torch.fx.Node,
+    ring: tuple[str, ...] | None,
+    completion: tuple[str, str, str] | None,
+) -> bool:
+    """Whether ``tmem_dot_scaled`` may alternate two buffers for the scales it
+    stores from registers (``PIPELINE``), waiting for the MMA two back instead
+    of the one it just issued.  Its completions must count steps for that wait:
+    an accumulator ring's, or a ring channel's (``completion``: the MMA frees
+    the step's slot on the channel's barrier, which is per slot, so the MMA two
+    back is the last one to complete there), and the loop must hold no other
+    scaled dot, which would alternate the same buffers on the same count."""
+    return (ring is not None or completion is not None) and _scaled_dots(
+        node.graph
+    ) == 1
 
 
 def _stage_call(

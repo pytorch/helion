@@ -979,6 +979,26 @@ class TestTensorDescriptor(RefEagerTestBase, TestCase):
 
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfTileIR("tileir backend will ignore `range_num_stages` hints")
+    @skipUnlessTensorDescriptor("Tensor descriptor support is required")
+    def test_tensor_descriptor_tiles_past_dim_end(self):
+        # The K loop's whole tiles run past the 96 columns: a descriptor's zero
+        # fill there is the load's masked value, so the load keeps the
+        # descriptor.
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def row_sum(x: torch.Tensor) -> torch.Tensor:
+            out = torch.empty([x.size(0)], dtype=torch.float32, device=x.device)
+            for tile_m in hl.tile(64, block_size=16):
+                acc = hl.zeros([tile_m], dtype=torch.float32)
+                for tile_k in hl.tile(128, block_size=32):
+                    acc = acc + torch.sum(x[tile_m, tile_k].to(torch.float32), dim=1)
+                out[tile_m] = acc
+            return out
+
+        x = torch.randn([64, 96], device=DEVICE, dtype=HALF_DTYPE)
+        code, result = code_and_output(row_sum, (x,), indexing="tensor_descriptor")
+        torch.testing.assert_close(result, x.float().sum(1), rtol=1e-3, atol=1e-3)
+        self.assertNotIn("tl.load(x +", code)
+
     def test_multistage_range_tensor_descriptor(self):
         @helion.kernel(
             config=helion.Config(

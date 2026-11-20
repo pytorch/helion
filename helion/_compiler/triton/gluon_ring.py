@@ -2114,6 +2114,26 @@ def _first_waits(body: list[ast.stmt]) -> None:
         waited = {key for key in waited if key[1] not in stored}
 
 
+def _is_proxy_fence(statement: ast.stmt) -> bool:
+    """Whether ``statement`` is a generic-to-async proxy fence (``fence.proxy.async``)."""
+    if not isinstance(statement, ast.Assign) or not isinstance(
+        statement.value, ast.Call
+    ):
+        return False
+    call = statement.value
+    if not (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == "inline_asm_elementwise"
+    ):
+        return False
+    asm = next((k.value for k in call.keywords if k.arg == "asm"), None)
+    return (
+        isinstance(asm, ast.Constant)
+        and isinstance(asm.value, str)
+        and asm.value.startswith("fence.proxy.async")
+    )
+
+
 def _is_wait(statement: ast.stmt, waits: set[str]) -> bool:
     if isinstance(statement, (ast.If, ast.For)):
         nested = [*statement.body, *statement.orelse]
@@ -2403,6 +2423,11 @@ class _Slice:
             orelse = self.block(statement.orelse, else_live, follows)
             if not body and not orelse:
                 return None
+            if all(_is_proxy_fence(s) for s in (*body, *orelse)):
+                # Only proxy fences: fencing unconditionally orders at least as
+                # much, and the partition need not evaluate the branch's test
+                # (which may read what only the body computes).
+                return (body or orelse)[:1]
             live |= body_live | else_live | _names(statement.test)
             return create(
                 ast.If,
