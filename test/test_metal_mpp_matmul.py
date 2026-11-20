@@ -5040,11 +5040,10 @@ class TestMppStaging(_MppCase):
                 with self.subTest(kernel=kernel.name, config=config):
                     out, _, msl = _run(kernel, args, config)
                     _close(out, expected)
-                    if config is JAM64 and kernel is not kloop_arg_scale:
+                    if config is JAM64:
                         # One SIMD group builds the K loop's operand in
-                        # registers; kloop_arg_scale's reads a scalar
-                        # argument, which the lanes' recompute check
-                        # (OperandRecomputable) doesn't follow: staged.
+                        # registers (kloop_arg_scale's scalar argument is
+                        # uniform, which every lane recomputes).
                         self.assertIn("_mr_a", msl)
                         continue
                     self.assertIn("threadgroup bfloat _mpp_tile", msl)
@@ -8206,17 +8205,20 @@ class TestMppLaneJam(unittest.TestCase):
         config: helion.Config | None,
         *refs: tuple[torch.Tensor | int, torch.Tensor],
         runs: int = 1,
+        lanes: bool = True,
     ) -> None:
         """Run ``kernel`` and compare each ``(got, ref)``: a tensor argument
         the kernel writes, or the index of one of its outputs.  The lanes
-        run as copies or rolled loops beside one ``run`` per op, which no
+        run as copies or rolled loops (with ``lanes``; without, the kernel
+        has no Scalar work for them) beside one ``run`` per op, which no
         lane loop encloses."""
         with self.subTest(kernel=kernel.name, config=config):
             out, _, msl = _run(kernel, args, config)
             outs = out if isinstance(out, tuple) else (out,)
             for got, ref in refs:
                 _close(outs[got] if isinstance(got, int) else got, ref)
-            self.assertRegex(msl, r"__lane1|for \(int lane_\d+ = 0")
+            if lanes:
+                self.assertRegex(msl, r"__lane1|for \(int lane_\d+ = 0")
             self.assertEqual(msl.count(".run("), runs)
             for match in re.finditer(r"\.run\(", msl):
                 loops = _open_loops(msl, match.start())
@@ -8238,7 +8240,9 @@ class TestMppLaneJam(unittest.TestCase):
             ),
         ):
             self._check(side_store, (x, y, z), config, (0, rt), (1, zd + 1))
-        self._check(root_scaled, (x, y, 0.5), M_LANES, (0, rt * 0.5))
+        # Its scale, a float argument, is uniform: an element-wise epilogue
+        # on the cooperative result, with no Scalar work for lanes.
+        self._check(root_scaled, (x, y, 0.5), M_LANES, (0, rt * 0.5), lanes=False)
         self._check(acc_from_load, (x, y, z), M_LANES, (0, rt + zd))
         self._check(seed_bcast, (x, y, bias), M_LANES, (0, rt + bias.cpu().double()))
         self._check(row_carry, (x, y, w), M_LANES, (0, rt * wd.sum(-1)[:, None]))
@@ -8330,6 +8334,7 @@ class TestMppLaneJam(unittest.TestCase):
                 block_sizes=[32, 32, 32], num_threads=[1, 0, 1], num_warps=32
             ),
             (0, self.rt * 0.5),
+            lanes=False,
         )
         cp = torch.zeros(48, 72, device=DEVICE, dtype=torch.float16)
         xd = x.cpu().double()
@@ -11573,6 +11578,8 @@ class TestMppCarryUpdate(unittest.TestCase):
         cases = [
             (inloop_scale, (p, v, w), TILE16, lambda acc, ks: acc * _d(w)[:, None]),
             (inloop_const, (p, v), TILE16, lambda acc, ks: acc * 0.5),
+            # A float kernel argument: uniform, as a constant is.
+            (upd_scalar_arg, (p, v, 0.7), TILE16, lambda acc, ks: acc * 0.7),
         ]
         for config in (None, helion.Config(block_sizes=[32, 16])):
             cases.append(
@@ -12110,14 +12117,6 @@ class TestMppCarryUpdateRejects(_MppCase):
                 "a matmul whose acc is computed from a loop carry that its result "
                 "does not replace",
             )
-
-    def test_scalar_argument(self) -> None:
-        self._rejects_at(
-            upd_scalar_arg,
-            (self.p, self.v, 0.7),
-            (TILE16,),
-            "a scalar that isn't a tensor, such as a float kernel argument",
-        )
 
     def test_positional(self) -> None:
         """A square [N, M] load or carry added to the [M, N] carry, and an
@@ -14970,6 +14969,19 @@ class TestMppWholeKDot(_WholeKDotCase):
         for config in (None, helion.Config(block_sizes=[32, 32, 32])):
             self._mpp(mamba2_chunk_state, args, config, ref)
 
+    def test_update_by_a_float_argument(self) -> None:
+        """An update of the carry by a float kernel argument takes MPP: the
+        argument is uniform, which the update's element loop reads."""
+        x, y = _randn(40, 64), _randn(64, 48)
+        xd, yd = _cpu64(x, y)
+        ref = torch.zeros(40, 48, dtype=torch.float64)
+        for k in range(0, 64, 16):
+            ref = ref * 0.5 + (2 * xd[:, k : k + 16]) @ yd[k : k + 16]
+        k16 = helion.Config(block_sizes=[16, 16, 16])
+        out, code, _ = _run(dot_update_by_arg, (x, y, 0.5), k16)
+        self.assertIn("_helion_mpp_run(", code)
+        _close(out, ref)
+
 
 @_requires_mps
 class TestMppWholeKDotRejects(_WholeKDotCase):
@@ -15096,7 +15108,6 @@ class TestMppWholeKDotRejects(_WholeKDotCase):
         self._scalar(dot_result_scaled, (x, y), k16, scaled)
         self._scalar(dot_loaded_acc, (x, y, c), k16, 4 * cd + 2 * xd @ yd)
         self._scalar(dot_update_read_twice, (x, y), k16, update + tot)
-        self._scalar(dot_update_by_arg, (x, y, 1.0), k16, 2 * xd @ yd)
         self._scalar(dot_outer_decay, (x, y), None, 0.875 * 2 * xd @ yd)
         self._scalar(dot_colon_carried, (x, y), None, 6 * xd @ yd)
         self._scalar(

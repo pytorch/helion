@@ -49,6 +49,28 @@ METAL_MATMUL_CHOICES = ("mpp", "fragment", "scalar")
 METAL_TABULATE = "metal_tabulate_max_entries"
 METAL_TABULATE_CHOICES = (0, 16, 256)
 
+#: Whether a fragment config builds each operand its loop doesn't change
+#: (``mpp_matmul._hoist_invariant``: attention's scaled queries) into
+#: fragments once, before the loop, rather than at each run
+#: (``fragment_mma.codegen_fragment_hoist``).  More registers held across
+#: the loop for less work in it; off, the default, as before the key.
+METAL_FRAGMENT_HOIST = "metal_fragment_hoist"
+
+#: The SIMD groups that split each fragment grid's rows
+#: (``fragment_mma.row_split_refusal``): each runs the tiles, as a K split's
+#: do, on its share of the rows, so a threadgroup holds that many times the
+#: rows of one SIMD group's grid at the same registers per lane.  1, the
+#: default, as before the key.
+METAL_FRAGMENT_ROW_SPLIT = "metal_fragment_row_split"
+METAL_FRAGMENT_ROW_SPLIT_CHOICES = (1, 2, 4, 8)
+
+#: Whether a fragment config's runs load their device-view operands from
+#: threadgroup tiles that every thread copies, coalesced, once per loop
+#: body, rather than each lane loading its elements
+#: (``fragment_mma.tile_side``).  A barrier pair per loop body for shared,
+#: coalesced loads; off, the default, as before the key.
+METAL_FRAGMENT_STAGE = "metal_fragment_stage"
+
 
 @dataclasses.dataclass(frozen=True)
 class MetalKernelFacts:
@@ -79,6 +101,25 @@ class MetalKernelFacts:
     #: (``mpp_registers.register_split``, which codegen runs only here); a
     #: reduction, which also would draw on it, refuses the split.
     register_splits: bool = False
+    #: The K loops with a ``range_num_stages`` slot whose bounds are known
+    #: only at runtime: they load a tile ahead only through their tile
+    #: copies (``fragment_mma.pipeline_tile_copies``), so 2 stages need
+    #: ``metal_fragment_stage``.
+    tile_pipelined_loops: frozenset[int] = frozenset()
+    #: Whether a fragment operand is invariant in its loop, which
+    #: ``metal_fragment_hoist`` builds before it.
+    fragment_hoists: bool = False
+    #: The block those matmuls' grid rows lie over when SIMD groups can
+    #: split them (``fragment_mma.row_split_refusal``), which
+    #: ``metal_fragment_row_split`` splits; else None.
+    fragment_row_block: int | None = None
+    #: The row block's static extent, which an op over it cuts the block to
+    #: (:func:`op_dim`); None when it is known only at runtime.
+    fragment_row_extent: int | None = None
+    #: Whether a fragment operand is a device view that
+    #: ``metal_fragment_stage`` can load from a threadgroup tile
+    #: (``fragment_mma.can_stage``).
+    fragment_staging: bool = False
     #: The tunable tiles of each device loop, the grid's first (empty when it
     #: has none), when the kernel's matmuls lower on MPP's cooperative ops or
     #: on fragments, whose launches take whole SIMD groups (:func:`fit_threads`),
@@ -102,6 +143,19 @@ class MetalKernelFacts:
     fragment_blocks: tuple[tuple[int, int, int], ...] = ()
 
 
+def op_dim(size: int, extent: int | None) -> int:
+    """An op's M or N over a block of ``size`` whose loop has the static
+    ``extent`` (``mpp_matmul.op_dims``; None for one known only at runtime,
+    or an op that keeps its block): 8 for a block of 1, else the block cut
+    to the extent rounded up to 8."""
+    if size == 1:
+        return 8
+    if extent is None:
+        return size
+    # A zero-trip loop still gets an op MPP accepts.
+    return min(size, -(-max(extent, 1) // 8) * 8)
+
+
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
     """The spec's :class:`MetalKernelFacts`; empty ones when
     ``register_search_surface`` recorded none."""
@@ -115,6 +169,23 @@ def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
 def metal_tabulate_max_entries(config: Mapping[str, object]) -> int:
     """The config's ``metal_tabulate_max_entries``, 0 when it has none."""
     value = config.get(METAL_TABULATE, METAL_TABULATE_CHOICES[0])
+    assert isinstance(value, int)
+    return value
+
+
+def metal_fragment_hoist(config: Mapping[str, object]) -> bool:
+    """The config's ``metal_fragment_hoist``, False when it has none."""
+    return config.get(METAL_FRAGMENT_HOIST, False) is True
+
+
+def metal_fragment_stage(config: Mapping[str, object]) -> bool:
+    """The config's ``metal_fragment_stage``, False when it has none."""
+    return config.get(METAL_FRAGMENT_STAGE, False) is True
+
+
+def metal_fragment_row_split(config: Mapping[str, object]) -> int:
+    """The config's ``metal_fragment_row_split``, 1 when it has none."""
+    value = config.get(METAL_FRAGMENT_ROW_SPLIT, 1)
     assert isinstance(value, int)
     return value
 
@@ -257,6 +328,13 @@ def _table_choices(config_spec: ConfigSpec) -> tuple[int, ...]:
 #: loop pay off where few threadgroups run, as a few-row matmul with few
 #: output columns has; the search moves it from there.
 SPLIT_SEED = 4
+
+#: The ``metal_fragment_row_split`` of the row-split seeds: four or eight
+#: SIMD groups hold four or eight times one SIMD group's rows at its
+#: registers per lane, as fast attention kernels do (eight over 64 rows ran
+#: fastest on DFlash2's few-row attention and on ``examples/attention.py``,
+#: whose search from four alone did not reach it); the search moves them.
+ROW_SPLIT_SEEDS = (4, 8)
 
 #: The ``range_num_stages`` a loop over fragment runs takes: 0 and 1 load
 #: each K tile's operands in its iteration, 2 one tile ahead
@@ -423,22 +501,96 @@ def fit_threads(config_spec: ConfigSpec, config: dict[str, object]) -> None:
     config["num_threads"] = counts
 
 
+def fits_row_split(facts: MetalKernelFacts, block: int, split: int) -> bool:
+    """Whether ``split`` SIMD groups each take whole 8-row fragments of the
+    grid rows an op over a row block of ``block`` holds
+    (``fragment_mma.fragment_grid``): the block cut to the row block's
+    extent (:func:`op_dim`), not the block itself."""
+    rows = op_dim(block, facts.fragment_row_extent) // 8
+    return rows > 0 and rows % split == 0
+
+
+def _fit_row_split(config_spec: ConfigSpec, config: dict[str, object]) -> None:
+    """Lower a searched config's ``metal_fragment_row_split`` to the most
+    SIMD groups that take whole 8-row fragments of its rows
+    (:func:`fits_row_split`), dropping it at 1, so the search's mutations of
+    the block or the split don't land on configs codegen refuses."""
+    facts = kernel_facts(config_spec)
+    block_id = facts.fragment_row_block
+    split = config.get(METAL_FRAGMENT_ROW_SPLIT)
+    blocks = config.get("block_sizes")
+    if (
+        block_id is None
+        or block_id not in config_spec.block_sizes.valid_block_ids()
+        or not isinstance(split, int)
+        or not isinstance(blocks, list)
+    ):
+        # No row block, or a literal-size one, which codegen checks.
+        return
+    size = int(cast("int", config_spec.block_sizes.config_get(blocks, block_id, 1)))
+    fits = [
+        w
+        for w in METAL_FRAGMENT_ROW_SPLIT_CHOICES
+        if w <= split and fits_row_split(facts, size, w)
+    ]
+    best = max(fits, default=1)
+    if best == 1:
+        config.pop(METAL_FRAGMENT_ROW_SPLIT, None)
+    else:
+        config[METAL_FRAGMENT_ROW_SPLIT] = best
+
+
+def _fit_stages(config_spec: ConfigSpec, config: dict[str, object]) -> None:
+    """Lower a searched config's 2 stages to 0 on the K loops that load a
+    tile ahead only through their tile copies
+    (``MetalKernelFacts.tile_pipelined_loops``) when it stages nothing, so
+    the search's draws of the slots and ``metal_fragment_stage`` don't land
+    on configs codegen refuses."""
+    loops = kernel_facts(config_spec).tile_pipelined_loops
+    stages = config.get("range_num_stages")
+    if not loops or metal_fragment_stage(config) or not isinstance(stages, list):
+        return
+    for block in loops:
+        index = config_spec.range_num_stages.block_id_to_index(block)
+        if stages[index] >= 2:
+            stages[index] = 0
+
+
 class MetalSearchSurface(BackendSearchSurface):
-    config_keys = frozenset({METAL_MATMUL, METAL_TABULATE})
+    config_keys = frozenset(
+        {
+            METAL_MATMUL,
+            METAL_TABULATE,
+            METAL_FRAGMENT_HOIST,
+            METAL_FRAGMENT_ROW_SPLIT,
+            METAL_FRAGMENT_STAGE,
+        }
+    )
 
     def extra_fields(self, config_spec: ConfigSpec) -> dict[str, ConfigSpecFragment]:
         """``metal_matmul`` where more than one lowering applies
         (:func:`matmul_choices`); ``metal_tabulate_max_entries`` where the
-        kernel's fragment elements would read a table."""
+        kernel's fragment elements would read a table;
+        ``metal_fragment_hoist`` where a fragment operand is invariant in its
+        loop; ``metal_fragment_row_split`` where SIMD groups can split the
+        fragment grids' rows; ``metal_fragment_stage`` where a fragment
+        operand is a device view a threadgroup tile can hold."""
         choices = matmul_choices(config_spec)
         if len(choices) == 1:
             return {}
         fields: dict[str, ConfigSpecFragment] = {METAL_MATMUL: EnumFragment(choices)}
-        if (
-            lowers_on_fragments(config_spec)
-            and len(tables := _table_choices(config_spec)) > 1
-        ):
+        if not lowers_on_fragments(config_spec):
+            return fields
+        if len(tables := _table_choices(config_spec)) > 1:
             fields[METAL_TABULATE] = EnumFragment(tables)
+        if kernel_facts(config_spec).fragment_hoists:
+            fields[METAL_FRAGMENT_HOIST] = EnumFragment((False, True))
+        if kernel_facts(config_spec).fragment_row_block is not None:
+            fields[METAL_FRAGMENT_ROW_SPLIT] = EnumFragment(
+                METAL_FRAGMENT_ROW_SPLIT_CHOICES
+            )
+        if kernel_facts(config_spec).fragment_staging:
+            fields[METAL_FRAGMENT_STAGE] = EnumFragment((False, True))
         return fields
 
     def trim_reference_config(self, config_spec: ConfigSpec, config: Config) -> None:
@@ -450,10 +602,62 @@ class MetalSearchSurface(BackendSearchSurface):
             config.config.pop(METAL_MATMUL, None)
         if metal_tabulate_max_entries(config.config) == 0:
             config.config.pop(METAL_TABULATE, None)
+        if not metal_fragment_hoist(config.config):
+            config.config.pop(METAL_FRAGMENT_HOIST, None)
+        if metal_fragment_row_split(config.config) == 1:
+            config.config.pop(METAL_FRAGMENT_ROW_SPLIT, None)
+        if not metal_fragment_stage(config.config):
+            config.config.pop(METAL_FRAGMENT_STAGE, None)
         stages = config.config.get("range_num_stages", [])
         assert isinstance(stages, list)
         if not any(stages):
             config.config.pop("range_num_stages", None)
+
+    def _featured_fragment_seeds(self, config_spec: ConfigSpec) -> list[Config]:
+        """Seeds splitting the grid rows over each of ROW_SPLIT_SEEDS SIMD
+        groups (largest first), the row block raised to a fragment row each
+        at least, that take whole fragments of its rows
+        (:func:`fits_row_split`), else, where none does or the kernel has no
+        row block, one on one SIMD group where an operand stages; each
+        staging device-view operands, loading their tiles a tile ahead and
+        building invariant ones before their loops, each where it can."""
+        seeds: list[Config] = []
+        facts = kernel_facts(config_spec)
+        slots = len(config_spec.range_num_stages)
+        spec = config_spec.block_sizes
+        block = facts.fragment_row_block
+        # Each seed's row split and block sizes (None: the default's).
+        splits: list[tuple[int, list[int] | None]] = []
+        if block is not None:
+            for row_split in ROW_SPLIT_SEEDS[::-1]:
+                if block not in spec.valid_block_ids():
+                    # A literal-size tile (a fixed ``block_size=``) has no
+                    # block to raise; codegen checks its rows.
+                    splits.append((row_split, None))
+                    continue
+                blocks = list(
+                    cast("list[int]", config_spec.default_config()["block_sizes"])
+                )
+                index = spec.block_id_to_index(block)
+                blocks[index] = max(blocks[index], 8 * row_split)
+                if fits_row_split(facts, blocks[index], row_split):
+                    splits.append((row_split, blocks))
+        if not splits and facts.fragment_staging:
+            splits.append((1, None))
+        for row_split, blocks in splits:
+            seed = Config(metal_matmul="fragment", num_warps=1)
+            if row_split > 1:
+                seed.config[METAL_FRAGMENT_ROW_SPLIT] = row_split
+            if blocks is not None:
+                seed.config["block_sizes"] = blocks
+            if facts.fragment_staging:
+                seed.config[METAL_FRAGMENT_STAGE] = True
+                if slots:
+                    seed.config["range_num_stages"] = [2] * slots
+            if facts.fragment_hoists:
+                seed.config[METAL_FRAGMENT_HOIST] = True
+            seeds.append(seed)
+        return seeds
 
     def seed_configs(self, config_spec: ConfigSpec) -> list[Config]:
         """Fragment configs in the initial population beside MPP's default,
@@ -462,10 +666,22 @@ class MetalSearchSurface(BackendSearchSurface):
         can (``range_num_stages`` slots), on one SIMD group per threadgroup
         and, where its K loops split, on :data:`SPLIT_SEED` SIMD groups
         splitting them.  The scalar contraction needs no seed: the search
-        draws it from ``metal_matmul`` as it draws the others."""
+        draws it from ``metal_matmul`` as it draws the others.
+
+        A slow kernel's budget can cut the initial population after a few
+        configs, so each lowering's strongest guess comes first: the seed that
+        turns on every fragment feature the kernel takes (the largest row
+        split, with staging and hoisting), then MPP's default, then the other
+        fragment seeds.  Listed last, the featured seeds went unmeasured on
+        attention at 8192 keys (1258 ms against the 2295 ms the cut kept), and
+        MPP's default, which the search adds after every seed, on a grouped
+        GEMM of 8192-square groups."""
         if not lowers_on_fragments(config_spec):
             return []
-        seeds = []
+        featured = self._featured_fragment_seeds(config_spec)
+        # MPP's default: the default config, which leaves ``metal_matmul`` out.
+        default = config_spec.default_config()
+        seeds = [*featured[:1], default, *featured[1:]]
         slots = len(config_spec.range_num_stages)
         splits = (1, SPLIT_SEED) if kernel_facts(config_spec).fragment_splits else (1,)
         for num_warps in splits:
@@ -477,6 +693,12 @@ class MetalSearchSurface(BackendSearchSurface):
                     if stages:
                         seed.config["range_num_stages"] = [stages] * slots
                     seeds.append(seed)
+        facts = kernel_facts(config_spec)
+        if facts.fragment_hoists:
+            # One seed building its invariant operands before their loops.
+            seeds.append(
+                Config(metal_matmul="fragment", num_warps=1, metal_fragment_hoist=True)
+            )
         return seeds
 
     def normalize_knobs(
@@ -485,6 +707,7 @@ class MetalSearchSurface(BackendSearchSurface):
         for key, choices in (
             (METAL_MATMUL, METAL_MATMUL_CHOICES),
             (METAL_TABULATE, METAL_TABULATE_CHOICES),
+            (METAL_FRAGMENT_ROW_SPLIT, METAL_FRAGMENT_ROW_SPLIT_CHOICES),
         ):
             if key not in config:
                 continue
@@ -497,9 +720,19 @@ class MetalSearchSurface(BackendSearchSurface):
                     f"{key} must be one of {choices}, got {config[key]!r}"
                 )
             del config[key]
+        for key in (METAL_FRAGMENT_HOIST, METAL_FRAGMENT_STAGE):
+            value = config.get(key)
+            if value is not None and not isinstance(value, bool):
+                if not fix_invalid:
+                    raise InvalidConfig(f"{key} must be a bool, got {value!r}")
+                del config[key]
         if metal_matmul(config) != "fragment":
-            # Tables are read by fragment elements only.
+            # Tables are read, operands hoisted and rows split by fragment
+            # runs only.
             config.pop(METAL_TABULATE, None)
+            config.pop(METAL_FRAGMENT_HOIST, None)
+            config.pop(METAL_FRAGMENT_ROW_SPLIT, None)
+            config.pop(METAL_FRAGMENT_STAGE, None)
         if metal_matmul(config) == "fragment" and (
             "num_warps" not in config
             or (fix_invalid and not kernel_facts(config_spec).fragment_splits)
@@ -511,6 +744,13 @@ class MetalSearchSurface(BackendSearchSurface):
             # (``operand_elements.split_refusal``) the search's fragment configs
             # take 1, and a config setting another value fails, saying why.
             config["num_warps"] = 1
+        if fix_invalid and config.get("num_warps", 1) != 1:
+            # SIMD groups split the rows or the K loops, not both
+            # (``fragment_mma.row_split_refusal``), and a split K loop stages
+            # nothing: the search's configs keep the K split, and a user's
+            # config fails, saying why.
+            config.pop(METAL_FRAGMENT_ROW_SPLIT, None)
+            config.pop(METAL_FRAGMENT_STAGE, None)
 
     def normalize_before_sequences(
         self, config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
@@ -552,6 +792,9 @@ class MetalSearchSurface(BackendSearchSurface):
             # were before Metal took the key: the sequence pass gives it an
             # empty range_num_stages, which this drops.
             config.pop("range_num_stages", None)
+        if fix_invalid:
+            _fit_row_split(config_spec, config)
+            _fit_stages(config_spec, config)
         if fix_invalid and kernel_facts(config_spec).thread_loops:
             fit_threads(config_spec, config)
         if (

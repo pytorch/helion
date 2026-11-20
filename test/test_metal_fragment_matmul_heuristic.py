@@ -75,11 +75,15 @@ class TestFragmentMatmulSeeds(unittest.TestCase):
         self.assertEqual(kernel_facts(spec).fragment_blocks, ((0, 1, 2),))
         self.assertEqual(_seeds(bound), FEW_ROWS)
         self.assertIn(MetalFragmentMatmulHeuristic.name, spec.autotuner_heuristics)
-        # Among the search surface's fragment seeds, which name no blocks.
+        # Among the search surface's fragment seeds, which name no blocks
+        # but the row-split seed's (its row block whole fragments per SIMD
+        # group).
         planted = [
             (c.config["block_sizes"], c.config["num_warps"])
             for c in spec.compiler_seed_configs
-            if c.config.get("metal_matmul") == "fragment" and "block_sizes" in c.config
+            if c.config.get("metal_matmul") == "fragment"
+            and "block_sizes" in c.config
+            and "metal_fragment_row_split" not in c.config
         ]
         self.assertEqual(planted, FEW_ROWS)
         self.assertEqual(spec.default_config().config["block_sizes"], [16, 16, 16])

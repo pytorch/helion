@@ -38,18 +38,23 @@ from .fragment_lines import emit_line_reduce
 from .fragment_mma import FRAGMENT_SLOT
 from .fragment_mma import EarlyLoad
 from .fragment_mma import emit_fragment_acc
+from .fragment_mma import emit_fragment_hoist
 from .fragment_mma import emit_fragment_run
 from .fragment_mma import emit_split_combine
+from .fragment_mma import emit_tile_copies
 from .fragment_mma import fragment_elements
 from .fragment_mma import is_fragment_acc
+from .fragment_mma import pipeline_tile_copies
 from .fragment_mma import prefetch_loads
 from .fragment_mma import split_runs
+from .fragment_mma import tile_copy_groups
 from .lane_fold import BF16_CAST
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .lane_fold import tl_store
 from .mpp_matmul import ACC_SEED
+from .mpp_matmul import FRAG_HOIST_LOOP
 from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import HOLD_LOOP
 from .mpp_matmul import LINE_ACC
@@ -171,6 +176,18 @@ class EmitState:
     #: Each held element value (``fragment_lines``), a lane's elements of a
     #: fragment root in registers, to its root.
     held: dict[str, str] = dataclasses.field(default_factory=dict)
+    #: ``" + _frag_sg * R"``, the first grid row of this SIMD group's share
+    #: when SIMD groups split the fragment rows (``fragment_mma``), else "";
+    #: set from the kernel's fragment grids before its first statement.
+    row_base: str = ""
+    #: The SIMD groups that split them, 1 when one holds them.
+    row_split: int = 1
+    #: The tiles of fragment runs' tile sides whose copies were emitted
+    #: (``fragment_mma.tile_copy_groups``).
+    tiles_copied: set[str] = dataclasses.field(default_factory=set)
+    #: Each pipelined tile (``fragment_mma.pipeline_tile_copies``) of the K
+    #: loop being emitted, to the registers its copy writes it from.
+    tile_regs: dict[str, list[str]] = dataclasses.field(default_factory=dict)
 
     def is_declared(self, name: str) -> bool:
         return name in self.declared or any(name in s for s in self._enclosing)
@@ -261,7 +278,18 @@ def _emit_stmts(
     This function does pure text emission.
     """
     pad = " " * indent
-    for stmt in stmts:
+    # The fragment runs' tile copies, each group's at its first run.
+    copies = tile_copy_groups(stmts) if state.fragments else {}
+    for index, stmt in enumerate(stmts):
+        if index in copies:
+            parts.extend(
+                emit_tile_copies(
+                    copies[index],
+                    pad,
+                    state,
+                    lambda e: _ast_expr_to_msl(e, subs=subs),
+                )
+            )
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
             target = stmt.targets[0]
             value = stmt.value
@@ -737,6 +765,19 @@ def _emit_for(
         )
         return
 
+    # --- A hoisted fragment operand (fragment_mma.codegen_fragment_hoist) ---
+    if isinstance(func, ast.Name) and func.id == FRAG_HOIST_LOOP:
+        emit_fragment_hoist(
+            stmt,
+            parts,
+            indent,
+            state,
+            lambda body, out, ind, st, extra: _emit_stmts(
+                body, out, indent=ind, state=st, subs={**(subs or {}), **extra}
+            ),
+        )
+        return
+
     # --- A fragment group's op over one K tile (fragment_mma.fragment_run) ---
     if isinstance(func, ast.Name) and func.id == FRAG_RUN:
         emit_fragment_run(
@@ -747,6 +788,7 @@ def _emit_for(
             lambda body, out, ind, st, extra: _emit_stmts(
                 body, out, indent=ind, state=st, subs={**(subs or {}), **extra}
             ),
+            lambda e: _ast_expr_to_msl(e, subs=subs),
         )
         return
 
@@ -883,15 +925,28 @@ def _emit_for(
         start, step = split_range(start, step, state.split)
         state.split_loops.append(loop_var)
     before, top = prefetch_loads(stmt.body, loop_var, end, pad, state)
-    parts += before
+    piped = set(state.tile_regs)
+    tile_before, tile_top = pipeline_tile_copies(
+        stmt.body,
+        loop_var,
+        start,
+        end,
+        step,
+        pad,
+        state,
+        lambda e: _ast_expr_to_msl(e, subs=subs),
+    )
+    parts += before + tile_before
     parts.append(
         f"{pad}for (int {loop_var} = {start}; {loop_var} < {end}; {loop_var} += {step}) {{"
     )
-    parts += top
+    parts += top + tile_top
     with state.block_scope():
         state.declare(loop_var)
         _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
+    for buf in set(state.tile_regs) - piped:
+        del state.tile_regs[buf]
     if runs or register_runs:
         state.split_loops.pop()
     if runs:

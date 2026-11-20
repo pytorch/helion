@@ -73,6 +73,24 @@ def row_sums_broadcast(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(backend="metal", static_shapes=True)
+def guarded_shift(x: torch.Tensor, y: torch.Tensor, scale: float) -> torch.Tensor:
+    """The accumulator scaled by a float kernel argument, less its row max,
+    the max replaced by 0 in rows where it is -inf (a bool row value)."""
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=F32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
+        s = acc * scale
+        row_max = s.amax(1)
+        safe = torch.where(row_max == float("-inf"), 0.0, row_max)
+        out[tile_m, :] = s - safe[:, None]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
 def cleared_bias_line(
     x: torch.Tensor, y: torch.Tensor, b: torch.Tensor
 ) -> torch.Tensor:
@@ -127,6 +145,24 @@ def cleared_bias_seed(
         for tile_n in hl.tile(n):
             m_i = torch.maximum(m_i, torch.amax(torch.mm(q, y[:, tile_n]), 1))
         out[tile_m] = m_i
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def nan_or_negative_shift(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """The accumulator less its row max, the max replaced by 0 in rows
+    where it is NaN or negative: bool row values from a call
+    (``isnan``) and from an or of it."""
+    m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=F32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
+        row_max = acc.amax(1)
+        bad = torch.isnan(row_max) | (row_max < 0)
+        out[tile_m, :] = acc - torch.where(bad, 0.0, row_max)[:, None]
     return out
 
 
@@ -310,6 +346,17 @@ class TestFragmentLines(TestCase):
         ):
             render_msl(row_sums_broadcast, (x, y), config)
 
+    def test_predicate_line(self) -> None:
+        """A bool row value (``row_max == -inf``) is a line, its slots
+        ``bool``, and the ``where`` that reads it is one; the result scaled
+        by a float kernel argument, the same on every thread, stays on the
+        fragments."""
+        x = torch.randn(16, 32, dtype=torch.float16)
+        y = torch.randn(32, 16, dtype=torch.float16)
+        msl = render_msl(guarded_shift, (x, y, 0.5), fragment_config([16, 16]))
+        _assert_lines(msl)
+        self.assertRegex(msl, r"bool _line_\d+\[2\];|bool \w+\[2\];")
+
     def test_written_tensor(self) -> None:
         """A row value read from a tensor the kernel writes is no line, nor
         an input of a line reduction or a seed: a line loop, a reduction's
@@ -326,6 +373,25 @@ class TestFragmentLines(TestCase):
                 ),
             ):
                 render_msl(kernel, args, fragment_config([16, 16]))
+
+    def test_line_dtypes(self) -> None:
+        """A line's slots take its dtype, whatever computes it: ``isnan`` of
+        a row max, and its or with a comparison, are ``bool`` lines; the
+        ``where`` that reads them a ``float`` one."""
+        x = torch.randn(16, 32, dtype=torch.float16)
+        y = torch.randn(32, 16, dtype=torch.float16)
+        msl = render_msl(nan_or_negative_shift, (x, y), fragment_config([16, 16]))
+        _assert_lines(msl)
+        kinds = {name: kind for kind, name in re.findall(r"\b(\w+) (\w+)\[2\];", msl)}
+
+        def kind_of(pattern: str) -> str:
+            match = re.search(rf"(\w+)\[_ri\] = {pattern}", msl)
+            assert match is not None, pattern
+            return kinds[match.group(1)]
+
+        self.assertEqual(kind_of(r"metal::isnan\("), "bool")
+        self.assertEqual(kind_of(r"\(\w+\[_ri\] \| \w+\[_ri\]\)"), "bool")
+        self.assertEqual(kind_of(r"\(\w+\[_ri\] \? "), "float")
 
     def test_lines_scoped(self) -> None:
         """An element loop reads only the row values it uses: a transposed

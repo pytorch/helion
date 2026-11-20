@@ -448,6 +448,7 @@ class MetalBackend(Backend):
             "pid_type",
             "num_sm_multiplier",
             "range_num_stages",
+            "loop_orders",
         }
     )
 
@@ -745,8 +746,11 @@ class MetalBackend(Backend):
         from ..compile_environment import FixedBlockSizeSource
         from ..device_ir import ForLoopGraphInfo
         from ..host_function import HostFunction
-        from .fragment_mma import FRAGMENT_LOWERING
+        from .fragment_mma import FragmentLowering
+        from .fragment_mma import can_stage
         from .fragment_mma import loads_ahead
+        from .fragment_mma import row_block
+        from .fragment_mma import row_split_refusal
         from .free_arange import free_arange_blocks
         from .mpp_matmul import has_matmuls
         from .mpp_matmul import plan_mpp_matmuls
@@ -773,10 +777,16 @@ class MetalBackend(Backend):
                 mpp = None
             fragment_graphs = [i.copy() for i in device_ir.graphs]
             try:
-                plan = plan_mpp_matmuls(fragment_graphs, set(), FRAGMENT_LOWERING)
+                # Hoisting on, to find the operands metal_fragment_hoist takes.
+                plan = plan_mpp_matmuls(
+                    fragment_graphs, set(), FragmentLowering(hoist=True)
+                )
             except exc.BackendUnsupported:
                 plan = None
             splits = plan is not None and split_refusal(plan, fragment_graphs) is None
+            row_splits = (
+                plan is not None and row_split_refusal(plan, fragment_graphs) is None
+            )
             free = free_arange_blocks()
         # The MPP matmuls that stage an operand per K tile, which the staged
         # matmul heuristic seeds tall tiles for.
@@ -841,6 +851,37 @@ class MetalBackend(Backend):
         # accumulator's run: a run per K tile (a per-K-tile product)
         # declares its fragments in the loop body (``prefetch_loads``).
         carried = {g.k_block for g in plan.by_matmul.values() if g.levels}
+        # A slot per carried K loop that can load a tile ahead
+        # (``fragment_mma.codegen_fragment_run`` checks each run's loop under it):
+        # one between known bounds (``loads_ahead``) does at any config; one
+        # between bounds known only at runtime does only through its tile
+        # copies (``fragment_mma.pipeline_tile_copies``), under
+        # ``metal_fragment_stage``, where each run in it has a side it can
+        # stage and no side loading per lane (a view it can't stage, or a
+        # hoisted one, which loads per lane where hoisting is off).
+        bounds = _loop_bounds(device_ir)
+
+        def tiles_pipe(block: int) -> bool:
+            runs = [g for g in plan.by_matmul.values() if g.k_block == block]
+            return all(
+                any(can_stage(g, side) for side in (0, 1))
+                and all(
+                    can_stage(g, side) or operand.elements is not None
+                    for side, operand in enumerate((g.lhs, g.rhs))
+                )
+                for g in runs
+            )
+
+        known = {b for b in carried if b in bounds and loads_ahead(*bounds[b])}
+        tile_pipes = {b for b in carried - known if tiles_pipe(b)}
+        # The row block and its static extent, which an op over it cuts the
+        # block to (``mpp_matmul.op_dims``).
+        rows = row_block(plan) if row_splits else None
+        row_extent = (
+            None
+            if rows is None
+            else CompileEnvironment.current().block_sizes[rows].size
+        )
         if blocks:
             # The nodes the matmuls compute from, where fragment elements
             # would read tables.
@@ -862,13 +903,22 @@ class MetalBackend(Backend):
                     for g in plan.by_matmul.values()
                     if g.levels
                 ),
+                fragment_row_block=rows,
+                fragment_row_extent=row_extent if isinstance(row_extent, int) else None,
+                fragment_staging=any(
+                    can_stage(g, side)
+                    for g in plan.by_matmul.values()
+                    for side in (0, 1)
+                ),
+                tile_pipelined_loops=frozenset(tile_pipes),
+                fragment_hoists=any(
+                    o.hoist is not None
+                    for g in plan.by_matmul.values()
+                    for o in (g.lhs, g.rhs)
+                ),
             )
-            # A slot per K loop that can load a tile ahead: known bounds it
-            # runs between (``fragment_mma.loads_ahead``, which codegen
-            # checks under the slot).
-            bounds = _loop_bounds(device_ir)
             for block in blocks:
-                if block in carried and block in bounds and loads_ahead(*bounds[block]):
+                if block in known or block in tile_pipes:
                     stages.append(FragmentNumStagesSpec([block]))
 
     def default_num_sm_multiplier(self) -> int:
@@ -957,7 +1007,8 @@ class MetalBackend(Backend):
         tile_strategy: TileStrategyDispatch,
     ) -> None:
         from ..compile_environment import CompileEnvironment
-        from .fragment_mma import FRAGMENT_LOWERING
+        from .fragment_mma import FragmentLowering
+        from .fragment_mma import row_split_refusal
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .literal_dims import reject_literal_dims
@@ -972,6 +1023,9 @@ class MetalBackend(Backend):
         from .repeated_blocks import plan_repeated_blocks
         from .search_surface import fragment_split
         from .search_surface import kernel_facts
+        from .search_surface import metal_fragment_hoist
+        from .search_surface import metal_fragment_row_split
+        from .search_surface import metal_fragment_stage
         from .search_surface import metal_matmul
         from .search_surface import mpp_one_simdgroup
 
@@ -997,7 +1051,9 @@ class MetalBackend(Backend):
             self.mpp_plan = plan_mpp_matmuls(
                 graphs,
                 threaded,
-                FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
+                FragmentLowering(hoist=metal_fragment_hoist(config))
+                if metal_matmul(config) == "fragment"
+                else None,
                 functools.partial(_widen_k, config),
                 REGISTER_LOWERING if metal_matmul(config) == "mpp" else None,
             )
@@ -1032,6 +1088,27 @@ class MetalBackend(Backend):
                     )
         if split > 1 and self.mpp_plan.by_matmul:
             self.mpp_plan.split = split
+        row_split = metal_fragment_row_split(config)
+        if row_split > 1 and self.mpp_plan.by_matmul:
+            refusal = (
+                "SIMD groups split the K loops (num_warps)"
+                if split > 1
+                else row_split_refusal(self.mpp_plan, graphs)
+            )
+            if refusal is not None:
+                raise metal_unsupported(
+                    f"fragment grid rows split over {row_split} SIMD groups "
+                    f"(metal_fragment_row_split={row_split}): {refusal}"
+                )
+            self.mpp_plan.row_split = row_split
+        if metal_fragment_stage(config) and self.mpp_plan.by_matmul:
+            if split > 1:
+                raise metal_unsupported(
+                    "fragment operands staged in threadgroup memory "
+                    f"(metal_fragment_stage) under a K loop split over {split} "
+                    f"SIMD groups (num_warps={split}); use num_warps=1"
+                )
+            self.mpp_plan.stage = True
         check_free_lanes(
             self.free_arange_plan, self.mpp_plan, graphs, self._fragment_tiles
         )
@@ -1474,13 +1551,14 @@ class MetalBackend(Backend):
                     f"threads on axis {axis}, but the kernel launches {dims}"
                 )
         check_free_arange_launch(self.free_arange_plan, self._tid_axes, dims)
-        split = 1
+        simdgroups = 1
         if self.mpp_plan is not None:
             check_mpp_launch(self.mpp_plan, dims)
-            split = self.mpp_plan.split
-        # The SIMD groups that split fragment or register runs' K loops each
-        # run the tiles' threads: the launch stacks them along z.
-        return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2] * split})"]
+            simdgroups = self.mpp_plan.split * self.mpp_plan.row_split
+        # The SIMD groups that split fragment or register runs' K loops, or
+        # fragment grid rows, each run the tiles' threads: the launch stacks
+        # them along z.
+        return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2] * simdgroups})"]
 
     def build_launcher_args(
         self,

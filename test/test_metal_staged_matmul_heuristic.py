@@ -131,10 +131,12 @@ class TestStagedMatmulSeeds(unittest.TestCase):
         ]
         self.assertEqual(_seeds(bound), expected)
         self.assertIn(MetalStagedMatmulHeuristic.name, spec.autotuner_heuristics)
+        # MPP's seeds besides its default, which the fragment seeds list too.
         planted = [
             (c.config["block_sizes"], c.config["num_warps"])
             for c in spec.compiler_seed_configs
             if "metal_matmul" not in c.config
+            and c.config != spec.default_config().config
         ]
         self.assertEqual(planted, expected)
         self.assertEqual(spec.default_config().config["block_sizes"], [16, 16, 16])

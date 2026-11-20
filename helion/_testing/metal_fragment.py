@@ -239,8 +239,11 @@ def affine_reference(args: tuple[torch.Tensor, ...]) -> torch.Tensor:
 
 def fragment_transposed(msl: str) -> bool:
     """Whether a fragment matmul's accumulator is transposed in its MSL: its
-    A fragments' rows run over N (``fragment_mma.transposed``)."""
-    a_rows = re.search(r"int (_e_[mn]) = 8 \* \(_fi >> 1\) \+ _fm;", msl)
+    A fragments' rows run over N (``fragment_mma.transposed``), under a row
+    split (``metal_fragment_row_split``) offset to the SIMD group's share."""
+    a_rows = re.search(
+        r"int (_e_[mn]) = 8 \* \(_fi >> 1\) \+ _fm(?: \+ _frag_sg \* \d+)?;", msl
+    )
     assert a_rows is not None, "no fragment run"
     return a_rows.group(1) == "_e_n"
 
