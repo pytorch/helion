@@ -1341,8 +1341,27 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             sources = self.compile(lambda x: torch.var_mean(x, -1), x)
         self.assertEqual(len(sources), 2)
 
+    def test_sink_softmax(self):
+        # Softmax with attention sinks over rows of 100 scores and a sink:
+        # the reductions over the cat dim are the scores' and the sink's,
+        # combined (split_cat_reductions()), so one kernel reads each row of
+        # scores as a tile and writes its normalized row.
+        scores = torch.randn(4, 32, 100, device=DEVICE)
+        sinks = torch.randn(4, device=DEVICE)
+
+        def fn(scores, sinks):
+            x = torch.cat([scores, sinks[:, None, None].expand(-1, 32, 1)], -1)
+            x = x - x.amax(-1, keepdim=True)
+            return torch.softmax(x, -1)[..., :-1]
+
+        (source,) = self.compile(fn, scores, sinks, tol=1e-4)
+        self.assertIn("in0[tile_y, tile_x, :]", source)
+        self.assertIn("torch.maximum(", source)
+        self.assertNotIn("extra_mask", source)
+
     def test_proven_mask(self):
-        # (cat([x, y], -1) * 2)[:, :50] reads only x: the value ranges prove
+        # (cat([x, y], -1) * 2)[:, :50] reads only x, inside its part, which
+        # split_cat_reductions() leaves to the kernel: the value ranges prove
         # tile_x.index < 100 over its [64, 50] tiles, so x's load has no mask
         # (HelionKernel.masked()) and no torch.where picks between x and y
         # (HelionOverrides.where()).
@@ -1360,8 +1379,10 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         x = -torch.ones(8, 1900, device=DEVICE)
         (source,) = self.compile(lambda x: F.pad(x, (0, 100), value=1.0).sum(-1), x)
         self.assertNotIn("rdim = in0[tile_x, :].size(1)", source)
-        a, b = torch.ones(8, 2100, device=DEVICE), torch.ones(8, 900, device=DEVICE)
-        self.compile(lambda a, b: torch.cat([a, b], -1).sum(-1), a, b)
+        # Five parts, more than split_cat_reductions() splits, so the kernel
+        # reads the cat.
+        parts = [torch.ones(8, n, device=DEVICE) for n in (2100, 300, 200, 200, 200)]
+        self.compile(lambda *parts: torch.cat(parts, -1).sum(-1), *parts)
 
     def test_nchw_reductions(self):
         # sum and var_mean over N, H and W of an NCHW tensor split into a
