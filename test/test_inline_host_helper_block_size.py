@@ -164,6 +164,28 @@ def branch_on_device_helper(x: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(autotune_effort="none")
+def mask_tile_at_tunable_index(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty_like(x)
+    foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+    for tile_n in hl.tile(n, block_size=1):
+        keep = (tile_n.id == foo - 1) & (x[tile_n] > 0)
+        out[tile_n] = torch.where(keep, x[tile_n], 0.0)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
+def flip_tile_at_tunable_index(x: torch.Tensor) -> torch.Tensor:
+    (n,) = x.size()
+    out = torch.empty_like(x)
+    foo = hl.register_tunable("foo", PowerOfTwoFragment(16, 256))
+    for tile_n in hl.tile(n, block_size=1):
+        keep = (x[tile_n] > 0) != (tile_n.id == foo - 1)
+        out[tile_n] = torch.where(keep, x[tile_n], 0.0)
+    return out
+
+
+@helion.kernel(autotune_effort="none")
 def sum_device_helper_width(x: torch.Tensor) -> torch.Tensor:
     m, n = x.size()
     out = torch.empty([m], dtype=x.dtype, device=x.device)
@@ -837,6 +859,27 @@ def test_device_branch_on_a_helper_value_follows_the_config(
 ) -> None:
     code = _render(branch_on_device_helper, torch.empty(64, 1000), foo=foo)
     assert f"if {taken}:" in code, code
+
+
+# A scalar comparison with the tunable combined with a tensor (``(tile.id ==
+# foo - 1) & mask``, ``mask != (tile.id == foo - 1)``): the tensor op
+# converted the SymBool with bool(), a test at the hint that refused the
+# kernel. The comparison stays in the code, and the mask combines with it
+# (CuTe spells != as operator.ne).
+@pytest.mark.parametrize(
+    ("kernel", "combine"),
+    [
+        (mask_tile_at_tunable_index, r"v_\d+ & eq\b"),
+        (flip_tile_at_tunable_index, r"v_\d+ != eq\b|operator\.ne\(v_\d+, eq\)"),
+    ],
+)
+def test_device_comparison_with_the_tunable_masks_a_tensor(
+    kernel: helion.Kernel, combine: str
+) -> None:
+    code = _render(kernel, torch.empty(1000), foo=64)
+    assert "eq = tile_id == -1 + foo" in code, code
+    assert re.search(combine, code), code
+    assert "foo = 64" in code, code
 
 
 # A device cdiv over config values is the arithmetic it stands for, so its

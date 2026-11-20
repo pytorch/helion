@@ -7,6 +7,7 @@ from cutlass import Int32
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
+from ..inline_asm_constraints import input_constraint_codes
 from ._mlir_compat import ir
 
 
@@ -22,34 +23,6 @@ def _i32_constant(
     return llvm.mlir_constant(
         ir.IntegerAttr.get(Int32.mlir_type, value), loc=loc, ip=ip
     )
-
-
-def input_constraint_codes(constraints: str) -> list[str]:
-    """The constraint code of every asm input operand, in operand order.
-
-    An LLVM constraint string lists the outputs (``=`` prefixed, ``&`` for an
-    early clobber) before the inputs, which bind to the call's operands in
-    order; a matching constraint (``0``) ties an input to that output's
-    register class; ``~{...}`` clobbers bind nothing.  GCC's read-write ``+``
-    prefix is not LLVM IR syntax: LLVM parses ``+r`` as a plain input and
-    Clang spells a read-write operand as ``=r`` plus a trailing matching
-    input, so a ``+`` is rejected instead of mis-bound.
-    """
-    items = [item.strip() for item in constraints.split(",") if item.strip()]
-    if any(item.startswith("+") for item in items):
-        raise ValueError(
-            f"'+' is not an LLVM inline asm constraint prefix: {constraints!r}; "
-            "spell a read-write operand as an '=' output plus a matching input"
-        )
-    outputs = [item.lstrip("=&") for item in items if item.startswith("=")]
-    codes = []
-    for item in items[len(outputs) :]:
-        if item.startswith("~"):
-            continue
-        if item.isdigit() and int(item) < len(outputs):
-            item = outputs[int(item)]
-        codes.append(item)
-    return codes
 
 
 def _asm_kwargs(
