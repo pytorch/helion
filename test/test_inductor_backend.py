@@ -12,6 +12,7 @@ import torch
 from torch._dynamo.utils import counters
 from torch._inductor import config
 from torch._inductor.choices import InductorChoices
+from torch._inductor.codecache import PyCodeCache
 from torch._inductor.codegen import common
 from torch._inductor.test_case import TestCase
 from torch._inductor.utils import fresh_cache
@@ -66,6 +67,13 @@ def randn(*shape, dtype=torch.bfloat16):
 # blocks: by default a row of up to 1024 elements is one block, a persistent
 # reduction (HelionChoices.should_use_persistent_reduction()).
 looped = config.patch({"triton.persistent_reductions": False})
+
+
+def conv_inplace(x, w):
+    """A conv's output that its kernel adds 1 to and stores again, an in-place
+    buffer (buf1 takes over the conv's buf0), and its rows' mean square."""
+    y = torch.nn.functional.conv2d(x, w, padding=1) + 1.0
+    return y, y.pow(2).mean(-1)
 
 
 def pin_blocks(r_block: int):
@@ -644,6 +652,25 @@ class TestInductorCute(InductorBackendTestCase):
             with config.patch(assert_indirect_indexing=False):
                 (source,) = self.compile(fn, i, w, tol=1e-4, backend="cute")
             self.assertRegex(source, r"in1\[tmp\d+, :\]")
+
+    def test_inplace_param(self):
+        # TestInductorBackend.test_inplace_param under CuTe, whose one parameter
+        # lets it reduce each row of 128 over 32 threads, four elements a
+        # thread (num_threads=[1, 32]). With an input and an output passed buf1
+        # each, that config fails with "synthetic-lane reduction would reorder
+        # a potentially aliasing write".
+        x = torch.randn(1, 1, 64, 128, device=DEVICE)
+        w = torch.randn(1, 1, 3, 3, device=DEVICE)
+        (source,) = self.compile(conv_inplace, x, w, tol=1e-4, backend="cute")
+        self.assertIn("def kernel(in_out0: torch.Tensor, out0: torch.Tensor)", source)
+        kernel = PyCodeCache.load(source).kernel
+        conv = F.conv2d(x, w, padding=1).view(64, 128)
+        y, mean = conv.clone(), torch.empty(64, device=DEVICE)
+        warp_per_row = helion.Config(block_sizes=[1], num_threads=[1, 32])
+        kernel.bind((y, mean)).compile_config(warp_per_row)(y, mean)
+        torch.testing.assert_close(y, conv + 1)
+        expected = (conv + 1).pow(2).mean(-1)
+        torch.testing.assert_close(mean, expected, rtol=1e-4, atol=1e-4)
 
     def test_masked_view(self):
         # TestInductorBackend.test_masked_view's pad: CuTe reads x through its
@@ -1820,6 +1847,18 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
             self.skipTest("Triton converts to float8_e4m3fn on SM89 and later")
         (source,) = self.compile(fn, x)
         self.assertIn(line, source)
+
+    def test_inplace_param(self):
+        # The conv's output, which the kernel adds 1 to and stores again (buf1
+        # takes over buf0), is one parameter that the kernel reads and writes
+        # (kernel_params()), passed once, not an input and an output passed
+        # buf1 each: kernel(in_out0, out0), not kernel(in0, out0, out1).
+        x = torch.randn(1, 1, 64, 128, device=DEVICE)
+        w = torch.randn(1, 1, 3, 3, device=DEVICE)
+        (source,) = self.compile(conv_inplace, x, w, tol=1e-4)
+        self.assertIn("def kernel(in_out0: torch.Tensor, out0: torch.Tensor)", source)
+        self.assertRegex(source, r"= in_out0\[tile_x, :\]")
+        self.assertRegex(source, r"in_out0\[tile_x, :\] = ")
 
     def test_inplace_reuse_chain(self):
         def fn(x, w):

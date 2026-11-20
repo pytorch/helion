@@ -121,6 +121,18 @@ class HelionTensorArg:
     output: bool
 
 
+@dataclass(frozen=True)
+class HelionParam:
+    """A parameter of the kernel (HelionKernel.kernel_params())."""
+
+    name: str
+    # What the wrapper passes for it.
+    reference: str
+    # The arguments it holds: one, or an input and an output an in-place
+    # buffer joins.
+    args: list[HelionTensorArg]
+
+
 class HelionCSEProxy(CSEProxy):
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:  # noqa: ANN401
         args = cast("HelionKernel", self.kernel).align_args(args)
@@ -923,8 +935,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if self.uses_rand and helion_config.backend == "cute":
             settings += ', cute_rng_stream="word0"'
         code.writeline(f"@helion.kernel({settings})")
-        names = self.kernel_arg_names()
-        params = [*names.values()]
+        kernel_params = self.kernel_params()
+        # The parameter name of each argument's placeholder.
+        names = {arg.ref: param.name for param in kernel_params for arg in param.args}
+        params = [param.name for param in kernel_params]
         if self.mix_order_reduction:
             # The [partials, splits, cols] workspace of the column reduction's
             # partials (codegen_split_rows()).
@@ -1020,22 +1034,37 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         ]
         return sorted(args, key=lambda arg: arg.output)
 
-    def kernel_arg_names(self) -> dict[str, str]:
-        counts: collections.Counter[str] = collections.Counter()
-        names = {}
-        for arg in self.kernel_args():
-            prefix = "out" if arg.output else "in"
-            names[arg.ref] = f"{prefix}{counts[prefix]}"
-            counts[prefix] += 1
-        return names
+    def kernel_params(self) -> list[HelionParam]:
+        """The kernel's parameters, inputs first.
 
-    def call_args(self) -> list[str]:
-        # An input whose storage an output took over is passed as that output.
+        An input whose storage an output took over (an in-place buffer) is
+        passed as that output. Arguments passed the same storage at the same
+        view are one parameter, named in_out0 for an input and an output, as
+        Triton's in_out_ptr0, rather than one each, as for the RMSNorm after a
+        matmul whose output it adds to (buf1 takes over the matmul's buf0):
+            def kernel(in0, in1, in2, out0, out1):
+                tmp1 = in1[tile_x, :]
+                ...
+                out0[tile_x, :] = tmp2.to(torch.bfloat16)
+            kernel(arg2_1, buf1, arg3_1, buf1, buf3)
+        is
+            def kernel(in0, in_out0, in1, out0):
+                tmp1 = in_out0[tile_x, :]
+                ...
+                in_out0[tile_x, :] = tmp2.to(torch.bfloat16)
+            kernel(arg2_1, buf1, arg3_1, buf3)
+        CuTe must assume two parameters alias at any offset, and rejects each
+        config that reduces a row over fewer threads than its elements
+        ("synthetic-lane reduction would reorder a potentially aliasing
+        write"): with in1 and out0, only num_threads=[1, 512] (a thread per
+        element of the row of 512) compiles; with in_out0, also
+        num_threads=[2, 32] (a warp per row), as Triton's kernel reduces it.
+        """
         # Reuse can chain inside one kernel: with buf1 reusing buf0 and buf2
         # reusing buf1, the wrapper runs `buf1 = buf0; del buf0` and
         # `buf2 = buf1; del buf1`, so buf0 is passed as buf2.
         reused = {inp: out for out, inp in self.inplace_update_buffers.items()}
-        args = []
+        groups: dict[tuple[Any, ...], tuple[str, list[HelionTensorArg]]] = {}
         for arg in self.kernel_args():
             operand = arg.operand
             name = operand.get_name()
@@ -1044,12 +1073,31 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             if name != operand.get_name():
                 target = V.graph.get_buffer(name)
                 operand = ReinterpretView(data=target, layout=operand.get_layout())
-            args.append(
+            reference = (
                 operand.codegen_reference()
                 if isinstance(operand, ReinterpretView)
                 else operand.get_name()
             )
-        return args
+            layout = operand.get_layout()
+            view = (
+                name,
+                layout.dtype,
+                tuple(layout.size),
+                tuple(layout.stride),
+                layout.offset,
+            )
+            groups.setdefault(view, (reference, []))[1].append(arg)
+        counts: collections.Counter[str] = collections.Counter()
+        params: list[HelionParam] = []
+        for reference, args in groups.values():
+            kinds = {arg.output for arg in args}
+            prefix = "in_out" if len(kinds) == 2 else "out" if True in kinds else "in"
+            params.append(HelionParam(f"{prefix}{counts[prefix]}", reference, args))
+            counts[prefix] += 1
+        return params
+
+    def call_args(self) -> list[str]:
+        return [param.reference for param in self.kernel_params()]
 
     def codegen_nan_check(self) -> None:
         # Check each buffer, as Triton does, not call_args(): a flat operand is
