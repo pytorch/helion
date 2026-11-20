@@ -208,6 +208,7 @@ _BASE_VALID_KEYS = """
     cross_loop_dsmem
     cross_loop_inband_protocol
     worker_registers
+    cross_loop_claim_lag
 """
 
 # ``BACKEND_SPECIFIC_KEYS``.
@@ -378,6 +379,7 @@ _BASE_BACKEND_SPECIFIC_KEYS = """
     cross_loop_dsmem
     cross_loop_inband_protocol
     worker_registers
+    cross_loop_claim_lag
 """
 
 # ``_CUTE_IMPLICIT_DEFAULT_KEYS``.
@@ -616,10 +618,12 @@ _BASE_TRITON_ACCEPTED = """
 
 # The same census for ``GluonBackend``: Triton's keys but the ones Gluon
 # ignores (``maxnreg``, ``range_flattens``, ``range_multi_buffers``), and its
-# own: ``cross_loop_dsmem``, ``cross_loop_tmem_prefetch`` and
-# ``worker_registers`` (the last two hand overrides the search never proposes).
+# own: ``cross_loop_claim_lag``, ``cross_loop_dsmem``,
+# ``cross_loop_tmem_prefetch`` and ``worker_registers`` (all but
+# ``cross_loop_dsmem`` hand overrides the search never proposes).
 _BASE_GLUON_ACCEPTED = """
-    advanced_controls_file atomic_indexing block_sizes cross_loop_dsmem
+    advanced_controls_file atomic_indexing block_sizes cross_loop_claim_lag
+    cross_loop_dsmem
     cross_loop_inband_protocol cross_loop_pipeline
     cross_loop_tmem_prefetch epilogue_subtile flatten_loops indexing l2_groupings load_cache_modifiers
     load_eviction_policies loop_orders num_sm_multiplier num_stages num_warps

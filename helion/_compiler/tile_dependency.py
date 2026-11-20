@@ -23,8 +23,10 @@ from .. import exc
 if TYPE_CHECKING:
     import ast
     from collections.abc import Callable
+    from collections.abc import Sequence
 
     from .device_ir import DeviceIR
+    from .device_ir import GraphInfo
 
 log = logging.getLogger(__name__)
 
@@ -4969,6 +4971,20 @@ class TileDependencyGraph:
         if allocation_id not in self.inband_allocation_ids:
             return None
         return _scatter_position(self.inband_store(allocation_id))
+
+    def matmul_roots(self, graphs: Sequence[GraphInfo]) -> frozenset[int]:
+        """Roots that run a matmul (a ``matmul_operand_positions`` target in
+        one of their graphs, ``graphs`` the DeviceIR's): they stream their
+        operands, so a claim group orders them after the earlier matmuls'
+        live keys."""
+        from .device_ir_analysis import matmul_operand_positions
+
+        targets = matmul_operand_positions()
+        return frozenset(
+            site.root
+            for site in self.execution_sites
+            if any(node.target in targets for node in graphs[site.graph_id].graph.nodes)
+        )
 
     @property
     def dsmem_candidate_ids(self) -> tuple[int, ...]:

@@ -71,6 +71,31 @@ def mm_then_mm(x: torch.Tensor, w: torch.Tensor, v: torch.Tensor) -> torch.Tenso
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def mm_then_scaled_mm(
+    x: torch.Tensor, w: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """``mm_then_mm`` with the second dot's activation doubled in the body (a
+    filled operand, ``gluon_ring.ring_fill``)."""
+    m, k = x.size()
+    _, n = w.size()
+    _, n2 = v.size()
+    y = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    out = torch.empty([m, n2], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], w[tile_k, tile_n], acc=acc)
+        y[tile_m, tile_n] = acc.to(x.dtype)
+    for tile_p, tile_q in hl.tile([m, n2]):
+        acc2 = hl.zeros([tile_p, tile_q], dtype=torch.float32)
+        for tile_j in hl.tile(n):
+            a = (y[tile_p, tile_j].to(torch.float32) * 2).to(x.dtype)
+            acc2 = hl.dot(a, v[tile_j, tile_q], acc=acc2)
+        out[tile_p, tile_q] = acc2
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def scale_then_wx(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     """Weight rows as the MMA's M (swap-AB) over the first root's output."""
     m, k = x.size()
@@ -84,6 +109,87 @@ def scale_then_wx(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         for tile_k in hl.tile(k):
             acc = hl.dot(w[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc)
         out[tile_n, tile_m] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def scale_then_normed_wx(
+    x: torch.Tensor, g: torch.Tensor, w: torch.Tensor
+) -> torch.Tensor:
+    """``scale_then_wx`` with the activation the body computes each K step from
+    the first root's output and a vector, both loaded ahead of the step's weight
+    tile, in the weight's dtype (a norm and a quantization): the body fills its
+    slot of the step (``gluon_ring.ring_fill``)."""
+    m, k = x.size()
+    n = w.size(0)
+    y = torch.empty_like(x)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([m, k]):
+        y[tile_r, tile_c] = x[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            a = (
+                y[tile_m, tile_k].to(torch.float32)
+                * g[tile_k].to(torch.float32)[None, :]
+            ).to(w.dtype)
+            acc = hl.dot(w[tile_n, tile_k], a.T, acc=acc)
+        out[tile_n, tile_m] = acc
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def wx_then_scaled_vx(
+    x: torch.Tensor, w: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Two K loops of a task: ``w`` times the input, then ``v`` times the input
+    doubled in the body each K step, which fills its slot of the step: no
+    producer streams the gated group the filled operand takes, so the first
+    loop's steps get its arrival from the weight producer."""
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc)
+        acc2 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            a = (x[tile_m, tile_k].to(torch.float32) * 2).to(x.dtype)
+            acc2 = hl.dot(v[tile_n, tile_k], a.T, acc=acc2)
+        out[tile_n, tile_m] = acc + acc2
+    return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def filled_beside_two_dots(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    z: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    u: torch.Tensor,
+) -> torch.Tensor:
+    """One K loop of three dots: ``v`` times an operand the body computes (from
+    the tile's indices, in ``x``'s dtype), which fills its slot of the step, then
+    ``w`` times ``y`` and ``u`` times ``z`` (TMA operands): the MMA channel's
+    other steps run between the body's fills."""
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        acc2 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        acc3 = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            a = (
+                tile_m.index[:, None].to(torch.float32) * 0.01
+                + tile_k.index[None, :].to(torch.float32) * 0.001
+            ).to(x.dtype)
+            acc = hl.dot(v[tile_n, tile_k], a.T, acc=acc)
+            acc2 = hl.dot(w[tile_n, tile_k], y[tile_m, tile_k].T, acc=acc2)
+            acc3 = hl.dot(u[tile_n, tile_k], z[tile_m, tile_k].T, acc=acc3)
+        out[tile_n, tile_m] = acc + acc2 + acc3
     return out
 
 

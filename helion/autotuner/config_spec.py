@@ -916,6 +916,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
         "cross_loop_dsmem",
         "cross_loop_inband_protocol",
         "worker_registers",
+        "cross_loop_claim_lag",
         "load_cache_modifiers",
         "store_cache_modifiers",
         "host_tensor_descriptors",
@@ -2587,6 +2588,7 @@ class ConfigSpec:
             "store_cache_modifiers",
             "cross_loop_dsmem",
             "cross_loop_inband_protocol",
+            "cross_loop_claim_lag",
             "indexing",
             "atomic_indexing",
             "prefetch_indexing",
@@ -2746,6 +2748,26 @@ class ConfigSpec:
         dsmem = config.get("cross_loop_dsmem")
         if isinstance(dsmem, list) and any(dsmem):
             self._normalize_dsmem(config)
+        # ``cross_loop_claim_lag`` (a hand override the search never proposes):
+        # waves of claims a claim group's consumers trail their light
+        # producers' keys (cross_loop_codegen.claim_group_body).  0, or no lag,
+        # forms no group.  Only claim groups (dynamic workers under a ring)
+        # read it.
+        if config.get("cross_loop_pipeline") != "dynamic" or not ring_depth(
+            config, self.backend_name
+        ):
+            config.pop("cross_loop_claim_lag", None)
+        else:
+            lag = config.get("cross_loop_claim_lag", 0)
+            if not isinstance(lag, int) or isinstance(lag, bool) or lag < 0:
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        f"cross_loop_claim_lag must be an int >= 0, got {lag!r}"
+                    )
+                lag = 0
+            if lag == 0:
+                # Off is no entry.
+                config.pop("cross_loop_claim_lag", None)
         surface.normalize_recurrence_families(self, config, fix_invalid=_fix_invalid)
         surface.normalize_pre_pid_type(self, config, fix_invalid=_fix_invalid)
         indirect_modes = (

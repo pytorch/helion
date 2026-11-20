@@ -2090,6 +2090,8 @@ class _GuardedExtent:
     body: list[ast.stmt]
     hoisted_names: tuple[str, ...]
     live_tasks: str
+    # Tasks per tile of the guarded axis: a whole multiple of them are live.
+    inner_tasks: int
 
 
 def _is_tl_call(
@@ -2387,7 +2389,182 @@ def _guarded_extent(
             )
         ),
         live_tasks=tiles if inner_tasks == 1 else f"{inner_tasks} * {tiles}",
+        inner_tasks=inner_tasks,
     )
+
+
+def _key_major(order: DenseTaskOrder, axis: int, tasks: int, keys: int) -> bool:
+    """Whether ``order`` runs the tasks of each index of ``axis`` (its keys) as
+    one block of ``tasks`` ordinals, in key order."""
+    for key in range(keys):
+        if order.ordinal_by_task.value_bounds({axis: key}) != (
+            key * tasks,
+            key * tasks + tasks - 1,
+        ):
+            return False
+    return True
+
+
+def _waits_on_earlier_keys(
+    plan: ReadinessCounterPlan,
+    producer_root: int,
+    consumer_root: int,
+    orders: tuple[DenseTaskOrder, ...],
+    axes: dict[int, int],
+    tasks: dict[int, int],
+    keys: int,
+) -> bool:
+    """Whether every task of ``consumer_root`` under key ``k`` of its slowest
+    axis waits through ``plan`` only on tasks of ``producer_root`` under keys
+    up to ``k`` (both key-major: ``_key_major``)."""
+    for producer in plan.producers:
+        if producer.producer_root != producer_root:
+            continue
+        for consumer in plan.consumers:
+            if consumer.consumer_root != consumer_root:
+                continue
+            if (
+                producer.producer_site_id is not None
+                or consumer.consumer_site_id is not None
+            ):
+                return False
+            waited = consumer.keys_by_consumer.then(producer.incidence.items_by_key)
+            latest = (
+                None
+                if waited is None
+                else waited.max_target_value_by_source(
+                    orders[producer_root].ordinal_by_task
+                )
+            )
+            if latest is None:
+                return False
+            for key in range(keys):
+                # No bounds: none provable (or no waits under the key).
+                bounds = latest.value_bounds({axes[consumer_root]: key})
+                if bounds is None or bounds[1] // tasks[producer_root] > key:
+                    return False
+    return True
+
+
+# Keys a root may have to join a claim group: each is proven key-major and
+# waiting on earlier keys one by one, at compile time.
+_GROUP_MAX_KEYS = 1024
+
+
+def _key_count(domain: CoordinateDomain, axis: int) -> int | None:
+    """The static index count of ``axis`` in ``domain`` (a claim group's keys),
+    or None when it is symbolic (``axis_counts`` would raise)."""
+    count = sympy.sympify(domain.axis_count_expressions[axis])
+    return int(count) if isinstance(count, sympy.Integer) else None
+
+
+def _claim_groups(
+    runs: list[list[int]],
+    *,
+    claimed: frozenset[int],
+    counters: tuple[ReadinessCounterPlan, ...],
+    orders: tuple[DenseTaskOrder, ...],
+    domains: tuple[CoordinateDomain, ...],
+    axes: dict[int, int],
+    tasks: dict[int, int],
+    matmuls: frozenset[int],
+    root_barrier_edges: frozenset[tuple[int, int]],
+) -> tuple[list[tuple[int, ...]], frozenset[int]]:
+    """Split runs of consecutive guarded roots (``runs``) into claim groups,
+    each starting at a root of ``claimed`` (one that claims
+    its own tasks; its claim counter becomes the group's), a later member
+    possibly a single wave: each root key-major over its slowest axis
+    (``axes``, ``tasks`` a key), and waiting on an earlier root of its group
+    only through readiness counters on keys up to its own
+    (``_waits_on_earlier_keys``; a ``matmuls`` root needs no proof: its keys
+    come after every earlier key, and trail the light roots' keys only where
+    it holds for them, the second value) with more than one key: a single-key
+    counter's wait is the same for every task and goes before the claim loop,
+    where it would wait on the group's own claims.  Each root has at most
+    ``_GROUP_MAX_KEYS`` keys.
+    A group interleaves its roots' claims key by key (``_group_ticket``), so a
+    consumer's key follows its producers' as they complete, not their root's
+    last claim (``claim_group_body`` places each root's keys)."""
+    groups: list[tuple[int, ...]] = []
+    trailing: set[int] = set()
+    for run in runs:
+        if len(run) < 2:
+            continue
+        group: list[int] = []
+        for root in run:
+            keys = _key_count(domains[root], axes[root])
+            key_major = (
+                keys is not None
+                and keys <= _GROUP_MAX_KEYS
+                and _key_major(orders[root], axes[root], tasks[root], keys)
+            )
+            fits = (
+                bool(group)
+                and key_major
+                and not any((earlier, root) in root_barrier_edges for earlier in group)
+                and all(
+                    plan.readiness_key_domain.size > 1
+                    and (
+                        root in matmuls
+                        or _waits_on_earlier_keys(
+                            plan, earlier, root, orders, axes, tasks, cast("int", keys)
+                        )
+                    )
+                    for plan in counters
+                    for earlier in group
+                    if any(c.consumer_root == root for c in plan.consumers)
+                    and any(p.producer_root == earlier for p in plan.producers)
+                )
+            )
+            if not fits:
+                if len(group) > 1:
+                    groups.append(tuple(group))
+                group = [root] if key_major and root in claimed else []
+                continue
+            if root in matmuls and all(
+                _waits_on_earlier_keys(
+                    plan, earlier, root, orders, axes, tasks, cast("int", keys)
+                )
+                for plan in counters
+                for earlier in group
+                if earlier not in matmuls
+            ):
+                trailing.add(root)
+            group.append(root)
+        if len(group) > 1:
+            groups.append(tuple(group))
+    return groups, frozenset(trailing)
+
+
+def _round_plus(round_: int | str, count: int | str) -> int | str:
+    """A claim group round ``count`` rounds after ``round_`` (a runtime value
+    when either is one)."""
+    if isinstance(round_, int) and isinstance(count, int):
+        return round_ + count
+    return count if round_ == 0 else f"{round_} + {count}"
+
+
+def _capped_round(terms: list[int | str], cap: int) -> int | str:
+    """``min(max(terms), cap)``: the static terms fold into one."""
+    static = [term for term in terms if isinstance(term, int)]
+    if len(static) == len(terms) or (static and max(static) >= cap):
+        return min(max(static), cap)
+    expression, *rest = [term for term in terms if isinstance(term, str)]
+    for term in rest + ([max(static)] if static else []):
+        expression = f"tl.maximum({expression}, {term})"
+    return f"tl.minimum({expression}, {cap})"
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClaimGroupPart:
+    """One root's share of a claim group's lowering (``claim_group_body``)."""
+
+    barrier_waits: list[ast.stmt]
+    hoisted: list[ast.stmt]
+    task_body: list[ast.stmt]
+    live: str
+    segment_begin: int
+    lane: str
 
 
 class _Rename(ast.NodeTransformer):
@@ -3424,7 +3601,14 @@ def emit_cross_loop_schedule(
         )
 
     def root_barrier_dependency(root: int) -> tuple[str, str]:
-        arrivals = static_pipeline_plan.root_barrier_arrival_count(root)
+        # Every worker publishes a claim group member's barrier after the
+        # group's loop, whichever of its tasks it ran (the plan's count,
+        # ``root_barrier_arrival_count``, is its static publishers).
+        arrivals = (
+            launch_worker_count
+            if root in claim_group_of
+            else static_pipeline_plan.root_barrier_arrival_count(root)
+        )
         return (
             root_barrier_counter(root),
             f"tl.cast({epoch_var}, tl.uint32) * tl.cast({arrivals}, tl.uint32)",
@@ -3864,6 +4048,72 @@ def emit_cross_loop_schedule(
         for access in dependency_graph.accesses
         if dependency_graph.is_inband(access) and access.kind != "store"
     }
+    # Claim groups (``_claim_groups``) among consecutive guarded roots of
+    # claimed dispatch that only synchronize on this rank, each group one claim
+    # counter (its first root's, which claims its tasks itself): a single-wave
+    # root may join a group behind a claimed one.
+    peer_counter_roots = {
+        endpoint
+        for plan in peer_counter_plans
+        for endpoint in (
+            *(producer.producer_root for producer in plan.producers),
+            *(consumer.consumer_root for consumer in plan.consumers),
+        )
+    }
+    # A trigger between loops (``hl.pdl_launch_dependents()``) runs at the
+    # block of its root (or the first resident one after it).
+    pdl_trigger_env = CompileEnvironment.current().pdl_trigger_root
+    pdl_trigger_root = (
+        None
+        if pdl_trigger_env is None
+        else next(
+            (r for r in static_pipeline_plan.resident_roots if r >= pdl_trigger_env),
+            None,
+        )
+    )
+    claim_runs: list[list[int]] = [[]]
+    for root in static_pipeline_plan.resident_roots:
+        if root == pdl_trigger_root and claim_runs[-1]:
+            # The trigger precedes the root's tasks: a group ends before it.
+            claim_runs.append([])
+        if (
+            dispatch_mode == "claimed"
+            and root in guarded_extents
+            and root not in deferred_releases
+            and not any(root in edge for edge in peer_edges)
+            and root not in done_roots
+            and root not in peer_counter_roots
+            and root not in inband_consumer_roots
+            and (peer is None or root not in peer.scatter_roots)
+        ):
+            claim_runs[-1].append(root)
+        elif claim_runs[-1]:
+            claim_runs.append([])
+    candidates = [root for run in claim_runs for root in run]
+    group_axes = {root: case_geometries[root][0][-1] for root in candidates}
+    group_tasks = {root: guarded_extents[root].inner_tasks for root in candidates}
+    group_matmuls = dependency_graph.matmul_roots(device_ir.graphs) & frozenset(
+        candidates
+    )
+    # Waves of claims a consumer's keys trail its light producers' (0 or no
+    # lag: no group, each root claims its own tasks).
+    claim_lag = cast("int", device_function.config.get("cross_loop_claim_lag", 0))
+    claim_groups, trailing_matmuls = (
+        _claim_groups(
+            claim_runs,
+            claimed=frozenset(claim_indices),
+            counters=static_pipeline_plan.readiness_counters,
+            orders=static_pipeline_plan.execution_orders,
+            domains=root_domains,
+            axes=group_axes,
+            tasks=group_tasks,
+            matmuls=group_matmuls,
+            root_barrier_edges=root_barrier_edges,
+        )
+        if claim_lag
+        else ([], frozenset())
+    )
+    claim_group_of = {root: group for group in claim_groups for root in group}
 
     def waits_on_dependency(root: int) -> bool:
         return bool(
@@ -5246,13 +5496,14 @@ def emit_cross_loop_schedule(
 
     def static_members(root: int) -> frozenset[int] | None:
         """The workers ``root_lane`` gives ``root``'s tasks when that is static
-        (None: a cluster's lanes, a rotation by earlier roots' live tasks, or a
-        deferred release every worker publishes).  Valid once the earlier
+        (None: a cluster's lanes, a rotation by earlier roots' live tasks, a
+        deferred release every worker publishes, or a claim group's tickets).  Valid once the earlier
         resident roots are lowered."""
         if (
             root in dsmem_producers
             or root in dsmem_consumers
             or root in deferred_releases
+            or root in claim_group_of
             or skipped_lanes(root)
         ):
             return None
@@ -5419,6 +5670,138 @@ def emit_cross_loop_schedule(
 
         return over_skipped(marks), over_skipped(body)
 
+    claim_group_parts: dict[int, _ClaimGroupPart] = {}
+
+    def claim_group_body(group: tuple[int, ...]) -> list[ast.stmt]:
+        """A claim group's roots as one claimed task loop (``_group_ticket``).
+
+        Its roots' barrier waits, hoisted statements and guard-skipped tasks'
+        arrivals come first (a skipped task writes nothing, and no claimed task
+        can then wait on one), its roots' root-barrier arrivals after the loop.
+        The order keeps the weight stream busy.  A matmul root streams its
+        operands (the ring's bandwidth, which every matmul root of the group
+        shares), so it comes after the live keys of the matmul roots before
+        it: interleaved with matmul producers it would only delay their last
+        keys and leave less ready streaming work to cover the dependency
+        chain at the end (in the group it still takes its first tasks as
+        workers free up, not each its static one).  It trails the light
+        roots' keys as a light root does where it waits on their keys up to
+        its own only (``trailing_matmuls``), and comes after every key of
+        theirs otherwise.  Any other root is light: run as a phase
+        of its own it would leave the stream idle, so its keys come
+        ``cross_loop_claim_lag`` waves of claims behind its producers', inside
+        the stream (at a lag of 0, or none, no group forms)."""
+        assert claim_counter_arg is not None
+        parts = [claim_group_parts[root] for root in group]
+        tasks = [group_tasks[root] for root in group]
+        keys = [
+            cast("int", _key_count(root_domains[root], group_axes[root]))
+            for root in group
+        ]
+        offsets = [0]  # the most each root lags: its static round
+        rounds: list[int | str] = [0]  # the ticket offsets: a runtime value or not
+        for index in range(1, len(group)):
+            # After every earlier key: also the most a lag places a root (a
+            # longer one only adds empty rounds).
+            after = max(o + k for o, k in zip(offsets, keys[:index], strict=True))
+            # A wave: the rounds of the earlier roots' tickets that take every
+            # worker's claim once.
+            wave = -(-launch_worker_count // sum(tasks[:index]))
+            lag = claim_lag * wave
+            if group[index] not in group_matmuls:
+                offsets.append(min(offsets[-1] + lag, after))
+                # A lag behind the root before it as it runs.
+                rounds.append(_capped_round([_round_plus(rounds[-1], lag)], after))
+                continue
+            offsets.append(after)
+            light = [j for j in range(index) if group[j] not in group_matmuls]
+            if not light or group[index] not in trailing_matmuls:
+                rounds.append(after)
+                continue
+            # After the live keys of the matmul roots before it, and a lag
+            # behind the light ones' keys (key for key, as they trail their
+            # producers): no round of light tickets only between the streams.
+            rounds.append(
+                _capped_round(
+                    [
+                        _round_plus(rounds[j], lag)
+                        if j in light
+                        else _round_plus(rounds[j], f"({parts[j].live}) // {tasks[j]}")
+                        for j in range(index)
+                    ],
+                    after,
+                )
+            )
+        end = len(group) << 32
+        # Each root's live tasks, its tasks a key and its first round.
+        arguments = ", ".join(
+            [
+                *(
+                    f"({', '.join(map(str, values))},)"
+                    for values in ([part.live for part in parts], tasks, rounds)
+                ),
+                str(end),
+            ]
+        )
+        claim = device_function.new_var("tile_dependency_claim", dce=False)
+        device_function.sync_roles[claim] = SyncRole("claim")
+        lane = parts[0].lane
+        index_type = CompileEnvironment.current().index_type()
+        branches = [
+            create(
+                ast.If,
+                test=expr_from_string(f"({claim} >> 32) == {position}"),
+                body=[
+                    statement_from_string(
+                        f"{strategy.virtual_pid_var} = {part.segment_begin} + "
+                        f"tl.cast({claim} & 4294967295, {index_type})"
+                    ),
+                    *part.task_body,
+                ],
+                orelse=[],
+            )
+            for position, part in enumerate(parts)
+        ]
+        take = statement_from_string(
+            f"{claim} = helion_dist_utils._group_claim({claim_counter_arg} + "
+            f"{claim_indices[group[0]] * _CROSS_LOOP_COUNTER_ALIGNMENT_WORDS}, "
+            f"{launch_worker_count}, {arguments})"
+        )
+        waits = [wait for part in parts for wait in part.barrier_waits]
+        body = _batch_waits(device_function, waits)
+        if body:
+            body.extend(
+                _covering_as(device_function, device_function.async_load_fence(), waits)
+            )
+        body.extend(statement for part in parts for statement in part.hoisted)
+        # The worker's first ticket is its lane (one past the live tickets
+        # decodes to the end).
+        body.append(
+            statement_from_string(
+                f"{claim} = helion_dist_utils._group_ticket({lane}, {arguments})"
+            )
+        )
+        body.append(
+            create(
+                ast.While,
+                test=expr_from_string(f"({claim} >> 32) < {len(group)}"),
+                body=[*branches, take],
+                orelse=[],
+            )
+        )
+        # One release sync covers every root's arrivals after the loop.
+        synced = False
+        for root in group:
+            publication = root_barrier_publication(root, synced=synced)
+            body.extend(publication)
+            synced = synced or bool(publication)
+        log.info(
+            "Roots %s claim one interleaved ticket stream (key lags %s rounds)",
+            list(group),
+            offsets,  # the most each lags (a matmul root's runtime lag is capped there)
+        )
+        return body
+
     def static_root_body(root: int) -> list[ast.stmt]:
         """Lower one resident root from its scalar ownership fold."""
         task_count_value = static_pipeline_plan.execution_orders[root].task_count
@@ -5442,9 +5825,14 @@ def emit_cross_loop_schedule(
         skipped_dispatch: list[ast.stmt] = []
         segment_stop = f"({segment_end})"
         live: str | None = None
+        # A claim group runs its members' hoisted statements and root-level
+        # waits on every worker, before the group's loop.
+        every_worker = (
+            active_worker_count == launch_worker_count or root in claim_group_of
+        )
         if extent is not None:
             hoisted, live = guarded_live_tasks(extent)
-            if active_worker_count == launch_worker_count:
+            if every_worker:
                 guard_statements.update(
                     id(statement)
                     for statement in hoisted
@@ -5496,7 +5884,6 @@ def emit_cross_loop_schedule(
         # publication follows it too: after the task loop, or riding the last
         # task's arrivals, both after the first task's top-level wait.
         incoming_roots = root_barrier_incoming.get(root, ())
-        every_worker = active_worker_count == launch_worker_count
         # None: a hoisted load reads through a name that is no tensor argument.
         hoisted_loads = _loaded_allocations(hoisted, argument_allocations)
         hoisted_reads = (
@@ -5525,9 +5912,11 @@ def emit_cross_loop_schedule(
         )
         for producer in incoming_roots:
             covered, _publication = barrier_covers(root, producer)
+            # A claimed task (a claim group's too) is no worker's first.
             if (
                 task_loop_pipelined
                 or claimed
+                or root in claim_group_of
                 or root in ws_roots
                 or guarded_kernel_scope_root(root)
                 or covered is None
@@ -5592,6 +5981,22 @@ def emit_cross_loop_schedule(
         )
         if timeline is not None:
             task_body = timeline.task(root, local_task, epoch_var, worker, task_body)
+        if root in claim_group_of:
+            # A claim group's worker may run any of its roots' tasks: the
+            # waits precede the group's loop.
+            assert live is not None and not peer_waits(root)
+            assert not peer_publications(root) and not kernel_scope and not trailer
+            claim_group_parts[root] = _ClaimGroupPart(
+                barrier_waits=barrier_waits,
+                hoisted=[*invariant_waits, *hoisted, *skipped_marks, *skipped_dispatch],
+                task_body=task_body,
+                live=f"tl.maximum({segment_stop} - {segment_begin}, 0)",
+                segment_begin=segment_begin,
+                lane=lane,
+            )
+            resident_live_tasks[root] = (live, task_count_value)
+            group = claim_group_of[root]
+            return claim_group_body(group) if root == group[-1] else []
         if root in settled_extents:
             # The extent's hoisted loads read what these waits protect (every
             # worker here has a static task).
@@ -5781,13 +6186,8 @@ def emit_cross_loop_schedule(
         # first resident one after it), at kernel scope so that every worker
         # does, member or not.
         env = CompileEnvironment.current()
-        trigger_root = (
-            None
-            if env.pdl_trigger_root is None
-            else next((r for r in resident_roots if r >= env.pdl_trigger_root), None)
-        )
-        if trigger_root is not None:
-            blocks[trigger_root].insert(
+        if pdl_trigger_root is not None:
+            blocks[pdl_trigger_root].insert(
                 0,
                 statement_from_string(env.backend.pdl_instruction("launch_dependents")),
             )

@@ -92,10 +92,15 @@ def gluon_cpu_codegen() -> Generator[None, None, None]:
     148-SM sm100 target: kernels trace on ``cuda:0`` as on the GPU
     (``cute_codegen.cuda_metadata_trace``, so kernels with cross-loop
     dependencies bind), the Gluon, warp-specialization and tensor-descriptor
-    probes report support, the ring lowering sees 2048 thread slots a SM, the
-    dsmem transports' residency probe sees every SM in clusters of any size
+    probes report support, the ring lowering sees an sm100 SM's 2048 thread
+    slots and shared memory (228 KB a SM, 227 KB a CTA), the dsmem transports'
+    residency probe sees every SM in clusters of any size
     (``_cluster_capacity``), and initializing CUDA fails the test."""
-    device = SimpleNamespace(max_threads_per_multi_processor=2048)
+    device = SimpleNamespace(
+        max_threads_per_multi_processor=2048,
+        shared_memory_per_multiprocessor=233472,
+        shared_memory_per_block_optin=232448,
+    )
     with ExitStack() as stack:
         stack.enter_context(cuda_metadata_trace())
         for name, value in (

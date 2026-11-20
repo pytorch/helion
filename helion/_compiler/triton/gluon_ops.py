@@ -929,6 +929,15 @@ def stage(
     return smem
 
 
+@gl_builtin
+def slot_store(slot, x, _semantic: Any = None):
+    """A body value into the shared-memory ``slot`` (``gluon_ring.ring_fill``),
+    its registers settled as ``stage`` settles them."""
+    shape = [int(d) for d in x.type.shape]
+    t = _semantic.settle(x, gluon_layout.default_layout(shape, _semantic._warps()))
+    slot.store(t, _semantic=_semantic)
+
+
 @gluon.constexpr_function
 def _k_major(dtype: Any) -> bool:
     """Whether tcgen05 reads ``dtype`` operands K-major only (Triton's MMAv5 rule:
@@ -1104,6 +1113,36 @@ def _scales(dtype: gl.constexpr, shape: gl.constexpr):
     return sc
 
 
+@gluon.jit
+def slot_scales(
+    dtype: gl.constexpr, ROWS: gl.constexpr, COLS: gl.constexpr, S: gl.constexpr
+):
+    """A tensor-memory buffer of ``[ROWS, COLS]`` block scales per slot of a ring
+    channel (``S``), which the channel's scaled dots share by channel step
+    (``tmem_dot_scaled``); the ring allocates them with the accumulator rings, so
+    they last the whole kernel (an allocation a dot made would end at its MMA's
+    issue, the allocator's last read)."""
+    slots = (allocate_tensor_memory(dtype, [ROWS, COLS], TensorMemoryScalesLayout()),)
+    for _ in gl.static_range(1, S):
+        slots = slots + (  # noqa: RUF005 (a JIT tuple grows by concatenation)
+            allocate_tensor_memory(dtype, [ROWS, COLS], TensorMemoryScalesLayout()),
+        )
+    return slots
+
+
+@gluon.jit
+def _slot_scale(slots, shape: gl.constexpr, index):
+    """Buffer ``index`` of ``slot_scales``, as scales of ``shape`` (of the same
+    storage, ``scale_storage``)."""
+    sc = slots[0]
+    for i in gl.static_range(1, len(slots)):
+        if index == i:
+            sc = slots[i]
+    if shape[0] != sc.shape[0] or shape[1] != sc.shape[1]:
+        sc = reinterpret(sc, sc.dtype, shape, TensorMemoryScalesLayout())  # pyrefly: ignore [bad-argument-count]
+    return sc
+
+
 @gluon.constexpr_function
 def _restaged(layout: Any, fmt: Any, other: Any, b: Any) -> bool:
     """Whether tcgen05 cannot read an fp4 operand's slot (``layout``) as is:
@@ -1141,39 +1180,35 @@ def tmem_dot_scaled(
     A_COPY: gl.constexpr,
     B_COPY: gl.constexpr,
     SYNC: gl.constexpr,
-    PIPELINE: gl.constexpr,
+    a_slots=None,
+    b_slots=None,
 ):
-    """``tm += (a * a_scale) @ (b * b_scale)`` (``=`` while ``fresh``).  Scales
-    stored from registers wait for the MMA reading the previous ones, or
-    (``PIPELINE``) alternate two buffers, waiting for the MMA two back; with a
-    restaged operand (one buffer: the next call's restage) it waits as ``SYNC``."""
+    """``tm += (a * a_scale) @ (b * b_scale)`` (``=`` while ``fresh``).  A ring
+    channel's dot (``done`` / ``count`` / ``S`` the channel's) puts each step's
+    block scales in its step's slot of the channel's ``a_slots`` / ``b_slots``
+    (``slot_scales``) and waits for no MMA: the slot fills again only once the
+    MMA that read it completed (its release freed the slot), which completes
+    every MMA before it.  So no scale is rewritten under a reading MMA, from
+    registers or by tcgen05.cp (PTX orders a cp after an MMA only from ISA 9.5).
+    Otherwise (no slots: ``None``) the dot allocates its scales and waits for its
+    MMA right away; so does a restaged operand (one buffer: the next call's
+    restage), as ``SYNC``."""
     A_RESTAGED: gl.constexpr = _restaged(a.type.layout, a_format, b_format, False)  # pyrefly: ignore [bad-assignment]
     WAIT: gl.constexpr = (
         # pyrefly: ignore [bad-assignment]
         SYNC or A_RESTAGED or _restaged(b.type.layout, b_format, a_format, True)
     )
+    RING: gl.constexpr = a_slots is not None  # pyrefly: ignore [bad-assignment]
     a = _fp4_operand(a, a_format, b_format, False)  # pyrefly: ignore [bad-argument-count, bad-argument-type]
     b = _fp4_operand(b, b_format, a_format, True)  # pyrefly: ignore [bad-argument-count, bad-argument-type]
     s = count % S
-    A_STORED: gl.constexpr = not A_COPY  # pyrefly: ignore [bad-assignment]
-    B_STORED: gl.constexpr = not B_COPY  # pyrefly: ignore [bad-assignment]
-    a_sc = _scales(a_scale.dtype, a_scale.shape)  # pyrefly: ignore [bad-argument-count]
-    b_sc = _scales(b_scale.dtype, b_scale.shape)  # pyrefly: ignore [bad-argument-count]
-    # Scales stored from registers in two alternating buffers (``PIPELINE``).
-    ALTERNATE: gl.constexpr = (A_STORED or B_STORED) and PIPELINE and S > 1 and not WAIT  # pyrefly: ignore [bad-assignment]
-    if ALTERNATE:
-        a_alt = a_sc
-        b_alt = b_sc
-        if A_STORED:
-            a_alt = _scales(a_scale.dtype, a_scale.shape)  # pyrefly: ignore [bad-argument-count]
-        if B_STORED:
-            b_alt = _scales(b_scale.dtype, b_scale.shape)  # pyrefly: ignore [bad-argument-count]
-        back = count - 2 + fresh
-        if back >= 0:
-            mbarrier.wait(done.index(back % S), (back // S) & 1)
-        if count % 2 == 1:
-            a_sc = a_alt
-            b_sc = b_alt
+    if RING:
+        gl.static_assert(len(a_slots) == S and len(b_slots) == S)  # pyrefly: ignore [bad-argument-type]
+        a_sc = _slot_scale(a_slots, a_scale.shape, s)  # pyrefly: ignore [bad-argument-count, bad-argument-type]
+        b_sc = _slot_scale(b_slots, b_scale.shape, s)  # pyrefly: ignore [bad-argument-count, bad-argument-type]
+    else:
+        a_sc = _scales(a_scale.dtype, a_scale.shape)  # pyrefly: ignore [bad-argument-count]
+        b_sc = _scales(b_scale.dtype, b_scale.shape)  # pyrefly: ignore [bad-argument-count]
     _scale_put(a_scale, A_COPY, a_sc)  # pyrefly: ignore [bad-argument-count]
     _scale_put(b_scale, B_COPY, b_sc)  # pyrefly: ignore [bad-argument-count]
     tcgen05_mma_scaled(
@@ -1187,7 +1222,7 @@ def tmem_dot_scaled(
         use_acc=fresh == 0,
         mbarriers=[done.index(s)],
     )
-    if not ALTERNATE and (A_STORED or B_STORED or WAIT):
+    if WAIT or not RING:
         mbarrier.wait(done.index(s), (count // S) & 1)
 
 
@@ -1232,26 +1267,34 @@ def is_scale(dot_node: torch.fx.Node, position: int) -> bool:
     return position in _SCALES.get(dot_node.target, ())
 
 
-def _scale_tmem(
-    dot_node: torch.fx.Node, in_smem: dict[int, bool]
-) -> list[tuple[int, int]]:
-    """The tensor memory ``tmem_dot_scaled`` may take for a dot's block scales,
-    as (rows, 32-bit columns): a buffer per scale (``_scales``: at least 32
-    rows), and for one stored from registers an alternate (which it takes only
-    when pipelined).  Triton 3.8 lays a buffer of 8-bit scales
-    (``TensorMemoryScalesLayout``) over all 128 lanes (each warp's 32 lanes
-    hold the same rows), two columns per 64 rows and 4 scales a row, at
-    4-column offsets: [128, 16] takes 16 columns, [32, 16] 8."""
+def scale_tiles(dot_node: torch.fx.Node) -> list[tuple[torch.dtype, int, int]]:
+    """A dot's block scales' tensor-memory buffers, (dtype, rows, 32-bit columns'
+    bytes) each: at least 32 rows (``_scales``)."""
     tiles = []
     for position in _SCALES.get(dot_node.target, ()):
-        rows, cols = concrete(
-            cast("torch.fx.Node", dot_node.args[position]).meta["val"].shape
-        )[-2:]
-        columns = 2 * -(-max(rows, 64) // 64) * -(-cols // 4)
-        tile = (128, 4 * -(-columns // 4))
-        copied = in_smem[position] and copied_scale(dot_node, position)
-        tiles += [tile] * (1 if copied else 2)
+        val = cast("torch.fx.Node", dot_node.args[position]).meta["val"]
+        rows, cols = concrete(val.shape)[-2:]
+        tiles.append((val.dtype, max(rows, 32), cols))
     return tiles
+
+
+def scale_storage(rows: int, cols: int) -> int:
+    """Triton's logical storage size of a ``[rows, cols]`` buffer of 8-bit block
+    scales (``TensorMemoryScalesLayout``): what a reinterpret of it must keep."""
+    return max(rows, 64) * max(cols, 4)
+
+
+def scale_columns(rows: int, cols: int) -> int:
+    """Tensor-memory columns Triton allocates a ``[rows, cols]`` buffer of 8-bit
+    block scales (at least 32 rows): every lane, ``scale_storage`` / 128 columns,
+    at least 4."""
+    return max(4, scale_storage(rows, cols) // 128)
+
+
+def _scale_tmem(dot_node: torch.fx.Node) -> list[tuple[int, int]]:
+    """The tensor memory ``tmem_dot_scaled`` takes for a dot's block scales it
+    allocates itself, as (rows, 32-bit columns): a buffer per scale."""
+    return [(128, scale_columns(rows, cols)) for _, rows, cols in scale_tiles(dot_node)]
 
 
 def copied_scale(dot_node: torch.fx.Node, position: int) -> bool:
@@ -1591,10 +1634,13 @@ def codegen_tmem_dot(
     node: torch.fx.Node,
     completion: tuple[str, str, str] | None = None,
     ring: tuple[str, ...] | None = None,
+    scale_slots: tuple[str, str] | None = None,
 ) -> ast.AST:
     """The dot as a tcgen05 MMA, its accumulator in tensor memory through its loop
     (``resident``, or ``ring``'s), else per statement.  It completes on
-    ``completion`` (a ring channel's ``done``, ``count``, ``S``), else on its own."""
+    ``completion`` (a ring channel's ``done``, ``count``, ``S``), else on its own;
+    a scaled one on a channel takes its block scales in ``scale_slots`` (the
+    ring's ``slot_scales`` of each)."""
     cg = cast("GenerateAST", interp.cg)
     device_function = cg.device_function
     a_pos, b_pos = matmul_operand_positions()[node.target]
@@ -1660,10 +1706,16 @@ def codegen_tmem_dot(
                 own if lazy else (),
             )
     if device_function.ring is not None:
-        # Beside the ring's accumulators: its ledger.
+        # Beside the ring's accumulators: its ledgers, by root.
+        root = device_function.ring.tmem_root(cg)
         if ring is None:
-            device_function.ring.tmem.append((M, N))
-        device_function.ring.scale_tmem.extend(_scale_tmem(node, in_smem))
+            device_function.ring.tmem.setdefault(root, []).append((M, N))
+        if scale_slots is None:
+            # The dot allocates its block scales itself: live with its root's
+            # code (the ring charges its channels' ``slot_scales``).
+            device_function.ring.scale_tmem.setdefault(root, []).extend(
+                _scale_tmem(node)
+            )
     # Else an operand staged from registers waits for its MMA right away.
     sync = not lazy and not (in_smem[a_pos] and in_smem[b_pos])
     acc_node = _accumulator(node)
@@ -1730,8 +1782,8 @@ def codegen_tmem_dot(
             f"{ALIAS}.tmem_dot_scaled({{a}}, {{a_scale}}, {a_format}, "
             f"{{b}}, {{b_scale}}, {b_format}, {tmem}, "
             f"{in_smem[a_scale] and copied_scale(node, a_scale)}, "
-            f"{in_smem[b_scale] and copied_scale(node, b_scale)}, {sync}, "
-            f"{ring is not None and _scaled_dots(node.graph) == 1})",
+            f"{in_smem[b_scale] and copied_scale(node, b_scale)}, {sync}"
+            f"{''.join(f', {slots}' for slots in scale_slots or ())})",
             a=operand_asts[a_pos],
             a_scale=operand_asts[a_scale],
             b=operand_asts[b_pos],
@@ -1763,10 +1815,6 @@ def codegen_tmem_dot(
         for statement in suffix:
             cg.add_statement(statement_from_string(statement))
     return create(ast.Name, id=name, ctx=ast.Load())
-
-
-def _scaled_dots(graph: torch.fx.Graph) -> int:
-    return sum(n.target is dot_scaled for n in graph.nodes)
 
 
 def _stage_call(

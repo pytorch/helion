@@ -32,6 +32,7 @@ from helion._testing.distributed_kernels import tagged_ring_exchange_kernel
 from helion._testing.gluon_kernels import crossed_parts
 from helion._testing.gluon_kernels import dot_mm
 from helion._testing.gluon_kernels import mm_then_mm
+from helion._testing.gluon_kernels import mm_then_scaled_mm
 from helion._testing.gluon_kernels import nvfp4_mm
 from helion._testing.gluon_kernels import scale_then_nested_wx
 from helion._testing.gluon_kernels import scale_then_two_wx
@@ -40,6 +41,7 @@ from helion._testing.gluon_kernels import scale_then_wx_and_f16_vx
 from helion._testing.gluon_kernels import scale_then_wx_and_nvfp4
 from helion._testing.gluon_kernels import split_k_gemv
 from helion._testing.gluon_kernels import split_k_parts
+from helion._testing.gluon_kernels import wx_then_scaled_vx
 from helion._testing.triton_codegen import GLUON_RING_CONFIG as _RING
 from helion._testing.triton_codegen import gluon_cpu_codegen
 from helion._testing.triton_codegen import gluon_tail_ring_config
@@ -1008,10 +1010,10 @@ class TestTmemPrefetch(TestCase):
 
     def test_block_scales_take_from_the_tails_budget(self) -> None:
         """An nvfp4 dot in the K loop's task keeps its block scales in tensor
-        memory beside the two accumulator rings (2 x 64 columns): the scales'
-        48 columns (a_scale's two [128, 16] buffers of 16, b_scale's two
-        [32, 16] ones of 8: Triton spreads each over all 128 lanes) leave 336,
-        10 tiles of 32 (12 without them)."""
+        memory beside the two accumulator rings (2 x 64 columns): a buffer per
+        ring slot of each (``slot_scales``), 96 columns (four slots of a_scale's
+        [128, 16] of 16 and b_scale's [32, 16] of 8: Triton spreads each over all
+        128 lanes), leave 288, 9 tiles of 32 (12 without them)."""
         x = torch.empty([32, 1024], dtype=torch.bfloat16)
         w = torch.empty([256, 1024], dtype=torch.bfloat16)
         a = torch.empty([256, 256], dtype=torch.uint8)
@@ -1026,7 +1028,8 @@ class TestTmemPrefetch(TestCase):
             )
         self.assertIn("_helion_gluon.tmem_dot_scaled(", code)
         self.assertEqual(code.count("tail_fill("), 1)
-        self.assertIn("tail_buffers(w_ring_desc, 10, 128, 64)", code)
+        self.assertEqual(code.count("slot_scales("), 2)
+        self.assertIn("tail_buffers(w_ring_desc, 9, 128, 64)", code)
 
     def test_tails_share_a_buffer_per_tile_shape(self) -> None:
         """Two tasks' K loops of one tile shape fill one buffer (14 of 16 steps
@@ -1168,6 +1171,76 @@ class TestInbandHold(TestCase):
         self.assertIn("_producer1", holds)
         self.assertEqual({part for part, n in holds.items() if n}, {"_body"}, holds)
         self.assertEqual(holds["_body"], 1)
+
+
+def _bodies(code: str) -> dict[str, str]:
+    """Each generated function's body (its signature dropped), by name."""
+    return {
+        fn.name: "\n".join(ast.unparse(st) for st in fn.body)
+        for fn in ast.parse(code).body
+        if isinstance(fn, ast.FunctionDef)
+    }
+
+
+class TestFilledOperand(TestCase):
+    def test_a_filled_group_without_a_producer(self) -> None:
+        """A filled operand whose gating group no producer streams (every other
+        operand is ungated) takes no producer for it: on the channel's steps
+        without a fill (the first K loop's), the weight producer arrives for
+        that group too."""
+        x = torch.empty([64, 512], dtype=torch.bfloat16)
+        w = torch.empty([256, 512], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = wx_then_scaled_vx.bind((x, w, w))
+            slots = len(bound.config_spec.range_warp_specialize)
+            code = bound.to_triton_code(
+                helion.Config(
+                    **_RING,
+                    block_sizes=[128, 32, 64, 64],
+                    range_warp_specializes=[True] * slots,
+                )
+            )
+        functions = _bodies(code)
+        prefix = "_helion_wx_then_scaled_vx"
+        self.assertNotIn(f"{prefix}_producer1", functions)
+        fill = re.search(
+            r"_helion_ring\.ring_fill\(\w+, (\w+), ", functions[f"{prefix}_body"]
+        )
+        assert fill is not None
+        (full,) = fill.groups()
+        producer = functions[f"{prefix}_producer0"]
+        self.assertRegex(producer, rf"ring_skip\({full}, \w+, \w+, \w+, \w+\)")
+        self.assertNotIn(", False)", producer)
+        self.assertRegex(
+            functions[prefix], rf"{full} = _helion_ring\.ring_barriers\(\w+, 2\)"
+        )
+        self.assertIn("def _helion_wx_then_scaled_vx_mma(", code)
+        self.assertNotIn("_helion_gluon.stage(", code)
+
+    def test_barrier_mode_skips_once_a_step(self) -> None:
+        """Under barrier mode (phase loops sharing the roots' statements) a
+        filled operand of the second root (the first root's output, a plain
+        load there, doubled) gets the weight producer's arrival once on each
+        of the first root's steps."""
+        x = torch.empty([128, 1024], dtype=torch.bfloat16)
+        w = torch.empty([1024, 128], dtype=torch.bfloat16)
+        v = torch.empty([128, 128], dtype=torch.bfloat16)
+        with gluon_cpu_codegen():
+            bound = mm_then_scaled_mm.bind((x, w, v))
+            slots = len(bound.config_spec.range_warp_specialize)
+            code = bound.to_triton_code(
+                helion.Config(
+                    **_RING,
+                    block_sizes=[128, 128, 64, 128, 64, 64],
+                    num_warps=4,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline="barrier",
+                )
+            )
+        self.assertIn("_helion_ring.ring_fill(", code)
+        self.assertNotIn("def _helion_mm_then_scaled_mm_producer1(", code)
+        self.assertIn("ring_skip(", code)
+        self.assertNotRegex(code, r"ring_skip\([^\n]*\n *_helion_ring\.ring_skip\(")
 
 
 class TestWorkerRegisters(TestCase):
@@ -1431,6 +1504,26 @@ def _rereads_last_iteration(x: torch.Tensor, scratch: torch.Tensor) -> torch.Ten
     return out
 
 
+@helion.kernel(static_shapes=True, backend="gluon")
+def _wx_plus_scaled_bias(
+    x: torch.Tensor, w: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """The first root's output read only in the second root's epilogue, through a
+    register-read ring slot."""
+    m, k = x.size()
+    n = w.size(0)
+    c = torch.empty_like(b)
+    out = torch.empty([n, m], dtype=torch.float32, device=x.device)
+    for tile_r, tile_c in hl.tile([n, m]):
+        c[tile_r, tile_c] = b[tile_r, tile_c] * 2
+    for tile_n, tile_m in hl.tile([n, m]):
+        acc = hl.zeros([tile_n, tile_m], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(w[tile_n, tile_k], x[tile_m, tile_k].T, acc=acc)
+        out[tile_n, tile_m] = acc + c[tile_n, tile_m].to(torch.float32)
+    return out
+
+
 class TestPartitionWaits(TestCase):
     def test_a_first_access_barrier_fence_covers_what_it_orders(self) -> None:
         """The barrier before a loop's first access of ``scratch`` (a load the
@@ -1474,6 +1567,47 @@ class TestPartitionWaits(TestCase):
             x_reads = frozenset([_allocation(fakes["x"])])
             self.assertTrue(gluon_ring._orders(function, wait, scratch_reads, named))  # pyrefly: ignore
             self.assertFalse(gluon_ring._orders(function, wait, x_reads, named))  # pyrefly: ignore
+
+    def test_body_drops_waits_its_ring_acquires_cover(self) -> None:
+        """A consumer's ``ring_acquire`` repeats the producer's ``ring_put``
+        arguments (the slot's descriptor and coordinates) but reads shared memory
+        only: a wait ordering nothing else the body reads is dropped (the producer
+        loading the slot keeps it); a wait also ordering the root's barrier
+        publication, or a plain load of the same allocation, keeps it."""
+
+        class Function:
+            def __init__(self) -> None:
+                self.sync_roles = {
+                    "reads": SyncRole("wait", covers=frozenset([1])),
+                    "publishes": SyncRole(
+                        "wait", covers=frozenset([1]), publication=True
+                    ),
+                }
+
+            def sync_names(self, *kinds: str) -> set[str]:
+                return {n for n, r in self.sync_roles.items() if r.kind in kinds}
+
+        def kept(wait: str, plain_load: bool = False) -> bool:
+            body = ast.parse(
+                f"{wait} = 0\n"
+                "slot = _helion_ring.ring_acquire(buf, full, empty, step, S, "
+                "c_ring_desc, (tl.cast(o, tl.int32),), True, nbytes, box)\n"
+                "v = _helion_ring.ring_read(slot, empty, step, S, True)\n"
+                + ("u = tl.load(c + o)\n" if plain_load else "")
+                + "tl.store(out + o, v)\n"
+            ).body
+            # c_ring_desc and c name allocation 1, out allocation 2.
+            names = {"c_ring_desc": 1, "c": 1, "out": 2}
+            with patch.object(gluon_ring, "_argument_allocations", return_value=names):
+                result = gluon_ring._without_waits(body, Function(), frozenset())  # pyrefly: ignore
+            return any(
+                isinstance(st, ast.Assign) and wait in gluon_ring._stored_names([st])
+                for st in result
+            )
+
+        self.assertFalse(kept("reads"))
+        self.assertTrue(kept("publishes"))
+        self.assertTrue(kept("reads", plain_load=True))
 
     def test_partitions_keep_only_waits_ordering_their_reads(self) -> None:
         """A partition keeps a wait only if it orders a read the partition makes;
