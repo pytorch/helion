@@ -253,6 +253,44 @@ def atomic_add_tensor_index_kernel(
     return out
 
 
+@helion.kernel()
+def atomic_add_block_size_value_kernel(x: torch.Tensor) -> torch.Tensor:
+    for tm, tn in hl.tile([x.size(0), x.size(1)], block_size=[4, 32]):
+        value = hl.full([tm.block_size, tn.block_size], 1.0, dtype=x.dtype)
+        hl.atomic_add(x, [tm, tn], value)
+    return x
+
+
+@helion.kernel()
+def atomic_add_tile_over_y_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(y.size(0), block_size=4):
+        hl.atomic_add(x, [tile], y[tile])
+    return x
+
+
+@helion.kernel()
+def atomic_max_tile_over_y_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(y.size(0), block_size=4):
+        hl.atomic_max(x, [tile], y[tile])
+    return x
+
+
+@helion.kernel()
+def atomic_add_3d_kernel(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    for ta, tb, tc in hl.tile(y.size()):
+        hl.atomic_add(x, [ta, tb, tc], y[ta, tb, tc])
+    return x
+
+
+@helion.kernel()
+def atomic_xchg_return_kernel(
+    x: torch.Tensor, y: torch.Tensor, prev: torch.Tensor
+) -> torch.Tensor:
+    for tile in hl.tile(x.size(0)):
+        prev[tile] = hl.atomic_xchg(x, [tile], y[tile])
+    return x
+
+
 # New kernels for other atomics
 
 
@@ -399,6 +437,103 @@ class TestAtomicOperations(RefEagerTestBase, TestCase):
 
         expected = torch.ones(8, device=DEVICE)
         torch.testing.assert_close(result, expected)
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_stride0_target(self):
+        # Every lane adds into x_base[0] through a stride-0 view: 0 + ... + 7.
+        x_base = torch.zeros(1, device=DEVICE)
+        y = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        code_and_output(atomic_add_kernel, (x_base.expand(8), y), block_sizes=[32])
+        torch.testing.assert_close(x_base, torch.tensor([28.0], device=DEVICE))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_max_stride0_target(self):
+        # Every lane takes its max into x_base[0] through a stride-0 view.
+        x_base = torch.zeros(1, device=DEVICE)
+        y = torch.arange(8, device=DEVICE, dtype=torch.float32)
+        code_and_output(atomic_max_kernel, (x_base.expand(8), y), block_sizes=[32])
+        torch.testing.assert_close(x_base, torch.tensor([7.0], device=DEVICE))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_block_size_value(self):
+        # A value of tile.block_size lanes: the last column tile holds one
+        # lane of 32, and only the lanes inside the target add.
+        x = torch.zeros(4, 33, device=DEVICE)
+        code_and_output(atomic_add_block_size_value_kernel, (x,))
+        torch.testing.assert_close(x, torch.ones(4, 33, device=DEVICE))
+        # Through a stride-0 dim, the 4 rows add into one.
+        x_base = torch.zeros(1, 33, device=DEVICE)
+        code_and_output(atomic_add_block_size_value_kernel, (x_base.expand(4, 33),))
+        torch.testing.assert_close(x_base, torch.full((1, 33), 4.0, device=DEVICE))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_size1_target_broadcasts_over_tile(self):
+        # x has one element and the tiles of 4 run over 9 lanes, the last tile
+        # holding one: compiled code drops the offset of a size-1 dim, so
+        # every lane of every tile updates x[0].
+        y = torch.arange(1, 10, device=DEVICE, dtype=torch.float32)
+        x = torch.zeros(1, device=DEVICE)
+        code_and_output(atomic_add_tile_over_y_kernel, (x, y))
+        torch.testing.assert_close(x, torch.tensor([45.0], device=DEVICE))
+        x = torch.zeros(1, device=DEVICE)
+        code_and_output(atomic_max_tile_over_y_kernel, (x, y))
+        torch.testing.assert_close(x, torch.tensor([9.0], device=DEVICE))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_overlapping_strides(self):
+        # Every lane adds into x_base[j + k]: the stride-0 dim repeats each
+        # address, and so do the two overlapping unit strides.
+        x_base = torch.zeros(3, device=DEVICE)
+        x = x_base.as_strided((2, 2, 2), (0, 1, 1))
+        y = torch.ones(2, 2, 2, device=DEVICE)
+        code_and_output(atomic_add_3d_kernel, (x, y))
+        torch.testing.assert_close(x_base, torch.tensor([2.0, 4.0, 2.0], device=DEVICE))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_add_one_element_index_broadcasts(self):
+        # indices[tile] has one element, which broadcasts over the 8 lanes of
+        # y[tile]: every lane adds into x[0]. Ref mode does not broadcast a
+        # tensor index over the value's lanes; it raises rather than keep the
+        # first lane and drop the rest.
+        x = torch.zeros(2, device=DEVICE)
+        y = torch.arange(1, 9, device=DEVICE, dtype=torch.float32)
+        indices = torch.zeros(1, device=DEVICE, dtype=torch.int64)
+        args = (x, y, indices)
+        if self._in_ref_eager_mode:
+            with pytest.raises(RuntimeError, match="expanded size"):
+                code_and_output(atomic_add_overlap_kernel, args, block_sizes=[32])
+            return
+        _, result = code_and_output(atomic_add_overlap_kernel, args, block_sizes=[32])
+        torch.testing.assert_close(result, torch.tensor([36.0, 0.0], device=DEVICE))
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_xchg_stride0_target_returns_lane_values(self):
+        # Every lane exchanges x_base[0] in turn and returns the value it
+        # replaced: the start value or another lane's, whatever the order.
+        x_base = torch.zeros(1, device=DEVICE)
+        y = torch.arange(1, 5, device=DEVICE, dtype=torch.float32)
+        prev = torch.full((4,), -1.0, device=DEVICE)
+        code_and_output(
+            atomic_xchg_return_kernel, (x_base.expand(4), y, prev), block_sizes=[32]
+        )
+        torch.testing.assert_close(
+            torch.cat([prev, x_base]).sort().values,
+            torch.arange(5, device=DEVICE, dtype=torch.float32),
+        )
+
+    @onlyBackends(["triton", "cute"])
+    def test_atomic_cas_stride0_target(self):
+        # Every lane compares and swaps x_base[0] through a stride-0 view: one
+        # finds 0 and writes 5, the others find 5.
+        x_base = torch.zeros(1, device=DEVICE, dtype=torch.int32)
+        y = torch.full((8,), 5, device=DEVICE, dtype=torch.int32)
+        expect = torch.zeros(8, device=DEVICE, dtype=torch.int32)
+        code_and_output(
+            atomic_cas_kernel, (x_base.expand(8), y, expect), block_sizes=[32]
+        )
+        torch.testing.assert_close(
+            x_base, torch.tensor([5], device=DEVICE, dtype=torch.int32)
+        )
 
     @xfailIfPallas("Integer indexing not supported on Pallas")
     def test_atomic_add_1d_tensor(self):

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import itertools
+import operator
 from typing import Callable
 
 import torch
@@ -73,13 +75,14 @@ def _refuse_device_load_target(target: torch.Tensor, op: str) -> None:
 def _ref_atomic_binop(
     target: torch.Tensor,
     index: list[object],
-    value: torch.Tensor | float | bool,
-    op: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    op: Callable[..., torch.Tensor],
+    *values: torch.Tensor | float | bool,
 ) -> torch.Tensor:
-    """Shared ref implementation for simple atomic binary ops (xchg/and/or/xor/max/min).
+    """Shared ref implementation of the atomics other than add
+    (xchg/and/or/xor/max/min/cas).
 
-    Processes indices, clones the previous value, applies the op, and returns prev.
-    For xchg, pass op=lambda old, val: val.
+    Processes indices, applies ``op(old, *values)`` at ``target[index]``, and
+    returns the previous values. For xchg, pass op=lambda old, val: val.
     """
     from .ref_tile import RefTile
 
@@ -91,16 +94,165 @@ def _ref_atomic_binop(
             processed_index.append(int(idx.item()))
         else:
             processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val = (
+    operands = [
         value
         if isinstance(value, torch.Tensor)
         else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = op(target[idx_tuple], val)
+        for value in values
+    ]
+    return _ref_atomic_apply(target, index, processed_index, op, *operands)
+
+
+def _ref_atomic_apply(
+    target: torch.Tensor,
+    index: list[object],
+    processed_index: list[object],
+    op: Callable[..., torch.Tensor],
+    *operands: torch.Tensor,
+) -> torch.Tensor:
+    """Apply ``op(old, *operands)`` at ``target[processed_index]`` as compiled
+    code does, and return the previous values. ``index`` is the index the
+    kernel wrote, with ref tiles where ``processed_index`` has their slices.
+
+    An index of ints and slices goes through a view of ``target`` that holds
+    one entry per lane compiled code runs. A ref tile's slice runs to the
+    end of its loop, which can pass the end of a target dim. Compiled code
+    drops the offset of a size-1 target dim, so every lane of a tile there
+    addresses its one element: element 0, expanded with stride 0 to the
+    tile's length. An operand of ``tile.block_size`` lanes on a tile's dim,
+    past the tile's length on the last, partial tile, holds padding, which
+    compiled code masks: it drops (``_ref_fit_operand``). Lanes that share
+    an element apply their updates in turn (``_ref_update_lanes``);
+    otherwise one update applies them all.
+
+    Any other index keeps one setitem: one with a tensor, or with a None,
+    whose broadcast over the operand ref mode cannot tell from a tile's
+    padding.
+    """
+    from .ref_tile import RefTile
+
+    # A bool is an int too, but as an index it adds a dim: it keeps setitem.
+    if len(processed_index) > target.ndim or not all(
+        isinstance(idx, slice) or (isinstance(idx, int) and not isinstance(idx, bool))
+        for idx in processed_index
+    ):
+        idx_tuple = tuple(processed_index)
+        # pyrefly: ignore [bad-index]
+        prev = target[idx_tuple].clone()
+        # pyrefly: ignore [bad-index, unsupported-operation]
+        target[idx_tuple] = op(target[idx_tuple], *operands)
+        return prev
+    view_index: list[object] = []
+    sizes: list[int] = []  # the view's size per result dim
+    # per result dim: a tile's (length, block size), or None
+    tiles: list[tuple[int, int] | None] = []
+    for idx, size, written in zip(processed_index, target.shape, index, strict=False):
+        if not isinstance(idx, slice):
+            view_index.append(idx)
+            continue
+        if not isinstance(written, RefTile):
+            view_index.append(idx)
+            sizes.append(len(range(*idx.indices(size))))
+            tiles.append(None)
+            continue
+        length = idx.stop - idx.start
+        view_index.append(slice(0, 1) if size == 1 else idx)
+        sizes.append(length if size == 1 else len(range(*idx.indices(size))))
+        tiles.append((length, written._block_size))
+    sizes.extend(target.shape[len(processed_index) :])
+    tiles.extend([None] * (target.ndim - len(processed_index)))
+    operands = tuple(_ref_fit_operand(operand, tiles) for operand in operands)
+    # pyrefly: ignore [bad-index]
+    view = target[tuple(view_index)].expand(sizes)
+    shared = [
+        d
+        for d, (n, st) in enumerate(zip(view.shape, view.stride(), strict=True))
+        if n > 1 and st == 0
+    ]
+    # Overlapping strides (an as_strided view) can repeat an address in the
+    # lanes the stride-0 dims leave: then every lane goes in turn.
+    rest = view[tuple(0 if d in shared else slice(None) for d in range(view.ndim))]
+    if _ref_strides_may_overlap(rest) and _ref_repeats_address(rest):
+        shared = list(range(view.ndim))
+    if shared:
+        return _ref_update_lanes(view, shared, op, *operands)
+    prev = view.clone()
+    view.copy_(op(view, *operands))
+    return prev
+
+
+def _ref_strides_may_overlap(view: torch.Tensor) -> bool:
+    """Whether the strides of ``view`` might let two lanes share an address:
+    some stride is no larger than the span of the smaller strides' dims. A
+    cheap test that clears dense layouts (contiguous or permuted) and their
+    slices; True only calls for the exact check."""
+    span = 0
+    for stride, size in sorted(
+        (st, n) for n, st in zip(view.shape, view.stride(), strict=True) if n > 1
+    ):
+        if stride <= span:
+            return True
+        span += (size - 1) * stride
+    return False
+
+
+def _ref_repeats_address(view: torch.Tensor) -> bool:
+    """Whether two lanes of ``view`` address the same storage element."""
+    offsets = torch.zeros((), dtype=torch.int64, device=view.device)
+    for d, (n, st) in enumerate(zip(view.shape, view.stride(), strict=True)):
+        lane = torch.arange(n, device=view.device)
+        offsets = (
+            offsets + lane.view([n if e == d else 1 for e in range(view.ndim)]) * st
+        )
+    return torch.unique(offsets).numel() < view.numel()
+
+
+def _ref_fit_operand(
+    operand: torch.Tensor, tiles: list[tuple[int, int] | None]
+) -> torch.Tensor:
+    """``operand`` cut for a result whose dims come from ``tiles``: per dim,
+    a tile's (length, block size), or None for a dim that is not a tile's.
+
+    Leading size-1 dims past the result's rank drop, as setitem drops them.
+    On a tile's dim, an operand of the tile's block size on a shorter, last
+    tile drops its padding past the tile's length. Any other shape is left
+    for the update to reject.
+    """
+    while operand.ndim > len(tiles) and operand.shape[0] == 1:
+        operand = operand.squeeze(0)
+    for d in range(1, min(operand.ndim, len(tiles)) + 1):
+        tile = tiles[-d]
+        if tile is not None and operand.shape[-d] == tile[1] > tile[0]:
+            operand = operand.narrow(operand.ndim - d, 0, tile[0])
+    return operand
+
+
+def _ref_update_lanes(
+    view: torch.Tensor,
+    shared: list[int],
+    op: Callable[..., torch.Tensor],
+    *operands: torch.Tensor,
+) -> torch.Tensor:
+    """Apply ``op(old, *operands)`` to ``view``, whose lanes share elements
+    through the dims ``shared``, as compiled atomics do: every
+    lane's update lands, and each lane returns the value its own update
+    replaced.
+
+    The lanes go in turn over the dims in ``shared`` (the stride-0 dims, or
+    all of them when other lanes repeat an address too), in row-major order;
+    each step updates a sub-view of distinct elements in one go.
+    """
+    shape = view.shape
+    operands = tuple(operand.expand(shape) for operand in operands)
+    prev = view.new_empty(shape)
+    for coords in itertools.product(*(range(shape[d]) for d in shared)):
+        select: list[int | slice] = [slice(None)] * len(shape)
+        for d, c in zip(shared, coords, strict=True):
+            select[d] = c
+        lane = tuple(select)
+        sub = view[lane]
+        prev[lane] = sub
+        sub.copy_(op(sub, *(operand[lane] for operand in operands)))
     return prev
 
 
@@ -263,13 +415,13 @@ def _(
             target[element] += values[flat]
         return prev
 
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    val_tensor = _convert_value_to_target_dtype(value)
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = target[idx_tuple] + val_tensor
-    return prev
+    return _ref_atomic_apply(
+        target,
+        index,
+        processed_index,
+        operator.add,
+        _convert_value_to_target_dtype(value),
+    )
 
 
 # -- atomic_xchg --
@@ -326,7 +478,7 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_xchg")
-    return _ref_atomic_binop(target, index, value, lambda old, val: val)
+    return _ref_atomic_binop(target, index, lambda old, val: val, value)
 
 
 # -- atomic_and/or/xor --
@@ -380,7 +532,7 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_and")
-    return _ref_atomic_binop(target, index, value, torch.bitwise_and)
+    return _ref_atomic_binop(target, index, torch.bitwise_and, value)
 
 
 @has_side_effect
@@ -431,7 +583,7 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_or")
-    return _ref_atomic_binop(target, index, value, torch.bitwise_or)
+    return _ref_atomic_binop(target, index, torch.bitwise_or, value)
 
 
 @has_side_effect
@@ -482,7 +634,7 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_xor")
-    return _ref_atomic_binop(target, index, value, torch.bitwise_xor)
+    return _ref_atomic_binop(target, index, torch.bitwise_xor, value)
 
 
 # -- atomic_max/min --
@@ -537,7 +689,7 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_max")
-    return _ref_atomic_binop(target, index, value, torch.maximum)
+    return _ref_atomic_binop(target, index, torch.maximum, value)
 
 
 @has_side_effect
@@ -589,7 +741,7 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_min")
-    return _ref_atomic_binop(target, index, value, torch.minimum)
+    return _ref_atomic_binop(target, index, torch.minimum, value)
 
 
 # -- atomic_cas --
@@ -663,34 +815,13 @@ def _(
 ) -> torch.Tensor:
     _validate_sem(sem)
     _refuse_device_load_target(target, "atomic_cas")
-    from .ref_tile import RefTile
-
-    processed_index: list[object] = []
-    for idx in index:
-        if isinstance(idx, RefTile):
-            processed_index.append(idx._slice)
-        elif isinstance(idx, torch.Tensor) and idx.numel() == 1:
-            processed_index.append(int(idx.item()))
-        else:
-            processed_index.append(idx)
-    idx_tuple = tuple(processed_index)
-    # pyrefly: ignore [bad-index]
-    prev = target[idx_tuple].clone()
-    exp_t = (
-        expected
-        if isinstance(expected, torch.Tensor)
-        else torch.as_tensor(expected, dtype=target.dtype, device=target.device)
+    return _ref_atomic_binop(
+        target,
+        index,
+        lambda old, exp, val: torch.where(old == exp, val, old),
+        expected,
+        value,
     )
-    val_t = (
-        value
-        if isinstance(value, torch.Tensor)
-        else torch.as_tensor(value, dtype=target.dtype, device=target.device)
-    )
-    # pyrefly: ignore [bad-index]
-    mask = target[idx_tuple] == exp_t
-    # pyrefly: ignore [bad-index, unsupported-operation]
-    target[idx_tuple] = torch.where(mask, val_t, target[idx_tuple])
-    return prev
 
 
 ATOMIC_OPS: frozenset[Callable[..., object]] = frozenset(
