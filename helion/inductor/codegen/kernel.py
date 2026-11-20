@@ -202,8 +202,18 @@ class HelionCSEProxy(CSEProxy):
             # the same: bf16 and fp16 values are exact in fp32 and tf32, and the
             # dot accumulates in fp32 either way.
             return x
+        source = kernel.cast_sources.get(x.name)
+        if source is not None and source.dtype == dtype:
+            # A cast back to a value's dtype, through one that holds each of
+            # its values exactly, is the value: any(x.to(torch.int64).to(
+            # torch.bool)) reads the bool x, where each lane would widen to
+            # int64 and back.
+            return source
         if not (kernel.rolled and x in kernel.dot_results):
-            return self._default("to_dtype", (x, dtype), kwargs)
+            value = self._default("to_dtype", (x, dtype), kwargs)
+            if exact_cast(x.dtype, value.dtype):
+                kernel.cast_sources[value.name] = x
+            return value
         # A bf16 matmul output saved for backward is rounded between the dot and
         # its reduction. Emitted in the K loop, the rounding reads the running sum
         # and the store after the loop cannot use it:
@@ -226,6 +236,28 @@ class HelionCSEProxy(CSEProxy):
         # The epilogue then reads value, not out0[tile_y, tile_x] from memory.
         kernel.outer_vars.add(value)
         return value
+
+
+def exact_cast(src: torch.dtype | None, dst: torch.dtype | None) -> bool:
+    """Whether a cast from the bool or integer dtype `src` to `dst` and back is
+    the identity: bool to any dtype but float8_e8m0fnu (whose values are the
+    powers of two: False casts to 2**-127, and back to True), and an integer to
+    a wider integer or to a float whose significand holds it (int8 to
+    bfloat16, int32 to float64). A float `src` is left out: a cast back to
+    bfloat16 or float16 computes in float32 (use_compute_types), which the
+    narrow value would not."""
+    if src is None or dst is None or src == dst or dst.is_complex:
+        return False
+    if src == torch.bool:
+        return dst != torch.float8_e8m0fnu
+    if src.is_floating_point or src.is_complex or dst == torch.bool:
+        return False
+    info = torch.iinfo(src)
+    if dst.is_floating_point:
+        # Integers up to 2 / eps are exact: 256 in bfloat16, 2**24 in float32.
+        return 2 / torch.finfo(dst).eps >= max(-info.min, info.max)
+    target = torch.iinfo(dst)
+    return target.min <= info.min and info.max <= target.max
 
 
 def as_less(relation: sympy.Rel) -> tuple[sympy.Basic, sympy.Basic, bool]:
@@ -304,6 +336,9 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # note_predicate().
         self.symbolic: dict[str, sympy.Expr] = {}
         self.predicates: dict[str, list[sympy.Rel]] = {}
+        # The value each cast that keeps every value exactly was cast from
+        # (HelionCSEProxy.to_dtype()).
+        self.cast_sources: dict[str, CSEVariable] = {}
         self.accumulator_count = 0
         self.has_fp32_dot = False
         # Whether the kernel draws random numbers; see rand().

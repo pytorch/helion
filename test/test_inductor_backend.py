@@ -43,6 +43,7 @@ from torch._inductor.choices import registered_inductor_choices
 import helion
 import helion.inductor
 from helion.inductor import config as helion_config
+from helion.inductor.codegen.kernel import exact_cast
 import helion.language as hl
 
 SOURCE_RE = re.compile(r'helion_\w+_source = """\\\n(.*?)"""', re.DOTALL)
@@ -1500,6 +1501,22 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
             sources = self.compile(fn, x, expected=(var, mean))
         self.assertEqual(len(sources), 1 if rows else 2)
+
+    def test_cast_round_trip(self):
+        # A bool widened to int64 and cast back is the bool (exact_cast()):
+        # torch.any reads the comparison, where each lane would widen to int64
+        # and back.
+        x = torch.randn(64, 300, device=DEVICE)
+        (source,) = self.compile(lambda x: (x > 0).long().bool().any(-1), x)
+        self.assertNotIn(".to(torch.bool)", source)
+        # float8_e8m0fnu has no 0: False casts to 2**-127 and back to True. A
+        # bf16 value widened to float32 is not folded back: under compute
+        # types its cast to bf16 is the float32 value itself.
+        self.assertFalse(exact_cast(torch.bool, torch.float8_e8m0fnu))
+        self.assertTrue(exact_cast(torch.bool, torch.float8_e4m3fn))
+        self.assertTrue(exact_cast(torch.int16, torch.float32))
+        self.assertFalse(exact_cast(torch.int32, torch.float32))
+        self.assertFalse(exact_cast(torch.bfloat16, torch.float32))
 
     def test_mean_beside_var(self):
         # torch.mean(x, -1) beside torch.var(x, -1) in one block: the kernel
