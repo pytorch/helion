@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from typing import TYPE_CHECKING
 
 import sympy
+import torch
 from torch._inductor import config as inductor_config
 from torch._inductor.choices import FusionScore
 from torch._inductor.choices import InductorChoices
@@ -13,6 +15,7 @@ from torch._inductor.scheduler import FusedMixOrderReductions
 from torch._inductor.scheduler import MixOrderReduction
 from torch._inductor.utils import sympy_product
 from torch._inductor.virtualized import V
+from torch.fx.operator_schemas import normalize_function
 from torch.utils._ordered_set import OrderedSet
 
 from . import config
@@ -23,6 +26,8 @@ from .support import numerics_modes
 from .support import python_wrapper
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from torch._inductor.codegen.simd_kernel_features import SIMDKernelFeatures
     from torch._inductor.ir import IRNode
     from torch._inductor.scheduler import BaseSchedulerNode
@@ -65,6 +70,28 @@ def rereads_softmax_row(features: SIMDKernelFeatures) -> bool:
         )
         for node in features.scheduler_nodes()
     )
+
+
+# The shortest contiguous run a split reduction's chunk is made of
+# (HelionChoices.layout_split()): over fewer values, the first kernel's
+# partials cost about what its rows do.
+MIN_SPLIT_RUN = 32
+
+
+def contiguous_run(value: torch.Tensor, dims: Sequence[int]) -> int:
+    """The number of values in the last of `value`'s reduced `dims` that are
+    one contiguous run of memory, the innermost first: H and W, 3136 values,
+    of an NCHW [32, 256, 56, 56] reduced over N, H and W; 1 when the
+    innermost dim of memory is not reduced, as NHWC's C. Dims of size 1 do
+    not count."""
+    run = 1
+    for dim in sorted({d % value.dim() for d in dims}, reverse=True):
+        if value.shape[dim] == 1:
+            continue
+        if value.stride(dim) != run:
+            break
+        run *= value.shape[dim]
+    return run
 
 
 def static_layout(node: IRNode) -> bool:
@@ -155,11 +182,14 @@ class HelionChoices(InductorChoices):
         exps), so a loop over the row reads it twice. The first kernel of every
         split reduction keeps Triton's rule too (Inductor marks it, _split_size,
         only with config.triton.mix_order_reduction on, its default outside
-        fbcode): its chunks of the row run past its end, so its loads are masked
+        fbcode). Where its chunks run past the row's end (no count near
+        Inductor's divides it, reduction_split_factor()), its loads are masked
         and flat, no full row of an operand names the row's dim, and a row named
-        by a factory's dim cannot be rolled (HelionKernel.row_dim()): the chunk
-        of 2047 strided rows of a column sum over [1152000, 512] would be read
-        as one block. With the CuTe backend, an online-softmax row of up to
+        by a factory's dim cannot be rolled (HelionKernel.row_dim()): the chunks
+        of a column sum over [65537, 512], a prime number of rows that no count
+        near Inductor's divides, would each be read as one block. The chunks
+        that divide the row (layout_split()) loop as well, the form measured.
+        With the CuTe backend, an online-softmax row of up to
         PERSISTENT_SOFTMAX_ROW is one block all the same in a kernel that reads
         each row again after it (rereads_softmax_row()), which the autotuner can
         keep in registers across those passes; a kernel that only reduces the
@@ -302,6 +332,100 @@ class HelionChoices(InductorChoices):
                 memory_score=MixOrderReduction.get_fusion_score(node1, node2),
             )
         return score
+
+    def reduction_split_factor(
+        self,
+        device: torch.device,
+        reduction_numel_hint: int,
+        numel_hint: int,
+        inner_reduction: bool,
+    ) -> int:
+        """Inductor's number of chunks for a split reduction, moved to the
+        nearest number, within a factor of 2, that divides the row: the first
+        kernel then reads whole chunks, with no mask past the end of the row.
+        var_mean over N, H and W of a channels-last [128, 144, 56, 56], a row
+        of 401408, in Inductor's 591 chunks of 680 (472 past the end):
+
+            for tile_y, tile_x in hl.tile([591, 144]):
+                for tile_r in hl.tile(680):
+                    tmp3 = hl.load(in0, [tile_x.index.reshape([tile_x, 1])
+                        + 144*(((tile_r.index + 680*tile_y.index.reshape(
+                        [tile_y, 1, 1])) % 401408))], extra_mask=tmp2...)
+
+        and in 512 chunks of 784, a tile of a view of in0 with no mask:
+
+            for tile_y, tile_x in hl.tile([512, 144]):
+                for tile_r in hl.tile(784):
+                    tmp0 = in0[tile_y, tile_r, tile_x]"""
+        split = super().reduction_split_factor(
+            device, reduction_numel_hint, numel_hint, inner_reduction
+        )
+        if device.type != "cuda" or inductor_config.cuda_backend != "helion":
+            return split
+        if (
+            layout := HelionChoices.layout_split(reduction_numel_hint, numel_hint)
+        ) is not None:
+            return layout
+        if split <= 1 or reduction_numel_hint % split == 0:
+            return split
+        divisors = [
+            d
+            for d in sympy.divisors(reduction_numel_hint)
+            if max(2, split // 2) <= d <= 2 * split
+        ]
+        return min(divisors, key=lambda d: abs(d - split), default=split)
+
+    @staticmethod
+    def layout_split(reduction_numel: int, numel: int) -> int | None:
+        """The split of the reduction V.graph.current_node lowers into chunks
+        of one contiguous run of its input each (contiguous_run()), as
+        Inductor asks whether to split it: sum, var_mean and the like over N,
+        H and W of an NCHW [32, 256, 56, 56] in 32 chunks of H * W. Inductor's
+        split then reduces each run of 3136 values first, a tile of a view of
+        the input, and the 32 partials of each channel after, with its own
+        math (create_multilayer(), split Welford), where its split of the flat
+        reduction index runs its chunks across N. The first kernel reads the
+        runs as the 8192 rows of a view (N and C, whose strides join):
+
+            for tile_r in hl.tile(3136):
+                tmp0 = in0[tile_x, tile_r].to(torch.float32)
+
+        rather than in0[3136*tile_x + 802816*(tile_r.index // 3136) + ...],
+        whose division and remainder keep the loads from being vectors. The
+        split is asked of whether Inductor would split (Helion cannot reduce
+        over N and H * W apart in one kernel), but not of the second
+        reduction, over the partials, nor of another reduction than the
+        node's own: None then, and when the run is the whole reduction (a
+        contiguous row), shorter than MIN_SPLIT_RUN, or the input's layout is
+        not static."""
+        node = V.graph.current_node
+        if node is None or node.op != "call_function" or isinstance(node.target, str):
+            return None
+        normalized = normalize_function(
+            node.target, node.args, node.kwargs, normalize_to_only_use_kwargs=True
+        )
+        if normalized is None:
+            return None
+        x, dims = normalized.kwargs.get("input"), normalized.kwargs.get("dim")
+        if isinstance(dims, int):
+            dims = [dims]
+        if (
+            not isinstance(x, torch.fx.Node)
+            or not isinstance(value := x.meta.get("val"), torch.Tensor)
+            or not isinstance(dims, (list, tuple))
+            or not dims
+            or not all(isinstance(n, int) for n in (*value.shape, *value.stride()))
+        ):
+            return None
+        rnumel = math.prod(value.shape[d % value.dim()] for d in set(dims))
+        run = contiguous_run(value, dims)
+        if (
+            rnumel != reduction_numel
+            or value.numel() != rnumel * numel
+            or not MIN_SPLIT_RUN <= run < rnumel
+        ):
+            return None
+        return rnumel // run
 
     def uuid(self) -> None:
         # The FX graph cache key already holds what use_native_matmul() reads:

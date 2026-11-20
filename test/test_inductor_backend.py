@@ -1101,14 +1101,16 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         # Tiles over the dims the indexes divide the flat ranges by, with no
         # // or % (natural_tiling()). mean: the mean over H and W of a
         # channels-last x, read at 64*r + 2304*(x // 64) + x % 64 by the
-        # 1-D tiling. broadcast: w[c] beside x[n, c], read at x % 384.
+        # 1-D tiling, an outer reduction, whose contiguous C is the last dim of
+        # the tile. broadcast: w[c] beside x[n, c], read at x % 384.
         # mask: the column and row, x % 100 and x // 100, of a causal mask.
         if case == "mean":
             x = torch.randn(8, 64, 6, 6, device=DEVICE)
             x = x.to(memory_format=torch.channels_last)
             (source,) = self.compile(lambda x: x.mean([2, 3]), x, tol=1e-4)
             self.assertIn("for tile_y, tile_x in hl.tile([8, 64]):", source)
-            self.assertIn("in0[tile_y, tile_x, :]", source)
+            self.assertIn("in0[tile_y, :, tile_x]", source)
+            self.assertIn("torch.sum(tmp0, -2)", source)
         elif case == "broadcast":
             x = torch.randn(32, 384, device=DEVICE)
             w = torch.randn(384, device=DEVICE)
@@ -1312,6 +1314,67 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         with V.set_choices_handler(Choices()):
             sources = self.compile(lambda x: torch.var_mean(x, -1), x)
         self.assertEqual(len(sources), 2)
+
+    def test_nchw_reductions(self):
+        # sum and var_mean over N, H and W of an NCHW tensor split into a
+        # chunk per run of H * W contiguous values (HelionChoices.layout_split()):
+        # the first kernel reads each run as a row of a view, with no division
+        # or remainder in its index, and the second combines the 8 partials of
+        # each channel.
+        x = torch.randn(8, 16, 32, 32, device=DEVICE)
+        for fn in (
+            lambda x: x.sum([0, 2, 3]),
+            lambda x: torch.var_mean(x, [0, 2, 3], correction=0),
+        ):
+            first, second = self.compile(fn, x, tol=1e-4)
+            self.assertRegex(first, r"in0\[tile_x, (tile_r|:)\]")
+            self.assertNotIn("//", first)
+            self.assertIn("in0[tile_x, :]", second)
+
+    @parametrize("case", ["persistent", "looped"])
+    def test_outer_reductions(self, case):
+        # Reductions over the outer dim of [1000, 100] (Inductor's hint OUTER),
+        # whose kernels read rows of x (reads_outer_rows()) and reduce the row
+        # before tile_x, in one block or a loop over tile_r, as the sums of
+        # test_nchw_reductions: argmax and argmin with a NaN, and var_mean,
+        # amax and prod, which Inductor splits, whose first kernel reads
+        # in0[tile_y, tile_r, tile_x] and whose second combines the partials.
+        x = torch.randn(1000, 100, device=DEVICE)
+        x[10, 3] = float("nan")
+        row = ":" if case == "persistent" else "tile_r"
+        outer = rf"in0\[(tile_y, tile_r|{row}), tile_x\]"
+        for fn in (
+            lambda x: (torch.argmax(x, 0), torch.argmin(x, 0)),
+            lambda x: torch.var_mean(x, 0),
+            lambda x: (x.amax(0), x.prod(0).abs().clamp(max=1.0)),
+        ):
+            with config.patch({"triton.persistent_reductions": case == "persistent"}):
+                sources = self.compile(fn, x, tol=1e-4)
+            for source in sources:
+                self.assertRegex(source, outer)
+
+    def test_column_sum(self):
+        # A column sum with enough columns not to split, which Inductor hints
+        # DEFAULT: its tiling scores put the contiguous bytes along x, so the
+        # row is the first dim of the tile and x, of stride 1, the last
+        # (reads_outer_rows()), not in0[tile_x, :].
+        x = torch.randn(64, 32768, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum(0), x, tol=1e-4)
+        self.assertIn("tmp0 = in0[:, tile_x]", source)
+        self.assertIn("torch.sum(tmp0, -2)", source)
+
+    def test_split_reduction_chunks(self):
+        # Inductor cuts the column sum over 100000 rows into 782 chunks of 128,
+        # the last past the end of the rows, which masks every load of the
+        # first kernel; HelionChoices.reduction_split_factor() picks 800 chunks
+        # of 125, whose loads are tiles of a view of x, with x's contiguous dim
+        # last (an outer reduction).
+        x = torch.randn(100000, 96, device=DEVICE)
+        # The sums of 100000 values, in chunks, differ from eager's by 1e-4.
+        first, _ = self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertIn("for tile_y, tile_x in hl.tile([800, 96]):", first)
+        self.assertIn("for tile_r in hl.tile(125):", first)
+        self.assertIn("tmp0 = in0[tile_y, tile_r, tile_x]", first)
 
     def test_welford_layer_norm(self):
         # bf16 with its affine epilogue, in one kernel.

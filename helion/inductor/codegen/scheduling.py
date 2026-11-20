@@ -235,7 +235,7 @@ class HelionScheduling(SIMDScheduling):
 
             1536*r + 497664*tile_y.index + tile_x.index
 
-        a tile of a [128, 1536, 324] view, which the kernel subscripts by its
+        a tile of a [128, 324, 1536] view, which the kernel subscripts by its
         tiles. Helion lowers the // and % of a reshaped index with sign
         corrections (it no longer knows the index is non-negative), and the
         backend does not see that consecutive tile_x are consecutive addresses,

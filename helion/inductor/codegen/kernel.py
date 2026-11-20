@@ -23,6 +23,7 @@ from torch._inductor.ir import IRNode
 from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
+from torch._inductor.runtime.hints import ReductionHint
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -36,6 +37,8 @@ from ..support import names_row_dim
 from .overrides import HelionOverrides
 from .overrides import HelionPrinter
 from .overrides import upcast_compute_type
+from .tiling import contiguous_reads
+from .tiling import static_int
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -255,8 +258,19 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         super().__init__(tiling, **kwargs)
         self.outer_vars: OrderedSet[CSEVariable] = OrderedSet()
         # A matmul orders r0_ before x so dot operands read [y, r0_] and [r0_, x].
-        matmul = self.is_native_matmul
-        order = ("z0_", "y", "r0_", "x") if matmul else ("z0_", "y", "x", "r0_")
+        # So does an outer reduction, whose x is contiguous in memory and r0_
+        # strided, so that a tile's last dim is the contiguous one, as in the
+        # first kernel of a split var_mean over the rows of a [401408, 144]:
+        #     tmp0 = in0[tile_y, tile_r, tile_x]          # x of stride 1
+        #     tmp7 = torch.sum(tmp6, -2)
+        # where in0[tile_y, tile_x, tile_r] puts the dim of stride 144 last,
+        # and the autotuner must find lanes and vectors along a dim that is not.
+        outer = self.inside_reduction and self.reads_outer_rows()
+        order = (
+            ("z0_", "y", "r0_", "x")
+            if self.is_native_matmul or outer
+            else ("z0_", "y", "x", "r0_")
+        )
         self.axes = tuple(axis for axis in order if axis in self.numels)
         self.outer_axes = tuple(axis for axis in self.axes if axis != "r0_")
         roots = {tree.prefix: tree for tree in self.range_trees}
@@ -372,6 +386,30 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             )
         )
 
+    def reads_outer_rows(self) -> bool:
+        """Whether the reduction is an outer one, whose rows are strided and
+        whose pointwise dims are contiguous: Inductor's hint says so (OUTER,
+        OUTER_TINY), or, for the hint DEFAULT that Inductor gives a reduction
+        with enough rows not to split, its loads read more bytes with a unit
+        stride along a pointwise dim than along r0_ (contiguous_reads()), as
+        Inductor's num_splits() decides from their strides: the column sum of a
+        [16384, 30522] gradient (a bias's), but not F.embedding(i, w).sum(-1),
+        whose gathered rows of w are contiguous along r0_."""
+        hint = self.features.get_reduction_hint()
+        if hint in (ReductionHint.OUTER, ReductionHint.OUTER_TINY):
+            return True
+        if hint != ReductionHint.DEFAULT:
+            return False
+        numel = static_int(self.features.numel)
+        rnumel = static_int(self.features.reduction_numel)
+        if numel is None or rnumel is None:
+            return False
+        found = contiguous_reads(self.features.node_schedule, numel, rnumel)
+        if found is None:
+            return False
+        rows, columns = found
+        return rows < columns
+
     def dim_code(self, dim: object) -> str:
         """A dim of a value's shape, as code: in a persistent reduction tile_r
         is no loop variable but the whole row (row_dim())."""
@@ -438,7 +476,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
 
     def value_shape(self, axes: Iterable[str]) -> TileShape:
         """Shape of a value over `axes`: their tiles in the kernel's axis order,
-        (z, y, r0_, x) with a dot and (z, y, x, r0_) without. A value holds only
+        (z, y, r0_, x) with a dot or an outer reduction (reads_outer_rows())
+        and (z, y, x, r0_) without. A value holds only
         its own tiles, since an r0_-only value in a matmul's K loop is [tile_r]
         next to [tile_y, tile_r] but [tile_r, 1] next to [tile_r, tile_x];
         align_args() reshapes values as ops combine them."""
@@ -1258,8 +1297,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     ) -> tuple[str, TileShape]:
         """torch.<fn> of a block of `value` over tile_r, e.g. torch.sum(tmp0, -1),
         for an accumulator of `dtype`, and its shape."""
-        # Reduce tile_r wherever the axis order puts it: last without a dot, before
-        # tile_x in a matmul's K loop, as in (a @ b, (a[:, :, None] * b[None]).sum(1)):
+        # Reduce tile_r wherever the axis order puts it: last without a dot or an
+        # outer reduction, before tile_x in an outer reduction (torch.sum(tmp0,
+        # -2) of in0[tile_y, tile_r, tile_x]) and in a matmul's K loop, as in
+        # (a @ b, (a[:, :, None] * b[None]).sum(1)):
         #     acc = torch.addmm(acc, tmp0, tmp1)
         #     tmp3 = tmp2 * tmp1                     # [tile_y, tile_r, tile_x]
         #     acc1 = acc1 + torch.sum(tmp3, -2)
