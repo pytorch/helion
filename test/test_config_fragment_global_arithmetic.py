@@ -10,11 +10,15 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing.tunable_fragments import host_assignment_values
 from helion.autotuner import EnumFragment
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 
 SCALAR = 1e16
 OTHER = 2.0

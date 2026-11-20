@@ -14,6 +14,7 @@ import helion
 from helion._compiler.compile_environment import RuntimeInputSpecialization
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.binding_observation import (
     observe_compiled_binding as _compile_observer,
 )
@@ -60,6 +61,7 @@ def _nested_container(x, a: hl.constexpr, b: hl.constexpr):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("container", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_later_branch_preserves_new_guard_in_eager_and_direct_calls(container):
     if container:
         fn = _nested_container.fn
@@ -113,6 +115,7 @@ def _selected_anchor(x, selector: hl.constexpr, value: hl.constexpr):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("container", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_shallow_first_call_does_not_force_repeated_deep_traces(container):
     fn = _nested_container.fn if container else _nested_fragment.fn
     first, second = (
@@ -132,6 +135,7 @@ def test_shallow_first_call_does_not_force_repeated_deep_traces(container):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_same_site_guard_with_different_anchor_is_not_reused():
     kernel = helion.kernel(_selected_anchor.fn, autotune_effort="none")
     x = torch.empty(17)
@@ -176,6 +180,7 @@ def _field_fragment_equality(x, holder):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("holder_type", [_DataclassPair, _NamedPair])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fragment_field_aliases_preserve_cached_and_direct_routes(holder_type):
     kernel = helion.kernel(_field_fragment_equality.fn, autotune_effort="none")
     x = torch.empty(17)
@@ -217,6 +222,7 @@ def _captured_tuple_constructor(x, value: hl.constexpr, host: hl.constexpr):
 
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("host", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_identity_preserving_tuple_constructor_keeps_capture_origin(host):
     kernel = helion.kernel(_captured_tuple_constructor.fn, autotune_effort="none")
     x = torch.empty(17)
@@ -245,6 +251,7 @@ def _ordinary(x):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_ordinary_direct_call_does_not_add_a_bind():
     kernel = helion.kernel(_ordinary.fn, autotune_effort="none")
     x = torch.empty(17)
@@ -270,6 +277,7 @@ def _selected_input_container(x, values: hl.constexpr, index: hl.constexpr):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_complete_partition_keeps_specialized_source_selection():
     kernel = helion.kernel(_selected_input_container.fn, autotune_effort="none")
     x = torch.empty(17)
@@ -333,6 +341,7 @@ def test_binding_anchor_witness_retains_identity_without_repr_or_equality():
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_multi_shape_keeps_selection_after_later_guard_requires_fresh_binding():
     tensor = torch.empty(17)
     shallow_args = (tensor, BooleanFragment(), FIRST)

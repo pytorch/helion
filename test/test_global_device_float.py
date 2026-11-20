@@ -11,6 +11,7 @@ import helion
 from helion._compiler.type_info import _preserve_host_float_operation
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.host_float_control_flow import aliased_host_float
 from helion._testing.host_float_control_flow import rebound_host_float
@@ -18,7 +19,10 @@ from helion._testing.tunable_fragments import host_functions
 from helion._testing.tunable_fragments import load_host_function
 import helion.language as hl
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 SCALAR = 1e16
 
 

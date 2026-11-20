@@ -16,6 +16,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from helion._testing import skipIfRefEagerMark
 from helion.autotuner import benchmarking
 from helion.autotuner.benchmark_provider import _clone_args
 from helion.autotuner.benchmark_worker import BenchmarkTimeout
@@ -35,9 +36,8 @@ if TYPE_CHECKING:
 # with no traceback) on the single-GPU A10G ref-eager runner.
 pytestmark = [
     pytest.mark.cpu_only,
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="handoff worker subprocesses flake on the A10G ref-eager runner",
+    skipIfRefEagerMark(
+        "handoff worker subprocesses flake on the A10G ref-eager runner"
     ),
 ]
 
@@ -180,6 +180,22 @@ def test_mutation_is_reset_before_every_measured_call(tmp_path: Path) -> None:
     assert all(sample > 0 for sample in outcome.samples)
     saved = torch.load(tmp_path / "case_0/inputs.pt", weights_only=False)
     torch.testing.assert_close(saved, pristine)
+
+
+@pytest.mark.parametrize("graph", [None, "1"])
+def test_a_case_leaves_graph_benchmarking_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, graph: str | None
+) -> None:
+    # A case times without graphs, then restores HELION_BENCHMARK_CUDAGRAPH:
+    # later benchmarks in the same process keep their own setting.
+    if graph is None:
+        monkeypatch.delenv("HELION_BENCHMARK_CUDAGRAPH", raising=False)
+    else:
+        monkeypatch.setenv("HELION_BENCHMARK_CUDAGRAPH", graph)
+    _bundle(tmp_path)
+    outcome = _job(tmp_path, repetitions=1)()
+    assert outcome.status == "ok", outcome.error
+    assert os.environ.get("HELION_BENCHMARK_CUDAGRAPH") == graph
 
 
 def test_undeclared_mutation_fails_despite_correct_output(tmp_path: Path) -> None:

@@ -20,6 +20,7 @@ from helion._compiler.compile_environment import _is_supported_tensor_input_sour
 from helion._compiler.compile_environment import _replay_tensor_input_source
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.tensor_container_guards import TensorField
 from helion._testing.tensor_container_guards import TensorTuple
@@ -48,6 +49,7 @@ def _scaled(x, config: hl.constexpr):
 
 @pytest.mark.parametrize("holder_type", [DataclassScale, NamedTupleScale])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_device_code_reads_class_field(holder_type):
     with cpu_render_target():
         bound = cpu_bind(_scaled, (torch.empty(17), holder_type(2.5)))
@@ -109,6 +111,7 @@ class DataclassPseudoFields:
 
 @pytest.mark.parametrize("holder_type", [DataclassNonInitFields, DataclassPseudoFields])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fake_dataclass_preserves_non_init_fields_without_reconstruction(holder_type):
     x = torch.empty(17)
     if holder_type is DataclassPseudoFields:
@@ -148,6 +151,7 @@ def _runtime_fields(x, config):
 
 @pytest.mark.parametrize("holder_type", [DataclassFields, NamedTupleFields])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_host_launcher_reads_runtime_fields_as_attributes(holder_type):
     x = torch.empty(17)
     config = holder_type(2.5, torch.empty_like(x))
@@ -199,6 +203,7 @@ def _specialized_field_stride(groups, device):
 
 @pytest.mark.parametrize("holder_type", [DataclassFields, NamedTupleFields])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_field_stride_specialization_replays_actual_inputs(holder_type):
     x = torch.empty(16, 16)
     original = ({"configs": [holder_type(2.5, x)]}, x.device)
@@ -248,6 +253,7 @@ def _specialized_field_scalar(groups, device):
 @pytest.mark.parametrize("specialization", ["size", "scalar"])
 @pytest.mark.parametrize("sequence_type", [list, tuple])
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nested_field_specialization_keeps_fake_conversion_path(
     holder_type, specialization, sequence_type
 ):
@@ -280,6 +286,7 @@ def _captured_tensor(x, callback):
 
 
 @onlyBackends(["triton", "cute"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_captured_callable_tensor_stays_external():
     x, weight = torch.empty(16), torch.empty(16)
 
@@ -306,6 +313,7 @@ def test_captured_callable_tensor_stays_external():
 
 @pytest.mark.parametrize("holder_type", [TensorField, TensorTuple])
 @pytest.mark.parametrize("direct", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_record_tensor_store_matches_local_alias(holder_type, direct):
     values = torch.arange(38, dtype=torch.float32)[::2]
     holder = holder_type(values)
@@ -333,6 +341,7 @@ def _invalid_record_store(holder, device: torch.device):
     return holder.weight
 
 
+@skipIfRefEager("checks a compile-time error, which ref mode does not raise")
 def test_record_tensor_store_still_validates_rhs():
     with cpu_render_target(), pytest.raises(helion.exc.RequiresTensorInAssignment):
         cpu_bind(

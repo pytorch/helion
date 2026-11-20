@@ -608,6 +608,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                 torch.testing.assert_close(fn(*contiguous_args), x + 1)
                 torch.testing.assert_close(fn(*transposed_args), transposed + 64)
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_record_tensor_assignment_matches_local_alias(self):
         for holder_type in (TensorField, TensorTuple):
             for direct in (False, True):
@@ -1065,6 +1066,7 @@ class TestSpecialize(RefEagerTestBase, TestCase):
                         masked_copy(x, mask), torch.where(mask, x, 0.0)
                     )
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_container_broadcast_transitions_use_current_shape(self):
         # Direct fields and composed dict/list/namedtuple projections exercise
         # generated argument replay. The CPU module covers every container kind.

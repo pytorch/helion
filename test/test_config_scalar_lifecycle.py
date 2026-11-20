@@ -14,6 +14,7 @@ import helion
 from helion._compiler._inductor.template_buffer import _FusionAutotuneAdapter
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner import EnumFragment
 import helion.language as hl
@@ -34,6 +35,7 @@ def _selected_scalar(x, choices: hl.constexpr):
 @pytest.mark.parametrize(
     "default,selected", [(0.0, -0.0), (-0.0, 0.0), (2, 2.0), (True, 1)]
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_minimize_preserves_scalar_type_and_sign(default, selected):
     with cpu_render_target():
         bound = cpu_bind(_selected_scalar, (torch.empty(17), (default, selected)))
@@ -74,6 +76,7 @@ def test_minimize_preserves_nested_scalar_metadata():
 
 
 @pytest.mark.parametrize("reverse", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fusion_benchmark_paths_keep_typed_config_identity(reverse):
     with cpu_render_target():
         bound = cpu_bind(
@@ -129,6 +132,7 @@ def _compiled_host(bound):
 
 
 @pytest.mark.parametrize("reverse", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_scalar_selections_use_distinct_compiled_entries(reverse):
     with cpu_render_target():
         values = (True, 1, False, 0, -0.0, 0.0)
@@ -174,6 +178,7 @@ def _ordinary_reduction(x):
 
 
 @pytest.mark.parametrize("reduction", [False, True])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_minimize_round_trip_keeps_selected_compiled_entry(reduction, tmp_path):
     with cpu_render_target():
         kernel = _ordinary_reduction if reduction else _ordinary_pointwise
@@ -237,6 +242,7 @@ def test_minimize_keeps_config_when_omission_invalidates_dependent_fields():
         assert minimal.config == full.config
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_minimize_does_not_add_custom_default_calls():
     class CountingEnum(EnumFragment):
         def __init__(self):

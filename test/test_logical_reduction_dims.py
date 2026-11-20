@@ -13,6 +13,7 @@ from helion._compiler.merge_reduction_dims import _META_KEY
 from helion._testing import _get_backend
 from helion._testing import cpu_render_target
 from helion._testing import skipIfCute
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_full_logical_votes import shared_full_votes
 import helion.language as hl
@@ -77,6 +78,7 @@ def test_logical_duplicate_axes_still_raise(operation):
 
 
 @pytest.mark.parametrize("initialized", (False, True))
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_default_multi_axis_vote_binds_and_renders(monkeypatch, initialized):
     @helion.kernel(static_shapes=True)
     def vote(x: torch.Tensor) -> torch.Tensor:
@@ -154,6 +156,7 @@ def test_logical_chains_retain_layout_merge_metadata(operation):
 
 
 @pytest.mark.parametrize("columns", (32, 64) if _get_backend() == "cute" else (32,))
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_matrix_score_vote_refuses_unsupported_aten_mm_on_cute(columns):
     initialized = torch.cuda.is_initialized()
 
@@ -187,6 +190,7 @@ def test_matrix_score_vote_refuses_unsupported_aten_mm_on_cute(columns):
 
 
 @skipIfCute("covered by complete-owner module")
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_shared_vote_producer_keeps_non_cute_render():
     initialized = torch.cuda.is_initialized()
     with cpu_render_target(fake_device_sm_count=148):
@@ -202,6 +206,7 @@ def test_shared_vote_producer_keeps_non_cute_render():
     assert torch.cuda.is_initialized() == initialized
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_dynamic_vote_keeps_existing_layout_admission():
     @helion.kernel(static_shapes=False)
     def vote(x: torch.Tensor) -> torch.Tensor:

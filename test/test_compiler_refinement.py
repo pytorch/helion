@@ -11,6 +11,7 @@ import torch
 
 import helion
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.compiler_refinement import compiler_refinement_candidates
@@ -24,7 +25,10 @@ from helion.runtime.config_cache import ConfigCache
 from helion.runtime.config_cache import ConfigSet
 from helion.runtime.settings import Settings
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 KEYS = ("first_option", "second_option", "third_option")
 CHOICES = ((False, True), (False, True), (0, 1, 2, 3))
 # These remain four distinct layouts after every backend's normalization.

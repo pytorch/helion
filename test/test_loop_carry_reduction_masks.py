@@ -12,14 +12,13 @@ kernels and checks their values.
 
 from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 
 import helion
 from helion._compiler.device_ir import ForLoopGraphInfo
 from helion._testing import cpu_render_target
+from helion._testing import skipIfRefEagerMark
 from helion._testing import skipUnlessBackends
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -28,10 +27,7 @@ from helion.language._tracing_ops import _mask_to
 pytestmark = [
     pytest.mark.cpu_only,
     skipUnlessBackends(["triton", "cute"]),
-    pytest.mark.skipif(
-        os.environ.get("HELION_INTERPRET") == "1",
-        reason="inspects the device IR; ref mode has none",
-    ),
+    skipIfRefEagerMark("inspects the device IR; ref mode has none"),
 ]
 
 

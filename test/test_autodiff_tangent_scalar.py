@@ -17,6 +17,7 @@ from helion._compiler.compile_environment import FixedBlockSizeSource
 from helion._compiler.device_ir import RootGraphInfo
 from helion._testing import cpu_render_target
 from helion._testing import matchesBackends
+from helion._testing import skipIfRefEager
 from helion._testing import skipUnlessBackends
 from helion._testing.autodiff_shapes import ALIAS_SHAPE_CASES
 from helion._testing.autodiff_shapes import alias_shape_backward
@@ -41,6 +42,7 @@ pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["triton", "cute"])]
 # Each named case has a distinct coupled shape/dataflow proof; the rationale
 # and complete list live beside ALIAS_SHAPE_CASES, rather than a product grid.
 @pytest.mark.parametrize("case", ALIAS_SHAPE_CASES)
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_alias_branches_preserve_compatible_physical_ranks(case: str) -> None:
     forward, inputs, blocks = alias_shape_case(case, "cpu")
     outputs = forward(*inputs)
@@ -135,6 +137,7 @@ def test_local_expand_rejects_tiled_singleton_reduction_input() -> None:
 
 @pytest.mark.parametrize("dim", [1, 2])
 @pytest.mark.parametrize("operation", ["sum", "mean", "scaled_mean", "negated_sum"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_scalar_tangent_arithmetic_keeps_the_existing_broadcast_axis(
     dim: int, operation: str
 ) -> None:
@@ -173,6 +176,7 @@ def test_scalar_tangent_arithmetic_keeps_the_existing_broadcast_axis(
         "leading-view-roundtrip",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_multi_axis_tangent_scalar_views_preserve_gradient_values(
     operation: str, axes: tuple[int, int], view_dim: int | None
 ) -> None:
@@ -274,6 +278,7 @@ def _render_backward(
 
 
 @pytest.mark.parametrize("dim,cast_kind", [(1, "aten"), (2, "prims")])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_dtype_cast_preserves_the_tangent_broadcast_axis(
     dim: int, cast_kind: str
 ) -> None:
@@ -294,6 +299,7 @@ def test_dtype_cast_preserves_the_tangent_broadcast_axis(
         "scalar_middle_views",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_mixed_outputs_do_not_prebroadcast_the_full_rank_tangent(identity: str) -> None:
     def forward(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         full = 2 * x
@@ -374,6 +380,7 @@ def test_mixed_outputs_do_not_prebroadcast_the_full_rank_tangent(identity: str) 
         "unpaired_transpose",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_inverse_views_restore_existing_padding(case: str) -> None:
     if case in ("vector_endpoint", "vector_scalar_endpoint", "identity_view"):
         shape, blocks = (128,), [16]
@@ -444,6 +451,7 @@ def test_inverse_views_restore_existing_padding(case: str) -> None:
         "incompatible_axes",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_inverse_views_join_compatible_tangent_branches(case: str) -> None:
     if case in ("vector", "view"):
         shape, blocks = (128,), [16]
@@ -529,6 +537,7 @@ def test_inverse_views_join_compatible_tangent_branches(case: str) -> None:
         "later_arbitrary",
     ],
 )
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_nonlinear_primal_and_tangent_views_share_shapes(case: str) -> None:
     # Each named graph covers a distinct shape effect; this is not a knob product.
     shape = (
@@ -638,6 +647,7 @@ def test_nonlinear_primal_and_tangent_views_share_shapes(case: str) -> None:
         bound.to_code(helion.Config(block_sizes=blocks))
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_local_expand_uses_literal_singleton_iteration_load() -> None:
     forward, inputs, blocks = alias_shape_case("literal_singleton_expand", "cpu")
     _graph, _converter, module, source = alias_shape_backward(
@@ -841,6 +851,7 @@ def _autodiff_semantic_operands(x: torch.Tensor, y: torch.Tensor, pruned: hl.con
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_autodiff_refuses_pruned_required_tensor():
     with cpu_render_target():
         bound = cpu_bind(
@@ -865,6 +876,7 @@ def test_autodiff_refuses_pruned_required_tensor():
         assert str(root.graph) == before
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_autodiff_preserves_optional_tensor_none():
     with cpu_render_target():
         bound = cpu_bind(
@@ -920,6 +932,7 @@ def _scan_pruned_tensor(x: torch.Tensor):
     return out
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_scan_combine_refuses_pruned_required_tensor():
     with cpu_render_target():
         bound = cpu_bind(_scan_pruned_tensor, (torch.empty(8, 16),))

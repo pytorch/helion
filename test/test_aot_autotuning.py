@@ -34,6 +34,7 @@ from helion import exc
 from helion._hardware import HardwareInfo
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEager
 from helion._testing.cute_codegen import cpu_bind
 from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
@@ -1394,6 +1395,7 @@ def _fresh_aot_binding(x, value: hl.constexpr):
 @onlyBackends(["triton", "cute"])
 @pytest.mark.parametrize("mode", ["evaluate", "compile"])
 @pytest.mark.parametrize("construction", ["default", "indexed", "direct"])
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 def test_fresh_aot_binding_preserves_explicit_selection_mode(
     monkeypatch, tmp_path, mode, construction
 ):

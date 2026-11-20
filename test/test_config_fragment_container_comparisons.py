@@ -8,13 +8,17 @@ import torch
 import helion
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfRefEagerMark
 from helion._testing.binding_observation import observe_compiled_binding
 from helion.autotuner import BooleanFragment
 from helion.autotuner import EnumFragment
 import helion.language as hl
 from helion.runtime.kernel import BoundKernel
 
-pytestmark = pytest.mark.cpu_only
+pytestmark = [
+    pytest.mark.cpu_only,
+    skipIfRefEagerMark("reads compiler state, which ref mode does not build"),
+]
 ANCHOR = BooleanFragment()
 SAVED = (ANCHOR,)
 NESTED = ((ANCHOR,),)
