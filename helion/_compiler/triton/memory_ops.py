@@ -12,6 +12,7 @@ import ast
 import itertools
 import logging
 import math
+import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 from typing import cast
@@ -20,12 +21,15 @@ import torch
 
 from ..._compat import supports_tensor_descriptor
 from ...language import _decorators
+from ...language import _tracing_ops
+from ...language import view_ops
 from ...language.memory_ops import PREFETCH_SLOT_META
 from ...language.memory_ops import _maybe_materialize_tile_index_load
 from ...language.memory_ops import load
 from ...language.memory_ops import prefetch
 from ...language.memory_ops import prefetch_is_bulk
 from ...language.memory_ops import store
+from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE
 from ..compile_environment import CompileEnvironment
@@ -35,8 +39,10 @@ from ..device_function import SymbolArgument
 from ..host_function import HostFunction
 from ..indexing_strategy import SubscriptIndexing
 from ..indexing_strategy import _has_active_codegen_block
+from ..indexing_strategy import _in_warp_specialized_loop
 from ..indexing_strategy import _resolve_codegen_block_id
 from ..indexing_strategy import is_block_size_index
+from ..matmul_utils import _resolve_dim_size
 from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
@@ -61,6 +67,185 @@ _EVICTION_POLICY_MAP = {
     "first": "evict_first",
     "last": "evict_last",
 }
+
+
+def _strip_broadcast_index(node: object) -> object:
+    while isinstance(node, torch.fx.Node):
+        if (
+            node.target is _tracing_ops._new_var
+            and len(node.args) == 1
+            and not node.kwargs
+        ):
+            node = node.args[0]
+            continue
+        if (
+            node.target is view_ops.subscript
+            and len(node.args) == 2
+            and not node.kwargs
+            and isinstance(node.args[1], (list, tuple))
+            and all(index is None or index == slice(None) for index in node.args[1])
+        ):
+            node = node.args[0]
+            continue
+        break
+    return node
+
+
+def _flattened_2d_indices(
+    node: object, shape: tuple[int | torch.SymInt, int | torch.SymInt]
+) -> tuple[torch.fx.Node, torch.fx.Node] | None:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.target not in (operator.add, torch.ops.aten.add.Tensor)
+        or len(node.args) != 2
+        or node.kwargs
+    ):
+        return None
+    env = CompileEnvironment.current()
+    for row_term, col_term in (node.args, node.args[::-1]):
+        if (
+            not isinstance(row_term, torch.fx.Node)
+            or row_term.target not in (operator.mul, torch.ops.aten.mul.Tensor)
+            or len(row_term.args) != 2
+            or row_term.kwargs
+        ):
+            continue
+        for row, stride in (row_term.args, row_term.args[::-1]):
+            if not isinstance(stride, (int, torch.SymInt)):
+                continue
+            if not env.known_equal(stride, shape[1]):
+                continue
+            row = _strip_broadcast_index(row)
+            col = _strip_broadcast_index(col_term)
+            if not isinstance(row, torch.fx.Node) or not isinstance(col, torch.fx.Node):
+                continue
+            row_value = row.meta.get("val")
+            col_value = col.meta.get("val")
+            if (
+                isinstance(row_value, torch.Tensor)
+                and row_value.ndim == 1
+                and isinstance(col_value, torch.Tensor)
+                and col_value.ndim == 1
+            ):
+                return row, col
+    return None
+
+
+def _is_bound_comparison(
+    node: object,
+    index: torch.fx.Node,
+    extent: int | torch.SymInt,
+) -> bool:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.target not in (operator.lt, torch.ops.aten.lt.Scalar)
+        or len(node.args) != 2
+        or node.kwargs
+        or _strip_broadcast_index(node.args[0]) is not index
+    ):
+        return False
+    bound = node.args[1]
+    return isinstance(
+        bound, (int, torch.SymInt)
+    ) and CompileEnvironment.current().known_equal(bound, extent)
+
+
+def _is_2d_bounds_mask(
+    node: object,
+    row: torch.fx.Node,
+    col: torch.fx.Node,
+    shape: tuple[int | torch.SymInt, int | torch.SymInt],
+) -> bool:
+    if (
+        not isinstance(node, torch.fx.Node)
+        or node.target not in (operator.and_, torch.ops.aten.bitwise_and.Tensor)
+        or len(node.args) != 2
+        or node.kwargs
+    ):
+        return False
+    left, right = node.args
+    return (
+        _is_bound_comparison(left, row, shape[0])
+        and _is_bound_comparison(right, col, shape[1])
+    ) or (
+        _is_bound_comparison(left, col, shape[1])
+        and _is_bound_comparison(right, row, shape[0])
+    )
+
+
+def _flattened_2d_descriptor_store(
+    state: CodegenState,
+    tensor: torch.Tensor,
+    value: ast.AST,
+) -> ast.AST | None:
+    """Recover a rank-2 host descriptor from a flattened contiguous output view."""
+    node = state.fx_node
+    base = tensor._base
+    env = CompileEnvironment.current()
+    if (
+        node is None
+        or base is None
+        or base.ndim != 2
+        or base.dtype != torch.bfloat16
+        or not base.is_contiguous()
+        or env.ptx_capability is None
+        or env.ptx_capability[0] != 10
+        or not _in_warp_specialized_loop(state)
+    ):
+        return None
+    shape = cast(
+        "tuple[int | torch.SymInt, int | torch.SymInt]",
+        tuple(base.shape),
+    )
+    layout = env.tensor_descriptor_layout_signature(base)
+    subscript = node.args[1]
+    if not isinstance(subscript, (list, tuple)) or len(subscript) != 1:
+        return None
+    indices = _flattened_2d_indices(subscript[0], shape)
+    if indices is None or not _is_2d_bounds_mask(
+        node.args[3], indices[0], indices[1], shape
+    ):
+        return None
+    value_proxy = state.proxy_arg(2)
+    block_shape = (
+        tuple(_resolve_dim_size(size) for size in value_proxy.shape)
+        if isinstance(value_proxy, torch.Tensor)
+        else ()
+    )
+    if (
+        not isinstance(value_proxy, torch.Tensor)
+        or value_proxy.ndim != 2
+        or value_proxy.dtype != base.dtype
+        or block_shape != (128, 256)
+        or not all(
+            type(size) is int and size > 0 and size <= 256 and size & (size - 1) == 0
+            for size in block_shape
+        )
+        or layout is None
+        or layout[0] is None
+        or not all(aligned or dim == layout[0] for dim, aligned in enumerate(layout[1]))
+        or not env.tensor_descriptor_base_is_aligned(base)
+    ):
+        return None
+    block_shape = cast("tuple[int, int]", block_shape)
+    offsets = tuple(state.env.get(index) for index in indices)
+    if not all(isinstance(offset, ast.AST) for offset in offsets):
+        return None
+    offsets = cast("tuple[ast.AST, ast.AST]", offsets)
+    descriptor = state.device_function.tensor_descriptor_arg(
+        base, list(block_shape), force_host=True
+    )
+    state.device_function.note_tma_store(
+        warp_specialized=_in_warp_specialized_loop(state)
+    )
+    return expr_from_string(
+        f"{descriptor.name}.store("
+        "[tl.cast(tl.min({row}), tl.int32), "
+        "tl.cast(tl.min({col}), tl.int32)], {value})",
+        row=offsets[0],
+        col=offsets[1],
+        value=value,
+    )
 
 
 @_decorators.codegen(store, "triton")
@@ -97,6 +282,16 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
+        if (
+            state.codegen.store_transform is None
+            and tensor.ndim == 1
+            and extra_mask is not None
+            and (
+                descriptor_store := _flattened_2d_descriptor_store(state, tensor, value)
+            )
+            is not None
+        ):
+            return descriptor_store
         codegen_store = tagged_store_codegen(
             state, inband_store_codegen(state, strategy.codegen_store)
         )

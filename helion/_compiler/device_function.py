@@ -418,7 +418,7 @@ class DeviceFunction:
         self.body: list[ast.AST] = []
         self._tensor_args: dict[torch.Tensor, TensorArg] = {}
         self._tensor_descriptor_args: dict[
-            tuple[torch.Tensor, str, bool | None], TensorDescriptorArg
+            tuple[torch.Tensor, str, bool | None, bool], TensorDescriptorArg
         ] = {}
         self.prefetch_map_args: dict[tuple[torch.Tensor, tuple[int, ...]], str] = {}
         self._expr_args: dict[sympy.Expr, NumericArgument] = {}
@@ -1177,6 +1177,7 @@ class DeviceFunction:
         block_size: list[int | torch.SymInt],
         *,
         ring_swizzle: bool | None = None,
+        force_host: bool = False,
     ) -> TensorDescriptorArg:
         """``ring_swizzle`` set: a Gluon host descriptor filling the ring's
         slots (``gluon_ring.ring_descriptor``), swizzled unless it holds scales."""
@@ -1186,7 +1187,11 @@ class DeviceFunction:
         # unswizzled scale slot keeps its own).
         gluon = CompileEnvironment.current().backend_name == "gluon"
         swizzle = True if gluon and ring_swizzle is None else ring_swizzle
-        key = (fake_value, block_size_expr, swizzle)
+        use_host = (
+            force_host
+            or CompileEnvironment.current().backend.host_tensor_descriptors(self.config)
+        )
+        key = (fake_value, block_size_expr, swizzle, use_host)
         if key not in self._tensor_descriptor_args:
             origin = host_function.tensor_to_origin[fake_value]
             desc_name = self.new_var(
@@ -1219,9 +1224,7 @@ class DeviceFunction:
                 permutation if permutation is not None else [*range(fake_value.ndim)]
             )
             assert descriptor_dims[-1] == stride_one_dim
-            if CompileEnvironment.current().backend.host_tensor_descriptors(
-                self.config
-            ):
+            if use_host:
                 tensor_host = origin.host_str()
                 tensor_base = env.backend.tensor_descriptor_host_base(
                     fake_value, tensor_host

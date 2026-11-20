@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 import helion
 from helion._testing import DEVICE
@@ -106,6 +107,18 @@ def _reference_dot_scaled(
     x_factor = torch.exp2(x_scale.float() - 127).repeat_interleave(group, dim=1)
     y_factor = torch.exp2(y_scale.float() - 127).repeat_interleave(group, dim=1)
     return (x.float() * x_factor) @ (y.float() * y_factor.T)
+
+
+def _pack_e8m0_scales(scales: torch.Tensor) -> torch.Tensor:
+    """Pack four scale bytes per MN-major int32 word."""
+    packed = F.pad(scales, (0, (-scales.shape[1]) % 4)).contiguous().view(torch.int32)
+    aligned_rows = (packed.shape[0] + 3) // 4 * 4
+    storage = torch.empty(
+        (packed.shape[1], aligned_rows), device=scales.device, dtype=torch.int32
+    )
+    result = storage.T[: packed.shape[0]]
+    result.copy_(packed)
+    return result
 
 
 @onlyBackends(["triton", "cute"])
@@ -234,6 +247,169 @@ class TestDotScaled(TestCase):
 
         code, result = code_and_output(scaled_kernel, (x, x_scale, y, y_scale))
         _assert_scaled_dot_codegen(self, code)
+        if _get_backend() == "triton":
+            self.assertNotIn("mxfp8_lhs_words", code)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_utccp_codegen_and_correctness(self):
+        """Packed scales use either UTCCP descriptors or compact swapped MMA."""
+        M, N, K = 128, 256, 256
+
+        @helion.kernel(autotune_effort="none", static_shapes=True)
+        def packed_scaled_kernel(
+            x: torch.Tensor,
+            x_scale: torch.Tensor,
+            y: torch.Tensor,
+            y_scale: torch.Tensor,
+        ) -> torch.Tensor:
+            m, k = x.size()
+            n, _ = y.size()
+            out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+            flat_out = out.view(m * n)
+            block_m = hl.register_block_size(16, 128)
+            block_n = hl.register_block_size(128, 256)
+            block_groups = hl.register_block_size(4)
+            for task_m, task_n in hl.grid(
+                [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n]
+            ):
+                rows = task_m * block_m + hl.arange(block_m)
+                cols = task_n * block_n + hl.arange(block_n)
+                acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+                for groups in hl.tile(k // 32, block_size=block_groups):
+                    columns = groups.begin * 32 + hl.arange(block_groups * 32)
+                    lhs = hl.load(
+                        x,
+                        [rows, columns],
+                        extra_mask=(rows[:, None] < m) & (columns[None, :] < k),
+                    )
+                    rhs = hl.load(
+                        y,
+                        [cols, columns],
+                        extra_mask=(cols[:, None] < n) & (columns[None, :] < k),
+                    )
+                    lhs_words = hl.load(
+                        x_scale,
+                        [rows, groups.index // 4],
+                        extra_mask=(rows[:, None] < m),
+                    )
+                    rhs_words = hl.load(
+                        y_scale,
+                        [cols, groups.index // 4],
+                        extra_mask=(cols[:, None] < n),
+                    )
+                    lhs_scale = (
+                        (lhs_words >> ((groups.index % 4) * 8)[None, :]) & 255
+                    ).to(torch.uint8)
+                    rhs_scale = (
+                        (rhs_words >> ((groups.index % 4) * 8)[None, :]) & 255
+                    ).to(torch.uint8)
+                    acc = hl.dot_scaled(
+                        lhs,
+                        lhs_scale,
+                        "e4m3",
+                        rhs.T,
+                        rhs_scale,
+                        "e4m3",
+                        acc=acc,
+                    )
+                hl.store(
+                    flat_out,
+                    [rows[:, None] * n + cols[None, :]],
+                    acc,
+                    extra_mask=(rows[:, None] < m) & (cols[None, :] < n),
+                )
+            return out
+
+        torch.manual_seed(0)
+        x = (torch.randn(M, K, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        y = (torch.randn(N, K, device=DEVICE) * 0.5).to(torch.float8_e4m3fn)
+        x_scale_bytes = torch.randint(
+            120, 136, (M, K // 32), device=DEVICE, dtype=torch.uint8
+        )
+        y_scale_bytes = torch.randint(
+            120, 136, (N, K // 32), device=DEVICE, dtype=torch.uint8
+        )
+        code, result = code_and_output(
+            packed_scaled_kernel,
+            (
+                x,
+                _pack_e8m0_scales(x_scale_bytes),
+                y,
+                _pack_e8m0_scales(y_scale_bytes),
+            ),
+        )
+        self.assertIn("mxfp8_lhs_words", code)
+        self.assertIn(".trans(1, 0, 3, 2, 4).trans(0, 3, 2, 1, 4)", code)
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(128)", code)
+        self.assertIn("_BLOCK_SIZE_1 = tl.constexpr(256)", code)
+        self.assertIn("_BLOCK_SIZE_2 = tl.constexpr(4)", code)
+        self.assertIn("warp_specialize=True", code)
+        self.assertIn("disallow_acc_multi_buffer=True", code)
+        self.assertIn("flatten=False", code)
+        self.assertIn("_helion_tensor_descriptor(", code)
+        self.assertIn("_desc.load(", code)
+        self.assertIn("_desc.store(", code)
+        self.assertNotIn("tl.make_tensor_descriptor", code)
+        expected = _reference_dot_scaled(x, x_scale_bytes, y.T, y_scale_bytes)
+        torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+
+        compact_m = 8
+        compact_x = (torch.randn(compact_m, K, device=DEVICE) * 0.5).to(
+            torch.float8_e4m3fn
+        )
+        compact_scale_bytes = torch.randint(
+            120, 136, (compact_m, K // 32), device=DEVICE, dtype=torch.uint8
+        )
+        compact_code, compact_result = code_and_output(
+            packed_scaled_kernel,
+            (
+                compact_x,
+                _pack_e8m0_scales(compact_scale_bytes),
+                y,
+                _pack_e8m0_scales(y_scale_bytes),
+            ),
+        )
+        self.assertIn("_BLOCK_SIZE_0 = tl.constexpr(16)", compact_code)
+        self.assertIn("_BLOCK_SIZE_1 = tl.constexpr(128)", compact_code)
+        self.assertIn("tl.dot_scaled(tl.permute(", compact_code)
+        self.assertNotIn("mxfp8_lhs_words", compact_code)
+        compact_expected = _reference_dot_scaled(
+            compact_x, compact_scale_bytes, y.T, y_scale_bytes
+        )
+        torch.testing.assert_close(
+            compact_result.float(), compact_expected, atol=2e-2, rtol=1e-2
+        )
+
+        unaligned_n = 129
+        unaligned_y = (torch.randn(unaligned_n, K, device=DEVICE) * 0.5).to(
+            torch.float8_e4m3fn
+        )
+        unaligned_scale_bytes = torch.randint(
+            120,
+            136,
+            (unaligned_n, K // 32),
+            device=DEVICE,
+            dtype=torch.uint8,
+        )
+        fallback_code, fallback_result = code_and_output(
+            packed_scaled_kernel,
+            (
+                x,
+                _pack_e8m0_scales(x_scale_bytes),
+                unaligned_y,
+                _pack_e8m0_scales(unaligned_scale_bytes),
+            ),
+        )
+        self.assertNotIn("warp_specialize=True", fallback_code)
+        self.assertNotIn("mxfp8_lhs_words", fallback_code)
+        fallback_expected = _reference_dot_scaled(
+            x, x_scale_bytes, unaligned_y.T, unaligned_scale_bytes
+        )
+        torch.testing.assert_close(
+            fallback_result.float(), fallback_expected, atol=2e-2, rtol=1e-2
+        )
 
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")

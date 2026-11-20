@@ -8,6 +8,8 @@ from typing import Any
 from typing import ClassVar
 from typing import Literal
 from typing import NamedTuple
+from typing import Protocol
+from typing import TypeVar
 from typing import cast
 
 import torch
@@ -24,7 +26,11 @@ from ...autotuner.config_spec import LiveTile
 from ...autotuner.config_spec import LoopAxisFact
 from ...autotuner.config_spec import ReductionCategory
 from ...exc import InvalidConfig
+from ...language.matmul_ops import dot_scaled
+from ...language.memory_ops import store
 from ...runtime.config import Config
+from ..mxfp8 import match_packed_scale
+from ..mxfp8 import tile_load
 from .common import clamp_block_size_targets
 from .common import dedupe_configs
 from .common import matches_hardware
@@ -320,6 +326,267 @@ def _h100_build_block_sizes(
         v = min(v, bs_spec.max_size)
         out.append(v)
     return out
+
+
+def _packed_mxfp8_dots(device_ir: DeviceIR) -> list[torch.fx.Node]:
+    result = []
+    for graph in device_ir.graphs:
+        for node in graph.graph.nodes:
+            if (
+                node.target is dot_scaled
+                and len(node.args) >= 6
+                and node.args[2] == "e4m3"
+                and node.args[5] == "e4m3"
+                and match_packed_scale(node.args[1], None, 4, allow_mask=True)
+                is not None
+                and match_packed_scale(node.args[4], None, 4, allow_mask=True)
+                is not None
+            ):
+                result.append(node)
+    return result
+
+
+def _has_bf16_flat_output(device_ir: DeviceIR) -> bool:
+    for graph in device_ir.graphs:
+        for node in graph.graph.nodes:
+            if node.target is not store or not node.args:
+                continue
+            tensor_node = node.args[0]
+            tensor = (
+                tensor_node.meta.get("val")
+                if isinstance(tensor_node, torch.fx.Node)
+                else None
+            )
+            if (
+                isinstance(tensor, torch.Tensor)
+                and tensor.ndim == 1
+                and tensor._base is not None
+                and tensor._base.ndim == 2
+                and tensor._base.dtype == torch.bfloat16
+            ):
+                return True
+    return False
+
+
+class _BlockSequenceItem(Protocol):
+    block_ids: list[int]
+
+
+_Value = TypeVar("_Value")
+
+
+def _block_sequence_values(
+    sequence: Collection[_BlockSequenceItem],
+    assignments: Mapping[int, _Value],
+    default: _Value,
+) -> list[_Value]:
+    result = []
+    for item in sequence:
+        values = [
+            assignments[block_id]
+            for block_id in item.block_ids
+            if block_id in assignments
+        ]
+        result.append(values[0] if values else default)
+    return result
+
+
+def _packed_mxfp8_split_k(
+    m: int,
+    n: int,
+    k: int,
+    num_sm: int,
+    choices: Collection[int],
+    *,
+    block_m: int = 128,
+    block_n: int = 256,
+    compact_swap: bool = False,
+) -> int:
+    """Increase small-grid MXFP8 parallelism to roughly half an SM wave."""
+    if k < 2048:
+        return 1
+    tiles = math.ceil(m / block_m) * math.ceil(n / block_n)
+    target_tiles = max(1, math.ceil(num_sm / 2))
+    if compact_swap and tiles >= math.ceil(num_sm / 4):
+        return 1
+    valid = sorted(
+        split
+        for split in choices
+        if type(split) is int
+        and split >= 1
+        and (k // 32) % split == 0
+        and (k // 32 // split) % 4 == 0
+    )
+    if not valid or tiles >= target_tiles:
+        return 1
+    return next(
+        (split for split in valid if tiles * split >= target_tiles),
+        valid[-1],
+    )
+
+
+class TritonB200PackedMXFP8Heuristic(AutotunerHeuristic):
+    """AutoWS-style persistent schedule for a proved packed MXFP8 contraction."""
+
+    name = "triton_b200_packed_mxfp8"
+    backend = "triton"
+    promote_seed_to_default = True
+    HARDWARE_TARGETS = (("cuda", "sm100"), ("cuda", "sm103"))
+    CACHE_SPECIALIZATION_FACTS = frozenset({"device_num_sm"})
+
+    @classmethod
+    def _fact(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> tuple[MatmulFact, int, int] | None:
+        dots = _packed_mxfp8_dots(device_ir)
+        if (
+            not matches_hardware(env, cls.HARDWARE_TARGETS)
+            or len(dots) != 1
+            or not _has_bf16_flat_output(device_ir)
+        ):
+            return None
+        facts = env.config_spec.matmul_facts
+        fact = facts[0] if len(facts) == 1 else None
+        outer_block_id = (
+            env.config_spec.grid_block_ids[0]
+            if env.config_spec.grid_block_ids
+            else None
+        )
+        scale_node = dots[0].args[1]
+        if not isinstance(scale_node, torch.fx.Node):
+            return None
+        scale_value = scale_node.meta.get("val")
+        lhs = tile_load(dots[0].args[0], allow_mask=True)
+        rhs_node = dots[0].args[3]
+        if (
+            isinstance(rhs_node, torch.fx.Node)
+            and rhs_node.target is torch.ops.aten.permute.default
+        ):
+            rhs_node = rhs_node.args[0]
+        rhs = tile_load(rhs_node, allow_mask=True)
+        if lhs is None or rhs is None or env.size_hint(rhs[0].shape[0]) % 16:
+            return None
+        k_block_id = (
+            next(
+                (
+                    info.block_id
+                    for info in env.block_sizes
+                    if env.known_equal(info.var, scale_value.shape[1])
+                ),
+                None,
+            )
+            if isinstance(scale_value, torch.Tensor) and scale_value.ndim == 2
+            else None
+        )
+        if (
+            fact is None
+            or not _is_fp8_matmul_fact(fact)
+            or fact.m_block_id is None
+            or fact.n_block_id is None
+            or k_block_id is None
+            or outer_block_id is None
+            or "persistent_blocked" not in env.config_spec.allowed_pid_types
+        ):
+            return None
+        fact = fact._replace(
+            k_block_id=k_block_id,
+            static_m=env.size_hint(lhs[0].shape[0]),
+            static_n=env.size_hint(rhs[0].shape[0]),
+            static_k=env.size_hint(lhs[0].shape[1]),
+        )
+        range_sequences = (
+            env.config_spec.range_warp_specialize,
+            env.config_spec.range_num_stages,
+            env.config_spec.range_multi_buffers,
+            env.config_spec.range_flattens,
+        )
+        if not all(
+            outer_block_id in sequence.valid_block_ids()
+            and k_block_id in sequence.valid_block_ids()
+            for sequence in range_sequences
+        ):
+            return None
+        return fact, k_block_id, outer_block_id
+
+    @classmethod
+    def is_eligible(cls, env: CompileEnvironment, device_ir: DeviceIR) -> bool:
+        return cls._fact(env, device_ir) is not None
+
+    @classmethod
+    def get_seed_config(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> Config | None:
+        matched = cls._fact(env, device_ir)
+        if matched is None:
+            return None
+        fact, k_block_id, outer_block_id = matched
+        spec = env.config_spec
+        compact_swap = fact.static_m is not None and fact.static_m <= 32
+        block_m = 16 if fact.static_m is not None and fact.static_m <= 16 else 32
+        block_n = 128
+        block_sizes = _h100_build_block_sizes(spec, fact, block_m, block_n, 4)
+        assert fact.m_block_id is not None and fact.n_block_id is not None
+        block_m = block_sizes[fact.m_block_id]
+        block_n = block_sizes[fact.n_block_id]
+        compact_swap = compact_swap and block_m in (16, 32) and block_n >= 128
+        if not compact_swap:
+            block_m, block_n = 128, 256
+            block_sizes = _h100_build_block_sizes(spec, fact, block_m, block_n, 4)
+        split_fragment = spec.user_defined_tunables.get("split_k")
+        split_choices = (
+            split_fragment.search_values() if split_fragment is not None else None
+        )
+        split_k = (
+            _packed_mxfp8_split_k(
+                fact.static_m,
+                fact.static_n,
+                fact.static_k,
+                spec.num_sm,
+                cast("Collection[int]", split_choices),
+                block_m=block_m,
+                block_n=block_n,
+                compact_swap=compact_swap,
+            )
+            if fact.static_m is not None
+            and fact.static_n is not None
+            and fact.static_k is not None
+            and split_choices is not None
+            else 1
+        )
+        l2_groupings = _block_sequence_values(spec.l2_groupings, {outer_block_id: 8}, 1)
+        outer_inner = {
+            outer_block_id: split_k == 1 and not compact_swap,
+            k_block_id: False,
+        }
+        stages = 5 if compact_swap else 3
+        raw: dict[str, object] = {
+            "block_sizes": block_sizes,
+            "num_warps": 4,
+            "num_stages": stages,
+            "split_k": split_k,
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "l2_groupings": l2_groupings,
+            "range_warp_specializes": _block_sequence_values(
+                spec.range_warp_specialize, outer_inner, False
+            ),
+            "range_num_stages": _block_sequence_values(
+                spec.range_num_stages,
+                {outer_block_id: stages, k_block_id: 0},
+                0,
+            ),
+            "range_multi_buffers": _block_sequence_values(
+                spec.range_multi_buffers,
+                {outer_block_id: False, k_block_id: False},
+                None,
+            ),
+            "range_flattens": _block_sequence_values(
+                spec.range_flattens,
+                {outer_block_id: False, k_block_id: False},
+                None,
+            ),
+        }
+        return _materialize_config(raw, config_spec=spec)
 
 
 class TritonH100MatmulHeuristic(AutotunerHeuristic):
@@ -5485,6 +5752,7 @@ TRITON_HEURISTICS: tuple[type[AutotunerHeuristic], ...] = (
     TritonSkinnyGemmHeuristic,
     # The two sm100 front ends are disjoint and both provide fast
     # autotune-off defaults as well as autotuner seeds.
+    TritonB200PackedMXFP8Heuristic,
     TritonB200FormulaMatmulHeuristic,
     TritonB200MultiMatmulHeuristic,
     TritonMatmulReductionEpilogueHeuristic,
