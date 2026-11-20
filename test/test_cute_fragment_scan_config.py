@@ -18,6 +18,7 @@ from helion._compiler.cute.autotune.search_surface import _normalize_fragment_op
 from helion._compiler.cute.emitters import PlannedRootEmitter
 from helion._testing import cpu_render_target
 from helion._testing.cute_codegen import cpu_bind
+from helion._testing.cute_scan_kernels import computed_scan as _computed_scan
 from helion.autotuner.config_fragment import EnumFragment
 from helion.autotuner.pattern_search import InitialPopulationStrategy
 import helion.language as hl
@@ -25,17 +26,6 @@ import helion.language as hl
 pytestmark = pytest.mark.cpu_only
 
 KEY = "cute_fragment_scan"
-
-
-@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
-def _computed_scan(x: torch.Tensor, axis: hl.constexpr, reverse: hl.constexpr):
-    out = torch.empty_like(x)
-    reused = torch.empty_like(x)
-    for row in hl.tile(x.size(0)):
-        values = x[row, :, :] + 1
-        out[row, :, :] = hl.cumsum(values, dim=axis, reverse=reverse)
-        reused[row, :, :] = values * 2
-    return out, reused
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")

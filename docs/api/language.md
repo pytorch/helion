@@ -321,6 +321,12 @@ The `Tile` class represents a portion of an iteration space with the following k
 
 ## Scan Operations
 
+`cumsum` and `cumprod` promote integer and boolean inputs to `torch.int64`
+by default, as PyTorch does. To scan in a different dtype, pass `dtype=`.
+Pallas rejects unsupported 64-bit scan dtypes instead of narrowing them.
+For integer `cumsum` on Pallas, supply an explicit supported dtype such as
+`torch.int32`. Calling `associative_scan` directly never applies this promotion.
+
 ### associative_scan()
 
 ```{eval-rst}

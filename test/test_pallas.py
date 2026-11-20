@@ -1051,8 +1051,8 @@ def _prefix_sum_pallas_kernel(
     reverse = torch.empty_like(x)
     for _program in hl.grid(1):
         values = x[:]
-        forward[:] = torch.cumsum(values, dim=-1)
-        reverse[:] = hl.cumsum(values, dim=-1, reverse=True)
+        forward[:] = torch.cumsum(values, dim=-1, dtype=x.dtype)
+        reverse[:] = hl.cumsum(values, dim=-1, reverse=True, dtype=x.dtype)
     return forward, reverse
 
 
@@ -1155,6 +1155,25 @@ class TestPallas(TestCase):
                 x.dtype
             ),
         )
+
+    def test_prefix_sum_rejects_unsupported_scan_dtype(self) -> None:
+        @helion.kernel(backend="pallas", static_shapes=True)
+        def scan(x: torch.Tensor, dtype: hl.constexpr) -> torch.Tensor:
+            out = torch.empty_like(x)
+            for _program in hl.grid(1):
+                out[:] = (torch.cumsum(x[:], dim=-1, dtype=dtype) > 0).to(x.dtype)
+            return out
+
+        x = torch.full((256,), 2**30, device=DEVICE, dtype=torch.int32)
+        for dtype, expected in [
+            (None, r"int64 scans.*dtype=torch\.int32"),
+            (torch.float64, "float64 scans"),
+        ]:
+            with (
+                self.subTest(dtype=dtype),
+                self.assertRaisesRegex(helion.exc.BackendUnsupported, expected),
+            ):
+                code_and_output(scan, (x, dtype), block_sizes=[])
 
     def test_cat_columns(self) -> None:
         x = torch.randn(128, 64, device=DEVICE, dtype=torch.bfloat16)

@@ -14,6 +14,7 @@ from ...language.scan_ops import _associative_scan
 from ..ast_extension import expr_from_string
 from ..ast_extension import statement_from_string
 from ..compile_environment import CompileEnvironment
+from .backend import _JAX_UNSUPPORTED_DTYPES
 
 if TYPE_CHECKING:
     import ast
@@ -55,6 +56,13 @@ def _(state: CodegenState) -> ast.AST:
     value = fx_node.meta.get("val")
     if not isinstance(value, torch.Tensor):
         raise exc.BackendUnsupported("pallas", "associative_scan input")
+    if value.dtype in _JAX_UNSUPPORTED_DTYPES:
+        raise exc.BackendUnsupported(
+            "pallas",
+            f"{value.dtype} scans; pass a supported dtype= to cumsum "
+            "(e.g. dtype=torch.int32 for integer inputs), "
+            "or cast the associative_scan input",
+        )
     if dim < 0:
         dim += value.ndim
     if dim != value.ndim - 1:
