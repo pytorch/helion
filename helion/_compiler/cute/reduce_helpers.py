@@ -1231,8 +1231,9 @@ def _cute_grouped_reduce_cluster_body(
     live before the first remote store (the device-function codegen emits
     this once for all sites).
 
-    ``identity``'s dtype must be Float32 (the hoist pass rewrites the
-    identity to the fp32 accumulator dtype).
+    ``identity``'s dtype must be Float32: the exchange buffers every partial
+    as Float32, and the emitters of a cluster reduce refuse any other
+    accumulator dtype.
     """
     warps = group_span // 32
     slots = warps * cluster_n

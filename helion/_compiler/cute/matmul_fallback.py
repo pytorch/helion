@@ -470,14 +470,18 @@ def _emit_cute_grouped_sum_reduction(
     direct_warp_ok = pre <= 1 and reduce_extent <= 32
     if direct_warp_ok:
         return backend.reduction_expr(
-            input_name, "sum", 0, threads_in_group=reduce_extent
+            input_name, "sum", 0, threads_in_group=reduce_extent, dtype=value_dtype
         )
 
     lane_expr = backend.thread_linear_index_expr(axis_sizes)
     if lane_expr is None:
         if reduce_extent <= 32:
             return backend.reduction_expr(
-                input_name, "sum", 0, threads_in_group=reduce_extent
+                input_name,
+                "sum",
+                0,
+                threads_in_group=reduce_extent,
+                dtype=value_dtype,
             )
         raise exc.BackendUnsupported(
             "cute",
@@ -494,7 +498,11 @@ def _emit_cute_grouped_sum_reduction(
     if actual_threads > 0 and num_threads > actual_threads:
         if reduce_extent <= 32:
             return backend.reduction_expr(
-                input_name, "sum", 0, threads_in_group=reduce_extent
+                input_name,
+                "sum",
+                0,
+                threads_in_group=reduce_extent,
+                dtype=value_dtype,
             )
         raise exc.BackendUnsupported(
             "cute",

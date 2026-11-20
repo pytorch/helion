@@ -557,6 +557,15 @@ class CuteLaneState:
     # (instead of building a per-lane V-fold, which would double-count the
     # already-accumulated running sum).  See ``_emit_cute_matmul``.
     matmul_running_sums: set[str] = dataclasses.field(default_factory=set)
+    # The dtype each direct warp reduction combines in (``warp_reduction_sum``,
+    # ``warp_reduction_max`` and the generic ``warp_reduction``), by the text
+    # of the value it reduces: a name, or an expression such as an argmax's
+    # index candidate (``CuteBackend.reduction_expr``, where its caller
+    # passes the dtype).  The call names no
+    # dtype (a grouped helper's identity argument does), so
+    # ``hoist_warp_reduce`` looks up the input name of a call it folds here
+    # to type its V-fold; ``None`` for a text recorded with two dtypes.
+    reduce_input_dtypes: dict[str, str | None] = dataclasses.field(default_factory=dict)
     # Rolled reductions over a symbolic extent expose their trip count as
     # a host-computed ``cutlass.Constexpr`` kernel parameter so the
     # two-pass load fuser can size a per-thread register cache that is
