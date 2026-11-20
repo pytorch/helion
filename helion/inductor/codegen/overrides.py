@@ -144,13 +144,34 @@ class HelionOverrides(OpOverrides):
     def floordiv(a: str, b: str) -> str:
         return f'torch.div({a}, {b}, rounding_mode="floor")'
 
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def where(condition: object, a: object, b: object) -> object:
+        """torch.where(condition, a, b), or the value it picks where the tiles'
+        ranges prove `condition` (HelionKernel.proven()), as for the
+        tile_x.index < 100 of
+        (torch.cat([x, y], -1) * 2)[:, :50] over tiles of x < 50 only:
+            tmp13 = torch.where(tmp4, tmp7, tmp12)
+            tmp15 = tmp13 * tmp14
+        becomes tmp12 = tmp5 * tmp11, and the other branch, y's masked load
+        (HelionKernel.masked()), is dead code Helion drops. A Python number
+        picked, as the 0 of ops.where(size == 0, 0, alpha) of a size proven
+        0, keeps the torch.where: the kernel's CSE takes no number."""
+        if isinstance(condition, CSEVariable):
+            truth = cast("HelionKernel", V.kernel).proven(condition)
+            if truth is not None:
+                picked = a if truth else b
+                if isinstance(picked, (CSEVariable, str)):
+                    return picked
+        return f"torch.where({condition}, {a}, {b})"
+
 
 # Inductor ops that are one torch function of the same arguments, e.g.
 # ops.sinh(x) -> torch.sinh(x) and ops.atan2(y, x) -> torch.atan2(y, x).
 # fmt: off
 TORCH_FUNCTIONS = {
     **{name: f"torch.{name}" for name in [
-        "where", "minimum", "maximum", "logical_and", "logical_or", "logical_not",
+        "minimum", "maximum", "logical_and", "logical_or", "logical_not",
         "logical_xor", "relu", "abs", "sign", "signbit", "isinf", "isnan", "reciprocal",
         "sqrt", "rsqrt", "exp", "exp2", "expm1", "log", "log1p", "log2", "log10",
         "sigmoid", "erf", "erfc", "erfinv", "lgamma", "i0", "sin", "cos", "tan", "sinh",

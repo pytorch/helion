@@ -86,6 +86,10 @@ def pin_blocks(r_block: int):
     return patch("helion.kernel", pinned)
 
 
+# The load of x in test_masked_view: through its own view, tiled as the output.
+MASKED_VIEW_LOAD = r"hl\.load\(in0, \[tile_y, tile_x\], extra_mask=tmp\d+\)"
+
+
 class PersistentChoices(InductorChoices):
     """Choices that make every reduction persistent."""
 
@@ -433,7 +437,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
             randn(64),
             randn(72),
         )
-        self.assertIn("hl.load(in2, [tile_x.index], extra_mask=", source)
+        self.assertIn("hl.load(in2, [tile_x], extra_mask=", source)
         self.assertIn("hl.load(in3, [(-64) + tile_x.index], extra_mask=", source)
 
     @parametrize("case", ["horizontal", "vertical", "y_only"])
@@ -624,6 +628,28 @@ class TestInductorCute(InductorBackendTestCase):
         with config.patch(assert_indirect_indexing=False):
             sources = self.compile(fn, x, t, tol=1e-4, backend="cute")
         self.assertTrue(any("for tile_r in hl.tile(4096):" in s for s in sources))
+
+    def test_gathered_rows(self):
+        # TestInductorBackend.test_gather_cases' embedding rows: CuTe reads each
+        # row of w at a value as a view of w subscripted by the value
+        # (gather_subscript()), in a reduction over the row and in a softmax
+        # that reads it whole.
+        w = torch.randn(1000, 64, device=DEVICE)
+        i = torch.randint(0, 1000, (16384,), device=DEVICE)
+        for fn in (
+            lambda i, w: F.embedding(i, w).pow(2).sum(-1),
+            lambda i, w: torch.softmax(F.embedding(i, w), -1),
+        ):
+            with config.patch(assert_indirect_indexing=False):
+                (source,) = self.compile(fn, i, w, tol=1e-4, backend="cute")
+            self.assertRegex(source, r"in1\[tmp\d+, :\]")
+
+    def test_masked_view(self):
+        # TestInductorBackend.test_masked_view's pad: CuTe reads x through its
+        # [64, 250] view too, masked past 250 in each row of 256.
+        x = torch.randn(64, 250, device=DEVICE)
+        (source,) = self.compile(lambda x: F.pad(x, (0, 6)) * 2, x, backend="cute")
+        self.assertRegex(source, MASKED_VIEW_LOAD)
 
     @looped
     def test_welford(self):
@@ -1040,7 +1066,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
             "welford": "hl.full([], 963.0, dtype=torch.float32)",
             "neg_inf_row": "tmp0 = in0[tile_x, :]",
             "broadcast": ".expand(tile_x, rdim)",
-            "pad": "[300*tile_x.index.reshape([tile_x, 1]) + (hl.arange(rdim))]",
+            "pad": "[hl.arange(rdim) + 300*tile_x.index.reshape([tile_x, 1])]",
         }[case]
         self.assertIn(line, source)
         self.assertEqual(
@@ -1315,6 +1341,28 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             sources = self.compile(lambda x: torch.var_mean(x, -1), x)
         self.assertEqual(len(sources), 2)
 
+    def test_proven_mask(self):
+        # (cat([x, y], -1) * 2)[:, :50] reads only x: the value ranges prove
+        # tile_x.index < 100 over its [64, 50] tiles, so x's load has no mask
+        # (HelionKernel.masked()) and no torch.where picks between x and y
+        # (HelionOverrides.where()).
+        x = torch.randn(64, 100, device=DEVICE)
+        y = torch.randn(64, 4, device=DEVICE)
+        fn = lambda x, y: (torch.cat([x, y], -1) * 2)[:, :50].exp()  # noqa: E731
+        (source,) = self.compile(fn, x, y)
+        self.assertIn("tmp5 = in0[tile_y, tile_x]", source)
+        self.assertNotIn("torch.where", source)
+
+    def test_pad_row(self):
+        # Rows of 2000 and 3000, past UNROLLED_ROW_MAX, of which an input holds
+        # 1900 and 2100: rdim is the row's, not that input's, which would drop
+        # the rest of the row.
+        x = -torch.ones(8, 1900, device=DEVICE)
+        (source,) = self.compile(lambda x: F.pad(x, (0, 100), value=1.0).sum(-1), x)
+        self.assertNotIn("rdim = in0[tile_x, :].size(1)", source)
+        a, b = torch.ones(8, 2100, device=DEVICE), torch.ones(8, 900, device=DEVICE)
+        self.compile(lambda a, b: torch.cat([a, b], -1).sum(-1), a, b)
+
     def test_nchw_reductions(self):
         # sum and var_mean over N, H and W of an NCHW tensor split into a
         # chunk per run of H * W contiguous values (HelionChoices.layout_split()):
@@ -1426,6 +1474,40 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             sources = self.compile(fn, x, expected=(var, mean))
         self.assertEqual(len(sources), 1 if rows else 2)
 
+    def test_masked_view(self):
+        # A pad of rows of 250 to 256: tile_x.index < 250 masks each row's last
+        # 6 lanes, which bounds tile_x to 250 in x's load (masked_extents()),
+        # so it reads x through its own [64, 250] view, tiled as the output,
+        #     tmp5 = hl.load(in0, [tile_y, tile_x], extra_mask=tmp4)
+        # rather than at the flat index tile_x.index + 250*tile_y.index[:, None].
+        x = torch.randn(64, 250, device=DEVICE)
+        (source,) = self.compile(lambda x: F.pad(x, (0, 6)) * 2, x)
+        self.assertRegex(source, MASKED_VIEW_LOAD)
+
+    def test_where_wrapped_cast(self):
+        # int8(arange(256))[128:] < 0 holds on every lane, as the cast wraps
+        # 128..255 to -128..-1, where Inductor's value ranges of the condition
+        # say it never does: the torch.where keeps a (HelionKernel.proven()).
+        def fn(a):
+            wrapped = torch.arange(256, dtype=torch.int8, device=a.device)[128:]
+            return torch.where(wrapped < 0, a, 0.0)
+
+        self.compile(fn, torch.randn(128, device=DEVICE))
+
+    def test_masked_view_wrapped_cast(self):
+        # A mask of an index cast to int8 bounds no tile: int8(tile_x.index) <
+        # 100 holds at 128..255 too, where the cast wraps negative, so y is
+        # read through its own [256] view, not a [100] one whose lanes past 100
+        # the mask leaves on.
+        def fn(y):
+            mask = torch.arange(256, dtype=torch.int8, device=y.device) < 100
+            index = torch.arange(256, device=y.device)
+            return torch.ops.aten._unsafe_masked_index(y, mask, [index], 0.0) * 2
+
+        (source,) = self.compile(fn, torch.randn(256, device=DEVICE))
+        self.assertIn("hl.load(in0, [tile_x], extra_mask=", source)
+        self.assertNotIn("(100, ), (1, )", self.code)
+
     def test_gather(self):
         x = torch.randn(64, 100, device=DEVICE)
         i = torch.randint(0, 100, (64, 10), device=DEVICE)
@@ -1455,6 +1537,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         [
             "embedding",
             "embedding_norm",
+            "embedding_softmax",
             "maxpool_offsets",
             "index_select",
             "negative",
@@ -1468,9 +1551,15 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         ],
     )
     def test_gather_cases(self, case):
-        # One case per lowering of an indirect index (12 > 8). embedding_norm:
-        # rows read at i[tile_x] in a reduction over their columns, at the index
-        # 64 * i + r of [tile_x, tile_r]. maxpool_offsets: max_pool2d's backward
+        # One case per lowering of an indirect index, and embedding_softmax for
+        # a gathered row that the online softmax reads whole (13 > 8).
+        # embedding_norm:
+        # rows read at i[tile_x] in a reduction over their columns, as a view of
+        # w at the value, in1[tmp1, :] (gather_subscript()), as index_select's
+        # rows are, in1[tmp5, tile_x]: with 16384 rows, enough for Inductor's
+        # hint DEFAULT, an inner reduction, whose gathered rows are contiguous
+        # along it (contiguous_reads()). embedding_softmax: such rows through an
+        # online softmax to a store of the whole row. maxpool_offsets: max_pool2d's backward
         # over a width of 300, which scatters at 298 * (o // 2) + ... of its int8
         # offsets o. negative: x[i] with i < 0 reads x[i + 100], at an index that
         # is only the value read. arange: an index computed from iota,
@@ -1490,6 +1579,10 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
                 (ids, w),
             ),
             "embedding_norm": (
+                lambda i, w: torch.nn.functional.embedding(i, w).pow(2).sum(-1),
+                (torch.randint(0, 1000, (16384,), device=DEVICE), w),
+            ),
+            "embedding_softmax": (
                 lambda i, w: torch.nn.functional.embedding(i, w).softmax(-1),
                 (ids, w),
             ),
@@ -1558,8 +1651,15 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
             ),
         }[case]
         with config.patch(assert_indirect_indexing=case == "arange"):
-            self.compile(fn, *args, tol=1e-4)
+            sources = self.compile(fn, *args, tol=1e-4)
         self.assertNotIn("@triton.jit", self.code)
+        rows = {
+            "embedding_norm": r"in1\[tmp\d+, :\]",
+            "embedding_softmax": r"in1\[tmp\d+, :\]",
+            "index_select": r"in1\[tmp\d+, tile_x\]",
+        }
+        if case in rows:
+            self.assertRegex("\n".join(sources), rows[case])
 
     @skipIfLowVRAM("x takes 2 GiB", required_bytes=3 * 2**30)
     def test_gather_wide_index(self):
