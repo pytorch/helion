@@ -104,6 +104,18 @@ class InductorBackendTestCase(TestCase):
             self.assertNotRegex(self.code, r"extern_kernels\.\w*mm\w*\(")
         return sources
 
+    def stock_inductor(self, fn, *args):
+        """`fn`'s output from stock Inductor (cuda_backend "triton"). It reseeds
+        after, so that the next compile draws Inductor's seeds from the same
+        state: a dropout mask can be compared with stock Inductor's."""
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        with config.patch(cuda_backend="triton"):
+            result = torch.compile(fn, fullgraph=True)(*args)
+        torch._dynamo.reset()
+        torch.manual_seed(0)
+        return result
+
     def assertUnsupported(self, names, fn, *args, backend="triton"):
         """Check that compiling `fn` fails with Unsupported: `names`."""
         if backend == "cute" and not _has_cute_dsl():
@@ -490,6 +502,16 @@ class TestInductorCute(InductorBackendTestCase):
         x = torch.randn(64, 1000, device=DEVICE)
         (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, backend="cute")
         self.assertIn(".expand(tile_r)", source)
+
+    def test_rand(self):
+        # Stock Inductor's numbers, bit for bit: CuTe's default Philox4 stream
+        # draws others.
+        x = torch.randn(64, 1000, device=DEVICE)
+        expected = self.stock_inductor(torch.rand_like, x)
+        (source,) = self.compile(
+            torch.rand_like, x, expected=expected, tol=0, backend="cute"
+        )
+        self.assertIn('cute_rng_stream="word0"', source)
 
     def test_gather(self):
         x = torch.randn(64, 100, device=DEVICE)
@@ -1065,13 +1087,59 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertIn("buf2 = buf1; del buf1  # reuse", self.code)
         self.assertRegex(self.code, r"helion_\w+\(reinterpret_tensor\(buf2, ")
 
+    def test_rand(self):
+        # rand_like(x) draws stock Inductor's tl.rand numbers, bit for bit.
+        x = torch.randn(64, 1000, device=DEVICE)
+        expected = self.stock_inductor(torch.rand_like, x)
+        (source,) = self.compile(torch.rand_like, x, expected=expected, tol=0)
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x in hl.tile(64000):
+        tmp0 = in0[()]
+        tmp1 = (tile_x.index).to(torch.int32)
+        tmp2 = hl.rand([], seed=tmp0, offsets=tmp1.to(torch.int64) & 0xFFFFFFFF)
+        out0[tile_x] = tmp2
+""",
+        )
+
+    @parametrize("case", ["pointwise", "reduction", "two_seeds"])
+    def test_dropout(self, case):
+        # Stock Inductor's masks, bit for bit. reduction: a dropout in a
+        # softmax's kernel; two_seeds: two dropouts, which read seeds[0] and
+        # seeds[1] through 0-d views of the seed buffer.
+        x = torch.randn(64, 1000, device=DEVICE)
+        drop = torch.nn.functional.dropout
+        fn = {
+            "pointwise": lambda x: drop(x, 0.5) == 0,
+            "reduction": lambda x: drop(torch.softmax(x, -1), 0.1) == 0,
+            "two_seeds": lambda x: (drop(x, 0.3) == 0) & (drop(x * 2, 0.6) == 0),
+        }[case]
+        (source,) = self.compile(fn, x, expected=self.stock_inductor(fn, x))
+        self.assertEqual(source.count("hl.rand("), 2 if case == "two_seeds" else 1)
+
+    @pytest.mark.slow
+    @skipIfLowVRAM("two masks of 2 GiB", required_bytes=8 * 2**30)
+    def test_rand_wide_offset(self):
+        # 2**31 + 16 elements: Inductor's int32 offset wraps for the last 16,
+        # which stock Inductor draws at offset.to(tl.uint32).
+        fn = lambda x: torch.rand(2**31 + 16, device=x.device) > 0.5  # noqa: E731
+        x = torch.zeros(1, device=DEVICE)
+        self.compile(fn, x, expected=self.stock_inductor(fn, x))
+
     # One case per name that unsupported() and HelionScheduling report (9 > 8:
     # each is a separate check); test_gather_unsupported has the index ones.
     @parametrize(
         "case",
         [
             "xor_sum",
-            "dropout",
+            "randn",
             "dynamic",
             "strict_reduction",
             "batch_invariant",
@@ -1090,8 +1158,8 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
             # The one reduction type of Inductor's that Helion kernels lack.
             fn = lambda x: torch.ops.prims.xor_sum(x, [1])  # noqa: E731
             args = [torch.randint(0, 100, (64, 100), device=DEVICE, dtype=torch.int32)]
-        elif case == "dropout":
-            fn = lambda x: torch.nn.functional.dropout(x, 0.5)  # noqa: E731
+        elif case == "randn":
+            fn = lambda x: x + torch.randn_like(x)  # noqa: E731
         elif case == "dynamic":
             torch._dynamo.mark_dynamic(x, 0)
         elif case == "combo_kernels":
@@ -1099,7 +1167,7 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
             args = [x, torch.randn(32, 50, device=DEVICE)]
         names, patches = {
             "xor_sum": ("xor_sum", {}),
-            "dropout": ("load_seed, rand", {}),
+            "randn": ("randn", {}),
             "dynamic": ("dynamic_shape", {}),
             "strict_reduction": ("strict_reduction", {"numerics": "strict_reduction"}),
             "batch_invariant": ("batch_invariant", {"batch_invariant": True}),

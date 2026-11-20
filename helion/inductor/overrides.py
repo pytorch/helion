@@ -121,6 +121,11 @@ class HelionOverrides(OpOverrides):
 
     @staticmethod
     # pyrefly: ignore [bad-override]
+    def rand(seed: CSEVariable, offset: CSEVariable) -> str:
+        return cast("HelionKernel", V.kernel).rand(seed, offset)
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
     def identity(x: CSEVariable) -> CSEVariable:
         return x
 
