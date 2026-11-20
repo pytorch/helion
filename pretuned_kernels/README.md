@@ -14,7 +14,8 @@ materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against one or more named
 reference baselines, except the speculative-decoding verify megakernels outside
-`muse_spark/`, which so far have only a `correctness_check()`.
+`muse_spark/`, which so far have only a `correctness_check()`, and
+`inkling2_small/`, which runs inside vLLM (see its README).
 
 ## File structure
 
@@ -58,6 +59,7 @@ pretuned_kernels/
     ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE, decode and verify
     ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4, decode and verify
     ├── deepseek_v3_attention_nvfp4_tp/
+    ├── inkling2_small/               # Inkling-2-Small verify layers, TP4, served in vLLM
     └── muse_spark/
 ```
 
