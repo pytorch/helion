@@ -1214,6 +1214,13 @@ class TestPretunedKernelsCorrectness(TestCase):
         module = _import_muse_spark_module("swa")
         module.correctness_check()
 
+    @skipIfCute("mxfp8_gemm is pinned to backend='triton'; see mxfp8_gemm_cute")
+    def test_mxfp8_gemm(self):
+        if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("mxfp8_gemm is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("mxfp8_gemm")
+        module.correctness_check()
+
     @pytest.mark.timeout(900)
     @skipIfCute(_PINNED_TO_TRITON)
     def test_deepseek_v3_moe_nvfp4(self):
@@ -1267,6 +1274,23 @@ class TestPretunedCuteCodegen(TestCase):
 
     def test_interleaved_swiglu(self) -> None:
         self._run_tcgen05_fragment_epilogue_correctness("interleaved_swiglu")
+
+    def test_mxfp8_gemm_cute(self) -> None:
+        if not is_cuda() or torch.cuda.get_device_capability()[0] != 10:
+            self.skipTest("mxfp8_gemm_cute is pretuned for NVIDIA SM100.")
+        module = _import_pretuned_kernel_module("mxfp8_gemm_cute")
+        module.correctness_check()
+
+    def test_mxfp8_gemms_are_registered_for_b200(self) -> None:
+        path = PRETUNED_KERNELS_DIR / "run.py"
+        spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
+        assert spec is not None and spec.loader is not None
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        for name in ("mxfp8_gemm", "mxfp8_gemm_cute"):
+            with self.subTest(name=name):
+                self.assertIn(name, runner.KERNELS)
+                self.assertEqual(runner._supported_hardware(name), {"b200"})
 
     def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
         path = PRETUNED_KERNELS_DIR / "run.py"
