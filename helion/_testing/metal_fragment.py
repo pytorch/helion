@@ -243,3 +243,138 @@ def fragment_transposed(msl: str) -> bool:
     a_rows = re.search(r"int (_e_[mn]) = 8 \* \(_fi >> 1\) \+ _fm;", msl)
     assert a_rows is not None, "no fragment run"
     return a_rows.group(1) == "_e_n"
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def batched_k_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x @ y per batch: a ``torch.baddbmm`` K loop on each batch tile, the
+    lhs computed (scaled), the rhs a view, a stored epilogue."""
+    b, m, k = x.size()
+    n = y.size(2)
+    out = torch.empty([b, m, n], dtype=F32, device=x.device)
+    for tile_b, tile_m, tile_n in hl.tile([b, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            a = (x[tile_b, tile_m, tile_k] * 0.5).to(x.dtype)
+            acc = torch.baddbmm(acc, a, y[tile_b, tile_k, tile_n])
+        out[tile_b, tile_m, tile_n] = acc + 1.0
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def batched_whole_k(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """x @ y.T per batch over a ':' K, as attention's scores: one
+    ``torch.bmm`` run per batch tile and N tile of an inner loop.  The lhs,
+    loaded before the loop, is computed (re-run at each element); the rhs
+    is a transposed view."""
+    b, m, k = x.size()
+    n = y.size(1)
+    out = torch.empty([b, m, n], dtype=F32, device=x.device)
+    for tile_b, tile_m in hl.tile([b, m]):
+        q = x[tile_b, tile_m, :]
+        for tile_n in hl.tile(n):
+            s = torch.bmm(q, y[tile_b, tile_n, :].transpose(1, 2), F32)
+            out[tile_b, tile_m, tile_n] = s
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def matmul_softmax(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """softmax(x @ y, dim=1), N whole: two row reductions of the K loop's
+    accumulator (its max and the sum of its exponentials) that the store's
+    element loop reads at each element."""
+    m, k = x.size()
+    n = hl.specialize(y.size(1))
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=F32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
+        mx = torch.amax(acc, 1)
+        p = torch.exp(acc - mx[:, None])
+        out[tile_m, :] = p / p.sum(1)[:, None]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def row_lse(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """logsumexp(x @ y, dim=1), online over N tiles: a ':' K matmul per N
+    tile, whose row max and row sum update a running max and sum the N loop
+    carries, then stored per row."""
+    m = x.size(0)
+    hl.specialize(x.size(1))
+    n = y.size(1)
+    lse = torch.empty([m], dtype=F32, device=x.device)
+    for tile_m in hl.tile(m):
+        m_i = hl.full([tile_m], float("-inf"), dtype=F32)
+        l_i = hl.zeros([tile_m], dtype=F32)
+        q = x[tile_m, :]
+        for tile_n in hl.tile(n):
+            s = torch.mm(q, y[:, tile_n])
+            m_new = torch.maximum(m_i, torch.amax(s, 1))
+            p = torch.exp(s - m_new[:, None])
+            l_i = l_i * torch.exp(m_i - m_new) + torch.sum(p, 1)
+            m_i = m_new
+        lse[tile_m] = m_i + torch.log(l_i)
+    return lse
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def online_rescale(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """An accumulator rescaled before each N tile's matmul by a row value,
+    as attention rescales its output: ``acc = acc * exp(m - m_new)[:, None]
+    + w[:, tile_n] @ v[tile_n]``, m the running row max of x @ y; the
+    epilogue reads the final max."""
+    m = x.size(0)
+    hl.specialize(x.size(1))
+    n = y.size(1)
+    d = hl.specialize(v.size(1))
+    out = torch.empty([m, d], dtype=F32, device=x.device)
+    for tile_m in hl.tile(m):
+        m_i = hl.full([tile_m], float("-inf"), dtype=F32)
+        acc = hl.zeros([tile_m, d], dtype=F32)
+        for tile_n in hl.tile(n):
+            s = torch.mm(x[tile_m, :], y[:, tile_n])
+            m_new = torch.maximum(m_i, torch.amax(s, 1))
+            acc = acc * torch.exp(m_i - m_new)[:, None]
+            acc = torch.addmm(acc, w[tile_m, tile_n], v[tile_n, :])
+            m_i = m_new
+        out[tile_m, :] = acc * torch.exp(m_i)[:, None]
+    return out
+
+
+def online_rescale_ref(
+    x: torch.Tensor, y: torch.Tensor, w: torch.Tensor, v: torch.Tensor, block_n: int
+) -> torch.Tensor:
+    """``online_rescale``'s result in float64 on the CPU, over N tiles of
+    ``block_n``: each tile's product scaled by exp of the running max after
+    it."""
+    xd, yd, wd, vd = (t.cpu().double() for t in (x, y, w, v))
+    s = xd @ yd
+    out = torch.zeros(x.size(0), v.size(1), dtype=torch.float64)
+    run = torch.full((x.size(0),), float("-inf"), dtype=torch.float64)
+    for n0 in range(0, y.size(1), block_n):
+        run = torch.maximum(run, s[:, n0 : n0 + block_n].amax(1))
+        out += (wd[:, n0 : n0 + block_n] @ vd[n0 : n0 + block_n]) * run.exp()[:, None]
+    return out
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def chained_rhs(x: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``w @ exp(x @ y)`` over M tiles: each tile's scores, a ':' K matmul,
+    feed the rhs of the accumulating matmul, whose K is their M (and whose
+    M, w's rows, a ':' slice)."""
+    m = x.size(0)
+    hl.specialize(x.size(1))
+    n = y.size(1)
+    d = hl.specialize(w.size(0))
+    out = torch.empty([d, n], dtype=F32, device=x.device)
+    for tile_n in hl.tile(n):
+        acc = hl.zeros([d, tile_n], dtype=F32)
+        for tile_m in hl.tile(m):
+            s = torch.mm(x[tile_m, :], y[:, tile_n])
+            acc = torch.addmm(acc, w[:, tile_m], torch.exp(s))
+        out[:, tile_n] = acc
+    return out

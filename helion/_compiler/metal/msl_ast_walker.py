@@ -31,6 +31,10 @@ from typing import TYPE_CHECKING
 from typing import Iterator
 
 from ... import exc
+from .fragment_lines import element_reads
+from .fragment_lines import emit_hold_loop
+from .fragment_lines import emit_line_loop
+from .fragment_lines import emit_line_reduce
 from .fragment_mma import FRAGMENT_SLOT
 from .fragment_mma import EarlyLoad
 from .fragment_mma import emit_fragment_acc
@@ -47,6 +51,10 @@ from .lane_fold import tl_load
 from .lane_fold import tl_store
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_RUN
+from .mpp_matmul import HOLD_LOOP
+from .mpp_matmul import LINE_ACC
+from .mpp_matmul import LINE_RED
+from .mpp_matmul import LINES
 from .mpp_matmul import REG_RUN
 from .mpp_registers import emit_register_combine
 from .mpp_registers import emit_register_run
@@ -151,6 +159,18 @@ class EmitState:
     lanes: dict[tuple[Atom, str, bool], CoopLanes] = dataclasses.field(
         default_factory=dict
     )
+    #: Each fragment row value (``fragment_lines``) declared so far, to its
+    #: row slots, and a line reduction's partial and combine, which its
+    #: ``_helion_mpp_line_acc`` folds an element into.
+    lines: dict[str, int] = dataclasses.field(default_factory=dict)
+    #: Each register array's (a line's, a held value's) Metal element type,
+    #: from its FX node's dtype (``fragment_lines.codegen_slot``); a line's
+    #: copy takes its source's when declared.
+    slot_types: dict[str, str] = dataclasses.field(default_factory=dict)
+    line_acc: tuple[str, str] | None = None
+    #: Each held element value (``fragment_lines``), a lane's elements of a
+    #: fragment root in registers, to its root.
+    held: dict[str, str] = dataclasses.field(default_factory=dict)
 
     def is_declared(self, name: str) -> bool:
         return name in self.declared or any(name in s for s in self._enclosing)
@@ -303,6 +323,15 @@ def _emit_stmts(
                 elif state.put_type is not None:
                     value = f"static_cast<{state.put_type}>({value})"
                 parts.append(f"{pad}{state.put} = {value};")
+            elif _is_call_to(call, LINE_ACC):
+                # A line reduction's fold of its element (fragment_lines).
+                assert isinstance(call, ast.Call) and state.line_acc is not None
+                acc, combine = state.line_acc
+                value, *mask = (_ast_expr_to_msl(a, subs=subs) for a in call.args)
+                folded = combine.format(a=acc, b=value)
+                if mask:
+                    folded = f"(({mask[0]}) ? {folded} : {acc})"
+                parts.append(f"{pad}{acc} = {folded};")
             elif _is_call_to(call, "_helion_mpp_fence"):
                 parts.append(
                     f"{pad}threadgroup_barrier(mem_flags::mem_device | "
@@ -715,8 +744,28 @@ def _emit_for(
             parts,
             indent,
             state,
-            lambda body, out, ind, st: _emit_stmts(body, out, indent=ind, state=st),
+            lambda body, out, ind, st, extra: _emit_stmts(
+                body, out, indent=ind, state=st, subs={**(subs or {}), **extra}
+            ),
         )
+        return
+
+    # --- Fragment row values and held element values (fragment_lines) ---
+    if isinstance(func, ast.Name) and func.id in (LINES, LINE_RED, HOLD_LOOP):
+
+        def emit_line_body(
+            body: list[ast.stmt], out: list[str], ind: int, extra: dict[str, str]
+        ) -> None:
+            _emit_stmts(
+                body, out, indent=ind, state=state, subs={**(subs or {}), **extra}
+            )
+
+        emit = {
+            LINES: emit_line_loop,
+            LINE_RED: emit_line_reduce,
+            HOLD_LOOP: emit_hold_loop,
+        }[func.id]
+        emit(stmt, parts, indent, state, emit_line_body)
         return
 
     # --- MPP element loop over a cooperative tensor (mpp_matmul.elementize) ---
@@ -731,6 +780,8 @@ def _emit_for(
             **(subs or {}),
             **{name: element for name, r in state.coop.items() if r == root},
         }
+        if root in state.fragments:
+            element_subs |= element_reads(state, root, stmt)
         unroll = any(k.arg == "unroll" for k in it.keywords)
         if root in state.coop_fold:
             # A fold's update reads its product's element at its own slot: the

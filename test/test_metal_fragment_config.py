@@ -22,6 +22,8 @@ from helion._testing import import_example
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import addmm_k_loop
 from helion._testing.metal import render_msl
+from helion._testing.metal_fragment import batched_k_loop
+from helion._testing.metal_fragment import batched_whole_k
 from helion._testing.metal_fragment import fp8_rows
 from helion._testing.metal_fragment import fragment_config
 from helion._testing.metal_fragment import k_from_16
@@ -137,20 +139,6 @@ def carried_scale(x: torch.Tensor, y: torch.Tensor, g: torch.Tensor) -> torch.Te
                 acc, x[tile_m, tile_k], (y[tile_k, tile_n] * sc).to(x.dtype)
             )
         out[tile_m, tile_n] = acc
-    return out
-
-
-@helion.kernel(backend="metal", static_shapes=True)
-def row_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """The result read in the Scalar layout: summed over N."""
-    m, k = x.size()
-    n = y.size(1)
-    out = torch.empty([m], dtype=F32, device=x.device)
-    for tile_m in hl.tile(m):
-        acc = hl.zeros([tile_m, n], dtype=F32)
-        for tile_k in hl.tile(k):
-            acc = torch.addmm(acc, x[tile_m, tile_k], y[tile_k, :])
-        out[tile_m] = acc.sum(1)
     return out
 
 
@@ -582,6 +570,37 @@ class TestFragmentConfig(unittest.TestCase):
         bound = whole_k.bind((x, y))
         self.assertFalse(kernel_facts(bound.config_spec).fragment_splits)
 
+    def test_batched(self) -> None:
+        """A batched matmul lowers on fragments on its batch tile's one
+        index: a K loop of baddbmm and a ':' K bmm in an inner N loop, each
+        with a computed lhs, whose elements recompute over the batch block,
+        and a view rhs, which reads the batch tile's offset as an outer
+        index.  A batch tile over 1 raises."""
+        x = torch.randn(3, 16, 32, dtype=torch.float16)
+        for kernel, args, config in (
+            (
+                batched_k_loop,
+                (x, torch.randn(3, 32, 24, dtype=torch.float16)),
+                fragment_config([1, 16, 16, 16]),
+            ),
+            (
+                batched_whole_k,
+                (x, torch.randn(3, 24, 32, dtype=torch.float16)),
+                fragment_config([1, 16, 16]),
+            ),
+        ):
+            with self.subTest(kernel=kernel.name):
+                msl = render_msl(kernel, args, config)
+                self.assertEqual(_lowering(msl), "fragment")
+                # The computed lhs's re-run load and the y view's outer
+                # index read the batch tile.
+                self.assertIn("(indices_0 * 512)", msl)
+                self.assertIn("(offset_0 * 768)", msl)
+                self.assertIn("fragment", matmul_choices(kernel.bind(args).config_spec))
+        args = (x, torch.randn(3, 32, 24, dtype=torch.float16))
+        with self.assertRaises(exc.BackendUnsupported):
+            render_msl(batched_k_loop, args, fragment_config([2, 16, 16, 16]))
+
     def test_whole_k_extent(self) -> None:
         """A ':' K is one fragment K tile, which no config changes: past the
         unrolled steps' bound the search offers no fragment configs, and an
@@ -613,12 +632,6 @@ class TestFragmentConfig(unittest.TestCase):
                 (x, y, g),
                 fragment_config([16, 16, 16]),
                 f"{REFUSED} the operand",
-            ),
-            (
-                row_sums,
-                (x, y),
-                fragment_config([16, 16]),
-                "result is read in the Scalar layout",
             ),
             (
                 overwritten,

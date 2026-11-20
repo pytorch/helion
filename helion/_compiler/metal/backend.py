@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from ...autotuner.search_surface import BackendSearchSurface
     from ...runtime.config import Config
     from ...runtime.kernel import BoundKernel
+    from ..aten_lowering import LoweringContext
     from ..autotuner_heuristics.registry import AutotunerHeuristicType
     from ..compile_environment import BlockSizeInfo
     from ..compile_environment import CompileEnvironment
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
     from ..emitter_protocols import RetryPolicy
     from ..host_function import HostFunction
     from ..inductor_lowering import CodegenState
+    from ..inductor_lowering import GraphInterpreter
     from ..reduction_strategy import BlockReductionStrategy
     from ..tile_dispatch import TileStrategyDispatch
     from ..tile_strategy import TileStrategy
@@ -921,6 +923,27 @@ class MetalBackend(Backend):
         from .grid_budget import config_is_viable  # the cycle above
 
         return config_is_viable(config_spec, config, self._grid_roots)
+
+    def emit_completed_matmul_sum(
+        self, ctx: LoweringContext, node: torch.fx.Node
+    ) -> ast.AST | None:
+        """A fragment plan's row reduction of a matmul result, which its
+        lanes fold in registers (``fragment_lines``); None for any other
+        reduction."""
+        if self.mpp_plan is None or node not in self.mpp_plan.line_reds:
+            return None
+        from .fragment_lines import codegen_line_reduce
+
+        return codegen_line_reduce(ctx, node)
+
+    def codegen_node(self, interp: GraphInterpreter, node: torch.fx.Node) -> object:
+        """A fragment plan's register values (a row value, its seed, a held
+        element value) record their Metal types (``fragment_lines``)."""
+        if self.mpp_plan is None:
+            return NotImplemented
+        from .fragment_lines import codegen_slot
+
+        return codegen_slot(interp, node)
 
     def retry_policy(self) -> RetryPolicy:
         from .mask_elision import MetalRetry

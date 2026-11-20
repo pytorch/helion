@@ -2002,8 +2002,10 @@ class Backend(abc.ABC):
     def emit_completed_matmul_sum(
         self, ctx: LoweringContext, node: torch.fx.Node
     ) -> ast.AST | None:
-        """Codegen for a reduction the backend already completed inside a
-        matmul; ``None`` runs the shared reduction lowering."""
+        """Codegen for a reduction of a matmul's result that the backend
+        lowers with the matmul: one it completed inside the matmul, or one
+        it folds in the registers that hold the result (Metal's fragment
+        row reductions); ``None`` runs the shared reduction lowering."""
         return None
 
     def reduction_active_block_id(
