@@ -41,6 +41,7 @@ from .distributed_ops import inband_load_codegen
 from .distributed_ops import inband_store_codegen
 from .distributed_ops import tagged_access
 from .distributed_ops import tagged_store_codegen
+from .packed_mxfp8 import flat_output_descriptor_store
 from .prefetch import TENSOR_MAP_ACQUIRE_ASM
 from .prefetch import prefetch_asm
 from .prefetch import tensor_prefetch_asm
@@ -97,9 +98,19 @@ def _(state: CodegenState) -> ast.AST:
             if modifier_idx < len(modifiers) and modifiers[modifier_idx]:
                 cache_modifier = ast.Constant(value=modifiers[modifier_idx])
 
+        strategy_store = strategy.codegen_store
         codegen_store = tagged_store_codegen(
-            state, inband_store_codegen(state, strategy.codegen_store)
+            state, inband_store_codegen(state, strategy_store)
         )
+        if (
+            codegen_store is strategy_store
+            and state.codegen.store_transform is None
+            and cache_modifier is None
+            and epilogue_subtile_group_id is None
+            and (flat_store := flat_output_descriptor_store(state, tensor, value))
+            is not None
+        ):
+            return flat_store
         if state.codegen.store_transform is not None:
             return state.codegen.store_transform(
                 state,

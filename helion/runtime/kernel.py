@@ -5180,16 +5180,28 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         that rolls a reduction orders differently from the facts
         (``DeviceIR.config_memory_op_fact_pairs``)."""
         indexing = config.indexing
-        if not indexing_uses_tensor_descriptor(indexing):
-            return frozenset()
         every_op = frozenset(
             fact.indexing_index for fact in self.config_spec.memory_op_facts
         )
+        assert self.host_function is not None
+        device_ir = self.host_function.device_ir
+        # The native packed MXFP8 lowering loads operands and scale words, and
+        # stores a flattened output, through host descriptors whatever
+        # ``indexing`` says (``triton/packed_mxfp8.py``).
+        from .._compiler.mxfp8 import find_packed_mxfp8_dot
+        from .._compiler.mxfp8 import native_packed_mxfp8_target
+
+        with self.env:
+            if (
+                native_packed_mxfp8_target(self.env)
+                and find_packed_mxfp8_dot(device_ir.graphs) is not None
+            ):
+                return every_op
+        if not indexing_uses_tensor_descriptor(indexing):
+            return frozenset()
         if indexing == "tensor_descriptor":
             # Every load and store, in any order.
             return every_op
-        assert self.host_function is not None
-        device_ir = self.host_function.device_ir
         try:
             with self.env:
                 graphs = device_ir.config_codegen_graphs(config)

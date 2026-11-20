@@ -49,6 +49,8 @@ KERNELS = [
     "scale_mm_cute",
     "nvfp4_gemv",
     "nvfp4_gemv_cute",
+    "mxfp8_gemm",
+    "mxfp8_gemm_cute",
     # B200 tcgen05 register-fragment epilogues.
     "projection_rotary",
     "interleaved_swiglu",
