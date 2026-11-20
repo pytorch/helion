@@ -115,7 +115,14 @@ def test_host_float_mutation_remains_rejected(function):
 
 
 def test_pallas_buffer_slots_exclude_host_float_arguments():
-    kernel = helion.kernel(float_branch.fn, autotune_effort="none", backend="pallas")
+    # Pallas emits no dtype asserts; the dtype-asserts lane's
+    # HELION_DEBUG_DTYPE_ASSERTS=1 would otherwise reject the backend.
+    kernel = helion.kernel(
+        float_branch.fn,
+        autotune_effort="none",
+        backend="pallas",
+        debug_dtype_asserts=False,
+    )
     with cpu_render_target():
         bound = kernel.bind((torch.empty(17), 1.25))
         assert bound.config_spec.pallas_load_buffer_count.length == 1

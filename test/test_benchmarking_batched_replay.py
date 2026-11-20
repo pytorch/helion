@@ -1009,7 +1009,7 @@ def test_search_timer_keeps_the_events_where_it_cannot_trace(
 
 
 @_trace_test
-def test_release_l2_pins_reads_the_buffer_with_evict_last_loads() -> None:
+def test_release_l2_pins_reads_the_buffer_with_evict_last_loads(monkeypatch) -> None:
     """The pin release is one sweep of the whole buffer whose loads carry
     the evict-last hint: only such loads displace the lines earlier work
     pinned in L2 (an evict-first or a plain sweep leaves them)."""
@@ -1027,7 +1027,14 @@ def test_release_l2_pins_reads_the_buffer_with_evict_last_loads() -> None:
     programs = buffer.numel() // benchmarking._L2_SWEEP_WIDTH
     sink = benchmarking._l2_sweep_sinks[(buffer.device.index, programs)]
     assert sink.numel() == programs
-    compiled = benchmarking._l2_sweep_kernel()[(programs,)](
+    # Read the IR of a compile of its own. The kernel compiled above may come
+    # from the Triton cache, where an autotune that ran it (another test, maybe
+    # in another worker) left only the binary: autotuning sets
+    # TRITON_STORE_BINARY_ONLY. A new JITFunction skips the in-memory cache.
+    monkeypatch.setenv("TRITON_ALWAYS_COMPILE", "1")
+    monkeypatch.setenv("TRITON_STORE_BINARY_ONLY", "0")
+    kernel = benchmarking._l2_sweep_kernel()
+    compiled = type(kernel)(kernel.fn)[(programs,)](
         buffer, sink, WIDTH=benchmarking._L2_SWEEP_WIDTH
     )
     # Triton 3.9 prints the load's policy as ``eviction_policy``, 3.8 and

@@ -36,7 +36,10 @@ def test_pre_broadcast_preserves_consumer_input_groups(outer, repeated):
         mock_cuda_unavailable(),
         forbid_cuda_work(),
         CompileEnvironment(
-            torch.device("cpu"), helion.Settings(backend="pallas")
+            torch.device("cpu"),
+            # Pallas emits no dtype asserts; the dtype-asserts lane's
+            # HELION_DEBUG_DTYPE_ASSERTS=1 would otherwise reject the backend.
+            helion.Settings(backend="pallas", debug_dtype_asserts=False),
         ) as env,
     ):
 
