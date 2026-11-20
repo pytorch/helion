@@ -653,11 +653,11 @@ class TestInductorCute(InductorBackendTestCase):
 
     @looped
     def test_welford(self):
-        # welford() emits eq, where, truediv, isinf, isnan and logical_or, and
-        # the block's weight sums hl.full([], 1.0).expand(tile_r).
+        # welford()'s combine emits eq, where and truediv, and the block's weight
+        # is the scalar tmp2 * (tile_r.end - tile_r.begin).
         x = torch.randn(64, 1000, device=DEVICE)
         (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, backend="cute")
-        self.assertIn(".expand(tile_r)", source)
+        self.assertIn("(tile_r.end - tile_r.begin)", source)
 
     def test_persistent_reduction(self):
         # Rows of 300 in one block: softmax, argmax over hl.arange(rdim) and
@@ -1021,8 +1021,10 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         # of -inf as in test_arg_reduction. pow2: a row of 128 is named rdim
         # too, not 128. few: a row of 12, not a power of two, keeps a loop of one
         # block, even under choices that make every reduction persistent
-        # (names_row_dim()). welford: test_welford_extremes' rows in one block
-        # each, whose weight is R.
+        # (names_row_dim()). welford: rows in one block each, whose weight is R:
+        # test_welford_extremes' inf rows and its row of 1e38 and 0 in turn,
+        # and rows of equal values (3.0 and 1000.0) whose scaled sums are
+        # exact in a block of 963, whose variance is 0.
         # neg_inf_row: softmax of a row of -inf is nan, as in eager. broadcast:
         # the max over a broadcast dim of z, all -0.0, is -0.0. pad: rows of
         # 304 whose last 4 the mask (hl.arange(rdim) < 300) takes from the pad.
@@ -1041,7 +1043,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         elif case == "welford":
             x = torch.randn(6, 963, device=DEVICE)
             x[1], x[2, 480:] = float("inf"), float("inf")
-            x[3], x[4], x[5] = 2e19, 100553424.0, 0.0
+            x[3], x[4], x[5] = 3.0, 1000.0, 0.0
             x[5, ::2] = 1e38
             fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
             var, mean = torch.var_mean(x, -1)
@@ -1250,49 +1252,37 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             tmp0 = in0[tile_x, tile_r]
             tmp1 = hl.full([], 0.0, dtype=torch.float32)
             tmp2 = hl.full([], 1.0, dtype=torch.float32)
-            tmp3 = tmp2.expand(tile_r)
-            tmp4 = torch.sum(tmp3, -1)
-            tmp5 = tmp2 / tmp4
-            tmp6 = tmp0 * tmp5
-            tmp7 = torch.sum(tmp6, -1)
-            tmp8 = torch.isinf(tmp7)
-            tmp9 = torch.isnan(tmp7)
-            tmp10 = torch.logical_or(tmp8, tmp9)
-            tmp11 = torch.where(tmp10, tmp1, tmp7)
-            tmp12 = tmp11.reshape([tile_x, 1])
-            tmp13 = tmp0 - tmp12
-            tmp14 = tmp13 * tmp5
-            tmp15 = torch.sum(tmp14, -1)
-            tmp16 = tmp11 + tmp15
-            tmp17 = tmp16.reshape([tile_x, 1])
-            tmp18 = tmp0 - tmp17
-            tmp19 = tmp18 * tmp5
-            tmp20 = torch.sum(tmp19, -1)
-            tmp21 = tmp20.reshape([tile_x, 1])
-            tmp22 = tmp18 - tmp21
-            tmp23 = tmp22 * tmp22
-            tmp24 = torch.sum(tmp23, -1)
-            tmp25 = acc2 + tmp4
-            tmp26 = acc == tmp16
-            tmp27 = tmp16 - acc
-            tmp28 = torch.where(tmp26, tmp1, tmp27)
-            tmp29 = tmp25 == tmp1
-            tmp30 = tmp4 / tmp25
-            tmp31 = torch.where(tmp29, tmp1, tmp30)
-            tmp32 = tmp28 * tmp31
-            tmp33 = acc + tmp32
-            tmp34 = acc1 + tmp24
-            tmp35 = acc2 * tmp31
-            tmp36 = tmp28 * tmp35
-            tmp37 = tmp36 * tmp28
-            tmp38 = tmp34 + tmp37
-            acc = tmp33
-            acc1 = tmp38
-            acc2 = tmp25
+            tmp3 = tmp2 * (tile_r.end - tile_r.begin)
+            tmp4 = tmp2 / tile_r.block_size
+            tmp5 = tmp0 * tmp4
+            tmp6 = torch.sum(tmp5, -1)
+            tmp7 = tmp3 * tmp4
+            tmp8 = tmp6 / tmp7
+            tmp9 = tmp8.reshape([tile_x, 1])
+            tmp10 = tmp0 - tmp9
+            tmp11 = tmp10 * tmp10
+            tmp12 = torch.sum(tmp11, -1)
+            tmp13 = acc2 + tmp3
+            tmp14 = acc == tmp8
+            tmp15 = tmp8 - acc
+            tmp16 = torch.where(tmp14, tmp1, tmp15)
+            tmp17 = tmp13 == tmp1
+            tmp18 = tmp3 / tmp13
+            tmp19 = torch.where(tmp17, tmp1, tmp18)
+            tmp20 = tmp16 * tmp19
+            tmp21 = acc + tmp20
+            tmp22 = acc1 + tmp12
+            tmp23 = acc2 * tmp19
+            tmp24 = tmp16 * tmp23
+            tmp25 = tmp24 * tmp16
+            tmp26 = tmp22 + tmp25
+            acc = tmp21
+            acc1 = tmp26
+            acc2 = tmp13
         out0[tile_x] = acc
-        tmp39 = hl.full([], 99.0, dtype=torch.float32)
-        tmp40 = acc1 / tmp39
-        out1[tile_x] = tmp40
+        tmp27 = hl.full([], 99.0, dtype=torch.float32)
+        tmp28 = acc1 / tmp27
+        out1[tile_x] = tmp28
 """,
         )
 
@@ -1306,22 +1296,30 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         # value of 2000, as in some channels of LLM activations, whose mean is
         # as close to eager's as Triton's; rows 8-15 of 1e37, whose sum
         # overflows; rows 16-23 of 100000000 and 100000008 in turn, whose mean
-        # rounds.
+        # rounds to 100000000 or 100000008: the deviations 0 and 8 give the
+        # variance 32 * 4096 / 4095 as from Inductor's persistent reductions,
+        # where eager gives half of it.
         fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
         if case == "split":
             x = torch.randn(8, 65537, device=DEVICE) + 100
             self.assertEqual(len(self.compile(fn, x)), 2)
-            # Halves of 1e37 and -1e37: partial means of 1e37 with weights of
-            # thousands, whose product overflows. The mean is finite and the
-            # variance overflows, as in eager.
-            x[:, :32768], x[:, 32768:] = 1e37, -1e37
-            var, mean = torch.compile(fn, fullgraph=True)(x)
+            # Halves of 3e38 and -3e38, in chunks of one sign each (65536 = 2**16
+            # values): partial means of 3e38 with weights of thousands, whose
+            # product overflows, and whose deviation from the combine's anchor,
+            # 3e38, would. The mean is finite and the variance overflows, as in
+            # eager. (A chunk of both signs would overflow the merge of its
+            # blocks' means, delta = -6e38, as Triton's welford_combine does.)
+            x = torch.empty(8, 65536, device=DEVICE)
+            x[:, :32768], x[:, 32768:] = 3e38, -3e38
+            var, mean = torch.compile(fn, fullgraph=True, dynamic=False)(x)
             self.assertTrue(torch.isinf(var).all() and torch.isfinite(mean).all())
             return
         x = torch.randn(24, 4096, device=DEVICE)
         x[:8, 100], x[8:16], x[16:] = 2000.0, 1e37, 100000000.0
         x[16:, ::2] = 100000008.0
-        self.assertEqual(len(self.compile(fn, x)), 1)
+        var, mean = fn(x)
+        var[16:] = 32 * 4096 / 4095
+        self.assertEqual(len(self.compile(fn, x, expected=(var, mean))), 1)
 
     def test_welford_empty_chunks(self):
         # A reduction_split_factor() of 1024 cuts R = 9000 into chunks of 9, so
@@ -1466,16 +1464,20 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         # reductions (eager gives nan), since the delta of two equal means is
         # 0, where inf - inf is nan. Row 3, of 2e19, gets the variance 0, as on
         # its first block acc_weight is 0 and delta 2e19, whose square is inf in
-        # float32. Row 4, of 100553424 (c), gets the variance 0, as the last
-        # block's mean is c, where (c + c + c) / 3 is 100553432. Row 5, of 1e38
-        # and 0 in turn, gets the mean 5e37: its deviations of 5e37 are divided
-        # by the weight before they are summed. split: test_welford_cases'
-        # masked split, whose first kernel has partials of weight 0 and mean 0
-        # past the end of R. Rows of -134217720, whose blocks of unequal weight
-        # give their mean exactly only with the correction, and of 2e19, whose
-        # squared deviation from that 0 is inf, get the variance 0.
+        # float32. Row 4, of 100553424 (c): the last block's sum of 3c rounds,
+        # so its mean, sum(x) / 3 as Inductor's persistent reductions take it,
+        # is 100553432, and its deviations of 8 give the variance (3 * 64 + 64 *
+        # 960 * 3 / 963) / 962, where eager gives 0. Row 5, of 1e38 and 0 in
+        # turn, gets the mean 5e37: its deviations of 5e37 are scaled before
+        # they are summed. split: test_welford_cases' masked split, whose first
+        # kernel has partials of weight 0 and mean 0 past the end of R: rows of
+        # 2e19, whose squared deviation from that 0 is inf, get the variance 0,
+        # and so does row 0, of -134217720, whose chunks' equal means the
+        # combine keeps (its anchor), where their weighted sum rounds and gives
+        # the variance 64.9.
         # split_empty: the same split, whose last block of the last chunk holds
-        # only a partial of weight 0, whose mean would be 0 / 0.
+        # only a partial of weight 0, whose mean would be 0 / 0, and whose 0
+        # would make the mean of row 1, of inf, nan in the merge.
         rows = case == "rows"
         if rows:
             x = torch.randn(6, 963, device=DEVICE)
@@ -1483,17 +1485,70 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             x[3], x[4], x[5] = 2e19, 100553424.0, 0.0
             x[5, ::2] = 1e38
         elif case == "split":
-            x = torch.full((8, 65537), -134217720.0, device=DEVICE)
-            x[4:] = 2e19
+            x = torch.randn(8, 65537, device=DEVICE) * 3 + 100
+            x[0], x[4:] = -134217720.0, 2e19
         else:
             x = torch.randn(8, 65537, device=DEVICE)
+            x[1] = float("inf")
         var, mean = torch.var_mean(x, -1)
         if rows:
             mean[1:3] = float("inf")
+            var[4] = (3 * 64 + 64 * 960 * 3 / 963) / 962
+        elif case == "split_empty":
+            mean[1] = float("inf")
         with pin_blocks(1 if case == "split_empty" else 64):
             fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
             sources = self.compile(fn, x, expected=(var, mean))
         self.assertEqual(len(sources), 1 if rows else 2)
+
+    def test_mean_beside_var(self):
+        # torch.mean(x, -1) beside torch.var(x, -1) in one block: the kernel
+        # sums x first, torch.sum(tmp0, -1), and the Welford block takes that
+        # block sum: two block sums, the other m2's. A loop over tile_r, whose
+        # Welford block comes first, keeps the sum's own: three (its scaled
+        # sum times B would lose the low bits of tiny values). Row 0, of 1e37,
+        # whose sum overflows: its mean is inf, as in eager, and so is its
+        # variance where the Welford block takes the graph's sum, as from
+        # Inductor's persistent reductions (eager gives 0).
+        x = torch.randn(64, 1024, device=DEVICE)
+        x[0] = 1e37
+        mean_var = lambda x: (x.mean(-1), x.var(-1))  # noqa: E731
+        mean, var = mean_var(x)
+        var[0] = float("inf")
+        (source,) = self.compile(mean_var, x, expected=(mean, var), tol=1e-4)
+        self.assertIn("torch.sum(tmp0, -1)", source)
+        self.assertEqual(source.count("torch.sum("), 2)
+        x[0] = 1.0
+        with looped:
+            (source,) = self.compile(lambda x: (x.var(-1), x.mean(-1)), x, tol=1e-4)
+        self.assertEqual(source.count("torch.sum("), 3)
+
+    def test_welford_small_values(self):
+        # A loop over blocks of 64 of rows of 65536 values of 1.0005e-36: each
+        # block is scaled by 1 / 64, its size, so x * s stays normal, where
+        # 1 / 65536, R's, would make it subnormal (1.5e-41), which keeps some
+        # 13 bits (the mean 4.4e-5 off) or flushes to 0.
+        x = torch.full((8, 65536), 1.0005e-36, device=DEVICE)
+        with pin_blocks(64), looped, config.patch(split_reductions=False):
+            var, mean = torch.compile(torch.var_mean, fullgraph=True)(x, -1)
+        torch.testing.assert_close(mean, x.mean(-1), rtol=1e-5, atol=0)
+
+    @parametrize("case", ["persistent", "looped"])
+    def test_welford_large_mean(self, case):
+        # Rows whose squared deviations overflow float32, as eager's float32
+        # Welford does: [2**87] * 15 + [2**87 + 2**64], whose mean rounds to
+        # 2**87, so that its deviation of 2**64 squared is inf (its m2, 3.19e38,
+        # would fit), and 1e38 * rand(16). Their variance is inf, not nan, and
+        # their mean finite. looped: blocks of 8.
+        x = torch.full((4, 16), 2.0**87, device=DEVICE)
+        x[:2, -1] = 2.0**87 + 2.0**64
+        x[2:] = 1e38 * torch.rand(2, 16, device=DEVICE)
+        fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
+        if case == "persistent":
+            self.compile(fn, x)
+        else:
+            with pin_blocks(8), looped:
+                self.compile(fn, x)
 
     def test_masked_view(self):
         # A pad of rows of 250 to 256: tile_x.index < 250 masks each row's last

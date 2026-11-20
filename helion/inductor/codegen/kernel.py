@@ -24,6 +24,7 @@ from torch._inductor.ir import MutationLayoutSHOULDREMOVE
 from torch._inductor.ir import Reduction
 from torch._inductor.ir import ReinterpretView
 from torch._inductor.runtime.hints import ReductionHint
+from torch._inductor.runtime.runtime_utils import next_power_of_2
 from torch._inductor.shape_propagation import ShapePropagationOpsHandler
 from torch._inductor.utils import IndentedBuffer
 from torch._inductor.utils import sympy_subs
@@ -1718,114 +1719,149 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         (the count) of x over tile_r, which var_mean and layer_norm lower to.
         welford_reduce reduces x; welford_combine reduces the (mean, m2, weight)
         partials of a split reduction's first kernel. Each block of tile_r is
-        reduced to its own weight, mean and m2, in sums over the block in
-        registers (the mean, its correction, then m2), and folded into the
+        reduced to its own weight, mean and m2, in two sums over the block in
+        registers (the mean, then the deviations' spread), and folded into the
         accumulators acc_mean, acc_m2 and acc_weight as Triton's welford_combine
         does (Chan et al.), with V.ops.
         torch.var_mean(x, -1), with the locals each line comes from:
-            tmp3 = tmp2.expand(tile_r)                  # one
-            tmp4 = torch.sum(tmp3, -1)                  # weight
-            tmp5 = tmp2 / tmp4                          # fraction
-            tmp6 = tmp0 * tmp5
-            tmp7 = torch.sum(tmp6, -1)
+            tmp3 = tmp2 * (tile_r.end - tile_r.begin)   # weight
+            tmp4 = tmp2 / tile_r.block_size             # scale
+            tmp5 = tmp0 * tmp4
+            tmp6 = torch.sum(tmp5, -1)
+            tmp7 = tmp3 * tmp4
+            tmp8 = tmp6 / tmp7                          # mean
+            tmp9 = tmp8.reshape([tile_x, 1])
+            tmp10 = tmp0 - tmp9                         # dev
+            tmp11 = tmp10 * tmp10
+            tmp12 = torch.sum(tmp11, -1)                # m2
+            tmp13 = acc2 + tmp3                         # new_weight
             ...
-            tmp11 = torch.where(tmp10, tmp1, tmp7)      # m0
+            tmp16 = torch.where(tmp14, tmp1, tmp15)     # delta
             ...
-            tmp16 = tmp11 + tmp15                       # mean
-            tmp17 = tmp16.reshape([tile_x, 1])
-            tmp18 = tmp0 - tmp17                        # dev
+            tmp19 = torch.where(tmp17, tmp1, tmp18)     # share
+            tmp20 = tmp16 * tmp19
+            tmp21 = acc + tmp20                         # new_mean
             ...
-            tmp22 = tmp18 - tmp21                       # dev less its mean
-            tmp23 = tmp22 * tmp22                       # spread(dev)
-            tmp24 = torch.sum(tmp23, -1)                # m2
-            tmp25 = acc2 + tmp4                         # new_weight
-            ...
-            tmp28 = torch.where(tmp26, tmp1, tmp27)     # delta
-            ...
-            tmp31 = torch.where(tmp29, tmp1, tmp30)     # share
-            tmp32 = tmp28 * tmp31
-            tmp33 = acc + tmp32                         # new_mean
-            ...
-            acc = tmp33
-            acc1 = tmp38                                # new_m2
-            acc2 = tmp25
+            acc = tmp21
+            acc1 = tmp26                                # new_m2
+            acc2 = tmp13
         A row of inf gets the mean inf, as from Triton's persistent reductions
         (eager and Triton's looped ones give nan): the delta of two equal means
-        is 0, where inf - inf would make it nan. A row of 2e19 gets the
-        variance 0: see the order of the products below. As in any float32
-        Welford, the merge takes each block's rounded mean, so on a row whose
-        spread is below the float32 spacing of its mean the variance depends on
-        the block size: [1e8, 1e8 + 8] * 32 + [1e8 + 8, 1e8 + 16] * 32, of
-        variance 32.25, gives 32.25 in one block of 128, 80.6 in blocks of 64
-        and 124.7 in blocks of 16."""
+        is 0, where inf - inf would make it nan. A row of 2e19 in blocks of 64
+        gets the variance 0: see the order of the products below. As in any
+        float32 Welford, the merge takes each block's rounded mean, so on a row
+        whose spread is below the float32 spacing of its mean the variance
+        depends on the block size, and a block whose own mean rounds keeps the
+        deviations' mean in its m2, as Inductor's persistent reductions do
+        (welford_reduce_fallback())."""
         ops = V.ops
         zero = ops.constant(0.0, dtype)
 
-        def finite_or_zero(value: CSEVariable) -> CSEVariable:
-            isinf, isnan = ops.isinf(value), ops.isnan(value)
-            return ops.where(ops.logical_or(isinf, isnan), zero, value)
+        def block_sum(
+            term: CSEVariable, empty: CSEVariable | None = None
+        ) -> CSEVariable:
+            total = self.reduce_block_value("sum", term, dtype)
+            return total if empty is None else ops.where(empty, zero, total)
 
-        # The block's weight, each value's share of it (1 / weight for x, w[r] /
-        # weight for a partial r, as w[r] times a mean of 1e37 overflows), and
-        # each value's term of m2 given its deviation from the block's mean.
+        # Two sums over each block, as Inductor's welford_reduce_fallback()
+        # reduces a persistent row: the mean, then m2, the deviations' spread.
+        # As there, a mean that rounds leaves the deviations a mean of their
+        # own: of 100000000 and 100000008 in turn, the mean 100000004 rounds to
+        # 100000000, and the deviations 0 and 8 give the variance 32, where
+        # eager gives 16.
+        # The accumulators of a loop: mean, m2 and weight.
+        accumulators = (
+            None
+            if self.persistent_reduction
+            else tuple(self.accumulator(0, dtype) for _ in range(3))
+        )
         if reduction_type == "welford_reduce":
             (value,) = values
+            # The mean is sum(x * s) / (weight * s), s = 1 / B for B the power of
+            # two at or above the block's weight: both products are exact
+            # (where x * s stays normal, as x * (1 / weight) has to), so the
+            # mean is Inductor's sum(x) / weight, and the scaled sum does not
+            # overflow where sum(x) would (a row of 1e37 sums to inf over 4096
+            # lanes). sum(x * (1 / weight)) would round each term, and a row of
+            # 768 values of 100000 get the mean 100000.0078.
             if self.persistent_reduction:
                 # The row is one block of R values: hl.full([], 300.0, ...),
                 # rather than the sum of hl.full([], 1.0, ...).expand(rdim),
-                # which would name the row's dim (row_dim()).
-                weight = ops.constant(float(self.numels["r0_"]), dtype)
+                # which would name the row's dim (row_dim()), and B the power
+                # of two at or above R.
+                rows = int(self.numels["r0_"])
+                weight = ops.constant(float(rows), dtype)
+                scale = ops.constant(1.0 / next_power_of_2(rows), dtype)
             else:
-                # Helion masks the lanes past the end of R, so this counts the
-                # others.
-                one = self.over_tile_r(ops.constant(1.0, dtype))
-                weight = self.reduce_block_value("sum", one, dtype)
-            fraction = ops.truediv(ops.constant(1.0, dtype), weight)
-            empty = None
-
-            def spread(dev: CSEVariable) -> CSEVariable:
-                return ops.mul(dev, dev)
-
+                # The block's lanes within R (Helion masks the others): a
+                # scalar, where a sum of hl.full([], 1.0, ...).expand(tile_r)
+                # would be one more block sum; B is the block size.
+                one = ops.constant(1.0, dtype)
+                line = f"{one} * (tile_r.end - tile_r.begin)"
+                weight = self.cse.generate(self.compute, line, dtype=dtype, shape=())
+                line = f"{one} / tile_r.block_size"
+                scale = self.cse.generate(self.compute, line, dtype=dtype, shape=())
+            # A block sum of x that the kernel took before, as of torch.mean(x,
+            # -1) beside torch.var(x, -1), is the Welford block's too, times s:
+            # one sum of x for both, where there were two. The mean is then
+            # Inductor's own sum(x) / weight, unscaled: on a row whose sum
+            # overflows (1024 values of 1e37) it is inf and so is the variance,
+            # as from Inductor's persistent reductions, where the scaled sum
+            # would keep them finite. A sum after the Welford block keeps its
+            # own: the scaled sum times B would lose the low bits of values
+            # whose x * s is subnormal (1024 values of 1e-42).
+            shared = self.cse.try_get(self.reduce_block("sum", value, dtype)[0])
+            if shared is not None:
+                total = ops.mul(shared, scale)
+            else:
+                total = block_sum(ops.mul(value, scale))
+            mean = ops.truediv(total, ops.mul(weight, scale))
+            dev = ops.sub(value, mean)
+            m2 = block_sum(ops.mul(dev, dev))
         else:
             value, part_m2, part_weight = values
             weight = self.reduce_block_value("sum", part_weight, dtype)
-            fraction = ops.truediv(part_weight, weight)
             # A block of weight 0, the (0, 0, 0) partials past the end of R in a
-            # masked split, gets the mean and m2 0 rather than 0 / 0.
+            # masked split, gets m2 0 rather than 0 / 0, and the mean 0 or, in a
+            # loop, acc_mean, which the merge below then keeps: its 0 against
+            # an acc_mean of inf would make delta -inf, and -inf * 0 nan.
             empty = ops.eq(weight, zero)
-
-            def spread(dev: CSEVariable) -> CSEVariable:
-                # m2[r] + w[r] * dev^2, the weight first: a partial of weight 0
-                # adds 0, where dev * dev could overflow to inf, and inf * 0 is nan.
-                return ops.add(part_m2, ops.mul(ops.mul(part_weight, dev), dev))
-
-        def weighted_mean(term: CSEVariable) -> CSEVariable:
-            total = self.reduce_block_value("sum", ops.mul(term, fraction), dtype)
-            return total if empty is None else ops.where(empty, zero, total)
-
-        # The mean is m0 + weighted_mean(x - m0), with m0 = weighted_mean(x) (0
-        # if inf or nan): weighted before they are summed, neither sum overflows
-        # where sum(x) / weight would (a row of 1e37 sums to inf over 4096
-        # lanes). The second corrects the rounding of the first, so that equal
-        # values give their value exactly: (c + c + c) / 3 of c = 100553424 is
-        # 100553432, which would make m2 192 rather than 0.
-        m0 = finite_or_zero(weighted_mean(value))
-        mean = ops.add(m0, weighted_mean(ops.sub(value, m0)))
-        # The deviations from the mean, less their own mean, which is not 0 when
-        # the mean rounds: of 100000000 and 100000008 in turn, the mean
-        # 100000004 rounds to 100000000, and the deviations 0 and 8 would give
-        # the variance 32 rather than 16.
-        dev = ops.sub(value, mean)
-        dev = ops.sub(dev, weighted_mean(dev))
-        m2 = self.reduce_block_value("sum", spread(dev), dtype)
-        if self.persistent_reduction:
+            # The mean is anchor + the partials' deviations from it, each times
+            # w[r] / weight, the anchor the largest mean of a partial of weight
+            # > 0, or 0 where that is not finite: the equal means of a constant
+            # row's chunks give the anchor itself, as Triton's welford_combine
+            # gives them (delta 0), where the sum of each mean times its share
+            # would round. The deviations are of the halves, m / 2 - anchor /
+            # 2, exact and within float32 where m - anchor can overflow (-3e38
+            # from an anchor of 3e38), and their weighted sum s is added twice,
+            # anchor + s + s, which stays between the mean and the anchor.
+            # (m * share - anchor * share would not cancel: an FMA rounds only
+            # the second product.)
+            valid = ops.gt(part_weight, zero)
+            neg_inf = ops.constant(float("-inf"), dtype)
+            anchor = self.reduce_block_value(
+                "amax", ops.where(valid, value, neg_inf), dtype
+            )
+            unbounded = ops.logical_or(ops.isinf(anchor), ops.isnan(anchor))
+            anchor = ops.where(unbounded, zero, anchor)
+            fraction = ops.truediv(part_weight, weight)
+            half = ops.constant(0.5, dtype)
+            shift = ops.sub(ops.mul(value, half), ops.mul(anchor, half))
+            shifts = block_sum(ops.where(valid, ops.mul(shift, fraction), zero))
+            empty_mean = zero if accumulators is None else accumulators[0]
+            combined = ops.add(ops.add(anchor, shifts), shifts)
+            mean = ops.where(empty, empty_mean, combined)
+            # m2[r] + w[r] * dev^2, the weight first: a partial of weight 0 adds
+            # 0, where dev * dev could overflow to inf, and inf * 0 is nan.
+            dev = ops.sub(value, mean)
+            spread = ops.add(part_m2, ops.mul(ops.mul(part_weight, dev), dev))
+            m2 = block_sum(spread, empty)
+        if accumulators is None:
             # The row is one block, so its mean, m2 and weight are the result, a
             # two-pass variance as in Triton's persistent reductions, with no
             # accumulators to combine them into.
             return mean, m2, weight
-        acc_mean = self.accumulator(0, dtype)
-        acc_m2 = self.accumulator(0, dtype)
-        acc_weight = self.accumulator(0, dtype)
+        acc_mean, acc_m2, acc_weight = accumulators
         # Triton's welford_combine of the accumulators and the block, with 0 for
         # the difference of two equal means, as inf - inf is nan, and for the
         # share of a new_weight of 0: a split's chunk past the end of R, as in
