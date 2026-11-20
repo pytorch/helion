@@ -15,6 +15,8 @@ import torch
 
 import helion
 from helion._compiler.backend import Backend
+from helion._compiler.triton.backend import GluonBackend
+from helion._compiler.triton.backend import TileIRBackend
 from helion._compiler.triton.backend import TritonBackend
 from helion._testing import DEVICE
 from helion._testing import TestCase
@@ -409,6 +411,13 @@ def test_cute_backend_probes_long_kernels_before_timing() -> None:
 
     backend = CuteBackend.__new__(CuteBackend)
     assert backend.probe_long_autotune_kernels(SimpleNamespace()) is True  # pyrefly: ignore[bad-argument-type]
+
+
+@pytest.mark.cpu_only
+def test_triton_backends_probe_long_kernels_before_timing() -> None:
+    for backend_type in (TritonBackend, GluonBackend, TileIRBackend):
+        backend = backend_type.__new__(backend_type)
+        assert backend.probe_long_autotune_kernels(SimpleNamespace()) is True  # pyrefly: ignore[bad-argument-type]
 
 
 @pytest.mark.cpu_only
