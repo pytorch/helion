@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -46,8 +47,8 @@ def main(verbose: bool = True) -> dict:
     baselines = _baselines()
 
     def make_calls(n: int) -> tuple:
-        x = torch.randn(n, device="cuda", dtype=torch.float32)
-        y = torch.randn(n, device="cuda", dtype=torch.float32)
+        x = torch.randn(n, device=DEVICE, dtype=torch.float32)
+        y = torch.randn(n, device=DEVICE, dtype=torch.float32)
 
         def helion_call() -> torch.Tensor:
             return vector_add(x, y)

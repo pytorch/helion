@@ -12,6 +12,7 @@ import math
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -186,12 +187,12 @@ def main(verbose: bool = True) -> dict:
     def make_calls(shape: tuple[int, int, int]) -> tuple:
         M, K, N = shape
         scale = 1.0 / math.sqrt(K)
-        a = (scale * (0.5 + torch.rand(M, K, device="cuda"))).to(fp8_dtype)
-        b = (scale * (0.5 + torch.rand(N, K, device="cuda"))).to(fp8_dtype).t()
-        c = torch.empty((M, N), dtype=out_dtype, device="cuda")
-        scale_a = torch.rand((1, 1), dtype=torch.float32, device="cuda") + 0.5
-        scale_b = torch.rand((1, 1), dtype=torch.float32, device="cuda") + 0.5
-        bias = 0.5 * (torch.rand(N, dtype=out_dtype, device="cuda") - 0.5)
+        a = (scale * (0.5 + torch.rand(M, K, device=DEVICE))).to(fp8_dtype)
+        b = (scale * (0.5 + torch.rand(N, K, device=DEVICE))).to(fp8_dtype).t()
+        c = torch.empty((M, N), dtype=out_dtype, device=DEVICE)
+        scale_a = torch.rand((1, 1), dtype=torch.float32, device=DEVICE) + 0.5
+        scale_b = torch.rand((1, 1), dtype=torch.float32, device=DEVICE) + 0.5
+        bias = 0.5 * (torch.rand(N, dtype=out_dtype, device=DEVICE) - 0.5)
 
         def helion_call() -> None:
             scaled_mm(c, a, b, scale_a, scale_b, bias)

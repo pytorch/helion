@@ -8,6 +8,7 @@ from typing import Callable
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -247,17 +248,17 @@ def _make_inputs(
     head_dim = hidden_size // q_heads
     q = torch.randn(
         [1, q_heads, seq_length, head_dim],
-        device="cuda",
+        device=DEVICE,
         dtype=torch.bfloat16,
         requires_grad=True,
     )
     k = torch.randn(
         [1, k_heads, seq_length, head_dim],
-        device="cuda",
+        device=DEVICE,
         dtype=torch.bfloat16,
         requires_grad=True,
     )
-    angles = torch.randn([1, seq_length, head_dim], device="cuda", dtype=torch.bfloat16)
+    angles = torch.randn([1, seq_length, head_dim], device=DEVICE, dtype=torch.bfloat16)
     return q, k, torch.cos(angles), torch.sin(angles)
 
 

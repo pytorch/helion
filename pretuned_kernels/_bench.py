@@ -26,6 +26,7 @@ from typing import cast
 import torch
 
 from helion import exc
+from helion._hardware import get_hardware_info
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.logger import classify_triton_exception
 from helion.autotuner.logger import match_unrecoverable_runtime_error
@@ -294,7 +295,7 @@ def run_sweep(
             print(*args)
 
     if verbose:
-        _p(f"GPU: {torch.cuda.get_device_name()}")
+        _p(f"GPU: {get_hardware_info().hardware_name}")
     speedups_by_base: dict[str, list[float]] = {}
     best_speedups: list[float] = []
     helion_wins = 0

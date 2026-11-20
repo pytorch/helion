@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 # Optional vLLM baseline: the production kernel this is benchmarked against. The
@@ -157,10 +158,10 @@ def correctness_check() -> None:
     group_size = 128
     const = (group_size, 1e-10, -448.0, 448.0, False)
     for num_tokens, hidden_size in _bench_shapes():
-        inp = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+        inp = torch.randn(num_tokens, hidden_size, device=DEVICE, dtype=torch.bfloat16)
         groups = hidden_size // group_size
         oq = torch.empty_like(inp, dtype=torch.float8_e4m3fn)
-        os = torch.empty((num_tokens, groups), device="cuda", dtype=torch.float32)
+        os = torch.empty((num_tokens, groups), device=DEVICE, dtype=torch.float32)
         oq_ref = torch.empty_like(oq)
         os_ref = torch.empty_like(os)
         per_token_group_fp8_quant(inp, oq, os, *const)
@@ -188,12 +189,12 @@ def main(verbose: bool = True) -> dict:
     def make_calls(shape: tuple) -> tuple:
         num_tokens, hidden_size = shape
         input = torch.randn(  # noqa: A001
-            num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
+            num_tokens, hidden_size, device=DEVICE, dtype=torch.bfloat16
         )
         groups_per_row = hidden_size // group_size
         output_q = torch.empty_like(input, dtype=fp8_dtype)
         output_s = torch.empty(
-            (num_tokens, groups_per_row), device="cuda", dtype=torch.float32
+            (num_tokens, groups_per_row), device=DEVICE, dtype=torch.float32
         )
         output_q_ref = torch.empty_like(output_q)
         output_s_ref = torch.empty_like(output_s)

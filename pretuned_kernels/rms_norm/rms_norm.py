@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 
 import helion
+from helion._testing import DEVICE
 import helion.language as hl
 
 
@@ -96,8 +97,8 @@ def main(verbose: bool = True) -> dict:
 
     def make_calls(shape: tuple[int, int]) -> tuple:
         M, N = shape
-        x = torch.randn([M, N], device="cuda", dtype=torch.bfloat16)
-        weight = torch.randn([N], device="cuda", dtype=torch.bfloat16)
+        x = torch.randn([M, N], device=DEVICE, dtype=torch.bfloat16)
+        weight = torch.randn([N], device=DEVICE, dtype=torch.bfloat16)
 
         def helion_call() -> torch.Tensor:
             return rms_norm(x, weight)
