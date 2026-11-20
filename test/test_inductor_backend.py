@@ -25,6 +25,7 @@ from helion._testing import DEVICE
 from helion._testing import _has_cute_dsl
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotCUDA
 
 if not requires_torch_version("2.16"):
@@ -415,11 +416,13 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
         self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [True, False])
 
     def test_matmul_unsupported(self):
-        # Lowered to a dot, which a kernel that Helion cannot emit holds.
+        # Lowered to a dot, which a kernel that Helion cannot emit holds: a[i]
+        # needs a bounds check, which Helion kernels lack (test_gathered_operand
+        # has none).
         b = randn(64, 48)
         i = torch.randint(0, 80, (32,), device=DEVICE)
         self.assertUnsupported(
-            "indirect_indexing", lambda a, i, b: a[i] @ b, randn(80, 64), i, b
+            "check_bounds", lambda a, i, b: a[i] @ b, randn(80, 64), i, b
         )
         self.assertUnsupported(
             "cpu_scalar_input",
@@ -428,6 +431,16 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
             b,
             torch.tensor(2.0),
         )
+
+    def test_gathered_operand(self):
+        # a[i] @ b with assert_indirect_indexing=False (with it, the check of i
+        # fails the compile, test_matmul_unsupported): the dot reads a's rows at
+        # i[tile_y], [tile_y] against [tile_y, tile_r].
+        a, b = randn(80, 64), randn(64, 48)
+        i = torch.randint(0, 80, (32,), device=DEVICE)
+        with config.patch(assert_indirect_indexing=False):
+            (source,) = self.compile(lambda a, i, b: a[i] @ b, a, i, b, tol=2e-2)
+        self.assertIn("torch.addmm(", source)
 
     def test_cudagraph_tree(self):
         def fn(a, b):
@@ -477,6 +490,15 @@ class TestInductorCute(InductorBackendTestCase):
         x = torch.randn(64, 1000, device=DEVICE)
         (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, backend="cute")
         self.assertIn(".expand(tile_r)", source)
+
+    def test_gather(self):
+        x = torch.randn(64, 100, device=DEVICE)
+        i = torch.randint(0, 100, (64, 10), device=DEVICE)
+        with config.patch(assert_indirect_indexing=False):
+            (source,) = self.compile(
+                lambda x, i: x.gather(1, i) * 2, x, i, backend="cute"
+            )
+        self.assertIn("in1[tmp1 + ", source)
 
 
 @skipIfNotCUDA()
@@ -828,6 +850,171 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             sources = self.compile(fn, x, expected=(var, mean))
         self.assertEqual(len(sources), 1 if rows else 2)
 
+    def test_gather(self):
+        x = torch.randn(64, 100, device=DEVICE)
+        i = torch.randint(0, 100, (64, 10), device=DEVICE)
+        with config.patch(assert_indirect_indexing=False):
+            (source,) = self.compile(lambda x, i: x.gather(1, i) * 2, x, i)
+        self.assertExpectedInline(
+            source,
+            """\
+import torch
+import helion
+import helion.language as hl
+
+@helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
+def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
+    for tile_x in hl.tile(640):
+        tmp0 = in0[tile_x]
+        tmp1 = tmp0.to(torch.int64)
+        tmp2 = in1[tmp1 + 100*(tile_x.index // 10)]
+        tmp3 = hl.full([], 2.0, dtype=torch.float32)
+        tmp4 = tmp2 * tmp3
+        out0[tile_x] = tmp4
+""",
+        )
+
+    @parametrize(
+        "case",
+        [
+            "embedding",
+            "embedding_norm",
+            "maxpool_offsets",
+            "index_select",
+            "negative",
+            "arange",
+            "cross_entropy",
+            "argmax",
+            "masked_index",
+            "masked_constant",
+            "index_put",
+            "scatter_add",
+        ],
+    )
+    def test_gather_cases(self, case):
+        # One case per lowering of an indirect index (12 > 8). embedding_norm:
+        # rows read at i[tile_x] in a reduction over their columns, at the index
+        # 64 * i + r of [tile_x, tile_r]. maxpool_offsets: max_pool2d's backward
+        # over a width of 300, which scatters at 298 * (o // 2) + ... of its int8
+        # offsets o. negative: x[i] with i < 0 reads x[i + 100], at an index that
+        # is only the value read. arange: an index computed from iota,
+        # which the body holds as a direct index and a check_bounds that passes,
+        # so it is Helion with assert_indirect_indexing. cross_entropy: the
+        # gather of the target's logit in a reduction kernel. argmax: an index
+        # that is a fused reduction's accumulator. masked_index: a load at one
+        # index for all lanes, out of range, under a mask that turns them off;
+        # masked_constant: the same at a constant index, a direct load.
+        # index_put: a store at an index read from a tensor (no repeats), and
+        # scatter_add an atomic add.
+        x, w = torch.randn(64, 100, device=DEVICE), torch.randn(1000, 64, device=DEVICE)
+        ids = torch.randint(0, 1000, (32,), device=DEVICE)
+        fn, args = {
+            "embedding": (
+                lambda i, w: torch.nn.functional.embedding(i, w) * 3,
+                (ids, w),
+            ),
+            "embedding_norm": (
+                lambda i, w: torch.nn.functional.embedding(i, w).softmax(-1),
+                (ids, w),
+            ),
+            "maxpool_offsets": (
+                lambda o, g: torch.zeros(2, 1200, device=g.device).scatter_add(
+                    1,
+                    torch.ops.prims._low_memory_max_pool_offsets_to_indices(
+                        o, [2, 2], [4, 300], [2, 2], [0, 0], [1, 1]
+                    ).view(2, 300),
+                    g.view(2, 300),
+                ),
+                (
+                    torch.randint(0, 4, (1, 2, 2, 150), device=DEVICE).to(torch.int8),
+                    torch.randn(1, 2, 2, 150, device=DEVICE),
+                ),
+            ),
+            "index_select": (lambda w, i: w.index_select(0, i) + 1, (w, ids)),
+            "negative": (
+                lambda x, i: x[i] * 2,
+                (x[0], torch.randint(-100, 100, (64,), device=DEVICE)),
+            ),
+            "arange": (
+                lambda x: x.gather(
+                    1, torch.arange(10, device=x.device).expand(64, 10) * 7
+                ),
+                (x,),
+            ),
+            "cross_entropy": (
+                torch.nn.functional.cross_entropy,
+                (
+                    torch.randn(128, 1000, device=DEVICE),
+                    torch.randint(0, 1000, (128,), device=DEVICE),
+                ),
+            ),
+            "argmax": (
+                lambda x, y: y.gather(1, x.argmax(1, keepdim=True)),
+                (x, torch.randn(64, 100, device=DEVICE)),
+            ),
+            "masked_index": (
+                lambda w, m, i: torch.ops.aten._unsafe_masked_index(w, m, [i], 0.0),
+                (
+                    w.flatten(),
+                    torch.zeros(64, dtype=torch.bool, device=DEVICE),
+                    torch.tensor([2**40], device=DEVICE).expand(64),
+                ),
+            ),
+            "masked_constant": (
+                lambda w, m: torch.ops.aten._unsafe_masked_index(
+                    w, m, [torch.full((64,), 2**40, device=w.device)], 0.0
+                ),
+                (w.flatten(), torch.zeros(64, dtype=torch.bool, device=DEVICE)),
+            ),
+            "index_put": (
+                lambda i, v: torch.zeros(1000, 64, device=v.device).index_put((i,), v),
+                (
+                    torch.randperm(1000, device=DEVICE)[:32],
+                    torch.randn(32, 64, device=DEVICE),
+                ),
+            ),
+            "scatter_add": (
+                lambda i, s: torch.zeros(64, 100, device=s.device).scatter_add(1, i, s),
+                (
+                    torch.randint(0, 100, (64, 10), device=DEVICE),
+                    torch.randn(64, 10, device=DEVICE),
+                ),
+            ),
+        }[case]
+        with config.patch(assert_indirect_indexing=case == "arange"):
+            self.compile(fn, *args, tol=1e-4)
+        self.assertNotIn("@triton.jit", self.code)
+
+    @skipIfLowVRAM("x takes 2 GiB", required_bytes=3 * 2**30)
+    def test_gather_wide_index(self):
+        # x[i] with an int32 i into x of 2**31 + 8 elements (2 GB of uint8): -1
+        # reads x at i + 2147483656, past int32.
+        x = torch.empty(2**31 + 8, dtype=torch.uint8, device=DEVICE)
+        x[-1] = 7
+        i = torch.tensor([-1, 5, 2**31 - 1], dtype=torch.int32, device=DEVICE)
+        with config.patch(assert_indirect_indexing=False):
+            self.compile(lambda x, i: x[i] + 1, x, i)
+
+    @parametrize("case", ["check_bounds", "dynamic_index", "where_index"])
+    def test_gather_unsupported(self, case):
+        # check_bounds: Inductor checks an index of unknown range, Triton with
+        # tl.device_assert; Helion kernels have none. dynamic_index: x[i] into a
+        # dynamic dim, which a negative i wraps by. where_index: x[arange - 1], at
+        # the direct index Where(p0 - 1 < 0, p0 + 9, p0 - 1).
+        x = torch.randn(64, 100, device=DEVICE)
+        if case == "check_bounds":
+            fn = lambda x, i: x.gather(1, i) * 2  # noqa: E731
+            args = (x, torch.randint(0, 100, (64, 10), device=DEVICE))
+        elif case == "where_index":
+            fn = lambda x: x[torch.arange(10, device=x.device) - 1] + 1  # noqa: E731
+            args = (x,)
+        else:
+            torch._dynamo.mark_dynamic(x, 0)
+            fn = lambda x, i: x[i] * 2  # noqa: E731
+            args = (x, torch.randint(-64, 64, (32,), device=DEVICE))
+        with config.patch(assert_indirect_indexing=case == "check_bounds"):
+            self.assertUnsupported(case, fn, *args)
+
     def test_any(self):
         x = torch.randn(64, 100, device=DEVICE)
         (source,) = self.compile(lambda x: torch.any(x > 2.0, -1), x)
@@ -878,14 +1065,13 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         self.assertIn("buf2 = buf1; del buf1  # reuse", self.code)
         self.assertRegex(self.code, r"helion_\w+\(reinterpret_tensor\(buf2, ")
 
-    # One case per name that unsupported() and HelionScheduling report (10 > 8:
-    # each is a separate check).
+    # One case per name that unsupported() and HelionScheduling report (9 > 8:
+    # each is a separate check); test_gather_unsupported has the index ones.
     @parametrize(
         "case",
         [
             "xor_sum",
             "dropout",
-            "gather",
             "dynamic",
             "strict_reduction",
             "batch_invariant",
@@ -906,9 +1092,6 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             args = [torch.randint(0, 100, (64, 100), device=DEVICE, dtype=torch.int32)]
         elif case == "dropout":
             fn = lambda x: torch.nn.functional.dropout(x, 0.5)  # noqa: E731
-        elif case == "gather":
-            fn = lambda x, i: x[i] * 2  # noqa: E731
-            args = [x, torch.randint(0, 64, (32,), device=DEVICE)]
         elif case == "dynamic":
             torch._dynamo.mark_dynamic(x, 0)
         elif case == "combo_kernels":
@@ -917,7 +1100,6 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         names, patches = {
             "xor_sum": ("xor_sum", {}),
             "dropout": ("load_seed, rand", {}),
-            "gather": ("indirect_indexing", {}),
             "dynamic": ("dynamic_shape", {}),
             "strict_reduction": ("strict_reduction", {"numerics": "strict_reduction"}),
             "batch_invariant": ("batch_invariant", {"batch_invariant": True}),

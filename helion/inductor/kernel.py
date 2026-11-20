@@ -132,6 +132,35 @@ class HelionCSEProxy(CSEProxy):
                 )
         return result
 
+    def indirect_indexing(
+        self,
+        var: CSEVariable,
+        size: sympy.Expr | int,
+        check: bool = True,
+        wrap_neg: bool = True,
+    ) -> sympy.Symbol:
+        # Indices are int64, as in Triton, where an int8 or int32 i of x[i] meets
+        # its wrap's tl.full([1], size, tl.int64) and promotes. A 0-d int64 does
+        # not promote: max_pool2d's backward, which reads int8 offsets, would get
+        #     tmp2 = tmp0 + hl.full([], 4, dtype=torch.int64)
+        #     tmp4 = torch.where(tmp3, tmp2, tmp0)
+        #     hl.atomic_add(out0, [... + 957*(tmp4 // 2) + ...], tmp5)
+        # with 957*(tmp4 // 2) computed in int8, wrapping, and an illegal memory
+        # access. var's recorded dtype does not say: Inductor records tmp2 as
+        # int64, so the cast is unconditional (and free for an int64 var).
+        kernel = cast("HelionKernel", self.kernel)
+        var = kernel.cse.generate(
+            kernel.compute,
+            f"{var}.to(torch.int64)",
+            bounds=var.bounds,
+            dtype=torch.int64,
+            shape=var.shape,
+        )
+        symbol = super().indirect_indexing(var, size, check, wrap_neg)
+        # Named after var or its wrap, both CSE variables.
+        kernel.indirect[symbol] = kernel.cse.varname_map[symbol.name]
+        return symbol
+
     def dot(self, x: CSEVariable, y: CSEVariable) -> CSEVariable:
         return cast("HelionKernel", self.kernel).dot(x, y)
 
@@ -214,6 +243,10 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self.dot_results: OrderedSet[CSEVariable] = OrderedSet()
         # Values stored outside the current reduction loop; see disable_reduction().
         self.outer_stores: dict[str, CSEVariable] = {}
+        # Whether an indirect index needs a bounds check; see check_bounds().
+        self.needs_bounds_check = False
+        # The values indices read, by the symbols that stand for them.
+        self.indirect: dict[sympy.Symbol, CSEVariable] = {}
 
     def __enter__(self) -> Self:
         super().__enter__()
@@ -235,8 +268,28 @@ class HelionKernel(SIMDKernel[CSEVariable]):
     def dtype_to_str(self, dtype: torch.dtype) -> str:
         return str(dtype)
 
+    def indirect_vars(self, index: sympy.Expr) -> dict[sympy.Symbol, CSEVariable]:
+        """The values that `index` reads: x.gather(1, i) loads x at 100*x1 + tmp4,
+        tmp4 = i[x1, x0] (see HelionCSEProxy.indirect_indexing())."""
+        return {
+            symbol: self.indirect[symbol]
+            for symbol in index.free_symbols
+            if symbol in self.indirect
+        }
+
     def index_axes(self, index: sympy.Expr) -> list[str]:
-        return [axis for axis in self.axes if self.symbols[axis] in index.free_symbols]
+        """The axes of `index`: those of its tile indices and of the values it
+        reads (indirect_vars())."""
+        axes = OrderedSet(
+            axis
+            for var in self.indirect_vars(index).values()
+            for axis in tile_axes(var.shape)
+        )
+        return [
+            axis
+            for axis in self.axes
+            if self.symbols[axis] in index.free_symbols or axis in axes
+        ]
 
     def value_shape(self, axes: Iterable[str]) -> TileShape:
         """Shape of a value over `axes`: their tiles in the kernel's axis order,
@@ -584,7 +637,11 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         buffer = V.graph.get_buffer(name)
         index = self.tile_index(index)
         axes = self.index_axes(index)
-        mask, mask_axes = self.load_mask(axes)
+        mask, mask_axes = self.load_mask(
+            axes,
+            bool(self.indirect_vars(index))
+            or (bool(self.load_masks) and not self.in_range(buffer, index)),
+        )
         if not mask_axes <= OrderedSet(axes):
             axes = [axis for axis in self.axes if axis in axes or axis in mask_axes]
             arg, coordinates, shape = self.flat_subscript(buffer, index, axes)
@@ -628,12 +685,8 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         #     hl.atomic_add(out0, [tile_x], tmp0)  # out0: a stride-0 view of out
         # Subscripted out0[()], the [tile_x] value fails: "Cannot broadcast Helion
         # ('tile_x',) to ()".
-        value_axes = tile_axes(value.shape)
-        axes = [
-            axis
-            for axis in self.axes
-            if self.symbols[axis] in index.free_symbols or axis in value_axes
-        ]
+        store_axes = OrderedSet([*self.index_axes(index), *tile_axes(value.shape)])
+        axes = [axis for axis in self.axes if axis in store_axes]
         arg, coordinates, shape = self.subscript(buffer, index, axes, output=True)
         dtype = buffer.get_dtype()
         cast_suffix = "" if value.dtype == dtype else f".to({dtype})"
@@ -666,25 +719,49 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         )
 
     def index_tensor_expr(self, index: sympy.Expr, axes: Sequence[str]) -> str:
-        if index.free_symbols - OrderedSet(self.symbols[axis] for axis in axes):
+        indirect = self.indirect_vars(index)
+        values = OrderedSet(indirect)
+        symbols = OrderedSet(self.symbols[axis] for axis in axes)
+        if index.free_symbols - symbols - values:
             raise NotImplementedError(f"Unsupported Helion index: {index}")
         scope = [axis for axis in self.axes if axis in axes]
-        # tile.index is int32; widen it if any subexpression could overflow.
+        # tile.index is int32; widen it if any subexpression could overflow. One
+        # that reads a value with tiles is int64 already
+        # (HelionCSEProxy.indirect_indexing()): x.gather(1, i) reads x at
+        # tmp1 + 100*(tile_x.index // 10). A 0-d value does not promote an int32
+        # tensor, so an index that reads one always widens: in
+        # ((tile_x.index + 4*tmp0) % 100) with tmp0 = 2**29, the sum would wrap.
         ranges = {
             self.symbols[axis]: ValueRanges(0, self.numels[axis] - 1) for axis in axes
         }
-        bounds = [bound_sympy(term, ranges) for term in sympy.preorder_traversal(index)]
+        # The terms without a value are summed in int32 before the value's term
+        # joins: bound their sum too.
+        rest = index.xreplace(dict.fromkeys(values, sympy.Integer(0)))
+        bounds = [
+            bound_sympy(term, ranges)
+            for term in (rest, *sympy.preorder_traversal(index))
+            if not term.free_symbols & values
+        ]
         widen = any(not (b.lower >= -(2**31) and b.upper < 2**31) for b in bounds)
+        widen |= any(not tile_axes(var.shape) for var in indirect.values())
         suffix = ".to(torch.int64)" if widen else ""
         replacements = {
             self.symbols[axis]: sympy.Symbol(self.index_tensor(axis, scope) + suffix)
             for axis in axes
         }
+        # A value read as an index broadcasts like a tile index:
+        # softmax(embedding(i, w), -1) reads w at
+        #     in1[64*tmp1.reshape([tile_x, 1]) + tile_r.index]
+        # where tmp1 = in0[tile_x].to(torch.int64) alone would be [tile_x] against
+        # [tile_r].
+        shape = self.value_shape(scope)
+        for symbol, var in indirect.items():
+            replacements[symbol] = sympy.Symbol(self.align(var, shape))
         expr = HelionPrinter().doprint(index.xreplace(replacements), simplify=False)
         # Broadcast to the tiles of `axes` the index skips, e.g. those of a store's
         # value or a load's mask: (tile_x.index // 2).expand(tile_y, tile_x), or
         # hl.full([tile_x], 0, dtype=torch.int32) for the index 0.
-        if all(self.symbols[axis] in index.free_symbols for axis in scope):
+        if OrderedSet(self.index_axes(index)) >= OrderedSet(scope):
             return expr
         tiles = ", ".join(TILE_NAMES[axis] for axis in scope)
         if not index.free_symbols:
@@ -692,18 +769,36 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             return f"hl.full([{tiles}], {expr}, dtype={dtype})"
         return f"({expr}).expand({tiles})"
 
+    def in_range(self, buffer: IRNode, index: sympy.Expr) -> bool:
+        """Whether a direct `index` is within `buffer`'s storage on every lane."""
+        ranges = {
+            symbol: ValueRanges(0, self.numels[axis] - 1)
+            for axis, symbol in self.symbols.items()
+        }
+        bound = bound_sympy(index, ranges)
+        sizevars = V.graph.sizevars
+        return sizevars.statically_known_geq(
+            bound.lower, 0
+        ) and sizevars.statically_known_lt(
+            bound.upper, buffer.get_layout().storage_size()
+        )
+
     def load_mask(
-        self, axes: Sequence[str]
+        self, axes: Sequence[str], unproven: bool
     ) -> tuple[CSEVariable | None, OrderedSet[str]]:
         """The extra_mask of a load over `axes`, and its axes: the masks that are
-        0-d or over any of those axes. A mask over other axes only cannot move the
-        load's address and is left to masked()."""
+        0-d or over any of those axes, or all of them for a load whose address
+        is not proven in range. A mask over other axes only cannot move a direct
+        load's address and is left to masked(), but an indirect one's can be out
+        of range on the lanes a mask turns off, even at one address for all of
+        them, as for _unsafe_masked_index(x, mask, [i.expand(64)], 0.0), and so
+        can a direct one: [torch.full((64,), 2**40)] reads x at 2**40."""
         load_axes = OrderedSet(axes)
         guards = []
         guard_axes: OrderedSet[str] = OrderedSet()
         for mask in self.load_masks:
             mask_axes = OrderedSet(tile_axes(mask.shape))
-            if not mask_axes or mask_axes & load_axes:
+            if unproven or not mask_axes or mask_axes & load_axes:
                 guards.append(mask)
                 guard_axes |= mask_axes
         if not guards:
@@ -727,6 +822,16 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         if result.dtype is None:
             raise AssertionError(f"expected a dtype for masked value {result}")
         return V.ops.where(mask, result, V.ops.constant(other, result.dtype))
+
+    def check_bounds(
+        self, expr: sympy.Expr, size: sympy.Expr, lower: bool, upper: bool
+    ) -> None:
+        # Triton checks x.gather(1, i) with an i of unknown range by
+        #     tl.device_assert((0 <= tmp4) & (tmp4 < 100), "index out of bounds: ...")
+        # Helion kernels have no device assert, so such a kernel fails with
+        # "Unsupported: check_bounds" (HelionScheduling). Raising here, inside
+        # the node's codegen, would log "Error in codegen" before the error.
+        self.needs_bounds_check |= lower or upper
 
     def reduction_accumulator(
         self, reduction_type: str, src_dtype: torch.dtype, dtype: torch.dtype
