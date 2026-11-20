@@ -42,12 +42,22 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing_extensions import Self
 
+    from torch._inductor.ops_handler import ReductionType
+
 
 # A tile name per dim, or 1 for a broadcast dim.
 TileShape = tuple[str | int, ...]
 TILE_NAMES = {"z0_": "tile_z", "y": "tile_y", "x": "tile_x", "r0_": "tile_r"}
 TILE_AXES = {name: axis for axis, name in TILE_NAMES.items()}
-REDUCTIONS = OrderedSet(["sum", "prod", "max", "min"])
+ARG_REDUCTIONS = OrderedSet(["argmax", "argmin"])
+REDUCTIONS = OrderedSet(["sum", "prod", "max", "min", "any", *ARG_REDUCTIONS])
+
+
+def accumulator_dtype(dtype: torch.dtype) -> torch.dtype:
+    """fp16 and bf16 accumulate in fp32, as in Triton's reductions, also with
+    config.triton.codegen_upcast_to_fp32 off. In bf16, a sum of 65536 ones in
+    blocks of 128 stops at 32768, where 32768 + 128 rounds to 32768."""
+    return torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
 
 
 def tile_axes(shape: Iterable[str | int] | None) -> list[str]:
@@ -707,6 +717,18 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             raise AssertionError(f"expected a dtype for masked value {result}")
         return V.ops.where(mask, result, V.ops.constant(other, result.dtype))
 
+    def reduction_accumulator(
+        self, reduction_type: str, src_dtype: torch.dtype, dtype: torch.dtype
+    ) -> CSEVariable:
+        """An accumulator of `dtype` that starts at `reduction_type`'s initial
+        value for `src_dtype`, e.g. -inf for max."""
+        init = Reduction.default_accumulator(
+            reduction_type, accumulator_dtype(src_dtype)
+        )
+        if not isinstance(init, (bool, float, int)):
+            raise AssertionError(f"expected one initial value, got {init}")
+        return self.accumulator(init, dtype)
+
     def accumulator(self, init: bool | float, dtype: torch.dtype) -> CSEVariable:
         tiles = tuple(TILE_NAMES[axis] for axis in self.outer_axes)
         name = f"acc{self.accumulator_count or ''}"
@@ -747,45 +769,54 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         self,
         dtype: torch.dtype,
         src_dtype: torch.dtype,
-        reduction_type: str,
+        reduction_type: ReductionType,
         value: CSEVariable | tuple[CSEVariable, ...],
     ) -> CSEVariable | tuple[CSEVariable, ...]:
         if reduction_type == "dot":
             return value
         if reduction_type not in REDUCTIONS:
             raise AssertionError(f"Helion kernels do not support {reduction_type}")
-        if not isinstance(value, CSEVariable):
+        if isinstance(value, tuple):
             raise AssertionError(f"expected one value to reduce, got {value}")
-
-        # fp16 and bf16 accumulate in fp32, as in Triton's reductions, also with
-        # config.triton.codegen_upcast_to_fp32 off. In bf16, a sum of 65536 ones
-        # in blocks of 128 stops at 32768, where 32768 + 128 rounds to 32768.
-        def accumulator_dtype(dtype: torch.dtype) -> torch.dtype:
-            low = (torch.float16, torch.bfloat16)
-            return torch.float32 if dtype in low else dtype
-
         if value.dtype is not None and accumulator_dtype(value.dtype) != value.dtype:
             line = f"{value}.to(torch.float32)"
             value = self.cse.generate(
                 self.compute, line, dtype=torch.float32, shape=value.shape
             )
-        if "tile_r" not in map(str, value.shape or ()):
-            # Broadcast over tile_r, so that each block reduces one copy per lane:
-            #     tmp1 = tmp0.reshape([tile_x, 1]).expand(tile_x, tile_r)
-            # Adding hl.zeros([tile_x, tile_r]) instead would turn -0.0 into 0.0,
-            # the max of z.expand(64, 300) with z all -0.0.
-            axes = tile_axes(value.shape)
-            shape = self.value_shape([*axes, "r0_"])
-            line = f"{self.align(value, shape)}.expand({', '.join(map(str, shape))})"
-            value = self.cse.generate(
-                self.compute, line, dtype=value.dtype, shape=shape
-            )
-        init = Reduction.default_accumulator(
-            reduction_type, accumulator_dtype(src_dtype)
-        )
-        if not isinstance(init, (bool, float, int)):
-            raise AssertionError(f"expected one initial value, got {init}")
-        acc = self.accumulator(init, accumulator_dtype(dtype))
+        value = self.over_tile_r(value)
+        if reduction_type in ARG_REDUCTIONS:
+            return self.arg_reduce(reduction_type, value, accumulator_dtype(src_dtype))
+        acc_dtype = accumulator_dtype(dtype)
+        acc = self.reduction_accumulator(reduction_type, src_dtype, acc_dtype)
+        fn = {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin", "any": "any"}
+        part, _ = self.reduce_block(fn[reduction_type], value, acc_dtype)
+        block = {
+            "sum": f"{acc} + {part}",
+            "prod": f"{acc} * {part}",
+            "max": f"torch.maximum({acc}, {part})",
+            "min": f"torch.minimum({acc}, {part})",
+            "any": f"{acc} | {part}",
+        }[reduction_type]
+        self.compute.writeline(f"{acc} = {block}")
+        return acc
+
+    def over_tile_r(self, value: CSEVariable) -> CSEVariable:
+        """`value`, broadcast over tile_r if it has no tile_r, so that each block
+        reduces one copy per lane: tmp1 = tmp0.reshape([tile_x, 1]).expand(tile_x,
+        tile_r). Adding hl.zeros([tile_x, tile_r]) instead would turn -0.0 into
+        0.0, the max of z.expand(64, 300) with z all -0.0."""
+        if "tile_r" in map(str, value.shape or ()):
+            return value
+        axes = tile_axes(value.shape)
+        shape = self.value_shape([*axes, "r0_"])
+        line = f"{self.align(value, shape)}.expand({', '.join(map(str, shape))})"
+        return self.cse.generate(self.compute, line, dtype=value.dtype, shape=shape)
+
+    def reduce_block(
+        self, fn: str, value: CSEVariable, dtype: torch.dtype
+    ) -> tuple[str, TileShape]:
+        """torch.<fn> of a block of `value` over tile_r, e.g. torch.sum(tmp0, -1),
+        for an accumulator of `dtype`, and its shape."""
         # Reduce tile_r wherever the axis order puts it: last without a dot, before
         # tile_x in a matmul's K loop, as in (a @ b, (a[:, :, None] * b[None]).sum(1)):
         #     acc = torch.addmm(acc, tmp0, tmp1)
@@ -795,26 +826,79 @@ class HelionKernel(SIMDKernel[CSEVariable]):
         # [u0, u2]". The result is aligned to the accumulator, e.g. (tile_y, 1).
         dims = [str(dim) for dim in value.shape or ()]
         kept = [TILE_AXES[dim] for dim in dims if dim not in ("tile_r", "1")]
-        fn = {"sum": "sum", "prod": "prod", "max": "amax", "min": "amin"}[
-            reduction_type
-        ]
         # torch.sum and torch.prod return int64 for an integer tile. For
         # x.sum(-1, dtype=torch.int32), acc = acc + torch.sum(tmp0, -1) would make
         # the int32 acc int64: "Tensor mismatch in control flow for variable
         # 'None': dtype torch.int32 != torch.int64".
         args = [str(value), str(dims.index("tile_r") - len(dims))]
         integer = value.dtype is not None and not value.dtype.is_floating_point
-        if fn in ("sum", "prod") and integer and acc.dtype != torch.int64:
-            args.append(f"dtype={acc.dtype}")
+        if fn in ("sum", "prod") and integer and dtype != torch.int64:
+            args.append(f"dtype={dtype}")
         part = f"torch.{fn}({', '.join(args)})"
         aligned = scope_shape(kept, self.outer_axes)
         if aligned != self.value_shape(kept):
             part = f"{part}.reshape([{', '.join(map(str, aligned))}])"
-        block = {
-            "sum": f"{acc} + {part}",
-            "prod": f"{acc} * {part}",
-            "max": f"torch.maximum({acc}, {part})",
-            "min": f"torch.minimum({acc}, {part})",
-        }[reduction_type]
-        self.compute.writeline(f"{acc} = {block}")
-        return acc
+        return part, aligned
+
+    def reduce_block_value(
+        self, fn: str, value: CSEVariable, dtype: torch.dtype
+    ) -> CSEVariable:
+        """reduce_block() as a value, for a combine written with V.ops."""
+        line, shape = self.reduce_block(fn, value, dtype)
+        return self.cse.generate(self.compute, line, dtype=dtype, shape=shape)
+
+    def arg_reduce(
+        self, reduction_type: str, value: CSEVariable, dtype: torch.dtype
+    ) -> CSEVariable:
+        """The first index of the max (argmax) or min (argmin) of x over tile_r,
+        as torch.argmax gives it: a NaN is both the max and the min. Each block
+        is reduced to its max and the smallest index that holds it, and folded
+        into the accumulators acc and acc_index as Triton's
+        max_with_first_index and maximum_with_index do, with V.ops.
+        torch.argmax(x, -1), with the locals each line comes from:
+            tmp1 = (tile_r.index).to(torch.int64)          # index
+            tmp2 = torch.amax(tmp0, -1)                    # block
+            ...
+            tmp6 = torch.logical_or(tmp4, tmp5)            # hit: x == block or isnan(x)
+            tmp7 = hl.full([], 9223372036854775807, dtype=torch.int64)
+            tmp8 = torch.where(tmp6, tmp1, tmp7)
+            tmp9 = torch.amin(tmp8, -1)                    # first
+            tmp10 = tmp2 > acc                             # larger
+            ...
+            tmp21 = torch.logical_or(tmp16, tmp20)         # take
+            tmp22 = torch.where(tmp21, tmp9, acc1)
+            tmp23 = torch.where(tmp21, tmp2, acc)
+            acc1 = tmp22
+            acc = tmp23
+        take is "larger, or equal at a smaller index". The tie makes the first
+        block of a row of -inf win: argmax is 0 there, not the initial index,
+        int64 max."""
+        ops = V.ops
+        index = ops.index_expr(self.symbols["r0_"], torch.int64)
+        largest = reduction_type.startswith("argmax")
+        acc = self.reduction_accumulator(reduction_type, dtype, dtype)
+        index_max = torch.iinfo(torch.int64).max
+        acc_index = self.accumulator(index_max, torch.int64)
+        block = self.reduce_block_value("amax" if largest else "amin", value, dtype)
+        hit = ops.eq(value, block)
+        floating = dtype.is_floating_point
+        if floating:
+            hit = ops.logical_or(hit, ops.isnan(value))
+        sentinel = ops.constant(index_max, torch.int64)
+        first = self.reduce_block_value(
+            "amin", ops.where(hit, index, sentinel), torch.int64
+        )
+        larger = ops.gt(block, acc) if largest else ops.lt(block, acc)
+        equal = ops.eq(block, acc)
+        if floating:
+            block_nan, acc_nan = ops.isnan(block), ops.isnan(acc)
+            larger = ops.logical_or(
+                larger, ops.logical_and(block_nan, ops.logical_not(acc_nan))
+            )
+            equal = ops.logical_or(equal, ops.logical_and(block_nan, acc_nan))
+        take = ops.logical_or(larger, ops.logical_and(equal, ops.lt(first, acc_index)))
+        new_index = ops.where(take, first, acc_index)
+        new_value = ops.where(take, block, acc)
+        self.compute.writeline(f"{acc_index} = {new_index}")
+        self.compute.writeline(f"{acc} = {new_value}")
+        return acc_index
