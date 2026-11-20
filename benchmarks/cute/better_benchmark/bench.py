@@ -67,6 +67,19 @@ even:
   batches too (``rotation_skip_reason``; the record's ``rotate_inputs`` says
   what was decided and why).
 
+The record says what ran right behind each Helion port's batch in the rounds
+of each order (``behind_helion``) and, with a warning, which Inductor
+compiles a listing puts there, or first in an order that a port ends
+(``carryover_risk``): on some ports the batch right behind a Helion port's
+reads up to a microsecond a call higher than behind anything else (README,
+Timers), and the listing of ``common.ALL_IMPLS`` keeps the oracle, the
+memcopy and the other port there.
+
+The record also holds the baseline two ways (``fastest_inductor``,
+``common.fastest_inductor``): the fastest of the Inductor compiles, which
+the reports divide by, and the same without what choosing among noisy
+readings takes off.
+
 The entries of the Inductor compiles name the config that each of
 their Triton kernels ended on (``inductor_configs``,
 ``common.inductor_kernel_configs``): coordinate descent tunes again in every
@@ -117,6 +130,21 @@ the job on its GPU are listed before and after the timing, and ``nvidia-smi
 pmon`` samples their SM utilization once a second through the whole run
 (``foreign_gpu_activity``; ``BB_FOREIGN_ACTIVITY=0`` turns it off), so a
 record tells a foreign job that computed from an idle resident process.
+
+The Inductor kernels are compiled by the Triton of the environment the
+bench runs in, and the record names it (``triton_backend``): the
+distribution, its version and commit, and the switches in effect, Meta's
+warp specialization in fbtriton (``TRITON_USE_META_WS``) and the Tile IR
+backend of the Triton-to-tile-IR fork (``ENABLE_TILE``). A bench of such a
+baseline never passes for one when it is not (the README's Other Triton
+builds): it ends before compiling when its switch cannot be in effect or
+its cache directories hold another build's kernels (``preflight``), and an
+Inductor compile whose launched binaries were not compiled by this Triton
+through the switch is an error (``common.artifact_issue``;
+``inductor_configs`` names each binary's ``artifact``). Where that is the
+default compile, the numerics gate has no anchor, as where that compile
+fails: no implementation is judged by another build's kernel, whether or
+where ``--impls`` lists ``inductor``.
 """
 
 from __future__ import annotations
@@ -352,6 +380,87 @@ def alternating_rounds(
     return runs
 
 
+def behind_helion(names: list[str]) -> dict[str, dict[str, str | None]]:
+    """What runs right behind each Helion port's batch in the rounds of each
+    order, for the implementations ``names`` in listing order:
+    ``{"forward": {port: follower}, "reverse": {...}}``, the follower None
+    where the port is the last of that order: the first implementation of
+    the order follows it there, at the start of the next sample, behind the
+    flush-only graph where the round times batches (ports whose fastest
+    implementation takes under 64 us a call; a longer port is timed replay
+    by replay, each behind a flush of its own, and has no such graph).
+
+    On some ports the batch right behind a Helion port's reads up to a
+    microsecond a call higher than behind any other implementation (README,
+    Timers), and the two orders give a port its two listing neighbours as
+    followers and no other."""
+    return {
+        label: {
+            name: order[place + 1] if place + 1 < len(order) else None
+            for place, name in enumerate(order)
+            if name.startswith("helion_")
+        }
+        for label, order in (("forward", names), ("reverse", names[::-1]))
+    }
+
+
+def carryover_risk(names: list[str]) -> list[str]:
+    """The Inductor compiles that ``names`` lists so that their batch is the
+    next one replayed after a Helion port's in some round: right behind it
+    (``behind_helion``), each as ``"<compile> behind <port> in <order>
+    rounds"``, or, where the port is the last of an order, as the first of
+    that order: ``"<compile> behind <port> at the start of the next sample
+    in <order> rounds"`` (with the flush-only graph of a batched round
+    between them, up to a quarter of what the port leaves was still read:
+    README, Timers). Their readings, and with them the
+    fastest Inductor compile's, can be high by what the port leaves behind.
+    ``common.ALL_IMPLS`` has the oracle between the compiles and the ports
+    and the memcopy last: no risk."""
+    orders = {"forward": names, "reverse": names[::-1]}
+    risks = []
+    for label, followers in behind_helion(names).items():
+        for port, follower in followers.items():
+            later = follower is None
+            if later:
+                # The last of an order: its first follows, a sample later.
+                follower = orders[label][0]
+            if follower in common.INDUCTOR_IMPLS:
+                when = "at the start of the next sample " if later else ""
+                risks.append(f"{follower} behind {port} {when}in {label} rounds")
+    return risks
+
+
+def timed_implementations(timings: dict[str, dict[str, Any]]) -> list[str]:
+    """The implementations that ``time_impls`` timed, in listing order:
+    those of ``timings`` without a ``timing_error``. The rounds are over
+    these alone, so they decide who runs behind whom (``note_carryover``),
+    and the rotating pass times the same."""
+    return [impl for impl, values in timings.items() if "timing_error" not in values]
+
+
+def note_carryover(record: dict[str, Any], timed: list[str]) -> None:
+    """Put into a bench ``record`` what ran right behind each Helion port in
+    the rounds over the implementations ``timed`` (``behind_helion``) and
+    which Inductor compiles that listing puts there (``carryover_risk``),
+    and warn of each of those on stderr: its reading, and with it the
+    fastest Inductor compile's, is not the one a listing with the oracle
+    between them gives."""
+    record["behind_helion"] = behind_helion(timed)
+    record["carryover_risk"] = carryover_risk(timed)
+    for risk in record["carryover_risk"]:
+        print(
+            f"[carryover] {risk}: a batch right behind a Helion port's can "
+            "read up to 1 us a call high (a quarter of that behind the "
+            "flush-only graph of a batched round), and the fastest Inductor "
+            "compile with it. "
+            "List the oracle between the Inductor compiles and the Helion "
+            "ports and the memcopy last, as common.ALL_IMPLS does (README, "
+            "Timers).",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def cold_fields(prefix: str, runs: list[float]) -> dict[str, Any]:
     """What a cold timer records of an implementation's rounds, for
     ``cold_us`` and ``rot_us`` alike: ``<prefix>_us``, the median over each
@@ -429,16 +538,17 @@ class Placement:
     in the records made before this).
 
     A small kernel's reading depends on where its inputs and outputs lie.
-    One CuTe config of var_mean_c3ea8f7ce5c6 (48 MB of traffic) read 11.05 to
-    12.07 us on six input sets of the same values in one process, each
-    timed after every other in turn, and Inductor's kernel 11.26 to 11.91 us
-    on its six, the same sets slow and fast for both. The allocation order
-    of a process is the same every time, so the same placement comes back
-    in every process and reads as an effect of the implementation's place
-    in ``--impls``: the CuTe port of that point read 11.47 us in 5 of 5
-    processes listed second and 10.66 to 11.26 us listed fourth. What ran
-    before a kernel is not it: the same graph took the same time after each
-    of the other implementations' (within 0.1 us).
+    One CuTe config of var_mean_c3ea8f7ce5c6 (48 MB of traffic) read
+    differently on six input sets of the same values in one process, each
+    timed after every other in turn, and so did Inductor's kernel on its
+    six, the same sets slow and fast for both. The allocation order of a
+    process is the same every time, so the same placement comes back in
+    every process and reads as an effect of the implementation's place in
+    ``--impls``: the CuTe port of that point read lower listed fourth than
+    listed second. What ran before a kernel was not it there: the same
+    graph took the same time after each of the other implementations' (with
+    the picks of that time; ``behind_helion`` says when it can be). The
+    readings are in README.md ("Baseline: several bench processes").
 
     ``shift`` releases the allocator's cached blocks and holds a block of a
     random number of 2 MiB pages, so the buffers allocated next come from
@@ -740,17 +850,45 @@ def rotate_inputs(
         print(f"[rotate-inputs] {decision['error']}", file=sys.stderr, flush=True)
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
-    shape = args.shape or common.default_shape(args.repro_id)
-    impls = [i for i in args.impls.split(",") if i]
-    record: dict[str, Any] = {
+def preflight(backend: dict[str, Any] | None) -> dict[str, str]:
+    """What a bench checks before it compiles anything, so that a run
+    started as a baseline (``TRITON_USE_META_WS=1`` under fbtriton,
+    ``ENABLE_TILE=1`` under the Triton-to-tile-IR fork) is never a stock
+    run in disguise: the switch can be in effect in the installed Triton
+    (``backend``: ``common.triton_backend``;
+    ``common.check_triton_switches``), and the cache directories are this
+    Triton build's and switch state's alone (``common.claim_caches``, whose
+    directories it returns). ``common.TritonSwitchError`` otherwise. Each
+    Inductor compile's launched kernels are held against the build once
+    they exist (``common.artifact_issue``, in ``run``)."""
+    common.check_triton_switches(backend)
+    return common.claim_caches(backend)
+
+
+def new_record(
+    args: argparse.Namespace, backend: dict[str, Any] | None
+) -> dict[str, Any]:
+    """A bench's record before anything ran, with the status of a bench
+    that did not finish: its point (the default shape where none was
+    given), the GPU, the versions, and the Triton build that compiles the
+    Inductor kernels with the switches in effect (``backend``: the
+    process's ``common.triton_backend``, which ``main`` asks once)."""
+    return {
         "repro": args.repro_id,
-        "shape": shape,
+        "shape": args.shape or common.default_shape(args.repro_id),
         "status": "error",
         "gpu": common.gpu_info(),
-        "versions": common.versions(),
+        "versions": common.versions(backend),
+        "triton_backend": backend,
         "impls": {},
     }
+
+
+def run(args: argparse.Namespace, backend: dict[str, Any] | None) -> dict[str, Any]:
+    """The bench's record (``new_record``, filled)."""
+    impls = [i for i in args.impls.split(",") if i]
+    record = new_record(args, backend)
+    shape = record["shape"]
     started = time.monotonic()
     seed = args.placement_seed
     if seed is None and not args.fixed_placement:
@@ -783,6 +921,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         rotating: dict[str, Rotating] = {}
         default_compile: Callable | None = None
         gate: common.AnchoredGate | None = None
+        # Whether the kernels that the default Inductor compile launches
+        # were held against this build (common.artifact_issue), and why it
+        # was refused if it was: a kernel of another build or switch state
+        # anchors no gate, so nothing is judged by it.
+        anchor_checked = False
+        refused_anchor: str | None = None
 
         def inductor_default() -> Callable:
             nonlocal default_compile
@@ -792,9 +936,41 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 )
             return default_compile
 
+        def launched_configs(call: Callable) -> list[dict[str, Any]]:
+            """The config each Triton kernel of an Inductor compile ended
+            on (``common.inductor_kernel_configs``), from a call of its own
+            once the compile has settled: the first call compiled, and
+            launched the variants a mix-order reduction's compile tries
+            its split sizes with."""
+            with common.inductor_kernels_launched() as launched, torch.no_grad():
+                call(inputs())
+            return common.inductor_kernel_configs(launched)
+
+        def check_anchor() -> None:
+            """Hold the default compile's kernels against this build before
+            the gate is anchored on it, where the listing has not done so:
+            it leaves ``inductor`` out, or has another implementation
+            before it."""
+            nonlocal anchor_checked, refused_anchor
+            if backend is not None:
+                compiled = inductor_default()
+                with torch.no_grad():
+                    compiled(*inputs())
+                refused_anchor = common.artifact_issue(
+                    backend, launched_configs(lambda inp: compiled(*inp))
+                )
+            anchor_checked = True
+
         def numerics_gate() -> common.AnchoredGate:
             """The gate, with the default Inductor compile as its baseline."""
             nonlocal gate
+            if not anchor_checked:
+                check_anchor()
+            if refused_anchor is not None:
+                raise common.TritonSwitchError(
+                    "the numerics gate has no anchor: the default Inductor "
+                    f"compile was refused ({refused_anchor})"
+                )
             if gate is None:
                 gate = common.AnchoredGate(
                     args.repro_id, shape, instance, inductor_default()
@@ -853,17 +1029,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if impl in common.INDUCTOR_IMPLS:
                     # The config each of the compile's Triton kernels ended
                     # on: coordinate descent tunes again in every process,
-                    # and its pick moves a reading (README, Baseline). From
-                    # a call of its own, now that the compile has settled:
-                    # the first call compiled, and launched the variants a
-                    # mix-order reduction's compile tries its split sizes
-                    # with.
-                    with (
-                        common.inductor_kernels_launched() as launched,
-                        torch.no_grad(),
-                    ):
-                        call(inputs())
-                    info["inductor_configs"] = common.inductor_kernel_configs(launched)
+                    # and its pick moves a reading (README, Baseline).
+                    info["inductor_configs"] = launched_configs(call)
+                    # A cached kernel of another Triton build or switch
+                    # state is not this run's: an error, not a timing.
+                    issue = common.artifact_issue(backend, info["inductor_configs"])
+                    if impl == "inductor":
+                        # The gate's anchor, held here where it is listed
+                        # before whatever the gate judges.
+                        anchor_checked, refused_anchor = True, issue
+                    if issue is not None:
+                        raise common.TritonSwitchError(issue)
                 info["errors_vs_eager"] = common.output_errors(actual, expected)
                 # Every element of every output must be the replay's own: an
                 # implementation that left some unwritten is not timed.
@@ -940,18 +1116,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     us = values.get(key)
                     if us and us > 0:
                         info[key.replace("_us", "_gbps")] = total_bytes / us / 1e3
+        # The rounds were over these: what ran right behind each Helion
+        # port among them (README, Timers), and what the rotating pass times.
+        timed = timed_implementations(timings)
+        note_carryover(record, timed)
         if args.rotate_inputs:
             # After the other timers, which thus run as they do without it.
             rotate_inputs(
-                args,
-                record,
-                {
-                    impl: rotating[impl]
-                    for impl, values in timings.items()
-                    if "timing_error" not in values
-                },
-                input_bytes,
+                args, record, {impl: rotating[impl] for impl in timed}, input_bytes
             )
+        # The baseline two ways: the fastest Inductor compile, and the same
+        # without the selection among noisy readings (rot_us included).
+        record["fastest_inductor"] = common.fastest_inductor(record["impls"])
         record["temperature_after_c"] = common.gpu_temperature()
         record["foreign_gpu_processes_after"] = common.foreign_gpu_processes()
         record["status"] = "ok"
@@ -1026,11 +1202,23 @@ def main() -> None:
         )
     if args.rotate_max_l2 <= 0:
         parser.error(f"--rotate-max-l2 {args.rotate_max_l2}: a positive factor")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Asked once: it lists every installed distribution.
+    backend = common.triton_backend()
+    try:
+        caches = preflight(backend)
+    except common.TritonSwitchError as error:
+        # Before anything compiles: the record says why there are no timings.
+        record = new_record(args, backend)
+        record["error"] = f"TritonSwitchError: {error}"
+        common.write_json(args.output, record)
+        print(record["error"], file=sys.stderr)
+        sys.exit(1)
     activity: dict[str, Any] = {}
     with common.watch_foreign_gpu_activity(activity):
-        record = run(args)
+        record = run(args, backend)
     record.update(activity)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    record["cache_directories"] = caches
     common.write_json(args.output, record)
     summary = {
         impl: (

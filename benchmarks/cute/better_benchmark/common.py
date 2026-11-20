@@ -23,11 +23,13 @@ when the checkout is elsewhere.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import csv
 import functools
 import gc
 import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import math
@@ -221,6 +223,18 @@ def aggregate_bench_records(
       when any process says so: a result that one of several processes does
       not reproduce is not a result.
 
+    The aggregate also keeps what ran right behind each Helion port in
+    each counted process's rounds (``behind_helion_per_process``: each
+    process's ``behind_helion``, None for a record made before ``bench.py``
+    noted it) and the Inductor compiles that any of them timed there
+    (``carryover_risk``), where a process's record has them.
+
+    It holds each counted process's baseline two ways as well
+    (``fastest_inductor_per_process``: each ``fastest_inductor`` of that
+    process's record, None where it has none): the fastest Inductor
+    compile's timing, and the same without what choosing among noisy
+    readings takes off.
+
     ``report.py`` takes the ratio of two implementations from
     ``per_process``: the ratio in each process (the fastest of the
     Inductor compiles of that process over the port's time in the same
@@ -247,7 +261,15 @@ def aggregate_bench_records(
     first = records[0]
     out: dict[str, Any] = {
         key: first[key]
-        for key in ("repro", "shape", "gpu", "versions", "outputs", "total_bytes")
+        for key in (
+            "repro",
+            "shape",
+            "gpu",
+            "versions",
+            "triton_backend",
+            "outputs",
+            "total_bytes",
+        )
         if key in first
     }
     out["status"] = "ok"
@@ -329,6 +351,11 @@ def aggregate_bench_records(
                 info[verdict] = _all_or_any_false(values)
         impls[impl] = info
     out["impls"] = impls
+    # Each counted process's baseline two ways (fastest_inductor), from the
+    # rounds its own record holds.
+    out["fastest_inductor_per_process"] = [
+        fastest_inductor(record["impls"]) for record in records
+    ]
     out["foreign_gpu_activity"] = _merged_activity(records)
     for key in ("foreign_gpu_processes_before", "foreign_gpu_processes_after"):
         # None in a process: nvidia-smi could not tell.
@@ -342,6 +369,21 @@ def aggregate_bench_records(
         out[key] = None if listed is None else sorted(listed)
     if "rotate_inputs" in first:
         out["rotate_inputs"] = first["rotate_inputs"]
+    # What ran right behind a Helion port in each counted process's rounds
+    # (bench.py's behind_helion: an implementation that one process could
+    # not time is in none of that process's rounds; None for a record made
+    # before the field), and every Inductor compile that one of them timed
+    # there.
+    followers = [record.get("behind_helion") for record in records]
+    if any(found is not None for found in followers):
+        out["behind_helion_per_process"] = followers
+        out["carryover_risk"] = list(
+            dict.fromkeys(
+                risk
+                for record in records
+                for risk in record.get("carryover_risk") or []
+            )
+        )
     out["wall_s"] = round(sum(record.get("wall_s") or 0.0 for record in records), 1)
     return out
 
@@ -538,10 +580,26 @@ def inductor_kernel_configs(launched: Sequence[Any]) -> list[dict[str, Any]]:
     coordinate descent found it, the split size the kernel was generated
     for (``rsplit_size``, mix-order reductions only) and the registers,
     spills and shared memory of the compiled kernel. A kernel that holds
-    another number of launchers than one lists them all (``launchers``)."""
+    another number of launchers than one lists them all (``launchers``).
+    ``artifact`` is what Triton's cache holds of the binary that the
+    launcher launches (``compiled_artifact``): the backend it was compiled
+    for, the Triton that compiled it and the switch it was compiled under.
+    ``cache_hash`` is that binary's name in the cache: Triton's hash of
+    what it compiled (the kernel's source, signature and constants, the
+    compile options, the Triton build), the same in every process for the
+    same code (the cubin's bytes are not: they hold the path of the
+    kernel's source in the process's Inductor cache). It tells apart two
+    binaries that agree in all the rest (``fastest_inductor``).
+    ``backend_hash`` is the Triton build and backend that the kernel was
+    generated for, as Inductor writes it into every kernel's source
+    (``inductor_backend_hash``; None from an Inductor that does not), so a
+    kernel that came back from Inductor's FX-graph cache names the build of
+    the run that filled it. ``artifact_issue`` holds both against the
+    process's Triton build."""
     kernels = []
     for kernel in launched:
         meta = kernel.inductor_meta
+        device = kernel.triton_meta.get("device", 0)
         configs = [
             {
                 "block_sizes": dict(launcher.config.kwargs),
@@ -553,12 +611,15 @@ def inductor_kernel_configs(launched: Sequence[Any]) -> list[dict[str, Any]]:
                 "n_regs": launcher.n_regs,
                 "n_spills": launcher.n_spills,
                 "shared": launcher.shared,
+                "artifact": compiled_artifact(device, launcher.cache_hash),
+                "cache_hash": launcher.cache_hash,
             }
             for launcher in kernel.launchers
         ]
         entry: dict[str, Any] = {
             "name": meta.get("kernel_name", kernel.fn.__name__),
             "grid_type": meta.get("grid_type"),
+            "backend_hash": meta.get("backend_hash"),
         }
         if meta.get("RSPLIT_SIZE") is not None:
             entry["rsplit_size"] = meta["RSPLIT_SIZE"]
@@ -568,6 +629,59 @@ def inductor_kernel_configs(launched: Sequence[Any]) -> list[dict[str, Any]]:
             entry["launchers"] = configs
         kernels.append(entry)
     return kernels
+
+
+def inductor_backend_hash() -> str:
+    """Inductor's name for the Triton build and backend of this process
+    (``torch.utils._triton.triton_hash_with_backend``): a hash of Triton's
+    own key, which covers the files of the installed package, and of the
+    backend's (its assembler; the Tile IR fork's backend under
+    ``ENABLE_TILE=1``). Inductor writes it into the source of every kernel
+    it generates (``inductor_meta``; ``inductor_kernel_configs`` records
+    it), and it tells builds apart that ``triton.__version__`` does not:
+    stock Triton 3.9.0 and the Tile IR fork's main both say 3.9.0, and
+    the metadata Triton keeps of a compiled kernel names no other version.
+    It asks the active driver for its target, so it needs the device."""
+    import torch.utils._triton
+
+    return torch.utils._triton.triton_hash_with_backend()
+
+
+def compiled_artifact(device: int, cache_hash: str) -> dict[str, Any] | None:
+    """What Triton's cache holds of the compiled kernel that one of
+    Inductor's launchers launches (its ``cache_hash``, the entry's directory
+    in the Triton cache of ``device``): the ``backend`` the kernel was
+    compiled for (``cuda``, or ``tileir`` under the Tile IR fork's
+    ``ENABLE_TILE=1``), the ``triton_version`` that compiled it, the value
+    of ``TRITON_USE_META_WS`` it was compiled under (``meta_ws``; Triton
+    writes its cache-invalidating variables into the kernel's metadata, so
+    None means the variable was unset) and the ``kinds`` of files beside it
+    (a Tile IR kernel has ``tileir`` and no ``ptx``). None when the cache
+    holds no such entry.
+
+    Read from the cache and not from the process's own compiles: Inductor
+    compiles in worker processes and takes their kernels by cubin path, and
+    a hit in its FX-graph cache hands back the files of the run that filled
+    it. Either way the entry is what the launcher launches."""
+    from torch._inductor.runtime.cache_dir_utils import triton_cache_dir
+
+    directory = Path(triton_cache_dir(device)) / cache_hash
+    metadata = [
+        path for path in directory.glob("*.json") if not path.name.startswith("__grp__")
+    ]
+    if len(metadata) != 1:
+        return None
+    found = json.loads(metadata[0].read_text())
+    return {
+        "backend": found["target"]["backend"],
+        "triton_version": found.get("triton_version"),
+        "meta_ws": found.get("TRITON_USE_META_WS"),
+        "kinds": sorted(
+            path.suffix[1:]
+            for path in directory.iterdir()
+            if path.stem == metadata[0].stem and path.suffix != ".json"
+        ),
+    }
 
 
 def load_oracle(repro_id: str, inputs: list[Any]) -> Callable[[list[Any]], Any]:
@@ -788,14 +902,22 @@ def per_kernel(kernels: dict[str, dict[str, Any]], field: str) -> dict[str, Any]
 
 def timed_record_fields(tuned: dict[str, Any]) -> dict[str, Any]:
     """The fields with which a bench record names the autotune record
-    ``tuned`` that a port's timing pinned: its kernels' code digests and
-    whether it was provisional or reused.  An autotune that runs after the
+    ``tuned`` that a port's timing pinned: its kernels' code digests,
+    whether it was provisional or reused, and the regime its searches timed
+    their candidates in (the record's, and each kernel's where the record
+    says).  An autotune that runs after the
     bench replaces the record, and ``report.py`` counts the timing only while
     the record holds the same kernels."""
     return {
         "autotune_code_sha256": per_kernel(tuned["kernels"], "code_sha256"),
         "autotune_provisional": bool(tuned.get("provisional")),
         "autotune_reused_from": tuned.get("reused_from"),
+        # How the record's searches timed their candidates (``REGIMES``),
+        # and each kernel's own regime where the record says.
+        "autotune_regime": record_regime(tuned),
+        "autotune_regimes": {
+            name: entry["regime"] for name, entry in tuned.get("regimes", {}).items()
+        },
     }
 
 
@@ -851,6 +973,156 @@ def _bound_kernel(name: str, kernel: Any) -> Any:
             "different configs; give each call site its own kernel"
         )
     return bounds[0]
+
+
+# How ``autotune.py`` times the candidates of a port's kernels (its
+# ``--regime``, the autotune record's ``regime``). ``port``: a kernel that
+# runs behind earlier kernel calls of its port is timed behind them, each at
+# the config it runs with, on the port's own tensors
+# (``kernels_in_sequence``); the port's first kernel is timed alone, which
+# is how the port runs it. ``alone``: every kernel is timed alone after an
+# L2 flush, as every record made before the regime existed was.
+REGIMES = ("port", "alone")
+
+
+def default_regime(backend: str) -> str:
+    """The regime ``autotune.py`` tunes a backend's ports in when none is
+    named: ``port`` for the CuTe backend, ``alone`` for the others. The port
+    regime was measured on CuTe ports only. A CuTe search reads a short
+    kernel's candidates from the CUDA activity trace; a Triton search reads
+    every candidate between two CUDA events, which behind earlier kernels
+    is a coarse reading of a short kernel (a 6 us max pool read 18 to 19 us
+    in 2 us steps, rank correlation -0.12 with the port), and no Triton port
+    was measured. ``--regime`` names one regime for both backends."""
+    return "port" if backend == "cute" else "alone"
+
+
+def record_regime(record: dict[str, Any]) -> str:
+    """The regime an autotune record's searches ran in: its ``regime``, and
+    ``alone`` for a record made before ``autotune.py`` named one."""
+    return record.get("regime", "alone")
+
+
+# The kernel call a port's ``forward`` is in, inside ``kernels_in_sequence``:
+# the kernel's name in the port, the regime the call is treated in, and how
+# many kernel calls ran before it. A search started inside the call is that
+# call's (``autotune.run`` notes it with the search's metrics): the port's
+# name for a kernel is not the search's (``Kernel.name`` is its function's,
+# which several kernels of a port may share), and a kernel may search at
+# more than one call.
+searching_call: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "better_benchmark_searching_call", default=None
+)
+
+
+@contextlib.contextmanager
+def kernels_in_sequence(
+    module: types.ModuleType,
+    regime: str,
+    regimes: dict[str, dict[str, Any]],
+    alone_reason: str = "--regime alone",
+) -> Iterator[None]:
+    """Run a port's ``forward`` with its kernels followed as a sequence, so
+    a search that starts inside (a kernel's first call) times its candidates
+    the way the port runs the kernel.
+
+    A port launches its kernels one behind the other, and the bench flushes
+    L2 once, before the port. Only the first kernel then meets what a search
+    of a kernel alone times (flush, then the kernel): every later kernel
+    finds its operands as the earlier kernels left them, in L2 where they
+    fit and their tail where they do not, and the two states can rank a
+    kernel's tiles and layouts in opposite orders. Under the regime ``port``
+    every kernel call that follows another is therefore given the calls
+    before it as its prelude (``helion.autotuner.benchmark_prelude``, an
+    internal entry point of the autotuner): the benchmark worker runs them,
+    at the configs they run with and on the port's own tensors, between the
+    L2 flush and each timed call, and hands the candidate what they
+    produced. The timed quantity is still the kernel's own time. Every
+    earlier call is replayed, whether or not it feeds the kernel: what it
+    read and wrote is in L2 too. Only kernel calls are replayed: a tensor
+    that host code makes between two kernels (the ``torch.sort`` of
+    pointwise_59acdb823e92) is a constant of the prelude, which the later
+    kernel reads flushed, as it would tuned alone. Under ``alone`` no call
+    gets a prelude and nothing of a call is kept: the kernels run and
+    search exactly as outside the block, and only their names are noted,
+    with ``alone_reason`` (who chose the regime: the flag, or the backend's
+    default) as the reason of every call after the first.
+
+    The module's kernels are replaced by wrappers for the duration of the
+    block and are the kernels again after it, so the records and the pin
+    check read them as before. ``regimes`` receives, per kernel, how its
+    first call (the one that searches) was treated: ``regime`` (``port`` or
+    ``alone``), ``reason``, and ``behind``, the kernels launched before it,
+    one name per call. A call that reads an earlier output as another dtype
+    has no prelude, and neither has any call after it (``KernelSequence``):
+    those kernels are tuned alone, with that reason. During every call
+    ``searching_call`` names it, for the search it may start.
+    """
+    from helion.autotuner.benchmark_prelude import KernelSequence
+    from helion.autotuner.benchmark_prelude import PreludeUnsupported
+    from helion.autotuner.benchmark_prelude import timed_behind
+
+    if regime not in REGIMES:
+        raise ValueError(f"regime {regime!r}: one of {REGIMES}")
+    kernels = port_kernels(module)
+    sequence = KernelSequence()
+    launched: list[str] = []
+
+    @contextlib.contextmanager
+    def in_call(name: str, entry: dict[str, Any]) -> Iterator[None]:
+        token = searching_call.set(
+            {"kernel": name, "regime": entry["regime"], "behind": len(launched)}
+        )
+        try:
+            yield
+        finally:
+            searching_call.reset(token)
+
+    def in_sequence(name: str, kernel: Any) -> Callable[..., Any]:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            entry: dict[str, Any] = {"regime": "alone", "behind": list(launched)}
+            prelude = None
+            # Only the port regime asks anything of the kernel or keeps
+            # anything of a call (what the compiled function takes:
+            # positional, defaults filled).
+            call_args = (
+                kernel.normalize_args(*args, **kwargs) if regime == "port" else ()
+            )
+            if not launched:
+                entry["reason"] = "the port's first kernel call: nothing runs before it"
+            elif regime == "alone":
+                entry["reason"] = alone_reason
+            else:
+                try:
+                    prelude = sequence.prelude(call_args)
+                except PreludeUnsupported as error:
+                    entry["reason"] = f"no prelude: {error}"
+                else:
+                    entry["regime"] = "port"
+                    entry["reason"] = (
+                        f"runs behind {len(launched)} earlier kernel call(s) of "
+                        "the port"
+                    )
+            regimes.setdefault(name, entry)
+            # (without a prelude ``timed_behind`` names nothing)
+            with in_call(name, entry), timed_behind(prelude):
+                output = kernel(*args, **kwargs)
+            if regime == "port":
+                # the compiled function of the config the call ran with
+                compiled = kernel.bind(call_args).compile_config(allow_print=False)
+                sequence.record(compiled, call_args, output)
+            launched.append(name)
+            return output
+
+        return call
+
+    for name, kernel in kernels.items():
+        setattr(module, name, in_sequence(name, kernel))
+    try:
+        yield
+    finally:
+        for name, kernel in kernels.items():
+            setattr(module, name, kernel)
 
 
 def generated_code(bound: Any) -> str:
@@ -910,6 +1182,162 @@ def order_balanced(
         statistic(list(rounds[start::2])) for start in (0, 1) if rounds[start::2]
     ]
     return sum(per_order) / len(per_order), per_order
+
+
+def ran_and_passed(info: dict[str, Any]) -> bool:
+    """Whether an implementation of a bench record ran and passed the
+    numerics gate: what its timing needs first to enter a comparison
+    (``report.usable``) or a baseline (``fastest_inductor``)."""
+    return info.get("status") == "ok" and info.get("numerics_pass") is not False
+
+
+def is_timing(value: object) -> bool:
+    """Whether ``value`` is a usable timing: a finite, positive number (a
+    median of flush-subtracted samples none of which stayed positive is
+    infinite)."""
+    return isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+
+
+# The timers that ``fastest_inductor`` takes a de-biased baseline of: those
+# whose value is the median over each order's rounds (``order_balanced``).
+# ``bb_us`` is a minimum over every replay of every round by design, and a
+# choice on other rounds would make it something else.
+DEBIASED_TIMERS = ("cold", "rot")
+
+
+def debiased_fastest(candidates: Sequence[Sequence[float]]) -> float:
+    """The time of the fastest of ``candidates``, each given by its readings
+    round by round (forward order in even rounds, reverse order in odd
+    ones), without the bias of choosing and timing on the same readings.
+
+    The minimum of several noisy readings reads low: of three compiles of
+    one code it is the luckiest reading, 1.5% under their mean for ports
+    under 20 us (``fastest_inductor``). Here every pair of rounds (a forward
+    and a reverse one) takes its readings from the candidate that the OTHER
+    rounds read fastest (by ``order_balanced``'s median: without a pair the
+    rounds still alternate), and the result is that same statistic of the
+    readings so chosen. With one candidate, or with rounds for a single
+    pair, nothing can be chosen on other rounds: the result is the fastest
+    candidate's own value.
+
+    That takes off what the rounds' noise adds to a minimum, not a
+    candidate's luck that holds through every round of a process (where its
+    buffers lie moves a small kernel's reading by 2 to 4%): one compile
+    timed in three slots of 15 processes and passed here as three
+    candidates read 0.56% under their pooled readings, where the minimum of
+    the three read 0.79% under (``fastest_inductor`` pools what it knows to
+    be one code)."""
+
+    def value(readings: Sequence[float]) -> float:
+        return order_balanced(readings, statistics.median)[0]
+
+    count = len(candidates[0])
+    if len(candidates) == 1 or count <= 2:
+        return min(value(readings) for readings in candidates)
+    chosen: list[float] = []
+    for start in range(0, count, 2):
+        fastest = min(
+            candidates,
+            key=lambda readings: value([*readings[:start], *readings[start + 2 :]]),
+        )
+        chosen += fastest[start : start + 2]
+    return value(chosen)
+
+
+def fastest_inductor(impls: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    """The baseline of one bench process two ways, from its implementations'
+    entries (``impls``): for each cold timer (``cold_us``, ``rot_us``:
+    ``DEBIASED_TIMERS``) the ``headline``, the fastest of the usable
+    Inductor compiles (``INDUCTOR_IMPLS``; what ``report.py`` divides by,
+    by the rule it uses: those that ran and passed the gate,
+    ``ran_and_passed``, with a finite, positive timing, ``is_timing``),
+    and ``debiased``, the same without what the choice among noisy readings
+    takes off.
+
+    The headline is a minimum of up to three readings, and it reads low
+    where the compiles are close: over the processes of one campaign whose
+    three compiles ended on the same kernel configs, it read 1.5% under the
+    mean of the three for ports under 20 us (19 of 48 processes), 0.3% for
+    larger ones. The de-biased figure pools the compiles that ended on the
+    same code, round by round (``same_code``: the same kernels by name with
+    the same block sizes, warps, stages, registers, spills and shared
+    memory, whoever found the config, and the same binaries by Triton's
+    hash, ``cache_hash``; a record made before its entries named the hash
+    is compared by the rest alone), and chooses among the distinct ones
+    on other rounds than it times (``debiased_fastest``). Against the same
+    compile in a fourth slot of the process (15 processes of three ports of
+    7 to 12 us) the minimum of three slots read 0.60% +- 0.33 low and the
+    pooled three 0.19% +- 0.34 high: the pooling is what removes the bias,
+    and distinct compiles that happen to be equally fast keep most of it
+    (``debiased_fastest``). It stands beside the headline; which of the two
+    defines a goal is for the reader of the report to say.
+
+    None when no compile is usable, and when one of them does not name its
+    kernels' configs (``inductor_configs``: missing in a record made before
+    ``bench.py`` noted them, empty for a compile that launches no Triton
+    kernel): which compiles are one code is then unknown, and without the
+    pooling the figure would keep most of the bias under a name that says
+    otherwise. A timer has no figure where no compile has it, and
+    where its value is not the order-balanced median of its rounds (a
+    record made before that rule holds no ``<timer>_order_medians_us``; its
+    ``cold_us`` is the median of five rounds, another statistic than this
+    figure's, until ``report.py --rebalance`` recomputes it)."""
+    usable = {
+        impl: info
+        for impl in INDUCTOR_IMPLS
+        if (info := impls.get(impl)) and ran_and_passed(info)
+    }
+    if not usable or not all(info.get("inductor_configs") for info in usable.values()):
+        return None
+    code = {
+        impl: json.dumps(
+            [
+                {k: v for k, v in kernel.items() if k != "found_by_coordesc"}
+                for kernel in info["inductor_configs"]
+            ],
+            sort_keys=True,
+        )
+        for impl, info in usable.items()
+    }
+
+    def same_code(compiles: Sequence[str]) -> list[list[str]]:
+        groups: dict[str, list[str]] = {}
+        for impl in compiles:
+            groups.setdefault(code[impl], []).append(impl)
+        return list(groups.values())
+
+    out: dict[str, Any] = {"same_code": same_code(list(usable))}
+    for timer in DEBIASED_TIMERS:
+        metric, rounds = f"{timer}_us", f"{timer}_runs_us"
+        # The compiles that the headline is the fastest of (report.py's
+        # impl_time), where the record holds their rounds and took the
+        # timing from them as this figure is taken.
+        timed = {
+            impl: info for impl, info in usable.items() if is_timing(info.get(metric))
+        }
+        if not timed or not all(
+            info.get(rounds) and f"{timer}_order_medians_us" in info
+            for info in timed.values()
+        ):
+            continue
+        if len({len(info[rounds]) for info in timed.values()}) != 1:
+            continue
+        pooled = [
+            [
+                sum(readings) / len(readings)
+                for readings in zip(
+                    *(timed[impl][rounds] for impl in members), strict=True
+                )
+            ]
+            for members in same_code(list(timed))
+        ]
+        debiased = debiased_fastest(pooled)
+        if is_timing(debiased):
+            out[metric] = {
+                "headline": min(info[metric] for info in timed.values()),
+                "debiased": debiased,
+            }
+    return out
 
 
 def capture_graph(fn: Callable[[], Any]) -> tuple[Any, Any]:
@@ -2351,9 +2779,10 @@ def git_revision(path: Path) -> str | None:
     return f"{rev}{'-dirty' if dirty else ''}"
 
 
-def versions() -> dict[str, Any]:
-    import importlib.metadata
-
+def versions(triton: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The versions a record names. ``triton``: the process's
+    ``triton_backend`` where the caller has asked for it already
+    (``bench.py`` asks once for all it records); asked here otherwise."""
     import torch
 
     out: dict[str, Any] = {
@@ -2364,9 +2793,486 @@ def versions() -> dict[str, Any]:
         "helion_git": git_revision(REPO_ROOT),
         "better_benchmark_git": git_revision(BB_ROOT),
     }
-    for package in ("triton", "nvidia-cutlass-dsl"):
-        try:
-            out[package] = importlib.metadata.version(package)
-        except importlib.metadata.PackageNotFoundError:
-            out[package] = None
+    # The distribution that provides the ``triton`` package is not always
+    # named triton (fbtriton, triton-tileir): ``triton_backend`` finds it.
+    backend = triton or triton_backend()
+    out["triton"] = None if backend is None else backend["distribution_version"]
+    try:
+        out["nvidia-cutlass-dsl"] = importlib.metadata.version("nvidia-cutlass-dsl")
+    except importlib.metadata.PackageNotFoundError:
+        out["nvidia-cutlass-dsl"] = None
     return out
+
+
+# The environment variables that switch a Triton build onto another compiler
+# path for the same Inductor kernels: Meta's warp specialization in fbtriton
+# (https://github.com/facebookexperimental/triton) and the Tile IR backend
+# of the Triton-to-tile-IR fork (https://github.com/triton-lang/Triton-to-tile-IR).
+TRITON_SWITCHES = ("TRITON_USE_META_WS", "ENABLE_TILE")
+# What a cache directory of a switched run holds beside its entries
+# (``claim_caches``): the ``triton_identity`` of the runs that filled it.
+CACHE_STAMP = "bb_triton_backend.json"
+
+
+class TritonSwitchError(RuntimeError):
+    """A switch of ``TRITON_SWITCHES`` is set and cannot be in effect, or a
+    kernel was not compiled through it: the run would pass for a baseline
+    it is not."""
+
+
+def _switch_requested(name: str) -> bool:
+    """Whether the environment asks for the switch ``name``: set to
+    anything but a spelling of off."""
+    return _is_on(os.environ.get(name))
+
+
+def _holds_installed_triton(distribution: str) -> bool:
+    """Whether the installed ``triton`` package is this distribution's
+    files: its record of Triton's compiled library (``libtriton.so``) has
+    the size of the file that is there. Several distributions can claim
+    the package, each installed over the last (fbtriton, or a fork under a
+    name of its own, over the ``triton`` that torch requires); the files
+    are those of the one installed last. False where the distribution
+    records no size of the library."""
+    for path in importlib.metadata.files(distribution) or ():
+        if path.name == "libtriton.so" and path.size is not None:
+            library = Path(str(path.locate()))
+            return library.is_file() and library.stat().st_size == path.size
+    return False
+
+
+def triton_backend() -> dict[str, Any] | None:
+    """Which Triton build compiles the Inductor kernels of this process,
+    and through which path; None where no Triton is installed.
+
+    - ``distribution`` and ``distribution_version``: the installed
+      distribution that provides the ``triton`` package (``triton``,
+      ``fbtriton``, the Tile IR fork's ``triton`` or ``triton_tileir``);
+      where several claim it (fbtriton or the fork installed over torch's
+      ``triton``), the one whose files are installed
+      (``_holds_installed_triton``), else the one whose version
+      ``triton.__version__`` continues, and ``distributions`` names them
+      all. ``version`` is ``triton.__version__`` and ``commit`` the git
+      revision either names.
+    - ``switches``: the values of ``TRITON_SWITCHES`` in the environment,
+      and what the build makes of them: ``meta_ws`` (fbtriton's
+      ``knobs.nvidia.use_meta_ws``; False for a build without the knob)
+      and ``tile`` (the fork reads ``ENABLE_TILE=1``, and on its main
+      ``TRITON_DEFAULT_BACKEND`` first; False for a build without a Tile IR
+      backend). ``tileiras`` is the assembler the fork resolved, or
+      ``tileiras_error`` why it found none.
+    - ``environment``: the other variables the Triton builds and Inductor
+      read that are set (``TRITON_*``, ``TILEIR_*``, ``TILE_IR_*``,
+      ``TORCHINDUCTOR_*``; not the cache directories), and
+      ``static_cuda_launcher``, whether Inductor launches the kernels
+      itself: under the fork's ``ENABLE_TILE=1`` (its main as its older
+      pin) a current Inductor compiles them only with
+      ``TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER=0``.
+    - ``name``: ``stock``, ``fbtriton``, ``fbtriton+meta_ws``, ``tileir`` or
+      ``tileir-fork-ptx`` (the fork with its switch off).
+
+    ``check_triton_switches`` holds the switches against it."""
+    if importlib.util.find_spec("triton") is None:
+        return None
+    import torch._inductor.config
+    import triton
+
+    owners = importlib.metadata.packages_distributions().get("triton") or []
+    found = {name: importlib.metadata.version(name) for name in dict.fromkeys(owners)}
+    # Of several owners, the one whose files are installed: the versions do
+    # not always tell (stock Triton and a fork on the same base both make
+    # triton.__version__ the base's, with the commit in the distribution's
+    # version only). Where no record tells, the one whose version
+    # triton.__version__ continues (fbtriton's, with its commit appended),
+    # else the longest version it starts.
+    distribution = max(
+        found,
+        key=lambda name: (
+            len(found) > 1 and _holds_installed_triton(name),
+            triton.__version__.startswith(found[name]),
+            len(os.path.commonprefix([found[name], triton.__version__])),
+        ),
+        default=None,
+    )
+    distribution_version = None if distribution is None else found[distribution]
+    commit = re.search(
+        r"git([0-9a-f]{7,40})", f"{triton.__version__} {distribution_version}"
+    )
+    fork = importlib.util.find_spec("triton.backends.tileir") is not None
+    tile = False
+    tileiras = tileiras_error = None
+    if fork:
+        enabled = getattr(
+            sys.modules["triton.runtime.driver"], "_is_tileir_enabled", None
+        )
+        tile = (
+            os.environ.get("ENABLE_TILE", "0") == "1" if enabled is None else enabled()
+        )
+        # The fork's module: stock Triton has none.
+        from triton.backends.tileir.conf import (  # pyrefly: ignore [missing-import]
+            TileIREnvConf,
+        )
+
+        try:
+            tileiras = TileIREnvConf.get_tileiras_path()
+        except RuntimeError as error:
+            # The fork's "tileiras not found": check_triton_switches says so
+            # where Tile IR is in effect.
+            tileiras_error = str(error)
+    # The knob reads the environment at every access: None without it.
+    knob = getattr(triton.knobs.nvidia, "use_meta_ws", None)
+    has_meta_ws = knob is not None
+    meta_ws = bool(knob)
+    if fork:
+        name = "tileir" if tile else "tileir-fork-ptx"
+    elif has_meta_ws:
+        name = "fbtriton+meta_ws" if meta_ws else "fbtriton"
+    else:
+        name = "stock"
+    return {
+        "name": name,
+        "distribution": distribution,
+        "distribution_version": distribution_version,
+        "distributions": found,
+        "version": triton.__version__,
+        "commit": None if commit is None else commit.group(1),
+        "backends": sorted(triton.backends.backends),
+        "switches": {name: os.environ.get(name) for name in TRITON_SWITCHES},
+        "has_meta_ws": has_meta_ws,
+        "meta_ws": meta_ws,
+        "has_tileir": fork,
+        "tile": tile,
+        "tileiras": tileiras,
+        "tileiras_error": tileiras_error,
+        "environment": {
+            name: os.environ[name]
+            for name in sorted(os.environ)
+            if name.startswith(("TRITON_", "TILEIR_", "TILE_IR_", "TORCHINDUCTOR_"))
+            and name not in TRITON_SWITCHES
+            and not name.endswith("_CACHE_DIR")
+        },
+        "static_cuda_launcher": bool(torch._inductor.config.use_static_cuda_launcher),
+    }
+
+
+def triton_identity(backend: dict[str, Any] | None) -> dict[str, Any] | None:
+    """What of ``triton_backend`` decides the code a kernel compiles to: two
+    processes with the same identity may share a cache directory and a run
+    directory, two with different ones may not."""
+    if backend is None:
+        return None
+    return {
+        key: backend[key]
+        for key in (
+            "name",
+            "distribution",
+            "distribution_version",
+            "version",
+            "switches",
+            "meta_ws",
+            "tile",
+            "environment",
+            "static_cuda_launcher",
+        )
+    }
+
+
+def triton_label(backend: dict[str, Any]) -> str:
+    """A Triton build and its switches (``triton_backend``, or its
+    ``triton_identity``) on a line, for the reports and the guards'
+    errors; an empty identity is an environment without a Triton."""
+    if not backend:
+        return "no Triton"
+    switches = ", ".join(
+        f"{name}={value}"
+        for name, value in backend["switches"].items()
+        if value is not None
+    )
+    return (
+        f"{backend['name']}: {backend['distribution']} "
+        f"{backend['distribution_version']}"
+        + (f", {switches}" if switches else "")
+        + ("" if backend["static_cuda_launcher"] else ", Inductor's launcher off")
+    )
+
+
+def check_triton_switches(backend: dict[str, Any] | None) -> None:
+    """Raise ``TritonSwitchError`` when the environment asks for a switch of
+    ``TRITON_SWITCHES`` that the installed Triton (``triton_backend``)
+    cannot put in effect, before anything compiles: another build than the
+    switch's (stock Triton ignores both variables and would compile as
+    always) or a spelling the build does not read as on; so with
+    ``TRITON_DEFAULT_BACKEND=tileir`` under a build without that backend,
+    which has nothing to select. And where Tile IR
+    is in effect, however it was selected (``ENABLE_TILE=1``, or
+    ``TRITON_DEFAULT_BACKEND=tileir`` on the fork's main): a Tile IR
+    assembler that is missing, or the fork's fallback to its PTX path
+    (``TRITON_TILEIR_RUNTIME_FALLBACK=1``), which reruns a kernel whose Tile
+    IR launch raised without saying so."""
+    asked = [name for name in TRITON_SWITCHES if _switch_requested(name)]
+    if backend is None:
+        if asked:
+            raise TritonSwitchError(
+                f"{asked[0]}={os.environ[asked[0]]} is set, and no Triton is installed"
+            )
+        return
+    build = (
+        f"the installed Triton ({backend['distribution']} "
+        f"{backend['distribution_version']}, triton.__version__ {backend['version']})"
+    )
+    for name in asked:
+        value = os.environ[name]
+        if name == "TRITON_USE_META_WS":
+            if not backend["has_meta_ws"]:
+                raise TritonSwitchError(
+                    f"{name}={value} is set, but {build} has no Meta warp "
+                    "specialization (no knobs.nvidia.use_meta_ws: not fbtriton); "
+                    "it would compile as without the switch"
+                )
+            if not backend["meta_ws"]:
+                raise TritonSwitchError(
+                    f"{name}={value} is set, but {build} does not read that value as on"
+                )
+            continue
+        if not backend["has_tileir"]:
+            raise TritonSwitchError(
+                f"{name}={value} is set, but {build} has no Tile IR backend "
+                "(no triton.backends.tileir: not the Triton-to-tile-IR fork); "
+                "it would compile through PTX as without the switch"
+            )
+        if not backend["tile"]:
+            raise TritonSwitchError(
+                f"{name}={value} is set, but {build} does not select its Tile "
+                "IR backend: it reads ENABLE_TILE=1 only, and "
+                f"TRITON_DEFAULT_BACKEND "
+                f"({os.environ.get('TRITON_DEFAULT_BACKEND')!r}) first where set"
+            )
+    if (
+        os.environ.get("TRITON_DEFAULT_BACKEND") == "tileir"
+        and not backend["has_tileir"]
+    ):
+        raise TritonSwitchError(
+            f"TRITON_DEFAULT_BACKEND=tileir is set, but {build} has no Tile IR "
+            "backend to select (no triton.backends.tileir: not the "
+            "Triton-to-tile-IR fork)"
+        )
+    if not backend["tile"]:
+        return
+    selected = ", ".join(
+        f"{name}={os.environ[name]}"
+        for name in ("ENABLE_TILE", "TRITON_DEFAULT_BACKEND")
+        if os.environ.get(name)
+    )
+    if os.environ.get("TRITON_TILEIR_RUNTIME_FALLBACK", "0") == "1":
+        raise TritonSwitchError(
+            f"Tile IR is in effect ({selected}) with "
+            "TRITON_TILEIR_RUNTIME_FALLBACK=1: a kernel whose Tile IR launch "
+            "raises would run through PTX instead, unnoticed"
+        )
+    tileiras = backend["tileiras"]
+    if tileiras is None or not os.access(tileiras, os.X_OK):
+        raise TritonSwitchError(
+            f"Tile IR is in effect ({selected}), but its assembler is missing "
+            f"(tileiras: {tileiras or backend['tileiras_error']}; "
+            f"TRITON_TILEIRAS_PATH={os.environ.get('TRITON_TILEIRAS_PATH')!r})"
+        )
+
+
+def cache_directories() -> dict[str, str]:
+    """The on-disk caches a compiled Inductor kernel can come back from,
+    by the variable that names each: Inductor's (its FX-graph cache hands
+    back the cubins of the run that filled it) and, where it is set,
+    Triton's (unset, Inductor puts Triton's inside its own)."""
+    from torch._inductor.runtime.cache_dir_utils import default_cache_dir
+
+    found = {
+        "TORCHINDUCTOR_CACHE_DIR": os.path.abspath(
+            os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
+        )
+    }
+    if os.environ.get("TRITON_CACHE_DIR"):
+        found["TRITON_CACHE_DIR"] = os.path.abspath(os.environ["TRITON_CACHE_DIR"])
+    return found
+
+
+def _holds_kernels(variable: str, path: Path) -> bool:
+    """Whether the cache directory ``path`` (``variable`` names which of
+    ``cache_directories`` it is) holds compiled kernels. An entry of
+    Triton's cache is a kernel's when it holds the kernel's metadata: a
+    Triton build also keeps the launcher modules of its drivers there, which
+    the fork builds as it is imported (``cuda_utils``, ``tileir_utils``).
+    Of Inductor's cache every entry counts, but Triton's inside it, which
+    is judged as Triton's, and the stamp, also the file that another
+    process of the run is leaving it from (``leave_stamp``)."""
+    if not path.is_dir():
+        return False
+    if variable == "TRITON_CACHE_DIR":
+        return any(path.glob("*/*.json"))
+    return any(path.glob("triton/*/*/*.json")) or any(
+        entry.name != "triton" and not entry.name.startswith(CACHE_STAMP)
+        for entry in path.iterdir()
+    )
+
+
+def leave_stamp(stamp: Path, identity: dict[str, Any]) -> None:
+    """Leave ``identity`` as the ``stamp`` of a cache directory
+    (``claim_caches``) or of a run directory (``campaign.py``) unless one
+    is there, whole or not at all: processes started at once on one fresh
+    directory (benches by hand, after one ``source`` of an environment's
+    script) each write a file of their own and link it as the stamp. The
+    first link stands, and each of them is then held against it."""
+    own = stamp.with_name(f"{stamp.name}.{os.getpid()}.tmp")
+    own.write_text(json.dumps(identity, indent=1) + "\n")
+    try:
+        with contextlib.suppress(FileExistsError):
+            os.link(own, stamp)
+    finally:
+        own.unlink()
+
+
+def claim_caches(backend: dict[str, Any] | None) -> dict[str, str]:
+    """Hold this process's cache directories (``cache_directories``) to its
+    Triton build and switches; the directories.
+
+    Triton keys its kernel cache on ``TRITON_USE_META_WS`` and on the
+    backend, but Inductor's FX-graph cache keys on the installed ``triton``
+    package alone: a run with a switch on that finds the entries of a run
+    with it off compiles nothing and launches that run's cubins (measured
+    with fbtriton). So a run with a switch in effect takes only directories
+    that hold no kernels (``_holds_kernels``) or that runs of the same
+    ``triton_identity`` filled, and leaves that identity there
+    (``CACHE_STAMP``, ``leave_stamp``); every run, with a switch or
+    without, refuses a directory that carries another identity
+    (``TritonSwitchError``), also the one that a process started beside it
+    left first. A run without a switch leaves no stamp and takes an
+    unstamped directory as it is, as before.
+
+    ``campaign.py`` gives every job empty directories of its own; this is
+    for benches started by hand."""
+    identity = triton_identity(backend)
+    switched = backend is not None and (backend["meta_ws"] or backend["tile"])
+    directories = cache_directories()
+
+    def hold(variable: str, directory: str) -> None:
+        """Refuse a directory whose stamp is another identity's."""
+        stamp = Path(directory) / CACHE_STAMP
+        if stamp.exists() and (other := json.loads(stamp.read_text())) != identity:
+            raise TritonSwitchError(
+                f"{variable} {directory} holds the kernels of another Triton "
+                f"build or switch state ({triton_label(other)}), and this "
+                f"process is {triton_label(identity or {})} ({identity}): give "
+                "every baseline cache directories of its own"
+            )
+
+    # Every directory is judged before any is stamped: a bench that one of
+    # them refuses leaves no stamp in another that it then never fills.
+    for variable, directory in directories.items():
+        hold(variable, directory)
+        path = Path(directory)
+        if (
+            switched
+            and not (path / CACHE_STAMP).exists()
+            and _holds_kernels(variable, path)
+        ):
+            raise TritonSwitchError(
+                f"{variable} {directory} is not empty and names no Triton "
+                "build: a kernel that a run without the switch cached there "
+                "would be launched as this run's (Inductor's FX-graph cache "
+                "does not key on the switch); give the run empty cache "
+                "directories of its own"
+            )
+    if switched:
+        assert identity is not None
+        for variable, directory in directories.items():
+            path = Path(directory)
+            if not (path / CACHE_STAMP).exists():
+                path.mkdir(parents=True, exist_ok=True)
+                leave_stamp(path / CACHE_STAMP, identity)
+            # Also the stamp that a process started beside this one left.
+            hold(variable, directory)
+    return directories
+
+
+def _is_on(value: str | None) -> bool:
+    return (value or "").strip().lower() not in ("", "0", "false", "off", "no")
+
+
+def artifact_issue(
+    backend: dict[str, Any] | None, configs: Sequence[dict[str, Any]]
+) -> str | None:
+    """Why the kernels an Inductor compile launches (``configs``:
+    ``inductor_kernel_configs``) are not this process's Triton build's
+    (``backend``: ``triton_backend``) compiled in its switch state, or
+    None when they are. In either direction: a run with a switch must not
+    time a kernel compiled without it, and a run without one (stock
+    Triton, or the control of a baseline: fbtriton or the Tile IR fork
+    with the switch off) must not time a kernel compiled under it.
+
+    - A kernel generated for another Triton build or backend than this
+      process's (its ``backend_hash`` against ``inductor_backend_hash``,
+      which is asked only where a kernel names one: the kernels of an
+      Inductor that writes none are not compared).
+    - A launched binary that a Triton of another ``triton.__version__``
+      compiled.
+    - One compiled for another backend than Tile IR under ``ENABLE_TILE=1``,
+      or for Tile IR without it.
+    - One compiled without ``TRITON_USE_META_WS`` under it, or under it
+      without.
+    - With a switch in effect, one of which Triton's cache holds no
+      metadata to tell.
+
+    Such a compile is a cached kernel of another run, and its timing would
+    pass for this one's."""
+    if backend is None:
+        return None
+    switched = backend["meta_ws"] or backend["tile"]
+    here = None
+    for kernel in configs:
+        generated = kernel.get("backend_hash")
+        if generated is not None:
+            here = here or inductor_backend_hash()
+            if generated != here:
+                return (
+                    f"{kernel['name']} was generated for another Triton build or "
+                    f"backend than this process's {backend['distribution']} "
+                    f"{backend['distribution_version']} (Inductor's backend_hash "
+                    f"{generated[:12]}, here {here[:12]})"
+                )
+        for config in kernel.get("launchers", [kernel]):
+            artifact = config.get("artifact")
+            if artifact is None:
+                if switched:
+                    return (
+                        f"{kernel['name']}: Triton's cache holds no metadata of "
+                        "the binary it launches, so nothing shows that it was "
+                        f"compiled as {backend['name']}"
+                    )
+                continue
+            if artifact["triton_version"] not in (None, backend["version"]):
+                return (
+                    f"{kernel['name']} launches a binary that Triton "
+                    f"{artifact['triton_version']} compiled, not this process's "
+                    f"{backend['version']}"
+                )
+            if backend["tile"] and artifact["backend"] != "tileir":
+                return (
+                    f"{kernel['name']} launches a binary compiled for the "
+                    f"{artifact['backend']} backend, not through Tile IR"
+                )
+            if not backend["tile"] and artifact["backend"] == "tileir":
+                return (
+                    f"{kernel['name']} launches a binary compiled through Tile "
+                    "IR, and ENABLE_TILE is not in effect in this process"
+                )
+            if backend["meta_ws"] and not _is_on(artifact["meta_ws"]):
+                return (
+                    f"{kernel['name']} launches a binary compiled without "
+                    "TRITON_USE_META_WS"
+                )
+            if not backend["meta_ws"] and _is_on(artifact["meta_ws"]):
+                return (
+                    f"{kernel['name']} launches a binary compiled under "
+                    f"TRITON_USE_META_WS={artifact['meta_ws']}, which is not in "
+                    "effect in this process"
+                )
+    return None

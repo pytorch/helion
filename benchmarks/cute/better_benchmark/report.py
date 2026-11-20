@@ -68,9 +68,12 @@ config each Triton kernel of Inductor's compiles ended on where the
 bench records name them (``inductor_configs``; of a repeated bench, each
 distinct set of picks with the number of processes that ended on it), the
 Inductor compiles that are not usable in some process of a repeated bench
-(that process's baseline is of the other compiles alone), and the
-implementations whose kernels' profiler spans overlap (dependent launches:
-their ``kernel_us`` is of the kernels' steps).
+(that process's baseline is of the other compiles alone), the benches whose
+listing timed an Inductor compile right behind a Helion port's batch
+(``bench.py``'s ``carryover_risk``: that compile's reading, and the ratio
+over it, can be high), and the implementations whose kernels' profiler
+spans overlap (dependent launches: their ``kernel_us`` is of the kernels'
+steps).
 
 When bench records carry ``rot_us`` (``bench.py --rotate-inputs``: the cold
 timer on private input sets, one per call, which hinted loads cannot keep in
@@ -81,6 +84,18 @@ same kernels, and a ``cute/ind rot`` column per kernel; a last section says
 which records were timed that way, why the others were not, and that the two
 speedups bracket the hint-free one only where the CuTe config has no such
 hints (``ROTATION_CAVEAT``). Every other number is computed as without them.
+
+Inductor's time is a minimum of up to three compiles' readings, which reads
+low where they are close. Where bench records hold the figure or the rounds
+and kernel configs to take it from (``common.fastest_inductor``: the
+compiles that ended on the same code pooled, the fastest distinct one
+chosen on other rounds than it is timed on), the per-kernel table gains
+Helion+CuTe's speedup over that de-biased baseline (``cute/ind de-biased``,
+and ``cute/ind rot de-biased`` beside the ``rot_us`` speedup), and under
+the ``cold_us`` aggregates a line gives the two geomeans over the kernels
+that have both and how many of them lie more than 0.5% apart, for
+``cold_us`` and for ``rot_us``. The speedups above, the aggregates and the
+``--goal`` file stay over the fastest compile.
 
 ``--rebalance`` recomputes every ``cold_us`` and ``bb_us``, the baseline
 run's included, from the recorded rounds by ``bench.py``'s current rule, the
@@ -150,10 +165,8 @@ def usable(info: dict[str, Any], stale_ok: bool = False) -> bool:
     """Whether an implementation's timing enters the comparisons (with
     ``stale_ok``, whether it shows: a port timed on a provisional config
     shows whatever code that config generates now)."""
-    return (
-        info.get("status") == "ok"
-        and info.get("numerics_pass") is not False
-        and (stale_ok or info.get("code_matches_autotune") is not False)
+    return common.ran_and_passed(info) and (
+        stale_ok or info.get("code_matches_autotune") is not False
     )
 
 
@@ -175,9 +188,95 @@ def impl_time(
     if not usable(info, stale_ok):
         return None
     value = info.get(metric)
-    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+    if common.is_timing(value):
         return value
     return None
+
+
+def tuning_regimes(autotunes: list[dict[str, Any]]) -> dict[str, Any]:
+    """How the run's autotune records timed their kernels' candidates
+    (``common.kernels_in_sequence``), per backend (the backends differ in
+    their default regime, ``common.default_regime``): ``records`` counts a
+    backend's records by the regime they name (``common.record_regime``:
+    ``alone`` for one made before ``autotune.py`` named any), ``kernels``
+    its kernels by how their search was timed (``unrecorded``: the kernels
+    of records that say nothing per kernel). ``later_alone`` names
+    (``<repro>__<shape>__<backend>.<kernel>``) the kernels of records in
+    the port regime that a search timed alone although earlier kernels of
+    their port run before them, with the record's reason: the exceptions
+    within that regime, not the kernels of a record tuned alone as a
+    whole."""
+    records: dict[str, dict[str, int]] = {}
+    kernels: dict[str, dict[str, int]] = {}
+    later_alone: dict[str, str] = {}
+    for record in autotunes:
+        if record.get("provisional"):
+            continue
+        backend = record["backend"]
+        regime = common.record_regime(record)
+        by_regime = records.setdefault(backend, {})
+        by_regime[regime] = by_regime.get(regime, 0) + 1
+        counts = kernels.setdefault(backend, {"port": 0, "alone": 0, "unrecorded": 0})
+        entries = record.get("regimes")
+        if entries is None:
+            counts["unrecorded"] += len(record.get("kernels", ()))
+            continue
+        for name, entry in entries.items():
+            counts[entry["regime"]] += 1
+            if regime == "port" and entry["regime"] == "alone" and entry.get("behind"):
+                point = f"{record['repro']}__{record['shape']}__{backend}"
+                later_alone[f"{point}.{name}"] = entry.get("reason", "")
+    return {"records": records, "kernels": kernels, "later_alone": later_alone}
+
+
+def tuning_regime_lines(regimes: dict[str, Any]) -> list[str]:
+    """The report's section on ``tuning_regimes``; nothing for a run without
+    autotune records."""
+    if not regimes["records"]:
+        return []
+    lines = [
+        "## Tuning regime",
+        "",
+        (
+            "How the autotunes timed their candidates (`autotune.py --regime`), "
+            "per backend:"
+        ),
+        "",
+    ]
+    for backend, by_regime in sorted(regimes["records"].items()):
+        kernels = regimes["kernels"][backend]
+        lines.append(
+            f"- {backend}: "
+            + ", ".join(
+                f"{count} record(s) `{regime}`"
+                for regime, count in sorted(by_regime.items())
+            )
+            + f". Kernels: {kernels['port']} tuned behind the earlier kernels of "
+            f"their port (run between the L2 flush and every timed call), "
+            f"{kernels['alone']} tuned alone after a flush"
+            + (
+                f", {kernels['unrecorded']} in records that name no regime "
+                "(tuned alone)"
+                if kernels["unrecorded"]
+                else ""
+            )
+            + "."
+        )
+    lines.append("")
+    if regimes["later_alone"]:
+        lines += [
+            (
+                "Kernels of records in the port regime that were tuned alone "
+                "although earlier kernels of their port run before them:"
+            ),
+            "",
+        ]
+        lines += [
+            f"- {name}: {reason}"
+            for name, reason in sorted(regimes["later_alone"].items())
+        ]
+        lines.append("")
+    return lines
 
 
 def processes(record: dict[str, Any]) -> int:
@@ -219,14 +318,51 @@ def impl_times(
     else:
         counts = [usable(info, stale_ok)] * count
     return [
-        value
-        if counted
-        and isinstance(value, (int, float))
-        and math.isfinite(value)
-        and value > 0
-        else None
+        value if counted and common.is_timing(value) else None
         for value, counted in zip(values, counts, strict=True)
     ]
+
+
+def debiased_baseline(record: dict[str, Any], metric: str) -> list[float | None]:
+    """The de-biased fastest Inductor compile's time in each process of a
+    record (``common.fastest_inductor``: the baseline without what choosing
+    the fastest of several noisy readings takes off), None where a process
+    has none. A record of one process made before ``bench.py`` stored the
+    figure gets it from its rounds here; an aggregate holds each
+    process's (``fastest_inductor_per_process``), and one made before has
+    them once ``main`` has read its processes' records
+    (``with_fastest_inductor``)."""
+    if "aggregate" in record:
+        per_process = record.get("fastest_inductor_per_process") or [None] * processes(
+            record
+        )
+    else:
+        held = record.get("fastest_inductor")
+        per_process = [held or common.fastest_inductor(record["impls"])]
+    return [((entry or {}).get(metric) or {}).get("debiased") for entry in per_process]
+
+
+def with_fastest_inductor(record: dict[str, Any], path: Path) -> dict[str, Any]:
+    """``record`` (read from ``path``) with each process's baseline two ways
+    (``fastest_inductor_per_process``): an aggregate made before the figure
+    takes it from the records of the processes it counted, which lie beside
+    it, while every one of them is the record the aggregate was made of
+    (the digests it holds, ``aggregate.records``). Otherwise the aggregate
+    stays without the figure: a baseline of other readings than the
+    headline's is not shown beside it."""
+    if "aggregate" in record and "fastest_inductor_per_process" not in record:
+        digests = record["aggregate"]["records"]
+        per_process = []
+        for name in record["aggregate"]["counted"]:
+            process = path.with_name(name)
+            if not process.exists():
+                return record
+            held = process.read_bytes()
+            if hashlib.sha256(held).hexdigest() != digests.get(name):
+                return record
+            per_process.append(common.fastest_inductor(json.loads(held)["impls"]))
+        record["fastest_inductor_per_process"] = per_process
+    return record
 
 
 def middle(values: list[float | None]) -> float | None:
@@ -326,6 +462,9 @@ def summarize(
                 for process in zip(*compiles.values(), strict=True)
             )
         ],
+        # The same baseline without the bias of choosing the fastest of
+        # noisy readings; beside the headline, which stays the minimum.
+        "inductor_debiased": debiased_baseline(record, metric),
         "oracle": impl_times(record, "oracle", metric),
         **{impl: impl_times(record, impl, metric, impl in elsewhere) for impl in PORTS},
         "memcopy": impl_times(record, "memcopy", metric),
@@ -355,6 +494,7 @@ def summarize(
     row["speedups"] = {}
     for key, impl, base in (
         ("cute_vs_inductor", "helion_cute", "inductor"),
+        ("cute_vs_inductor_debiased", "helion_cute", "inductor_debiased"),
         ("cute_vs_oracle", "helion_cute", "oracle"),
         ("cute_vs_helion_triton", "helion_cute", "helion_triton"),
         ("triton_vs_inductor", "helion_triton", "inductor"),
@@ -421,6 +561,9 @@ def summarize(
         | set(record.get("foreign_gpu_processes_after") or [])
     )
     row["foreign_activity"] = common.foreign_activity(record)
+    # The Inductor compiles that the bench timed right behind a Helion port
+    # (bench.py's carryover_risk; an aggregate's are of all its processes).
+    row["carryover_risk"] = list(record.get("carryover_risk") or [])
     row["issues"] = issues
 
     def counted(impl: str) -> bool:
@@ -712,6 +855,49 @@ def seed_pairing_lines(pairing: dict[str, Any], baseline_name: str) -> list[str]
     return [*lines, ""]
 
 
+# From this relative difference on, a kernel's two speedups (over the
+# fastest Inductor compile and over the de-biased baseline) count as apart.
+DEBIASED_APART = 0.005
+
+
+def debiased_lines(table: list[dict[str, Any]], rot: bool = False) -> list[str]:
+    """What the report says of the de-biased baseline under a timer's
+    aggregates: over the kernels that the aggregates count and that have
+    both speedups, the two geomeans and how many kernels' speedups lie more
+    than ``DEBIASED_APART`` apart (``rot``: of the ``rot_us`` rows, under
+    the ``cold_us`` ones). Nothing for a run whose records have no rounds
+    to take the figure from, nor for ``bb_us``, which has none."""
+    pairs = [
+        (headline, r["cute_vs_inductor_debiased"])
+        for r in table
+        if (headline := ratio(r, "helion_cute", "inductor")) is not None
+        and r["cute_vs_inductor_debiased"] is not None
+    ]
+    if not pairs:
+        return []
+    apart = sum(abs(other / headline - 1) > DEBIASED_APART for headline, other in pairs)
+    what = (
+        "The same by `rot_us`"
+        if rot
+        else (
+            "De-biased baseline (`common.fastest_inductor`: the compiles that "
+            "ended on the same code pooled, the fastest distinct one chosen on "
+            "other rounds than it is timed on; the headline above divides by "
+            "the fastest compile's own reading, a minimum of noisy readings)"
+        )
+    )
+    return [
+        (
+            f"{what}: CuTe/ind geomean "
+            f"{fmt(geomean([other for _, other in pairs]), '.3f')} "
+            f"over {len(pairs)} kernels, {fmt(geomean([h for h, _ in pairs]), '.3f')} "
+            f"by the headline over the same; {apart} of them differ by more "
+            f"than {DEBIASED_APART:.1%}."
+        ),
+        "",
+    ]
+
+
 def aggregate_lines(
     columns: dict[str, dict[str, Any]], baseline_name: str | None
 ) -> list[str]:
@@ -831,6 +1017,7 @@ def main() -> None:
     records = []
     paths = {}
     for path, record in ok_records(args.run_dir, "bench").items():
+        record = with_fastest_inductor(record, path)
         records.append(rebalance(record) if args.rebalance else record)
         paths[(record["repro"], record["shape"])] = path
     autotunes = list(ok_records(args.run_dir, "configs").values())
@@ -915,10 +1102,15 @@ def main() -> None:
     if records:
         gpu = records[0].get("gpu", {})
         ver = records[0].get("versions", {})
+        # The Triton build that compiled the Inductor kernels, where the
+        # records name it (bench.py's triton_backend): a baseline run's is
+        # fbtriton or the Tile IR fork with its switch on.
+        build = records[0].get("triton_backend")
+        triton = "" if build is None else f" ({common.triton_label(build)})"
         lines += [
             (
                 f"GPU: {gpu.get('name')} ({gpu.get('power_limit_w')} W cap); "
-                f"torch {ver.get('torch')}, triton {ver.get('triton')}, "
+                f"torch {ver.get('torch')}, triton {ver.get('triton')}{triton}, "
                 f"cutlass-dsl {ver.get('nvidia-cutlass-dsl')}, "
                 f"helion {ver.get('helion_git')}"
             ),
@@ -984,6 +1176,9 @@ def main() -> None:
             for name, group in members.items()
         }
         lines += [f"## {metric}", "", *aggregate_lines(columns, baseline_name), ""]
+        lines += debiased_lines(table)
+        if check is not None:
+            lines += debiased_lines(rows["rot_us"], rot=True)
         lines += [
             (
                 "| family | kernels | CuTe/ind geomean | CuTe/ind time-weighted"
@@ -1010,18 +1205,32 @@ def main() -> None:
             else None
         )
         rot_column = "" if by_rot is None else " | cute/ind rot"
+        # ... and over rot_us's de-biased baseline, where records have it.
+        by_rot_debiased = None
+        if check is not None and any(
+            r["cute_vs_inductor_debiased"] is not None for r in rows["rot_us"]
+        ):
+            by_rot_debiased = {
+                (r["repro"], r["shape"]): r["cute_vs_inductor_debiased"]
+                for r in rows["rot_us"]
+            }
+            rot_column += " | cute/ind rot de-biased"
         # The speedup's range over the processes of a repeated bench.
         repeated = any(r["processes"] > 1 for r in table)
         spread_column = " | cute/ind per process (n)" if repeated else ""
+        # The speedup over the de-biased baseline, where records have it.
+        debiased = any(r["cute_vs_inductor_debiased"] is not None for r in table)
+        debiased_column = " | cute/ind de-biased" if debiased else ""
         lines += [
             "",
             (
                 "| repro | shape | MB | inductor | helion-cute | cute/ind"
-                f"{spread_column}{rot_column}{baseline_column} | helion-triton"
+                f"{debiased_column}{spread_column}{rot_column}{baseline_column}"
+                " | helion-triton"
                 " | triton/ind | oracle | memcopy | ind %SOL | cute %SOL | numerics"
                 " | left out of the aggregates |"
             ),
-            f"|{'---|' * (14 + repeated + bool(rot_column) + bool(baseline_column))}",
+            f"|{'---|' * (14 + debiased + repeated + rot_column.count('|') + bool(baseline_column))}",
         ]
         for r in sorted(table, key=lambda r: r["cute_vs_inductor"] or 0):
             num = ",".join(f"{k.split('_')[-1]}={v}" for k, v in r["numerics"].items())
@@ -1038,6 +1247,8 @@ def main() -> None:
                 if by_rot is None
                 else f" | {fmt(by_rot.get((r['repro'], r['shape'])), '.3f')}"
             )
+            if by_rot_debiased is not None:
+                rot += f" | {fmt(by_rot_debiased.get((r['repro'], r['shape'])), '.3f')}"
             spread = ""
             if repeated:
                 ratios = r.get("cute_vs_inductor_per_process")
@@ -1046,10 +1257,13 @@ def main() -> None:
                     if ratios
                     else "-"
                 )
+            other = (
+                f" | {fmt(r['cute_vs_inductor_debiased'], '.3f')}" if debiased else ""
+            )
             lines.append(
                 f"| {r['repro']} | {r['shape']} | {fmt((r['total_bytes'] or 0) / 1e6, '.1f')}"
                 f" | {fmt(r['inductor'])} | {fmt(r['helion_cute'])}"
-                f" | {fmt(r['cute_vs_inductor'], '.3f')}{spread}{rot}{before}"
+                f" | {fmt(r['cute_vs_inductor'], '.3f')}{other}{spread}{rot}{before}"
                 f" | {fmt(r['helion_triton'])} | {fmt(r['triton_vs_inductor'], '.3f')}"
                 f" | {fmt(r['oracle'])} | {fmt(r['memcopy'])}"
                 f" | {fmt(100 * r['inductor_of_sol'] if r.get('inductor_of_sol') else None, '.0f')}"
@@ -1057,6 +1271,8 @@ def main() -> None:
                 f" | {num} | {left_out or '-'} |"
             )
         lines.append("")
+    regimes = tuning_regimes(autotunes)
+    lines += tuning_regime_lines(regimes)
     counted = "counted" if args.include_unsampled else "left out of the aggregates"
     lines += [
         "## Foreign GPU activity",
@@ -1178,6 +1394,28 @@ def main() -> None:
             *missing,
             "",
         ]
+    behind = [
+        f"- {r['repro']}[{r['shape']}]: {'; '.join(r['carryover_risk'])}"
+        for r in sorted(rows["cold_us"], key=operator.itemgetter("repro", "shape"))
+        if r["carryover_risk"]
+    ]
+    if behind:
+        lines += [
+            "## Inductor compiles behind a Helion port",
+            "",
+            (
+                "Benches whose listing timed an Inductor compile right behind "
+                "a Helion port's batch, or first in an order that the port "
+                "ends (`bench.py`'s `carryover_risk`). On some ports that "
+                "compile then reads up to a microsecond a call higher, and "
+                "the ratio over the fastest Inductor compile with it (README, "
+                "Timers): list the oracle between the Inductor compiles and "
+                "the Helion ports, and the memcopy last."
+            ),
+            "",
+            *behind,
+            "",
+        ]
     overlapping = {
         f"{r['repro']}__{r['shape']} {impl}": spans
         for r in rows["cold_us"]
@@ -1230,6 +1468,7 @@ def main() -> None:
         "autotune_s": autotune_s,
         "reused": reused,
         "provisional": provisional,
+        "tuning_regimes": regimes,
         "contaminated": contaminated,
         "unsampled": unsampled,
         "uncovered": uncovered,

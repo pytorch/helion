@@ -138,6 +138,23 @@ autotune records pinned to it, alone.
   a port may reorder its own statements if that changes no result, saying
   why in a comment (`mean_var_236af0aff0ee` reads both seeds before its first
   draw).
+- **Let the harness follow the kernels.** `autotune.py` tunes each kernel the
+  way the port runs it: the first one alone, every later one behind the
+  kernel calls before it (README, How a port is tuned). It follows the calls
+  that `forward` makes through the kernels' module-level names, in the
+  order `forward` makes them, and the tensors by their storage. So call
+  every kernel by its global name (not through an alias bound at import, a
+  default argument or a closure), launch the kernels in Inductor's order,
+  and hand a kernel the earlier kernel's output itself or a view of it
+  (`view`, `permute`, a slice, `as_strided`), not a copy and not a view as
+  another dtype: a kernel that reads an earlier output through a copy is
+  tuned behind kernels that wrote another buffer, and one that reads it as
+  another dtype is tuned alone, as is every kernel after it (the record's
+  `regimes` says so). Host code
+  between two kernels is not replayed: what it computes is a constant of
+  the later kernels' searches, read flushed (where Inductor's wrapper calls
+  ATen between two kernels the port must too, and that kernel is then
+  tuned on a colder operand than the port hands it).
 
 ## Examples
 
