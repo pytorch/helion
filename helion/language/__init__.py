@@ -18,6 +18,7 @@ from .creation_ops import arange as arange
 from .creation_ops import full as full
 from .creation_ops import zeros as zeros
 from .debug_ops import breakpoint as breakpoint  # noqa: A004
+from .debug_ops import device_assert as device_assert
 from .device_print import device_print as device_print
 from .distributed_ops import AsyncCopyDescriptor as AsyncCopyDescriptor
 from .distributed_ops import make_async_remote_copy as make_async_remote_copy

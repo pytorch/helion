@@ -31,6 +31,7 @@ from ...autotuner.config_spec import NumThreadsSpec
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import FixedBlockSizeSource
 from . import target_facts
+from .autotune.flash_surface import enable_cute_attention_generic_fallback
 from .autotune.flash_surface import enable_cute_flash_gated_search
 from .autotune.flash_surface import enable_cute_flash_search
 from .state import cute_env_state
@@ -268,6 +269,18 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     config_spec.cute_native_redux_sites = has_native_redux_reduction(
         device_ir, config_spec.target_device_capability
     )
+    if env.has_device_assert:
+        # The fused attention and tcgen05 bodies, whose search surfaces
+        # follow, emit their own code, which leaves an hl.device_assert out or
+        # runs it before their tile loop, on the zero accumulator:
+        #     acc = cutlass.Float32(0.0)
+        #     v_0 = operator.eq(acc, acc)
+        #     cute.testing.assert_(v_0, 'nan')
+        #     ...  (the tile loop and its MMAs)
+        # A kernel with one keeps the generic lowering (tcgen05 needs this
+        # surface), which checks the product after its K loop.
+        enable_cute_attention_generic_fallback(config_spec)
+        return
     # Enable the flash-attention autotune surface when
     # the dense flash dataflow is detected, analogous to how a matmul
     # detection sets ``tcgen05.search_enabled``. Default-off
