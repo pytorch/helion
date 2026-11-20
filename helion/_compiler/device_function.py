@@ -6,6 +6,7 @@ import contextlib
 import dataclasses
 import enum
 import itertools
+import logging
 import math
 import threading
 from typing import TYPE_CHECKING
@@ -83,6 +84,7 @@ if TYPE_CHECKING:
 
 
 tls: _TLS = cast("_TLS", threading.local())
+log: logging.Logger = logging.getLogger(__name__)
 
 
 class RingFallback(exc.Base):
@@ -544,6 +546,9 @@ class DeviceFunction:
         # sends as tagged words and the graph whose transport says so.
         self.tagged_allocation_ids: frozenset[int] | None = None
         self.codegen_dependency_graph: TileDependencyGraph | None = None
+        # The roots before which the megakernel codegen ran hl.prefetch_code()
+        # (``CompileEnvironment.prefetch_code_sites``); the others run at entry.
+        self.prefetch_code_placed: set[int] = set()
         # Cross-grid polling is safe in isolation only when the required worker
         # cohort can reside together. The launcher validates exact compiled
         # occupancy, but does not reserve capacity against concurrent streams.
@@ -1124,6 +1129,23 @@ class DeviceFunction:
     def sync_names(self, *kinds: str) -> set[str]:
         return {name for name, role in self.sync_roles.items() if role.kind in kinds}
 
+    def prefetch_code_statement(self) -> ast.stmt:
+        """An hl.prefetch_code() site's call, read by every ``READER_STRIDE``-th
+        CTA, which split the text (``prefetch_code_ptx``).  Counted from the CTA
+        that idles longest there: a persistent grid's last worker (the static
+        plan fills each root from its first worker, so the last ones start their
+        first tasks last), a grid of waves' first CTA (the later CTAs run after
+        it)."""
+        # Imported here: importing prefetch_code installs its compiler hook.
+        from ..runtime.triton.prefetch_code import READER_STRIDE
+
+        pid = "tl.program_id(0)"
+        if str(self.config.pid_type).startswith("persistent"):
+            pid = f"(tl.num_programs(0) - 1 - {pid})"
+        return statement_from_string(
+            f"helion_prefetch_code.prefetch_code({pid} % {READER_STRIDE} == 0)"
+        )
+
     def graph_infos(self) -> list[GraphInfo]:
         """This config's codegen graph copies, then the traced originals (a copy's
         ``placeholder_to_outer_arg`` returns nodes of the originals)."""
@@ -1561,13 +1583,24 @@ class DeviceFunction:
             and "wait" not in env.pdl_entry
         ):
             raise exc.PdlStateWithoutWait
-        prefetch_code = (
-            [statement_from_string("helion_prefetch_code.prefetch_code()")]
-            if env.prefetch_code and backend.uses_triton_compiler
-            else []
-        )
+        unplaced = [
+            root
+            for root in env.prefetch_code_sites
+            if root is not None and root not in self.prefetch_code_placed
+        ]
+        for root in unplaced:
+            log.info(
+                "hl.prefetch_code() before root %d runs at entry: the launch does "
+                "not run that root's tasks as a block of its own (a static or "
+                "claimed persistent schedule does)",
+                root,
+            )
         entry = [
-            *prefetch_code,
+            *(
+                [self.prefetch_code_statement()]
+                if None in env.prefetch_code_sites or unplaced
+                else []
+            ),
             *[
                 statement_from_string(backend.pdl_instruction(op))
                 for op in env.pdl_entry

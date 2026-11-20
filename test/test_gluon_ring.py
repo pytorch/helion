@@ -384,6 +384,30 @@ def mm_then_scale(
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
+def mm_prefetch_mm(
+    x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two dot roots, the code prefetch between them."""
+    m, k = x.size()
+    _, n = w1.size()
+    _, p = w2.size()
+    y = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    out = torch.empty([m, p], dtype=torch.float32, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = hl.dot(x[tile_m, tile_k], w1[tile_k, tile_n], acc=acc)
+        y[tile_m, tile_n] = acc.to(torch.bfloat16)
+    hl.prefetch_code()
+    for tile_i, tile_p in hl.tile([m, p]):
+        acc2 = hl.zeros([tile_i, tile_p], dtype=torch.float32)
+        for tile_j in hl.tile(n):
+            acc2 = hl.dot(y[tile_i, tile_j], w2[tile_j, tile_p], acc=acc2)
+        out[tile_i, tile_p] = acc2
+    return y, out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
 def scale_boxprefetch_mm(
     x: torch.Tensor, w: torch.Tensor, wp: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1408,11 +1432,56 @@ class TestGluonRing(TestCase):
                     functions["_helion_scale_then_mm_mma"] if specialize else body
                 )
                 at = prefetching.index(
-                    "prefetch code here" if specialize else "prefetch_code()"
+                    "call.uni helion_prefetch_code_fn_1;"
+                    if specialize
+                    else "helion_prefetch_code.prefetch_code("
                 )
                 self.assertLess(at, prefetching.index("_launch("))
                 self.assertIn("return (tile_dependency_epoch,)", body)
                 self.assertNotIn("def _helion_scale_then_mm_claimer(", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_code_prefetch_between_roots_in_mma_partition(self) -> None:
+        """A code prefetch between two dot roots runs in the MMA partition after
+        the first root's MMAs and before the second's, and nowhere else."""
+        x = torch.randn([256, 512], device=DEVICE, dtype=torch.bfloat16)
+        w1 = torch.randn([512, 256], device=DEVICE, dtype=torch.bfloat16)
+        w2 = torch.randn([256, 128], device=DEVICE, dtype=torch.bfloat16)
+        base = {
+            "block_sizes": [128, 64, 64, 128, 64, 64],
+            "pid_type": "persistent_blocked",
+            "num_sm_multiplier": 1,
+            "num_warps": 4,
+            "indexing": "tensor_descriptor",
+        }
+        _, (y_ref, expected) = code_and_output(
+            mm_prefetch_mm, (x, w1, w2), cross_loop_pipeline="static", **base
+        )
+        slots = len(mm_prefetch_mm.bind((x, w1, w2)).config_spec.range_warp_specialize)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                code, (y, out) = code_and_output(
+                    mm_prefetch_mm,
+                    (x, w1, w2),
+                    num_stages=2,
+                    range_warp_specializes=[True] * slots,
+                    cross_loop_pipeline=pipeline,
+                    **base,
+                )
+                torch.testing.assert_close(y, y_ref, atol=0, rtol=0)
+                torch.testing.assert_close(out, expected, atol=0, rtol=0)
+                # The MMA partition's one warp calls the prefetch, on every 16th
+                # CTA counted from the last worker.
+                self.assertEqual(code.count("call.uni helion_prefetch_code_fn_"), 1)
+                self.assertNotIn("helion_prefetch_code.prefetch_code(", code)
+                mma = _functions(code)["_helion_mm_prefetch_mm_mma"]
+                at = mma.index("call.uni helion_prefetch_code_fn_1;")
+                self.assertLess(mma.index("tmem_dot"), at)
+                self.assertLess(at, mma.rindex("tmem_dot"))
+                self.assertIn(
+                    "(tl.num_programs(0) - 1 - tl.program_id(0)) % 16 == 0", mma
+                )
 
     def _prefetch_case(self, kernel, args: tuple[object, ...]) -> str:
         """Run a prefetching ``scale_then_mm`` variant in a ring and check it

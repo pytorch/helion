@@ -1709,9 +1709,11 @@ def _check_no_stmts_between_loops(body: list[ast.stmt]) -> None:
 
 def _place_pdl_ops(body: list[ast.stmt]) -> None:
     """Run top level hl.pdl_* ops at entry if they precede the loops, else at
-    exit; hl.prefetch_code() marks the kernel (entry only).  A trigger between
-    grid loops also records the root of the next one (``pdl_trigger_root``),
-    where a persistent megakernel places it instead of at exit."""
+    exit; hl.prefetch_code() prefetches at entry before the first grid loop, or,
+    after one, where the kernel reaches the next grid loop (root).  A trigger
+    between grid loops also records the root of the next one
+    (``pdl_trigger_root``), where a persistent megakernel places it instead of at
+    exit."""
     env = CompileEnvironment.current()
     roots = [
         (index, stmt._root_id)
@@ -1739,7 +1741,7 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
             continue
         op = ops[0]._type_info
         assert isinstance(op, PdlResultType) and isinstance(op.value, str)
-        if seen_loop and op.value in ("wait", "prefetch_code"):
+        if seen_loop and op.value == "wait":
             raise exc.PdlPlacement
         later = next((root for at, root in roots if at > index), None)
         between = op.value == "launch_dependents" and seen_loop and later is not None
@@ -1749,10 +1751,21 @@ def _place_pdl_ops(body: list[ast.stmt]) -> None:
                 raise exc.PdlPlacement
             trigger_root = later
         if op.value == "prefetch_code":
+            if seen_loop and later is None:
+                # No code left to prefetch.
+                raise exc.PdlPlacement
             # The cubin pass resolves sm_90+ relocations (``.rela.nv.global.init``;
-            # older targets emit ``.rel``): elsewhere the kernel is not marked.
+            # older targets emit ``.rel``) of kernels Triton compiles: elsewhere
+            # the call does nothing.
             capability = env.ptx_capability
-            env.prefetch_code = capability is not None and capability >= (9, 0)
+            site = later if seen_loop else None
+            if (
+                capability is not None
+                and capability >= (9, 0)
+                and env.backend.uses_triton_compiler
+                and site not in env.prefetch_code_sites
+            ):
+                env.prefetch_code_sites.append(site)
             continue
         # griddepcontrol needs sm_90; older targets run in plain stream order.
         capability = env.backend.pdl_capability(env)

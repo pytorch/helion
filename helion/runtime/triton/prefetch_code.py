@@ -3,15 +3,17 @@
 A megakernel's native text outgrows the launch prefetch window, and the weights
 it and the kernels between its launches stream evict that text from L2, so its
 tasks first run their code from DRAM. Kernels that call ``prefetch_code()`` (what
-``hl.prefetch_code()`` lowers to) prefetch their own text into L2 at entry,
-before their PDL wait.
+``hl.prefetch_code()`` lowers to) prefetch their own text into L2 where the call
+sits: at entry (before their PDL wait), or between two roots, so the roots after a
+large weight stream find their code in L2.
 Importing this module (a generated kernel calling ``prefetch_code()`` does)
-registers a compiler stage hook: the PTX stage gives a marked kernel a table of
-its entry and helper functions plus the entry loop, and the cubin stage turns the
-table's function relocations into text addresses and writes the text sizes (when
-it cannot, the sizes stay zero, the loop loads nothing and a warning says so).
-Unmarked kernels are unchanged; the hook adds this module's source hash to the
-cache key of the kernels compiled after it in the process.
+registers a compiler stage hook: a call site is a call of a prefetch function the
+PTX stage declares and defines, with a table of the kernel's entry and helper
+functions it walks, and the cubin stage turns the table's function relocations
+into text addresses and writes the text sizes (when it cannot, the sizes stay
+zero, the loop loads nothing and a warning says so).  Kernels calling none are
+unchanged; the hook adds this module's source hash to the cache key of the
+kernels compiled after it in the process.
 """
 
 from __future__ import annotations
@@ -36,81 +38,119 @@ log: logging.Logger = logging.getLogger(__name__)
 
 
 _PC_TAB = "helion_prefetch_code_tab"
-_PC_FN = "helion_prefetch_code_fn"
-_PC_MARK = "// helion prefetch code"
+# Every READER_STRIDE-th CTA reads (``DeviceFunction.prefetch_code_statement``).
+READER_STRIDE = 16
+_PC_FN = "helion_prefetch_code_fn"  # _<W>: the prefetch by W warps
+_CALL = re.compile(rf"call\.uni\s+{_PC_FN}_(\d+);")
+
+
+def _call_asm(warps: int, first_warp: bool) -> str:
+    """The call site: ``$1`` (the reader predicate, CTA uniform) calls the
+    prefetch of ``warps`` warps (``_PC_FN``), only from the CTA's first warp if
+    ``first_warp`` (the body of a kernel not warp-specialized there).  The asm is
+    the call itself: wherever LLVM copies it (jump threading duplicates inline
+    asm onto incoming paths), each copy calls."""
+    lead = "mov.u32 %pcq, %tid.x; setp.lt.and.u32 %pcr, %pcq, 32, %pcr; "
+    return (
+        "{ .reg .pred %pcr; .reg .b32 %pcq; setp.ne.s32 %pcr, $1, 0; "
+        f"{lead if first_warp else ''}@%pcr call.uni {_PC_FN}_{warps}; "
+        "mov.u32 $0, 0; }"
+    )
+
+
+# The body's call site (the first warp of each reader CTA).
+_BODY_CALL = tl.constexpr(_call_asm(1, first_warp=True))
 
 
 @triton.jit
-def prefetch_code():  # noqa: ANN201
-    """Mark the calling kernel to prefetch its own native text into L2 at entry."""
+def prefetch_code(reader):  # noqa: ANN001, ANN201
+    """Prefetch the calling kernel's native text into L2 here, by the first warp
+    of each CTA ``reader`` holds."""
     tl.inline_asm_elementwise(
-        "mov.u32 $0, 0; // helion prefetch code",
-        "=r",
-        [],
+        _BODY_CALL,  # pyrefly: ignore [bad-argument-type]
+        "=r,r",
+        [reader.to(tl.int32)],
         dtype=tl.int32,
         is_pure=False,
         pack=1,
     )
 
 
-def prefetch_code_here(warps: int) -> str:
+def prefetch_code_here(warps: int, reader: str) -> str:
     """Device code prefetching the kernel's text where it sits, by the calling
-    partition's ``warps`` warps (a warp-specialized kernel's idle partition)."""
-    marker = f"mov.u32 $0, 0; {_PC_MARK} here {warps}"
-    return f"tl.inline_asm_elementwise({marker!r}, '=r', [], tl.int32, False, 1)"
+    partition's ``warps`` warps (a warp-specialized kernel's idle partition), on
+    the CTAs the device expression ``reader`` holds."""
+    asm = _call_asm(warps, first_warp=False)
+    return (
+        f"tl.inline_asm_elementwise({asm!r}, '=r,r', [({reader}).to(tl.int32)], "
+        "tl.int32, False, 1)"
+    )
 
 
 def prefetch_code_ptx(ptx: str) -> str:
-    """Declare the text-range table (a (base, bytes) pair per function, then a
-    sink word) and emit the prefetch (CTAs with blockIdx % 16 == 0 share the lines,
-    evict_last loads): at a partition's prefetch_code_here<W> marker by its W warps,
-    else at entry by one warp.  The prefetch is its own function: inline, its loop
-    costs ptxas its uniform-register analysis across the whole kernel (every
-    kernel argument then moves to a uniform register at each use).  It must not
-    use bar.sync 0: a warp-specialized partition calls it."""
-    if _PC_MARK not in ptx:
+    """Declare and define the prefetch functions a kernel's call sites call
+    (``_call_asm``): a text-range table (a (base, bytes) pair per function, then
+    a sink word) and, per partition width W, ``_PC_FN``_W: the calling warps
+    (lanes ``%tid.x`` mod 32 W) of the reader CTAs load the text's lines with
+    evict_last, the readers splitting them.  (Reading every line in each reader
+    puts a copy in each die's L2 of a two-die GPU, but the readers' first tasks
+    then wait for the whole text: on GB300 the split ran 0.9-2.6 us faster on
+    attention and MoE megakernels.)  A reader's index is its distance from the
+    last CTA in strides, which numbers the readers of either predicate from 0.
+    The prefetch is its own function: inline, its loop costs
+    ptxas its uniform-register analysis across the whole kernel (every kernel
+    argument then moves to a uniform register at each use).  It must not use
+    bar.sync 0: a warp-specialized partition calls it."""
+    widths = sorted({int(w) for w in _CALL.findall(ptx)})
+    if not widths:
         return ptx
     head = re.search(r"\.visible \.entry (\w+)\([^)]*\)", ptx, re.DOTALL)
-    body = re.search(
-        r"\.visible \.entry \w+\([^)]*\)\s*(?:\.\w+[^{]*)?\{", ptx, re.DOTALL
+    first = re.search(
+        r"^(?:\.(?:visible|weak|extern)\s+)?\.(?:func|entry)\b", ptx, re.MULTILINE
     )
-    if head is None or body is None:
+    assert first is not None  # the calls sit in a function
+    declare = "".join(f".func {_PC_FN}_{w}();\n" for w in widths)
+    if head is None:
+        # No table to walk: the functions load nothing.
         _warn_unresolved("no kernel entry in the PTX")
-        return ptx
+        empty = "".join(f".func {_PC_FN}_{w}()\n{{\n\tret;\n}}\n" for w in widths)
+        return f"{ptx[: first.start()]}{declare}{ptx[first.start() :]}\n{empty}"
     funcs = re.findall(
         r"^(?:\.(?:visible|weak)\s+)?\.func\s+(?:\([^)]*\)\s*)?([\w$]+)\s*\(",
         ptx,
         re.MULTILINE,
     )
     names = list(dict.fromkeys([head[1], *funcs]))
-    marker = r"(mov\.u32 \t?%r\d+, 0; " + re.escape(_PC_MARK) + r" here (\d+))"
-    here = re.search(marker, ptx[body.end() :])
-    if here is None and f"{_PC_MARK} here" in ptx:
-        _warn_unresolved(
-            "a partition prefetch marker outside the entry; prefetching at entry"
-        )
-    lanes = 32 * int(here[2]) if here is not None else 32
     slots = ", ".join(f"{n}, 0" for n in names)
     table = f".global .align 8 .u64 {_PC_TAB}[{2 * len(names) + 1}] = {{{slots}, 0}};"
-    lane = (
-        "setp.ge.u32 %pcp, %pct, 32; @%pcp bra PC_DONE;"
-        if here is None
-        else f"and.b32 %pct, %pct, {lanes - 1};"
-    )
+    prefetch = "".join(_prefetch_function(w, len(names)) for w in widths)
+    i = head.start()
+    if first.start() < i:
+        ptx = f"{ptx[: first.start()]}{declare}{ptx[first.start() :]}"
+        i += len(declare)
+        declare = ""
+    return f"{ptx[:i]}{declare}{head[0]};\n{table}\n{ptx[i:]}\n{prefetch}"
+
+
+def _prefetch_function(warps: int, functions: int) -> str:
+    """``_PC_FN``_``warps``: its warps walk the table's ``functions`` text ranges,
+    eight 128-byte lines in flight per lane, and fold their words into a store
+    that never happens (it keeps the loads live; their L2 fill is the effect)."""
+    lanes = 32 * warps
     prefetch = f"""\
-.func {_PC_FN}()
+.func {_PC_FN}_{warps}()
 {{
 \t{{
-\t.reg .pred %pcp; .reg .b32 %pct, %pcc, %pcnw, %pcw, %pcn, %pci, %pck, %pcacc, %pcx;
+\t.reg .pred %pcp; .reg .b32 %pct, %pcnw, %pcw, %pcn, %pci, %pck, %pcacc, %pcc;
 \t.reg .b64 %pcbase, %pcbytes, %pcaddr, %pcpol;
-\tmov.u32 %pct, %tid.x; {lane}
-\tmov.u32 %pcc, %ctaid.x; and.b32 %pcx, %pcc, 15; setp.ne.u32 %pcp, %pcx, 0;
-\t@%pcp bra PC_DONE;
-\tmov.u32 %pcnw, %nctaid.x; add.u32 %pcnw, %pcnw, 15; shr.u32 %pcnw, %pcnw, 4;
-\tshr.u32 %pcw, %pcc, 4; mad.lo.u32 %pcw, %pcw, {lanes}, %pct; mul.lo.u32 %pcnw, %pcnw, {lanes};
+\tmov.u32 %pct, %tid.x; and.b32 %pcw, %pct, {lanes - 1};
+\tmov.u32 %pcnw, %nctaid.x; mov.u32 %pcc, %ctaid.x; sub.u32 %pcc, %pcnw, %pcc;
+\tsub.u32 %pcc, %pcc, 1; div.u32 %pcc, %pcc, {READER_STRIDE};
+\tadd.u32 %pcnw, %pcnw, {READER_STRIDE - 1}; div.u32 %pcnw, %pcnw, {READER_STRIDE};
+\tmad.lo.u32 %pcw, %pcc, {lanes}, %pcw; mul.lo.u32 %pcnw, %pcnw, {lanes};
 \tcreatepolicy.fractional.L2::evict_last.b64 %pcpol, 1.0; mov.u32 %pcacc, 0;
 """
-    for i in range(len(names)):
+    for i in range(functions):
         prefetch += f"""\
 \tld.global.u64 %pcbase, [{_PC_TAB}+{16 * i}];
 \tld.global.u64 %pcbytes, [{_PC_TAB}+{16 * i + 8}];
@@ -119,7 +159,6 @@ def prefetch_code_ptx(ptx: str) -> str:
 PC_LOOP{i}:
 \tsetp.ge.u32 %pcp, %pci, %pcn; @%pcp bra PC_NEXT{i};
 """
-        # Eight lines in flight per lane, then fold their words.
         for j in range(8):
             prefetch += f"""\
 \t{{ .reg .b32 %pcv; .reg .pred %pcq; mad.lo.u32 %pck, %pcnw, {j}, %pci;
@@ -129,22 +168,14 @@ PC_LOOP{i}:
 \txor.b32 %pcacc, %pcacc, %pcv; }}
 """
         prefetch += f"\tmad.lo.u32 %pci, %pcnw, 8, %pci; bra PC_LOOP{i};\nPC_NEXT{i}:\n"
-    # An impossible store keeps the loads live; their L2 fill is the only effect.
     prefetch += f"""\
 \tsetp.eq.u32 %pcp, %pcacc, 0x9E3779B9;
-\t@%pcp st.global.u32 [{_PC_TAB}+{16 * len(names)}], %pcacc;
-PC_DONE:
+\t@%pcp st.global.u32 [{_PC_TAB}+{16 * functions}], %pcacc;
 \t}}
 \tret;
-}}"""
-    i, j = head.start(), body.end()
-    call = f"\tcall.uni {_PC_FN};"
-    rest = ptx[j:]
-    if here is not None:
-        rest = "\n" + rest.replace(here[1], f"{here[1]}\n{call}", 1)
-    else:
-        rest = f"\n{call}\n{rest}"
-    return f"{ptx[:i]}{head[0]};\n{table}\n.func {_PC_FN}();\n{ptx[i:j]}{rest}\n{prefetch}\n"
+}}
+"""
+    return prefetch
 
 
 def prefetch_code_cubin(cubin: bytes) -> bytes:

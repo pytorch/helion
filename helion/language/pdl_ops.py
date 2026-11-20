@@ -68,14 +68,20 @@ def pdl_launch_dependents() -> None:
 )
 def prefetch_code() -> None:
     """
-    Prefetch the kernel's own native code into L2 at entry.
+    Prefetch the kernel's own native code into L2.
 
-    Call it on the host before the first loop. A megakernel's code outgrows the
-    launch prefetch, and the weights streamed between its launches evict it from
-    L2, so its first tasks would fetch their instructions from DRAM; the prefetch
-    loads the code into L2 ahead of the body (and of any PDL wait). It does
-    nothing outside the Triton and Gluon backends on NVIDIA GPUs of compute
-    capability 9.0 or newer.
+    Call it on the host before the first loop or between two loops, as often as
+    needed. A megakernel's code outgrows the launch prefetch, and the weights
+    streamed between its launches evict it from L2, so its first tasks would
+    fetch their instructions from DRAM; the prefetch loads the code into L2
+    ahead of the body (and of any PDL wait). Between two loops it runs where the
+    megakernel's workers reach the second one (in a Gluon ring, its idle MMA
+    partition; under a dry pass of that root, on its dry trip), so the code of
+    the roots after a large weight stream is warm when they run; where workers
+    do not run a root's tasks as a block of their own (packet dispatch, a
+    non-persistent launch) it runs at entry. Every 16th CTA reads a share of
+    the text. It does nothing outside the Triton and Gluon backends on NVIDIA
+    GPUs of compute capability 9.0 or newer.
     """
     raise exc.NotInsideKernel
 
