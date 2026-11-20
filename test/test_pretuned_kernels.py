@@ -36,6 +36,7 @@ from helion._testing import skipIfCute
 from helion._testing import skipIfNotTriton
 from helion._testing import skipIfRefEager
 from helion._testing import skipIfSharedMemoryLessThan
+from helion._testing import skipUnlessGluon
 from helion._testing import slowIfBackends
 
 if TYPE_CHECKING:
@@ -582,6 +583,18 @@ def test_deepseek_v3_tp_megakernels_run_on_four_ranks(name: str) -> None:
         },
         check=True,
     )
+
+
+@skipIfRefEager("tile dependencies are built only in compiled mode")
+@skipUnlessGluon()
+@pytest.mark.timeout(1200)
+@pytest.mark.parametrize("name", ["gpt_oss_decode_layer", "gpt_oss_verify_layer"])
+def test_gpt_oss_120b_layer_megakernels(name: str) -> None:
+    """The decode and EAGLE3 verify layer megakernels against the FP32
+    reference on synthetic weights (they pin backend='gluon')."""
+    if not is_cuda() or torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip(f"{name} is pretuned for NVIDIA SM100")
+    _import_pretuned_kernel_module(name).correctness_check()
 
 
 @pytest.mark.slow

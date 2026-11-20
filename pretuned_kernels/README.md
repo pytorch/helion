@@ -53,6 +53,7 @@ pretuned_kernels/
     ├── llama32_1b_decode_layer_bf16/ # Llama-3.2-1B BF16 decode layer
     ├── gemma4_a4b_moe/               # Gemma 4 26B-A4B MoE
     ├── gpt_oss_moe/                  # gpt-oss MoE
+    ├── gpt_oss_120b/                 # GPT-OSS-120B decode + EAGLE3 verify layers (gluon)
     ├── flash_mla/                    # DeepSeek-V3 MLA decode, one request
     ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE
     ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4
