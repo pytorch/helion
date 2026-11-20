@@ -375,6 +375,61 @@ def _packed_mxfp8_gemm_with_bias_rows(
     return out, rows_of_bias
 
 
+@helion.kernel(autotune_effort="none", static_shapes=False)
+def _dynamic_packed_mxfp8_gemm(
+    x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
+) -> torch.Tensor:
+    """``_packed_mxfp8_gemm`` with dynamic shapes, specializing only ``x``'s
+    sizes and ``n``: ``y``'s K and every stride stay symbolic."""
+    m, k = x.size()
+    n = y.size(0)
+    hl.specialize(m)
+    hl.specialize(n)
+    hl.specialize(k)
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=x.device)
+    flat_out = out.view(m * n)
+    block_m = hl.register_block_size(16, 128)
+    block_n = hl.register_block_size(128, 256)
+    block_groups = hl.register_block_size(4)
+    for task_m, task_n in hl.grid(
+        [(m + block_m - 1) // block_m, (n + block_n - 1) // block_n]
+    ):
+        rows = task_m * block_m + hl.arange(block_m)
+        cols = task_n * block_n + hl.arange(block_n)
+        acc = hl.zeros([block_m, block_n], dtype=torch.float32)
+        for groups in hl.tile(k // 32, block_size=block_groups):
+            columns = groups.begin * 32 + hl.arange(block_groups * 32)
+            lhs = hl.load(
+                x,
+                [rows, columns],
+                extra_mask=(rows[:, None] < m) & (columns[None, :] < k),
+            )
+            rhs = hl.load(
+                y,
+                [cols, columns],
+                extra_mask=(cols[:, None] < n) & (columns[None, :] < k),
+            )
+            lhs_words = hl.load(
+                x_scale, [rows, groups.index // 4], extra_mask=rows[:, None] < m
+            )
+            rhs_words = hl.load(
+                y_scale, [cols, groups.index // 4], extra_mask=cols[:, None] < n
+            )
+            shift = ((groups.index % 4) * 8)[None, :]
+            lhs_scale = ((lhs_words >> shift) & 255).to(torch.uint8)
+            rhs_scale = ((rhs_words >> shift) & 255).to(torch.uint8)
+            acc = hl.dot_scaled(
+                lhs, lhs_scale, "e4m3", rhs.T, rhs_scale, "e4m3", acc=acc
+            )
+        hl.store(
+            flat_out,
+            [rows[:, None] * n + cols[None, :]],
+            acc.to(out.dtype),
+            extra_mask=(rows[:, None] < m) & (cols[None, :] < n),
+        )
+    return out
+
+
 @helion.kernel(autotune_effort="none", static_shapes=True)
 def _copy_then_packed_mxfp8_gemm(
     x: torch.Tensor, x_scale: torch.Tensor, y: torch.Tensor, y_scale: torch.Tensor
@@ -681,6 +736,53 @@ class TestDotScaled(TestCase):
         self.assertIn("(copy_desc.load(", code)
         self.assertIn("fence.proxy.async", code)
         torch.testing.assert_close(result, expected, atol=2e-2, rtol=1e-2)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_dynamic_shapes(self):
+        """An operand dimension the kernel does not specialize (``y``'s K)
+        still lowers through a descriptor, so the warp-specialized seed reads
+        every operand natively."""
+        args, expected = _packed_mxfp8_inputs(256, 512, 1280)
+        code, result = code_and_output(_dynamic_packed_mxfp8_gemm, args)
+        self.assertIn("warp_specialize=True", code)
+        self.assertIn("(x_desc.load(", code)
+        self.assertIn("(y_desc.load(", code)
+        self.assertIn("out_desc.store(", code)
+        torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+
+    @requires_sm100
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Codegen inspection not applicable in ref eager mode")
+    def test_packed_mxfp8_warp_specialize_needs_descriptor_operands(self):
+        """An operand without a descriptor (a base not 16-byte aligned) gets
+        its own bound kernel, which keeps the seed off warp specialization,
+        and a warp-specialized config that would mix it with descriptor loads
+        is rejected."""
+        (x, x_scale, y, y_scale), expected = _packed_mxfp8_inputs(128, 256, 256)
+        aligned = _packed_mxfp8_gemm.bind((x, x_scale, y, y_scale))
+        self.assertTrue(
+            aligned.config_spec.default_config()["range_warp_specializes"][0]
+        )
+        storage = torch.empty(y.numel() + 1, device=DEVICE, dtype=y.dtype)
+        unaligned_y = storage[1:].view_as(y)
+        unaligned_y.copy_(y)
+        args = (x, x_scale, unaligned_y, y_scale)
+        bound = _packed_mxfp8_gemm.bind(args)
+        self.assertIsNot(bound, aligned)
+        seed = bound.config_spec.default_config()
+        self.assertEqual(seed["range_warp_specializes"][0], False)
+        code, result = code_and_output(_packed_mxfp8_gemm, args)
+        self.assertIn("(x_desc.load(", code)
+        self.assertNotIn("(y_desc.load(", code)
+        torch.testing.assert_close(result.float(), expected, atol=2e-2, rtol=1e-2)
+        with self.assertRaisesRegex(helion.exc.InvalidConfig, "warp-specialized"):
+            bound.to_triton_code(
+                helion.Config(
+                    **{**seed.config, "range_warp_specializes": [True, False]}
+                )
+            )
 
     @requires_sm100
     @skipIfRefEager("Codegen inspection not applicable in ref eager mode")

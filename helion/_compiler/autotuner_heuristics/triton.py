@@ -563,11 +563,21 @@ class TritonB200PackedMXFP8Heuristic(AutotunerHeuristic):
                 compact_swap=compact_swap,
             )
             raw[partition_key] = split_k
+        # Warp-specialize only a dot the native lowering takes whole: with one
+        # operand left on pointer loads, codegen rejects the config
+        # (``triton/packed_mxfp8.py``).  The 128x256x4 tile with whole-word
+        # K partitions satisfies the config-dependent part of its proof.
         # Triton 3.8's automatic warp specialization rejects a K loop whose
         # bounds depend on the persistent tile (a split-K partition).
+        from ..triton.packed_mxfp8 import descriptor_operands
+
+        dot = find_packed_mxfp8_dot(device_ir.graphs)
         warp_specialize = (
             split_k == 1
             and not compact_swap
+            and fact.static_k % 128 == 0
+            and dot is not None
+            and descriptor_operands(dot)
             and (
                 _static_loop_bounds(device_ir, k_block_id)
                 or get_triton_version().release[:2] >= (3, 9)

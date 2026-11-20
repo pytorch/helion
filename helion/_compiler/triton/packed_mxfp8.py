@@ -19,6 +19,11 @@ replaces:
 
 The last two are proved for the config being compiled: a split-K kernel's
 partition tunable decides both.
+
+Inside a warp-specialized loop the dot is lowered natively only as a whole:
+a pointer-loaded operand beside descriptor loads and the TMA output store
+gives wrong, nondeterministic results there (Triton 3.9), so such a config
+is rejected (``InvalidConfig``).
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from typing import cast
 import sympy
 import torch
 
+from ... import exc
 from ..._compat import tensor_descriptor_supports_dtype
 from ...language import _tracing_ops
 from ...language import view_ops
@@ -106,6 +112,13 @@ def packed_mxfp8_dot(state: CodegenState) -> PackedMxfp8Dot | None:
         return PackedMxfp8Dot(None, None, None, None, swap)
     lhs_operand = _operand_ast(state, lhs)
     rhs_operand = _operand_ast(state, rhs)
+    if (lhs_operand is None or rhs_operand is None) and _in_warp_specialized_loop(
+        state
+    ):
+        raise exc.InvalidConfig(
+            "a warp-specialized loop needs every packed MXFP8 operand loaded "
+            "through a tensor descriptor; this config leaves one on pointer loads"
+        )
     if rhs_operand is not None:
         rhs_operand = expr_from_string("tl.permute({value}, [1, 0])", value=rhs_operand)
     return PackedMxfp8Dot(lhs_operand, lhs_scale, rhs_operand, rhs_scale, swap)
@@ -189,6 +202,14 @@ def _static(value: object) -> int | None:
         return None
     expr = CompileEnvironment.current().specialize_expr(expr)
     return int(expr) if isinstance(expr, sympy.Integer) else None
+
+
+def _tensor_extent(value: object) -> sympy.Expr | None:
+    """A tensor dimension, specialized when the bound kernel keys on it."""
+    expr = _expr(value)
+    if expr is None:
+        return None
+    return CompileEnvironment.current().specialize_expr(expr)
 
 
 def _configured(state: CodegenState, value: object) -> sympy.Expr | None:
@@ -341,10 +362,11 @@ def _tile_begins(state: CodegenState, start: sympy.Expr) -> tuple[int, int] | No
 
 
 def _bound_clips_only_outside(
-    state: CodegenState, index: object, bound: object, extent: int
+    state: CodegenState, index: object, bound: object, extent: int | sympy.Expr
 ) -> bool:
     """Whether ``index < bound`` is false only where ``index >= extent``,
-    on every tile the config executes."""
+    on every tile the config executes.  A symbolic ``extent`` (a dimension
+    the bound kernel does not specialize) only passes the tile proof."""
     configured = _configured(state, bound)
     if configured is None:
         return False
@@ -413,7 +435,7 @@ def mask_clips_only_outside(
     state: CodegenState,
     mask: object,
     indices: tuple[object, object],
-    shape: tuple[int, int],
+    shape: tuple[int | sympy.Expr, int | sympy.Expr],
 ) -> bool:
     """Whether a 2-D access's mask equals its out-of-bounds lanes.
 
@@ -469,6 +491,71 @@ def _node_ast(state: CodegenState, node: object) -> ast.AST | None:
     return value if isinstance(value, ast.AST) else None
 
 
+def _descriptor_eligible(
+    tensor: torch.Tensor, *, stride_one_dim: int | None = None
+) -> bool:
+    """The config-independent checks for a 2-D host descriptor over ``tensor``
+    (its layout signature and base alignment are part of the bound kernel's
+    key)."""
+    env = CompileEnvironment.current()
+    layout = env.tensor_descriptor_layout_signature(tensor)
+    return (
+        tensor.ndim == 2
+        # Offsets are cast to int32 (as ``TensorDescriptorIndexingStrategy``).
+        and (
+            env.index_dtype != torch.int64
+            or all(_tensor_dimension_fits_int32(size) for size in tensor.shape)
+        )
+        and tensor_descriptor_supports_dtype(tensor.dtype)
+        and layout is not None
+        and layout[0] is not None
+        and stride_one_dim in (None, layout[0])
+        and all(aligned or dim == layout[0] for dim, aligned in enumerate(layout[1]))
+        and env.tensor_descriptor_base_is_aligned(tensor)
+    )
+
+
+def descriptor_operands(dot: torch.fx.Node) -> bool:
+    """Whether both operands of a packed MXFP8 ``dot`` and its MN-major scale
+    words admit this lowering's host descriptors.
+
+    A seed that warp-specializes the dot's loop checks this: the rest of the
+    proof (contiguous indices, masks, word-aligned K tiles) then holds for
+    the seed's own tiles, so its config lowers every operand natively.
+    """
+    rhs = _unmask_zero_operand(dot.args[3])
+    if (
+        not isinstance(rhs, torch.fx.Node)
+        or rhs.target is not torch.ops.aten.permute.default
+    ):
+        return False
+    tensors: list[tuple[torch.Tensor, int | None]] = []
+    for load in (_unmask_zero_operand(dot.args[0]), rhs.args[0]):
+        loaded = tile_load(load, allow_mask=True)
+        if loaded is None:
+            return False
+        tensors.append((loaded[0], None))
+    for scale in (dot.args[1], dot.args[4]):
+        value = scale.meta.get("val") if isinstance(scale, torch.fx.Node) else None
+        groups = (
+            value.shape[1]
+            if isinstance(value, torch.Tensor)
+            and value.ndim == 2
+            and type(value.shape[1]) is int
+            else None
+        )
+        match = match_packed_scale(
+            scale, None, groups, allow_mask=True, allow_tile=True
+        )
+        if match is None:
+            return False
+        # The words load as a [words, rows] block of MN-major storage.
+        tensors.append((match.tensor, 0))
+    return all(
+        _descriptor_eligible(tensor, stride_one_dim=dim) for tensor, dim in tensors
+    )
+
+
 def descriptor_tile(
     state: CodegenState,
     tensor: torch.Tensor,
@@ -491,21 +578,13 @@ def descriptor_tile(
     ]
     layout = env.tensor_descriptor_layout_signature(tensor)
     if (
-        tensor.ndim != 2
-        or len(index_asts) != 2
+        len(index_asts) != 2
         # Fences around cross-thread syncs only cover TMA the function knows of.
         or not state.device_function.uses_async_proxy_global
         or not native_packed_mxfp8_target(env)
-        # Offsets are cast to int32 (as ``TensorDescriptorIndexingStrategy``).
-        or (
-            env.index_dtype == torch.int64
-            and not all(_tensor_dimension_fits_int32(size) for size in tensor.shape)
-        )
-        or not tensor_descriptor_supports_dtype(tensor.dtype)
+        or not _descriptor_eligible(tensor)
         or layout is None
         or layout[0] is None
-        or not all(aligned or dim == layout[0] for dim, aligned in enumerate(layout[1]))
-        or not env.tensor_descriptor_base_is_aligned(tensor)
         or not all(
             0 < size <= CUDA_TENSOR_DESCRIPTOR_MAX_BLOCK_SIZE and size & (size - 1) == 0
             for size in block_shape
@@ -563,19 +642,22 @@ def _operand_ast(state: CodegenState, operand: _Operand) -> ast.AST | None:
         "tuple[object, object]", tuple(cast("list[object]", operand.load.args[1]))
     )
     rows, groups = operand.tile
-    shape = tuple(_resolve_dim_size(size) for size in operand.tensor.shape)
+    # A dimension the bound kernel does not specialize (for example the K of
+    # ``b`` when only ``a``'s K is passed to ``hl.specialize``) stays symbolic:
+    # the mask proof then has to hold for every value of it.
+    shape = tuple(_tensor_extent(size) for size in operand.tensor.shape)
     value = operand.load.meta.get("val")
     if (
         not isinstance(value, torch.Tensor)
         or tuple(_configured(state, size) for size in value.shape)
         != (rows, groups * 32)
-        or not all(type(size) is int for size in shape)
+        or any(size is None for size in shape)
         or any(_contiguous(state, index) is None for index in indices)
         or not mask_clips_only_outside(
             state,
             operand.load.args[2],
             indices,
-            cast("tuple[int, int]", shape),
+            cast("tuple[sympy.Expr, sympy.Expr]", shape),
         )
     ):
         return None
