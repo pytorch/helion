@@ -5452,6 +5452,86 @@ class TestPointwiseComputeItemsize(TestCase):
         self.assertEqual(fact.compute_itemsize, 8)
 
 
+@onlyBackends(["triton"])
+class TestPointwiseGatheredSlab(TestCase):
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_slab_does_not_scale_with_table_rows(self) -> None:
+        @helion.kernel(backend="triton")
+        def embedding_like(idx: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = torch.empty(
+                [idx.size(0), table.size(1)], dtype=table.dtype, device=table.device
+            )
+            for tile_b, tile_d in hl.tile([idx.size(0), table.size(1)]):
+                out[tile_b, tile_d] = table[idx[tile_b], tile_d]
+            return out
+
+        heuristic = TritonPointwiseSeedHeuristic
+        idx = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        for rows, dtype, hardware in (
+            (8, torch.bfloat16, BLACKWELL_HARDWARE),  # table smaller than output
+            (64, torch.bfloat16, BLACKWELL_HARDWARE),  # already full tile
+            (8192, torch.bfloat16, BLACKWELL_HARDWARE),
+            (8192, torch.bfloat16, HOPPER_HARDWARE),
+            (8192, torch.float32, BLACKWELL_HARDWARE),
+            (8192, torch.bfloat16, RTX5080_HARDWARE),
+        ):
+            with self.subTest(rows=rows, dtype=dtype, hardware=hardware):
+                table = torch.empty([rows, 256], device=DEVICE, dtype=dtype)
+                bound = embedding_like.bind((idx, table))
+                assert bound.host_function is not None
+                (fact,) = bound.config_spec.pointwise_facts
+                self.assertEqual(fact.embedding_lookup_slabs, (2, 1))
+                tuned_arch = hardware == BLACKWELL_HARDWARE
+                with (
+                    bound.env,
+                    patch("helion._hardware.get_hardware_info", return_value=hardware),
+                    patch("helion.runtime.get_num_sm", return_value=148),
+                    patch.object(heuristic, "warp_slots_per_sm", return_value=64),
+                ):
+                    old_seed = heuristic._seed_from_fact(
+                        bound.env, fact, 148, tuned_arch
+                    )
+                    corrected = heuristic._seed_from_fact(
+                        bound.env,
+                        fact._replace(slab_numel=2, max_op_slab_numel=1),
+                        148,
+                        tuned_arch,
+                    )
+                    seed = heuristic.get_seed_config(
+                        bound.env, bound.host_function.device_ir
+                    )
+                if (
+                    rows == 8192
+                    and dtype == torch.bfloat16
+                    and hardware in (HOPPER_HARDWARE, BLACKWELL_HARDWARE)
+                ):
+                    self.assertLess(
+                        math.prod(old_seed.block_sizes), heuristic.BLOCK_FLOOR
+                    )
+                    self.assertGreaterEqual(
+                        math.prod(seed.block_sizes), heuristic.BLOCK_FLOOR
+                    )
+                    self.assertEqual(seed, corrected)
+                else:
+                    if rows >= 64:
+                        self.assertNotEqual(old_seed, corrected)
+                    self.assertEqual(seed, old_seed)
+
+    @skipIfRefEager("Compiler pointwise facts are not collected in ref eager mode")
+    def test_broadcast_column_is_not_a_direct_lookup(self) -> None:
+        @helion.kernel(backend="triton")
+        def lookup(idx: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+            out = table.new_empty((idx.size(0), table.size(1)))
+            for t, d in hl.tile(out.size()):
+                out[t, d] = table[idx[t], d.begin, None]
+            return out
+
+        idx = torch.zeros([16], device=DEVICE, dtype=torch.int32)
+        table = torch.empty([32, 64], device=DEVICE, dtype=torch.bfloat16)
+        (fact,) = lookup.bind((idx, table)).config_spec.pointwise_facts
+        self.assertIsNone(fact.embedding_lookup_slabs)
+
+
 class TestPointwiseGatherStride(TestCase):
     """``gather_stride`` is the address-expression scale, not the layout stride.
 

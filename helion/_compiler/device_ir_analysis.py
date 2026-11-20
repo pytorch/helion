@@ -37,6 +37,7 @@ from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
 from .fx_side_effects import is_impure_node
 from .indexing_strategy import _contiguous_integer_tensor_index
+from .indexing_strategy import is_block_size_index
 from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .tile_dependency import TILE_ACCESS_META
@@ -1960,6 +1961,74 @@ class DeviceIRAnalysis:
 
         return tuple(accesses)
 
+    def _is_direct_embedding(self, spec: ConfigSpec) -> bool:
+        """Recognize out[token, col] = table[ids[token], col] on a two-axis grid."""
+        if (
+            len(self.graphs) != 1
+            or len(spec.block_sizes) != 2
+            or len(spec.memory_op_facts) != 3
+        ):
+            return False
+        ids, table, out = spec.memory_op_facts
+        token, feature = spec.block_sizes
+        shape = (token.size_hint, feature.size_hint)
+        if not (
+            ids.kind == table.kind == "load"
+            and out.kind == "store"
+            and ids.dtype in (torch.int32, torch.int64)
+            and ids.ndim == 1
+            and table.ndim == out.ndim == 2
+            and ids.subscript_block_ids == (token.block_id,)
+            and table.subscript_block_ids == (None, feature.block_id)
+            and out.subscript_block_ids == (token.block_id, feature.block_id)
+            and ids.subscript_extents == shape[:1]
+            and out.subscript_extents == shape
+            and table.inner_extent == feature.size_hint > 1
+            and table.subscript_strides == out.subscript_strides == (shape[1], 1)
+            and ids.subscript_strides == (1,)
+        ):
+            return False
+        # Prove the dataflow too: an affine index or a fused transform can
+        # have exactly the same axis and layout facts.
+        ops = [
+            n
+            for n in self.graphs[0].nodes
+            if n.op == "call_function" and (n.target is hl.load or is_impure_node(n))
+        ]
+        if len(ops) != 3:
+            return False
+        index_load, lookup, store = ops
+        if store.target is not hl.store or not (
+            lookup.target is index_load.target is hl.load
+        ):
+            return False
+        match index_load.args[1], lookup.args[1], store.args[1]:
+            case [token_index], [rows, column], [out_token, out_column]:
+                # A scalar tile.begin can carry the same block ID. Require full tiles.
+                return (
+                    rows is index_load
+                    and store.args[2] is lookup
+                    and all(
+                        isinstance(base, torch.fx.Node)
+                        and base.target is _tracing_ops._host_tensor
+                        for base in (index_load.args[0], lookup.args[0], store.args[0])
+                    )
+                    and all(
+                        isinstance(k, torch.fx.Node)
+                        and is_block_size_index(k.meta.get("val"))
+                        for k in (token_index, column, out_token, out_column)
+                    )
+                    and all(
+                        mask is None
+                        for mask in (
+                            *index_load.args[2:3],
+                            *lookup.args[2:3],
+                            *store.args[3:4],
+                        )
+                    )
+                )
+        return False
+
     def pointwise_fact(
         self,
         spec: ConfigSpec,
@@ -2131,6 +2200,8 @@ class DeviceIRAnalysis:
             sfu_ops=sfu_op_count,
             gather_stride=gather_stride,
             max_op_slab_numel=max_op_slab_numel,
+            # One table read and one output write; the index is shared across features.
+            embedding_lookup_slabs=(2, 1) if self._is_direct_embedding(spec) else None,
         )
 
     def kernel_matmul_fact(
