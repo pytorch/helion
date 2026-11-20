@@ -56,6 +56,7 @@ from .fma_fusion import fuse_multiply_adds
 from .fragment_mma import FRAGMENT_LOWERING
 from .fragment_mma import LANE
 from .fragment_mma import LANE_PREAMBLE
+from .fragment_mma import TILE_PREFIX
 from .fragment_mma import is_fragment_acc
 from .lane_fold import MASKED_LOAD
 from .lane_fold import MSL_SCALAR_BYTES
@@ -425,15 +426,18 @@ def _generate_msl_kernel(
     body_stmts = defer_group_sums(body_stmts, param_names)
     # The threads each SIMD group lays the tiles out over when SIMD groups
     # split the fragment or register runs' K loops (``fragment_mma``,
-    # ``mpp_registers``): the launch stacks one such layout per SIMD group
-    # along z.
+    # ``mpp_registers``) or the fragment grids' rows: the launch stacks one
+    # such layout per SIMD group along z.
     split = _k_split(body_stmts)
     grid = _grid_runs(body_stmts)
+    row_split, row_base = _fragment_row_split(body_stmts)
+    assert split == 1 or row_split == 1, (split, row_split)
+    simdgroups = split * row_split
     layout = required_threads_per_threadgroup
-    if layout is not None and split > 1:
+    if layout is not None and simdgroups > 1:
         tx, ty, tz = layout
-        assert tz % split == 0, (layout, split)
-        layout = (tx, ty, tz // split)
+        assert tz % simdgroups == 0, (layout, simdgroups)
+        layout = (tx, ty, tz // simdgroups)
     body_stmts = elementize(
         body_stmts,
         tensor_dtypes,
@@ -491,11 +495,17 @@ def _generate_msl_kernel(
         ),
     )
     uses_reductions = _uses_reductions(body_stmts)
-    # Each SIMD group that splits the K loops runs the kernel's other code
-    # too, as the only one would, so codegen refuses kernels with reductions
-    # or staged tiles (``operand_elements.split_refusal``): their threadgroup
-    # memory would take writes from all of them.
-    assert split == 1 or not (uses_reductions or threadgroup_buffers)
+    # Each SIMD group that splits the K loops or rows runs the kernel's other
+    # code too, as the only one would, so codegen refuses kernels with
+    # reductions or staged tiles (``operand_elements.split_refusal``,
+    # ``fragment_mma.row_split_refusal``): their threadgroup memory would take writes
+    # from all of them.
+    # The fragment runs' tiles take every thread's copy and barriers
+    # (``fragment_mma.emit_tile_copies``).
+    assert simdgroups == 1 or not (
+        uses_reductions
+        or any(not n.startswith(TILE_PREFIX) for n, _, _ in threadgroup_buffers)
+    )
     if uses_reductions:
         reduction_at, preamble_at = len(msl_parts), len(msl_parts) + 2
         msl_parts.extend(("", "", REDUCTION_PREAMBLE))
@@ -557,13 +567,13 @@ def _generate_msl_kernel(
         )
 
     attributes = [("uint3", "tgid", "threadgroup_position_in_grid")]
-    if split == 1:
+    if simdgroups == 1:
         attributes.append(("uint3", "tid", "thread_position_in_threadgroup"))
     if uses_fragments:
         attributes.append(("uint", LANE, "thread_index_in_simdgroup"))
     if uses_registers:
         attributes.append(("uint", REGISTER_LANE, "thread_index_in_simdgroup"))
-    if split > 1 or grid:
+    if simdgroups > 1 or grid:
         # The same integer type as the other position attributes.
         attributes.append(("uint", SIMDGROUP, "simdgroup_index_in_threadgroup"))
     preamble = msl_parts
@@ -584,7 +594,7 @@ def _generate_msl_kernel(
         prologue.append(f"    constexpr uint {site} = {GROUP_PATHS.index(path)};")
     if uses_fragments:
         prologue.extend(f"    {line}" for line in LANE_PREAMBLE)
-    if split > 1:
+    if simdgroups > 1:
         # Each SIMD group's lanes take the layout's threads, in launch order.
         assert layout is not None
         tx, ty, _ = layout
@@ -611,6 +621,8 @@ def _generate_msl_kernel(
             kernel_constants(body_stmts) if uses_fragments or uses_registers else {}
         ),
         split=split,
+        row_base=row_base,
+        row_split=row_split,
         slot_types={
             name[len(SLOT_TYPE_GLOBAL_PREFIX) :]: cast("str", kind)
             for name, kind in fn_globals.items()
@@ -749,6 +761,31 @@ def _k_split(body_stmts: list[ast.stmt]) -> int:
                     splits.add(1 if split is None else split[1])
     assert len(splits) <= 1, splits
     return splits.pop() if splits else 1
+
+
+def _fragment_row_split(body_stmts: list[ast.stmt]) -> tuple[int, str]:
+    """The SIMD groups that split the fragment grids' rows (each fragment
+    accumulator's ``fragment=(rows, cols, transposed, split)``;
+    ``fragment_mma``), 1 when one SIMD group holds them, and the first
+    grid row of a SIMD group's share (``EmitState.row_base``): every
+    statement that names a row, from the kernel's first, starts there,
+    a line's seed before any accumulator too."""
+    grids = set()
+    for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == ACC:
+                for keyword in node.keywords:
+                    if keyword.arg == "fragment":
+                        grids.add(ast.literal_eval(keyword.value))
+    splits = {grid[3] for grid in grids}
+    assert len(splits) <= 1, splits
+    split = splits.pop() if splits else 1
+    if split == 1:
+        return 1, ""
+    # ``row_split_refusal``: every fragment group's rows lie over one
+    # block, in one grid.
+    (rows,) = {grid[0] for grid in grids}
+    return split, f" + {SIMDGROUP} * {8 * rows}"
 
 
 def _uses_reductions(body_stmts: list[ast.stmt]) -> bool:

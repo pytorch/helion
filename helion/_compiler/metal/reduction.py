@@ -191,9 +191,10 @@ def plan_reduced_tile_axes(
       onto axes of its own, so the sibling would claim a fresh axis and every
       thread on it would repeat the body.
 
-    Blocks within one multi-block strategy keep their order (``loop_orders``
-    does not move Metal thread axes), so a reduction over the inner block of
-    ``hl.tile([m, n])`` stays strided and takes the ``strided`` collective
+    Blocks within one multi-block strategy take thread axes in its loop
+    order (``loop_orders``, by default the tile's), so a reduction over the
+    block that order puts second (the inner block of ``hl.tile([m, n])``
+    by default) stays strided and takes the ``strided`` collective
     (``masked`` when the stride is not a power of two).
     """
     from ..cute.execution_plans import CuTeGridExecutionPlan

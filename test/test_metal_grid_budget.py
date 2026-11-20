@@ -14,6 +14,7 @@ import helion
 from helion._compiler.metal import grid_budget
 from helion._compiler.metal.backend import MetalBackend
 from helion._testing import skipUnlessBackends
+from helion._testing.metal import render_msl
 from helion.autotuner.finite_search import FiniteSearch
 import helion.language as hl
 
@@ -178,6 +179,35 @@ class TestMetalGridBudget(unittest.TestCase):
         )
         search = FiniteSearch(bound, (x,), configs)
         self.assertEqual(search._apply_config_filter(configs)[1], [0, 1])
+
+    def test_loop_orders_reorder_the_grid(self) -> None:
+        """Metal takes the shared ``loop_orders``: the default keeps the
+        tile order (a config without the key, every one saved before Metal
+        took it, launches as before), and ``[[1, 0]]`` puts the second
+        tile's blocks on the fastest grid axis."""
+        args = (torch.zeros(64, 128),)
+        spec = add_one.bind(args).config_spec
+        self.assertEqual(spec.default_config().config["loop_orders"], [[0, 1]])
+
+        def offsets(**knobs: object) -> list[str]:
+            msl = render_msl(
+                add_one, args, helion.Config(block_sizes=[16, 32], **knobs)
+            )
+            return [line.strip() for line in msl.splitlines() if "auto offset_" in line]
+
+        before = [
+            "auto offset_0 = (pid_0 * _BLOCK_SIZE_0);",
+            "auto offset_1 = (pid_1 * _BLOCK_SIZE_1);",
+        ]
+        self.assertEqual(offsets(), before)
+        self.assertEqual(offsets(loop_orders=[[0, 1]]), before)
+        self.assertEqual(
+            offsets(loop_orders=[[1, 0]]),
+            [
+                "auto offset_1 = (pid_0 * _BLOCK_SIZE_1);",
+                "auto offset_0 = (pid_1 * _BLOCK_SIZE_0);",
+            ],
+        )
 
 
 if __name__ == "__main__":

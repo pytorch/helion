@@ -228,6 +228,23 @@ def whole_k_dot(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 @helion.kernel(**S)
+def hoisted_reciprocal(
+    x: torch.Tensor, y: torch.Tensor, b: torch.Tensor
+) -> torch.Tensor:
+    """``1 / (x + b) @ y`` over N tiles: the computed lhs reads only values
+    loaded before the N loop, so ``metal_fragment_hoist`` builds it once."""
+    m, _ = x.size()
+    n = y.size(1)
+    out = torch.empty([m, n], dtype=F32, device=x.device)
+    for tile_m in hl.tile(m):
+        rows = x[tile_m, :]
+        bias = b[()]
+        for tile_n in hl.tile(n):
+            out[tile_m, tile_n] = hl.dot(torch.reciprocal(rows + bias), y[:, tile_n])
+    return out
+
+
+@helion.kernel(**S)
 def running_sums(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """out[b] = x[0] @ y[0] + ... + x[b] @ y[b]: an accumulator an outer
     loop carries from one K loop to the next, stored after each."""
@@ -641,8 +658,9 @@ class TestFragmentMma(unittest.TestCase):
     def test_chain(self) -> None:
         """Operands built from another group's fragments: attention's P
         (``examples/attention.py``, bfloat, a K tail-free S of 96 in tiles of
-        16 and 32, and its log-sum-exp), and a chained rhs whose K is the
-        scores' M."""
+        16 and 32, and its log-sum-exp), also with its rows split over 2 and
+        4 SIMD groups (``metal_fragment_row_split``; 64 rows leave an M
+        tail), and a chained rhs whose K is the scores' M."""
         ex = import_example("attention")
         kernel = helion.kernel(
             ex.attention.fn, backend="metal", static_shapes=True, fast_math=True
@@ -654,11 +672,20 @@ class TestFragmentMma(unittest.TestCase):
         ref, ref_lse = ex._attention_reference(
             q.cpu().float(), k.cpu().float(), v.cpu().float()
         )
-        for block_n in (16, 32):
-            with self.subTest(block_n=block_n):
-                (out, lse), _, msl = run_with_msl(
-                    kernel, (q, k, v), fragment_config([1, 16, block_n])
+        for block_m, block_n, hoist, split in (
+            (16, 16, False, 1),
+            (16, 32, False, 1),
+            (16, 16, True, 1),
+            (32, 32, False, 2),
+            (64, 16, True, 4),
+        ):
+            with self.subTest(block_m=block_m, block_n=block_n, hoist=hoist):
+                config = fragment_config(
+                    [1, block_m, block_n],
+                    metal_fragment_hoist=hoist,
+                    metal_fragment_row_split=split,
                 )
+                (out, lse), _, msl = run_with_msl(kernel, (q, k, v), config)
                 self._close(cast("torch.Tensor", out), ref, tol=2e-2)
                 self._close(cast("torch.Tensor", lse), ref_lse, tol=2e-2)
                 self.assertIn("simdgroup_matrix<bfloat, 8, 8> _frag_a[2];", msl)
@@ -677,6 +704,170 @@ class TestFragmentMma(unittest.TestCase):
         out, msl = _run(chained_rhs, args, fragment_config([16, 16]))
         x, y, w = (a.cpu().double() for a in args)
         self._close(out, w @ torch.exp(x @ y))
+
+    def test_hoist_k_tail(self) -> None:
+        """A hoisted operand over a K of 12 in a K tile of 16: its elements
+        past K are 0, as a run's are, where ``1 / (x + 0)`` past K is inf
+        and the MMA's ``inf * 0`` would be NaN in every output."""
+        x = torch.rand(16, 12, device=DEVICE) + 0.5
+        y = torch.randn(12, 32, device=DEVICE)
+        b = torch.zeros((), device=DEVICE)
+        ref = torch.reciprocal(x.cpu().double()) @ y.cpu().double()
+        for hoist in (False, True):
+            with self.subTest(hoist=hoist):
+                config = fragment_config([16, 16], metal_fragment_hoist=hoist)
+                out, msl = _run(hoisted_reciprocal, (x, y, b), config)
+                self._close(out, ref)
+                self.assertEqual("_frag_h" in msl, hoist)
+
+    def test_stage(self) -> None:
+        """Operands loaded from threadgroup tiles (``metal_fragment_stage``):
+        half views with tails along M, N and K (masked copies of one element
+        at a time), over one row (a block of 1 grown to an 8-row fragment),
+        and a transposed view (its B fragments loaded transposed); two runs
+        of one K loop over float tiles (2 elements a copy); and attention
+        with S = 80 in K and V tiles of 32 (a tail), its rows split over 4
+        SIMD groups, its queries hoisted."""
+        x = torch.randn(13, 40, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(40, 20, device=DEVICE, dtype=torch.float16)
+        bias = torch.randn(20, device=DEVICE)
+        ref = torch.relu(x.cpu().double() @ y.cpu().double() + bias.cpu().double())
+        stage = functools.partial(fragment_config, metal_fragment_stage=True)
+        out, msl = _run(views_epilogue, (x, y, bias), stage([16, 16, 16]))
+        self._close(out, ref)
+        self.assertIn("_frag_tile", msl)
+        out, _ = _run(views_epilogue, (x[:1], y, bias), stage([1, 16, 16]))
+        self._close(out, ref[:1])
+        yt = torch.randn(24, 40, device=DEVICE, dtype=torch.float16)
+        out, msl = _run(transposed_views, (x, yt), stage([16, 16, 16]))
+        self._close(out, x.cpu().double() @ yt.cpu().double().T)
+        self.assertIn("ulong2(0, 0), true);", msl)
+        xf, yf, zf = (
+            torch.randn(*shape, device=DEVICE)
+            for shape in ((32, 64), (64, 32), (64, 32))
+        )
+        out2, _, msl = run_with_msl(two_groups, (xf, yf, zf), stage([16, 16, 16]))
+        a, b = cast("tuple[torch.Tensor, torch.Tensor]", out2)
+        self._close(a, xf.cpu().double() @ yf.cpu().double())
+        self._close(b, xf.cpu().double() @ zf.cpu().double())
+        self.assertIn("packed_uint2", msl)
+        ex = import_example("attention")
+        kernel = helion.kernel(
+            ex.attention.fn, backend="metal", static_shapes=True, fast_math=True
+        )
+        q, k, v = (
+            torch.randn(2, 3, 80, 128, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        ref_out, ref_lse = ex._attention_reference(
+            q.cpu().float(), k.cpu().float(), v.cpu().float()
+        )
+        config = stage(
+            [1, 32, 32], metal_fragment_row_split=4, metal_fragment_hoist=True
+        )
+        (out, lse), _, msl = run_with_msl(kernel, (q, k, v), config)
+        self._close(cast("torch.Tensor", out), ref_out, tol=2e-2)
+        self._close(cast("torch.Tensor", lse), ref_lse, tol=2e-2)
+        self.assertIn("packed_ushort4", msl)
+
+    def test_stage_transposed(self) -> None:
+        """A transposed group (its rhs computed) loads its lhs view's
+        fragments, the MMA's B side, from a threadgroup tile: a seeded
+        half matmul with tails along M, N and K, also loading a tile ahead,
+        and an nvfp4 few-row matmul of 8 rows (a tile shorter than the
+        block), also loading a tile ahead and at the search's featured
+        seed, which also splits the grid rows (N's) over 4 SIMD groups."""
+        stage = functools.partial(fragment_config, metal_fragment_stage=True)
+        x = torch.randn(13, 40, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(40, 20, device=DEVICE, dtype=torch.float16)
+        c = torch.randn(13, 20, device=DEVICE)
+        ref = c.cpu().double() + x.cpu().double() @ (y.cpu().double() * 2)
+        (x4, wq, s), nvfp4_ref = _quantized("nvfp4", 8, 48, 256)
+        threads = [1, 2, 16]
+        # The search's featured fragment seed (``seed_configs``), which the
+        # transposed group's staging turns on.
+        spec = nvfp4_rows.bind((x4, wq, s)).config_spec
+        seed = next(
+            c
+            for c in spec.autotune_seed_configs()
+            if c.config.get("metal_fragment_stage")
+        )
+        self.assertEqual(seed.config.get("metal_fragment_row_split"), 4, seed)
+        self.assertEqual(seed.config.get("range_num_stages"), [2], seed)
+        for kernel, args, expected, config in (
+            (seeded_rhs, (x, y, c), ref, stage([16, 16, 16])),
+            (seeded_rhs, (x, y, c), ref, stage([16, 32, 32], range_num_stages=[2])),
+            (nvfp4_rows, (x4, wq, s), nvfp4_ref, stage([8, 16, 16], threads)),
+            (
+                nvfp4_rows,
+                (x4, wq, s),
+                nvfp4_ref,
+                stage([8, 16, 32], threads, range_num_stages=[2]),
+            ),
+            (nvfp4_rows, (x4, wq, s), nvfp4_ref, seed),
+        ):
+            with self.subTest(kernel=kernel.name, config=config):
+                out, msl = _run(kernel, args, config)
+                self._close(out, expected)
+                self.assertTrue(fragment_transposed(msl))
+                self.assertRegex(
+                    msl,
+                    r"simdgroup_load\(_frag_b\[0\], _frag_tile \+ \(0\) \* \d+ \+ 8,",
+                )
+
+    def _assert_pipelined(self, msl: str) -> None:
+        """The K loop's tile copies load a tile ahead
+        (``fragment_mma.pipeline_tile_copies``): each thread's registers of
+        the first tile loaded before the loop, the next tile's at the top of
+        each iteration, and the tile written from them."""
+        self.assertIn("_frag_tile", msl)
+        self.assertRegex(msl, r"_pipe0_frag_tile\w*_next = \*reinterpret_cast<")
+        self.assertIn("const int _pipe_next = ", msl)
+        self.assertRegex(
+            msl, r"<threadgroup \w+\*>\(_frag_tile\w* [^;]*\) = _pipe0_frag_tile\w*;"
+        )
+
+    def test_pipelined_stage(self) -> None:
+        """Tile copies loaded a tile ahead (``metal_fragment_stage`` with
+        ``range_num_stages=[2]``), the first compiler seed of a kernel that
+        stages: a half matmul with tails along M, N and K (K 40 in tiles of
+        16 and 32: the last tile ahead is masked, past the loop's end none
+        is loaded), and attention (S = 80) at its first seed and in K and V
+        tiles of 32 (a tail)."""
+        x = torch.randn(13, 40, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(40, 20, device=DEVICE, dtype=torch.float16)
+        bias = torch.randn(20, device=DEVICE)
+        ref = torch.relu(x.cpu().double() @ y.cpu().double() + bias.cpu().double())
+        pipelined = functools.partial(
+            fragment_config, metal_fragment_stage=True, range_num_stages=[2]
+        )
+        for block_k in (16, 32):
+            with self.subTest(block_k=block_k):
+                out, msl = _run(
+                    views_epilogue, (x, y, bias), pipelined([16, 16, block_k])
+                )
+                self._close(out, ref)
+                self._assert_pipelined(msl)
+        ex = import_example("attention")
+        kernel = helion.kernel(
+            ex.attention.fn, backend="metal", static_shapes=True, fast_math=True
+        )
+        q, k, v = (
+            torch.randn(2, 3, 80, 128, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        ref_out, ref_lse = ex._attention_reference(
+            q.cpu().float(), k.cpu().float(), v.cpu().float()
+        )
+        (seed, *_) = _seeds(kernel.bind((q, k, v)).config_spec)
+        self.assertTrue(seed.config.get("metal_fragment_stage"), seed)
+        self.assertEqual(seed.config.get("range_num_stages"), [2], seed)
+        for config in (seed, pipelined([1, 16, 32])):
+            with self.subTest(config=config):
+                (out, lse), _, msl = run_with_msl(kernel, (q, k, v), config)
+                self._close(cast("torch.Tensor", out), ref_out, tol=2e-2)
+                self._close(cast("torch.Tensor", lse), ref_lse, tol=2e-2)
+                self._assert_pipelined(msl)
 
     def test_two_groups(self) -> None:
         """Two fragment groups in one K loop share the lane preamble, each
