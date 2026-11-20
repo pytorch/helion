@@ -14,13 +14,40 @@ from typing import TYPE_CHECKING
 import torch
 from torch._inductor.utils import triton_type
 
+from ..._compat import is_hip
 from ...language import _decorators
 from ...language.inline_asm_ops import inline_asm_elementwise
 from ..ast_extension import create
 from ..ast_extension import expr_from_string
+from ..compile_environment import CompileEnvironment
+from ..inline_asm_constraints import input_constraint_codes
+from ..inline_asm_constraints import output_constraint_codes
 
 if TYPE_CHECKING:
     from ..inductor_lowering import CodegenState
+
+# NVPTX register classes. On ROCm, Triton's AMD backend logs an LLVM error for
+# these but still builds the kernel, without the asm: results are silently
+# wrong, so refuse them before Triton compiles.
+_NVPTX_ONLY_CONSTRAINTS = frozenset("bcdfhlq")
+
+
+def _check_rocm_constraints(constraints: str) -> None:
+    backend = CompileEnvironment.current().backend
+    outputs = output_constraint_codes(constraints)
+    if not outputs:
+        # Without an "=" output LLVM's AMDGPU backend aborts the process
+        # (e.g. GCC's read-write "+v,v"); an input spelled "+v" is fine.
+        raise backend.unsupported(
+            f"inline asm constraints {constraints!r} declare no '=' output on ROCm"
+        )
+    codes = outputs + input_constraint_codes(constraints, allow_plus=True)
+    if nvptx := sorted({code for code in codes if code in _NVPTX_ONLY_CONSTRAINTS}):
+        raise backend.unsupported(
+            f"inline asm constraint(s) {nvptx} in {constraints!r} on ROCm: these "
+            "are NVPTX register classes; write AMDGCN asm with AMDGPU "
+            "constraints such as 'v'"
+        )
 
 
 @_decorators.codegen(inline_asm_elementwise, "triton")
@@ -31,6 +58,11 @@ def _(state: CodegenState) -> ast.AST | list[ast.AST]:
     dtype = state.proxy_arg(3)
     is_pure = state.proxy_arg(4)
     pack = state.proxy_arg(5)
+    # ROCm specifically: Triton's AMD backend is what drops this asm silently.
+    # Other targets that do not lower to PTX (TileIR) reject inline asm.
+    if is_hip():
+        assert isinstance(constraints_str, str)  # checked by the language op
+        _check_rocm_constraints(constraints_str)
 
     # Convert the list of tensor args to AST
     # We need to create a proper list AST with the tensor elements
