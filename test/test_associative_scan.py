@@ -1369,7 +1369,7 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
                     helion_combine_tuple_fn, input_tuple, 0
                 )
 
-                output[tile_e, tile_f] = out_vals
+                output[tile_e, tile_f] = out_vals + 0 * out_idxs
 
             return output
 
@@ -1383,6 +1383,9 @@ class TestAssociativeScan(RefEagerTestBase, TestCase):
         code, result = code_and_output(
             test_segmented_tuple_kernel, (indices, input_data)
         )
+        if _get_backend() == "triton":
+            # Both results come from one scan.
+            self.assertEqual(code.count("tl.associative_scan("), 1)
 
         # Expected: cumulative sum for each position
         expected = torch.tensor(

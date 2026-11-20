@@ -29,7 +29,6 @@ from helion._compiler.cross_loop_codegen import _dry_pass_binds
 from helion._compiler.cross_loop_codegen import _dry_pass_rewrite
 from helion._compiler.cross_loop_codegen import _free_reads
 from helion._compiler.cross_loop_codegen import _outline_cross_loop_region
-from helion._compiler.cross_loop_codegen import _scope_wait
 from helion._compiler.cross_loop_codegen import _triton_root_requires_kernel_scope
 from helion._compiler.device_function import DeviceFunction
 from helion._compiler.device_function import SyncRole
@@ -651,6 +650,27 @@ def pdl_unwaited_chain(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def broadcast_index_consumer(x: torch.Tensor) -> torch.Tensor:
+    """A consumer reading the producer's columns through broadcast index tensors
+    (live rows, ``tile.index.unsqueeze(0)``): its column tile still keys it."""
+    rows, columns = x.size()
+    tmp = torch.empty_like(x)
+    out = torch.empty_like(x)
+    for producer_column in hl.tile(columns, block_size=16):
+        tmp[:, producer_column] = x[:, producer_column] + 1
+    for consumer_column in hl.tile(columns, block_size=16):
+        lanes = hl.arange(rows)
+        live = torch.where(lanes < rows, lanes, 0)
+        columns_index = consumer_column.index
+        values = hl.load(tmp, [live[:, None], columns_index.unsqueeze(0)])
+        out[:, consumer_column] = values * 2
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def nested_two_axis_consumer(x: torch.Tensor) -> torch.Tensor:
     """Exercise conservative fallback for an unrendered two-axis action scope."""
     rows, columns = x.size()
@@ -864,6 +884,29 @@ def shard_of_whole_rows(x: torch.Tensor, shard: hl.constexpr) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
+def row_block_beside_whole_rows(x: torch.Tensor) -> torch.Tensor:
+    rows, splits, width = x.shape
+    y = torch.empty_like(x)
+    peaks = torch.empty((splits, rows), dtype=x.dtype, device=x.device)
+    out = torch.empty((rows // 4, splits, width), dtype=x.dtype, device=x.device)
+
+    for tile_row, tile_split in hl.tile([rows, splits], block_size=[1, 1]):
+        values = x[tile_row.begin, tile_split.begin, :]
+        y[tile_row.begin, tile_split.begin, :] = values * 2
+        peaks[tile_split.begin, tile_row.begin + hl.arange(1)] = torch.amax(
+            values[None, :], dim=1
+        )
+    for tile_block, tile_split in hl.tile([rows // 4, splits], block_size=[1, 1]):
+        block = y[tile_block.begin * 4 + hl.arange(4), tile_split.begin, :]
+        peak = torch.amax(peaks[tile_split.begin, :], dim=0)
+        out[tile_block.begin, tile_split.begin, :] = torch.sum(block, dim=0) + peak
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
 def keyed_rows_beside_whole_read(x: torch.Tensor) -> torch.Tensor:
     rows, width = x.shape
     totals = torch.empty((2, width), dtype=x.dtype, device=x.device)
@@ -894,10 +937,39 @@ def join_of_whole_reads(x: torch.Tensor) -> torch.Tensor:
     for tile_r in hl.tile(rows, block_size=1):
         b[tile_r.begin, :] = x[tile_r.begin, :] * 2
     for tile_r in hl.tile(rows, block_size=1):
+        row = x[tile_r.begin, :]
         # Every task reads both producers whole: one wait serves them all.
         whole = torch.sum(a[:, :], dim=0) + torch.sum(b[:, :], dim=0)
-        out[tile_r.begin, :] = whole + x[tile_r.begin, :]
+        out[tile_r.begin, :] = whole + row
     return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def rank_ordered_reader(
+    xc: torch.Tensor,
+    xa: torch.Tensor,
+    xb: torch.Tensor,
+    y: torch.Tensor,
+    idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    c = torch.empty_like(xc)
+    a = torch.empty_like(xa)
+    b = torch.empty_like(xb)
+    out = torch.empty_like(xa)
+    for tile_r in hl.tile(xc.size(0), block_size=1):
+        c[tile_r.begin, :] = xc[tile_r.begin, :] - 1
+    for tile_r in hl.tile(xa.size(0), block_size=1):
+        a[tile_r.begin, :] = xa[tile_r.begin, :] + 1
+    for tile_r in hl.tile(xb.size(0), block_size=1):
+        b[tile_r.begin, :] = xb[tile_r.begin, :] * 2
+    for tile_r in hl.tile(xa.size(0), block_size=1):
+        # A keyed wait on a's root, a root barrier on b's (a gathered row).
+        row = idx[tile_r.begin]
+        out[tile_r.begin, :] = (a[tile_r.begin, :] + b[row, :]) * y[tile_r.begin, :]
+    return c, out
 
 
 @helion.kernel(
@@ -1244,6 +1316,42 @@ def barrier_after_weight_load(
         weight = w[tile_n, :]
         out[tile_n] = torch.sum(weight * act[None, :], dim=1)
     return act, out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def counter_read_before_barrier(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    w: torch.Tensor,
+    count: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    n, k = w.size()
+    act = torch.empty_like(x)
+    side = torch.empty_like(y)
+    mid = torch.empty((n,), dtype=x.dtype, device=x.device)
+    out = torch.empty_like(x)
+    for tile_k in hl.tile(k, block_size=64):
+        act[tile_k] = x[tile_k] + 1
+    for tile_k in hl.tile(k, block_size=64):
+        side[tile_k] = y[tile_k] * 3
+    # Every task reads all of act: a root barrier.
+    for tile_n in hl.tile(n, block_size=16):
+        mid[tile_n] = torch.sum(w[tile_n, :] * act[None, :], dim=1)
+    # act and side through one readiness counter (side's root reaches no
+    # barrier), mid through a root barrier (a loop of no static extent).
+    for tile_k in hl.tile(k, block_size=64):
+        early = act[tile_k] * 2 + side[tile_k]
+        early = early + torch.sum(hl.dot(u[tile_k, :], v[:, :]), dim=1)
+        total = hl.zeros([tile_k], dtype=torch.float32)
+        for g in hl.grid(count[0] // 16):
+            total = total + torch.sum(hl.load(mid, [g * 16 + hl.arange(16)]))
+        out[tile_k] = early + total
+    return act, side, mid, out
 
 
 @helion.kernel(
@@ -1623,29 +1731,40 @@ class TestCrossLoopCodegenHelpers(TestCase):
         )
         self.assertTrue(pinned("for t in tl.range(a, b):\n" + receive))
 
-    def test_scope_wait_passes_only_independent_loads(self) -> None:
+    def test_schedule_waits_moves_only_independent_statements(self) -> None:
+        """A wait goes before the first statement needing it; independent loads
+        and index math after that statement still move ahead of it unless they
+        follow a statement that stays (a name, or memory it may write or order).
+        With two waits each statement follows the last one it needs."""
         wait = ast.parse(
             "w = tl.inline_asm_elementwise(asm='x', constraints='=r,l', "
             "args=[state + key], dtype=tl.uint32, is_pure=False, pack=1)"
         ).body
-        allocations = {"a": 1, "a_view": 1, "b": 2}
+        allocations = {"a": 1, "a_view": 1, "b": 2, "c": 3, "flags": 4, "table": 5}
+
+        def schedule(source: str, renames: dict[str, str] | None = None) -> list:
+            body = ast.parse(source).body
+            return cross_loop_codegen._schedule_waits(
+                body,
+                [(wait, frozenset({1}))],
+                allocations,
+                renames or {},
+                frozenset({"state"}),
+            )
 
         def placed(source: str) -> int:
-            body = ast.parse(source).body
-            _scope_wait(body, wait, frozenset({1}), frozenset({"state"}), allocations)
-            return next(i for i, s in enumerate(body) if s is wait[0])
+            return schedule(source).index(wait[0])
 
-        # Index math and loads of uncovered tensors pass the wait; a covered
-        # tensor, under any of its argument names, stops it.
         self.assertEqual(
             placed("i = pid * 4\nx = tl.load(b + i)\ny = tl.load(a + i)"), 2
         )
         self.assertEqual(placed("x = tl.load(b + 1)\ny = a_view.shape"), 1)
+        # Nothing touches what it orders: the wait still runs, last.
+        self.assertEqual(placed("i = pid * 4"), 1)
         for stop in (
             "tl.store(b + i, x)",
             "tl.atomic_add(b + i, 1)",
             "helper(b)",
-            "d.load([0])",
             "x = tl.load(q + 1)",  # an address naming no tensor argument
             "x = tl.load(tl.load(b + 0).to(tl.pointer_type(tl.float32)) + 1)",
             "x = tl.load(state + 1)",
@@ -1658,12 +1777,63 @@ class TestCrossLoopCodegenHelpers(TestCase):
             self.assertEqual(
                 placed(f"i = pid * 4\n{stop}\ny = tl.load(a + i)"), 1, stop
             )
-        # Nothing touches what it orders: the wait still runs, last.
-        self.assertEqual(placed("i = pid * 4"), 1)
 
-    def test_batch_waits_polls_adjacent_spins_together(self) -> None:
-        """Adjacent spins issue every first load before any spin loop, and
-        adjacent wait-only guards of one test merge; anything else splits."""
+        def moved(between: str, renames: dict[str, str] | None = None) -> bool:
+            source = f"i = pid * 4\ny = tl.load(a + i)\n{between}\nz = tl.load(b + i)"
+            body = schedule(source, renames)
+            z = next(s for s in body if ast.unparse(s).startswith("z = "))
+            return body.index(z) < body.index(wait[0])
+
+        for passes in (
+            "u = y * 2",
+            "tl.store(c + i, y)",  # another tensor
+            "v = tl.load(c + i)",
+            "v = tl.load(c + i, volatile=True) + y",
+            "tl.atomic_add(flags + 0, 1, sem='relaxed')",
+            # A barrier orders the CTA's accesses before it: none of b here.
+            "tl.store(c + i, y)\ntl.debug_barrier()",
+            "for k in tl.range(0, 4):\n    u = y + k",
+        ):
+            self.assertTrue(moved(passes), passes)
+        for stops in (
+            "tl.store(b + i, y)",  # the moved load's tensor
+            "tl.store(p, tl.load(c + i))",  # an address naming no tensor argument
+            "tl.store(tl.load(table + 0).to(tl.pointer_type(tl.float32)) + i, y)",
+            "tl.atomic_add(flags + 0, 0, sem='acquire')",  # orders later loads
+            "tl.atomic_add(c + i, 1)",  # acq_rel by default
+            "helper(c)",
+            "tl.store(b + i, y)\ntl.debug_barrier()",
+            "i = i + 1",  # redefines what the load reads
+        ):
+            self.assertFalse(moved(stops), stops)
+        # The value a loop leaves is its loop variable after the final rename.
+        self.assertFalse(
+            moved("for k in tl.range(0, 4):\n    i_1 = i + k", {"i_1": "i"})
+        )
+
+        second = ast.parse(
+            "w2 = tl.inline_asm_elementwise(asm='x', constraints='=r,l', "
+            "args=[state + key2], dtype=tl.uint32, is_pure=False, pack=1)"
+        ).body
+        body = cross_loop_codegen._schedule_waits(
+            ast.parse(
+                "x = tl.load(b + 0)\ny = tl.load(a + x)\nz = tl.load(c + 0)\nu = y + z"
+            ).body,
+            [(wait, frozenset({1})), (second, frozenset({3}))],
+            allocations,
+            {},
+            frozenset({"state"}),
+        )
+        self.assertEqual(
+            [ast.unparse(s).split(" = ")[0] for s in body],
+            ["x", "w", "y", "w2", "z", "u"],
+        )
+
+    def test_batch_waits_polls_a_blocks_spins_together(self) -> None:
+        """A block's spins issue every first load at the first spin and reload
+        the later unmet counters after each spin; a statement assigning a
+        later counter or target starts a new group, and adjacent wait-only
+        guards of one test merge."""
 
         def spin(name: str, counter: str, fence: bool = True) -> str:
             load = (
@@ -1703,6 +1873,7 @@ class TestCrossLoopCodegenHelpers(TestCase):
                 "a",
                 "b",
                 "while a != t:",
+                "b",  # reloaded while unmet
                 "while b != t:",
                 "a_sync",
                 "a_fence",
@@ -1710,9 +1881,19 @@ class TestCrossLoopCodegenHelpers(TestCase):
                 "x",
             ],
         )
-        # A statement between two spins keeps them apart.
+        # A statement between two spins keeps its place after the first spin,
+        # the second spin after it; the second counter polls with the first
+        # (its name defined ahead for a dry pass that guards the runs apart).
         self.assertEqual(
-            batched(f"{spin('a', 's')}\ny = 1\n{spin('b', 's')}")[:3],
+            batched(f"{spin('a', 's')}\ny = tl.load(q)\n{spin('b', 's + 32')}"),
+            [
+                *["b", "a", "b", "while a != t:", "b", "a_sync", "a_fence", "y"],
+                *["while b != t:", "b_sync", "b_fence"],
+            ],
+        )
+        # One assigning the second spin's target starts a new group.
+        self.assertEqual(
+            batched(f"{spin('a', 's')}\nt = 1\n{spin('b', 's + 32')}")[:3],
             ["a", "while a != t:", "a_sync"],
         )
         guarded = [
@@ -1724,9 +1905,16 @@ class TestCrossLoopCodegenHelpers(TestCase):
         self.assertEqual(len(out), 1)
         assert isinstance(out[0], ast.If)
         self.assertEqual(
-            [ast.unparse(s).split(" = ")[0].split("\n")[0] for s in out[0].body][:4],
-            ["a", "b", "while a != t:", "while b != t:"],
+            [ast.unparse(s).split(" = ")[0].split("\n")[0] for s in out[0].body][:5],
+            ["a", "b", "while a != t:", "b", "while b != t:"],
         )
+        # Reassigning a guard's input between two guards starts a new group.
+        out = cross_loop_codegen._batch_waits(
+            cast("Any", df),
+            ast.parse("\n".join([guarded[0], "pid = 1", guarded[1]])).body,
+        )
+        assert isinstance(out[0], ast.If)
+        self.assertNotIn("b", [ast.unparse(s).split(" = ")[0] for s in out[0].body])
         # A guard whose test reads what the first body assigns does not merge.
         feeding = [guarded[0], guarded[1].replace("pid == 0", "a == 0")]
         out = cross_loop_codegen._batch_waits(
@@ -2487,6 +2675,125 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 self.assertIn("async_load_fence", code)
 
     @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_task_publishes_before_stores_no_other_root_orders(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def side_output(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a = torch.empty_like(x)
+            side = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                a[tile_m, tile_n] = x[tile_m, tile_n] + 1
+                side[tile_m, tile_n] = x[tile_m, tile_n] * 3
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[tile_m, tile_n] = a[tile_m, tile_n] * 2
+            return out, side
+
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def side_read(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            a = torch.empty_like(x)
+            side = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                a[tile_m, tile_n] = x[tile_m, tile_n] + 1
+                side[tile_m, tile_n] = x[tile_m, tile_n] * 3
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                out[tile_m, tile_n] = a[tile_m, tile_n] * 2 + side[tile_m, tile_n]
+            return out, side
+
+        x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
+        for kernel, read_side in ((side_output, False), (side_read, True)):
+            with mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ):
+                code, (out, side) = code_and_output(
+                    kernel,
+                    (x,),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="dynamic",
+                    num_sm_multiplier=1,
+                    num_warps=4,
+                    indexing="pointer",
+                )
+            torch.testing.assert_close(out, (x + 1) * 2 + (x * 3 if read_side else 0))
+            torch.testing.assert_close(side, x * 3)
+            # The first root's task: its completion precedes its store to
+            # ``side`` only when no later root reads ``side``.
+            task = ast.unparse(_generated_function(code, "tile_dependency_root_0"))
+            self.assertEqual("sem='release'" in task, not read_side)
+            if not read_side:
+                self.assertLess(
+                    task.index("sem='release'"), task.index("tl.store(side + ")
+                )
+                self.assertLess(
+                    task.index("tl.store(a + "), task.index("sem='release'")
+                )
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_task_publishes_after_its_reads_another_root_overwrites(self) -> None:
+        @helion.kernel(static_shapes=True, autotune_effort="none")
+        def war_tail(
+            x: torch.Tensor, a: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            b = torch.empty_like(x)
+            out = torch.empty_like(x)
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                b[tile_m, tile_n] = x[tile_m, tile_n] * 2
+                out[tile_m, tile_n] = x[tile_m, tile_n] + a[tile_m, tile_n]
+            for tile_m, tile_n in hl.tile(x.size(), block_size=[32, 32]):
+                a[tile_m, tile_n] = b[tile_m, tile_n] + 1
+            return out, a
+
+        x = torch.arange(64 * 128, device=DEVICE, dtype=torch.float32).reshape(64, 128)
+        a = torch.full_like(x, 5.0)
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "choose_final_arrival_continuations",
+            return_value=(),
+        ):
+            code, (out, a_out) = code_and_output(
+                war_tail,
+                (x, a.clone()),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="dynamic",
+                num_sm_multiplier=1,
+                num_warps=4,
+                indexing="pointer",
+            )
+        torch.testing.assert_close(out, x + 5)
+        torch.testing.assert_close(a_out, x * 2 + 1)
+        task = ast.unparse(_generated_function(code, "tile_dependency_root_0"))
+        # The second root overwrites ``a``: the first root's completion follows
+        # its read of ``a`` (published earlier, the second root's stores could
+        # land before that read).
+        self.assertIn("tl.load(a + ", task)
+        if "sem='release'" in task:
+            self.assertLess(task.index("tl.load(a + "), task.index("sem='release'"))
+
+    def test_volatile_load_stays_ahead_of_an_early_publication(self) -> None:
+        # Trailing statements of a task: a store another root orders (``out``),
+        # a load of ``flag``, a store no root orders (``side``).  The release may
+        # precede the load only when it is not volatile (a word another
+        # program writes during the launch).
+        allocations = {"out": 0, "flag": 1, "side": 2}
+        for volatile, ordered in ((False, 1), (True, 2)):
+            body = [
+                ast.parse(statement).body[0]
+                for statement in (
+                    "tl.store(out + offsets, value)",
+                    f"word = tl.load(flag + offsets, volatile={volatile})",
+                    "tl.store(side + offsets, word)",
+                )
+            ]
+            split = cross_loop_codegen._split_publication(
+                body, frozenset({0}), allocations, {}
+            )
+            self.assertEqual(len(body) if split is None else len(split[0]), ordered)
+
+    @skipIfNotCUDA()
     @skipUnlessTensorDescriptor("Tensor descriptor support is required")
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_middle_root_tma_store_drains_every_release(self) -> None:
@@ -3090,6 +3397,29 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_broadcast_index_subscripts_keep_a_counter(self) -> None:
+        """A broadcast ``tile.index`` indexes as ``tile.index`` does (unsqueeze
+        keeps its values), so the consumer's column tile keys a readiness counter
+        instead of a barrier on every producer task."""
+        x = torch.arange(8 * 64, device=DEVICE, dtype=torch.float32).reshape(8, 64)
+        for pipeline in ("static", "dynamic"):
+            with self.subTest(pipeline=pipeline):
+                with self.assertLogs("helion.megakernel", "INFO") as logs:
+                    code, out = code_and_output(
+                        broadcast_index_consumer,
+                        (x,),
+                        pid_type="persistent_blocked",
+                        cross_loop_pipeline=pipeline,
+                        num_sm_multiplier=1,
+                        num_warps=1,
+                    )
+                torch.testing.assert_close(out, (x + 1) * 2)
+                report = "\n".join(logs.output)
+                self.assertIn("root 0 -> root 1 (tmp): counter of 4 keys", report)
+                self.assertNotIn("tile_dependency_root_barrier_wait", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_two_axis_nested_loop_falls_back_to_root_barrier(self) -> None:
         x = torch.arange(32 * 32, device=DEVICE, dtype=torch.float32).reshape(32, 32)
         for pipeline in ("static", "dynamic"):
@@ -3342,8 +3672,10 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, (x + 1) * 2)
-        self.assertIn("tile_dependency_root_barrier_wait", code)
-        self.assertNotIn("tile_dependency_readiness_wait", code)
+        # The 32-wide consumer's last tile reads past the 5 producer tiles of
+        # its row; clipped, it waits for the row's producers.
+        self.assertIn("tile_dependency_readiness_wait", code)
+        self.assertNotIn("tile_dependency_root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -3711,6 +4043,47 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
             and "tile_dependency_root_barrier_wait" in ast.unparse(node)
         ]
         self.assertEqual(len(guards), 1)
+
+    @skipIfNotCUDA()
+    @skipIfCudaCapabilityLessThan((10, 0), reason="kernel-scope dot roots need sm100")
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_counter_ordered_read_precedes_root_barrier_wait(self) -> None:
+        # The last root reads act through a readiness counter and mid through
+        # mid's root barrier, which act's root reaches through its own barrier.
+        # The barrier covers act transitively, but the counter's wait orders
+        # act's reads: the barrier wait follows them, up to mid's first read.
+        x = torch.randn((256,), device=DEVICE, dtype=torch.float32)
+        y = torch.randn((256,), device=DEVICE, dtype=torch.float32)
+        w = torch.randn((64, 256), device=DEVICE, dtype=torch.float32)
+        count = torch.tensor([64], device=DEVICE, dtype=torch.int32)
+        u = torch.randn((256, 16), device=DEVICE, dtype=torch.bfloat16)
+        v = torch.randn((16, 16), device=DEVICE, dtype=torch.bfloat16)
+        code, (act, side, mid, out) = code_and_output(
+            counter_read_before_barrier,
+            (x, y, w, count, u, v),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_sm_multiplier=1,
+            num_warps=4,
+        )
+        expected_mid = (w * (x + 1)[None, :]).sum(1)
+        torch.testing.assert_close(act, x + 1)
+        torch.testing.assert_close(side, y * 3)
+        torch.testing.assert_close(mid, expected_mid, rtol=1e-4, atol=1e-3)
+        expected = (x + 1) * 2 + y * 3 + (u.float() @ v.float()).sum(1)
+        torch.testing.assert_close(
+            out, expected + expected_mid.sum(), rtol=1e-3, atol=1e-2
+        )
+        kernel = ast.unparse(
+            _generated_function(code, "_helion_counter_read_before_barrier")
+        )
+        # The last root's reads are the last of act and mid in the kernel.
+        read = kernel.rindex("tl.load(act ")
+        barrier_read = kernel.rindex("tl.load(mid ")
+        readiness = kernel.rindex("tile_dependency_readiness_wait", 0, read)
+        barrier = kernel.rindex("tile_dependency_root_barrier_wait", 0, barrier_read)
+        self.assertLess(readiness, read)
+        self.assertLess(read, barrier)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
@@ -4142,6 +4515,31 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_row_block_beside_whole_rows_waits_per_split(self) -> None:
+        # The consumer reads a block of four rows of its split and every row's
+        # peak: projecting the rows out of the block's (row // 4) items leaves
+        # one key per split, which all of the split's rows publish.
+        x = torch.arange(8 * 4 * 64, device=DEVICE, dtype=torch.float32).reshape(
+            8, 4, 64
+        )
+        expected = (x * 2).reshape(2, 4, 4, 64).sum(dim=1) + x.amax(dim=(0, 2))[
+            None, :, None
+        ]
+        for pipeline in ("static", "dynamic"):
+            code, out = code_and_output(
+                row_block_beside_whole_rows,
+                (x,),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline=pipeline,
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+            torch.testing.assert_close(out, expected)
+            self.assertIn("tl.cast(8, tl.uint32)", code, pipeline)
+            self.assertNotIn("tile_dependency_root_barrier", code, pipeline)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_whole_read_root_keeps_other_producers_keyed(self) -> None:
         # Every consumer task waits on all of the first root (a barrier), but
         # that must not coarsen its per-row wait on the second root.
@@ -4170,9 +4568,14 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
     def test_task_invariant_wait_runs_once_per_worker(self) -> None:
-        x = torch.randn((8, 64), device=DEVICE, dtype=torch.float32)
-        expected = (x + 1).sum(dim=0) + (x * 2).sum(dim=0) + x
-        for pipeline in ("static", "dynamic"):
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        for rows, pipeline in (
+            (8, "static"),
+            (2 * workers, "static"),
+            (8, "dynamic"),
+        ):
+            x = torch.randn((rows, 8), device=DEVICE, dtype=torch.float32)
+            expected = (x + 1).sum(dim=0) + (x * 2).sum(dim=0) + x
             code, out = code_and_output(
                 join_of_whole_reads,
                 (x,),
@@ -4187,18 +4590,66 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 _generated_function(code, "tile_dependency_root_2_scheduled_task")
             )
             kernel = code[code.index("def _helion_join_of_whole_reads") :]
-            if pipeline == "static":
-                # The join's wait runs once, before the worker's task loop.
+            if pipeline == "static" and rows > workers:
+                # A worker runs several tasks: the join's wait runs once, before
+                # its task loop.
                 self.assertNotIn("tile_dependency_readiness_wait", task)
                 self.assertLess(
                     kernel.index("tile_dependency_readiness_wait ="),
                     kernel.rindex("for virtual_pid in"),
+                )
+            elif pipeline == "static":
+                # At most one task per worker: the wait is scoped in the task,
+                # after the loads it does not order.
+                body = task + ast.unparse(
+                    _generated_function(code, "tile_dependency_root_2")
+                )
+                self.assertLess(
+                    body.index("tl.load(x"),
+                    body.index("tile_dependency_readiness_wait ="),
                 )
             else:
                 # A program running one packet waits in it (at the task's
                 # first read of what the wait orders).
                 root = ast.unparse(_generated_function(code, "tile_dependency_root_2"))
                 self.assertIn("tile_dependency_readiness_wait", task + root)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_scoped_waits_follow_completion_rank(self) -> None:
+        # Packed on the launch's W workers: c's root on workers [0, 16); a's
+        # (W - 8 tasks) wraps to [0, W - 8), behind c's tasks; b's root (8
+        # tasks) packs onto [W - 8, W), concurrent with both and independent.
+        # So b's root (index 2) completes first in the static schedule (rank 0)
+        # and a's (index 1) after c's (rank 1): the reader waits for b's
+        # barrier before a's counter, unlike root order.
+        workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
+        xc = torch.randn((16, 64), device=DEVICE, dtype=torch.float32)
+        xa = torch.randn((workers - 8, 64), device=DEVICE, dtype=torch.float32)
+        xb = torch.randn((8, 64), device=DEVICE, dtype=torch.float32)
+        y = torch.randn((workers - 8, 64), device=DEVICE, dtype=torch.float32)
+        idx = torch.randint(0, 8, (workers - 8,), device=DEVICE, dtype=torch.int32)
+        with mock.patch.object(
+            cross_loop_scheduler,
+            "choose_final_arrival_continuations",
+            return_value=(),
+        ):
+            code, (c, out) = code_and_output(
+                rank_ordered_reader,
+                (xc, xa, xb, y, idx),
+                pid_type="persistent_blocked",
+                cross_loop_pipeline="static",
+                num_sm_multiplier=1,
+                num_warps=1,
+            )
+        torch.testing.assert_close(c, xc - 1)
+        expected = ((xa + 1) + (xb * 2)[idx.long()]) * y
+        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+        root = ast.unparse(_generated_function(code, "tile_dependency_root_3"))
+        wait_a = root.index("while tile_dependency_readiness_wait")
+        wait_b = root.index("while tile_dependency_root_barrier_wait")
+        self.assertLess(wait_b, wait_a)
+        self.assertLess(wait_a, root.index("tl.load(a"))
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((10, 0), reason="dot roots stay in kernel scope")
@@ -4616,19 +5067,18 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         )
 
         torch.testing.assert_close(out, torch.sum(x + 1, dim=-1) + x[:, 0] + 1)
-        # The early read keeps its own entry wait (one key: once per worker,
-        # before the root's task loop); the nested wait follows it.
+        # The early read keeps its own wait (one key; the root's one task waits
+        # in the task, before the read), and the nested wait, which orders
+        # producer tasks the early wait does not, follows it.
         self.assertNotIn("tile_dependency_root_barrier", code)
-        kernel = ast.unparse(
-            _generated_function(code, "_helion_prewait_singleton_reduction")
-        )
-        self.assertLess(
-            kernel.index("tile_dependency_readiness_wait"),
-            kernel.index("tile_dependency_root_1_scheduled_task("),
-        )
         root = ast.unparse(_generated_function(code, "tile_dependency_root_1"))
         self.assertLess(
-            root.index("first = "), root.index("tile_dependency_nested_loop_wait")
+            root.index("while tile_dependency_readiness_wait"),
+            root.index("first = "),
+        )
+        self.assertLess(
+            root.index("first = "),
+            root.index("while tile_dependency_nested_loop_wait"),
         )
 
     @skipIfNotCUDA()

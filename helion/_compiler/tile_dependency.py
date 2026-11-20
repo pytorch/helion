@@ -254,6 +254,67 @@ def _concrete_integer(value: IntegerExpression, *, description: str) -> int:
     return int(expression)
 
 
+def _projected_source_span(
+    bounds: tuple[sympy.Expr, sympy.Expr, int],
+    count: sympy.Expr,
+) -> tuple[int, int] | None:
+    """The first and last value of a source axis's ``(begin, end, step)``
+    bounds inside its ``count`` values (a piece's bounds may run past the
+    axis), when they are concrete and the run is nonempty."""
+    begin, end, step = bounds
+    try:
+        first = _concrete_integer(begin, description="projected source begin")
+        stop = _concrete_integer(end, description="projected source end")
+    except ValueError:
+        return None
+    count = sympy.sympify(count)
+    if isinstance(count, sympy.Integer):
+        stop = min(stop, int(count))
+    elif not _is_provably_nonnegative(count - stop, None):
+        return None
+    first = first % step if first < 0 else first
+    if stop <= first:
+        return None
+    return first, first + (stop - first - 1) // step * step
+
+
+def _projected_floor_range(
+    begin: sympy.Expr,
+    symbol: sympy.Symbol,
+    bounds: tuple[sympy.Expr, sympy.Expr, int],
+    count: sympy.Expr,
+) -> tuple[sympy.Expr, sympy.Expr] | None:
+    """The union of ``[f(x), f(x) + 1)``, ``f(x) = r + (s * x + b) // w`` (a
+    block mapping, as ``Incidence.from_fibers`` derives; sympy moves the
+    multiples of ``w`` out of the floor into ``r``), over ``x`` in ``bounds``
+    (of ``count`` values): one range while a step of ``x`` moves ``f`` by at
+    most one."""
+    floors = [t for t in sympy.Add.make_args(begin) if symbol in t.free_symbols]
+    quotient = (
+        _static_integer_quotient(cast("sympy.Expr", floors[0]))
+        if len(floors) == 1
+        else None
+    )
+    if quotient is None:
+        return None
+    numerator, divisor = quotient
+    numerator = sympy.expand(numerator)
+    stride = numerator.coeff(symbol)
+    span = _projected_source_span(bounds, count)
+    if (
+        span is None
+        or not isinstance(stride, sympy.Integer)
+        or not 0 < stride * bounds[2] <= divisor
+        or symbol in (numerator - stride * symbol).free_symbols
+    ):
+        return None
+    first, last = span
+    return (
+        cast("sympy.Expr", begin.subs(symbol, first)),
+        sympy.Add(begin.subs(symbol, last), 1),
+    )
+
+
 def _analyze_integer_expression(
     expression: sympy.Expr,
     domain: CoordinateDomain | None = None,
@@ -1060,15 +1121,26 @@ class CoordinateRelation:
                 (eliminated_axis,) = eliminated_axes
                 eliminated_uses.add(eliminated_axis)
                 eliminated_symbol = coordinate_axis_symbol(eliminated_axis)
+                if target_step != 1:
+                    return None
+                width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
+                if width_expression == 1 and (
+                    floor_range := _projected_floor_range(
+                        begin,
+                        eliminated_symbol,
+                        source_bounds[eliminated_axis],
+                        current_counts[eliminated_axis],
+                    )
+                ):
+                    target_ranges.append((target_axis, *floor_range, 1))
+                    continue
                 expanded_begin = sympy.expand(begin)
                 stride_expression = expanded_begin.coeff(eliminated_symbol)
                 base_expression = sympy.simplify(
                     expanded_begin - stride_expression * eliminated_symbol
                 )
-                width_expression = sympy.simplify(end - begin)  # pyrefly: ignore[unsupported-operation]
                 if (
-                    target_step != 1
-                    or stride_expression.free_symbols
+                    stride_expression.free_symbols
                     or width_expression.free_symbols
                     or stride_expression.is_integer is not True
                     or width_expression.is_integer is not True
@@ -1102,20 +1174,12 @@ class CoordinateRelation:
                         )
                     )
                     continue
-                try:
-                    concrete_begin = _concrete_integer(
-                        source_begin, description="projected source begin"
-                    )
-                    concrete_end = _concrete_integer(
-                        source_end, description="projected source end"
-                    )
-                except ValueError:
-                    return None
-                if concrete_end <= concrete_begin:
-                    return None
-                final_source = concrete_begin + (
-                    (concrete_end - concrete_begin - 1) // source_step * source_step
+                span = _projected_source_span(
+                    source_bounds[eliminated_axis], current_counts[eliminated_axis]
                 )
+                if span is None:
+                    return None
+                concrete_begin, final_source = span
                 if width not in (1, stride * source_step):
                     return None
                 target_ranges.append(
@@ -1227,8 +1291,11 @@ class CoordinateRelation:
             )
             if source_axis is not None:
                 retained_axes.append((axis, source_axis))
+            # Else the whole axis, once clipped to it (a masked tile past the
+            # end reaches beyond it).
             elif not (
-                sympy.simplify(begin) == 0 and sympy.simplify(end - count) == 0  # pyrefly: ignore[unsupported-operation]
+                _is_provably_nonnegative(-begin, None)
+                and _is_provably_nonnegative(end - count, None)  # pyrefly: ignore[unsupported-operation]
             ):
                 return None
 
@@ -5668,6 +5735,7 @@ def _symbolic_access_map(
 def _rectangular_overlap_sources(
     owner: CoordinateRelation,
     query: CoordinateRelation,
+    over_approximate: bool = False,
 ) -> CoordinateRelation | None:
     if (
         owner.target_domain != query.target_domain
@@ -5700,11 +5768,15 @@ def _rectangular_overlap_sources(
             fixed = _constant_range(owner_begin, owner_end)
             if fixed is not None:
                 # A range no owner coordinate moves (a fixed index on a view
-                # dimension) constrains no owner item: it only decides whether
-                # a fixed query range on that axis meets it at all.
+                # dimension, a tile narrower than the dim) constrains no owner
+                # item: it only decides whether a fixed query range on that
+                # axis meets it at all; with ``over_approximate``, a moving
+                # one may meet it.
                 query_fixed = _constant_range(query_begin, query_end)
                 if query_fixed is None:
-                    return None
+                    if not over_approximate:
+                        return None
+                    continue
                 if query_fixed[0] < fixed[1] and fixed[0] < query_fixed[1]:
                     continue
                 disjoint = True
@@ -5915,16 +5987,22 @@ def _access_incidence(
 ) -> Incidence | None:
     owner_relation, _ = owner
     query_relation, _ = query
-    items = _rectangular_overlap_sources(owner_relation, query_relation)
-    if items is None:
-        items = _dense_overlap_sources(owner, query_relation, prove_nonnegative)
-    if items is None:
-        return None
-    keys = items.converse()
-    if keys is None:
-        keys = _rectangular_overlap_sources(query_relation, owner_relation)
-    if keys is None:
-        keys = _dense_overlap_sources(query, owner_relation, prove_nonnegative)
+    items = _rectangular_overlap_sources(
+        owner_relation, query_relation
+    ) or _dense_overlap_sources(owner, query_relation, prove_nonnegative)
+    if items is not None:
+        keys = (
+            items.converse()
+            or _rectangular_overlap_sources(query_relation, owner_relation)
+            or _dense_overlap_sources(query, owner_relation, prove_nonnegative)
+        )
+    else:
+        # No exact form: the rectangular over-approximation (which a wait may
+        # take), whose keys must be its converse to agree with it.
+        items = _rectangular_overlap_sources(owner_relation, query_relation, True)
+        if items is None:
+            return None
+        keys = items.converse()
     return Incidence.from_fibers(
         items, keys_by_item=keys, prove_nonnegative=prove_nonnegative
     )

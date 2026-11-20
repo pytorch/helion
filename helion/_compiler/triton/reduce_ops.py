@@ -175,17 +175,7 @@ def _create_reduce_expression(
 def _create_tuple_result_expressions(
     state: CodegenState, reduce_expr: ast.AST
 ) -> list[ast.AST]:
-    """Create getitem expressions for tuple results."""
-    from ..ast_extension import expr_from_string
-
+    """Getitem expressions for tuple results, over one bound reduction."""
     raw_input = state.ast_args[1]
     num_elements = len(raw_input) if isinstance(raw_input, tuple) else 2
-
-    return [
-        expr_from_string(
-            "{reduce_result}[{index}]",
-            reduce_result=reduce_expr,
-            index=ast.Constant(value=i),
-        )
-        for i in range(num_elements)
-    ]
+    return state.tuple_results(reduce_expr, num_elements, prefix="reduce_tuple")

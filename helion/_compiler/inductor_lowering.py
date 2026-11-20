@@ -2202,5 +2202,19 @@ class CodegenState(NamedTuple):
     def add_statement(self, statement: ast.AST | str) -> None:
         return self.codegen.add_statement(statement)
 
+    def tuple_results(
+        self, expr: ast.AST, count: int, *, prefix: str, dce: bool = True
+    ) -> list[ast.AST]:
+        """``expr[0] .. expr[count - 1]`` over ``expr`` bound to a name once: each
+        result indexing the expression itself would emit the call once per
+        result (MLIR CSE does not merge region ops such as ``tt.reduce``)."""
+        from .ast_extension import expr_from_string
+
+        result = self.codegen.lift(expr, dce=dce, prefix=prefix)
+        return [
+            expr_from_string("{result}[{index}]", result=result, index=ast.Constant(i))
+            for i in range(count)
+        ]
+
     def sympy_expr(self, expr: sympy.Expr) -> str:
         return self.codegen.device_function.sympy_expr(expr)

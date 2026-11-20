@@ -398,6 +398,10 @@ def _root_task_orders(
     return tuple(result)
 
 
+# The acquire poll of a dependency counter (``_wait_for_counter``'s spin load).
+_COUNTER_POLL_ASM = "ld.acquire.gpu.global.u32 $0, [$1];"
+
+
 def _wait_for_counter(
     *,
     device_function: DeviceFunction,
@@ -421,7 +425,7 @@ def _wait_for_counter(
     device_function.spin_ends.add(sync)
     load = (
         "tl.inline_asm_elementwise("
-        "asm='ld.acquire.gpu.global.u32 $0, [$1];', "
+        f"asm={_COUNTER_POLL_ASM!r}, "
         "constraints='=r,l', "
         f"args=[{counter}], dtype=tl.uint32, is_pure=False, pack=1)"
     )
@@ -711,18 +715,15 @@ def _loaded_allocations(
     statements: Sequence[ast.AST], allocations: dict[str, int]
 ) -> frozenset[int] | None:
     """The allocations ``statements`` load, given the tensor arguments'
-    (descriptors included), or ``None`` when a load's address names no tensor
-    argument or inline asm takes one."""
+    (descriptors included), or ``None`` when a load's address is no
+    ``_plain_address`` or inline asm takes a tensor argument."""
     loaded: set[int] = set()
     for call in (n for s in statements for n in ast.walk(s) if isinstance(n, ast.Call)):
         if _is_load(call):
-            # ``tl.*``: the pointer or descriptor is the first argument.
-            tl_load = _is_tl_call(call, None)
-            address = call.args[0] if tl_load and call.args else call.func.value  # pyrefly: ignore [missing-attribute]
-            names = _all_names([address]) & allocations.keys()
-            if not names:
+            address = _load_address(call)
+            if not _plain_address(address, allocations):
                 return None
-            loaded.update(allocations[name] for name in names)
+            loaded |= _named_allocations(address, allocations)
         elif _is_tl_call(call, frozenset({"inline_asm_elementwise"})) and (
             _all_names([call]) & allocations.keys()
         ):
@@ -735,14 +736,39 @@ def _named_allocations(statement: ast.AST, allocations: dict[str, int]) -> set[i
     return {allocations[n] for n in _all_names([statement]) if n in allocations}
 
 
+def _reload_unmet(load: ast.stmt, loop: ast.stmt) -> ast.stmt:
+    """``_wait_for_counter``'s spin load again, issued only while the value it
+    holds is not the spin's target (one predicated acquire load: a guard on the
+    wait's own value would leave a partition that drops the wait reading it)."""
+    assert isinstance(load, ast.Assign) and isinstance(load.value, ast.Call)
+    assert isinstance(loop, ast.While) and isinstance(loop.test, ast.Compare)
+    assert len(loop.test.comparators) == 1
+    (value,) = _stored_names([load])
+    (args,) = [k.value for k in load.value.keywords if k.arg == "args"]
+    assert isinstance(args, ast.List) and len(args.elts) == 1
+    counter = ast.unparse(args.elts[0])
+    target = ast.unparse(loop.test.comparators[0])
+    return statement_from_string(
+        f"{value} = tl.inline_asm_elementwise("
+        "asm='{ .reg .pred p; setp.ne.u32 p, $1, $2; mov.u32 $0, $1; "
+        "@p ld.acquire.gpu.global.u32 $0, [$3]; }', constraints='=r,r,r,l', "
+        f"args=[{value}, tl.cast({target}, tl.uint32), {counter}], dtype=tl.uint32, "
+        "is_pure=False, pack=1)"
+    )
+
+
 def _batch_waits(
     device_function: DeviceFunction, body: list[ast.stmt]
 ) -> list[ast.stmt]:
-    """``body`` with each run of adjacent dependency spins polled together:
-    every counter's first load ahead of any spin (and adjacent wait-only
-    guards of one test merged), so waits already met cost one memory round
-    trip between them rather than one each.  Each spin still precedes the
-    reads after the run."""
+    """``body`` with its dependency spins polled together: each spin's first
+    load moves up to the first spin of its group (the spins at this level, or
+    in wait-only guards of one test, whose counters nothing between them
+    assigns), and after each spin the group's later counters still unmet are
+    reloaded together, so waits met while another spun cost one memory round
+    trip between them rather than one each (adjacent wait-only guards of one
+    test are merged).  Each spin stays where it was: it still precedes the
+    reads it orders, and the statements between spins (e.g. scoped loads of
+    what an earlier wait ordered) keep their place."""
     waits = device_function.sync_names("wait")
 
     def asm(statement: ast.stmt) -> str:
@@ -752,27 +778,35 @@ def _batch_waits(
         text = next((k.value for k in call.keywords if k.arg == "asm"), None)
         return cast("str", text.value) if isinstance(text, ast.Constant) else ""
 
-    def spin(index: int) -> int:
+    def spin(statements: list[ast.stmt], index: int) -> int:
         """The length of the spin at ``index`` (``_wait_for_counter``'s load,
         while loop, warp sync and optional fence), else 0."""
-        if index + 2 >= len(body):
+        if index + 2 >= len(statements):
             return 0
-        load, loop, sync = body[index : index + 3]
+        load, loop, sync = statements[index : index + 3]
         target = _stored_names([load])
         if not (
             isinstance(load, ast.Assign)
             and len(target) == 1
             and target <= waits
-            and "ld.acquire" in asm(load)
+            and asm(load) == _COUNTER_POLL_ASM
             and isinstance(loop, ast.While)
             and _all_names([loop.test]) & target
             and "bar.warp.sync" in asm(sync)
         ):
             return 0
-        fence = index + 3 < len(body) and asm(body[index + 3]).startswith(
+        fence = index + 3 < len(statements) and asm(statements[index + 3]).startswith(
             "fence.proxy.async.global; mov"
         )
         return 3 + fence
+
+    def run(statements: list[ast.stmt], index: int) -> list[list[ast.stmt]]:
+        """The spins of the run of adjacent spins at ``index``."""
+        spins: list[list[ast.stmt]] = []
+        while length := spin(statements, index):
+            spins.append(statements[index : index + length])
+            index += length
+        return spins
 
     def guard(statement: ast.stmt) -> ast.If | None:
         """A guard holding spins only, whose test they do not feed and whose
@@ -790,21 +824,20 @@ def _batch_waits(
             return None
         return statement
 
-    kept: list[ast.stmt] = []
+    # The body as spin runs (their guard's test, or None), each with the group
+    # of runs it polls with, and the other statements in between.
+    items: list[ast.stmt | tuple[ast.expr | None, list[list[ast.stmt]], int]] = []
+    groups: list[list[list[list[ast.stmt]]]] = []  # a group's runs
+    open_groups: dict[str, int] = {}  # a test's (or "") group still open
+    assigned: dict[int, set[str]] = {}  # names assigned since a group's first run
     index = 0
     while index < len(body):
-        if length := spin(index):
-            spins: list[list[ast.stmt]] = []
-            while length:
-                spins.append(body[index : index + length])
-                index += length
-                length = spin(index)
-            kept += [s[0] for s in spins]
-            kept += [s[1] for s in spins]
-            kept += [t for s in spins for t in s[2:]]
-            continue
         statement = body[index]
-        if (first := guard(statement)) is not None:
+        test: ast.expr | None = None
+        spins = run(body, index)
+        if spins:
+            index += sum(len(s) for s in spins)
+        elif (first := guard(statement)) is not None:
             merged = list(first.body)
             while (
                 index + 1 < len(body)
@@ -813,58 +846,329 @@ def _batch_waits(
             ):
                 merged += other.body
                 index += 1
-            statement = create(
-                ast.If,
-                test=first.test,
-                body=_batch_waits(device_function, merged),
-                orelse=[],
-            )
-        kept.append(statement)
-        index += 1
+            index += 1
+            spins = run(merged, 0)
+            if sum(len(s) for s in spins) != len(merged):
+                items.append(
+                    create(
+                        ast.If,
+                        test=first.test,
+                        body=_batch_waits(device_function, merged),
+                        orelse=[],
+                    )
+                )
+                for names in assigned.values():
+                    names |= _stored_names(merged)
+                continue
+            test = first.test
+        else:
+            items.append(statement)
+            for names in assigned.values():
+                names |= _stored_names([statement])
+            index += 1
+            continue
+        key = "" if test is None else ast.dump(test)
+        group = open_groups.get(key)
+        # A counter, target or guard input a statement since the group's first
+        # run assigns cannot be polled there: this run starts a new group.
+        reads = {
+            name
+            for s in spins
+            for name in _all_names([s[0].value, s[1].test])  # pyrefly: ignore [missing-attribute]
+        } - _stored_names([s[0] for s in spins])
+        if test is not None:
+            reads |= _all_names([test])
+        if group is None or reads & assigned[group]:
+            group = len(groups)
+            groups.append([])
+            open_groups[key] = group
+            assigned[group] = set()
+        groups[group].append(spins)
+        items.append((test, spins, group))
+
+    kept: list[ast.stmt] = []
+    for item in items:
+        if isinstance(item, ast.stmt):
+            kept.append(item)
+            continue
+        test, spins, group = item
+        later = [s for r in groups[group] for s in r]
+        position = later.index(spins[0])
+        first = groups[group][0] is spins
+        polled: list[ast.stmt] = []
+        if first:
+            polled += [s[0] for s in later]
+            # The later runs read their first loads: defined on every path (a
+            # guard false here is false there too, and a dry pass later wraps
+            # unguarded runs in guards of their own).
+            kept += [
+                statement_from_string(f"{name} = tl.full([], 0, tl.uint32)")
+                for s in later[len(spins) :]
+                for name in _stored_names([s[0]])
+            ]
+        for offset, current in enumerate(spins):
+            polled.append(current[1])
+            # Once this spin ends, the later counters' first loads may be
+            # stale (each met while this one spun): reload every unmet one
+            # together, so the group ends one round trip after its last
+            # counter is met instead of one per later spin.
+            polled += [
+                _reload_unmet(s[0], s[1]) for s in later[position + offset + 1 :]
+            ]
+        polled += [t for s in spins for t in s[2:]]
+        if test is None:
+            kept += polled
+        else:
+            kept.append(create(ast.If, test=test, body=polled, orelse=[]))
     return kept
 
 
-def _scope_wait(
-    body: list[ast.stmt],
-    wait: list[ast.stmt],
-    covered: frozenset[int],
-    state: frozenset[str],
-    allocations: dict[str, int],
-) -> None:
-    """Insert ``wait`` before the first statement of ``body`` that may touch
-    what it orders: one naming a tensor of ``covered`` (allocations) or the
-    schedule's ``state``, assigning what the wait reads, or making a call other
-    than a pure op or a load from a tensor argument plus pure index math."""
-    reads = _all_names(wait)
+@dataclasses.dataclass(frozen=True)
+class _Footprint:
+    """What one top-level statement of a task body touches, for reordering it
+    (``_schedule_waits``, ``_split_publication``).  Names are as the final rename emits them
+    (``DeviceFunction.variable_renames``: the value a loop leaves is its loop
+    variable).  ``loaded`` / ``written``: the allocations it loads and writes;
+    ``loaded`` is None for a load through an address no tensor argument names
+    (a pointer loaded from a table), ``written`` None for a write of unknown
+    memory or a call that orders memory (an atomic with ordering, inline asm, a
+    helper).  A statement with a CTA barrier also stands for every access
+    before it, which the barrier orders against the accesses after it
+    (``_footprints``).  Distinct tensor arguments are distinct storage, as
+    everywhere in the cross-loop dependency analysis."""
 
-    def independent_call(call: ast.Call) -> bool:
-        if not _is_tl_call(call, frozenset({"load"})):
-            return _effect_kind(call) == "pure"
-        return bool(
-            call.args and _named_allocations(call.args[0], allocations)
-        ) and all(
-            _effect_kind(c) == "pure"
-            and not (
-                isinstance(c.func, ast.Attribute) and c.func.attr == "pointer_type"
+    reads: frozenset[str]
+    stores: frozenset[str]
+    named: frozenset[int]
+    loaded: frozenset[int] | None
+    written: frozenset[int] | None
+    # A loop or branch: it runs where the source has it, after every statement
+    # before it (later statements may still move past it).
+    compound: bool
+    # Loads a word another program writes during the launch (a flag or an
+    # in-band word).
+    volatile: bool
+    barrier: bool
+
+    @property
+    def memory(self) -> bool:
+        return (
+            self.loaded is None
+            or self.written is None
+            or bool(self.loaded or self.written)
+        )
+
+    def follows(self, earlier: _Footprint) -> bool:
+        """Whether this statement must stay after ``earlier``: a name one
+        stores the other reads or stores, or memory one writes the other
+        accesses."""
+        if earlier.stores & (self.reads | self.stores) or self.stores & earlier.reads:
+            return True
+
+        def meets(writes: frozenset[int] | None, other: _Footprint) -> bool:
+            if writes is None:
+                return other.memory
+            if not writes:
+                return False
+            return (
+                other.loaded is None
+                or other.written is None
+                or bool(writes & (other.loaded | other.written))
             )
-            for c in ast.walk(call.args[0])
-            if isinstance(c, ast.Call)
-        )
 
-    def independent(statement: ast.stmt) -> bool:
-        assigned = _stored_names([statement])
-        return not (
-            _named_allocations(statement, allocations) & covered
+        return meets(earlier.written, self) or meets(self.written, earlier)
+
+
+def _footprint(
+    statement: ast.stmt, allocations: dict[str, int], renames: Mapping[str, str]
+) -> _Footprint:
+    loaded: set[int] | None = set()
+    written: set[int] | None = set()
+    volatile = barrier = False
+    for call in (n for n in ast.walk(statement) if isinstance(n, ast.Call)):
+        if _is_load(call):
+            address = _load_address(call)
+            if loaded is not None:
+                loaded = (
+                    loaded | _named_allocations(address, allocations)
+                    if _plain_address(address, allocations)
+                    else None
+                )
+            volatile |= any(
+                k.arg == "volatile"
+                and not (isinstance(k.value, ast.Constant) and not k.value.value)
+                for k in call.keywords
+            )
+        elif _is_tl_call(call, frozenset({"debug_barrier"})):
+            barrier = True
+        elif written is not None:
+            write = _plain_write(call, allocations)
+            written = None if write is None else written | write
+    return _Footprint(
+        reads=frozenset(
+            renames.get(n.id, n.id)
+            for n in ast.walk(statement)
+            if isinstance(n, ast.Name)
+            and (isinstance(n.ctx, ast.Load) or isinstance(statement, ast.AugAssign))
+        ),
+        stores=frozenset(_stored_names([statement], renames)),
+        named=frozenset(_named_allocations(statement, allocations)),
+        loaded=None if loaded is None else frozenset(loaded),
+        written=None if written is None else frozenset(written),
+        compound=barrier
+        or not isinstance(statement, (ast.Assign, ast.AugAssign, ast.Expr)),
+        volatile=volatile,
+        barrier=barrier,
+    )
+
+
+def _footprints(
+    body: list[ast.stmt], allocations: dict[str, int], renames: Mapping[str, str]
+) -> list[_Footprint]:
+    """``_footprint`` of each statement of ``body``, a CTA barrier's widened to
+    the accesses before it."""
+
+    def union(
+        first: frozenset[int] | None, second: frozenset[int] | None
+    ) -> frozenset[int] | None:
+        return None if first is None or second is None else first | second
+
+    prints: list[_Footprint] = []
+    for statement in body:
+        current = _footprint(statement, allocations, renames)
+        if current.barrier:
+            for earlier in prints:
+                current = dataclasses.replace(
+                    current,
+                    loaded=union(current.loaded, earlier.loaded),
+                    written=union(current.written, earlier.written),
+                )
+        prints.append(current)
+    return prints
+
+
+def _schedule_waits(
+    body: list[ast.stmt],
+    waits: Sequence[tuple[list[ast.stmt], frozenset[int]]],
+    allocations: dict[str, int],
+    renames: Mapping[str, str],
+    state: frozenset[str],
+) -> list[ast.stmt]:
+    """A task body with its scoped ``waits`` (statements, covered allocations),
+    given in the order their producers are expected to complete, each placed
+    as late as the statements that need it allow, so the task's independent
+    loads issue before it spins.  A statement needs a wait whose covered
+    allocations it names or whose reads it stores, and every wait if it writes
+    memory, loads through an address no tensor argument names, or names the
+    schedule's ``state``.  Each statement follows the last wait it, or a
+    statement it follows (``_Footprint.follows``), needs; the statements after
+    one wait keep their order."""
+    prints = _footprints(body, allocations, renames)
+    wait_reads = [{renames.get(n, n) for n in _all_names(wait)} for wait, _ in waits]
+    every = frozenset(range(len(waits)))
+    levels: list[int] = []
+    for index, (statement, current) in enumerate(zip(body, prints, strict=True)):
+        if (
+            current.written != frozenset()
+            or current.loaded is None
             or _all_names([statement]) & state
-            or assigned & reads
-        ) and all(
-            independent_call(call)
-            for call in ast.walk(statement)
-            if isinstance(call, ast.Call)
-        )
+        ):
+            needs = every
+        else:
+            needs = frozenset(
+                k
+                for k, (_, covered) in enumerate(waits)
+                if current.named & covered or current.stores & wait_reads[k]
+            )
+        level = max(needs, default=-1)
+        for earlier in range(index):
+            if current.compound or current.follows(prints[earlier]):
+                level = max(level, levels[earlier])
+        levels.append(level)
+    scheduled = [body[i] for i in range(len(body)) if levels[i] < 0]
+    for level, (wait, _) in enumerate(waits):
+        scheduled += [*wait, *(body[i] for i in range(len(body)) if levels[i] == level)]
+    return scheduled
 
-    index = next((i for i, s in enumerate(body) if not independent(s)), len(body))
-    body[index:index] = wait
+
+def _split_publication(
+    body: list[ast.stmt],
+    shared: frozenset[int],
+    allocations: dict[str, int],
+    renames: Mapping[str, str],
+) -> tuple[list[ast.stmt], list[ast.stmt]] | None:
+    """A task body split around its publication (release and arrivals), which
+    then goes as early as the statements it orders allow: those that touch
+    ``shared`` (the allocations another root of the launch accesses in order
+    with this one), load a volatile word or through an address no tensor
+    argument names, or write anything but plain stores to tensor arguments
+    (waits included), with the statements they follow (``_Footprint``).  The
+    rest are outputs read after the launch, which trail it; None if none of
+    them stores."""
+    prints = _footprints(body, allocations, renames)
+    ordered: set[int] = set()
+    for index in reversed(range(len(body))):
+        current = prints[index]
+        if (
+            current.loaded is None
+            or current.written is None
+            or current.volatile
+            or (current.named | current.loaded | current.written) & shared
+            or any(
+                prints[later].compound or prints[later].follows(current)
+                for later in ordered
+            )
+        ):
+            ordered.add(index)
+    trailing = [i for i in range(len(body)) if i not in ordered]
+    if not any(prints[i].written for i in trailing):
+        return None
+    return (
+        [body[i] for i in range(len(body)) if i in ordered],
+        [body[i] for i in trailing],
+    )
+
+
+def _load_address(call: ast.Call) -> ast.expr:
+    """A load's pointer or descriptor: ``tl.*`` takes it first; a descriptor
+    method is called on it."""
+    return call.args[0] if _is_tl_call(call, None) else call.func.value  # pyrefly: ignore [missing-attribute]
+
+
+def _plain_address(address: ast.expr, allocations: dict[str, int]) -> bool:
+    """Whether ``address`` is a tensor argument plus pure index math: it names an
+    argument and no pointer loaded from a table (whose target no name shows)."""
+    return bool(_named_allocations(address, allocations)) and all(
+        _effect_kind(c) == "pure"
+        and not (isinstance(c.func, ast.Attribute) and c.func.attr == "pointer_type")
+        for c in ast.walk(address)
+        if isinstance(c, ast.Call)
+    )
+
+
+def _plain_write(call: ast.Call, allocations: dict[str, int]) -> set[int] | None:
+    """The allocations ``call`` may write when it orders nothing else: none for a
+    load (a volatile one is relaxed) or a pure op (a CTA barrier is one: it
+    orders only the CTA's own accesses, whose writes the caller tracks); its
+    address's for a store or relaxed atomic through a ``_plain_address``; None
+    for anything else that may write or order memory (an atomic with ordering,
+    inline asm, a helper, a store through any other address)."""
+    if not _may_write(call):
+        return set()
+    if not _is_tl_call(call, frozenset({"store", "store_tensor_descriptor"})) and not (
+        _is_tl_call(call, None)
+        and call.func.attr.startswith("atomic_")  # pyrefly: ignore [missing-attribute]
+        and any(
+            k.arg == "sem"
+            and isinstance(k.value, ast.Constant)
+            and k.value.value == "relaxed"
+            for k in call.keywords
+        )
+    ):
+        return None
+    if not (call.args and _plain_address(call.args[0], allocations)):
+        return None
+    return _named_allocations(call.args[0], allocations)
 
 
 def _bound_wait(device_function: DeviceFunction, call: str) -> ast.stmt:
@@ -3137,6 +3441,14 @@ def emit_cross_loop_schedule(
     # later wait ordering no more is redundant.
     kernel_barrier_waits: dict[int, list[tuple[frozenset[int] | None, bool]]] = {}
     root_barrier_reachability = _root_barrier_reachability(root_barrier_edges)
+    # Per consumer root: the dependencies its readiness counters' waits order.
+    counter_ordered_dependencies: dict[int, frozenset[int]] = {}
+    for plan in all_readiness_counter_plans:
+        for consumer in plan.consumers:
+            counter_ordered_dependencies[consumer.consumer_root] = (
+                counter_ordered_dependencies.get(consumer.consumer_root, frozenset())
+                | {obligation[0] for obligation in consumer.covered_obligations}
+            )
 
     def barrier_covers(root: int, producer: int) -> tuple[frozenset[int] | None, bool]:
         """The allocations whose reads ``root``'s wait on ``producer``'s barrier
@@ -3145,11 +3457,15 @@ def emit_cross_loop_schedule(
         assert dependency_graph is not None
         # The barrier orders root's edges from producer and (barrier edges
         # being transitively reduced) from every root producer's barrier waits
-        # for; one with an allocation unknown to the partitions orders every
-        # access, as does one no edge explains.  In a root publishing a barrier
-        # it also orders that publication: its waiters rely on it transitively
-        # (without ring partitions, which keep waits by what they order, it
-        # orders every access, so that later waits on producer are redundant).
+        # for, except the dependencies a readiness counter of root orders: the
+        # counter's own wait precedes those reads, so the barrier's need not
+        # (a read of an earlier root's output ordered by a counter runs ahead
+        # of a later root's barrier).  One with an allocation unknown to the
+        # partitions orders every access, as does one no edge explains.  In a
+        # root publishing a barrier it also orders that publication: its
+        # waiters rely on it transitively (without ring partitions, which keep
+        # waits by what they order, it orders every access, so that later
+        # waits on producer are redundant).
         sources = {producer} | {
             source for source, target in root_barrier_reachability if target == producer
         }
@@ -3158,10 +3474,13 @@ def emit_cross_loop_schedule(
             for edge in dependency_graph.edges
             if edge.producer_root in sources and edge.consumer_root == root
         ]
+        counter_ordered = counter_ordered_dependencies.get(root, frozenset())
         covered = frozenset(
             access_allocations[dependency.consumer_access_id]
             for edge in edges
             for dependency in edge.access_dependencies
+            if edge.producer_root == producer
+            or dependency.dependency_id not in counter_ordered
         )
         publication = root in root_barrier_indices
         if (
@@ -3320,6 +3639,14 @@ def emit_cross_loop_schedule(
     # The allocation of each access (the device IR's view), and of each tensor
     # argument, for guard-first waits.
     access_allocations = _access_allocations()
+    # The allocations each root accesses in order with another root (its side of
+    # every dependency it produces): its completion must follow those accesses.
+    ordered_allocations: dict[int, set[int]] = {}
+    for edge in dependency_graph.edges:
+        ordered_allocations.setdefault(edge.producer_root, set()).update(
+            access_allocations[dependency.producer_access_id]
+            for dependency in edge.access_dependencies
+        )
     argument_allocations = _argument_allocations(device_function)
     dependencies_by_id = {
         dependency.dependency_id: dependency
@@ -3379,8 +3706,10 @@ def emit_cross_loop_schedule(
     def invariant_wait(
         root: int, plan: ReadinessCounterPlan, consumer: ReadinessConsumer
     ) -> bool:
-        """Whether ``root`` waits on ``plan`` once, before its task loop: the
-        counter is the same for every task."""
+        """Whether ``root`` may wait on ``plan`` once, before its task loop: the
+        counter is the same for every task (``static_root_body`` still scopes the
+        wait in the task when every task of an unguarded root has a worker of
+        its own)."""
         return (
             consumer.keys_by_consumer.is_total_function()
             and plan.readiness_key_domain.size == 1
@@ -4347,6 +4676,54 @@ def emit_cross_loop_schedule(
         body = case_bodies[root] if extent is None else extent.body
         return root in kernel_scope_roots and _write_guard(body) is not None
 
+    # The workers each resident root's tasks run on, as the static placement lowers
+    # them (``static_members``: None where unknown); empty under packet dispatch.
+    members: dict[int, frozenset[int] | None] = {}
+    dependency_pairs = frozenset(
+        (edge.producer_root, edge.consumer_root) for edge in dependency_graph.edges
+    )
+
+    def completion_rank(root: int, ranks: dict[int, int]) -> int:
+        """Where ``root``'s tasks complete in the static schedule's order: one past
+        the latest earlier root it follows, through a dependency or by sharing a
+        worker (which runs the earlier root's tasks first).  Roots on disjoint
+        workers with no dependency between them run concurrently and tie.  A root
+        whose workers are unknown (not yet lowered, a continuation root, a
+        cluster's or shifted lanes, packet dispatch: no ``members`` set) shares
+        every worker.  ``ranks`` memoizes one caller's ranks (``members`` grows as
+        roots are lowered)."""
+        if root not in ranks:
+
+            def shares(earlier: int) -> bool:
+                mine, theirs = members.get(root), members.get(earlier)
+                return mine is None or theirs is None or bool(mine & theirs)
+
+            ranks[root] = max(
+                (
+                    completion_rank(earlier, ranks) + 1
+                    for earlier in range(root)
+                    if (earlier, root) in dependency_pairs or shares(earlier)
+                ),
+                default=0,
+            )
+        return ranks[root]
+
+    def dependency_rank(root: int, ranks: dict[int, int]) -> int:
+        """The longest dependency chain ending at ``root`` (``completion_rank``
+        without shared workers): of two roots of a rank, one that only follows
+        an earlier root's tasks on its own workers completes before one that
+        waits for every task of the roots it reads."""
+        if root not in ranks:
+            ranks[root] = max(
+                (
+                    dependency_rank(earlier, ranks) + 1
+                    for earlier in range(root)
+                    if (earlier, root) in dependency_pairs
+                ),
+                default=0,
+            )
+        return ranks[root]
+
     def scheduled_root_task_body(
         root: int,
         root_local_pid_task: str,
@@ -4355,14 +4732,17 @@ def emit_cross_loop_schedule(
         *,
         force_noinline: bool = False,
         invariant_waits: list[ast.stmt] | None = None,
-        barrier_waits: Sequence[tuple[list[ast.stmt], frozenset[int]]] = (),
+        barrier_waits: Sequence[
+            tuple[list[ast.stmt], frozenset[int], frozenset[int]]
+        ] = (),
         root_arrival: _Arrival | None = None,
     ) -> list[ast.stmt]:
         """One task of ``root``; waits whose counter is the same for every task
         go to ``invariant_waits`` when given (the caller waits once).
-        ``barrier_waits``: root-barrier waits and the allocations they cover,
-        placed like the covered readiness waits.  ``root_arrival``: the
-        worker's root-barrier arrival, made with its last task's arrivals."""
+        ``barrier_waits``: root-barrier waits, the allocations they cover and
+        their producer roots, placed like the covered readiness waits.
+        ``root_arrival``: the worker's root-barrier arrival, made with its last
+        task's arrivals."""
         body: list[ast.stmt] = []
         if root in dsmem_producers:
             # Before any send, rank 0's barriers are this launch's.
@@ -4422,10 +4802,13 @@ def emit_cross_loop_schedule(
                 )
             )
         )
-        guard_first_waits: list[tuple[list[ast.stmt], frozenset[int]]] = []
+        # (wait, covered allocations, the producer roots it waits for)
+        guard_first_waits: list[
+            tuple[list[ast.stmt], frozenset[int], frozenset[int]]
+        ] = []
         # Waits that order only covered tensors move to the task's first
         # access of them, so its independent loads issue before the spin.
-        scoped_waits: list[tuple[list[ast.stmt], frozenset[int]]] = []
+        scoped_waits: list[tuple[list[ast.stmt], frozenset[int], frozenset[int]]] = []
         guard_first_index = len(body)
         guard_first_allocations: set[int] = set()
         for (
@@ -4504,11 +4887,15 @@ def emit_cross_loop_schedule(
                         orelse=[],
                     )
                 ]
+            producers = frozenset(
+                producer.producer_root
+                for producer in incoming_readiness_counter.producers
+            )
             if guard_first:
-                guard_first_waits.append((wait, covered))
+                guard_first_waits.append((wait, covered, producers))
                 guard_first_allocations.update(covered)
             elif covered and not token_waits:
-                scoped_waits.append((wait, covered))
+                scoped_waits.append((wait, covered, producers))
             else:
                 body.extend(wait)
         peer_counter_spins, peer_tokens = peer_counter_waits(
@@ -4569,30 +4956,51 @@ def emit_cross_loop_schedule(
         scoped_waits.extend(barrier_waits)
         if guard_first_waits and _write_guard(tile_body) is None:
             # No guard to follow: covered waits are scoped like any root's.
-            scoped_waits.extend((w, c) for w, c in guard_first_waits if c)
-            guard_first_waits = [(w, c) for w, c in guard_first_waits if not c]
+            scoped_waits.extend((w, c, p) for w, c, p in guard_first_waits if c)
+            guard_first_waits = [(w, c, p) for w, c, p in guard_first_waits if not c]
         state_names = frozenset(n for n in (state_arg, epoch_var) if n is not None)
         # A guarded kernel-scope root and an allocation no argument names keep
         # their waits at task entry.
         relaxed = guarded_kernel_scope_root(root)
         arguments = set(argument_allocations.values())
-        for wait, covered in scoped_waits:
+        for wait, covered, _ in scoped_waits:
             if relaxed or covered - arguments:
                 body.extend(wait)
-            else:
-                _scope_wait(
-                    tile_body,
-                    wait,
-                    covered,
-                    state_names,
-                    argument_allocations,
-                )
+        # The waits in their producers' expected completion order
+        # (``completion_rank``: the static schedule's order, not root order, as
+        # packed roots on disjoint workers run concurrently; then
+        # ``dependency_rank``), so a task loads what an earlier producer wrote
+        # while it spins on a later one.  The waits commute (a launch's counters
+        # only grow); ties keep their source order.
+        ranks: dict[int, int] = {}
+        depths: dict[int, int] = {}
+        scoped = sorted(
+            (
+                scoped_wait
+                for scoped_wait in scoped_waits
+                if not (relaxed or scoped_wait[1] - arguments)
+            ),
+            key=lambda scoped_wait: max(
+                (completion_rank(producer, ranks), dependency_rank(producer, depths))
+                for producer in scoped_wait[2]
+            ),
+        )
+        renames = device_function.variable_renames()
+        tile_body[:] = _schedule_waits(
+            tile_body,
+            [(wait, covered) for wait, covered, _ in scoped],
+            argument_allocations,
+            renames,
+            state_names,
+        )
         if guard_first_waits:
             guard = _write_guard(tile_body)
             reads = (
                 None if guard is None else _guard_reads(tile_body, argument_allocations)
             )
-            entry = [statement for wait, _ in guard_first_waits for statement in wait]
+            entry = [
+                statement for wait, _, _ in guard_first_waits for statement in wait
+            ]
             if reads is not None and not reads & guard_first_allocations:
                 assert guard is not None
                 guard.body[:0] = entry
@@ -4604,18 +5012,6 @@ def emit_cross_loop_schedule(
             timeline.ready(root, root_local_pid_task, tile_body)
             timeline.ready(root, root_local_pid_task, body)
         task_body_head = body
-        if root in kernel_scope_roots:
-            body.extend(tile_body)
-        else:
-            body.append(
-                _outline_cross_loop_region(
-                    device_function,
-                    name_hint=f"tile_dependency_root_{root}",
-                    body=tile_body,
-                    extra_argument_names=extra_argument_names,
-                    noinline=force_noinline,
-                )
-            )
         peer_counter_adds = peer_counter_publications(
             root,
             scheduled_coordinates,
@@ -4636,6 +5032,48 @@ def emit_cross_loop_schedule(
             and arrives_unreleased(root)
             else None
         )
+        arrivals = [
+            *(
+                part
+                for plan, producer in producer_counters
+                for part in emit_readiness_arrivals_from_producer(
+                    plan, producer, scheduled_coordinates
+                )
+            ),
+            *([] if root_arrival is None else [root_arrival]),
+        ]
+        # The task publishes ahead of its trailing stores that no other root
+        # orders against (a local completion: no peer counters).
+        split = (
+            _split_publication(
+                tile_body,
+                frozenset(ordered_allocations.get(root, ())),
+                argument_allocations,
+                renames,
+            )
+            if arrivals and guard is None and not peer_counter_adds
+            else None
+        )
+        published = split is not None
+        if split is not None:
+            tile_body[:] = [
+                *split[0],
+                *_release_sync(device_function),
+                *_emit_arrivals(device_function, arrivals, "release"),
+                *split[1],
+            ]
+        if root in kernel_scope_roots:
+            body.extend(tile_body)
+        else:
+            body.append(
+                _outline_cross_loop_region(
+                    device_function,
+                    name_hint=f"tile_dependency_root_{root}",
+                    body=tile_body,
+                    extra_argument_names=extra_argument_names,
+                    noinline=force_noinline,
+                )
+            )
         if guard is not None:
             # A task whose guard fails writes nothing: its arrivals need no
             # release (which would wait on every outstanding write).  (A task
@@ -4653,24 +5091,10 @@ def emit_cross_loop_schedule(
                 "relaxed",
             )
             body = guard.body
-        if producer_counters or peer_counter_adds or root_arrival is not None:
-            body.extend(_release_sync(device_function))
-        body.extend(
-            _emit_arrivals(
-                device_function,
-                [
-                    *(
-                        part
-                        for plan, producer in producer_counters
-                        for part in emit_readiness_arrivals_from_producer(
-                            plan, producer, scheduled_coordinates
-                        )
-                    ),
-                    *([] if root_arrival is None else [root_arrival]),
-                ],
-                "release",
-            )
-        )
+        if not published:
+            if producer_counters or peer_counter_adds or root_arrival is not None:
+                body.extend(_release_sync(device_function))
+            body.extend(_emit_arrivals(device_function, arrivals, "release"))
         body.extend(peer_counter_adds)
         if guard is not None:
             body = task_body_head
@@ -4787,13 +5211,12 @@ def emit_cross_loop_schedule(
             )
         return rotated_lane(root, worker)
 
-    def rotated_lane(root: int, worker: str) -> str:
-        # A root begins mid-wave, where the earlier roots' live tasks end
-        # (without packing, only trailing roots): rotate workers onto its
-        # lanes. Waves and slots stay the plan's; only a lane's worker moves.
+    def skipped_lanes(root: int) -> list[str]:
+        """The earlier roots' skipped tasks that shift ``root``'s lanes (their
+        live counts are known only at run time)."""
         plan = static_pipeline_plan
         start = root_lane_origins[root]
-        skipped = [
+        return [
             f"({count} - tl.minimum({live}, {count}))"
             for earlier, (live, count) in resident_live_tasks.items()
             if (
@@ -4802,6 +5225,13 @@ def emit_cross_loop_schedule(
                 else plan.static_base(earlier) < start
             )
         ]
+
+    def rotated_lane(root: int, worker: str) -> str:
+        # A root begins mid-wave, where the earlier roots' live tasks end
+        # (without packing, only trailing roots): rotate workers onto its
+        # lanes. Waves and slots stay the plan's; only a lane's worker moves.
+        start = root_lane_origins[root]
+        skipped = skipped_lanes(root)
         if skipped:
             # Whole waves keep the dividend nonnegative.
             waves = start // launch_worker_count + 1
@@ -4812,6 +5242,29 @@ def emit_cross_loop_schedule(
         rotation = -start % launch_worker_count
         return (
             f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
+        )
+
+    def static_members(root: int) -> frozenset[int] | None:
+        """The workers ``root_lane`` gives ``root``'s tasks when that is static
+        (None: a cluster's lanes, a rotation by earlier roots' live tasks, or a
+        deferred release every worker publishes).  Valid once the earlier
+        resident roots are lowered."""
+        if (
+            root in dsmem_producers
+            or root in dsmem_consumers
+            or root in deferred_releases
+            or skipped_lanes(root)
+        ):
+            return None
+        active = min(
+            launch_worker_count,
+            static_pipeline_plan.execution_orders[root].task_count,
+        )
+        rotation = -root_lane_origins[root] % launch_worker_count
+        return frozenset(
+            w
+            for w in range(launch_worker_count)
+            if (w + rotation) % launch_worker_count < active
         )
 
     def guarded_live_tasks(extent: _GuardedExtent) -> tuple[list[ast.stmt], str]:
@@ -5039,7 +5492,9 @@ def emit_cross_loop_schedule(
         # statements make none of is placed in each task like its covered
         # readiness waits; a worker with no task (guarded extent) waits once
         # before its skipped-task arrivals and publications, which follow the
-        # wait as they did at the root's entry.
+        # wait as they did at the root's entry.  The root's own barrier
+        # publication follows it too: after the task loop, or riding the last
+        # task's arrivals, both after the first task's top-level wait.
         incoming_roots = root_barrier_incoming.get(root, ())
         every_worker = active_worker_count == launch_worker_count
         # None: a hoisted load reads through a name that is no tensor argument.
@@ -5055,7 +5510,7 @@ def emit_cross_loop_schedule(
             }
         )
         barrier_waits: list[ast.stmt] = []
-        task_barriers: list[tuple[list[ast.stmt], frozenset[int]]] = []
+        task_barriers: list[tuple[list[ast.stmt], frozenset[int], frozenset[int]]] = []
         # Producers whose barrier a worker with no task here still waits for.
         no_task_producers: list[int] = []
         # Triton pipelines a multi-stage task loop, issuing a task's loads
@@ -5069,14 +5524,13 @@ def emit_cross_loop_schedule(
             > 1
         )
         for producer in incoming_roots:
-            covered, publication = barrier_covers(root, producer)
+            covered, _publication = barrier_covers(root, producer)
             if (
                 task_loop_pipelined
                 or claimed
                 or root in ws_roots
                 or guarded_kernel_scope_root(root)
                 or covered is None
-                or publication
                 or hoisted_reads is None
                 or covered & hoisted_reads
             ):
@@ -5096,7 +5550,7 @@ def emit_cross_loop_schedule(
                 body=[*wait, *fence],
                 orelse=[],
             )
-            task_barriers.append(([first_wait], covered))
+            task_barriers.append(([first_wait], covered, frozenset({producer})))
             if extent is not None:
                 no_task_producers.append(producer)
         # A worker's root-barrier arrival rides its last task's arrivals: one
@@ -5123,7 +5577,16 @@ def emit_cross_loop_schedule(
             f"{case_offsets[root]} + ({local_task})",
             task_arguments,
             # A hoisted wait would precede the deferred release it may need.
-            invariant_waits=None if root in deferred_releases else invariant_waits,
+            # When every task has a worker of its own, a worker runs at most one
+            # task: hoisting saves no repeated spin, so the wait is scoped in the
+            # task like a keyed one (the task's independent loads issue before
+            # it spins).  Not with a guarded extent: ``settled_tensors`` lets
+            # its hoisted loads read what an invariant wait orders, so the wait
+            # must precede the task loop.
+            invariant_waits=None
+            if root in deferred_releases
+            or (extent is None and active_worker_count == task_count_value)
+            else invariant_waits,
             barrier_waits=task_barriers,
             root_arrival=root_arrival,
         )
@@ -5198,7 +5661,8 @@ def emit_cross_loop_schedule(
             )
         waits = peer_waits(root)
         publications = peer_publications(root)
-        # Only its skipped-task arrivals and publications rely on the barrier.
+        # Its skipped-task arrivals, peer publications and own barrier publication
+        # rely on the barrier.
         no_task_waits = [
             create(
                 ast.If,
@@ -5212,7 +5676,7 @@ def emit_cross_loop_schedule(
                 orelse=[],
             )
             for producer in no_task_producers
-            if skipped_dispatch or publications
+            if skipped_dispatch or publications or root in root_barrier_indices
             for wait in [root_barrier_wait(root, producer, False)]
         ]
         task_dispatch: list[ast.stmt] = [
@@ -5290,6 +5754,7 @@ def emit_cross_loop_schedule(
             else None
         )
         for root in resident_roots:
+            members[root] = static_members(root)
             body = static_root_body(root)
             # The gates precede the first task loop, after the loads hoisted
             # above it, at kernel scope (a root on fewer workers than the

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import functools
 import itertools
 import os
@@ -72,6 +73,32 @@ def mm_times_total(
             # Every task reads the first root whole: one wait serves all of them.
             out[tile_m, tile_n] = acc * torch.sum(part[:])
     return out
+
+
+@helion.kernel(static_shapes=True, backend="gluon")
+def live_barrier_chain(
+    x: torch.Tensor, w: torch.Tensor, rows: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``x + 1``, the first ``rows`` rows of ``w`` times all of it, then ``x +
+    1`` plus the product's total: root barriers chain the roots, the last one's
+    read of ``x + 1`` relying on the middle one's barrier, which it publishes
+    after waiting on the first one's."""
+    m, n = x.size()
+    r, _ = w.size()
+    act = torch.empty_like(x)
+    out = torch.zeros([r, n], dtype=torch.float32, device=x.device)
+    res = torch.empty_like(x)
+    for tile_m, tile_n in hl.tile([m, n]):
+        act[tile_m, tile_n] = x[tile_m, tile_n] + 1
+    for tile_r in hl.tile(r, block_size=16):
+        if tile_r.begin < rows[0]:
+            weight = w[tile_r, :]
+            out[tile_r, :] = hl.dot(
+                weight, act[:, :].to(torch.bfloat16), out_dtype=torch.float32
+            )
+    for tile_m, tile_n in hl.tile([m, n]):
+        res[tile_m, tile_n] = act[tile_m, tile_n] + torch.sum(out[:, :], dim=[0, 1])
+    return act, out, res
 
 
 @helion.kernel(static_shapes=True, backend="gluon")
@@ -1909,6 +1936,73 @@ class TestGluonRing(TestCase):
         self.assertIn("@_helion_gluon.native_kernel", code)
         self.assertIn("gluon_ops import tl_namespace as tl", code)
         self.assertNotIn("@triton.jit", code)
+
+    @skipIfRefEager("checks generated code")
+    @skipUnlessGluon()
+    def test_publishing_root_scopes_barrier_wait(self) -> None:
+        """A guarded root waiting on one root barrier and publishing another
+        waits in each worker's first task, and a worker with no live task once
+        before it publishes: the barrier publication follows the wait in the
+        partition that publishes."""
+        x = torch.randn([64, 64], device=DEVICE, dtype=torch.float32)
+        w = torch.randn([64, 64], device=DEVICE, dtype=torch.bfloat16)
+        # No live task, some of the workers' tasks, every task.
+        for live in (0, 16, 64):
+            with self.subTest(live=live):
+                rows = torch.tensor([live], device=DEVICE, dtype=torch.int32)
+                code, (act, out, res) = code_and_output(
+                    live_barrier_chain,
+                    (x, w, rows),
+                    **RING,
+                    block_sizes=[32, 32, 32, 32],
+                    cross_loop_pipeline="static",
+                )
+                expected = w.float() @ (x + 1).to(torch.bfloat16).float()
+                expected[live:] = 0
+                torch.testing.assert_close(act, x + 1, atol=0, rtol=0)
+                torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-3)
+                torch.testing.assert_close(
+                    res, x + 1 + expected.sum(), rtol=1e-4, atol=1e-2
+                )
+        body = next(
+            node
+            for node in ast.parse(code).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_helion_live_barrier_chain_body"
+        )
+        # The middle root's block: its task loop, the wait of a worker with no
+        # live task, then the publication; no wait at the root's entry.
+        block = next(
+            node.body
+            for node in ast.walk(body)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(s, ast.For) and "w_desc" in ast.unparse(s) for s in node.body
+            )
+        )
+        steps = {
+            s: "tasks"
+            if isinstance(s, ast.For)
+            else "wait"
+            if "root_barrier_wait" in ast.unparse(s)
+            else "publish"
+            for s in block
+            if isinstance(s, ast.For)
+            or any(
+                text in ast.unparse(s) for text in ("root_barrier_wait", "atomic_add")
+            )
+        }
+        self.assertEqual(list(steps.values()), ["tasks", "wait", "publish"])
+        tasks, no_task_wait, _ = steps
+        assert isinstance(tasks, ast.For) and isinstance(no_task_wait, ast.If)
+        self.assertTrue(ast.unparse(no_task_wait.test).startswith("not "))
+        first = [
+            s
+            for s in tasks.body
+            if isinstance(s, ast.If) and "virtual_pid ==" in ast.unparse(s.test)
+        ]
+        self.assertEqual(len(first), 1)
+        self.assertIn("root_barrier_wait", ast.unparse(first[0]))
 
 
 if __name__ == "__main__":
