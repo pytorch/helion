@@ -137,6 +137,17 @@ exclude = ["test/data/*", ".github/*", "notebooks/**/*.ipynb", "_helion_aot_*.py
 # compressed-transpose kernel (tallax/tax/bitonic/*); its helpers are kept untyped
 # for diff fidelity, so exempt the ANN nits (like the vendored file above).
 "helion/_compiler/pallas/topk_impl.py" = ["ANN001", "ANN202", "ANN003"]
+# The Inkling-2-Small megakernels and their vLLM driver are kept as they were
+# served (the layer kernels are generated from the attention and MoE kernels),
+# so the annotation and style nits are exempt.
+"pretuned_kernels/megakernels/inkling2_small/*" = [
+  "ANN",
+  "C408",
+  "F841",
+  "FURB118",
+  "RUF005",
+  "UP031",
+]
 # Keep the attributed TileGym Triton kernel close to its upstream source. Normal
 # Python annotations and style rewrites are inappropriate for several @triton.jit
 # functions and would make future source comparisons needlessly difficult.
