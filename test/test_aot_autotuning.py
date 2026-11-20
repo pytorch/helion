@@ -953,6 +953,7 @@ def test_aot_cache_canonicalizes_defaults_for_compile_get(
         settings=bound_kernel.settings,
         args=(tensor,),
         _benchmark_provider_cls=LocalBenchmarkProvider,
+        _benchmark_prelude=None,
     )
     monkeypatch.setenv("HELION_AOT_MODE", "compile")
     monkeypatch.setattr(aot_cache_module, "get_aot_data_dir", lambda: tmp_path)

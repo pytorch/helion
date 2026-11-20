@@ -328,7 +328,9 @@ class TestMultiShapeRuntime(unittest.TestCase):
             workload_key=workload_key,
         )
         cache.autotuner = SimpleNamespace(  # pyrefly: ignore [bad-assignment]
-            settings=settings, _benchmark_provider_cls=LocalBenchmarkProvider
+            settings=settings,
+            _benchmark_provider_cls=LocalBenchmarkProvider,
+            _benchmark_prelude=None,
         )
 
         key = cache._generate_key()

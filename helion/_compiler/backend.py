@@ -1280,7 +1280,9 @@ class Backend(abc.ABC):
         the early stop of a differential-evolution search counts such a move
         of its best reading as no improvement
         (``DifferentialEvolutionSearch._stop_tolerance``). A
-        search whose best initial reading is at or above it, and every
+        search whose best initial reading is at or above it (unless it is
+        behind a benchmark prelude, ``helion.autotuner.benchmark_prelude``,
+        where it moves to the trace whatever that reading), and every
         search with ``None``, keeps the event timer and the fixed
         ``min_improvement_delta``. A backend answers ``None`` for a search
         that re-times its members with another timer than the benchmark

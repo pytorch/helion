@@ -41,6 +41,8 @@ from helion.autotuner import PatternSearch
 from helion.autotuner.base_search import BaseSearch
 from helion.autotuner.base_search import PopulationBasedSearch
 from helion.autotuner.base_search import PopulationMember
+from helion.autotuner.benchmark_prelude import BenchmarkPrelude
+from helion.autotuner.benchmark_prelude import PreludeStep
 from helion.autotuner.benchmark_provider import BenchmarkResult
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_provider import MultiShapeBenchmarkProvider
@@ -1407,6 +1409,37 @@ class TestCandidateTimer(TestCase):
                     search._settle_candidate_timer(population)
                 self.assertEqual(search.traces_candidates, not custom)
                 self.assertEqual(provider.trace_search_candidates, not custom)
+
+    @pytest.mark.cpu_only
+    def test_a_search_behind_a_prelude_moves_to_the_trace_at_any_length(self) -> None:
+        """Behind a benchmark prelude an event-timed sample can hold the
+        candidate's launch on the host (the device may have finished the
+        prelude's work before the launch is queued), which the trace leaves
+        out: such a search moves to the trace also when its best reading is
+        above the backend's bound. A backend that names no bound keeps the
+        events, as without a prelude."""
+        step = PreludeStep(len, ((),))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HELION_AUTOTUNE_L2_FLUSH", None)
+            search = self._search()
+            search._settle_candidate_timer(self._measured(search, 0.2))
+            self.assertFalse(search.traces_candidates)
+
+            search = self._search()
+            search._benchmark_prelude = BenchmarkPrelude((step,), ())
+            population = self._measured(search, 0.2)
+            search._settle_candidate_timer(population)
+            self.assertTrue(search.traces_candidates)
+            self.assertTrue(search.benchmark_provider.trace_search_candidates)
+            said = search.log.call_args.args[0]
+            self.assertIn("behind a benchmark prelude", said)
+            self.assertIn("CUDA activity trace", said)
+            self.assertAlmostEqual(search.best_perf_so_far, 0.2 - 0.0046)
+
+            search = self._search(bound=None)
+            search._benchmark_prelude = BenchmarkPrelude((step,), ())
+            search._settle_candidate_timer(self._measured(search, 0.2))
+            self.assertFalse(search.traces_candidates)
 
     @pytest.mark.cpu_only
     def test_a_search_without_a_bound_reads_no_search_state(self) -> None:

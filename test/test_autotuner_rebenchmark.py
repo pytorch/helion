@@ -1973,6 +1973,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2037,6 +2038,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2274,6 +2276,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = math.inf
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
 
                 class _Log:
                     def __call__(self, *a, **kw):
@@ -2371,6 +2374,7 @@ class TestAutotuneBestOfK(RefEagerTestDisabled, TestCase):
                 self.best_perf_so_far = 1.0
                 self._skip_cache = False
                 self._benchmark_provider_cls = LocalBenchmarkProvider
+                self._benchmark_prelude = None
                 self.log = _Log()
 
             def autotune(self, *, skip_cache: bool = False):
