@@ -172,6 +172,25 @@ REG_B = "_helion_mpp_reg_b"
 REG_EPILOGUE = "_helion_mpp_reg_epilogue"
 #: The runs whose element statements fold per element (``operand_elements``).
 ELEMENT_RUNS = (FRAG_RUN, REG_RUN)
+#: A fragment plan's row values (``fragment_lines``): a line's seed and a
+#: row reduction's markers, a loop over a lane's row slots that computes
+#: or stores lines (``LINES``), a line reduction's loop over a lane's
+#: elements of each row (``LINE_RED``), and its fold of an element's value
+#: (``LINE_ACC``).
+LINE_FILL = "_helion_mpp_line_fill"
+LINE_REDUCE = "_helion_mpp_line_reduce"
+LINES = "_helion_mpp_lines"
+LINE_RED = "_helion_mpp_line_red"
+LINE_ACC = "_helion_mpp_line_acc"
+#: A fragment group's element value read by two element-level consumers,
+#: computed once into registers (``fragment_lines``): its marker, and the
+#: element loop that writes each element a lane holds (``HOLD_LOOP``).
+HOLD = "_helion_mpp_hold"
+HOLD_LOOP = "_helion_mpp_hold_loop"
+#: The prefix of the module globals that record each register array's
+#: Metal element type (a line's, a held value's), from its FX node's dtype:
+#: ``_METAL_SLOT_TYPE_<name> = 'bool'`` (``fragment_lines.codegen_slot``).
+SLOT_TYPE_GLOBAL_PREFIX = "_METAL_SLOT_TYPE_"
 _ELEMENT_LOOPS = (
     ELEMENTS,
     FRAG_RUN,
@@ -181,6 +200,9 @@ _ELEMENT_LOOPS = (
     REG_A,
     REG_B,
     REG_EPILOGUE,
+    LINES,
+    LINE_RED,
+    HOLD_LOOP,
 )
 BIND = "_helion_mpp_bind"
 STAGE = "_helion_mpp_stage"
@@ -466,6 +488,16 @@ class MppGroup:
     partners: list[MppGroup] = dataclasses.field(
         default_factory=list, repr=False, compare=False
     )
+    #: Values over the group's M block that its element loops read in place
+    #: (``fragment_lines``: a fragment group's row values, held per lane).
+    lines: set[Node] = dataclasses.field(default_factory=set)
+    #: Reductions over the group's N block of its cooperative values that
+    #: give such row values (``fragment_lines``).
+    line_reds: set[Node] = dataclasses.field(default_factory=set)
+    #: ``(update node, input)`` pairs of a fragment group's update whose
+    #: input :func:`_plan_update` left for ``fragment_lines`` to keep as a
+    #: row value or stage (:func:`stage_update_vecs`).
+    pending_vecs: list[tuple[Node, Node]] = dataclasses.field(default_factory=list)
 
     @property
     def acc_dtype(self) -> torch.dtype:
@@ -525,6 +557,18 @@ class MppPlan:
     #: fragment group's (``fragment_mma``) or a register run's
     #: (``mpp_registers``), each running the tile's 32-thread layout.
     split: int = 1
+    #: A fragment plan's row values (``fragment_lines``), each to its M block.
+    lines: dict[Node, int] = dataclasses.field(default_factory=dict)
+    #: Each row reduction of a fragment result to its group.
+    line_reds: dict[Node, MppGroup] = dataclasses.field(default_factory=dict)
+    #: Each ``_frag_line_seed`` node, which seeds a loop-carried row value,
+    #: to its M block.
+    line_seeds: dict[Node, int] = dataclasses.field(default_factory=dict)
+    #: Stores of row values, which lanes holding column 0 of their row write.
+    line_stores: set[Node] = dataclasses.field(default_factory=set)
+    #: Each ``_frag_hold`` node, an element value computed once into a
+    #: fragment group's registers (``fragment_lines``), to its group.
+    holds: dict[Node, MppGroup] = dataclasses.field(default_factory=dict)
 
     def groups(self) -> list[MppGroup]:
         """Every group that holds a cooperative tensor: each matmul's, and
@@ -1190,17 +1234,27 @@ def _plan_matmuls(
                     )
                 continue
             tile_product = True
-        plan_k = _plan_full_k
-        if k_block is None:
+        loop_k = k_block is None
+        if loop_k:
             if not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
                 raise metal_unsupported(
                     "a matmul over a tiled K outside its K loop; loop over K "
                     "with hl.tile, or take K whole with a ':' slice"
                 )
             k_block = g.block_ids[0]
-            plan_k = _plan_group
+        assert k_block is not None
         widen = fragment is not None and (widen_k is None or widen_k(k_block))
-        group = plan_k(len(plan.by_matmul), matmul, k_block, known, widen)
+        if loop_k:
+            group = _plan_group(
+                len(plan.by_matmul),
+                matmul,
+                k_block,
+                known,
+                widen,
+                defer_vecs=fragment is not None,
+            )
+        else:
+            group = _plan_full_k(len(plan.by_matmul), matmul, k_block, known, widen)
         # Each group's op updates its storage in place, so one value can hold
         # only one group's cooperative tensor.
         storage = group.old | group.cur
@@ -1229,10 +1283,14 @@ def _plan_matmuls(
     if plan.by_matmul:
         if fragment is None:
             _classify_partner_uses(plan, known)
+        else:
+            fragment.plan_lines(plan, known)
         _link_element_staging(plan)
         _order_memory(plan, live, known)
         _prune_partners(plan)
         _unlink_dropped(plan)
+        if fragment is not None:
+            fragment.plan_holds(plan, known)
         for group in plan.groups():
             _stage_epilogue_vecs(group, plan, known)
             _finalize(group, plan, known)
@@ -1505,11 +1563,19 @@ def _if_result(if_node: Node, index: int, graphs: Graphs) -> Node | None:
 
 
 def _plan_group(
-    gid: int, matmul: Node, k_loop_block: int, graphs: Graphs, widen: bool = False
+    gid: int,
+    matmul: Node,
+    k_loop_block: int,
+    graphs: Graphs,
+    widen: bool = False,
+    defer_vecs: bool = False,
 ) -> MppGroup:
     """The group of ``matmul``, accumulated across its K loop over
     ``k_loop_block``; ``widen``: whether a fragment group may read a few-row
-    activation as the 16-bit view it widens (:func:`_widen`)."""
+    activation as the 16-bit view it widens (:func:`_widen`).  ``defer_vecs``
+    (a fragment plan) leaves the update's operands that no element
+    recomputes unstaged, in ``pending_vecs``: they may be row values
+    ``fragment_lines`` keeps in registers."""
     acc, lhs, rhs = matmul_operands(matmul)
     assert acc is not None
     placeholder = acc
@@ -1573,7 +1639,7 @@ def _plan_group(
         group.old.add(upd)
         group.plumbing.add((placeholder, upd))
         group.recomputable = Recomputable(group, graphs)
-        _plan_update(group, graphs)
+        _plan_update(group, graphs, defer_vecs)
     else:
         _storage(group, acc)
         group.recomputable = Recomputable(group, graphs)
@@ -1625,34 +1691,48 @@ def _update_chain(
     return placeholder, chain
 
 
-def _plan_update(group: MppGroup, graphs: Graphs) -> None:
+def _plan_update(group: MppGroup, graphs: Graphs, defer_vecs: bool = False) -> None:
     """Admit the update's other operands: each is recomputable at any
     element, or a Scalar value over the group's blocks, which a ``_mpp_vec``
-    node stages for the element loop."""
+    node stages for the element loop (with ``defer_vecs``, later:
+    :func:`stage_update_vecs`)."""
     coop = set(group.update) | set(_aliases(group.levels[0].placeholder))
     recomputable = group.recomputable
-    staged: dict[Node, Node] = {}
     for node in group.update:
         for a in list(node.all_input_nodes):
             if a in coop or recomputable(a):
                 continue
-            vec = staged.get(a)
-            if vec is None:
-                val = a.meta.get("val")
-                if not isinstance(val, torch.Tensor):
-                    raise metal_unsupported(
-                        f"an update of an MPP accumulator reads {a.name}, a scalar "
-                        "that isn't a tensor, such as a float kernel argument"
-                    )
-                if not _mn_dims(group, val):
-                    raise metal_unsupported(
-                        f"an update of an MPP accumulator reads {a.name}, which is "
-                        "neither recomputable at any element nor a value over "
-                        "the tile's M or N blocks"
-                    )
-                vec = staged[a] = _stage_vec(a, node, graphs)
-                group.vecs.append(vec)
-            node.replace_input_with(a, vec)
+            val = a.meta.get("val")
+            if not isinstance(val, torch.Tensor):
+                raise metal_unsupported(
+                    f"an update of an MPP accumulator reads {a.name}, a scalar "
+                    "that isn't a tensor, such as a float kernel argument"
+                )
+            if not _mn_dims(group, val):
+                raise metal_unsupported(
+                    f"an update of an MPP accumulator reads {a.name}, which is "
+                    "neither recomputable at any element nor a value over "
+                    "the tile's M or N blocks"
+                )
+            group.pending_vecs.append((node, a))
+    if not defer_vecs:
+        stage_update_vecs(group, graphs)
+
+
+def stage_update_vecs(group: MppGroup, graphs: Graphs) -> None:
+    """Stage each of the update's pending operands that is not a row value
+    the group's element loops read in place (``group.lines``) into a
+    ``_mpp_vec`` tile, inserted before its first reader in the update."""
+    staged: dict[Node, Node] = {}
+    for node, a in group.pending_vecs:
+        if a in group.lines:
+            continue
+        vec = staged.get(a)
+        if vec is None:
+            vec = staged[a] = _stage_vec(a, node, graphs)
+            group.vecs.append(vec)
+        node.replace_input_with(a, vec)
+    group.pending_vecs = []
 
 
 def _mn_dims(group: MppGroup, val: torch.Tensor) -> set[int | None]:
@@ -2622,7 +2702,7 @@ class Recomputable:
         return out
 
 
-def _classify_uses(group: MppGroup, graphs: Graphs) -> None:
+def _classify_uses(group: MppGroup, graphs: Graphs, masks: bool = False) -> None:
     """Find the uses an element loop evaluates on the cooperative tensor's
     own elements: element-wise ops whose other inputs are recomputable at
     any element (``derived``), and stores of the result or such an op at a
@@ -2633,6 +2713,10 @@ def _classify_uses(group: MppGroup, graphs: Graphs) -> None:
     run before the op first writes it in place: an element loop there reads
     the value from before the write.  A use after the write that reads the
     carry, through any chain, needs its snapshot.
+
+    With ``masks`` (a fragment plan, whose element loops every lane runs
+    alike) a ``_mask_to`` is element-wise too: a select on the tile masks,
+    which an element loop recomputes at its element.
     """
     recomputable = group.recomputable
     group.early = _carry_aliases(group)
@@ -2655,7 +2739,10 @@ def _classify_uses(group: MppGroup, graphs: Graphs) -> None:
                 if _admits_store(user, node, recomputable, group.stores):
                     group.stores.append(user)
                 continue
-            if _pointwise(user) and _inputs_kept(
+            element_wise = _pointwise(user) or (
+                masks and user.target is _tracing_ops._mask_to
+            )
+            if element_wise and _inputs_kept(
                 user, group.cur | group.derived | group.early, group
             ):
                 group.derived.add(user)
@@ -2705,7 +2792,7 @@ def _inputs_kept(node: Node, coop: set[Node], group: MppGroup) -> bool:
     ``node``: each input is cooperative, recomputable at any element or a
     vector a tile can stage (:func:`_vec_input`)."""
     return all(
-        a in coop or group.recomputable(a) or _vec_input(group, a)
+        a in coop or a in group.lines or group.recomputable(a) or _vec_input(group, a)
         for a in node.all_input_nodes
     )
 
@@ -2738,7 +2825,7 @@ def _prune_derived(group: MppGroup) -> None:
         stores = [s for s in group.stores if s.args[2] in coop]
         # A partner's derived value may read this group's at its own index
         # (:func:`_classify_partner_uses`), and this group's its partners'.
-        keep = set(stores) | group.derived
+        keep = set(stores) | group.derived | group.line_reds
         shared: set[Node] = set()
         for partner in group.partners:
             keep |= partner.derived
@@ -3105,7 +3192,7 @@ def _finalize(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
     # The update's nodes read the carry where the update's element loop
     # runs them, before the op; a fold's element loop computes the folded
     # nodes from this group's result.
-    keep = coop | set(group.stores) | set(group.update)
+    keep = coop | set(group.stores) | set(group.update) | group.line_reds
     if group.fold is not None:
         keep |= set(group.fold.update)
     # A partner's element loop reads this group's result at its own index
@@ -3152,7 +3239,7 @@ def _stage_epilogue_vecs(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None
     staged: dict[Node, Node] = {}
     for d in sorted(group.derived, key=lambda n: n.name):
         for a in list(d.all_input_nodes):
-            if group.recomputable(a) or not _vec_input(group, a):
+            if a in group.lines or group.recomputable(a) or not _vec_input(group, a):
                 continue
             vec = staged.get(a)
             if vec is None:
@@ -4848,8 +4935,111 @@ def elementize(
         for side in lowering.run_binds(cast("ast.Call", a.value))
         for b in side
     }
-    copies = _Copies(body, bound, set(alias), leaves, vec_reads)
+    # A held value (``fragment_lines``) is written per element once, and
+    # every statement computed from it is re-run per element.
+    held = {
+        t
+        for a in _assigns(body)
+        if call_name(a.value) == HOLD and (t := assign_target(a)) is not None
+    }
+    copies = _Copies(body, bound, set(alias), leaves, vec_reads | held)
     derived: dict[str, str] = {}  # recomputed name -> its cooperative root
+    # A fragment plan's row values (``fragment_lines``): each line's name to
+    # its row slots, its M block and the bindings that make a lane act as
+    # the thread holding a row in the Scalar layout.
+    lines: dict[str, tuple[int, int, list[ast.expr]]] = {}
+
+    def line_loop(
+        stmt: ast.stmt, layout: tuple[int, int, list[ast.expr]], seen: list[ast.stmt]
+    ) -> ast.For:
+        """``stmt``, which assigns or stores a line, in a loop over the row
+        slots that re-runs the recomputed statements it reads."""
+        rows, block_m, row_binds = layout
+        binds: dict[str, ast.expr] = {}
+        for b in row_binds:
+            assert isinstance(b, ast.Tuple)
+            binds[_bind_name(b)] = b.elts[1]
+        head, _ = rerun(binds, names_read(stmt), [stmt], seen)
+        target = assign_target(stmt)
+        targets = [] if target is None else [target]
+        loop = ast.For(
+            target=ast.Name("_it", ast.Store()),
+            iter=ast.Call(
+                ast.Name(LINES, ast.Load()),
+                [
+                    ast.Constant(rows),
+                    ast.Constant(block_m),
+                    ast.List([ast.Constant(t) for t in targets], ast.Load()),
+                    ast.Constant(target is None),
+                ],
+                [],
+            ),
+            body=[*head, copy.deepcopy(stmt)],
+            orelse=[],
+        )
+        ast.fix_missing_locations(loop)
+        return loop
+
+    def line_layout(value: ast.Call) -> tuple[int, int, list[ast.expr]]:
+        """A line marker's row slots, M block and row bindings, its last
+        three arguments."""
+        rows, block_m, row_binds = value.args[-3:]
+        assert isinstance(row_binds, ast.List)
+        return ast.literal_eval(rows), ast.literal_eval(block_m), row_binds.elts
+
+    def hold_loop(t: str, value: ast.Call, seen: list[ast.stmt]) -> ast.For:
+        """The loop that writes a held value at each element a lane holds of
+        its root, re-running what it is computed from; its name then reads
+        that register at a consumer's element."""
+        (src,) = value.args
+        assert isinstance(src, ast.Name)
+        root = derived.get(src.id, alias.get(src.id))
+        assert root is not None, src.id
+        derived[t] = root
+        binds = {_bind_name(b): b.elts[1] for b in _binds(groups[root])}
+        put = ast.Expr(
+            ast.Call(ast.Name(PUT, ast.Load()), [ast.Name(src.id, ast.Load())], [])
+        )
+        head, _ = rerun(binds, {src.id}, [src], seen)
+        loop = ast.For(
+            target=ast.Name("_it", ast.Store()),
+            iter=ast.Call(
+                ast.Name(HOLD_LOOP, ast.Load()),
+                [ast.Name(root, ast.Load()), ast.Constant(t)],
+                [],
+            ),
+            body=[*head, put],
+            orelse=[],
+        )
+        ast.fix_missing_locations(loop)
+        return loop
+
+    def line_reduce(t: str, value: ast.Call, seen: list[ast.stmt]) -> ast.For:
+        """A row reduction: per row slot, a fold over the lane's elements of
+        its root's row, each re-run at the element, ending in
+        ``_helion_mpp_line_acc(value[, mask])``."""
+        op, src, mask = value.args[:3]
+        assert isinstance(src, ast.Name)
+        root = derived.get(src.id, alias.get(src.id))
+        assert root is not None, src.id
+        binds = {_bind_name(b): b.elts[1] for b in _binds(groups[root])}
+        acc_args: list[ast.expr] = [ast.Name(src.id, ast.Load())]
+        if not (isinstance(mask, ast.Constant) and mask.value is None):
+            acc_args.append(copy.deepcopy(mask))
+        acc = ast.Expr(ast.Call(ast.Name(LINE_ACC, ast.Load()), acc_args, []))
+        head, _ = rerun(binds, names_read(acc), list(acc_args), seen)
+        loop = ast.For(
+            target=ast.Name("_it", ast.Store()),
+            iter=ast.Call(
+                ast.Name(LINE_RED, ast.Load()),
+                [ast.Name(root, ast.Load()), copy.deepcopy(op), ast.Constant(t)],
+                [],
+            ),
+            body=[*head, acc],
+            orelse=[],
+        )
+        ast.fix_missing_locations(loop)
+        return loop
 
     def roots_of(names: set[str]) -> set[str]:
         return {alias[n] for n in names if n in alias} | {
@@ -4911,12 +5101,50 @@ def elementize(
                 out.append(s)
                 seen.append(s)
                 continue
-            out += copies.take(s)
+            for snap in copies.take(s):
+                read = names_read(snap) & lines.keys()
+                if read:
+                    lines[cast("str", assign_target(snap))] = lines[min(read)]
+                    out.append(line_loop(snap, lines[min(read)], seen))
+                else:
+                    out.append(snap)
+            if t is not None and isinstance(value, ast.Call):
+                if call_name(value) == HOLD:
+                    out.append(hold_loop(t, value, seen))
+                    continue
+                if call_name(value) == LINE_FILL:
+                    lines[t] = line_layout(value)
+                    fill = ast.Assign([ast.Name(t, ast.Store())], value.args[0])
+                    ast.fix_missing_locations(fill)
+                    out.append(line_loop(fill, lines[t], seen))
+                    continue
+                if call_name(value) == LINE_REDUCE:
+                    lines[t] = line_layout(value)
+                    out.append(line_reduce(t, value, seen))
+                    continue
             roots = (
                 roots_of(names_read(s))
                 if not isinstance(s, (ast.For, ast.If))
                 else set()
             )
+            line_reads = (
+                names_read(s) & lines.keys()
+                if not isinstance(s, (ast.For, ast.If))
+                else set()
+            )
+            if line_reads and not roots:
+                # A line op (or a line's copy) or a line's store: run per
+                # row slot.  The planner gives a line no other reader.
+                layout = lines[min(line_reads)]
+                if t is not None:
+                    lines[t] = layout
+                elif not _is_store(s):
+                    raise metal_unsupported(
+                        "a fragment row value reaches a use that needs it in the "
+                        "Scalar layout"
+                    )
+                out.append(line_loop(s, layout, seen))
+                continue
             # A fold's update reads its product's elements at its own.
             roots -= {folds[r] for r in roots if r in folds}
             if len(roots) > 1:
@@ -4971,8 +5199,15 @@ def elementize(
                     "this thread's own element of a materialized MPP result"
                 )
             # Re-run exactly the recomputed names; any other name holds one
-            # value for every element of this thread and is read as it stands.
-            if name in binds or name in alias or name not in copies.recomputed:
+            # value for every element of this thread and is read as it stands,
+            # and a line is read at the element's row slot.
+            if (
+                name in binds
+                or name in alias
+                or name in lines
+                or name in held
+                or name not in copies.recomputed
+            ):
                 return
             s = defs.get(name)
             if s is None or name in copies.reassigned:

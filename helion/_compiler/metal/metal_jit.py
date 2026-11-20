@@ -41,6 +41,7 @@ import inspect
 import textwrap
 import types
 from typing import TYPE_CHECKING
+from typing import cast
 
 import torch
 
@@ -65,6 +66,7 @@ from .masked_branch import branch_masked_steps
 from .mpp_matmul import ACC
 from .mpp_matmul import REG_RUN
 from .mpp_matmul import RUN
+from .mpp_matmul import SLOT_TYPE_GLOBAL_PREFIX
 from .mpp_registers import GRID_TILE
 from .mpp_registers import LANE as REGISTER_LANE
 from .mpp_registers import REGISTER_LOWERING
@@ -609,6 +611,11 @@ def _generate_msl_kernel(
             kernel_constants(body_stmts) if uses_fragments or uses_registers else {}
         ),
         split=split,
+        slot_types={
+            name[len(SLOT_TYPE_GLOBAL_PREFIX) :]: cast("str", kind)
+            for name, kind in fn_globals.items()
+            if name.startswith(SLOT_TYPE_GLOBAL_PREFIX)
+        },
         # Register operands' layouts are probed where the kernel runs
         # (``coop_layout``).
         on_gpu=any(

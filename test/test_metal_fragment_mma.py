@@ -24,6 +24,7 @@ import helion
 from helion._compiler.metal.fragment_matmul_heuristic import (
     MetalFragmentMatmulHeuristic,
 )
+from helion._testing import import_example
 from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import heuristic_seeds
@@ -31,13 +32,20 @@ from helion._testing.metal import run_with_msl
 from helion._testing.metal_fragment import affine_args
 from helion._testing.metal_fragment import affine_mm
 from helion._testing.metal_fragment import affine_reference
+from helion._testing.metal_fragment import batched_k_loop
+from helion._testing.metal_fragment import batched_whole_k
+from helion._testing.metal_fragment import chained_rhs
 from helion._testing.metal_fragment import e4m3
 from helion._testing.metal_fragment import filled
 from helion._testing.metal_fragment import fp8_rows
 from helion._testing.metal_fragment import fragment_config
 from helion._testing.metal_fragment import fragment_transposed
 from helion._testing.metal_fragment import k_from_16
+from helion._testing.metal_fragment import matmul_softmax
 from helion._testing.metal_fragment import nvfp4_rows
+from helion._testing.metal_fragment import online_rescale
+from helion._testing.metal_fragment import online_rescale_ref
+from helion._testing.metal_fragment import row_lse
 from helion._testing.metal_fragment import seeded_rhs
 from helion._testing.metal_fragment import two_groups
 from helion._testing.metal_fragment import views_epilogue
@@ -590,6 +598,85 @@ class TestFragmentMma(unittest.TestCase):
         out, msl = _run(whole_k_dot, (x, y), fragment_config([16, 16]))
         self._close(out, xd @ yd)
         self.assertIn("simdgroup_multiply_accumulate", msl)
+
+    def test_batched(self) -> None:
+        """Batched matmuls on a batch tile of 1: a baddbmm K loop with a
+        computed lhs, and attention-shaped scores, a ':' K bmm per N tile
+        against a transposed view."""
+        x = torch.randn(3, 16, 32, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(3, 32, 24, device=DEVICE, dtype=torch.float16)
+        xd = x.cpu().double()
+        out, msl = _run(batched_k_loop, (x, y), fragment_config([1, 16, 16, 16]))
+        ref = (x.cpu() * 0.5).double() @ y.cpu().double() + 1.0
+        self._close(out, ref)
+        self._assert_fragments(msl, transposed=False)
+        yt = torch.randn(3, 24, 32, device=DEVICE, dtype=torch.float16)
+        out, msl = _run(batched_whole_k, (x, yt), fragment_config([1, 16, 16]))
+        self._close(out, xd @ yt.cpu().double().transpose(1, 2))
+        self._assert_fragments(msl, transposed=False)
+
+    def test_lines(self) -> None:
+        """Row values kept in registers (``fragment_lines``): a softmax of
+        the accumulator over 13 rows, an online logsumexp over N tiles with
+        an N tail (N = 40 in tiles of 16), and an accumulator rescaled by a
+        running row max before each N tile's op."""
+        x = torch.randn(13, 32, device=DEVICE, dtype=torch.float16)
+        y = torch.randn(32, 32, device=DEVICE, dtype=torch.float16)
+        out, msl = _run(matmul_softmax, (x, y), fragment_config([16, 16]))
+        self._close(out, torch.softmax(x.cpu().double() @ y.cpu().double(), 1))
+        self.assertIn("simd_shuffle_xor(_lr, 8)", msl)
+        xf = torch.randn(13, 32, device=DEVICE) * 0.3
+        yf = torch.randn(32, 40, device=DEVICE) * 0.3
+        out, msl = _run(row_lse, (xf, yf), fragment_config([16, 16]))
+        ref = torch.logsumexp(xf.cpu().double() @ yf.cpu().double(), 1)
+        self._close(out, ref)
+        args = tuple(
+            torch.randn(*shape, device=DEVICE) * 0.3
+            for shape in ((16, 32), (32, 48), (16, 48), (48, 16))
+        )
+        out, msl = _run(online_rescale, args, fragment_config([16, 16]))
+        self._close(out, online_rescale_ref(*args, block_n=16))
+        self.assertNotIn("threadgroup_barrier", msl)
+
+    def test_chain(self) -> None:
+        """Operands built from another group's fragments: attention's P
+        (``examples/attention.py``, bfloat, a K tail-free S of 96 in tiles of
+        16 and 32, and its log-sum-exp), and a chained rhs whose K is the
+        scores' M."""
+        ex = import_example("attention")
+        kernel = helion.kernel(
+            ex.attention.fn, backend="metal", static_shapes=True, fast_math=True
+        )
+        q, k, v = (
+            torch.randn(2, 3, 96, 128, device=DEVICE, dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        ref, ref_lse = ex._attention_reference(
+            q.cpu().float(), k.cpu().float(), v.cpu().float()
+        )
+        for block_n in (16, 32):
+            with self.subTest(block_n=block_n):
+                (out, lse), _, msl = run_with_msl(
+                    kernel, (q, k, v), fragment_config([1, 16, block_n])
+                )
+                self._close(cast("torch.Tensor", out), ref, tol=2e-2)
+                self._close(cast("torch.Tensor", lse), ref_lse, tol=2e-2)
+                self.assertIn("simdgroup_matrix<bfloat, 8, 8> _frag_a[2];", msl)
+        # S = 80 in tiles of 32: P's K tail reads bfloat zeros.
+        q, k, v = (t[:, :, :80] for t in (q, k, v))
+        ref, ref_lse = ex._attention_reference(
+            q.cpu().float(), k.cpu().float(), v.cpu().float()
+        )
+        (out, lse), _, _ = run_with_msl(kernel, (q, k, v), fragment_config([1, 16, 32]))
+        self._close(cast("torch.Tensor", out), ref, tol=2e-2)
+        self._close(cast("torch.Tensor", lse), ref_lse, tol=2e-2)
+        args = tuple(
+            torch.randn(*shape, device=DEVICE) * 0.3
+            for shape in ((32, 16), (16, 24), (16, 32))
+        )
+        out, msl = _run(chained_rhs, args, fragment_config([16, 16]))
+        x, y, w = (a.cpu().double() for a in args)
+        self._close(out, w @ torch.exp(x @ y))
 
     def test_two_groups(self) -> None:
         """Two fragment groups in one K loop share the lane preamble, each
