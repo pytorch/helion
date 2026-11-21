@@ -7786,6 +7786,36 @@ def _tile_masks(code: str) -> list[str]:
     return sorted(set(re.findall(r"\bmask_\d+\b", code)))
 
 
+@helion.kernel(backend="metal", static_shapes=True)
+def _gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = torch.addmm(acc, x[tile_m, tile_k], w[tile_n, tile_k].T)
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+@_requires_darwin
+class TestMetalDeferredGroupSum(unittest.TestCase):
+    """A GEMV whose K tile spreads over threads sums the threads' partials
+    once, after the K loop (``deferred_reduction``)."""
+
+    def test_split_k_gemv_matches_torch(self) -> None:
+        x = torch.randn(1, 1000, device=DEVICE, dtype=torch.float16)
+        w = torch.randn(70, 1000, device=DEVICE, dtype=torch.float16)
+        config = helion.Config(
+            block_sizes=[1, 8, 256], metal_matmul="scalar", num_threads=[1, 8, 32]
+        )
+        out = _gemv.bind((x, w)).compile_config(config)(x, w)
+        torch.testing.assert_close(
+            out.float(), x.float() @ w.float().T, atol=5e-2, rtol=1e-2
+        )
+
+
 @_requires_darwin
 class TestMetalTileMaskElision(unittest.TestCase):
     """A tile whose block divides its extent drops its bounds mask when the
