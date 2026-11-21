@@ -793,6 +793,11 @@ def _get_backend_tunable_keys() -> frozenset[str]:
         return _BASE_BACKEND_TUNABLE_KEYS
 
 
+# cross_loop_inband_protocol's choices: "tagged" in-band words carry the launch
+# epoch; "lamport" words carry none, each lane xor'd with a NaN key, in three
+# launch slots that readers re-arm.
+INBAND_PROTOCOLS: tuple[str, ...] = ("tagged", "lamport")
+
 BACKEND_TUNABLE_KEYS: frozenset[str] = _get_backend_tunable_keys()
 # Generic keys whose support is gated per backend (``supports_config_key``)
 # rather than declared by one backend's surface: the Triton host descriptor and
@@ -802,6 +807,7 @@ _BACKEND_GATED_GENERIC_KEYS: frozenset[str] = frozenset(
     {
         "cross_loop_pipeline",
         "cross_loop_tmem_prefetch",
+        "cross_loop_inband_protocol",
         "worker_registers",
         "load_cache_modifiers",
         "store_cache_modifiers",
@@ -1211,6 +1217,11 @@ class ConfigSpec:
         # implicit cross-root dependency the backend can lower (CuTe offers
         # the barrier pipeline only).
         self.cross_loop_pipeline: EnumFragment | None = None
+        # One entry per inband allocation whose words may travel as Lamport words
+        # (TileDependencyGraph.lamport_candidate_ids, sorted).
+        self.cross_loop_inband_protocol = ListOf(
+            EnumFragment(choices=INBAND_PROTOCOLS), length=0
+        )
         # Whether a cross-rank dependency transports a scatter in band: its
         # guard-skipped tasks need static or claimed (gluon ring) roots.
         self.inband_scatter: bool = False
@@ -2403,6 +2414,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
             "prefetch_indexing",
@@ -2425,6 +2437,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
             "prefetch_indexing",
@@ -2482,6 +2495,31 @@ class ConfigSpec:
             config.setdefault(
                 "store_cache_modifiers", self.store_cache_modifiers.default()
             )
+        for key, flags, entry, valid in (
+            (
+                "cross_loop_inband_protocol",
+                self.cross_loop_inband_protocol,
+                '"tagged" or "lamport" per Lamport candidate',
+                lambda value: value in INBAND_PROTOCOLS,
+            ),
+        ):
+            if not (self.supports_config_key(key) and flags.length > 0):
+                config.pop(key, None)
+                continue
+            values = config.setdefault(key, flags.default())
+            if (
+                not isinstance(values, (list, tuple))
+                or len(values) != flags.length
+                or not all(map(valid, values))
+            ):
+                if not _fix_invalid:
+                    raise InvalidConfig(
+                        f"{key} must be a list of {entry} "
+                        f"(expected {flags.length}, got {values!r})"
+                    )
+                config[key] = flags.default()
+            else:
+                config[key] = list(values)
         if self.supports_config_key("indexing"):
             config.setdefault("indexing", self.indexing.default())
         if self.supports_config_key("atomic_indexing"):
@@ -3305,6 +3343,13 @@ class ConfigSpec:
             and self.store_cache_modifiers.length > 0
         ):
             fields["store_cache_modifiers"] = self.store_cache_modifiers
+        fields.update(
+            (key, flags)
+            for key, flags in (
+                ("cross_loop_inband_protocol", self.cross_loop_inband_protocol),
+            )
+            if self.supports_config_key(key) and flags.length > 0
+        )
         if self.supports_config_key("num_threads"):
             fields["num_threads"] = self.num_threads
         if is_tileir:
@@ -3635,6 +3680,7 @@ class ConfigSpec:
             "load_eviction_policies",
             "load_cache_modifiers",
             "store_cache_modifiers",
+            "cross_loop_inband_protocol",
             "indexing",
             "atomic_indexing",
             "prefetch_indexing",

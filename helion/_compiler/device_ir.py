@@ -4648,6 +4648,10 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
                 ),
             )
             cross_rank = device_ir.tile_dependency_graph.crosses_ranks()
+            if config_spec.supports_config_key("cross_loop_inband_protocol"):
+                config_spec.cross_loop_inband_protocol.length = len(
+                    device_ir.tile_dependency_graph.lamport_candidate_ids
+                )
             _install_dependency_phases(
                 device_ir,
                 visitor.root_nodes,

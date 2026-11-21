@@ -1478,6 +1478,43 @@ def _pinned_task_loops(code: str) -> list[ast.For]:
     ]
 
 
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def fixed_index_view_chain(x: torch.Tensor) -> torch.Tensor:
+    # Producer tasks write one half (fixed index 0) of a [G, 2, S, W] view; a
+    # consumer reads every split of its group's half.
+    groups, splits, width = x.size()
+    ws = torch.empty([groups, 2 * splits, width], dtype=torch.float32, device=x.device)
+    halves = ws.view(groups, 2, splits, width)
+    out = torch.empty([groups, width], dtype=torch.float32, device=x.device)
+    for g, s in hl.tile([groups, splits], block_size=[1, 1]):
+        halves[g, 0, s, :] = x[g, s, :].to(torch.float32) + 1
+    for g2 in hl.tile(groups, block_size=1):
+        out[g2, :] = torch.sum(halves[g2.begin, 0, :, :], dim=0)[None, :]
+    return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    autotune_effort="none",
+)
+def fixed_index_view_halves(x: torch.Tensor) -> torch.Tensor:
+    # Producer tasks write both halves of a [G, 2, S, W] view, a store each; a
+    # consumer reads every split of its group's second half only.
+    groups, splits, width = x.size()
+    ws = torch.empty([groups, 2 * splits, width], dtype=torch.float32, device=x.device)
+    halves = ws.view(groups, 2, splits, width)
+    out = torch.empty([groups, width], dtype=torch.float32, device=x.device)
+    for g, s in hl.tile([groups, splits], block_size=[1, 1]):
+        halves[g, 0, s, :] = x[g, s, :].to(torch.float32) + 1
+        halves[g, 1, s, :] = x[g, s, :].to(torch.float32) + 2
+    for g2 in hl.tile(groups, block_size=1):
+        out[g2, :] = torch.sum(halves[g2.begin, 1, :, :], dim=0)[None, :]
+    return out
+
+
 class TestCrossLoopCodegenHelpers(TestCase):
     @pytest.mark.cpu_only
     @skipIfNotTriton("Triton's software pipeliner")
@@ -2861,6 +2898,44 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
                 )
                 self.assertIn("tile_dependency_readiness_wait_1", code)
                 self.assertNotIn("tile_dependency_root_barrier_wait", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_fixed_view_index_keeps_consumer_keys(self) -> None:
+        # The fixed index on a view dimension constrains no producer task: the
+        # consumer still waits on its own group's tasks, not on a root barrier.
+        x = torch.randn(4, 19, 64, device=DEVICE)
+        code, out = code_and_output(
+            fixed_index_view_chain,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(out, (x + 1).sum(1))
+        # One counter a group, which its 19 split tasks arrive on.
+        self.assertIn("tl.cast(19, tl.uint32)", code)
+        self.assertNotIn("root_barrier", code)
+
+    @skipIfNotCUDA()
+    @skipIfRefEager("persistent tile-dependency codegen is unavailable")
+    def test_fixed_view_index_disjoint_store(self) -> None:
+        # The first half's store is apart from the consumer's fixed index (the
+        # region check records no dependency for it); the second half's still
+        # keys the consumer.
+        x = torch.randn(4, 19, 64, device=DEVICE)
+        code, out = code_and_output(
+            fixed_index_view_halves,
+            (x,),
+            pid_type="persistent_blocked",
+            cross_loop_pipeline="static",
+            num_warps=4,
+            num_stages=1,
+        )
+        torch.testing.assert_close(out, (x + 2).sum(1))
+        self.assertIn("tl.cast(19, tl.uint32)", code)
+        self.assertNotIn("root_barrier", code)
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
