@@ -389,12 +389,14 @@ class MetalBackend(Backend):
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         from .fragment_matmul_heuristic import MetalFragmentMatmulHeuristic
         from .row_reduction_heuristic import MetalRowReductionHeuristic
+        from .split_reduction_heuristic import MetalSplitReductionHeuristic
         from .staged_matmul_heuristic import MetalStagedMatmulHeuristic
 
         return (
             MetalRowReductionHeuristic,
             MetalStagedMatmulHeuristic,
             MetalFragmentMatmulHeuristic,
+            MetalSplitReductionHeuristic,
         )
 
     @staticmethod
