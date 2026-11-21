@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 import torch
 
+import helion
 from helion._compiler.metal import coop_layout
 from helion._compiler.metal import mpp_registers
 from helion._testing import TestCase
@@ -23,6 +24,7 @@ from helion._testing.metal_fragment import affine_mm
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
+from helion._testing.metal_registers import dequant_forms_mm
 from helion._testing.metal_registers import inner_tiled_mm
 from helion._testing.metal_registers import register_config
 
@@ -388,6 +390,132 @@ class TestRegisterCodegen(TestCase):
         )
         self.assertIn("if (_mrl0_v0) {", msl)
         self.assertIn("} else _mr_a[0] = 0;", msl)
+
+    def test_fast_half_families(self) -> None:
+        """The affine split's GPU table, read from the device's name: on for
+        the M5 family on macOS 26.2 or newer, off for the M1 to M4 and for a
+        device whose family isn't listed."""
+        for name, macos, fast in (
+            ("Apple M5", True, True),
+            ("Apple M5 Max", True, True),
+            ("Apple M5 Max", False, False),
+            ("Apple M4 Max", True, False),
+            ("Apple M1", True, False),
+            ("Apple M6 Pro", True, False),
+            ("Apple Paravirtual device", True, False),
+        ):
+            with (
+                self.subTest(name=name, macos=macos),
+                mock.patch.object(
+                    torch._C, "_mps_get_name", return_value=name, create=True
+                ),
+                mock.patch.object(
+                    torch.backends.mps, "is_macos_or_newer", return_value=macos
+                ),
+            ):
+                self.assertEqual(coop_layout.fast_half_inputs(), fast)
+
+    def test_affine_split(self) -> None:
+        """Where half inputs run faster (forced here), a K tile within one
+        group has one scale and bias per weight row: x times the codes in
+        half, x's row sums from a product with ones, and each accumulator
+        element adds the tile's scale times its product plus the bias times
+        its row's sum.  Off where no GPU runs the kernel, without
+        fast_math, and over a K tile of two groups."""
+        for bits, group, k_block, rows in (
+            (4, 32, 32, 16),
+            (5, 128, 128, 8),
+            (6, 128, 64, 16),
+        ):
+            with self.subTest(bits=bits, rows=rows):
+                args = affine_args(bits, group, rows, 64, 512)
+                config = register_config([16, 32, k_block])
+                with mock.patch.object(
+                    mpp_registers, "affine_split_enabled", return_value=True
+                ):
+                    msl = render_msl(affine_mm, args, config)
+                loop = _k_loop(msl)
+                self.assertIn("_mr_ones[_e] = static_cast<half>(1.0f);", loop)
+                self.assertIn(
+                    "get_right_input_cooperative_tensor<half, half, float>", loop
+                )
+                self.assertEqual(loop.count("_mpp_op_0.run("), 2 * (k_block // 16))
+                self.assertRegex(
+                    loop,
+                    r"acc_copy_0\[0\] = \(_mr_av \+ \(\(_mpp_rs_0 \* _mr_pv\) "
+                    r"\+ \(_mpp_rb_0 \* _mr_xv\)\)\);",
+                )
+                self.assertRegex(
+                    loop, rf"auto v_\d+ = static_cast<int>\(\(offset_2 / {group}\)\);"
+                )
+                self.assertNotIn("_mr_ones", render_msl(affine_mm, args, config))
+        args = affine_args(4, 32, 16, 64, 512)
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            msl = render_msl(affine_mm, args, register_config([16, 32, 64]))
+        self.assertNotIn("_mr_ones", msl)
+        # Where half inputs pay, only under fast_math: the split
+        # reassociates the sum.
+        fast = helion.kernel(backend="metal", static_shapes=True, fast_math=True)(
+            affine_mm.fn
+        )
+        config = register_config([16, 32, 32])
+        with mock.patch.object(mpp_registers, "_half_pays", lambda: True):
+            self.assertNotIn("_mr_ones", render_msl(affine_mm, args, config))
+            self.assertIn("_mr_ones", render_msl(fast, args, config))
+        # Nor, under fast_math, where no GPU runs the kernel.
+        self.assertNotIn("_mr_ones", render_msl(fast, args, config))
+        # Nor where it wouldn't pay or could overflow: a weight already
+        # half, whose op takes half inputs as it is, and a float32 scale and
+        # bias, whose products can pass float's range where the weights
+        # don't.
+        x, w, scales, biases = affine_args(4, 32, 16, 64, 384)
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            msl = render_msl(
+                dequant_forms_mm,
+                (x, w, scales, biases, "half"),
+                register_config([16, 32, 32]),
+            )
+            self.assertIn("get_right_input_cooperative_tensor<half, half, float>", msl)
+            self.assertNotIn("_mr_ones", msl)
+            wide = (x, w, scales.float(), biases.float())
+            msl = render_msl(affine_mm, wide, register_config([16, 32, 32]))
+            self.assertIn("_mr_b", msl)
+            self.assertNotIn("_mr_ones", msl)
+            # An fp16 scale and bias the float32 codes promote split; a
+            # product rounded to bf16 on the way, or a group index that
+            # isn't constant over an aligned tile (k // -32), doesn't.
+            x, w, scales, biases = affine_args(4, 32, 16, 64, 288)
+            for form, split in (
+                ("promoted", True),
+                ("bf16_product", False),
+                ("negative_group", False),
+            ):
+                with self.subTest(form=form):
+                    wide_scales = torch.randn(64, 10).to(torch.float16)
+                    msl = render_msl(
+                        dequant_forms_mm,
+                        (x, w, wide_scales, wide_scales.clone(), form),
+                        register_config([16, 32, 32]),
+                    )
+                    self.assertIn("_mr_b", msl)
+                    self.assertEqual("_mr_ones" in msl, split)
+        # On a layout read at run time, an accumulator element the lane
+        # doesn't hold keeps its value.
+        args = affine_args(4, 32, 16, 64, 256)
+        with (
+            mock.patch.object(mpp_registers, "affine_split_enabled", return_value=True),
+            mock.patch.object(mpp_registers, "factor", lambda coords, d: None),
+        ):
+            msl = render_msl(affine_mm, args, register_config([16, 32, 32]))
+        self.assertRegex(
+            msl,
+            r"if \(_mrl\d+_v0\) \{\n\s+\{\n\s+int _e_m = 0 \+ _mrl\d+_r0;\n"
+            r"\s+int _e_n = 0 \+ _mrl\d+_c0;\n\s+int _e_k = 0;\n\s+float _mr_av",
+        )
 
 
 if __name__ == "__main__":

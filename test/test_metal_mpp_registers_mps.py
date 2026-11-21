@@ -1,7 +1,7 @@
 """MPP's register operands (``mpp_registers``) on the GPU: the probed
 layouts, and numerics against float64 for 4-, 5- and 6-bit affine weights
-at 4 to 32 rows, with x built in registers or read as a device view, and
-the register run's other forms."""
+at 4 to 32 rows, with x built in registers or read as a device view, with
+and without the affine split, and the register run's other forms."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ from helion._testing.metal_fragment import affine_reference
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import seeded_rhs
+from helion._testing.metal_registers import dequant_forms_mm
+from helion._testing.metal_registers import dequant_reference
 from helion._testing.metal_registers import inner_tiled_mm
 from helion._testing.metal_registers import register_config
 
@@ -44,11 +46,14 @@ _requires_mps = unittest.skipUnless(
 )
 
 #: The affine weights' cases, all pairs of: the bit width (4 divides a
-#: word, 5 straddles words 3 times in 16, 6 twice in 8), x's rows (at 8 or
+#: word, 5 straddles words 4 times in 16, 6 twice in 8), x's rows (at 8 or
 #: fewer x is a device view and the op takes 8 rows; at 16 and 32 both
-#: operands are in registers on an M4), and the K tile (within one group,
-#: or over several).
-_AFFINE = pairwise(bits=(4, 5, 6), rows=(4, 8, 16, 32), one_group=(True, False))
+#: operands are in registers on an M4), and the K tile's form: two groups of
+#: 32, which the affine split doesn't take, or one group, unsplit (the M4's
+#: default) or split (forced on).
+_AFFINE = pairwise(
+    bits=(4, 5, 6), rows=(4, 8, 16, 32), mode=("two groups", "one group", "split")
+)
 
 
 def _run(
@@ -97,18 +102,22 @@ class TestMppRegisters(unittest.TestCase):
                 self.assertEqual(probed, coop_layout.blocked_layout(atom))
 
     def test_affine(self) -> None:
-        """4-, 5- and 6-bit affine weights at 4 to 32 rows against float64."""
-        for bits, rows, one_group in _AFFINE:
-            group = 32 if bits == 4 else 128
-            k_block = group if one_group else 64
-            if not one_group:
-                group = 32
-            with self.subTest(bits=bits, rows=rows, one_group=one_group):
+        """4-, 5- and 6-bit affine weights at 4 to 32 rows against float64,
+        with and without the affine split."""
+        for bits, rows, mode in _AFFINE:
+            group = 32 if bits == 4 or mode == "two groups" else 128
+            k_block = 64 if mode == "two groups" else group
+            split = mode == "split"
+            with self.subTest(bits=bits, rows=rows, mode=mode):
                 args = affine_args(bits, group, rows, 96, 1024, DEVICE)
                 config = register_config([16 if rows <= 16 else 32, 32, k_block])
-                out, msl = _run(affine_mm, args, config)
+                with mock.patch.object(
+                    mpp_registers, "affine_split_enabled", return_value=split
+                ):
+                    out, msl = _run(affine_mm, args, config)
                 self._close(out, affine_reference(args))
                 self.assertIn("execution_simdgroup> _mpp_op_0;", msl)
+                self.assertEqual("_mr_ones" in msl, split)
                 self._assert_view(msl, rows)
 
     def _assert_view(self, msl: str, rows: int) -> None:
@@ -120,6 +129,32 @@ class TestMppRegisters(unittest.TestCase):
             self.assertTrue(view)
         elif "M4" in torch.backends.mps.get_name():  # pyrefly: ignore[missing-attribute]
             self.assertFalse(view)
+
+    def test_affine_cancelling_and_tail(self) -> None:
+        """The affine split, forced on, against float64: with MLX's biases
+        (b = -7.5 s for 4 bits), whose terms cancel, and over a K tail whose
+        last group is partial (1040 = 32.5 groups of 32)."""
+        config = register_config([16, 32, 32])
+        x, w, scales, _ = affine_args(4, 32, 16, 96, 1024, DEVICE)
+        biases = (-7.5 * scales.float()).to(torch.float16)
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            out, msl = _run(affine_mm, (x, w, scales, biases), config)
+        self.assertIn("_mr_ones", msl)
+        self._close(out, affine_reference((x, w, scales, biases)))
+        gen = torch.Generator().manual_seed(7)
+        x = torch.randn(16, 1040, generator=gen).to(torch.float16)
+        w = torch.randint(-(2**15), 2**15, (96, 260), generator=gen, dtype=torch.int16)
+        scales = (torch.rand(96, 33, generator=gen) * 0.02).to(torch.float16)
+        biases = (torch.randn(96, 33, generator=gen) * 0.02).to(torch.float16)
+        args = tuple(t.to(DEVICE) for t in (x, w, scales, biases))
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            out, msl = _run(dequant_forms_mm, (*args, "promoted"), config)
+        self.assertIn("_mr_ones", msl)
+        self._close(out, dequant_reference(*args))
 
     def test_runtime_coordinates(self) -> None:
         """Elements read at run time from the op compute the same."""

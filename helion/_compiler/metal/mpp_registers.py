@@ -33,19 +33,31 @@ operand's elements are too; between two register operands the K
 positions are relabelled so each lane's elements of a row are adjacent
 (``coop_layout.k_order``), which a view is read as when the GPU's layout
 already keeps them adjacent.
+
+Under ``fast_math``, where the GPU's matrix units run half inputs over
+twice as fast as float (``coop_layout.fast_half_inputs``, by GPU family),
+a dequantized weight ``codes * scale + bias`` whose scale and bias are
+constant over each K tile is split (:func:`_affine_parts`,
+:func:`affine_split_enabled`): x times the codes, exact in half, and each
+tile's scale and bias applied in float to its products and to x's row
+sums.
 """
 
 from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 import math
 from typing import TYPE_CHECKING
 from typing import cast
 
 import torch
 
+from ...language import _tracing_ops
+from ...language.creation_ops import full
 from ...language.memory_ops import load
+from ...language.tile_ops import tile_index
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
 from ._constants import SIMD_WIDTH
@@ -54,6 +66,7 @@ from .coop_layout import INVALID
 from .coop_layout import Atom
 from .coop_layout import base_fact
 from .coop_layout import factor
+from .coop_layout import fast_half_inputs
 from .coop_layout import k_order
 from .coop_layout import lane_bits
 from .coop_layout import lane_expr
@@ -64,12 +77,14 @@ from .mpp_matmul import MAX_OP_TILE
 from .mpp_matmul import PUT
 from .mpp_matmul import REG_A
 from .mpp_matmul import REG_B
+from .mpp_matmul import REG_EPILOGUE
 from .mpp_matmul import REG_RUN
 from .mpp_matmul import RUN
 from .mpp_matmul import WIDENING
 from .mpp_matmul import Graphs
 from .mpp_matmul import MppGroup
 from .mpp_matmul import MppPlan
+from .mpp_matmul import block_id_of
 from .mpp_matmul import call_name
 from .mpp_matmul import current_plan
 from .mpp_matmul import group_sides
@@ -90,6 +105,7 @@ from .operand_elements import offset_fact
 from .operand_elements import parse_expr
 from .operand_elements import src
 from .operand_elements import static_int
+from .operand_elements import static_loop
 from .operand_elements import tile_mask
 from .operand_elements import tiles_in_range
 
@@ -111,19 +127,31 @@ LANE = "_mpp_lane"
 #: folded, so the source grows with them.  A bound on the code, not a
 #: hardware limit: a K tile past it is staged.
 MAX_STEPS = 16
+#: Ops the affine split looks through to the rhs's value: they move or mask
+#: its elements.
+_SPLIT_MOVES = (
+    torch.ops.aten.permute.default,
+    torch.ops.aten.alias.default,
+    _tracing_ops._mask_to,
+)
+#: The names an affine split's epilogue element reads: its accumulator
+#: element, its tile's product element and x's row sum at its row.
+_SPLIT_VALUES = ("_mr_av", "_mr_pv", "_mr_xv")
 
 
 @dataclasses.dataclass(frozen=True)
 class RegisterRun:
     """How a group's op takes its operands in registers: the op, each
     side's kind (``"reg"``, a cooperative tensor built in registers, or
-    ``"view"``, a device view), its K tile's steps, and whether the K
-    positions are relabelled across steps (two register operands)."""
+    ``"view"``, a device view), its K tile's steps, whether the K positions
+    are relabelled across steps (two register operands), and the affine
+    split's FX values ``(codes, scale, bias)`` when the op takes it."""
 
     atom: Atom
     sides: tuple[str, str]
     steps: int
     interleave: bool
+    affine: tuple[Node, Node, Node] | None
 
 
 def _narrow_dtype(node: Node, dtype: torch.dtype) -> torch.dtype:
@@ -155,10 +183,180 @@ def _coop_type(group: MppGroup, side: int) -> str:
     return CompileEnvironment.current().backend.dtype_str(dtype)
 
 
+def _exact_codes(node: object) -> bool:
+    """Whether ``node`` is a float conversion of integers each exactly
+    representable in half: an 8-bit integer, or an integer masked to at
+    most 11 bits (``q & 0x1F``; half holds the integers up to 2048
+    exactly)."""
+    if not isinstance(node, torch.fx.Node) or node.target not in WIDENING:
+        return False
+    source = node.args[0]
+    if not isinstance(source, torch.fx.Node):
+        return False
+    val = source.meta.get("val")
+    if not isinstance(val, torch.Tensor) or val.dtype.is_floating_point:
+        return False
+    if val.dtype in (torch.int8, torch.uint8):
+        return True
+    mask = (
+        source.args[1] if source.target is torch.ops.aten.bitwise_and.Scalar else None
+    )
+    return isinstance(mask, int) and 0 <= mask < 2048
+
+
+def _tile_constant(
+    node: object, k_block: int, k_tile: int, memo: dict[object, bool]
+) -> bool:
+    """Whether ``node``'s value is the same at every K position of each K
+    tile: it reads the K block's positions only through ``k // g`` for a
+    constant ``g`` the K tile (``k_tile``, from a begin it divides) divides,
+    as a quantization group's scale index does.  Conservative: a value
+    without inputs whose shape spans the K block (an ``hl.arange``) is
+    taken to vary."""
+    if isinstance(node, (list, tuple)):
+        return all(_tile_constant(a, k_block, k_tile, memo) for a in node)
+    if isinstance(node, torch.SymInt):
+        return block_id_of(node) != k_block
+    if not isinstance(node, torch.fx.Node):
+        return True
+    if node in memo:
+        return memo[node]
+    val = node.meta.get("val")
+    if node.target is tile_index:
+        assert isinstance(val, torch.Tensor)
+        result = block_id_of(val.size(0)) != k_block
+    elif (
+        node.target is torch.ops.aten.div.Tensor_mode
+        and node.kwargs.get("rounding_mode") == "floor"
+        and isinstance(source := node.args[0], torch.fx.Node)
+        and source.target is tile_index
+        and isinstance(group_size := node.args[1], int)
+        and group_size > 0
+        and group_size % k_tile == 0
+    ):
+        result = True
+    elif not node.all_input_nodes:
+        sizes = val.size() if isinstance(val, torch.Tensor) else ()
+        result = node.target is full or all(block_id_of(d) != k_block for d in sizes)
+        if isinstance(val, torch.SymInt):
+            result = block_id_of(val) != k_block
+    else:
+        result = all(
+            _tile_constant(a, k_block, k_tile, memo)
+            for a in (*node.args, *node.kwargs.values())
+        )
+    memo[node] = result
+    return result
+
+
+def _k_loop_tile(cg: GenerateAST, group: MppGroup) -> tuple[int, int] | None:
+    """The begin and the K tile of the group's K loop when codegen knows
+    them, inside the loop (the run) or before it (the accumulator)."""
+    loop = static_loop(cg, group.k_block)
+    if loop is not None:
+        return loop[1], loop[2]
+    if not group.levels:
+        return None
+    begins = group.levels[0].owner.args[1]
+    step = cg.device_function.resolved_block_size(group.k_block)
+    if (
+        not isinstance(begins, list)
+        or len(begins) != 1
+        or not isinstance(begins[0], int)
+        or not isinstance(step, int)
+    ):
+        return None
+    return begins[0], step
+
+
+def _affine_parts(cg: GenerateAST, group: MppGroup) -> tuple[Node, Node, Node] | None:
+    """The FX values ``(codes, scale, bias)`` of a rhs ``codes * scale +
+    bias`` (a dequantized weight, through element moves) whose codes are
+    exact in half (:func:`_exact_codes`) and whose scale and bias are the
+    same over each K tile (:func:`_tile_constant`) and fp16 values, with the
+    product and the sum taken in float32, or None.  Over such a tile
+    ``sum_k x (q s + b) = s sum_k x q + b sum_k x``, the reassociation MLX's
+    quantized kernels use.  Its error grows with the cancellation between
+    the two terms, to about eps * (|s| sum |x q| + |b| sum |x|) where the
+    unsplit run's is eps * sum |x w|, since P and X round apart.  With x in
+    half too, codes of at most 11 bits and at most 512 K positions a tile
+    (:data:`MAX_STEPS` steps of at most 32), ``|s P|`` and ``|b X|`` stay
+    below 2**52, so neither overflows float where the weights don't; a
+    float32 or bf16 scale or bias, whose range is float's, isn't split, nor
+    a weight rounded on the way (a product or sum in a narrower type)."""
+    tile = _k_loop_tile(cg, group)
+    if tile is None or tile[0] % tile[1]:
+        return None
+    node = matmul_operands(group.matmul)[2]
+    while node.target in _SPLIT_MOVES:
+        source = node.args[0]
+        assert isinstance(source, torch.fx.Node)
+        node = source
+    if (
+        node.target is not torch.ops.aten.add.Tensor
+        or node.kwargs.get("alpha", 1) != 1
+        or not _float32(node)
+    ):
+        return None
+    memo: dict[object, bool] = {}
+    for product, bias in itertools.permutations(node.args[:2]):
+        if not (
+            isinstance(product, torch.fx.Node)
+            and product.target is torch.ops.aten.mul.Tensor
+            and _float32(product)
+            and isinstance(bias, torch.fx.Node)
+        ):
+            continue
+        for codes, scale in itertools.permutations(product.args[:2]):
+            if (
+                _exact_codes(codes)
+                and isinstance(scale, torch.fx.Node)
+                and _fp16_values(scale)
+                and _fp16_values(bias)
+                and _tile_constant(scale, group.k_block, tile[1], memo)
+                and _tile_constant(bias, group.k_block, tile[1], memo)
+            ):
+                assert isinstance(codes, torch.fx.Node)
+                return codes, scale, bias
+    return None
+
+
+def _float32(node: Node) -> bool:
+    """Whether ``node``'s value is a float32 tensor."""
+    val = node.meta.get("val")
+    return isinstance(val, torch.Tensor) and val.dtype == torch.float32
+
+
+def _fp16_values(node: Node) -> bool:
+    """Whether ``node``'s values are fp16 ones: an fp16 tensor's, or one
+    widened from it."""
+    val = node.meta.get("val")
+    return (
+        isinstance(val, torch.Tensor)
+        and _narrow_dtype(node, val.dtype) == torch.float16
+    )
+
+
 def _on_gpu() -> bool:
-    """Whether the kernel runs on the GPU here: its layouts are then probed
-    there."""
+    """Whether the kernel runs on the GPU here: its layouts are then probed,
+    and its affine split decided, there."""
     return CompileEnvironment.current().device.type == "mps"
+
+
+def affine_split_enabled() -> bool:
+    """Whether register runs split dequantized weights: under ``fast_math``
+    only, since the split reassociates the sum (its error grows where the
+    scale's and the bias's terms cancel), and where half inputs pay
+    (:func:`_half_pays`)."""
+    return CompileEnvironment.current().settings.fast_math and _half_pays()
+
+
+def _half_pays() -> bool:
+    """Whether the GPU that runs the kernel runs ``matmul2d`` on half inputs
+    over twice as fast as on float, as two half ops must to replace one
+    half-by-float op: by its family (``coop_layout.fast_half_inputs``),
+    which an M4 isn't."""
+    return _on_gpu() and fast_half_inputs()
 
 
 def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
@@ -289,7 +487,20 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
         atom = atom_of(sides)
     if atom is None:
         return None
-    return RegisterRun(atom, sides, k // atom.k, sides == ("reg", "reg"))
+    affine = None
+    # Only a float right input gains from the split (two half ops for one
+    # half-by-float op).
+    if (
+        sides[1] == "reg"
+        and atom.left == "half"
+        and atom.right == "float"
+        and affine_split_enabled()
+    ):
+        parts = _affine_parts(cg, group)
+        if parts is not None:
+            affine = parts
+            atom = dataclasses.replace(atom, right="half")
+    return RegisterRun(atom, sides, k // atom.k, sides == ("reg", "reg"), affine)
 
 
 def _view_fits(view: View, tile: tuple[int, int]) -> bool:
@@ -343,6 +554,7 @@ def codegen_register_run(
     group: MppGroup,
     acc: ast.Name,
     values: tuple[object, object],
+    env: Mapping[Node, object],
     spec: RegisterRun,
 ) -> ast.AST:
     """``_helion_mpp_run(acc, gid, lhs..., rhs..., registers=[lhs, rhs],
@@ -356,8 +568,8 @@ def codegen_register_run(
     live by construction.  ``steps`` is the K tile's steps, ``interleave``
     whether they relabel K, ``k_live`` the tile's live length, which masks
     a register operand's K tail and cuts a view's last steps (None when
-    every tile is whole), and ``facts`` the tile offsets' ``(offset,
-    multiple, least)``."""
+    every tile is whole), ``facts`` the tile offsets' ``(offset, multiple,
+    least)``, and ``affine`` the split's codes, scale and bias names."""
     backend = CompileEnvironment.current().backend
     k = static_tile(cg, (group.k_block,))[0]
     parts: list[str] = []
@@ -400,12 +612,23 @@ def codegen_register_run(
         for block in (group.m_block, group.n_block, group.k_block)
         if (fact := offset_fact(cg, block)) is not None
     ]
+    affine = ""
+    if spec.affine is not None:
+        names = [
+            cg.lift(
+                backend.cast_ast(cast("ast.AST", env[node]), torch.float32), prefix=p
+            )
+            for node, p in zip(
+                spec.affine, ("_mpp_rq", "_mpp_rs", "_mpp_rb"), strict=True
+            )
+        ]
+        affine = f", affine=({', '.join(name.id for name in names)})"
     anchor_list = ", ".join(f"({p}, {a})" for p, a in anchors)
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], "
         f"registers=[{', '.join(sides)}], steps={spec.steps}, "
-        f"interleave={spec.interleave}, k_live={k_live}, facts={facts!r})"
+        f"interleave={spec.interleave}, k_live={k_live}, facts={facts!r}{affine})"
     )
 
 
@@ -442,13 +665,18 @@ def register_run(
     element: its value's name with the Scalar statements it reads re-run by
     ``rerun(binds, reads, checked)`` under its bindings, their loads past
     the M or N tile's loop end reading the tile's first position
-    (``clamp_past_end``), 0 past the K tile's live length."""
+    (``clamp_past_end``), 0 past the K tile's live length.  Under an affine
+    split the rhs's elements are its codes, and a loop over the
+    destination's elements applies the tile's scale and bias
+    (:data:`_SPLIT_VALUES`)."""
     sides = keyword(call, "registers")
     k_live = keyword(call, "k_live")
+    affine = keyword(call, "affine")
     assert isinstance(sides, ast.List)
     live = not (isinstance(k_live, ast.Constant) and k_live.value is None)
     pos = 2
     loops: list[ast.stmt] = []
+    rhs: tuple[dict[str, ast.expr], object] | None = None
 
     def element_loop(marker: str, stmts: list[ast.stmt]) -> ast.For:
         return ast.For(
@@ -479,6 +707,10 @@ def register_run(
         source = call.args[pos]
         args[pos] = ast.Constant(None)
         pos += 1
+        if affine is not None and i == 1:
+            assert isinstance(affine, ast.Tuple)
+            source = affine.elts[0]
+            rhs = (binds, past)
         value = parse_expr(f"static_cast(float, {src(source)})")
         if live:
             assert k_live is not None
@@ -494,9 +726,27 @@ def register_run(
             element_loop(REG_A if i == 0 else REG_B, round_bf16_casts([*stmts, put]))
         )
     assert pos == len(call.args)
+    if affine is not None:
+        assert isinstance(affine, ast.Tuple) and rhs is not None
+        binds, past = rhs
+        _, scale, bias = (src(e) for e in affine.elts)
+        av, pv, xv = _SPLIT_VALUES
+        # The tile's terms first: where they cancel, the accumulator keeps
+        # its own precision.
+        value = parse_expr(f"{av} + ({scale} * {pv} + {bias} * {xv})")
+        put = ast.Expr(ast.Call(ast.Name(PUT, ast.Load()), [value], []))
+        stmts = rerun(binds, names_read(put) - set(_SPLIT_VALUES), [value])
+        if past is not None:
+            mask, index, offset = cast("tuple[str, str, str]", past)
+            stmts = clamp_past_end(stmts, mask, index, offset, binds, "_e_n")
+        loops.append(element_loop(REG_EPILOGUE, round_bf16_casts([*stmts, put])))
+    keywords = [
+        ast.keyword(k.arg, ast.Constant(True)) if k.arg == "affine" else k
+        for k in call.keywords
+    ]
     loop = ast.For(
         ast.Name("_it", ast.Store()),
-        ast.Call(ast.Name(REG_RUN, ast.Load()), args, list(call.keywords)),
+        ast.Call(ast.Name(REG_RUN, ast.Load()), args, keywords),
         loops,
         [],
     )
@@ -677,7 +927,13 @@ def emit_register_run(
     operands (``coop_layout.k_order``: a lane's elements of a row over the
     steps are then one run of adjacent K positions, a few words of packed
     codes), and ``s * K + kappa`` beside a view, which the op reads in
-    order; a view's step past the tile's live K is skipped."""
+    order; a view's step past the tile's live K is skipped.
+
+    Under an affine split the op's destination tensors start from 0 each
+    tile and take x times the codes; a right input of ones gives x's row
+    sums in a destination tensor of the same layout, whose element at each
+    index lies in the same row; and each accumulator element adds the
+    tile's scale times its product plus the bias times its row's sum."""
     pad = " " * indent
     inner = pad + "    "
     call = stmt.iter
@@ -698,6 +954,7 @@ def emit_register_run(
     interleave = bool(
         ast.literal_eval(cast("ast.expr", keyword(call, "interleave")))
     ) and _relabels(state, atom)
+    affine = keyword(call, "affine") is not None
     facts = dict(state.lane_facts)
     for name, multiple, least in ast.literal_eval(
         cast("ast.expr", keyword(call, "facts"))
@@ -725,6 +982,33 @@ def emit_register_run(
             pos += 9
     names = ["_mr_a", "_mr_b"]
     saved = state.put, state.put_type
+    dest = None
+    if affine:
+        dest = operand_lanes(state, atom, "dest")
+        facts.update(state.lane_facts)
+    if dest is not None:
+        parts += [
+            f"{pad}{{",
+            *(
+                line
+                for tensor in ("_mr_p", "_mr_x")
+                for line in (
+                    f"{inner}auto {tensor} = {atom.tensor(op, 'dest')};",
+                    f"{inner}#pragma unroll",
+                    (
+                        f"{inner}for (ushort _e = 0; _e < {len(dest.rows)}; _e++) "
+                        f"{tensor}[_e] = 0.0f;"
+                    ),
+                )
+            ),
+            f"{inner}auto _mr_ones = {atom.tensor(op, 'right')};",
+            f"{inner}#pragma unroll",
+            (
+                f"{inner}for (ushort _e = 0; _e < _mr_ones.get_capacity(); _e++) "
+                f"_mr_ones[_e] = static_cast<{atom.right}>(1.0f);"
+            ),
+        ]
+        pad, inner = inner, inner + "    "
     for step in range(steps):
         lines = [f"{pad}{{", f"{inner}constexpr short _fs = {step};"]
         live_terms: list[str] = []
@@ -782,7 +1066,10 @@ def emit_register_run(
                 lines += [f"{inner}{line}" for line in decls_v]
                 live_terms += live_v
                 lines.append(f"{inner}{handle}")
-        runs = [f"{op}.run({names[0]}, {names[1]}, {acc.id});"]
+        target = "_mr_p" if affine else acc.id
+        runs = [f"{op}.run({names[0]}, {names[1]}, {target});"]
+        if affine:
+            runs.append(f"{op}.run({names[0]}, _mr_ones, _mr_x);")
         if live_terms:
             # A view's step past the tile's live K adds nothing; every term
             # is uniform over the SIMD group.
@@ -794,6 +1081,37 @@ def emit_register_run(
         else:
             lines += [f"{inner}{run}" for run in runs]
         parts += [*lines, f"{pad}}}"]
+    if dest is not None:
+        loop = loops[REG_EPILOGUE]
+        av, pv, xv = _SPLIT_VALUES
+        state.put_type = None
+        for e in range(len(dest.rows)):
+            decls = (
+                f"_e_m = {_at(0, dest.rows[e])}",
+                f"_e_n = {_at(0, dest.cols[e])}",
+                "_e_k = 0",
+            )
+            state.put = f"{acc.id}[{e}]"
+            body, _, _ = element_body(loop, decls, 0, e, facts, 0, state)
+            element = [
+                f"{pad}{{",
+                *(f"{pad}    int {decl};" for decl in decls),
+                f"{pad}    float {av} = {acc.id}[{e}];",
+                f"{pad}    float {pv} = _mr_p[{e}];",
+                f"{pad}    float {xv} = _mr_x[{e}];",
+            ]
+            with state.isolated_scope():
+                emit_body(body, element, len(pad) + 4, state)
+            element.append(f"{pad}}}")
+            if dest.valid is not None:
+                # An element the lane doesn't hold keeps its accumulator.
+                element = [
+                    f"{pad}if ({dest.valid[e]}) {{",
+                    *(f"    {line}" for line in element),
+                    f"{pad}}}",
+                ]
+            parts += element
+        parts.append(f"{' ' * indent}}}")
     state.put, state.put_type = saved
 
 
