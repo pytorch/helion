@@ -19,6 +19,7 @@ from torch._inductor.virtualized import V
 import torch.nn.functional as F
 from torch.testing._internal.common_utils import instantiate_parametrized_tests
 from torch.testing._internal.common_utils import parametrize
+from torch.testing._internal.common_utils import subtest
 import torch.utils._pytree as pytree
 
 from helion._compat import requires_torch_version
@@ -26,8 +27,10 @@ from helion._testing import DEVICE
 from helion._testing import _has_cute_dsl
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing import skipIfFbTriton
 from helion._testing import skipIfLowVRAM
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEager
 
 if not requires_torch_version("2.16"):
     # helion.inductor uses the Inductor of torch 2.16, e.g. config.strict_reduction.
@@ -213,7 +216,26 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, in2: torch.Tensor, out0: torch.
         self.assertEqual("extern_kernels.mm(" in code, not native_matmul)
         self.assertNotIn("helion_", code)
 
-    @parametrize("native_matmul", [True, False])
+    @parametrize(
+        "native_matmul",
+        [
+            True,
+            subtest(
+                False,
+                decorators=[
+                    skipIfFbTriton(
+                        "fbtriton's TLX plugin adds its matmul templates to "
+                        "tuned_mm, and for this mm (a where() prologue into a "
+                        "transposed b) their compute_epilogue reads "
+                        "IterationRangesRoot.symt, which torch 2.16 does not "
+                        "have: LoweringException: AttributeError, stock "
+                        "Inductor's too (fbtriton 3.9.0.dev20261113, "
+                        "fbtriton-h100 CI, Nov 2026)"
+                    )
+                ],
+            ),
+        ],
+    )
     def test_backward(self, native_matmul):
         # AOTAutograd compiles the backward graph at its first run, in the autograd
         # thread, with the config of this thread: cuda_backend "helion" and
@@ -600,7 +622,26 @@ class TestInductorBackend(InductorBackendTestCase):
                 )
         self.assertIn("helion", dict(registered_inductor_choices()))
 
-    @parametrize("case", ["distinct", "repeated", "rows", "one_element"])
+    @parametrize(
+        "case",
+        [
+            "distinct",
+            "repeated",
+            "rows",
+            subtest(
+                "one_element",
+                decorators=[
+                    skipIfRefEager(
+                        "ref mode's atomic_add writes the stride-0 view of "
+                        "out[0] with a setitem, which PyTorch refuses: more "
+                        "than one element of the written-to tensor refers to a "
+                        "single memory location (unlanded fix: "
+                        "pytorch/helion#4576; drop this skip with it)"
+                    )
+                ],
+            ),
+        ],
+    )
     def test_atomic_store(self, case):
         # index_put(accumulate=True) at an arange-based index is an atomic_add
         # store with a direct index, where repeated indices add up.
@@ -647,6 +688,10 @@ class TestInductorBackend(InductorBackendTestCase):
             with self.assertRaisesRegex(RuntimeError, "helion.fast_mathh"):
                 torch.compile(torch.exp, options={"helion.fast_mathh": True})(x)
 
+    @skipIfRefEager(
+        "ref mode binds add_kernel without the host function Helion's Dynamo "
+        "variable traces: kernel binding succeeded but host_function is None"
+    )
     def test_helion_kernel_in_graph(self):
         # A @helion.kernel called in the compiled function is Helion's own
         # template, here with relu and * 2 fused into it (torch_compile_fusion).
@@ -655,6 +700,10 @@ class TestInductorBackend(InductorBackendTestCase):
         self.compile(fn, x, y, expected=fn(x, y), expect_helion=False)
         self.assertRegex(self.code, r"def _helion_add_\w*_fused_mul_relu_0\(")
 
+    @skipIfRefEager(
+        "ref mode runs scale_kernel in PyTorch: code_and_output returns its "
+        "Python source, not Triton code"
+    )
     def test_helion_kernel_numerics(self):
         # Helion lowers a @helion.kernel through Inductor as for cuda_backend
         # "triton", with the fp32 constant of x * 0.1 for a bf16 x.
@@ -1404,6 +1453,10 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
 
     @pytest.mark.slow
     @skipIfLowVRAM("two masks of 2 GiB", required_bytes=8 * 2**30)
+    @skipIfRefEager(
+        "ref mode materializes hl.rand's 2**31 + 16 int64 offsets at once: "
+        "CUDA out of memory for 16 GiB on CI's A10G"
+    )
     def test_rand_wide_offset(self):
         # 2**31 + 16 elements: Inductor's int32 offset wraps for the last 16,
         # which stock Inductor draws at offset.to(tl.uint32).
