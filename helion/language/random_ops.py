@@ -275,7 +275,12 @@ def _philox_randint_from_seed_and_offset(
         raise ValueError(f"low ({low}) must be less than high ({high})")
     c0, _, _, _ = _philox_uint32x4(seed, offset)
     signed = _uint32_to_signed_int64(c0)
-    magnitude = torch.where(signed < 0, -signed, signed)
+    # Preserve the existing stream for narrow ranges. Wider ranges need all
+    # 32 random bits; abs(int32) only has 31 bits of magnitude.
+    if high - low > 1 << 31:
+        magnitude = c0
+    else:
+        magnitude = torch.where(signed < 0, -signed, signed)
     return _convert_element_type(low + (magnitude % (high - low)), torch.int32)
 
 
