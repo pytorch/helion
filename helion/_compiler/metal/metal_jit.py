@@ -48,6 +48,7 @@ from ... import exc
 from ._constants import DTYPE_TO_METAL
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from .c10_helpers import c10_source
+from .deferred_reduction import defer_group_sums
 from .export import MetalArgument
 from .export import MetalLaunch
 from .fma_fusion import fuse_multiply_adds
@@ -419,6 +420,7 @@ def _generate_msl_kernel(
     for dtype in tensor_dtypes.values():
         if dtype not in DTYPE_TO_METAL:
             raise ValueError(f"Unsupported Metal dtype: {dtype}")
+    body_stmts = defer_group_sums(body_stmts, param_names)
     # The threads each SIMD group lays the tiles out over when SIMD groups
     # split the fragment or register runs' K loops (``fragment_mma``,
     # ``mpp_registers``): the launch stacks one such layout per SIMD group
