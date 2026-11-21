@@ -3470,18 +3470,25 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
         idx_base: str,
         threads: int,
         fence: bool = True,
-    ) -> None:
+    ) -> bool:
         """Every pass of ``tiles`` by the ``threads`` threads with local
         index ``idx_base``: ``wait`` (the TMA of in-place rewrites), the
         passes, then publish the generic writes to the async proxy (unless
         a later fence of the same threads precedes the reading batch).
         Under ``pass_guard`` the passes (and their internal barrier, a
         named barrier over the pass threads) run on the pass threads alone;
-        the wait stays with every thread."""
-        if wait is not None and any(
+        the wait stays with every thread.
+
+        Returns whether ``wait`` was emitted. It is only where a pass
+        rewrites what the TMA delivered; a tile the TMA delivers and no
+        pass touches is still in flight behind passes that only write
+        other tiles, and its readers are the caller's to hold back."""
+        waited = wait is not None and any(
             tile.route in (ROUTE_INPLACE, ROUTE_CONVERT, ROUTE_DERIVED)
             for tile in tiles
-        ):
+        )
+        if waited:
+            assert wait is not None
             self.emit(wait)
         guard = self.pass_guard(threads)
         sync = self.sync
@@ -3505,6 +3512,7 @@ class Tcgen05MmaDagEmitter(MmaDagEmitterBase):
                     self.emit('cute.arch.fence_proxy(kind="async.shared", space="cta")')
         finally:
             self.sync = sync
+        return waited
 
     def emit_derived_pass(
         self, tile: Tcgen05Tile, stage: str, idx_base: str, threads: int

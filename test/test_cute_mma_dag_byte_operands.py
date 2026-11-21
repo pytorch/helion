@@ -69,6 +69,67 @@ def test_byte_operand_source(
         assert ".sts_v4_b32(" in source
 
 
+def _top_level_index(body: list[ast.stmt], text: str) -> int:
+    """The index of the one statement of ``body`` whose source holds ``text``."""
+    (index,) = [i for i, node in enumerate(body) if text in ast.unparse(node)]
+    return index
+
+
+# An unaligned byte operand is staged by the threads' own scalar loads (a
+# pass that rewrites nothing a TMA delivered) while the other operand comes
+# by TMA: both operand sides and orientations of that pair.
+@pytest.mark.parametrize(
+    "byte_rhs,transpose_byte",
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_a_tma_operand_beside_a_scalar_pass_is_waited_for(
+    byte_rhs: bool, transpose_byte: bool
+) -> None:
+    byte = torch.empty((64, 80), dtype=torch.int8)[:, 1:65]
+    other = torch.empty((64, 64), dtype=torch.bfloat16)
+    args = (other, byte) if byte_rhs else (byte, other)
+    with cpu_target():
+        bound = cpu_bind(
+            helion.kernel(byte_matmul, backend="cute", static_shapes=True),
+            (*args, byte_rhs, transpose_byte, False),
+        )
+        with bound.env:
+            config = bound.config_spec.normalized_config(
+                helion.Config(
+                    block_sizes=[64],
+                    cute_mma_dag="tcgen05",
+                    cute_mma_dag_warps=4,
+                    cute_mma_dag_stages=1,
+                )
+            )
+        source = bound.to_code(config)
+    (kernel,) = [
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "_helion_byte_matmul"
+    ]
+    body = kernel.body
+    # One TMA load, of the operand no pass touches, on the root frame's
+    # barrier; the byte operand is loaded by the threads.
+    assert source.count("cp_async_bulk_tensor_shared_cta_global(") == 1
+    assert ".ldg_s8_pred(" in source
+    issue = _top_level_index(body, "cp_async_bulk_tensor_shared_cta_global(")
+    assert ast.unparse(body[issue]).rstrip().endswith(", md_sfr)")
+    # Every thread waits for that load: a statement of the kernel body, under
+    # no warp or thread condition, behind the pass and its fence and ahead of
+    # the barrier that lets the first batch read both tiles.
+    wait = _top_level_index(body, ".mbar_wait(md_sfr, 0)")
+    assert isinstance(body[wait], ast.Expr)
+    assert ast.unparse(body[wait - 1]) == (
+        "cute.arch.fence_proxy(kind='async.shared', space='cta')"
+    )
+    assert ast.unparse(body[wait + 1]) == "cute.arch.barrier()"
+    batch = min(
+        i for i, node in enumerate(body) if ".tcgen05_mma(" in ast.unparse(node)
+    )
+    assert issue < wait < batch
+
+
 def test_byte_to_fp32_keeps_the_generic_fallback() -> None:
     # The new packet protocol writes 16-bit operands. A tf32 destination
     # has a separate transpose/scatter contract and must not enter it.
