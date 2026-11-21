@@ -400,9 +400,12 @@ def test_the_loader_and_the_v_conversion_take_the_ring_in_turns_of_its_depth():
     # One request helper serves K and V; each request names its ring's depth.
     enqueue = text("_enqueue_operand_tile")
     assert "ring = _ring_slot(step, pair_head, depth)" in enqueue
-    assert "_wait_non_mma(free + ring, _ring_phase(step, depth) ^ 1, sleep_waits)" in (
-        enqueue
-    )
+    # (The phase of a ring counted in tiles is its head's: the helpers take
+    # the head, which a depth in pages does not read.)
+    assert (
+        "_wait_non_mma(free + ring, _ring_phase(step, depth, pair_head) ^ 1, "
+        "sleep_waits)"
+    ) in enqueue
     requests = [
         call
         for name in ("_load_pages", "_drain_values")
@@ -417,7 +420,7 @@ def test_the_loader_and_the_v_conversion_take_the_ring_in_turns_of_its_depth():
     assert by_ring == {"raw_k": ["KEY_RING_PAGES"] * 2, "raw_v": ["value_ring"] * 3}
     values = text("_convert_values")
     assert "ring = _ring_slot(step, head, value_ring)" in values
-    assert "_ring_phase(step, value_ring)" in values
+    assert "_ring_phase(step, value_ring, head)" in values
     # The K ring keeps the default depth: its conversion takes its slot and
     # phase from the same helpers, at that depth. The depth is the K ring's
     # own constant, as in the K requests above: the V ring's default names
@@ -453,7 +456,13 @@ def test_the_loader_and_the_v_conversion_take_the_ring_in_turns_of_its_depth():
                     strict=False,
                 )
             )
-            assert passed["value_ring"] == "value_ring", callee
+            # The ring the body binds once: the depth in pages, or the
+            # ring counted in tiles in its place.
+            assert passed["value_ring"] == "raw_v_ring", callee
+    assert (
+        "raw_v_ring = ValueRingTiles(value_ring_tiles) if value_ring_tiles "
+        "else value_ring"
+    ) in body
 
 
 def test_a_depth_must_fit_the_partition_and_the_value_transport():

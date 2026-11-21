@@ -467,12 +467,28 @@ shares. A skew costs its own length at the end of the launch, where the
 first CTA runs on alone, so it pays only as a small part of the share; at
 the mean share it would give the last CTAs empty or reversed ranges, on
 which a launch hangs. The device therefore applies `min(k, (T // G) // 32)`,
-none on a single CTA, whatever the lengths are: a launch of short units, or
-of a window's few pages out of a long page table, applies less than the
-config names, down to none, and no range is ever empty. A config may name
-only the skews that some launch of the bind can apply in full
-(`partition_skew_choices`: up to `units * (pages + 1) // min(units, SMs) //
-32`). A skew changes which units are split and where, so results move
+none on a single CTA, whatever the lengths are: a launch of short units
+applies less than the config names, down to none, and no range is ever
+empty. A config may name only the skews that some launch of the bind can
+apply in full (`partition_skew_choices`: up to `units * (pages + 1) //
+min(units, SMs) // 32`), where `pages` is the most a unit walks: the page
+table's extent, and under a static sliding window the pages that hold a key
+one of the unit's rows sees (`window_page_bound`: `(window + positions +
+126) // 128 + 1`, 18 for a 2047-key window). The positions are counted
+from the rows and their group, `(rows - 1) // group + 1`, not read off the
+constant the source subtracts from a request's length, which places the
+first row. Only the direct-I/O layout and the head-wide rescale predicate
+tie the rows to `query_len * group`, that constant times the group;
+elsewhere it may be any offset, zero included. The bound applies where
+the mask has a static window and the page table's key coordinates fit an
+Int32; without a window, on a longer table, and under a window that holds
+more pages than the table, the extent decides as before. It is the mask's
+bound, not the loop's: a source whose loop visits more pages than its rows
+see is offered fewer skews than its launches could apply. A windowed bind
+therefore offers 0 and 1 to 320 units on 148 SMs and no skew to 200 units,
+where the page table's extent alone offered skews up to 16, each a kernel a
+search compiled and timed that ran the schedule of a smaller skew.
+A skew changes which units are split and where, so results move
 within the rounding described next. Finding the CTAs of a split unit under
 a skew walks down from the equal shares' owner, one CTA and two divisions a
 step in one thread (`_slot_cta`); the bound keeps that to two steps on 148
@@ -483,7 +499,9 @@ whole added 0.3% and 0.1%; on a 2047-key window (shares of 39 and 25 slots)
 8 pages applied whole added 7% and 10% (63.6 against 59.4 us and 45.3
 against 41.0), which is where the bound comes from. With it those launches
 apply one page and none, and a config that names 8 reads 59.7 and 41.1 us,
-within the measurement's spread of no skew.
+within the measurement's spread of no skew. On a windowed bind such a
+config is no longer one of its configs: an `InvalidConfig` that names the
+bind's choices, repaired to equal shares.
 
 Units that run in one CTA keep `item`'s bits. A unit in parts differs by the
 rounding of a reassociated sum: its parts round their probabilities to BF16
@@ -655,6 +673,36 @@ a config, in a search step onto it or under an override, as it pins nothing
 but the transport it needs; the balanced seeds run the default split, and the
 search crosses the two options.
 
+The paired body's K and V conversions have forms of their own on the packed
+scale tile (`packed_scale_tile_layout`: 128 dimensions in groups of 32 whose
+four scale bytes are one word of the staged scale tile, and a source
+postscale of at least `2**-6`). Only the paired body asks for them
+(`packed_tile_forms=True`); the single-head pipelines and every other layout
+keep the code they had. A native conversion (S2F6 and an exponent
+correction) is exact for a scale byte of at most 247, and the full-domain
+conversion in FP32 covers every byte. The V conversion runs the native arm
+for a whole tile, its sixteen stores, and votes on the tile's scales behind
+them (`_stage_voted_s8_transpose_tiles`): where the vote fails, the warp
+waits for those stores and the full-domain arm stores the tile again, so the
+guard is on no tile's path to its first store. Each warp votes on its own
+dimension group. K's rows and V's lanes correct the exponent once, a row or
+a lane: the scale word plus `0x01010101 * (6 + postscale)`
+(`_corrected_scale_word`). And the per-tile loops of the compute groups,
+both conversions and both issuers count in Int32 where the bind bounds the
+stream below `2**31` pages (`stream_page_bound`, the page table's static
+extent times the units a CTA may stream; `paired_stream_page_bound`), and in
+Int64 as the source's loop does elsewhere. No result changes: on a B200 the
+ten SDG eval shapes store the bits of the kernel without the forms under two
+input generators, events at every tile position and scale bytes out of the
+native range included, where a kernel without the guard differs.
+
+A work item's first tile is always an event, on the output panel of zeros
+the item starts with, so the rescale of that panel (load, multiply by the
+rows' alpha, store) is left out at step zero of a range (`_compute_pages`:
+`maximum_changed & (step > 0)`) and every later event keeps it. Both
+drivers zero the panel ahead of each range they hand the recurrence, a part
+of a split unit included. No result changes.
+
 The paired schedule's `cute_mma_dag_boundary_prefetch=K` gives the control
 warp that is idle with one unit per CTA and no value-metadata transport a
 role: it requests the first K pages of K, both heads with their packed
@@ -693,8 +741,9 @@ section 9.7.15.1), and elsewhere no role waits for them.
 
 Everything else has no role: a grid that exactly fills the device, leaves
 more than a fifth of the SMs idle or holds more than two and a half waves,
-another schedule, the value-metadata transport, a persistent partition, a K
-layout whose pair of heads is not one byte range per page, an unknown SM
+another schedule, the value-metadata transport, a persistent partition
+(the balanced one has a prefetch of its own, with its own option, below), a
+K layout whose pair of heads is not one byte range per page, an unknown SM
 count and a kernel with other roots. A config that names pages there is an
 `InvalidConfig`, repaired to none, where the schedule it names has no role
 for them: the paired schedule in one of those cases, or another
@@ -766,6 +815,96 @@ resolves the knob only where it moves a call by more than the benchmark's
 timer step per call (2.048 us a sample: 0.7 us at three calls, 1 us at
 two): a smaller effect, such as the cost over many inputs, reads as a tie
 between candidates with and without pages.
+
+`cute_mma_dag_boundary_prefetch_cold=N` extends the sibling form to the
+launches without a head start. Zero, the default and the meaning of a
+missing key, is off and renders the kernel without the option; a config may
+name 2, beside a boundary prefetch on a grid whose form is the sibling one.
+Anywhere else a depth is an `InvalidConfig`, repaired to none, and it goes
+with the pages wherever a step, an override or a repair takes them. A
+launch whose installed head start is zero (the first captured call, a call
+behind another kernel, an eager call) then lets its first `SMs - units`
+CTAs serve as those of an overlapped launch would, the waiting units' first
+`N` pages only (`prefetch_boundary_units(cold_depth=N)`); an overlapped
+launch serves its `K` pages as before. What holds in each wait mode:
+
+- A cold launch in the early mode has waited at the kernel's entry, so the
+  role's reads and requests are behind the launch's dependencies.
+- A cold launch in the before-writes mode (behind a launch of another
+  kernel that the guard proved it may overlap) reads the served units'
+  bounds and page ids and issues its requests ahead of its dependency wait,
+  as an overlapped launch's role does. These are tensors the capture proof
+  lists as loaded, a launch that stores one of them is a dependency the
+  guard answers with the early mode, and a prefetch reads nothing back.
+
+It pays only where the call sequence returns to the same pages within a few
+launches. Measured on a B200 with the SDG eval harness (128 requests of a
+17-page window, us per call at three calls a sample against the same config
+without the depth):
+
+- Over the eval's three input banks: 0.23 to 0.38 less at 27k-bs512 verify
+  position 0, and 0.04 to 0.06 less there at twelve calls a sample. At
+  position 512 the depth alone read 0.14 less at 27k-bs512 verify and 0.07
+  less at 50k-bs512 verify; the ranges measured there, 0.12 to 0.18 and
+  0.06 to 0.10 less, are of the depth together with the first-tile skip
+  above, which alone read 0.03 to 0.07 less there.
+- Over six banks: nothing (0.04 and 0.07 more).
+- On the harness's random data (every page nonzero), measured with the
+  first-tile skip as well: 0.04 to 0.16 less, and at twelve calls a sample
+  between 0.07 more and 0.12 less.
+- Deeper cold depths lose: 7 pages 0.18 more, 12 pages 1.21 more.
+- The requests of the timed launch itself cost about 0.2 us; the gain is
+  made by the launch three calls earlier, which requested the pages this
+  one loads.
+
+So the depth is sampled where the sibling prefetch is (bank cycles) with
+off leading its choices, and on a windowed kernel every seed that
+prefetches follows once more with two pages, behind every other seed. A
+step onto a depth from a config without pages takes the first page count
+(8) and what the pages need, and an `autotune_config_overrides` entry that
+names a depth gives every paired candidate the same: its own pages where it
+prefetches, 8 where it does not (`reconcile_overridden_boundary_prefetch`).
+The candidates of the other schedules, which have no prefetch, are
+rejected under such an entry, as under one that names pages.
+
+`cute_mma_dag_boundary_prefetch_ahead` is the balanced partition's own
+prefetch, the range-ahead prefetch, and its value is a distance in CTAs.
+Zero, the default and the meaning of a missing key, is off and renders the
+kernel without the role; a config may name 48 or 96 on the balanced
+partition of a grid of more units than SMs (`range_ahead_distances`: a
+distance names a CTA of the grid, and a grid of more than 608 units, whose
+spare warp scans lengths, has none). It is an option of its own beside
+`cute_mma_dag_boundary_prefetch`, whose values are pages of a unit on a
+grid of one unit per CTA: a config has at most one of the two, and a
+distance on another partition is an `InvalidConfig`, repaired to none, as
+pages are on a persistent one.
+
+The spare control warp of CTA `c` requests, at the CTA's start, the first
+three K pages and five V pages of the stream of CTA `c + D`, both heads
+with their packed scales (`_prefetch_range_ahead`). The warp waits at the plan
+scan's barrier beside the loader, finds the launch's slots, active CTAs and
+applied skew from the scan's tables, arrives at the setup rendezvous
+without waiting there and reads nothing the rendezvous publishes. The
+served range is cut and its first unit located as that CTA's own loader
+finds them, and a step's page comes from the body's one walk
+(`attention_page_coordinates`), so under every page order a lane requests
+the tile the served loader requests at that step. The role reads the page
+table only, one id a lane inside the table's extent; the served unit's
+length is the scan's word in shared memory. A request is formed only for an
+id inside its operand's pool, and a CTA within the distance of the grid's
+end, or of the launch's active CTAs, serves nobody. In the before-writes
+mode those reads come ahead of the dependency wait, like every loader's: a
+page table that the launch ahead stores is a dependency the capture guard
+answers with the early mode, and a device test replays that pair with the
+guard's decision overridden as its failing control. The whole-units
+partition has no range-ahead prefetch: the role was measured and tested on
+the balanced partition alone. The search has the distance as a field of
+its own wherever the bind offers one, sampled where the page counts are (a
+benchmark that cycles input banks); a step onto a distance takes the
+balanced partition and its transport, and an `autotune_config_overrides`
+entry that names one gives every paired candidate the same
+(`boundary_prefetch_ahead_needs`,
+`reconcile_overridden_boundary_prefetch_ahead`).
 
 The paired schedule's `cute_mma_dag_release_lead`, in pages, is the lead of
 its loader's tail release (`cute_pdl_release="loader_tail"`): the loader
@@ -930,6 +1069,136 @@ it (a kernel without a window, a grid of one wave, a benchmark over bank
 cycles), the seed with 16 pages is followed by its counterpart with three
 pages per head and V issued with its K; everywhere else the search starts
 from two pages and has the depth as one of its moves.
+
+`cute_mma_dag_value_ring_tiles` counts that ring in tiles for a persistent
+CTA of a kernel with a static sliding window. Zero, the default and the
+meaning of a missing key, is the ring in pages and renders the kernel
+without the option; a config may name 5, beside the default depth in pages
+on the whole-units or the balanced partition. One unit per CTA, a kernel
+without such a window, another depth in pages and the value-metadata
+transport have no ring in tiles: an `InvalidConfig`, repaired to none.
+Tile `2 * step + head` of the CTA's stream takes slot `tile % 5`, and the
+phase of the slot's barriers is `(tile // 5) & 1` (`_ring_tile`,
+`_ring_slot`, `_ring_phase`), in Int32, for which the bind's stream bound
+(units times the page table's extent) must be below `2**30` pages. Half a
+page per head more than the default is one more raw tile with its scales
+and barriers. The contract's replay of the shared-memory table takes the
+tile count (`ValueRingTiles`) with the partition's query stages and plan
+tables: on a B200 (232,448 bytes) five tiles fit a persistent CTA of 40
+query columns with two query stages (222,552 bytes) where a third page per
+head does not (238,936), and the render asserts the table it allocates
+against the capacity the count was admitted on. The count changes no
+result. It is a field of the search in every timing regime where the device
+holds it; a step onto it takes a persistent partition, and an override is
+reconciled the same way (`reconcile_overridden_value_ring_tiles`). Such a
+move can leave another knob of the same candidate without the partition
+that runs or holds it, and the candidate then loses that knob, as a row
+of the search does when normalization repairs it
+(`drop_displaced_stream_knobs`): a tile count or a range-ahead distance
+that a fixed page count moved to one unit per CTA, and, on the partition a
+fixed tile count or distance moved a candidate to, its pages of one unit
+per CTA, a page order that partition does not run (the bucketed order, and
+the reversed walk on a grid of one wave) and a ring in pages deeper than
+its CTA holds. So under an `autotune_config_overrides` entry that names a
+tile count or a distance every paired candidate is on a persistent
+partition with it: one with one unit per CTA takes the balanced partition
+and its query TMA, and under a tile count gives up a deeper ring in pages,
+beside whose default alone a ring is counted in tiles. Only an option the
+entry itself names is never dropped: a candidate that cannot hold it is
+rejected.
+
+The range-ahead prefetch and the ring in tiles were measured together with
+the newest-first walk, on a B200 with the SDG eval harness (320 requests of
+a 2047-key window, the frozen harness at two calls a sample, us per call
+against the tuned config of the balanced partition): the walk alone 0.58
+less, the walk and the prefetch 0.51 less, the walk and the ring 0.68 less,
+all three 1.16 less, one timer step, in 11 of 12 legs. With the walk and
+the ring, a distance of 48 CTAs read 1.11 less, 96 CTAs 1.45 less and one
+CTA 0.29 more. No single step from the walk shows the gain, so on a
+windowed kernel past one wave, where a search samples the prefetch, the
+balanced seed in reversed order (clipped page eight pages from a unit's
+end) follows once per distance with the prefetch and five tiles, and each
+once more under the `l2_evict_last` store hint. These seeds and the cold
+depth's exist only where the search samples the boundary prefetch, a
+benchmark that cycles more than one input bank
+(`autotune_benchmark_input_banks`): with one bank no seed names a distance,
+a tile count or a cold depth. At twelve calls a sample
+the walk's forms were slower than the source order at 296 and 320 requests
+(all three 0.28 more at 296). Without a window the ring alone cost 4.96 us
+at 320 requests of 211 pages, which is why it is a windowed kernel's.
+
+The softmax tile loop of every paired kernel runs in warp-uniform form where
+the bind bounds its trip count. A compute group takes the loop's trip count,
+its barrier phase and the unit's first step, page range and length from
+words every thread of the group loads from shared memory (a persistent
+CTA's plan and the group's record) or from the kernel's inputs. They are
+one value for the group, which the assembler cannot know: for a balanced
+CTA it keeps the loop's two try-waits inside convergence regions (`BSSY` /
+`BSYNC`) and yields at the loop's top, and the loop reloads the unit's first
+step from the group's record at every tile. Under the bound that lets the
+per-tile loops count in Int32 (`stream_page_bound`) `_compute_pages` passes
+those values through `cute.arch.make_warp_uniform` at the unit's head and
+keeps the first step in that value. A tile's key base then comes from
+the one mapping every role takes its tiles from,
+`attention_page_coordinates`, walked in Int32 (the source's loop and the
+reversed walk with every lead of its clipped page; a source reflection
+keeps its own dtype and the Int64 mapping), where the keys of the page
+table's extent fit an Int32 as well: a page's index times its 128 keys, so
+a table of fewer than 2**24 pages, which the steps' bound (the units times
+that extent) does not imply. Above it the product stays in Int64, and a
+table of dynamic extent states neither bound and keeps the loop that marks
+nothing. Every value is the integer it was, so results are bit-identical,
+and there is no option.
+
+What the compiled loop loses depends on its recurrence and on the assembler
+(`softmax_loop_forms` in `helion/_testing/cute_paged_stream.py` counts it
+in a disassembly). The counts here are measurements with one toolkit, the
+assembler of CUDA 13.3 (`Cuda compilation tools, release 13.3, V13.3.27`),
+and another may leave fewer. The tests ask for what does not depend on it:
+no yield in the loop, and fewer convergence regions and fewer try-waits
+inside one than the same kernel has without the bind's bound; these counts
+are their ceilings. The per-key recurrence has two try-waits a tile, and
+the loop of a balanced CTA is left with no `YIELD`, `BSSY` or `BSYNC`. The
+recurrence over reference scores under `early_tmem`, which the kernels of
+the parity work run, votes twice a tile and has three try-waits: the QK
+and, on either side of the vote's branch, the previous PV. Three of its
+tuned kernels (a 2047-key window, position 0), compiled without a device,
+without the form and with it:
+
+| loop of | instructions | `YIELD` | `BSSY` | `WARPSYNC` | `BRA.DIV` |
+|---|---|---|---|---|---|
+| 320 requests, draft | 605 to 580 | 1 to 0 | 6 to 2 | 6 to 4 | 3 to 1 |
+| 320 requests, verify | 714 to 699 | 1 to 0 | 6 to 1 | 5 to 3 | 3 to 1 |
+| 128 requests, verify (one unit per CTA) | 692 to 678 | 0 | 3 to 2 | 3 | 1 |
+
+In the two 320-request kernels the yield and the regions around the QK wait
+and around the previous-PV wait behind an event are gone; the kernel of one
+unit per CTA had neither. The previous-PV wait of a tile without an event
+keeps one region of the two it had in the draft kernel and in the
+128-request one: it stands under the vote's branch, and the vote is not
+marked (next paragraph). The region around the group barrier of an event
+stays in all three. The test fixture's loop over reference scores has the
+draft kernel's two regions at 32 query columns and only the barrier's at
+eight, where the same kernels without the bound have six, with all three
+waits inside one.
+
+The result of the maximum vote is not marked, although a barrier's
+reduction gives every thread of the group the same value. Marked too, the
+loop also loses the warp synchronizations of the vote's branch, and that
+kernel measured worse: nothing at 320 requests and 0.2 to 0.4 us more with
+one unit per CTA (200 requests, verify position 0: 0.19 more for the vote's
+mark alone, 0.37 more with the rest), for a reason that is not understood.
+Measured on a B200 with the SDG eval harness (a 2047-key window, us per
+call against the tuned kernel of the same batch at two | twelve calls a
+sample, hand-edited snapshots of the same changes):
+
+- 320 requests on the balanced partition: draft position 0 0.34 less | 0.44
+  less, verify position 0 0.50 less | 0.97 less; in the frozen harness 0.3
+  to 1.1 less at each of the six 320-request cases.
+- One unit per CTA: 200 requests, verify position 0, level (0.02 less |
+  0.03 less), and the six 200-request cases of the frozen harness keep
+  their timer steps; 128 requests, verify, 0.17 less | 0.15 less at
+  position 0 and 0.19 less | 0.21 less at position 512.
 
 The paired schedule's `cute_mma_dag_page_order` is the order in which a CTA
 streams a unit's pages. `source`, the default and the meaning of a missing

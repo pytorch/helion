@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import functools
 from typing import TYPE_CHECKING
 from typing import cast
 
@@ -26,6 +27,7 @@ from .packet_flush_names import PAIRED_BODY_NAME
 from .packet_flush_names import PAIRED_BODY_STORE_POLICY
 from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
 from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from .paged_attention_partition import paired_stream_page_bound
 from .paged_attention_partition import partition_workspace_arg
 from .paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
 from .paged_attention_prefetch import boundary_prefetch_form
@@ -272,6 +274,28 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         df.placeholder_args.add(name)
         return name
 
+    accesses = selected.program.accesses
+
+    @functools.cache
+    def program_tensors(operation: object) -> frozenset[str]:
+        """The tensors the program loads (``memory_ops.load``) or stores
+        (``memory_ops.store``), by name: computed once per operation, where
+        the render first asks, since naming a tensor binds its argument."""
+        return frozenset(
+            tensor_name(access)
+            for access in accesses
+            if _is_call(access.node, operation)
+        )
+
+    def stores_a_loaded_tensor() -> bool:
+        """Whether the program stores a tensor it also loads. A prefetch
+        role reads the page table where a launch may read its inputs, ahead
+        of the dependency wait of a captured launch, whose proof covers the
+        tensors the program loads: such a program gets no role."""
+        return bool(
+            program_tensors(memory_ops.load) & program_tensors(memory_ops.store)
+        )
+
     maps = tuple(df.new_var("pa_map") for _ in range(4))
     wrapper: dict[str, object] = {"kind": "helion_paged_attention"}
     for index, (access, param) in enumerate(
@@ -394,12 +418,34 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
     if schedule.register_quotas != PAIRED_DEFAULT_REGISTER_QUOTAS:
         assert schedule.paired_items
         panel_arg += f", register_quotas={schedule.register_quotas!r}"
+    if schedule.paired_items:
+        page_bound = paired_stream_page_bound(
+            semantic.page_table.fake.shape[1],
+            schedule.partition_units
+            if schedule.partition != MMA_DAG_PARTITION_ITEM
+            else 1,
+        )
+        if page_bound:
+            # The body's per-tile loops count in Int32 below this bound.
+            panel_arg += f", stream_page_bound={page_bound}"
     if schedule.value_ring != PAIRED_DEFAULT_VALUE_RING:
         # The body repeats the contract's check on the table it allocates,
         # against the capacity the depth was admitted on.
         assert schedule.paired_items and not schedule.value_metadata_skip
         panel_arg += (
             f", value_ring={schedule.value_ring}"
+            f", shared_memory_capacity={schedule.smem_capacity}"
+        )
+    if schedule.value_ring_tiles:
+        # A persistent CTA's ring counted in tiles, in the place of the
+        # default depth in pages; the body repeats the contract's check on
+        # the table it allocates, as for a deeper ring in pages.
+        assert schedule.paired_items and not schedule.value_metadata_skip
+        assert schedule.partition != MMA_DAG_PARTITION_ITEM
+        assert schedule.value_ring == PAIRED_DEFAULT_VALUE_RING
+        assert semantic.mask.window_left is not None
+        panel_arg += (
+            f", value_ring_tiles={schedule.value_ring_tiles}"
             f", shared_memory_capacity={schedule.smem_capacity}"
         )
     if schedule.page_order != MMA_DAG_PAGE_ORDER_SOURCE:
@@ -530,6 +576,39 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             )
             if schedule.partition_skew:
                 partition_arg += f", partition_skew={schedule.partition_skew}"
+        if schedule.boundary_prefetch_ahead:
+            # The balanced partition's range-ahead prefetch: the spare warp
+            # requests the first pages of the CTA a distance ahead. The
+            # config contract admitted it from the bind's facts; the render
+            # repeats what the role rests on and leaves it out where that
+            # does not hold, as for the forms of one unit per CTA below.
+            # The role reads the page table where the launch may read its
+            # inputs, so it is left out where the program also stores a
+            # tensor it loads (``stores_a_loaded_tensor``). It evaluates the
+            # served unit from the lengths the plan scan kept, so it needs
+            # the prelude's twin that takes a scanned length.
+            assert schedule.partition == MMA_DAG_PARTITION_BALANCED
+            assert not schedule.boundary_prefetch
+            key_layout = boundary_prefetch_layout(transport)
+            value_layout = boundary_prefetch_layout(transport, transport.value)
+            aliased = stores_a_loaded_tensor()
+            if (
+                key_layout is not None
+                and value_layout is not None
+                and scanned_helper is not None
+                and not aliased
+                and len(HostFunction.current().device_ir.root_ids) == 1
+            ):
+                partition_arg += (
+                    f", boundary_prefetch_ahead={schedule.boundary_prefetch_ahead}"
+                    f", boundary_prefetch_key={tensor_name(transport.key.raw)}"
+                    f", boundary_prefetch_key_scales={tensor_name(transport.key.scale)}"
+                    f", boundary_prefetch_layout={key_layout!r}"
+                    f", boundary_prefetch_value={tensor_name(transport.value.raw)}"
+                    ", boundary_prefetch_value_scales="
+                    f"{tensor_name(transport.value.scale)}"
+                    f", boundary_prefetch_value_layout={value_layout!r}"
+                )
     prefetch_arg = ""
     if schedule.boundary_prefetch:
         # The config contract admitted the form from the bind's facts; the
@@ -558,18 +637,11 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         # program loads. The role names only such tensors (the page table,
         # the key operands and what the prelude's bounds read), so it is
         # left out where the program also stores one it loads.
-        program_loads, program_stores = (
-            {
-                tensor_name(access)
-                for access in selected.program.accesses
-                if _is_call(access.node, operation)
-            }
-            for operation in (memory_ops.load, memory_ops.store)
-        )
+        aliased = stores_a_loaded_tensor()
         if (
             prefetch_layout is not None
             and prefetch_capacity is not None
-            and not program_loads & program_stores
+            and not aliased
             and len(HostFunction.current().device_ir.root_ids) == 1
             and pdl_launch_ctas(df) == prefetch_units
             and boundary_prefetch_form(prefetch_units, prefetch_capacity) == form
@@ -597,6 +669,13 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
                 # The host installs, above the wait mode, how many of the
                 # launch's first CTAs start beside the launch ahead.
                 wrapper["capture_pdl_head_start"] = True
+                if schedule.boundary_prefetch_cold:
+                    # A launch without a head start serves too, to this
+                    # depth: the role's own extension, rendered with it and
+                    # left out with it.
+                    prefetch_arg += (
+                        f", boundary_prefetch_cold={schedule.boundary_prefetch_cold}"
+                    )
     emitter.emit(
         f"{body_name}("
         f"{tensor_name(semantic.query)}, {tensor_name(semantic.page_table)}, "
@@ -618,11 +697,7 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
         cast("list[str]", alias_plan["tensor_names"]).append(workspace_name)
         cast("list[bool]", alias_plan["stored"]).append(True)
     if guarded_pdl:
-        loaded = {
-            tensor_name(access)
-            for access in selected.program.accesses
-            if _is_call(access.node, memory_ops.load)
-        }
+        loaded = program_tensors(memory_ops.load)
         alias_plan["capture_loaded"] = [
             name in loaded for name in cast("list[str]", alias_plan["tensor_names"])
         ]

@@ -13,6 +13,9 @@ import ast
 import functools
 import importlib.abc
 import importlib.util
+import inspect
+from pathlib import Path
+import re
 import types
 from typing import TYPE_CHECKING
 from typing import cast
@@ -38,6 +41,11 @@ from .poisoned_outputs import poisoned_launch
 from .poisoned_outputs import written_bits
 from helion._compiler.cute import target_facts
 from helion._compiler.cute.cute_mma_dag_seeds import MmaDagSeedPlanner
+from helion._compiler.cute.paged_attention_shared_memory import (
+    MMA_DAG_VALUE_RING_TILES_KEY,
+)
+from helion._compiler.cute.paged_attention_shared_memory import ValueRingTiles
+from helion._compiler.cute.paged_attention_shared_memory import value_ring_reason
 from helion.runtime.cute.capture_pdl import WaitMode
 
 if TYPE_CHECKING:
@@ -63,6 +71,11 @@ NO_WINDOW = -1
 # SMs the GPU tests' grid of one unit per CTA leaves idle: one wave, on
 # which a ``loader_tail`` release is the loader's own.
 IDLE_SMS = 20
+# CTAs a persistent launch of the one-wave fixture gets in the GPU tests of
+# the persistent partitions' stream options: its units (the device's SMs
+# less ``IDLE_SMS``) outnumber them, so every CTA streams more than one
+# unit and the balanced partition splits units between CTAs.
+PERSISTENT_CTAS = 64
 # Compiled pairs of the GPU tests, by their arguments: each kernel is
 # compiled once per process.
 _PAIRS: dict[tuple[object, ...], tuple[object, ...]] = {}
@@ -103,6 +116,31 @@ def jit_host_body(function: object) -> Callable[..., object]:
     )
 
 
+def source_function(name: str, module: types.ModuleType) -> ast.FunctionDef:
+    """The definition of function ``name`` in the source of ``module``, as
+    its syntax tree: the one function of that name at any depth. A CPU test
+    reads from it what a device template's code says, statement by
+    statement."""
+    (found,) = [
+        node
+        for node in ast.walk(ast.parse(Path(inspect.getfile(module)).read_text()))
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    ]
+    return found
+
+
+def source_calls(node: ast.AST, name: str) -> list[ast.Call]:
+    """The calls of ``name`` in the syntax tree ``node``, by the last part
+    of the called name: ``prims.barrier_cta_sync(...)`` is a call of
+    ``barrier_cta_sync``."""
+    return [
+        call
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func).rpartition(".")[2] == name
+    ]
+
+
 @functools.cache
 def stream_bound(
     units: int = 128,
@@ -115,6 +153,7 @@ def stream_bound(
     rows: int = 8,
     table_pages: int = PAGES,
     pool_pages: int = 13,
+    reference_scores: bool = False,
 ) -> BoundKernel[object]:
     """The partition fixture's kernel over ``units`` head pairs, bound without
     a GPU on a device of ``sms`` SMs.
@@ -125,11 +164,14 @@ def stream_bound(
     back in one captured graph. ``smem_capacity_bytes`` models a device with
     another shared-memory capacity per CTA than the B200's. ``rows`` are the
     query rows of an item: 8, 32 or 40 query columns. ``table_pages`` is the
-    page table's extent and ``pool_pages`` the pool's.
+    page table's extent and ``pool_pages`` the pool's. ``reference_scores``
+    is the fixture's recurrence over scores relative to the running maximum,
+    the one bind that is offered the early probability schedules.
     """
     args = partition_attention_args(
         units=units,
         rows=rows,
+        reference_scores=reference_scores,
         window=table_pages * PAGE - 1 if window is None else window,
         table_pages=table_pages,
         pool_pages=pool_pages,
@@ -205,12 +247,120 @@ def stream_seeds(
         return planner.configs(planner.ranked())
 
 
+# What a softmax tile loop that the assembler cannot prove warp-uniform
+# carries on its tile path: a yield, convergence regions around its waits,
+# warp synchronizations and divergent branches.
+_LOOP_FORMS = ("TRYWAIT", "YIELD", "BSSY", "BSYNC", "WARPSYNC", "BRA.DIV")
+# The try-waits of the loop that stand inside a convergence region.
+LOOP_WAITS_IN_REGIONS = "TRYWAIT in a region"
+_SASS_LABEL = re.compile(r"^\s*(\.L_x_\d+):")
+_SASS_INSTRUCTION = re.compile(r"/\*[0-9a-f]{4,6}\*/\s+(.*);")
+_SASS_BRANCH = re.compile(r"\bBRA(?:\.\w+)*\s+(?:!?U?P\d+,\s*)?`\((\.L_x_\d+)\)")
+
+
+def _sass_form(form: str, instruction: str) -> bool:
+    return bool(re.search(r"(^|[\s.])" + re.escape(form) + r"\b", instruction))
+
+
+def softmax_loop_forms(sass: str) -> dict[str, int]:
+    """Counts, in the innermost loop around the softmax's maximum vote of a
+    disassembled paired kernel (``nvdisasm -c``; a kernel has one such
+    loop), of its mbarrier try-waits and of what a loop that is not
+    warp-uniform adds to them: ``YIELD``, ``BSSY`` / ``BSYNC`` regions,
+    ``WARPSYNC`` and ``BRA.DIV``; and, as ``LOOP_WAITS_IN_REGIONS``, of the
+    try-waits that stand between a ``BSSY`` and its ``BSYNC``.
+
+    The loop is the shortest span from a label to a branch back to it that
+    holds a vote, ``BAR.RED.OR``. The recurrence over reference scores
+    votes twice a tile (whether a row's maximum changed and, behind such
+    an event, whether a row's reference is invalid) where the per-key one
+    votes once: the loop around either vote is the same loop."""
+    rows: list[tuple[str, str]] = []
+    for line in sass.splitlines():
+        label = _SASS_LABEL.match(line)
+        if label:
+            rows.append(("label", label.group(1)))
+            continue
+        instruction = _SASS_INSTRUCTION.search(line)
+        if instruction:
+            rows.append(("instruction", instruction.group(1).strip()))
+    labels = {text: index for index, (kind, text) in enumerate(rows) if kind == "label"}
+    votes = [
+        index
+        for index, (kind, text) in enumerate(rows)
+        if kind == "instruction" and "BAR.RED.OR" in text
+    ]
+    assert votes
+    loops = set()
+    for vote in votes:
+        spans = []
+        for index, (kind, text) in enumerate(rows):
+            branch = _SASS_BRANCH.search(text) if kind == "instruction" else None
+            if branch and labels.get(branch.group(1), index) < vote < index:
+                spans.append(
+                    (index - labels[branch.group(1)], labels[branch.group(1)], index)
+                )
+        loops.add(min(spans))
+    ((_length, top, back),) = loops
+    body = [text for kind, text in rows[top : back + 1] if kind == "instruction"]
+    forms = {form: sum(_sass_form(form, text) for text in body) for form in _LOOP_FORMS}
+    # A region is the instructions from its ``BSSY`` to its ``BSYNC``, which
+    # the disassembly lists in that order, an inner region inside its outer.
+    depth = 0
+    enclosed = 0
+    for text in body:
+        if _sass_form("BSSY", text):
+            depth += 1
+        elif _sass_form("BSYNC", text):
+            depth -= 1
+            assert depth >= 0
+        elif _sass_form("TRYWAIT", text) and depth > 0:
+            enclosed += 1
+    assert depth == 0
+    forms[LOOP_WAITS_IN_REGIONS] = enclosed
+    return forms
+
+
+def seeds_ahead_of_the_range_ahead(
+    seeds: list[helion.Config],
+) -> list[helion.Config]:
+    """The seeds ahead of those that name a distance of the range-ahead
+    prefetch, which a windowed kernel on a grid of more units than SMs has
+    behind every other seed where its search samples the boundary
+    prefetches (``test_cute_paged_attention_range_ahead`` pins them)."""
+    served = [
+        seed for seed in seeds if "cute_mma_dag_boundary_prefetch_ahead" in seed.config
+    ]
+    ahead = seeds[: len(seeds) - len(served)]
+    assert seeds[len(ahead) :] == served
+    return ahead
+
+
+def seeds_ahead_of_the_cold_prefetch(
+    seeds: list[helion.Config],
+) -> list[helion.Config]:
+    """The seeds ahead of those that name the sibling prefetch's depth in a
+    cold launch, which a windowed kernel on a grid of fewer units than SMs
+    has behind every other seed but the range-ahead ones where its search
+    samples that prefetch (``test_cute_paged_attention_prefetch_cold`` pins
+    them)."""
+    seeds = seeds_ahead_of_the_range_ahead(seeds)
+    cold = [
+        seed for seed in seeds if "cute_mma_dag_boundary_prefetch_cold" in seed.config
+    ]
+    ahead = seeds[: len(seeds) - len(cold)]
+    assert seeds[len(ahead) :] == cold
+    return ahead
+
+
 def seeds_ahead_of_the_store_hint(
     seeds: list[helion.Config],
 ) -> list[helion.Config]:
     """The seeds ahead of those that store their outputs under the L2
     evict-last hint, which a kernel with a sliding window has behind every
-    other seed (``test_cute_paged_attention_store_policy`` pins them)."""
+    other seed but the cold prefetch's and the range-ahead ones
+    (``test_cute_paged_attention_store_policy`` pins them)."""
+    seeds = seeds_ahead_of_the_cold_prefetch(seeds)
     hinted = [
         seed
         for seed in seeds
@@ -263,6 +413,21 @@ def transferred_seeds(
     generation = spec.create_config_generation(overrides=overrides)
     pairs = generation.seed_flat_config_pairs(failures.append)
     return [config for _flat, config in pairs], failures
+
+
+def seed_transfers(
+    spec: ConfigSpec, overrides: dict[str, object] | None
+) -> list[tuple[helion.Config, helion.Config | None]]:
+    """Each compiler seed of ``spec`` beside the config a search under
+    ``overrides`` starts from in its place, ``None`` for a seed the search
+    rejects: ``transferred_seeds`` seed by seed, which leaves out a seed
+    that became the config of one ahead of it as well."""
+    generation = spec.create_config_generation(overrides=overrides)
+    moves: list[tuple[helion.Config, helion.Config | None]] = []
+    for seed in spec.compiler_seed_configs:
+        pair = generation.transfer_seed(seed)
+        moves.append((seed, None if pair is None else pair[1]))
+    return moves
 
 
 def launched_bits(kernel: object, args: tuple[object, ...]) -> list[torch.Tensor]:
@@ -394,6 +559,79 @@ def stream_pair(
         torch.cuda.synchronize()
         _PAIRS[key] = (args, *kernels, *sources)
     return cast("tuple[tuple[object, ...], object, object, str, str]", _PAIRS[key])
+
+
+def persistent_pair(
+    candidate: dict[str, object],
+    ctas: int,
+    rendered: dict[str, str],
+    *,
+    window: int = PAGES * PAGE - 1,
+    rows: int = 8,
+    **schedule: object,
+) -> tuple[tuple[object, ...], object, object]:
+    """The one-wave fixture's arguments, its kernel on a persistent
+    partition of ``ctas`` CTAs under ``schedule``, and the same kernel with
+    ``candidate``'s options.
+
+    ``rendered`` are the keywords the candidate's call of the paired body
+    has for those options, each with its source text, none of which the
+    kernel without them has. A candidate that counts its raw V ring in
+    tiles is skipped on a device whose CTA does not hold the count."""
+    units = one_wave_units()
+    tiles = candidate.get(MMA_DAG_VALUE_RING_TILES_KEY)
+    if tiles:
+        reason = value_ring_reason(
+            ValueRingTiles(cast("int", tiles)),
+            device_shared_memory(),
+            8 if rows <= 8 else 32 if rows <= 32 else 40,
+            query_stages=2,
+            units=units,
+            balanced=schedule.get("cute_mma_dag_partition") == "balanced",
+        )
+        if reason is not None:
+            pytest.skip(reason)
+    if not ctas < units:
+        pytest.skip("the grid needs more units than CTAs")
+    args, off, on, plain, source = stream_pair(
+        candidate,
+        schedule=schedule,
+        window=window,
+        rows=rows,
+        reserved_sms=units + IDLE_SMS - ctas,
+    )
+    plain_keywords, keywords = body_keywords(plain), body_keywords(source)
+    for name, text in rendered.items():
+        assert name not in plain_keywords, name
+        assert keywords[name] == text, name
+    return args, off, on
+
+
+def check_persistent_bits(
+    candidate: dict[str, object],
+    ctas: int,
+    rendered: dict[str, str],
+    *,
+    window: int = PAGES * PAGE - 1,
+    rows: int = 8,
+    calls: int = 3,
+    **schedule: object,
+) -> None:
+    """``persistent_pair`` over streams of every length the table has, eager
+    and captured: the kernel with the options stores the bits of the kernel
+    without them."""
+    args, off, on = persistent_pair(
+        candidate, ctas, rendered, window=window, rows=rows, **schedule
+    )
+    units = cast("torch.Tensor", args[6]).numel()
+    check_same_bits(
+        args,
+        off,
+        on,
+        stream_patterns(units, window),
+        calls=calls,
+        what=(candidate, ctas, rows, schedule),
+    )
 
 
 def stream_patterns(

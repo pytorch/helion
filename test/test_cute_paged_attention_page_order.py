@@ -407,7 +407,10 @@ def test_the_loader_takes_the_order_behind_its_head_pages():
         )
     )
     for name in ("capture_release_tail", "capture_release_lead", "value_ring"):
-        assert first[name] == second[name] == handed[name] == name
+        # The ring is the one the body binds: its depth in pages, or the
+        # ring counted in tiles in its place.
+        passed = "raw_v_ring" if name == "value_ring" else name
+        assert first[name] == second[name] == name and handed[name] == passed
         # The ordered loader has no default to fall back on.
         assert name in [argument.arg for argument in loader.args.args]
     assert not loader.args.defaults

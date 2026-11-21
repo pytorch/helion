@@ -12,35 +12,68 @@ from helion._testing.cute_paged_decode_reference import check_full_domain_decode
 
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    "scale_row_stride, scale_swizzle", [(4, False), (8, False), (4, True)]
+    "scale_row_stride, scale_swizzle, packed_tile_forms",
+    [
+        (4, False, False),
+        (8, False, False),
+        (4, True, False),
+        # The paired body's forms on the packed tile: the tile converted
+        # ahead of the vote on the warp's own group, with the replays that
+        # place out-of-range scale bytes where that vote decides.
+        (4, False, True),
+        # Asked for on a padded scale layout, which keeps its packet votes.
+        (8, False, True),
+    ],
 )
 def test_transposed_byte_decode_full_domain_and_replay(
-    scale_row_stride: int, scale_swizzle: bool
+    scale_row_stride: int, scale_swizzle: bool, packed_tile_forms: bool
 ) -> None:
     """Native packed V staging and padded/composed indexed-load fallbacks."""
-    check_full_domain_decode(128, 32, scale_row_stride, scale_swizzle, True)
+    check_full_domain_decode(
+        128,
+        32,
+        scale_row_stride,
+        scale_swizzle,
+        True,
+        packed_tile_forms=packed_tile_forms,
+    )
 
 
+# Each layout is one route of the row decoder (its store width, its scale
+# load), so the list is the routes and no product of the columns; the last
+# two ask for the paired body's forms, on the packed tile and on a layout of
+# four 16-dimension groups that keeps its per-group arithmetic.
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    "columns, scale_group, padding, swizzle",
+    "columns, scale_group, padding, swizzle, packed_tile_forms",
     [
-        (128, 32, 0, False),
-        (64, 32, 0, False),
-        (64, 16, 0, False),
-        (128, 16, 0, False),
-        (128, 64, 0, False),
-        (96, 32, 0, False),
-        (128, 32, 4, False),
-        (128, 32, 0, True),
+        (128, 32, 0, False, False),
+        (64, 32, 0, False, False),
+        (64, 16, 0, False, False),
+        (128, 16, 0, False, False),
+        (128, 64, 0, False, False),
+        (96, 32, 0, False, False),
+        (128, 32, 4, False, False),
+        (128, 32, 0, True, False),
+        (128, 32, 0, False, True),
+        (64, 16, 0, False, True),
     ],
 )
 def test_row_byte_decode_grouped_stores(
-    columns: int, scale_group: int, padding: int, swizzle: bool
+    columns: int,
+    scale_group: int,
+    padding: int,
+    swizzle: bool,
+    packed_tile_forms: bool,
 ) -> None:
     """Group batching, original store widths, and noncontiguous scale layouts."""
     check_full_domain_decode(
-        columns, scale_group, columns // scale_group + padding, swizzle, False
+        columns,
+        scale_group,
+        columns // scale_group + padding,
+        swizzle,
+        False,
+        packed_tile_forms=packed_tile_forms,
     )
 
 

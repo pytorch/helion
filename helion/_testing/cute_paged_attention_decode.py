@@ -1,4 +1,10 @@
-"""Native row and transpose shared-byte-to-TMEM fixtures for decoder contracts."""
+"""Native row and transpose shared-byte-to-TMEM fixtures for decoder contracts.
+
+``packed_tile_forms`` asks the conversions for the forms the paired body
+takes on the packed four-scales-per-row tile
+(``_paged_attention_runtime.packed_scale_tile_layout``); the kernel waits
+for its stores and joins behind the conversion, as that body does.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +35,7 @@ def packet_kernel(
     scale_group: cutlass.Constexpr[int],
     post_scale_log2: cutlass.Constexpr[int],
     positive_zero: cutlass.Constexpr[bool] = False,
+    packed_tile_forms: cutlass.Constexpr[bool] = False,
 ) -> None:
     assert not transpose or (columns == 128 and scale_group == 32)
     assert not positive_zero or transpose
@@ -79,10 +86,18 @@ def packet_kernel(
             128,
             post_scale_log2,
             positive_zero=positive_zero,
+            packed_tile_forms=packed_tile_forms,
         )
     else:
         stage_scaled_s8_rows_to_tmem(
-            shared_raw, shared_scales, row, base, columns, scale_group, post_scale_log2
+            shared_raw,
+            shared_scales,
+            row,
+            base,
+            columns,
+            scale_group,
+            post_scale_log2,
+            packed_tile_forms=packed_tile_forms,
         )
     prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
     prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
@@ -118,6 +133,7 @@ def launch(
     scale_group: cutlass.Constexpr[int] = 32,
     post_scale_log2: cutlass.Constexpr[int] = 0,
     positive_zero: cutlass.Constexpr[bool] = False,
+    packed_tile_forms: cutlass.Constexpr[bool] = False,
 ) -> None:
     packet_kernel(
         raw,
@@ -130,6 +146,7 @@ def launch(
         scale_group,
         post_scale_log2,
         positive_zero,
+        packed_tile_forms,
     ).launch(grid=(cute.size(raw, mode=[0]), 1, 1), block=(128, 1, 1), stream=stream)
 
 

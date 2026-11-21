@@ -13,24 +13,37 @@ from helion._testing.cute_paged_reference import check_reference_attention_fixtu
 
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    "post_scale,stride,swizzle",
+    "post_scale,stride,swizzle,packed_tile_forms",
     [
-        (-22, 4, False),
-        (-14, 4, False),
-        (-13, 4, False),
-        (-6, 4, False),
-        (0, 4, False),
-        (-22, 8, False),
-        (-22, 4, True),
+        (-22, 4, False, False),
+        (-14, 4, False, False),
+        (-13, 4, False, False),
+        (-6, 4, False, False),
+        (0, 4, False, False),
+        (-22, 8, False, False),
+        (-22, 4, True, False),
+        # The paired body's forms of the packed tile: the source's ``+ 0``
+        # is the full-domain arm's alone there, on the replaced tiles.
+        (-6, 4, False, True),
+        (0, 4, False, True),
     ],
 )
-def test_positive_zero_decode_bits_and_changed_replay(post_scale, stride, swizzle):
+def test_positive_zero_decode_bits_and_changed_replay(
+    post_scale, stride, swizzle, packed_tile_forms
+):
     # The exponent endpoints and zero-domain boundary share the packed layout;
     # padded and swizzled scales force each generic path without a product grid.
     # Each configuration covers all 65,536 byte/scale pairs, signed zeros,
     # NaNs and infinities, plus sparse boundary and changed-data graph replays.
     check_full_domain_decode(
-        128, 32, stride, swizzle, True, post_scale, positive_zero=True
+        128,
+        32,
+        stride,
+        swizzle,
+        True,
+        post_scale,
+        positive_zero=True,
+        packed_tile_forms=packed_tile_forms,
     )
 
 

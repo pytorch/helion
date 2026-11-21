@@ -48,11 +48,12 @@ from .paged_attention_page_order import ReversedWalk
 
 @cute.jit
 def attention_page_coordinates(
-    first: cutlass.Int64,
-    last: cutlass.Int64,
-    step: cutlass.Int64,
+    first: cutlass.Int64 | cutlass.Int32,
+    last: cutlass.Int64 | cutlass.Int32,
+    step: cutlass.Int64 | cutlass.Int32,
     page_walk: cutlass.Constexpr = None,
-) -> tuple[cutlass.Int64, cutlass.Int64]:
+    integer: cutlass.Constexpr = None,
+) -> tuple[cutlass.Int64 | cutlass.Int32, cutlass.Int64]:
     """The logical page and key base of step ``step`` of a walk over the
     pages ``[first, last)``: the one mapping the loader, the softmax's
     masks, a boundary prefetch and the value-metadata actor share, so that
@@ -74,30 +75,51 @@ def attention_page_coordinates(
     outside them has no page: the result is defined and the caller's own
     range test discards it (a prefetch evaluates its fixed depth of steps
     for a unit of any length).
+
+    ``integer`` is the type the walk is computed in, that of ``first``,
+    ``last`` and ``step``. ``None`` is the source's Int64, in which every
+    role calls the mapping but one: the compute groups of the paired body,
+    whose softmax masks take the key base, call it with ``cutlass.Int32``
+    in the warp-uniform tile loop where the bind holds every page index of
+    a range, and 128 times it, below 2**31 (``int32_keys``, a page table
+    of fewer than 2**24 pages). The source's loop and a ``ReversedWalk``
+    are the same integers there, operation for operation: the page comes
+    back in that type and the key base widened to Int64. A source
+    reflection is typed by its own dtype whatever the caller's: its range
+    and step are widened first, and it is the Int64 mapping.
     """
+    reflected = page_walk is not None and not isinstance(page_walk, ReversedWalk)
+    if cutlass.const_expr(integer is None):
+        integer = cutlass.Int64
+    if cutlass.const_expr(reflected and integer is not cutlass.Int64):
+        first = cutlass.Int64(first)
+        last = cutlass.Int64(last)
+        step = cutlass.Int64(step)
     if cutlass.const_expr(not isinstance(page_walk, ReversedWalk)):
         iteration = first + step
     else:
-        iteration = last - cutlass.Int64(1) - step
+        iteration = last - integer(1) - step
         if cutlass.const_expr(page_walk.clipped_page_lead > 1):
             clipped_step = last - first - page_walk.clipped_page_lead
             if clipped_step < 0:
-                clipped_step = cutlass.Int64(0)
+                clipped_step = integer(0)
             if step == clipped_step:
                 iteration = first
             if step > clipped_step:
-                iteration = iteration + cutlass.Int64(1)
+                iteration = iteration + integer(1)
     page = iteration
     key_base = iteration * 128
-    if cutlass.const_expr(
-        page_walk is not None and not isinstance(page_walk, ReversedWalk)
-    ):
+    if cutlass.const_expr(reflected):
         reflected_dtype = page_walk
         total = reflected_dtype(reflected_dtype(first) + reflected_dtype(last))
         prefix = reflected_dtype(total - reflected_dtype(1))
         token = reflected_dtype(cutlass.Int64(prefix) - iteration)
         page = cutlass.Int64(token)
         key_base = cutlass.Int64(reflected_dtype(token * reflected_dtype(128)))
+    if cutlass.const_expr(integer is not cutlass.Int64):
+        # A walk in another type hands its key base on in Int64, which a
+        # reflection's already is.
+        key_base = cutlass.Int64(key_base)
     return page, key_base
 
 

@@ -79,6 +79,10 @@ KEY = MMA_DAG_PAGE_ORDER_KEY
 LEAD = MMA_DAG_CLIPPED_PAGE_LEAD_KEY
 RING = "cute_mma_dag_value_ring"
 PREFETCH = "cute_mma_dag_boundary_prefetch"
+# The sibling prefetch's depth in a cold launch: the prefetching seeds in
+# reversed order follow once more with it, behind every other seed
+# (``test_cute_paged_attention_prefetch_cold`` pins those).
+COLD = "cute_mma_dag_boundary_prefetch_cold"
 PARTITION = "cute_mma_dag_partition"
 SKIP = "cute_mma_dag_value_metadata_skip"
 READ_OVERLAP = "cute_mma_dag_value_metadata_read_overlap"
@@ -521,6 +525,7 @@ def test_every_role_takes_its_tiles_from_the_one_walk():
     # Everywhere else the walk is only handed on: an argument of a call or
     # a parameter. The one function that reads it is the mapping.
     mapped = 0
+    narrow = []
     for module in (template, prefetch, bucketed_role):
         tree = ast.parse(Path(inspect.getfile(module)).read_text())
         handed = {
@@ -541,13 +546,18 @@ def test_every_role_takes_its_tiles_from_the_one_walk():
                 isinstance(call, ast.Call)
                 and ast.unparse(call.func) == "attention_page_coordinates"
             ):
-                assert len(call.args) == 4 and not call.keywords
+                assert len(call.args) == 4
                 assert ast.unparse(call.args[3]) == "page_walk"
+                # Only the integer type of a walk in Int32 is named as well.
+                narrow += [ast.unparse(keyword) for keyword in call.keywords]
                 mapped += 1
     # The loader's step, which both of its V-lag forms begin with, the
-    # compute groups, the value-metadata actor, the prefetch and the
-    # bucketed order's role.
-    assert mapped == 5
+    # compute groups, the value-metadata actor, the prefetch of one unit
+    # per CTA, the balanced partition's range-ahead prefetch and the
+    # bucketed order's role; and the compute groups once more, in Int32,
+    # for a bind that bounds its table's keys.
+    assert mapped == 7
+    assert narrow == ["integer=cutlass.Int32"]
     mapping = _function("attention_page_coordinates", partial)
     assert "ReversedWalk" in ast.unparse(mapping)
 
@@ -738,7 +748,7 @@ def test_the_walk_is_searched_everywhere_and_seeded_in_two_forms():
             assert [
                 config.config.get(LEAD)
                 for _flat, config in pairs
-                if KEY in config.config
+                if KEY in config.config and COLD not in config.config
             ] == [8, None] * (len(walked) // 2)
     keywords = body_keywords(stream_render(banks, named[2]))
     assert keywords["page_order"] == "'reversed'"
@@ -964,10 +974,11 @@ def test_overrides_keep_the_paired_seeds_with_or_without_their_walk():
         paired = [
             seed for seed in seeded if seed.get("cute_mma_dag_pass_warps") == PAIRED
         ]
-        assert [seed.config.get(LEAD) for seed in seeded if KEY in seed.config] == [
-            8,
-            None,
-        ] * 3
+        assert [
+            seed.config.get(LEAD)
+            for seed in seeded
+            if KEY in seed.config and COLD not in seed.config
+        ] == [8, None] * 3
         # A fixed order is layered over complete candidates: every paired
         # one takes it and keeps its place; a candidate on another schedule
         # is left to that body's rule, which has no walk.

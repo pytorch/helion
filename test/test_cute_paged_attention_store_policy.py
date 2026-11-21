@@ -452,8 +452,10 @@ def test_policy_stores_differ_by_the_cache_operator_or_hint_alone(kernel):
         if sites == 1:
             # Nothing else differs but the stores' addresses, which the
             # plain form folds into its operand: one addition a store but
-            # the first.
-            assert moved == {"add.s64": stores - 1}, (policy, moved)
+            # the first. (Around them the assembler may form one index in
+            # the other width: an addition for a conversion.)
+            assert moved.pop("add.s64") == stores - 1, (policy, moved)
+            assert moved in ({}, {"add.s32": -1, "cvt.u64.u32": 1}), (policy, moved)
         else:
             # A merging kernel also forms a row's address once where the
             # plain stores form it per element: integer arithmetic only.

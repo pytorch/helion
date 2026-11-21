@@ -13,23 +13,33 @@ from helion._testing.cute_paged_reference import check_reference_attention_fixtu
 
 @skipIfNotCUDA()
 @pytest.mark.parametrize(
-    "exponent,transpose,stride,swizzle",
+    "exponent,transpose,stride,swizzle,packed_tile_forms",
     [
-        (-22, False, 4, False),
-        (-22, True, 4, False),
-        (-7, False, 8, False),
-        (-22, True, 4, True),
-        (-18, True, 8, False),
-        (-14, False, 4, True),
-        (-7, True, 4, False),
-        (-8, True, 4, False),
-        (-3, False, 4, False),
-        (-18, True, 4, False),
-        (-14, True, 4, False),
-        (-6, True, 4, False),
+        (-22, False, 4, False, False),
+        (-22, True, 4, False, False),
+        (-7, False, 8, False, False),
+        (-22, True, 4, True, False),
+        (-18, True, 8, False, False),
+        (-14, False, 4, True, False),
+        (-7, True, 4, False, False),
+        (-8, True, 4, False, False),
+        (-3, False, 4, False, False),
+        (-18, True, 4, False, False),
+        (-14, True, 4, False, False),
+        (-6, True, 4, False, False),
+        # The paired body's forms of the packed tile: both decoders at the
+        # smallest postscale they hold for, where the corrected exponent of
+        # scale byte zero is zero, and at one inside, and the first
+        # postscale below, which keeps the guard at the head of the tile.
+        (-6, True, 4, False, True),
+        (-6, False, 4, False, True),
+        (-3, True, 4, False, True),
+        (-7, True, 4, False, True),
     ],
 )
-def test_postscaled_decode_full_domain_and_replay(exponent, transpose, stride, swizzle):
+def test_postscaled_decode_full_domain_and_replay(
+    exponent, transpose, stride, swizzle, packed_tile_forms
+):
     # Cover underflow, intermediate gap, and original fused domains with both
     # decoders and all layout routes, without a Cartesian compile grid. Every
     # chosen exponent checks all 65,536 byte pairs and mixed boundary replays.
@@ -37,7 +47,15 @@ def test_postscaled_decode_full_domain_and_replay(exponent, transpose, stride, s
     # Packed -18/-14 cases exercise an inner and endpoint zero exponent;
     # generic layouts cannot take the complete-tile arm. The -6 control pins
     # the nonapplicable path without the p<-6 clamp and packed multiply.
-    check_full_domain_decode(128, 32, stride, swizzle, transpose, exponent)
+    check_full_domain_decode(
+        128,
+        32,
+        stride,
+        swizzle,
+        transpose,
+        exponent,
+        packed_tile_forms=packed_tile_forms,
+    )
 
 
 @skipIfNotCUDA()

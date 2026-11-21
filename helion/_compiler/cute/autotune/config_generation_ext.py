@@ -60,6 +60,8 @@ from ..cute_flash import FLASH_SOFTMAX_DISC_KEY
 from ..cute_flash import FLASH_SOFTMAX_LOWERING_KEY
 from ..cute_flash import _flash_resident_softmax_overrides
 from ..cute_flash import flash_exp2_packet_is_compound
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY
 from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from ..cute_mma_dag import MMA_DAG_KEY
 from ..cute_mma_dag import MMA_DAG_OFF
@@ -80,6 +82,7 @@ from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
 from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
 from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from ..pdl_release import CUTE_PDL_CAPTURE_RELEASE_CHOICES
 from ..pdl_release import CUTE_PDL_RELEASE_DEFAULT
@@ -96,10 +99,13 @@ from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
 from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
 from .mma_dag_surface import PARTITION_TRANSPORT
 from .mma_dag_surface import SEARCHED_VALUE_RING_PARTITION
+from .mma_dag_surface import boundary_prefetch_ahead_needs
+from .mma_dag_surface import boundary_prefetch_cold_needs
 from .mma_dag_surface import boundary_prefetch_needs
 from .mma_dag_surface import kept_capture_policy
 from .mma_dag_surface import page_order_needs
 from .mma_dag_surface import value_ring_needs
+from .mma_dag_surface import value_ring_tiles_needs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -528,17 +534,21 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         prerequisites: a work partition and its range skew
         (``_partition_neighbor_updates``), the dependent-launch policies
         (``_pdl_neighbor_updates``), a boundary prefetch
-        (``_prefetch_neighbor_updates``), a lead of the tail release
+        (``_prefetch_neighbor_updates``) or the range-ahead prefetch
+        (``_prefetch_ahead_neighbor_updates``), a lead of the tail release
         (``_release_lead_neighbor_updates``), a depth of the raw V ring
-        (``_value_ring_neighbor_updates``), and a page order or the
+        (``_value_ring_neighbor_updates``) or its count in tiles
+        (``_value_ring_tiles_neighbor_updates``), and a page order or the
         reversed order's lead of its clipped page
         (``_page_order_neighbor_updates``)."""
         return {
             **self._partition_neighbor_updates(base, requested),
             **self._pdl_neighbor_updates(base, requested),
             **self._prefetch_neighbor_updates(base, requested),
+            **self._prefetch_ahead_neighbor_updates(base, requested),
             **self._release_lead_neighbor_updates(base, requested),
             **self._value_ring_neighbor_updates(base, requested),
+            **self._value_ring_tiles_neighbor_updates(base, requested),
             **self._page_order_neighbor_updates(base, requested),
         }
 
@@ -658,6 +668,38 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
                 **value_ring_needs(facts.attention, requested[ring], partition),
                 **SEARCHED_VALUE_RING_PARTITION,
             }
+        )
+
+    def _value_ring_tiles_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a raw V ring counted in tiles with what it needs.
+
+        That ring is a persistent CTA's, beside the default depth in pages
+        and without the value-metadata transport. Normalization repairs a
+        count without them to the ring in pages
+        (``paged_attention_value_ring_tiles_reason``) and never changes
+        another knob, so from a config with one unit per CTA the step alone
+        would be an alias of where it started: it takes the balanced
+        partition (or whole units where only those have room) with that
+        partition's transport, and a config already on a partition with
+        room keeps it (``mma_dag_surface.value_ring_tiles_needs``). A step
+        that also moves the partition is the partition's.
+        """
+        if not self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_VALUE_RING_TILES_KEY, 0
+        ):
+            return {}
+        generation = self.generation
+        layout = generation._key_to_flat_indices
+        tiles = layout[MMA_DAG_VALUE_RING_TILES_KEY][0][0]
+        partition: object = MMA_DAG_PARTITION_ITEM
+        if MMA_DAG_PARTITION_KEY in layout:
+            partition = requested[layout[MMA_DAG_PARTITION_KEY][0][0]]
+        facts = generation.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.attention is not None
+        return self._slots(
+            value_ring_tiles_needs(facts.attention, requested[tiles], partition)
         )
 
     def _repair_value_ring(self, flat_config: FlatConfig) -> None:
@@ -835,16 +877,57 @@ class CuteConfigGenerationExtension(ConfigGenerationExtension):
         changes another knob, so from most configs the step alone would be
         an alias of where it started. A step that also moves the partition
         is the partition's.
+
+        A step onto a depth of the sibling form in a cold launch takes what
+        the pages need and the pages: those the step itself names or the
+        row already has, else the first count the option has
+        (``boundary_prefetch_cold_needs``). Normalization repairs a depth
+        without pages to none.
         """
-        if not self._steps_onto_paired_knob(
+        facts = self.generation.config_spec.cute_mma_dag_facts
+        updates: dict[int, object] = {}
+        if self._steps_onto_paired_knob(
             base, requested, MMA_DAG_BOUNDARY_PREFETCH_KEY, 0
         ):
+            assert facts is not None and facts.attention is not None
+            updates.update(
+                self._slots(
+                    boundary_prefetch_needs(facts.attention.boundary_prefetch_form)
+                )
+            )
+        if self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY, 0
+        ):
+            assert facts is not None and facts.attention is not None
+            layout = self.generation._key_to_flat_indices
+            pages = requested[layout[MMA_DAG_BOUNDARY_PREFETCH_KEY][0][0]]
+            updates.update(
+                self._slots(
+                    boundary_prefetch_cold_needs(
+                        facts.attention.boundary_prefetch_form, pages
+                    )
+                )
+            )
+        return updates
+
+    def _prefetch_ahead_neighbor_updates(
+        self, base: FlatConfig, requested: FlatConfig
+    ) -> dict[int, object]:
+        """Step onto a distance of the range-ahead prefetch with what it
+        needs: the balanced partition and that partition's transport
+        (``mma_dag_surface.boundary_prefetch_ahead_needs``).
+
+        Normalization repairs a distance off that partition to none
+        (``paged_attention_boundary_prefetch_ahead_reason``) and never
+        changes another knob, so from a config with one unit per CTA the
+        step alone would be an alias of where it started. A step that also
+        moves the partition is the partition's.
+        """
+        if not self._steps_onto_paired_knob(
+            base, requested, MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY, 0
+        ):
             return {}
-        facts = self.generation.config_spec.cute_mma_dag_facts
-        assert facts is not None and facts.attention is not None
-        return self._slots(
-            boundary_prefetch_needs(facts.attention.boundary_prefetch_form)
-        )
+        return self._slots(boundary_prefetch_ahead_needs())
 
     def _partition_neighbor_updates(
         self, base: FlatConfig, requested: FlatConfig

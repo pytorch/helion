@@ -86,13 +86,19 @@ from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_BUCKETED
 from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_KEY
 from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_REVERSED
 from .paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
+from .paged_attention_prefetch import BOUNDARY_PREFETCH_RANGE_AHEAD_DISTANCES
+from .paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_CHOICES
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_DEFAULT
 from .paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_CHOICES
 from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_CHOICES
+from .paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
+from .paged_attention_shared_memory import ValueRing
+from .paged_attention_shared_memory import ValueRingTiles
 from .paged_attention_shared_memory import value_ring_reason
 
 if TYPE_CHECKING:
@@ -257,6 +263,52 @@ MMA_DAG_PARTITION_SKEW_CHOICES: tuple[int, ...] = (0, 1, 2, 4, 8, 16)
 # and the grids past which they measured a loss).
 MMA_DAG_BOUNDARY_PREFETCH_KEY = "cute_mma_dag_boundary_prefetch"
 MMA_DAG_BOUNDARY_PREFETCH_CHOICES: tuple[int, ...] = (0, 8, 12, 4)
+# The sibling prefetch of a cold launch: K pages the CTAs that would start on
+# idle SMs request for the waiting units in a launch whose host installed no
+# head start. On a grid of fewer units than SMs the sibling form serves only
+# in a launch the capture guard overlapped with a launch of the same kernel
+# that left SMs idle; every other launch (the first call of a sequence, a
+# call behind another kernel, an eager call) has a head start of zero and
+# requested nothing. With this option such a launch's first ``SMs - units``
+# CTAs serve as they would overlapped, its first pages only. Zero, the
+# default and the meaning of a missing key, is off and renders the kernel
+# without it; results are bit-identical with any value.
+#
+# The requests of a cold launch do not help that launch: its waiting units
+# start as its own SMs free up, long behind them. They help the next launch
+# that reads the same pages, and only while those are still in L2.
+# Measured (B200, the SDG eval harness, a 17-page window, 128 requests, us
+# per call at three calls a sample against the same config without it):
+# with the eval's three input banks, whose call sequence returns to a
+# bank's pages three launches later, 2 pages took 0.23 to 0.38 off one
+# case and 0.14 and 0.07 off two others (0.12 to 0.18 and 0.06 to 0.10
+# together with the first tile's skipped rescale); with six banks it gained
+# nothing (+0.04 +- 0.11 and +0.07 +- 0.02). On the harness's random data,
+# measured with that skip, 0.04 to 0.16 off, and at twelve calls a sample
+# between 0.07 more and 0.12 less. Deeper cold prefetches lost
+# (7 pages +0.18, 12 pages +1.21). Where it does not pay it costs each
+# serving CTA twelve page requests. No default selects it; a search samples
+# it with the sibling prefetch it belongs to, where its benchmark cycles
+# input banks.
+MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY = "cute_mma_dag_boundary_prefetch_cold"
+MMA_DAG_BOUNDARY_PREFETCH_COLD_CHOICES: tuple[int, ...] = (0, 2)
+# The range-ahead prefetch of the paired schedule's ``balanced`` partition,
+# as a distance in CTAs: the spare control warp of CTA ``c`` requests the
+# first three K pages and five V pages of the stream of CTA ``c + D`` at the
+# CTA's start (``range_ahead`` in ``paged_attention_prefetch``, with the
+# distances and what was measured). It has a key of its own beside the page
+# counts of ``cute_mma_dag_boundary_prefetch``: those are pages of a unit on
+# a grid of one unit per CTA, this is a CTA of a persistent launch, on a
+# grid of more units than SMs, and a config has at most one of the two.
+# Zero, the default and the meaning of a missing key, is off and renders the
+# kernel without the role; results are bit-identical with any value. No
+# default selects it; a search samples it where it samples the page counts,
+# where its benchmark cycles input banks.
+MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY = "cute_mma_dag_boundary_prefetch_ahead"
+MMA_DAG_BOUNDARY_PREFETCH_AHEAD_CHOICES: tuple[int, ...] = (
+    0,
+    *BOUNDARY_PREFETCH_RANGE_AHEAD_DISTANCES,
+)
 # The lead of the paired loader's tail release (``cute_pdl_release=
 # "loader_tail"``), in pages: the loader releases the launch's dependents
 # when its stream has that many pages left. Four, the default and the
@@ -482,6 +534,61 @@ def paged_attention_boundary_prefetch_choices(
     return (0,)
 
 
+def paged_attention_boundary_prefetch_cold_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+    boundary_prefetch: object = 0,
+) -> tuple[int, ...]:
+    """K pages the sibling prefetch of a config may request in a cold launch.
+
+    The option extends the sibling form's role to the launches without a
+    head start, so it belongs to a config that runs that role: a boundary
+    prefetch of ``boundary_prefetch`` pages, other than none, on a grid
+    whose form is the sibling one (fewer units than SMs). Zero, off, leads
+    everywhere. Normalization, the config contract and the planner take
+    the choices from here.
+    """
+    if (
+        type(boundary_prefetch) is int
+        and boundary_prefetch != 0
+        and boundary_prefetch
+        in paged_attention_boundary_prefetch_choices(
+            attention, pass_warps, value_metadata_skip, partition
+        )
+        and attention is not None
+        and attention.boundary_prefetch_form == BOUNDARY_PREFETCH_SIBLING
+    ):
+        return MMA_DAG_BOUNDARY_PREFETCH_COLD_CHOICES
+    return (0,)
+
+
+def paged_attention_boundary_prefetch_ahead_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+) -> tuple[int, ...]:
+    """Distances in CTAs at which the spare control warp of a balanced CTA
+    may prefetch for the CTA ahead: the range-ahead prefetch.
+
+    The role is the balanced partition's, on the paired schedule without
+    the value-metadata transport, where the bind's grid has it
+    (``PagedAttentionScheduleFacts.boundary_prefetch_range_ahead``: more
+    units than SMs). Zero, off, leads everywhere. Normalization, the config
+    contract and the planner take the choices from here.
+    """
+    paired = paged_attention_paired_facts(attention, pass_warps, value_metadata_skip)
+    if (
+        paired is not None
+        and paired.boundary_prefetch_range_ahead
+        and partition == MMA_DAG_PARTITION_BALANCED
+    ):
+        return (0, *paired.boundary_prefetch_range_ahead)
+    return (0,)
+
+
 def paged_attention_release_lead_choices(
     attention: PagedAttentionScheduleFacts | None, pass_warps: object
 ) -> tuple[int, ...]:
@@ -575,8 +682,53 @@ def paged_attention_value_ring_choices(
     )
 
 
+def paged_attention_value_ring_tiles_choices(
+    attention: PagedAttentionScheduleFacts | None,
+    pass_warps: object,
+    value_metadata_skip: object = False,
+    partition: object = MMA_DAG_PARTITION_ITEM,
+    value_ring: object = PAIRED_DEFAULT_VALUE_RING,
+) -> tuple[int, ...]:
+    """Tiles of raw V the paired body may stage in a ring counted in tiles,
+    zero (the ring counted in pages) first.
+
+    Such a ring is a persistent CTA's, of a kernel with a sliding window,
+    in the place of the default depth in pages: a config that names another
+    depth in pages has that ring. The tile count must fit the device with
+    the query stages and plan tables of the config's partition
+    (``paged_attention_shared_memory.value_ring_reason``), and twice the
+    pages a CTA streams must fit the Int32 the body numbers its tiles in.
+    On a B200 five tiles fit a persistent CTA of 40 query columns with two
+    query stages (222,552 of 232,448 bytes at its largest layout, 640
+    units), where a third page per head, six tiles, does not (238,936).
+    Normalization, the config contract and
+    the planner take the choices from here.
+    """
+    ringed = paged_attention_value_ring_facts(
+        attention, pass_warps, value_metadata_skip, partition
+    )
+    if (
+        ringed is None
+        or partition == MMA_DAG_PARTITION_ITEM
+        or not ringed.windowed
+        or type(value_ring) is not int
+        or value_ring != PAIRED_DEFAULT_VALUE_RING
+        or not 0 < ringed.partition_units * ringed.partition_page_limit < 2**30
+    ):
+        return (0,)
+    return (
+        0,
+        *(
+            tiles
+            for tiles in MMA_DAG_VALUE_RING_TILES_CHOICES[1:]
+            if paged_attention_value_ring_fit(ringed, ValueRingTiles(tiles), partition)
+            is None
+        ),
+    )
+
+
 def paged_attention_value_ring_fit(
-    attention: PagedAttentionScheduleFacts, depth: int, partition: object
+    attention: PagedAttentionScheduleFacts, depth: ValueRing, partition: object
 ) -> str | None:
     """Why a paired CTA of ``partition`` cannot stage ``depth`` pages of raw
     V per head on the bind's device, or None: ``value_ring_reason`` for one
@@ -898,8 +1050,11 @@ MMA_DAG_KEYS: tuple[str, ...] = (
     MMA_DAG_PARTITION_SKEW_KEY,
     MMA_DAG_REGISTER_QUOTAS_KEY,
     MMA_DAG_BOUNDARY_PREFETCH_KEY,
+    MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY,
+    MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY,
     MMA_DAG_RELEASE_LEAD_KEY,
     MMA_DAG_VALUE_RING_KEY,
+    MMA_DAG_VALUE_RING_TILES_KEY,
     MMA_DAG_PAGE_ORDER_KEY,
     MMA_DAG_CLIPPED_PAGE_LEAD_KEY,
     MMA_DAG_LOADS_KEY,

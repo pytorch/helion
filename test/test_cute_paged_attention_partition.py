@@ -18,6 +18,7 @@ from cutlass.base_dsl.compiler import DumpDir
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 import pytest
+import torch
 
 import helion
 from helion import exc
@@ -45,6 +46,7 @@ from helion._compiler.cute.paged_attention_partition import (
 from helion._compiler.cute.paged_attention_partition import partition_q_stages
 from helion._compiler.cute.paged_attention_partition import partition_skew_choices
 from helion._compiler.cute.paged_attention_partition import partition_slot_bits
+from helion._compiler.cute.paged_attention_partition import window_page_bound
 from helion._compiler.cute.paged_attention_partition_bounds import (
     partition_record_bytes,
 )
@@ -64,6 +66,7 @@ from helion._testing.cute_codegen import cpu_bind
 from helion._testing.cute_codegen import cpu_target
 from helion._testing.cute_codegen import load_generated_module
 from helion._testing.cute_paged_bounded import bounded_partial_fixture
+from helion._testing.cute_paged_partition import PAGES
 from helion._testing.cute_paged_partition import SHORT_WINDOW
 from helion._testing.cute_paged_partition import partition_attention_args
 from helion._testing.cute_paged_partition import partition_attention_kernel
@@ -1003,11 +1006,14 @@ def test_units_stream_with_their_own_steps_and_the_cta_total():
     step_helper = _function(tree, "_loader_step")
     (coordinates,) = calls(step_helper, "attention_page_coordinates")
     assert ast.unparse(coordinates.args[2]) == "step0 + step"
-    # The compute groups map the same step of the unit, not the part's own.
-    (coordinates,) = calls(
-        _function(tree, "_compute_pages"), "attention_page_coordinates"
+    # The compute groups map the same step of the unit, not the part's own:
+    # in Int32 where the bind bounds its table's keys, and in Int64.
+    narrow, wide = sorted(
+        calls(_function(tree, "_compute_pages"), "attention_page_coordinates"),
+        key=lambda call: call.lineno,
     )
-    assert ast.unparse(coordinates.args[2]) == "step0 + step"
+    assert ast.unparse(narrow.args[2]) == "cutlass.Int32(step0) + cutlass.Int32(step)"
+    assert ast.unparse(wide.args[2]) == "step0 + step"
     (shift,) = calls(step_helper, "logical_attention_key_shift")
     assert [ast.unparse(value) for value in shift.args[:3]] == [
         "logical_key_base",
@@ -1077,7 +1083,7 @@ def _shared_bytes(
         "units if partition != 'item' else 0",
         "partition == 'balanced'",
         "boundary_prefetch_form == 'wave_ahead'",
-        "value_ring",
+        "raw_v_ring",
         "bucketed",
     ]
     # The block's slots are counted there and laid out here: the body reads
@@ -3133,6 +3139,223 @@ def test_range_skew_is_a_knob_of_the_balanced_partition():
     }
     assert keywords["partition_skew"] == "8"
     assert "partition_skew" not in _render(partition_config("balanced"), **WIDE_SHARES)
+
+
+def test_a_static_window_bounds_the_skews_a_bind_offers():
+    """Under a static sliding window a unit walks the pages its window's
+    keys lie in, however long the page table: the skews are sized by the
+    smaller of the two, where the table's extent alone offered skews no
+    launch of the bind applies whole, each a kernel a search compiled and
+    timed that ran the schedule of a smaller one."""
+    # ``n`` consecutive keys start at worst on a page's last key: one or two
+    # positions (eight or sixteen rows in groups of eight) behind a window.
+    assert window_page_bound(0, 8, 8, 391) == 1
+    assert window_page_bound(0, 16, 8, 391) == 2
+    assert window_page_bound(127, 8, 8, 391) == 2
+    assert window_page_bound(127, 16, 8, 391) == 2
+    assert window_page_bound(128, 16, 8, 391) == 3
+    # The sliding-window shapes: 2047 keys behind the four or five positions
+    # of 32 or 40 rows.
+    assert window_page_bound(2047, 32, 8, 391) == 18
+    assert window_page_bound(2047, 40, 8, 391) == 18
+    every = (0, 1, 2, 4, 8, 16)
+    # 320 requests on 148 SMs share 847 slots of a 391-page table and 41
+    # of the window's 18 pages; 200 requests share 25, 128 on 128 CTAs 19.
+    assert partition_skew_choices(every, 320, 391, 148) == every
+    assert partition_skew_choices(every, 320, 391, 148, 18) == (0, 1)
+    assert partition_skew_choices(every, 320, 211, 148, 18) == (0, 1)
+    assert partition_skew_choices(every, 200, 391, 148, 18) == (0,)
+    assert partition_skew_choices(every, 128, 211, 148, 18) == (0,)
+    # A window that holds more pages than the table bounds nothing, and
+    # without one the table's extent decides as before.
+    assert partition_skew_choices(every, 320, 17, 148, 18) == (
+        partition_skew_choices(every, 320, 17, 148)
+    )
+    assert partition_skew_choices(every, 320, 391, 148, None) == every
+    # The module's wide bind: 160 units of at most 17 pages on 11 SMs. Its
+    # default window holds the whole table; one of 255 keys lies in four
+    # pages (with the fixture's five query positions), without a window
+    # the table's extent decides.
+    wide = _bound(**WIDE_SHARES)
+    short = _bound(window=255, **WIDE_SHARES)
+    unwindowed = _bound(window=-1, **WIDE_SHARES)
+    choices = {}
+    for name, bound in (("wide", wide), ("short", short), ("none", unwindowed)):
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.attention is not None
+        assert facts.attention.windowed is (name != "none")
+        choices[name] = facts.attention.partition_skew_choices
+    assert choices == {"wide": WIDE_SKEWS, "short": (0, 1, 2), "none": WIDE_SKEWS}
+    assert window_page_bound(255, 40, 8, PAGES) == 4
+    assert partition_skew_choices(every, 160, PAGES, 11, 4) == (0, 1, 2)
+    sms = WIDE_SHARES["sms"]
+    with (
+        cpu_render_target(fake_device_sm_count=sms, num_sm=sms),
+        short.env,
+        short.host_function,
+    ):
+        kept = short.config_spec.normalized_config(
+            partition_config("balanced", **{SKEW: 2})
+        )
+        assert (kept.config[KEY], kept.config[SKEW]) == ("balanced", 2)
+        # A skew the table's extent offered is no config of the bind any
+        # more: refused by name, and repaired to the equal partition.
+        removed = partition_config("balanced", **{SKEW: 8})
+        reason = f"{SKEW} must be one of (0, 1, 2) for {KEY}='balanced'"
+        with pytest.raises(exc.InvalidConfig, match=re.escape(reason)):
+            short.config_spec.normalized_config(removed)
+        short.config_spec.normalize(removed, _fix_invalid=True)
+        assert SKEW not in removed.config
+        assert removed.config.get(KEY) == "balanced"
+    # No seed names a skew the bind does not offer.
+    for seed in _seeds(short):
+        assert seed.config.get(SKEW, 0) in (0, 1, 2)
+    # A search over a cycle of input banks samples the skew: from the
+    # bind's choices.
+    cycled = _bound(window=255, input_banks=2, **WIDE_SHARES)
+    assert cycled.config_spec.cute_mma_dag_partition_skew_searched
+    assert tuple(cycled.config_spec.cute_mma_dag_partition_skew.choices) == (0, 1, 2)
+    assert (
+        tuple(
+            _bound(
+                input_banks=2, **WIDE_SHARES
+            ).config_spec.cute_mma_dag_partition_skew.choices
+        )
+        == WIDE_SKEWS
+    )
+
+
+def test_the_window_bound_counts_positions_from_the_query_rows():
+    """The constant a source subtracts from a request's length places the
+    unit's first query row; it is no count of positions, and the matcher
+    accepts any non-negative one. The bound takes the positions from the
+    rows and their group, so a bind whose offset is zero binds, and offers
+    what its rows and window give."""
+    # Eight rows in one group stand at one position, wherever it lies: 128
+    # units of a 255-key window have one CTA each and no skew, which is what
+    # the page table's extent alone gave them.
+    for offset in (0, 1):
+        args = list(partition_attention_args(units=128, rows=8, window=255))
+        assert args[7:10] == [1, 8, 255]
+        args[7] = offset
+        with cpu_render_target(fake_device_sm_count=148, num_sm=148):
+            bound = cpu_bind(partition_attention_kernel(), args, num_sm=148)
+        facts = bound.config_spec.cute_mma_dag_facts
+        assert facts is not None and facts.attention is not None
+        assert facts.attention.windowed
+        assert "balanced" in facts.attention.partition_choices
+        assert facts.attention.partition_skew_choices == (0,)
+    every = (0, 1, 2, 4, 8, 16)
+    assert partition_skew_choices(every, 128, PAGES, 148) == (0,)
+    # The module's wide bind has forty rows, five positions, behind either
+    # offset: its 255-key window lies in four pages.
+    sms = WIDE_SHARES["sms"]
+    args = list(partition_attention_args(units=WIDE_SHARES["units"], window=255))
+    assert args[7:9] == [5, 8]
+    args[7] = 0
+    with cpu_render_target(fake_device_sm_count=sms, num_sm=sms):
+        shifted = cpu_bind(partition_attention_kernel(), args, num_sm=sms)
+    facts = shifted.config_spec.cute_mma_dag_facts
+    assert facts is not None and facts.attention is not None
+    assert facts.attention.partition_skew_choices == (0, 1, 2)
+    # No window, no bound; nor where the table's key coordinates do not fit
+    # an Int32, in which two of its pages could hold the same ones.
+    assert window_page_bound(None, 40, 8, PAGES) is None
+    assert window_page_bound(255, 40, 8, 2**24) == 4
+    assert window_page_bound(255, 40, 8, 2**24 + 1) is None
+    assert window_page_bound(255, 40, 8, 2**25, 64) == 6
+    assert window_page_bound(255, 40, 8, 2**25 + 1, 64) is None
+    assert partition_skew_choices(every, 320, 391, 148, None) == every
+
+
+def _pages_rows_see(
+    window: int,
+    rows: int,
+    group: int,
+    offset: int,
+    lengths: list[int],
+    table: int,
+    width: int,
+    dtype: torch.dtype,
+) -> list[int]:
+    """Pages of a ``table``-page table that hold a key some row sees, per
+    request length, by the source's own arithmetic: the length less the
+    offset wraps in Int32, the grouped row and the window are applied in
+    the coordinate dtype, and every key of every page is tested against
+    every row."""
+    base = (torch.tensor(lengths, dtype=torch.int32) - offset).to(dtype)
+    position = base[:, None] + (torch.arange(rows) // group).to(dtype)[None, :]
+    key = torch.arange(table * width).to(dtype)
+    visible = (key[None, None, :] <= position[:, :, None]) & (
+        key[None, None, :] >= position[:, :, None] - window
+    )
+    seen = visible.any(dim=1).view(len(lengths), table, width).any(dim=2)
+    return seen.sum(dim=1).tolist()
+
+
+# Brute force over what the bound reads and what it must not depend on: the
+# window (page edges, the eval's, and one whose page count more than five
+# positions raise), the rows and their group (one to forty positions, whole
+# and ragged groups), the first row's offset below the length (zero, the
+# positions, and unrelated ones), the request's length (every alignment of
+# the window's first key in a page, short requests, Int32 wrap), the key
+# width and the coordinate dtype.
+@pytest.mark.parametrize(
+    "width,dtype", [(128, torch.int32), (128, torch.int64), (64, torch.int32)]
+)
+def test_no_row_sees_more_pages_than_the_window_bound(width, dtype):
+    table = 24
+    geometries = [
+        # rows, group, offset
+        (8, 8, 1),
+        (8, 8, 0),
+        (32, 8, 4),
+        (40, 8, 5),
+        (40, 8, 0),
+        (40, 8, 1),
+        (5, 1, 5),
+        (7, 2, 9),
+        (33, 8, 40),
+        # More than five positions: forty, and ten.
+        (40, 1, 3),
+        (40, 4, 0),
+    ]
+    # 120: ten and forty positions touch a page more than five do, at
+    # either key width.
+    windows = [0, 1, 120, 126, 127, 128, 129, 255, 300, 1023, 2047]
+    reached = 0
+    for window in windows:
+        for rows, group, offset in geometries:
+            bound = window_page_bound(window, rows, group, table, width)
+            assert bound is not None
+            positions = len({row // group for row in range(rows)})
+            lengths = [
+                # The window's first key at every place of a page.
+                page * width + first + window + offset
+                for page in (0, 2)
+                for first in (0, 1, width // 2, width - 2, width - 1)
+            ]
+            # Requests shorter than the window, than the offset, and those
+            # whose length arithmetic wraps.
+            lengths += [0, 1, offset, window // 2 + offset, table * width]
+            lengths += [2**31 - 1, 2**31 - 3, -(2**31), -(2**31) + offset]
+            seen = _pages_rows_see(
+                window, rows, group, offset, lengths, table, width, dtype
+            )
+            assert max(seen) <= bound, (window, rows, group, offset, seen, bound)
+            # The run of keys the rows see is the window and the positions.
+            span = window + positions
+            assert bound == (span - 1 + width - 1) // width + 1
+            if bound + 3 <= table:
+                # Reached where the window starts on a page's last key.
+                assert max(seen) == bound, (window, rows, group, offset)
+                reached += 1
+    assert reached > len(windows) * len(geometries) // 2
+    # The formula with the offset in the place of the positions, which is
+    # what a count read off the offset gives, is below what rows see.
+    (seen,) = _pages_rows_see(125, 40, 8, 1, [127 + 125 + 1], table, width, dtype)
+    assert seen == window_page_bound(125, 40, 8, table, width)
+    assert seen > (125 + 1 + width - 2) // width + 1
 
 
 def test_a_persistent_bind_is_specialized_on_the_sm_count():

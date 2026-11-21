@@ -49,6 +49,8 @@ from ..cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_CHOICES
 from ..cute_flash_bwd_row_mma import FLASH_BWD_ROW_Q_SPLIT_KEY
 from ..cute_flash_bwd_row_mma import flash_bwd_row_search_grid
 from ..cute_mma_dag import MMA_DAG_AUX_KEY
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY
+from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY
 from ..cute_mma_dag import MMA_DAG_BOUNDARY_PREFETCH_KEY
 from ..cute_mma_dag import MMA_DAG_CLUSTER_KEY
 from ..cute_mma_dag import MMA_DAG_DERIVED_KEY
@@ -76,7 +78,13 @@ from ..cute_mma_dag import MMA_DAG_V_LAG_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_READ_OVERLAP_KEY
 from ..cute_mma_dag import MMA_DAG_VALUE_METADATA_SKIP_KEY
 from ..cute_mma_dag import MMA_DAG_WARPS_KEY
+from ..cute_mma_dag import paged_attention_boundary_prefetch_ahead_choices
+from ..cute_mma_dag import paged_attention_boundary_prefetch_choices
+from ..cute_mma_dag import paged_attention_boundary_prefetch_cold_choices
 from ..cute_mma_dag import paged_attention_early_retirement_default
+from ..cute_mma_dag import paged_attention_page_order_choices
+from ..cute_mma_dag import paged_attention_value_ring_choices
+from ..cute_mma_dag import paged_attention_value_ring_tiles_choices
 from ..cute_mma_dag import paired_output_stores
 from ..cute_register_subblocks import COLSIDE_KEY as RSB_COLSIDE_KEY
 from ..cute_register_subblocks import KEY as RSB_KEY
@@ -101,6 +109,7 @@ from ..paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
 from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
+from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from ..pdl_release import CUTE_PDL_CAPTURE_DEFAULT
 from ..pdl_release import CUTE_PDL_CAPTURE_OVERLAP_KEY
@@ -214,8 +223,11 @@ from .flash_surface import prepare_override_normalization
 from .mma_dag_surface import CAPTURE_POLICY
 from .mma_dag_surface import CAPTURE_POLICY_REQUIREMENTS
 from .mma_dag_surface import PAIRED_CAPTURE_SCHEDULE
+from .mma_dag_surface import PAIRED_NEED_DEFAULTS
 from .mma_dag_surface import _normalize_cute_mma_dag
 from .mma_dag_surface import _normalize_cute_register_subblocks
+from .mma_dag_surface import boundary_prefetch_ahead_needs
+from .mma_dag_surface import boundary_prefetch_cold_needs
 from .mma_dag_surface import boundary_prefetch_needs
 from .mma_dag_surface import capture_overlap_eligible
 from .mma_dag_surface import carried_capture_policies
@@ -229,6 +241,7 @@ from .mma_dag_surface import paired_capture_schedule
 from .mma_dag_surface import rederive_overridden_key_clip
 from .mma_dag_surface import take_overridden_partition_transport
 from .mma_dag_surface import value_ring_needs
+from .mma_dag_surface import value_ring_tiles_needs
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -1959,6 +1972,8 @@ def _normalize_boundary_prefetch_policy(
     if not fix_invalid:
         raise InvalidConfig(reason)
     config.pop(MMA_DAG_BOUNDARY_PREFETCH_KEY)
+    # And the depth it would have had in a cold launch.
+    config.pop(MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY, None)
 
 
 def reconcile_overridden_boundary_prefetch(
@@ -1999,12 +2014,98 @@ def reconcile_overridden_boundary_prefetch(
     facts = config_spec.cute_mma_dag_facts
     if facts is None or facts.attention is None:
         return
+    needs = boundary_prefetch_needs(facts.attention.boundary_prefetch_form)
+    _reconcile_overridden_paired_knob(
+        config, overrides, MMA_DAG_BOUNDARY_PREFETCH_KEY, 0, needs
+    )
+    # The depth of a cold launch is the sibling prefetch's: it needs what
+    # the pages need and the pages themselves. A candidate that names a
+    # depth keeps the pages it has; one without pages takes the first of
+    # the seeded counts under an override that names a depth, as a search's
+    # step onto a depth does
+    # (``CuteConfigGenerationExtension._prefetch_neighbor_updates``), and
+    # loses its own depth under an override that takes the pages away.
     _reconcile_overridden_paired_knob(
         config,
         overrides,
-        MMA_DAG_BOUNDARY_PREFETCH_KEY,
+        MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY,
         0,
-        boundary_prefetch_needs(facts.attention.boundary_prefetch_form),
+        boundary_prefetch_cold_needs(
+            facts.attention.boundary_prefetch_form,
+            config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY, 0),
+        ),
+    )
+
+
+def boundary_prefetch_ahead_policy_reason(config_spec: ConfigSpec) -> str | None:
+    """Why the kernel cannot run the range-ahead prefetch a config names,
+    its schedule admitted.
+
+    The role assumes the grid of a kernel whose only root is the proved
+    paired schedule, as the boundary prefetches of one unit per CTA do
+    (``boundary_prefetch_policy_reason``). It needs no dependent-launch
+    policy: every CTA of a persistent launch starts with the launch.
+    """
+    facts = config_spec.cute_mma_dag_facts
+    if (
+        facts is None
+        or facts.attention is None
+        or not config_spec.cute_pdl_capture_overlap_available
+    ):
+        return (
+            f"{MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY} needs a kernel whose only "
+            "root runs the paired attention schedule"
+        )
+    return None
+
+
+def _normalize_boundary_prefetch_ahead_policy(
+    config_spec: ConfigSpec, config: dict[str, object], *, fix_invalid: bool
+) -> None:
+    """Repair a range-ahead distance that the kernel cannot run to none,
+    the missing key (``boundary_prefetch_ahead_policy_reason``). The
+    schedule's own rules ran before
+    (``mma_dag_surface._normalize_partition``)."""
+    distance = config.get(MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY, 0)
+    if type(distance) is int and distance == 0:
+        return
+    reason = boundary_prefetch_ahead_policy_reason(config_spec)
+    if reason is None:
+        return
+    if not fix_invalid:
+        raise InvalidConfig(reason)
+    config.pop(MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY)
+
+
+def reconcile_overridden_boundary_prefetch_ahead(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name a distance of the range-ahead prefetch or take away what
+    the candidate's own distance needs
+    (``_reconcile_overridden_paired_knob``).
+
+    The role is the balanced partition's, with that partition's transport
+    (``mma_dag_surface.boundary_prefetch_ahead_needs``). A search steps
+    onto a distance together with those
+    (``CuteConfigGenerationExtension._prefetch_ahead_neighbor_updates``).
+    Under an override that names a distance every paired candidate takes
+    them, and under one that contradicts them (another partition, the
+    value-metadata transport, no query TMA, another schedule) a candidate
+    loses its own distance and stays in the search. What such a move
+    leaves without its partition, pages of one unit per CTA among it,
+    ``drop_displaced_stream_knobs`` takes behind this."""
+    facts = config_spec.cute_mma_dag_facts
+    if facts is None or facts.attention is None:
+        return
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY,
+        0,
+        boundary_prefetch_ahead_needs(),
     )
 
 
@@ -2068,7 +2169,10 @@ def _reconcile_overridden_paired_knob(
 
     - An override that names the knob is layered over complete candidates.
       Every candidate on the paired schedule takes what the step takes,
-      wherever no override says otherwise.
+      wherever no override says otherwise. A candidate that does not name
+      one of those options has the option's default
+      (``mma_dag_surface.PAIRED_NEED_DEFAULTS``), which is not always the
+      value the knob needs: a depth of the cold prefetch needs pages.
     - An override that contradicts one of those options, or selects another
       schedule, would leave a candidate's own value behind for strict
       normalization to reject. The candidate becomes the one it is without
@@ -2097,14 +2201,18 @@ def _reconcile_overridden_paired_knob(
             config.pop(key)
         return
     # The capture policy is three options that hold only together, so a
-    # candidate gets each of them by name; any other option only where it
+    # candidate gets each of them by name; any other option only where the
+    # candidate's value, or the option's default for one it does not name,
     # differs.
     config.update(
         {
             name: value
             for name, value in needed.items()
             if name not in overrides
-            and (name in CUTE_PDL_CAPTURE_DEFAULT or config.get(name, value) != value)
+            and (
+                name in CUTE_PDL_CAPTURE_DEFAULT
+                or config.get(name, PAIRED_NEED_DEFAULTS[name]) != value
+            )
         }
     )
 
@@ -2174,6 +2282,141 @@ def reconcile_overridden_value_ring(
             config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM),
         ),
     )
+
+
+def reconcile_overridden_value_ring_tiles(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name a raw V ring counted in tiles or take away what the
+    candidate's own count needs (``_reconcile_overridden_paired_knob``).
+
+    Such a ring needs the paired schedule without the value-metadata
+    transport, the default depth in pages and a persistent partition whose
+    CTA holds it (``mma_dag_surface.value_ring_tiles_needs``). A search
+    steps onto a count together with those
+    (``CuteConfigGenerationExtension._value_ring_tiles_neighbor_updates``).
+    Under an override that names a count every paired candidate takes
+    them, and under one that contradicts them (one unit per CTA, a depth
+    in pages, the value-metadata transport, another schedule) a candidate
+    loses its own count and stays in the search. What the move onto a
+    persistent partition leaves without its partition (pages of one unit
+    per CTA, a page order that partition does not run),
+    ``drop_displaced_stream_knobs`` takes behind this."""
+    facts = config_spec.cute_mma_dag_facts
+    if facts is None or facts.attention is None:
+        return
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_VALUE_RING_TILES_KEY,
+        0,
+        value_ring_tiles_needs(
+            facts.attention,
+            config.get(MMA_DAG_VALUE_RING_TILES_KEY),
+            config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM),
+        ),
+    )
+
+
+def drop_displaced_stream_knobs(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Drop a paired candidate's own page order, ring depth, boundary
+    prefetch, cold depth, range-ahead distance or ring counted in tiles
+    where what the reconciliations ahead of this gave the candidate no
+    longer runs or holds it.
+
+    Each of those takes, for an override that names a knob, what the knob
+    needs of the candidate, and that can be another partition than the one
+    a second knob of the same candidate stands on: a fixed page count moves
+    a balanced seed to one unit per CTA, where its ring counted in tiles
+    and its range-ahead distance name nothing; a fixed tile count or
+    distance moves a seed that prefetches pages onto the balanced
+    partition, which also does not run every page order (the bucketed one,
+    and the reversed walk on a grid of one wave) and whose CTA may not hold
+    a deeper ring in pages. The candidate becomes the one it is without the
+    displaced knob, as it does under an override that contradicts the knob
+    directly (``_reconcile_overridden_paired_knob``), and as a search's
+    step onto the overridden knob leaves it: the step takes the partition
+    and normalization repairs what the partition does not run. An
+    overridden option is never changed, and without overrides nothing is:
+    a candidate is legal as the planner seeded it."""
+    facts = config_spec.cute_mma_dag_facts
+    if not overrides or facts is None or facts.attention is None:
+        return
+    attention = facts.attention
+    pass_warps = config.get(MMA_DAG_PASS_WARPS_KEY)
+    skip = config.get(MMA_DAG_VALUE_METADATA_SKIP_KEY, False)
+    partition = config.get(MMA_DAG_PARTITION_KEY, MMA_DAG_PARTITION_ITEM)
+    order = config.get(MMA_DAG_PAGE_ORDER_KEY, MMA_DAG_PAGE_ORDER_SOURCE)
+    if (
+        MMA_DAG_PAGE_ORDER_KEY not in overrides
+        and order != MMA_DAG_PAGE_ORDER_SOURCE
+        and order
+        not in paged_attention_page_order_choices(
+            attention, pass_warps, skip, partition
+        )
+    ):
+        # With it goes its lead of the clipped page, which names nothing
+        # beside the source's order (``_normalize_partition``).
+        config.pop(MMA_DAG_PAGE_ORDER_KEY)
+    ring = config.get(MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING)
+    if (
+        MMA_DAG_VALUE_RING_KEY not in overrides
+        and ring != PAIRED_DEFAULT_VALUE_RING
+        and ring
+        not in paged_attention_value_ring_choices(
+            attention, pass_warps, skip, partition
+        )
+    ):
+        config.pop(MMA_DAG_VALUE_RING_KEY)
+        ring = PAIRED_DEFAULT_VALUE_RING
+    pages = config.get(MMA_DAG_BOUNDARY_PREFETCH_KEY, 0)
+    if (
+        MMA_DAG_BOUNDARY_PREFETCH_KEY not in overrides
+        and pages != 0
+        and pages
+        not in paged_attention_boundary_prefetch_choices(
+            attention, pass_warps, skip, partition
+        )
+    ):
+        config.pop(MMA_DAG_BOUNDARY_PREFETCH_KEY)
+        pages = 0
+    cold = config.get(MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY, 0)
+    if (
+        MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY not in overrides
+        and cold != 0
+        and cold
+        not in paged_attention_boundary_prefetch_cold_choices(
+            attention, pass_warps, skip, partition, pages
+        )
+    ):
+        config.pop(MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY)
+    distance = config.get(MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY, 0)
+    if (
+        MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY not in overrides
+        and distance != 0
+        and distance
+        not in paged_attention_boundary_prefetch_ahead_choices(
+            attention, pass_warps, skip, partition
+        )
+    ):
+        config.pop(MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY)
+    tiles = config.get(MMA_DAG_VALUE_RING_TILES_KEY, 0)
+    if (
+        MMA_DAG_VALUE_RING_TILES_KEY not in overrides
+        and tiles != 0
+        and tiles
+        not in paged_attention_value_ring_tiles_choices(
+            attention, pass_warps, skip, partition, ring
+        )
+    ):
+        config.pop(MMA_DAG_VALUE_RING_TILES_KEY)
 
 
 def reconcile_overridden_page_order(
@@ -2608,6 +2851,7 @@ def _decline_boundary_prefetch_without_search(
         and facts.attention.boundary_prefetch_form == BOUNDARY_PREFETCH_SIBLING
     ):
         declined.pop(MMA_DAG_BOUNDARY_PREFETCH_KEY, None)
+        declined.pop(MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY, None)
     return declined
 
 
@@ -5078,6 +5322,9 @@ def normalize_recurrence_families(
     _normalize_paired_store_policy(config_spec, config)
     _normalize_cute_pdl_capture_overlap(config_spec, config, fix_invalid=fix_invalid)
     _normalize_boundary_prefetch_policy(config_spec, config, fix_invalid=fix_invalid)
+    _normalize_boundary_prefetch_ahead_policy(
+        config_spec, config, fix_invalid=fix_invalid
+    )
     _normalize_release_lead_policy(config, fix_invalid=fix_invalid)
     if config_spec.cute_register_subblocks is not None:
         _normalize_cute_register_subblocks(config_spec, config, fix_invalid=fix_invalid)
@@ -6195,6 +6442,14 @@ def cute_flat_fields(
         prefetch_fragment = config_spec.cute_mma_dag_boundary_prefetch
         if prefetch_fragment is not None:
             fields[MMA_DAG_BOUNDARY_PREFETCH_KEY] = prefetch_fragment
+        # Nor a depth of it in a cold launch.
+        cold_fragment = config_spec.cute_mma_dag_boundary_prefetch_cold
+        if cold_fragment is not None:
+            fields[MMA_DAG_BOUNDARY_PREFETCH_COLD_KEY] = cold_fragment
+        # Nor a distance of the balanced partition's range-ahead prefetch.
+        ahead_fragment = config_spec.cute_mma_dag_boundary_prefetch_ahead
+        if ahead_fragment is not None:
+            fields[MMA_DAG_BOUNDARY_PREFETCH_AHEAD_KEY] = ahead_fragment
         # Likewise the tail release's own lead of four pages.
         lead_fragment = config_spec.cute_mma_dag_release_lead
         if lead_fragment is not None:
@@ -6203,6 +6458,10 @@ def cute_flat_fields(
         ring_fragment = config_spec.cute_mma_dag_value_ring
         if ring_fragment is not None:
             fields[MMA_DAG_VALUE_RING_KEY] = ring_fragment
+        # Counted in pages, not in tiles.
+        ring_tiles_fragment = config_spec.cute_mma_dag_value_ring_tiles
+        if ring_tiles_fragment is not None:
+            fields[MMA_DAG_VALUE_RING_TILES_KEY] = ring_tiles_fragment
         # And the source's own page order.
         order_fragment = config_spec.cute_mma_dag_page_order
         if order_fragment is not None:
@@ -6887,13 +7146,19 @@ class CuteSearchSurface(BackendSearchSurface):
         reopen_load_hint_forms(config, overrides)
         # The partition, then a page order, which the partition must
         # run, then a depth of the raw V ring, which the partition's CTA
-        # must hold, then a prefetch, which has a role only with one unit
-        # per CTA and may need the capture policy, then a lead of the tail
-        # release, which needs that policy, then the policy itself.
+        # must hold, and its count in tiles, then a prefetch, which has a
+        # role only with one unit per CTA and may need the capture policy,
+        # and the balanced partition's range-ahead prefetch, then a lead of
+        # the tail release, which needs that policy, then the policy itself.
         take_overridden_partition_transport(config_spec, config, overrides)
         reconcile_overridden_page_order(config_spec, config, overrides)
         reconcile_overridden_value_ring(config_spec, config, overrides)
+        reconcile_overridden_value_ring_tiles(config_spec, config, overrides)
         reconcile_overridden_boundary_prefetch(config_spec, config, overrides)
+        reconcile_overridden_boundary_prefetch_ahead(config_spec, config, overrides)
+        # A knob may have moved the candidate off what another of its own
+        # knobs stands on.
+        drop_displaced_stream_knobs(config_spec, config, overrides)
         reconcile_overridden_release_lead(config_spec, config, overrides)
         _decline_overridden_capture_policy(
             capture_policy_available(config_spec), config, overrides

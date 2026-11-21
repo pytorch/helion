@@ -353,6 +353,7 @@ EMITTERS = (
             "_compiler/cute/_paged_attention_io.py",
             "_compiler/cute/paged_attention_page_order.py",
             "_compiler/cute/paged_attention_partition_bounds.py",
+            "_compiler/cute/paged_attention_prefetch.py",
             "_compiler/cute/paged_attention_registers.py",
             "_compiler/cute/paged_attention_release.py",
             "_compiler/cute/paged_attention_shared_memory.py",
