@@ -1,7 +1,7 @@
 """Kernels the Metal fragment-matmul tests share: the GPU module
-(``test/test_metal_fragment_mma.py``) runs them and the CPU-only ones
-(``test/test_metal_fragment_config.py``, ``test/test_metal_fragment_split.py``,
-``test/test_metal_fragment_rows.py``) read their config specs, code and MSL."""
+(``test/test_metal_fragment_mma.py``) runs them, and the CPU-only
+``test/test_metal_fragment_*.py`` modules read their config specs, seeds,
+code and MSL."""
 
 from __future__ import annotations
 
@@ -167,3 +167,69 @@ def nvfp4_cpu_args(rows: int = 8) -> tuple[torch.Tensor, ...]:
         torch.randint(-(2**31), 2**31 - 1, (48, 32), dtype=torch.int32),
         torch.randint(0, 0x60, (48, 16), dtype=torch.uint8),
     )
+
+
+@helion.kernel(backend="metal", static_shapes=True)
+def affine_mm(
+    x: torch.Tensor, w: torch.Tensor, scales: torch.Tensor, biases: torch.Tensor
+) -> torch.Tensor:
+    """x @ W.T for W in MLX's affine format: ``W[n, k] = scales[n, g] * code +
+    biases[n, g]``, ``g = k // group``, with the codes packed little-endian in
+    int16 words w [N, K * bits / 16]; the bit width and the group follow
+    from the shapes.  A code that straddles two words (5 bits: 4 of every
+    16; 6 bits: 2 of every 8) reads both.  The product runs on float
+    operands, the weight unrounded."""
+    m, k = x.size()
+    n, kw = w.size()
+    bits = 16 * kw // k
+    group = k // scales.size(1)
+    mask = (1 << bits) - 1
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros([tile_m, tile_n], dtype=F32)
+        for tile_k in hl.tile(k):
+            bit = tile_k.index * bits
+            lo = w[tile_n, bit // 16].to(torch.int32) & 0xFFFF
+            if 16 % bits == 0:
+                q = (lo >> (bit % 16)[None, :]) & mask
+            else:
+                nxt = torch.clamp(bit // 16 + 1, max=kw - 1)
+                hi = w[tile_n, nxt].to(torch.int32) & 0xFFFF
+                q = ((lo | (hi << 16)) >> (bit % 16)[None, :]) & mask
+            grp = tile_k.index // group
+            deq = q.to(F32) * scales[tile_n, grp].to(F32) + biases[tile_n, grp].to(F32)
+            acc = torch.addmm(acc, x[tile_m, tile_k].to(F32), deq.T)
+        out[tile_m, tile_n] = acc.to(x.dtype)
+    return out
+
+
+def affine_args(
+    bits: int, group: int, m: int, n: int, k: int, device: str = "cpu"
+) -> tuple[torch.Tensor, ...]:
+    """Arguments of :func:`affine_mm`: random fp16 rows, codes, scales and
+    biases."""
+    gen = torch.Generator().manual_seed(bits * 1000 + m)
+    x = torch.randn(m, k, generator=gen).to(torch.float16)
+    w = torch.randint(
+        -(2**15), 2**15, (n, k * bits // 16), generator=gen, dtype=torch.int16
+    )
+    scales = (torch.rand(n, k // group, generator=gen) * 0.02).to(torch.float16)
+    biases = (torch.randn(n, k // group, generator=gen) * 0.02).to(torch.float16)
+    return tuple(t.to(device) for t in (x, w, scales, biases))
+
+
+def affine_reference(args: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    """:func:`affine_mm` in float64 on the CPU."""
+    x, w, scales, biases = (t.cpu() for t in args)
+    n, kw = w.shape
+    k = x.size(1)
+    bits = 16 * kw // k
+    group = k // scales.size(1)
+    words = w.to(torch.int64) & 0xFFFF
+    bit = torch.arange(k) * bits
+    lo = words[:, bit // 16]
+    hi = words[:, torch.clamp(bit // 16 + 1, max=kw - 1)]
+    codes = ((lo | (hi << 16)) >> (bit % 16)) & ((1 << bits) - 1)
+    grp = torch.arange(k) // group
+    deq = codes.double() * scales.double()[:, grp] + biases.double()[:, grp]
+    return x.double() @ deq.T
