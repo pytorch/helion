@@ -182,6 +182,7 @@
  "test/test_cute_host_remainder_fills.py": 1.4,
  "test/test_cute_host_single_sum_abi.py": 0.0,
  "test/test_cute_inductor_epilogues_gpu.py": 29.7,
+ "test/test_cute_integer_extrema_cuda.py": 20.5,
  "test/test_cute_integer_literals_gpu.py": 2.9,
  "test/test_cute_integer_vector_io.py": 4.6,
  "test/test_cute_interchanged_store_dce.py": 4.1,

@@ -2205,7 +2205,9 @@ class CutePersistentReductionEmitter(
                 self._sibling_axis_group_params(state) if group_params is None else None
             )
 
-            def marker(value: str, combine: str, identity: str) -> str:
+            def marker(
+                value: str, combine: str, identity: str, index_candidates: bool = False
+            ) -> str:
                 if group_params is not None:
                     group_pre, group_span, group_lane_expr = group_params
                     return _lane_reduce_marker_expr(
@@ -2218,6 +2220,7 @@ class CutePersistentReductionEmitter(
                         group_lane_expr=group_lane_expr,
                         owner_lane=owner_lane,
                         broadcast_owner=broadcast_owner,
+                        index_candidates=index_candidates,
                     )
                 if sibling_params is not None:
                     (
@@ -2239,6 +2242,7 @@ class CutePersistentReductionEmitter(
                         owner_lane=owner_lane,
                         broadcast_owner=broadcast_owner,
                         shared_lane_expr=shared_lane_expr,
+                        index_candidates=index_candidates,
                     )
                 return _lane_reduce_marker_expr(
                     value,
@@ -2247,6 +2251,7 @@ class CutePersistentReductionEmitter(
                     threads,
                     owner_lane=owner_lane,
                     broadcast_owner=broadcast_owner,
+                    index_candidates=index_candidates,
                 )
 
             if not backend.is_indexed_reduction(reduction_type):
@@ -2279,7 +2284,7 @@ class CutePersistentReductionEmitter(
                     + argreduce_candidate_expr(index, input_expr, value_var, max_index)
                 )
                 expr = backend.cast_expr(
-                    marker(candidate_var, "min", max_index),
+                    marker(candidate_var, "min", max_index, index_candidates=True),
                     backend.dtype_str(fake_output.dtype),
                 )
             return expr_from_string(
@@ -4023,6 +4028,7 @@ class CuteBlockReductionEmitter(
         threads: int,
         *,
         strided_restore: bool = False,
+        index_candidates: bool = False,
     ) -> str:
         """Emit the two-pass lane-reduction marker for a lane-looped block.
 
@@ -4074,6 +4080,7 @@ class CuteBlockReductionEmitter(
                 threads,
                 owner_lane=owner_lane,
                 strided_restore=strided_restore,
+                index_candidates=index_candidates,
             )
         group_pre, group_span, group_count, group_lane_expr = group_params
         return _lane_reduce_marker_expr(
@@ -4088,6 +4095,7 @@ class CuteBlockReductionEmitter(
             group_cluster_n=cluster_n,
             owner_lane=owner_lane,
             strided_restore=strided_restore,
+            index_candidates=index_candidates,
         )
 
     def emit_device_lane_loop_marker(
@@ -4216,6 +4224,7 @@ class CuteBlockReductionEmitter(
                 max_index,
                 threads,
                 strided_restore=strided_restore,
+                index_candidates=True,
             ),
             backend.dtype_str(torch.int64),
         )

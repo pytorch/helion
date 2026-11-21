@@ -4174,34 +4174,26 @@ class CuteBackend(Backend):
         val: str,
         dtype: torch.dtype,
     ) -> str:
-        # Use Python ternary instead of cute.where for max/min because
-        # these operate on scalar registers, not tensors.
-        #
         # Cast the incoming value to the accumulator dtype first.  The
         # accumulator is promoted to the computation dtype (fp32 for
         # half-precision inputs), but the per-iteration reduction input keeps
-        # the tensor's storage dtype (e.g. bf16 for a masked half load).  The
-        # CUTLASS DSL strictly type-checks the two branches of a Python ternary
-        # ("Then and else blocks of ifexp return different types"), so a bare
-        # ``acc if acc > val else val`` with mixed fp32/bf16 operands fails to
-        # compile.  The cast is a no-op when ``val`` already matches.
+        # the tensor's storage dtype (e.g. bf16 for a masked half load), and
+        # the CUTLASS DSL type-checks the operands of a combine: mixed
+        # fp32/bf16 operands fail to compile.  The cast is a no-op when
+        # ``val`` already matches.
         val = self.cast_expr(val, self.dtype_str(dtype))
         if reduction_type == "sum":
             return f"({acc} + {val})"
-        if reduction_type in ("min", "max") and dtype == torch.int32:
-            # Preserve signed ordering through unsigned keys. The CUDA compiler
-            # can lose a source negation when combining a signed Int32 extrema
-            # chain into VIMNMX3. Flipping the sign bit is an exact order
-            # isomorphism and avoids that invalid signed fusion.
-            sign_bit = "cutlass.Uint32(2147483648)"
-            lhs = f"(cutlass.Uint32({acc}) ^ {sign_bit})"
-            rhs = f"(cutlass.Uint32({val}) ^ {sign_bit})"
-            return (
-                f"cutlass.Int32(cute.math.{reduction_type}({lhs}, {rhs}) ^ {sign_bit})"
-            )
         if reduction_type in ("max", "min"):
+            # The accumulate is a chain of extrema: Int32 and Int16 compare
+            # through unsigned keys, since ptxas loses a negation when it
+            # fuses their signed chain (``nan_extremum_expr``).
             return nan_extremum_expr(
-                reduction_type, acc, val, float32=dtype == torch.float32
+                reduction_type,
+                acc,
+                val,
+                float32=dtype == torch.float32,
+                chain_dtype=self.dtype_str(dtype),
             )
         if reduction_type == "prod":
             return f"({acc} * {val})"

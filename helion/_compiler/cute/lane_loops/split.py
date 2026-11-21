@@ -58,7 +58,6 @@ from .markers import HELION_FINALIZED
 from .markers import HELION_LANE_SPLIT_ATTR
 from .markers import HELION_VECTOR_REDUCTION_OWNER_ATTR
 from .markers import LaneSplitRecord
-from .markers import _combine_expr
 from .markers import _create_lane_loop
 from .markers import _dtype_ctor_from_identity
 from .markers import _finalize_lane_reduce_marker
@@ -725,13 +724,7 @@ def _split_impure_producer(
         statement_from_string(f"{stash}.append({name})")
         for name, stash in produced_stashes.items()
     )
-    ctor = _dtype_ctor_from_identity(marker.identity_expr)
-    value = f"{ctor}({marker.input_name})" if ctor else marker.input_name
-    produce.append(
-        statement_from_string(
-            f"{acc} = {_combine_expr(marker.reduction_type, acc, value, ctor)}"
-        )
-    )
+    produce.append(statement_from_string(f"{acc} = {marker.accumulate_expr(acc)}"))
     result.extend(
         [unrolled(produce), statement_from_string("cute.arch.sync_threads()")]
     )
@@ -1122,14 +1115,7 @@ def _split_one_lane_loop(
         acc_var = f"{m.result_var}_lane_acc"
         accumulators.append(acc_var)
         prefix.append(statement_from_string(f"{acc_var} = {m.identity_expr}"))
-        # Cast the per-lane input to the accumulator dtype before combining so
-        # the CUTLASS DSL's strict ternary type check (max/min emit a Python
-        # ``a if a > b else b``) does not see mixed fp32/bf16 operands.
-        ctor = _dtype_ctor_from_identity(m.identity_expr)
-        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
-        update = statement_from_string(
-            f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
-        )
+        update = statement_from_string(f"{acc_var} = {m.accumulate_expr(acc_var)}")
         accumulate_body.append(update)
         marker_updates[marker_index] = update
         finalize.extend(_finalize_lane_reduce_marker(m, acc_var))
@@ -1543,16 +1529,9 @@ def _validate_owned_lane_carry_schedule(
             marker = _is_lane_reduce_marker_assign(body[index])
             assert marker is not None
             accumulator = f"{marker.result_var}_lane_acc"
-            ctor = _dtype_ctor_from_identity(marker.identity_expr)
-            value = (
-                f"{ctor}({marker.input_name})"
-                if ctor is not None
-                else marker.input_name
-            )
             expected.append(
                 statement_from_string(
-                    f"{accumulator} = "
-                    f"{_combine_expr(marker.reduction_type, accumulator, value, ctor)}"
+                    f"{accumulator} = {marker.accumulate_expr(accumulator)}"
                 )
             )
         if not (
@@ -2032,15 +2011,8 @@ def _split_dependent_lane_reductions(
         acc_var = f"{marker.result_var}_lane_acc"
         result.append(statement_from_string(f"{acc_var} = {marker.identity_expr}"))
         acc_body = [_rerun_copy(stmt) for stmt in stage]
-        ctor = _dtype_ctor_from_identity(marker.identity_expr)
-        combine_val = (
-            f"{ctor}({marker.input_name})" if ctor is not None else marker.input_name
-        )
         acc_body.append(
-            statement_from_string(
-                f"{acc_var} = "
-                f"{_combine_expr(marker.reduction_type, acc_var, combine_val, ctor)}"
-            )
+            statement_from_string(f"{acc_var} = {marker.accumulate_expr(acc_var)}")
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
         result.extend(_finalize_lane_reduce_marker(marker, acc_var))
@@ -2590,12 +2562,8 @@ def _split_lane_loop_with_register_stash(
         acc_body.extend(_rerun_copy(s) for s in recompute_kept)
         acc_body.extend(read_stash_stmts())
         acc_body.extend(_rerun_copy(s) for s in input_stmts)
-        ctor = _dtype_ctor_from_identity(m.identity_expr)
-        combine_val = f"{ctor}({m.input_name})" if ctor is not None else m.input_name
         acc_body.append(
-            statement_from_string(
-                f"{acc_var} = {_combine_expr(m.reduction_type, acc_var, combine_val, ctor)}"
-            )
+            statement_from_string(f"{acc_var} = {m.accumulate_expr(acc_var)}")
         )
         result.append(_clone_lane_loop_with_body(loop, acc_body))
         result.extend(_finalize_lane_reduce_marker(m, acc_var))
@@ -3254,12 +3222,8 @@ def _rereduce_restored_lane_markers(
             marker, result_var=share, wrap_template=HELION_FINALIZED
         )
         loop_body.extend(_finalize_lane_reduce_marker(per_lane, marker.input_name))
-        ctor = _dtype_ctor_from_identity(marker.identity_expr)
-        value = f"{ctor}({share})" if ctor is not None else share
         loop_body.append(
-            statement_from_string(
-                f"{total} = {_combine_expr(marker.reduction_type, total, value, ctor)}"
-            )
+            statement_from_string(f"{total} = {marker.accumulate_expr(total, share)}")
         )
         finalized.append(
             statement_from_string(
