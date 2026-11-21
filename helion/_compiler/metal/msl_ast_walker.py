@@ -42,11 +42,15 @@ from .fragment_mma import is_fragment_acc
 from .fragment_mma import prefetch_loads
 from .fragment_mma import split_range
 from .fragment_mma import split_runs
+from .lane_fold import BF16_CAST
 from .lane_fold import LANE_PUT
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_RUN
+from .mpp_matmul import REG_RUN
+from .mpp_registers import emit_register_run
+from .mpp_registers import register_atom
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
@@ -54,6 +58,9 @@ from .msl_reduction import REDUCTION_NAMESPACE
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from .affine_fold import Fact
+    from .coop_layout import Atom
+    from .mpp_registers import CoopLanes
     from .operand_elements import ElementBody
 
 
@@ -122,8 +129,24 @@ class EmitState:
     split: int = 1
     split_loops: list[str] = dataclasses.field(default_factory=list)
     split_slots: int = 0
-    #: The element an element loop's ``_helion_mpp_put`` writes.
+    #: The element an element loop's ``_helion_mpp_put`` writes, and the
+    #: type it converts the value to first, if any.
     put: str = "*_it"
+    put_type: str | None = None
+    #: Each register group's accumulator root to its op (``mpp_registers``).
+    register_atoms: dict[str, Atom] = dataclasses.field(default_factory=dict)
+    #: Whether the kernel runs on the GPU here, which the register operands'
+    #: layouts are then probed on (``coop_layout``).
+    on_gpu: bool = False
+    #: The lane bases of those layouts' elements: each base's values to its
+    #: name, the preamble's declarations of them, the facts the fold knows of
+    #: them, and each op's operand's elements in terms of them.
+    lane_names: dict[tuple[int, ...], str] = dataclasses.field(default_factory=dict)
+    lane_decls: list[str] = dataclasses.field(default_factory=list)
+    lane_facts: dict[str, Fact] = dataclasses.field(default_factory=dict)
+    lanes: dict[tuple[Atom, str, bool], CoopLanes] = dataclasses.field(
+        default_factory=dict
+    )
 
     def is_declared(self, name: str) -> bool:
         return name in self.declared or any(name in s for s in self._enclosing)
@@ -277,9 +300,15 @@ def _emit_stmts(
                 # An element loop's write of the updated element (mpp_matmul's
                 # _helion_mpp_update).
                 assert isinstance(call, ast.Call)
-                parts.append(
-                    f"{pad}{state.put} = {_ast_expr_to_msl(call.args[0], subs=subs)};"
-                )
+                value = _ast_expr_to_msl(call.args[0], subs=subs)
+                if state.put_type == "bfloat":
+                    # MSL converts float to bfloat only explicitly, and its
+                    # cast flushes bfloat subnormals, which the staged
+                    # path's rounding keeps (mpp_matmul.ROUND).
+                    value = f"{BF16_CAST}({value})"
+                elif state.put_type is not None:
+                    value = f"static_cast<{state.put_type}>({value})"
+                parts.append(f"{pad}{state.put} = {value};")
             elif _is_call_to(call, "_helion_mpp_fence"):
                 parts.append(
                     f"{pad}threadgroup_barrier(mem_flags::mem_device | "
@@ -370,19 +399,32 @@ def _emit_coop_acc(
     lhs_dtype, rhs_dtype, acc_dtype = dtypes
     lhs = f"tensor<{lhs_space} {lhs_dtype}, extents<int32_t, {lhs_extents}>, tensor_inline>"
     rhs = f"tensor<{rhs_space} {rhs_dtype}, extents<int32_t, {rhs_extents}>, tensor_inline>"
-    parts.extend(
-        [
-            (
-                f"{pad}constexpr auto {desc} = matmul2d_descriptor({tm}, {tn}, {tk}, "
-                f"{flags}, false, matmul2d_descriptor::mode::multiply_accumulate);"
-            ),
-            f"{pad}matmul2d<{desc}, execution_simdgroups<{scope}>> _mpp_op_{gid};",
-            (
-                f"{pad}auto {name} = _mpp_op_{gid}.get_destination_cooperative_tensor<"
-                f"{lhs}, {rhs}, {acc_dtype}>();"
-            ),
-        ]
-    )
+    atom = register_atom(call)
+    if atom is not None:
+        # An op on register operands (``mpp_registers``): one SIMD group's,
+        # its destination typed by its cooperative and device inputs.
+        state.register_atoms[name] = atom
+        parts.extend(
+            [
+                f"{pad}{atom.op_type()} _mpp_op_{gid};",
+                f"{pad}auto {name} = {atom.tensor(f'_mpp_op_{gid}', 'dest')};",
+            ]
+        )
+    else:
+        parts.extend(
+            [
+                (
+                    f"{pad}constexpr auto {desc} = matmul2d_descriptor({tm}, {tn}, "
+                    f"{tk}, {flags}, false, "
+                    "matmul2d_descriptor::mode::multiply_accumulate);"
+                ),
+                f"{pad}matmul2d<{desc}, execution_simdgroups<{scope}>> _mpp_op_{gid};",
+                (
+                    f"{pad}auto {name} = _mpp_op_{gid}.get_destination_cooperative_"
+                    f"tensor<{lhs}, {rhs}, {acc_dtype}>();"
+                ),
+            ]
+        )
     if seed is None:
         value = f"{float(fill)!r}f" if acc_dtype == "float" else repr(int(fill))
         parts.append(
@@ -455,6 +497,9 @@ def _coop_view(
     tile_dims: tuple[bool, bool],
     blocks: tuple[int, int],
     outer: list[ast.expr],
+    k_dim: int | None = None,
+    k_shift: str = "0",
+    k_tail: bool = True,
 ) -> tuple[list[str], list[str], str]:
     """A device view of one tile, from ``tensor, (origin, extent, size,
     stride)`` per dim, and ``(index, size, stride)`` per outer dim, each
@@ -473,6 +518,11 @@ def _coop_view(
     ``origin < extent``.  A tile dim's origin is its loop offset and its
     extent the size, so it is live by construction (offset < loop end <=
     size).
+
+    A register run reads a view one K step at a time
+    (``mpp_registers.emit_register_run``): ``k_dim``'s origin moves by
+    ``k_shift`` and its block is the step's K, and a step past the dim's
+    extent isn't live; with no K tail (``k_tail`` false) every step is.
     """
     ptr = _ast_expr_to_msl(args[0])
     decls: list[str] = []
@@ -483,6 +533,10 @@ def _coop_view(
     for d in range(2):
         o, e, size, stride = (_ast_expr_to_msl(a) for a in args[1 + 4 * d : 5 + 4 * d])
         strides.append(stride)
+        if d == k_dim and k_shift != "0":
+            o = f"({o}) + {k_shift}"
+            if tile_dims[d] and k_tail:
+                live.append(f"(long)({o}) < (long)({size})")
         if tile_dims[d]:
             origins.append(f"(long)({o})")
             extents.append(
@@ -641,6 +695,18 @@ def _emit_for(
         raise exc.BackendUnsupported("metal", f"for loop iter: {ast.unparse(it)}")
 
     func = it.func
+
+    # --- An op on register operands over one K tile (mpp_registers) ---
+    if isinstance(func, ast.Name) and func.id == REG_RUN:
+        emit_register_run(
+            stmt,
+            parts,
+            indent,
+            state,
+            lambda body, out, ind, st: _emit_stmts(body, out, indent=ind, state=st),
+            _coop_view,
+        )
+        return
 
     # --- A fragment group's op over one K tile (fragment_mma.fragment_run) ---
     if isinstance(func, ast.Name) and func.id == FRAG_RUN:

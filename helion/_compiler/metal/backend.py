@@ -906,6 +906,7 @@ class MetalBackend(Backend):
         from .mpp_matmul import MppPlan
         from .mpp_matmul import metal_unsupported
         from .mpp_matmul import plan_mpp_matmuls
+        from .mpp_registers import REGISTER_LOWERING
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
@@ -929,11 +930,14 @@ class MetalBackend(Backend):
         else:
             # MatmulFallback reads whether a failed pass's planner raised.
             self.mpp_plan_refused = True
+            # MPP builds the computed operands of ops one SIMD group runs in
+            # registers (``mpp_registers``), which decides per group at codegen.
             self.mpp_plan = plan_mpp_matmuls(
                 graphs,
                 threaded,
                 FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
                 functools.partial(_widen_k, config),
+                REGISTER_LOWERING if metal_matmul(config) == "mpp" else None,
             )
             self.mpp_plan_refused = False
         split = fragment_split(CompileEnvironment.current().config_spec, config)
