@@ -13,7 +13,10 @@ into your code, then retune when your target shapes or hardware differ
 materially from the included sweep.
 
 Each kernel module has a `main()` that benchmarks against one or more named
-reference baselines.
+reference baselines, except the speculative-decoding verify megakernels outside
+`muse_spark/`, which so far have only a `correctness_check()`, and the Muse
+Spark layer megakernel (`muse_spark/layer.py`), whose `main()` runs its FP64
+checks and times it alone (its baseline is the serving engine's layer).
 
 ## File structure
 
@@ -48,16 +51,16 @@ pretuned_kernels/
 ├── gdn_decode/                       # TPU/Pallas fixed-config recurrent decode
 └── megakernels/
     ├── kda_decode/                   # Kimi-K3 KDA decode sublayer
-    ├── qwen3_8b/                     # Qwen3-8B FP8 and BF16 decode layers
+    ├── qwen3_8b/                     # Qwen3-8B FP8 and BF16 decode layers, BF16 verify layer
     ├── qwen3_30b_a3b_moe/            # Qwen3-30B-A3B MoE block
-    ├── llama32_1b_decode_layer_bf16/ # Llama-3.2-1B BF16 decode layer
+    ├── llama32_1b_decode_layer_bf16/ # Llama-3.2-1B BF16 decode and verify layers
     ├── gemma4_a4b_moe/               # Gemma 4 26B-A4B MoE
     ├── gpt_oss_moe/                  # gpt-oss MoE
     ├── flash_mla/                    # DeepSeek-V3 MLA decode, one request
-    ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE
-    ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4
+    ├── deepseek_v3_moe_nvfp4/        # DeepSeek-V3 NVFP4 MoE, decode and verify
+    ├── deepseek_v3_moe_nvfp4_tp/     # DeepSeek-V3 NVFP4 MoE + all-reduce + RMSNorm, TP4, decode and verify
     ├── deepseek_v3_attention_nvfp4_tp/
-    └── muse_spark/
+    └── muse_spark/                   # Muse Spark verify: decoder layer (TP4, TP8), LM head, EP4 MoE
 ```
 
 Each kernel ships with one heuristic file per supported compute capability.
@@ -167,8 +170,9 @@ falls back to older compatible CUDA/ROCm capabilities.  For example, on
 
 ## Running benchmarks
 
-Each kernel module has a `main()` that benchmarks the Helion kernel against its
-named reference baselines across the included shape set:
+Each kernel module (except the verify megakernels noted above) has a `main()`
+that benchmarks the Helion kernel against its named reference baselines across
+the included shape set:
 
 ```bash
 cd pretuned_kernels/softmax

@@ -38,6 +38,37 @@ def stable_key(values: torch.Tensor, index: torch.Tensor, count: int) -> torch.T
     return ordered * count + (count - 1 - index.to(torch.int64))
 
 
+# A key below every ``stable_key`` key: a picked expert.
+PICKED = -9223372036854775807
+
+
+def key_index(key: torch.Tensor, count: int) -> torch.Tensor:
+    """The index packed in a ``stable_key`` key's low digits."""
+    return (count - 1 - (key % count + count) % count).to(torch.int32)
+
+
+def top_k_picks(
+    scores: torch.Tensor, keys: torch.Tensor, indices: torch.Tensor, count: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The eight largest ``keys``' experts [8] in pick order, their ``scores``
+    and those scores' sum in pick order."""
+    picks = hl.arange(8)
+    ids = hl.full([8], 0, dtype=torch.int32)
+    # One max per pick: the largest key is the stable maximum, and its low
+    # digits name the expert.
+    for pick in hl.static_range(8):
+        best = torch.amax(keys)
+        keys = torch.where(keys == best, PICKED, keys)
+        ids = torch.where(picks == pick, key_index(best, count), ids)
+    # Every pick's score in one reduction (one-hot sums: exact).
+    picked = torch.where(indices[None, :] == ids[:, None], scores[None, :], 0.0)
+    weights = torch.sum(picked, dim=1)
+    total = torch.sum(torch.where(picks == 0, weights, 0.0))
+    for pick in hl.static_range(7):
+        total = total + torch.sum(torch.where(picks == pick + 1, weights, 0.0))
+    return ids, weights, total
+
+
 def routing_keys(
     logits: torch.Tensor,
     correction_bias: torch.Tensor,
