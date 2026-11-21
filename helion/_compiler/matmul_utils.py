@@ -664,6 +664,27 @@ def matmul_contraction_block_ids() -> set[int]:
     return result
 
 
+def kernel_holds_tensor_memory() -> bool:
+    """Whether the kernel may take tensor memory on Blackwell: its device IR
+    holds a matmul (``matmul_operand_indices``: tcgen05.mma, and tcgen05.cp
+    for ``dot_scaled``'s scales) or user Triton or assembly, which may."""
+    from ..language import inline_asm_ops
+    from ..language import inline_triton_ops
+    from .host_function import HostFunction
+
+    targets = {
+        *matmul_operand_indices(),
+        inline_asm_ops.inline_asm_elementwise,
+        inline_triton_ops.inline_triton,
+        inline_triton_ops.triton_kernel,
+    }
+    return any(
+        node.op == "call_function" and node.target in targets
+        for graph_info in HostFunction.current().device_ir.graphs
+        for node in graph_info.graph.nodes
+    )
+
+
 def kernel_has_half_precision_matmul() -> bool:
     """Whether some matmul of the kernel has a 16-bit float operand, which a
     warp-MMA plan (the direct grouped-N path) may lower with its own thread

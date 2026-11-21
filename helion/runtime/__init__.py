@@ -18,6 +18,9 @@ from .kernel import OutputCodeOptions as OutputCodeOptions
 from .kernel import kernel as kernel
 from .pallas.launcher import default_pallas_launcher as default_pallas_launcher
 from .settings import is_pallas_interpret as _module_is_pallas_interpret
+from .triton.launcher import CLUSTER_LAUNCH_REFUSED as _CLUSTER_LAUNCH_REFUSED
+from .triton.launcher import TENSOR_MEMORY_REFUSED as _TENSOR_MEMORY_REFUSED
+from .triton.launcher import check_cluster_device as _check_cluster_device
 from .triton.launcher import default_launcher as _triton_default_launcher
 from .triton.launcher import get_num_sm as _triton_get_num_sm
 from .triton.launcher import get_num_xcd as get_num_xcd
@@ -63,6 +66,8 @@ def default_launcher(
     _persistent_state_rank_shares: tuple[int, ...] = (),
     _timeline: tuple[int, TimelineMeta] | None = None,
     _minimum_resident_programs: int = 0,
+    _cluster_size: int = 1,
+    _tensor_memory: bool = True,
     ptx_options: str | None = None,
     launch_cooperative_grid: bool = False,
     **kwargs: dict,
@@ -94,6 +99,8 @@ def default_launcher(
             if _timeline is None
             else _timeline_register(_timeline[1]),
             _minimum_resident_programs=_minimum_resident_programs,
+            _cluster_size=_cluster_size,
+            _tensor_memory=_tensor_memory,
             ptx_options=ptx_options,
             launch_cooperative_grid=launch_cooperative_grid,
             **kwargs,
@@ -102,25 +109,38 @@ def default_launcher(
         message = str(error)
         if "Cannot make_shape_compatible: incompatible dimensions" in message:
             raise exc.ShapeMismatch("kernel operands", message) from error
-        if message.startswith("Cross-loop scheduling requires "):
+        if message.startswith(
+            (
+                "Cross-loop scheduling requires ",
+                _CLUSTER_LAUNCH_REFUSED,
+                _TENSOR_MEMORY_REFUSED,
+            )
+        ):
             raise exc.InvalidConfig(message) from error
         raise
 
 
-def get_num_sm(device: torch.device, *, reserved_sms: int = 0) -> int:
+def get_num_sm(
+    device: torch.device, *, reserved_sms: int = 0, cluster_size: int = 1
+) -> int:
     """Number of SMs (persistent-kernel grid size) for any Helion device.
 
     Adds the CPU (Pallas-interpret) and TPU cases on top of the dependency-free
     GPU helper :func:`helion.runtime.triton.launcher.get_num_sm`. See that
     function for argument/return semantics.
     """
+    if device.type in ("cpu", "tpu"):
+        # The GPU helper checks the cluster size on the other devices.
+        _check_cluster_device(device, cluster_size)
     if device.type == "cpu":
         if not _module_is_pallas_interpret():
             raise AssertionError("TODO: implement for other devices")
         return 1
     if device.type == "tpu":
         return 1
-    return _triton_get_num_sm(device, reserved_sms=reserved_sms)
+    return _triton_get_num_sm(
+        device, reserved_sms=reserved_sms, cluster_size=cluster_size
+    )
 
 
 if not TYPE_CHECKING:  # keep type checkers flagging typos in helion.runtime
