@@ -221,6 +221,45 @@ def make_test_function(input_dtype, acc_dtype, static_shapes_option):
 
 @onlyBackends(["triton", "cute"])
 class TestDot(RefEagerTestBase, TestCase):
+    @onlyBackends(["triton"])
+    @skipIfRefEager("Tests the H100 compiler default")
+    def test_h100_bf16_dot_converts_fp8_weights(self):
+        if not is_cuda() or torch.cuda.get_device_capability() != (9, 0):
+            self.skipTest("Requires an H100-class GPU")
+
+        @helion.kernel(static_shapes=True)
+        def matmul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+            m, k = x.shape
+            n = y.shape[1]
+            out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+            for tile_m, tile_n in hl.tile([m, n]):
+                acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+                for tile_k in hl.tile(k):
+                    weights = y[tile_k, tile_n].to(torch.bfloat16)
+                    acc = hl.dot(x[tile_m, tile_k], weights, acc=acc)
+                out[tile_m, tile_n] = acc
+            return out
+
+        for dtype, transposed in (
+            (torch.float8_e4m3fn, False),
+            (torch.float8_e5m2, True),
+            (torch.bfloat16, False),
+        ):
+            with self.subTest(dtype=dtype, transposed=transposed):
+                x = torch.randn((37, 1031), dtype=torch.bfloat16, device=DEVICE)
+                shape = (1543, 1031) if transposed else (1031, 1543)
+                y = torch.randn(shape, dtype=torch.bfloat16, device=DEVICE).to(dtype)
+                if transposed:
+                    y = y.T
+                bound = matmul._bind_isolated((x, y))
+                config = bound.config_spec.default_config()
+                blocks = config.config["block_sizes"]
+                assert isinstance(blocks, list)
+                self.assertEqual(blocks[0], 64)
+                out = bound.compile_config(config)(x, y)
+                expected = x.float() @ y.to(torch.bfloat16).float()
+                torch.testing.assert_close(out.float(), expected, rtol=0.02, atol=0.2)
+
     def test_hl_dot_operands_uniform_along_k(self):
         """Operands expanded from size-1 dims are uniform along K, but each of
         K's lanes is still a product of the contraction: CuTe's scalar matmul
