@@ -33,28 +33,39 @@ import sympy
 import torch
 
 from ...language import _tracing_ops
+from ...language.creation_ops import full
+from ...language.matmul_ops import dot
+from ...language.memory_ops import load
 from ..ast_read_writes import ast_rename
+from ..inductor_lowering import ReductionLowering
 from .affine_fold import Affine
 from .affine_fold import Fact
 from .affine_fold import fold
+from .free_arange import live_graphs
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ELEMENT_RUNS
+from .mpp_matmul import WRITES
 from .mpp_matmul import Graphs
 from .mpp_matmul import MppGroup
+from .mpp_matmul import MppPlan
 from .mpp_matmul import Recomputable
 from .mpp_matmul import assign_target
 from .mpp_matmul import assigned_names
 from .mpp_matmul import block_id_of
 from .mpp_matmul import call_name
 from .mpp_matmul import names_read
+from .mpp_matmul import storage_key
 from .tabulate import tabulate
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Mapping
+    from collections.abc import Sequence
 
     from torch.fx.node import Node
 
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from ..tile_strategy import LoopDimInfo
     from .msl_ast_walker import EmitState
@@ -90,6 +101,132 @@ class OperandRecomputable(Recomputable):
             not isinstance(val, torch.Tensor)
             or all(s == 1 or block_id_of(s) in self.blocks() for s in val.size())
         )
+
+
+#: A kernel whose SIMD groups split its K loops (fragment runs' and MPP's
+#: register runs', :func:`split_refusal`): each thread's SIMD group in the
+#: threadgroup, and the threadgroup buffer through which the SIMD groups
+#: past the first pass their accumulators to it.
+SIMDGROUP = "_frag_sg"
+SPLIT_BUFFER = "_frag_split"
+
+
+def split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
+    """Why the SIMD groups of a threadgroup can't split the K loops of the
+    plan's groups (fragment runs, or MPP's register runs), or None when they
+    can. Each SIMD group runs the kernel as one SIMD group would, over its
+    share of each K loop's tiles, and after the loop the first adds the
+    others' accumulators to its own; the others then hold zeros and write
+    nothing. So a K loop may carry nothing but accumulators its runs alone
+    update, and write nothing; an accumulator starts from a constant (the
+    first SIMD group's; the others start from 0); the kernel reads no tensor
+    it writes, which the SIMD groups past the first would read without
+    having written it; and it has no reduction, whose threadgroup combine
+    would take every SIMD group's threads as its own, nor an ``hl.dot`` the
+    runs don't take, whose scalar contraction reduces so too."""
+    known = Graphs(graphs)
+    live = live_graphs(graphs)
+    if any(
+        isinstance(node.meta.get("lowering"), ReductionLowering)
+        for info in live
+        for node in info.graph.nodes
+    ):
+        return "the kernel has a reduction"
+    if any(
+        node not in plan.by_matmul
+        for info in live
+        for node in info.graph.find_nodes(op="call_function", target=dot)
+    ):
+        return (
+            "the kernel has an hl.dot the fragment runs don't take, whose "
+            "contraction reduces across threads"
+        )
+    loops: dict[Node, list[MppGroup]] = {}
+    for group in plan.by_matmul.values():
+        if not group.levels:
+            # One run over the whole K, or over one K tile from zeros: no K
+            # loop of its own to split.
+            return "a matmul over a ':' K or one K tile's product"
+        if group.seed is None or group.seed.target is not full:
+            return "an accumulator starts from a tile"
+        if group.update or group.upd is not None:
+            return "the K loop updates an accumulator other than by its matmul"
+        loops.setdefault(group.levels[0].owner, []).append(group)
+    for groups in loops.values():
+        body = groups[0].matmul.graph
+        (output,) = body.find_nodes(op="output")
+        accumulators = {group.matmul for group in groups}
+        carried = output.args[0]
+        assert isinstance(carried, (list, tuple))
+        if any(value not in accumulators for value in carried):
+            return "the K loop carries a value besides its matmuls' accumulators"
+        if any(
+            node.target in WRITES
+            for info in live
+            if known.within(info.graph, body)
+            for node in info.graph.nodes
+        ):
+            return "the K loop writes memory"
+    if any(
+        node.target is load and storage_key(node) in plan.written
+        for info in live
+        for node in info.graph.nodes
+    ):
+        return "the kernel reads a tensor it writes"
+    return None
+
+
+def emit_split_adds(
+    elements: Sequence[str],
+    resets: Sequence[str],
+    slot: Callable[[str, int], str],
+    split: int,
+    parts: list[str],
+    pad: str,
+) -> None:
+    """After a K loop ``split`` SIMD groups split, add a lane's ``elements``
+    of the others' accumulators into the first's: the others write each
+    element to its ``slot`` (of a SIMD group's index from 0 for the second,
+    and the element's) in threadgroup memory, then run ``resets``, each
+    restarting an accumulator from 0, which keeps one an enclosing loop
+    carries summed once; the first adds them in SIMD-group order, so a
+    launch's sum is the same every time.  The first barrier keeps the writes
+    after the first SIMD group's reads of an earlier combine, the second its
+    reads after the writes."""
+    inner = pad + "    "
+    barrier = f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);"
+    parts += [
+        barrier,
+        f"{pad}if ({SIMDGROUP} != 0) {{",
+        *(
+            f"{inner}{slot(f'({SIMDGROUP} - 1)', e)} = {element};"
+            for e, element in enumerate(elements)
+        ),
+        *(f"{inner}{reset}" for reset in resets),
+        f"{pad}}}",
+        barrier,
+        f"{pad}if ({SIMDGROUP} == 0) {{",
+        f"{inner}for (uint _s = 0; _s < {split - 1}; _s++) {{",
+        *(
+            f"{inner}    {element} += {slot('_s', e)};"
+            for e, element in enumerate(elements)
+        ),
+        f"{inner}}}",
+        f"{pad}}}",
+    ]
+
+
+def split_range(start: str, step: str, simdgroups: int) -> tuple[str, str]:
+    """A split K loop's start and step: each SIMD group starts at its own
+    tile and steps over the others'."""
+
+    def paren(text: str) -> str:
+        return text if text.isidentifier() or text.isdigit() else f"({text})"
+
+    first = f"{SIMDGROUP} * {paren(step)}"
+    if start != "0":
+        first = f"{paren(start)} + {first}"
+    return first, f"{simdgroups} * {paren(step)}"
 
 
 def static_int(expr: object) -> int | None:

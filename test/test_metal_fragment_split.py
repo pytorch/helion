@@ -287,7 +287,7 @@ class TestFragmentSplit(TestCase):
     def test_refused(self) -> None:
         """The split refuses, at codegen, kernels whose SIMD groups past the
         first would compute or write something else than one SIMD group
-        does (``fragment_mma.split_refusal``), and the search keeps their
+        does (``operand_elements.split_refusal``), and the search keeps their
         fragment configs on one SIMD group; at ``num_warps=1`` each
         compiles."""
         x, y = _xy()

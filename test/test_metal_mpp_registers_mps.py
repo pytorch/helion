@@ -27,8 +27,10 @@ from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import seeded_rhs
 from helion._testing.metal_registers import dequant_forms_mm
 from helion._testing.metal_registers import dequant_reference
+from helion._testing.metal_registers import filled_mm
 from helion._testing.metal_registers import inner_tiled_mm
 from helion._testing.metal_registers import register_config
+from helion._testing.metal_registers import two_acc_mm
 
 if TYPE_CHECKING:
     import helion
@@ -54,6 +56,12 @@ _requires_mps = unittest.skipUnless(
 _AFFINE = pairwise(
     bits=(4, 5, 6), rows=(4, 8, 16, 32), mode=("two groups", "one group", "split")
 )
+
+
+#: The K split's cases, all pairs of: the bit width, x's rows (8, where x
+#: is a device view, 16 and 32) and the SIMD groups that split K (2, 8 and
+#: 16).
+_SPLIT = pairwise(bits=(4, 5, 6), rows=(8, 16, 32), num_warps=(2, 8, 16))
 
 
 def _run(
@@ -129,6 +137,49 @@ class TestMppRegisters(unittest.TestCase):
             self.assertTrue(view)
         elif "M4" in torch.backends.mps.get_name():  # pyrefly: ignore[missing-attribute]
             self.assertFalse(view)
+
+    def test_split(self) -> None:
+        """K loops split over 2 to 16 SIMD groups, with x in registers or
+        read as a device view and a K tail, and with the affine split,
+        against float64."""
+        for bits, rows, num_warps in _SPLIT:
+            with self.subTest(bits=bits, rows=rows, num_warps=num_warps):
+                group = 32 if bits == 4 else 128
+                args = affine_args(bits, group, rows, 96, 4096 + group, DEVICE)
+                config = register_config(
+                    [16 if rows <= 16 else 32, 16, 64], num_warps=num_warps
+                )
+                out, msl = _run(affine_mm, args, config)
+                self._close(out, affine_reference(args))
+                self.assertIn(f"offset_2 += {num_warps} * _BLOCK_SIZE_2", msl)
+                self._assert_view(msl, rows)
+        # With the affine split forced on, over 4 SIMD groups.
+        args = affine_args(4, 32, 16, 96, 4096 + 32, DEVICE)
+        config = register_config([16, 32, 32], num_warps=4)
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            out, msl = _run(affine_mm, args, config)
+        self.assertIn("_mr_ones", msl)
+        self.assertIn("offset_2 += 4 * _BLOCK_SIZE_2", msl)
+        self._close(out, affine_reference(args))
+
+    def test_split_fill_and_accumulators(self) -> None:
+        """Split over 4 SIMD groups, an accumulator filled with 0.5 and two
+        accumulators of one K loop, against float64."""
+        x = torch.randn(16, 256, device=DEVICE).to(torch.float16)
+        y = torch.randn(256, 32, device=DEVICE)
+        z = torch.randn(256, 32, device=DEVICE)
+        config = register_config([16, 32, 32], num_warps=4)
+        x64, y64, z64 = (t.cpu().double() for t in (x, y, z))
+        out, msl = _run(filled_mm, (x, y), config)
+        self.assertIn("_frag_sg == 0 ? 0.5f : 0.0f", msl)
+        self._close(out, 0.5 + x64 @ (y64 * 0.5))
+        outs, _, msl = run_with_msl(two_acc_mm, (x, y, z), config, module_key="two")
+        self.assertIn("b[0];", msl)
+        a, b = cast("tuple[torch.Tensor, torch.Tensor]", outs)
+        self._close(a, x64 @ (y64 * 0.5))
+        self._close(b, x64 @ (z64 * 0.25))
 
     def test_affine_cancelling_and_tail(self) -> None:
         """The affine split, forced on, against float64: with MLX's biases

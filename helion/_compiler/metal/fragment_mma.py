@@ -62,13 +62,10 @@ from typing import cast
 
 import sympy
 
-from ...language.creation_ops import full
-from ...language.matmul_ops import dot
 from ...language.memory_ops import load
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
 from ..compile_environment import _to_sympy
-from ..inductor_lowering import ReductionLowering
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from ._constants import SIMD_WIDTH
 from .affine_fold import Affine
@@ -76,7 +73,6 @@ from .affine_fold import Fact
 from .affine_fold import evaluate
 from .affine_fold import render
 from .backend import static_extent
-from .free_arange import live_graphs
 from .lane_fold import load_mask_other
 from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
@@ -85,7 +81,6 @@ from .mpp_matmul import FRAG_B
 from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import PUT
 from .mpp_matmul import RUN
-from .mpp_matmul import WRITES
 from .mpp_matmul import Dim
 from .mpp_matmul import Graphs
 from .mpp_matmul import MppGroup
@@ -105,10 +100,13 @@ from .mpp_matmul import static_tile
 from .mpp_matmul import storage_key
 from .mpp_matmul import view_args
 from .mpp_matmul import virtual_thread
+from .operand_elements import SIMDGROUP
+from .operand_elements import SPLIT_BUFFER
 from .operand_elements import ElementBody
 from .operand_elements import OperandRecomputable
 from .operand_elements import clamp_past_end
 from .operand_elements import element_body
+from .operand_elements import emit_split_adds
 from .operand_elements import keyword
 from .operand_elements import offset_fact
 from .operand_elements import parse_expr
@@ -124,9 +122,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     import torch
-    from torch.fx.node import Node
 
-    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .msl_ast_walker import EmitState
 
@@ -141,12 +137,6 @@ LANE_PREAMBLE = (
 )
 #: What the fold (``affine_fold``) knows of ``_fm`` and ``_fn``.
 _LANE_FACTS = {"_fm": Fact(1, 0, 7), "_fn": Fact(2, 0, 6)}
-#: A kernel whose SIMD groups split its K loops: each thread's SIMD group in
-#: the threadgroup, and the threadgroup buffer through which the SIMD groups
-#: past the first pass their accumulators to it, a lane's two elements of
-#: each fragment (:func:`emit_split_combine`).
-SIMDGROUP = "_frag_sg"
-SPLIT_BUFFER = "_frag_split"
 
 
 def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
@@ -207,71 +197,6 @@ def check_fragment_group(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None
                 f"the operand {node.name}, computed from a load of a tensor the "
                 "kernel writes"
             )
-
-
-def split_refusal(plan: MppPlan, graphs: list[GraphInfo]) -> str | None:
-    """Why the SIMD groups of a threadgroup can't split the K loops of the
-    plan's fragment groups, or None when they can.  Each SIMD group runs
-    the kernel as one SIMD group would, over its share of each K loop's
-    tiles, and after the loop the first adds the others' accumulators to
-    its own; the others then hold zeros and write nothing.  So a K loop may
-    carry nothing but accumulators its runs alone update, and write nothing;
-    an accumulator starts from a constant (the first SIMD group's; the
-    others start from 0); the kernel reads no tensor it writes, which the
-    SIMD groups past the first would read without having written it; and
-    it has no reduction, whose threadgroup combine would take every SIMD
-    group's threads as its own, nor an ``hl.dot`` the runs don't take,
-    whose scalar contraction reduces so too."""
-    known = Graphs(graphs)
-    live = live_graphs(graphs)
-    if any(
-        isinstance(node.meta.get("lowering"), ReductionLowering)
-        for info in live
-        for node in info.graph.nodes
-    ):
-        return "the kernel has a reduction"
-    if any(
-        node not in plan.by_matmul
-        for info in live
-        for node in info.graph.find_nodes(op="call_function", target=dot)
-    ):
-        return (
-            "the kernel has an hl.dot the fragment runs don't take, whose "
-            "contraction reduces across threads"
-        )
-    loops: dict[Node, list[MppGroup]] = {}
-    for group in plan.by_matmul.values():
-        if not group.levels:
-            # One run over the whole K, or over one K tile from zeros: no K
-            # loop of its own to split.
-            return "a matmul over a ':' K or one K tile's product"
-        if group.seed is None or group.seed.target is not full:
-            return "an accumulator starts from a tile"
-        if group.update or group.upd is not None:
-            return "the K loop updates an accumulator other than by its matmul"
-        loops.setdefault(group.levels[0].owner, []).append(group)
-    for groups in loops.values():
-        body = groups[0].matmul.graph
-        (output,) = body.find_nodes(op="output")
-        accumulators = {group.matmul for group in groups}
-        carried = output.args[0]
-        assert isinstance(carried, (list, tuple))
-        if any(value not in accumulators for value in carried):
-            return "the K loop carries a value besides its matmuls' accumulators"
-        if any(
-            node.target in WRITES
-            for info in live
-            if known.within(info.graph, body)
-            for node in info.graph.nodes
-        ):
-            return "the K loop writes memory"
-    if any(
-        node.target is load and storage_key(node) in plan.written
-        for info in live
-        for node in info.graph.nodes
-    ):
-        return "the kernel reads a tensor it writes"
-    return None
 
 
 def transposed(group: MppGroup) -> bool:
@@ -1248,30 +1173,13 @@ def split_runs(body: list[ast.stmt], loop_var: str) -> list[ast.For]:
     return runs
 
 
-def split_range(start: str, step: str, simdgroups: int) -> tuple[str, str]:
-    """A split K loop's start and step: each SIMD group starts at its own
-    tile and steps over the others'."""
-
-    def paren(text: str) -> str:
-        return text if text.isidentifier() or text.isdigit() else f"({text})"
-
-    first = f"{SIMDGROUP} * {paren(step)}"
-    if start != "0":
-        first = f"{paren(start)} + {first}"
-    return first, f"{simdgroups} * {paren(step)}"
-
-
 def emit_split_combine(
     runs: list[ast.For], parts: list[str], pad: str, state: EmitState
 ) -> None:
     """After a K loop the SIMD groups split, add their accumulators (those
-    the loop's ``runs`` update) into the first's: the others write a lane's
-    two elements of each fragment to threadgroup memory and restart from 0,
-    which keeps an accumulator an enclosing loop carries summed once, and
-    the first adds them in SIMD-group order, so a launch's sum is the same
-    every time.  The first barrier keeps the writes after the first SIMD
-    group's reads of an earlier combine, the second its reads after the
-    writes."""
+    the loop's ``runs`` update) into the first's (``emit_split_adds``): a
+    lane's two elements of each fragment, each fragment then refilled with
+    0."""
     fragments: list[str] = []
     for run in runs:
         assert isinstance(run.iter, ast.Call)
@@ -1285,36 +1193,26 @@ def emit_split_combine(
     count = len(fragments)
     lanes = 2 * SIMD_WIDTH
     state.split_slots = max(state.split_slots, (state.split - 1) * count * lanes)
-    inner = pad + "    "
 
-    def slot(simdgroup: str, f: int, e: int) -> str:
+    def slot(simdgroup: str, i: int) -> str:
+        f, e = divmod(i, 2)
         return f"{SPLIT_BUFFER}[({simdgroup} * {count} + {f}) * {lanes} + 2 * {LANE} + {e}]"
 
-    elements = [
-        (f, e, f"{fragment}.thread_elements()[{e}]")
-        for f, fragment in enumerate(fragments)
-        for e in range(2)
-    ]
-    barrier = f"{pad}threadgroup_barrier(mem_flags::mem_threadgroup);"
-    parts += [
-        barrier,
-        f"{pad}if ({SIMDGROUP} != 0) {{",
-        *(
-            f"{inner}{slot(f'({SIMDGROUP} - 1)', f, e)} = {element};"
-            for f, e, element in elements
-        ),
-        *(
-            f"{inner}{fragment} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);"
+    emit_split_adds(
+        [
+            f"{fragment}.thread_elements()[{e}]"
             for fragment in fragments
-        ),
-        f"{pad}}}",
-        barrier,
-        f"{pad}if ({SIMDGROUP} == 0) {{",
-        f"{inner}for (uint _s = 0; _s < {state.split - 1}; _s++) {{",
-        *(f"{inner}    {element} += {slot('_s', f, e)};" for f, e, element in elements),
-        f"{inner}}}",
-        f"{pad}}}",
-    ]
+            for e in range(2)
+        ],
+        [
+            f"{fragment} = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);"
+            for fragment in fragments
+        ],
+        slot,
+        state.split,
+        parts,
+        pad,
+    )
 
 
 def fragment_acc_keywords(

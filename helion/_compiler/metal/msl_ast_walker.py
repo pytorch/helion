@@ -32,7 +32,6 @@ from typing import Iterator
 
 from ... import exc
 from .fragment_mma import FRAGMENT_SLOT
-from .fragment_mma import SIMDGROUP
 from .fragment_mma import EarlyLoad
 from .fragment_mma import emit_fragment_acc
 from .fragment_mma import emit_fragment_run
@@ -40,7 +39,6 @@ from .fragment_mma import emit_split_combine
 from .fragment_mma import fragment_elements
 from .fragment_mma import is_fragment_acc
 from .fragment_mma import prefetch_loads
-from .fragment_mma import split_range
 from .fragment_mma import split_runs
 from .lane_fold import BF16_CAST
 from .lane_fold import LANE_PUT
@@ -49,11 +47,15 @@ from .lane_fold import tl_load
 from .mpp_matmul import ACC_SEED
 from .mpp_matmul import FRAG_RUN
 from .mpp_matmul import REG_RUN
+from .mpp_registers import emit_register_combine
 from .mpp_registers import emit_register_run
 from .mpp_registers import register_atom
+from .mpp_registers import register_split_runs
 from .msl_expr import GLOBAL_SCOPE
 from .msl_expr import TEMPLATE_CALLS
 from .msl_reduction import REDUCTION_NAMESPACE
+from .operand_elements import SIMDGROUP
+from .operand_elements import split_range
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -123,7 +125,8 @@ class EmitState:
     #: How many prefetch registers the kernel has named, which keeps their
     #: names unique.
     early_count: int = 0
-    #: The SIMD groups that split each fragment K loop (``fragment_mma``),
+    #: The SIMD groups that split each fragment or register run's K loop
+    #: (``fragment_mma``, ``mpp_registers``),
     #: the offsets of the split loops being emitted, and the float slots
     #: their combines pass accumulators through.
     split: int = 1
@@ -204,8 +207,9 @@ def _emit_tl_store(
     Dereferences the pointer expression: ``*(ptr + offset) = val``.
     All three positional args (ptr, val, mask) are always present —
     PointerIndexingStrategy emits them positionally.  When ``split`` SIMD
-    groups split the fragment K loops, the first writes and the others,
-    which run the same code, don't (``fragment_mma``).
+    groups split the fragment or register runs' K loops, the first writes
+    and the others, which run the same code, don't (``fragment_mma``,
+    ``mpp_registers``).
     """
     pad = " " * indent
     access = _ptr_access_expr(node.args[0], subs=subs)
@@ -427,6 +431,10 @@ def _emit_coop_acc(
         )
     if seed is None:
         value = f"{float(fill)!r}f" if acc_dtype == "float" else repr(int(fill))
+        if float(fill) and state.split > 1:
+            # SIMD groups split its K loop (``mpp_registers.register_split``):
+            # the others add their tiles to 0.
+            value = f"({SIMDGROUP} == 0 ? {value} : 0.0f)"
         parts.append(
             f"{pad}for (auto _it = {name}.begin(); _it != {name}.end(); _it++) "
             f"*_it = {value};"
@@ -685,9 +693,11 @@ def _emit_for(
     - ``_helion_mpp_fragments(acc, steps, facts, tables, k_step, split)`` → a
       fragment group's op over one K tile (``fragment_mma.emit_fragment_run``)
 
-    A range loop whose fragment runs SIMD groups split runs each from its
-    own tile over every ``split``-th one (``fragment_mma.split_range``),
-    then adds their accumulators (``fragment_mma.emit_split_combine``).
+    A range loop whose fragment or register runs SIMD groups split runs
+    each from its own tile over every ``split``-th one
+    (``operand_elements.split_range``), then adds their accumulators
+    (``fragment_mma.emit_split_combine``,
+    ``mpp_registers.emit_register_combine``).
     """
     pad = " " * indent
     it = stmt.iter
@@ -827,7 +837,8 @@ def _emit_for(
         step = _ast_expr_to_msl(args[2], subs=subs)
 
     runs = split_runs(stmt.body, loop_var)
-    if runs:
+    register_runs = register_split_runs(stmt.body, loop_var)
+    if runs or register_runs:
         start, step = split_range(start, step, state.split)
         state.split_loops.append(loop_var)
     before, top = prefetch_loads(stmt.body, loop_var, end, pad, state)
@@ -840,9 +851,12 @@ def _emit_for(
         state.declare(loop_var)
         _emit_stmts(stmt.body, parts, indent=indent + 4, state=state, subs=subs)
     parts.append(f"{pad}}}")
-    if runs:
+    if runs or register_runs:
         state.split_loops.pop()
+    if runs:
         emit_split_combine(runs, parts, pad, state)
+    if register_runs:
+        emit_register_combine(register_runs, parts, pad, state)
 
 
 def _element_head(
