@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import random
+from unittest.mock import MagicMock
 from unittest.mock import patch
 
 import pytest
@@ -20,6 +21,7 @@ from helion._testing.cute_codegen import forbid_cuda_work
 from helion._testing.cute_codegen import mock_cuda_unavailable
 from helion.autotuner.effort_profile import get_effort_profile
 from helion.autotuner.surrogate_pattern_search import LFBOTreeSearch
+from helion.exc import InvalidConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -302,3 +304,55 @@ def test_mn_descriptor_discount_requires_aligned_tma_inputs() -> None:
                 if seed.get("tcgen05_grouped_worklist_orientation") == "mn"
             ]
             assert bool(mn) is (offset == 0)
+
+
+def test_a_best_available_seed_legal_under_mn_alone_is_skipped() -> None:
+    # 1,552 columns are no multiple of 32, so the compiler seeds no M,N tile
+    # for this bind and the orientation is no coordinate of its search. A
+    # config that names the orientation is legal all the same, with 13 A/B
+    # stages, which only M,N admits: flattened, it loses the orientation and
+    # no longer normalizes. The best config of an LLM-guided first stage
+    # reaches the second stage as a best-available seed; such a seed is
+    # logged and skipped, as a compiler or user seed is, and the stage runs.
+    args = _args(2048, 16, 1552, 2048)
+    orientation = "tcgen05_grouped_worklist_orientation"
+    reason = "tcgen05_ab_stages must be in [1, 12], got 13"
+    with forbid_cuda_work(), _target(), mock_cuda_unavailable():
+        bound = cpu_bind(_kernel(), args)
+        spec = bound.config_spec
+        seed = spec.normalized_config(
+            helion.Config(
+                block_sizes=[256, 128, 64],
+                tcgen05_cluster_m=2,
+                tcgen05_ab_stages=13,
+                tcgen05_grouped_mode="worklist_nm",
+                tcgen05_grouped_worklist_orientation="mn",
+                tcgen05_grouped_worklist_mma_n=128,
+                tcgen05_grouped_full_allocation_a=True,
+            )
+        )
+        assert seed[orientation] == "mn"
+        assert seed["tcgen05_ab_stages"] == 13
+        search = LFBOTreeSearch(
+            bound,
+            args,
+            **LFBOTreeSearch.get_kwargs_from_profile(
+                get_effort_profile("quick"), bound.settings
+            ),
+        )
+        generation = search.config_gen
+        assert not any(
+            config.get(orientation) == "mn" for config in spec.compiler_seed_configs
+        )
+        assert orientation not in generation._flat_fields()
+        with pytest.raises(InvalidConfig) as raised:
+            generation.unflatten(generation.flatten(seed))
+        assert str(raised.value) == reason
+        search.set_best_available_seed_configs([seed])
+        search.log = MagicMock()
+        with patch.object(search, "_find_similar_cached_configs", return_value=[]):
+            population = search._generate_best_available_population_flat()
+        configs = [generation.unflatten(row) for row in population]
+    assert configs
+    assert all(config.get(orientation, "nm") == "nm" for config in configs)
+    search.log.assert_any_call(f"Failed to transfer explicit seed config: {reason}")

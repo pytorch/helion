@@ -1826,6 +1826,37 @@ class TestGenerateBestAvailablePopulation(unittest.TestCase):
         self.assertEqual(config_gen.unflatten(result[0]), normalized_seed)
         self.assertEqual(result[1], config_gen.default_flat())
 
+    def test_best_available_seed_that_does_not_transfer_is_skipped(self):
+        """A caller-provided seed whose transfer raises InvalidConfig is
+        logged and skipped, as a compiler or user seed is; the seed beside
+        it and the default stay."""
+        config_gen = self._make_config_gen()
+        rejected = Config(block_sizes=[16, 32], num_warps=4, num_stages=3)
+        seed = Config(block_sizes=[32, 64], num_warps=8, num_stages=2)
+        mock_search = self._make_mock_search(config_gen, cached_configs=[])
+        mock_search._best_available_seed_configs = [rejected, seed]
+        flatten = config_gen.flatten
+
+        def flatten_or_reject(config: Config) -> list[object]:
+            if config is rejected:
+                raise InvalidConfig("num_stages must be in [1, 2], got 3")
+            return flatten(config)
+
+        with patch.object(config_gen, "flatten", side_effect=flatten_or_reject):
+            result = PopulationBasedSearch._generate_best_available_population_flat(
+                mock_search
+            )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(
+            config_gen.unflatten(result[0]), config_gen.unflatten(flatten(seed))
+        )
+        self.assertEqual(result[1], config_gen.default_flat())
+        mock_search.log.assert_any_call(
+            "Failed to transfer explicit seed config: "
+            "num_stages must be in [1, 2], got 3"
+        )
+
     def test_duplicate_configs_deduplicated(self):
         """Duplicate cached configs are discarded."""
         config_gen = self._make_config_gen()
