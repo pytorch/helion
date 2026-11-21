@@ -267,6 +267,7 @@
  "test/test_cute_paged_attention_pair_forms_gpu.py": 12.8,
  "test/test_cute_paged_attention_pair_gpu.py": 15.9,
  "test/test_cute_paged_attention_partition_gpu.py": 22.6,
+ "test/test_cute_paged_attention_partition_look_gpu.py": 10.2,
  "test/test_cute_paged_attention_pdl_gpu.py": 14.1,
  "test/test_cute_paged_attention_postscale_gpu.py": 19.8,
  "test/test_cute_paged_attention_prefetch_gpu.py": 4.9,

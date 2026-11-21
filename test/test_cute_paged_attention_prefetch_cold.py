@@ -391,6 +391,7 @@ def test_every_option_a_need_names_has_its_default_in_the_table():
             (form, pages) for form in forms for pages in (0, 8, 12, 4)
         ],
         "boundary_prefetch_ahead_needs": [()],
+        "partition_look_needs": [()],
         "_paired_loader_needs": [(True,), (False,)],
         "page_order_needs": [
             (attention, order)

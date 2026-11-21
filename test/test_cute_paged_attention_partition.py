@@ -1087,7 +1087,8 @@ def _shared_bytes(
         "bucketed",
     ]
     # The block's slots are counted there and laid out here: the body reads
-    # the barrier plan with the table's five arguments for it.
+    # the barrier plan with the table's five arguments for it, and with the
+    # spare warp's look, whose two barriers lie in the block's padding.
     (plan,) = [
         call
         for call in ast.walk(body)
@@ -1095,7 +1096,8 @@ def _shared_bytes(
         and ast.unparse(call.func) == "pipeline_barrier_plan"
     ]
     assert [ast.unparse(argument) for argument in plan.args] == [
-        ast.unparse(table.args[index]) for index in (1, 2, 5, 6, 7)
+        *(ast.unparse(table.args[index]) for index in (1, 2, 5, 6, 7)),
+        "spare_look",
     ]
     # The optional parts are evaluated once as well.
     assert ast.unparse(shared_parts) == "shared_parts"
@@ -1111,6 +1113,7 @@ def _shared_bytes(
         "unit_bounds_scanned is not None",
         "partition == 'balanced'",
         "bucketed",
+        "spare_look",
     ]
     persistent = partition != "item"
     balanced = partition == "balanced"
@@ -2706,10 +2709,13 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
     """The workspace is global memory that the launch before this one may
     still write: a captured launch that overlaps its predecessor reads only
     its inputs ahead of the dependency wait. Read from the template: every
-    access to the workspace is in one of six helpers; a compute group
-    calls them for a part behind the wait it executes at the part's end;
-    the spare warp waits before it arrives; and a group merges a posted
-    unit only at the end of its walk, behind the spare warp's reply."""
+    access to the workspace is in one of eight helpers; a compute group
+    calls them for a part behind the wait it executes at the part's end
+    (where the spare warp looks, behind the wait in front of the other
+    part's loads and the stores' wait: the group then reads no counter);
+    the spare warp waits before it arrives, before it looks and before it
+    copies another part's panel; and a group merges a posted unit only at
+    the end of its walk, behind the spare warp's reply."""
     helpers = ast.parse(DEVICE_HELPERS.read_text())
     loads = {"_load_pair": "ldcg_v2_f32", "_load_quad": "ldcg_v4_f32"}
     for name, row in loads.items():
@@ -2720,6 +2726,7 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
         "stg_u32_l2",
         "stg_v2_f32_l2",
         "stg_v4_f32_l2",
+        "cp_bulk_global_to_shared",
         *loads,
         *loads.values(),
     }
@@ -2748,12 +2755,14 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
         "pair_partial",
         "merge_parts",
         "post_parts",
+        "look_parts",
+        "stage_panels",
     }
     assert {
         node.name
         for node in helpers.body
         if isinstance(node, ast.FunctionDef) and counting & set(_call_names(node))
-    } == {"split_arrival", "arrive_part", "post_parts"}
+    } == {"split_arrival", "arrive_part", "post_parts", "look_parts"}
     template = ast.parse(TEMPLATE.read_text())
     assert not accesses & set(_call_names(template))
     callers = {
@@ -2764,39 +2773,83 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
     assert callers == {
         "_reduce_part": {"pair_partial"},
         "_compute_units": {"split_arrival", "store_part", "arrive_part", "merge_parts"},
-        "paged_attention_paired_body": {"post_parts"},
+        "paged_attention_paired_body": {"post_parts", "look_parts", "stage_panels"},
     }
     compute = _function(template, "_compute_units")
     (walk,) = [node for node in compute.body if isinstance(node, ast.While)]
-    # A part's epilogue starts with the wait; the arrival's read, the
-    # reduction that loads another part, the stores and the merge follow.
-    (part,) = [
+    # Where the group looks, a part's epilogue starts with the wait; the
+    # arrival's read, the reduction that loads another part, the stores
+    # and the merge follow.
+    wait = "if capture_pdl_wait_mode != 0:\n    cute.arch.griddepcontrol_wait()"
+    (forms,) = [
         node
         for node in ast.walk(walk)
         if isinstance(node, ast.If)
-        and ast.unparse(node.test) == "split"
+        and ast.unparse(node.test) == "cutlass.const_expr(look_stage is not None)"
         and "split_arrival" in _call_names(node)
     ]
+    (part,) = forms.orelse
+    assert ast.unparse(part.test) == "split" and not part.orelse
     waited, arrival = part.body
-    assert ast.unparse(waited) == (
-        "if capture_pdl_wait_mode != 0:\n    cute.arch.griddepcontrol_wait()"
-    )
+    assert ast.unparse(waited) == wait
     assert ast.unparse(arrival.test) == "thread == 0"
-    for name in ("_reduce_part", "store_part", "arrive_part", "merge_parts"):
+    (decision,) = [
+        node
+        for node in ast.walk(arrival)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "split_arrival"
+    ]
+    assert not decision.keywords
+    # Where the spare warp looks, no thread of the group reads the counter
+    # (``test_cute_paged_attention_partition_look`` pins the meeting and
+    # the role): the one call there is for a part to post, which compiles
+    # no counter access, so the block needs no wait.
+    assert wait not in ast.unparse(ast.Module(forms.body, []))
+    (posting,) = [
+        node
+        for statement in forms.body
+        for node in ast.walk(statement)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "split_arrival"
+    ]
+    assert [(k.arg, ast.unparse(k.value)) for k in posting.keywords] == [
+        ("posts", "True")
+    ]
+    assert touching & set(_call_names(ast.Module(forms.body, []))) == {"split_arrival"}
+    deciding = _function(helpers, "split_arrival")
+    (posts,) = [
+        node
+        for node in deciding.body
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "cutlass.const_expr(posts)"
+    ]
+    assert not accesses & set(_call_names(ast.Module(posts.body, [])))
+    assert "_count_arrival" in _call_names(ast.Module(posts.orelse, []))
+    # The stores' wait stands between the reduction and a part's stores,
+    # arrival and merge, with either look.
+    (reduced,) = [
+        node
+        for node in ast.walk(walk)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_reduce_part"
+    ]
+    assert reduced.lineno > forms.end_lineno
+    (stored,) = [
+        node
+        for node in walk.body
+        if ast.unparse(node) == wait and node.lineno > reduced.lineno
+    ]
+    for name in ("store_part", "arrive_part", "merge_parts"):
         (call,) = [
             node
             for node in ast.walk(walk)
             if isinstance(node, ast.Call) and ast.unparse(node.func) == name
         ]
-        assert call.lineno > waited.end_lineno
-        if name != "_reduce_part":
-            # These run for parts only, whose epilogue waited.
-            assert any(
-                isinstance(node, ast.If)
-                and ast.unparse(node.test) == "split"
-                and call in ast.walk(node)
-                for node in ast.walk(walk)
-            )
+        assert call.lineno > stored.end_lineno
+        # These run for parts only.
+        assert any(
+            isinstance(node, ast.If)
+            and ast.unparse(node.test) == "split"
+            and call in ast.walk(node)
+            for node in ast.walk(walk)
+        )
     # A whole unit's reduction loads no other part: the pair is a part's role.
     reduce = _function(template, "_reduce_part")
     (pairing,) = [
@@ -2812,6 +2865,65 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
         for node in ast.walk(reduce)
         if isinstance(node, ast.If) and "pair_partial" in _call_names(node)
     )
+    # The other part's loads: behind the part's wait where the group
+    # looks, and behind a wait in front of them where the spare warp does,
+    # which is where that warp staged the other part's rows. The wait mode
+    # reaches them with either look.
+    (partial,) = [
+        node
+        for node in ast.walk(reduce)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "pair_partial"
+    ]
+    assert [ast.unparse(argument) for argument in partial.args[-2:]] == [
+        "look_stage",
+        "capture_pdl_wait_mode",
+    ]
+    (handed,) = [
+        node
+        for node in ast.walk(walk)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "_reduce_part"
+    ]
+    assert [ast.unparse(argument) for argument in handed.args[-3:]] == [
+        "capture_pdl_wait_mode",
+        "panel_stage",
+        "panel_staged",
+    ]
+    loading = _function(helpers, "pair_partial")
+    assert [argument.arg for argument in loading.args.args[-2:]] == [
+        "staged",
+        "capture_pdl_wait_mode",
+    ]
+    # Where the spare warp staged the pairs it also staged the panel's
+    # leading columns, which are not loaded: the wait is compiled where a
+    # column is left to load.
+    waits = [
+        index
+        for index, node in enumerate(loading.body)
+        if ast.unparse(node)
+        == (
+            "if cutlass.const_expr(staged is not None and held < query_columns // 4):\n"
+            "    if capture_pdl_wait_mode != 0:\n"
+            "        cute.arch.griddepcontrol_wait()"
+        )
+    ]
+    reads = [
+        index
+        for index, node in enumerate(loading.body)
+        if {"_load_quad", "_load_pair"} & set(_call_names(node))
+    ]
+    assert len(waits) == 1 and len(reads) == 2 and waits[0] < min(reads)
+    (held,) = [
+        node
+        for node in loading.body
+        if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == "held"
+    ]
+    assert ast.unparse(held.value) == (
+        "partition_look_panel_columns(query_columns) // 4 if staged is not None else 0"
+    )
+    (quads,) = [node for node in loading.body if isinstance(node, ast.For)]
+    assert ast.unparse(quads.iter) == (
+        "cutlass.range_constexpr(held, query_columns // 4)"
+    )
     # The spare warp's lane waits before its arrival.
     post = _function(helpers, "post_parts")
     (posted,) = [
@@ -2824,6 +2936,48 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
     assert ast.unparse(posted.body[0]) == (
         "if capture_pdl_wait_mode != 0:\n    cute.arch.griddepcontrol_wait()"
     )
+    # And before its look and before the loads of what it stages: both
+    # accesses of the look lie in a block that starts with the wait.
+    look = _function(helpers, "look_parts")
+    waiting = [
+        node
+        for node in ast.walk(look)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.body[0])
+        == "if capture_pdl_wait_mode != 0:\n    cute.arch.griddepcontrol_wait()"
+    ]
+    assert len(waiting) == 2
+    reads = [
+        call
+        for call in ast.walk(look)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) in ("_count_arrival", "_load_pair")
+    ]
+    assert [ast.unparse(call.func) for call in reads] == [
+        "_count_arrival",
+        "_load_pair",
+    ]
+    for call, block in zip(reads, waiting, strict=True):
+        assert any(call in ast.walk(statement) for statement in block.body[1:])
+    # And before its copies of another part's panel, one lane's: the wait
+    # opens the block that issues them.
+    stage = _function(helpers, "stage_panels")
+    (copying,) = [
+        node
+        for node in ast.walk(stage)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.body[0])
+        == "if capture_pdl_wait_mode != 0:\n    cute.arch.griddepcontrol_wait()"
+    ]
+    assert ast.unparse(copying.test) == "copies != 0"
+    copies = [
+        call
+        for call in ast.walk(stage)
+        if isinstance(call, ast.Call)
+        and ast.unparse(call.func) == "cp_bulk_global_to_shared"
+    ]
+    assert len(copies) == 1
+    assert any(copies[0] in ast.walk(statement) for statement in copying.body[1:])
     # The late merge of a posted unit: behind the spare warp's reply, in a
     # group whose every path to the end of its walk waited.
     tail = compute.body[compute.body.index(walk) + 1 :]
@@ -2842,8 +2996,41 @@ def test_parts_touch_the_workspace_only_behind_the_dependency_wait():
         for node in ast.walk(statement)
         if isinstance(node, ast.Expr) and "barrier_cta_sync" in _call_names(node)
     ]
-    assert len(reply) == 1 and reply[0].lineno < late.lineno
-    assert "POSTED_BARRIER + pair_head" in ast.unparse(reply[0])
+    # The reply is stated once per form of the look. Where the group looks,
+    # every group meets the spare warp here; where the spare warp looks, a
+    # group that met it behind its lowest part heard the verdict there (the
+    # warp answers a post before it looks) and any other meets it here.
+    assert len(reply) == 2 and all(node.lineno < late.lineno for node in reply)
+    assert all("POSTED_BARRIER + pair_head" in ast.unparse(node) for node in reply)
+    (forms,) = [
+        node
+        for statement in tail
+        for node in ast.walk(statement)
+        if isinstance(node, ast.If)
+        and ast.unparse(node.test) == "cutlass.const_expr(look_stage is not None)"
+        and reply[0] in ast.walk(node)
+    ]
+    (every,) = forms.orelse
+    (unmet,) = [
+        node
+        for node in forms.body
+        if isinstance(node, ast.If) and ast.unparse(node.test) == "not looked"
+    ]
+    assert not unmet.orelse
+    assert {id(every), id(unmet.body[-1])} == {id(node) for node in reply}
+    assert "looked = cutlass.Int32(walk[WALK_LOOKED]) != 0" in ast.unparse(forms)
+    # Where the spare warp looks, a group that met the warp behind its
+    # lowest part comes to the late merge without that reply: ahead of
+    # everything else in its branch the group joins at a barrier of its
+    # own, behind which the merge's row owners rewrite the scratch rows and
+    # the row state the lowest part's epilogue read, and waits for the
+    # launch's dependencies itself.
+    assert ast.unparse(late.body[0]) == (
+        "if cutlass.const_expr(look_stage is not None):\n"
+        "    cute.arch.barrier(barrier_id=1 + pair_head * 2, number_of_threads=128)\n"
+        "    if capture_pdl_wait_mode != 0:\n"
+        "        cute.arch.griddepcontrol_wait()"
+    )
 
 
 def test_a_group_posts_by_one_decision():
@@ -2866,29 +3053,47 @@ def test_a_group_posts_by_one_decision():
         ]
 
     decide = _function(helpers, "split_arrival")
-    (branch,) = [
+    (forms,) = [
         node
         for node in decide.body
         if isinstance(node, ast.If) and "PART_POST" in ast.unparse(node)
     ]
+    # The caller's part is one to post (where the spare warp looks, which
+    # decides for a lowest part itself), or the thread tells by the steps.
+    assert ast.unparse(forms.test) == "cutlass.const_expr(posts)"
+    (branch,) = forms.orelse
     assert ast.unparse(branch.test) == "step0 + count != pages"
-    taken = [ast.unparse(statement) for statement in branch.body]
-    for statement in (
+    post = [
+        "lowest = _slot_cta(header + 1, slots, active, skew, slot_bits, skewed)",
         "role = cutlass.Int32(PART_POST)",
+        "_note_post(walk, mail, lowest, highest, item)",
+    ]
+    assert [ast.unparse(statement) for statement in forms.body] == post
+    assert [ast.unparse(statement) for statement in branch.body] == post
+    noting = _function(helpers, "_note_post")
+    taken = [ast.unparse(statement) for statement in noting.body[1:]]
+    assert taken[:2] == [
         "walk[WALK_POSTED] = cutlass.Int32(1)",
         "mail[MAIL_KIND] = cutlass.Int32(MAIL_PART)",
-    ):
-        assert statement in taken
+    ]
     assert not any(
         name in ast.unparse(statement)
         for statement in branch.orelse
-        for name in ("PART_POST", "WALK_POSTED", "MAIL_PART")
+        for name in ("PART_POST", "WALK_POSTED", "MAIL_PART", "_note_post")
     )
-    # No other helper notes a post, and the template only clears the note:
+    assert [
+        node.name
+        for node in helpers.body
+        if isinstance(node, ast.FunctionDef) and "_note_post" in _call_names(node)
+    ] == ["split_arrival"]
+    # No other helper notes a post, and the template clears the note:
     # thread 0, in its record of the CTA's first unit, ahead of the
     # barrier that publishes the record.
     assert notes(helpers) == ["walk[WALK_POSTED] = cutlass.Int32(1)"]
-    assert notes(template) == ["walk[WALK_POSTED] = cutlass.Int32(0)"]
+    assert notes(template) == [
+        "walk[WALK_POSTED] = cutlass.Int32(0)",
+        "walk[WALK_POSTED] = cutlass.Int32(1)",
+    ]
     compute = _function(template, "_compute_units")
     (walk,) = [node for node in compute.body if isinstance(node, ast.While)]
     (record,) = [
@@ -2906,7 +3111,34 @@ def test_a_group_posts_by_one_decision():
     ]
     assert ast.unparse(cleared.test) == "unit == cutlass.Int32(plan[PLAN_FIRST])"
     following = walk.body[walk.body.index(record) + 1 :]
-    assert ast.unparse(following[0]).startswith("cute.arch.barrier(")
+    # Where the spare warp looks for a unit's lowest part, a group whose
+    # first range is no part to post says so there and then, behind the
+    # cleared note and ahead of the same barrier, so that the warp can look
+    # before the walk ends: the one place besides ``split_arrival`` that
+    # notes a post. It decides by the test ``split_arrival`` posts by,
+    # negated, on the range's own steps: a range that holds its unit's last
+    # step is no part to post. The end of the walk then reads the note as
+    # it reads ``split_arrival``'s.
+    early = following[0]
+    assert ast.unparse(early.test) == "cutlass.const_expr(look_stage is not None)"
+    assert notes(early) == ["walk[WALK_POSTED] = cutlass.Int32(1)"]
+    assert ast.unparse(early.body[1]) == (
+        "closing = _group_uniform(step0 + count == unit_pages)"
+    )
+    (first,) = [node for node in early.body if isinstance(node, ast.If) and notes(node)]
+    assert ast.unparse(first.test) == (
+        "_group_uniform(unit == cutlass.Int32(plan[PLAN_FIRST]))"
+    )
+    (none,) = [node for node in first.body if notes(node)]
+    assert ast.unparse(none.test) == "closing" and not none.orelse
+    noted, arrived = none.body
+    assert ast.unparse(noted) == (
+        "if thread == 0:\n"
+        "    walk[WALK_POSTED] = cutlass.Int32(1)\n"
+        "    mail[MAIL_KIND] = cutlass.Int32(MAIL_NONE)"
+    )
+    assert "barrier_cta_arrive(POST_BARRIER + pair_head" in ast.unparse(arrived)
+    assert ast.unparse(following[1]).startswith("cute.arch.barrier(")
     # In the walk the group arrives for a part by its role.
     arrivals = [
         node
@@ -2962,15 +3194,27 @@ def test_the_lane_that_decides_a_parts_role_waits_for_no_other_cta():
     assert _own_calls(arrival) == {
         "cute.arch.block_idx",
         "cutlass.Int32",
+        "cutlass.const_expr",
         "_slot_cta",
+        "_note_post",
         "_count_arrival",
     }
     assert not any(isinstance(node, (ast.While, ast.For)) for node in ast.walk(arrival))
+    # A post's note is five words of shared memory.
+    noting = _function(helpers, "_note_post")
+    assert _own_calls(noting) == {"cutlass.Int32"}
+    assert not any(isinstance(node, (ast.While, ast.For)) for node in ast.walk(noting))
+    # The look itself: the counter, once. (Where the CTA's spare warp
+    # looks, the group's thread comes here for a part to post alone.)
     (look,) = [
         call
         for call in ast.walk(arrival)
         if isinstance(call, ast.Call) and ast.unparse(call.func) == "_count_arrival"
     ]
+    assert ast.unparse(look) == (
+        "_count_arrival(workspace, cta, highest - cta, pair_head, record_bytes, "
+        "arrive=False)"
+    )
     assert [ast.unparse(keyword.value) for keyword in look.keywords] == ["False"]
     assert [keyword.arg for keyword in look.keywords] == ["arrive"]
     # The counter's helper: one access to read or to add, one to reset, a
@@ -3016,14 +3260,20 @@ def test_the_lane_that_decides_a_parts_role_waits_for_no_other_cta():
             "cutlass.Int64",
         }
     compute = _function(ast.parse(TEMPLATE.read_text()), "_compute_units")
-    (deciding,) = [
+    # One call per form of the look: where the group looks, and for a
+    # part to post where the spare warp does.
+    deciding = [
         node
         for node in ast.walk(compute)
-        if isinstance(node, ast.If) and "split_arrival" in _call_names(node.body[0])
+        if isinstance(node, ast.If)
+        and isinstance(node.body[0], ast.Expr)
+        and "split_arrival" in _call_names(node.body[0])
     ]
-    assert ast.unparse(deciding.test) == "thread == 0" and not deciding.orelse
-    (call,) = deciding.body
-    assert isinstance(call, ast.Expr) and _call_names(call)[0] == "split_arrival"
+    assert len(deciding) == 2 == _call_names(compute).count("split_arrival")
+    for block in deciding:
+        assert ast.unparse(block.test) == "thread == 0" and not block.orelse
+        (call,) = block.body
+        assert _call_names(call)[0] == "split_arrival"
     # The group's barriers are ``cute.arch.barrier`` (``bar.sync``); the
     # spare warp's are the non-aligned primitives.
     assert "barrier" in _call_names(
@@ -3621,15 +3871,20 @@ def test_only_the_compute_groups_and_the_join_meet_at_aligned_barriers():
     other role of a persistent CTA publishes through the non-aligned form
     (the plan at barriers 7 and 6, the retirement at barrier 5, the spare
     warp's posts): their participants reach them at different
-    instructions."""
+    instructions. The walk has two: the one ahead of a unit's pages, and
+    the one a late merge starts with where the spare warp looks
+    (``test_cute_paged_attention_partition_look`` pins it). The row
+    reduction states its barrier twice, for a kernel without that look
+    and for the ranges of one with it that are no lowest part: a lowest
+    part meets the spare warp there instead."""
     first = "cute.arch.barrier(barrier_id=2 + pair_head * 2, number_of_threads=128)"
     second = "cute.arch.barrier(barrier_id=1 + pair_head * 2, number_of_threads=128)"
     assert _aligned_barriers() == {
         "_compute_begin": [first],
-        "_reduce_rows": [second],
+        "_reduce_rows": [second, second],
         "_compute_reduce": [second],
         "_reduce_part": [second],
-        "_compute_units": [first],
+        "_compute_units": [first, second],
         "arrive_part": [second, second],
         "merge_parts": [second, second],
         "paged_attention_paired_body": ["cute.arch.barrier()"],

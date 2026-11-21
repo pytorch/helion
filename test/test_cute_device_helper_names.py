@@ -729,6 +729,7 @@ PTX_ROW_EXPORTS: dict[str, tuple[str, ...]] = {
     ),
     "_paged_attention_partition": (
         "atom_add_acq_rel_gpu_u32",
+        "cp_bulk_global_to_shared",
         "fence_acq_rel_gpu",
         "l2_policy_evict_first",
         "l2_policy_evict_last",
@@ -878,6 +879,14 @@ PTX_ROW_FINGERPRINTS: dict[str, _Fingerprint] = {
         "r,l,~{memory}",
         True,
         ("i32", "i64"),
+        None,
+        None,
+    ),
+    "cp_bulk_global_to_shared": (
+        "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [$0], [$1], $2, [$3];",
+        "r,l,r,r,~{memory}",
+        True,
+        ("smem_ptr", "i64", "i32", "smem_ptr"),
         None,
         None,
     ),

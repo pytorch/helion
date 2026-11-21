@@ -1612,6 +1612,11 @@ class ConfigSpec:
         # Where a walk in reversed page order takes the work item's oldest
         # page, wherever the kernel is offered that order.
         self.cute_mma_dag_clipped_page_lead: EnumFragment | None = None
+        # Which threads of a balanced CTA of that schedule look at the
+        # counter of the split unit it runs the lowest part of, on a grid
+        # of more units than SMs: the compute group, the default, or the
+        # CTA's spare warp.
+        self.cute_mma_dag_partition_look: EnumFragment | None = None
         self.cute_mma_dag_loads: EnumFragment | None = None
         self.cute_mma_dag_aux: EnumFragment | None = None
         # How a dot operand that is a pointwise chain over loaded tiles

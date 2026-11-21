@@ -111,6 +111,7 @@ from ..cute_mma_dag import paged_attention_early_retirement_default
 from ..cute_mma_dag import paged_attention_key_clip_choices
 from ..cute_mma_dag import paged_attention_page_order_choices
 from ..cute_mma_dag import paged_attention_partition_choices
+from ..cute_mma_dag import paged_attention_partition_look_choices
 from ..cute_mma_dag import paged_attention_partition_skew_choices
 from ..cute_mma_dag import paged_attention_pass_warp_choices
 from ..cute_mma_dag import paged_attention_register_quota_choices
@@ -146,6 +147,8 @@ from ..paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
 from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_DEFAULT
 from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from ..paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
+from ..paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
@@ -381,6 +384,7 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
     config_spec.cute_mma_dag_value_ring_tiles = None
     config_spec.cute_mma_dag_page_order = None
     config_spec.cute_mma_dag_clipped_page_lead = None
+    config_spec.cute_mma_dag_partition_look = None
     if facts.attention is not None and facts.attention.paired_items:
         # Searched whatever the benchmark's timing regime: the split changes
         # the roles' instruction schedule, not what a cache holds.
@@ -555,6 +559,20 @@ def enable_cute_mma_dag_search(config_spec: ConfigSpec, facts: CuteMmaDagFacts) 
         )
         if len(leads) > 1:
             config_spec.cute_mma_dag_clipped_page_lead = EnumFragment(choices=leads)
+        # A field where the balanced partition of the kernel has a spare
+        # warp that can look for a unit's lowest part: a grid of more units
+        # than SMs, on a device that holds what the warp stages. Searched
+        # whatever the benchmark's timing regime: the look moves work
+        # between the roles of one launch. A search steps onto the spare
+        # warp's look with the balanced partition (``partition_look_needs``).
+        looks = paged_attention_partition_look_choices(
+            facts.attention,
+            MMA_DAG_PASS_WARPS_ATTENTION_PAIRED,
+            False,
+            MMA_DAG_PARTITION_BALANCED,
+        )
+        if len(looks) > 1:
+            config_spec.cute_mma_dag_partition_look = EnumFragment(choices=looks)
         config_spec.cute_mma_dag_v_lag = EnumFragment(choices=MMA_DAG_V_LAG_CHOICES)
         config_spec.cute_mma_dag_sleep_waits = EnumFragment(choices=(False, True))
         config_spec.cute_mma_dag_early_tmem_retirement = EnumFragment(
@@ -815,6 +833,7 @@ def _pin_paired_knobs(config: dict[str, object]) -> None:
     config.pop(MMA_DAG_VALUE_RING_TILES_KEY, None)
     config.pop(MMA_DAG_PAGE_ORDER_KEY, None)
     config.pop(MMA_DAG_CLIPPED_PAGE_LEAD_KEY, None)
+    config.pop(MMA_DAG_PARTITION_LOOK_KEY, None)
 
 
 def _hold_paired_knob(
@@ -867,7 +886,10 @@ def _normalize_partition(
     stream to the source's, the missing key as well. A lead of the clipped
     page is the reversed walk's: a value that is none of the option's is
     repaired to the default, and a lead beside any other order, which names
-    nothing, is dropped with the default, the missing key.
+    nothing, is dropped with the default, the missing key. A look of the
+    spare warp that the partition, the grid or the device's shared memory
+    beside the config's raw V ring does not have is repaired to the compute
+    group's, the missing key.
     """
     from ..paged_attention_config import paged_attention_boundary_prefetch_ahead_reason
     from ..paged_attention_config import paged_attention_boundary_prefetch_cold_reason
@@ -875,6 +897,7 @@ def _normalize_partition(
     from ..paged_attention_config import paged_attention_clipped_page_lead_applies
     from ..paged_attention_config import paged_attention_clipped_page_lead_reason
     from ..paged_attention_config import paged_attention_page_order_reason
+    from ..paged_attention_config import paged_attention_partition_look_reason
     from ..paged_attention_config import paged_attention_partition_reason
     from ..paged_attention_config import paged_attention_partition_skew_reason
     from ..paged_attention_config import paged_attention_release_lead_reason
@@ -961,6 +984,14 @@ def _normalize_partition(
         and not paged_attention_clipped_page_lead_applies(facts, config)
     ):
         config.pop(MMA_DAG_CLIPPED_PAGE_LEAD_KEY)
+    # Behind the raw V ring, beside which the look's stage must fit.
+    _hold_paired_knob(
+        config,
+        MMA_DAG_PARTITION_LOOK_KEY,
+        MMA_DAG_PARTITION_LOOK_GROUP,
+        paged_attention_partition_look_reason(facts, config),
+        fix_invalid=fix_invalid,
+    )
 
 
 # What a persistent partition needs of a config's transport: the two options
@@ -1176,6 +1207,25 @@ def value_ring_tiles_needs(
                 needed.update(PARTITION_TRANSPORT)
                 break
     return needed
+
+
+def partition_look_needs() -> dict[str, object]:
+    """What the spare warp's look for a unit's lowest part
+    (``cute_mma_dag_partition_look="spare"``) needs of a paired config: the
+    balanced partition, the only one that splits units, and what that
+    partition needs of the transport (``PARTITION_TRANSPORT``). It names no
+    skew and no ring: where the config's raw V ring leaves the look's stage
+    no room, the config contract refuses the look
+    (``paged_attention_partition_look_reason``).
+
+    The one statement of it, for a search's step onto the look
+    (``CuteConfigGenerationExtension._partition_look_neighbor_updates``)
+    and a fixed override
+    (``search_surface.reconcile_overridden_partition_look``)."""
+    return {
+        MMA_DAG_PARTITION_KEY: MMA_DAG_PARTITION_BALANCED,
+        **PARTITION_TRANSPORT,
+    }
 
 
 # The partition a search samples a deeper raw V ring on: one unit per CTA

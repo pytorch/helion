@@ -83,6 +83,7 @@ from ..cute_mma_dag import paged_attention_boundary_prefetch_choices
 from ..cute_mma_dag import paged_attention_boundary_prefetch_cold_choices
 from ..cute_mma_dag import paged_attention_early_retirement_default
 from ..cute_mma_dag import paged_attention_page_order_choices
+from ..cute_mma_dag import paged_attention_partition_look_choices
 from ..cute_mma_dag import paged_attention_value_ring_choices
 from ..cute_mma_dag import paged_attention_value_ring_tiles_choices
 from ..cute_mma_dag import paired_output_stores
@@ -108,6 +109,8 @@ from ..paged_attention_page_order import MMA_DAG_PAGE_ORDER_SOURCE
 from ..paged_attention_prefetch import BOUNDARY_PREFETCH_SIBLING
 from ..paged_attention_registers import MMA_DAG_REGISTER_QUOTAS_KEY
 from ..paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from ..paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
+from ..paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_KEY
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_KEY
 from ..paged_attention_shared_memory import MMA_DAG_VALUE_RING_TILES_KEY
 from ..paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
@@ -238,6 +241,7 @@ from .mma_dag_surface import key_clip_choices
 from .mma_dag_surface import normalize_value_metadata_options
 from .mma_dag_surface import page_order_needs
 from .mma_dag_surface import paired_capture_schedule
+from .mma_dag_surface import partition_look_needs
 from .mma_dag_surface import rederive_overridden_key_clip
 from .mma_dag_surface import take_overridden_partition_transport
 from .mma_dag_surface import value_ring_needs
@@ -2321,31 +2325,68 @@ def reconcile_overridden_value_ring_tiles(
     )
 
 
+def reconcile_overridden_partition_look(
+    config_spec: ConfigSpec,
+    config: dict[str, object],
+    overrides: Mapping[str, object],
+) -> None:
+    """Keep a paired candidate legal where ``overrides``, already layered
+    over it, name the spare warp's look for a unit's lowest part or take
+    away what the candidate's own needs
+    (``_reconcile_overridden_paired_knob``).
+
+    That look needs the paired schedule on the balanced partition with its
+    transport (``mma_dag_surface.partition_look_needs``). A search steps
+    onto it together with those
+    (``CuteConfigGenerationExtension._partition_look_neighbor_updates``).
+    Under an override that names it every paired candidate takes them, and
+    under one that contradicts them (another partition, the value-metadata
+    transport, another schedule) a candidate loses its own look and stays
+    in the search. A candidate keeps its other options through the move:
+    what the balanced partition does not hold of them is dropped behind
+    this (``drop_displaced_stream_knobs``). So is a candidate's own look
+    where an overridden raw V ring leaves its stage no room; under an
+    override that names the look such a candidate is left for validation
+    to reject."""
+    facts = config_spec.cute_mma_dag_facts
+    if facts is None or facts.attention is None:
+        return
+    _reconcile_overridden_paired_knob(
+        config,
+        overrides,
+        MMA_DAG_PARTITION_LOOK_KEY,
+        MMA_DAG_PARTITION_LOOK_GROUP,
+        partition_look_needs(),
+    )
+
+
 def drop_displaced_stream_knobs(
     config_spec: ConfigSpec,
     config: dict[str, object],
     overrides: Mapping[str, object],
 ) -> None:
     """Drop a paired candidate's own page order, ring depth, boundary
-    prefetch, cold depth, range-ahead distance or ring counted in tiles
-    where what the reconciliations ahead of this gave the candidate no
-    longer runs or holds it.
+    prefetch, cold depth, range-ahead distance, ring counted in tiles or
+    spare warp's look where what the reconciliations ahead of this gave
+    the candidate no longer runs or holds it.
 
     Each of those takes, for an override that names a knob, what the knob
     needs of the candidate, and that can be another partition than the one
     a second knob of the same candidate stands on: a fixed page count moves
-    a balanced seed to one unit per CTA, where its ring counted in tiles
-    and its range-ahead distance name nothing; a fixed tile count or
-    distance moves a seed that prefetches pages onto the balanced
-    partition, which also does not run every page order (the bucketed one,
-    and the reversed walk on a grid of one wave) and whose CTA may not hold
-    a deeper ring in pages. The candidate becomes the one it is without the
-    displaced knob, as it does under an override that contradicts the knob
-    directly (``_reconcile_overridden_paired_knob``), and as a search's
-    step onto the overridden knob leaves it: the step takes the partition
-    and normalization repairs what the partition does not run. An
-    overridden option is never changed, and without overrides nothing is:
-    a candidate is legal as the planner seeded it."""
+    a balanced seed to one unit per CTA, where its ring counted in tiles,
+    its range-ahead distance and its spare warp's look name nothing; a
+    fixed tile count or distance moves a seed that prefetches pages onto
+    the balanced partition, which also does not run every page order (the
+    bucketed one, and the reversed walk on a grid of one wave) and whose
+    CTA may not hold a deeper ring in pages; a fixed depth of the raw V
+    ring can leave the stage of a spare warp's look no room. The candidate
+    becomes the one it is without the displaced knob, as it does under an
+    override that contradicts the knob directly
+    (``_reconcile_overridden_paired_knob``), and as a search's step onto
+    the overridden knob leaves it: the step takes the partition and
+    normalization repairs what the partition does not run. An overridden
+    option is never changed, and without overrides nothing is: a candidate
+    is legal as the planner seeded it."""
     facts = config_spec.cute_mma_dag_facts
     if not overrides or facts is None or facts.attention is None:
         return
@@ -2417,6 +2458,23 @@ def drop_displaced_stream_knobs(
         )
     ):
         config.pop(MMA_DAG_VALUE_RING_TILES_KEY)
+    look = config.get(MMA_DAG_PARTITION_LOOK_KEY, MMA_DAG_PARTITION_LOOK_GROUP)
+    if (
+        MMA_DAG_PARTITION_LOOK_KEY not in overrides
+        and look != MMA_DAG_PARTITION_LOOK_GROUP
+        and look
+        not in paged_attention_partition_look_choices(
+            attention,
+            pass_warps,
+            skip,
+            partition,
+            config.get(MMA_DAG_VALUE_RING_KEY, PAIRED_DEFAULT_VALUE_RING),
+            config.get(MMA_DAG_VALUE_RING_TILES_KEY, 0),
+        )
+    ):
+        # Another partition, or a raw V ring that leaves the look's stage
+        # no room in the device's shared memory.
+        config.pop(MMA_DAG_PARTITION_LOOK_KEY)
 
 
 def reconcile_overridden_page_order(
@@ -6470,6 +6528,12 @@ def cute_flat_fields(
         clipped_lead_fragment = config_spec.cute_mma_dag_clipped_page_lead
         if clipped_lead_fragment is not None:
             fields[MMA_DAG_CLIPPED_PAGE_LEAD_KEY] = clipped_lead_fragment
+        # Who looks for the other parts of a split unit when a CTA runs its
+        # lowest part: the compute group, which a config without the key
+        # has, or the CTA's spare warp.
+        look_fragment = config_spec.cute_mma_dag_partition_look
+        if look_fragment is not None:
+            fields[MMA_DAG_PARTITION_LOOK_KEY] = look_fragment
         fields[MMA_DAG_LOADS_KEY] = config_spec.cute_mma_dag_loads
         # (Locals: the type checker's attribute narrowing does not
         # reach this far into the function.)
@@ -7146,14 +7210,16 @@ class CuteSearchSurface(BackendSearchSurface):
         reopen_load_hint_forms(config, overrides)
         # The partition, then a page order, which the partition must
         # run, then a depth of the raw V ring, which the partition's CTA
-        # must hold, and its count in tiles, then a prefetch, which has a
-        # role only with one unit per CTA and may need the capture policy,
-        # and the balanced partition's range-ahead prefetch, then a lead of
-        # the tail release, which needs that policy, then the policy itself.
+        # must hold, and its count in tiles, then the spare warp's look,
+        # the balanced partition's, then a prefetch, which has a role only
+        # with one unit per CTA and may need the capture policy, and the
+        # balanced partition's range-ahead prefetch, then a lead of the
+        # tail release, which needs that policy, then the policy itself.
         take_overridden_partition_transport(config_spec, config, overrides)
         reconcile_overridden_page_order(config_spec, config, overrides)
         reconcile_overridden_value_ring(config_spec, config, overrides)
         reconcile_overridden_value_ring_tiles(config_spec, config, overrides)
+        reconcile_overridden_partition_look(config_spec, config, overrides)
         reconcile_overridden_boundary_prefetch(config_spec, config, overrides)
         reconcile_overridden_boundary_prefetch_ahead(config_spec, config, overrides)
         # A knob may have moved the candidate off what another of its own

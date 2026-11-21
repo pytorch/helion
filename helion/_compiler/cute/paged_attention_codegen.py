@@ -34,6 +34,7 @@ from .paged_attention_prefetch import boundary_prefetch_form
 from .paged_attention_prefetch import boundary_prefetch_layout
 from .paged_attention_registers import PAIRED_DEFAULT_REGISTER_QUOTAS
 from .paged_attention_release import MMA_DAG_RELEASE_LEAD_DEFAULT
+from .paged_attention_shared_memory import MMA_DAG_PARTITION_LOOK_GROUP
 from .paged_attention_shared_memory import PAIRED_DEFAULT_VALUE_RING
 from .paged_attention_transport import paged_attention_launch_warps
 from .paged_attention_transport import paged_attention_tma_accesses
@@ -468,6 +469,20 @@ def codegen_paged_attention(cg: GenerateAST, schedule: PagedAttentionSchedule) -
             panel_arg += f", page_order_shift={schedule.page_order_shift}"
     else:
         assert not schedule.clipped_page_lead
+    if schedule.partition_look != MMA_DAG_PARTITION_LOOK_GROUP:
+        # The spare warp of a balanced CTA looks for the unit's lowest
+        # part and stages row statistics for the compute groups: the body
+        # repeats the contract's check on the table it allocates, against
+        # the capacity the look was admitted on. A deeper ring and a ring
+        # counted in tiles name that capacity above, once.
+        assert schedule.paired_items and not schedule.value_metadata_skip
+        assert schedule.partition == MMA_DAG_PARTITION_BALANCED
+        panel_arg += f", partition_look={schedule.partition_look!r}"
+        if (
+            schedule.value_ring == PAIRED_DEFAULT_VALUE_RING
+            and not schedule.value_ring_tiles
+        ):
+            panel_arg += f", shared_memory_capacity={schedule.smem_capacity}"
     store_policy = df.config.config.get("cute_store_policy", "default")
     if schedule.paired_items and store_policy != "default":
         # The policy of the kernel's output stores, which this body makes
