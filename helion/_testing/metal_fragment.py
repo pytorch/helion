@@ -5,6 +5,8 @@ code and MSL."""
 
 from __future__ import annotations
 
+import re
+
 import torch
 
 import helion
@@ -233,3 +235,11 @@ def affine_reference(args: tuple[torch.Tensor, ...]) -> torch.Tensor:
     grp = torch.arange(k) // group
     deq = codes.double() * scales.double()[:, grp] + biases.double()[:, grp]
     return x.double() @ deq.T
+
+
+def fragment_transposed(msl: str) -> bool:
+    """Whether a fragment matmul's accumulator is transposed in its MSL: its
+    A fragments' rows run over N (``fragment_mma.transposed``)."""
+    a_rows = re.search(r"int (_e_[mn]) = 8 \* \(_fi >> 1\) \+ _fm;", msl)
+    assert a_rows is not None, "no fragment run"
+    return a_rows.group(1) == "_e_n"

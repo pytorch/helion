@@ -98,6 +98,9 @@ class EmitState:
     tables: dict[tuple[str, tuple[str, ...]], str] = dataclasses.field(
         default_factory=dict
     )
+    #: The fragment accumulators whose runs order their MMAs fragment by
+    #: fragment (``fragment_mma``'s ``by_fragment``).
+    by_fragment: set[str] = dataclasses.field(default_factory=set)
     #: Each fragment run's K offset, the loads its K loop issues a tile
     #: early, to the registers holding them, and the elements built to find
     #: them (``fragment_mma``'s ``prefetch_loads``), by the run's loop.

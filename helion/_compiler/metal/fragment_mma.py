@@ -36,6 +36,13 @@ operand element from loads, iotas and element-wise ops alone
 (:func:`check_fragment_group`); a tile laid out over one SIMD group's 32
 threads (``check_mpp_launch``) and multiples of 8 (:func:`fragment_grid`).
 
+A few-row matmul whose activation the planner reads as the 16-bit view it
+widens (``mpp_matmul._widen``) is transposed, the weight the MMA's A, and
+its runs (the accumulator's ``by_fragment``) order the MMAs as MLX's
+few-row kernel (``affine_qmv_mma``) does: the tile's B fragments first,
+then each A fragment computed and multiplied at each step in turn
+(:func:`_emit_by_fragment`).
+
 ``num_warps`` SIMD groups split each K loop (the plan's ``split``): each
 runs the tile's 32-thread layout over every ``num_warps``-th K tile, from
 its own, and after the loop the first adds the others' accumulators to
@@ -47,6 +54,7 @@ from __future__ import annotations
 
 import ast
 import collections
+from collections.abc import Callable
 import copy
 from fractions import Fraction
 import math
@@ -111,7 +119,6 @@ from .search_surface import metal_tabulate_max_entries
 from .tabulate import tabulate
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from collections.abc import Mapping
 
     from torch.fx.node import Node
@@ -1043,6 +1050,8 @@ def emit_fragment_acc(
         state.coop_fold.add(name)
     state.coop_tile[name] = (block_m, block_n)
     state.fragments[name] = (rows, cols, flipped)
+    if _keyword(call, "by_fragment") is not None:
+        state.by_fragment.add(name)
     # The fragments cover the op's M and N, which are cut to the loops'
     # extents and so lie inside the blocks unless a block of 1 grew to 8.
     if tm > block_m or tn > block_n:
@@ -1076,11 +1085,10 @@ def emit_fragment_acc(
 
 def _run_setup(
     stmt: ast.For, state: EmitState, root: str
-) -> tuple[int, list[tuple[ast.For, str, int, tuple[str, str]]], dict[str, Fact], int]:
-    """A fragment run's step count, its sides ``(loop, fragment array,
-    fragments, position declarations)``, the facts its elements fold
-    over and its table cap (``metal_tabulate_max_entries``); ``root`` is its
-    accumulator's."""
+) -> tuple[int, list[tuple[ast.For, int, tuple[str, str]]], dict[str, Fact], int]:
+    """A fragment run's step count, its A and B sides ``(loop, fragments,
+    position declarations)``, the facts its elements fold over and its table
+    cap (``metal_tabulate_max_entries``); ``root`` is its accumulator's."""
     assert isinstance(stmt.iter, ast.Call)
     _, steps, facts_arg, tables, _, _ = stmt.iter.args
     rows, cols, flipped = _grid(state, root)
@@ -1094,7 +1102,6 @@ def _run_setup(
     sides = [
         (
             a_loop,
-            "_frag_a",
             rows,
             (
                 f"{row} = 8 * (_fi >> 1) + _fm",
@@ -1103,7 +1110,6 @@ def _run_setup(
         ),
         (
             b_loop,
-            "_frag_b",
             cols,
             (
                 f"_e_k = {n_steps} * _fm + _fs",
@@ -1175,9 +1181,11 @@ def emit_fragment_run(
     (``tabulate``).  In a K loop that loads a tile ahead
     (``range_num_stages=2``), the run reuses the elements the prefetch
     planner built (:func:`prefetch_loads`, through ``state.prefetch``), and
-    their early loads read the registers loaded the iteration before."""
-    pad = " " * indent
-    inner = pad + "    "
+    their early loads read the registers loaded the iteration before.  A
+    few-row group's runs (``_Operand.few_rows``, the accumulator's
+    ``by_fragment``) order their MMAs fragment by fragment
+    (:func:`_emit_by_fragment`) instead of step by step
+    (:func:`_emit_steps`)."""
     assert isinstance(stmt.iter, ast.Call)
     acc = stmt.iter.args[0]
     assert isinstance(acc, ast.Name)
@@ -1187,7 +1195,64 @@ def emit_fragment_run(
     rows, cols, _ = _grid(state, state.coop[acc.id])
     n_steps, sides, facts, tables = _run_setup(stmt, state, state.coop[acc.id])
     k, early, elements = state.prefetch.get(stmt, ("", {}, {}))
+    elements = dict(elements)
+    for step in range(n_steps):
+        for side, (loop, count, decls) in enumerate(sides):
+            for i in range(2 * count):
+                if (side, step, i) not in elements:
+                    elements[side, step, i] = _element_body(
+                        loop, decls, step, i, facts, tables, state
+                    )
+
+    def element_lines(side: int, step: int, i: int, at: str) -> list[str]:
+        """The block, at indent ``at``, that writes lane element ``i`` of a
+        ``side`` fragment at ``step``: its constant and declarations, then
+        its statements, which in a K loop that loads a tile ahead read the
+        registers loaded the iteration before."""
+        decls = sides[side][2]
+        body, env, element_facts = elements[side, step, i]
+        if early:
+            body = _read_early(body, env, element_facts, k, early)
+        lines = [
+            f"{at}{{",
+            f"{at}    constexpr short _fi = {i};",
+            *(f"{at}    int {decl};" for decl in decls),
+        ]
+        with state.isolated_scope():
+            emit_body(body, lines, len(at) + 4, state)
+        return [*lines, f"{at}}}"]
+
     saved = state.put
+    if state.coop[acc.id] in state.by_fragment:
+        assert not early, "the planner keeps a prefetching K loop's x computed"
+        _emit_by_fragment(
+            acc.id, rows, cols, n_steps, parts, indent, state, element_lines
+        )
+    else:
+        _emit_steps(acc.id, rows, cols, n_steps, parts, indent, state, element_lines)
+    state.put = saved
+
+
+#: Builds the block that writes a lane's element of a fragment
+#: (``emit_fragment_run``'s ``element_lines``): its side, step, element and
+#: indent.
+ElementLines = Callable[[int, int, int, str], list[str]]
+
+
+def _emit_steps(
+    acc: str,
+    rows: int,
+    cols: int,
+    n_steps: int,
+    parts: list[str],
+    indent: int,
+    state: EmitState,
+    element_lines: ElementLines,
+) -> None:
+    """A run's steps in turn: each builds its A and B fragments, then runs
+    its MMAs (:func:`emit_fragment_run`)."""
+    pad = " " * indent
+    inner = pad + "    "
     for step in range(n_steps):
         parts += [
             f"{pad}{{",
@@ -1195,31 +1260,65 @@ def emit_fragment_run(
             f"{inner}simdgroup_float8x8 _frag_a[{rows}];",
             f"{inner}simdgroup_float8x8 _frag_b[{cols}];",
         ]
-        for side, (loop, array, count, decls) in enumerate(sides):
-            state.put = f"{array}{FRAGMENT_SLOT}"
+        for side, count in enumerate((rows, cols)):
+            state.put = f"{('_frag_a', '_frag_b')[side]}{FRAGMENT_SLOT}"
             for i in range(2 * count):
-                lines = [
-                    f"{inner}{{",
-                    f"{inner}    constexpr short _fi = {i};",
-                    *(f"{inner}    int {decl};" for decl in decls),
-                ]
-                element = elements.get((side, step, i))
-                if element is None:
-                    element = _element_body(loop, decls, step, i, facts, tables, state)
-                body, env, element_facts = element
-                if early:
-                    body = _read_early(body, env, element_facts, k, early)
-                with state.isolated_scope():
-                    emit_body(body, lines, indent + 8, state)
-                parts += [*lines, f"{inner}}}"]
+                parts += element_lines(side, step, i, inner)
         parts += [
-            f"{inner}simdgroup_multiply_accumulate({acc.id}[{a * cols + b}], "
-            f"_frag_a[{a}], _frag_b[{b}], {acc.id}[{a * cols + b}]);"
+            f"{inner}simdgroup_multiply_accumulate({acc}[{a * cols + b}], "
+            f"_frag_a[{a}], _frag_b[{b}], {acc}[{a * cols + b}]);"
             for a in range(rows)
             for b in range(cols)
         ]
         parts.append(f"{pad}}}")
-    state.put = saved
+
+
+def _emit_by_fragment(
+    acc: str,
+    rows: int,
+    cols: int,
+    n_steps: int,
+    parts: list[str],
+    indent: int,
+    state: EmitState,
+    element_lines: ElementLines,
+) -> None:
+    """A few-row run's MMAs fragment by fragment, as MLX's few-row kernel
+    orders them: first the B fragments (the activation's) of every step,
+    then per A fragment (a weight row's) that fragment at each step,
+    computed and followed by its MMAs, so the compiler overlaps one
+    fragment's decode with the MMAs before it.  Each accumulator adds its
+    steps in the order :func:`_emit_steps` does."""
+    pad = " " * indent
+    inner = pad + "    "
+    parts.append(f"{pad}{{")
+    for step in range(n_steps):
+        parts += [
+            f"{inner}simdgroup_float8x8 _frag_b{step}[{cols}];",
+            f"{inner}{{",
+            f"{inner}    constexpr short _fs = {step};",
+        ]
+        state.put = f"_frag_b{step}{FRAGMENT_SLOT}"
+        for i in range(2 * cols):
+            parts += element_lines(1, step, i, inner + "    ")
+        parts.append(f"{inner}}}")
+    for a in range(rows):
+        for step in range(n_steps):
+            parts += [
+                f"{inner}{{",
+                f"{inner}    constexpr short _fs = {step};",
+                f"{inner}    simdgroup_float8x8 _frag_a[{rows}];",
+            ]
+            state.put = f"_frag_a{FRAGMENT_SLOT}"
+            for i in (2 * a, 2 * a + 1):
+                parts += element_lines(0, step, i, inner + "    ")
+            parts += [
+                f"{inner}    simdgroup_multiply_accumulate({acc}[{a * cols + b}], "
+                f"_frag_a[{a}], _frag_b{step}[{b}], {acc}[{a * cols + b}]);"
+                for b in range(cols)
+            ]
+            parts.append(f"{inner}}}")
+    parts.append(f"{pad}}}")
 
 
 #: A load a fragment run reads a K tile early: its tensor, its index without
@@ -1359,7 +1458,7 @@ def prefetch_loads(
         # The elements built here, which the run's emission reuses.
         elements: dict[tuple[int, int, int], FragmentElement] = {}
         for s in range(n_steps):
-            for side, (loop, _, count, decls) in enumerate(sides):
+            for side, (loop, count, decls) in enumerate(sides):
                 for i in range(2 * count):
                     element = _element_body(loop, decls, s, i, facts, tables, state)
                     elements[side, s, i] = element
@@ -1520,9 +1619,15 @@ def fragment_acc_keywords(
     cg: GenerateAST, group: MppGroup, m: int, n: int, k: int
 ) -> str:
     """The keywords of a fragment group's ``_helion_mpp_acc``: its grid
-    (:func:`fragment_grid`)."""
+    (:func:`fragment_grid`), and ``by_fragment=True`` for a few-row group
+    (``_Operand.few_rows``)."""
     grid = fragment_grid(group, m, n, k)
-    return f", fragment={grid!r}"
+    # A few-row group's runs order their MMAs fragment by fragment
+    # (:func:`_emit_by_fragment`): the case that order was measured in.  A
+    # transposed group whose activation is already a float32 view keeps the
+    # step order, though the overlap the order buys doesn't depend on it.
+    by_fragment = ", by_fragment=True" if group.lhs.few_rows else ""
+    return f", fragment={grid!r}{by_fragment}"
 
 
 class FragmentLowering:

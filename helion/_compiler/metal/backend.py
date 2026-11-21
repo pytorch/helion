@@ -4,6 +4,7 @@ helion/_compiler/backend.py."""
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from typing import TYPE_CHECKING
 from typing import Any
@@ -89,6 +90,23 @@ def _reduction_contracted(block_id: int, contracted: set[int]) -> bool:
 
     # A twin's reductions run on its owner's lanes (``MetalPaddedTwinStrategy``).
     return not contracted.isdisjoint((block_id, *padded_twins(block_id)))
+
+
+def _widen_k(config: Config, block: int) -> bool:
+    """Whether a fragment K loop over ``block`` may run a few-row matmul's
+    transposed form (``mpp_matmul._widen``): its tiles are whole, the K
+    extent a multiple of the config's block, and loaded in their own
+    iteration (``range_num_stages`` below 2), as in the configs that form
+    was measured at."""
+    from ..compile_environment import CompileEnvironment
+    from .search_surface import fragment_stages
+
+    env = CompileEnvironment.current()
+    if fragment_stages(env.config_spec, config, block) >= 2:
+        return False
+    size = env.block_sizes[block].from_config(config)
+    extent = static_extent(env.block_sizes[block].size)
+    return isinstance(size, int) and extent is not None and extent % size == 0
 
 
 def threadgroup_budget(config: Config, device_ir: DeviceIR | None = None) -> int:
@@ -915,6 +933,7 @@ class MetalBackend(Backend):
                 graphs,
                 threaded,
                 FRAGMENT_LOWERING if metal_matmul(config) == "fragment" else None,
+                functools.partial(_widen_k, config),
             )
             self.mpp_plan_refused = False
         split = fragment_split(CompileEnvironment.current().config_spec, config)
