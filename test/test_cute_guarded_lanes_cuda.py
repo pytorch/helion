@@ -13,12 +13,19 @@ import torch
 
 import helion
 from helion._testing import DEVICE
+from helion._testing.guarded_lane_kernels import IDENTITY_CHAINS
+from helion._testing.guarded_lane_kernels import LITERAL_IDENTITY_CHAINS
 from helion._testing.guarded_lane_kernels import extrema
 from helion._testing.guarded_lane_kernels import extrema_bound_chains
 from helion._testing.guarded_lane_kernels import extrema_carried_max
+from helion._testing.guarded_lane_kernels import extrema_carried_max_copies
+from helion._testing.guarded_lane_kernels import extrema_carried_max_identities
 from helion._testing.guarded_lane_kernels import extrema_chains
+from helion._testing.guarded_lane_kernels import extrema_identity_chains
+from helion._testing.guarded_lane_kernels import extrema_literal_identity_chains
 from helion._testing.guarded_lane_kernels import extrema_outside_chains
 from helion._testing.guarded_lane_kernels import extrema_relu_clamp
+from helion._testing.guarded_lane_kernels import extrema_view_chains
 from helion._testing.guarded_lane_kernels import flags_reread_after_a_store
 from helion._testing.guarded_lane_kernels import masked_accumulate
 from helion._testing.guarded_lane_kernels import neighbor_max_into
@@ -555,6 +562,36 @@ def _chain_references(
     }
 
 
+def _view_chain_case(
+    dtype: torch.dtype,
+) -> tuple[tuple[torch.Tensor, ...], dict[str, torch.Tensor]]:
+    """Inputs of ``extrema_view_chains`` and eager's results, by chain."""
+    x = _integer_rows(dtype, 4)
+    y = _integer_rows(dtype, 5).t().contiguous()
+    a = _integer_rows(dtype, 6)[:, 0].contiguous()
+    c = _integer_rows(dtype, 7)[0].contiguous()
+    expected = {
+        "broadcast": torch.maximum(torch.maximum(-a, -(a * 2))[:, None], -c[None, :]),
+        "expanded": torch.minimum(torch.minimum(-c, -(c * 2))[None, :], -a[:, None]),
+        "sliced": torch.maximum(torch.maximum(-x, -(x * 2)), -(x + 1)),
+        "permuted": torch.minimum(torch.minimum(-y, -(y * 2)).permute(1, 0), -x),
+        "copied": torch.minimum(torch.minimum(-x, -(x * 3)), -(x - 1)),
+        "raised": torch.maximum(torch.maximum(-x, -(x * 3)), -(x - 1)),
+    }
+    return (a, c, x, y), expected
+
+
+def _identity_chain_references(
+    chains: tuple[tuple[str, str], ...], x: torch.Tensor
+) -> dict[str, torch.Tensor]:
+    """Eager's results of an identity chain kernel over ``x``, by chain."""
+    expected = {}
+    for index, (name, kind) in enumerate(chains):
+        op = torch.maximum if kind == "max" else torch.minimum
+        expected[name] = op(op(-x, -(x * (index + 2))), -(x + 1))
+    return expected
+
+
 def _mismatches(
     kernel: object,
     args: tuple[object, ...],
@@ -582,9 +619,19 @@ def test_chains_of_integer_extrema_of_negated_values_equal_eager(
     instruction: the elementwise extremum of three or four negated values
     was that of a mix of negated and plain ones, nested or through a named
     value, as ``torch.maximum``, as lower ``clamp`` bounds, and accumulated
-    by a serial loop.  The links of such a chain compare through unsigned
-    keys now.  A ``relu`` over a maximum, also a chain, was right and stays
-    so."""
+    by a serial loop, and also when only a view (a broadcast, a full slice,
+    a ``permute``), a copy (a ``clone``, a ``repeat`` of one, a flip of no
+    dim) or a value identity (``+ 0``, ``* 1``, ``| 0``, a rounding,
+    ``-(-inner)``, a conversion to int64 and back, ...) lies between the
+    two extrema or at the boundary of that loop, or, in a loop's body, a
+    sum with a zero difference and a plain copy of the variable.  The links
+    of such a chain compare through unsigned keys now (after that sum, the
+    later one).  A ``relu`` over a maximum, also a chain, was right and
+    stays so.
+
+    The direct chains run at six thread layouts.  The chains through
+    copies, views and identities, whose keyed code the CPU tests pin form
+    by form, run at one layout each: the keys are the direct chains'."""
     a, b, c, d = (_integer_rows(dtype, seed) for seed in range(4))
     wrong = _mismatches(
         extrema_chains, (a, b, c, d), _chain_references(a, b, c, d), _ELEMENT_LAYOUTS
@@ -593,15 +640,42 @@ def test_chains_of_integer_extrema_of_negated_values_equal_eager(
         "clamp_over_clamp": torch.clamp(torch.clamp(-a, min=-(a * 2)), min=-(a + 1)),
         "relu_over_max": torch.relu(torch.maximum(-a, -(a * 2))),
     }
-    two = {name: _ELEMENT_LAYOUTS[name] for name in ("default", "packets_of_4")}
-    wrong += _mismatches(extrema_bound_chains, (a,), bounds, two)
+    default = {"default": _ELEMENT_LAYOUTS["default"]}
+    packets = {"packets_of_4": _ELEMENT_LAYOUTS["packets_of_4"]}
+    wrong += _mismatches(extrema_bound_chains, (a,), bounds, default | packets)
     carried = {"carried_max": torch.amax(-a, dim=-1)}
-    serial: dict[str, dict[str, object]] = {
-        "four_rows_per_block": {"block_sizes": [4]},
-        "one_row_per_block": {"block_sizes": [1]},
+    four_rows: dict[str, dict[str, object]] = {
+        "four_rows_per_block": {"block_sizes": [4]}
     }
+    one_row: dict[str, dict[str, object]] = {"one_row_per_block": {"block_sizes": [1]}}
     lowest = torch.iinfo(dtype).min
-    wrong += _mismatches(extrema_carried_max, (a, lowest), carried, serial)
+    wrong += _mismatches(extrema_carried_max, (a, lowest), carried, four_rows | one_row)
+    chained = torch.maximum(torch.maximum(-a, -(a * 2)), -(a + 1))
+    copies = {
+        "taken": carried["carried_max"],
+        "handed": carried["carried_max"],
+        "repeated_in": carried["carried_max"],
+        "repeated_out": carried["carried_max"],
+        "flipped_out": carried["carried_max"],
+        "chained": chained,
+        "moved_last": chained[:, -1],
+    }
+    wrong += _mismatches(extrema_carried_max_copies, (a, lowest), copies, four_rows)
+    # The broadcast views were wrong at the default layout only.
+    wrong += _mismatches(extrema_view_chains, *_view_chain_case(dtype), default)
+    for kernel, chains, layout in (
+        (extrema_literal_identity_chains, LITERAL_IDENTITY_CHAINS, default),
+        (extrema_identity_chains, IDENTITY_CHAINS, packets),
+    ):
+        references = _identity_chain_references(chains, a)
+        wrong += _mismatches(kernel, (a,), references, layout)
+    identities = {
+        "rounded": carried["carried_max"],
+        "raised": carried["carried_max"],
+    }
+    wrong += _mismatches(
+        extrema_carried_max_identities, (a, lowest), identities, one_row
+    )
     assert not wrong
 
 
@@ -631,4 +705,6 @@ def test_chains_of_int8_extrema_of_negated_values_equal_eager() -> None:
     carried = {"carried_max": torch.amax(-a, dim=-1)}
     serial: dict[str, dict[str, object]] = {"four_rows_per_block": {"block_sizes": [4]}}
     wrong += _mismatches(extrema_carried_max, (a, -128), carried, serial)
+    default = {"default": _ELEMENT_LAYOUTS["default"]}
+    wrong += _mismatches(extrema_view_chains, *_view_chain_case(torch.int8), default)
     assert not wrong
