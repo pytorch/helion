@@ -35,6 +35,8 @@ REPO_ROOT = PRETUNED_KERNELS_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from helion._hardware import get_hardware_info  # noqa: E402  (needs the sys.path setup)
+
 # Module file stem == kernel name; the module lives in pretuned_kernels/<name>/,
 # megakernels/<name>/ or a model-family folder megakernels/<family>/.  Ordered
 # cheap-to-expensive so a partial run (e.g. timeout) still captures the quick
@@ -76,9 +78,9 @@ KERNELS = [
     "grouped_gemm_deepgemm",
 ]
 
-# Map a compute capability (heuristic file suffix) to a hardware alias. The
-# nightly runs one GPU per alias.
-_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200"}
+# Map a compute capability (heuristic file suffix) to a hardware alias (gfx950
+# also covers MI355X). Each benchmark job passes its alias with --hardware.
+_HARDWARE_BY_COMPUTE = {"sm90": "h100", "sm100": "b200", "gfx950": "mi350x"}
 
 
 def _kernel_directory(name: str) -> Path:
@@ -107,15 +109,25 @@ def grouped_reference_requirements(value: str) -> dict[str, bool]:
 def _supported_hardware(name: str) -> set[str]:
     """Hardware a kernel is pretuned for, inferred from its checked-in heuristics.
 
-    Each ``_helion_aot_<name>_cuda_sm<NN>.py`` file declares a compute capability
+    Each ``_helion_aot_<name>_cuda_sm<NN>.py`` or
+    ``_helion_aot_<name>_rocm_gfx<arch>.py`` file declares a compute capability
     the kernel ships a config for; map those to hardware aliases. This is the
     single source of truth -- no per-kernel declaration to keep in sync.
     """
     hardware = set()
-    for path in _kernel_directory(name).glob(f"_helion_aot_{name}_cuda_sm*.py"):
-        match = re.search(r"_cuda_(sm\d+)\.py$", path.name)
+    for path in _kernel_directory(name).glob(f"_helion_aot_{name}_*.py"):
+        # ``cuda_``/``rocm_`` must follow ``<name>_`` directly, so a sibling
+        # kernel sharing the prefix (``<name>_bf16``) is not counted. ROCm
+        # heuristics are named after the base arch; a legacy name with target
+        # features (``gfx950:sramecc+:xnack-``) loads only on a GPU with exactly
+        # those features, so it does not count.
+        match = re.fullmatch(
+            rf"_helion_aot_{re.escape(name)}_(?:cuda_(sm\d+)|rocm_(gfx[0-9a-f]+))\.py",
+            path.name,
+        )
         if match:
-            hardware.add(_HARDWARE_BY_COMPUTE.get(match.group(1), match.group(1)))
+            compute = match.group(1) or match.group(2)
+            hardware.add(_HARDWARE_BY_COMPUTE.get(compute, compute))
     return hardware
 
 
@@ -136,8 +148,10 @@ def _import_kernel_module(name: str) -> ModuleType:
 
 
 def _compute_capability() -> str:
-    major, minor = torch.cuda.get_device_capability()
-    return f"sm{major}{minor}"
+    # The runtime's GPU identity (on ROCm the arch, not torch's "sm95" for
+    # gfx950), so the runner agrees with the AOT heuristic lookup. The ROCm
+    # report may carry target features ("gfx950:sramecc+:xnack-").
+    return get_hardware_info().compute_capability.split(":")[0]
 
 
 def run_kernel(name: str, current_hardware: str) -> dict:

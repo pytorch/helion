@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch.testing._internal.distributed.fake_pg import FakeStore
 
 import helion
+from helion._hardware import HardwareInfo
 from helion._hardware import get_hardware_info
 from helion._testing import DEVICE
 from helion._testing import PRETUNED_KERNELS_DIR
@@ -107,6 +108,17 @@ def _import_pretuned_heuristic(name: str, compute: str = "sm100"):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     return sys.modules[module_name]
+
+
+def _import_pretuned_runner():
+    """A fresh ``pretuned_kernels/run.py`` module, so a test can patch it freely."""
+    spec = importlib.util.spec_from_file_location(
+        "_pretuned_runner", PRETUNED_KERNELS_DIR / "run.py"
+    )
+    assert spec is not None and spec.loader is not None
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    return runner
 
 
 @pytest.mark.parametrize(
@@ -196,6 +208,57 @@ def test_qwen3_decode_layer_has_explicit_runtime_metadata_contract() -> None:
     assert max(module.CONTEXT_LENGTHS) <= module.CONTEXT
 
 
+def test_runner_supported_hardware_parses_cuda_and_rocm_heuristics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _import_pretuned_runner()
+    monkeypatch.setattr(runner, "_kernel_directory", lambda _name: tmp_path)
+
+    for suffix in (
+        "cuda_sm90",
+        "cuda_sm100",
+        "cuda_sm121",
+        "rocm_gfx950",
+        "rocm_gfx942",
+    ):
+        (tmp_path / f"_helion_aot_softmax_{suffix}.py").touch()
+    (tmp_path / "_helion_aot_softmax_unrelated.py").touch()
+    # A legacy ROCm name with target features loads only on a GPU with exactly
+    # those features, so it does not count as pretuned for the arch.
+    (tmp_path / "_helion_aot_softmax_rocm_gfx90a:sramecc+:xnack-.py").touch()
+    # A sibling kernel sharing the name as a prefix keeps its own heuristics.
+    (tmp_path / "_helion_aot_softmax_bf16_cuda_sm103.py").touch()
+    (tmp_path / "_helion_aot_softmax_bf16_rocm_gfx90a.py").touch()
+    # Structural-policy files are not plain heuristics.
+    for policy in ("cuda_sm103", "rocm_gfx1100", "rocm_gfx1100:xnack-"):
+        (tmp_path / f"_helion_aot_softmax_{policy}__policy_abc.py").touch()
+    assert runner._supported_hardware("softmax") == {
+        "h100",
+        "b200",
+        "sm121",
+        "mi350x",
+        "gfx942",
+    }
+
+
+def test_runner_compute_capability_uses_rocm_base_arch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _import_pretuned_runner()
+
+    def hardware(device_kind: str, compute_capability: str) -> None:
+        info = HardwareInfo(device_kind, compute_capability, "0", compute_capability)
+        monkeypatch.setattr(runner, "get_hardware_info", lambda: info)
+
+    # torch reports gfx950 as capability (9, 5), which must not become "sm95";
+    # a report with target features gives the same arch.
+    for compute_capability in ("gfx950", "gfx950:sramecc+:xnack-"):
+        hardware("rocm", compute_capability)
+        assert runner._compute_capability() == "gfx950"
+    hardware("cuda", "sm90")
+    assert runner._compute_capability() == "sm90"
+
+
 def test_kda_decode_uses_existing_tuning_surface() -> None:
     module = _import_pretuned_kernel_module("kda_decode")
     heuristic = _import_pretuned_heuristic("kda_decode")
@@ -203,13 +266,7 @@ def test_kda_decode_uses_existing_tuning_surface() -> None:
         "pretuned_kernels.megakernels.kda_decode._standalone"
     )
 
-    runner_path = PRETUNED_KERNELS_DIR / "run.py"
-    runner_spec = importlib.util.spec_from_file_location(
-        "_kda_pretuned_runner", runner_path
-    )
-    assert runner_spec is not None and runner_spec.loader is not None
-    runner = importlib.util.module_from_spec(runner_spec)
-    runner_spec.loader.exec_module(runner)
+    runner = _import_pretuned_runner()
     assert "kda_decode" in runner.KERNELS
     assert runner._supported_hardware("kda_decode") == {"b200"}
 
@@ -1269,11 +1326,7 @@ class TestPretunedCuteCodegen(TestCase):
         self._run_tcgen05_fragment_epilogue_correctness("interleaved_swiglu")
 
     def test_tcgen05_fragment_epilogues_are_registered_for_b200(self) -> None:
-        path = PRETUNED_KERNELS_DIR / "run.py"
-        spec = importlib.util.spec_from_file_location("_pretuned_runner", path)
-        assert spec is not None and spec.loader is not None
-        runner = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(runner)
+        runner = _import_pretuned_runner()
         for name in ("projection_rotary", "interleaved_swiglu"):
             with self.subTest(name=name):
                 self.assertIn(name, runner.KERNELS)
