@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 from unittest import mock
 
@@ -9,6 +10,7 @@ import torch
 from torch._inductor.codecache import PyCodeCache
 
 import helion
+from helion._compiler.metal import c10_preamble
 import helion.language as hl
 
 if TYPE_CHECKING:
@@ -23,6 +25,14 @@ class _NoShader:
 
     def __getattr__(self, name: str) -> object:
         return lambda *args, **kwargs: None
+
+
+def _whole_c10(whole: bool) -> contextlib.AbstractContextManager[object]:
+    """With ``whole``, Metal kernels compiled inside take the whole c10
+    headers, ``c10_preamble`` off."""
+    if not whole:
+        return contextlib.nullcontext()
+    return mock.patch.object(c10_preamble, "prune", lambda msl: msl)
 
 
 def _load(
@@ -74,6 +84,8 @@ def render_msl(
     args: tuple[object, ...],
     config: helion.Config,
     num_sm: int = 16,
+    module_key: str = "",
+    whole_c10: bool = False,
 ) -> str:
     """The MSL ``kernel`` generates for ``args`` at ``config``, without an
     Apple GPU: its generated module runs on ``args``, CPU tensors whose
@@ -87,9 +99,13 @@ def render_msl(
     launch plans by everything but the tensors' device, so a shared module
     would hand this render's no-op plan to a GPU run, or a GPU run's shader
     to this render.  The key also holds ``num_sm``, which the generated
-    code doesn't, so each core count renders its own MSL."""
-    module, _, args = _load(kernel, args, config, f"render_msl:{num_sm}")
+    code doesn't, so each core count renders its own MSL; a new
+    ``module_key`` renders it anew.  ``whole_c10`` renders it with the whole
+    c10 headers, in place of the declarations it uses (``c10_preamble``)."""
+    key = f"render_msl:{num_sm}:{module_key}:{whole_c10}"
+    module, _, args = _load(kernel, args, config, key)
     with (
+        _whole_c10(whole_c10),
         mock.patch.object(
             torch.mps, "compile_shader", lambda source: _NoShader(), create=True
         ),
@@ -108,14 +124,18 @@ def run_with_msl(
     args: tuple[object, ...],
     config: helion.Config | None = None,
     module_key: str = "",
+    whole_c10: bool = False,
 ) -> tuple[object, str, str]:
     """Compile and run ``kernel`` on ``args`` at ``config`` (None: as
     ``BoundKernel.to_code`` picks one, the kernel's own config if it has
     one) through the normal Helion pipeline;
     return its result, its generated Python and the MSL it compiled.  A new
-    ``module_key`` loads a fresh module, whose MSL is generated anew."""
-    module, code, args = _load(kernel, args, config, module_key)
-    result = getattr(module, kernel.fn.__name__)(*args)
+    ``module_key`` loads a fresh module, whose MSL is generated anew;
+    ``whole_c10`` compiles it with the whole c10 headers (``c10_preamble``
+    off)."""
+    module, code, args = _load(kernel, args, config, f"{module_key}:{whole_c10}")
+    with _whole_c10(whole_c10):
+        result = getattr(module, kernel.fn.__name__)(*args)
     torch.mps.synchronize()
     return result, code, _compiled_msl(module)
 

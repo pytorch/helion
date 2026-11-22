@@ -211,7 +211,10 @@ class TestFragmentSplit(TestCase):
             (views_epilogue, _views_args(), fragment_config([16, 16, 16])),
         ):
             with self.subTest(kernel=kernel.name):
-                self.assertExpectedJournal(render_msl(kernel, args, config))
+                # With the whole c10 includes: the journal pins Helion's
+                # code, not the declarations torch's headers hold.
+                msl = render_msl(kernel, args, config, whole_c10=True)
+                self.assertExpectedJournal(msl)
 
     def test_split(self) -> None:
         """At ``num_warps=2`` two SIMD groups run the tile's 32-thread layout
@@ -224,7 +227,7 @@ class TestFragmentSplit(TestCase):
         code = views_epilogue.bind(args).to_code(config)
         self.assertRegex(code, r"split=\('offset_\d+', 2\)")
         self.assertIn("_block_dims=(4, 8, 2)", code)
-        msl = render_msl(views_epilogue, args, config)
+        msl = render_msl(views_epilogue, args, config, whole_c10=True)
         self.assertExpectedJournal(msl)
         self.assertIn("[[required_threads_per_threadgroup(4, 8, 2)]]", msl)
         self.assertIn("uint _frag_sg [[simdgroup_index_in_threadgroup]]", msl)

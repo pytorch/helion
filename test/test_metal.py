@@ -2996,7 +2996,9 @@ class TestMetalReductions(unittest.TestCase):
         """
         x = torch.randn(64, 256, device=DEVICE)
         msl = _get_msl(row_sum, (x,))
-        self.assertIn("#include <c10/metal/reduction_utils.h>", msl)
+        # Its SIMD reductions, carried in the kernel (``c10_preamble``).
+        self.assertNotIn("#include <c10/", msl)
+        self.assertRegex(msl[: msl.index("namespace helion_red")], r"\bsimd_sum\b")
         self.assertIn("::c10::metal::simd_##NAME", msl)
         self.assertNotIn("::c10::metal::threadgroup_", msl)
         # A span of 256 takes the cross-SIMD-group tier and its scratch.

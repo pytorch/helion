@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import logging
 import textwrap
 import types
 from typing import TYPE_CHECKING
@@ -37,6 +38,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ... import exc
+from . import c10_preamble
 from ._constants import MAX_THREADGROUP_MEMORY_BYTES
 from .fma_fusion import fuse_multiply_adds
 from .fragment_mma import FRAGMENT_LOWERING
@@ -78,6 +80,10 @@ if TYPE_CHECKING:
 #: Python int as 8 bytes and a float as 4.
 _RUNTIME_SCALAR_TYPES: dict[type, str] = {int: "long", float: "float"}
 _NO_SCALARS: Mapping[str, str] = types.MappingProxyType({})
+
+log: logging.Logger = logging.getLogger(__name__)
+#: The kernels whose pruned c10 preamble failed to compile, warned about once.
+_PRUNE_FAILURES: set[str] = set()
 
 
 def metal_jit(fn: Callable[..., object]) -> _MetalKernel:
@@ -186,7 +192,7 @@ class _MetalKernel:
             if isinstance(node, ast.FunctionDef)
         )
         param_names = [a.arg for a in fn_def.args.args]
-        self.msl_source = _generate_msl(
+        full = _generate_msl(
             kernel_name=self._name,
             body_stmts=fn_def.body,
             param_names=param_names,
@@ -197,7 +203,29 @@ class _MetalKernel:
                 param_names[i]: _RUNTIME_SCALAR_TYPES[type(args[i])] for i in by_value
             },
         )
-        return torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
+        # The c10 declarations the kernel uses in place of the whole headers
+        # (``c10_preamble``); the whole headers where those don't compile.
+        self.msl_source = c10_preamble.prune(full)
+        try:
+            return torch.mps.compile_shader(self.msl_source)  # type: ignore[attr-defined]
+        except SyntaxError as error:
+            if self.msl_source == full:
+                raise
+            lines = str(error).splitlines()
+            # The first error, past the warnings the compiler lists first.
+            reason = next((line for line in lines if "error:" in line), lines[0])
+        # Outside the handler: an error here is the kernel's own, shown alone.
+        self.msl_source = full
+        lib = torch.mps.compile_shader(full)  # type: ignore[attr-defined]
+        if self._name not in _PRUNE_FAILURES:
+            _PRUNE_FAILURES.add(self._name)
+            log.warning(
+                "%s: the pruned c10 preamble does not compile; compiled with "
+                "the whole c10 headers instead: %s",
+                self._name,
+                reason,
+            )
+        return lib
 
 
 def _shared_storage(args: tuple[object, ...]) -> frozenset[int]:
