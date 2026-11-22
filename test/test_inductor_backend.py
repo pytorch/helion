@@ -525,7 +525,8 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
         b = randn(72, 136)
         fn, a, lines = {
             # The mask needs tile_y and tile_r, and a [40, 72] view of the [36, 64]
-            # input would leave its storage, so the load is flat.
+            # input would leave its storage, so the load is flat. (With the CuTe
+            # backend, the pad is a kernel of its own: test_pad_prologue.)
             "pad": (
                 lambda a, b: torch.nn.functional.pad(a, (0, 8, 0, 4)) @ b,
                 randn(36, 64),
@@ -681,6 +682,26 @@ class TestInductorCute(InductorBackendTestCase):
             torch.bmm, randn(4, 128, 64), randn(4, 64, 128), backend="cute"
         )
         self.assertIn("tmp2 = torch.bmm(tmp0, tmp1)", source)
+
+    @needs_native_matmul
+    @config.patch(force_shape_pad=True)
+    def test_padded_operand(self):
+        # pad_mm pads N from 1001 to 1008. The pad is a kernel of its own, and
+        # the dot reads the padded b as tiles, not through b's masked loads.
+        a, b = randn(64, 128), randn(1001, 128).t()
+        sources = self.compile(torch.matmul, a, b, backend="cute")
+        self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
+        self.assertIn("tmp1 = in1[tile_r, tile_x]", sources[1])
+        self.assertNotIn("hl.load(", sources[1])
+
+    @needs_native_matmul
+    def test_pad_prologue(self):
+        # F.pad of a is a kernel of its own too (on Triton it stays in the dot:
+        # TestInductorMatmul.test_operand).
+        fn = lambda a, b: torch.nn.functional.pad(a, (0, 8, 0, 4)) @ b  # noqa: E731
+        sources = self.compile(fn, randn(36, 64), randn(72, 136), backend="cute")
+        self.assertEqual([bool(DOT_RE.search(s)) for s in sources], [False, True])
+        self.assertIn("tmp0 = in0[tile_y, tile_r]", sources[1])
 
     def test_unsupported_op(self):
         # Helion's CuTe backend compiles no lgamma.
