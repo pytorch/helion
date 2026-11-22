@@ -92,7 +92,9 @@ benched again when one of its autotunes runs again, is newer than its bench
 record, or is another record than the one that bench record's port was timed
 on. The last is judged by what the records hold, not by their dates
 (``common.timed_on_record``: a bench record names the kernels each port was
-pinned to), so it also holds for a record that was copied, removed or dated
+pinned to by the digests of their code, source-line comments apart where
+the bench record and the autotune record both hold the digests without
+them), so it also holds for a record that was copied, removed or dated
 oddly, and for a bench that left out a port of ``--backends`` which the
 benches now time and the point has an ok autotune record of (it ran with
 other ``--bench-impls``). Starting a job moves its previous record to

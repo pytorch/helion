@@ -18,6 +18,11 @@ generated code and outputs, which is how ``bench.py`` pins them later. That
 call of the pinned port starts from poisoned memory, and a pick that leaves
 part of an output unwritten fails the record (``common.check_written``): the
 search's own calls left the allocator's free blocks full of right results.
+The record holds two digests of each kernel's code (``common.code_digests``):
+of the whole text (``code_sha256``) and of the text without the comments
+that quote the port's source (``code_nosrc_sha256``), which is the one the
+kernel is pinned by, so a comment in the port or a line added above a kernel
+leaves the record standing.
 
 Run it through ``campaign.py``, which gives every job a fresh process, a
 random seed (a fresh one, or with ``--seeds-from`` the one another run's

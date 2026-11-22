@@ -214,7 +214,10 @@ def check_pinned(
     it): ``ok`` with what was checked, ``error`` with why, or ``missing``
     when the directory has no record of the port on this backend, or the
     record of an autotune that failed. A record that is there and cannot be
-    read is an error: nothing was checked."""
+    read is an error: nothing was checked. ``code_matches_autotune`` says
+    whether the pinned kernels still generate the code the record holds
+    (``common.pin_roundtrip``: the source-line comments do not count, except
+    for a record that holds only the digest of the whole text)."""
     path = common.config_record_path(args.configs_dir, repro_id, shape, backend)
     record: dict[str, Any] = {"autotune_record": str(path), "status": "error"}
     if not path.exists():

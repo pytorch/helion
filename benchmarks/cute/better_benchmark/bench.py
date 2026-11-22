@@ -14,10 +14,16 @@ Implementations (``--impls``):
 - ``helion_triton`` / ``helion_cute``: the Helion port with the kernels pinned
   to the decorators a cold full autotune reported (``autotune.py``); the
   record names that autotune record's code digests and whether it was
-  provisional (``autotune_code_sha256``, ``autotune_provisional``), so
-  ``report.py`` tells the timing from one of a later autotune of the port.
-  It names them before the port loads (``pinned_port``): an entry without
-  them found no ok autotune record, whatever else failed
+  provisional (``autotune_code_sha256``, ``autotune_code_nosrc_sha256``
+  where the record holds the digests without source-line comments,
+  ``autotune_provisional``), so ``report.py`` tells the timing from one of
+  a later autotune of the port. It names them before the port loads
+  (``pinned_port``): an entry without them found no ok autotune record,
+  whatever else failed. An entry that ran also says whether the pinned
+  kernels generated the code the record holds (``code_matches_autotune``,
+  ``common.pin_roundtrip``): the same text but for its source-line
+  comments, or the same whole text for a record made before autotune
+  records held the digest without them
 - ``memcopy``: better-benchmark's speed-of-light proxy, a copy of the repro's
   effective bytes (``byte_accounting.count_bytes_effective``)
 

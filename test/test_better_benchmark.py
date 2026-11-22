@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import contextlib
 import gc
 import hashlib
@@ -46,10 +47,14 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import helion
 from helion._testing import DEVICE
+from helion._testing import cpu_render_target
 from helion._testing import skipIfNotCUDA
+from helion._testing import skipIfRefEagerMark
+from helion._testing.cute_codegen import codegen_skip_reason
 from helion.autotuner import benchmark_prelude
 from helion.autotuner import benchmarking
 import helion.runtime
+from helion.runtime.settings import _get_backend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -4412,6 +4417,267 @@ def test_a_bench_entry_is_of_the_record_whose_kernels_it_names() -> None:
     assert not common.timed_on_record(before, None)
 
 
+def _digest_record(whole: str, nosrc: str | None = None) -> dict[str, Any]:
+    """An ok autotune record of one kernel with these digests of its code:
+    of the whole text and, unless the record is one made before records
+    held it (None), of the text without source-line comments."""
+    kernel = {"decorator": "@helion.kernel(version=1)", "code_sha256": whole}
+    if nosrc is not None:
+        kernel["code_nosrc_sha256"] = nosrc
+    return {"status": "ok", "kernels": {"k": kernel}}
+
+
+def test_a_bench_entry_is_of_a_record_with_its_code_but_for_source_comments() -> None:
+    tuned = _digest_record("whole-1", "nosrc-1")
+    info = common.timed_record_fields(tuned)
+    assert info["autotune_code_sha256"] == {"k": "whole-1"}
+    assert info["autotune_code_nosrc_sha256"] == {"k": "nosrc-1"}
+    assert common.timed_on_record(info, tuned)
+    # The port autotuned again after an edit of its comments, to the same
+    # statements: the record holds the kernels the bench timed. After an
+    # edit of its statements it does not.
+    comments = _digest_record("whole-2", "nosrc-1")
+    statements = _digest_record("whole-3", "nosrc-3")
+    assert common.timed_on_record(info, comments)
+    assert report.timed_record_issue(info, comments) is None
+    assert not common.timed_on_record(info, statements)
+    assert report.timed_record_issue(info, statements) == (
+        "replaced: autotuned again after the bench"
+    )
+    # (the second digest decides alone where both hold it)
+    assert not common.timed_on_record(info, _digest_record("whole-1", "nosrc-3"))
+    # A record made before the second digest holds the first alone, and so
+    # does the entry of a bench that pinned it. The whole text decides for
+    # them as it did, also against an entry or a record that holds both.
+    before = _digest_record("whole-1")
+    named = common.timed_record_fields(before)
+    assert named["autotune_code_sha256"] == {"k": "whole-1"}
+    assert "autotune_code_nosrc_sha256" not in named
+    assert common.timed_on_record(named, before)
+    assert common.timed_on_record(named, tuned)
+    assert not common.timed_on_record(named, comments)
+    assert common.timed_on_record(info, before)
+    assert not common.timed_on_record(info, _digest_record("whole-2"))
+    # A record in which one kernel lacks the second digest (the harness
+    # writes none; one put together by hand) is not one that holds it: the
+    # entry names the digests of the whole text alone, and those decide.
+    mixed = _digest_record("whole-1", "nosrc-1")
+    edited = _digest_record("whole-2", "nosrc-1")
+    for record in (mixed, edited):
+        record["kernels"]["j"] = before["kernels"]["k"]
+    partly = common.timed_record_fields(mixed)
+    assert partly["autotune_code_sha256"] == {"k": "whole-1", "j": "whole-1"}
+    assert "autotune_code_nosrc_sha256" not in partly
+    assert common.timed_on_record(partly, mixed)
+    assert not common.timed_on_record(partly, edited)
+
+
+def test_only_source_comments_between_statements_leave_the_digested_code() -> None:
+    quote = "# src[port.py:12]: y = x + 1"
+    # The lines of a module, and which of them are source-line comments:
+    # those that begin as the printer's do and stand between two logical
+    # lines, where they have their line to themselves.
+    lines = [
+        (f"{quote}\n", True),
+        ("import torch\n", False),
+        ("\n", False),
+        ('QUOTED = """\n', False),
+        (f"{quote}\n", False),  # a line of a string
+        ('"""\n', False),
+        ("\n", False),
+        ("def kernel(x):\n", False),
+        (f"    {quote}\n", True),
+        ("    # src[port.py:12-19]: ...\n", True),
+        (f"    y = x + 1  {quote}\n", False),  # behind code
+        ("    # a note that quotes nothing\n", False),
+        (f"    # as the port has it: {quote}\n", False),  # begins otherwise
+        ("    #src[port.py:12]: y = x + 1\n", False),
+        ("    if y:\n", False),
+        ("        # src[unknown]: [source unavailable]\n", True),
+        ("        y = (\n", False),
+        (f"            {quote}\n", False),  # inside brackets
+        ("            y)\n", False),
+        ('    z = f"""{\n', False),
+        (f"{quote}\n", False),  # in a field, whose value has its line break
+        ('y = }"""\n', False),
+        (f"    {quote}\n", True),
+        ("    return z\n", False),
+        ("    \\\n", False),
+        (f"{quote}\n", False),  # joined to the backslash's line
+        (f"{quote}\n", True),
+        ("kernel(1)\n", False),
+        (quote, True),  # the module's last line, without a line break
+    ]
+    code = "".join(line for line, _ in lines)
+    kept = "".join(line for line, comment in lines if not comment)
+    assert common.without_source_comments(code) == kept
+    assert common.without_source_comments(kept) == kept
+    # The same lines with CRLF ends are told apart the same way. A carriage
+    # return of its own ends a line for Python and not for the lines read
+    # here, where the comment's line would take the statement behind it:
+    # such a text stays whole.
+    crlf = code.replace("\n", "\r\n")
+    assert common.without_source_comments(crlf) == kept.replace("\n", "\r\n")
+    alone = f"x = 1\n{quote}\rimport os\n"
+    assert [type(node) for node in ast.parse(alone).body] == [ast.Assign, ast.Import]
+    assert common.without_source_comments(alone) == alone
+    if sys.version_info >= (3, 12):
+        # (a comment in an f-string's field parses from Python 3.12 on)
+        program = ast.dump(ast.parse(code))
+        assert ast.dump(ast.parse(kept)) == program
+        # The lines that stay at the start of a line are of the program:
+        # without the one in the string, the one in the field (a line break
+        # of z's value) or the one behind the backslash (which would join
+        # the call to the kernel's body), the module is another.
+        for index, entry in enumerate(lines):
+            if entry == (f"{quote}\n", False):
+                less = "".join(
+                    line
+                    for at, (line, comment) in enumerate(lines)
+                    if not comment and at != index
+                )
+                assert ast.dump(ast.parse(less)) != program
+
+
+_TOY_PORT = "scale_000000000001"
+_TOY_PORT_SOURCE = '''"""A toy port: one kernel, which doubles its input."""
+
+from __future__ import annotations
+
+import torch
+
+import helion
+import helion.language as hl
+
+
+@helion.kernel(static_shapes=True)
+def scale_rows(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        row = x[tile_m, :].to(torch.float32)  # the row, in fp32
+        out[tile_m, :] = (row * 2.0).to(out.dtype)
+    return out
+
+
+def forward(inputs: list) -> tuple[torch.Tensor, ...]:
+    return (scale_rows(inputs[0]),)
+'''
+# The port as a porter edits it: a reworded comment in the kernel, a line
+# added above the kernel (the number of every line below it moves) and a
+# statement that computes something else.
+_TOY_PORT_EDITS = {
+    "unedited": _TOY_PORT_SOURCE,
+    "comment": _TOY_PORT_SOURCE.replace("# the row, in fp32", "# each row, as fp32"),
+    "inserted": _TOY_PORT_SOURCE.replace(
+        "@helion.kernel(", "# Inductor's one kernel.\n@helion.kernel("
+    ),
+    "statement": _TOY_PORT_SOURCE.replace("row * 2.0", "row * 3.0"),
+}
+# Where the toy port is rendered: under a backend the harness has ports for.
+# (Not ``skipUnlessBackends``, which takes ``tileir`` for ``triton``: the
+# harness loads no port on that backend.)
+_harness_backend = pytest.mark.skipif(
+    _get_backend() not in ("triton", "cute"),
+    reason="the harness's ports are for the Triton and CuTe backends",
+)
+
+
+@pytest.fixture
+def toy_ports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, tuple[types.ModuleType, str]]:
+    """The toy port under each of ``_TOY_PORT_EDITS`` on the lane's backend:
+    the port with its kernel bound and set to its default config on this CPU
+    process (what a call of ``forward`` leaves, the launch aside), and the
+    kernel's code as the printer writes it without source-line comments."""
+    backend = _get_backend()
+    if reason := codegen_skip_reason(backend):
+        pytest.skip(reason)
+    ports = {}
+    with cpu_render_target():
+        for edit, source in _TOY_PORT_EDITS.items():
+            # A directory for each edit: the printer reads the lines it
+            # quotes from the port's file, which linecache keeps by path.
+            kernels = tmp_path / edit
+            kernels.mkdir()
+            (kernels / f"{_TOY_PORT}.py").write_text(source)
+            monkeypatch.setattr(common, "KERNELS_DIR", kernels)
+            port = common.load_port(_TOY_PORT, backend)
+            rows = torch.zeros(8, 64, dtype=torch.bfloat16)
+            bound = port.scale_rows.bind((rows,))
+            # Setting the config renders it and loads the module, which
+            # takes no GPU. The backend would name its compile cache in the
+            # environment first, for every test after this one too.
+            monkeypatch.setattr(
+                bound.env.backend, "setup_compile_cache_dir", lambda device: None
+            )
+            bound.set_config(bound.config_spec.default_config())
+            plain = bound.to_code(bound._config, output_origin_lines=False)
+            ports[edit] = (port, plain)
+    return ports
+
+
+# One test for the pins and the digests: the port is rendered once under
+# each edit.
+@_harness_backend
+@skipIfRefEagerMark("ref eager mode generates no code")
+def test_a_pin_holds_through_comment_edits_unless_its_record_has_the_whole_text_only(
+    toy_ports: dict[str, tuple[types.ModuleType, str]],
+) -> None:
+    ports = {edit: port for edit, (port, _) in toy_ports.items()}
+    recorded = common.bound_kernel_records(ports["unedited"])
+    # The record as autotune.py made it before the second digest.
+    before = {
+        name: {
+            field: value
+            for field, value in kernel.items()
+            if field != "code_nosrc_sha256"
+        }
+        for name, kernel in recorded.items()
+    }
+    held = {
+        edit: (common.pin_roundtrip(port, recorded), common.pin_roundtrip(port, before))
+        for edit, port in ports.items()
+    }
+    yes, no = {"scale_rows": True}, {"scale_rows": False}
+    assert held == {
+        "unedited": (yes, yes),
+        "comment": (yes, no),
+        "inserted": (yes, no),
+        "statement": (no, no),
+    }
+    (kernel,) = recorded.values()
+    assert list(kernel) == ["decorator", "config", "code_sha256", "code_nosrc_sha256"]
+    assert common.pinning_digest(kernel) == "code_nosrc_sha256"
+    assert common.pinning_digest(before["scale_rows"]) == "code_sha256"
+    # (which decides alone: the entry's digest of the whole text still matches)
+    other = {"scale_rows": {**kernel, "code_nosrc_sha256": ""}}
+    assert common.pin_roundtrip(ports["unedited"], other) == no
+    # A kernel the port no longer has generates no code to compare.
+    assert common.pin_roundtrip(ports["unedited"], {"gone": kernel}) == {"gone": False}
+
+    whole, nosrc = {}, {}
+    for edit, (port, plain) in toy_ports.items():
+        bound = common._bound_kernel("scale_rows", port.scale_rows)
+        code = common.generated_code(bound)
+        # The code that was compiled quotes the port. Without those lines it
+        # is, to the character, the code the printer writes without them.
+        assert f"{common.SOURCE_COMMENT}{_TOY_PORT}.py:" in code
+        assert common.without_source_comments(code) == plain
+        (digests,) = common.code_digests(port).values()
+        whole[edit] = digests["code_sha256"]
+        nosrc[edit] = digests["code_nosrc_sha256"]
+        assert whole[edit] == hashlib.sha256(code.encode()).hexdigest()
+        assert nosrc[edit] == hashlib.sha256(plain.encode()).hexdigest()
+    # Every edit changes the text: the line it quotes, the numbers of the
+    # lines it quotes, or a statement.
+    assert len(set(whole.values())) == len(_TOY_PORT_EDITS)
+    # Only the changed statement changes the code that runs.
+    assert nosrc["comment"] == nosrc["inserted"] == nosrc["unedited"]
+    assert nosrc["statement"] != nosrc["unedited"]
+
+
 def _rotation_args(count: int = 8) -> object:
     return types.SimpleNamespace(
         rotate_inputs=count,
@@ -6445,7 +6711,10 @@ def test_the_files_a_job_sets_aside_under_one_name_are_one_starts(
 
 
 def _toy_kernels(backend: str, version: int = 1) -> dict[str, dict[str, str]]:
-    """The kernels of a toy autotune record."""
+    """The kernels of a toy autotune record, as records held them before
+    ``code_nosrc_sha256``: with the digest of the whole text only, by which
+    the harness goes on comparing such records (``_digest_record`` makes
+    the other kind)."""
     return {
         "k": {
             "decorator": f"@helion.kernel(version={version})",

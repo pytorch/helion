@@ -56,9 +56,10 @@ at both.
   implementation (Unwritten outputs, below). `--configs-dir RUN/configs`
   also checks each port pinned to the pick of a campaign.
 - `autotune.py`: cold full autotune of one port on one backend; records each
-  kernel's winning `@helion.kernel(...)` decorator. On the CuTe backend a
-  kernel that the port runs behind earlier kernels is tuned behind them (How
-  a port is tuned, below).
+  kernel's winning `@helion.kernel(...)` decorator and the digests of the
+  code it generates, by which the kernel is pinned afterwards (What a pin
+  compares, below). On the CuTe backend a kernel that the port runs behind
+  earlier kernels is tuned behind them (How a port is tuned, below).
 - `bench.py`: time Inductor (default, coordinate descent, and the options of
   `mode="max-autotune"`; the comparison is against the fastest), the repro's
   hand-written Triton oracle, both Helion backends and a memcopy
@@ -472,6 +473,66 @@ What the record says, and what follows from it:
   s against 696 s for the two kernels of sum_2ba0992ca00b, 575 s against
   542 s for the two of sum_sum_sum_907cbb3d9f19, 435 s against 570 s for
   the max pool of pointwise_b0a24575ebc9.
+
+## What a pin compares
+
+An autotune record holds, for every kernel its port bound (`kernels`), the
+decorator its search ended on, the config, and two digests of the code that
+decorator generated:
+
+- `code_sha256`, of the generated module's whole text;
+- `code_nosrc_sha256`, of the text without its source-line comments.
+
+Helion's printer quotes the kernel's source above the statements it
+generated from it, in comment lines of their own:
+
+```text
+    # src[amax_amax_any_80cdfb3610b6.py:56]:     x = scores[tile_r, :].to(torch.float32)
+    # src[amax_amax_any_80cdfb3610b6.py:55-80]: ...
+```
+
+These lines name the port's file and line and repeat the line, so the whole
+text changes with every comment in a port and every line added above a
+kernel, where the statements, and so the kernel that was tuned and timed,
+stay the same. A pin therefore goes by the second digest. `autotune.py`
+(its record's `pin_roundtrip`), `bench.py` and `check_port.py --configs-dir`
+(`code_matches_autotune`) and `plan_run.py` (a Triton record it reuses)
+compare what the pinned kernels generate now with the record through
+`common.pin_roundtrip`, and a port edited in its comments alone still
+matches: its timings count, and its record is reused, without another
+autotune. A change to the generated statements moves both digests.
+
+Nothing else is left out (`common.without_source_comments`). A line goes
+only where Python's tokenizer reads a comment that begins `# src[` between
+two logical lines (after a statement or a block's header, or at the start
+of the module): where the printer puts them, where such a comment has its
+line to itself, and where Python ignores a comment line. A line that reads
+the same inside a string literal, a comment behind a statement and a
+comment inside a statement that spans lines (between brackets, or joined to
+the line before it by a backslash) stay, so the text that runs is compared
+character for character. A text with a carriage return other than in a
+line's CRLF ending, which the printer never writes, is compared whole:
+Python ends a line there, so the line of a comment could hold code.
+
+A record made before the second digest holds `code_sha256` alone, which
+tells the two kinds apart, and is compared by it as before: by the whole
+text, comments included. A comment edit still makes such a record stale; a
+new autotune of the point replaces it with a record that holds both.
+
+A record that holds both is compared by `code_nosrc_sha256` alone;
+`code_sha256` stays for the reader and for an older harness. The records
+name no version of the rule above, so a change to the lines it leaves out
+that moves the digest of real code has to record its digest under a new
+name: under this one every record made until then would stop matching,
+unchanged whole text or not.
+
+A bench entry names the digests of the autotune record it pinned:
+`autotune_code_sha256`, and `autotune_code_nosrc_sha256` where the record
+holds those. It is of the point's current record (`report.py` counts it,
+and `campaign.py` does not bench the point again for it) while that record
+holds the same kernels: by the digests without source-line comments where
+the entry and the record both hold them, by those of the whole text
+otherwise.
 
 ## Baseline: several bench processes
 
