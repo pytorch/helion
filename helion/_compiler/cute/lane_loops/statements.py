@@ -54,6 +54,7 @@ from .._ast_pass_utils import is_vloop
 from ..access_regions import access_address
 from ..address_maps import Load
 from ..cache_policy_loads import _CUTE_CACHE_LOAD_HELPER_NAMES
+from ..debug_ops import CUTE_DEVICE_ASSERT
 from ..reduce_call import CLUSTER_REDUCES
 from .markers import _find_lane_reduce_call
 from .markers import _is_lane_reduce_marker_assign
@@ -143,10 +144,23 @@ _PERSISTENT_VEC_STORE = "_helion_persistent_branch_vec_store"
 _PERSISTENT_VEC_STORE_ADDRESS = 3
 _RANGE_CALLS = frozenset({"range", "cutlass.range", "cutlass.range_constexpr"})
 # The vector type argument of a 16-byte ``cute.arch.load``, the store
-# protocol's register-only conversion of a whole byte packet and the layout
-# arithmetic of an atomic's address.
+# protocol's register-only conversion of a whole byte packet, the layout
+# arithmetic of an atomic's address, and hl.device_assert's
+# ``cute.testing.assert_``, which reads only its condition and writes
+# nothing.  Placed by its reads,
+#     _mask_to = cutlass.Boolean(v_1) if mask_0 else cutlass.Boolean(True)
+#     cute.testing.assert_(_mask_to, 'lane past the end')
+# goes after a lane reduction's accumulate pass, though before the writes
+# after it (``_depends``); as an unknown call it raised BackendUnsupported ("a
+# lane-invariant statement is ordered before the accumulate pass of a lane
+# reduction").
 _PURE_CALLS = frozenset(
-    {"ir.VectorType.get", "_cute_signed_bitfield_to_bf16_packed", "cute.crd2idx"}
+    {
+        "ir.VectorType.get",
+        "_cute_signed_bitfield_to_bf16_packed",
+        "cute.crd2idx",
+        CUTE_DEVICE_ASSERT,
+    }
 )
 # Attributes querying a tensor's metadata: ``t[...].shape``, ``t[...].layout``
 # and ``t.iterator.alignment`` read no element of ``t`` (an epilogue sizing
@@ -1010,6 +1024,9 @@ class _Statement:
     # The tensors mentioned outside those calls: by a plain load or store, a
     # subscript, a pointer built in the open.
     visible: frozenset[str] = frozenset()
+    # Whether the statement holds an hl.device_assert, which the writes after
+    # it stay after (``_depends``).
+    asserts: bool = False
     # The regions of the statement's accesses, per tensor, when the memory-op
     # codegen recorded one for every mention of the tensor
     # (``_access_regions``).
@@ -1229,11 +1246,24 @@ def _analyze(index: int, node: ast.AST, renames: Mapping[str, str]) -> _Statemen
             for tensor, regions in _access_regions(node).items()
         },
         lane_ordered=canonical(getattr(node, HELION_LANE_ORDERED_ATTR, ())),
+        asserts=any(
+            isinstance(call, ast.Call) and ast.unparse(call.func) == CUTE_DEVICE_ASSERT
+            for call in ast.walk(node)
+        ),
     )
 
 
 def _depends(earlier: _Statement, later: _Statement) -> bool:
     """Whether ``later`` must stay after ``earlier`` (registers, tensor names)."""
+    # An hl.device_assert, placed by its reads like a register computation,
+    # still precedes the writes after it.  Otherwise a scatter it guards stores
+    # first:
+    #     (dst.iterator + cutlass.Int32(cutlass.Int32(amin)) * ...).store(...)
+    #     for synthetic_lane_1 in range(2):
+    #         ...
+    #         cute.testing.assert_(v_4, 'index out of bounds')
+    if earlier.asserts and later.tensors_written:
+        return True
     if earlier.pinned or later.pinned:
         if not (earlier.register_only or later.register_only):
             return True

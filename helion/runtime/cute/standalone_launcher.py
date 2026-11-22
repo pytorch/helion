@@ -243,6 +243,9 @@ def _standalone_compile(
             compile_options.append(cute.EnableTVMFFI(True))
         elif token == "--generate-line-info":
             compile_options.append(cute.GenerateLineInfo(True))
+        elif token == "--enable-assertions":
+            # Keeps cute.testing.assert_ (hl.device_assert).
+            compile_options.append(cute.EnableAssertions(True))
         elif token.startswith("--ptxas-options="):
             compile_options.append(cute.PtxasOptions(token.partition("=")[2]))
         elif token == "--opt-level":

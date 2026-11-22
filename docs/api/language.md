@@ -383,6 +383,12 @@ For integer `cumsum` on Pallas, supply an explicit supported dtype such as
 .. autofunction:: device_print
 ```
 
+### device_assert()
+
+```{eval-rst}
+.. autofunction:: device_assert
+```
+
 ## Constexpr Operations
 
 ### constexpr()
