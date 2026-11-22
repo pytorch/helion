@@ -103,6 +103,7 @@ from .cute.structural_config import select_structural_policy
 from .ref_mode import RefModeContext
 from .ref_mode import is_ref_mode_enabled
 from .settings import Settings
+from .settings import decorator_codegen_settings
 from .structural_policy import StructuralConfig
 from .structural_policy import StructuralPolicyError
 from .structural_policy import require_same_structural_policy
@@ -4033,6 +4034,7 @@ class BoundKernel(_AutotunableKernel, Generic[_R]):
         ]
         if settings.index_dtype is not None:
             parts.append(f"index_dtype={settings.index_dtype}")
+        parts.extend(decorator_codegen_settings(settings))
         # Resolved from the settings' backend: callers pass foreign Settings
         # and ``self`` may be None.
         parts.extend(get_backend(settings.backend).decorator_settings(settings))

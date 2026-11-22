@@ -2829,8 +2829,8 @@ class Backend(abc.ABC):
         """Extra ``name=value`` parts of the ``@helion.kernel`` repro decorator.
 
         Resolved from ``settings.backend`` (not from a compile environment) by
-        ``BoundKernel.format_kernel_decorator``; the parts follow ``config``,
-        ``static_shapes`` and ``index_dtype`` in the printed decorator.
+        ``BoundKernel.format_kernel_decorator``; the parts follow the
+        backend-independent ones in the printed decorator.
         """
         return []
 
