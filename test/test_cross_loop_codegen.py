@@ -948,12 +948,13 @@ def join_of_whole_reads(x: torch.Tensor) -> torch.Tensor:
     static_shapes=True,
     autotune_effort="none",
 )
-def rank_ordered_reader(
+def source_ordered_reader(
     xc: torch.Tensor,
     xa: torch.Tensor,
     xb: torch.Tensor,
     y: torch.Tensor,
     idx: torch.Tensor,
+    b_first: hl.constexpr,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     c = torch.empty_like(xc)
     a = torch.empty_like(xa)
@@ -968,7 +969,12 @@ def rank_ordered_reader(
     for tile_r in hl.tile(xa.size(0), block_size=1):
         # A keyed wait on a's root, a root barrier on b's (a gathered row).
         row = idx[tile_r.begin]
-        out[tile_r.begin, :] = (a[tile_r.begin, :] + b[row, :]) * y[tile_r.begin, :]
+        if b_first:
+            gathered = b[row, :]
+            out[tile_r.begin, :] = (a[tile_r.begin, :] + gathered) * y[tile_r.begin, :]
+        else:
+            own = a[tile_r.begin, :]
+            out[tile_r.begin, :] = (own + b[row, :]) * y[tile_r.begin, :]
     return c, out
 
 
@@ -4616,40 +4622,43 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
 
     @skipIfNotCUDA()
     @skipIfRefEager("persistent tile-dependency codegen is unavailable")
-    def test_scoped_waits_follow_completion_rank(self) -> None:
+    def test_scoped_waits_follow_source_order(self) -> None:
         # Packed on the launch's W workers: c's root on workers [0, 16); a's
         # (W - 8 tasks) wraps to [0, W - 8), behind c's tasks; b's root (8
         # tasks) packs onto [W - 8, W), concurrent with both and independent.
-        # So b's root (index 2) completes first in the static schedule (rank 0)
-        # and a's (index 1) after c's (rank 1): the reader waits for b's
-        # barrier before a's counter, unlike root order.
+        # The static schedule fixes where tasks run, not how long they take,
+        # so the reader waits in the order its body reads a and b.
         workers = torch.cuda.get_device_properties(DEVICE).multi_processor_count
         xc = torch.randn((16, 64), device=DEVICE, dtype=torch.float32)
         xa = torch.randn((workers - 8, 64), device=DEVICE, dtype=torch.float32)
         xb = torch.randn((8, 64), device=DEVICE, dtype=torch.float32)
         y = torch.randn((workers - 8, 64), device=DEVICE, dtype=torch.float32)
         idx = torch.randint(0, 8, (workers - 8,), device=DEVICE, dtype=torch.int32)
-        with mock.patch.object(
-            cross_loop_scheduler,
-            "choose_final_arrival_continuations",
-            return_value=(),
-        ):
-            code, (c, out) = code_and_output(
-                rank_ordered_reader,
-                (xc, xa, xb, y, idx),
-                pid_type="persistent_blocked",
-                cross_loop_pipeline="static",
-                num_sm_multiplier=1,
-                num_warps=1,
-            )
-        torch.testing.assert_close(c, xc - 1)
         expected = ((xa + 1) + (xb * 2)[idx.long()]) * y
-        torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
-        root = ast.unparse(_generated_function(code, "tile_dependency_root_3"))
-        wait_a = root.index("while tile_dependency_readiness_wait")
-        wait_b = root.index("while tile_dependency_root_barrier_wait")
-        self.assertLess(wait_b, wait_a)
-        self.assertLess(wait_a, root.index("tl.load(a"))
+        for b_first in (False, True):
+            with mock.patch.object(
+                cross_loop_scheduler,
+                "choose_final_arrival_continuations",
+                return_value=(),
+            ):
+                code, (c, out) = code_and_output(
+                    source_ordered_reader,
+                    (xc, xa, xb, y, idx, b_first),
+                    pid_type="persistent_blocked",
+                    cross_loop_pipeline="static",
+                    num_sm_multiplier=1,
+                    num_warps=1,
+                )
+            torch.testing.assert_close(c, xc - 1)
+            torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+            root = ast.unparse(_generated_function(code, "tile_dependency_root_3"))
+            wait_a = root.index("while tile_dependency_readiness_wait")
+            wait_b = root.index("while tile_dependency_root_barrier_wait")
+            if b_first:
+                self.assertLess(wait_b, wait_a)
+            else:
+                self.assertLess(wait_a, wait_b)
+            self.assertLess(wait_a, root.index("tl.load(a"))
 
     @skipIfNotCUDA()
     @skipIfCudaCapabilityLessThan((10, 0), reason="dot roots stay in kernel scope")

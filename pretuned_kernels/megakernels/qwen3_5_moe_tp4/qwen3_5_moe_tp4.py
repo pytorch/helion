@@ -602,6 +602,9 @@ def qwen3_5_moe_tp4(
     for partial_tile_t, partial_tile_n in hl.tile([rows, hidden], block_size=[1, None]):
         partial_token = partial_tile_t.begin
         pick_lanes = hl.arange(pick_lanes_n)
+        # The shared expert's output first: it is ready long before the routed
+        # rows (a task waits for what it reads in the order it reads it).
+        partial_shared = shared_output[partial_token, partial_tile_n].to(torch.float32)
         partial_values = routed_output[partial_token, :, partial_tile_n].to(
             torch.float32
         )
@@ -612,8 +615,7 @@ def qwen3_5_moe_tp4(
         partial_values = torch.where((pick_lanes < top_k)[:, None], partial_values, 0.0)
         partial_routed = torch.sum(partial_values * partial_weights[:, None], dim=0)
         symmetric_partial[partial_token, partial_tile_n] = (
-            partial_routed
-            + shared_output[partial_token, partial_tile_n].to(torch.float32)
+            partial_routed + partial_shared
         ).to(torch.bfloat16)
 
     hl.pdl_launch_dependents()

@@ -1055,7 +1055,7 @@ def _schedule_waits(
     state: frozenset[str],
 ) -> list[ast.stmt]:
     """A task body with its scoped ``waits`` (statements, covered allocations),
-    given in the order their producers are expected to complete, each placed
+    in the order they are waited for, each placed
     as late as the statements that need it allow, so the task's independent
     loads issue before it spins.  A statement needs a wait whose covered
     allocations it names or whose reads it stores, and every wait if it writes
@@ -4940,54 +4940,6 @@ def emit_cross_loop_schedule(
         body = case_bodies[root] if extent is None else extent.body
         return root in kernel_scope_roots and _write_guard(body) is not None
 
-    # The workers each resident root's tasks run on, as the static placement lowers
-    # them (``static_members``: None where unknown); empty under packet dispatch.
-    members: dict[int, frozenset[int] | None] = {}
-    dependency_pairs = frozenset(
-        (edge.producer_root, edge.consumer_root) for edge in dependency_graph.edges
-    )
-
-    def completion_rank(root: int, ranks: dict[int, int]) -> int:
-        """Where ``root``'s tasks complete in the static schedule's order: one past
-        the latest earlier root it follows, through a dependency or by sharing a
-        worker (which runs the earlier root's tasks first).  Roots on disjoint
-        workers with no dependency between them run concurrently and tie.  A root
-        whose workers are unknown (not yet lowered, a continuation root, a
-        cluster's or shifted lanes, packet dispatch: no ``members`` set) shares
-        every worker.  ``ranks`` memoizes one caller's ranks (``members`` grows as
-        roots are lowered)."""
-        if root not in ranks:
-
-            def shares(earlier: int) -> bool:
-                mine, theirs = members.get(root), members.get(earlier)
-                return mine is None or theirs is None or bool(mine & theirs)
-
-            ranks[root] = max(
-                (
-                    completion_rank(earlier, ranks) + 1
-                    for earlier in range(root)
-                    if (earlier, root) in dependency_pairs or shares(earlier)
-                ),
-                default=0,
-            )
-        return ranks[root]
-
-    def dependency_rank(root: int, ranks: dict[int, int]) -> int:
-        """The longest dependency chain ending at ``root`` (``completion_rank``
-        without shared workers): of two roots of a rank, one that only follows
-        an earlier root's tasks on its own workers completes before one that
-        waits for every task of the roots it reads."""
-        if root not in ranks:
-            ranks[root] = max(
-                (
-                    dependency_rank(earlier, ranks) + 1
-                    for earlier in range(root)
-                    if (earlier, root) in dependency_pairs
-                ),
-                default=0,
-            )
-        return ranks[root]
-
     def scheduled_root_task_body(
         root: int,
         root_local_pid_task: str,
@@ -4996,15 +4948,13 @@ def emit_cross_loop_schedule(
         *,
         force_noinline: bool = False,
         invariant_waits: list[ast.stmt] | None = None,
-        barrier_waits: Sequence[
-            tuple[list[ast.stmt], frozenset[int], frozenset[int]]
-        ] = (),
+        barrier_waits: Sequence[tuple[list[ast.stmt], frozenset[int]]] = (),
         root_arrival: _Arrival | None = None,
     ) -> list[ast.stmt]:
         """One task of ``root``; waits whose counter is the same for every task
         go to ``invariant_waits`` when given (the caller waits once).
-        ``barrier_waits``: root-barrier waits, the allocations they cover and
-        their producer roots, placed like the covered readiness waits.
+        ``barrier_waits``: root-barrier waits and the allocations they cover,
+        placed like the covered readiness waits.
         ``root_arrival``: the worker's root-barrier arrival, made with its last
         task's arrivals."""
         body: list[ast.stmt] = []
@@ -5066,13 +5016,10 @@ def emit_cross_loop_schedule(
                 )
             )
         )
-        # (wait, covered allocations, the producer roots it waits for)
-        guard_first_waits: list[
-            tuple[list[ast.stmt], frozenset[int], frozenset[int]]
-        ] = []
+        guard_first_waits: list[tuple[list[ast.stmt], frozenset[int]]] = []
         # Waits that order only covered tensors move to the task's first
         # access of them, so its independent loads issue before the spin.
-        scoped_waits: list[tuple[list[ast.stmt], frozenset[int], frozenset[int]]] = []
+        scoped_waits: list[tuple[list[ast.stmt], frozenset[int]]] = []
         guard_first_index = len(body)
         guard_first_allocations: set[int] = set()
         for (
@@ -5151,15 +5098,11 @@ def emit_cross_loop_schedule(
                         orelse=[],
                     )
                 ]
-            producers = frozenset(
-                producer.producer_root
-                for producer in incoming_readiness_counter.producers
-            )
             if guard_first:
-                guard_first_waits.append((wait, covered, producers))
+                guard_first_waits.append((wait, covered))
                 guard_first_allocations.update(covered)
             elif covered and not token_waits:
-                scoped_waits.append((wait, covered, producers))
+                scoped_waits.append((wait, covered))
             else:
                 body.extend(wait)
         peer_counter_spins, peer_tokens = peer_counter_waits(
@@ -5220,39 +5163,43 @@ def emit_cross_loop_schedule(
         scoped_waits.extend(barrier_waits)
         if guard_first_waits and _write_guard(tile_body) is None:
             # No guard to follow: covered waits are scoped like any root's.
-            scoped_waits.extend((w, c, p) for w, c, p in guard_first_waits if c)
-            guard_first_waits = [(w, c, p) for w, c, p in guard_first_waits if not c]
+            scoped_waits.extend((w, c) for w, c in guard_first_waits if c)
+            guard_first_waits = [(w, c) for w, c in guard_first_waits if not c]
         state_names = frozenset(n for n in (state_arg, epoch_var) if n is not None)
         # A guarded kernel-scope root and an allocation no argument names keep
         # their waits at task entry.
         relaxed = guarded_kernel_scope_root(root)
         arguments = set(argument_allocations.values())
-        for wait, covered, _ in scoped_waits:
+        for wait, covered in scoped_waits:
             if relaxed or covered - arguments:
                 body.extend(wait)
-        # The waits in their producers' expected completion order
-        # (``completion_rank``: the static schedule's order, not root order, as
-        # packed roots on disjoint workers run concurrently; then
-        # ``dependency_rank``), so a task loads what an earlier producer wrote
-        # while it spins on a later one.  The waits commute (a launch's counters
-        # only grow); ties keep their source order.
-        ranks: dict[int, int] = {}
-        depths: dict[int, int] = {}
+        # The waits in the order the task body first uses what they cover: the
+        # static schedule fixes where tasks run, not how long they take, so it
+        # cannot tell which of two producers completes first, and the source's
+        # order of use stands.  The waits commute (a launch's counters only
+        # grow).
+        def first_use(covered: frozenset[int]) -> int:
+            return next(
+                (
+                    index
+                    for index, statement in enumerate(tile_body)
+                    if _named_allocations(statement, argument_allocations) & covered
+                ),
+                len(tile_body),
+            )
+
         scoped = sorted(
             (
                 scoped_wait
                 for scoped_wait in scoped_waits
                 if not (relaxed or scoped_wait[1] - arguments)
             ),
-            key=lambda scoped_wait: max(
-                (completion_rank(producer, ranks), dependency_rank(producer, depths))
-                for producer in scoped_wait[2]
-            ),
+            key=lambda scoped_wait: first_use(scoped_wait[1]),
         )
         renames = device_function.variable_renames()
         tile_body[:] = _schedule_waits(
             tile_body,
-            [(wait, covered) for wait, covered, _ in scoped],
+            scoped,
             argument_allocations,
             renames,
             state_names,
@@ -5263,7 +5210,7 @@ def emit_cross_loop_schedule(
                 None if guard is None else _guard_reads(tile_body, argument_allocations)
             )
             entry = [
-                statement for wait, _, _ in guard_first_waits for statement in wait
+                statement for wait, _ in guard_first_waits for statement in wait
             ]
             if reads is not None and not reads & guard_first_allocations:
                 assert guard is not None
@@ -5506,30 +5453,6 @@ def emit_cross_loop_schedule(
         rotation = -start % launch_worker_count
         return (
             f"(({worker}) + {rotation}) % {launch_worker_count}" if rotation else worker
-        )
-
-    def static_members(root: int) -> frozenset[int] | None:
-        """The workers ``root_lane`` gives ``root``'s tasks when that is static
-        (None: a cluster's lanes, a rotation by earlier roots' live tasks, a
-        deferred release every worker publishes, or a claim group's tickets).  Valid once the earlier
-        resident roots are lowered."""
-        if (
-            root in dsmem_producers
-            or root in dsmem_consumers
-            or root in deferred_releases
-            or root in claim_group_of
-            or skipped_lanes(root)
-        ):
-            return None
-        active = min(
-            launch_worker_count,
-            static_pipeline_plan.execution_orders[root].task_count,
-        )
-        rotation = -root_lane_origins[root] % launch_worker_count
-        return frozenset(
-            w
-            for w in range(launch_worker_count)
-            if (w + rotation) % launch_worker_count < active
         )
 
     def guarded_live_tasks(extent: _GuardedExtent) -> tuple[list[ast.stmt], str]:
@@ -5911,7 +5834,7 @@ def emit_cross_loop_schedule(
             }
         )
         barrier_waits: list[ast.stmt] = []
-        task_barriers: list[tuple[list[ast.stmt], frozenset[int], frozenset[int]]] = []
+        task_barriers: list[tuple[list[ast.stmt], frozenset[int]]] = []
         # Producers whose barrier a worker with no task here still waits for.
         no_task_producers: list[int] = []
         # Triton pipelines a multi-stage task loop, issuing a task's loads
@@ -5953,7 +5876,7 @@ def emit_cross_loop_schedule(
                 body=[*wait, *fence],
                 orelse=[],
             )
-            task_barriers.append(([first_wait], covered, frozenset({producer})))
+            task_barriers.append(([first_wait], covered))
             if extent is not None:
                 no_task_producers.append(producer)
         # A worker's root-barrier arrival rides its last task's arrivals: one
@@ -6173,7 +6096,6 @@ def emit_cross_loop_schedule(
             else None
         )
         for root in resident_roots:
-            members[root] = static_members(root)
             body = static_root_body(root)
             # The gates precede the first task loop, after the loads hoisted
             # above it, at kernel scope (a root on fewer workers than the

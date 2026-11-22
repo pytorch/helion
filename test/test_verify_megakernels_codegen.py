@@ -71,7 +71,11 @@ def _modelled_b200() -> Generator[None, None, None]:
     """CPU tensors trace as ``cuda:0`` ones of a B200; symmetric buffers are
     plain ones."""
     device = SimpleNamespace(
-        max_threads_per_multi_processor=2048, multi_processor_count=_SMS
+        max_threads_per_multi_processor=2048,
+        multi_processor_count=_SMS,
+        # The Gluon ring sizes its depths by the shared memory budget.
+        shared_memory_per_block_optin=232448,
+        shared_memory_per_multiprocessor=233472,
     )
     with contextlib.ExitStack() as stack:
         stack.enter_context(gluon_cpu_codegen())

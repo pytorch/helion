@@ -7,10 +7,14 @@ import operator
 from typing import TYPE_CHECKING
 from typing import NamedTuple
 
+import sympy
 import torch
 from torch.fx import Node
 from torch.fx import map_arg
 from torch.fx.experimental.symbolic_shapes import statically_known_true
+from torch.utils._sympy.numbers import int_oo
+from torch.utils._sympy.value_ranges import ValueRanges
+from torch.utils._sympy.value_ranges import bound_sympy
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -956,9 +960,7 @@ def _apart(
                 (range_a, range_b),
                 (range_b, range_a),
             ):
-                if statically_known_true(high < other_low) and statically_known_true(
-                    other_high - low < 2**31
-                ):
+                if _below(high, other_low) and _below(other_high - low, 2**31):
                     return True
         block_id = _loop_block(a, earlier.loop)
         if (
@@ -972,14 +974,53 @@ def _apart(
     return bool(earlier.loop) and tiles == set(earlier.loop)
 
 
+def _below(lower: int | torch.SymInt, upper: int | torch.SymInt) -> bool:
+    """Whether ``lower < upper`` for every value their symbols take: by the
+    shape environment's ranges, a tile's begin or a grid index of a loop from 0
+    in unit steps (a canonical task origin) lying from 0 to the loop's extent
+    less one."""
+    from .compile_environment import CompileEnvironment
+    from .host_function import HostFunction
+    from .variable_origin import GridOrigin
+    from .variable_origin import TileBeginOrigin
+
+    if statically_known_true(lower < upper):
+        return True
+    env = CompileEnvironment.current()
+    host = HostFunction.current()
+    gap = upper - lower
+    difference = gap._sympy_() if isinstance(gap, torch.SymInt) else sympy.Integer(gap)
+    ranges: dict[sympy.Symbol, ValueRanges] = {}
+    for symbol in difference.free_symbols:
+        assert isinstance(symbol, sympy.Symbol)
+        known = env.shape_env.var_to_range.get(symbol, ValueRanges.unknown_int())
+        info = host.expr_to_origin.get(symbol)
+        origin = None if info is None else info.origin
+        if (
+            type(origin) in (GridOrigin, TileBeginOrigin)
+            and origin.block_id
+            not in host.device_ir.noncanonical_task_origin_block_ids
+        ):
+            extent = env.block_sizes[origin.block_id].size
+            known &= ValueRanges(0, extent - 1 if type(extent) is int else int_oo)
+        ranges[symbol] = known
+    try:
+        bound = bound_sympy(difference, ranges)
+    except (KeyError, AttributeError, NotImplementedError):
+        # A function bound_sympy has no rule for proves nothing.
+        return False
+    return bool(bound.lower > 0)
+
+
 def _index_range(
     index: object,
 ) -> tuple[int | torch.SymInt, int | torch.SymInt] | None:
     """The first and last index an index entry takes: a non-negative
     integer, a slice with such bounds, a scalar (such as a tile's
-    ``begin``), a unit-step ``hl.arange`` of 32 or 64 bits, or one of those
-    plus or minus an integer, or a broadcast of one; None for anything else
-    (a tile, a loaded index)."""
+    ``begin``), a unit-step ``hl.arange`` of 32 or 64 bits, a sum or
+    difference of those (or of one and an integer), one of those times a
+    non-negative integer, any integer index times zero, or a broadcast of
+    one; None for anything else (a tile, a loaded index)."""
     from ..language.view_ops import subscript
     from .compile_environment import CompileEnvironment
 
@@ -1013,6 +1054,12 @@ def _index_range(
         ):
             return _index_range(base)
         return None
+    if index.target in (
+        torch.ops.aten.unsqueeze.default,
+        torch.ops.aten.expand.default,
+    ):
+        # The same values, broadcast.
+        return _index_range(index.args[0])
     if index.target is torch.ops.prims.iota.default:
         (length,) = index.args
         start = index.kwargs.get("start", 0)
@@ -1030,10 +1077,29 @@ def _index_range(
         torch.ops.aten.sub.Scalar: -1,
     }
     if index.target in shifts and len(index.args) == 2 and not index.kwargs:
-        inner, shift = index.args
-        if type(shift) is int and (shifted := _index_range(inner)) is not None:
-            delta = shifts[index.target] * shift
-            return shifted[0] + delta, shifted[1] + delta
+        # Interval sum or difference: an integer term may be negative.
+        first, second = (
+            (term, term) if type(term) is int else _index_range(term)
+            for term in index.args
+        )
+        if first is not None and second is not None:
+            if shifts[index.target] == 1:
+                return first[0] + second[0], first[1] + second[1]
+            return first[0] - second[1], first[1] - second[0]
+    if (
+        index.target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar)
+        and len(index.args) == 2
+        and not index.kwargs
+    ):
+        inner, scale = index.args
+        if type(inner) is int:
+            inner, scale = scale, inner
+        if type(scale) is int and scale >= 0:
+            # Any index times zero is zero (a zero-stride broadcast).
+            if scale == 0:
+                return 0, 0
+            if (scaled := _index_range(inner)) is not None:
+                return scaled[0] * scale, scaled[1] * scale
     return None
 
 

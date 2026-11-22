@@ -4540,14 +4540,16 @@ def lower_to_device_ir(func: HostFunction) -> DeviceIR:
             # and then overwrites it) cannot be warp-specialized (see
             # intra_loop_raw_reread_block_ids); its slot stays in the config
             # space pinned to None.
-            reread_block_ids = intra_loop_raw_reread_block_ids(
-                device_ir.graphs,
-                device_ir.root_ids,
-                device_ir.grid_block_ids,
-                atomics=backend.intra_loop_barriers_order_atomics,
-                carries=backend.intra_loop_barriers_carry_iterations,
-                reads=backend.intra_loop_barriers_order_reads,
-            )
+            # The walk reads the IR's task origins (index ranges).
+            with HostFunction.current().lent_device_ir(device_ir):
+                reread_block_ids = intra_loop_raw_reread_block_ids(
+                    device_ir.graphs,
+                    device_ir.root_ids,
+                    device_ir.grid_block_ids,
+                    atomics=backend.intra_loop_barriers_order_atomics,
+                    carries=backend.intra_loop_barriers_carry_iterations,
+                    reads=backend.intra_loop_barriers_order_reads,
+                )
             for spec in warp_specialize_specs:
                 if reread_block_ids.intersection(spec.block_ids):
                     spec.pinned = True

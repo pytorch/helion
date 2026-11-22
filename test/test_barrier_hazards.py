@@ -217,6 +217,42 @@ def _stores_two_slots(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _stores_slots_through_a_zero_stride(x: torch.Tensor) -> torch.Tensor:
+    for tile_m in hl.tile(x.size(0)):
+        rows = tile_m.index[:, None]
+        # A zero-stride slot index (the broadcast spelling of a constant).
+        zero = rows * 0
+        columns = hl.arange(128)[None, :]
+        hl.store(x, [rows, zero, columns], x.new_ones([tile_m, 128]))
+        hl.store(x, [rows, zero + 1, columns], x.new_zeros([tile_m, 128]))
+    return x
+
+
+def _stores_shifted_column_blocks(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_h in hl.tile([x.size(0), 2], block_size=[None, 1]):
+        # A block per head: the head's offset is in both indices.
+        columns = tile_h.begin * 128 + hl.arange(128)
+        x[tile_m, columns] = x.new_ones([tile_m, 128])
+        x[tile_m, 256 + columns] = x.new_zeros([tile_m, 128])
+    return x
+
+
+def _stores_a_block_past_the_first(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_v in hl.tile([x.size(0), 128], block_size=[None, 16]):
+        x[tile_m, hl.arange(128)] = x.new_ones([tile_m, 128])
+        # The loop runs from 0: its tile begins at 0 or later.
+        x[tile_m, 128 + tile_v.begin + hl.arange(16)] = x.new_zeros([tile_m, 16])
+    return x
+
+
+def _stores_a_block_into_the_first(x: torch.Tensor) -> torch.Tensor:
+    for tile_m, tile_v in hl.tile([x.size(0), 128], block_size=[None, 16]):
+        x[tile_m, hl.arange(128)] = x.new_ones([tile_m, 128])
+        # Columns 120 to 127 of the first block, in the first tile.
+        x[tile_m, 120 + tile_v.begin + hl.arange(16)] = x.new_zeros([tile_m, 16])
+    return x
+
+
 def _doubles_one_half_into_the_other(x: torch.Tensor) -> torch.Tensor:
     for tile_m in hl.tile(x.size(0)):
         x[tile_m, 64:128] = x[tile_m, 0:64] * 2.0
@@ -290,6 +326,10 @@ _ARGS: dict[object, tuple[object, ...]] = {
     _writes_a_shifted_view: _pair(),
     _stores_reversed_every_other_iteration: (torch.randn(32, 64), torch.randn(32, 128)),
     _stores_two_slots: (torch.randn(32, 2, 128),),
+    _stores_slots_through_a_zero_stride: (torch.randn(32, 2, 128),),
+    _stores_shifted_column_blocks: (torch.randn(32, 512),),
+    _stores_a_block_past_the_first: (torch.randn(32, 256),),
+    _stores_a_block_into_the_first: (torch.randn(32, 256),),
     _reads_the_slot_the_last_iteration_stored: (
         torch.randn(32, 33),
         torch.randn(32, 32),
@@ -362,6 +402,7 @@ def _tma_code(fn: object, indexing: list[str]) -> str:
         # element takes both halves to it.
         (_restores_part_of_what_it_stored, "tl.store(x", "tl.store(x", ()),
         (_stores_wrapping_halves, "tl.store(x", "tl.store(x", ()),
+        (_stores_a_block_into_the_first, "tl.store(x", "tl.store(x", ()),
         (
             _stores_the_halves_of_a_row,
             "tl.store(x",
@@ -399,6 +440,11 @@ def test_accesses_that_may_meet_follow_a_barrier(
         _stores_the_halves_of_a_row,
         _stores_two_slots,
         _doubles_one_half_into_the_other,
+        # A zero-stride slot, a shared symbolic offset, and a tile's begin
+        # in a loop from 0.
+        _stores_slots_through_a_zero_stride,
+        _stores_shifted_column_blocks,
+        _stores_a_block_past_the_first,
         # The same store each iteration, from the same threads.
         _stores_its_rows_each_iteration,
     ],
