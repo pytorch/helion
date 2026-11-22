@@ -115,7 +115,8 @@ class TestFragmentChain(TestCase):
         )
         # One exponential per score element (2 x 2 fragments of a 16 x 16
         # tile, 8 per lane) and one per row value (2 rows).
-        self.assertEqual(msl.count("metal::fast::exp("), 8 + 2)
+        self.assertEqual(msl.count("metal::fast::exp2("), 8 + 2)
+        self.assertNotIn("metal::fast::exp(", msl)
         self.assertIn("simd_shuffle_xor(_lr, 8)", msl)
         self.assertIn("fragment", matmul_choices(attention.bind(args).config_spec))
 

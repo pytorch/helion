@@ -13378,6 +13378,19 @@ precise_exp_div = helion.kernel(
 )
 
 
+@helion.kernel(backend="metal", configs=_DEFAULT_CONFIG)
+def exp2_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.exp2(x[tile])
+    return out
+
+
+fast_exp2_kernel = helion.kernel(
+    exp2_kernel.fn, backend="metal", fast_math=True, configs=_DEFAULT_CONFIG
+)
+
+
 @helion.kernel(backend="metal", fast_math=True, configs=_DEFAULT_CONFIG)
 def fast_int_true_div(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
@@ -13464,6 +13477,26 @@ class TestMetalFastMath(unittest.TestCase):
             rtol=1e-2,
             equal_nan=True,
         )
+
+    def test_exp2_takes_metal_exp2(self) -> None:
+        """``exp2`` lowers to Metal's exp2, not ``exp(x * log(2))``: precise,
+        or fast under ``fast_math``."""
+        x = torch.cat([20 * torch.randn(300), torch.tensor([-float("inf"), 0.0])])
+        args = (x.to(DEVICE),)
+        for kernel, form, tol in (
+            (exp2_kernel, "metal.precise.exp2(", 1.3e-6),
+            (fast_exp2_kernel, "metal.fast.exp2(", 1e-5),
+        ):
+            with self.subTest(form=form):
+                code = kernel.bind(args).to_code()
+                self.assertIn(form, code)
+                self.assertNotRegex(code, r"metal\.(precise|fast)\.exp\(")
+                torch.testing.assert_close(
+                    kernel(*args).cpu().double(),
+                    torch.exp2(x.double()).float().double(),
+                    rtol=tol,
+                    atol=0,
+                )
 
     def test_without_fast_math_keeps_precise_forms(self) -> None:
         x, y = _exp_div_args(torch.float32)
