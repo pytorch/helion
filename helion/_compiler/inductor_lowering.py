@@ -41,6 +41,7 @@ from torch.fx.interpreter import Interpreter
 from torch.fx.node import Argument
 from torch.fx.node import Node
 from torch.fx.node import map_arg
+from torch.overrides import TorchFunctionMode
 
 from .. import exc
 from ..exc import InductorLoweringError
@@ -98,6 +99,41 @@ def _patched_inductor_config() -> contextlib.AbstractContextManager[None]:
     if settings.fast_math:
         patch["use_fast_math"] = True
     return inductor_config.patch(patch)
+
+
+class _HostScalarTensors(TorchFunctionMode):
+    """Builds the tensor a call converts a Python number to a dtype in on the
+    CPU, where the call names no device.
+
+    Inductor's lowerings round a Python scalar to a 16-bit dtype as
+    ``torch.tensor(v, dtype=dtype).item()`` (``promote_constants``, for
+    add, sub and comparisons among others, and the ``tensor`` constructor),
+    as Helion's fp32 fallback does.  Under the kernel's ``torch.device`` and
+    fake mode that tensor is a fake one on the kernel's device, and fake
+    mode constant-propagates a copy to another device only where CUDA, XPU,
+    HPU or a PrivateUse1 backend is available: on MPS its ``.item()`` is an
+    unbacked SymFloat, which codegen prints as an undeclared name
+    (``zuf0``).  On the CPU it is the same rounding, read back as the number
+    it is.  A call without a dtype, ``torch.tensor(0.0).device``, is
+    Inductor's lookup of the default device, which stays the kernel's."""
+
+    def __torch_function__(
+        self,
+        func: Callable[..., object],
+        types: object,
+        args: tuple[object, ...] = (),
+        kwargs: dict[str, object] | None = None,
+    ) -> object:
+        kwargs = kwargs or {}
+        if (
+            func is torch.tensor
+            and kwargs.get("device") is None
+            and kwargs.get("dtype") is not None
+            and len(args) == 1
+            and isinstance(args[0], (bool, int, float))
+        ):
+            kwargs = {**kwargs, "device": "cpu"}
+        return func(*args, **kwargs)
 
 
 def prepare_graph_lowerings(graph: torch.fx.Graph) -> None:
@@ -357,7 +393,7 @@ def prepare_node_lowering(
     prior_buffers = len(graph_lowering.buffers)
     input_names: list[str] = []
     input_layouts: dict[str, tuple[list[sympy.Expr], list[sympy.Expr]]] = {}
-    with _patched_inductor_config():
+    with _patched_inductor_config(), _HostScalarTensors():
         with node.meta["location"], graph_lowering.set_current_node(node):
             try:
                 result = graph_lowering.call_function(

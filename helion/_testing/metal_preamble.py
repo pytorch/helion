@@ -31,8 +31,8 @@ def erf_of(x: torch.Tensor) -> torch.Tensor:
 
 @helion.kernel(backend="metal", static_shapes=True)
 def bfloat_mul_add(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """``x * y + x`` of bfloat tensors, in bfloat."""
+    """``x * y + 1`` of bfloat tensors, in bfloat."""
     out = torch.empty_like(x)
     for tile in hl.tile(x.size()):
-        out[tile] = x[tile] * y[tile] + x[tile]
+        out[tile] = x[tile] * y[tile] + 1.0
     return out

@@ -40,6 +40,7 @@ from helion._compiler.reduction_strategy import LoopedReductionStrategy
 from helion._testing import import_example
 from helion._testing import skipIfRefEager
 from helion._testing.metal import addmm_k_loop
+from helion._testing.metal import literal_math
 from helion._testing.metal import mpp_only
 from helion._testing.metal import run_with_msl
 from helion.autotuner.config_generation import ConfigGeneration
@@ -869,6 +870,28 @@ class TestMetalMathOps(unittest.TestCase):
 @_requires_darwin
 class TestMetalDtypes(unittest.TestCase):
     """Elementwise ops across different dtypes."""
+
+    def test_16_bit_literals(self) -> None:
+        """Python-number literals in 16-bit math, each rounded to the
+        tensors' dtype on the host as eager rounds it, give eager's bits:
+        added on either side, subtracted, compared, and divided into by
+        remainder, computed in float32 as CPU and CUDA eager compute it
+        (MPS eager's 16-bit remainder can land a period away)."""
+        for dtype in (torch.bfloat16, torch.float16):
+            with self.subTest(dtype=dtype):
+                x = torch.randn(1024, device=DEVICE, dtype=dtype)
+                y = torch.randn(1024, device=DEVICE, dtype=dtype)
+                u = x * y
+                expected = torch.stack(
+                    [
+                        u + 1.1,
+                        1.1 + u,
+                        u - 1.1,
+                        torch.where(u > 0.3, u, -u),
+                        torch.remainder(u.cpu(), 0.7).to(DEVICE),
+                    ]
+                )
+                torch.testing.assert_close(literal_math(x, y), expected, rtol=0, atol=0)
 
     def test_float16_add(self) -> None:
         x = torch.randn(1024, device=DEVICE, dtype=torch.float16)

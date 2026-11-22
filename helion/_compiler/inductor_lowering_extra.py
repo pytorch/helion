@@ -64,7 +64,10 @@ def create_fp16_to_fp32_fallback_lowering(
                 arg = to_dtype(arg, result_dtype)
             return to_dtype(arg, torch.float32)
         if isinstance(arg, (int, float)) and not isinstance(arg, bool):
-            return torch.tensor(arg, dtype=result_dtype).item()
+            # On the CPU, where fake mode keeps the number, as
+            # ``inductor_lowering._HostScalarTensors`` puts Inductor's
+            # roundings; this one doesn't rely on that mode.
+            return torch.tensor(arg, dtype=result_dtype, device="cpu").item()
         return arg
 
     @functools.wraps(original_op)

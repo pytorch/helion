@@ -164,3 +164,21 @@ def mpp_only(
     if config is None:
         config = kernel.bind(args).config_spec.default_config()
     return helion.Config.from_dict({"metal_matmul": "mpp", **config.config})
+
+
+@helion.kernel(
+    backend="metal", static_shapes=True, configs=[helion.Config(block_sizes=[256])]
+)
+def literal_math(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``x * y`` with Python-number literals, which lowering rounds to a
+    16-bit x's dtype on the host: added on either side, subtracted, compared
+    and divided into by remainder."""
+    out = torch.empty([5, x.size(0)], dtype=x.dtype, device=x.device)
+    for tile in hl.tile(x.size(0)):
+        u = x[tile] * y[tile]
+        out[0, tile] = u + 1.1
+        out[1, tile] = 1.1 + u
+        out[2, tile] = u - 1.1
+        out[3, tile] = torch.where(u > 0.3, u, -u)
+        out[4, tile] = torch.remainder(u, 0.7)
+    return out
