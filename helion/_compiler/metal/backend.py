@@ -387,10 +387,15 @@ class MetalBackend(Backend):
     _pre_inductor_squeeze = True
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
+        from .fragment_matmul_heuristic import MetalFragmentMatmulHeuristic
         from .row_reduction_heuristic import MetalRowReductionHeuristic
         from .staged_matmul_heuristic import MetalStagedMatmulHeuristic
 
-        return (MetalRowReductionHeuristic, MetalStagedMatmulHeuristic)
+        return (
+            MetalRowReductionHeuristic,
+            MetalStagedMatmulHeuristic,
+            MetalFragmentMatmulHeuristic,
+        )
 
     @staticmethod
     def _get_dtype_to_metal() -> dict[torch.dtype, str]:
@@ -794,6 +799,11 @@ class MetalBackend(Backend):
                 fragment_matmuls=True,
                 table_sizes=frozenset(table_sizes(inputs)),
                 fragment_splits=splits,
+                fragment_blocks=tuple(
+                    (g.m_block, g.n_block, g.k_block)
+                    for g in plan.by_matmul.values()
+                    if g.levels
+                ),
             )
             # A slot per K loop that can load a tile ahead: known bounds it
             # runs between (``fragment_mma.loads_ahead``, which codegen

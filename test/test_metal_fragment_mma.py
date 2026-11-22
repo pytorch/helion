@@ -21,8 +21,15 @@ import pytest
 import torch
 
 import helion
+from helion._compiler.metal.fragment_matmul_heuristic import (
+    MetalFragmentMatmulHeuristic,
+)
 from helion._testing import skipUnlessBackends
+from helion._testing.metal import heuristic_seeds
 from helion._testing.metal import run_with_msl
+from helion._testing.metal_fragment import affine_args
+from helion._testing.metal_fragment import affine_mm
+from helion._testing.metal_fragment import affine_reference
 from helion._testing.metal_fragment import e4m3
 from helion._testing.metal_fragment import filled
 from helion._testing.metal_fragment import fp8_rows
@@ -689,6 +696,26 @@ class TestFragmentMma(unittest.TestCase):
                 self.assertIn("[[simdgroup_index_in_threadgroup]]", msl)
                 self.assertRegex(msl, rf"\+= {simdgroups} \* _BLOCK_SIZE_\d+\)")
                 self.assertIn("for (uint _s = 0; _s < ", msl)
+                self.assertNotIn("matmul2d", msl)
+
+    def test_straddling_codes(self) -> None:
+        """5-bit codes that straddle 16-bit words (``affine_mm``) at each
+        of the fragment matmul heuristic's seeds (a 128-wide K block: a
+        lane's run of 16 codes is five whole words, its word offsets and
+        shifts constants) and at a 32-wide K block loading a tile ahead
+        (each element shifts by a computed amount and reads two words)."""
+        args = affine_args(5, 128, 8, 256, 1024, DEVICE)
+        ref = affine_reference(args)
+        seeds = heuristic_seeds(MetalFragmentMatmulHeuristic, affine_mm.bind(args))
+        self.assertEqual(len(seeds), 2)
+        k32 = fragment_config([16, 32, 32], num_warps=8, range_num_stages=[2])
+        for config in [*seeds, k32]:
+            with self.subTest(config=config):
+                out, msl = _run(affine_mm, args, config)
+                self._close(out, ref)
+                # On fragments, its K loop split over SIMD groups (a
+                # threadgroup combine, which _assert_fragments refuses).
+                self.assertIn("simdgroup_multiply_accumulate(", msl)
                 self.assertNotIn("matmul2d", msl)
 
     def test_k_from_16(self) -> None:

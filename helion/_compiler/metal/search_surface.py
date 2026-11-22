@@ -89,6 +89,9 @@ class MetalKernelFacts:
     #: the staged tile), the staged operand's other side, and K
     #: (``staged_matmul_heuristic``).
     staged_matmuls: tuple[tuple[int, int, int], ...] = ()
+    #: The K-loop matmuls the fragment lowering takes: ``(m, n, k)`` blocks
+    #: of each (``fragment_matmul_heuristic``).
+    fragment_blocks: tuple[tuple[int, int, int], ...] = ()
 
 
 def kernel_facts(config_spec: ConfigSpec) -> MetalKernelFacts:
