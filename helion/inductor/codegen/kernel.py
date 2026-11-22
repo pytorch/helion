@@ -117,6 +117,26 @@ def feeds_only_dots(node: torch.fx.Node | None) -> bool:
     )
 
 
+def rounded_dot_dtype(node: torch.fx.Node | None) -> torch.dtype | None:
+    """The dtype loop-body dot `node` rounds its product to before anything else
+    reads it: its reduction's dtype, reached through casts to that dtype only, as
+    in ops.reduction(bf16, bf16, "dot", dot) for a bf16 a @ b, or with
+    to_dtype(dot, bf16) between them when the product is saved for backward.
+    None for a product read in fp32, as torch.mm(a, b, out_dtype=torch.float32)
+    reads it."""
+    dtypes: list[torch.dtype] = []
+    while node is not None and len(node.users) == 1:
+        (node,) = node.users
+        if node.target == "to_dtype":
+            dtypes.append(cast("torch.dtype", node.args[2]))
+        elif node.target == "reduction":
+            dtypes.append(cast("torch.dtype", node.args[1]))
+            return dtypes[0] if len(set(dtypes)) == 1 else None
+        else:
+            return None
+    return None
+
+
 @dataclass(frozen=True)
 class HelionTensorArg:
     # Placeholder for the parameter, named by codegen_kernel().
@@ -239,12 +259,31 @@ class HelionCSEProxy(CSEProxy):
         kernel.indirect_sizes[symbol] = sympy.sympify(size)
         return symbol
 
+    def load(self, name: str, index: sympy.Expr) -> CSEVariable:
+        value = super().load(name, index)
+        if value.dtype is None or feeds_only_dots(V.interpreter.current_node):
+            return value
+        dtype = upcast_compute_type(value.dtype)
+        if dtype == value.dtype:
+            return value
+        # A value stored and read again in the kernel comes from the CSE store
+        # cache as it is: in the compute type, but for the bf16 product of a dot
+        # whose K is one block (HelionKernel.dot()). (a @ b + 1000) - 1000 would
+        # compute in bf16:
+        #     tmp2 = torch.mm(tmp0, tmp1)
+        #     tmp4 = tmp2 + tmp3  # tmp3 = hl.full([], 1000.0, dtype=torch.float32)
+        # bf16, since a 0-d fp32 does not promote it, and bf16 spacing near 1000
+        # is 4: off by up to 2 from Inductor's Triton kernel. Read in fp32, as
+        # the load of out0 from memory would be:
+        #     tmp3 = tmp2.to(torch.float32)
+        kernel = cast("HelionKernel", self.kernel)
+        line = f"{value}.to({dtype})"
+        return kernel.cse.generate(kernel.compute, line, dtype=dtype, shape=value.shape)
+
     def dot(self, x: CSEVariable, y: CSEVariable) -> CSEVariable:
         kernel = cast("HelionKernel", self.kernel)
-        return kernel.dot(
-            kernel.as_tensor(x),
-            kernel.as_tensor(y),
-        )
+        rounded = rounded_dot_dtype(V.interpreter.current_node)
+        return kernel.dot(kernel.as_tensor(x), kernel.as_tensor(y), rounded)
 
     def to_dtype(
         self,
@@ -1902,14 +1941,36 @@ class HelionKernel(SIMDKernel[CSEVariable]):
             self.body.writeline(f"{acc} = hl.full([{shape}], {value}, dtype={dtype})")
         return acc
 
-    def dot(self, lhs: CSEVariable, rhs: CSEVariable) -> CSEVariable:
+    def dot(
+        self, lhs: CSEVariable, rhs: CSEVariable, rounded: torch.dtype | None
+    ) -> CSEVariable:
+        """`lhs @ rhs`, whose product is rounded to `rounded` (rounded_dot_dtype())
+        before anything else reads it."""
         batch = ["z0_"] if "z0_" in self.numels else []
         lhs = self.dot_operand(lhs, [*batch, "y", "r0_"])
         rhs = self.dot_operand(rhs, [*batch, "r0_", "x"])
-        # Each dot has its own accumulator, so horizontally fused dots stay apart.
         self.has_fp32_dot |= torch.float32 in (lhs.dtype, rhs.dtype)
+        if self.persistent_reduction and lhs.dtype == rhs.dtype == rounded:
+            # K in one block: one matmul of the whole rows, which accumulates in
+            # fp32 and rounds once, as the store of an accumulator would:
+            #     tmp2 = torch.bmm(tmp0, tmp1)
+            #     out0[tile_z, tile_y, tile_x] = tmp2
+            # rather than
+            #     acc = hl.zeros([tile_z, tile_y, tile_x], dtype=torch.float32)
+            #     acc = torch.baddbmm(acc, tmp0, tmp1)
+            #     out0[tile_z, tile_y, tile_x] = acc.to(torch.bfloat16)
+            # Both round the fp32 sum once, so the first gives the same result
+            # and leaves the backend a plain matmul, which its matmul path can
+            # take as it stands. A product read in fp32 (rounded is None), as
+            # by torch.mm(a, b, out_dtype=torch.float32), keeps the
+            # accumulator: torch.mm of bf16 tiles would round it to bf16.
+            op = "bmm" if batch else "mm"
+            tiles = tuple(TILE_NAMES[axis] for axis in [*batch, "y", "x"])
+            line = f"torch.{op}({lhs}, {rhs})"
+            return self.cse.generate(self.compute, line, dtype=rounded, shape=tiles)
+        # Each dot has its own accumulator, so horizontally fused dots stay apart.
         acc = self.accumulator(0, torch.float32)
-        op = "baddbmm" if "z0_" in self.numels else "addmm"
+        op = "baddbmm" if batch else "addmm"
         self.compute.writeline(f"{acc} = torch.{op}({acc}, {lhs}, {rhs})")
         self.dot_results.add(acc)
         return acc
