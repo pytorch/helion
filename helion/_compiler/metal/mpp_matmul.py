@@ -362,6 +362,10 @@ class _Operand:
     #: The group from whose element loop the operand is staged
     #: (:func:`_link_element_staging`); None to stage it from the Scalar layout.
     elements: int | None = None
+    #: A few-row activation read as the 16-bit view it widens
+    #: (:func:`_operand`), whose transposed group's runs order their MMAs
+    #: fragment by fragment (``fragment_mma``).
+    few_rows: bool = False
 
     @property
     def staged(self) -> bool:
@@ -861,17 +865,26 @@ def _operand(
     dims: tuple[tuple[int, int], tuple[int, int]],
     batch: int | None,
     graphs: Graphs,
+    widen: bool = False,
 ) -> _Operand:
     """A device view when the operand is one, else staged.  The threads
     compute a staged operand in the Scalar layout, one element per block
     coordinate (``c`` parts on a factored K), and write it into the tile at
     those coordinates, so every node it is computed from must meet its
-    operands' dims by block."""
+    operands' dims by block.  Under the fragment lowering, with ``widen``
+    (:func:`_widen`), an lhs of float32 that widens a 16-bit view
+    (:func:`_widened_view`) of at most :data:`_WIDENED_ROWS` rows, as a
+    decode's activation does, is that view, read and widened at each
+    element (``few_rows``)."""
     try:
         view = _view(node, dims, batch, graphs)
     except _NotAView:
         val = node.meta["val"]
         assert isinstance(val, torch.Tensor)
+        if widen:
+            view = _widened_view(node, dims, batch, graphs)
+            if view is not None and _few_rows(view):
+                return _Operand(val.dtype, view, few_rows=True)
         if val.dtype not in _OPERAND_DTYPES:
             raise metal_unsupported(f"an MPP operand of dtype {val.dtype}") from None
         positional_rebind.check_positional_merges(
@@ -879,6 +892,94 @@ def _operand(
         )
         return _Operand(val.dtype)
     return _Operand(view.tensor.dtype, view)
+
+
+#: The most rows a fragment group's activation may have to be read as the
+#: view it widens (:func:`_operand`): a few-row matmul's.
+_WIDENED_ROWS = 16
+
+
+def _widen(allowed: bool, weight: Node, graphs: Graphs) -> bool:
+    """Whether a fragment group (``allowed``: its K tiles whole and not
+    loaded a tile ahead) may read its lhs, a few-row activation, as the
+    16-bit view it widens (:func:`_operand`), which transposes the group
+    (``fragment_mma.transposed``): the rhs ``weight`` then is the MMA's A.
+    Only for the weights that form was measured to pay on: codes unpacked
+    from integer words by shifts (as 4- and 8-bit affine weights are), each
+    tensor read once per element and none at an index read from memory.  Codes that straddle two words (5 or 6 bits) ran slower in that
+    form and stay untransposed, as do other computed weights (a dense int8
+    weight, a lookup table's), whose transposed form wasn't measured."""
+    if not allowed:
+        return False
+    producers = _producers(weight, graphs)
+    loads = [n for n in producers if n.target is load]
+    keys = [storage_key(n) for n in loads]
+    codes = any(
+        isinstance(val := n.meta.get("val"), torch.Tensor)
+        and not val.dtype.is_floating_point
+        for n in loads
+    )
+    unpacked = any(
+        isinstance(n.target, torch._ops.OpOverload)
+        and n.target.overloadpacket in _SHIFTS
+        for n in producers
+    )
+    gathered = any(
+        m.target is load
+        for n in loads
+        for index in n.all_input_nodes
+        for m in _producers(index, graphs)
+    )
+    return codes and unpacked and not gathered and len(keys) == len(set(keys))
+
+
+#: The right shifts that unpack codes from words (:func:`_widen`).
+_SHIFTS = (torch.ops.aten.__rshift__, torch.ops.aten.bitwise_right_shift)
+
+
+def _widened_view(
+    node: Node,
+    dims: tuple[tuple[int, int], tuple[int, int]],
+    batch: int | None,
+    graphs: Graphs,
+) -> View | None:
+    """The 16-bit device view a float32 operand widens (``x.to(float32)``),
+    exactly, or None."""
+    val = node.meta["val"]
+    if node.target not in _WIDENING or val.dtype != torch.float32:
+        return None
+    source = node.args[0]
+    if not isinstance(source, Node):
+        return None
+    source_val = source.meta.get("val")
+    if not isinstance(source_val, torch.Tensor) or source_val.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return None
+    try:
+        return _view(source, dims, batch, graphs)
+    except (_NotAView, exc.BackendUnsupported):
+        return None
+
+
+#: Conversions whose result holds its input's values exactly.
+_WIDENING = (
+    torch.ops.prims.convert_element_type.default,
+    torch.ops.aten._to_copy.default,
+)
+
+
+def _few_rows(view: View) -> bool:
+    """Whether an lhs ``view``'s rows number at most :data:`_WIDENED_ROWS`. A
+    fragment group that reads such an activation as its view, beside a
+    computed weight, takes the transposed form
+    (``fragment_mma.transposed``): the weight is the MMA's A, each lane's
+    elements one run of K positions of one row."""
+    from .backend import static_extent
+
+    rows = static_extent(view.tensor.size(view.positions[0]))
+    return rows is not None and rows <= _WIDENED_ROWS
 
 
 def _view_mask(extra_mask: object, dims: Sequence[Dim], graphs: Graphs) -> None:
@@ -919,6 +1020,7 @@ def plan_mpp_matmuls(
     graphs: list[GraphInfo],
     threaded: set[int],
     fragment: FragmentLowering | None = None,
+    widen_k: Callable[[int], bool] | None = None,
 ) -> MppPlan:
     """Admit each aten matmul (``addmm``, ``mm``, ``bmm``, ``baddbmm``), each
     ``hl.dot`` over a K held as per-thread parts, and the other ``hl.dot`` calls
@@ -928,7 +1030,10 @@ def plan_mpp_matmuls(
     than one thread; ``fragment`` (``fragment_mma.FRAGMENT_LOWERING`` under
     the config's ``metal_matmul="fragment"``) lowers every group on
     simdgroup-matrix fragments, or raises ``BackendUnsupported`` for one that
-    can't be.
+    can't be; ``widen_k`` says of a K block whether the config's tiles of
+    it are whole and loaded in their own iteration, where a few-row
+    activation may be read as the view it widens (:func:`_widen`; None:
+    they are).
 
     Each use of a group's cooperative value is decided from the FX graph: an
     element-wise use or a store that an element loop can evaluate at any
@@ -955,9 +1060,9 @@ def plan_mpp_matmuls(
     take_dots = (
         bool(dots)
         and all(_dot_admissible(m, dot_ks) for m in dots)
-        and _takes_dots(graphs, threaded, fragment)
+        and _takes_dots(graphs, threaded, fragment, widen_k)
     )
-    return _plan_matmuls(graphs, take_dots, fragment)
+    return _plan_matmuls(graphs, take_dots, fragment, widen_k)
 
 
 def has_matmuls(graphs: list[GraphInfo]) -> bool:
@@ -976,6 +1081,7 @@ def _plan_matmuls(
     graphs: list[GraphInfo],
     take_dots: bool,
     fragment: FragmentLowering | None = None,
+    widen_k: Callable[[int], bool] | None = None,
 ) -> MppPlan:
     from ..device_ir import ForLoopGraphInfo
 
@@ -1026,15 +1132,17 @@ def _plan_matmuls(
                     )
                 continue
             tile_product = True
-        if k_block is not None:
-            group = _plan_full_k(len(plan.by_matmul), matmul, k_block, known)
-        elif not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
-            raise metal_unsupported(
-                "a matmul over a tiled K outside its K loop; loop over K with "
-                "hl.tile, or take K whole with a ':' slice"
-            )
-        else:
-            group = _plan_group(len(plan.by_matmul), matmul, g.block_ids[0], known)
+        plan_k = _plan_full_k
+        if k_block is None:
+            if not isinstance(g, ForLoopGraphInfo) or len(g.block_ids) != 1:
+                raise metal_unsupported(
+                    "a matmul over a tiled K outside its K loop; loop over K "
+                    "with hl.tile, or take K whole with a ':' slice"
+                )
+            k_block = g.block_ids[0]
+            plan_k = _plan_group
+        widen = fragment is not None and (widen_k is None or widen_k(k_block))
+        group = plan_k(len(plan.by_matmul), matmul, k_block, known, widen)
         # Each group's op updates its storage in place, so one value can hold
         # only one group's cooperative tensor.
         storage = group.old | group.cur
@@ -1170,6 +1278,7 @@ def _takes_dots(
     graphs: list[GraphInfo],
     threaded: set[int],
     fragment: FragmentLowering | None = None,
+    widen_k: Callable[[int], bool] | None = None,
 ) -> bool:
     """Whether the planner takes the kernel's ``hl.dot`` calls: it
     plans a copy of the graphs with them, with ``fragment``'s lowering when
@@ -1190,7 +1299,7 @@ def _takes_dots(
         if _matmul_derived(_node(m.args[side]), known)
     }
     try:
-        plan = _plan_matmuls(copies, take_dots=True, fragment=fragment)
+        plan = _plan_matmuls(copies, take_dots=True, fragment=fragment, widen_k=widen_k)
     except exc.BackendUnsupported:
         return False
     if any(
@@ -1332,7 +1441,12 @@ def _if_result(if_node: Node, index: int, graphs: Graphs) -> Node | None:
     return value if isinstance(value, Node) else None
 
 
-def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: Graphs) -> MppGroup:
+def _plan_group(
+    gid: int, matmul: Node, k_loop_block: int, graphs: Graphs, widen: bool = False
+) -> MppGroup:
+    """The group of ``matmul``, accumulated across its K loop over
+    ``k_loop_block``; ``widen``: whether a fragment group may read a few-row
+    activation as the 16-bit view it widens (:func:`_widen`)."""
     acc, lhs, rhs = matmul_operands(matmul)
     assert acc is not None
     placeholder = acc
@@ -1375,7 +1489,7 @@ def _plan_group(gid: int, matmul: Node, k_loop_block: int, graphs: Graphs) -> Mp
         m,
         n,
         kdim[0],
-        _operand(lhs, ((m, 1), kdim), batch, graphs),
+        _operand(lhs, ((m, 1), kdim), batch, graphs, _widen(widen, rhs, graphs)),
         _operand(rhs, (kdim, (n, 1)), batch, graphs),
         k_factor=kdim[1],
         levels=levels,
@@ -1588,7 +1702,9 @@ def _full_k(matmul: Node) -> int | None:
     return block
 
 
-def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGroup:
+def _plan_full_k(
+    gid: int, matmul: Node, k_block: int, graphs: Graphs, widen: bool = False
+) -> MppGroup:
     """A matmul over a ``:`` K: one op over the whole K, seeded by a constant
     fill or a Scalar value of the op's own graph, or, with no acc, by zeros
     the op emits itself.  Also a matmul with no acc in the loop over its
@@ -1621,7 +1737,7 @@ def _plan_full_k(gid: int, matmul: Node, k_block: int, graphs: Graphs) -> MppGro
         m,
         n,
         kdim[0],
-        _operand(lhs, ((m, 1), kdim), batch, graphs),
+        _operand(lhs, ((m, 1), kdim), batch, graphs, _widen(widen, rhs, graphs)),
         _operand(rhs, (kdim, (n, 1)), batch, graphs),
         batch_block=batch,
     )

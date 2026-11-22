@@ -24,6 +24,7 @@ import helion
 from helion._compiler.metal.fragment_matmul_heuristic import (
     MetalFragmentMatmulHeuristic,
 )
+from helion._testing import pairwise
 from helion._testing import skipUnlessBackends
 from helion._testing.metal import heuristic_seeds
 from helion._testing.metal import run_with_msl
@@ -34,6 +35,7 @@ from helion._testing.metal_fragment import e4m3
 from helion._testing.metal_fragment import filled
 from helion._testing.metal_fragment import fp8_rows
 from helion._testing.metal_fragment import fragment_config
+from helion._testing.metal_fragment import fragment_transposed
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_rows
 from helion._testing.metal_fragment import seeded_rhs
@@ -49,6 +51,22 @@ if TYPE_CHECKING:
     from helion.runtime.kernel import BoundKernel
 
 DEVICE = "mps"
+#: The few-row affine cases.  The few-row form takes 4- or 8-bit codes over
+#: whole K tiles, both at once, so its cases pair each of those bit widths
+#: with every group (one, two or four per K tile of 128) and every row count
+#: (1 and 4 pad x's 8-column fragment, 16 takes two); the cases that keep x
+#: computed, 5- and 6-bit codes (which straddle words) and a K tail (masked
+#: loads), pair their own groups with the row counts.
+_FEW_ROWS = [
+    *(
+        (bits, group, rows, False)
+        for bits, group, rows in pairwise(
+            bits=(4, 8), group=(32, 64, 128), rows=(1, 4, 8, 16)
+        )
+    ),
+    *((bits, 128, rows, False) for bits, rows in ((5, 1), (5, 16), (6, 4), (6, 8))),
+    *((4, group, rows, True) for group, rows in ((32, 8), (64, 4))),
+]
 F32 = torch.float32
 S = {"backend": "metal", "static_shapes": True}
 
@@ -284,10 +302,7 @@ class TestFragmentMma(unittest.TestCase):
         self.assertNotIn("threadgroup_barrier", msl)
         self.assertNotRegex(msl, r"\bthreadgroup \w+ ")
         if transposed is not None:
-            # A transposed accumulator's A fragments run over N.
-            a_rows = re.search(r"int (_e_[mn]) = 8 \* \(_fi >> 1\) \+ _fm;", msl)
-            assert a_rows is not None
-            self.assertEqual(a_rows.group(1), "_e_n" if transposed else "_e_m")
+            self.assertEqual(fragment_transposed(msl), transposed)
 
     def _close(self, out: torch.Tensor, ref: torch.Tensor, tol: float = 1e-2) -> None:
         torch.testing.assert_close(out.cpu().double(), ref.double(), atol=tol, rtol=tol)
@@ -717,6 +732,42 @@ class TestFragmentMma(unittest.TestCase):
                 # threadgroup combine, which _assert_fragments refuses).
                 self.assertIn("simdgroup_multiply_accumulate(", msl)
                 self.assertNotIn("matmul2d", msl)
+
+    def test_few_row_affine(self) -> None:
+        """Affine weights of 4 to 8 bits at groups of 32 to 128 and 1 to 16
+        rows, against float64.  At 4 and 8 bits over whole K tiles x is read
+        as its half view, so the accumulator is transposed and the MMAs run
+        fragment by fragment, a bfloat x as a half one.  A K tail, and 5-
+        and 6-bit codes, which straddle words, keep x computed and the
+        accumulator untransposed."""
+        for bits, group, rows, tail in _FEW_ROWS:
+            with self.subTest(bits=bits, group=group, rows=rows, tail=tail):
+                k = 1024 + (64 if tail else 0)
+                args = affine_args(bits, group, rows, 96, k, DEVICE)
+                out, msl = _run(
+                    affine_mm,
+                    args,
+                    fragment_config([16, 32, 128], [1, 1, 32], num_warps=4),
+                )
+                self._close(out, affine_reference(args), tol=2e-3)
+                few_rows = bits in (4, 8) and k % 128 == 0
+                self._assert_fragments_split(msl, transposed=few_rows)
+                self.assertEqual("simdgroup_float8x8 _frag_b15[" in msl, few_rows)
+        # A bfloat activation reads its view into the float fragments too.
+        x, *weight = affine_args(4, 64, 8, 96, 1024, DEVICE)
+        args = (x.to(torch.bfloat16), *weight)
+        config = fragment_config([16, 32, 128], [1, 1, 32], num_warps=4)
+        out, msl = _run(affine_mm, args, config)
+        self._close(out, affine_reference(args), tol=8e-3)
+        self._assert_fragments_split(msl, transposed=True)
+
+    def _assert_fragments_split(self, msl: str, transposed: bool) -> None:
+        """The op is MMAs on register fragments whose K loop SIMD groups
+        split, and its accumulator transposed or not."""
+        self.assertIn("simdgroup_multiply_accumulate(", msl)
+        self.assertIn("_frag_split", msl)
+        self.assertNotIn("matmul2d", msl)
+        self.assertEqual(fragment_transposed(msl), transposed)
 
     def test_k_from_16(self) -> None:
         """A K loop from 16 under 2 stages loads its first tile, K 16 to 48,
