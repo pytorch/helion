@@ -4079,12 +4079,6 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
     TILE_BYTES_SM100 = 16384
     MIN_WAVES = 8  # grid >= num_sm * MIN_WAVES (size_hint-aware grid floor)
     BLOCK_FLOOR = 256  # never regress toward the bs=32 default
-    # Paired H100/B200 timings support growing underfilled 16-bit embedding tiles;
-    # growing an already full tile regressed a large-batch lookup on B200.
-    EMBEDDING_TARGETS: ClassVar[tuple[HardwareTarget, ...]] = (
-        ("cuda", "sm90"),
-        ("cuda", "sm100"),
-    )
     # Per-program register/working-set ceiling (fp32-compute bytes) before spill / block-numel
     # overflow: wide enough not to bind the flat family, tight enough to bind a heavy rope slab.
     REGISTER_BYTES = 65536
@@ -4154,35 +4148,6 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         fact = spec.pointwise_facts[0]
         num_sm = max(1, get_num_sm(env.device))
         tuned_arch = matches_hardware(env, cls.TUNED_TARGETS)
-        seed = cls._seed_from_fact(env, fact, num_sm, tuned_arch)
-        lookup = fact.embedding_lookup_slabs
-        if (
-            lookup is None
-            or fact.slab_numel <= lookup[0]
-            or fact.storage_itemsize != 2
-            or math.prod(seed.block_sizes) >= cls.BLOCK_FLOOR
-            or not matches_hardware(env, cls.EMBEDDING_TARGETS)
-        ):
-            return seed
-        corrected = cls._seed_from_fact(
-            env,
-            fact._replace(slab_numel=lookup[0], max_op_slab_numel=lookup[1]),
-            num_sm,
-            tuned_arch,
-        )
-        return (
-            corrected if math.prod(corrected.block_sizes) >= cls.BLOCK_FLOOR else seed
-        )
-
-    @classmethod
-    def _seed_from_fact(
-        cls,
-        env: CompileEnvironment,
-        fact: PointwiseElementwiseFact,
-        num_sm: int,
-        tuned_arch: bool,
-    ) -> Config:
-        spec = env.config_spec
         # slab_numel (untiled inner slab per tiled element) scaled by two widths into two caps:
         # budget_target = tiled elements per bandwidth-saturating program (STORAGE bytes); reg_cap =
         # how many fit before the fp32 working set spills (COMPUTE bytes; coarse proxy — see the fact).
@@ -4274,6 +4239,15 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         that is ``occ_cap`` in ``get_seed_config``, and shrinking the tile instead
         measured worse on every cell tried. The SFU ramp is kept as a floor, since
         transcendental latency is independent of byte traffic.
+
+        Neither term applies to a kernel that loads rows behind a loaded index
+        (``fact.row_gather``: ``table[ids[tile], tile_d]``, however the row is
+        written): the row's address waits on the ``ids`` load and every warp of the
+        program waits with it, so more warps than the default only take resident
+        slots from other programs. The two terms are capped at the default for it.
+        Measured on B200 against sequential ids (the same), a copy (indifferent)
+        and other ways to write the row (the same); a loaded index on the
+        contiguous dim fetches element by element and keeps its warps.
         """
         per_thread = cls._elems_per_thread(fact.gather_stride)
         work = cls._pow2_floor(max(1, tile_numel // (32 * per_thread)))
@@ -4283,6 +4257,9 @@ class TritonPointwiseSeedHeuristic(AutotunerHeuristic):
         )
         resident_wave = cls._pow2_floor(max(1, (num_sm * wave_slots) // programs))
         target = max(work, resident_wave)
+        # Neither term holds for a row lookup (see the docstring).
+        if fact.row_gather:
+            target = min(target, cls.DEFAULT_WARPS)
         # The SFU ramp as a floor (never lowers the ladder's answer).
         if fact.sfu_ops >= cls.SFU_W16:
             target = max(target, cls.MAX_WARPS)

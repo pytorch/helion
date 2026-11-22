@@ -642,6 +642,33 @@ class MemoryOpFact(NamedTuple):
     # check (a full-rank ``[M,1]`` broadcast passes ndim) or a shape-only product (a stride-0 expand
     # passes shape).
     accessed_numel: int = 0
+    # For an op indexed through an INDEX TENSOR that no tile axis resolves (a gather or
+    # scatter: the ``ids[tile]`` in ``table[ids[tile], tile_d]``): the elements it addresses
+    # for one element of the tunable tiles, i.e. the numel of the region ``tensor[index]`` with
+    # every tunable block size (``ConfigSpec.block_sizes``) set to one and every other block
+    # at its loop's extent. 1 for an embedding lookup, the row width for
+    # ``table[ids[tile], :]``, k for k ids per token. Such an op is addressed once per index
+    # element, however long the gathered axis is, so its footprint is this, not
+    # ``subscript_extents`` or ``accessed_numel``. A scalar subscript selects one element, a
+    # grid index included (``subscript_extents`` charges other ops a grid index's whole axis).
+    # ``None`` for any other op, and for a region without such a numel: one that is not linear
+    # in a tunable block size (a size of ``tile // 2``, or two index tensors over one tile), or
+    # one that depends on a registered tunable.
+    gather_numel: int | None = None
+    # For an op with a subscript computed from a load (``ids[tile]`` or anything derived from
+    # it), whose address therefore waits on that load: whether it takes rows of what the
+    # loaded index picks, i.e. its other subscripts span more than one element and no loaded
+    # index addresses a stride-1 dim of the tensor. True for ``table[ids[tile], tile_d]``
+    # however the rest of the row is written (a tile, a slice, ``hl.arange``), False for
+    # ``x[tile_m, cols[tile_n]]``, which scatters the elements themselves, and for one
+    # element per index element (``scales[ids[tile]]``, ``t[ids[tile], 3]``). None for an op
+    # without such a subscript (``hl.arange`` alone is computed, not loaded, and so is
+    # ``tile.index``, subscripted or not). Independent of ``gather_numel``.
+    row_gather: bool | None = None
+    # For such an op: the blocks its loaded indices run along, one entry per dim of such an
+    # index that is not of size one, None for a dim without a block. ``(block of tile,)`` for
+    # the ``ids[tile]`` of an embedding lookup: one fetch per element of the tile.
+    loaded_index_block_ids: tuple[int | None, ...] = ()
 
 
 class AccumulatorFact(NamedTuple):
@@ -667,7 +694,11 @@ class PointwiseElementwiseFact(NamedTuple):
       = ``sum(accessed_numel // total_numel)`` over those ops (flat kernel: 1 per op; rope:
       heads*head_dim). A BROADCAST operand (``bias[N]``, ``[M,1]``, stride-0) has
       ``accessed_numel < total_numel`` → amortized → excluded; an OVERSIZED operand still touches the
-      full problem → counted (hence ``>=``).
+      full problem → counted (hence ``>=``). A GATHERED op (one indexed through an index tensor,
+      ``table[ids[tile], tile_d]``; see ``MemoryOpFact.gather_numel``) is the exception
+      to the tensor-size ratio: it reads one row per index element however many rows the table
+      has, so it adds ``MemoryOpFact.gather_numel`` (1 for an embedding lookup; the row width
+      for ``table[ids[tile], :]``), not ``vocab / tokens``.
     - ``storage_itemsize`` / ``compute_itemsize``: the STORAGE (HBM) and widest COMPUTE (fp32) byte
       widths that scale slab_numel into the two budgets — ``slab_numel * storage`` = bandwidth traffic,
       ``slab_numel * compute`` = register cap (compute reads the promoted dtype; a memory op knows only
@@ -689,9 +720,16 @@ class PointwiseElementwiseFact(NamedTuple):
     - ``max_op_slab_numel``: the LARGEST single op's untiled fan-out, vs ``slab_numel``'s SUM
       of the same quantity. Bytes ADD across ops (so the sum sizes the byte/register budgets)
       but LANES do not (separate vector instructions over the same threads), so the max is what
-      bounds a num_warps starvation cap.
-    - ``embedding_lookup_slabs``: exact (sum, max) for a direct embedding lookup.
-      The seed can use these when the extent-based estimate underfills a tile.
+      bounds a num_warps starvation cap: the product of the op's extents at untiled positions,
+      or for a gathered op its ``gather_numel``.
+    - ``row_gather``: the kernel has a LOAD behind a loaded index that takes rows
+      (``MemoryOpFact.row_gather``), as an embedding lookup does, and every element gather
+      beside it fetches along blocks the rows are picked along
+      (``MemoryOpFact.loaded_index_block_ids``): one scale per row does not make the kernel an
+      element gather, one weight per column does. The address of a row load waits on another
+      load, and all warps of the program wait with it, so warps beyond the default buy nothing
+      (see ``TritonPointwiseSeedHeuristic._warps_for_sm100``). Unlike the slab fields it also
+      counts a table with fewer elements than the output.
     """
 
     total_numel: int
@@ -702,7 +740,7 @@ class PointwiseElementwiseFact(NamedTuple):
     sfu_ops: int = 0
     gather_stride: int = 1
     max_op_slab_numel: int = 1
-    embedding_lookup_slabs: tuple[int, int] | None = None
+    row_gather: bool = False
 
 
 def shrink_block_sizes_for_numel_constraints(

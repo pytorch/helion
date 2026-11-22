@@ -14,6 +14,7 @@ import torch
 
 from .. import exc
 from .. import language as hl
+from .._compat import shape_env_size_hint
 from ..autotuner.config_spec import AccumulatorFact
 from ..autotuner.config_spec import DotAxes
 from ..autotuner.config_spec import DotAxisKind
@@ -35,6 +36,7 @@ from .compile_environment import FixedBlockSizeSource
 from .compile_environment import _has_unbacked
 from .compile_environment import _symint_free_symbols
 from .compile_environment import _symint_sympy_expr
+from .compile_environment import _to_sympy
 from .fx_side_effects import is_impure_node
 from .indexing_strategy import _contiguous_integer_tensor_index
 from .indexing_strategy import is_block_size_index
@@ -42,6 +44,7 @@ from .indexing_strategy import subscript_index_scale
 from .indexing_strategy import subscript_tile_info
 from .tile_dependency import TILE_ACCESS_META
 from .tile_dependency import _relation_product_is_within_budget
+from .utils import compute_slice_size
 from .utils import is_full_slice
 from .variable_origin import GridOrigin
 from .variable_origin import TileBeginOrigin
@@ -51,6 +54,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Container
     from collections.abc import Iterable
+    from collections.abc import Sequence
 
     from ..autotuner.config_spec import ConfigSpec
     from .compile_environment import CompileEnvironment
@@ -268,6 +272,174 @@ _INDEX_CASTS = (
     torch.ops.aten._to_copy.default,
 )
 _INDEX_DTYPES = (torch.int32, torch.int64)
+
+
+def _is_gather_subscript(env: CompileEnvironment, subscript: object) -> bool:
+    """Whether ``subscript`` is an index tensor that no tile axis resolves: the
+    ``ids[tile]`` of ``table[ids[tile], tile_d]``, but not ``2 * tile.index``."""
+    return (
+        isinstance(subscript, torch.fx.Node)
+        and isinstance(subscript.meta.get("val"), torch.Tensor)
+        and subscript_index_scale(env, subscript)[0] is None
+    )
+
+
+def _placeholder_resolver(
+    device_ir: DeviceIR,
+) -> Callable[[torch.fx.Node], torch.fx.Node]:
+    """A function from a node to itself, or for a placeholder of a rolled or
+    nested graph to the value its enclosing graph passes in."""
+    from .device_ir import HelperFunctionGraphInfo
+    from .device_ir import NodeArgsGraphInfo
+
+    graph_info_by_graph = {
+        graph_info.graph: graph_info for graph_info in device_ir.graphs
+    }
+
+    def resolve_placeholder(node: torch.fx.Node) -> torch.fx.Node:
+        seen: set[torch.fx.Node] = set()
+        while node.op == "placeholder" and node not in seen:
+            seen.add(node)
+            graph_info = graph_info_by_graph.get(node.graph)
+            if not isinstance(graph_info, NodeArgsGraphInfo) or isinstance(
+                graph_info, HelperFunctionGraphInfo
+            ):
+                break
+            try:
+                node = graph_info.placeholder_to_outer_arg(node)
+            except KeyError:
+                break
+        return node
+
+    return resolve_placeholder
+
+
+def _reads_memory(
+    subscript: object, resolve: Callable[[torch.fx.Node], torch.fx.Node]
+) -> bool:
+    """Whether the value of ``subscript`` is computed from a load of a tensor in
+    memory: ``ids[tile]`` and anything derived from it. Not a tile, ``hl.arange``
+    or ``tile.index``, however that is subscripted (``tile.index[:, None]`` is a
+    load too, of the index itself), and not a size: the shape of a loaded tensor
+    is not read from memory. ``resolve`` is ``_placeholder_resolver``'s."""
+    pending = [subscript] if isinstance(subscript, torch.fx.Node) else []
+    seen: set[torch.fx.Node] = set()
+    while pending:
+        node = resolve(pending.pop())
+        if node in seen or not isinstance(node.meta.get("val"), torch.Tensor):
+            continue
+        seen.add(node)
+        if node.target is hl.load:
+            base = node.args[0]
+            if (
+                isinstance(base, torch.fx.Node)
+                and resolve(base).target is _tracing_ops._host_tensor
+            ):
+                return True
+        pending.extend(node.all_input_nodes)
+    return False
+
+
+def _index_dims(subscript: object) -> tuple[int | torch.SymInt, ...]:
+    """The dims of an index tensor subscript that are not of size one (none for
+    a scalar index)."""
+    val = subscript.meta.get("val") if isinstance(subscript, torch.fx.Node) else None
+    if not isinstance(val, torch.Tensor):
+        return ()
+    return tuple(
+        size for size in val.shape if not (isinstance(size, int) and size == 1)
+    )
+
+
+def _indexed_region_sizes(
+    env: CompileEnvironment, tensor: torch.Tensor, index_list: torch.fx.node.Argument
+) -> list[int | torch.SymInt]:
+    """The sizes of the region ``tensor[index_list]`` addresses.
+
+    The dims ``SubscriptIndexing.compute_shape`` gives the subscript, but a
+    slice contributes its own length: the reduction dim that stands for it is
+    allocated when the subscript is typed, not here.
+    """
+    index = cast(
+        "list[object]", torch.fx.map_arg(index_list, lambda node: node.meta["val"])
+    )
+    tensors = [k for k in index if isinstance(k, torch.Tensor)]
+    broadcast = env.should_broadcast_tensor_indexers(index)
+    sizes: list[int | torch.SymInt] = []
+    dims = iter(tensor.shape)
+    for k in index:
+        if k is None:
+            continue  # A new axis of size one: it addresses no dim of the tensor.
+        size = next(dims)
+        if isinstance(k, slice):
+            sizes.append(compute_slice_size(k, size))
+        elif isinstance(k, torch.Tensor):
+            # Adjacent index tensors address one group of dims (the Cartesian
+            # product of 1-D ones, else their broadcast); index tensors that
+            # something else separates each address their own.
+            if not broadcast:
+                sizes.extend(env.tensor_indexer_dims(k))
+            elif k is tensors[0]:
+                sizes.extend(env.tensor_indexer_broadcast_shape(tensors))
+        elif isinstance(k, torch.SymInt) and is_block_size_index(k):
+            sizes.append(k)
+        # Else a scalar (an int, a symbolic value, a grid index): one element
+        # along this dim.
+    return sizes
+
+
+def _block_extents(env: CompileEnvironment) -> dict[sympy.Basic, sympy.Basic]:
+    """Each block's symbol mapped to the extent of the loop it iterates. A block
+    without a single extent has no value here: its symbol stays."""
+    return {
+        info.symbol(): _to_sympy(info.size)
+        for info in env.block_sizes
+        if isinstance(info.size, (int, torch.SymInt))
+    }
+
+
+def _spans_several(
+    env: CompileEnvironment, sizes: Sequence[int | torch.SymInt]
+) -> bool:
+    """Whether a region of ``sizes`` has more than one element with every block at
+    its loop's extent. A size that is not a number then (a dynamic shape, a
+    registered tunable) is taken to."""
+    numel = sympy.Mul(*(_to_sympy(size) for size in sizes))
+    numel = numel.xreplace(_block_extents(env))
+    return not numel.is_number or int(numel) > 1
+
+
+def _numel_at_unit_tiles(
+    env: CompileEnvironment, sizes: Sequence[int | torch.SymInt]
+) -> int | None:
+    """The numel of a region of ``sizes`` for one element of the tunable tiles:
+    every tunable block size set to one, every other block at its loop's extent,
+    a dynamic input size at its hint.
+
+    ``None`` when the region has no such numel:
+
+    * it is not linear in a tunable block size: ``tile // 2`` has no value at a
+      tile of one element, and ``tile * tile`` (two index tensors over one
+      tile) grows with the tile;
+    * it depends on an unbacked value that is not a block size, such as a
+      registered tunable, which has no value before a config picks one.
+    """
+    tunable = {spec.block_id for spec in env.config_spec.block_sizes}
+    unit_tiles: dict[sympy.Basic, sympy.Basic] = {
+        info.symbol(): sympy.Integer(1)
+        for info in env.block_sizes
+        if info.block_id in tunable
+    }
+    numel = sympy.Mul(*(_to_sympy(size) for size in sizes))
+    for tile in numel.free_symbols & unit_tiles.keys():
+        if not numel.is_polynomial(tile) or sympy.degree(numel, tile) > 1:
+            return None
+    # Every other block is as large as the loop it iterates; a region that
+    # needs a block without one extent is not counted.
+    numel = numel.xreplace({**_block_extents(env), **unit_tiles})
+    if _has_unbacked(numel):
+        return None
+    return shape_env_size_hint(env.shape_env, numel)
 
 
 def _scalar_subscript_affine(
@@ -1343,30 +1515,11 @@ class DeviceIRAnalysis:
         env: CompileEnvironment,
     ) -> DeviceIRAnalysis:
         from .device_ir import ForLoopGraphInfo
-        from .device_ir import HelperFunctionGraphInfo
-        from .device_ir import NodeArgsGraphInfo
         from .device_ir import ReductionLoopGraphInfo
         from .device_ir import control_flow_parent_ids
 
         dot_targets = frozenset(matmul_operand_positions())
-        graph_info_by_graph = {
-            graph_info.graph: graph_info for graph_info in device_ir.graphs
-        }
-
-        def resolve_placeholder(node: torch.fx.Node) -> torch.fx.Node:
-            seen: set[torch.fx.Node] = set()
-            while node.op == "placeholder" and node not in seen:
-                seen.add(node)
-                graph_info = graph_info_by_graph.get(node.graph)
-                if not isinstance(graph_info, NodeArgsGraphInfo) or isinstance(
-                    graph_info, HelperFunctionGraphInfo
-                ):
-                    break
-                try:
-                    node = graph_info.placeholder_to_outer_arg(node)
-                except KeyError:
-                    break
-            return node
+        resolve_placeholder = _placeholder_resolver(device_ir)
 
         graphs = tuple(
             GraphAnalysis.build(
@@ -1617,6 +1770,7 @@ class DeviceIRAnalysis:
 
         load_op = memory_ops.load
         store_op = memory_ops.store
+        resolve = _placeholder_resolver(device_ir)
         operand_positions = matmul_operand_positions()
         operands: dict[torch.fx.Node, str] = {}
         records: list[tuple[torch.fx.Node, MemoryOpFact]] = []
@@ -1676,6 +1830,9 @@ class DeviceIRAnalysis:
             subscript_index_scales: tuple[int, ...] = ()
             subscript_affine_block_ids: tuple[int | None, ...] = ()
             subscript_extents: tuple[int, ...] = ()
+            gather_numel: int | None = None
+            row_gather: bool | None = None
+            loaded_index_block_ids: tuple[int | None, ...] = ()
             inner_extent: int | None = None
             accessed_numel = 0
             if fake is not None:
@@ -1715,6 +1872,48 @@ class DeviceIRAnalysis:
                         env.size_hint(fake.shape[position])
                         for position in indexed_positions
                     )
+                    # ``None`` adds an axis and addresses no dim of the tensor.
+                    # In a rolled or nested graph a subscript computed outside
+                    # it is a placeholder: read what it stands for.
+                    subscripts = [
+                        resolve(k) if isinstance(k, torch.fx.Node) else k
+                        for k in index_list
+                        if k is not None
+                    ]
+                    if any(_is_gather_subscript(env, k) for k in subscripts):
+                        gather_numel = _numel_at_unit_tiles(
+                            env, _indexed_region_sizes(env, fake, index_list)
+                        )
+                    # An address that waits on another load. It takes rows
+                    # of what the loaded index picks when the other
+                    # subscripts span more than one element and no loaded
+                    # index addresses a stride-1 dim, which scatters the
+                    # elements themselves. Either way it fetches once for
+                    # each element of its loaded indices.
+                    loaded = [_reads_memory(k, resolve) for k in subscripts]
+                    if any(loaded):
+                        row_gather = not any(
+                            is_loaded and env.size_hint(fake_strides[dim]) == 1
+                            for dim, is_loaded in enumerate(loaded)
+                        ) and _spans_several(
+                            env,
+                            _indexed_region_sizes(
+                                env,
+                                fake,
+                                [
+                                    0 if is_loaded else k
+                                    for k, is_loaded in zip(
+                                        subscripts, loaded, strict=True
+                                    )
+                                ],
+                            ),
+                        )
+                        loaded_index_block_ids = tuple(
+                            env.resolve_block_id(size)
+                            for dim, k in enumerate(subscripts)
+                            if loaded[dim]
+                            for size in _index_dims(k)
+                        )
                 if fake.ndim >= 2:
                     inner_extent = env.size_hint(fake.shape[-1])
 
@@ -1741,6 +1940,9 @@ class DeviceIRAnalysis:
                         subscript_affine_block_ids=subscript_affine_block_ids,
                         subscript_extents=subscript_extents,
                         accessed_numel=accessed_numel,
+                        gather_numel=gather_numel,
+                        row_gather=row_gather,
+                        loaded_index_block_ids=loaded_index_block_ids,
                     ),
                 )
             )
@@ -1961,74 +2163,6 @@ class DeviceIRAnalysis:
 
         return tuple(accesses)
 
-    def _is_direct_embedding(self, spec: ConfigSpec) -> bool:
-        """Recognize out[token, col] = table[ids[token], col] on a two-axis grid."""
-        if (
-            len(self.graphs) != 1
-            or len(spec.block_sizes) != 2
-            or len(spec.memory_op_facts) != 3
-        ):
-            return False
-        ids, table, out = spec.memory_op_facts
-        token, feature = spec.block_sizes
-        shape = (token.size_hint, feature.size_hint)
-        if not (
-            ids.kind == table.kind == "load"
-            and out.kind == "store"
-            and ids.dtype in (torch.int32, torch.int64)
-            and ids.ndim == 1
-            and table.ndim == out.ndim == 2
-            and ids.subscript_block_ids == (token.block_id,)
-            and table.subscript_block_ids == (None, feature.block_id)
-            and out.subscript_block_ids == (token.block_id, feature.block_id)
-            and ids.subscript_extents == shape[:1]
-            and out.subscript_extents == shape
-            and table.inner_extent == feature.size_hint > 1
-            and table.subscript_strides == out.subscript_strides == (shape[1], 1)
-            and ids.subscript_strides == (1,)
-        ):
-            return False
-        # Prove the dataflow too: an affine index or a fused transform can
-        # have exactly the same axis and layout facts.
-        ops = [
-            n
-            for n in self.graphs[0].nodes
-            if n.op == "call_function" and (n.target is hl.load or is_impure_node(n))
-        ]
-        if len(ops) != 3:
-            return False
-        index_load, lookup, store = ops
-        if store.target is not hl.store or not (
-            lookup.target is index_load.target is hl.load
-        ):
-            return False
-        match index_load.args[1], lookup.args[1], store.args[1]:
-            case [token_index], [rows, column], [out_token, out_column]:
-                # A scalar tile.begin can carry the same block ID. Require full tiles.
-                return (
-                    rows is index_load
-                    and store.args[2] is lookup
-                    and all(
-                        isinstance(base, torch.fx.Node)
-                        and base.target is _tracing_ops._host_tensor
-                        for base in (index_load.args[0], lookup.args[0], store.args[0])
-                    )
-                    and all(
-                        isinstance(k, torch.fx.Node)
-                        and is_block_size_index(k.meta.get("val"))
-                        for k in (token_index, column, out_token, out_column)
-                    )
-                    and all(
-                        mask is None
-                        for mask in (
-                            *index_load.args[2:3],
-                            *lookup.args[2:3],
-                            *store.args[3:4],
-                        )
-                    )
-                )
-        return False
-
     def pointwise_fact(
         self,
         spec: ConfigSpec,
@@ -2161,18 +2295,43 @@ class DeviceIRAnalysis:
         max_op_slab_numel = 1
         storage_itemsize = 1
         gather_stride = 1
+        # The loads behind a loaded index: along which blocks do the row loads
+        # pick their rows, and along which do the element gathers fetch.
+        # Whatever the slab rules below make of such a load, it is one: a
+        # table smaller than the output included.
+        row_load = False
+        row_block_ids: set[int | None] = set()
+        element_block_ids: list[int | None] = []
         for memory_fact in spec.memory_op_facts:
+            if memory_fact.kind == "load" and memory_fact.row_gather is not None:
+                if memory_fact.row_gather:
+                    row_load = True
+                    row_block_ids.update(memory_fact.loaded_index_block_ids)
+                else:
+                    element_block_ids.extend(memory_fact.loaded_index_block_ids)
+            # A broadcast operand is amortized. This stays ahead of the gather
+            # accounting: an op that touches less than the problem is not
+            # counted, however it is indexed.
             if memory_fact.dtype is None or memory_fact.accessed_numel < total_numel:
                 continue
-            slab_numel += memory_fact.accessed_numel // total_numel
-            op_slab = 1
-            for block_id, extent in zip(
-                memory_fact.subscript_affine_block_ids,
-                memory_fact.subscript_extents,
-                strict=True,
-            ):
-                if block_id is None or block_id not in tiled_ids:
-                    op_slab *= max(1, extent)
+            if memory_fact.gather_numel is not None:
+                # A gathered op is addressed once per index element, however
+                # long the gathered axis is. The tensor-size ratio would
+                # charge it the table's rows per index element (vocab /
+                # tokens for an embedding lookup), and the extents below the
+                # whole gathered axis.
+                op_slab = memory_fact.gather_numel
+                slab_numel += op_slab
+            else:
+                slab_numel += memory_fact.accessed_numel // total_numel
+                op_slab = 1
+                for block_id, extent in zip(
+                    memory_fact.subscript_affine_block_ids,
+                    memory_fact.subscript_extents,
+                    strict=True,
+                ):
+                    if block_id is None or block_id not in tiled_ids:
+                        op_slab *= max(1, extent)
             max_op_slab_numel = max(max_op_slab_numel, op_slab)
             storage_itemsize = max(storage_itemsize, memory_fact.dtype.itemsize)
             for block_id, stride in zip(
@@ -2200,8 +2359,15 @@ class DeviceIRAnalysis:
             sfu_ops=sfu_op_count,
             gather_stride=gather_stride,
             max_op_slab_numel=max_op_slab_numel,
-            # One table read and one output write; the index is shared across features.
-            embedding_lookup_slabs=(2, 1) if self._is_direct_embedding(spec) else None,
+            # An element gather beside the rows fetches once per element of
+            # its index. Along the blocks the rows are picked along
+            # (``scales[ids[tile]]``, one per row) that is nothing next to the
+            # rows; along any other axis it may be as much as they move.
+            row_gather=row_load
+            and all(
+                block_id is not None and block_id in row_block_ids
+                for block_id in element_block_ids
+            ),
         )
 
     def kernel_matmul_fact(
