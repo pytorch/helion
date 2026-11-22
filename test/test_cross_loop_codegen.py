@@ -3188,7 +3188,17 @@ class TestCrossLoopCodegen(RefEagerTestBase, TestCase):
         self.assertEqual(len(roots), 2)
         self.assertNotIn("%", roots[0])
         workers = helion.runtime.get_num_sm(DEVICE)
-        self.assertIn(f"(tl.program_id(0) + {workers - 10}) % {workers}", roots[1])
+        first_idle = 10 % workers
+        if first_idle and first_idle + 6 <= workers:
+            # The second root's 2 x 3 tasks fit on the workers the first root
+            # leaves idle, so its lanes start there.
+            self.assertIn(
+                f"(tl.program_id(0) + {workers - first_idle}) % {workers}", roots[1]
+            )
+        else:
+            # Its lanes start a wave: the first root fills whole waves, or the
+            # second would wrap onto busy workers.
+            self.assertNotIn("%", roots[1])
         # Guarded roots move later roots by their runtime live counts.
         x = torch.randn((32, 256), device=DEVICE, dtype=torch.float32)
         for live in (0, 1, 5, 16):
