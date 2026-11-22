@@ -7681,11 +7681,25 @@ class _Matcher:
         return False
 
     def _dot(self, node: Node, loop: int) -> Dot:
+        from ...language import memory_ops
+
         region = "loop" if loop >= 0 else "epilogue"
         if rounded_dot_dtype(node) is not None:
             # The evaluator rounds the fragment where a pointwise reader
-            # evaluates it; no reader takes its registers as they are.
-            if not all(_is_pointwise(user) for user in self.users_of(node)):
+            # evaluates it.  A store reads it rounded too: ``_store`` admits
+            # only a value of the tensor's own dtype, and writing the fp32
+            # registers to that 16-bit tensor rounds them once, as in
+            #     out[tile_m, tile_n] = torch.mm(a[tile_m, :], b[:, tile_n])
+            # whose store is
+            #     md_v = cutlass.BFloat16(md_c0_0_0_0)
+            # bit for bit the store of acc = torch.addmm(acc, a, b) as
+            # acc.to(torch.bfloat16).  Without the store, the matmul above
+            # stays SIMT (4096 x 2048 x 64 on a B200: 2.8 ms against 14 us).
+            # Any other reader would take the registers as they are.
+            if not all(
+                _is_pointwise(user) or _is_call(user, memory_ops.store)
+                for user in self.users_of(node)
+            ):
                 raise _NotMine
         elif mm_dot_dtype(node) is not None:
             # An fp32 matmul: a tf32 dot (``addmm`` carries its accumulator
