@@ -1613,8 +1613,9 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         self, reference: Config
     ) -> tuple[object, Sequence[object]]:
         """The autotuning reference config's baseline run, or, when the
-        compiler refuses it and every shrink of it, the first of a few configs
-        sampled from the search space that runs (``_sampled_baseline_configs``).
+        compiler refuses it and every shrink of it, the first that runs of the
+        compiler's seeds and then configs sampled from the search space
+        (``_sampled_baseline_configs``).
 
         A backend can decline a kernel's conservative lowering for a reason no
         block size fixes (the cute backend refuses an ``hl.split`` exchange
@@ -1627,8 +1628,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         still stops the search right away, as does a reference whose every
         attempt compiled past ``autotune_compile_timeout``: a sampled config
         is no likelier to compile in time than a smaller block size of the
-        reference, and each of the ``_MAX_SAMPLED_BASELINE_ATTEMPTS`` would wait
-        out the deadline and the kill's grace period again."""
+        reference, and each of the up to ``2 * _MAX_SAMPLED_BASELINE_ATTEMPTS``
+        would wait out the deadline and the kill's grace period again."""
         failures: list[Exception] = []
         try:
             return self._run_baseline_config(
@@ -1667,9 +1668,15 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             return result
         raise reference_error
 
-    def _sampled_baseline_configs(self, count: int) -> list[Config]:
-        """Up to ``count`` random configs of the search space to try for the
-        baseline; none when the spec cannot generate them."""
+    def _sampled_baseline_configs(self, count: int) -> Iterator[Config]:
+        """Configs of the search space to try for the baseline: up to
+        ``count`` of the compiler's seeds, then up to ``count`` random
+        configs, drawn as they are tried; none when the spec cannot generate
+        them.  The seeds come first: they are the backend's picks of configs
+        that lower the kernel well, where a random point of a search space
+        most of which a backend refuses (lane-loop and tile limits) seldom
+        runs, and a random draw that fails (no valid point found) ends the
+        configs without dropping the seeds."""
         from .config_generation import ConfigGeneration
 
         try:
@@ -1677,10 +1684,20 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.config_spec,
                 process_group_name=self.kernel.env.process_group_name,
             )
-            return [generation.random_config() for _ in range(count)]
         except Exception as e:
             self.log.warning(f"No sampled baseline configs: {e}")
-            return []
+            return
+        # The seed transfer skips seeds the spec can't hold itself; an error
+        # past it is a bug, which surfaces.
+        seeds = [config for _, config in generation.seed_flat_config_pairs()]
+        yield from seeds[:count]
+        for _ in range(count):
+            try:
+                config = generation.random_config()
+            except exc.InvalidConfig as e:
+                self.log.warning(f"No more sampled baseline configs: {e}")
+                return
+            yield config
 
     def _run_baseline_config(
         self,

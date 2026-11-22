@@ -277,6 +277,58 @@ def test_a_refused_reference_falls_back_to_a_sampled_config() -> None:
     assert "is refused at compile time" in warnings[-1]
 
 
+def test_the_sampled_baseline_configs_try_the_compiler_seeds_first() -> None:
+    # A random point of a search space a backend mostly refuses seldom runs;
+    # the compiler's seeds (at most ``count`` of them) go first.
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+    provider, _compiled, _warnings = _provider(spec, lambda config: True)
+    seeds = [helion.Config(block_sizes=[s], mode="simt") for s in (2, 4, 8)]
+    random = helion.Config(block_sizes=[64], mode="simt")
+
+    class _Generation:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def seed_flat_config_pairs(self) -> list[tuple[object, helion.Config]]:
+            return [(None, seed) for seed in seeds]
+
+        def random_config(self) -> helion.Config:
+            return random
+
+    with patch("helion.autotuner.config_generation.ConfigGeneration", _Generation):
+        assert list(provider._sampled_baseline_configs(2)) == [
+            *seeds[:2],
+            random,
+            random,
+        ]
+
+
+def test_a_failing_random_draw_keeps_the_seeds() -> None:
+    # A search space the backend mostly refuses can make ``random_config``
+    # give up (``InvalidConfig``): the seeds before it are still tried.
+    spec = _Spec(
+        {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
+    )
+    provider, _compiled, warnings = _provider(spec, lambda config: True)
+    seeds = [helion.Config(block_sizes=[s], mode="simt") for s in (2, 4)]
+
+    class _Generation:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def seed_flat_config_pairs(self) -> list[tuple[object, helion.Config]]:
+            return [(None, seed) for seed in seeds]
+
+        def random_config(self) -> helion.Config:
+            raise helion.exc.InvalidConfig("no valid config")
+
+    with patch("helion.autotuner.config_generation.ConfigGeneration", _Generation):
+        assert list(provider._sampled_baseline_configs(4)) == seeds
+    assert warnings[-1].startswith("No more sampled baseline configs")
+
+
 def test_a_refused_reference_without_a_running_sample_raises() -> None:
     spec = _Spec(
         {"block_sizes": [8], "mode": "simt"}, {"block_sizes": [8], "mode": "simt"}
