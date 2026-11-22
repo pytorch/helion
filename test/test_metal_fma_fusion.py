@@ -53,6 +53,16 @@ class TestMetalFmaFusionRewrite(unittest.TestCase):
             """
         self.assertEqual(got, ast.unparse(ast.parse(textwrap.dedent(expected))))
 
+    def test_half_product_fuses(self) -> None:
+        """A half product added to a half fuses into a half fma, which rounds
+        once where the multiply and the add round twice."""
+        got = self._fuse(
+            "a = static_cast(half, n)\nb = h[0]\nt = a * b\nu = t + h[1]\n"
+        )
+        self.assertEqual(
+            got, "a = static_cast(half, n)\nb = h[0]\nu = metal.fma(a, b, h[1])"
+        )
+
     def test_viewed_float_fuses(self) -> None:
         """A float reinterpreted from int bits (``as_type``) is a float."""
         got = self._fuse("a = as_type(float, n)\nb = w[0]\nt = a * b\nu = t + r[0]\n")
@@ -83,7 +93,14 @@ class TestMetalFmaFusionRewrite(unittest.TestCase):
     def test_kept(self) -> None:
         for name, source in (
             ("int index math", "t = n * 4\nu = t + n\n"),
-            ("half operands", "a = h[0]\nb = h[1]\nc = r[0]\nt = a * b\nu = t + c\n"),
+            (
+                "half product, float addend",
+                "a = h[0]\nb = h[1]\nc = r[0]\nt = a * b\nu = t + c\n",
+            ),
+            (
+                "half times float",
+                "a = h[0]\nb = x[0]\nc = h[1]\nt = a * b\nu = t + c\n",
+            ),
             (
                 "addend rounded to half",
                 "a = x[0]\nb = w[0]\nc = static_cast(half, r[0])\nt = a * b\nu = t + c\n",

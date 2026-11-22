@@ -1,4 +1,4 @@
-"""Fuse a float multiply into the add that consumes it, as ``metal::fma``.
+"""Fuse a floating multiply into the add that consumes it, as ``metal::fma``.
 
 PyTorch and MLX compile shaders in safe math mode, where Metal keeps every
 ``a * b + c`` a multiply and an add; Triton and nvcc contract them by default.
@@ -7,8 +7,10 @@ across an explicit narrowing (``float(half(a * b)) + c`` becomes one fma),
 dropping a rounding the kernel asked for.  So the fusion happens here, on the
 generated statements: a product of names or literals, used once, by an add in
 the same block, with neither operand reassigned in between, and all three
-operands inferred ``float`` (index math and narrower types keep their
-operators).
+operands inferred one type, ``float`` or ``half`` (index math, bfloat and
+mixed types keep their operators).  A half fma rounds once where the
+multiply and add round twice, as Triton's and nvcc's contraction of half
+arithmetic does.
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
 FLOAT = "float"
+#: The types whose multiply-adds fuse: the three operands share one of them.
+FUSED_TYPES = frozenset({FLOAT, "half"})
 _SCALAR_TYPES = frozenset(
     {"float", "half", "bfloat", "int", "uint", "short", "long", "bool"}
 )
@@ -79,10 +83,11 @@ def _fuse_block(
     assigned: Counter[str],
     env: dict[str, str],
 ) -> list[ast.stmt]:
-    products: dict[str, tuple[int, ast.BinOp]] = {}
+    # Each fusable product's statement, value and type.
+    products: dict[str, tuple[int, ast.BinOp, str]] = {}
     dropped: set[int] = set()
     for i, stmt in enumerate(stmts):
-        new_product: tuple[str, ast.BinOp] | None = None
+        new_product: tuple[str, ast.BinOp, str] | None = None
         if isinstance(stmt, (ast.For, ast.If)):
             stmt.body = _fuse_block(stmt.body, uses, assigned, env)
             stmt.orelse = _fuse_block(stmt.orelse, uses, assigned, env)
@@ -96,9 +101,9 @@ def _fuse_block(
                     if (
                         isinstance(product, ast.Name)
                         and product.id in products
-                        and _type(other, env) == FLOAT
+                        and _type(other, env) == products[product.id][2]
                     ):
-                        j, mul = products.pop(product.id)
+                        j, mul, _ = products.pop(product.id)
                         stmt.value = ast.Call(
                             func=ast.Attribute(
                                 value=ast.Name(id="metal", ctx=ast.Load()),
@@ -120,23 +125,25 @@ def _fuse_block(
                     and isinstance(value.op, ast.Mult)
                     and all(
                         isinstance(x, (ast.Name, ast.Constant))
-                        and _type(x, env) == FLOAT
                         for x in (value.left, value.right)
                     )
+                    and (kind := _type(value.left, env)) is not None
+                    and kind in FUSED_TYPES
+                    and _type(value.right, env) == kind
                     and uses[target.id] == 1
                     and assigned[target.id] == 1
                 ):
-                    new_product = target.id, value
+                    new_product = target.id, value, kind
         # A product whose operands this statement reassigns, or which it
         # reads or writes itself, can no longer move.
         written = _assigned_names(stmt)
         loaded = _loaded_names(stmt)
-        for name, (_, mul) in list(products.items()):
+        for name, (_, mul, _) in list(products.items()):
             if written & _loaded_names(mul) or name in loaded | written:
                 del products[name]
         if new_product is not None:
-            name, value = new_product
-            products[name] = (i, value)
+            name, value, kind = new_product
+            products[name] = (i, value, kind)
     return [stmt for i, stmt in enumerate(stmts) if i not in dropped]
 
 
