@@ -24,9 +24,21 @@ from helion._testing.metal_fragment import affine_mm
 from helion._testing.metal_fragment import k_from_16
 from helion._testing.metal_fragment import nvfp4_cpu_args
 from helion._testing.metal_fragment import nvfp4_rows
+from helion._testing.metal_fragment import seeded_rhs
+from helion._testing.metal_registers import bounded_k_mm
+from helion._testing.metal_registers import copying_mm
+from helion._testing.metal_registers import counted_mm
 from helion._testing.metal_registers import dequant_forms_mm
+from helion._testing.metal_registers import filled_mm
+from helion._testing.metal_registers import free_cols_mm
 from helion._testing.metal_registers import inner_tiled_mm
+from helion._testing.metal_registers import mm_and_double
 from helion._testing.metal_registers import register_config
+from helion._testing.metal_registers import row_scaled_mm
+from helion._testing.metal_registers import rowsum_mm
+from helion._testing.metal_registers import transposed_out_mm
+from helion._testing.metal_registers import two_acc_mm
+from helion.autotuner.config_spec import DEFAULT_NUM_WARPS
 
 pytestmark = [pytest.mark.cpu_only, skipUnlessBackends(["metal"])]
 
@@ -516,6 +528,202 @@ class TestRegisterCodegen(TestCase):
             r"if \(_mrl\d+_v0\) \{\n\s+\{\n\s+int _e_m = 0 \+ _mrl\d+_r0;\n"
             r"\s+int _e_n = 0 \+ _mrl\d+_c0;\n\s+int _e_k = 0;\n\s+float _mr_av",
         )
+
+
+class TestRegisterSplit(TestCase):
+    """An MPP config whose tiles take one SIMD group and whose ``num_warps``
+    is above 1 splits its register runs' K loops over that many SIMD groups
+    (``mpp_registers.register_split``); where the split can't apply, the
+    config keeps its one SIMD group, as before."""
+
+    def test_split(self) -> None:
+        """Eight SIMD groups each run the tile's 32-thread layout over every
+        eighth K tile from their own register operands; after the loop the
+        first adds the others' accumulators through threadgroup memory, in
+        SIMD-group order, and alone stores."""
+        args = affine_args(4, 32, 16, 64, 4096)
+        msl = render_msl(affine_mm, args, register_config([16, 16, 64], num_warps=8))
+        self.assertIn("[[required_threads_per_threadgroup(4, 8, 8)]]", msl)
+        self.assertIn("uint _frag_sg [[simdgroup_index_in_threadgroup]]", msl)
+        self.assertIn(
+            "const uint3 tid = uint3(_mpp_lane % 4, (_mpp_lane / 4) % 8, "
+            "_mpp_lane / 32);",
+            msl,
+        )
+        self.assertIn("threadgroup float _frag_split[1792];", msl)
+        self.assertIn(
+            "for (int offset_2 = _frag_sg * _BLOCK_SIZE_2; offset_2 < 4096; "
+            "offset_2 += 8 * _BLOCK_SIZE_2) {",
+            msl,
+        )
+        self.assertIn("_mpp_op_0.run(_mr_a, _mr_b, acc_copy_0);", msl)
+        tail = msl[msl.index("    threadgroup_barrier(") :]
+        for e in range(8):
+            self.assertIn(
+                f"_frag_split[((_frag_sg - 1) * 8 + {e}) * 32 + _mpp_lane] = acc[{e}];",
+                tail,
+            )
+            self.assertIn(f"acc[{e}] = 0.0f;", tail)
+            self.assertIn(
+                f"acc[{e}] += _frag_split[(_s * 8 + {e}) * 32 + _mpp_lane];", tail
+            )
+        self.assertIn("for (uint _s = 0; _s < 7; _s++) {", tail)
+        self.assertIn("if (_frag_sg == 0 && ((mask_0 & mask_1))) {", tail)
+        # x read as a device view at 8 rows: each SIMD group's tile offset.
+        args = affine_args(6, 128, 8, 64, 4096)
+        msl = render_msl(affine_mm, args, register_config([16, 16, 128], num_warps=16))
+        self.assertIn("offset_2 += 16 * _BLOCK_SIZE_2) {", msl)
+        self.assertIn("auto _mpp_a = tensor<device half", msl)
+        self.assertIn("_mpp_op_0.run(_mpp_a, _mr_b, acc_copy_0);", msl)
+        # With the affine split, each SIMD group's epilogue adds its own
+        # tiles' terms before the combine.
+        args = affine_args(4, 32, 16, 64, 4096)
+        config = register_config([16, 32, 32], num_warps=4)
+        with mock.patch.object(
+            mpp_registers, "affine_split_enabled", return_value=True
+        ):
+            msl = render_msl(affine_mm, args, config)
+        self.assertIn("offset_2 += 4 * _BLOCK_SIZE_2) {", msl)
+        self.assertIn("get_right_input_cooperative_tensor<half, half, float>", msl)
+        self.assertIn("_mr_ones", msl)
+        tail = msl[msl.index("    threadgroup_barrier(") :]
+        self.assertIn("for (uint _s = 0; _s < 3; _s++) {", tail)
+
+    def test_normalize(self) -> None:
+        """An MPP config whose counts launch one SIMD group and that leaves
+        num_warps out gets 1, as such configs ran before the split, rather
+        than the default; one that names it keeps it, and a launch of more
+        SIMD groups keeps the default, as fragment configs do."""
+        bound = affine_mm.bind(affine_args(4, 32, 16, 64, 1024))
+        nested = {"block_sizes": [[16, 16], 64], "num_threads": [4, 8, 1]}
+        grouped = {"block_sizes": [16, 16, 64], "num_threads": [[4, 8], 1]}
+        for config, warps in (
+            (register_config([16, 16, 64]), 1),
+            (register_config([16, 16, 64], num_warps=8), 8),
+            (register_config([16, 64, 64], [4, 16, 1]), DEFAULT_NUM_WARPS),
+            # Grouped sequences read as their flat form.
+            (helion.Config.from_dict(nested), 1),
+            (helion.Config.from_dict(grouped), 1),
+        ):
+            with self.subTest(config=config):
+                normalized = helion.Config.from_dict(dict(config.config))
+                bound.config_spec.normalize(normalized)
+                self.assertEqual(normalized.config["num_warps"], warps)
+        # A reduction's threads come from the num_warps budget too, and it
+        # refuses the split: the default stays.
+        x = torch.randn(16, 256).to(torch.float16)
+        bound = rowsum_mm.bind((x, torch.randn(256, 32), torch.randn(16, 8)))
+        normalized = helion.Config.from_dict(dict(register_config([16, 16, 32]).config))
+        bound.config_spec.normalize(normalized)
+        self.assertEqual(normalized.config["num_warps"], DEFAULT_NUM_WARPS)
+        # Counts that launch one SIMD group only once a bounded block is
+        # clamped (K to the N block's 16, its 32 threads to 16) get 1 too,
+        # so codegen doesn't split them.
+        args = (x, torch.randn(256, 256))
+        given = {"block_sizes": [16, 16, 64], "num_threads": [1, 2, 32]}
+        normalized = helion.Config.from_dict(dict(given))
+        bounded_k_mm.bind(args).config_spec.normalize(normalized)
+        self.assertEqual(normalized.config["num_warps"], 1)
+        msl = render_msl(bounded_k_mm, args, helion.Config.from_dict(dict(given)))
+        self.assertNotIn("_frag_sg", msl)
+
+    def test_unmodelled_launch(self) -> None:
+        """No split where normalization doesn't see the launch codegen
+        builds: beside a free hl.arange axis, whose threads come from the
+        num_warps budget, and in a kernel of two roots, where a config that
+        leaves num_warps out keeps the default 4.  Both keep one SIMD
+        group's register run."""
+        x = torch.randn(64, 256).to(torch.float16)
+        config = helion.Config.from_dict(
+            {"block_sizes": [16, 16, 32], "num_threads": [16, 2, 1], "num_warps": 8}
+        )
+        msl = render_msl(free_cols_mm, (x, torch.randn(256, 16)), config)
+        self.assertIn("[[required_threads_per_threadgroup(2, 16, 1)]]", msl)
+        self.assertIn("_mr_b", msl)
+        self.assertNotIn("_frag_split", msl)
+        args = (x[:16], torch.randn(256, 32), torch.randn(64))
+        config = helion.Config.from_dict(
+            {"block_sizes": [16, 32, 32, 32], "num_threads": [4, 8, 1, 4]}
+        )
+        normalized = helion.Config.from_dict(dict(config.config))
+        mm_and_double.bind(args).config_spec.normalize(normalized)
+        self.assertEqual(normalized.config["num_warps"], DEFAULT_NUM_WARPS)
+        msl = render_msl(mm_and_double, args, config)
+        self.assertIn("execution_simdgroup> _mpp_op_0;", msl)
+        self.assertNotIn("_frag_split", msl)
+        # Nor at counts partly on auto, which normalization doesn't take
+        # for one SIMD group, so num_warps keeps the default 4.
+        config = helion.Config.from_dict(
+            {"block_sizes": [16, 16, 64], "num_threads": [2, 0, 1]}
+        )
+        affine = affine_args(4, 32, 16, 64, 1024)
+        msl = render_msl(affine_mm, affine, config)
+        self.assertIn("execution_simdgroup> _mpp_op_0;", msl)
+        self.assertNotIn("_frag_split", msl)
+
+    def test_fill_and_accumulators(self) -> None:
+        """Under a split only the first SIMD group starts from a fill other
+        than 0, and one combine after the K loop adds up each of its
+        accumulators, each at its own slots."""
+        x = torch.randn(16, 256).to(torch.float16)
+        y = torch.randn(256, 32)
+        config = register_config([16, 32, 32], num_warps=4)
+        msl = render_msl(filled_mm, (x, y), config)
+        self.assertIn("*_it = (_frag_sg == 0 ? 0.5f : 0.0f);", msl)
+        msl = render_msl(two_acc_mm, (x, y, torch.randn(256, 32)), config)
+        self.assertEqual(msl.count("threadgroup_barrier("), 2)
+        for line in (
+            "_frag_split[((_frag_sg - 1) * 32 + 0) * 32 + _mpp_lane] = a[0];",
+            "_frag_split[((_frag_sg - 1) * 32 + 16) * 32 + _mpp_lane] = b[0];",
+            "b[15] += _frag_split[(_s * 32 + 31) * 32 + _mpp_lane];",
+        ):
+            self.assertIn(line, msl)
+
+    def test_fallback(self) -> None:
+        """Where the split can't apply the config keeps the code it had: as
+        on fewer SIMD groups, which a launch whose counts it takes doesn't
+        change.  An accumulator seeded from a tile, a K loop that carries a
+        count beside its accumulator or writes memory
+        (``operand_elements.split_refusal``), an accumulator read in the
+        Scalar layout or beside a staged row vector (both through
+        threadgroup memory) and a combine over more threadgroup memory than
+        there is (a 32x32 tile on 16 SIMD groups) keep one SIMD group's
+        register run; a tile whose threads span two SIMD groups stages."""
+        x = torch.randn(16, 256).to(torch.float16)
+        y = torch.randn(256, 32)
+        affine = affine_args(4, 32, 32, 64, 1024)
+        for name, kernel, args, block_sizes, threads, warps in (
+            ("seeded", seeded_rhs, (x, y, torch.randn(16, 32)), [16, 32, 32], None, 1),
+            ("counted", counted_mm, (x, y), [16, 32, 32], None, 1),
+            ("copying", copying_mm, (x, y, torch.empty_like(x)), [16, 32, 32], None, 1),
+            ("materialized", transposed_out_mm, (x, y), [16, 32, 32], None, 1),
+            (
+                "row vector",
+                row_scaled_mm,
+                (x, y, torch.randn(4, 32)),
+                [16, 32, 32],
+                None,
+                1,
+            ),
+            ("combine", affine_mm, affine, [32, 32, 64], None, 1),
+            ("two simdgroups", affine_mm, affine, [16, 64, 64], [4, 16, 1], 2),
+        ):
+            with self.subTest(name):
+                msl = render_msl(
+                    kernel, args, register_config(block_sizes, threads, num_warps=16)
+                )
+                self.assertNotIn("_frag_sg", msl)
+                self.assertEqual(
+                    msl,
+                    render_msl(
+                        kernel,
+                        args,
+                        register_config(block_sizes, threads, num_warps=warps),
+                    ),
+                )
+                self.assertIn(
+                    "threadgroup float _mpp_tile" if threads else "_mr_b", msl
+                )
 
 
 if __name__ == "__main__":

@@ -511,8 +511,9 @@ class MppPlan:
     register_specs: dict[int, RegisterRun | None] = dataclasses.field(
         default_factory=dict
     )
-    #: The SIMD groups that split each fragment group's K loop (``num_warps``,
-    #: ``fragment_mma``), each running the tile's 32-thread layout.
+    #: The SIMD groups that split each group's K loop (``num_warps``): a
+    #: fragment group's (``fragment_mma``) or a register run's
+    #: (``mpp_registers``), each running the tile's 32-thread layout.
     split: int = 1
 
     def groups(self) -> list[MppGroup]:
@@ -3040,7 +3041,8 @@ def check_mpp_launch(plan: MppPlan, block_dims: Sequence[int]) -> None:
     """Every thread joins each MPP op, whose scope is the launch's SIMD
     groups.  A fragment group's tile takes one SIMD group's 32 threads,
     ``block_dims``, which each of the ``split`` SIMD groups of the launch
-    runs."""
+    runs; so does a register run's when SIMD groups split its K loop
+    (``mpp_registers.register_split``)."""
     if not plan.by_matmul:
         return
     threads = math.prod(block_dims)
@@ -3064,10 +3066,15 @@ def check_mpp_launch(plan: MppPlan, block_dims: Sequence[int]) -> None:
             "num_threads or the block sizes)"
         )
     # Codegen builds operands in registers only for the launch it sees
-    # (``mpp_registers.register_run_spec``).
+    # (``mpp_registers.register_run_spec``), whose SIMD groups a split
+    # stacks (``register_split`` checked both).
     assert all(t == threads for t in plan.register_groups.values()), (
         threads,
         plan.register_groups,
+    )
+    assert plan.split == 1 or (threads == 32 and plan.split * 32 <= 1024), (
+        threads,
+        plan.split,
     )
     for m, n in plan.wide.values():
         if threads // 32 < _WIDE_MIN_SIMDGROUPS:

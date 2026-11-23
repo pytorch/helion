@@ -710,10 +710,10 @@ class MetalBackend(Backend):
         from ..host_function import HostFunction
         from .fragment_mma import FRAGMENT_LOWERING
         from .fragment_mma import loads_ahead
-        from .fragment_mma import split_refusal
         from .free_arange import free_arange_blocks
         from .mpp_matmul import has_matmuls
         from .mpp_matmul import plan_mpp_matmuls
+        from .operand_elements import split_refusal
         from .search_surface import FragmentNumStagesSpec
         from .search_surface import MetalKernelFacts
         from .tabulate import table_sizes
@@ -819,6 +819,7 @@ class MetalBackend(Backend):
                 fragment_matmuls=True,
                 table_sizes=frozenset(table_sizes(inputs)),
                 fragment_splits=splits,
+                register_splits=splits and bool(launch_facts.thread_loops),
                 fragment_blocks=tuple(
                     (g.m_block, g.n_block, g.k_block)
                     for g in plan.by_matmul.values()
@@ -899,7 +900,6 @@ class MetalBackend(Backend):
     ) -> None:
         from ..compile_environment import CompileEnvironment
         from .fragment_mma import FRAGMENT_LOWERING
-        from .fragment_mma import split_refusal
         from .free_arange import check_free_lanes
         from .free_arange import plan_free_aranges
         from .literal_dims import reject_literal_dims
@@ -907,11 +907,15 @@ class MetalBackend(Backend):
         from .mpp_matmul import metal_unsupported
         from .mpp_matmul import plan_mpp_matmuls
         from .mpp_registers import REGISTER_LOWERING
+        from .mpp_registers import register_split
+        from .operand_elements import split_refusal
         from .positional_rebind import reject_positional_rebinds
         from .reduction import plan_reduced_tile_axes
         from .repeated_blocks import plan_repeated_blocks
         from .search_surface import fragment_split
+        from .search_surface import kernel_facts
         from .search_surface import metal_matmul
+        from .search_surface import mpp_one_simdgroup
 
         reject_positional_rebinds(graphs)
         reject_literal_dims(graphs, config)
@@ -940,14 +944,35 @@ class MetalBackend(Backend):
                 REGISTER_LOWERING if metal_matmul(config) == "mpp" else None,
             )
             self.mpp_plan_refused = False
-        split = fragment_split(CompileEnvironment.current().config_spec, config)
-        if split > 1 and self.mpp_plan.by_matmul:
-            refusal = split_refusal(self.mpp_plan, graphs)
-            if refusal is not None:
-                raise metal_unsupported(
-                    f"a fragment K loop split over {split} SIMD groups "
-                    f"(num_warps={split}): {refusal}; use num_warps=1"
+        if metal_matmul(config) == "mpp":
+            # A config whose tiles take one SIMD group splits its register
+            # runs' K loops over its num_warps SIMD groups where they all
+            # take one, else keeps its one SIMD group (``register_split``);
+            # only in a kernel whose launch normalization sees as codegen
+            # does (``register_splits``), and at counts all explicit
+            # (``mpp_one_simdgroup``), where normalization gave a config that
+            # leaves num_warps out one SIMD group.
+            split = 1
+            spec = CompileEnvironment.current().config_spec
+            if kernel_facts(spec).register_splits and mpp_one_simdgroup(
+                spec, config.config
+            ):
+                split = register_split(
+                    config,
+                    self.mpp_plan,
+                    graphs,
+                    math.prod(tile_strategy.thread_block_dims()),
                 )
+        else:
+            split = fragment_split(CompileEnvironment.current().config_spec, config)
+            if split > 1 and self.mpp_plan.by_matmul:
+                refusal = split_refusal(self.mpp_plan, graphs)
+                if refusal is not None:
+                    raise metal_unsupported(
+                        f"a fragment K loop split over {split} SIMD groups "
+                        f"(num_warps={split}): {refusal}; use num_warps=1"
+                    )
+        if split > 1 and self.mpp_plan.by_matmul:
             self.mpp_plan.split = split
         check_free_lanes(
             self.free_arange_plan, self.mpp_plan, graphs, self._fragment_tiles
@@ -1382,8 +1407,8 @@ class MetalBackend(Backend):
         if self.mpp_plan is not None:
             check_mpp_launch(self.mpp_plan, dims)
             split = self.mpp_plan.split
-        # The SIMD groups that split fragment K loops each run the tiles'
-        # threads: the launch stacks them along z.
+        # The SIMD groups that split fragment or register runs' K loops each
+        # run the tiles' threads: the launch stacks them along z.
         return [f"_block_dims=({dims[0]}, {dims[1]}, {dims[2] * split})"]
 
     def build_launcher_args(

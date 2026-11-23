@@ -16,8 +16,12 @@ tensor, re-running the Scalar statements that compute each element with
 the thread and lanes that hold it in the Scalar layout bound, as a
 fragment element is computed (``operand_elements``), and the op runs on
 them.  The accumulator and its element loops (stores, updates,
-epilogues) are the MPP lowering's.  A launch of more SIMD groups keeps
-staging: they share each tile, which one decode serves.
+epilogues) are the MPP lowering's.  Tiles that take more SIMD groups keep
+staging: they share each tile, which one decode serves.  Tiles of one SIMD
+group can still run in several: a config's ``num_warps`` above 1 splits
+the K loop among that many (:func:`register_split`), each over every
+``num_warps``-th K tile from its own registers, the first adding the
+others' accumulators after the loop.
 
 Which elements a lane holds is the op's layout, probed on the GPU that runs
 the kernel and factored into lane bases plus constants (``coop_layout``),
@@ -60,6 +64,8 @@ from ...language.memory_ops import load
 from ...language.tile_ops import tile_index
 from ..ast_extension import expr_from_string
 from ..compile_environment import CompileEnvironment
+from ._constants import MAX_THREADGROUP_MEMORY_BYTES
+from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
 from .affine_fold import Fact
 from .coop_layout import INVALID
@@ -72,6 +78,7 @@ from .coop_layout import lane_bits
 from .coop_layout import lane_expr
 from .coop_layout import layout
 from .coop_layout import op_position
+from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import round_bf16_casts
 from .mpp_matmul import MAX_OP_TILE
 from .mpp_matmul import PUT
@@ -97,12 +104,15 @@ from .mpp_matmul import transposed_view
 from .mpp_matmul import view_args
 from .mpp_matmul import view_span
 from .mpp_matmul import virtual_thread
+from .operand_elements import SPLIT_BUFFER
 from .operand_elements import OperandRecomputable
 from .operand_elements import clamp_past_end
 from .operand_elements import element_body
+from .operand_elements import emit_split_adds
 from .operand_elements import keyword
 from .operand_elements import offset_fact
 from .operand_elements import parse_expr
+from .operand_elements import split_refusal
 from .operand_elements import src
 from .operand_elements import static_int
 from .operand_elements import static_loop
@@ -115,6 +125,8 @@ if TYPE_CHECKING:
 
     from torch.fx.node import Node
 
+    from ...runtime.config import Config
+    from ..device_ir import GraphInfo
     from ..generate_ast import GenerateAST
     from .coop_layout import Coords
     from .mpp_matmul import View
@@ -379,9 +391,39 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
     projections and 8-20% slower on q/og and down, whose long K loops read
     a word of packed codes per element of a row in K order."""
     plan = current_plan()
-    if plan.registers is None:
-        return None
     if math.prod(cg.launch_thread_axis_sizes().values()) != SIMD_WIDTH:
+        assert plan.split == 1
+        return None
+    tile = static_tile(cg, (group.m_block, group.n_block, group.k_block))
+    chosen = _register_op(group, plan, tile[0], tile[1], tile[2])
+    if chosen is None:
+        # The plan's split took every group's op (:func:`register_split`).
+        assert plan.split == 1, group.gid
+        return None
+    atom, sides = chosen
+    affine = None
+    if _affine_candidate(atom, sides) and affine_split_enabled():
+        parts = _affine_parts(cg, group)
+        if parts is not None:
+            affine = parts
+            atom = dataclasses.replace(atom, right="half")
+    return RegisterRun(atom, sides, tile[2] // atom.k, sides == ("reg", "reg"), affine)
+
+
+def _affine_candidate(atom: Atom, sides: tuple[str, str]) -> bool:
+    """Whether the op could take the affine split (:func:`_affine_parts`),
+    which runs it on half inputs: only a float right input in registers
+    beside a half left one gains (two half ops for one half-by-float op)."""
+    return sides[1] == "reg" and atom.left == "half" and atom.right == "float"
+
+
+def _register_op(
+    group: MppGroup, plan: MppPlan, block_m: int, block_n: int, k: int
+) -> tuple[Atom, tuple[str, str]] | None:
+    """The op and each side's kind (:class:`RegisterRun`) of the group's
+    register run over a ``block_m`` x ``block_n`` tile and a K tile of ``k``
+    on one SIMD group, or None (:func:`register_run_spec`)."""
+    if plan.registers is None:
         return None
     if (
         group.fold is not None
@@ -391,7 +433,6 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
         or not group.lhs.dtype.is_floating_point
     ):
         return None
-    block_m, block_n, k = static_tile(cg, (group.m_block, group.n_block, group.k_block))
     kinds: list[str] = []
     for operand, tile in ((group.lhs, (block_m, k)), (group.rhs, (k, block_n))):
         if operand.view is not None:
@@ -485,22 +526,67 @@ def register_run_spec(cg: GenerateAST, group: MppGroup) -> RegisterRun | None:
         # both operands in registers may.
         sides = built
         atom = atom_of(sides)
-    if atom is None:
-        return None
-    affine = None
-    # Only a float right input gains from the split (two half ops for one
-    # half-by-float op).
+    return None if atom is None else (atom, sides)
+
+
+def register_split(
+    config: Config, plan: MppPlan, graphs: list[GraphInfo], threads: int
+) -> int:
+    """The SIMD groups that split the K loops of an MPP config's register
+    runs, as a fragment config's do: its ``num_warps`` when its tiles take
+    one SIMD group (``threads``), every group's op takes register operands
+    there, the kernel admits a split (``operand_elements.split_refusal``)
+    and the combine's threadgroup memory fits; else 1, the config's meaning
+    before, where ``num_warps`` doesn't change a one-SIMD-group launch.
+    Each SIMD group runs the tiles over every ``num_warps``-th K tile from
+    its own register operands, and after the loop the first adds the
+    others' accumulators to its own (:func:`emit_register_combine`) and
+    alone writes memory."""
+    split = int(cast("int", config.get("num_warps", 1)))
     if (
-        sides[1] == "reg"
-        and atom.left == "half"
-        and atom.right == "float"
-        and affine_split_enabled()
+        split <= 1
+        or threads != SIMD_WIDTH
+        or split * SIMD_WIDTH > MAX_THREADS_PER_THREADGROUP
+        or not plan.by_matmul
+        or split_refusal(plan, graphs) is not None
     ):
-        parts = _affine_parts(cg, group)
-        if parts is not None:
-            affine = parts
-            atom = dataclasses.replace(atom, right="half")
-    return RegisterRun(atom, sides, k // atom.k, sides == ("reg", "reg"), affine)
+        return 1
+    env = CompileEnvironment.current()
+    # The combine's threadgroup memory per K loop, which loops after one
+    # another reuse (``split_slots``): each loop's accumulators' elements.
+    elements: dict[object, int] = {}
+    for group in plan.by_matmul.values():
+        tile = [
+            env.block_sizes[b].from_config(config)
+            for b in (group.m_block, group.n_block, group.k_block)
+        ]
+        if not all(isinstance(t, int) for t in tile):
+            return 1
+        if (
+            group.mats
+            or group.stage_uses
+            or any(g is group for g in plan.by_vec.values())
+        ):
+            # Its result read in the Scalar layout, or a row or column
+            # vector its element loop reads, goes through threadgroup
+            # memory, which every SIMD group would write.
+            return 1
+        chosen = _register_op(group, plan, *cast("list[int]", tile))
+        if chosen is None:
+            return 1
+        # The affine split may run the op on half inputs instead
+        # (register_run_spec), whose destination layout may differ.
+        atoms = [chosen[0]]
+        if _affine_candidate(*chosen) and affine_split_enabled():
+            atoms.append(dataclasses.replace(chosen[0], right="half"))
+        slots = max(_dest_slots(atom, _on_gpu()) for atom in atoms)
+        # split_refusal refused groups outside a loop.
+        loop = group.levels[0].owner
+        elements[loop] = elements.get(loop, 0) + slots * SIMD_WIDTH
+    most = max(elements.values())
+    if (split - 1) * most * MSL_SCALAR_BYTES["float"] > MAX_THREADGROUP_MEMORY_BYTES:
+        return 1
+    return split
 
 
 def _view_fits(view: View, tile: tuple[int, int]) -> bool:
@@ -509,6 +595,12 @@ def _view_fits(view: View, tile: tuple[int, int]) -> bool:
     path requires of a view (``mpp_matmul._codegen_matmul``): each K
     step's handle covers part of the tile."""
     return view_span(view, tile) < 2**31
+
+
+def _dest_slots(atom: Atom, on_gpu: bool) -> int:
+    """The destination elements each lane holds of ``atom``'s op, read
+    from its layout (``coop_layout.layout``)."""
+    return len(layout(atom, on_gpu).dest[0])
 
 
 def check_register_operands(group: MppGroup, plan: MppPlan, graphs: Graphs) -> None:
@@ -569,7 +661,9 @@ def codegen_register_run(
     whether they relabel K, ``k_live`` the tile's live length, which masks
     a register operand's K tail and cuts a view's last steps (None when
     every tile is whole), ``facts`` the tile offsets' ``(offset, multiple,
-    least)``, and ``affine`` the split's codes, scale and bias names."""
+    least)``, ``k_split`` the K loop's offset and the SIMD groups that split
+    the loop (:func:`register_split`), None for one, and ``affine`` the
+    split's codes, scale and bias names."""
     backend = CompileEnvironment.current().backend
     k = static_tile(cg, (group.k_block,))[0]
     parts: list[str] = []
@@ -623,12 +717,15 @@ def codegen_register_run(
             )
         ]
         affine = f", affine=({', '.join(name.id for name in names)})"
+    split = current_plan().split
+    k_split = None if split == 1 else (cg.offset_var(group.k_block), split)
     anchor_list = ", ".join(f"({p}, {a})" for p, a in anchors)
     return expr_from_string(
         f"{RUN}({acc.id}, {group.gid}, {', '.join(parts)}, "
         f"anchors=[{anchor_list}], outer=[{', '.join(outers)}], "
         f"registers=[{', '.join(sides)}], steps={spec.steps}, "
-        f"interleave={spec.interleave}, k_live={k_live}, facts={facts!r}{affine})"
+        f"interleave={spec.interleave}, k_live={k_live}, facts={facts!r}, "
+        f"k_split={k_split!r}{affine})"
     )
 
 
@@ -948,6 +1045,9 @@ def emit_register_run(
     outers = keyword(call, "outer")
     assert isinstance(sides_kw, ast.List) and isinstance(outers, ast.List)
     steps = cast("int", ast.literal_eval(cast("ast.expr", keyword(call, "steps"))))
+    k_split = ast.literal_eval(cast("ast.expr", keyword(call, "k_split")))
+    # Its K loop, which it lies in, splits it (``split_range``).
+    assert k_split is None or k_split[0] in state.split_loops, k_split
     k_live = keyword(call, "k_live")
     # Every K tile whole: no view's step runs past the tile's live K.
     whole = isinstance(k_live, ast.Constant) and k_live.value is None
@@ -1113,6 +1213,50 @@ def emit_register_run(
             parts += element
         parts.append(f"{' ' * indent}}}")
     state.put, state.put_type = saved
+
+
+def register_split_runs(body: list[ast.stmt], loop_var: str) -> list[ast.For]:
+    """The register runs in a K loop's ``body`` that SIMD groups split over
+    the loop (``loop_var``): their ``k_split`` names its offset."""
+    runs: list[ast.For] = []
+    for stmt in body:
+        if isinstance(stmt, ast.For) and call_name(stmt.iter) == REG_RUN:
+            assert isinstance(stmt.iter, ast.Call)
+            split = keyword(stmt.iter, "k_split")
+            assert split is not None
+            value = ast.literal_eval(split)
+            if value is not None and value[0] == loop_var:
+                runs.append(stmt)
+    return runs
+
+
+def emit_register_combine(
+    runs: list[ast.For], parts: list[str], pad: str, state: EmitState
+) -> None:
+    """After a K loop the SIMD groups split, add their accumulators (those
+    the loop's register ``runs`` update) into the first's
+    (``operand_elements.emit_split_adds``), as fragment runs' are: a lane's
+    elements of each destination tensor, each then reset to 0."""
+    held: list[str] = []
+    for run in runs:
+        assert isinstance(run.iter, ast.Call)
+        acc = run.iter.args[0]
+        assert isinstance(acc, ast.Name)
+        root = state.coop[acc.id]
+        atom = state.register_atoms[root]
+        count = len(operand_lanes(state, atom, "dest").rows)
+        elements = [f"{root}[{e}]" for e in range(count)]
+        if elements[0] not in held:
+            held += elements
+    count = len(held)
+    state.split_slots = max(state.split_slots, (state.split - 1) * count * SIMD_WIDTH)
+
+    def slot(simdgroup: str, e: int) -> str:
+        return f"{SPLIT_BUFFER}[({simdgroup} * {count} + {e}) * {SIMD_WIDTH} + {LANE}]"
+
+    emit_split_adds(
+        held, [f"{element} = 0.0f;" for element in held], slot, state.split, parts, pad
+    )
 
 
 class RegisterLowering:

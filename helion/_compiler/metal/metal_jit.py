@@ -42,8 +42,6 @@ from .fma_fusion import fuse_multiply_adds
 from .fragment_mma import FRAGMENT_LOWERING
 from .fragment_mma import LANE
 from .fragment_mma import LANE_PREAMBLE
-from .fragment_mma import SIMDGROUP
-from .fragment_mma import SPLIT_BUFFER
 from .fragment_mma import is_fragment_acc
 from .lane_fold import MSL_SCALAR_BYTES
 from .lane_fold import jam_lanes_into_loops
@@ -62,6 +60,8 @@ from .msl_reduction import GROUP_PATHS
 from .msl_reduction import REDUCTION_INCLUDES
 from .msl_reduction import REDUCTION_NAMESPACE
 from .msl_reduction import REDUCTION_PREAMBLE
+from .operand_elements import SIMDGROUP
+from .operand_elements import SPLIT_BUFFER
 from .operand_elements import kernel_constants
 from .reduction import LAUNCH_DIM_VARS
 from .reduction import RED_SITE_GLOBAL_PREFIX
@@ -243,9 +243,10 @@ def _generate_msl(
         if dtype not in DTYPE_TO_METAL:
             raise ValueError(f"Unsupported Metal dtype: {dtype}")
     # The threads each SIMD group lays the tiles out over when SIMD groups
-    # split the fragment K loops (``fragment_mma``): the launch stacks one
-    # such layout per SIMD group along z.
-    split = _fragment_split(body_stmts)
+    # split the fragment or register runs' K loops (``fragment_mma``,
+    # ``mpp_registers``): the launch stacks one such layout per SIMD group
+    # along z.
+    split = _k_split(body_stmts)
     layout = required_threads_per_threadgroup
     if layout is not None and split > 1:
         tx, ty, tz = layout
@@ -305,7 +306,7 @@ def _generate_msl(
     uses_reductions = _uses_reductions(body_stmts)
     # Each SIMD group that splits the K loops runs the kernel's other code
     # too, as the only one would, so codegen refuses kernels with reductions
-    # or staged tiles (``fragment_mma.split_refusal``): their threadgroup
+    # or staged tiles (``operand_elements.split_refusal``): their threadgroup
     # memory would take writes from all of them.
     assert split == 1 or not (uses_reductions or threadgroup_buffers)
     if uses_reductions:
@@ -419,9 +420,10 @@ def _generate_msl(
         # Each SIMD group's lanes take the layout's threads, in launch order.
         assert layout is not None
         tx, ty, _ = layout
+        lane = LANE if uses_fragments else REGISTER_LANE
         msl_parts.append(
-            f"    const uint3 tid = uint3({LANE} % {tx}, ({LANE} / {tx}) % {ty}, "
-            f"{LANE} / {tx * ty});"
+            f"    const uint3 tid = uint3({lane} % {tx}, ({lane} / {tx}) % {ty}, "
+            f"{lane} / {tx * ty});"
         )
 
     # ``threadgroup`` variables are only legal at kernel scope, but a reduction
@@ -453,7 +455,8 @@ def _generate_msl(
     # The lane bases of the register operands' layouts.
     msl_parts[body_at:body_at] = [f"    {line}" for line in state.lane_decls]
     if state.split_slots:
-        # ``fragment_mma._split`` kept it within the threadgroup memory.
+        # ``fragment_mma._split`` and ``mpp_registers.register_split`` kept
+        # it within the threadgroup memory.
         assert (
             state.split_slots * MSL_SCALAR_BYTES["float"]
             <= MAX_THREADGROUP_MEMORY_BYTES
@@ -503,17 +506,20 @@ def _matmul_kinds(body_stmts: list[ast.stmt]) -> tuple[bool, bool, bool]:
     return markers and not fragments, fragments, registers
 
 
-def _fragment_split(body_stmts: list[ast.stmt]) -> int:
-    """The SIMD groups that split the body's fragment K loops (each fragment
-    run's ``split``; ``fragment_mma``), 1 when one SIMD group runs them."""
+def _k_split(body_stmts: list[ast.stmt]) -> int:
+    """The SIMD groups that split the body's K loops, 1 when one SIMD group
+    runs them: the ``split`` of each fragment run (``fragment_mma``) and the
+    ``k_split`` of each register run (``mpp_registers``), both keywords of
+    the run's ``RUN`` call, as the body reads before elementize."""
     splits = set()
     for node in ast.walk(ast.Module(body=body_stmts, type_ignores=[])):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            if node.func.id == RUN:
-                for keyword in node.keywords:
-                    if keyword.arg == "split":
-                        split = ast.literal_eval(keyword.value)
-                        splits.add(1 if split is None else split[1])
+            if node.func.id != RUN:
+                continue
+            for keyword in node.keywords:
+                if keyword.arg in ("split", "k_split"):
+                    split = ast.literal_eval(keyword.value)
+                    splits.add(1 if split is None else split[1])
     assert len(splits) <= 1, splits
     return splits.pop() if splits else 1
 

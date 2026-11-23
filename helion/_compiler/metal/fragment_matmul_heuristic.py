@@ -19,7 +19,7 @@ with these tiles it picks the 128-wide one.
 Each seed takes the largest fragment K tile (``MAX_STEPS`` steps) the K
 extent allows, a row block of 16 (a Metal matmul block's least), a column
 block of 16 or 32, and, where SIMD groups can split the K loop
-(``fragment_mma.split_refusal``), 8 or 16 of them, capped at the largest
+(``operand_elements.split_refusal``), 8 or 16 of them, capped at the largest
 power of two the K loop has tiles for: the few threadgroups a few-row
 matmul's output columns make need the split to fill the GPU. Six of that
 model's eight few-row matmul shapes tuned to a 128-wide K block at 16 or 32
