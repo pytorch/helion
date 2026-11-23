@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import importlib
+import inspect
 import re
 import unittest
 from unittest.mock import patch
@@ -10,6 +11,7 @@ import pytest
 import torch
 from torch._dynamo.utils import counters
 from torch._inductor import config
+from torch._inductor import metrics
 from torch._inductor.choices import InductorChoices
 from torch._inductor.codegen import common
 from torch._inductor.test_case import TestCase
@@ -61,9 +63,30 @@ def randn(*shape, dtype=torch.bfloat16):
 
 
 # For the tests of a loop over tile_r, its accumulators and their combine across
-# blocks: by default a row of up to 1024 elements is one block, a persistent
-# reduction (HelionChoices.should_use_persistent_reduction()).
+# blocks: by default a reduction is one block, a persistent reduction, at any
+# length, and those that loop as Triton's do (choices.LOOPED_REDUCTIONS) up to
+# Triton's 1024 elements of an inner reduction or 64 of another
+# (HelionChoices.should_use_persistent_reduction()).
 looped = config.patch({"triton.persistent_reductions": False})
+
+
+def pin_blocks(r_block: int):
+    """A patch of helion.kernel that pins each kernel's blocks: 1 for its outer
+    tiles and r_block for tile_r. A split's first kernel tiles its x and
+    chunks of R,
+        for tile_y, tile_x in hl.tile([8, 64]):
+    its second kernel x alone."""
+    kernel = helion.kernel
+
+    def pinned(fn=None, **kwargs):
+        if fn is None:  # @helion.kernel(backend=..., ...)
+            return functools.partial(pinned, **kwargs)
+        source = inspect.getsource(fn)
+        outer = re.search(r"for (.*) in hl\.tile\(", source).group(1)
+        blocks = [1] * (outer.count(",") + 1) + [r_block]
+        return kernel(fn, config=helion.Config(block_sizes=blocks), **kwargs)
+
+    return patch("helion.kernel", pinned)
 
 
 class PersistentChoices(InductorChoices):
@@ -556,6 +579,58 @@ class TestInductorCute(InductorBackendTestCase):
         (source,) = self.compile(fn, x, tol=1e-4, backend="cute")
         self.assertIn("torch.maximum(acc, ", source)
 
+    def test_long_rdim_named_by_input(self):
+        # TestInductorBackend.test_long_rdim_named_by_input's rdim of 4096,
+        # named by the input's full rdim, whose load Helion drops.
+        fn = lambda x: (x * torch.arange(4096, device=x.device)).sum(-1)  # noqa: E731
+        x = torch.randn(64, 4096, device=DEVICE)
+        (source,) = self.compile(fn, x, tol=1e-3, backend="cute")
+        self.assertIn("rdim = in0[tile_x, :].size(1)", source)
+
+    def test_expanded_input(self):
+        # TestInductorBackend.test_expanded_input's stores of a value expanded
+        # over the tiles its stride-0 input lacks, over 2-D and 3-D tiles.
+        x = torch.randn(1, 7, 31, device=DEVICE).expand(64, 7, 31)
+        (source,) = self.compile(lambda x: x * 2, x, backend="cute")
+        self.assertIn("out0[tile_y, tile_x] = tmp2.expand(tile_y, tile_x)", source)
+        i = torch.randint(0, 17, (1, 7), device=DEVICE).expand(64, 7)
+        w = torch.randn(17, 31, device=DEVICE)
+        with config.patch(assert_indirect_indexing=False):
+            (source,) = self.compile(
+                lambda i, w: F.embedding(i, w) * 2, i, w, backend="cute"
+            )
+        self.assertIn(".expand(tile_z, tile_y, tile_x)", source)
+
+    def test_long_softmax_rdim(self):
+        # Softmax over rdims of 4096 reads each rdim as one block, up to
+        # PERSISTENT_SOFTMAX_RDIM: its max, its sum of exps and the output pass
+        # over an rdim the autotuner can keep in registers, where Triton's loop
+        # reads it twice (TestInductorBackend.test_long_softmax_rdim). A kernel
+        # that only reduces the rdim, as cross-entropy's max and sum of exps,
+        # keeps the loop, which reads it once (rereads_softmax_rdim()).
+        x = torch.randn(64, 4096, device=DEVICE)
+        fn = lambda x: torch.softmax(x, -1)  # noqa: E731
+        (source,) = self.compile(fn, x, tol=1e-4, backend="cute")
+        self.assertIn("tmp0 = in0[tile_x, :]", source)
+        self.assertNotIn("for tile_r", source)
+        t = torch.randint(0, 4096, (64,), device=DEVICE)
+        fn = lambda x, t: F.cross_entropy(x, t, reduction="none")  # noqa: E731
+        with config.patch(assert_indirect_indexing=False):
+            sources = self.compile(fn, x, t, tol=1e-4, backend="cute")
+        self.assertTrue(any("for tile_r in hl.tile(4096):" in s for s in sources))
+        # So does one that also writes y = x * 2, which the softmax's results
+        # do not reach: the loop writes it in the pass that reduces the rdim.
+        (source,) = self.compile(
+            self.logsumexp_beside_logits, x, tol=1e-4, backend="cute"
+        )
+        self.assertIn("for tile_r in hl.tile(4096):", source)
+
+    @staticmethod
+    def logsumexp_beside_logits(x):
+        y = x * 2
+        m = y.amax(-1, keepdim=True)
+        return y, m + (y - m).exp().sum(-1, keepdim=True).log()
+
     @looped
     def test_welford(self):
         # welford() emits eq, where, truediv, isinf, isnan and logical_or, and
@@ -628,17 +703,20 @@ class TestInductorBackend(InductorBackendTestCase):
             "distinct",
             "repeated",
             "rows",
-            subtest(
-                "one_element",
-                decorators=[
-                    skipIfRefEager(
-                        "ref mode's atomic_add writes the stride-0 view of "
-                        "out[0] with a setitem, which PyTorch refuses: more "
-                        "than one element of the written-to tensor refers to a "
-                        "single memory location (unlanded fix: "
-                        "pytorch/helion#4576; drop this skip with it)"
-                    )
-                ],
+            *(
+                subtest(
+                    case,
+                    decorators=[
+                        skipIfRefEager(
+                            "ref mode's atomic_add writes the stride-0 view of "
+                            "out[0] with a setitem, which PyTorch refuses: more "
+                            "than one element of the written-to tensor refers to "
+                            "a single memory location (unlanded fix: "
+                            "pytorch/helion#4576; drop this skip with it)"
+                        )
+                    ],
+                )
+                for case in ("one_element", "constant")
             ),
         ],
     )
@@ -652,14 +730,20 @@ class TestInductorBackend(InductorBackendTestCase):
                 "repeated": n // 2,
                 "rows": n // 2,
                 "one_element": n * 0,
+                "constant": n * 0,
             }[case]
             out = torch.zeros(2 * x.size(0), *x.shape[1:], device=x.device)
-            return out.index_put((index,), x, True)
+            # constant: a 0-d value at an index with no tile, which each of
+            # the 64 elements still adds once (HelionKernel.store()).
+            value = torch.ones_like(x) if case == "constant" else x
+            return out.index_put((index,), value, True)
 
         x = torch.randn(64, *([8] if case == "rows" else []), device=DEVICE)
         with config.patch(assert_indirect_indexing=False):
             sources = self.compile(fn, x, tol=1e-4)
         self.assertEqual(len([s for s in sources if "hl.atomic_add(" in s]), 1)
+        if case == "constant":
+            self.assertRegex(self.code, r"hl\.atomic_add\(\w+, \[tile_x\], tmp\d+\)")
         if case == "one_element":
             # Every x[i] adds at out[0], through a stride-0 view.
             self.assertRegex(
@@ -827,7 +911,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         # (max, sum) pairs, and the first reduces blocks of the -inf half, and
         # (-inf, 0) past the end of R (65537 elements, a prime: no split divides
         # it);
-        # neg_inf_row: softmax of a row of -inf is nan, as in eager;
+        # neg_inf_row: softmax of an rdim of -inf is nan, as in eager;
         # log_softmax: the same rewrite, x - max - log(sum).
         if case == "split":
             x = torch.randn(8, 65537, device=DEVICE)
@@ -882,10 +966,11 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
         )
 
     def test_persistent_reduction_source(self):
-        # A row of up to 1024 elements is one block, as in Triton's persistent
-        # reductions: x is read once, and exp(x - max) computed once for both
-        # the sum and the output. In a loop over tile_r, three loops read x and
-        # the last two compute the exp.
+        # An amax and a sum are one block, a persistent reduction, at any
+        # length (HelionChoices.should_use_persistent_reduction()): x is read
+        # once, and exp(x - max) computed once for both the sum and the output.
+        # In a loop over tile_r, three loops read x and the last two compute
+        # the exp.
         def fn(x):
             e = torch.exp(x - x.amax(-1, keepdim=True)) * 2
             return e / e.sum(-1, keepdim=True)
@@ -921,14 +1006,14 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
     )
     def test_persistent_reduction(self, case):
         # argmax: the row's indices are hl.arange(rdim), with rdim the dim of
-        # a factory of 300 elements beside tile_x, which is the reduction dim
-        # of in0[tile_x, :] (HelionKernel.row_dim()); a NaN, ties and a row of
-        # -inf as in test_arg_reduction. pow2: a row of 128 is a dim of its
-        # own size. few: a row of 12, not a power of two, keeps a loop of one
+        # a factory's dim, hl.zeros([tile_x, 300]), as an rdim of up to 1024
+        # stays one block (HelionKernel.codegen_rdim()); a NaN, ties and an rdim
+        # of -inf as in test_arg_reduction. pow2: an rdim of 128 is named rdim
+        # too, not 128. few: an rdim of 12, not a power of two, keeps a loop of one
         # block, even under choices that make every reduction persistent
-        # (names_row_dim()). welford: test_welford_extremes' rows in one block
+        # (names_rdim()). welford: test_welford_extremes' rdims in one block
         # each, whose weight is R.
-        # neg_inf_row: softmax of a row of -inf is nan, as in eager. broadcast:
+        # neg_inf_row: softmax of an rdim of -inf is nan, as in eager. broadcast:
         # the max over a broadcast dim of z, all -0.0, is -0.0. pad: rows of
         # 304 whose last 4 the mask (hl.arange(rdim) < 300) takes from the pad.
         x = torch.randn(64, 300, device=DEVICE)
@@ -966,7 +1051,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         self.assertEqual("acc" in source, case == "few")
         line = {
             "argmax": "rdim = hl.zeros([tile_x, 300]).size(1)",
-            "pow2": "hl.arange(128)",
+            "pow2": "hl.arange(rdim)",
             "few": "for tile_r in hl.tile(12):",
             "welford": "hl.full([], 963.0, dtype=torch.float32)",
             "neg_inf_row": "tmp0 = in0[tile_x, :]",
@@ -974,7 +1059,142 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
             "pad": "[300*tile_x.index.reshape([tile_x, 1]) + (hl.arange(rdim))]",
         }[case]
         self.assertIn(line, source)
-        self.assertEqual("rdim" in source, case in ("argmax", "broadcast", "pad"))
+        self.assertEqual(
+            "rdim" in source, case in ("argmax", "pow2", "broadcast", "pad")
+        )
+
+    def test_long_rdim_reduction(self):
+        # A sum over an rdim of 4096, past Triton's 1024 for a persistent rdim,
+        # reads the rdim as one block, which Helion can roll into a loop
+        # (Config.reduction_loops); var_mean keeps its loop, which combines
+        # each block into the Welford accumulators as it reads it.
+        x = torch.randn(64, 4096, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum(-1), x, tol=1e-3)
+        self.assertIn("tmp0 = in0[tile_x, :]", source)
+        self.assertNotIn("for tile_r", source)
+        (source,) = self.compile(lambda x: torch.var_mean(x, -1), x, tol=1e-4)
+        self.assertIn("for tile_r in hl.tile(4096):", source)
+        # So does argmax, whose one block reduces the rdim twice (its max, then
+        # the first index of it), where the loop folds both in one pass.
+        (source,) = self.compile(lambda x: torch.argmax(x, -1), x)
+        self.assertIn("for tile_r in hl.tile(4096):", source)
+
+    def test_long_softmax_rdim(self):
+        # Softmax over rdims of 4096 keeps the online-softmax loop, which reads
+        # each rdim twice, where CuTe reads each rdim as one block
+        # (TestInductorCute.test_long_softmax_rdim).
+        x = torch.randn(64, 4096, device=DEVICE)
+        (source,) = self.compile(lambda x: torch.softmax(x, -1), x, tol=1e-4)
+        self.assertIn("for tile_r in hl.tile(4096):", source)
+
+    def test_long_unnamed_rdim(self):
+        # An rdim of 2**21, unsplit, that only a flipped (flat) load reads: no
+        # full rdim of an operand names its dim, and a factory of 2**21 does not
+        # compile, so it keeps a loop over tile_r
+        # (HelionScheduling.create_kernel_choices()).
+        x = torch.randn(2, 2**21, device=DEVICE)
+        with config.patch(split_reductions=False):
+            (source,) = self.compile(lambda x: x.flip(-1).sum(-1), x, tol=1e-2)
+        self.assertIn("for tile_r in hl.tile(2097152):", source)
+        # A flipped rdim of 100000, past UNROLLED_RDIM_MAX: no input's full rdim
+        # names it, and a factory's dim would make each rdim one block of
+        # 131072 lanes, so it loops over tile_r too.
+        x = torch.randn(4, 100000, device=DEVICE)
+        with config.patch(split_reductions=False):
+            (source,) = self.compile(lambda x: x.flip(-1).sum(-1), x, tol=1e-2)
+        self.assertIn("for tile_r in hl.tile(100000):", source)
+
+    def test_split_reduction_loops(self):
+        # The first kernel of a split reduction keeps Triton's rule
+        # (HelionChoices.should_use_persistent_reduction(), which reads
+        # Inductor's _split_size): the chunks of x.sum(0) over [100000, 96],
+        # outer reductions of more than 64 values each, loop over tile_r.
+        # Inductor marks the split only with mix_order_reduction on.
+        self.enterContext(config.patch({"triton.mix_order_reduction": True}))
+        x = torch.randn(100000, 96, device=DEVICE)
+        first, _ = self.compile(lambda x: x.sum(0), x, tol=1e-3)
+        self.assertIn("for tile_r in hl.tile(", first)
+
+    def test_long_rdim_named_by_input(self):
+        # A persistent rdim past UNROLLED_RDIM_MAX that the kernel names, for the
+        # arange it broadcasts over the rdim, takes the dim of an input's full
+        # rdim (HelionKernel.codegen_rdim()), which the autotuner can roll:
+        #     rdim = in0[tile_x, :].size(1)
+        #     tmp1 = (hl.arange(rdim)).to(torch.float32)
+        # The sum agrees with eager in one block, and rolled into blocks of 512
+        # (on an x of 32: a new kernel source, which Helion compiles again).
+        fn = lambda x: (x * torch.arange(4096, device=x.device)).sum(-1)  # noqa: E731
+        (source,) = self.compile(fn, torch.randn(64, 4096, device=DEVICE), tol=1e-3)
+        self.assertIn("rdim = in0[tile_x, :].size(1)", source)
+        kernel, configs = helion.kernel, []
+
+        def rolled(fn=None, **kwargs):
+            if fn is None:  # @helion.kernel(backend=..., ...)
+                return functools.partial(rolled, **kwargs)
+            configs.append(helion.Config(block_sizes=[1], reduction_loops=[512]))
+            return kernel(fn, config=configs[-1], **kwargs)
+
+        with patch("helion.kernel", rolled):
+            self.compile(fn, torch.randn(32, 4096, device=DEVICE), tol=1e-3)
+        self.assertEqual(len(configs), 1)
+
+    def test_inspected_kernel_counts_once(self):
+        # A persistent rdim past UNROLLED_RDIM_MAX is emitted once to tell what
+        # it needs of its rdim (HelionScheduling.create_kernel_choices()), then
+        # again: metrics.generated_kernel_count, which tests compare with the
+        # kernels a graph launches, counts it as it counts an rdim of 512, which
+        # is emitted once.
+        counts = []
+        for n in (512, 4096):
+            metrics.reset()
+            with config.patch(fx_graph_cache=False):
+                self.compile(
+                    lambda x: x.sum(-1), torch.randn(16, n, device=DEVICE), tol=1e-4
+                )
+            counts.append(metrics.generated_kernel_count)
+        self.assertEqual(counts[1], counts[0])
+
+    def test_permuted_copy_and_epilogue(self):
+        # y = x.permute(0, 2, 3, 1).contiguous() and y * 2: one kernel, whose
+        # tiling is natural_tiling()'s for each node and for the pair alike
+        # (HelionScheduling.can_fuse()), writes both.
+        x = torch.randn(8, 64, 32, 32, device=DEVICE)
+
+        def fn(x):
+            y = x.permute(0, 2, 3, 1).contiguous()
+            return y, y * 2
+
+        self.assertEqual(len(self.compile(fn, x)), 1)
+
+    @parametrize("case", ["mean", "broadcast", "mask"])
+    def test_natural_tiling(self, case):
+        # Tiles over the dims the indexes divide the flat ranges by, with no
+        # // or % (natural_tiling()). mean: the mean over H and W of a
+        # channels-last x, read at 64*r + 2304*(x // 64) + x % 64 by the
+        # 1-D tiling. broadcast: w[c] beside x[n, c], read at x % 384.
+        # mask: the x and y, x % 100 and x // 100, of a causal mask.
+        if case == "mean":
+            x = torch.randn(8, 64, 6, 6, device=DEVICE)
+            x = x.to(memory_format=torch.channels_last)
+            (source,) = self.compile(lambda x: x.mean([2, 3]), x, tol=1e-4)
+            self.assertIn("for tile_y, tile_x in hl.tile([8, 64]):", source)
+            self.assertIn("in0[tile_y, tile_x, :]", source)
+        elif case == "broadcast":
+            x = torch.randn(32, 384, device=DEVICE)
+            w = torch.randn(384, device=DEVICE)
+            (source,) = self.compile(lambda x, w: x * w + 1, x, w)
+            self.assertIn("for tile_y, tile_x in hl.tile([32, 384]):", source)
+            self.assertIn("in1[tile_x]", source)
+        else:
+            x = torch.randn(100, 100, device=DEVICE)
+
+            def fn(x):
+                i = torch.arange(100, device=x.device)
+                return torch.where(i[None, :] <= i[:, None], x, 0.0)
+
+            (source,) = self.compile(fn, x)
+            self.assertIn("for tile_y, tile_x in hl.tile([100, 100]):", source)
+        self.assertNotRegex(source, r"tile_\w\.index[^\n]*(//|%)")
 
     @parametrize("op", ["sum", "prod"])
     @looped
@@ -1192,8 +1412,7 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
         var, mean = torch.var_mean(x, -1)
         if rows:
             mean[1:3] = float("inf")
-        pinned = helion.Config(block_sizes=[1, 1 if case == "split_empty" else 64])
-        with patch("helion.kernel", functools.partial(helion.kernel, config=pinned)):
+        with pin_blocks(1 if case == "split_empty" else 64):
             fn = lambda x: torch.var_mean(x, -1)  # noqa: E731
             sources = self.compile(fn, x, expected=(var, mean))
         self.assertEqual(len(sources), 1 if rows else 2)
@@ -1212,13 +1431,13 @@ import helion.language as hl
 
 @helion.kernel(backend="triton", static_shapes=True, autotune_effort="none")
 def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor) -> None:
-    for tile_x in hl.tile(640):
-        tmp0 = in0[tile_x]
+    for tile_y, tile_x in hl.tile([64, 10]):
+        tmp0 = in0[tile_y, tile_x]
         tmp1 = tmp0.to(torch.int64)
-        tmp2 = in1[tmp1 + 100*(tile_x.index // 10)]
+        tmp2 = in1[tmp1 + 100*tile_y.index.reshape([tile_y, 1])]
         tmp3 = hl.full([], 2.0, dtype=torch.float32)
         tmp4 = tmp2 * tmp3
-        out0[tile_x] = tmp4
+        out0[tile_y, tile_x] = tmp4
 """,
         )
 
@@ -1520,6 +1739,48 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         fn = lambda z: torch.signbit(torch.amax(z.expand(64, 300), -1))  # noqa: E731
         (source,) = self.compile(fn, z)
         self.assertIn(".expand(tile_x, tile_r)", source)
+
+    def test_expanded_input(self):
+        # A graph input expanded along a dim (stride 0) reads no tile of that
+        # dim, and the store expands the value over it: x.expand(64, 7, 31) * 2
+        # (its tiles [64, 217]), and an embedding of expanded indices.
+        x = torch.randn(1, 7, 31, device=DEVICE).expand(64, 7, 31)
+        (source,) = self.compile(lambda x: x * 2, x)
+        self.assertIn("out0[tile_y, tile_x] = tmp2.expand(tile_y, tile_x)", source)
+        i = torch.randint(0, 17, (1, 7), device=DEVICE).expand(64, 7)
+        w = torch.randn(17, 31, device=DEVICE)
+        with config.patch(assert_indirect_indexing=False):
+            (source,) = self.compile(lambda i, w: F.embedding(i, w) * 2, i, w)
+        self.assertIn(".expand(tile_z, tile_y, tile_x)", source)
+        # A 0-d value stores as it is: torch.zeros(256) is out0[tile_x] = tmp0
+        # of tmp0 = hl.full([], 0.0, ...).
+        fn = lambda x: (x * 2, torch.zeros(256, device=DEVICE))  # noqa: E731
+        sources = self.compile(fn, torch.randn(64, 256, device=DEVICE))
+        (fill,) = [source for source in sources if "in0" not in source]
+        self.assertRegex(fill, r"out0\[tile_x\] = tmp\d+\n")
+        # Nor does a value align() gives the store's rank: each rdim's max,
+        # stored over that rdim, out0[tile_x, :] = tmp3.reshape([tile_x, 1]).
+        fn = lambda x: x.amax(-1, keepdim=True).expand_as(x) * 2  # noqa: E731
+        (source,) = self.compile(fn, torch.randn(64, 256, device=DEVICE))
+        self.assertRegex(
+            source, r"out0\[tile_x, :\] = tmp\d+\.reshape\(\[tile_x, 1\]\)\n"
+        )
+
+    def test_natural_tiling_joins(self):
+        # natural_tiling() joins dims past three pointwise and one reduction
+        # dim by the cheapest joins. A 5-D permuted copy keeps three pointwise
+        # dims, reading the joined ones through // and %:
+        #     for tile_z, tile_y, tile_x in hl.tile([384, 6, 10]):
+        # and a sum over dims 1 and 3 one reduction dim, an rdim of 16 * 64:
+        #     for tile_y, tile_x in hl.tile([8, 32]):
+        #         ... 2048*(hl.arange(rdim) // 64) ... ((hl.arange(rdim) % 64))
+        x = torch.randn(4, 6, 8, 10, 12, device=DEVICE)
+        (source,) = self.compile(lambda x: x.permute(0, 2, 4, 1, 3).contiguous(), x)
+        self.assertIn("for tile_z, tile_y, tile_x in hl.tile([384, 6, 10]):", source)
+        x = torch.randn(8, 16, 32, 64, device=DEVICE)
+        (source,) = self.compile(lambda x: x.sum((1, 3)), x, tol=1e-4)
+        self.assertIn("for tile_y, tile_x in hl.tile([8, 32]):", source)
+        self.assertIn("(hl.arange(rdim) // 64)", source)
 
     @config.patch({"triton.codegen_upcast_to_fp32": False})
     @looped
