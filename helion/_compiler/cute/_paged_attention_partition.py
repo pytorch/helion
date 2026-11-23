@@ -91,6 +91,7 @@ import cutlass.experimental.primitives as prims
 from ._paged_attention_compute import output_normalization_factor
 from .device.ptx import atom_add_acq_rel_gpu_u32
 from .device.ptx import fence_acq_rel_gpu
+from .device.ptx import l2_policy_evict_first
 from .device.ptx import l2_policy_evict_last
 from .device.ptx import ld_relaxed_gpu_u32
 from .device.ptx import ldcg_v2_f32
@@ -611,6 +612,9 @@ def _count_arrival(
     if last:
         if cutlass.const_expr(not arrive):
             fence_acq_rel_gpu()
+        # A counter's line is no partial's (``store_part``): one line a CTA,
+        # which the next launch's arrivals and looks touch again. It keeps
+        # the evict-last hint.
         stg_u32_l2(counter, 0, l2_policy_evict_last())
     return last
 
@@ -730,10 +734,20 @@ def store_part(
     cta = cutlass.Int32(cute.arch.block_idx()[0])
     lowest = cutlass.Int32(walk[WALK_LOWEST])
     slot = _partial_slot(workspace, cta, lowest, pair_head, record_bytes)
-    # The launch's key and value tiles stream through L2 many times between
-    # this part's stores and the merger's loads, and again before the next
-    # launch stores here: the workspace's lines stay in L2 through that.
-    policy = l2_policy_evict_last()
+    # A partial's hint is a trade, which the measurements in the README
+    # decide. In the common case, a unit in two parts that its lowest part
+    # merges, the other part's partial waits for the merge while the CTAs
+    # stream the rest of their shares through L2 (a CTA runs a part that
+    # is not its unit's lowest first, and a lowest part last): under this
+    # hint the merge's loads may miss L2. Against that, one merge uses a
+    # partial. (Only the panel's quads are read once on every path: the
+    # general merge reads every part, its own included, and the rows'
+    # pairs twice.) Lines kept in L2 for that are taken from the key and
+    # value stream of every CTA, and how much they cost depends on where
+    # the workspace lies among the process's allocations: these lines are
+    # the first the stream may displace. One policy word a thread, ahead of
+    # its stores.
+    policy = l2_policy_evict_first()
     for quad in cutlass.range_constexpr(query_columns // 4):
         stg_v4_f32_l2(
             slot + cutlass.Int64(quad * 128 + thread) * 16,

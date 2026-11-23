@@ -3,7 +3,10 @@ output stores: the default renders the kernel without the option,
 ``streaming`` renders the same stores with the streaming cache operator and
 ``l2_evict_last`` under the L2 evict-last hint, with one unit per CTA and on
 the persistent partitions, for an output addressed by its own layout and by
-proved storage strides; and where a search is offered the three."""
+proved storage strides; and where a search is offered the three. The
+option is the output stores' alone: a balanced launch stores the partials
+of its split units into its workspace under the L2 evict-first hint
+whatever the option says."""
 
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import torch
 import helion
 from helion._compiler.cute import _paged_attention_io as io
 from helion._compiler.cute import _paged_attention_paired_pipeline as template
+from helion._compiler.cute import _paged_attention_partition as partition_template
 from helion._compiler.cute.cute_mma_dag import paired_output_stores
 from helion._compiler.cute.packet_flush_names import streaming_store_rendered
 from helion._testing import cpu_render_target
@@ -66,11 +70,32 @@ STORED = {
         r"st\.global\.L2::cache_hint\.b16 \[%\w+\], h, %\w+; \}"
     ),
 }
-# The operator or hint a policy's scalar stores carry (the balanced
-# partition's workspace stores are hinted vector stores under every policy),
-# and the instruction that makes the hint's policy word.
+# The operator or hint a policy's output stores carry, and the instruction
+# that makes the ``l2_evict_last`` policy's word. A balanced kernel's
+# workspace stores carry the L2 hint under every policy, with policy words
+# of their own: its partials' vector stores an evict-first word, its
+# counters' resets evict-last ones. The store's kind after the mark picks
+# out the output stores (``.b16``, or ``.f32`` for a raw fp32 panel).
 MARK = {"streaming": "st.global.cs", "l2_evict_last": "st.global.L2::cache_hint"}
 POLICY_WORD = "createpolicy.fractional.L2::evict_last.b64"
+# A policy word as the PTX makes it, and a store that carries one: its kind
+# (``b16`` an output element, ``v4.f32`` and ``v2.f32`` a partial's panel
+# quad and row pair, ``u32`` a counter) and the word's register.
+_WORD_MADE = re.compile(r"createpolicy\.fractional\.L2::(evict_\w+)\.b64 (%\w+), 1\.0;")
+_HINTED = re.compile(r"st\.global\.L2::cache_hint\.([\w.]+) \[%\w+\], .*, (%\w+);")
+
+
+def _hinted_stores(ptx: str) -> Counter[tuple[str, str]]:
+    """The stores of a kernel under an L2 cache hint, counted by the kind of
+    store and the eviction priority of the policy word each is handed."""
+    words = {}
+    for priority, register in _WORD_MADE.findall(ptx):
+        # The assembler's input names a register once: one word, one policy.
+        assert register not in words
+        words[register] = priority
+    stores = _HINTED.findall(ptx)
+    assert len(stores) == ptx.count("st.global.L2::cache_hint")
+    return Counter((kind, words[register]) for kind, register in stores)
 
 
 def _opcodes(ptx: str) -> Counter[str]:
@@ -398,6 +423,9 @@ KERNELS = {
 
 @pytest.mark.parametrize("kernel", list(KERNELS))
 def test_policy_stores_differ_by_the_cache_operator_or_hint_alone(kernel):
+    """The output stores under each policy, and with them, from the same
+    compiles, what the kernel stores into a balanced launch's workspace
+    (``_workspace_stores_keep_their_own_policies``)."""
     rows, partition, sites = KERNELS[kernel]
     units = 128 if partition is None else WAVES
     bound = stream_bound(units, rows=rows)
@@ -410,6 +438,7 @@ def test_policy_stores_differ_by_the_cache_operator_or_hint_alone(kernel):
             compiled[policy] = compile_offline(
                 bound, arguments, source, Path(dump_dir) / policy
             ).ptx
+    _workspace_stores_keep_their_own_policies(kernel, compiled)
     plain = compiled["default"]
     stores = rows * sites
     # The plain kernel converts and stores each O element of a thread with
@@ -465,6 +494,96 @@ def test_policy_stores_differ_by_the_cache_operator_or_hint_alone(kernel):
                 for opcode in moved
             ), (policy, moved)
             assert not any(".f32" in opcode or "f32" in opcode for opcode in moved)
+
+
+# What a balanced kernel stores into its launch workspace at 32 query
+# columns: a part's partial, one quad of its panel a thread and row quad
+# and a row's pair, once in the kernel, and the reset of a unit's counter
+# wherever a thread reads or adds to one (the lowest part's look, a part's
+# own arrival, and the spare warp's arrival for each head's posted part).
+PARTIAL_STORES = {("v4.f32", "evict_first"): 8, ("v2.f32", "evict_first"): 1}
+COUNTER_RESETS = {("u32", "evict_last"): 4}
+
+
+def _workspace_stores_keep_their_own_policies(
+    kernel: str, compiled: dict[str, str]
+) -> None:
+    """A part's partial takes a hint of its own, a trade that the backend's
+    README states with ``cute_mma_dag_partition``: its stores into the
+    workspace carry the L2 evict-first hint under every
+    ``cute_store_policy``, with one policy word a thread. The output
+    stores carry the config's policy, and the counters' resets the
+    evict-last hint. A kernel that splits no unit, with one unit per CTA
+    or on the whole-units partition, stores nothing of the kind."""
+    rows, partition, sites = KERNELS[kernel]
+    for policy in ("default", *POLICIES):
+        ptx = compiled[policy]
+        expected: dict[tuple[str, str], int] = {}
+        made: dict[str, int] = {}
+        if policy == "l2_evict_last":
+            # One word at each place that stores a unit's outputs.
+            expected["b16", "evict_last"] = rows * sites
+            made["evict_last"] = sites
+        if partition == "balanced":
+            assert rows == 32
+            expected.update(PARTIAL_STORES)
+            expected.update(COUNTER_RESETS)
+            # One word for the partial's nine stores, and one a reset.
+            made["evict_first"] = 1
+            made["evict_last"] = made.get("evict_last", 0) + 4
+        assert _hinted_stores(ptx) == expected, (kernel, policy)
+        words = Counter(priority for priority, _register in _WORD_MADE.findall(ptx))
+        assert words == made, (kernel, policy)
+        assert ptx.count("createpolicy") == sum(made.values())
+        # The streaming operator is the output stores' alone.
+        streamed = rows * sites if policy == "streaming" else 0
+        assert ptx.count("st.global.cs") == streamed, (kernel, policy)
+
+
+def test_two_functions_of_the_template_write_the_workspace():
+    """Every store into a balanced launch's workspace is in two functions
+    of the partition template: ``store_part``, a part's partial, and
+    ``_count_arrival``, a counter's arrival (an atomic add, which takes no
+    hint) and its reset, under evict-last. Neither reads the body's store
+    policy. The partial's policy word is counted in the compiled kernels
+    (``_workspace_stores_keep_their_own_policies``)."""
+    tree = ast.parse(Path(inspect.getfile(partition_template)).read_text())
+    # What the template can write global memory with.
+    imported = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module == "device.ptx"
+        for alias in node.names
+    }
+    writers = {name for name in imported if name.startswith(("stg_", "atom_"))}
+    assert writers == {
+        "atom_add_acq_rel_gpu_u32",
+        "stg_u32_l2",
+        "stg_v2_f32_l2",
+        "stg_v4_f32_l2",
+    }
+    called: dict[str, list[tuple[str, ast.Call]]] = {}
+    for function in tree.body:
+        if isinstance(function, ast.FunctionDef):
+            for node in ast.walk(function):
+                if isinstance(node, ast.Call) and ast.unparse(node.func) in writers:
+                    called.setdefault(function.name, []).append(
+                        (ast.unparse(node.func), node)
+                    )
+    assert sorted(called) == ["_count_arrival", "store_part"]
+    # The partial: a quad of its panel and a row's pair.
+    assert sorted(name for name, _call in called["store_part"]) == [
+        "stg_v2_f32_l2",
+        "stg_v4_f32_l2",
+    ]
+    # The counter: the arrival and the reset.
+    assert sorted(name for name, _call in called["_count_arrival"]) == [
+        "atom_add_acq_rel_gpu_u32",
+        "stg_u32_l2",
+    ]
+    (reset,) = [call for name, call in called["_count_arrival"] if name == "stg_u32_l2"]
+    assert ast.unparse(reset.args[-1]) == "l2_policy_evict_last()"
+    assert "store_policy" not in ast.unparse(tree)
 
 
 def test_a_folded_output_takes_a_policy_by_its_storage_strides():
