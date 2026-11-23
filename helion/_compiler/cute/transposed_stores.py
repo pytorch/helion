@@ -10,7 +10,9 @@ key on, read from ``ConfigSpec.memory_op_facts``: a rank-2 store indexed by
 two tiles, one on its contiguous dim, beside another rank-2 access of the same
 graph indexed by the same two tiles the other way round.  A tile stored both
 ways (``out[tile_r, tile_v]`` beside ``out_t``) makes each store the other's
-witness; the store a load disagrees with comes first.
+witness; the store a load disagrees with comes first.  ``transposed_accesses``
+names those loads and the stores of the tile the other way round, with their
+tensors.
 
 ``batched_layout_stores`` is the same disagreement with batch tiles around
 it, a layout change such as NCHW to channels-last: ``out[tile_n, tile_s,
@@ -19,6 +21,11 @@ contiguously and loads ``tile_s`` contiguously.  It reads the facts from the
 graph nodes (``MEMORY_OP_FACT_META``) to hand the seeds the two tensors,
 whose packets they prove; ``root_tile_begins_at_multiple`` is the part of
 that proof the root loop's iterator answers.
+
+``transposed_accesses`` and ``batched_layout_stores`` serve seeds planted on
+a packet proof and read only the graphs in which the lowering takes a tile's
+lanes as packets (``_packet_graph_ids``): a root loop's, and a branch's that
+codegen folds away.
 """
 
 from __future__ import annotations
@@ -30,7 +37,9 @@ from typing import cast
 
 import torch
 
+from ...language._tracing_ops import _if
 from ..compile_environment import _to_sympy
+from ..variable_origin import BlockSizeOrigin
 
 if TYPE_CHECKING:
     from ...autotuner.config_spec import MemoryOpFact
@@ -47,6 +56,20 @@ class TransposedStore(NamedTuple):
     other: int
     contiguous: int
     itemsize: int
+
+
+class TransposedAccess(NamedTuple):
+    """An access ``transposed_accesses`` found, a load or (``stored``) a
+    store: the tensor, its contiguous dim, whether the access has an
+    ``extra_mask`` and whether a subscript is a tile's index plus a scalar
+    (``_shifted``; of a load, only the subscript of its contiguous dim
+    counts)."""
+
+    tensor: torch.Tensor
+    lane_dim: int
+    masked: bool
+    shifted: bool
+    stored: bool
 
 
 class BatchedLayoutStore(NamedTuple):
@@ -130,6 +153,85 @@ def transposed_stores(
     return [*against_loads, *against_stores]
 
 
+def _packet_graph_ids(device_ir: DeviceIR) -> list[int]:
+    """The graphs in which the lowering takes a tile's lanes as packets: the
+    root loops', and those of the branches in them that codegen folds away
+    (``if tile.block_size > 32:``).  A branch is folded when its test is one
+    ``DeviceFunction.evaluate_constexpr_condition`` resolves from a config:
+    symbolic, every free symbol a block size.  Under a test that is a
+    tensor's value or that reads a tile's begin, and in a nested loop,
+    graphs of their own too, the lowering loads and stores the lanes one by
+    one."""
+    # The heuristics are imported while ``device_ir`` still is.
+    from ..device_ir import control_flow_child_graph_ids
+
+    host_function = device_ir.host_function
+    assert host_function is not None
+    origins = host_function.expr_to_origin
+    found: list[int] = []
+    pending = list(device_ir.root_ids)
+    while pending:
+        graph_id = pending.pop(0)
+        found.append(graph_id)
+        for node in device_ir.graphs[graph_id].graph.nodes:
+            if node.op != "call_function" or node.target is not _if:
+                continue
+            # ``_if(test, if_graph_id, else_graph_id, ...)``.
+            test = node.args[0]
+            value = test.meta["val"] if isinstance(test, torch.fx.Node) else test
+            if isinstance(value, torch.SymBool) and all(
+                (origin := origins.get(symbol)) is not None
+                and isinstance(origin.origin, BlockSizeOrigin)
+                for symbol in value.node.expr.free_symbols
+            ):
+                pending.extend(control_flow_child_graph_ids(node))
+    return found
+
+
+def transposed_accesses(
+    device_ir: DeviceIR, store: TransposedStore
+) -> list[TransposedAccess]:
+    """The rank-2 accesses that have ``store``'s other tile on their
+    contiguous dim, where the lowering can take them as packets: the loads
+    it transposes and the stores of the tile the other way round.  Empty
+    when one of them, the store or another rank-2 access of the two tiles
+    sits outside the packet graphs (``_packet_graph_ids``).  Read from the
+    graph nodes (``MEMORY_OP_FACT_META``), as ``batched_layout_stores``
+    reads its accesses, to hand the seeds the tensors, whose packets they
+    prove."""
+    # The heuristics are imported while ``device_ir`` still is.
+    from ..device_ir import MEMORY_OP_FACT_META
+
+    packet_graphs = set(_packet_graph_ids(device_ir))
+    transposed = (store.other, store.contiguous)
+    accesses: list[TransposedAccess] = []
+    for graph_id, graph_info in enumerate(device_ir.graphs):
+        for node in graph_info.graph.nodes:
+            for fact in node.meta.get(MEMORY_OP_FACT_META, ()):
+                dims = _tile_dims(fact)
+                if dims is None or set(dims) != set(transposed):
+                    continue
+                if graph_id not in packet_graphs:
+                    return []
+                if dims != transposed:
+                    continue
+                stored = fact.kind == "store"
+                lane_dim = fact.subscript_block_ids.index(store.other)
+                accesses.append(
+                    TransposedAccess(
+                        # A fact with a rank is the fact of a traced tensor.
+                        cast("torch.fx.Node", node.args[0]).meta["val"],
+                        lane_dim,
+                        # ``load(tensor, index, extra_mask, eviction_policy)``
+                        # and ``store(tensor, index, value, extra_mask)``.
+                        node.args[3 if stored else 2] is not None,
+                        _shifted(node) if stored else _shifted(node, lane_dim),
+                        stored,
+                    )
+                )
+    return accesses
+
+
 def _batched_tile_dims(fact: MemoryOpFact) -> tuple[int, tuple[int, ...]] | None:
     """``(contiguous dim, blocks)`` of an access of rank 3 or more whose every
     dim a distinct tile indexes, exactly one of them the stride-1 dim, else
@@ -163,11 +265,11 @@ def _shifted(node: torch.fx.Node, position: int | None = None) -> bool:
 def batched_layout_stores(
     env: CompileEnvironment, device_ir: DeviceIR
 ) -> list[BatchedLayoutStore]:
-    """The stores of rank 3 or more, every dim indexed by a tile of its own,
-    whose contiguous dim's tile is not the one a load of the same graph over
-    the same tiles has on its contiguous dim: a batched layout change (NCHW
-    to channels-last and back), in graph order, once per tile a load has
-    contiguous instead."""
+    """The stores of rank 3 or more of the packet graphs
+    (``_packet_graph_ids``), every dim indexed by a tile of its own, whose
+    contiguous dim's tile is not the one a load of the same graph over the
+    same tiles has on its contiguous dim: a batched layout change (NCHW to
+    channels-last and back), once per tile a load has contiguous instead."""
     # The heuristics are imported while ``device_ir`` still is.
     from ..device_ir import MEMORY_OP_FACT_META
 
@@ -175,11 +277,11 @@ def batched_layout_stores(
     if spec.matmul_facts or len(device_ir.phases) > 1:
         return []
     found: list[BatchedLayoutStore] = []
-    for graph_info in device_ir.graphs:
+    for graph_id in _packet_graph_ids(device_ir):
         accesses: list[
             tuple[MemoryOpFact, tuple[int, tuple[int, ...]], torch.fx.Node]
         ] = []
-        for node in graph_info.graph.nodes:
+        for node in device_ir.graphs[graph_id].graph.nodes:
             for fact in node.meta.get(MEMORY_OP_FACT_META, ()):
                 dims = _batched_tile_dims(fact)
                 if dims is not None:

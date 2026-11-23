@@ -15,6 +15,7 @@ from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import cpu_render_target
 from helion._testing import onlyBackends
+from helion._testing import skipIfCudaCapabilityLessThan
 from helion._testing import skipIfNotCUDA
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -106,6 +107,287 @@ def _transpose_beside_a_row_loop(
     return out, out_y
 
 
+def _cast_and_transpose(x: torch.Tensor, out_t: torch.Tensor) -> torch.Tensor:
+    """``x`` cast to ``out_t``'s dtype and stored transposed into ``out_t`` and
+    as is: the shape of better-benchmark's ``cast_and_transpose``
+    (``pointwise_52fe1925ccda``), whose ``out_t`` is the first columns of a
+    padded buffer."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+_cast_both_ways = helion.kernel(
+    _cast_and_transpose, backend="cute", static_shapes=True, autotune_effort="none"
+)
+_cast_both_ways_dynamic = helion.kernel(
+    _cast_and_transpose, backend="cute", static_shapes=False, autotune_effort="none"
+)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _shifted_cast_both_ways(
+    x: torch.Tensor, out_t: torch.Tensor, lane: hl.constexpr
+) -> torch.Tensor:
+    """``_cast_both_ways`` of ``x`` one column over (``lane``: the load's
+    subscript on its contiguous dim is the tile's index plus a scalar) or
+    one row down."""
+    rows, cols = out_t.shape[1], out_t.shape[0]
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        if lane:
+            value = x[tile_r, tile_c.index + 1]
+        else:
+            value = x[tile_r.index + 1, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _sum_both_ways(
+    x: torch.Tensor, y: torch.Tensor, out_t: torch.Tensor
+) -> torch.Tensor:
+    """``_cast_both_ways`` of ``x + y``: two loads of the tile."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c] + y[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _sum_of_both_layouts(
+    x: torch.Tensor, yt: torch.Tensor, out_t: torch.Tensor
+) -> torch.Tensor:
+    """``_cast_both_ways`` of ``x`` plus the transposed ``yt``, a load that
+    has the store's tile on its contiguous dim."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c] + yt[tile_c, tile_r].permute(1, 0)
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_window_both_ways(
+    x: torch.Tensor, out_t: torch.Tensor, begin: hl.constexpr, end: hl.constexpr
+) -> torch.Tensor:
+    """``_cast_both_ways`` of the columns from ``begin`` to ``end``."""
+    rows = x.size(0)
+    out = torch.zeros_like(x, dtype=out_t.dtype)
+    for tile_r, tile_c in hl.tile([0, begin], [rows, end]):
+        value = x[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_both_ways_if(
+    x: torch.Tensor, out_t: torch.Tensor, flag: torch.Tensor, predicate: hl.constexpr
+) -> torch.Tensor:
+    """``_cast_both_ways`` under a branch, a graph of its own: on a tensor's
+    value, on a block size (which codegen folds away) or on a tile's
+    begin."""
+    rows, cols = x.shape
+    out = torch.zeros([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        if predicate == "tensor":
+            taken = flag[0] > 0
+        elif predicate == "block size":
+            taken = tile_c.block_size > 32
+        else:
+            taken = tile_r.begin > 0
+        if taken:
+            value = x[tile_r, tile_c]
+            out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+            out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_both_ways_of_a_branch_load(
+    x: torch.Tensor, out_t: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    """``_cast_both_ways`` with the load alone under a branch on a tensor's
+    value, the two stores after it."""
+    rows, cols = x.shape
+    out = torch.zeros([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = hl.zeros([tile_r, tile_c], dtype=x.dtype)
+        if flag[0] > 0:
+            value = x[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_into_both(
+    x: torch.Tensor, out_t: torch.Tensor, out: torch.Tensor, masked: hl.constexpr
+) -> torch.Tensor:
+    """``_cast_both_ways`` into an ``out`` that is an argument, stored under
+    an extra mask if ``masked``."""
+    rows, cols = x.shape
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        if masked:
+            hl.store(out, [tile_r, tile_c], value.to(out.dtype), extra_mask=value > 0)
+        else:
+            out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_both_ways_into_a_branch(
+    x: torch.Tensor, out_t: torch.Tensor, flag: torch.Tensor
+) -> torch.Tensor:
+    """``_cast_both_ways`` with the two stores alone under a branch on a
+    tensor's value, the load before it."""
+    rows, cols = x.shape
+    out = torch.zeros([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c]
+        if flag[0] > 0:
+            out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+            out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _transpose_beside_a_copy(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    out_t: torch.Tensor,
+    flag: torch.Tensor,
+    branch: hl.constexpr,
+) -> torch.Tensor:
+    """A copy of ``x`` beside a transposed cast of ``y``, which sits under a
+    branch on a tensor's value (``branch``) or beside the copy."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        out[tile_r, tile_c] = x[tile_r, tile_c].to(out.dtype)
+        if branch:
+            if flag[0] > 0:
+                out_t[tile_c, tile_r] = y[tile_r, tile_c].permute(1, 0).to(out_t.dtype)
+        else:
+            out_t[tile_c, tile_r] = y[tile_r, tile_c].permute(1, 0).to(out_t.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_both_ways_beside_a_reduction(
+    x: torch.Tensor, y: torch.Tensor, out_t: torch.Tensor
+) -> torch.Tensor:
+    """``_cast_both_ways`` of ``x`` plus the row sums of ``y``: a reduction
+    dim beside the two tiles."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c] + y[tile_r, :].sum(-1)[:, None]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _transpose_beside_row_sums(x: torch.Tensor, out_t: torch.Tensor) -> torch.Tensor:
+    """A transposed cast of ``x`` beside its row sums, a reduction of the
+    tile's lanes."""
+    rows, cols = x.shape
+    sums = torch.zeros([rows], dtype=x.dtype, device=x.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = x[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        hl.atomic_add(sums, [tile_r], value.sum(-1))
+    return sums
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_both_ways_beside_rows(
+    x: torch.Tensor, y: torch.Tensor, out_t: torch.Tensor
+) -> torch.Tensor:
+    """``_cast_both_ways`` and a copy of whole rows of ``y``, whose untiled
+    dim takes threads."""
+    rows, cols = x.shape
+    out = torch.empty_like(y)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        out_t[tile_c, tile_r] = x[tile_r, tile_c].permute(1, 0).to(out_t.dtype)
+        out[tile_r, :] = y[tile_r, :] + 1
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _transpose_in_place(x: torch.Tensor, flip: hl.constexpr) -> torch.Tensor:
+    """A square ``x`` stored transposed into itself (``flip``) or, with its
+    sign flipped, as it was loaded, beside a transposed copy."""
+    n = x.size(0)
+    out_t = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile([n, n]):
+        value = x[tile_r, tile_c]
+        if flip:
+            x[tile_c, tile_r] = value.permute(1, 0)
+        else:
+            out_t[tile_c, tile_r] = value.permute(1, 0)
+            x[tile_r, tile_c] = -value
+    return out_t
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _transpose_beside_a_flip(
+    x: torch.Tensor, out_t: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    """A transposed cast of a square ``x`` beside ``z`` stored transposed
+    into itself, read with the store's tile contiguous: not a load the
+    first store transposes."""
+    n = x.size(0)
+    for tile_r, tile_c in hl.tile([n, n]):
+        out_t[tile_c, tile_r] = x[tile_r, tile_c].permute(1, 0).to(out_t.dtype)
+        z[tile_r, tile_c] = z[tile_c, tile_r].permute(1, 0)
+    return out_t
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _index_sums_both_ways(out_t: torch.Tensor) -> torch.Tensor:
+    """A tile of index sums stored transposed and as is: each store is the
+    other's witness, and nothing is loaded."""
+    rows, cols = out_t.shape[1], out_t.shape[0]
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=out_t.device)
+    for tile_r, tile_c in hl.tile([rows, cols]):
+        value = (tile_r.index[:, None] + tile_c.index[None, :]).to(out.dtype)
+        out_t[tile_c, tile_r] = value.permute(1, 0)
+        out[tile_r, tile_c] = value
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _cast_both_ways_in_blocks(
+    x: torch.Tensor, out_t: torch.Tensor, rows_low: hl.constexpr, cols_low: hl.constexpr
+) -> torch.Tensor:
+    """``_cast_both_ways`` with registered tiles: the smallest block of the
+    rows is ``rows_low``, that of the columns ``cols_low``."""
+    rows, cols = x.shape
+    out = torch.empty([rows, cols], dtype=out_t.dtype, device=x.device)
+    block_r = hl.register_block_size(rows_low, 2 * rows_low)
+    block_c = hl.register_block_size(cols_low, 2 * cols_low)
+    for tile_r, tile_c in hl.tile([rows, cols], block_size=[block_r, block_c]):
+        value = x[tile_r, tile_c]
+        out_t[tile_c, tile_r] = value.permute(1, 0).to(out_t.dtype)
+        out[tile_r, tile_c] = value.to(out.dtype)
+    return out
+
+
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def _copy(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
@@ -156,6 +438,119 @@ def _channels_last_into(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     n, channels, plane = x.shape
     for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
         out[tile_n, tile_s, tile_c] = x[tile_n, tile_c, tile_s].permute(0, 2, 1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_if(
+    x: torch.Tensor, flag: torch.Tensor, predicate: hl.constexpr
+) -> torch.Tensor:
+    """``_to_channels_last`` under a branch, a graph of its own: on a
+    tensor's value, on a block size (which codegen folds away) or on a
+    tile's begin."""
+    n, channels, plane = x.shape
+    out = torch.zeros([n, plane, channels], dtype=x.dtype, device=x.device)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        if predicate == "tensor":
+            taken = flag[0] > 0
+        elif predicate == "block size":
+            taken = tile_c.block_size > 4
+        else:
+            taken = tile_s.begin > 0
+        if taken:
+            out[tile_n, tile_s, tile_c] = x[tile_n, tile_c, tile_s].permute(0, 2, 1)
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_beside_a_loop(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """``_to_channels_last`` and a loop over ``y`` of a tile of its own."""
+    n, channels, plane = x.shape
+    out = torch.empty([n, plane, channels], dtype=x.dtype, device=x.device)
+    out_y = torch.empty_like(y)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        out[tile_n, tile_s, tile_c] = x[tile_n, tile_c, tile_s].permute(0, 2, 1)
+    for tile_k in hl.tile(y.size(0)):
+        out_y[tile_k] = y[tile_k] + 1
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_beside_rows(
+    x: torch.Tensor, y: torch.Tensor, reduce: hl.constexpr
+) -> torch.Tensor:
+    """``_to_channels_last`` beside whole rows of ``y``, whose untiled dim
+    takes threads: a copy of them, or (``reduce``) their sums."""
+    n, channels, plane = x.shape
+    out = torch.empty([n, plane, channels], dtype=x.dtype, device=x.device)
+    out_y = torch.empty_like(y)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        value = x[tile_n, tile_c, tile_s].permute(0, 2, 1)
+        if reduce:
+            value = value + y[tile_n, :].sum(-1)[:, None, None].to(x.dtype)
+        else:
+            out_y[tile_n, :] = y[tile_n, :] + 1
+        out[tile_n, tile_s, tile_c] = value
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_and_channel_sums(x: torch.Tensor) -> torch.Tensor:
+    """``_to_channels_last`` beside the sums over the positions, a reduction
+    of the tile's lanes."""
+    n, channels, plane = x.shape
+    out = torch.empty([n, plane, channels], dtype=x.dtype, device=x.device)
+    sums = torch.zeros([n, channels], dtype=torch.float32, device=x.device)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        value = x[tile_n, tile_c, tile_s]
+        out[tile_n, tile_s, tile_c] = value.permute(0, 2, 1)
+        hl.atomic_add(sums, [tile_n, tile_c], value.to(torch.float32).sum(-1))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_of_a_sum(
+    x: torch.Tensor, y: torch.Tensor, into_y: hl.constexpr
+) -> torch.Tensor:
+    """``x + y`` of as many channels as positions stored channels-last, and
+    (``into_y``) into the second load's tensor as well."""
+    n, channels, plane = x.shape
+    out = torch.empty([n, plane, channels], dtype=x.dtype, device=x.device)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        value = (x[tile_n, tile_c, tile_s] + y[tile_n, tile_c, tile_s]).permute(0, 2, 1)
+        out[tile_n, tile_s, tile_c] = value
+        if into_y:
+            y[tile_n, tile_s, tile_c] = value
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_and_an_atomic(x: torch.Tensor) -> torch.Tensor:
+    """``_to_channels_last`` beside an atomic add of the whole tile."""
+    n, channels, plane = x.shape
+    out = torch.empty([n, plane, channels], dtype=x.dtype, device=x.device)
+    acc = torch.zeros([n, channels, plane], dtype=torch.float32, device=x.device)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        value = x[tile_n, tile_c, tile_s]
+        out[tile_n, tile_s, tile_c] = value.permute(0, 2, 1)
+        hl.atomic_add(acc, [tile_n, tile_c, tile_s], value.to(torch.float32))
+    return out
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _channels_last_in_place(x: torch.Tensor, flip: hl.constexpr) -> torch.Tensor:
+    """``x`` of as many channels as positions stored channels-last into
+    itself (``flip``) or, with its sign flipped, as it was loaded, beside a
+    channels-last copy."""
+    n, channels, plane = x.shape
+    out = torch.empty([n, plane, channels], dtype=x.dtype, device=x.device)
+    for tile_n, tile_c, tile_s in hl.tile([n, channels, plane]):
+        value = x[tile_n, tile_c, tile_s]
+        if flip:
+            x[tile_n, tile_s, tile_c] = value.permute(0, 2, 1)
+        else:
+            out[tile_n, tile_s, tile_c] = value.permute(0, 2, 1)
+            x[tile_n, tile_c, tile_s] = -value
     return out
 
 
@@ -322,6 +717,26 @@ def _seeds(bound: BoundKernel, packet: int) -> list[dict[str, object]]:
     ]
 
 
+def _load_packet_seeds(bound: BoundKernel) -> list[dict[str, object]]:
+    """The seeds with the packets on the load's tile: the only ones that
+    name a loop order without a lane unroll (the store-packet seeds), a
+    store policy (the batched ones) or a CTAs-per-SM minimum (the wide-row
+    seeds of the pointwise heuristic)."""
+    return [
+        dict(seed.config)
+        for seed in bound.config_spec.compiler_seed_configs
+        if "loop_orders" in seed.config
+        and not {"cute_lane_unroll", "cute_store_policy", "cute_min_blocks_per_mp"}
+        & set(seed.config)
+    ]
+
+
+def _padded_rows(cols: int, rows: int, dtype: torch.dtype) -> torch.Tensor:
+    """A ``[cols, rows]`` view of a buffer whose rows are padded to a
+    multiple of 16 elements, as the port's ``out_t`` is."""
+    return torch.empty(cols, rows + (-rows) % 16, dtype=dtype)[:, :rows]
+
+
 @pytest.mark.parametrize("transpose_first", [True, False])
 def test_bf16_seeds_give_the_threads_packets_of_rows(transpose_first: bool) -> None:
     """With either store first.  Stored first, the padded copy is transposed
@@ -459,6 +874,41 @@ def test_no_seeds_for_tiles_of_nested_loops() -> None:
         assert _NAME not in bound.config_spec.autotuner_heuristics
 
 
+def test_packet_seeds_follow_the_branches_codegen_folds() -> None:
+    """A branch is a graph of its own.  One on a block size is folded away
+    when the code is generated, and the accesses under it keep their
+    packets and their seeds; under one on a tensor's value or on a tile's
+    begin the lowering loads and stores a tile's lanes one by one, and the
+    seeds planted on a packet proof, the load-packet seed and the batched
+    ones, are not planted.  (The store-packet seeds of a rank-2 store,
+    which prove no packets, are planted under every branch.)"""
+    bf16 = torch.bfloat16
+    out_t = _padded_rows(256, 1001, bf16)
+    x = torch.empty(1001, 256)
+    wide = torch.empty(4, 96, 48, dtype=bf16)
+    flag = torch.ones(1)
+    with cpu_render_target():
+        bound = cpu_bind(_cast_both_ways_if, (x, out_t, flag, "block size"))
+        (seed,) = _load_packet_seeds(bound)
+        code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+        assert "block=(2, 32, 1)" in code
+        assert code.count("cute.arch.load(") == 1
+        bound = cpu_bind(_channels_last_if, (wide, flag, "block size"))
+        seeds = _batched_seeds(bound)
+        assert len(seeds) == 6
+        code = bound.to_code(
+            bound.config_spec.normalized_config(helion.Config(**seeds[0]))
+        )
+        assert code.count("_cute_store_u16_vec(") == 1
+
+        for predicate in ("tensor", "begin"):
+            bound = cpu_bind(_cast_both_ways_if, (x, out_t, flag, predicate))
+            assert len(_seeds(bound, 16)) == 2
+            assert _load_packet_seeds(bound) == []
+            bound = cpu_bind(_channels_last_if, (wide, flag, predicate))
+            assert _NAME not in bound.config_spec.autotuner_heuristics
+
+
 def test_no_seeds_without_a_transposed_store() -> None:
     with cpu_render_target():
         bound = cpu_bind(_copy, (torch.randn(256, 512),))
@@ -476,6 +926,268 @@ def test_no_seeds_beside_a_row_broadcast() -> None:
             cpu_bind(_copy, (torch.empty(256, 1).expand(256, 512),)),
         ):
             assert _NAME not in bound.config_spec.autotuner_heuristics
+
+
+def test_a_load_that_takes_packets_seeds_two_packet_threads() -> None:
+    """The shape of ``pointwise_52fe1925ccda``, small: fp32 ``[1001, 256]``
+    cast to bf16 and stored as is and transposed, into rows of 1001 elements
+    that no packet divides.  The load takes 32-byte packets of its rows, so
+    one seed has two threads along them on thread axis 0 (their tile leads
+    the loop order), each with four packets, the two threads' packets
+    alternating (strided lanes), and 32 threads along the transposed rows.
+    A bf16 load has 16 elements to the packet and tiles twice as long.  The
+    other seeds keep their places: a twin whose load is one element into its
+    storage, which no packet survives, has the same seeds but this one."""
+    bf16 = torch.bfloat16
+    out_t = _padded_rows(256, 1001, bf16)
+    with cpu_render_target():
+        bound = cpu_bind(_cast_both_ways, (torch.empty(1001, 256), out_t))
+        (seed,) = _load_packet_seeds(bound)
+        assert seed == {
+            "block_sizes": [32, 64],
+            "num_threads": [32, 2],
+            "cute_vector_widths": [1, 8],
+            "cute_lane_layouts": ["blocked", "strided"],
+            "loop_orders": [[1, 0]],
+        }
+        code = bound.to_code(bound.config_spec.normalized_config(helion.Config(**seed)))
+        # Two packet threads on thread axis 0, 32 rows on axis 1; the load
+        # and the untransposed store take packets.
+        assert "block=(2, 32, 1)" in code
+        assert code.count("cute.arch.load(") == 1
+        assert code.count("_cute_store_u16_vec(") == 1
+
+        seeds = [dict(s.config) for s in bound.config_spec.compiler_seed_configs]
+        offset = torch.empty(1001 * 256 + 1)[1:].view(1001, 256)
+        twin = cpu_bind(_cast_both_ways, (offset, out_t))
+        assert _load_packet_seeds(twin) == []
+        assert [s for s in seeds if s != seed] == [
+            dict(s.config) for s in twin.config_spec.compiler_seed_configs
+        ]
+
+        bound = cpu_bind(_cast_both_ways, (torch.empty(1001, 256, dtype=bf16), out_t))
+        (seed,) = _load_packet_seeds(bound)
+        assert seed["block_sizes"] == [32, 128]
+        assert seed["num_threads"] == [32, 2]
+        assert seed["cute_vector_widths"] == [1, 16]
+
+
+def test_a_load_packet_seed_beside_the_stores_packet_seeds() -> None:
+    """Where the transposed rows take packets too (1024 elements), the
+    store's seeds stay first and this one follows.  A store that only
+    transposes gets it as well, and a transposed load beside a plain store
+    has the packet threads along its rows, which are the store's columns."""
+    with cpu_render_target():
+        bound = cpu_bind(
+            _cast_both_ways,
+            (torch.empty(1024, 256), torch.empty(256, 1024, dtype=torch.bfloat16)),
+        )
+        seeds = [dict(s.config) for s in bound.config_spec.compiler_seed_configs]
+        (seed,) = _load_packet_seeds(bound)
+        store_seeds = _seeds(bound, 16)
+        assert len(store_seeds) == 2
+        assert [seeds.index(s) for s in store_seeds] == [
+            seeds.index(seed) - 2,
+            seeds.index(seed) - 1,
+        ]
+
+        bound = cpu_bind(_scaled_transpose, (torch.randn(2048, 4096),))
+        (seed,) = _load_packet_seeds(bound)
+        assert seed["block_sizes"] == [32, 64]
+        assert seed["num_threads"] == [32, 2]
+
+        bound = cpu_bind(
+            _transposed_input_copy, (torch.empty(4096, 2048, dtype=torch.bfloat16),)
+        )
+        (seed,) = _load_packet_seeds(bound)
+        assert seed == {
+            "block_sizes": [128, 32],
+            "num_threads": [2, 32],
+            "cute_vector_widths": [16, 1],
+            "cute_lane_layouts": ["strided", "blocked"],
+            "loop_orders": [[0, 1]],
+        }
+
+
+def test_larger_smallest_blocks_take_more_packets_and_rows() -> None:
+    """The seed's tiles are the search's: a smallest block of 256 columns
+    gives each of the two packet threads 16 packets, one of 64 or 256 rows
+    that many threads along them, and one of 512 rows, which would be 1024
+    threads, no seed."""
+    x = torch.empty(2048, 2048)
+    out_t = torch.empty(2048, 2048, dtype=torch.bfloat16)
+    with cpu_render_target():
+        for rows_low, cols_low, sizes in (
+            (64, 256, [64, 256]),
+            (256, 64, [256, 64]),
+            (512, 64, None),
+        ):
+            bound = cpu_bind(_cast_both_ways_in_blocks, (x, out_t, rows_low, cols_low))
+            seeds = _load_packet_seeds(bound)
+            if sizes is None:
+                assert seeds == []
+                continue
+            (seed,) = seeds
+            assert seed["block_sizes"] == sizes
+            assert seed["num_threads"] == [sizes[0], 2]
+            assert seed["cute_vector_widths"] == [1, 8]
+
+
+def test_no_load_packet_seed_for_tiles_smaller_than_the_seeds() -> None:
+    """The largest block of a tile is its extent rounded up to a power of
+    two: 32 fp32 columns hold four of the seed's eight packets, 64 bf16
+    columns likewise, and 16 rows half its threads.  40 columns and 17 rows
+    get the seed's blocks, as partial tiles."""
+    bf16 = torch.bfloat16
+    with cpu_render_target():
+        for x in (
+            torch.empty(1001, 32),
+            torch.empty(1001, 64, dtype=bf16),
+            torch.empty(16, 256),
+        ):
+            rows, cols = x.shape
+            bound = cpu_bind(_cast_both_ways, (x, _padded_rows(cols, rows, bf16)))
+            assert _NAME in bound.config_spec.autotuner_heuristics
+            assert _load_packet_seeds(bound) == []
+        bound = cpu_bind(
+            _cast_both_ways, (torch.empty(17, 40), _padded_rows(40, 17, bf16))
+        )
+        (seed,) = _load_packet_seeds(bound)
+        assert seed["block_sizes"] == [32, 64]
+
+
+def test_load_packet_seeds_need_packets_the_lowering_proves() -> None:
+    """The conditions of the batched seeds' packets, for the loads a rank-2
+    store transposes; the heuristic's other seeds do not depend on them.
+    Every refusal has a twin beside it that differs in the one condition and
+    gets the seed."""
+    bf16 = torch.bfloat16
+    out_t = _padded_rows(256, 1001, bf16)
+    x = torch.empty(1001, 256)
+    offset = torch.empty(1001 * 256 + 1)[1:].view(1001, 256)
+    with cpu_render_target():
+        for kernel, args in (
+            # Packets are bf16, fp16 and fp32.
+            (
+                _cast_both_ways,
+                (x.to(torch.int32), _padded_rows(256, 1001, torch.int32)),
+            ),
+            (_cast_both_ways, (x.double(), out_t)),
+            # Rows of 250 elements, which end inside a packet, as does a
+            # tile of the first 252 of 256.
+            (_cast_both_ways, (torch.empty(1001, 250), _padded_rows(250, 1001, bf16))),
+            (_cast_window_both_ways, (x, out_t, 0, 252)),
+            # Tiles that begin four elements into a packet.
+            (_cast_window_both_ways, (x, out_t, 4, 252)),
+            # A base one element into its storage, and rows 260 elements
+            # apart: packets off their alignment.
+            (_cast_both_ways, (offset, out_t)),
+            (_cast_both_ways, (torch.empty(1001, 260)[:, :256], out_t)),
+            # A mask is not proven uniform over a packet, nor a scalar added
+            # to the tile's index along the rows a multiple of it.
+            (_pad_and_transpose, (x, 256, True)),
+            (_shifted_cast_both_ways, (torch.empty(1001, 264), out_t, True)),
+            # No static extent to prove the packets on.
+            (_cast_both_ways_dynamic, (x, out_t)),
+            # A tile stored both ways that nothing loads.
+            (_index_sums_both_ways, (_padded_rows(256, 1001, torch.float32),)),
+            # The store of the tile the other way round takes no packets: a
+            # base one element into its storage, an extra mask.
+            (
+                _cast_into_both,
+                (
+                    x,
+                    out_t,
+                    torch.empty(1001 * 256 + 1, dtype=bf16)[1:].view(1001, 256),
+                    False,
+                ),
+            ),
+            (_cast_into_both, (x, out_t, torch.empty(1001, 256, dtype=bf16), True)),
+            # An access of the two tiles under a branch on a tensor's value,
+            # a graph of its own, where the lowering takes no packets: the
+            # load, the stores, or the transposed store and its load beside
+            # a copy whose load sits in the loop.
+            (_cast_both_ways_of_a_branch_load, (x, out_t, torch.ones(1))),
+            (_cast_both_ways_into_a_branch, (x, out_t, torch.ones(1))),
+            (_transpose_beside_a_copy, (x, x.clone(), out_t, torch.ones(1), True)),
+            # Not pointwise: beside a reduction of the tile's lanes the
+            # seed's config does not render.
+            (_transpose_beside_row_sums, (x, out_t)),
+            # The CTA is not the pair's alone: the threads of a reduction
+            # dim or of the untiled dim of whole rows take thread axis 0,
+            # and another root loop's the place of the two packet threads.
+            (_cast_both_ways_beside_a_reduction, (x, torch.empty(1001, 64), out_t)),
+            (_cast_both_ways_beside_rows, (x, torch.empty(1001, 8), out_t)),
+            (
+                _transpose_beside_a_row_loop,
+                (torch.empty(2048, 4096), torch.empty(1000)),
+            ),
+            # A store into a tensor the kernel loads: transposed into
+            # itself, which the code generator refuses, also for a tensor
+            # the store does not transpose; and as it was loaded, which
+            # renders the layout and is declined on purpose (no in-place
+            # kernel was measured).
+            (_transpose_in_place, (torch.empty(1024, 1024), True)),
+            (
+                _transpose_beside_a_flip,
+                (
+                    torch.empty(1024, 1024),
+                    torch.empty(1024, 1024, dtype=bf16),
+                    torch.empty(1024, 1024),
+                ),
+            ),
+            (_transpose_in_place, (torch.empty(1024, 1024), False)),
+            # Two loads: packets of 8 and of 16 elements, and one load that
+            # takes none.
+            (_sum_both_ways, (x, x.to(bf16), out_t)),
+            (_sum_both_ways, (x, offset, out_t)),
+        ):
+            bound = cpu_bind(kernel, args)
+            assert _NAME in bound.config_spec.autotuner_heuristics
+            assert _load_packet_seeds(bound) == []
+
+        # Before SM100 a packet is 16 bytes at most.
+        bound = cpu_bind(_cast_both_ways, (x, out_t), capability=(9, 0))
+        assert _load_packet_seeds(bound) == []
+
+        for kernel, args in (
+            (_cast_into_both, (x, out_t, torch.empty(1001, 256, dtype=bf16), False)),
+            (_cast_window_both_ways, (x, out_t, 8, 248)),
+            (_cast_both_ways, (torch.empty(1001, 264)[:, :256], out_t)),
+            # A scalar added to the index of the other tile moves no packet.
+            (_shifted_cast_both_ways, (torch.empty(1002, 256), out_t, False)),
+            (_sum_both_ways, (x, x, out_t)),
+            (_transpose_beside_a_copy, (x, x.clone(), out_t, torch.ones(1), False)),
+            # A load with the store's tile contiguous is not one the store
+            # transposes: its packets are not asked for.
+            (_sum_of_both_layouts, (x, torch.empty(256, 1001), out_t)),
+        ):
+            bound = cpu_bind(kernel, args)
+            (seed,) = _load_packet_seeds(bound)
+            assert seed["cute_vector_widths"] == [1, 8]
+            # The layout the seed names: two packet threads, packet loads.
+            code = bound.to_code(
+                bound.config_spec.normalized_config(helion.Config(**seed))
+            )
+            assert "block=(2, 32, 1)" in code
+            assert "cute.arch.load(" in code
+
+
+def test_the_load_packet_seed_leaves_the_search_space_as_it_was() -> None:
+    """The seed opens no knob: a load it declines (one element into its
+    storage) has the search space of one it serves."""
+    out_t = _padded_rows(256, 1001, torch.bfloat16)
+    with cpu_render_target():
+        served = cpu_bind(_cast_both_ways, (torch.empty(1001, 256), out_t))
+        declined = cpu_bind(
+            _cast_both_ways, (torch.empty(1001 * 256 + 1)[1:].view(1001, 256), out_t)
+        )
+        assert len(_load_packet_seeds(served)) == 1
+        assert _load_packet_seeds(declined) == []
+        assert (
+            served.config_spec.structural_fingerprint()
+            == declined.config_spec.structural_fingerprint()
+        )
 
 
 def test_a_batched_layout_change_stores_whole_sectors() -> None:
@@ -916,6 +1628,46 @@ def test_no_batched_seeds_without_a_layout_change_the_seeds_serve() -> None:
             assert _NAME not in bound.config_spec.autotuner_heuristics
 
 
+def test_batched_seeds_need_a_kernel_that_renders_their_layout() -> None:
+    """The admission the batched seeds share with the load-packet seed: a
+    pointwise kernel whose only blocks with threads are the store's tiles
+    and which stores into no tensor it loads.
+    Every refusal is ``_channels_last`` with one thing beside it; alone it
+    gets the six seeds, at either shape."""
+    bf16 = torch.bfloat16
+    x = torch.empty(4, 96, 48, dtype=bf16)
+    square = torch.empty(4, 96, 96, dtype=bf16)
+    with cpu_render_target():
+        for alone in (x, square):
+            assert len(_batched_seeds(cpu_bind(_channels_last, (alone,)))) == 6
+        bound = cpu_bind(_channels_last_of_a_sum, (square, square.clone(), False))
+        assert len(_batched_seeds(bound)) == 6
+        for kernel, args in (
+            # Not pointwise: beside a reduction of the tile's lanes four of
+            # the six seeds do not render.  An atomic add of the whole tile
+            # keeps the layouts and is declined with it on purpose.
+            (_channels_last_and_channel_sums, (x,)),
+            (_channels_last_and_an_atomic, (x,)),
+            # The untiled dim of whole rows, copied or summed, takes thread
+            # axis 0: CTAs of up to 1024 threads.
+            (_channels_last_beside_rows, (x, torch.empty(4, 8), False)),
+            (_channels_last_beside_rows, (x, torch.empty(4, 64), True)),
+            # Another root loop's threads: the store-packet seeds render no
+            # packet store.
+            (_channels_last_beside_a_loop, (x, torch.empty(1000))),
+            # A store into a tensor the kernel loads: channels-last into
+            # itself, which the code generator refuses, for the first load
+            # and for a second one; and as it was loaded, which renders the
+            # layout and is declined on purpose (no in-place kernel was
+            # measured).
+            (_channels_last_in_place, (square, True)),
+            (_channels_last_of_a_sum, (square, square.clone(), True)),
+            (_channels_last_in_place, (x, False)),
+        ):
+            bound = cpu_bind(kernel, args)
+            assert _NAME not in bound.config_spec.autotuner_heuristics
+
+
 def test_batched_seeds_leave_the_search_space_as_it_was() -> None:
     """The seeds open no knob: a shape they decline (60-channel rows of 50
     positions) has the search space of one they serve."""
@@ -961,6 +1713,36 @@ class TestCuteTransposedStoreSeeds(TestCase):
             _, out = code_and_output(_scaled_transpose, (x,), **seed)
             torch.testing.assert_close(out, (x * 2).t(), rtol=0, atol=0)
 
+    @skipIfCudaCapabilityLessThan((10, 0), reason="32-byte packets need SM100")
+    def test_the_load_packet_seed_is_bitwise_torch(self) -> None:
+        # Partial tiles along both dims: 200 rows in tiles of 32, 528 columns
+        # in tiles of 64 (fp32: the last tile holds two of its eight packets)
+        # and of 128 (bf16: one of its eight), into rows padded to 208.
+        bf16 = torch.bfloat16
+        seeds = {}
+        for dtype in (torch.float32, bf16):
+            x = torch.randn(200, 528, device=DEVICE).to(dtype)
+            padded = torch.zeros(528, 208, device=DEVICE, dtype=bf16)
+            args = (x, padded[:, :200])
+            (seeds[dtype],) = _load_packet_seeds(_cast_both_ways.bind(args))
+            code, out = code_and_output(_cast_both_ways, args, **seeds[dtype])
+            assert "cute.arch.load(" in code
+            torch.testing.assert_close(out, x.to(bf16), rtol=0, atol=0)
+            torch.testing.assert_close(padded[:, :200], x.to(bf16).t(), rtol=0, atol=0)
+            # The padding keeps its zeros.
+            assert not padded[:, 200:].any()
+        # The fp32 seed pinned on a load whose packets are not proven (one
+        # element into its storage): scalar loads.
+        x = torch.randn(200 * 528 + 1, device=DEVICE)[1:].view(200, 528)
+        padded = torch.zeros(528, 208, device=DEVICE, dtype=bf16)
+        args = (x, padded[:, :200])
+        assert _load_packet_seeds(_cast_both_ways.bind(args)) == []
+        code, out = code_and_output(_cast_both_ways, args, **seeds[torch.float32])
+        assert "cute.arch.load(" not in code
+        torch.testing.assert_close(out, x.to(bf16), rtol=0, atol=0)
+        torch.testing.assert_close(padded[:, :200], x.to(bf16).t(), rtol=0, atol=0)
+
+    @skipIfCudaCapabilityLessThan((10, 0), reason="32-byte packets need SM100")
     def test_batched_seeds_are_bitwise_torch(self) -> None:
         # Partial tiles along both lane dims: 80 bf16 channels in tiles of
         # 32 (the last tile holds one of its two packets), 72 fp32 channels
@@ -991,6 +1773,7 @@ class TestCuteTransposedStoreSeeds(TestCase):
             assert "cute.arch.load(" in code
             torch.testing.assert_close(out, x.permute(0, 2, 1), rtol=0, atol=0)
 
+    @skipIfCudaCapabilityLessThan((10, 0), reason="32-byte packets need SM100")
     def test_store_seeds_beside_a_masked_load_are_bitwise_torch(self) -> None:
         # The first 40 of 80 channels, zeros for the others, into rows of 48
         # positions in tiles of 32 and 16 (the last tile of 32 holds one of
@@ -1010,6 +1793,7 @@ class TestCuteTransposedStoreSeeds(TestCase):
             assert "_cute_store_u16_vec(" in code
             torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
+    @skipIfCudaCapabilityLessThan((10, 0), reason="32-byte packets need SM100")
     def test_seeds_beside_a_shifted_subscript_are_bitwise_torch(self) -> None:
         # The packets of the other side beside a subscript that adds a
         # scalar to a tile's index: the load's under a store 16 channels
@@ -1047,6 +1831,7 @@ class TestCuteTransposedStoreSeeds(TestCase):
         expected = x[:, :, 16:].permute(0, 2, 1)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
+    @skipIfCudaCapabilityLessThan((10, 0), reason="32-byte packets need SM100")
     def test_a_batched_seed_is_bitwise_torch_on_other_layouts(self) -> None:
         """A seed's config on layouts its packets are not proven on (a
         pinned config meets any input): what the lowering cannot prove it
@@ -1087,6 +1872,7 @@ class TestCuteTransposedStoreSeeds(TestCase):
         # The channels past the view keep their zeros.
         assert not buffer[:, :, 88:].any()
 
+    @skipIfCudaCapabilityLessThan((10, 0), reason="32-byte packets need SM100")
     def test_batched_seeds_off_a_tile_begin_are_bitwise_torch(self) -> None:
         """Channel tiles that begin at 8 keep the 16-byte seed (88 channels
         in tiles of 32: the last tile holds three of its four packets), for
