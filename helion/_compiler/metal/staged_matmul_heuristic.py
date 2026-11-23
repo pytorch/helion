@@ -29,12 +29,13 @@ from typing import TYPE_CHECKING
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-from ...runtime.config import Config
 from ..autotuner_heuristics.registry import AutotunerHeuristic
 from ._constants import SIMD_WIDTH
+from .block_seeds import block_seeds
 from .search_surface import kernel_facts
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
 
@@ -90,29 +91,14 @@ class MetalStagedMatmulHeuristic(AutotunerHeuristic):
         # their own lowerings (fragments, row kernels).
         if rows < 2 * ROWS_PER_SIMD_GROUP or rows < fragments[tall].low:
             return []
-        default = spec.default_config()
-        seeds: list[Config] = []
-        for k_block in K_BLOCKS:
-            for narrow_block in NARROW_BLOCKS:
-                chosen = {tall: rows, narrow: narrow_block, k: k_block}
-                if not all(
-                    fragments[b].low <= size <= fragments[b].high
-                    for b, size in chosen.items()
-                ):
-                    continue
-                block_sizes = [
-                    chosen.get(item.block_id, size)
-                    for item, size in zip(
-                        spec.block_sizes, default.block_sizes, strict=True
-                    )
-                ]
-                seed = Config.from_dict(
-                    {
-                        **default.config,
-                        "block_sizes": block_sizes,
-                        "num_warps": rows // ROWS_PER_SIMD_GROUP,
-                    }
+        return block_seeds(
+            spec,
+            (
+                (
+                    {tall: rows, narrow: narrow_block, k: k_block},
+                    {"num_warps": rows // ROWS_PER_SIMD_GROUP},
                 )
-                if seed not in seeds:
-                    seeds.append(seed)
-        return seeds
+                for k_block in K_BLOCKS
+                for narrow_block in NARROW_BLOCKS
+            ),
+        )

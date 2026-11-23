@@ -32,13 +32,14 @@ from typing import TYPE_CHECKING
 
 from torch._inductor.runtime.runtime_utils import next_power_of_2
 
-from ...runtime.config import Config
 from ..autotuner_heuristics.registry import AutotunerHeuristic
 from ._constants import SIMD_WIDTH
+from .block_seeds import block_seeds
 from .search_surface import METAL_MATMUL
 from .search_surface import kernel_facts
 
 if TYPE_CHECKING:
+    from ...runtime.config import Config
     from ..compile_environment import CompileEnvironment
     from ..device_ir import DeviceIR
 
@@ -90,7 +91,6 @@ class MetalFragmentMatmulHeuristic(AutotunerHeuristic):
         if not {m, n, k} <= tunable:
             return []
         specs = {b: spec.block_sizes.block_id_lookup(b) for b in (m, n, k)}
-        fragments = {b: s._fragment(spec) for b, s in specs.items()}
         rows_extent = specs[m].size_hint
         if rows_extent > MAX_ROWS:
             return []
@@ -108,34 +108,16 @@ class MetalFragmentMatmulHeuristic(AutotunerHeuristic):
         # counts, the 5-bit head above ran 2.5 ms at the seed's tile, 2.1 ms
         # this way.
         threaded = set(spec.num_threads.valid_block_ids()) == {m, n, k}
-        default = spec.default_config()
-        seeds: list[Config] = []
-        for columns in COLUMN_BLOCKS:
-            for num_warps in splits:
-                chosen = {m: ROW_BLOCK, n: columns, k: k_tile}
-                if not all(
-                    fragments[b].low <= size <= fragments[b].high
-                    for b, size in chosen.items()
-                ):
-                    continue
-                block_sizes = [
-                    chosen.get(item.block_id, size)
-                    for item, size in zip(
-                        spec.block_sizes, default.block_sizes, strict=True
-                    )
-                ]
-                config: dict[str, object] = {
-                    **default.config,
-                    "block_sizes": block_sizes,
-                    "num_warps": num_warps,
-                    METAL_MATMUL: "fragment",
-                }
-                if threaded:
-                    config["num_threads"] = [
-                        SIMD_WIDTH if item.block_id == k else 1
-                        for item in spec.num_threads
-                    ]
-                seed = Config.from_dict(config)
-                if seed not in seeds:
-                    seeds.append(seed)
-        return seeds
+        keys: dict[str, object] = {METAL_MATMUL: "fragment"}
+        if threaded:
+            keys["num_threads"] = [
+                SIMD_WIDTH if item.block_id == k else 1 for item in spec.num_threads
+            ]
+        return block_seeds(
+            spec,
+            (
+                ({m: ROW_BLOCK, n: columns, k: k_tile}, {"num_warps": s, **keys})
+                for columns in COLUMN_BLOCKS
+                for s in splits
+            ),
+        )

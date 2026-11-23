@@ -410,6 +410,7 @@ class MetalBackend(Backend):
 
     def autotuner_heuristics(self) -> tuple[AutotunerHeuristicType, ...]:
         from .fragment_matmul_heuristic import MetalFragmentMatmulHeuristic
+        from .mpp_matmul_heuristic import MetalMppMatmulHeuristic
         from .row_reduction_heuristic import MetalRowReductionHeuristic
         from .split_reduction_heuristic import MetalSplitReductionHeuristic
         from .staged_matmul_heuristic import MetalStagedMatmulHeuristic
@@ -418,6 +419,7 @@ class MetalBackend(Backend):
             MetalRowReductionHeuristic,
             MetalStagedMatmulHeuristic,
             MetalFragmentMatmulHeuristic,
+            MetalMppMatmulHeuristic,
             MetalSplitReductionHeuristic,
         )
 
@@ -796,6 +798,11 @@ class MetalBackend(Backend):
         launch_facts = MetalKernelFacts(
             scalar_matmuls=True,
             staged_matmuls=() if mpp is None else _staged_matmuls(mpp),
+            mpp_unstaged=mpp is not None
+            and len(mpp.by_matmul) == len(config_spec.matmul_facts)
+            and not any(
+                op.staged for g in mpp.by_matmul.values() for op in (g.lhs, g.rhs)
+            ),
         )
         reductions = any(
             info.reduction for info in CompileEnvironment.current().block_sizes

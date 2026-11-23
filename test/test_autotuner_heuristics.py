@@ -4444,6 +4444,7 @@ class TestHeuristicRegistry(TestCase):
                 "metal_row_reduction",
                 "metal_staged_matmul",
                 "metal_fragment_matmul",
+                "metal_mpp_matmul",
                 "metal_split_reduction",
             ),
         }
