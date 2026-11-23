@@ -582,6 +582,22 @@ def kernel(in0: torch.Tensor, in1: torch.Tensor, out0: torch.Tensor, out1: torch
         self.assertEqual(len(SOURCE_RE.findall(code)), 2)
 
 
+def rotate_half_case():
+    """RMSNorm then RoPE's rotate_half over head dims of 256, as Gemma's q/k
+    norm, and its inputs: the cat cuts each persistent rdim at 128."""
+    x = torch.randn(64, 8, 256, device=DEVICE)
+    w = torch.randn(256, device=DEVICE)
+    cos = torch.randn(64, 256, device=DEVICE)
+    sin = torch.randn(64, 256, device=DEVICE)
+
+    def fn(x, w, cos, sin):
+        y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (1 + w)
+        rotated = torch.cat([-y[..., 128:], y[..., :128]], -1)
+        return y * cos[:, None] + rotated * sin[:, None]
+
+    return fn, (x, w, cos, sin)
+
+
 # The CuTe lane, where CuTe DSL is installed, runs this.
 @skipIfNotCUDA()
 @onlyBackends(["cute"])
@@ -702,6 +718,15 @@ class TestInductorCute(InductorBackendTestCase):
         fn, args = repeat_kv_case()
         (source,) = self.compile(fn, *args, backend="cute")
         self.assertIn("in0[tile_z.index // 2, tile_y, tile_x]", source)
+
+    def test_rotate_half_rdim_segments(self):
+        # TestInductorBackend.test_rotate_half_rdim_segments under the CuTe
+        # backend, which packs the halves' slices of the rdims into vector loads
+        # and stores (one output parameter, segment_subscript()).
+        fn, args = rotate_half_case()
+        (source,) = self.compile(fn, *args, tol=1e-4, backend="cute")
+        self.assertIn("out0[tile_y, tile_x, 0:128] = ", source)
+        self.assertIn("out0[tile_y, tile_x, 128:256] = ", source)
 
     @looped
     def test_welford(self):
@@ -1472,8 +1497,29 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor, out1: torch.Tensor) -> None:
             sources = self.compile(lambda x: torch.var_mean(x, -1), x)
         self.assertEqual(len(sources), 2)
 
+    def test_sink_softmax(self):
+        # Softmax with attention sinks over rdims of 100 scores and a sink,
+        # whose slice is made contiguous, as before the matmul with v (a slice
+        # returned as it is keeps the cat: needs_cat_storage()): the
+        # reductions over the cat dim are the scores' and the sink's,
+        # combined (split_cat_reductions()), so one kernel reads each rdim of
+        # scores as a tile and writes it normalized.
+        scores = torch.randn(4, 32, 100, device=DEVICE)
+        sinks = torch.randn(4, device=DEVICE)
+
+        def fn(scores, sinks):
+            x = torch.cat([scores, sinks[:, None, None].expand(-1, 32, 1)], -1)
+            x = x - x.amax(-1, keepdim=True)
+            return torch.softmax(x, -1)[..., :-1].contiguous()
+
+        (source,) = self.compile(fn, scores, sinks, tol=1e-4)
+        self.assertIn("in0[tile_y, tile_x, :]", source)
+        self.assertIn("torch.maximum(", source)
+        self.assertNotIn("extra_mask", source)
+
     def test_proven_mask(self):
-        # (cat([x, y], -1) * 2)[:, :50] reads only x: the value ranges prove
+        # (cat([x, y], -1) * 2)[:, :50] reads only x, inside its part, which
+        # split_cat_reductions() leaves to the kernel: the value ranges prove
         # tile_x.index < 100 over its [64, 50] tiles, so x's load has no mask
         # (HelionKernel.masked()) and no torch.where picks between x and y
         # (HelionOverrides.where()).
@@ -1939,6 +1985,99 @@ def kernel(in0: torch.Tensor, out0: torch.Tensor) -> None:
         }[case]
         (source,) = self.compile(fn, x, expected=self.stock_inductor(fn, x))
         self.assertEqual(source.count("hl.rand("), 2 if case == "two_seeds" else 1)
+
+    def test_rotate_half_rdim_segments(self):
+        # RMSNorm then RoPE over head dims of 256, as Gemma's q/k norm: the cat
+        # of rotate_half cuts the persistent rdim at 128, and the elementwise
+        # tail is emitted once per half (HelionKernel.rdim_segment()), which
+        # reads and writes slices of the rdims, as the hand-written kernel does,
+        # where the whole rdim read the halves as flat loads masked by r < 128
+        # and selected between them. (The part a half proves unselected keeps its
+        # masked loads, which nothing reads and Helion drops.)
+        fn, args = rotate_half_case()
+        (source,) = self.compile(fn, *args, tol=1e-4)
+        self.assertNotIn("torch.where", source)
+        # Each half is a slice of the whole rdim's parameters (segment_subscript()),
+        # whose tries take no rdim where they decline: the kernel names no rdim.
+        # (The unselected part's masked load reads a flat view of x, in2.)
+        self.assertIn("[tile_y, tile_x, 128:256]", source)
+        self.assertIn("out0[tile_y, tile_x, 0:128] = ", source)
+        self.assertIn("out0[tile_y, tile_x, 128:256] = ", source)
+        self.assertNotIn("rdim", source)
+
+    def test_written_before_keeps_the_whole_rdim(self):
+        # z = x * 2, an output an earlier node of the kernel writes, which the
+        # trailing nodes read beside a cat: a segment of them would read the
+        # whole rdim's z (the value the CSE keeps of its store), so the rdim is
+        # not cut (HelionScheduling.rdim_segments()).
+        x, w = (torch.randn(64, 8, 256, device=DEVICE) for _ in range(2))
+        sin = torch.randn(64, 256, device=DEVICE)
+
+        def fn(x, w, sin):
+            z = x * 2
+            norm = z * torch.rsqrt(z.pow(2).mean(-1, keepdim=True) + 1e-6)
+            rotated = torch.cat([-w[..., 128:], w[..., :128]], -1)
+            return z, norm + rotated * sin[:, None]
+
+        (source,) = self.compile(fn, x, w, sin, tol=1e-4)
+        self.assertNotIn("128:256]", source)
+
+    def test_long_rdim_keeps_one_tail(self):
+        # rotate_half over rdims of 2048, past UNROLLED_RDIM_MAX: the tail is one
+        # emission over the whole rdim, which Helion can roll, not segments of
+        # 1024, whose literal dims it cannot (HelionKernel.rdim_code()).
+        x = torch.randn(16, 2048, device=DEVICE)
+
+        def fn(x):
+            y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6)
+            return torch.cat([-y[..., 1024:], y[..., :1024]], -1)
+
+        (source,) = self.compile(fn, x, tol=1e-4)
+        self.assertIn("rdim = in0[tile_x, :].size(1)", source)
+        self.assertNotIn("0:1024", source)
+
+    def test_rotate_half_rdim_segments_in_place(self):
+        # The tail adds rotate_half of an RMSNorm of w into x in place: the
+        # node reads x and stores x, so that each half must read its own x,
+        # not the half before's x stored through the CSE store cache.
+        x = torch.randn(64, 8, 256, device=DEVICE)
+        w = torch.randn(64, 8, 256, device=DEVICE)
+        cos = torch.randn(64, 256, device=DEVICE)
+        sin = torch.randn(64, 256, device=DEVICE)
+
+        def fn(x, w, cos, sin):
+            y = w * torch.rsqrt(w.pow(2).mean(-1, keepdim=True) + 1e-6)
+            rotated = torch.cat([-y[..., 128:], y[..., :128]], -1)
+            return x.add_(y * cos[:, None] + rotated * sin[:, None])
+
+        expected = fn(x.clone(), w, cos, sin)
+        (source,) = self.compile(
+            fn, x.clone(), w, cos, sin, expected=expected, tol=1e-4
+        )
+        self.assertIn("[tile_y, tile_x, 128:256]", source)
+
+    def test_rotate_half_rdim_segments_of_a_wider_buffer(self):
+        # As test_rotate_half_rdim_segments, of rdims that are the first 256
+        # of a matmul's rdims of 768 (q of a fused qkv projection): the part
+        # of the cat the second half proves unselected reads r = 256-383,
+        # which the view of the matmul's buffer holds, so that its
+        # masked load reads a slice too,
+        #     hl.load(in0, [tile_y, tile_x, slice(0, 128)], extra_mask=tmp44)
+        # where in0[tile_y, tile_x, 0:128] in an index list is a SyntaxError.
+        a = torch.randn(512, 64, device=DEVICE)
+        wqkv = torch.randn(64, 768, device=DEVICE)
+        w = torch.randn(256, device=DEVICE)
+        cos = torch.randn(64, 256, device=DEVICE)
+        sin = torch.randn(64, 256, device=DEVICE)
+
+        def fn(a, wqkv, w, cos, sin):
+            x = (a @ wqkv).view(64, 8, 768)[..., :256]
+            y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * (1 + w)
+            rotated = torch.cat([-y[..., 128:], y[..., :128]], -1)
+            return y * cos[:, None] + rotated * sin[:, None]
+
+        sources = self.compile(fn, a, wqkv, w, cos, sin, tol=1e-3)
+        self.assertTrue(any("slice(0, 128)" in source for source in sources))
 
     def test_reduced_dim_quotient(self):
         # A reduced dim's quotient (w.repeat_interleave(2) read at r // 2 in a
