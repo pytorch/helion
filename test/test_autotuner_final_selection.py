@@ -34,6 +34,8 @@ from helion.autotuner.base_search import PopulationMember
 from helion.autotuner.base_search import _InProcessFinalSelectionMeasurer
 from helion.autotuner.base_search import _WorkerFinalSelectionMeasurer
 from helion.autotuner.benchmark_job import BenchmarkJob
+from helion.autotuner.benchmark_prelude import BenchmarkPrelude
+from helion.autotuner.benchmark_prelude import PreludeStep
 from helion.autotuner.benchmark_provider import IsolatedBenchmarkFailure
 from helion.autotuner.benchmark_provider import LocalBenchmarkProvider
 from helion.autotuner.benchmark_worker import BenchmarkSubprocessError
@@ -520,6 +522,33 @@ class TestFinalSelection(TestCase):
         self.assertEqual(rows[0]["median_ms"], 1.00)
         self.assertEqual(rows[0]["rounds_ms"], [1.00, 1.08, 1.00])
         self.assertIsNone(rows[0]["disqualified"])
+
+    def test_the_record_counts_a_preludes_steps_only_behind_one(self) -> None:
+        """A search timed alone records what it always did; behind a prelude
+        (``benchmark_prelude.timed_behind``) the record also counts the
+        earlier kernel calls its windows ran behind."""
+
+        def record(prelude: BenchmarkPrelude | None) -> dict[str, object]:
+            fast, slow = _member(32, 1.00), _member(64, 1.10)
+            policy = FinalSelectionConfig(
+                top_k=4, rounds=3, screen_rep_ms=0, thermal_warmup_ms=1000
+            )
+            search = _make_search([fast, slow], policy=policy)
+            search._benchmark_prelude = prelude
+            readings = {id(fast): 1.00, id(slow): 1.10}
+            measurer = _FakeMeasurer(lambda member, window: readings[id(member)])
+            with patch.object(search, "_final_selection_measurer", new=measurer):
+                self.assertIs(search.final_rebenchmark_best(fast), fast)
+            metrics = search._autotune_metrics.final_selection
+            assert metrics is not None
+            return metrics
+
+        alone = record(None)
+        self.assertNotIn("prelude_steps", alone)
+        step = PreludeStep(len, ((),))
+        behind = record(BenchmarkPrelude((step, step), ()))
+        self.assertEqual(behind["prelude_steps"], 2)
+        self.assertEqual(behind.keys() - {"prelude_steps"}, alone.keys())
 
     def test_bank_budget_retry_discards_all_private_rounds(self) -> None:
         members = [_member(32, 1.0), _member(64, 2.0)]

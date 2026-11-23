@@ -51,6 +51,8 @@ from ..runtime.structural_policy import bound_structural_policy
 from ..runtime.structural_policy import require_same_structural_policy
 from .accuracy import effective_fp8_accuracy
 from .accuracy import keyable_accuracy_check
+from .benchmark_prelude import BenchmarkPrelude
+from .benchmark_prelude import active_prelude
 from .benchmark_provider import _COMPILER_SEED_TIMEOUT_RETRY_LIMIT
 from .benchmark_provider import BenchmarkProvider
 from .benchmark_provider import BenchmarkResult
@@ -495,6 +497,11 @@ class BaseSearch(BaseAutotuner):
 
     # Snapshot the timing policy for all queued measurements in this search.
     _input_bank_count: int = 1
+    # The prelude this search's candidates are timed behind, read when the
+    # search is made (``benchmark_prelude.timed_behind``); None: alone. Such
+    # a search takes every reading in its benchmark worker, as one that
+    # reads its candidates from the trace does.
+    _benchmark_prelude: BenchmarkPrelude | None = None
     # The config the search timed the returned kernel under, where it returns
     # a simpler config of that kernel (``_simplified_selected_config``): the
     # trace's trial rows are keyed by this one.
@@ -524,6 +531,7 @@ class BaseSearch(BaseAutotuner):
         self.kernel = kernel
         self.settings: Settings = kernel.settings
         self._input_bank_count = self.settings.autotune_benchmark_input_banks
+        self._benchmark_prelude = active_prelude()
         if isinstance(self.settings.autotune_config_overrides, StructuralConfig):
             raise StructuralPolicyError(
                 "Policy-bearing autotune overrides must be supplied before "
@@ -738,6 +746,19 @@ class BaseSearch(BaseAutotuner):
         """
         if self._prepared:
             return
+        if active_prelude() is not self._benchmark_prelude or (
+            self._benchmark_prelude is not None
+            and self._benchmark_provider_cls is not LocalBenchmarkProvider
+        ):
+            # The provider made below reads the block it is made in, and
+            # only the built-in one runs a prelude: a search that took the
+            # prelude for its cache key and its re-timings must not time
+            # alone, nor the other way round.
+            raise exc.InvalidAPIUsage(
+                "a search runs inside the benchmark_prelude.timed_behind block "
+                "it was made in (or outside any, as it was made), on the "
+                "built-in benchmark provider"
+            )
         if (
             self.settings.megakernel_timeline is not None
             and self.config_spec.offers_megakernel
@@ -3374,13 +3395,18 @@ class PopulationBasedSearch(BaseSearch):
         launch near the bound that picked its timer by its own reading read
         on two scales from call to call (59 or 64 us for one config). A
         search stays on one timer for all its candidates, short or long.
+        Where the backend names a bound, a search behind a benchmark prelude
+        (``benchmark_prelude``) moves to the trace whatever its best reading:
+        behind work that the device finishes before the host has queued the
+        candidate, an event-timed sample also holds the candidate's launch
+        on the host (``do_bench``), which the trace leaves out.
         The initial population moves with it: every member with a reading
         is read once more, on the trace (``_read_on_settled_timer``), before
         anything compares it with a traced candidate, and a member the trace
         cannot read leaves ``members`` and ``visited``. It keeps the events
-        when the best reading is at or above the bound, for a ratio
-        objective, in another L2 regime than the per-call flush, under
-        ``HELION_BENCHMARK_CUDAGRAPH=1`` (``do_bench`` then times a
+        when, without a prelude, the best reading is at or above the bound,
+        for a ratio objective, in another L2 regime than the per-call flush,
+        under ``HELION_BENCHMARK_CUDAGRAPH=1`` (``do_bench`` then times a
         candidate's graph replay and traces nothing), when the population
         was not timed in the benchmark worker, when that worker cannot time
         the re-timings from the trace (``_kernel_timer_usable``: a
@@ -3425,7 +3451,13 @@ class PopulationBasedSearch(BaseSearch):
         provider = self.benchmark_provider
         if (
             self.performance_unit != "ms"
-            or not self.best_perf_so_far * 1000.0 < self.short_kernel_below_us
+            # (behind a prelude a kernel of any length moves to the trace:
+            # an event-timed sample there can hold the launch's host time,
+            # ``do_bench``)
+            or not (
+                self._benchmark_prelude is not None
+                or self.best_perf_so_far * 1000.0 < self.short_kernel_below_us
+            )
             or _resolve_l2_flush_mode(None) != "call"
             # every candidate would be a graph replay, which is not traced
             or _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False)
@@ -3451,6 +3483,11 @@ class PopulationBasedSearch(BaseSearch):
             provider.restart_profiled_benchmark_worker()
             return
         best_us = self.best_perf_so_far * 1000.0
+        why = (
+            f"under {self.short_kernel_below_us:g} us"
+            if best_us < self.short_kernel_below_us
+            else "behind a benchmark prelude"
+        )
         provider.trace_search_candidates = True
         self.traces_candidates = True
         # reading the population again stops when the budget runs out
@@ -3469,15 +3506,14 @@ class PopulationBasedSearch(BaseSearch):
                 else "the CUDA activity trace read none of the initial configs"
             )
             self.log(
-                f"The best initial config reads {best_us:.1f} us (under "
-                f"{self.short_kernel_below_us:g} us), but {reason}: timing "
-                "this search's candidates with CUDA events"
+                f"The best initial config reads {best_us:.1f} us ({why}), but "
+                f"{reason}: timing this search's candidates with CUDA events"
             )
             return
         self.log(
-            f"The best initial config reads {best_us:.1f} us "
-            f"(under {self.short_kernel_below_us:g} us): timing this search's "
-            "candidates by their kernels' durations in the CUDA activity trace"
+            f"The best initial config reads {best_us:.1f} us ({why}): timing "
+            "this search's candidates by their kernels' durations in the CUDA "
+            "activity trace"
         )
 
     def _read_on_settled_timer(
@@ -4052,7 +4088,7 @@ class PopulationBasedSearch(BaseSearch):
         )
 
     def _final_rebenchmark_use_isolated(self) -> bool:
-        if self._input_bank_count > 1:
+        if self._input_bank_count > 1 or self._benchmark_prelude is not None:
             return True
 
         # The backend decides whether finalists are timed ISOLATED (each in
@@ -4638,6 +4674,11 @@ class PopulationBasedSearch(BaseSearch):
         if self._input_bank_count > 1:
             raise exc.InvalidAPIUsage(
                 "rotating input banks require isolated final selection"
+            )
+        if self._benchmark_prelude is not None:
+            raise exc.InvalidAPIUsage(
+                "a benchmark prelude requires the final selection's windows in "
+                "the benchmark worker"
             )
         args: _PrivateBenchmarkArgs | Sequence[object] | None = None
         if private_copies and not dist.is_initialized():
@@ -5450,6 +5491,13 @@ class PopulationBasedSearch(BaseSearch):
             "policy": dataclasses.asdict(policy),
             "family_keys": list(family_keys),
             "input_banks": self._input_bank_count,
+            # (only behind a prelude: the earlier kernel calls every window
+            # ran between its flush and its timed call)
+            **(
+                {}
+                if self._benchmark_prelude is None
+                else {"prelude_steps": len(self._benchmark_prelude.steps)}
+            ),
             "l2_flush_mode": regime_label,
             "second_l2_flush_mode": second_regime,
             "target_regime": final_selection_target_regime(),
@@ -5536,7 +5584,13 @@ class PopulationBasedSearch(BaseSearch):
         # read with CUDA events, on another scale than the members' readings
         # (the single-pass final verification asks for them under
         # ``HELION_AUTOTUNE_FINAL_REBENCHMARK_ISOLATED=0``).
-        use_isolated = use_isolated or self.traces_candidates
+        # So does a search behind a prelude: the in-process timers would
+        # time its members alone.
+        use_isolated = (
+            use_isolated
+            or self.traces_candidates
+            or self._benchmark_prelude is not None
+        )
         if isinstance(self.benchmark_provider, MultiShapeBenchmarkProvider):
             provider_timings = self.benchmark_provider.rebenchmark(
                 [member.config for member in members],
@@ -5599,6 +5653,14 @@ class PopulationBasedSearch(BaseSearch):
                     f"{desc}: the benchmark worker cannot time the "
                     f"{len(members)} configs; this search reads its candidates "
                     "from the CUDA activity trace, so they keep their readings"
+                )
+                return
+            if self._benchmark_prelude is not None:
+                # Likewise behind a prelude, which only the worker runs.
+                self.log.warning(
+                    f"{desc}: the benchmark worker cannot time the "
+                    f"{len(members)} configs; this search times its candidates "
+                    "behind a prelude, so they keep their readings"
                 )
                 return
             if candidate_private_args and dist.is_initialized():
@@ -5809,7 +5871,12 @@ class PopulationBasedSearch(BaseSearch):
             warmup=1,
             rep=rep,
             desc=desc,
-            fresh_process=candidate_private_args,
+            # Behind a prelude neither is needed: every timed call follows
+            # a flush and the prelude's work, which hands each member its
+            # arguments anew, and every window first displaces the L2 lines
+            # earlier ones pinned (``do_bench``), so no member reads what an
+            # earlier one left.
+            fresh_process=candidate_private_args and self._benchmark_prelude is None,
         )
 
     def mirrored_rebenchmark(
@@ -5829,6 +5896,11 @@ class PopulationBasedSearch(BaseSearch):
         if self.settings.autotune_benchmark_fn is not None:
             raise exc.AutotuneError(
                 "mirrored terminal refinement requires the default benchmark function"
+            )
+        if self._benchmark_prelude is not None:
+            # (these sweeps run in this process, which has no prelude)
+            raise exc.AutotuneError(
+                "mirrored terminal refinement cannot time behind a benchmark prelude"
             )
 
         repeat_reference_perf_ms = self._repeat_reference_perf(members)

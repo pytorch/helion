@@ -42,6 +42,7 @@ from ..runtime.config_cache import _stored_config
 from ..runtime.precompile_shim import already_compiled
 from ..runtime.precompile_shim import already_compiled_fail
 from ..runtime.precompile_shim import make_precompiler
+from ..runtime.settings import _env_get_bool
 from .accuracy import assert_close as _assert_close
 from .accuracy import effective_fp8_accuracy
 from .accuracy import entirely_nan
@@ -56,12 +57,18 @@ from .benchmark_job import BenchmarkJob
 from .benchmark_job import CompiledFunctionLoadError
 from .benchmark_job import KernelTimerProbeJob
 from .benchmark_job import _cuda_device_of
+from .benchmark_prelude import BenchmarkPrelude
+from .benchmark_prelude import PreludeFailed
+from .benchmark_prelude import PreludeUnsupported
+from .benchmark_prelude import active_prelude
 from .benchmark_worker import BenchmarkCompileTimeout
 from .benchmark_worker import BenchmarkSubprocessError
 from .benchmark_worker import BenchmarkTimeout
 from .benchmark_worker import BenchmarkWorker
 from .benchmark_worker import BenchmarkWorkerUnkillable
 from .benchmarking import _BATCH_MEMORY_FRACTION
+from .benchmarking import _BENCHMARK_CUDAGRAPH_ENV
+from .benchmarking import PRELUDE_REGIMES
 from .benchmarking import KernelTraceUnreadable
 from .benchmarking import _resolve_l2_flush_mode
 from .benchmarking import clear_jit_fast_path_caches
@@ -827,6 +834,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
     # ``_timed_out_config_role``). Created on first use so a provider built
     # without ``__init__`` keeps working.
     _input_bank_count: int = 1
+    # The prelude the search's candidates are timed behind
+    # (``benchmark_prelude.timed_behind``; None: alone, as always outside
+    # such a block) and its file for the benchmark worker (``setup``).
+    _benchmark_prelude: BenchmarkPrelude | None = None
+    _prelude_path: str | None = None
     _private_argument_copies_disabled: bool = False
     _measured_config_values: set[tuple[str, object]] | None = None
     _compile_failure_values: dict[tuple[str, object], tuple[int, str]] | None = None
@@ -913,6 +925,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     "rotating input banks require an isolated benchmark worker; "
                     "distributed, MTIA, and unsupported worker contexts are not supported"
                 )
+        self._benchmark_prelude = active_prelude()
+        self._prelude_path = None
+        if self._benchmark_prelude is not None:
+            self._check_benchmark_prelude()
         self._accuracy_failure_config_ids: list[int] = []
         self._compile_failure_config_ids: list[int] = []
         self._worker_failure_config_ids: list[int] = []
@@ -2112,6 +2128,69 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._precompile_tmpdir = tempfile.TemporaryDirectory()
         return self._precompile_tmpdir.name
 
+    def _check_benchmark_prelude(self) -> None:
+        """A search behind a prelude takes every reading in the benchmark
+        worker, between an L2 flush and a CUDA event pair or trace marker
+        (``benchmark_prelude``): refuse the setups that time elsewhere or
+        without a flush before every call, as rotating input banks refuse
+        theirs."""
+        assert self._benchmark_prelude is not None
+        mismatch = self._benchmark_prelude.mismatch(self.args)
+        if mismatch is not None:
+            # The worker runs every candidate on the prelude's arguments:
+            # they must be the ones this search specialized and checked its
+            # candidates on (a block that covers another kernel's search, or
+            # arguments not given as the compiled function takes them).
+            raise exc.InvalidAPIUsage(
+                f"the benchmark prelude is not of this search's call: {mismatch}"
+            )
+        settings = self.settings
+        backend = self.config_spec.backend
+        if (
+            self._input_bank_count > 1
+            or not settings.autotune_benchmark_subprocess
+            or settings.autotune_benchmark_fn is not None
+            or settings.autotune_handoff
+            or self._subprocess_benchmark_uses_wall_clock()
+            or backend.get_do_bench() is not None
+            or dist.is_initialized()
+            or self.kernel.env.device.type != "cuda"
+            or torch.version.hip is not None
+            or not self.kernel.supports_subprocess_benchmark()
+            # (its terminal refinement times in this process)
+            or self.config_spec.cute_flash_search_enabled
+        ):
+            raise exc.InvalidAPIUsage(
+                "a benchmark prelude requires the built-in benchmark worker with "
+                "its CUDA event and trace timers on an NVIDIA device: no rotating "
+                "input banks, custom benchmark callbacks, handoff, distributed "
+                "kernels, wall-clock timing or in-process refinement"
+            )
+        if _env_get_bool(_BENCHMARK_CUDAGRAPH_ENV, default=False):
+            # A replay runs a candidate on the arguments of its capture,
+            # not on the ones the prelude's work has just made.
+            raise exc.InvalidAPIUsage(
+                "a benchmark prelude cannot be timed through CUDA graph replays "
+                f"({_BENCHMARK_CUDAGRAPH_ENV})"
+            )
+        backend_regime = backend.default_final_selection_regime()
+        final_regime = final_selection_l2_flush_mode(backend_regime)
+        regimes = {
+            "HELION_AUTOTUNE_L2_FLUSH": _resolve_l2_flush_mode(None),
+            "HELION_AUTOTUNE_FINAL_L2_FLUSH": final_regime,
+            "HELION_AUTOTUNE_TARGET_REGIME": final_selection_second_regime(
+                final_regime, backend_regime
+            ),
+        }
+        for variable, regime in regimes.items():
+            if regime is not None and regime not in PRELUDE_REGIMES:
+                raise exc.InvalidAPIUsage(
+                    "a benchmark prelude runs between the L2 flush and every "
+                    "timed call, so the search, its final selection and the "
+                    f"regime it selects by must flush per call {PRELUDE_REGIMES}; "
+                    f"{variable} resolves to {regime!r}"
+                )
+
     def setup(self) -> None:
         """Prepare precompile tmpdir and args for spawn mode."""
         tmpdir = self._precompile_dir()
@@ -2147,6 +2226,19 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                     self._precompile_baseline_post_args_path = post_args_path
                 else:
                     self._benchmark_in_process(error)
+        if self._benchmark_prelude is not None:
+            # (the checks above left the worker on: its arguments crossed)
+            prelude_path = os.path.join(tmpdir, "prelude.pt")
+            try:
+                self._benchmark_prelude.save(prelude_path)
+            except PreludeUnsupported as error:
+                raise exc.InvalidAPIUsage(str(error)) from error
+            self._prelude_path = prelude_path
+            self.log(
+                f"Timing every candidate behind a prelude of "
+                f"{len(self._benchmark_prelude.steps)} earlier kernel call(s), "
+                "run between the L2 flush and each timed call"
+            )
 
     def _benchmark_in_process(self, error: Exception) -> None:
         """Keep the benchmark and accuracy check in this process (the
@@ -2155,6 +2247,11 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         if self._input_bank_count > 1:
             raise InputBankError(
                 "rotating input banks require arguments that can cross the "
+                f"benchmark subprocess boundary: {error}"
+            ) from error
+        if self._benchmark_prelude is not None:
+            raise exc.InvalidAPIUsage(
+                "a benchmark prelude requires arguments that can cross the "
                 f"benchmark subprocess boundary: {error}"
             ) from error
         self._args_unpicklable = True
@@ -3272,6 +3369,17 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self._record_worker_failure(config, "error")
             return inf
 
+        if self._benchmark_prelude is not None:
+            # Likewise behind a prelude: the in-process timer would time the
+            # candidate alone, in another L2 state than the readings it
+            # would be compared with.
+            self.log.warning(
+                f"No reading of {config!r}: the benchmark worker cannot time "
+                "it, and this search times its candidates behind a prelude"
+            )
+            self._record_worker_failure(config, "error")
+            return inf
+
         if self._input_bank_count > 1:
             raise exc.InvalidAPIUsage(
                 "rotating input banks cannot fall back to in-process benchmarking"
@@ -3569,6 +3677,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             self.log.warning(f"No reading of {config!r}: {e}")
             self._record_worker_failure(config, "error")
             return inf
+        except PreludeFailed as e:
+            # The prelude's failure, not the candidate's: no reading, and
+            # no compile failure charged to the config's values.
+            self.log.warning(f"No reading of {config!r}: {e}")
+            self._record_worker_failure(config, "error")
+            return inf
         except Exception as e:
             e.__traceback__ = None
             if match_unrecoverable_runtime_error(e):
@@ -3748,9 +3862,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 ),
             )
         except CompiledFunctionLoadError as error:
-            if self._input_bank_count > 1:
-                # Rotating banks cannot fall back in-process. Reject only this
-                # candidate, keeping the worker available for later wrappers.
+            if self._input_bank_count > 1 or self._benchmark_prelude is not None:
+                # Rotating banks and a search behind a prelude cannot fall
+                # back in-process. Reject only this candidate, keeping the
+                # worker available for later wrappers.
                 raise
             self._disable_unloadable_benchmark_worker(error)
             return None
@@ -3789,6 +3904,7 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             mutated_arg_indices=tuple(self.mutated_arg_indices),
             l2_flush_mode=l2_flush_mode,
             input_banks=self._input_bank_count,
+            prelude_path=self._prelude_path,
             # the final selection names its windows' regime; the search's
             # candidates and re-timings (no regime named) follow its timer
             trace_kernel_durations=(
@@ -3811,9 +3927,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 )
             )
         except CompiledFunctionLoadError as error:
-            if self._input_bank_count > 1:
-                # Rotating banks cannot fall back in-process. Reject only this
-                # candidate, keeping the worker available for later wrappers.
+            if self._input_bank_count > 1 or self._benchmark_prelude is not None:
+                # Rotating banks and a search behind a prelude cannot fall
+                # back in-process. Reject only this candidate, keeping the
+                # worker available for later wrappers.
                 raise
             self._disable_unloadable_benchmark_worker(error)
             return None
@@ -3899,7 +4016,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                 self.worker_profiled = True
                 try:
                     reason = self._get_benchmark_worker().run(
-                        KernelTimerProbeJob(None if device is None else device.index),
+                        KernelTimerProbeJob(
+                            None if device is None else device.index,
+                            # (behind a prelude the trace must split its
+                            # work off too)
+                            prelude_path=self._prelude_path,
+                        ),
                         timeout=float(self.settings.autotune_benchmark_timeout),
                     )
                 except BenchmarkWorkerUnkillable:
@@ -3954,6 +4076,12 @@ class LocalBenchmarkProvider(BenchmarkProvider):
         device next to the originals and leave room for rotating input banks
         (CUDA tensors only; other devices share)."""
         if self._private_argument_copies_disabled:
+            return False
+        if self._benchmark_prelude is not None:
+            # The prelude's work hands every finalist its arguments, written
+            # anew behind each flush, and every window first displaces the
+            # lines earlier ones pinned (``do_bench``): copies would keep
+            # nothing more apart.
             return False
         tensors = [
             tensor
@@ -4166,6 +4294,12 @@ class MultiShapeBenchmarkProvider(BenchmarkProvider):
     ) -> None:
         if not isinstance(args, _MultiShapeAutotuneArgs):
             raise TypeError("MultiShapeBenchmarkProvider requires multi-shape args")
+        if active_prelude() is not None:
+            # A prelude precedes one call of one kernel on one set of
+            # arguments (``benchmark_prelude``).
+            raise exc.InvalidAPIUsage(
+                "a benchmark prelude cannot time a multi-shape search"
+            )
         from .metrics import AutotuneMetrics
 
         self.kernel = kernel

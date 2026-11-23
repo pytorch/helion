@@ -17,8 +17,10 @@ from typing import Any
 from typing import Callable
 from typing import Literal
 from typing import NamedTuple
+from typing import Protocol
 from typing import TypeVar
 from typing import cast
+import weakref
 
 import torch
 import torch.autograd.profiler as autograd_profiler
@@ -108,6 +110,16 @@ def _l2_flush_mode() -> str:
     (``final_selection_l2_flush_mode``).  Which timer reads a search's own
     per-call-flushed candidates is not this variable's to say: the search
     chooses (``PopulationBasedSearch._settle_candidate_timer``).
+
+    Every regime times a candidate alone. A kernel that runs behind other
+    kernels meets its operands as they left them, which no regime here
+    reproduces: resident (``off``) only where the operands fit in L2 and
+    nothing else was read, flushed (``call``) only for a sequence's first
+    kernel. A harness that knows the sequence names the kernels that run
+    before the candidate as a prelude (``benchmark_prelude.timed_behind``,
+    internal: there is no variable or setting for it), and the per-call
+    flushed regimes then run that work between the flush and every timed
+    call (``do_bench``'s ``prelude``).
     """
     mode = _l2_flush_mode_from_env(_L2_FLUSH_ENV) or "call"
     # The kernel timer serves the final selection's steady windows; the
@@ -442,6 +454,39 @@ _HIP_MAX_QUEUED_CALLS = 1000
 
 def _no_cache_clear() -> None:
     """Cache clearer for the L2-resident regime (HELION_AUTOTUNE_L2_FLUSH=0)."""
+
+
+# The regimes a prelude can be timed in (``do_bench``'s ``prelude``): the
+# ones that flush before every timed call, which is where the prelude runs.
+PRELUDE_REGIMES = ("call", "kernel")
+
+
+def check_prelude_regime(regime: str) -> None:
+    """A prelude runs between the L2 flush and the timed call, so the regime
+    must flush before every call."""
+    if regime not in PRELUDE_REGIMES:
+        raise ValueError(
+            f"a benchmark prelude needs a regime that flushes L2 before every "
+            f"timed call {PRELUDE_REGIMES}, not {regime!r}"
+        )
+
+
+class TimedPrelude(Protocol):
+    """Work that runs between the L2 flush and every timed call of a
+    candidate (``benchmark_prelude``: the kernels that run before it in a
+    sequence). ``run`` does the work and leaves the candidate's call its
+    arguments; the candidate's callable reads them. Internal: the timers
+    take one only from a search's benchmark worker."""
+
+    def run(self) -> None: ...
+
+
+def _flush_then_prelude(flush: Callable[[], None], prelude: TimedPrelude) -> None:
+    """What precedes a timed call behind a prelude: the flush, then the
+    work. Every timer leaves it out of its reading as it leaves the flush
+    out (``do_bench``)."""
+    flush()
+    prelude.run()
 
 
 def _batched_replay_calls(estimate_us: float) -> int:
@@ -1501,6 +1546,35 @@ def _trace_marker() -> None:
     launch()
 
 
+def _traced_flush_events(
+    clear_cache: Callable[[], None],
+    di: Any,  # noqa: ANN401
+) -> tuple[int, int]:
+    """The trace events ``clear_cache`` issues before a marker, from a trace
+    of [``clear_cache``, marker] twice, and the events of that trace; zero
+    when the trace is not that (the caller says what follows)."""
+
+    def footprint() -> None:
+        for _ in range(2):
+            clear_cache()
+            _trace_marker()
+        di.synchronize()
+
+    _trace_marker()  # compiled outside the trace
+    events = _cuda_kernel_events(footprint)
+    markers = [
+        index for index, event in enumerate(events) if event.name == _TRACE_MARKER
+    ]
+    per_flush = markers[0] if markers else 0
+    if (
+        per_flush > 0
+        and markers == [per_flush, 2 * per_flush + 1]
+        and len(events) == 2 * per_flush + 2
+    ):
+        return per_flush, len(events)
+    return 0, len(events)
+
+
 def _learn_flush_trace(
     clear_cache: Callable[[], None],
     di: Any,  # noqa: ANN401
@@ -1511,34 +1585,70 @@ def _learn_flush_trace(
     is not [flush, marker] twice (foreign work on the device)."""
     global _flush_trace
     if _flush_trace is None:
-
-        def footprint() -> None:
-            for _ in range(2):
-                clear_cache()
-                _trace_marker()
-            di.synchronize()
-
-        _trace_marker()  # compiled outside the trace
-        events = _cuda_kernel_events(footprint)
-        markers = [
-            index for index, event in enumerate(events) if event.name == _TRACE_MARKER
-        ]
-        per_flush = markers[0] if markers else 0
-        if (
-            per_flush > 0
-            and markers == [per_flush, 2 * per_flush + 1]
-            and len(events) == 2 * per_flush + 2
-        ):
-            _flush_trace = per_flush
-        else:
-            _flush_trace = 0
+        _flush_trace, traced = _traced_flush_events(clear_cache, di)
+        if _flush_trace == 0:
             _log.warning(
                 "the CUDA activity trace shows %d events for two flushed "
                 "markers (another tool holds it, or other work ran on the "
                 "device); timing per-call flushed with CUDA events",
-                len(events),
+                traced,
             )
     return _flush_trace
+
+
+# The trace events of one flush followed by a prelude's work, per prelude
+# (``_learn_prelude_flush_trace``).
+_prelude_flush_traces: weakref.WeakKeyDictionary[object, int] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _learn_prelude_flush_trace(
+    clear_cache: Callable[[], None],
+    di: Any,  # noqa: ANN401
+    prelude: TimedPrelude,
+) -> int:
+    """``_learn_flush_trace`` for a window behind ``prelude``, whose
+    ``clear_cache`` is the flush and then the prelude's work
+    (``_flush_then_prelude``): the events both issue before the marker,
+    traced once per prelude (its work is the same for every candidate); zero
+    when the trace is not [flush, work, marker] twice. The flush alone keeps
+    the footprint ``_learn_flush_trace`` learned."""
+    events = _prelude_flush_traces.get(prelude)
+    if events is None:
+        events, traced = _traced_flush_events(clear_cache, di)
+        _prelude_flush_traces[prelude] = events
+        if events == 0:
+            _log.warning(
+                "the CUDA activity trace shows %d events for two runs of a "
+                "flush, a prelude's work and a marker, not the same events "
+                "twice (the work differs from run to run, or other work ran "
+                "on the device): windows behind this prelude have no trace "
+                "reading",
+                traced,
+            )
+    return events
+
+
+def prelude_trace_unready_reason(prelude: TimedPrelude) -> str | None:
+    """Why a process that can trace (``kernel_timer_unready_reason`` is None)
+    cannot time windows behind ``prelude`` from the trace, ``None`` when it
+    can: the footprint of the flush and the prelude's work is learned here
+    (``_learn_prelude_flush_trace``), and there is none when two runs of the
+    work do not show the same events. ``do_bench`` would then time the window
+    with CUDA events, as it does where the flush has no footprint; the
+    benchmark worker asks first (``BenchmarkJob``) and gives no reading."""
+    if prelude not in _prelude_flush_traces:
+        clear_cache = functools.partial(
+            _flush_then_prelude, _make_l2_cache_clearer(), prelude
+        )
+        _learn_prelude_flush_trace(clear_cache, torch.cuda, prelude)
+    if _prelude_flush_traces[prelude] == 0:
+        return (
+            "the CUDA activity trace of the prelude's work is not the same "
+            "from one run to the next"
+        )
+    return None
 
 
 def kernel_timer_available(process_group_name: str | None = None) -> bool:
@@ -1600,10 +1710,16 @@ def _do_bench_kernel_durations(
     probe_long_kernel: bool = False,
     grad_to_none: torch.Tensor | None = None,
     unreadable_reads_infinite: bool = True,
+    prelude: TimedPrelude | None = None,
 ) -> float | tuple[float, ...] | None:
     """``kernel`` mode: every call follows an L2 flush, and a sample is the
     device time of the kernels that call launched, read from the CUDA
     activity trace.
+
+    Behind a ``prelude``, ``clear_cache`` is the flush and then the
+    prelude's work (``do_bench``): its kernels run before the marker, so a
+    sample is still the candidate's kernels alone, and the events before a
+    marker are learned for the prelude (``_learn_prelude_flush_trace``).
 
     The per-call flush regime timed by CUDA events reads the flush plus the
     call minus the flush alone. Once the flush's dirty lines and the call's
@@ -1633,7 +1749,11 @@ def _do_bench_kernel_durations(
 
     if not _kernel_timer_preconditions(process_group_name):
         return None
-    per_flush = _learn_flush_trace(clear_cache, di)
+    per_flush = (
+        _learn_flush_trace(clear_cache, di)
+        if prelude is None
+        else _learn_prelude_flush_trace(clear_cache, di, prelude)
+    )
     if per_flush == 0:
         return None
     _trace_marker()  # built for this device outside any trace
@@ -1800,6 +1920,11 @@ def _release_l2_pins(cache: torch.Tensor) -> None:
     evict-first sweep alone displaces nothing.) A candidate's own evict-last
     loads still take effect inside its window, as they do in the final
     selection's.
+
+    Behind a prelude (``do_bench``) every window of the search runs on the
+    prelude's tensors, the final selection's too: its finalists get no
+    private copies, so each of their windows starts with this release, on
+    either timer.
     """
     assert cache.dtype == torch.int32 and cache.dim() == 1
     programs = cache.numel() // _L2_SWEEP_WIDTH
@@ -1825,6 +1950,7 @@ def _traced_candidate_window(
     fixed_repetitions: int | None,
     process_group_name: str | None,
     probe_long_kernel: bool = False,
+    prelude: TimedPrelude | None = None,
 ) -> float | tuple[float, ...] | None:
     """A search candidate's per-call flushed time from the CUDA activity
     trace (``do_bench``'s ``trace_kernel_durations``), ``None`` when
@@ -1853,10 +1979,17 @@ def _traced_candidate_window(
     """
     if (
         not _kernel_timer_preconditions(process_group_name)
-        or _learn_flush_trace(clear_cache, di) == 0
+        or (
+            _learn_flush_trace(clear_cache, di)
+            if prelude is None
+            else _learn_prelude_flush_trace(clear_cache, di, prelude)
+        )
+        == 0
     ):
         return None
-    _release_l2_pins(flush_buffer)
+    if prelude is None:
+        # (behind a prelude ``do_bench`` has released them, for every timer)
+        _release_l2_pins(flush_buffer)
     return _do_bench_kernel_durations(
         fn,
         clear_cache,
@@ -1869,6 +2002,7 @@ def _traced_candidate_window(
         process_group_name=process_group_name,
         probe_long_kernel=probe_long_kernel,
         unreadable_reads_infinite=False,
+        prelude=prelude,
     )
 
 
@@ -1890,6 +2024,7 @@ def do_bench(
     pre_warmed: bool = False,
     l2_flush_mode: str | None = None,
     trace_kernel_durations: bool = False,
+    prelude: TimedPrelude | None = None,
 ) -> float | tuple[float, ...]:
     """
     Benchmark the runtime of the provided function. By default, return the median runtime of :code:`fn` along with
@@ -1926,6 +2061,39 @@ def do_bench(
         graph replays and processes that cannot trace are timed as without
         it; a traced window whose trace cannot be read raises
         ``KernelTraceUnreadable``.
+    :param prelude: Work that precedes every timed call (``TimedPrelude``,
+        from ``benchmark_prelude``: the kernels that run before ``fn`` in a
+        sequence); ``fn`` reads the arguments the work leaves it, and the
+        caller has run both once. The work joins the flush: wherever a
+        timer flushes L2 before a call, it flushes and then runs the work,
+        so the reading leaves the work out exactly as it leaves the flush
+        out. A traced window holds [flush, work, marker, call] per call
+        and reads the kernels after the marker. A sample between two events
+        starts after both, or when the host records the start event if the
+        device has finished the work by then: the flush covers about 50 us
+        of host time on a B200, and work that takes the host longer to
+        queue than the device to run leaves the device idle at the event,
+        so the sample also holds the host's time to launch the call (a
+        16 MB add read 8.2 us behind work the device was still running and
+        15.6 us behind sixteen small launches; the trace read 4.4 us behind
+        both). The offset is the launch's, alike for every config of a
+        kernel. A spin on the device after the work removes it but lets the
+        memory system settle, which a kernel that streams cold operands
+        then reads (98 us by events against 110 us in the trace for one
+        over 370 MB): the timer does not spin, and a search behind a prelude
+        reads its candidates from the trace where its backend's searches
+        can (``PopulationBasedSearch._settle_candidate_timer``). A first
+        launch longer than the windows
+        (``probe_long_kernel``) is a sample from the trace; between events it
+        holds the work, so it only sizes the window to one flushed call,
+        timed like every other. Before the window the L2 lines that earlier
+        windows pinned are displaced (``_release_l2_pins``): the windows of
+        a search behind a prelude share the prelude's tensors. Only the
+        regimes that flush before every call (``call``, ``kernel``) have a
+        place for a prelude; the others raise, and so do a backward
+        benchmark and a CUDA graph replay (``HELION_BENCHMARK_CUDAGRAPH``),
+        which would run ``fn`` on the arguments of its capture. None (the
+        default) is a call timed alone: nothing here runs.
     """
     from triton import runtime
     from triton.testing import _summarize_statistics
@@ -1956,6 +2124,25 @@ def do_bench(
             runtime.driver.active.clear_cache,  # pyrefly: ignore
             flush_buffer,
         )
+    if prelude is not None:
+        check_prelude_regime(flush_mode)
+        if grad_to_none is not None:
+            raise ValueError(
+                "a prelude precedes the timed call of a forward benchmark, not "
+                "of a backward one (grad_to_none)"
+            )
+        if benchmark_function is not fn:
+            raise ValueError(
+                "a prelude cannot be timed through CUDA graph replays "
+                f"({_BENCHMARK_CUDAGRAPH_ENV}): a replay runs the call on the "
+                "arguments of its capture, not on the ones the prelude's work "
+                "has just made"
+            )
+        assert flush_buffer is not None
+        # The windows of a search behind a prelude all run on the prelude's
+        # tensors (no private copies, ``_release_l2_pins``).
+        _release_l2_pins(flush_buffer)
+        clear_cache = functools.partial(_flush_then_prelude, clear_cache, prelude)
     calls = 1
     flush_replay: Callable[[], None] | None = None
     if benchmark_function is not fn:
@@ -1978,6 +2165,7 @@ def do_bench(
             process_group_name=process_group_name,
             probe_long_kernel=probe_long_kernel,
             grad_to_none=grad_to_none,
+            prelude=prelude,
         )
         if kernel_timing is not None:
             return kernel_timing
@@ -2010,6 +2198,7 @@ def do_bench(
             fixed_repetitions=fixed_repetitions,
             process_group_name=process_group_name,
             probe_long_kernel=probe_long_kernel,
+            prelude=prelude,
         )
         if traced is not None:
             return traced
@@ -2033,7 +2222,9 @@ def do_bench(
             rep=rep,
             process_group_name=process_group_name,
         )
-        if probe_is_sample:
+        # (behind a prelude the probe holds the prelude's work too: it only
+        # sizes the window, to the one flushed call timed below)
+        if probe_is_sample and prelude is None:
             return cast(
                 "float | tuple[float, ...]",
                 _summarize_statistics([estimate_ms], quantiles, return_mode),

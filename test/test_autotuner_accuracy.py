@@ -2911,6 +2911,7 @@ class TestAccuracyCheck(unittest.TestCase):
                 SimpleNamespace(  # type: ignore[arg-type]
                     settings=settings,
                     _benchmark_provider_cls=LocalBenchmarkProvider,
+                    _benchmark_prelude=None,
                 ),
                 cute_flash_search_enabled=False,
             )
