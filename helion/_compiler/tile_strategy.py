@@ -3058,6 +3058,20 @@ class NDTileStrategy(_BaseNDTileStrategy):
     def mask_var(self, block_idx: int) -> str | None:
         return self.mask_vars[block_idx]
 
+    @staticmethod
+    def _static_thread_extent(
+        block_size: SymIntLike, block_size_var: str | None
+    ) -> int | None:
+        """The threads a tile axis spans, as ``_setup_mask`` is told it: a
+        literal ``block_size_var`` (a lane path's thread count), else the
+        block size, which a ``block_size_var`` naming it spans one element
+        per thread; None for a dynamic size or an axis on no thread."""
+        if block_size_var is None:
+            return None
+        if block_size_var.isdigit():
+            return int(block_size_var)
+        return block_size if isinstance(block_size, int) else None
+
     def _setup_mask(
         self,
         state: CodegenState,
@@ -3078,6 +3092,11 @@ class NDTileStrategy(_BaseNDTileStrategy):
             and not (
                 env.backend.launches_surplus_tile_threads()
                 and self.fn.tile_strategy.has_surplus_threads_for_block_id(block_idx)
+            )
+            and env.backend.allows_elided_tile_mask(
+                block_idx,
+                thread_axis,
+                self._static_thread_extent(block_size, block_size_var),
             )
         ):
             self.mask_vars[block_idx] = None

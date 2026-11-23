@@ -2385,6 +2385,18 @@ class Backend(abc.ABC):
         never demotes."""
         return None
 
+    def allows_elided_tile_mask(
+        self, block_id: int, thread_axis: int | None, thread_extent: int | None
+    ) -> bool:
+        """Whether a tile may drop the bounds mask of ``block_id``, which the
+        shared rule found redundant: its block divides the extent and the
+        dispatch plans no surplus threads on ``thread_axis`` (None: the tile
+        is on no thread axis), where it is ``thread_extent`` threads wide
+        (None: a launch-time size).  A backend whose launch may differ from
+        the dispatch's plan records the axes it relied on and checks them
+        against the launch."""
+        return True
+
     def record_launch_thread_extent(
         self, fn: DeviceFunction, name: str, axis: int, extent: int
     ) -> None:

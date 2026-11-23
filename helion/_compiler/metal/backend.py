@@ -25,6 +25,7 @@ from ..backend import _largest_divisor_at_most
 from ._constants import MAX_THREAD_AXES
 from ._constants import MAX_THREADS_PER_THREADGROUP
 from ._constants import SIMD_WIDTH
+from .mask_elision import MaskElisionRefuted
 from .msl_expr import PURE_CALLS
 from .msl_expr import cast_source
 from .msl_expr import parse_msl_expression
@@ -459,10 +460,20 @@ class MetalBackend(Backend):
         #: Whether this pass's MPP planner raised (``MatmulFallback``).
         self.mpp_plan_refused = False
         self._tid_axes: set[int] = set()
-        # Set by ``pre_codegen`` (see ``_uniform_thread_extent``), and cleared
-        # by ``create_loop_strategy`` because strategies of the next config
-        # are built, and may read ``force_tile_mask``, before it runs.
+        # Set by ``pre_codegen`` (see ``allows_elided_tile_mask``), and
+        # cleared by ``create_loop_strategy`` because strategies of the next
+        # config are built, and may read ``force_tile_mask``, before it runs.
+        self._mask_elision = False
+        #: The (block, thread axis, thread extent) of each tile mask this
+        #: pass elided, which the launch must match (``launcher_keyword_args``).
+        self._elided_masks: list[tuple[int, int, int]] = []
+        #: Whether this config's pass elides masks only on a uniform launch
+        #: (``_uniform_thread_extent``), after a pass whose launch refuted the
+        #: per-axis elision (``MaskElisionRefuted``); set by ``MetalRetry``.
+        self.uniform_masks = False
         self._uniform_extent: int | None = None
+        #: Whether this pass may elide masks per axis: not under MPP ops.
+        self._per_axis_masks = False
         # The config's ``threadgroup_budget``, its num_warps and whether its
         # tiles take one SIMD group (``search_surface.fragment_tiles``), set
         # by ``create_loop_strategy`` for the reduction strategies built after
@@ -620,10 +631,34 @@ class MetalBackend(Backend):
         return f"{self.thread_index(axis)} < ({block_size_var})"
 
     def force_tile_mask(self) -> bool:
-        # The shared per-tile rule judges surplus threads by the dispatch's
-        # planned thread axes, which can differ from the ones Metal emits and
-        # launches, so it only applies to a uniform launch.
-        return self._uniform_extent is None
+        # Before ``pre_codegen`` the pass's plans don't exist yet; free
+        # aranges claim threads that no strategy owns.
+        if not self._mask_elision:
+            return True
+        return self._uniform_rule() and self._uniform_extent is None
+
+    def _uniform_rule(self) -> bool:
+        return self.uniform_masks or not self._per_axis_masks
+
+    def allows_elided_tile_mask(
+        self, block_id: int, thread_axis: int | None, thread_extent: int | None
+    ) -> bool:
+        """The shared rule judges surplus threads by the dispatch's planned
+        thread axes, and Metal launches each axis at the largest extent its
+        emitted code gives it.  A tile on a thread axis drops its mask only at
+        a literal extent, recorded so that ``launcher_keyword_args`` checks
+        the launch runs exactly that many threads on the axis: then no thread
+        of the tile indexes past it.  A tile on no thread axis indexes the
+        same element on every thread.  A kernel with MPP ops keeps the
+        uniform rule: their staging writes and materialization reads bound a
+        wider sibling's surplus threads with the masks of the tiles beside
+        them."""
+        if thread_axis is None or self._uniform_rule():
+            return True
+        if thread_extent is None:
+            return False
+        self._elided_masks.append((block_id, thread_axis, thread_extent))
+        return True
 
     def launches_surplus_tile_threads(self) -> bool:
         # Each launch axis takes the largest extent among the strategies that
@@ -888,9 +923,9 @@ class MetalBackend(Backend):
         return config_is_viable(config_spec, config, self._grid_roots)
 
     def retry_policy(self) -> RetryPolicy:
-        from .search_surface import MatmulFallback
+        from .mask_elision import MetalRetry
 
-        return MatmulFallback()
+        return MetalRetry()
 
     def pre_codegen(
         self,
@@ -977,7 +1012,14 @@ class MetalBackend(Backend):
         check_free_lanes(
             self.free_arange_plan, self.mpp_plan, graphs, self._fragment_tiles
         )
+        self._mask_elision = not self.free_arange_plan
+        self._elided_masks = []
         self._uniform_extent = self._uniform_thread_extent(tile_strategy)
+        # MPP's staging and materialization bound a sibling's surplus threads
+        # through the tile masks of the strategies they share an axis with.
+        self._per_axis_masks = not (
+            self.mpp_plan is not None and self.mpp_plan.by_matmul
+        )
 
     def _uniform_thread_extent(self, tile_strategy: TileStrategyDispatch) -> int | None:
         """The one thread extent E of every strategy's thread axes, or
@@ -1397,11 +1439,17 @@ class MetalBackend(Backend):
         from .mpp_matmul import check_mpp_launch
 
         dims = tuple(DeviceFunction.current().codegen.max_thread_block_dims)
-        if self._uniform_extent is not None:
+        if self._uniform_rule() and self._uniform_extent is not None:
             assert all(dim in (1, self._uniform_extent) for dim in dims), (
                 f"tile masks are elided only if every launch axis is 1 or "
                 f"{self._uniform_extent}, but the kernel launches {dims}"
             )
+        for block_id, axis, extent in self._elided_masks:
+            if dims[axis] != extent:
+                raise MaskElisionRefuted(
+                    f"block {block_id}'s tile mask was elided for {extent} "
+                    f"threads on axis {axis}, but the kernel launches {dims}"
+                )
         check_free_arange_launch(self.free_arange_plan, self._tid_axes, dims)
         split = 1
         if self.mpp_plan is not None:
@@ -1457,7 +1505,7 @@ class MetalBackend(Backend):
         from ..compile_environment import CompileEnvironment
         from .search_surface import fragment_tiles
 
-        self._uniform_extent = None
+        self._mask_elision = False
         self._literal_tile_limit = None
         self._scalar_contraction_blocks = scalar_contraction_blocks(
             fn.codegen.codegen_graphs, config=config
