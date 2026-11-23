@@ -24,6 +24,15 @@ the M4 Max at 4 rows, over the 4-, 5- and 6-bit matmuls of a 30B model's
 verify step (``N x K`` from 256 x 6656 to 202048 x 6656), the 4-column
 seed ran within 3% of the best of earlier tuned configs and a hand-written
 kernel on every shape above 16 MB, the 2-column one on the 6-bit ones.
+
+At 1 and 2 rows a K seed joins them: one output column per threadgroup and
+the pass block on 256 threads, 8 SIMD groups, their partials combined after
+the loop.  Its K loop's last step leaves the threads past K idle, behind
+one branch (``masked_branch``).  At 1 row it ran 3-6% faster than the
+earlier tuned configs on the four large 4-, 5- and 6-bit shapes (6656 x
+19968 4-bit: 177 µs against 187) and leads; at 2 rows it was faster on the
+two 6656 x 19968 shapes and slower on the two with K = 6656, and comes
+last; at 4 rows it was slower on all four.
 """
 
 from __future__ import annotations
@@ -48,6 +57,10 @@ if TYPE_CHECKING:
 MAX_ROWS = 32
 #: Output columns per thread.
 COLUMNS = (4, 2)
+#: The K seed's threads along the pass block, 8 SIMD groups.
+K_THREADS = 256
+#: Most rows the K seed takes.
+K_ROWS = 2
 
 
 class MetalSplitReductionHeuristic(AutotunerHeuristic):
@@ -97,19 +110,30 @@ class MetalSplitReductionHeuristic(AutotunerHeuristic):
         (cols_block,) = (b for b in grid if b != rows_block)
         fragments = {b: blocks[b]._fragment(spec) for b in blocks}
         rows = next_power_of_2(blocks[rows_block].size_hint)
+        # (pass block = its threads, output columns) of each seed.
+        layouts = [(SIMD_WIDTH, columns) for columns in COLUMNS]
+        if rows <= K_ROWS:
+            k = (min(K_THREADS, next_power_of_2(blocks[pass_block].size_hint)), 1)
+            if rows == 1:
+                layouts.insert(0, k)
+            else:
+                layouts.append(k)
         seeds: list[Config] = []
-        for columns in COLUMNS:
-            chosen = {pass_block: SIMD_WIDTH, rows_block: rows, cols_block: columns}
+        for threads, columns in layouts:
+            chosen = {pass_block: threads, rows_block: rows, cols_block: columns}
             if not all(
                 fragments[b].low <= size <= fragments[b].high
                 for b, size in chosen.items()
             ):
                 continue
-            threads = {pass_block: SIMD_WIDTH, rows_block: 1, cols_block: 1}
-            seed = Config(
-                block_sizes=[chosen[i.block_id] for i in spec.block_sizes],
-                num_threads=[threads[i.block_id] for i in spec.num_threads],
-                num_warps=1,
+            seeds.append(
+                Config(
+                    block_sizes=[chosen[i.block_id] for i in spec.block_sizes],
+                    num_threads=[
+                        threads if i.block_id == pass_block else 1
+                        for i in spec.num_threads
+                    ],
+                    num_warps=max(1, threads // SIMD_WIDTH),
+                )
             )
-            seeds.append(seed)
         return seeds
