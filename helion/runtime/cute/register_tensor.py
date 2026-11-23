@@ -301,6 +301,20 @@ def _minimum_maximum(
             left.shape,
             left.dtype,
         )
+    if left.dtype == cutlass.Int32 and propagate_nan:
+        # ptxas loses the negation of one operand in a chain of signed Int32
+        # extrema (``math_templates.nan_extremum_expr``), and the maxima and
+        # minima of a register program form such chains.  Flipping the sign
+        # bit maps the signed order onto the unsigned one, which keeps every
+        # negation.  ``torch.fmax`` / ``torch.fmin`` (``propagate_nan`` off)
+        # stay signed: the sorting networks of a top-k are made of them, over
+        # encoded keys that are no negations, and the flips would slow them.
+        sign = cutlass.Int32(-(1 << 31))
+        unsigned = arith.minui if minimum else arith.maxui
+        keyed = unsigned(
+            (left ^ sign).ir_value(), (right ^ sign).ir_value(), loc=loc, ip=ip
+        )
+        return cute.TensorSSA(keyed, left.shape, left.dtype) ^ sign
     operation = cute.math.min if minimum else cute.math.max
     return operation(left, right, propagate_nan=propagate_nan, loc=loc, ip=ip)
 
