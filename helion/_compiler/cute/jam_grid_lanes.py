@@ -112,9 +112,11 @@ autotuning weighs.  The jam's own limit is the traced-statement budget.
 from __future__ import annotations
 
 import ast
+import collections
 import dataclasses
 import logging
 from typing import TYPE_CHECKING
+from typing import TypeGuard
 from typing import cast
 
 from ..ast_extension import create
@@ -123,6 +125,7 @@ from ..ast_extension import statement_from_string
 from ..ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ..ast_read_writes import ReadWrites
 from ..ast_read_writes import ast_rename
+from ._ast_pass_utils import COMPARISON_CALLS
 from ._ast_pass_utils import EXACT_DIVISION_HELPERS
 from ._ast_pass_utils import _is_proven_relocatable_call
 from ._ast_pass_utils import call_path_str
@@ -358,15 +361,13 @@ class _ElideResidueBounds(ast.NodeTransformer):
         return node
 
 
-def _bindings(body: Sequence[ast.stmt], name: str) -> int:
-    """How many times ``body`` binds ``name``."""
-    return sum(
-        1
+def _binding_counts(body: Sequence[ast.stmt]) -> collections.Counter[str]:
+    """How many times ``body`` binds each name, in one walk of the body."""
+    return collections.Counter(
+        node.id
         for stmt in body
         for node in ast.walk(stmt)
-        if isinstance(node, ast.Name)
-        and node.id == name
-        and isinstance(node.ctx, ast.Store)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
     )
 
 
@@ -552,7 +553,14 @@ def _private_atomic_site(call: ast.Call) -> tuple[str, str] | None:
     return iterator.value.id, addends[0]
 
 
-def _compared_names(compare: ast.Compare) -> set[str]:
+def _is_comparison(node: ast.AST) -> TypeGuard[ast.expr]:
+    """Whether `node` compares: ``a < b``, or ``operator.lt(a, b)``."""
+    return isinstance(node, ast.Compare) or (
+        isinstance(node, ast.Call) and call_path_str(node.func) in COMPARISON_CALLS
+    )
+
+
+def _compared_names(compare: ast.expr) -> set[str]:
     """The names a comparison reads outside the memory accesses in it: a
     loaded boolean (``keep[...].load() != 0``) addresses its element by the
     lane index without comparing the index."""
@@ -725,6 +733,8 @@ class _Jam:
         if _traced_statements(body) * self.extent > _MAX_UNROLLED_STATEMENTS:
             raise _Decline("the lanes' copies would trace too many statements")
         self._find_lane_index(body)
+        # The residues the fold finds read the lane index through its copies.
+        self._read_lane_index_copies(body)
         self._fold_mod_lane_bounds(body)
         self._find_private_caches(body)
         self.varying = self._varying_names(body)
@@ -870,20 +880,23 @@ class _Jam:
             raise _Decline("another statement reads the lane variable")
         if not self.lane_index:
             raise _Decline("no lane index of the form base + lane")
-        if _bindings(body, self.lane_index) != 1:
+        counts = _binding_counts(body)
+        if counts[self.lane_index] != 1:
             raise _Decline("the lane index is rebound")
-        if _bindings(body, self.lane_var):
+        if counts[self.lane_var]:
             raise _Decline("the body rebinds the lane variable")
         lane_reads = {
             name
             for stmt in body
             for node in ast.walk(stmt)
-            if isinstance(node, ast.Compare)
+            if _is_comparison(node)
             for name in _compared_names(node)
         }
-        if self.lane_index in lane_reads:
-            # A mask over the lane's index: a masked-off lane's accesses may
-            # point at a shared fallback element.
+        if lane_reads & {self.lane_index, *self._lane_index_copies(list(body))}:
+            # A mask over the lane's index, or over a copy of it, which
+            # _read_lane_index_copies() makes a read of the index itself: a
+            # masked-off lane's accesses may point at a shared fallback
+            # element.
             raise _Decline("the lane index is masked")
 
     def _fold_mod_lane_bounds(self, body: list[ast.stmt]) -> None:
@@ -897,9 +910,12 @@ class _Jam:
         binding reaches, the statements after it, and the select it guards
         there becomes its value, so the guarded loads can join a packet.  A
         read before the binding is the previous lane's residue, which
-        ``_check_registers`` rejects as carried."""
+        ``_check_registers`` rejects as carried.  The body reads the lane index
+        itself where it read a copy of it (``_read_lane_index_copies``, which
+        runs first)."""
         self.consecutive = {self.lane_index}
         bound: dict[str, int] = {}
+        counts = _binding_counts(body)
         for stmt in body:
             if bound:
                 _ElideResidueBounds(bound, self._constant_value).visit(stmt)
@@ -919,10 +935,73 @@ class _Jam:
                 and m is not None
                 and m > 0
                 and m % self.extent == 0
-                and _bindings(body, stmt.targets[0].id) == 1
+                and counts[stmt.targets[0].id] == 1
             ):
                 self.consecutive.add(stmt.targets[0].id)
                 bound[stmt.targets[0].id] = m
+
+    def _read_lane_index_copies(self, body: list[ast.stmt]) -> None:
+        """Make the body's reads of a plain copy of the lane index, bound once
+        (``_lane_index_copy``), read the lane index itself, from the copy's
+        binding on.  A 1-D tile indexes its loads by such a copy,
+
+            offsets_0 = base + cutlass.Int32(lane)
+            indices_0 = offsets_0
+            load_0 = (in0.iterator + indices_0 * stride).load()
+
+        whose lanes are as consecutive as the lane index's: read through the
+        copy, its loads and residues ``indices_0 % m`` would not join packets
+        (one scalar load per lane).  The body is a clone the jam discards on
+        a decline."""
+        copies: set[str] = set()
+        counts = _binding_counts(body)
+        for stmt in body:
+            for node in ast.walk(stmt):
+                if (
+                    isinstance(node, ast.Name)
+                    and isinstance(node.ctx, ast.Load)
+                    and node.id in copies
+                ):
+                    node.id = self.lane_index
+            if (copy := self._lane_index_copy(counts, stmt, copies)) is not None:
+                copies.add(copy)
+
+    def _lane_index_copies(self, body: list[ast.stmt]) -> set[str]:
+        """The plain copies of the lane index the body binds once, which
+        _read_lane_index_copies() reads as the index itself."""
+        copies: set[str] = set()
+        counts = _binding_counts(body)
+        for stmt in body:
+            if (copy := self._lane_index_copy(counts, stmt, copies)) is not None:
+                copies.add(copy)
+        return copies
+
+    def _lane_index_copy(
+        self, counts: collections.Counter[str], stmt: ast.stmt, copies: set[str]
+    ) -> str | None:
+        """The name `stmt` binds to the lane index or to one of its `copies`,
+        where the body binds it once (its ``_binding_counts``), else None.
+        Only a plain copy, ``indices_0 = offsets_0``: under
+        ``index_dtype=torch.int64`` the lane index is an Int64 that a cast
+        wraps,
+
+            offsets_0 = offsets_base_0 + cutlass.Int32(lane_0)  # Int64
+            v_0 = cutlass.Int32(offsets_0)
+            v_1 = cutlass.Float32(v_0)
+
+        and reading the index for ``v_0`` would emit
+        ``v_1_lane0 = cutlass.Float32(offsets_0_lane0)``, about 2**32 where
+        the wrapped value is the lane's 0 to 7."""
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(target := stmt.targets[0], ast.Name)
+            and isinstance(value := stmt.value, ast.Name)
+            and (value.id == self.lane_index or value.id in copies)
+            and counts[target.id] == 1
+        ):
+            return target.id
+        return None
 
     def _constant_value(self, node: ast.expr) -> int | None:
         """An integer literal, a constexpr, or a name holding one literal in

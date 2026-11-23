@@ -47,6 +47,7 @@ from helion._testing.cute_grid_lane_jam_kernels import invariant_rows_over_heads
 from helion._testing.cute_grid_lane_jam_kernels import kept_row_norm
 from helion._testing.cute_grid_lane_jam_kernels import leading_batch_bias_exp
 from helion._testing.cute_grid_lane_jam_kernels import nested_bias_exp
+from helion._testing.cute_grid_lane_jam_kernels import row_dot
 from helion._testing.cute_grid_lane_jam_kernels import row_norm
 from helion._testing.cute_grid_lane_jam_kernels import rows_into_two
 from helion._testing.cute_grid_lane_jam_kernels import scale_rows_in_place
@@ -969,15 +970,7 @@ def _gathered_rows_over_heads(x: torch.Tensor, xt: torch.Tensor) -> torch.Tensor
     return out
 
 
-@helion.kernel(backend="cute", static_shapes=True)
-def _gathered_row_dot(x: torch.Tensor, xt: torch.Tensor) -> torch.Tensor:
-    m = x.size(0)
-    out = torch.empty([m], dtype=torch.float32, device=x.device)
-    for tile_m in hl.tile(m):
-        out[tile_m] = torch.sum(
-            x[tile_m, :].to(torch.float32) * xt[tile_m, :].to(torch.float32), dim=-1
-        )
-    return out
+_gathered_row_dot = helion.kernel(backend="cute", static_shapes=True)(row_dot)
 
 
 @helion.kernel(backend="cute", static_shapes=True)
@@ -1044,8 +1037,10 @@ def test_a_second_reduction_dim_the_rows_span_gets_no_seed() -> None:
 
 
 def test_a_one_axis_grid_gets_no_seed() -> None:
-    # A one-axis grid tile lays out flattened, whose lanes the jam keeps
-    # rolled: the seed's knob would change nothing.
+    # A one-axis grid tile lays out flattened and indexes its lanes through a
+    # copy of the lane index (indices_0 = offsets_0), which the jam reads as
+    # the lane index (_read_lane_index_copies): its lanes jam too. The seed
+    # is still for N-D grids only.
     with cpu_render_target(reduction_smem_budget_bytes=232448):
         bound = cpu_bind(_gathered_row_dot, _gathered_rows())
         assert _jam_seed(bound) is None
@@ -1056,7 +1051,76 @@ def test_a_one_axis_grid_gets_no_seed() -> None:
             cute_grid_lane_jam=True,
         )
         code = bound.to_code(bound.config_spec.normalized_config(config))
+    assert "for lane_0 in range(8)" not in code
+    assert "_jam_vec" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True)
+def _masked_gathered_row_dot(
+    x: torch.Tensor, xt: torch.Tensor, y: torch.Tensor
+) -> torch.Tensor:
+    m = x.size(0)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        dot = torch.sum(
+            x[tile_m, :].to(torch.float32) * xt[tile_m, :].to(torch.float32), dim=-1
+        )
+        out[tile_m] = dot * hl.load(y, [tile_m.index], extra_mask=tile_m.index < 30)
+    return out
+
+
+def test_a_mask_over_a_copy_of_the_lane_index_declines() -> None:
+    # tile_m.index < 30 compares the lane index's copy (indices_0), which the
+    # jam reads as the lane index itself: the mask over the lane index
+    # declines the jam as it would read directly, and the lanes stay a loop.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        x, xt = _gathered_rows()
+        y = torch.empty(64, dtype=torch.float32)
+        bound = cpu_bind(_masked_gathered_row_dot, (x, xt, y))
+        config = helion.Config(
+            block_sizes=[8],
+            num_threads=[1, 128],
+            reduction_loops=[512],
+            cute_grid_lane_jam=True,
+        )
+        code = bound.to_code(bound.config_spec.normalized_config(config))
+    assert "_jam_vec" not in code
     assert "for lane_0 in range(8)" in code
+
+
+@helion.kernel(backend="cute", static_shapes=True, index_dtype=torch.int64)
+def _narrowed_lane_index_sums(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(2**32, 2**32 + 8):
+        v = tile.index.to(torch.int32).to(torch.float32)
+        s = torch.sum(v[:, None] * x[None, :], dim=-1)
+        hl.atomic_add(out, [tile.index % 32], s)
+    return out
+
+
+def test_a_cast_of_the_lane_index_is_not_a_copy() -> None:
+    # Under index_dtype=torch.int64 the lane index is an Int64 past 2**32,
+    # which tile.index.to(torch.int32) wraps:
+    #     offsets_0 = offsets_base_0 + cutlass.Int32(lane_0)
+    #     v_0 = cutlass.Int32(offsets_0)
+    #     v_1 = cutlass.Float32(v_0)
+    # The jam reads a plain copy of the index as the index
+    # (_read_lane_index_copies), not the cast: read for v_0, each lane would
+    # emit v_1_lane0 = cutlass.Float32(offsets_0_lane0), about 2**32 where
+    # the wrapped value is the lane's 0 to 7.
+    with cpu_render_target(reduction_smem_budget_bytes=232448):
+        args = (torch.empty(64), torch.empty(32))
+        bound = cpu_bind(_narrowed_lane_index_sums, args)
+        config = helion.Config(
+            block_sizes=[8],
+            num_threads=[1, 8],
+            reduction_loops=[8],
+            cute_privatize_atomics=True,
+            cute_grid_lane_jam=True,
+        )
+        code = bound.to_code(bound.config_spec.normalized_config(config))
+    assert "for lane_0 in range(8)" not in code
+    assert "v_0_lane0 = cutlass.Int32(offsets_0_lane0)" in code
+    assert "v_1_lane0 = cutlass.Float32(v_0_lane0)" in code
 
 
 @helion.kernel(backend="cute", static_shapes=True)

@@ -54,6 +54,7 @@ from ..lane_loop_context import lane_context
 from ..runtime_tensor_guards import _prepared_guard_source
 from ..utils import compute_slice_size
 from . import target_facts
+from ._ast_pass_utils import COMPARISON_CALLS
 from ._ast_pass_utils import assigned_name
 from ._ast_pass_utils import call_path_str
 from ._ast_pass_utils import names_read
@@ -5247,14 +5248,6 @@ def _cute_at_lane_base(node: ast.expr, lane: _CuteLaneIndexFacts) -> str:
 _CUTE_LANE_INT_CASTS = frozenset({"cutlass.Int32", "cutlass.Int64"})
 # The largest value every integer cast keeps.
 _CUTE_INT32_MAX = (1 << 31) - 1
-_CUTE_LANE_COMPARE_CALLS: dict[str, type[ast.cmpop]] = {
-    "operator.lt": ast.Lt,
-    "operator.le": ast.LtE,
-    "operator.gt": ast.Gt,
-    "operator.ge": ast.GtE,
-    "operator.eq": ast.Eq,
-    "operator.ne": ast.NotEq,
-}
 _CUTE_LANE_MIRRORED_COMPARE: dict[type[ast.cmpop], type[ast.cmpop]] = {
     ast.Lt: ast.Gt,
     ast.Gt: ast.Lt,
@@ -5274,7 +5267,7 @@ _CUTE_LANE_BINARY_CALLS: dict[str, type[ast.operator]] = {
 _CUTE_LANE_PURE_CALLS = (
     _CUTE_LANE_INT_CASTS
     | _CUTE_LANE_BINARY_CALLS.keys()
-    | _CUTE_LANE_COMPARE_CALLS.keys()
+    | COMPARISON_CALLS.keys()
     | {
         "_cute_python_mod",
         "cutlass.Boolean",
@@ -5656,9 +5649,9 @@ def _cute_lane_uniform_predicate(node: ast.expr, lane: _CuteLaneIndexFacts) -> b
             and len(node.args) == 1
         ):
             return _cute_lane_uniform_predicate(node.args[0], lane)
-        if name in _CUTE_LANE_COMPARE_CALLS and len(node.args) == 2:
+        if name in COMPARISON_CALLS and len(node.args) == 2:
             return _cute_lane_uniform_compare(
-                node.args[0], _CUTE_LANE_COMPARE_CALLS[name], node.args[1], lane
+                node.args[0], COMPARISON_CALLS[name], node.args[1], lane
             )
     return False
 

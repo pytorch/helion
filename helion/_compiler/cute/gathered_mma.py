@@ -15,6 +15,7 @@ import itertools
 from typing import TYPE_CHECKING
 
 from ..ast_read_writes import ReadWrites
+from ._ast_pass_utils import COMPARISON_CALLS
 from ._ast_pass_utils import flatten_addition
 from ._ast_pass_utils import same_expr as _same
 from .scalar_recipe import _clone
@@ -237,19 +238,11 @@ class _Normalize(ast.NodeTransformer):
             and not node.keywords
         ):
             return node.args[0]
-        comparisons = {
-            "operator.lt": ast.Lt,
-            "operator.le": ast.LtE,
-            "operator.gt": ast.Gt,
-            "operator.ge": ast.GtE,
-            "operator.eq": ast.Eq,
-            "operator.ne": ast.NotEq,
-        }
-        if name in comparisons and len(node.args) == 2 and not node.keywords:
+        if name in COMPARISON_CALLS and len(node.args) == 2 and not node.keywords:
             return self.visit_Compare(
                 ast.Compare(
                     left=node.args[0],
-                    ops=[comparisons[name]()],
+                    ops=[COMPARISON_CALLS[name]()],
                     comparators=[node.args[1]],
                 )
             )
@@ -422,12 +415,7 @@ def _integer_recipe(value: ast.expr, tensors: Mapping[str, GatherTensorFacts]) -
         "operator.xor",
         "operator.lshift",
         "operator.rshift",
-        "operator.lt",
-        "operator.le",
-        "operator.gt",
-        "operator.ge",
-        "operator.eq",
-        "operator.ne",
+        *COMPARISON_CALLS,
         "operator.neg",
         "operator.pos",
         "operator.invert",

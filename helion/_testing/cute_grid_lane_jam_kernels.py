@@ -319,3 +319,16 @@ SCATTER_CONFIG = {
     "cute_privatize_atomics": True,
 }
 """For ``bucket_grad_scatter`` over a batch of 16: two trips of the batch loop."""
+
+
+def row_dot(x: torch.Tensor, xt: torch.Tensor) -> torch.Tensor:
+    """The dot of each row of x with xt's row, over a one-axis tile: its lanes
+    index through a copy of the lane index (indices_0 = offsets_0), which the
+    jam reads as the lane index itself."""
+    m = x.size(0)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = torch.sum(
+            x[tile_m, :].to(torch.float32) * xt[tile_m, :].to(torch.float32), dim=-1
+        )
+    return out
