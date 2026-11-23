@@ -5,6 +5,11 @@ Implementations (``--impls``):
 
 - ``inductor``: ``torch.compile`` of the repro, default Inductor config
 - ``inductor_cd``: the same with ``coordinate_descent_tuning=True``
+- ``inductor_max``: the same with the options of
+  ``torch.compile(mode="max-autotune")`` (``max_autotune`` and
+  ``coordinate_descent_tuning``; ``common.inductor_options`` says why the
+  mode's CUDA-graph wrapper is left out). The comparison is against the
+  fastest Inductor compile of the record
 - ``oracle``: the repro's hand-written reference kernel (``oracle.py``)
 - ``helion_triton`` / ``helion_cute``: the Helion port with the kernels pinned
   to the decorators a cold full autotune reported (``autotune.py``); the
@@ -38,7 +43,12 @@ even:
   the rounds of records made before (whose ``cold_us`` was the median of 5
   rounds, a forward-order reading).
 - ``kernel_us``: summed device time of the kernels one replay launches
-  (torch.profiler; back-to-back replays, so L2-warm), with per-kernel names.
+  (torch.profiler; back-to-back replays, so L2-warm), with per-kernel names
+  and times (``kernels``). A kernel's time is its step, the end of its
+  profiler span minus the later of its start and the latest end before it
+  (``kernel_steps``): the spans of dependent launches overlap, and their
+  sum counted the overlap twice. ``kernel_span_us`` and each kernel's
+  ``span_us`` keep the spans.
 - ``rot_us`` (only with ``--rotate-inputs N``): ``cold_us``'s regime on
   inputs no earlier call left in L2. ``cold_us`` replays every call on the
   same input tensors, and lines loaded with an ``L2::evict_last`` hint
@@ -57,11 +67,32 @@ even:
   batches too (``rotation_skip_reason``; the record's ``rotate_inputs`` says
   what was decided and why).
 
+The entries of the Inductor compiles name the config that each of
+their Triton kernels ended on (``inductor_configs``,
+``common.inductor_kernel_configs``): coordinate descent tunes again in every
+process and its pick moves a reading. The buffers a process times lie at a
+placement drawn for that process (``Placement``; ``placement`` in the
+record), because a small kernel's reading depends on it and the allocation
+order of a process would otherwise repeat one placement, another for each
+place in ``--impls``. ``campaign.py --bench-repeats`` takes several
+processes of a point for both reasons (README, Baseline).
+
 Correctness is checked on what the timers run, a replay of the
 implementation captured in a CUDA graph (the oracles of the dropout repros
-take another path when they are not captured). Every implementation must
+take another path when they are not captured). The replay starts from
+poisoned memory, and an implementation that leaves part of an output
+unwritten is an error and is not timed (``_replayed``,
+``common.check_written``). Every implementation must
 match eager PyTorch's output count, shapes and dtypes, and eager's integer
-outputs exactly (except those that depend on random numbers). The Helion
+outputs exactly (except those that depend on random numbers). An integer or
+boolean output that the default Inductor compile itself does not reproduce
+(eager leaves the order of ``topk``'s tied values to its implementation, and
+Inductor's decomposition returns them in index order) may equal that
+compile's output instead, element for element. The implementation's entry
+then says so (``exact_vs_inductor``: the output, its size, and in how many
+elements the implementation's and Inductor's outputs differ from eager's);
+the default compile is its own reference there, and an oracle that makes
+eager's ATen call for such an op equals eager as before. The Helion
 ports must also match eager's strides; Inductor and the oracles may differ
 (Inductor pads some output strides), which ``errors_vs_eager`` records. Float
 outputs outside eager's loose tolerance (rtol = atol = 0.1) are only noted
@@ -70,11 +101,11 @@ computes in bf16, so it can sit far from Inductor and every other fp32
 implementation (pointwise_238e96847398 evaluates its whole
 cancellation-dominated graph in bf16; sum_sum_sum_d2c97d17f3dc rounds
 intermediates to bf16 and its outputs reach 1e18). The coordinate-descent
-compile, the oracle and the Helion ports also go through the anchored
-numerics gate (``common.AnchoredGate``, a loosened variant of
-better-benchmark's) with the default Inductor compile as the error baseline,
-which compares the outputs that depend on random numbers with that
-compile's. The default compile goes through it too: judged against itself,
+and max-autotune compiles, the oracle and the Helion ports also go through
+the anchored numerics gate (``common.AnchoredGate``, a loosened variant of
+better-benchmark's) with the default Inductor compile as the error
+baseline, which compares the outputs that depend on random numbers with
+that compile's. The default compile goes through it too: judged against itself,
 it fails only where its output is not finite and the reference is, which
 fails every other implementation as well. The oracle's random outputs are
 recorded but not gated, as
@@ -95,6 +126,8 @@ import gc
 import itertools
 import math
 from pathlib import Path
+import random
+import secrets
 import statistics
 import sys
 import time
@@ -122,7 +155,7 @@ from helion.autotuner.benchmarking import steady_graph_dispatch
 # Judged by the gate against the default Inductor compile ("inductor"),
 # which the gate judges too: against itself, that fails only an output that
 # is not finite where the reference is (common._anchored_leaf).
-GATED_IMPLS = ("inductor", "inductor_cd", "oracle", "helion_triton", "helion_cute")
+GATED_IMPLS = (*common.INDUCTOR_IMPLS, "oracle", "helion_triton", "helion_cute")
 
 # What the rounds of ``cold_us`` and of ``rot_us`` share. Untimed replays run
 # for ``SETTLE_S`` before the timed rounds: the GPU idles while the
@@ -161,44 +194,97 @@ ROTATE_BELOW_US = _BATCHED_REPLAY_BELOW_US
 BATCHED_MIN_SAMPLES = 20
 
 
+def kernel_steps(spans: list[tuple[float, float]]) -> list[float]:
+    """What each of ``spans`` (the start and end of a kernel in the profile,
+    in the order they started) adds to the time its stream is busy: its end
+    minus the later of its start and the latest end before it, and never
+    less than nothing.
+
+    For kernels that run one after the other that is the span. A kernel
+    launched as a programmatic dependent launch (CuTe's ``cute_pdl``) starts
+    its span while its predecessor still runs, where it waits for the
+    predecessor's writes, so its span holds the rest of the predecessor's
+    run too (the README has a port's numbers)."""
+    steps = []
+    done = -math.inf
+    for start, end in spans:
+        steps.append(max(end - max(start, done), 0.0))
+        done = max(done, end)
+    return steps
+
+
 def _profile_kernels(replay: Callable[[], None], calls: int = 10) -> dict[str, Any]:
+    """The device time of the kernels one replay launches, from a profile of
+    ``calls`` back-to-back replays (L2-warm): ``kernels`` lists each kernel
+    name's ``us``, the median of its steps (``kernel_steps``), the median of
+    its profiler spans (``span_us``) and its launches a call, by their share
+    of ``kernel_us``, the steps' total for one call. ``kernel_span_us`` is
+    the spans' total, which counts the overlap of dependent launches twice
+    (what ``kernel_us`` was before the steps); ``kernel_spans_overlap`` says
+    whether the two differ."""
     replay()
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CUDA]) as prof:
         for _ in range(calls):
             replay()
         torch.cuda.synchronize()
-    per_name: dict[str, list[float]] = {}
-    for event in prof.events() or []:
-        if event.device_type != torch.autograd.DeviceType.CUDA:
-            continue
-        per_name.setdefault(event.name, []).append(event.time_range.elapsed_us())
+    events = sorted(
+        (
+            (event.time_range.start, event.time_range.end, event.name)
+            for event in prof.events() or []
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ),
+    )
+    steps = kernel_steps([(start, end) for start, end, _ in events])
+    per_name: dict[str, list[tuple[float, float]]] = {}
+    for (start, end, name), step in zip(events, steps, strict=True):
+        per_name.setdefault(name, []).append((step, end - start))
     kernels = []
-    total = 0.0
-    for name, durations in per_name.items():
-        per_call = len(durations) / calls
-        median = statistics.median(durations)
-        total += median * per_call
-        kernels.append({"name": name[:200], "us": median, "per_call": per_call})
+    total = total_span = 0.0
+    for name, timings in per_name.items():
+        per_call = len(timings) / calls
+        step = statistics.median(step for step, _ in timings)
+        span = statistics.median(span for _, span in timings)
+        total += step * per_call
+        total_span += span * per_call
+        kernels.append(
+            {"name": name[:200], "us": step, "span_us": span, "per_call": per_call}
+        )
     kernels.sort(key=lambda k: -k["us"] * k["per_call"])
-    return {"kernel_us": total, "kernels": kernels}
+    return {
+        "kernel_us": total,
+        "kernel_span_us": total_span,
+        "kernel_spans_overlap": common.spans_overlap(total, total_span),
+        "kernels": kernels,
+    }
 
 
 def _replayed(
     call: Callable[[list[Any]], Any], fresh_inputs: Callable[[], list[Any]]
-) -> Callable[[list[Any]], Any]:
+) -> Callable[..., Any]:
     """``call`` run the way the timers run it: warmed up eagerly (on other
     inputs: a repro can write into its inputs), then captured in a CUDA graph
     on the given inputs and replayed once. The checks judge this, not an
     eager call, because an implementation may take another path under
     capture: the oracles of the dropout repros draw their random numbers in
     the kernel from Inductor's seed (``tl.rand``) while capturing, and load
-    a random tensor matching eager's otherwise."""
+    a random tensor matching eager's otherwise.
 
-    def run(inputs: list[Any]) -> Any:
+    The replay runs on poisoned memory (``common.POISON_BYTE``; ``poison``
+    names another byte, for ``common.check_written``). The capture allocates
+    the call's outputs and writes nothing, so between the capture and the
+    replay the outputs that the call allocated are filled with the byte, and
+    so is the memory the allocator holds free, the buffers that the captured
+    call freed among it: what the replay does not write is then that byte,
+    not the zeros of fresh device memory or what an earlier call left."""
+
+    def run(inputs: list[Any], poison: int = common.POISON_BYTE) -> Any:
         call(fresh_inputs())
         torch.cuda.synchronize()
+        held = common.allocated_blocks()
         graph, outputs = common.capture_graph(lambda: call(inputs))
+        common.poison_free_memory(poison)
+        common.poison_new_outputs(outputs, held, poison)
         graph.replay()
         torch.cuda.synchronize()
         return outputs
@@ -329,6 +415,80 @@ def time_impls(
         )
         out[name].update(_profile_kernels(graphs[name].replay))
     return out
+
+
+# A placement spacer is this many 2 MiB pages at most (``Placement``, which
+# says how few places that amounts to).
+PLACEMENT_PAGE_BYTES = 2 << 20
+PLACEMENT_MAX_PAGES = 128
+
+
+class Placement:
+    """Where the buffers that a process times lie in device memory, drawn
+    from ``seed`` (None: where the process's allocation order puts them, as
+    in the records made before this).
+
+    A small kernel's reading depends on where its inputs and outputs lie.
+    One CuTe config of var_mean_c3ea8f7ce5c6 (48 MB of traffic) read 11.05 to
+    12.07 us on six input sets of the same values in one process, each
+    timed after every other in turn, and Inductor's kernel 11.26 to 11.91 us
+    on its six, the same sets slow and fast for both. The allocation order
+    of a process is the same every time, so the same placement comes back
+    in every process and reads as an effect of the implementation's place
+    in ``--impls``: the CuTe port of that point read 11.47 us in 5 of 5
+    processes listed second and 10.66 to 11.26 us listed fourth. What ran
+    before a kernel is not it: the same graph took the same time after each
+    of the other implementations' (within 0.1 us).
+
+    ``shift`` releases the allocator's cached blocks and holds a block of a
+    random number of 2 MiB pages, so the buffers allocated next come from
+    the driver, somewhere else in every process: before each
+    implementation's timed inputs and before the timers capture their
+    graphs. One process still times one placement of each implementation;
+    the placements of several processes differ (``campaign.py
+    --bench-repeats``).
+
+    The draw is of few places. The driver lays device memory out in chunks
+    of 32 MiB (a B200): the first buffer after a spacer of p pages lay 16 *
+    ceil(p / 16) pages below where it lies without one (and in place after
+    a spacer of 5 to 8 pages, which the driver put elsewhere). So a buffer
+    of 32 MiB or more lands on one of 9 chunk starts over the 128 spacer
+    sizes, and a smaller one also on a page inside the spacer's last chunk
+    where that leaves it room (15 places for a 3 MB buffer). The record
+    therefore names what the draw came to, not the draw alone
+    (``placement``: each spacer's pages and device address, and the
+    addresses of the storages that each implementation's timed call
+    reads, ``timed_inputs``; the latter also under ``--fixed-placement``)."""
+
+    def __init__(self, seed: int | None) -> None:
+        self.seed = seed
+        self._random = None if seed is None else random.Random(seed)
+        self._spacers: list[torch.Tensor] = []
+        self._timed_inputs: dict[str, list[int]] = {}
+
+    def shift(self) -> None:
+        if self._random is None:
+            return
+        torch.cuda.empty_cache()
+        pages = self._random.randrange(1, PLACEMENT_MAX_PAGES + 1)
+        self._spacers.append(
+            torch.empty(pages * PLACEMENT_PAGE_BYTES, dtype=torch.uint8, device="cuda")
+        )
+
+    def placed(self, impl: str, inputs: list[Any]) -> None:
+        """Note where the tensors that ``impl``'s timed call reads lie: the
+        address of each distinct storage among ``inputs``."""
+        self._timed_inputs[impl] = list(common.input_storages(inputs))
+
+    def record(self) -> dict[str, Any]:
+        return {
+            "seed": self.seed,
+            "spacer_pages": [
+                spacer.numel() // PLACEMENT_PAGE_BYTES for spacer in self._spacers
+            ],
+            "spacer_addresses": [spacer.data_ptr() for spacer in self._spacers],
+            "timed_inputs": self._timed_inputs,
+        }
 
 
 class Rotating(NamedTuple):
@@ -592,6 +752,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "impls": {},
     }
     started = time.monotonic()
+    seed = args.placement_seed
+    if seed is None and not args.fixed_placement:
+        seed = secrets.randbits(31)
+    placement = Placement(None if args.fixed_placement else seed)
     try:
         torch.cuda.set_device(0)
         torch._dynamo.reset()
@@ -624,7 +788,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             nonlocal default_compile
             if default_compile is None:
                 default_compile = common.compile_inductor(
-                    args.repro_id, shape, instance, cd=False
+                    args.repro_id, shape, instance
                 )
             return default_compile
 
@@ -643,8 +807,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             try:
                 if impl == "memcopy":
                     n = max(total_bytes // 8, 256)
+                    placement.shift()
                     src = torch.empty(n, dtype=torch.float32, device="cuda")
                     dst = torch.empty_like(src)
+                    placement.placed(impl, [src, dst])
                     fns[impl] = lambda src=src, dst=dst: torch.add(src, 1, out=dst)
                     # Private sources; the stores keep their one buffer, as
                     # the outputs of the other implementations' calls do.
@@ -663,9 +829,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     compiled = inductor_default()
                     call = lambda inp, c=compiled: c(*inp)  # noqa: E731
                     info["numerics_baseline"] = True
-                elif impl == "inductor_cd":
+                elif impl in common.INDUCTOR_IMPLS:
                     compiled = common.compile_inductor(
-                        args.repro_id, shape, instance, cd=True
+                        args.repro_id, shape, instance, impl=impl
                     )
                     call = lambda inp, c=compiled: c(*inp)  # noqa: E731
                 elif impl == "oracle":
@@ -684,7 +850,28 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 replay = _replayed(call, inputs)
                 with torch.no_grad():
                     actual = replay(inputs())
+                if impl in common.INDUCTOR_IMPLS:
+                    # The config each of the compile's Triton kernels ended
+                    # on: coordinate descent tunes again in every process,
+                    # and its pick moves a reading (README, Baseline). From
+                    # a call of its own, now that the compile has settled:
+                    # the first call compiled, and launched the variants a
+                    # mix-order reduction's compile tries its split sizes
+                    # with.
+                    with (
+                        common.inductor_kernels_launched() as launched,
+                        torch.no_grad(),
+                    ):
+                        call(inputs())
+                    info["inductor_configs"] = common.inductor_kernel_configs(launched)
                 info["errors_vs_eager"] = common.output_errors(actual, expected)
+                # Every element of every output must be the replay's own: an
+                # implementation that left some unwritten is not timed.
+                with torch.no_grad():
+                    common.check_written(
+                        actual, lambda byte, replay=replay: replay(inputs(), byte)
+                    )
+                vs_inductor: list[dict[str, Any]] = []
                 try:
                     common.check_outputs(
                         actual,
@@ -693,13 +880,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         atol=1e-1,
                         stochastic=numerics_gate().stochastic,
                         check_strides=port is not None,
+                        inductor=lambda: numerics_gate().baseline,
+                        vs_inductor=vs_inductor,
                     )
                 except common.FloatMismatch as error:
                     # Low-precision eager can sit far from the exact result
                     # (it rounds every intermediate); the anchored gate below
                     # judges floating-point values. Structure and exact
-                    # (integer, bool) mismatches stay fatal.
+                    # (integer, bool) mismatches stay fatal, except where the
+                    # default Inductor compile is the exact reference.
                     info["eager_allclose_warning"] = str(error)[:1000]
+                if vs_inductor:
+                    info["exact_vs_inductor"] = vs_inductor
                 if port is not None:
                     roundtrip = common.pin_roundtrip(port, tuned["kernels"])
                     info["code_matches_autotune"] = all(roundtrip.values())
@@ -714,7 +906,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     )
                     info["anchored"] = verdict
                     info["numerics_pass"] = bool(verdict["pass"])
+                placement.shift()
                 run_inputs = inputs()
+                placement.placed(impl, run_inputs)
                 fns[impl] = lambda call=call, run_inputs=run_inputs: call(run_inputs)
                 rotating[impl] = Rotating(call, inputs)
                 info["status"] = "ok"
@@ -726,6 +920,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         # interleaved_bench captures graphs of its own: no garbage collection
         # while timing (see common.capture_graph).
         gc.collect()
+        placement.shift()
+        record["placement"] = placement.record()
         with torch.no_grad(), common.gc_paused():
             timings = time_impls(
                 fns,
@@ -781,6 +977,24 @@ def main() -> None:
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--rep-ms", type=int, default=200)
     parser.add_argument("--cold-rounds", type=int, default=6)
+    # One or the other: a seed with --fixed-placement would draw nothing.
+    placed = parser.add_mutually_exclusive_group()
+    placed.add_argument(
+        "--placement-seed",
+        type=int,
+        default=None,
+        metavar="SEED",
+        help="the seed that the placement of the timed buffers is drawn from "
+        "(Placement; the record names it): give a record's to time its "
+        "placement again (default: a fresh one in every process)",
+    )
+    placed.add_argument(
+        "--fixed-placement",
+        action="store_true",
+        help="leave the timed buffers where the process's allocation order "
+        "puts them, the same in every process, as in the records made before "
+        "the placement was drawn",
+    )
     parser.add_argument(
         "--rotate-inputs",
         type=int,

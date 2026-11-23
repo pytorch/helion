@@ -35,6 +35,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -110,12 +111,248 @@ def bench_record_path(bench_dir: Path, repro_id: str, shape: str) -> Path:
     return bench_dir / f"{repro_id}__{shape}.json"
 
 
+def bench_repeat_path(bench_dir: Path, repro_id: str, shape: str, repeat: int) -> Path:
+    """Where ``campaign.py --bench-repeats`` has the ``repeat``-th bench
+    process of a point (from 1) record it; ``bench_record_path`` is then the
+    point's aggregate record (``aggregate_bench_records``)."""
+    return bench_dir / f"{repro_id}__{shape}.r{repeat}.json"
+
+
+def is_repeat_record(path: Path) -> bool:
+    """Whether ``path`` names one process's record of a repeated bench
+    (``bench_repeat_path``), which stands for its point only through the
+    aggregate record."""
+    return re.search(r"\.r\d+\.json$", path.name) is not None
+
+
+# The timings of a repeated bench that the aggregate record gives as medians
+# over the processes (``aggregate_bench_records``).
+AGGREGATED_TIMINGS = ("bb_us", "cold_us", "rot_us", "kernel_us", "kernel_span_us")
+
+
+def spans_overlap(kernel_us: float, kernel_span_us: float) -> bool:
+    """Whether the profiler spans of an implementation's kernels overlap
+    (dependent launches): their total, ``kernel_span_us``, is more than the
+    total of the kernels' steps, ``kernel_us``, by over 1% of itself, which
+    is beyond what the profiler's clock gives two kernels in a row. A bench
+    record's ``kernel_spans_overlap``."""
+    return kernel_span_us - kernel_us > 0.01 * kernel_span_us
+
+
+# The Inductor compiles ``bench.py`` can time (``inductor_options``). A
+# comparison takes the fastest of those a record holds, in each process of a
+# repeated bench.
+INDUCTOR_IMPLS = ("inductor", "inductor_cd", "inductor_max")
+
+
+def _merged_activity(records: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """The foreign-activity samples of several jobs as one job's
+    (``watch_foreign_gpu_activity``): their counts and seconds added, the
+    longest gap, every process under its name with its highest utilization;
+    None when one of the jobs was not sampled. ``unknown_allowed`` is the
+    failed samples that the jobs allow, each its own
+    (``unknown_samples_allowed``), added up: the allowance of one job
+    applied to the sums would fail samples that cover every job."""
+    activities: list[dict[str, Any]] = []
+    for record in records:
+        activity = record.get("foreign_gpu_activity")
+        if not activity:
+            return None
+        activities.append(activity)
+    processes: dict[str, dict[str, Any]] = {}
+    for activity in activities:
+        for name, entry in activity["processes"].items():
+            seen = processes.setdefault(name, {"max_sm": 0, "active_s": 0.0})
+            seen["max_sm"] = max(seen["max_sm"], entry["max_sm"])
+            seen["active_s"] = round(seen["active_s"] + entry["active_s"], 1)
+            if "busy_s" in entry:
+                seen["busy_s"] = round(seen.get("busy_s", 0.0) + entry["busy_s"], 1)
+    merged: dict[str, Any] = {
+        "interval_s": activities[0]["interval_s"],
+        "samples": sum(a["samples"] for a in activities),
+        "unknown_samples": sum(a["unknown_samples"] for a in activities),
+        "unknown_allowed": sum(unknown_samples_allowed(a) for a in activities),
+        "processes": processes,
+    }
+    for key, combine in (("watched_s", sum), ("max_gap_s", max)):
+        if all(key in activity for activity in activities):
+            merged[key] = round(combine(a[key] for a in activities), 1)
+    return merged
+
+
+def _all_or_any_false(values: Sequence[Any]) -> bool | None:
+    """A verdict over several processes: False when one process says False,
+    True when every one says True, None otherwise (some did not judge)."""
+    if any(value is False for value in values):
+        return False
+    return True if all(value is True for value in values) else None
+
+
+def aggregate_bench_records(
+    processes: dict[str, dict[str, Any]], digests: dict[str, str]
+) -> dict[str, Any]:
+    """The aggregate record of a point that ``campaign.py --bench-repeats``
+    benched in several fresh processes: ``processes`` are their ok records
+    by file name, in the order of the repeats, ``digests`` the SHA-256 of
+    each file (the campaign aggregates again when they change).
+
+    A process counts unless foreign work contaminated its record or its
+    activity samples do not cover it (``left_out`` says why; when none
+    counts, all do and the aggregate is flagged ``contaminated``, like the
+    cleanest attempt of a job that was contaminated every time). The
+    aggregate is a bench record: each implementation's entry is that of its
+    representative process, the one whose ``cold_us`` is the median or
+    nearest to it, with
+
+    - ``cold_us``, ``bb_us``, ``rot_us``, ``kernel_us`` and
+      ``kernel_span_us`` replaced by the median over the counted processes
+      (``AGGREGATED_TIMINGS``; the throughputs follow, and
+      ``kernel_spans_overlap`` is of the two medians: a timing that one
+      process lacks has no median, and the flag goes with either total),
+      and the per-round fields left to the processes' own records.
+      ``kernels`` stays the representative's (``representative`` names its
+      record), so its entries need not add up to ``kernel_us``;
+    - ``per_process``: every counted process's status, verdicts and timings
+      in order, and for an Inductor compile the configs its kernels ended
+      on in each (``inductor_configs``: coordinate descent tunes again in
+      every process);
+    - ``status`` ok only when the implementation is ok and timed in every
+      counted process, ``numerics_pass`` and ``code_matches_autotune`` false
+      when any process says so: a result that one of several processes does
+      not reproduce is not a result.
+
+    ``report.py`` takes the ratio of two implementations from
+    ``per_process``: the ratio in each process (the fastest of the
+    Inductor compiles of that process over the port's time in the same
+    process), then the median of those ratios. The ratio of the medians is
+    not that number: the processes' Inductor picks differ, and a ratio is
+    only of timings that one process interleaved. The baseline of a process
+    is of the compiles that are usable in that process (its ``per_process``
+    status and verdict), whatever the aggregate's ``status`` of a compile
+    says: one that failed in a single process is missing from that
+    process's baseline alone."""
+    # A process made without the sampling counts, as a record made without
+    # it does where the report admits those.
+    left_out = {
+        name: issue
+        for name, record in processes.items()
+        if (issue := activity_issue(record, include_unsampled=True)) is not None
+    }
+    counted = {name: r for name, r in processes.items() if name not in left_out}
+    contaminated = not counted
+    if contaminated:
+        counted = dict(processes)
+    names = list(counted)
+    records = list(counted.values())
+    first = records[0]
+    out: dict[str, Any] = {
+        key: first[key]
+        for key in ("repro", "shape", "gpu", "versions", "outputs", "total_bytes")
+        if key in first
+    }
+    out["status"] = "ok"
+    out["aggregate"] = {
+        "processes": len(records),
+        "counted": names,
+        "left_out": left_out,
+        "records": digests,
+        "gpus": [record.get("gpu") for record in records],
+        "placement_seeds": [
+            (record.get("placement") or {}).get("seed") for record in records
+        ],
+    }
+    if contaminated:
+        out["contaminated"] = True
+    total_bytes = out.get("total_bytes")
+    impls: dict[str, Any] = {}
+    for impl in dict.fromkeys(impl for record in records for impl in record["impls"]):
+        infos = [
+            record["impls"].get(impl) or {"status": "not timed"} for record in records
+        ]
+        per_process: dict[str, list[Any]] = {
+            "status": [info.get("status") for info in infos],
+            "numerics_pass": [info.get("numerics_pass") for info in infos],
+        }
+        medians: dict[str, float] = {}
+        for metric in AGGREGATED_TIMINGS:
+            values = [info.get(metric) for info in infos]
+            if all(value is None for value in values):
+                continue
+            per_process[metric] = values
+            timed = [value for value in values if value is not None]
+            if len(timed) == len(values):
+                medians[metric] = statistics.median(timed)
+        if impl in INDUCTOR_IMPLS:
+            per_process["inductor_configs"] = [
+                info.get("inductor_configs") for info in infos
+            ]
+        # The representative: the process whose cold_us is nearest the median.
+        cold = medians.get("cold_us")
+        index = 0
+        if cold is not None:
+            index = min(
+                range(len(infos)), key=lambda i: abs(per_process["cold_us"][i] - cold)
+            )
+        info = {
+            key: value
+            for key, value in infos[index].items()
+            if not key.endswith(("_runs_us", "_order_medians_us", "_order_mins_us"))
+            and key not in AGGREGATED_TIMINGS
+            and not key.endswith("_gbps")
+        }
+        info.update(medians)
+        info.pop("kernel_spans_overlap", None)
+        if "kernel_us" in medians and "kernel_span_us" in medians:
+            info["kernel_spans_overlap"] = spans_overlap(
+                medians["kernel_us"], medians["kernel_span_us"]
+            )
+        if total_bytes:
+            for metric, value in medians.items():
+                # The throughputs bench.py records.
+                if value > 0 and metric != "kernel_span_us":
+                    info[metric.replace("_us", "_gbps")] = total_bytes / value / 1e3
+        info["representative"] = names[index]
+        info["per_process"] = per_process
+        failed = [
+            f"{name}: {status}"
+            for name, status in zip(names, per_process["status"], strict=True)
+            if status != "ok"
+        ]
+        if "cold_us" in per_process and "cold_us" not in medians:
+            failed.append("cold_us is missing in a process")
+        if failed:
+            info["status"] = "error"
+            info["error"] = f"not ok in every process ({'; '.join(failed)})"
+        for verdict in ("numerics_pass", "code_matches_autotune"):
+            values = [i.get(verdict) for i in infos]
+            if any(value is not None for value in values):
+                info[verdict] = _all_or_any_false(values)
+        impls[impl] = info
+    out["impls"] = impls
+    out["foreign_gpu_activity"] = _merged_activity(records)
+    for key in ("foreign_gpu_processes_before", "foreign_gpu_processes_after"):
+        # None in a process: nvidia-smi could not tell.
+        listed: set[str] | None = set()
+        for record in records:
+            found_processes = record.get(key)
+            if found_processes is None or listed is None:
+                listed = None
+            else:
+                listed.update(found_processes)
+        out[key] = None if listed is None else sorted(listed)
+    if "rotate_inputs" in first:
+        out["rotate_inputs"] = first["rotate_inputs"]
+    out["wall_s"] = round(sum(record.get("wall_s") or 0.0 for record in records), 1)
+    return out
+
+
 # The implementations ``bench.py`` times, in the order of a forward round (its
 # ``--impls``). ``helion_<backend>`` is the Helion port pinned to that
 # backend's autotune record.
 ALL_IMPLS = (
     "inductor",
     "inductor_cd",
+    "inductor_max",
     "oracle",
     "helion_triton",
     "helion_cute",
@@ -188,10 +425,10 @@ def make_inputs(repro_id: str, shape: str, seed: int = 0) -> list[Any]:
     return repro_harness.make_inputs_from_config(configs[shape])
 
 
-def input_bytes(inputs: Sequence[Any]) -> int:
-    """The device memory behind one input set: the bytes of the distinct
-    storages of its tensors (views of one buffer count it once, whatever
-    part of it they show)."""
+def input_storages(inputs: Sequence[Any]) -> dict[int, int]:
+    """``{address: bytes}`` of the distinct storages behind the tensors of
+    one input set, in the order of the inputs (views of one buffer are one
+    storage, whatever part of it they show)."""
     import torch
 
     storages = {}
@@ -199,7 +436,13 @@ def input_bytes(inputs: Sequence[Any]) -> int:
         if isinstance(value, torch.Tensor):
             storage = value.untyped_storage()
             storages[storage.data_ptr()] = storage.nbytes()
-    return sum(storages.values())
+    return storages
+
+
+def input_bytes(inputs: Sequence[Any]) -> int:
+    """The device memory behind one input set: the bytes of the distinct
+    storages of its tensors."""
+    return sum(input_storages(inputs).values())
 
 
 def compile_policy(repro_id: str, shape: str) -> dict[str, Any]:
@@ -209,22 +452,122 @@ def compile_policy(repro_id: str, shape: str) -> dict[str, Any]:
     return repro_harness.compile_policy_from_config(shape_configs(repro_id)[shape])
 
 
+def inductor_options(impl: str) -> dict[str, Any]:
+    """The ``torch.compile`` options an Inductor implementation adds to the
+    shape point's compile policy: none for ``inductor``,
+    ``coordinate_descent_tuning`` for ``inductor_cd``, and for
+    ``inductor_max`` what ``torch.compile(mode="max-autotune")`` sets, as
+    PyTorch lists them, without the mode's CUDA-graph wrapper
+    (``triton.cudagraphs``). The wrapper replays the compiled function as a
+    CUDA graph of its own, which cannot run inside the CUDA graphs the timers
+    capture every implementation in; the kernels and their tuning are those
+    of the mode (the same options as ``mode="max-autotune-no-cudagraphs"``).
+    ``torch.compile`` takes a mode or options, not both, and the compile
+    policy is options."""
+    if impl == "inductor":
+        return {}
+    if impl == "inductor_cd":
+        return {"coordinate_descent_tuning": True}
+    if impl == "inductor_max":
+        import torch._inductor
+
+        options = dict(torch._inductor.list_mode_options("max-autotune"))
+        del options["triton.cudagraphs"]
+        return options
+    raise ValueError(f"not an Inductor implementation: {impl!r}")
+
+
 def compile_inductor(
-    repro_id: str, shape: str, instance: Any, *, cd: bool
+    repro_id: str, shape: str, instance: Any, *, impl: str = "inductor"
 ) -> Callable[..., Any]:
     """``torch.compile`` of the repro as better-benchmark compiles it (the
-    shape point's compile policy), with ``coordinate_descent_tuning`` when
-    ``cd``. Compiles with different options coexist in one process (each
-    wraps its own backend), so no dynamo reset is needed in between."""
+    shape point's compile policy), with the options of the Inductor
+    implementation ``impl`` (``inductor_options``). Compiles with different
+    options coexist in one process (each wraps its own backend), so no
+    dynamo reset is needed in between."""
     bb_path()
     import repro_harness  # pyrefly: ignore [missing-import]
 
-    options = {"coordinate_descent_tuning": True} if cd else None
+    options = inductor_options(impl)
     return repro_harness.compile_repro(
         instance,
         compile_policy=compile_policy(repro_id, shape),
         **({"options": options} if options else {}),
     )
+
+
+@contextlib.contextmanager
+def inductor_kernels_launched() -> Iterator[list[Any]]:
+    """The Triton kernels (Inductor's ``CachingAutotuner`` objects) that the
+    Inductor-compiled code called in the block launches, in the order of
+    their first launch: ``inductor_kernel_configs`` reads the configs they
+    ended on. Taken at the launches, not from the modules Inductor has
+    loaded: those hold the kernels of every compile of the process, the
+    default one's beside the tuned one's under the same names, and the
+    variants that a mix-order reduction's compile benchmarks its split
+    sizes with. The compile happens at the first call of the compiled
+    code, which launches those variants too (their benchmark runs are left
+    out here, their warm-up launches are not): take the block around a
+    later call."""
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+    launched: list[Any] = []
+    run = CachingAutotuner.run
+
+    def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("benchmark_run") and not any(
+            kernel is self for kernel in launched
+        ):
+            launched.append(self)
+        return run(self, *args, **kwargs)
+
+    CachingAutotuner.run = recording  # type: ignore[method-assign]
+    try:
+        yield launched
+    finally:
+        CachingAutotuner.run = run  # type: ignore[method-assign]
+
+
+def inductor_kernel_configs(launched: Sequence[Any]) -> list[dict[str, Any]]:
+    """What a bench record says of each Triton kernel that an Inductor
+    compile launches (``inductor_kernels_launched``, after a call: a kernel
+    settles on one launcher at its first launch, where coordinate descent
+    tunes it): its name, the launcher's config (``block_sizes``: the
+    config's kwargs, such as ``XBLOCK``, ``R0_BLOCK`` and, for a mix-order
+    reduction, ``RSPLIT_SIZE``; ``num_warps``; ``num_stages``), whether
+    coordinate descent found it, the split size the kernel was generated
+    for (``rsplit_size``, mix-order reductions only) and the registers,
+    spills and shared memory of the compiled kernel. A kernel that holds
+    another number of launchers than one lists them all (``launchers``)."""
+    kernels = []
+    for kernel in launched:
+        meta = kernel.inductor_meta
+        configs = [
+            {
+                "block_sizes": dict(launcher.config.kwargs),
+                "num_warps": launcher.config.num_warps,
+                "num_stages": launcher.config.num_stages,
+                "found_by_coordesc": bool(
+                    getattr(launcher.config, "found_by_coordesc", False)
+                ),
+                "n_regs": launcher.n_regs,
+                "n_spills": launcher.n_spills,
+                "shared": launcher.shared,
+            }
+            for launcher in kernel.launchers
+        ]
+        entry: dict[str, Any] = {
+            "name": meta.get("kernel_name", kernel.fn.__name__),
+            "grid_type": meta.get("grid_type"),
+        }
+        if meta.get("RSPLIT_SIZE") is not None:
+            entry["rsplit_size"] = meta["RSPLIT_SIZE"]
+        if len(configs) == 1:
+            entry.update(configs[0])
+        else:
+            entry["launchers"] = configs
+        kernels.append(entry)
+    return kernels
 
 
 def load_oracle(repro_id: str, inputs: list[Any]) -> Callable[[list[Any]], Any]:
@@ -277,6 +620,10 @@ def load_port(
     autotuner reported for it (config plus the codegen settings it ran with);
     every kernel is then rebuilt from that decorator, which reproduces the
     tuned kernel without searching.
+
+    An unpinned port's kernels run their default configs
+    (``HELION_AUTOTUNE_EFFORT=none``) unless the environment asks for a
+    search: it names an effort, or ``HELION_FORCE_AUTOTUNE`` is true.
     """
     import torch
 
@@ -289,7 +636,22 @@ def load_port(
     # decorator expression is evaluated: the module's own decorators and the
     # pinned ones below both run under this override. A Triton decorator
     # names no backend, so the override is what makes it a Triton kernel.
-    with env_override(HELION_BACKEND=backend):
+    #
+    # An unpinned port searches on its first call. The harness's callers say
+    # which they mean (check_port.py: HELION_AUTOTUNE_EFFORT=none;
+    # autotune.py and the campaign: an effort, with HELION_FORCE_AUTOTUNE=1).
+    # Any other script that loads a port (a comparison written beside a
+    # port, say) gets the default config, not a full search on a GPU that
+    # others are timing on. Both variables are read the way the kernels'
+    # settings read them: an empty effort is no effort, and "off" forces
+    # nothing (settings made under the override, like the kernels': the
+    # caller's HELION_BACKEND does not matter to a port).
+    effort: dict[str, str] = {}
+    if pinned is None and not os.environ.get("HELION_AUTOTUNE_EFFORT", "").strip():
+        with env_override(HELION_BACKEND=backend):
+            if not helion.Settings().force_autotune:
+                effort["HELION_AUTOTUNE_EFFORT"] = "none"
+    with env_override(HELION_BACKEND=backend, **effort):
         name = f"_bb_port_{repro_id}_{backend}"
         spec = importlib.util.spec_from_file_location(name, path)
         assert spec is not None and spec.loader is not None
@@ -588,6 +950,296 @@ def gc_paused() -> Iterator[None]:
             gc.enable()
 
 
+# What the checks fill free device memory with before a call they judge
+# (``poison_free_memory``). ``torch.empty`` hands a call the block an earlier
+# call just freed, with what that call wrote there: the outputs of the
+# previous implementation of the same repro, which have the same sizes and
+# are correct. A kernel that skips part of its output then returns the right
+# values in that part, and every check passes it (a ConvBert port variant
+# that never wrote a ninth of its output passed the gate with error 0.0).
+# Bytes of 0xFF read as a NaN in the float dtypes and as -1 in the signed
+# integer ones (the two fp8 "fnuz" formats are the exception: their only NaN
+# is 0x80, and 0xFF is a finite value, -240.0 in float8_e4m3fnuz and
+# -57344.0 in float8_e5m2fnuz; no output of the ported repros has those
+# dtypes). An output that holds such elements after the call is run
+# again on memory filled with the second byte: an element that nothing wrote
+# holds the first byte, then the second (``check_written``).
+POISON_BYTE = 0xFF
+POISON_RECHECK_BYTE = 0x00
+
+
+class UnwrittenOutput(AssertionError):
+    """Part of an output is memory the implementation never wrote: never
+    acceptable, whatever values that memory happens to hold."""
+
+
+class UnfilledMemory(RuntimeError):
+    """A call took device memory from the driver in every one of its tries
+    (:func:`call_on_poisoned_memory`), so its outputs may lie in memory that
+    the fill never reached: what the call left unwritten there cannot be
+    told from what it wrote, and the call cannot be judged."""
+
+
+class _DeviceBytes:
+    """``size`` bytes of device memory at ``address``, as ``torch.as_tensor``
+    takes them (the CUDA array interface): a uint8 tensor over memory that it
+    does not own."""
+
+    def __init__(self, address: int, size: int) -> None:
+        self.__cuda_array_interface__ = {
+            "shape": (size,),
+            "typestr": "|u1",
+            "data": (address, False),
+            "version": 2,
+        }
+
+
+def _fill_device_bytes(address: int, size: int, byte: int) -> None:
+    import torch
+
+    torch.as_tensor(_DeviceBytes(address, size), device="cuda").fill_(byte)
+
+
+def _allocator_blocks(*states: str) -> dict[int, int]:
+    """``{address: bytes}`` of the blocks in one of ``states`` that
+    PyTorch's CUDA caching allocator holds on the current device, in every
+    memory pool (a CUDA graph capture allocates in a pool of its own); none
+    before the process has used CUDA. A block is ``active_allocated`` while
+    a tensor holds it, ``inactive`` when it is free, and
+    ``active_pending_free`` in between: freed while another stream still
+    used it (``Tensor.record_stream``), it stays with the allocator until
+    that stream's work is done and the next allocation notices."""
+    import torch
+
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return {}
+    device = torch.cuda.current_device()
+    return {
+        block["address"]: block["size"]
+        for segment in torch.cuda.memory_snapshot()
+        if segment["device"] == device
+        for block in segment["blocks"]
+        if block["state"] in states
+    }
+
+
+def allocated_blocks() -> set[int]:
+    """The addresses of the device memory blocks that live tensors hold now:
+    what :func:`poison_new_outputs` takes to tell the memory a call
+    allocated from the memory it was given."""
+    return set(_allocator_blocks("active_allocated"))
+
+
+def poison_free_memory(byte: int = POISON_BYTE) -> int:
+    """Fill the device memory that PyTorch's allocator holds free with
+    ``byte``, so that what the next call allocates there starts from it and
+    not from what an earlier call left (``POISON_BYTE``); the bytes filled.
+
+    The blocks are filled where they are, through their addresses, and none
+    is allocated: the allocator hands out the same blocks as without the
+    fill. That reaches the free blocks of a CUDA graph's private pool too,
+    which no allocation outside the capture can take (intermediate buffers
+    that the captured call freed; every replay writes them before it reads
+    them). Memory that the allocator takes fresh from the driver afterwards
+    is not covered: :func:`call_on_poisoned_memory` calls again when that
+    happened, and ``bench.py`` fills the outputs of a captured call itself
+    (:func:`poison_new_outputs`).
+
+    A block whose free waits for work on another stream is filled as well
+    (``active_pending_free``, see :func:`_allocator_blocks`): the next
+    allocation can hand it out, and it takes nothing from the driver for
+    it. The device is idle by then, so nothing reads or writes the block
+    any more."""
+    import torch
+
+    if not (torch.cuda.is_available() and torch.cuda.is_initialized()):
+        return 0
+    # First, so that the work the pending frees wait for is done.
+    torch.cuda.synchronize()
+    free = _allocator_blocks("inactive", "active_pending_free")
+    for address, size in free.items():
+        _fill_device_bytes(address, size, byte)
+    if free:
+        torch.cuda.synchronize()
+    return sum(free.values())
+
+
+def poison_new_outputs(outputs: Any, held: set[int], byte: int = POISON_BYTE) -> None:
+    """Fill with ``byte`` the storage of every tensor of ``outputs`` that
+    was allocated since ``held`` was taken (:func:`allocated_blocks`). For
+    the outputs of a call captured in a CUDA graph, between the capture and
+    the first replay: the capture allocated them and wrote nothing, so the
+    replay finds them as the driver handed them out. An output in memory
+    from before the call (a view of an input, the input that the repro
+    writes into, a buffer of the module) is left as it is."""
+    import torch
+
+    new = _allocator_blocks("active_allocated")
+    filled = set(held)
+    for tensor in flatten_outputs(outputs):
+        storage = tensor.untyped_storage()
+        address = storage.data_ptr()
+        if tensor.is_cuda and address in new and address not in filled:
+            filled.add(address)
+            _fill_device_bytes(address, storage.nbytes(), byte)
+    torch.cuda.synchronize()
+
+
+def _device_allocations() -> int:
+    """How many times PyTorch's allocator has taken memory from the driver
+    on the current device (0 before the process has used CUDA). The count
+    tells a call that took fresh memory where the reserved bytes do not: an
+    allocator that finds no room releases its cached blocks to the driver
+    and asks again, as does a call that empties the cache itself (a CUDA
+    graph capture does), and the bytes it holds afterwards can be those
+    from before the call, or fewer."""
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        return torch.cuda.memory_stats()["num_device_alloc"]
+    return 0
+
+
+def call_on_poisoned_memory(
+    call: Callable[[list[Any]], Any],
+    fresh_inputs: Callable[[], list[Any]],
+    byte: int = POISON_BYTE,
+    tries: int = 3,
+) -> Any:
+    """``call(fresh_inputs())`` on free memory filled with ``byte``
+    (:func:`poison_free_memory`; the inputs are made first, so they are not
+    part of it). A call during which the allocator took memory from the
+    driver may hold outputs or intermediate buffers there, which the fill
+    did not reach: its outputs are dropped and it runs again on new inputs,
+    now on the blocks that it left free, up to ``tries`` calls in all. A
+    call that takes memory from the driver every time (one that keeps what
+    it allocates, say, or that empties the allocator's cache) raises
+    :class:`UnfilledMemory`: fresh device memory reads as zeros on a B200,
+    so an element left unwritten there would pass wherever the right value
+    is zero."""
+    for _ in range(tries):
+        # The earlier call's outputs and inputs go before the fill: this
+        # call starts from the allocator state of the one before it, with
+        # the blocks that one took from the driver free and filled.
+        outputs = inputs = None
+        inputs = fresh_inputs()
+        poison_free_memory(byte)
+        taken = _device_allocations()
+        outputs = call(inputs)
+        if _device_allocations() == taken:
+            return outputs
+    raise UnfilledMemory(
+        f"the call took fresh device memory in each of {tries} calls: its "
+        "outputs may lie in memory that was not filled before it"
+    )
+
+
+def forward_on_poisoned_memory(
+    port: Any, repro_id: str, shape: str, byte: int = POISON_BYTE
+) -> Any:
+    """The port's outputs on fresh inputs of the shape point, from a call
+    that found the free device memory filled with ``byte``
+    (:func:`call_on_poisoned_memory`): what it returns is what it wrote, not
+    what an earlier call, of this config or another, left in the blocks that
+    ``torch.empty`` recycles. What ``check_port.py`` and ``autotune.py``
+    judge, and what :func:`check_written` has them run again."""
+    import torch
+
+    with torch.no_grad():
+        outputs = call_on_poisoned_memory(
+            port.forward, lambda: make_inputs(repro_id, shape), byte
+        )
+    torch.cuda.synchronize()
+    return outputs
+
+
+def _holds_byte(part: Any, byte: int) -> Any:
+    """Which elements of ``part`` (not complex) consist of the byte ``byte``
+    alone. Read through an integer view of the elements' own size, which no
+    layout needs a copy for: a copy of a bool tensor would make each byte 0
+    or 1."""
+    import torch
+
+    size = part.element_size()
+    integer = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[size]
+    pattern = int.from_bytes(bytes([byte]) * size, "little", signed=size > 1)
+    return part.view(integer) == pattern
+
+
+def _poison_left(tensor: Any, byte: int, also: tuple[Any, int] | None = None) -> int:
+    """How many elements of ``tensor`` consist of the byte ``byte`` alone (a
+    complex element: both of its parts); with ``also`` (another tensor of
+    the same shape and dtype, and a byte), how many of those are that byte
+    alone in the other tensor too. Counted slice by slice
+    (``CHECK_SLICE_ELEMENTS``)."""
+    import torch
+
+    pairs = tensor.is_complex()
+    other, other_byte = (None, 0) if also is None else also
+    if pairs:
+        tensor = torch.view_as_real(tensor)
+        other = None if other is None else torch.view_as_real(other)
+    count = 0
+    for part in _slices(tensor.shape):
+        found = _holds_byte(tensor[part], byte)
+        if other is not None:
+            found &= _holds_byte(other[part], other_byte)
+        if pairs:
+            found = found.all(dim=-1)
+        count += int(found.sum())
+    return count
+
+
+def check_written(outputs: Any, rerun: Callable[[int], Any]) -> None:
+    """Raise :class:`UnwrittenOutput` when an implementation left part of
+    its outputs unwritten. ``outputs`` are those of a call on memory filled
+    with ``POISON_BYTE`` (:func:`call_on_poisoned_memory`, or ``bench.py``'s
+    captured replay); ``rerun(byte)`` returns those of the same call on
+    memory filled with ``byte``.
+
+    An output without an element of that byte alone was written in full.
+    Otherwise the implementation runs once more, on ``POISON_RECHECK_BYTE``:
+    an element that nothing writes holds the first byte in the first
+    outputs and the second byte in the second, while a value that the
+    implementation computes (an integer -1, say) cannot follow the fill.
+    The comparison is of the outputs' bytes, so it holds for every dtype,
+    for outputs whose values no reference fixes (random numbers) and for
+    values within any tolerance of the right ones (a zero).
+
+    Its limit: the fill is of the memory that is free before the call. An
+    output allocated in a block that the same call freed earlier (an
+    intermediate buffer of its own) starts from what the call wrote there,
+    and an element left unwritten in it follows neither fill. It shows only
+    as a wrong value, so it passes if the intermediate held the output's
+    right values there (in ``bench.py``'s replay too, which writes the
+    intermediate again after the fill)."""
+    first = flatten_outputs(outputs)
+    suspects = [
+        index for index, tensor in enumerate(first) if _poison_left(tensor, POISON_BYTE)
+    ]
+    if not suspects:
+        return
+    second = flatten_outputs(rerun(POISON_RECHECK_BYTE))
+    unwritten = {}
+    for index in suspects:
+        a = first[index]
+        b = second[index] if index < len(second) else None
+        if b is None or a.shape != b.shape or a.dtype != b.dtype:
+            raise StructureMismatch(
+                f"output {index}: its shape or dtype differs between two calls"
+            )
+        if count := _poison_left(a, POISON_BYTE, (b, POISON_RECHECK_BYTE)):
+            unwritten[index] = count
+    if unwritten:
+        raise UnwrittenOutput(
+            "; ".join(
+                f"output {index}: {count} of {first[index].numel()} elements were "
+                "never written (they hold whatever the memory held before the call)"
+                for index, count in unwritten.items()
+            )
+        )
+
+
 # Outputs can have billions of elements (sum_b2873b4c9052's has 2**31, 16 GiB
 # as float64), so the numerics checks below compare them in slices of at most
 # this many elements: their temporaries, float64 conversions included, then
@@ -735,6 +1387,8 @@ def check_outputs(
     atol: float = 2e-2,
     stochastic: set[int] | frozenset[int] = frozenset(),
     check_strides: bool = True,
+    inductor: Callable[[], Any] | None = None,
+    vs_inductor: list[dict[str, Any]] | None = None,
 ) -> None:
     """Compare against eager; raises one of the mismatch classes above.
     Every output needs eager's shape and dtype, and with ``check_strides``
@@ -745,7 +1399,17 @@ def check_outputs(
     baseline is compared without them; :func:`output_errors` records the
     mismatch. Outputs in ``stochastic`` (random number dependent: eager draws
     them from its global generator) are not compared by value here;
-    :class:`AnchoredGate` compares them with Inductor's."""
+    :class:`AnchoredGate` compares them with Inductor's.
+
+    An integer or boolean output that differs from eager's is compared with
+    the default Inductor compile's when that compile's own output differs
+    from eager's too (:func:`_inductor_reference`): eager leaves such a value
+    to its implementation (the order of ``topk``'s tied values, say) and
+    Inductor's kernels, which the ports mirror, settle it another way.
+    ``inductor`` returns that compile's outputs on the same inputs and is
+    called only for such an output; ``vs_inductor`` gets an entry for each
+    output that passed this way. Without ``inductor``, and for every output
+    Inductor reproduces, eager is the only reference."""
     a_list = flatten_outputs(actual)
     e_list = flatten_outputs(expected)
     if len(a_list) != len(e_list):
@@ -768,11 +1432,47 @@ def check_outputs(
             if (error := _not_close(a, e, rtol=rtol, atol=atol)) is not None:
                 float_errors.append(f"output {index}: {error}")
         elif mismatches := _count_mismatches(a, e):
-            raise ExactMismatch(
-                f"output {index}: {mismatches} of {e.numel()} elements differ"
-            )
+            message = f"output {index}: {mismatches} of {e.numel()} elements differ"
+            if inductor is None:
+                raise ExactMismatch(message)
+            baseline = flatten_outputs(inductor())
+            # Only an output of eager's structure can stand in for eager's.
+            if len(baseline) != len(e_list) or baseline[index].shape != e.shape:
+                raise ExactMismatch(message)
+            inductor_mismatches = _inductor_reference(a, e, baseline[index], message)
+            if vs_inductor is not None:
+                vs_inductor.append(
+                    {
+                        "idx": index,
+                        "reference": "inductor",
+                        "elements": e.numel(),
+                        "mismatches_vs_eager": mismatches,
+                        "inductor_mismatches_vs_eager": inductor_mismatches,
+                    }
+                )
     if float_errors:
         raise FloatMismatch("\n".join(float_errors))
+
+
+def _inductor_reference(a: Any, e: Any, baseline: Any, message: str) -> int:
+    """Judge an integer or boolean output ``a`` that differs from eager's
+    ``e`` (``message`` says in how many elements) against the default
+    Inductor compile's ``baseline``. Inductor's output is the reference only
+    when it differs from eager's itself, and then ``a`` must equal it element
+    for element: a port that does what Inductor's kernels do reproduces
+    their output, so any other difference stays an :class:`ExactMismatch`.
+    Returns the number of elements in which Inductor's output differs from
+    eager's, which is why it is the reference."""
+    inductor_mismatches = _count_mismatches(baseline, e)
+    if not inductor_mismatches:
+        # Inductor reproduces eager, so every implementation has to.
+        raise ExactMismatch(message)
+    if differing := _count_mismatches(a, baseline):
+        raise ExactMismatch(
+            f"{message} from eager's and {differing} from the default Inductor "
+            f"compile's, which differs from eager's in {inductor_mismatches}"
+        )
+    return inductor_mismatches
 
 
 def _slice_not_close(
@@ -838,6 +1538,23 @@ def stochastic_outputs(repro_id: str, shape: str, instance: Any) -> set[int]:
             instance, make_inputs(repro_id, shape, seed=0)
         )
     )
+
+
+def inductor_outputs(repro_id: str, shape: str, instance: Any) -> Callable[[], Any]:
+    """The default Inductor compile's outputs on the repro's inputs, as
+    :func:`check_outputs` takes them (``inductor``): compiled and run by the
+    first call and kept for the later ones, so a job that compiles no
+    Inductor code otherwise (``autotune.py``) compiles it only for a port
+    with an integer or boolean output that differs from eager's."""
+    import torch
+
+    @functools.cache
+    def outputs() -> Any:
+        compiled = compile_inductor(repro_id, shape, instance)
+        with torch.no_grad():
+            return compiled(*make_inputs(repro_id, shape))
+
+    return outputs
 
 
 def ulp_of(dtype: Any, magnitude: Any) -> Any:
@@ -1024,7 +1741,15 @@ class AnchoredGate:
     such an implementation's random outputs against Inductor's without
     letting them decide the verdict. The other stochastic outputs have a
     nondeterministic summation order (atomic accumulation) and are judged
-    against the reference like the deterministic outputs."""
+    against the reference like the deterministic outputs.
+
+    The baseline's call and every candidate's start from free memory filled
+    with ``POISON_BYTE`` (``poison_free_memory``), so a float element that a
+    call leaves unwritten is a NaN (a finite value in the fp8 "fnuz"
+    formats) and not what the candidate judged before it left in the block.
+    The gate judges values; ``check_written`` tells an unwritten element
+    whatever its right value is and in every dtype, and the checks run it
+    beside the gate."""
 
     def __init__(
         self, repro_id: str, shape: str, instance: Any, compiled: Callable[..., Any]
@@ -1085,6 +1810,9 @@ class AnchoredGate:
                 self.reference = flatten_outputs(instance(*inputs))
         inputs = self.inputs()
         seed_everything(1)
+        # The baseline's outputs must be its own too (``POISON_BYTE``): a
+        # NaN that it leaves where the reference is finite fails the output.
+        poison_free_memory()
         with torch.no_grad():
             self.baseline = flatten_outputs(compiled(*inputs))
 
@@ -1113,6 +1841,13 @@ class AnchoredGate:
 
         inputs = self.inputs()
         seed_everything(1)
+        # The candidate's outputs start from poisoned memory, not from the
+        # block an earlier candidate freed with its outputs still in it
+        # (``POISON_BYTE``): float elements that the candidate leaves
+        # unwritten are NaN, which fails them unless the reference is NaN
+        # there too (``check_written`` finds those as well, and the fp8
+        # "fnuz" elements, where the fill is a finite value).
+        poison_free_memory()
         with torch.no_grad():
             outputs = flatten_outputs(candidate(inputs))
         if len(outputs) != len(self.reference):
@@ -1493,6 +2228,18 @@ MAX_ACTIVITY_GAP_S = 30.0
 MAX_SAMPLE_PERIOD_S = 6.0
 
 
+def unknown_samples_allowed(activity: dict[str, Any]) -> int:
+    """How many of a job's activity samples may have failed
+    (``MAX_UNKNOWN_SAMPLES``, or one in twenty of them). The samples of
+    several jobs merged into one, as an aggregate bench record holds them,
+    name what their jobs allowed, added up (``unknown_allowed``): each
+    process of a repeated bench has the allowance of a job."""
+    allowed = activity.get("unknown_allowed")
+    if allowed is None:
+        allowed = max(MAX_UNKNOWN_SAMPLES, activity["samples"] // 20)
+    return allowed
+
+
 def activity_coverage_issue(record: dict[str, Any]) -> str | None:
     """Why ``record``'s foreign-activity samples do not cover its job (no
     samples, too many that failed, or a stretch of the job without one), or
@@ -1505,7 +2252,7 @@ def activity_coverage_issue(record: dict[str, Any]) -> str | None:
     samples, unknown = activity["samples"], activity["unknown_samples"]
     if unknown >= samples:
         return f"none of {samples} samples read the GPU"
-    if unknown > max(MAX_UNKNOWN_SAMPLES, samples // 20):
+    if unknown > unknown_samples_allowed(activity):
         return f"{unknown} of {samples} samples failed"
     gap = activity.get("max_gap_s")
     if gap is not None:

@@ -3,13 +3,23 @@
 Reads ``<run>/bench/*.json`` (and the autotune records under
 ``<run>/configs``) and writes ``<run>/report.md`` and ``<run>/report.json``.
 Speedups are ``baseline_us / helion_cute_us`` (>1 means Helion+CuTe is
-faster); ``inductor`` is the better of Inductor's default and
-coordinate-descent compiles, as better-benchmark reports it. An
+faster); ``inductor`` is the fastest of the Inductor compiles a record
+holds (``common.INDUCTOR_IMPLS``: default, coordinate descent and the
+options of ``mode="max-autotune"``). A record of
+several bench processes (``campaign.py --bench-repeats``: the aggregate
+``<point>.json``; its per-process records ``<point>.r<k>.json`` are no rows
+of their own) gives each timing as the median over the processes and each
+speedup as the median of the per-process ratios, Inductor being the fastest
+of its compiles in each process (``summarize``; the README's Baseline
+section has the rule and why the ratio of the medians is not it). An
 implementation is left out of every comparison and aggregate when it failed
 its run or the anchored numerics gate (``FAIL`` in the numerics column),
 or, for a Helion port, when its pinned kernels no longer generate the code
 the autotune measured (``stale``: ``code_matches_autotune`` is false, so the
-timing is not of the tuned kernels).
+timing is not of the tuned kernels). One exception, in a record of several
+processes: an Inductor compile that failed in some of them (``FAIL`` in the
+column as well) still stands in the baseline of the processes in which it
+ran and passed (``impl_times``), and the report lists it.
 
 The aggregates count only records whose foreign GPU activity was sampled
 and clean (``common.activity_issue``): a bench record during which a
@@ -53,7 +63,14 @@ seed draws from the tree's search space, only where the two trees build the
 same one for the port, which the seeds do not tell).
 
 It also lists the records whose numerics gate fell back from the float64
-reference to the eager one (``common.AnchoredGate``'s ``ref_fallback``).
+reference to the eager one (``common.AnchoredGate``'s ``ref_fallback``), the
+config each Triton kernel of Inductor's compiles ended on where the
+bench records name them (``inductor_configs``; of a repeated bench, each
+distinct set of picks with the number of processes that ended on it), the
+Inductor compiles that are not usable in some process of a repeated bench
+(that process's baseline is of the other compiles alone), and the
+implementations whose kernels' profiler spans overlap (dependent launches:
+their ``kernel_us`` is of the kernels' steps).
 
 When bench records carry ``rot_us`` (``bench.py --rotate-inputs``: the cold
 timer on private input sets, one per call, which hinted loads cannot keep in
@@ -85,11 +102,13 @@ import contextlib
 import hashlib
 import json
 import math
+import operator
 from pathlib import Path
 import statistics
 import sys
 from typing import TYPE_CHECKING
 from typing import Any
+from typing import cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -161,6 +180,63 @@ def impl_time(
     return None
 
 
+def processes(record: dict[str, Any]) -> int:
+    """How many bench processes a record is of: one, or those an aggregate
+    record counts (``common.aggregate_bench_records``)."""
+    return record["aggregate"]["processes"] if "aggregate" in record else 1
+
+
+def impl_times(
+    record: dict[str, Any], impl: str, metric: str, stale_ok: bool = False
+) -> list[float | None]:
+    """An implementation's usable timing in each process of a record
+    (``impl_time``'s rule; an aggregate record's are its ``per_process``
+    values).
+
+    A port, an oracle or the memory copy of an aggregate record is usable
+    in every process or in none: what one process does not reproduce is not
+    the point's result. An Inductor compile is the baseline, and is taken
+    process by process, as that process's own record gives it: usable where
+    it ran and passed in that process. One that failed in a single process
+    is then missing from that process's baseline alone, and the others
+    still take the fastest of them all (``summarize`` names such processes:
+    ``inductor_missing``)."""
+    if "aggregate" not in record:
+        return [impl_time(record, impl, metric, stale_ok)]
+    count = processes(record)
+    info = record["impls"].get(impl) or {}
+    per_process = info.get("per_process") or {}
+    values = per_process.get(metric)
+    if values is None:
+        return [None] * count
+    if impl in common.INDUCTOR_IMPLS:
+        counts = [
+            usable({"status": status, "numerics_pass": passed})
+            for status, passed in zip(
+                per_process["status"], per_process["numerics_pass"], strict=True
+            )
+        ]
+    else:
+        counts = [usable(info, stale_ok)] * count
+    return [
+        value
+        if counted
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+        else None
+        for value, counted in zip(values, counts, strict=True)
+    ]
+
+
+def middle(values: list[float | None]) -> float | None:
+    """The median over a record's processes; None unless every process has
+    a value."""
+    if any(value is None for value in values):
+        return None
+    return statistics.median(cast("list[float]", values))
+
+
 def rebalance(record: dict[str, Any]) -> dict[str, Any]:
     """``record`` with each implementation's ``cold_us`` and ``bb_us``
     recomputed from its recorded rounds (``cold_runs_us``, ``bb_runs_us``)
@@ -168,7 +244,10 @@ def rebalance(record: dict[str, Any]) -> dict[str, Any]:
     over each order's rounds, averaged (``common.order_balanced``; with 5
     rounds the orders are forward, reverse, forward, reverse, forward). The
     per-order values go to ``cold_order_medians_us`` and
-    ``bb_order_mins_us``, as ``bench.py`` records them."""
+    ``bb_order_mins_us``, as ``bench.py`` records them. An aggregate record
+    holds no rounds (its processes' records do) and stays as it is."""
+    if "aggregate" in record:
+        return record
     for info in record["impls"].values():
         for metric, rounds, statistic, per_order in (
             ("cold_us", "cold_runs_us", statistics.median, "cold_order_medians_us"),
@@ -232,26 +311,59 @@ def summarize(
             issue := common.activity_issue(config, include_unsampled)
         ):
             issues[f"{backend} autotune"] = issue
-    ind = [impl_time(record, i, metric) for i in ("inductor", "inductor_cd")]
-    ind = [t for t in ind if t is not None]
+    # Each implementation's timing in each process of the record (one, or
+    # those of an aggregate); Inductor's is the fastest of its compiles
+    # (default, coordinate descent, max-autotune) in that process, of those
+    # that are usable there.
+    compiles = {
+        impl: impl_times(record, impl, metric) for impl in common.INDUCTOR_IMPLS
+    }
+    times: dict[str, list[float | None]] = {
+        "inductor": [
+            min(usable_times) if usable_times else None
+            for usable_times in (
+                [t for t in process if t is not None]
+                for process in zip(*compiles.values(), strict=True)
+            )
+        ],
+        "oracle": impl_times(record, "oracle", metric),
+        **{impl: impl_times(record, impl, metric, impl in elsewhere) for impl in PORTS},
+        "memcopy": impl_times(record, "memcopy", metric),
+    }
     row: dict[str, Any] = {
         "repro": record["repro"],
         "shape": record["shape"],
         "family": common.family(record["repro"]),
         "total_bytes": record.get("total_bytes"),
-        "inductor": min(ind) if ind else None,
-        "oracle": impl_time(record, "oracle", metric),
-        **{impl: impl_time(record, impl, metric, impl in elsewhere) for impl in PORTS},
-        "memcopy": impl_time(record, "memcopy", metric),
+        **{impl: middle(values) for impl, values in times.items()},
+        "processes": processes(record),
     }
+
+    def speedup(impl: str, base: str) -> tuple[float | None, list[float]]:
+        """``base`` time over ``impl`` time: the ratio in each process, and
+        the median of those (the gate's rule; one process's ratio for a
+        plain record). None unless both are timed in every process."""
+        if row[impl] is None or row[base] is None:
+            return None, []
+        ratios = [
+            cast("float", b) / cast("float", t)
+            for t, b in zip(times[impl], times[base], strict=True)
+        ]
+        return statistics.median(ratios), ratios
+
+    # ratio() reads these: (implementation, base) -> speedup.
+    row["speedups"] = {}
+    for key, impl, base in (
+        ("cute_vs_inductor", "helion_cute", "inductor"),
+        ("cute_vs_oracle", "helion_cute", "oracle"),
+        ("cute_vs_helion_triton", "helion_cute", "helion_triton"),
+        ("triton_vs_inductor", "helion_triton", "inductor"),
+    ):
+        row[key], per_process = speedup(impl, base)
+        row["speedups"].setdefault(impl, {})[base] = row[key]
+        if key == "cute_vs_inductor" and len(per_process) > 1:
+            row["cute_vs_inductor_per_process"] = per_process
     cute = row["helion_cute"]
-    for base in ("inductor", "oracle", "helion_triton"):
-        b = row[base]
-        row[f"cute_vs_{base}"] = b / cute if b and cute else None
-    triton = row["helion_triton"]
-    row["triton_vs_inductor"] = (
-        row["inductor"] / triton if row["inductor"] and triton else None
-    )
     if cute and row["total_bytes"]:
         row["cute_gbps"] = row["total_bytes"] / cute / 1e3
     if row["inductor"] and row["total_bytes"]:
@@ -262,19 +374,48 @@ def summarize(
         row["inductor_of_sol"] = row["memcopy"] / row["inductor"]
     row["numerics"] = {
         impl: verdict(record["impls"].get(impl) or {})
-        for impl in (
-            "inductor",
-            "inductor_cd",
-            "oracle",
-            "helion_triton",
-            "helion_cute",
-        )
+        for impl in (*common.INDUCTOR_IMPLS, "oracle", "helion_triton", "helion_cute")
     }
     kernels = {}
-    for impl in ("inductor", "inductor_cd", "helion_cute", "helion_triton"):
+    for impl in (*common.INDUCTOR_IMPLS, "helion_cute", "helion_triton"):
         info = record["impls"].get(impl) or {}
         kernels[impl] = [k["name"] for k in info.get("kernels", [])]
     row["kernels"] = kernels
+    # The configs Inductor's kernels ended on (bench.py's inductor_configs):
+    # a list per process.
+    row["inductor_configs"] = {
+        impl: picks
+        for impl in common.INDUCTOR_IMPLS
+        if (picks := inductor_picks(record["impls"].get(impl) or {}))
+    }
+    # The processes of a repeated bench in which an Inductor compile is not
+    # usable, by their records: their baseline is of the other compiles alone.
+    row["inductor_missing"] = {}
+    if "aggregate" in record:
+        names = record["aggregate"]["counted"]
+        row["inductor_missing"] = {
+            impl: missing
+            for impl, values in compiles.items()
+            if impl in record["impls"]
+            and (
+                missing := [
+                    name
+                    for name, value in zip(names, values, strict=True)
+                    if value is None
+                ]
+            )
+        }
+    # Implementations whose kernels' profiler spans overlap (dependent
+    # launches): their kernel_us is of the steps, not of the spans. An
+    # aggregate has the two totals only of an implementation that every
+    # process profiled.
+    row["overlapping_spans"] = {
+        impl: {"kernel_us": info["kernel_us"], "kernel_span_us": info["kernel_span_us"]}
+        for impl, info in record["impls"].items()
+        if info.get("kernel_spans_overlap")
+        and "kernel_us" in info
+        and "kernel_span_us" in info
+    }
     row["foreign_gpu_processes"] = sorted(
         set(record.get("foreign_gpu_processes_before") or [])
         | set(record.get("foreign_gpu_processes_after") or [])
@@ -292,10 +433,64 @@ def summarize(
 
 
 def ratio(row: dict[str, Any], impl: str, base: str) -> float | None:
-    """``base`` time over ``impl`` time, when the aggregates count both."""
+    """``base`` time over ``impl`` time, when the aggregates count both: of
+    a record of several processes, the median of the ratios in each
+    (``summarize``)."""
     if impl in row["counted"] and base in row["counted"]:
-        return row[base] / row[impl]
+        return row["speedups"][impl][base]
     return None
+
+
+def inductor_picks(info: dict[str, Any]) -> list[list[dict[str, Any]]]:
+    """The configs that the kernels of an Inductor compile ended on, a list
+    per bench process (``info``: the compile's entry in a bench record or in
+    an aggregate; none for a record made before ``bench.py`` named them)."""
+    if "per_process" in info:
+        return [picks or [] for picks in info["per_process"]["inductor_configs"]]
+    return [info["inductor_configs"]] if "inductor_configs" in info else []
+
+
+def pick_text(kernels: list[dict[str, Any]]) -> str:
+    """One compile's picks on a line: each kernel's block sizes, warps and
+    stages (a mix-order reduction's split size is among the block sizes).
+    A process that names no kernel says so: its compile failed before the
+    bench read its picks, or launches no Triton kernel."""
+    if not kernels:
+        return "no kernel recorded"
+    parts = []
+    for kernel in kernels:
+        launchers = kernel.get("launchers", [kernel])
+        configs = " | ".join(
+            " ".join(
+                [
+                    *(
+                        f"{name}={value}"
+                        for name, value in config["block_sizes"].items()
+                    ),
+                    f"warps={config['num_warps']}",
+                    f"stages={config['num_stages']}",
+                ]
+            )
+            for config in launchers
+        )
+        parts.append(f"{kernel['name']}: {configs or 'no launcher'}")
+    return "; ".join(parts)
+
+
+def inductor_config_lines(rows: list[dict[str, Any]]) -> list[str]:
+    """The report's section on the configs Inductor's kernels ended on: per
+    kernel row and compile, each distinct set of picks with the number of
+    bench processes that ended on it."""
+    lines = []
+    for row in sorted(rows, key=operator.itemgetter("repro", "shape")):
+        for impl, picks in row["inductor_configs"].items():
+            counts = collections.Counter(pick_text(kernels) for kernels in picks)
+            for text, count in counts.most_common():
+                share = (
+                    f" ({count} of {len(picks)} processes)" if len(picks) > 1 else ""
+                )
+                lines.append(f"- {row['repro']}[{row['shape']}] {impl}{share}: {text}")
+    return lines
 
 
 def aggregate(
@@ -377,6 +572,10 @@ def ok_records(run_dir: Path, kind: str) -> dict[Path, dict[str, Any]]:
     """The ok records of a run's ``bench`` or ``configs`` directory."""
     found = {}
     for path in sorted((run_dir / kind).glob("*__*.json")):
+        if common.is_repeat_record(path):
+            # One process of a repeated bench: its point's aggregate record
+            # stands for it (campaign.py --bench-repeats).
+            continue
         record = json.loads(path.read_text())
         if record.get("status") == "ok":
             found[path] = record
@@ -689,7 +888,10 @@ def main() -> None:
                 continue
             if rec.get("reused_from"):
                 reused.append(name)
-            if rec.get("contaminated"):
+            if rec.get("contaminated") and "aggregate" in rec:
+                # No process of the repeated bench was clean.
+                found = [*(found or []), f"all {processes(rec)} bench processes"]
+            elif rec.get("contaminated"):
                 attempts = len(rec.get("contaminated_attempts", []))
                 found = [*(found or []), f"the cleanest of {attempts} attempts"]
             if found:
@@ -719,6 +921,19 @@ def main() -> None:
                 f"torch {ver.get('torch')}, triton {ver.get('triton')}, "
                 f"cutlass-dsl {ver.get('nvidia-cutlass-dsl')}, "
                 f"helion {ver.get('helion_git')}"
+            ),
+            "",
+        ]
+    counts = sorted({processes(record) for record in records} - {1})
+    if counts:
+        lines += [
+            (
+                f"{sum(processes(record) > 1 for record in records)} of the "
+                f"{len(records)} bench records are aggregates over "
+                f"{', '.join(map(str, counts))} bench processes (`campaign.py "
+                "--bench-repeats`): a timing is the median over the processes, "
+                "and a speedup the median of the ratios taken in each process, "
+                "Inductor being the fastest of its compiles in that process."
             ),
             "",
         ]
@@ -795,15 +1010,18 @@ def main() -> None:
             else None
         )
         rot_column = "" if by_rot is None else " | cute/ind rot"
+        # The speedup's range over the processes of a repeated bench.
+        repeated = any(r["processes"] > 1 for r in table)
+        spread_column = " | cute/ind per process (n)" if repeated else ""
         lines += [
             "",
             (
                 "| repro | shape | MB | inductor | helion-cute | cute/ind"
-                f"{rot_column}{baseline_column} | helion-triton | triton/ind | oracle"
-                " | memcopy | ind %SOL | cute %SOL | numerics"
+                f"{spread_column}{rot_column}{baseline_column} | helion-triton"
+                " | triton/ind | oracle | memcopy | ind %SOL | cute %SOL | numerics"
                 " | left out of the aggregates |"
             ),
-            f"|{'---|' * (14 + bool(rot_column) + bool(baseline_column))}",
+            f"|{'---|' * (14 + repeated + bool(rot_column) + bool(baseline_column))}",
         ]
         for r in sorted(table, key=lambda r: r["cute_vs_inductor"] or 0):
             num = ",".join(f"{k.split('_')[-1]}={v}" for k, v in r["numerics"].items())
@@ -820,10 +1038,18 @@ def main() -> None:
                 if by_rot is None
                 else f" | {fmt(by_rot.get((r['repro'], r['shape'])), '.3f')}"
             )
+            spread = ""
+            if repeated:
+                ratios = r.get("cute_vs_inductor_per_process")
+                spread = " | " + (
+                    f"{min(ratios):.3f}..{max(ratios):.3f} ({len(ratios)})"
+                    if ratios
+                    else "-"
+                )
             lines.append(
                 f"| {r['repro']} | {r['shape']} | {fmt((r['total_bytes'] or 0) / 1e6, '.1f')}"
                 f" | {fmt(r['inductor'])} | {fmt(r['helion_cute'])}"
-                f" | {fmt(r['cute_vs_inductor'], '.3f')}{rot}{before}"
+                f" | {fmt(r['cute_vs_inductor'], '.3f')}{spread}{rot}{before}"
                 f" | {fmt(r['helion_triton'])} | {fmt(r['triton_vs_inductor'], '.3f')}"
                 f" | {fmt(r['oracle'])} | {fmt(r['memcopy'])}"
                 f" | {fmt(100 * r['inductor_of_sol'] if r.get('inductor_of_sol') else None, '.0f')}"
@@ -915,6 +1141,67 @@ def main() -> None:
         if not left:
             lines.append("- none")
         lines += ["", ROTATION_CAVEAT, ""]
+    picks = inductor_config_lines(rows["cold_us"])
+    if picks:
+        lines += [
+            "## Inductor configs",
+            "",
+            (
+                "The config that each Triton kernel of Inductor's compiles "
+                "ended on in the bench (block sizes, a mix-order reduction's "
+                "`RSPLIT_SIZE` among them, warps, stages). Coordinate descent "
+                "tunes `inductor_cd` and `inductor_max` again in every bench "
+                "process, and its pick moves a reading (README, Baseline)."
+            ),
+            "",
+            *picks,
+            "",
+        ]
+    missing = [
+        f"- {r['repro']}[{r['shape']}] {impl}: not usable in {len(names)} of "
+        f"{r['processes']} bench processes ({', '.join(names)})"
+        for r in sorted(rows["cold_us"], key=operator.itemgetter("repro", "shape"))
+        for impl, names in r["inductor_missing"].items()
+    ]
+    if missing:
+        lines += [
+            "## Inductor compiles missing from a process",
+            "",
+            (
+                "A repeated bench takes Inductor process by process, as the "
+                "fastest of the compiles that ran and passed in that process. "
+                "Where one of them failed, that process's baseline is of the "
+                "other compiles alone (as in a single bench), and its ratio "
+                "can be higher than the other processes' for that reason."
+            ),
+            "",
+            *missing,
+            "",
+        ]
+    overlapping = {
+        f"{r['repro']}__{r['shape']} {impl}": spans
+        for r in rows["cold_us"]
+        for impl, spans in r["overlapping_spans"].items()
+    }
+    if overlapping:
+        lines += [
+            "## Dependent launches",
+            "",
+            (
+                "Implementations whose kernels' profiler spans overlap (a kernel "
+                "launched as a dependent launch starts its span while its "
+                "predecessor runs): `kernel_us` and each kernel's `us` are of "
+                "the kernels' steps, end minus the later of start and the "
+                "latest earlier end; the spans add up to more."
+            ),
+            "",
+        ]
+        lines += [
+            f"- {name}: steps {spans['kernel_us']:.1f} us, spans "
+            f"{spans['kernel_span_us']:.1f} us"
+            for name, spans in sorted(overlapping.items())
+        ]
+        lines.append("")
     if args.goal is not None:
         shapes = []
         for r in rows[args.metric]:

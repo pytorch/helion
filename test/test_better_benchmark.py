@@ -12,6 +12,7 @@ import os
 import pathlib
 from pathlib import Path
 import re
+import runpy
 import secrets
 import signal
 import statistics
@@ -21,14 +22,18 @@ import threading
 import time
 import types
 from typing import TYPE_CHECKING
+from typing import Any
 from typing import cast
 import warnings
+import weakref
 
 from benchmarks.cute.better_benchmark import audit_activity
 from benchmarks.cute.better_benchmark import autotune
 from benchmarks.cute.better_benchmark import bench
 from benchmarks.cute.better_benchmark import campaign
+from benchmarks.cute.better_benchmark import check_port
 from benchmarks.cute.better_benchmark import common
+from benchmarks.cute.better_benchmark import inductor_code
 from benchmarks.cute.better_benchmark import ncu_profile
 from benchmarks.cute.better_benchmark import plan_run
 from benchmarks.cute.better_benchmark import report
@@ -46,6 +51,7 @@ import helion.runtime
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing_extensions import Self
 
 pytestmark = pytest.mark.cpu_only
 
@@ -868,6 +874,1117 @@ def test_the_errors_recorded_against_eager_see_every_difference(
         common.output_errors([expected[0]], expected)
 
 
+def test_an_exact_output_inductor_does_not_reproduce_must_equal_inductors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A sort permutation and a mask that eager's implementation and
+    # Inductor's kernels settle differently (the order of topk's tied values
+    # in pointwise_59acdb823e92), beside a float output.
+    monkeypatch.setattr(common, "flatten_outputs", list)
+    eager = [torch.tensor([0, 1, 2, 3]), torch.tensor([True, False]), torch.ones(2)]
+    inductor = [torch.tensor([0, 2, 1, 3]), torch.tensor([False, True]), torch.ones(2)]
+    asked: list[object] = []
+
+    def checked(*outputs: torch.Tensor) -> list[dict[str, object]]:
+        judged: list[dict[str, object]] = []
+        common.check_outputs(
+            list(outputs),
+            eager,
+            inductor=lambda: asked.append(outputs) or inductor,
+            vs_inductor=judged,
+        )
+        return judged
+
+    def entry(index: int, elements: int) -> dict[str, object]:
+        return {
+            "idx": index,
+            "reference": "inductor",
+            "elements": elements,
+            "mismatches_vs_eager": 2,
+            "inductor_mismatches_vs_eager": 2,
+        }
+
+    # Eager's values pass as before, and nothing asks for Inductor's.
+    assert checked(*eager) == [] and not asked
+    # Inductor's pass too, and the entries say why they were the reference;
+    # an output that equals eager's is compared with eager only.
+    assert checked(*inductor) == [entry(0, 4), entry(1, 2)]
+    assert checked(inductor[0], eager[1], eager[2]) == [entry(0, 4)]
+    # Values that are neither's fail, whatever they have in common with
+    # Inductor's.
+    with pytest.raises(
+        common.ExactMismatch,
+        match="output 0: 2 of 4 elements differ from eager's and 3 from the "
+        "default Inductor compile's, which differs from eager's in 2",
+    ):
+        checked(torch.tensor([1, 0, 2, 3]), *eager[1:])
+    # Inductor's float output is no reference: only the gate judges floats.
+    wrong = torch.full([2], 3.0)
+    judged: list[dict[str, object]] = []
+    with pytest.raises(common.FloatMismatch):
+        common.check_outputs(
+            [inductor[0], eager[1], wrong],
+            eager,
+            inductor=lambda: [*inductor[:2], wrong],
+            vs_inductor=judged,
+        )
+    assert judged == [entry(0, 4)]
+    # Without Inductor's outputs eager is the only reference (check_port.py
+    # --no-anchored), as it is for an output in which Inductor reproduces
+    # eager and for one where Inductor's has another structure.
+    as_today = r"output 0: 2 of 4 elements differ$"
+    with pytest.raises(common.ExactMismatch, match=as_today):
+        common.check_outputs(inductor, eager)
+    for reference in (eager, [inductor[0].view(2, 2), *eager[1:]], inductor[:2]):
+        with pytest.raises(common.ExactMismatch, match=as_today):
+            common.check_outputs(inductor, eager, inductor=lambda r=reference: r)
+
+
+def test_inductor_compiles_once_when_its_outputs_are_first_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiles: list[object] = []
+
+    def compile_inductor(
+        repro_id: str, shape: str, instance: object, *, impl: str = "inductor"
+    ) -> Callable[[torch.Tensor], torch.Tensor]:
+        compiles.append((repro_id, shape, instance, impl))
+        return lambda x: x + 1
+
+    monkeypatch.setattr(common, "compile_inductor", compile_inductor)
+    monkeypatch.setattr(common, "make_inputs", lambda *args, **kwargs: [torch.ones(3)])
+    outputs = common.inductor_outputs("r", "s", "instance")
+    assert not compiles
+    first = outputs()
+    assert torch.equal(first, torch.full([3], 2.0)) and outputs() is first
+    assert compiles == [("r", "s", "instance", "inductor")]
+
+
+# pointwise_59acdb823e92 in miniature: a float output and a sort permutation
+# in which eager orders two tied values one way and Inductor's kernels the
+# other, with the entry a check records for an implementation it judged
+# against Inductor's.
+_EAGER_ORDER = [0, 1, 2, 3]
+_INDUCTOR_ORDER = [0, 2, 1, 3]
+_NEITHER_ORDER = [1, 0, 2, 3]
+_VS_INDUCTOR = {
+    "idx": 1,
+    "reference": "inductor",
+    "elements": 4,
+    "mismatches_vs_eager": 2,
+    "inductor_mismatches_vs_eager": 2,
+}
+_NEITHER = (
+    "ExactMismatch: output 1: 2 of 4 elements differ from eager's and 3 from "
+    "the default Inductor compile's, which differs from eager's in 2"
+)
+
+
+def _ordering(order: list[int]) -> types.SimpleNamespace:
+    """A port of the stand-in repro whose permutation is ``order``."""
+    return types.SimpleNamespace(
+        forward=lambda inputs: (inputs[0] * 2, torch.tensor(order))
+    )
+
+
+@pytest.fixture
+def tie_order_repro(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stand-ins for that repro, its inputs and its Inductor compiles on a
+    machine without a device or better-benchmark; returns the ``impl`` of
+    each compile made."""
+
+    class Repro(torch.nn.Module):
+        def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            return _ordering(_EAGER_ORDER).forward([x])
+
+    compiles: list[str] = []
+
+    def compile_inductor(
+        repro_id: str, shape: str, instance: object, *, impl: str = "inductor"
+    ) -> Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+        compiles.append(impl)
+        return lambda x: _ordering(_INDUCTOR_ORDER).forward([x])
+
+    module = types.SimpleNamespace(Repro=Repro)
+    harness = types.SimpleNamespace(detect_stochastic_outputs=lambda *args: [])
+    monkeypatch.setitem(sys.modules, "oracle_harness", harness)
+    monkeypatch.setattr(common, "bb_path", lambda: None)
+    monkeypatch.setattr(common, "load_repro_module", lambda repro_id: module)
+    monkeypatch.setattr(common, "make_inputs", lambda *args, **kwargs: [torch.ones(3)])
+    monkeypatch.setattr(common, "flatten_outputs", list)
+    monkeypatch.setattr(common, "compile_inductor", compile_inductor)
+    monkeypatch.setattr(common, "gpu_info", dict)
+    monkeypatch.setattr(common, "versions", dict)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda index: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    return compiles
+
+
+def test_check_port_reports_the_outputs_it_judged_against_inductor(
+    tie_order_repro: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def check(order: list[int], *flags: str) -> tuple[object, str]:
+        monkeypatch.setattr(common, "load_port", lambda *args: _ordering(order))
+        argv = ["check_port.py", "r", "--shape", "s", "--backends", "cute", *flags]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exit_:
+            check_port.main()
+        return exit_.value.code, capsys.readouterr().out
+
+    # A port that returns Inductor's permutation passes, and the check says
+    # which output it compared with Inductor's and why.
+    code, out = check(_INDUCTOR_ORDER)
+    assert code == 0 and out.endswith("PASS\n")
+    assert (
+        "[cute]   exact output vs Inductor, whose own differs from eager's: "
+        f"{_VS_INDUCTOR}\n"
+    ) in out
+    # One that returns eager's passes as before.
+    code, out = check(_EAGER_ORDER)
+    assert code == 0 and out.endswith("PASS\n") and "vs Inductor" not in out
+    # One that returns neither fails.
+    code, out = check(_NEITHER_ORDER)
+    assert code == 1 and out.endswith("FAIL\n") and _NEITHER in out
+    # Without the gate nothing is compiled, and eager is the only reference.
+    tie_order_repro.clear()
+    code, out = check(_INDUCTOR_ORDER, "--no-anchored")
+    assert code == 1 and "ExactMismatch: output 1: 2 of 4 elements differ\n" in out
+    assert not tie_order_repro
+
+
+def test_an_autotune_record_names_the_outputs_it_judged_against_inductor(
+    tie_order_repro: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernels = _toy_kernels("cute")
+    monkeypatch.setattr(autotune, "register_post_autotune_hook", lambda hook: None)
+    monkeypatch.setattr(common, "bound_kernel_records", lambda port: kernels)
+    monkeypatch.setattr(common, "pin_roundtrip", lambda port, kernels: {"k": True})
+
+    def tuned(order: list[int]) -> dict[str, object]:
+        monkeypatch.setattr(
+            common, "load_port", lambda *args, **kwargs: _ordering(order)
+        )
+        tie_order_repro.clear()
+        job = argparse.Namespace(
+            repro_id="r", shape="s", backend="cute", rtol=2e-2, atol=2e-2
+        )
+        return autotune.run(job)
+
+    # The tuned run and the pinned one are both judged against the one
+    # default compile, which only a port that differs from eager needs.
+    record = tuned(_INDUCTOR_ORDER)
+    assert record["status"] == "ok" and record["exact_vs_inductor"] == [_VS_INDUCTOR]
+    assert record["errors_vs_eager"][1]["mismatches"] == 2  # pyrefly: ignore[bad-index]
+    assert tie_order_repro == ["inductor"]
+    record = tuned(_EAGER_ORDER)
+    assert record["status"] == "ok" and "exact_vs_inductor" not in record
+    assert not tie_order_repro
+    record = tuned(_NEITHER_ORDER)
+    assert record["status"] == "error" and _NEITHER in str(record["error"])
+    assert "kernels" not in record and "exact_vs_inductor" not in record
+
+
+def test_a_bench_record_names_the_outputs_it_judged_against_inductor(
+    tie_order_repro: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default compile is its own reference, the coordinate-descent
+    # compile and a port of Inductor's kernels reproduce it, an oracle that
+    # calls ATen reproduces eager, and a port that reproduces neither is an
+    # error that is not timed.
+    ports = {"triton": _INDUCTOR_ORDER, "cute": _NEITHER_ORDER}
+    accounting = types.SimpleNamespace(count_bytes_effective=lambda *args: 24)
+    monkeypatch.setitem(sys.modules, "byte_accounting", accounting)
+    monkeypatch.setattr(
+        common, "load_oracle", lambda *args: _ordering(_EAGER_ORDER).forward
+    )
+    monkeypatch.setattr(
+        bench,
+        "pinned_port",
+        lambda info, configs, repro, shape, backend: (
+            _ordering(ports[backend]),
+            {"kernels": {}},
+        ),
+    )
+    monkeypatch.setattr(common, "pin_roundtrip", lambda port, kernels: {})
+    monkeypatch.setattr(bench, "_replayed", lambda call, fresh_inputs: call)
+    monkeypatch.setattr(common, "foreign_gpu_processes", list)
+    monkeypatch.setattr(common, "gpu_temperature", lambda: None)
+    timed: list[str] = []
+
+    def time_impls(
+        fns: dict[str, Callable[[], object]], **rounds: int
+    ) -> dict[str, dict[str, float]]:
+        timed.extend(fns)
+        return {impl: {"bb_us": 2.0, "cold_us": 1.0} for impl in fns}
+
+    monkeypatch.setattr(bench, "time_impls", time_impls)
+    impls = ["inductor", "inductor_cd", "oracle", "helion_triton", "helion_cute"]
+    record = bench.run(
+        argparse.Namespace(
+            repro_id="r",
+            shape="s",
+            impls=",".join(impls),
+            configs_dir=tmp_path,
+            rounds=2,
+            rep_ms=1,
+            cold_rounds=2,
+            rotate_inputs=0,
+            placement_seed=None,
+            fixed_placement=True,
+        )
+    )
+    assert record["status"] == "ok" and timed == impls[:4]
+    entries = record["impls"]
+    for impl in ("inductor", "inductor_cd", "helion_triton"):
+        assert entries[impl]["status"] == "ok" and entries[impl]["numerics_pass"]
+        assert entries[impl]["exact_vs_inductor"] == [_VS_INDUCTOR]
+        assert entries[impl]["errors_vs_eager"][1]["mismatches"] == 2
+    assert entries["oracle"]["status"] == "ok" and entries["oracle"]["numerics_pass"]
+    assert "exact_vs_inductor" not in entries["oracle"]
+    assert entries["helion_cute"]["status"] == "error"
+    assert _NEITHER in entries["helion_cute"]["error"]
+    assert "exact_vs_inductor" not in entries["helion_cute"]
+    # The two Inductor compiles name their kernels' configs (these stand-ins
+    # launch none), and the record its placement (none drawn here).
+    assert [impl for impl in impls if "inductor_configs" in entries[impl]] == [
+        "inductor",
+        "inductor_cd",
+    ]
+    assert entries["inductor_cd"]["inductor_configs"] == []
+    placement = record["placement"]
+    assert placement["seed"] is None and placement["spacer_pages"] == []
+    # Where each timed implementation's inputs lie: one storage each.
+    assert list(placement["timed_inputs"]) == impls[:4]
+    assert all(len(addresses) == 1 for addresses in placement["timed_inputs"].values())
+
+
+def _unwritten(
+    values: torch.Tensor, skipped: slice, byte: int, written: bool = False
+) -> torch.Tensor:
+    """What a call that never writes ``skipped`` returns for ``values`` on
+    memory filled with ``byte``; with ``written``, a call that writes all."""
+    out = values.clone()
+    if not written:
+        size = out.element_size()
+        integer = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+        pattern = int.from_bytes(bytes([byte]) * size, "little", signed=size > 1)
+        out.view(integer[size])[skipped] = pattern
+    return out
+
+
+def test_the_fill_is_of_free_blocks_and_of_frees_that_wait_for_a_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Without a device: the allocator's blocks as its snapshot lists them.
+    # A block whose free waits for another stream's work (record_stream) is
+    # handed out by the next allocation once that work is done, with
+    # nothing taken from the driver, so it is filled with the free blocks,
+    # after the device has gone idle. Blocks that tensors hold, and another
+    # device's, are left alone.
+    steps: list[object] = []
+
+    def segment(device: int, *blocks: tuple[int, int, str]) -> dict[str, object]:
+        return {
+            "device": device,
+            "blocks": [
+                {"address": address, "size": size, "state": state}
+                for address, size, state in blocks
+            ],
+        }
+
+    def snapshot() -> list[dict[str, object]]:
+        steps.append("snapshot")
+        return [
+            segment(0, (16, 4, "active_allocated"), (32, 8, "inactive")),
+            segment(0, (64, 2, "active_pending_free"), (80, 1, "inactive")),
+            segment(1, (96, 16, "inactive"), (128, 16, "active_pending_free")),
+        ]
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", snapshot)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: steps.append("idle"))
+    monkeypatch.setattr(
+        common, "_fill_device_bytes", lambda *block: steps.append(block)
+    )
+    assert common.poison_free_memory() == 8 + 2 + 1
+    fill = common.POISON_BYTE
+    assert steps == [
+        "idle",
+        "snapshot",
+        (32, 8, fill),
+        (64, 2, fill),
+        (80, 1, fill),
+        "idle",
+    ]
+    assert common.allocated_blocks() == {16}
+
+
+# One case per kind of dtype the outputs have, each with values that the
+# fill bytes also spell (a NaN is not among them, -1, 0, True and False are).
+@pytest.mark.parametrize(
+    "values",
+    [
+        torch.tensor([1.5, 0.0, -2.0, 0.0], dtype=torch.bfloat16),
+        torch.tensor([3, -1, 0, -1]),
+        torch.tensor([True, False, True, False]),
+        torch.tensor([0, 255, 7, 0], dtype=torch.uint8),
+    ],
+    ids=lambda values: str(values.dtype),
+)
+def test_an_output_part_that_follows_the_fill_was_never_written(
+    monkeypatch: pytest.MonkeyPatch, values: torch.Tensor
+) -> None:
+    monkeypatch.setattr(common, "flatten_outputs", list)
+    reruns: list[int] = []
+
+    def check(skipped: slice, written: bool = False) -> None:
+        def run(byte: int) -> list[torch.Tensor]:
+            reruns.append(byte)
+            return [values[:2], _unwritten(values, skipped, byte, written)]
+
+        reruns.clear()
+        outputs = [values[:2], _unwritten(values, skipped, common.POISON_BYTE, written)]
+        common.check_written(outputs, run)
+
+    # Every element written: the values that spell the first fill byte (the
+    # integer -1, the byte 255) take one more call, on the second byte, and
+    # do not follow it.
+    check(slice(0, 0), written=True)
+    spelled = values.dtype in (torch.int64, torch.uint8)
+    assert reruns == ([common.POISON_RECHECK_BYTE] if spelled else [])
+    # Unwritten elements follow the fill whatever their right values are (a
+    # zero among them, which the second byte spells), and the error counts
+    # them.
+    for skipped, count in ((slice(1, 2), 1), (slice(0, 4), 4)):
+        with pytest.raises(common.UnwrittenOutput, match=f"output 1: {count} of 4"):
+            check(skipped)
+        assert reruns == [common.POISON_RECHECK_BYTE]
+
+
+def test_checks_take_outputs_slice_by_slice_and_through_any_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The fill is read in the elements' own bytes: a transposed bool output
+    # (a copy would make its bytes 0 or 1), a complex one, one without
+    # elements and a scalar, within the slice budget.
+    monkeypatch.setattr(common, "CHECK_SLICE_ELEMENTS", 5)
+    mask = torch.zeros(4, 6, dtype=torch.bool)
+    mask.view(torch.uint8)[1, 2:5] = 0xFF
+    scalar = torch.zeros((), dtype=torch.float32)
+    scalar.view(torch.int32).fill_(-1)
+    both = torch.zeros(3, dtype=torch.complex64)
+    torch.view_as_real(both).view(torch.int32)[0] = -1
+    torch.view_as_real(both).view(torch.int32)[1, 0] = -1
+    with LargestTensor() as mode:
+        counts = [
+            common._poison_left(tensor, 0xFF)
+            for tensor in (mask.t(), scalar, both, torch.zeros(0, 3))
+        ]
+    assert counts == [3, 1, 1, 0] and mode.largest <= 5
+    zeros = torch.zeros(6, 4, dtype=torch.bool)
+    assert common._poison_left(mask.t(), 0xFF, (zeros, 0x00)) == 3
+
+
+@pytest.fixture
+def filled_memory(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Without a device: the bytes that the checks fill free memory with,
+    in order (the last is what a stand-in call finds in memory that it does
+    not write)."""
+    fills: list[int] = []
+    monkeypatch.setattr(
+        common, "poison_free_memory", lambda byte=common.POISON_BYTE: fills.append(byte)
+    )
+    return fills
+
+
+def _skipping_port(fills: list[int], skipped: slice) -> types.SimpleNamespace:
+    """A port variant of the stand-in repro that never writes ``skipped`` of
+    its first output."""
+    return types.SimpleNamespace(
+        forward=lambda inputs: (
+            _unwritten(inputs[0] * 2, skipped, fills[-1]),
+            torch.tensor(_EAGER_ORDER),
+        )
+    )
+
+
+def test_check_port_fails_a_port_variant_that_skips_a_slice_of_its_output(
+    tie_order_repro: list[str],
+    filled_memory: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def check(skipped: slice, *flags: str) -> tuple[object, str]:
+        port = _skipping_port(filled_memory, skipped)
+        monkeypatch.setattr(common, "load_port", lambda *args: port)
+        argv = ["check_port.py", "r", "--shape", "s", "--backends", "cute", *flags]
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exit_:
+            check_port.main()
+        return exit_.value.code, capsys.readouterr().out
+
+    # The negative control: the port leaves one of three elements as it
+    # finds it. Every call it is judged by starts from filled memory (the
+    # baseline's, the port's, the gate's), and the one after the output
+    # showed the first byte from the second.
+    code, out = check(slice(2, 3))
+    assert code == 1 and out.endswith("FAIL\n")
+    assert "UnwrittenOutput: output 0: 1 of 3 elements were never written" in out
+    assert filled_memory == [common.POISON_BYTE] * 2 + [common.POISON_RECHECK_BYTE]
+    # Without the gate too, where nothing else looks at the values' bytes.
+    code, out = check(slice(0, 1), "--no-anchored")
+    assert code == 1 and "UnwrittenOutput: output 0: 1 of 3" in out
+    # The same port writing everything passes; the gate's own call of it
+    # starts from filled memory as well.
+    filled_memory.clear()
+    code, out = check(slice(0, 0))
+    assert code == 0 and out.endswith("PASS\n")
+    assert filled_memory == [common.POISON_BYTE] * 3
+
+
+def test_check_port_checks_the_pinned_config_of_a_campaign(
+    tie_order_repro: list[str],
+    filled_memory: list[int],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # --configs-dir: the port pinned to its autotune record is checked like
+    # the default config, and a pick that skips part of its output fails
+    # the port; a directory without a record of the port says so. What
+    # would check nothing without saying why fails: a record that cannot be
+    # read, and a directory that is not there.
+    loaded: list[object] = []
+
+    def load_port(repro_id: str, backend: str, pinned: object = None) -> object:
+        loaded.append(pinned)
+        skipped = slice(1, 2) if pinned == {"k": "@broken"} else slice(0, 0)
+        return _skipping_port(filled_memory, skipped)
+
+    monkeypatch.setattr(common, "load_port", load_port)
+    monkeypatch.setattr(common, "pin_roundtrip", lambda port, kernels: {"k": True})
+
+    def check(
+        decorator: str | None, text: str | None = None, configs: Path = tmp_path
+    ) -> tuple[object, str]:
+        path = common.config_record_path(tmp_path, "r", "s", "cute")
+        path.unlink(missing_ok=True)
+        if decorator is not None:
+            kernels = {"k": {"decorator": decorator, "code_sha256": "0"}}
+            text = json.dumps({"status": "ok", "kernels": kernels})
+        if text is not None:
+            path.write_text(text)
+        argv = ["check_port.py", "r", "--shape", "s", "--backends", "cute"]
+        monkeypatch.setattr(sys, "argv", [*argv, "--configs-dir", str(configs)])
+        loaded.clear()
+        with pytest.raises(SystemExit) as exit_:
+            check_port.main()
+        captured = capsys.readouterr()
+        return exit_.value.code, captured.out + captured.err
+
+    code, out = check("@good")
+    assert code == 0 and loaded == [None, {"k": "@good"}]
+    assert "pinned config" in out and "pinned anchored gate pass=True" in out
+    code, out = check("@broken")
+    assert code == 1 and "[cute] pinned_config_failure" in out
+    assert "UnwrittenOutput: output 0: 1 of 3" in out
+    code, out = check(None)
+    assert code == 0 and loaded == [None] and "__cute.json): missing" in out
+    # The record of an autotune that failed is no pick either.
+    code, out = check(None, json.dumps({"status": "error"}))
+    assert code == 0 and loaded == [None] and "__cute.json): missing" in out
+    code, out = check(None, '{"status": "ok", "kernels"')
+    assert code == 1 and loaded == [None] and "__cute.json): error" in out
+    assert "[cute] pinned_config_failure" in out and "JSONDecodeError" in out
+    code, out = check(None, configs=tmp_path / "absent")
+    assert code == 2 and not loaded and "absent: not a directory" in out
+
+
+def test_bench_does_not_time_an_implementation_that_skips_part_of_its_output(
+    tie_order_repro: list[str],
+    filled_memory: list[int],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The CuTe port leaves an element of its output unwritten, the Triton
+    # port writes all of it: the replay that the checks judge starts from
+    # filled memory, on the second byte for the call that tells an
+    # unwritten element from a value.
+    ports = {"triton": slice(0, 0), "cute": slice(1, 2)}
+    accounting = types.SimpleNamespace(count_bytes_effective=lambda *args: 24)
+    monkeypatch.setitem(sys.modules, "byte_accounting", accounting)
+    monkeypatch.setattr(
+        bench,
+        "pinned_port",
+        lambda info, configs, repro, shape, backend: (
+            _skipping_port(filled_memory, ports[backend]),
+            {"kernels": {}},
+        ),
+    )
+    monkeypatch.setattr(common, "pin_roundtrip", lambda port, kernels: {})
+
+    def replayed(
+        call: Callable[[list[torch.Tensor]], object], fresh_inputs: object
+    ) -> Callable[..., object]:
+        def run(inputs: list[torch.Tensor], poison: int = common.POISON_BYTE) -> object:
+            common.poison_free_memory(poison)
+            return call(inputs)
+
+        return run
+
+    monkeypatch.setattr(bench, "_replayed", replayed)
+    monkeypatch.setattr(common, "foreign_gpu_processes", list)
+    monkeypatch.setattr(common, "gpu_temperature", lambda: None)
+    timed: list[str] = []
+
+    def time_impls(
+        fns: dict[str, Callable[[], object]], **rounds: int
+    ) -> dict[str, dict[str, float]]:
+        timed.extend(fns)
+        return {impl: {"bb_us": 2.0, "cold_us": 1.0} for impl in fns}
+
+    monkeypatch.setattr(bench, "time_impls", time_impls)
+    record = bench.run(
+        argparse.Namespace(
+            repro_id="r",
+            shape="s",
+            impls="helion_triton,helion_cute",
+            configs_dir=tmp_path,
+            rounds=2,
+            rep_ms=1,
+            cold_rounds=2,
+            rotate_inputs=0,
+            placement_seed=None,
+            fixed_placement=True,
+        )
+    )
+    assert record["status"] == "ok" and timed == ["helion_triton"]
+    entries = record["impls"]
+    assert entries["helion_triton"]["status"] == "ok"
+    assert entries["helion_cute"]["status"] == "error"
+    assert "UnwrittenOutput: output 0: 1 of 3" in entries["helion_cute"]["error"]
+    assert "errors_vs_eager" in entries["helion_cute"]
+    assert common.POISON_RECHECK_BYTE in filled_memory
+
+
+def test_an_autotune_fails_a_pick_that_skips_part_of_its_output(
+    tie_order_repro: list[str],
+    filled_memory: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pick, rebuilt from its decorators as bench.py will pin it, is
+    # called on filled memory: one that leaves an element unwritten fails
+    # the record, whatever the search's calls left in that memory (its
+    # values alone are only a warning against eager).
+    kernels = _toy_kernels("cute")
+    monkeypatch.setattr(autotune, "register_post_autotune_hook", lambda hook: None)
+    monkeypatch.setattr(common, "bound_kernel_records", lambda port: kernels)
+    monkeypatch.setattr(common, "pin_roundtrip", lambda port, kernels: {"k": True})
+
+    def tuned(skipped: slice) -> dict[str, object]:
+        def load_port(
+            repro_id: str, backend: str, pinned: object = None
+        ) -> types.SimpleNamespace:
+            if pinned is None:
+                return _ordering(_EAGER_ORDER)
+            return _skipping_port(filled_memory, skipped)
+
+        monkeypatch.setattr(common, "load_port", load_port)
+        filled_memory.clear()
+        job = argparse.Namespace(
+            repro_id="r", shape="s", backend="cute", rtol=2e-2, atol=2e-2
+        )
+        return autotune.run(job)
+
+    record = tuned(slice(1, 2))
+    assert record["status"] == "error"
+    assert "UnwrittenOutput: output 0: 1 of 3" in str(record["error"])
+    assert filled_memory == [common.POISON_BYTE, common.POISON_RECHECK_BYTE]
+    record = tuned(slice(0, 0))
+    assert record["status"] == "ok" and filled_memory == [common.POISON_BYTE]
+
+
+def test_a_call_that_takes_fresh_memory_runs_again_or_cannot_be_judged(
+    filled_memory: list[int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Without a device: how many times the allocator has taken memory from
+    # the driver, as each try finds the count before and after its call. The
+    # bytes it has reserved never grow here: an allocator that released its
+    # cached blocks to the driver and asked again holds no more than before
+    # (under memory pressure, or because the call emptied the cache).
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda: 1 << 20)
+    made: list[weakref.ref[torch.Tensor]] = []
+    alive: list[int] = []
+
+    def fresh_inputs() -> list[torch.Tensor]:
+        # The inputs of the try before this one are gone: the try starts
+        # from the allocator state of the one before it.
+        alive.append(sum(made_before() is not None for made_before in made))
+        tensor = torch.ones(3)
+        made.append(weakref.ref(tensor))
+        return [tensor]
+
+    def called(allocations: list[int]) -> torch.Tensor:
+        made.clear()
+        alive.clear()
+        filled_memory.clear()
+        found = iter(allocations)
+        monkeypatch.setattr(
+            torch.cuda, "memory_stats", lambda: {"num_device_alloc": next(found)}
+        )
+        return common.call_on_poisoned_memory(
+            lambda inputs: inputs[0] * 2, fresh_inputs
+        )
+
+    # No memory taken: one call. Taken in the first call: a second one, on
+    # the blocks the first left, filled.
+    assert called([7, 7]).tolist() == [2.0] * 3 and len(made) == 1
+    assert called([7, 8, 8, 8]).tolist() == [2.0] * 3 and len(made) == 2
+    assert filled_memory == [common.POISON_BYTE] * 2 and alive == [0, 0]
+    # Taken in every call: where the outputs lie was never filled.
+    with pytest.raises(common.UnfilledMemory, match="in each of 3 calls"):
+        called([7, 8, 8, 10, 10, 11])
+    assert len(made) == 3 and alive == [0, 0, 0]
+    # For a random config of check_port.py that is an error, not a config
+    # that the backend's classification lets the autotuner skip.
+    backend = types.SimpleNamespace(classify_autotune_exception=lambda error: "warn")
+    assert check_port.classify_failure(RuntimeError("launch"), backend) == "warn"
+    unjudged = common.UnfilledMemory("in each of 3 calls")
+    assert check_port.classify_failure(unjudged, backend) == "error"
+
+
+def _writes_all_but(skipped: int) -> Callable[[list[torch.Tensor]], torch.Tensor]:
+    """An implementation of ``x * 2`` that allocates its output with
+    ``torch.empty`` and never writes its last ``skipped`` elements."""
+
+    def call(inputs: list[torch.Tensor]) -> torch.Tensor:
+        (x,) = inputs
+        out = torch.empty_like(x)
+        written = x.numel() - skipped
+        torch.mul(x[:written], 2, out=out[:written])
+        return out
+
+    return call
+
+
+def _tensors_of(value: object) -> list[object]:
+    """Stands in for ``common.flatten_outputs``, which needs the
+    better-benchmark checkout: the calls below return a tensor or a list."""
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+# What an earlier test of the process may have left free in the allocator,
+# in MiB: nothing, a block that holds any output of the test below, and
+# blocks around the sizes it allocates.
+@pytest.mark.cuda
+@skipIfNotCUDA()
+@pytest.mark.parametrize("left_free", [(), (64,), (3, 16, 3)], ids=str)
+def test_a_call_cannot_pass_on_what_an_earlier_call_left_in_its_memory(
+    left_free: tuple[int, ...], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(common, "flatten_outputs", _tensors_of)
+    # On the device, with PyTorch's allocator: the hole, then the fill.
+    # 3 MB outputs, a size of their own in the allocator's large pool.
+    n = 786432
+    torch.cuda.empty_cache()
+    earlier = [
+        torch.empty(size << 20, dtype=torch.uint8, device=DEVICE) for size in left_free
+    ]
+    del earlier
+
+    def inputs() -> list[torch.Tensor]:
+        return [torch.arange(n, device=DEVICE, dtype=torch.float32)]
+
+    expected = inputs()[0] * 2
+    good, broken = _writes_all_but(0), _writes_all_but(n // 8)
+    # The hole: torch.empty hands the broken call the block that the good
+    # call's output was just freed from, values and all.
+    left = good(inputs())
+    address = left.data_ptr()
+    del left
+    stale = broken(inputs())
+    assert stale.data_ptr() == address and torch.equal(stale, expected)
+    del stale
+    # Filled, the block is NaN wherever a call does not write it, however
+    # the allocator holds it (here: free, then recycled).
+    out = common.call_on_poisoned_memory(broken, inputs)
+    assert out.data_ptr() == address
+    assert bool(out[-n // 8 :].isnan().all()) and torch.equal(
+        out[: n - n // 8], expected[: n - n // 8]
+    )
+    with pytest.raises(common.UnwrittenOutput, match=f"{n // 8} of {n} elements"):
+        common.check_written(
+            [out], lambda byte: [common.call_on_poisoned_memory(broken, inputs, byte)]
+        )
+    del out
+    out = common.call_on_poisoned_memory(good, inputs)
+    common.check_written([out], lambda byte: pytest.fail("a second call"))
+    assert torch.equal(out, expected)
+    # A call that the allocator has no free block for takes its memory from
+    # the driver, which the fill did not reach: it runs again on that block.
+    # Its output is larger than all the memory the allocator holds free,
+    # whatever earlier calls and tests left there.
+    held = inputs()
+    free = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    count = free // 4 + 5 * n
+    calls: list[int] = []
+
+    def larger(inputs: list[torch.Tensor]) -> torch.Tensor:
+        calls.append(torch.cuda.memory_reserved())
+        out = torch.empty(count, device=DEVICE)
+        out[:n] = inputs[0]
+        return out
+
+    grown = common.call_on_poisoned_memory(larger, lambda: held)
+    assert len(calls) == 2 and calls[1] > calls[0]
+    assert bool(grown[n:].isnan().all())
+    del grown
+    # A call that takes fresh memory every time (it keeps its outputs, each
+    # larger than what is free) cannot be judged: its last output lies in
+    # memory that was never filled, which reads as zeros here, not as NaN.
+    kept: list[torch.Tensor] = []
+
+    def keeps_its_outputs(inputs: list[torch.Tensor]) -> torch.Tensor:
+        free = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        kept.append(torch.empty(free // 4 + 5 * n, device=DEVICE))
+        return kept[-1]
+
+    with pytest.raises(common.UnfilledMemory, match="in each of 3 calls"):
+        common.call_on_poisoned_memory(keeps_its_outputs, lambda: held)
+    assert len(kept) == 3
+    # Nor can a call during which the allocator returns its cached blocks to
+    # the driver and takes memory again (what it does when it finds no room,
+    # and what a CUDA graph capture does first): its output lies in fresh
+    # memory although the allocator holds no more bytes than before the call.
+    kept.clear()
+    torch.cuda.empty_cache()
+    # What stays free now lies in segments that live tensors share, which
+    # the allocator cannot give back. A cached block that it can, larger
+    # than what the call below takes:
+    free = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    spare = torch.empty(2 * free + (64 << 20), dtype=torch.uint8, device=DEVICE)
+    del spare
+    reserved: list[tuple[int, int]] = []
+
+    def empties_the_cache(inputs: list[torch.Tensor]) -> torch.Tensor:
+        before = torch.cuda.memory_reserved()
+        torch.cuda.empty_cache()
+        # More than is left free, so from the driver.
+        free = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        out = torch.empty(free // 4 + 5 * n, device=DEVICE)
+        reserved.append((before, torch.cuda.memory_reserved()))
+        return out
+
+    with pytest.raises(common.UnfilledMemory, match="in each of 3 calls"):
+        common.call_on_poisoned_memory(empties_the_cache, lambda: held)
+    assert len(reserved) == 3
+    assert all(after <= before for before, after in reserved)
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_the_fill_reaches_a_block_whose_free_waits_for_a_stream() -> None:
+    # A tensor that another stream used (record_stream) is not free when its
+    # last reference goes: the allocator keeps the block until that stream's
+    # work is done and its next allocation notices, and that allocation can
+    # be handed the block with what the tensor held.
+    n = 786432
+    waiting = torch.full((n,), 7.0, device=DEVICE)
+    waiting.record_stream(torch.cuda.Stream())
+    address, size = waiting.data_ptr(), waiting.untyped_storage().nbytes()
+    del waiting
+    assert address in common._allocator_blocks("active_pending_free")
+    common.poison_free_memory()
+    # The next allocation of that size, in whichever block the allocator
+    # picks, reads the fill, and so does the block that was waiting.
+    out = torch.empty(n, device=DEVICE)
+    block = torch.as_tensor(common._DeviceBytes(address, size), device=DEVICE)
+    assert bool((block == common.POISON_BYTE).all())
+    assert bool(out.isnan().all())
+
+
+@pytest.mark.cuda
+@skipIfNotCUDA()
+def test_a_captured_replay_starts_from_filled_outputs_and_buffers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(common, "flatten_outputs", _tensors_of)
+    # What bench.py judges and times is a replay of a captured call, whose
+    # outputs and buffers are in a pool of the capture's own, fresh from the
+    # driver (zeros on a B200's driver, which pass for values that are zero).
+    n = 786432
+
+    def inputs() -> list[torch.Tensor]:
+        return [torch.arange(n, device=DEVICE, dtype=torch.float32)]
+
+    def half_buffer(inputs: list[torch.Tensor]) -> torch.Tensor:
+        # Writes half of a buffer that it frees, and reads all of it.
+        buffer = torch.empty(n, device=DEVICE)
+        buffer[: n // 2] = 1.0
+        return buffer + inputs[0]
+
+    def in_place(inputs: list[torch.Tensor]) -> torch.Tensor:
+        return inputs[0].mul_(2)
+
+    expected = inputs()[0] * 2
+    with common.gc_paused():
+        broken = bench._replayed(_writes_all_but(n // 8), inputs)
+        out = broken(inputs())
+        assert bool(out[-n // 8 :].isnan().all())
+        with pytest.raises(common.UnwrittenOutput, match=f"{n // 8} of {n} elements"):
+            common.check_written([out], lambda byte: [broken(inputs(), byte)])
+        again = broken(inputs(), common.POISON_RECHECK_BYTE)
+        assert not bool(again.isnan().any()) and float(again[-1]) == 0.0
+        good = bench._replayed(_writes_all_but(0), inputs)
+        assert torch.equal(good(inputs()), expected)
+        # A buffer the captured call freed is filled where it lies.
+        out = bench._replayed(half_buffer, inputs)(inputs())
+        assert not bool(out[: n // 2].isnan().any()) and bool(
+            out[n // 2 :].isnan().all()
+        )
+        # An output in memory from before the call is the call's input.
+        assert torch.equal(bench._replayed(in_place, inputs)(inputs()), expected)
+
+
+def _triton_kernel(
+    name: str, meta: dict[str, object], *configs: tuple[dict[str, int], int, bool]
+) -> types.SimpleNamespace:
+    """A stand-in for one of Inductor's ``CachingAutotuner`` objects with
+    these launchers: each config's kwargs, its warps and whether coordinate
+    descent found it."""
+    launchers = []
+    for kwargs, warps, tuned in configs:
+        config = types.SimpleNamespace(kwargs=kwargs, num_warps=warps, num_stages=1)
+        if tuned:
+            config.found_by_coordesc = True
+        launchers.append(
+            types.SimpleNamespace(config=config, n_regs=40, n_spills=0, shared=512)
+        )
+    return types.SimpleNamespace(
+        inductor_meta=meta,
+        fn=types.SimpleNamespace(__name__=name),
+        launchers=launchers,
+    )
+
+
+def test_a_bench_record_names_the_config_each_inductor_kernel_ended_on() -> None:
+    pointwise = _triton_kernel(
+        "triton_poi_0",
+        {"kernel_name": "triton_poi_fused_add_0", "grid_type": "Grid1D"},
+        ({"XBLOCK": 2048}, 2, True),
+    )
+    # A mix-order reduction: its split size is a block size of the config
+    # and what the kernel was generated for.
+    mix_order = _triton_kernel(
+        "triton_per_1",
+        {"grid_type": "MixOrderReductionGrid", "RSPLIT_SIZE": 16},
+        ({"XBLOCK": 1, "RSPLIT_SIZE": 16, "NUM_STAGES": 1}, 8, False),
+    )
+    untuned = _triton_kernel(
+        "triton_red_2", {}, ({"XBLOCK": 1}, 4, False), ({"XBLOCK": 2}, 4, False)
+    )
+    first, second, third = common.inductor_kernel_configs(
+        [pointwise, mix_order, untuned]
+    )
+    assert first == {
+        "name": "triton_poi_fused_add_0",
+        "grid_type": "Grid1D",
+        "block_sizes": {"XBLOCK": 2048},
+        "num_warps": 2,
+        "num_stages": 1,
+        "found_by_coordesc": True,
+        "n_regs": 40,
+        "n_spills": 0,
+        "shared": 512,
+    }
+    assert second["name"] == "triton_per_1" and second["rsplit_size"] == 16
+    assert second["block_sizes"]["RSPLIT_SIZE"] == 16
+    assert second["num_warps"] == 8 and not second["found_by_coordesc"]
+    # A kernel that has not settled on one launcher lists them all.
+    assert [c["block_sizes"] for c in third["launchers"]] == [
+        {"XBLOCK": 1},
+        {"XBLOCK": 2},
+    ]
+    assert report.pick_text([first, second]) == (
+        "triton_poi_fused_add_0: XBLOCK=2048 warps=2 stages=1; "
+        "triton_per_1: XBLOCK=1 RSPLIT_SIZE=16 NUM_STAGES=1 warps=8 stages=1"
+    )
+
+
+def test_the_kernels_an_inductor_compile_launches_are_taken_at_their_launches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+
+    monkeypatch.setattr(
+        CachingAutotuner,
+        "run",
+        lambda self, *args, stream, benchmark_run=False: (self, args, stream),
+    )
+    stub = CachingAutotuner.run
+    first, second, candidate = object(), object(), object()
+    with common.inductor_kernels_launched() as launched:
+        # What the compiled code calls: each kernel's run, with its result.
+        assert CachingAutotuner.run(second, 1, stream=0) == (second, (1,), 0)
+        # The first call compiles: a mix-order reduction's compile runs the
+        # variants it benchmarks its split sizes with, as benchmark runs.
+        CachingAutotuner.run(candidate, stream=0, benchmark_run=True)
+        CachingAutotuner.run(first, stream=0)
+        CachingAutotuner.run(second, 2, stream=0)
+    assert launched == [second, first]
+    assert CachingAutotuner.run is stub
+    with pytest.raises(RuntimeError, match="stop"), common.inductor_kernels_launched():
+        raise RuntimeError("stop")
+    assert CachingAutotuner.run is stub
+
+
+def _span(name: str, start: float, end: float) -> types.SimpleNamespace:
+    """A device event of a profile."""
+    return types.SimpleNamespace(
+        name=name,
+        device_type=torch.autograd.DeviceType.CUDA,
+        time_range=types.SimpleNamespace(start=start, end=end),
+    )
+
+
+def test_a_dependent_launchs_time_is_its_step_not_its_span(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pointwise_06377502b8f5's first two kernels: the BatchNorm is launched
+    # as a dependent launch 2.3 us in, while the max-pool runs to 51.3 us,
+    # and ends at 67.1 us. A span that ends inside an earlier one adds
+    # nothing, and a kernel that starts after the latest end keeps its span.
+    spans = [(0.0, 51.3), (2.3, 67.1), (10.0, 60.0), (70.0, 75.5)]
+    assert bench.kernel_steps(spans) == pytest.approx([51.3, 15.8, 0.0, 5.5])
+
+    class Profile:
+        def __init__(self, activities: object) -> None:
+            pass
+
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            pass
+
+        def events(self) -> list[types.SimpleNamespace]:
+            # Two replays, each the max-pool and the BatchNorm inside it,
+            # in another order than they started; a host event is no kernel.
+            host = types.SimpleNamespace(
+                name="host", device_type=torch.autograd.DeviceType.CPU
+            )
+            return [
+                _span("batchnorm", 102.3, 167.1),
+                host,
+                _span("max_pool", 0.0, 51.3),
+                _span("max_pool", 100.0, 151.3),
+                _span("batchnorm", 2.3, 67.1),
+            ]
+
+    monkeypatch.setattr(bench, "profile", Profile)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    replays: list[int] = []
+    profiled = bench._profile_kernels(lambda: replays.append(1), calls=2)
+    assert len(replays) == 3
+    assert profiled["kernels"] == [
+        {
+            "name": "max_pool",
+            "us": pytest.approx(51.3),
+            "span_us": pytest.approx(51.3),
+            "per_call": 1.0,
+        },
+        {
+            "name": "batchnorm",
+            "us": pytest.approx(15.8),
+            "span_us": pytest.approx(64.8),
+            "per_call": 1.0,
+        },
+    ]
+    assert profiled["kernel_us"] == pytest.approx(67.1)
+    assert profiled["kernel_span_us"] == pytest.approx(116.1)
+    assert profiled["kernel_spans_overlap"] is True
+    # Kernels in a row: the steps are the spans.
+    monkeypatch.setattr(
+        Profile, "events", lambda self: [_span("a", 0.0, 4.0), _span("b", 4.0, 9.0)]
+    )
+    profiled = bench._profile_kernels(lambda: None, calls=1)
+    assert profiled["kernel_us"] == profiled["kernel_span_us"] == 9.0
+    assert profiled["kernel_spans_overlap"] is False
+
+
+def test_a_process_draws_the_placement_of_its_timed_buffers_from_a_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    released: list[int] = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: released.append(1))
+    monkeypatch.setattr(
+        torch, "empty", lambda size, dtype, device: torch.zeros(size, dtype=dtype)
+    )
+    monkeypatch.setattr(bench, "PLACEMENT_PAGE_BYTES", 16)
+
+    def pages(seed: int | None, shifts: int = 6) -> list[int]:
+        placement = bench.Placement(seed)
+        for _ in range(shifts):
+            placement.shift()
+        record = placement.record()
+        assert record["seed"] == seed
+        # What the draw came to: where each spacer lies.
+        assert len(set(record["spacer_addresses"])) == len(record["spacer_pages"])
+        return record["spacer_pages"]
+
+    # Without a seed nothing is held and nothing released: the buffers lie
+    # where the allocation order puts them.
+    assert pages(None) == [] and not released
+    # A seed's spacers: the allocator's cache released before each, their
+    # sizes whole pages, the same for the same seed and others for another.
+    drawn = pages(7)
+    assert len(drawn) == 6 == len(released)
+    assert all(1 <= count <= bench.PLACEMENT_MAX_PAGES for count in drawn)
+    assert pages(7) == drawn and pages(8) != drawn
+    # And where the tensors that an implementation's timed call reads lie:
+    # each storage once, with or without a draw.
+    x, y = torch.ones(4), torch.ones(4)
+    for seed in (None, 7):
+        placement = bench.Placement(seed)
+        placement.placed("helion_cute", [x, 3, x[1:], y])
+        assert placement.record()["timed_inputs"] == {
+            "helion_cute": [x.data_ptr(), y.data_ptr()]
+        }
+
+
+def test_bench_draws_a_fresh_placement_unless_told(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seeds: list[int | None] = []
+
+    class Placement:
+        def __init__(self, seed: int | None) -> None:
+            seeds.append(seed)
+            raise RuntimeError("stop here")
+
+    monkeypatch.setattr(bench, "Placement", Placement)
+    monkeypatch.setattr(common, "gpu_info", dict)
+    monkeypatch.setattr(common, "versions", dict)
+
+    def run(**placement: object) -> None:
+        args = argparse.Namespace(repro_id="r", shape="s", impls="", **placement)
+        with pytest.raises(RuntimeError, match="stop here"):
+            bench.run(args)
+
+    run(placement_seed=None, fixed_placement=True)
+    run(placement_seed=11, fixed_placement=False)
+    run(placement_seed=None, fixed_placement=False)
+    run(placement_seed=None, fixed_placement=False)
+    assert seeds[:2] == [None, 11]
+    assert None not in seeds[2:] and seeds[2] != seeds[3]
+
+
 def test_the_better_benchmark_revision_is_checked_once_wherever_it_is(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -896,11 +2013,35 @@ def test_the_better_benchmark_revision_is_checked_once_wherever_it_is(
 
 def test_the_selection_and_the_ports_match() -> None:
     # Every measured point has its port and every port its point: 48 picked
-    # by select_kernels.py, then the extras.
+    # by select_kernels.py, then the extras, then the next 99 by model share
+    # (``--after``), each repro once.
     kernels = json.loads(common.SELECTION_PATH.read_text())["kernels"]
     ports = {path.stem for path in common.KERNELS_DIR.glob("*.py")}
     assert sorted(k["repro"] for k in kernels) == sorted(ports)
-    assert [k["reason"] == "extra" for k in kernels] == [False] * 48 + [True] * 3
+    assert len(ports) == len(kernels) == 150
+    assert [k["reason"] == "extra" for k in kernels] == (
+        [False] * 48 + [True] * 3 + [False] * 99
+    )
+    assert {k["reason"] for k in kernels[51:]} == {"next model share"}
+
+
+def test_every_port_loads_on_both_backends_without_a_config() -> None:
+    # Every port, not a sample: each is a file of its own, and the rest of
+    # the suite loads only a few of them (the test above compares file
+    # names), so an edit that keeps a port from loading, or that breaks a
+    # rule of PORTING.md for its decorators, showed only in check_port.py on
+    # a GPU. load_port raises for a port without a kernel and for a kernel
+    # that names a backend ("Leave the backend alone"), hence both backends;
+    # "Let the autotuner tile" is static shapes and no config. No kernel is
+    # bound, so the 150 ports load in seconds without a GPU.
+    for point in json.loads(common.SELECTION_PATH.read_text())["kernels"]:
+        for backend in ("cute", "triton"):
+            port = common.load_port(point["repro"], backend)
+            assert callable(port.forward), point["repro"]
+            for name, kernel in common.port_kernels(port).items():
+                assert kernel.settings.static_shapes and not kernel.configs, (
+                    f"{point['repro']}.{name} on {backend}"
+                )
 
 
 def test_a_selection_pins_only_a_committed_better_benchmark(
@@ -914,6 +2055,318 @@ def test_a_selection_pins_only_a_committed_better_benchmark(
     with pytest.raises(SystemExit):
         select_kernels.main()
     assert "uncommitted changes" in capsys.readouterr().err
+
+
+def _git(repo: Path, *args: str) -> str:
+    identity = ["-c", "user.name=test", "-c", "user.email=test@example.com"]
+    return subprocess.run(
+        ["git", "-C", str(repo), *identity, "-c", "commit.gpgsign=false", *args],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _toy_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, times: dict[str, float]
+) -> tuple[Path, Path]:
+    """A committed better-benchmark checkout in which one model runs each of
+    ``times``' repros once (at shape ``s0``), and the all-shapes sweep that
+    times them: the checkout and the sweep, for ``select_kernels.main``."""
+    repo = tmp_path / "bb"
+    for repro in times:
+        (repo / "repros" / "canonical" / repro).mkdir(parents=True)
+        (repo / "repros" / "canonical" / repro / "repro.py").write_text("# captured\n")
+    (repo / "repro_harness.py").write_text("")
+    accounting = repo / "benchmarks" / "model_accounting" / "b200"
+    accounting.mkdir(parents=True)
+    fusible = {common.pattern_hash(repro): {"s0": 1} for repro in times}
+    model = {"identity": "suite/infer/model", "model": {"fusible": fusible}}
+    (accounting / "model.json").write_text(json.dumps(model))
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "repros")
+    sweep = {
+        f"repros/canonical/{repro}/repro.py": {
+            "point_s0": {"compiled_us": us, "n_kernels": 1}
+        }
+        for repro, us in times.items()
+    }
+    (tmp_path / "sweep.json").write_text(json.dumps(sweep))
+    monkeypatch.setattr(common, "BB_ROOT", repo)
+    monkeypatch.setattr(common, "_check_bb_revision", lambda: None)
+    monkeypatch.syspath_prepend(str(repo))
+    oracle_harness = types.SimpleNamespace(has_stochastic_ops=lambda path: False)
+    monkeypatch.setitem(sys.modules, "oracle_harness", oracle_harness)
+    return repo, tmp_path / "sweep.json"
+
+
+def _select(monkeypatch: pytest.MonkeyPatch, *args: str) -> None:
+    monkeypatch.setattr(sys, "argv", ["select_kernels.py", *args])
+    select_kernels.main()
+
+
+def test_a_selection_grows_after_an_earlier_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # --after keeps the earlier selection's points first, as they are, and
+    # adds the next repros by share alone (a first selection gives the
+    # second family its turn): none that the earlier one holds (its extra
+    # among them), none below --min-us, and no more than there are.
+    times = {f"sum_{index:012x}": us for index, us in enumerate([60, 50, 40, 30, 20])}
+    times |= {"sum_00000000000f": 5, "mean_00000000000a": 14, "mean_00000000000b": 13}
+    sums, means = list(times)[:5], list(times)[6:]
+    _, sweep = _toy_checkout(tmp_path, monkeypatch, times)
+    original = sweep.read_text()
+    out = tmp_path / "selection.json"
+    base = ("--sweep", str(sweep), "--output", str(out))
+    _select(monkeypatch, *base, "--count", "2", "--extra", f"{sums[4]}:s0")
+    first = json.loads(out.read_text())
+    assert [(k["repro"], k["reason"]) for k in first["kernels"]] == [
+        (sums[0], "top model share"),
+        (means[0], "family mean"),
+        (sums[4], "extra"),
+    ]
+    capsys.readouterr()
+
+    _select(monkeypatch, *base, "--after", str(out), "--count", "2")
+    grown = json.loads(out.read_text())
+    assert grown["kernels"][:3] == first["kernels"]
+    assert [(k["repro"], k["reason"]) for k in grown["kernels"][3:]] == [
+        (sums[1], "next model share"),
+        (sums[2], "next model share"),
+    ]
+    total = sum(times.values())
+    assert grown["selected_model_share"] == pytest.approx((60 + 14 + 50 + 40) / total)
+    assert grown["extra_model_share"] == pytest.approx(20 / total)
+    assert grown["better_benchmark_commit"] == first["better_benchmark_commit"]
+    # The file says what it grew from: its own step, then the earlier one's.
+    assert grown["params"] == {**first["params"], "extra": [], "top_fraction": 1.0} | {
+        "after": str(out)
+    }
+    assert first["params"]["top_fraction"] == 0.6
+    assert grown["earlier_selection"] == {
+        key: first[key] for key in ("sweep", "better_benchmark_commit", "params")
+    }
+    captured = capsys.readouterr()
+    assert captured.out.startswith(
+        "4 kernels, 0.71 of 1.0 model-shares, and 1 extras\n"
+    )
+    assert captured.err == ""
+
+    _select(monkeypatch, *base, "--after", str(out), "--count", "9")
+    again = json.loads(out.read_text())
+    assert [k["repro"] for k in again["kernels"][5:]] == [sums[3], means[1]]
+    assert again["earlier_selection"]["earlier_selection"] == grown["earlier_selection"]
+    capsys.readouterr()
+    for refused, reason in (
+        (("--extra", f"{means[1]}:s0"), "it takes none"),
+        (("--top-fraction", "0.6"), "no --top-fraction"),
+    ):
+        with pytest.raises(SystemExit):
+            _select(monkeypatch, *base, "--after", str(out), *refused)
+        assert reason in capsys.readouterr().err
+
+    # Another sweep may grow the selection: the earlier points keep their
+    # times and shares, and the tool says how many of them the sweep gives
+    # others. One more microsecond for any kernel of the model, also the 5 us
+    # one that no selection holds, moves every share; twice the time for
+    # every kernel moves none of them.
+    timed = json.loads(original)
+    one_selected = f"repros/canonical/{sums[0]}/repro.py"
+    not_selected = "repros/canonical/sum_00000000000f/repro.py"
+    for factor, slower in ((1, [one_selected]), (1, [not_selected]), (2, list(timed))):
+        retimed = json.loads(original)
+        for repro in slower:
+            entry = retimed[repro]["point_s0"]
+            entry["compiled_us"] = factor * entry["compiled_us"] + (factor == 1)
+        sweep.write_text(json.dumps(retimed))
+        _select(monkeypatch, *base, "--after", str(out), "--count", "1")
+        assert json.loads(out.read_text())["kernels"] == again["kernels"]
+        assert f"gives 7 of the 7 points of {out} another time or model share" in (
+            capsys.readouterr().err
+        )
+
+
+def test_a_grown_selection_pins_a_commit_that_has_the_earlier_repros_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The ports of the earlier points read their repros' inputs as the
+    # commit of the earlier selection has them, and the grown selection pins
+    # the checkout's commit for every point: a checkout that moved is taken
+    # only while those repros are the same in it.
+    names = [f"sum_{index:012x}" for index in range(3)]
+    times = dict(zip(names, [60.0, 50.0, 40.0], strict=True))
+    repo, sweep = _toy_checkout(tmp_path, monkeypatch, times)
+    out = tmp_path / "selection.json"
+    _select(monkeypatch, "--sweep", str(sweep), "--output", str(out), "--count", "1")
+    first = json.loads(out.read_text())
+    assert first["better_benchmark_commit"] == _git(repo, "rev-parse", "HEAD")
+    assert [k["repro"] for k in first["kernels"]] == [names[0]]
+    grow = ("--sweep", str(sweep), "--output", str(tmp_path / "grown.json"))
+    grow = (*grow, "--after", str(out), "--count", "1")
+
+    def recapture(repro: str) -> str:
+        path = repo / "repros" / "canonical" / repro / "repro.py"
+        path.write_text(path.read_text() + "# captured again\n")
+        _git(repo, "commit", "-q", "-am", f"recapture {repro}")
+        return _git(repo, "rev-parse", "HEAD")
+
+    moved = recapture(names[1])
+    _select(monkeypatch, *grow)
+    grown = json.loads((tmp_path / "grown.json").read_text())
+    assert grown["better_benchmark_commit"] == moved != first["better_benchmark_commit"]
+    assert [k["repro"] for k in grown["kernels"]] == names[:2]
+
+    recapture(names[0])
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        _select(monkeypatch, *grow)
+    error = capsys.readouterr().err
+    assert f"1 repros of {out} changed" in error
+    assert names[0] in error and names[1] not in error
+
+    # An earlier selection without points has no repro that could differ.
+    empty = tmp_path / "empty.json"
+    empty.write_text(json.dumps({**first, "kernels": []}))
+    _select(monkeypatch, *grow[:4], "--after", str(empty), "--count", "1")
+    grown = json.loads((tmp_path / "grown.json").read_text())
+    assert [k["repro"] for k in grown["kernels"]] == [names[0]]
+
+    # A pinned commit that the checkout does not have cannot be compared.
+    out.write_text(json.dumps({**first, "better_benchmark_commit": "0" * 40}))
+    with pytest.raises(SystemExit):
+        _select(monkeypatch, *grow)
+    assert "cannot compare better-benchmark commit" in capsys.readouterr().err
+
+
+def _without_autotune_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("HELION_AUTOTUNE_EFFORT", "HELION_FORCE_AUTOTUNE"):
+        # Set first, so that the variable is also removed after the test
+        # when the test's code sets it.
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name)
+
+
+@pytest.mark.parametrize(
+    ("env", "effort"),
+    [
+        ({}, "none"),
+        ({"HELION_AUTOTUNE_EFFORT": " "}, "none"),
+        ({"HELION_FORCE_AUTOTUNE": "0"}, "none"),
+        ({"HELION_FORCE_AUTOTUNE": "off"}, "none"),
+        ({"HELION_FORCE_AUTOTUNE": "1"}, "full"),
+        ({"HELION_FORCE_AUTOTUNE": "true"}, "full"),
+        ({"HELION_AUTOTUNE_EFFORT": "quick"}, "quick"),
+        ({"HELION_AUTOTUNE_EFFORT": "full", "HELION_FORCE_AUTOTUNE": "0"}, "full"),
+    ],
+)
+def test_an_unpinned_port_searches_only_when_the_environment_asks(
+    env: dict[str, str], effort: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A script that loads a port and calls it gets the default configs, not
+    # a search, unless the environment names an effort or forces autotuning,
+    # as Helion's settings read the two variables.
+    _without_autotune_variables(monkeypatch)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    before = dict(os.environ)
+    port = common.load_port("pointwise_0872313c7e7a", "triton")
+    kernels = common.port_kernels(port)
+    assert [k.settings.autotune_effort for k in kernels.values()] == [effort]
+    assert dict(os.environ) == before
+
+
+def test_a_port_loads_whatever_backend_the_environment_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The kernels are made under load_port's own HELION_BACKEND, and so is
+    # its reading of the two variables: a value the caller's shell holds
+    # for another purpose (or a misspelled one) is not looked at.
+    _without_autotune_variables(monkeypatch)
+    monkeypatch.setenv("HELION_BACKEND", "no-such-backend")
+    port = common.load_port("pointwise_0872313c7e7a", "triton")
+    (kernel,) = common.port_kernels(port).values()
+    assert (kernel.settings.backend, kernel.settings.autotune_effort) == (
+        "triton",
+        "none",
+    )
+    assert os.environ["HELION_BACKEND"] == "no-such-backend"
+
+
+def test_a_pinned_port_takes_its_settings_from_its_decorators(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The default-config override is for unpinned ports: a pinned kernel is
+    # rebuilt from its decorator under the caller's environment, as before.
+    _without_autotune_variables(monkeypatch)
+    decorator = "@helion.kernel(config=helion.Config(block_sizes=[64]))"
+    port = common.load_port(
+        "pointwise_0872313c7e7a", "triton", pinned={"leaky_relu": decorator}
+    )
+    (kernel,) = common.port_kernels(port).values()
+    assert kernel.settings.autotune_effort == "full"
+    assert [dict(config) for config in kernel.configs] == [{"block_sizes": [64]}]
+
+
+def test_a_standalone_autotune_asks_for_a_cold_full_search(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # autotune.py run as a script names both variables unless the
+    # environment does, so that load_port's default configs are not what a
+    # run that allows the autotune cache (HELION_FORCE_AUTOTUNE=0) records.
+    assert autotune.__file__ is not None
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "argv", ["autotune.py", "--help"])
+    for env, expected in (
+        ({}, ("full", "1")),
+        ({"HELION_FORCE_AUTOTUNE": "0"}, ("full", "0")),
+        ({"HELION_AUTOTUNE_EFFORT": " ", "HELION_FORCE_AUTOTUNE": "0"}, ("full", "0")),
+        (
+            {"HELION_AUTOTUNE_EFFORT": "quick", "HELION_FORCE_AUTOTUNE": ""},
+            ("quick", "1"),
+        ),
+    ):
+        _without_autotune_variables(monkeypatch)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with pytest.raises(SystemExit):
+            runpy.run_path(autotune.__file__, run_name="__main__")
+        assert (
+            os.environ["HELION_AUTOTUNE_EFFORT"],
+            os.environ["HELION_FORCE_AUTOTUNE"],
+        ) == expected
+    assert "--backend" in capsys.readouterr().out
+
+
+def test_a_standalone_port_check_names_no_search(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # check_port.py run as a script names the effort none unless the
+    # environment names one. An empty value names none: kept beside
+    # HELION_FORCE_AUTOTUNE=1, it would have load_port's unpinned kernels
+    # search (the settings read an empty effort as the default, full).
+    assert check_port.__file__ is not None
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "argv", ["check_port.py", "--help"])
+    for env, expected in (
+        ({}, "none"),
+        ({"HELION_AUTOTUNE_EFFORT": " ", "HELION_FORCE_AUTOTUNE": "1"}, "none"),
+        ({"HELION_AUTOTUNE_EFFORT": "quick"}, "quick"),
+    ):
+        _without_autotune_variables(monkeypatch)
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        with pytest.raises(SystemExit):
+            runpy.run_path(check_port.__file__, run_name="__main__")
+        assert os.environ["HELION_AUTOTUNE_EFFORT"] == expected
+    assert "--random-configs" in capsys.readouterr().out
+    # What the kernels of an unpinned port then run with, forced or not.
+    monkeypatch.setenv("HELION_AUTOTUNE_EFFORT", "none")
+    monkeypatch.setenv("HELION_FORCE_AUTOTUNE", "1")
+    port = common.load_port("pointwise_0872313c7e7a", "triton")
+    (kernel,) = common.port_kernels(port).values()
+    assert kernel.settings.autotune_effort == "none"
 
 
 # A small kernel's cold rounds as a campaign recorded them before the order
@@ -945,6 +2398,23 @@ def test_bench_takes_only_positive_even_round_counts(
         assert "a positive, even count is needed" in capsys.readouterr().err
     with pytest.raises(ValueError, match="at least one round"):
         common.order_balanced([], min)
+
+
+def test_flags_that_would_override_one_another_are_usage_errors(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A seed with --fixed-placement would draw nothing, and --no-cd would
+    # replace the compile that --impl names: neither goes unsaid.
+    files = ["--configs-dir", "c", "--output", "o"]
+    for main, flags in (
+        (bench.main, [*files, "--placement-seed", "3", "--fixed-placement"]),
+        (inductor_code.main, ["--impl", "inductor_max", "--no-cd"]),
+    ):
+        monkeypatch.setattr(sys, "argv", ["script.py", "r", *flags])
+        with pytest.raises(SystemExit) as exit_:
+            main()
+        assert exit_.value.code == 2
+        assert "not allowed with argument" in capsys.readouterr().err
 
 
 def test_report_rebalance_recomputes_the_timings_from_the_rounds() -> None:
@@ -2375,7 +3845,7 @@ def test_a_campaign_adds_rotating_timings_to_another_runs_picks(
         assert f"--configs-dir {run / 'configs'} " in command
         # Of the Helion ports, the selected backend's only.
         assert command.endswith(
-            "--impls inductor,inductor_cd,oracle,helion_triton,memcopy "
+            "--impls inductor,inductor_cd,inductor_max,oracle,helion_triton,memcopy "
             "--rotate-inputs 8"
         )
     # The earlier run is as it was.
@@ -2620,7 +4090,7 @@ def test_configs_from_benches_only_the_ports_whose_picks_it_takes(
         return copied["records"], ",".join(copied["bench_impls"]), jobs
 
     # Both backends: every implementation, in bench.py's order.
-    every = "inductor,inductor_cd,oracle,helion_triton,helion_cute,memcopy"
+    every = "inductor,inductor_cd,inductor_max,oracle,helion_triton,helion_cute,memcopy"
     assert every == ",".join(common.ALL_IMPLS)
     assert start(first, "cute,triton") == ([cute, triton], every, 1)
     times = {"inductor": 2.0, "helion_cute": 1.0, "helion_triton": 1.5}
@@ -3801,6 +5271,495 @@ def test_the_goal_file_takes_only_the_ratios_the_aggregates_count(
     assert ratios("--include-unsampled")["sum_000000000001[unsampled]"] == 2.0
 
 
+def _toy_process(
+    run: Path,
+    repeat: int,
+    times: dict[str, float],
+    max_sm: int | None = 0,
+    shape: str = "s1",
+    **impls: dict[str, object],
+) -> dict[str, object]:
+    """One process's record of a repeated bench of sum_000000000001
+    (``_toy_bench``'s, as ``<point>.r<repeat>.json``), each Inductor compile
+    naming a pick of that process; the record."""
+    picks = {
+        impl: {
+            "inductor_configs": [
+                {
+                    "name": "triton_k",
+                    "block_sizes": {"XBLOCK": 2**repeat},
+                    "num_warps": 4,
+                    "num_stages": 1,
+                }
+            ],
+            **impls.get(impl, {}),
+        }
+        for impl in common.INDUCTOR_IMPLS
+        if impl in times
+    }
+    _toy_bench(run, "sum_000000000001", shape, times, max_sm, **{**impls, **picks})
+    plain = common.bench_record_path(run / "bench", "sum_000000000001", shape)
+    path = common.bench_repeat_path(run / "bench", "sum_000000000001", shape, repeat)
+    plain.replace(path)
+    return json.loads(path.read_text())
+
+
+def _three_processes(run: Path, **impls: dict[str, object]) -> dict[str, object]:
+    """Three processes of a repeated bench whose Inductor picks differ: the
+    faster compile is another one in each (80, 108 and 110 us), and the
+    port's time differs too (100, 120 and 100 us), so the per-process
+    ratios are 0.8, 0.9 and 1.1 while the medians give 108 / 100; their
+    records by file name."""
+    times = [(100.0, 80.0, 100.0), (108.0, 130.0, 120.0), (130.0, 110.0, 100.0)]
+    return {
+        f"sum_000000000001__s1.r{repeat}.json": _toy_process(
+            run,
+            repeat,
+            {"inductor": default, "inductor_cd": tuned, "helion_cute": port},
+            **impls,
+        )
+        for repeat, (default, tuned, port) in enumerate(times, start=1)
+    }
+
+
+def test_an_aggregate_record_takes_medians_and_keeps_every_process(
+    tmp_path: Path,
+) -> None:
+    processes = _three_processes(tmp_path)
+    names = list(processes)
+    digests = {name: f"sha-{name}" for name in names}
+    record = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    assert record["status"] == "ok" and "contaminated" not in record
+    assert record["aggregate"]["processes"] == 3
+    assert record["aggregate"]["counted"] == names
+    assert record["aggregate"]["records"] == digests
+    cd = record["impls"]["inductor_cd"]
+    # The median, the process nearest to it, and every process's values.
+    assert cd["cold_us"] == 110.0 and cd["bb_us"] == 220.0
+    assert cd["representative"] == names[2]
+    assert cd["per_process"]["cold_us"] == [80.0, 130.0, 110.0]
+    assert cd["per_process"]["status"] == ["ok"] * 3
+    assert [
+        picks[0]["block_sizes"] for picks in cd["per_process"]["inductor_configs"]
+    ] == [{"XBLOCK": 2}, {"XBLOCK": 4}, {"XBLOCK": 8}]
+    assert cd["inductor_configs"][0]["block_sizes"] == {"XBLOCK": 8}
+    assert cd["status"] == "ok" and cd["numerics_pass"] is True
+    port = record["impls"]["helion_cute"]
+    assert port["autotune_code_sha256"] == {"k": "cute-1"}
+    # The samples of the three jobs read as one job's.
+    assert record["foreign_gpu_activity"]["samples"] == 27
+    assert common.activity_issue(record) is None
+
+    # What one process does not reproduce is not the point's result: a
+    # failed gate there fails the implementation, a process without it
+    # leaves it without a timing.
+    failing = dict(processes)
+    failing[names[1]] = _toy_process(
+        tmp_path,
+        2,
+        {"inductor": 90.0, "inductor_cd": 120.0, "helion_cute": 100.0},
+        helion_cute={"numerics_pass": False},
+        inductor_cd={"status": "error", "cold_us": None, "bb_us": None},
+    )
+    record = common.aggregate_bench_records(failing, digests)  # type: ignore[arg-type]
+    assert record["impls"]["helion_cute"]["numerics_pass"] is False
+    cd = record["impls"]["inductor_cd"]
+    assert cd["status"] == "error" and names[1] in cd["error"]
+    assert "cold_us" not in cd and cd["per_process"]["cold_us"] == [80.0, None, 110.0]
+
+    # A contaminated process is left out; when every one is, they all count
+    # and the aggregate is flagged like a job's cleanest attempt.
+    dirty = dict(processes)
+    dirty[names[0]] = _toy_process(
+        tmp_path, 1, {"inductor": 1.0, "inductor_cd": 1.0, "helion_cute": 100.0}, 70
+    )
+    record = common.aggregate_bench_records(dirty, digests)  # type: ignore[arg-type]
+    assert record["aggregate"]["counted"] == names[1:]
+    assert "contaminated" in record["aggregate"]["left_out"][names[0]]
+    assert record["impls"]["inductor_cd"]["cold_us"] == 120.0
+    record = common.aggregate_bench_records({names[0]: dirty[names[0]]}, digests)  # type: ignore[arg-type]
+    assert record["contaminated"] is True and record["aggregate"]["processes"] == 1
+    assert common.activity_issue(record) is not None
+
+
+def test_an_aggregates_samples_cover_it_when_each_processs_cover_that_process(
+    tmp_path: Path,
+) -> None:
+    # Each process of a repeated bench has a job's allowance of failed
+    # samples, here two of its nine. Added up, six of 27 are more than one
+    # job may lose, and the aggregate still counts, as each process does.
+    processes = cast("dict[str, dict[str, Any]]", _three_processes(tmp_path))
+    names = list(processes)
+    digests = dict.fromkeys(names, "sha")
+    for process in processes.values():
+        lost = common.MAX_UNKNOWN_SAMPLES
+        process["foreign_gpu_activity"]["unknown_samples"] = lost
+        assert common.activity_issue(process) is None
+    record = common.aggregate_bench_records(processes, digests)
+    assert record["aggregate"]["left_out"] == {}
+    activity = record["foreign_gpu_activity"]
+    assert (activity["samples"], activity["unknown_samples"]) == (27, 6)
+    assert activity["unknown_allowed"] == 6
+    assert common.activity_issue(record) is None
+    row = report.summarize(record, "cold_us")
+    assert "bench" not in row["issues"] and "inductor" in row["counted"]
+    assert row["cute_vs_inductor"] == pytest.approx(0.9)
+    # A process that lost more than a job may is left out, and takes its
+    # allowance with it.
+    processes[names[0]]["foreign_gpu_activity"]["unknown_samples"] = 3
+    record = common.aggregate_bench_records(processes, digests)
+    assert record["aggregate"]["left_out"] == {names[0]: "3 of 9 samples failed"}
+    assert record["foreign_gpu_activity"]["unknown_allowed"] == 4
+    assert common.activity_issue(record) is None
+    # One job's samples keep one job's allowance.
+    assert common.activity_coverage_issue(processes[names[0]]) is not None
+
+
+# The kernel profile of a port whose kernels' spans overlap (a pick with
+# dependent launches), as bench.py records it.
+_OVERLAPPING = {
+    "kernel_us": 156.0,
+    "kernel_span_us": 206.0,
+    "kernel_spans_overlap": True,
+    "kernels": [{"name": "k", "us": 16.0, "span_us": 66.0, "per_call": 1.0}],
+}
+_FAILED = {"status": "error", "error": "out of memory", "cold_us": None, "bb_us": None}
+
+
+def test_an_aggregates_overlap_flag_goes_with_its_two_kernel_totals(
+    tmp_path: Path,
+) -> None:
+    # kernel_spans_overlap says that kernel_us and kernel_span_us differ:
+    # in an aggregate it is of the two medians, and an implementation that
+    # one process did not profile has neither total nor the flag (whichever
+    # process the rest of its entry is taken from).
+    times = {"inductor": 100.0, "inductor_cd": 90.0, "helion_cute": 95.0}
+
+    def aggregated(*ports: dict[str, object]) -> dict[str, object]:
+        processes = {
+            f"sum_000000000001__s1.r{repeat}.json": _toy_process(
+                tmp_path, repeat, times, helion_cute=port
+            )
+            for repeat, port in enumerate(ports, start=1)
+        }
+        digests = dict.fromkeys(processes, "sha")
+        record = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+        return record["impls"]["helion_cute"]
+
+    port = aggregated(_OVERLAPPING, {**_OVERLAPPING, "kernel_us": 150.0}, _OVERLAPPING)
+    assert port["kernel_us"] == 156.0 and port["kernel_span_us"] == 206.0
+    assert port["kernel_spans_overlap"] is True
+    # Spans that one process read as overlapping by a hair: the medians do
+    # not.
+    hair = {**_OVERLAPPING, "kernel_us": 203.0}
+    level = {**hair, "kernel_us": 205.0, "kernel_spans_overlap": False}
+    assert aggregated(hair, level, level)["kernel_spans_overlap"] is False
+    # Failed in the second process, or in the first: no totals, no flag.
+    for ports in (
+        (_OVERLAPPING, _FAILED, _OVERLAPPING),
+        (_FAILED, _OVERLAPPING, _OVERLAPPING),
+    ):
+        port = aggregated(*ports)
+        assert port["status"] == "error"
+        assert not {"kernel_us", "kernel_span_us", "kernel_spans_overlap"} & set(port)
+        assert port["per_process"]["kernel_us"].count(156.0) == 2
+
+
+def test_the_report_takes_a_repeated_benchs_ratio_process_by_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The gate's rule: in each process the faster of Inductor's two compiles
+    # over the port's time (80 / 100, 108 / 120, 110 / 100), then the median
+    # of those ratios, 0.9. The medians of the implementations would give
+    # 108 / 100 = 1.08, a pass: no process timed that pair.
+    run = tmp_path / "run"
+    processes = _three_processes(run)
+    digests = dict.fromkeys(processes, "sha")
+    aggregate = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    out = common.bench_record_path(run / "bench", "sum_000000000001", "s1")
+    out.write_text(json.dumps(aggregate))
+    _toy_tuned(run, "sum_000000000001", "s1", "cute")
+    # Another point, benched in one process, beside it.
+    _toy_bench(run, "sum_000000000001", "s2", {"inductor": 50.0, "helion_cute": 25.0})
+    _toy_tuned(run, "sum_000000000001", "s2", "cute")
+    goal = tmp_path / "goal.json"
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run), "--goal", str(goal)])
+    report.main()
+    result = json.loads((run / "report.json").read_text())
+    rows = {row["shape"]: row for row in result["rows"]["cold_us"]}
+    # The per-process records are no rows of their own.
+    assert sorted(rows) == ["s1", "s2"]
+    row = rows["s1"]
+    assert row["processes"] == 3 and row["counted"] == ["inductor", "helion_cute"]
+    assert row["inductor"] == 108.0 and row["helion_cute"] == 100.0
+    assert row["cute_vs_inductor"] == pytest.approx(0.9)
+    assert row["cute_vs_inductor_per_process"] == pytest.approx([0.8, 0.9, 1.1])
+    assert row["inductor_missing"] == {} and row["overlapping_spans"] == {}
+    assert rows["s2"]["processes"] == 1 and rows["s2"]["cute_vs_inductor"] == 2.0
+    aggregates = result["aggregates"]["cold_us"]["all kernels"]
+    assert aggregates["cute_vs_inductor"] == pytest.approx(math.sqrt(0.9 * 2.0))
+    assert aggregates["time_weighted"] == pytest.approx(158.0 / 125.0)
+    shapes = {s["name"]: s for s in json.loads(goal.read_text())["shapes"]}
+    assert shapes["sum_000000000001[s1]"]["ratio"] == pytest.approx(0.9)
+    assert shapes["sum_000000000001[s1]"]["artifact"].endswith("__s1.json")
+    text = (run / "report.md").read_text()
+    assert "1 of the 2 bench records are aggregates over 3 bench processes" in text
+    assert "| 0.900 | 0.800..1.100 (3) |" in text and "| 2.000 | - |" in text
+    assert "## Inductor compiles missing" not in text
+    # Each compile's picks, with the processes that ended on them.
+    assert (
+        "- sum_000000000001[s1] inductor_cd (1 of 3 processes): "
+        "triton_k: XBLOCK=8 warps=4 stages=1\n"
+    ) in text
+    # --rebalance recomputes rounds, which only the processes' records hold.
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run), "--rebalance"])
+    report.main()
+    again = json.loads((run / "report.json").read_text())
+    assert again["rows"]["cold_us"] == result["rows"]["cold_us"]
+
+    # A port that failed the gate in one process is out of every comparison.
+    failed = dict(processes)
+    name = "sum_000000000001__s1.r2.json"
+    failed[name] = _toy_process(
+        run,
+        2,
+        {"inductor": 90.0, "inductor_cd": 120.0, "helion_cute": 100.0},
+        helion_cute={"numerics_pass": False},
+    )
+    out.write_text(json.dumps(common.aggregate_bench_records(failed, digests)))  # type: ignore[arg-type]
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run)])
+    report.main()
+    result = json.loads((run / "report.json").read_text())
+    row = next(row for row in result["rows"]["cold_us"] if row["shape"] == "s1")
+    assert row["helion_cute"] is None and row["cute_vs_inductor"] is None
+    assert row["numerics"]["helion_cute"] == "FAIL" and row["inductor"] == 90.0
+
+    # A port with overlapping spans that failed in one process has no kernel
+    # totals in the aggregate: the report leaves it out and goes on.
+    failed[name] = _toy_process(
+        run,
+        2,
+        {"inductor": 90.0, "inductor_cd": 120.0, "helion_cute": 100.0},
+        helion_cute=_FAILED,
+    )
+    for other in (1, 3):
+        failed[f"sum_000000000001__s1.r{other}.json"]["impls"]["helion_cute"].update(  # type: ignore[index]
+            _OVERLAPPING
+        )
+    aggregate = common.aggregate_bench_records(failed, digests)  # type: ignore[arg-type]
+    # Nor does a record that has the flag without the totals stop it.
+    flagged = json.loads(json.dumps(aggregate))
+    flagged["impls"]["helion_cute"]["kernel_spans_overlap"] = True
+    for record in (aggregate, flagged):
+        out.write_text(json.dumps(record))
+        report.main()
+        result = json.loads((run / "report.json").read_text())
+        row = next(row for row in result["rows"]["cold_us"] if row["shape"] == "s1")
+        assert row["helion_cute"] is None and row["overlapping_spans"] == {}
+        assert "## Dependent launches" not in (run / "report.md").read_text()
+
+    # A repeated bench without a clean process is listed and left out.
+    dirty = {name: _toy_process(run, 1, {"inductor": 90.0, "helion_cute": 100.0}, 70)}
+    out.write_text(json.dumps(common.aggregate_bench_records(dirty, digests)))  # type: ignore[arg-type]
+    report.main()
+    result = json.loads((run / "report.json").read_text())
+    row = next(row for row in result["rows"]["cold_us"] if row["shape"] == "s1")
+    assert row["counted"] == [] and "contaminated" in row["issues"]["bench"]
+    assert result["contaminated"]["bench"]["sum_000000000001__s1"][-1] == (
+        "all 1 bench processes"
+    )
+
+
+def test_an_inductor_compile_that_failed_in_one_process_leaves_only_that_baseline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Coordinate descent is the faster compile (80 us against 100 us) and
+    # failed in the second of three processes; the port takes 85 us. Each
+    # process's baseline is the faster of the compiles usable in it: 80,
+    # 100, 80 us, ratios 0.941, 1.176, 0.941, median 0.941. Leaving the
+    # compile out of every process would give 1.176, a pass.
+    run = tmp_path / "run"
+    times = {"inductor": 100.0, "inductor_cd": 80.0, "helion_cute": 85.0}
+    goal = tmp_path / "goal.json"
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run), "--goal", str(goal)])
+    _toy_tuned(run, "sum_000000000001", "s1", "cute")
+    out = common.bench_record_path(run / "bench", "sum_000000000001", "s1")
+    names = [f"sum_000000000001__s1.r{repeat}.json" for repeat in (1, 2, 3)]
+
+    def reported(**second: dict[str, object]) -> tuple[dict[str, object], str]:
+        processes = {
+            name: _toy_process(run, repeat, times, **(second if repeat == 2 else {}))
+            for repeat, name in enumerate(names, start=1)
+        }
+        digests = dict.fromkeys(processes, "sha")
+        out.write_text(json.dumps(common.aggregate_bench_records(processes, digests)))  # type: ignore[arg-type]
+        report.main()
+        (row,) = json.loads((run / "report.json").read_text())["rows"]["cold_us"]
+        return row, (run / "report.md").read_text()
+
+    for failed in (_FAILED, {"numerics_pass": False}):
+        row, text = reported(inductor_cd=failed)
+        assert row["cute_vs_inductor_per_process"] == pytest.approx(
+            [80 / 85, 100 / 85, 80 / 85]
+        )
+        assert row["cute_vs_inductor"] == pytest.approx(80 / 85)
+        assert row["inductor"] == 80.0 and row["counted"] == ["inductor", "helion_cute"]
+        assert row["inductor_missing"] == {"inductor_cd": [names[1]]}
+        (shape,) = json.loads(goal.read_text())["shapes"]
+        assert shape["ratio"] == pytest.approx(80 / 85)
+        assert (
+            "- sum_000000000001[s1] inductor_cd: not usable in 1 of 3 bench "
+            f"processes ({names[1]})\n"
+        ) in text
+    # The same for the default compile where it is the faster one.
+    times = {"inductor": 80.0, "inductor_cd": 100.0, "helion_cute": 85.0}
+    row, _ = reported(inductor=_FAILED)
+    assert row["cute_vs_inductor"] == pytest.approx(80 / 85)
+    assert row["inductor_missing"] == {"inductor": [names[1]]}
+    # A process without either compile has no baseline, and the point no
+    # ratio.
+    row, _ = reported(inductor=_FAILED, inductor_cd=_FAILED)
+    assert row["inductor"] is None and row["cute_vs_inductor"] is None
+    assert "inductor" not in row["counted"]
+
+
+def test_the_report_says_which_processes_name_no_inductor_kernel() -> None:
+    # A compile that failed in a process of a repeated bench has no picks
+    # there: the section counts that process and says so.
+    picks = [
+        {"name": "triton_k", "block_sizes": {"XBLOCK": 2}}
+        | {"num_warps": 4, "num_stages": 1}
+    ]
+    info = {"per_process": {"inductor_configs": [picks, None, picks]}}
+    row = {
+        "repro": "p",
+        "shape": "s",
+        "inductor_configs": {"inductor_max": report.inductor_picks(info)},
+    }
+    assert report.inductor_config_lines([row]) == [
+        "- p[s] inductor_max (2 of 3 processes): triton_k: XBLOCK=2 warps=4 stages=1",
+        "- p[s] inductor_max (1 of 3 processes): no kernel recorded",
+    ]
+    # One process, as a plain bench records a compile without Triton kernels.
+    row["inductor_configs"] = {
+        "inductor": report.inductor_picks({"inductor_configs": []})
+    }
+    assert report.inductor_config_lines([row]) == [
+        "- p[s] inductor: no kernel recorded"
+    ]
+
+
+def test_a_campaign_queues_every_repeat_and_aggregates_the_finished_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernels = [{"repro": "sum_000000000001", "shape": "s1"}]
+    run = tmp_path / "run"
+    _toy_tuned(run, "sum_000000000001", "s1", "cute")
+    flags = ("--phases", "bench", "--bench-repeats", "3")
+    # Every repeat is a job of its own.
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, "cute", *flags)
+    assert events[-2]["jobs"] == 3
+    assert not any(event["kind"] == "bench_aggregate" for event in events)
+    # Two finished: the third is queued, and the point has no aggregate yet.
+    times = {"inductor": 100.0, "helion_cute": 50.0}
+    for repeat in (1, 2):
+        _toy_process(run, repeat, times)
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, "cute", *flags)
+    assert events[-2]["jobs"] == 1
+    out = common.bench_record_path(run / "bench", "sum_000000000001", "s1")
+    assert not out.exists()
+    # All finished (by an earlier start): nothing to run, and the aggregate
+    # is written from the records, once.
+    _toy_process(run, 3, times)
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, "cute", *flags)
+    assert events[-2]["jobs"] == 0
+    assert [event["kind"] for event in events[:-2]] == ["bench_aggregate"]
+    assert events[0]["processes"] == [
+        f"sum_000000000001__s1.r{k}.json" for k in (1, 2, 3)
+    ]
+    first = json.loads(out.read_text())
+    assert first["aggregate"]["processes"] == 3
+    events = _stopped_campaign(tmp_path, monkeypatch, kernels, "cute", *flags)
+    assert [event["kind"] for event in events] == ["campaign_start", "campaign_end"]
+    # Another count of repeats: the aggregate is of those, the earlier one
+    # kept aside.
+    events = _stopped_campaign(
+        tmp_path,
+        monkeypatch,
+        kernels,
+        "cute",
+        "--phases",
+        "bench",
+        "--bench-repeats",
+        "2",
+    )
+    assert events[0]["kind"] == "bench_aggregate" and events[-2]["jobs"] == 0
+    assert json.loads(out.read_text())["aggregate"]["processes"] == 2
+    assert json.loads(out.with_name(f"{out.name}.prev").read_text()) == first
+    # Without the option the aggregate stands for the point's bench.
+    events = _stopped_campaign(
+        tmp_path, monkeypatch, kernels, "cute", "--phases", "bench"
+    )
+    assert events[-2]["jobs"] == 0
+    with pytest.raises(SystemExit):
+        _stopped_campaign(
+            tmp_path, monkeypatch, kernels, "cute", "--bench-repeats", "0"
+        )
+
+
+@pytest.mark.slow
+@_requires_proc
+def test_a_campaign_benches_each_repeat_in_a_process_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    point = "sum_000000000001__s1"
+    names = [f"{point}.r{k}.json" for k in (1, 2, 3)]
+    # The second repeat is contaminated once: it runs again, and the
+    # aggregate waits for the clean record.
+    run, events = _stub_campaign(
+        tmp_path, monkeypatch, {names[1]: [70, 0]}, "--bench-repeats", "3"
+    )
+    started = [e["job"] for e in events if e["kind"] == "job_start"]
+    assert sorted(started) == sorted(
+        [f"autotune:{point}__triton", *(f"bench:{point}#r{k}" for k in (1, 2, 2, 3))]
+    )
+    aggregated = [e for e in events if e["kind"] == "bench_aggregate"]
+    assert len(aggregated) == 1 and aggregated[0]["processes"] == names
+    assert aggregated[0]["missing"] == [] and events[-2] == aggregated[0]
+    out = run / "bench" / f"{point}.json"
+    record = json.loads(out.read_text())
+    assert record["aggregate"]["processes"] == 3
+    assert record["aggregate"]["records"] == {
+        name: hashlib.sha256((run / "bench" / name).read_bytes()).hexdigest()
+        for name in names
+    }
+    assert (run / "bench" / f"{names[1]}.attempt1").exists()
+    # Each process had a cache directory, and with it an Inductor cache, of
+    # its own.
+    caches = [
+        json.loads((run / "bench" / name).read_text())["env"]["HELION_CACHE_DIR"]
+        for name in names
+    ]
+    assert len(set(caches)) == 3
+    # Started again, nothing runs and the aggregate stands.
+    _, events = _stub_campaign(tmp_path, monkeypatch, {}, "--bench-repeats", "3")
+    assert [e["kind"] for e in events] == ["campaign_start", "campaign_end"]
+    assert json.loads(out.read_text()) == record
+    # Benched again, with a repeat that fails: while they run the point has
+    # no aggregate that passes for finished, and the new one is of the
+    # repeats that are ok.
+    for name in names:
+        (tmp_path / f"{name}.count").unlink()
+    _, events = _stub_campaign(
+        tmp_path, monkeypatch, {names[2]: [None]}, "--bench-repeats", "3", "--rebench"
+    )
+    aggregated = [e for e in events if e["kind"] == "bench_aggregate"]
+    assert len(aggregated) == 1 and aggregated[0]["processes"] == names[:2]
+    assert aggregated[0]["missing"] == [names[2]]
+    assert json.loads(out.read_text())["aggregate"]["processes"] == 2
+    assert json.loads(out.with_name(f"{out.name}.prev").read_text()) == record
+
+
 def test_the_unsampled_flags_admit_only_records_made_without_the_sampling(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4276,3 +6235,144 @@ def test_a_port_counts_only_while_its_autotune_record_holds_the_timed_kernels(
     assert all(row["helion_triton"] == 80.0 for row in rows)
     every = found["aggregates"]["cold_us"]["all kernels"]
     assert every["kernels"] == 7 and every["triton_vs_inductor_kernels"] == 2
+
+
+def test_the_max_autotune_compile_takes_the_modes_options_without_its_graph_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``inductor_max`` compiles with what ``mode="max-autotune"`` sets, as
+    PyTorch lists it, minus the CUDA-graph wrapper, on top of the point's
+    compile policy; the report compares against the fastest Inductor compile
+    a record holds."""
+    import torch._inductor
+
+    mode = torch._inductor.list_mode_options("max-autotune")
+    assert mode["max_autotune"] is True
+    assert mode["coordinate_descent_tuning"] is True
+    options = common.inductor_options("inductor_max")
+    assert options == {k: v for k, v in mode.items() if k != "triton.cudagraphs"}
+    assert options == torch._inductor.list_mode_options("max-autotune-no-cudagraphs")
+    assert common.inductor_options("inductor") == {}
+    assert common.inductor_options("inductor_cd") == {"coordinate_descent_tuning": True}
+    with pytest.raises(ValueError, match="not an Inductor implementation"):
+        common.inductor_options("oracle")
+
+    calls: list[dict[str, object]] = []
+    harness = types.SimpleNamespace(
+        compile_policy_from_config=lambda config: {"inductor": {"some_option": 1}},
+        compile_repro=lambda instance, **kwargs: calls.append(kwargs),
+    )
+    monkeypatch.setitem(sys.modules, "repro_harness", harness)
+    monkeypatch.setattr(common, "bb_path", lambda: None)
+    monkeypatch.setattr(common, "shape_configs", lambda repro_id: {"s": {}})
+    for impl in common.INDUCTOR_IMPLS:
+        common.compile_inductor("r", "s", object(), impl=impl)
+    policy = {"inductor": {"some_option": 1}}
+    assert calls == [
+        {"compile_policy": policy},
+        {"compile_policy": policy, "options": {"coordinate_descent_tuning": True}},
+        {"compile_policy": policy, "options": options},
+    ]
+    assert common.ALL_IMPLS[:3] == common.INDUCTOR_IMPLS
+    assert set(common.INDUCTOR_IMPLS) <= set(bench.GATED_IMPLS)
+
+    record = {
+        "repro": "sum_000000000001",
+        "shape": "s1",
+        "status": "ok",
+        "impls": {
+            "inductor": {"status": "ok", "cold_us": 100.0},
+            "inductor_cd": {"status": "ok", "cold_us": 90.0},
+            "inductor_max": {"status": "ok", "cold_us": 80.0},
+            "helion_cute": {"status": "ok", "cold_us": 60.0},
+        },
+    }
+    times = [
+        report.impl_time(record, impl, "cold_us") for impl in common.INDUCTOR_IMPLS
+    ]
+    assert times == [100.0, 90.0, 80.0]
+
+
+def test_the_max_autotune_compile_counts_in_each_process_of_a_repeated_bench(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Three processes: the default compile takes 100 us, coordinate descent
+    # 90 us and the port 85 us in each; max-autotune takes 80 and 84 us and
+    # failed in the third. Each process's baseline is the fastest compile
+    # usable in it (80, 84, 90 us), so the ratios are 0.941, 0.988 and
+    # 1.059 and the point's is 0.988. Without max-autotune every process
+    # would read 1.059, a pass.
+    run = tmp_path / "run"
+    names = [f"sum_000000000001__s1.r{repeat}.json" for repeat in (1, 2, 3)]
+    processes = {
+        name: _toy_process(
+            run,
+            repeat,
+            {
+                "inductor": 100.0,
+                "inductor_cd": 90.0,
+                "inductor_max": fastest,
+                "helion_cute": 85.0,
+            },
+            **({"inductor_max": _FAILED} if repeat == 3 else {}),
+        )
+        for repeat, (name, fastest) in enumerate(
+            zip(names, (80.0, 84.0, 70.0), strict=True), start=1
+        )
+    }
+    digests = dict.fromkeys(processes, "sha")
+    aggregate = common.aggregate_bench_records(processes, digests)  # type: ignore[arg-type]
+    # The aggregate keeps the compile's picks and timings of every process.
+    tuned = aggregate["impls"]["inductor_max"]
+    assert tuned["status"] == "error" and "cold_us" not in tuned
+    assert tuned["per_process"]["status"] == ["ok", "ok", "error"]
+    assert tuned["per_process"]["cold_us"] == [80.0, 84.0, None]
+    assert [
+        picks[0]["block_sizes"] for picks in tuned["per_process"]["inductor_configs"]
+    ] == [{"XBLOCK": 2}, {"XBLOCK": 4}, {"XBLOCK": 8}]
+    out = common.bench_record_path(run / "bench", "sum_000000000001", "s1")
+    out.write_text(json.dumps(aggregate))
+    _toy_tuned(run, "sum_000000000001", "s1", "cute")
+    # A single bench beside it, where max-autotune is the fastest compile.
+    _toy_bench(
+        run,
+        "sum_000000000001",
+        "s2",
+        {
+            "inductor": 100.0,
+            "inductor_cd": 90.0,
+            "inductor_max": 80.0,
+            "helion_cute": 60.0,
+        },
+    )
+    _toy_tuned(run, "sum_000000000001", "s2", "cute")
+    goal = tmp_path / "goal.json"
+    monkeypatch.setattr(sys, "argv", ["report.py", str(run), "--goal", str(goal)])
+    report.main()
+    result = json.loads((run / "report.json").read_text())
+    rows = {row["shape"]: row for row in result["rows"]["cold_us"]}
+    row = rows["s1"]
+    assert row["cute_vs_inductor_per_process"] == pytest.approx(
+        [80 / 85, 84 / 85, 90 / 85]
+    )
+    assert row["cute_vs_inductor"] == pytest.approx(84 / 85)
+    assert row["inductor"] == 84.0 and row["counted"] == ["inductor", "helion_cute"]
+    assert row["inductor_missing"] == {"inductor_max": [names[2]]}
+    assert list(row["inductor_configs"]) == list(common.INDUCTOR_IMPLS)
+    assert len(row["inductor_configs"]["inductor_max"]) == 3
+    assert list(row["numerics"])[:3] == list(common.INDUCTOR_IMPLS)
+    assert list(row["kernels"])[:3] == list(common.INDUCTOR_IMPLS)
+    assert rows["s2"]["inductor"] == 80.0
+    assert rows["s2"]["cute_vs_inductor"] == pytest.approx(80 / 60)
+    shapes = {s["name"]: s["ratio"] for s in json.loads(goal.read_text())["shapes"]}
+    assert shapes["sum_000000000001[s1]"] == pytest.approx(84 / 85)
+    assert shapes["sum_000000000001[s2]"] == pytest.approx(80 / 60)
+    text = (run / "report.md").read_text()
+    assert (
+        "- sum_000000000001[s1] inductor_max (1 of 3 processes): "
+        "triton_k: XBLOCK=4 warps=4 stages=1\n"
+    ) in text
+    assert (
+        "- sum_000000000001[s1] inductor_max: not usable in 1 of 3 bench "
+        f"processes ({names[2]})\n"
+    ) in text

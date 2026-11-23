@@ -28,7 +28,12 @@ autotune records pinned to it, alone.
    commands print `PASS`: outputs match eager in count, shape, dtype and
    strides, integer outputs exactly, outputs that depend on random numbers
    match Inductor's, and every config passes the anchored gate (a loosened
-   variant of better-benchmark's, see `common.AnchoredGate`).
+   variant of better-benchmark's, see `common.AnchoredGate`). An integer or
+   boolean output that Inductor's own compiled output does not reproduce
+   must equal Inductor's exactly instead, and the check prints it (see
+   Outputs below). Every checked call starts from poisoned memory, and a
+   port or a config that leaves part of an output unwritten fails
+   (`UnwrittenOutput`), whatever values the memory it was given held.
    Random configs the backend declines at compile time are "rejected", which
    is fine; "warn" marks a config the autotuner would skip with a warning (a
    PTXAS failure, an unexpected error inside the CuTe backend): not a
@@ -42,6 +47,19 @@ autotune records pinned to it, alone.
   workspace, for example), and nothing else. Do not merge, split or skip
   kernels, and do not move work to the host. Host code may only allocate
   outputs and take views (`view`, `permute`, `expand`, `as_strided`).
+  ATen work that Inductor's generated wrapper does on the host goes into a
+  kernel of the port when a kernel can express it: the
+  `workspace.sum(dim=0)` after a mix-order reduction
+  (`sum_sum_sum_3cac3bbf4e8f`), the `copy_` that fills a complex output
+  (`var_mean_d59520e0c4ae`). The one exception is an ATen call that the
+  wrapper makes between its kernels and that a Helion kernel cannot express
+  on both backends: it stays the same ATen call at the same place in
+  `forward()`, and the port's docstring names the call and says why
+  (`pointwise_59acdb823e92` sorts 4000 ids with `torch.sort`, as the
+  wrapper's `aten.sort.stable` does: Helion's `torch.sort` compares every
+  pair of elements, which the Triton backend cannot compile at that length).
+  Both implementations then spend the same time in the library, and the
+  comparison stays one of the kernels.
 - **Same math.** Load in the input dtype, compute in fp32 like Inductor
   (`.to(torch.float32)` at loads, cast to the output dtype at stores), keep
   the graph's op order and constants, and use exact functions (`torch.exp`,
@@ -63,6 +81,14 @@ autotune records pinned to it, alone.
   `torch.mean`) so the autotuner chooses persistent vs looped reductions.
   Only add an explicit inner `hl.tile` loop when the algorithm needs one
   (e.g. an online softmax over a reduction dim that Inductor also loops).
+  A kernel may tile a view with contiguous dims merged where Inductor's
+  flat index runs across them (`[N, C, H * W]` of an `[N, C, H, W]`
+  buffer, as `pointwise_457ec7dce9c1`'s concatenation does; taking the
+  view is host code, and a load that needs the row and the column takes
+  them from the tile's index with Inductor's division and remainder). It
+  is still one kernel with the same loads and stores. Either form is a
+  port: where the search vectorizes one and not the other, report that as
+  a compiler gap rather than reshape more ports around it.
 - **Stay shape-generic** where it is natural: derive sizes from the input
   tensors and shape-parameter lists rather than hardcoding the captured
   numbers; graph literals (iota lengths, scalar constants, eps) are fine. A
@@ -91,7 +117,18 @@ autotune records pinned to it, alone.
   same shapes, dtypes and strides as eager (`check_port.py` reports
   mismatches). An output that is a view of an input or of another output is
   a view in the port too. If the repro writes into an input (`copy_`), the
-  port writes into the same input.
+  port writes into the same input. Where eager leaves an integer result to
+  its implementation and Inductor's kernels settle it another way (`topk`
+  returns tied values in an implementation-defined order, Inductor's
+  decomposition in index order), follow Inductor's kernels: the checks
+  compare an integer or boolean output with eager's first, and one that
+  Inductor's own default compile does not reproduce either with that
+  compile's, which the port must then equal element for element
+  (`common.check_outputs`). `check_port.py` prints such an output ("exact
+  output vs Inductor") with the number of elements in which Inductor's
+  differs from eager's, and the autotune and bench records name it
+  (`exact_vs_inductor`); say in the port's docstring what differs and why
+  (`pointwise_59acdb823e92`).
 - **Leave the backend alone.** Do not set `backend=` in the decorator
   (`HELION_BACKEND` selects it) and do not edit Helion's compiler while
   porting. If the Triton backend passes but CuTe fails (compile error, crash,
