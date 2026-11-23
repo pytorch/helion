@@ -33,6 +33,7 @@ from ...ast_read_writes import HELION_BLOCK_UNIFORM_ATTR
 from ...ast_read_writes import HELION_LANE_LOOP_VAR_ATTR
 from ...ast_read_writes import HELION_VEC_LANE_OF_ATTR
 from ...ast_read_writes import ReadWrites
+from ...compile_environment import CompileEnvironment
 from ...device_function import DeviceFunction
 from ...host_function import NoCurrentFunction
 from ...tile_strategy import _clone_lane_loop_with_body
@@ -50,6 +51,7 @@ from .._ast_pass_utils import exposed_reads
 from .._ast_pass_utils import names_written
 from .._ast_pass_utils import resolve_alias
 from .._ast_pass_utils import tensor_roots_may_alias
+from ..passes.pipeline import _reload_modes
 from ..register_tile_admission import RegisterTileOptions
 from ..register_tile_admission import RegisterTileUnsupported
 from .markers import _CUTE_THREAD_VARYING_INTRINSICS
@@ -1165,7 +1167,31 @@ def _split_one_lane_loop(
         carry_indices = set()
 
     prefix: list[ast.AST] = []  # acc init statements (outside the lane loops)
-    accumulate_body: list[ast.AST] = [body[i] for i in phase1_indices]
+    # Under register reloads (cute_reduction_reloads "register"), the
+    # producers of the reductions' inputs that read no lane run once, ahead
+    # of the accumulate pass, rather than once per lane inside it: a softmax
+    # backward's per-row max and sum and its row's label gather,
+    #     tmp30 = cute.arch.load(in5.iterator + ... indices_2 ..., cop='cs')
+    #     tmp15 = (in3.iterator + ... v_11 ...).load() if ... else ...
+    # were loaded for each of a thread's 4 lanes of the row (the unrolled
+    # lanes keep the cache-hinted loads apart); 30.3 -> 28.7 us on a
+    # [32, 16, 128, 128] attention-mask softmax backward (GB300).  Only
+    # loads and pure computations move: the accumulate pass stores nothing,
+    # so no access of the loop can change what they read.  A float value
+    # moved out of the loop can let LLVM contract the loop's multiply-adds
+    # differently (hoist_lane_invariant_loads moves integers only, to keep
+    # every result bit for bit), so the move is the register mode's, which
+    # the autotuner checks against the baseline as it does every config,
+    # beside its stash of the consume pass's inputs (_stash_lane_frontier()).
+    registers = running_sum is None and _reloads_in_registers()
+    hoisted_indices = (
+        _lane_invariant_producers(body, phase1_indices, lane_var, rename_groups)
+        if registers
+        else set()
+    )
+    accumulate_body: list[ast.AST] = [
+        body[i] for i in phase1_indices if i not in hoisted_indices
+    ]
     marker_updates: dict[int, ast.AST] = {}
     accumulators: list[str] = []
     finalize: list[ast.AST] = []
@@ -1256,6 +1282,10 @@ def _split_one_lane_loop(
     lane_invariant_tail: list[ast.AST] = []
     lane_invariant_after_consume: list[ast.AST] = []
     lane_varying_tail: list[ast.AST] = []
+    # The phase-2 index of each lane-varying statement, and whether it holds
+    # an owner guard, for _stash_lane_frontier().
+    varying_tail_indices: list[int] = []
+    guarded = False
     for i, s in enumerate(phase2_body):
         if i in varying_indices and i not in keep_indices:
             continue
@@ -1266,6 +1296,15 @@ def _split_one_lane_loop(
             thread_axes_before.get(id(s), thread_axis_names),
             scalar_defs_before.get(id(s), {}),
         )
+        if (
+            phase2_indices[i] in hoisted_indices
+            and i not in varying_indices
+            and i not in after_consume
+        ):
+            # Hoisted ahead of the accumulate pass, whose value nothing
+            # between the passes can change: the hoisted statement serves
+            # the consume pass too.
+            continue
         if phase2_indices[i] in phase1_index_set:
             # The accumulate loop holds this producer already.  Each position
             # gets its own node: later passes key facts by node identity and
@@ -1273,6 +1312,8 @@ def _split_one_lane_loop(
             # two copies at one position and kept the consume loop's reload).
             s = _rerun_copy(s)
         if i in varying_indices:
+            varying_tail_indices.append(i)
+            guarded |= bool(owner_exprs)
             lane_varying_tail.append(
                 _guard_stmt_with_owner(s, owner_exprs) if owner_exprs else s
             )
@@ -1287,8 +1328,23 @@ def _split_one_lane_loop(
             else:
                 lane_invariant_tail.append(s)
 
+    if registers and not guarded:
+        stashed = _stash_lane_frontier(
+            loop,
+            lane_var,
+            phase2_body,
+            [phase2_indices[i] in phase1_index_set for i in varying_tail_indices],
+            varying_tail_indices,
+            lane_varying_tail,
+            accumulate_body,
+            rename_groups,
+        )
+        if stashed is not None:
+            stash_prefix, accumulate_body, lane_varying_tail = stashed
+            prefix = [*prefix, *stash_prefix]
     result: list[ast.AST] = []
     result.extend(prefix)
+    result.extend(body[i] for i in sorted(hoisted_indices))
     accumulate_loop = _clone_lane_loop_with_body(loop, accumulate_body)
     if running_sum is None:
         # What ``defer_tile_reductions`` moves out of an enclosing device
@@ -3573,6 +3629,173 @@ def _lane_split_reorders_aliasing_memory(
                         continue
                     return True
     return False
+
+
+# The most values per thread a lane split's stash of its consume pass's
+# inputs keeps (_stash_lane_frontier()): lanes times stashed values (a 64-bit
+# value takes two registers).
+_MAX_FRONTIER_STASH_VALUES = 32
+
+
+def _reloads_in_registers() -> bool:
+    """Whether the config keeps a reduction's re-read values in registers
+    (``cute_reduction_reloads`` "register" or "register_prefetch" for one of
+    its reductions)."""
+    if not CompileEnvironment.has_current():
+        return False
+    try:
+        fn = DeviceFunction.current()
+    except NoCurrentFunction:
+        return False
+    return any(
+        mode in ("register", "register_prefetch")
+        for mode in _reload_modes(fn, CompileEnvironment.current()).values()
+    )
+
+
+def _stash_lane_frontier(
+    loop: ast.For,
+    lane_var: str,
+    phase2_body: list[ast.AST],
+    reruns: list[bool],
+    varying_tail_indices: list[int],
+    lane_varying_tail: list[ast.AST],
+    accumulate_body: list[ast.AST],
+    rename_groups: Mapping[str, str],
+) -> tuple[list[ast.AST], list[ast.AST], list[ast.AST]] | None:
+    """The consume pass of a trace-time unrolled lane split reading the
+    accumulate pass's values instead of rerunning their producers: the
+    values the pass's own statements read of those producers (its
+    frontier), each kept per lane in a trace-time list that the accumulate
+    pass appends to and the consume pass indexes by lane.  Returns the
+    lists' initializers, the accumulate body with the appends and the
+    consume body (the frontier's reads, then the pass's own statements),
+    or None when the loop is not unrolled at trace time, the frontier is
+    empty or not plain assignments, or it would hold more than
+    _MAX_FRONTIER_STASH_VALUES values per thread.
+
+    A softmax backward reran, for each of its 4 lanes in the consume pass,
+    the row's gathers, exp and division that produce the two values the
+    pass reads:
+        v_24 = v_23 / tmp34                  # exp(...) / sum, both passes
+        v_25 = v_1 * v_24
+        ...
+        v_27 = cute.math.fma(-v_24, tmp39, v_25)
+    and now reads them, v_24 = v_24_lane_stash[synthetic_lane_3]: 30.4 ->
+    23.6 us on a [32, 16, 128, 128] attention-mask softmax backward (GB300)."""
+    extent = _static_lane_loop_extent(loop)
+    if extent is None or not _is_constexpr_lane_iter(loop):
+        return None
+    canonical = lambda names: {rename_groups.get(n, n) for n in names}  # noqa: E731
+    read_by_pass: set[str] = set()
+    for rerun, statement in zip(reruns, lane_varying_tail, strict=True):
+        if not rerun:
+            read_by_pass |= canonical(ReadWrites.from_ast(statement).reads)
+    frontier: list[tuple[int, str]] = []
+    for rerun, index in zip(reruns, varying_tail_indices, strict=True):
+        if not rerun:
+            continue
+        statement = phase2_body[index]
+        writes = canonical(ReadWrites.from_ast(statement).writes)
+        if not writes & read_by_pass:
+            continue
+        name = assigned_name(statement)
+        # (a name assigned twice, ``v = exp(x); v = v * 2``, would append to
+        # its stash twice per lane, and the consume pass would read another
+        # lane's value)
+        if name is None or any(name == kept for _, kept in frontier):
+            return None
+        frontier.append((index, name))
+    if not frontier or extent * len(frontier) > _MAX_FRONTIER_STASH_VALUES:
+        return None
+    stashes = {name: f"{name}_lane_stash" for _, name in frontier}
+    prefix: list[ast.AST] = [
+        statement_from_string(f"{stash} = []") for stash in stashes.values()
+    ]
+    sources = {id(phase2_body[index]): name for index, name in frontier}
+    accumulate: list[ast.AST] = []
+    for statement in accumulate_body:
+        accumulate.append(statement)
+        if (name := sources.get(id(statement))) is not None:
+            accumulate.append(statement_from_string(f"{stashes[name]}.append({name})"))
+    if sum(1 for statement in accumulate_body if id(statement) in sources) != len(
+        frontier
+    ):
+        return None
+    consume: list[ast.AST] = [
+        statement_from_string(f"{name} = {stashes[name]}[{lane_var}]")
+        for _, name in frontier
+    ]
+    consume.extend(
+        statement
+        for rerun, statement in zip(reruns, lane_varying_tail, strict=True)
+        if not rerun
+    )
+    return prefix, accumulate, consume
+
+
+def _lane_invariant_producers(
+    body: list[ast.AST],
+    phase1_indices: Sequence[int],
+    lane_var: str,
+    rename_groups: Mapping[str, str],
+) -> set[int]:
+    """The indices among ``phase1_indices`` (the producers of a lane
+    split's reduction inputs) of the plain assignments that read no lane,
+    directly or through another producer, and only load or compute: those
+    the split runs once ahead of its accumulate pass.
+
+    A producer that reads what a producer staying in the loop writes stays
+    too: of
+
+        doc = _cute_scalar_policy_load(seeds.iterator + base, ...)  # not relocatable
+        y = doc + cutlass.Int64(1)
+        v = cute.arch.load(x.iterator + lane) * cutlass.Float32(y)
+
+    ``y`` reads no lane, but hoisted ahead of the loop it would read ``doc``
+    before the loop assigns it (a NameError at trace time, or an earlier
+    value of ``doc``).  So does one that writes what a statement staying in
+    the loop writes, or what a statement before it reads: of
+
+        s = cutlass.Float32(0.0)
+        for j in cutlass.range(k):  # stays
+            s = s + cutlass.Float32((w.iterator + j).load())
+        v = cute.arch.load(x.iterator + lane) * s
+
+    the reset, hoisted, would run once and lane k would read k + 1 sums."""
+    producers = [body[index] for index in phase1_indices]
+    varying = _lane_varying_names(producers, lane_var, rename_groups)
+
+    def canonical(names: Iterable[str]) -> set[str]:
+        return {rename_groups.get(name, name) for name in names}
+
+    hoisted = {
+        index
+        for index in phase1_indices
+        if not _is_lane_varying_statement(body[index], lane_var, varying, rename_groups)
+        and _is_proven_relocatable_assignment(body[index], allow_load=True)
+    }
+    accesses = [ReadWrites.from_ast(statement) for statement in body]
+    while True:
+        staying = set().union(
+            *(
+                canonical(access.writes)
+                for index, access in enumerate(accesses)
+                if index not in hoisted
+            )
+        )
+        dropped = set()
+        for index in hoisted:
+            writes = canonical(accesses[index].writes)
+            if (
+                canonical(accesses[index].reads) & staying
+                or writes & staying
+                or any(writes & canonical(access.reads) for access in accesses[:index])
+            ):
+                dropped.add(index)
+        if not dropped:
+            return hoisted
+        hoisted -= dropped
 
 
 def _live_phase2_indices(body: list[ast.AST]) -> set[int]:
