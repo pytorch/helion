@@ -615,9 +615,9 @@ class TestMetalBoundsMasking(unittest.TestCase):
                 kernel(x[:, 0] if kernel is flat else x)
 
     def test_loop_carry_keeps_a_partial_tiles_fill_values_out(self) -> None:
-        """500 columns end in a 4-column tile of a 16-lane carry: the
-        update's ``torch.exp`` takes 0 in the 12 padded lanes
-        (``_mask_select``), each of which would otherwise add ``exp(0)``."""
+        """500 columns end in a 4-column tile of a 16-lane carry: the 12
+        padded lanes skip the update behind the tile's mask
+        (``masked_branch``), each of which would otherwise add ``exp(0)``."""
         x = torch.randn(64, 500, device=DEVICE)
         result, _, msl = run_with_msl(
             carry_exp_sum, (x,), helion.Config(block_sizes=[16, 4])
@@ -625,8 +625,9 @@ class TestMetalBoundsMasking(unittest.TestCase):
         torch.testing.assert_close(result, torch.exp(x).sum(-1), rtol=1e-4, atol=1e-4)
         self.assertRegex(
             msl,
-            r"_mask_select\w* = \(mask_\d+ \? \w+ : static_cast<float>\(0\)\);",
-            "the operand select not found in generated MSL",
+            r"if \(mask_\d+\) \{\n(?:\s+auto [^\n]*\n)+"
+            r"\s+acc = \(acc_copy_0 \+ _mask_select\);",
+            "the update not found under the tile's mask in generated MSL",
         )
 
 
