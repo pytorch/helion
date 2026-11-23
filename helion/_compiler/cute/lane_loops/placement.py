@@ -105,7 +105,6 @@ import operator
 from typing import TYPE_CHECKING
 from typing import cast
 
-from .... import exc
 from ...ast_extension import create
 from ...ast_extension import expr_from_string
 from ...ast_read_writes import HELION_ATOMIC_UNIFORM_LANES_ATTR
@@ -131,12 +130,15 @@ from .statements import _Statement
 from .statements import _structural_markers
 from .statements import _tensor_names
 from .statements import _uniform_lanes_of
+from .unsupported import lane_loop_unsupported
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from .... import exc
 
 
 log = logging.getLogger(LOGGER_NAME)
@@ -344,7 +346,7 @@ def _pin_repeated_atomics(
         predicate = " and ".join(by_lane[lane_var].first_lane for lane_var in lane_vars)
         node = _pinned(statement.node, predicate)
         if node is None:
-            raise exc.BackendUnsupported("cute", _unpinnable(statement.node, lane_vars))
+            raise lane_loop_unsupported(_unpinnable(statement.node, lane_vars))
         varying = pinned & statement.dataflow_lanes
         if varying:
             raise inexact_nest_error(
@@ -471,10 +473,10 @@ def _pin_uniform_atomics(
     tests = [first_lanes[lane_var] for lane_var in pinned]
     guarded = _pinned(node, " and ".join(tests)) if all(tests) else None
     if guarded is None:
-        raise exc.BackendUnsupported("cute", _unpinnable(node, pinned))
+        raise lane_loop_unsupported(_unpinnable(node, pinned))
     reason = _rebuilt_pin_conflict(node, bodies[pinned[0]], pinned[0])
     if reason is not None:
-        raise exc.BackendUnsupported("cute", reason)
+        raise lane_loop_unsupported(reason)
     for call in calls:
         setattr(
             call,
@@ -1387,8 +1389,8 @@ def check_full_nest(
 
 def inexact_nest_error(reason: str) -> exc.BackendUnsupported:
     """The error for a lane loop nest that does not run the tile program."""
-    return exc.BackendUnsupported(
-        "cute", f"the lane loop nest is not the tile program: {reason}"
+    return lane_loop_unsupported(
+        f"the lane loop nest is not the tile program: {reason}"
     )
 
 
