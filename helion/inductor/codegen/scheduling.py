@@ -426,7 +426,8 @@ class HelionScheduling(SIMDScheduling):
             # dim, which Helion cannot roll: x.flip(-1).sum(-1) over rdims of
             # 100000 would read each rdim as one block of 131072 lanes.
             # Emitting the body tells; such a kernel loops over the rdim, as
-            # Triton's rule has it.
+            # Triton's rule has it. A gather's rdim, in1[tmp1, :], needs no
+            # rdim name and stays one block.
             self.codegen_node_schedule_with_kernel(
                 kernel_features.node_schedule, kernel
             )
