@@ -752,6 +752,12 @@ class CuteDeviceFunctionState:
         # (``lower_uniform_comparisons``), which its tuple assignment does not
         # show: ``sweep_values`` types a carried dropout mask from them.
         self.uniform_cutoff_dtypes: dict[str, str] = {}
+        # Variable name -> ``max`` / ``min``: the variables that hold the
+        # result of an elementwise maximum or minimum, recorded as each is
+        # emitted (``handler_ops._nan_extremum``), and their plain copies
+        # (``tracing_ops``).  An extremum that reads one of its own kind
+        # chains with it.
+        self.extremum_results: dict[str, str] = {}
         self.signed_byte_packets: dict[Node, SignedBytePacket] = {}
         # The load_eviction_policies slot each load node took
         # (``memory_ops._cute_load_eviction_slot``): a load lowered again (a

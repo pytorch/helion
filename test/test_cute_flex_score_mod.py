@@ -28,6 +28,7 @@ from helion._compiler.cute.attention_plan import AttentionScorePlan
 from helion._compiler.cute.attention_plan import FlexAuxBuffer
 from helion._compiler.cute.attention_plan import FlexKvWalk
 from helion._compiler.cute.attention_plan import FlexRegion
+from helion._compiler.cute.device_state import CuteDeviceFunctionState
 from helion._compiler.cute.flash_score_mod import FlexHookCode
 from helion._compiler.cute.flash_score_mod import build_flex_region
 from helion._compiler.cute.flash_score_mod import flex_aux_smem_candidates
@@ -68,7 +69,8 @@ _BOUNDS = (_BATCH, _HEADS, 4 * 128, 8 * 128)
 
 # ---------------------------------------------------------------------------
 # Codegen context stand-ins (the live GenerateAST / DeviceFunction of a kernel
-# compile; here only the naming and statement-capture surface is needed).
+# compile; here only the naming and statement-capture surface is needed, and
+# the CuTe state in which the extremum handler records its results).
 # ---------------------------------------------------------------------------
 
 
@@ -103,6 +105,7 @@ class _StubDeviceFunction:
         self.expr_to_var_info: dict[object, object] = {}
         self._constexpr_args: dict[str, object] = {}
         self.config = helion.Config()
+        self.cute_state = CuteDeviceFunctionState()
         self.tile_strategy = types.SimpleNamespace(
             supports_index_rank_expansion=lambda: False,
             shape_str=lambda shape: str(shape),
@@ -117,6 +120,9 @@ class _StubDeviceFunction:
 
     def user_sympy_expr(self, expr: object) -> str:
         return str(expr)
+
+    def variable_aliases(self, name: str) -> tuple[str, ...]:
+        return (name,)
 
 
 @contextlib.contextmanager

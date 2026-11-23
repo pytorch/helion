@@ -320,6 +320,289 @@ def extrema_bound_chains(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def extrema_view_chains(
+    a: torch.Tensor, c: torch.Tensor, x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Chains of two extrema of negated integers whose links only a view or
+    a copy separates, over ``a`` [rows], ``c`` [columns], ``x`` [rows,
+    columns] and ``y`` [columns, rows]: a maximum broadcast by ``[:, None]``,
+    a minimum by ``unsqueeze`` and ``expand``, a maximum through a full
+    slice, a minimum through a ``permute``, and a minimum through a
+    ``clone``.  Last, a maximum through a power of one: a value identity,
+    which emits no statement either."""
+    rows, columns = x.shape
+    broadcast = torch.empty_like(x)
+    expanded = torch.empty_like(x)
+    sliced = torch.empty_like(x)
+    permuted = torch.empty_like(x)
+    copied = torch.empty_like(x)
+    raised = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile([rows, columns]):
+        row = a[tile_r]
+        column = c[tile_c]
+        value = x[tile_r, tile_c]
+        turned = y[tile_c, tile_r]
+        inner = torch.maximum(-row, -(row * 2))
+        broadcast[tile_r, tile_c] = torch.maximum(inner[:, None], -column[None, :])
+        inner = torch.minimum(-column, -(column * 2))
+        expanded[tile_r, tile_c] = torch.minimum(
+            inner.unsqueeze(0).expand(row.size(0), -1), (-row).unsqueeze(1)
+        )
+        inner = torch.maximum(-value, -(value * 2))
+        sliced[tile_r, tile_c] = torch.maximum(inner[:, :], -(value + 1))
+        inner = torch.minimum(-turned, -(turned * 2))
+        permuted[tile_r, tile_c] = torch.minimum(inner.permute(1, 0), -value)
+        inner = torch.minimum(-value, -(value * 3))
+        copied[tile_r, tile_c] = torch.minimum(inner.clone(), -(value - 1))
+        inner = torch.maximum(-value, -(value * 3))
+        raised[tile_r, tile_c] = torch.maximum(inner**1, -(value - 1))
+    return broadcast, expanded, sliced, permuted, copied, raised
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def extrema_carried_max_copies(
+    x: torch.Tensor, lowest: hl.constexpr
+) -> tuple[torch.Tensor, ...]:
+    """``extrema_carried_max`` five times, with a copy at the loop's
+    boundary: a ``clone`` of the value the body takes in and of the one it
+    hands back, a ``repeat`` of one of each, and a flip of no dim of the one
+    it hands back.  Then two loops with a maximum of a maximum of negated
+    values in their body.  The first stores it per column, with a ``repeat``
+    of one and a plain copy of the variable between the two maxima: nothing
+    is carried.  The second hands the last column's on, with the sum of the
+    first maximum and a difference that is zero and a plain copy between
+    them: the later maximum reads a copy of a value computed in the body."""
+    rows, columns = x.shape
+    taken = torch.empty([rows], dtype=x.dtype, device=x.device)
+    handed = torch.empty([rows], dtype=x.dtype, device=x.device)
+    repeated_in = torch.empty([rows], dtype=x.dtype, device=x.device)
+    repeated_out = torch.empty([rows], dtype=x.dtype, device=x.device)
+    flipped_out = torch.empty([rows], dtype=x.dtype, device=x.device)
+    chained = torch.empty_like(x)
+    moved_last = torch.empty([rows], dtype=x.dtype, device=x.device)
+    for tile_r in hl.tile(rows):
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(best.clone(), -x[tile_r, column])
+        taken[tile_r] = best
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(best, -x[tile_r, column]).clone()
+        handed[tile_r] = best
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(best.repeat(1), -x[tile_r, column])
+        repeated_in[tile_r] = best
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(best, -x[tile_r, column]).repeat(1)
+        repeated_out[tile_r] = best
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(best, -x[tile_r, column]).flip(())
+        flipped_out[tile_r] = best
+        for column in hl.grid(columns):
+            value = x[tile_r, column]
+            inner = torch.maximum(-value, -(value * 2))
+            same = inner.repeat(1)
+            kept = same
+            chained[tile_r, column] = torch.maximum(kept, -(value + 1))
+        last = hl.zeros([tile_r], dtype=x.dtype)
+        for column in hl.grid(columns):
+            value = x[tile_r, column]
+            inner = torch.maximum(-value, -(value * 2))
+            moved = inner + (value - value)
+            kept = moved
+            last = torch.maximum(kept, -(value + 1))
+        moved_last[tile_r] = last
+    return (
+        taken,
+        handed,
+        repeated_in,
+        repeated_out,
+        flipped_out,
+        chained,
+        moved_last,
+    )
+
+
+# The outputs of ``extrema_literal_identity_chains`` and of
+# ``extrema_identity_chains`` in order, each with its extremum.  Chain ``i``
+# of a kernel is ``op(op(-x, -(x * (i + 2))) <identity>, -(x + 1))``.
+LITERAL_IDENTITY_CHAINS = (
+    ("plus_zero", "max"),
+    ("minus_zero", "min"),
+    ("times_one", "max"),
+    ("floor_divided_by_one", "min"),
+    ("or_zero", "max"),
+    ("xor_zero", "min"),
+    ("and_all_ones", "max"),
+    ("shifted_left_by_zero", "min"),
+    ("shifted_right_by_zero", "max"),
+)
+IDENTITY_CHAINS = (
+    ("rounded", "max"),
+    ("floored", "min"),
+    ("truncated", "max"),
+    ("ceiled", "min"),
+    ("selected", "max"),
+    ("negated_twice", "min"),
+    ("widened", "max"),
+    ("negated_around_a_view", "min"),
+    ("negated_around_a_copy", "max"),
+    ("widened_around_a_view", "min"),
+    ("widened_around_a_copy", "max"),
+    ("negated_around_a_sum_with_zero", "min"),
+)
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def extrema_literal_identity_chains(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Chains of two extrema of negated integers with a value identity
+    between the links: an operation whose literal operand leaves the other
+    one as it is (``LITERAL_IDENTITY_CHAINS``, maxima and minima in turn).
+    Every chain has operands of its own, so no link is shared."""
+    rows, columns = x.shape
+    plus = torch.empty_like(x)
+    minus = torch.empty_like(x)
+    times = torch.empty_like(x)
+    divided = torch.empty_like(x)
+    ored = torch.empty_like(x)
+    xored = torch.empty_like(x)
+    anded = torch.empty_like(x)
+    left = torch.empty_like(x)
+    right = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile([rows, columns]):
+        value = x[tile_r, tile_c]
+        last = -(value + 1)
+        inner = torch.maximum(-value, -(value * 2))
+        plus[tile_r, tile_c] = torch.maximum(inner + 0, last)
+        inner = torch.minimum(-value, -(value * 3))
+        minus[tile_r, tile_c] = torch.minimum(inner - 0, last)
+        inner = torch.maximum(-value, -(value * 4))
+        times[tile_r, tile_c] = torch.maximum(inner * 1, last)
+        inner = torch.minimum(-value, -(value * 5))
+        divided[tile_r, tile_c] = torch.minimum(inner // 1, last)
+        inner = torch.maximum(-value, -(value * 6))
+        ored[tile_r, tile_c] = torch.maximum(inner | 0, last)
+        inner = torch.minimum(-value, -(value * 7))
+        xored[tile_r, tile_c] = torch.minimum(inner ^ 0, last)
+        inner = torch.maximum(-value, -(value * 8))
+        anded[tile_r, tile_c] = torch.maximum(inner & -1, last)
+        inner = torch.minimum(-value, -(value * 9))
+        left[tile_r, tile_c] = torch.minimum(inner << 0, last)
+        inner = torch.maximum(-value, -(value * 10))
+        right[tile_r, tile_c] = torch.maximum(inner >> 0, last)
+    return plus, minus, times, divided, ored, xored, anded, left, right
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def extrema_identity_chains(x: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Chains of two extrema of negated integers with a value identity
+    between the links (``IDENTITY_CHAINS``, maxima and minima in turn): the
+    four roundings, ``torch.where`` with one value for both branches, the
+    negation of a negation, and a conversion to int64 and back; then the
+    last two with a view (a full slice) and with a copy (a ``clone``)
+    between the two negations and between the two conversions, and two
+    negations with another identity (``+ 0``) between them."""
+    rows, columns = x.shape
+    rounded = torch.empty_like(x)
+    floored = torch.empty_like(x)
+    truncated = torch.empty_like(x)
+    ceiled = torch.empty_like(x)
+    selected = torch.empty_like(x)
+    negated = torch.empty_like(x)
+    widened = torch.empty_like(x)
+    negated_view = torch.empty_like(x)
+    negated_copy = torch.empty_like(x)
+    widened_view = torch.empty_like(x)
+    widened_copy = torch.empty_like(x)
+    negated_sum = torch.empty_like(x)
+    for tile_r, tile_c in hl.tile([rows, columns]):
+        value = x[tile_r, tile_c]
+        last = -(value + 1)
+        inner = torch.maximum(-value, -(value * 2))
+        rounded[tile_r, tile_c] = torch.maximum(torch.round(inner), last)
+        inner = torch.minimum(-value, -(value * 3))
+        floored[tile_r, tile_c] = torch.minimum(torch.floor(inner), last)
+        inner = torch.maximum(-value, -(value * 4))
+        truncated[tile_r, tile_c] = torch.maximum(torch.trunc(inner), last)
+        inner = torch.minimum(-value, -(value * 5))
+        ceiled[tile_r, tile_c] = torch.minimum(torch.ceil(inner), last)
+        inner = torch.maximum(-value, -(value * 6))
+        selected[tile_r, tile_c] = torch.maximum(
+            torch.where(value > 0, inner, inner), last
+        )
+        inner = torch.minimum(-value, -(value * 7))
+        negated[tile_r, tile_c] = torch.minimum(torch.neg(torch.neg(inner)), last)
+        inner = torch.maximum(-value, -(value * 8))
+        widened[tile_r, tile_c] = torch.maximum(inner.to(torch.int64).to(x.dtype), last)
+        inner = torch.minimum(-value, -(value * 9))
+        negated_view[tile_r, tile_c] = torch.minimum(
+            torch.neg(torch.neg(inner)[:, :]), last
+        )
+        inner = torch.maximum(-value, -(value * 10))
+        negated_copy[tile_r, tile_c] = torch.maximum(
+            torch.neg(torch.neg(inner).clone()), last
+        )
+        inner = torch.minimum(-value, -(value * 11))
+        widened_view[tile_r, tile_c] = torch.minimum(
+            inner.to(torch.int64)[:, :].to(x.dtype), last
+        )
+        inner = torch.maximum(-value, -(value * 12))
+        widened_copy[tile_r, tile_c] = torch.maximum(
+            inner.to(torch.int64).clone().to(x.dtype), last
+        )
+        inner = torch.minimum(-value, -(value * 13))
+        negated_sum[tile_r, tile_c] = torch.minimum(
+            torch.neg(torch.neg(inner) + 0), last
+        )
+    return (
+        rounded,
+        floored,
+        truncated,
+        ceiled,
+        selected,
+        negated,
+        widened,
+        negated_view,
+        negated_copy,
+        widened_view,
+        widened_copy,
+        negated_sum,
+    )
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def extrema_carried_max_identities(
+    x: torch.Tensor, lowest: hl.constexpr
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``extrema_carried_max`` twice, with a value identity at the loop's
+    boundary: a rounding of the value the body takes in, and a power of one
+    of the value it hands back."""
+    rows, columns = x.shape
+    rounded = torch.empty([rows], dtype=x.dtype, device=x.device)
+    raised = torch.empty([rows], dtype=x.dtype, device=x.device)
+    for tile_r in hl.tile(rows):
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(torch.round(best), -x[tile_r, column])
+        rounded[tile_r] = best
+        # pyrefly: ignore [bad-argument-type]
+        best = hl.full([tile_r], lowest, dtype=x.dtype)
+        for column in hl.grid(columns):
+            best = torch.maximum(best, -x[tile_r, column]) ** 1
+        raised[tile_r] = best
+    return rounded, raised
+
+
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
 def extrema_carried_max(x: torch.Tensor, lowest: hl.constexpr) -> torch.Tensor:
     """Row maxima of ``-x`` accumulated by a ``torch.maximum`` per column of
     a serial loop: a chain across the loop's trips, with no reduction."""
