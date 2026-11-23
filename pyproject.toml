@@ -205,9 +205,10 @@ filterwarnings = [
   "ignore:FastDivmodDivisor is deprecated:DeprecationWarning",
   "ignore:Migrated to examples/CuTeDSL/helpers:DeprecationWarning",
 ]
-# artifacts/ holds gitignored benchmark and probe outputs, some of them named
-# test_*.py with import-time side effects; pytest must never collect them
-# (pytest's built-in defaults plus artifacts and the docs build).
+# artifacts/ and inductor_artifacts/ (the hillclimb skills' scratch) hold
+# gitignored benchmark and probe outputs, some of them named test_*.py with
+# import-time side effects; pytest must never collect them (pytest's built-in
+# defaults plus those two and the docs build).
 norecursedirs = [
   "*.egg",
   ".*",
@@ -219,6 +220,7 @@ norecursedirs = [
   "venv",
   "{arch}",
   "artifacts",
+  "inductor_artifacts",
   "site",
 ]
 
