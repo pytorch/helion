@@ -422,6 +422,7 @@ def _dsmem_gemv_code() -> str:
         )
 
 
+@skipIfRefEager("reads compiler state, which ref mode does not build")
 class TestDsmem(TestCase):
     def _fallback(self, kernel: object, args: tuple[object, ...], config: dict) -> str:
         """The kernel's code under ``config`` and the fallback it logged."""
@@ -1144,6 +1145,7 @@ class TestInbandHold(TestCase):
     last launch read unwritten (test_cross_loop_scheduler has the static
     case)."""
 
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_hold_waits_in_the_storing_partition(self) -> None:
         """In a ring megakernel only the partition that issues the scatter
         stores waits for the hold; the gated producer of the scattered rows'
@@ -1441,6 +1443,7 @@ def _rereads_last_iteration(x: torch.Tensor, scratch: torch.Tensor) -> torch.Ten
 
 
 class TestPartitionWaits(TestCase):
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_a_first_access_barrier_fence_covers_what_it_orders(self) -> None:
         """The barrier before a loop's first access of ``scratch`` (a load the
         previous iteration's later store reaches) is emitted before any access

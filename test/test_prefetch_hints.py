@@ -14,6 +14,7 @@ from helion import exc
 from helion._testing import TestCase
 from helion._testing import onlyBackends
 from helion._testing import prefetch_kernels
+from helion._testing import skipIfRefEager
 from helion._testing import skipIfXPU
 from helion._testing.cute_codegen import cpu_bind
 import helion.language as hl
@@ -75,6 +76,7 @@ def written_hint_roots(
 # prefetch can take the tensor form; XPU builds of torch have no CUDA allocator.
 @skipIfXPU("the modelled CUDA target queries the CUDA allocator")
 class TestPrefetchHints(TestCase):
+    @skipIfRefEager("reads compiler state, which ref mode does not build")
     def test_prefetch_only_root_loads_order_no_later_write(self) -> None:
         ids = torch.arange(32, dtype=torch.int32)
         args = (torch.randn(64, 256), ids, torch.full_like(ids, 7))
