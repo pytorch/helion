@@ -286,6 +286,7 @@ def _runtime_settings(**overrides: object) -> SimpleNamespace:
         "autotune_baseline_accuracy_check_fn": None,
         "autotune_benchmark_fn": None,
         "autotune_benchmark_input_banks": 1,
+        "autotune_l2_flush_sweep": False,
         "autotune_config_filter": None,
         "autotune_config_overrides": {},
         "autotune_search_acf": [],

@@ -130,7 +130,10 @@ def test_incomplete_qualification_keeps_provider_cleanup_and_failure_metrics(
     incomplete_compound(phase)
     search._prepare = Mock()
     search.settings = SimpleNamespace(
-        autotune_log=False, autotune_log_details=False, autotune_compile_timeout=60
+        autotune_log=False,
+        autotune_log_details=False,
+        autotune_compile_timeout=60,
+        autotune_l2_flush_sweep=False,
     )
     search.benchmark_provider = Mock()
     search._finalize_autotune_metrics = Mock()

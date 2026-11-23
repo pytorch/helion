@@ -77,6 +77,7 @@ from .benchmarking import do_bench
 from .benchmarking import do_bench_generic
 from .benchmarking import final_selection_l2_flush_mode
 from .benchmarking import final_selection_second_regime
+from .benchmarking import l2_flush_sweep_enabled
 from .benchmarking import synchronize_device
 from .input_banks import InputBankError
 from .input_banks import InputBankMemoryError
@@ -3926,6 +3927,8 @@ class LocalBenchmarkProvider(BenchmarkProvider):
             l2_flush_mode=l2_flush_mode,
             input_banks=self._input_bank_count,
             prelude_path=self._prelude_path,
+            # (the search's ``autotune_l2_flush_sweep`` block)
+            l2_flush_sweep=l2_flush_sweep_enabled(),
             # the final selection names its windows' regime; the search's
             # candidates and re-timings (no regime named) follow its timer
             trace_kernel_durations=(
@@ -4040,8 +4043,10 @@ class LocalBenchmarkProvider(BenchmarkProvider):
                         KernelTimerProbeJob(
                             None if device is None else device.index,
                             # (behind a prelude the trace must split its
-                            # work off too)
+                            # work off too, and under the search's sweep
+                            # the sweep)
                             prelude_path=self._prelude_path,
+                            l2_flush_sweep=l2_flush_sweep_enabled(),
                         ),
                         timeout=float(self.settings.autotune_benchmark_timeout),
                     )

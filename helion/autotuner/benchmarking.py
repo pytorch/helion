@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import glob
@@ -37,6 +38,7 @@ from helion._dist_utils import all_ranks_agree
 from helion._dist_utils import sync_object
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from collections.abc import Sequence
 
     from .logger import AutotuningLogger
@@ -85,6 +87,13 @@ _KERNEL_TIMER_ESTIMATE_CALLS = 5
 # The trace events of one flush, read once per process; zero (another tool
 # holds the CUDA activity API) disables the kernel timer.
 _flush_trace: int | None = None
+# The same for a flush followed by the sweep (``l2_flush_sweep``).
+_flush_sweep_trace: int | None = None
+# Whether the timers follow every L2 flush with the sweep that displaces
+# lines pinned with evict-last hints (``l2_flush_sweep``).
+_L2_FLUSH_SWEEP: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "helion_l2_flush_sweep", default=False
+)
 # The regime the final selection selects by (see
 # ``final_selection_second_regime``): ``auto`` (unset) ranks in the final
 # selection's regime and, when that is a warm one (``replay`` / ``off``),
@@ -290,7 +299,8 @@ def _make_l2_cache_clearer() -> Callable[[], None]:
     def clear() -> None:
         active.clear_cache(cache)  # type: ignore[attr-defined]
 
-    return clear
+    # (inside an ``l2_flush_sweep`` block every flush is followed by the sweep)
+    return _with_sweep(clear, cache)
 
 
 def _cudagraph_unavailable_reason() -> str | None:
@@ -491,6 +501,69 @@ def _flush_then_prelude(flush: Callable[[], None], prelude: TimedPrelude) -> Non
     prelude.run()
 
 
+@contextlib.contextmanager
+def l2_flush_sweep(enabled: bool) -> Iterator[None]:
+    """Follow every L2 flush of the timers called inside the block with the
+    sweep of ``_release_l2_pins`` when ``enabled`` (the
+    ``autotune_l2_flush_sweep`` setting: a search enters the block for its
+    whole run, and so do a best-of-K rebench round and an AOT measurement of
+    a search's configs; the benchmark worker enters it for each job it was
+    queued with).
+
+    A flush writes ordinary lines, so the lines a candidate loaded or stored
+    with an evict-last hint stay in L2 through it, and from its second timed
+    call on a hinted candidate reads part of its operands warm. The timers
+    release such lines once per window (``_release_l2_pins``), which keeps
+    them from the next candidate but not from the candidate's own later
+    calls. On a GB300 the searched configs of four memory-bound reductions
+    read 14-33% slower per call flushed without their hints: a 196-row
+    BatchNorm mean's read 5.25 us with them and 6.87 us without, against
+    6.08 and 6.05 us with the sweep after every flush, which displaces the
+    lines as a model's other kernels would. The search then ranks hinted
+    configs ahead of ones that are faster wherever the kernel runs behind
+    other work.
+
+    Inside the block the timers run [flush, sweep, prelude (``do_bench``),
+    call] per call, and the reading leaves the sweep out as it leaves the
+    flush out: the trace timer reads the call's own kernels, and the event
+    timers time single calls with the flush and the sweep before their start
+    event. A batched graph of flushed calls minus a graph of the flushes
+    alone (``_build_batched_replays``) is not used: with the sweep in both
+    it read hinted calls 0.5-0.9 us under their kernels' span on a GB300,
+    so a short graph-replayed call is timed as single flushed replays
+    instead, launch latency included. A timer that never flushes (``off``)
+    does not sweep either.
+    """
+    token = _L2_FLUSH_SWEEP.set(enabled)
+    try:
+        yield
+    finally:
+        _L2_FLUSH_SWEEP.reset(token)
+
+
+def l2_flush_sweep_enabled() -> bool:
+    """Whether the enclosing ``l2_flush_sweep`` block sweeps after every
+    flush (False outside any block)."""
+    return _L2_FLUSH_SWEEP.get()
+
+
+def _flush_then_sweep(flush: Callable[[], None], buffer: torch.Tensor) -> None:
+    """A flush followed by the sweep of its buffer (``l2_flush_sweep``)."""
+    flush()
+    _release_l2_pins(buffer)
+
+
+def _with_sweep(flush: Callable[[], None], buffer: torch.Tensor) -> Callable[[], None]:
+    """``flush`` followed by the sweep of ``buffer``, the flush's own, inside
+    an ``l2_flush_sweep`` block that sweeps; ``flush`` itself otherwise. The
+    sweep runs once here, so its compile and its sink's allocation happen
+    before any graph capture or trace the timer starts."""
+    if not _L2_FLUSH_SWEEP.get():
+        return flush
+    _release_l2_pins(buffer)
+    return functools.partial(_flush_then_sweep, flush, buffer)
+
+
 def _batched_replay_calls(estimate_us: float) -> int:
     """How many flushed calls to fold into one timed graph replay."""
     if not math.isfinite(estimate_us) or estimate_us <= 0:
@@ -615,6 +688,11 @@ def _build_batched_replays(
     that fails on any rank halves the batch and says so; the last resort is
     the single replays, announced as such.
     """
+    if mode == "call" and _L2_FLUSH_SWEEP.get():
+        # A batch of [flush, sweep, call] minus one of [flush, sweep] reads
+        # hinted calls low (``l2_flush_sweep``): single flushed replays,
+        # timed after the flush and the sweep.
+        return 1, list(benchmark_functions), None
     keep_outputs = mode != "call"
     batch_clear_cache = clear_cache if mode == "call" else _no_cache_clear
     calls = sync_object(
@@ -981,9 +1059,15 @@ def interleaved_bench(
         fn()
     clear_cache: Callable[[], None]
     if flush_mode != "off":
-        clear_cache = functools.partial(
-            runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
-            runtime.driver.active.get_empty_cache_for_benchmark(),  # type: ignore[attr-defined]
+        flush_buffer = runtime.driver.active.get_empty_cache_for_benchmark()  # type: ignore[attr-defined]
+        # (inside an ``l2_flush_sweep`` block every flush is followed by the
+        # sweep)
+        clear_cache = _with_sweep(
+            functools.partial(
+                runtime.driver.active.clear_cache,  # type: ignore[attr-defined]
+                flush_buffer,
+            ),
+            flush_buffer,
         )
     else:
         clear_cache = _no_cache_clear
@@ -1584,25 +1668,49 @@ def _learn_flush_trace(
     """The trace events one flush issues, traced once per process (the first
     profiling session takes ~1 s to start); zero disables the timer for the
     process: no events (another tool holds the activity API) or a trace that
-    is not [flush, marker] twice (foreign work on the device)."""
-    global _flush_trace
-    if _flush_trace is None:
-        _flush_trace, traced = _traced_flush_events(clear_cache, di)
-        if _flush_trace == 0:
+    is not [flush, marker] twice (foreign work on the device). Inside an
+    ``l2_flush_sweep`` block that sweeps, ``clear_cache`` is the flush and the
+    sweep, whose events are learned and kept apart from the flush's."""
+    global _flush_trace, _flush_sweep_trace
+    learned = _learned_flush_trace()
+    if learned is None:
+        learned, traced = _traced_flush_events(clear_cache, di)
+        if _L2_FLUSH_SWEEP.get():
+            _flush_sweep_trace = learned
+        else:
+            _flush_trace = learned
+        if learned == 0:
             _log.warning(
                 "the CUDA activity trace shows %d events for two flushed "
                 "markers (another tool holds it, or other work ran on the "
                 "device); timing per-call flushed with CUDA events",
                 traced,
             )
-    return _flush_trace
+    return learned
+
+
+def _learned_flush_trace() -> int | None:
+    """The flush's trace events learned in this process for the enclosing
+    ``l2_flush_sweep`` block (``_learn_flush_trace``), None before."""
+    return _flush_sweep_trace if _L2_FLUSH_SWEEP.get() else _flush_trace
 
 
 # The trace events of one flush followed by a prelude's work, per prelude
-# (``_learn_prelude_flush_trace``).
+# (``_learn_prelude_flush_trace``), and of one flush followed by the sweep
+# and the work (``l2_flush_sweep``).
 _prelude_flush_traces: weakref.WeakKeyDictionary[object, int] = (
     weakref.WeakKeyDictionary()
 )
+_prelude_flush_sweep_traces: weakref.WeakKeyDictionary[object, int] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _prelude_traces() -> weakref.WeakKeyDictionary[object, int]:
+    """The per-prelude footprints of the enclosing ``l2_flush_sweep`` block."""
+    return (
+        _prelude_flush_sweep_traces if _L2_FLUSH_SWEEP.get() else _prelude_flush_traces
+    )
 
 
 def _learn_prelude_flush_trace(
@@ -1615,11 +1723,14 @@ def _learn_prelude_flush_trace(
     (``_flush_then_prelude``): the events both issue before the marker,
     traced once per prelude (its work is the same for every candidate); zero
     when the trace is not [flush, work, marker] twice. The flush alone keeps
-    the footprint ``_learn_flush_trace`` learned."""
-    events = _prelude_flush_traces.get(prelude)
+    the footprint ``_learn_flush_trace`` learned. (Inside an
+    ``l2_flush_sweep`` block that sweeps, the sweep runs between the two and
+    the footprint is kept apart.)"""
+    traces = _prelude_traces()
+    events = traces.get(prelude)
     if events is None:
         events, traced = _traced_flush_events(clear_cache, di)
-        _prelude_flush_traces[prelude] = events
+        traces[prelude] = events
         if events == 0:
             _log.warning(
                 "the CUDA activity trace shows %d events for two runs of a "
@@ -1640,12 +1751,14 @@ def prelude_trace_unready_reason(prelude: TimedPrelude) -> str | None:
     work do not show the same events. ``do_bench`` would then time the window
     with CUDA events, as it does where the flush has no footprint; the
     benchmark worker asks first (``BenchmarkJob``) and gives no reading."""
-    if prelude not in _prelude_flush_traces:
+    traces = _prelude_traces()
+    if prelude not in traces:
+        # (inside an ``l2_flush_sweep`` block the clearer sweeps too)
         clear_cache = functools.partial(
             _flush_then_prelude, _make_l2_cache_clearer(), prelude
         )
         _learn_prelude_flush_trace(clear_cache, torch.cuda, prelude)
-    if _prelude_flush_traces[prelude] == 0:
+    if traces[prelude] == 0:
         return (
             "the CUDA activity trace of the prelude's work is not the same "
             "from one run to the next"
@@ -1690,10 +1803,10 @@ def kernel_timer_unready_reason() -> str | None:
         return "no NVIDIA device whose CUDA activity this build collects"
     if not _kernel_timer_preconditions(None):
         return "a profiler is running in the timing process"
-    if _flush_trace is None:
+    if _learned_flush_trace() is None:
+        # (inside an ``l2_flush_sweep`` block the clearer sweeps too)
         _learn_flush_trace(_make_l2_cache_clearer(), torch.cuda)
-    assert _flush_trace is not None
-    if _flush_trace == 0:
+    if _learned_flush_trace() == 0:
         return "the CUDA activity trace is held by another tool or shows other work"
     return None
 
@@ -2054,7 +2167,8 @@ def do_bench(
     :param l2_flush_mode: L2 regime of the timed calls (``call``, ``off``,
         ``replay`` or ``kernel``, see ``_l2_flush_mode`` and
         ``_do_bench_kernel_durations``); ``None`` reads
-        ``HELION_AUTOTUNE_L2_FLUSH``.
+        ``HELION_AUTOTUNE_L2_FLUSH``. Inside an ``l2_flush_sweep`` block that
+        sweeps, every flush is followed by the sweep.
     :param trace_kernel_durations: Time the window of the per-call flushed
         regime from the CUDA activity trace, after releasing the L2 lines
         earlier work pinned (see ``_traced_candidate_window``; a search that
@@ -2122,8 +2236,13 @@ def do_bench(
     flush_buffer: torch.Tensor | None = None
     if flush_mode != "off":
         flush_buffer = runtime.driver.active.get_empty_cache_for_benchmark()  # pyrefly: ignore
-        clear_cache = functools.partial(
-            runtime.driver.active.clear_cache,  # pyrefly: ignore
+        # (inside an ``l2_flush_sweep`` block every flush is followed by the
+        # sweep, before the prelude's work)
+        clear_cache = _with_sweep(
+            functools.partial(
+                runtime.driver.active.clear_cache,  # pyrefly: ignore
+                flush_buffer,
+            ),
             flush_buffer,
         )
     if prelude is not None:

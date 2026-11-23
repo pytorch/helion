@@ -71,6 +71,7 @@ from .base_cache import LooseAutotuneCacheKey
 from .base_cache import _requires_uncached_tuning
 from .benchmark_provider import _MultiShapeAutotuneArgs
 from .benchmark_provider import _searching_candidates
+from .benchmarking import l2_flush_sweep
 
 if TYPE_CHECKING:
     from collections.abc import Hashable
@@ -776,6 +777,11 @@ class AOTAutotuneCache(AutotuneCacheBase):
         Measure all known configs for the current shape.
         Returns list of (config, timing_ms) pairs.
         """
+        # (with the search's L2 flush sweep, ``autotune_l2_flush_sweep``)
+        with l2_flush_sweep(self.autotuner.settings.autotune_l2_flush_sweep):
+            return self._measure_all_configs()
+
+    def _measure_all_configs(self) -> list[tuple[Config, float]]:
         self.autotuner._prepare()
         kernel_name = self.kernel.kernel.name
         all_configs = self._get_all_configs_for_kernel(kernel_name)

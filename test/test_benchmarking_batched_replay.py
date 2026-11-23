@@ -11,11 +11,11 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity
 from torch.profiler import profile
-from torch.profiler import supported_activities
 
 from helion._dist_utils import all_ranks_agree
 from helion._testing import DEVICE
 from helion._testing import skipIfRocm
+from helion._testing.benchmark_timers import trace_test
 from helion.autotuner import benchmark_job
 from helion.autotuner import benchmarking
 from helion.autotuner.benchmark_job import KernelTimerProbeJob
@@ -474,22 +474,6 @@ def test_backend_default_replaces_only_the_default_search_regime(
     assert benchmarking.final_selection_second_regime("replay", "kernel") == "kernel"
 
 
-_TRACE = (
-    skipIfRocm("the CUDA activity trace is NVIDIA-only"),
-    pytest.mark.skipif(DEVICE.type != "cuda", reason="requires CUDA"),
-    pytest.mark.skipif(
-        ProfilerActivity.CUDA not in supported_activities(),
-        reason="requires CUDA activity tracing",
-    ),
-)
-
-
-def _trace_test(fn: Callable[..., None]) -> Callable[..., None]:
-    for mark in _TRACE:
-        fn = mark(fn)
-    return fn
-
-
 @pytest.fixture
 def traced_windows(monkeypatch) -> list[int]:
     """The call counts of the trace windows split during a test: the kernel
@@ -508,7 +492,7 @@ def traced_windows(monkeypatch) -> list[int]:
     return windows
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_reads_each_calls_trace_durations(traced_windows) -> None:
     """``kernel`` samples are per-call spans of the call's kernels (graph
     replayed, as the final selection times them); a call that launches the
@@ -554,7 +538,7 @@ def test_kernel_timer_reads_each_calls_trace_durations(traced_windows) -> None:
     assert all(mm_ms <= sample < flush_ms for sample in samples)
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_sizes_windows_with_the_flush(traced_windows) -> None:
     """The flush runs before every warmup and timed call, so it sizes the
     windows with the call (a short call sized alone runs thousands of 256 MB
@@ -573,7 +557,7 @@ def test_kernel_timer_sizes_windows_with_the_flush(traced_windows) -> None:
     assert traced_windows
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_probes_a_long_call_once(traced_windows) -> None:
     """A call longer than both windows is one traced call, estimate and
     sample at once (``do_bench``'s long-kernel probe)."""
@@ -600,7 +584,7 @@ def test_kernel_timer_probes_a_long_call_once(traced_windows) -> None:
     assert reading == pytest.approx(start.elapsed_time(end), rel=0.2)
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_resets_gradients_before_every_call(traced_windows) -> None:
     x = torch.ones(4, device=DEVICE, requires_grad=True)
     seen: list[bool] = []
@@ -619,7 +603,7 @@ def test_kernel_timer_resets_gradients_before_every_call(traced_windows) -> None
     assert traced_windows == [3]
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_resizes_a_window_whose_estimate_ran_long(
     traced_windows,
 ) -> None:
@@ -644,7 +628,7 @@ def test_kernel_timer_resizes_a_window_whose_estimate_ran_long(
     assert traced_windows[1] > traced_windows[0]
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_builds_its_marker_outside_the_trace(
     monkeypatch, traced_windows
 ) -> None:
@@ -660,7 +644,7 @@ def test_kernel_timer_builds_its_marker_outside_the_trace(
     assert traced_windows == [3]
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_yields_to_a_profiler_of_another_thread(monkeypatch) -> None:
     """A profiling session of any thread (the process-wide flag) keeps the
     process that times the windows off the trace (a second session would
@@ -671,7 +655,7 @@ def test_kernel_timer_yields_to_a_profiler_of_another_thread(monkeypatch) -> Non
     assert benchmarking.kernel_timer_available()
 
 
-@_trace_test
+@trace_test
 def test_worker_probe_learns_the_trace() -> None:
     """The final selection asks the benchmark worker whether it traces
     (``KernelTimerProbeJob``) before it labels a column ``kernel``."""
@@ -679,7 +663,7 @@ def test_worker_probe_learns_the_trace() -> None:
     assert benchmarking._flush_trace
 
 
-@_trace_test
+@trace_test
 @pytest.mark.slow
 def test_worker_probe_runs_in_the_benchmark_worker() -> None:
     """The probe's profiling session runs in the killable worker, not here."""
@@ -696,7 +680,7 @@ def _no_trace(run: Callable[[], None]) -> list[object]:
     return []
 
 
-@_trace_test
+@trace_test
 def test_kernel_timer_falls_back_to_events(monkeypatch, caplog) -> None:
     """A running profiler (a second session would cancel its trace) and an
     empty flush trace (another tool holds the activity API; remembered and
@@ -822,7 +806,7 @@ def released_pins(monkeypatch) -> list[torch.Tensor]:
     return buffers
 
 
-@_trace_test
+@trace_test
 @pytest.mark.parametrize("probe_long_kernel", [False, True])
 def test_search_timer_traces_every_window_it_is_asked_to(
     traced_windows, released_pins, probe_long_kernel: bool
@@ -879,7 +863,7 @@ def test_search_timer_traces_every_window_it_is_asked_to(
     assert len(released_pins) == 4
 
 
-@_trace_test
+@trace_test
 @pytest.mark.parametrize("probe_long_kernel", [False, True])
 def test_a_traced_window_runs_no_event_estimate_first(
     monkeypatch, traced_windows, probe_long_kernel: bool
@@ -938,7 +922,7 @@ def test_a_traced_window_runs_no_event_estimate_first(
         assert len(calls) == 1
 
 
-@_trace_test
+@trace_test
 @pytest.mark.parametrize("probe_long_kernel", [False, True])
 def test_search_timer_keeps_the_events_where_it_cannot_trace(
     monkeypatch, caplog, traced_windows, released_pins, probe_long_kernel: bool
@@ -1008,7 +992,7 @@ def test_search_timer_keeps_the_events_where_it_cannot_trace(
     assert len(released_pins) == 3
 
 
-@_trace_test
+@trace_test
 def test_release_l2_pins_reads_the_buffer_with_evict_last_loads(monkeypatch) -> None:
     """The pin release is one sweep of the whole buffer whose loads carry
     the evict-last hint: only such loads displace the lines earlier work
@@ -1151,7 +1135,7 @@ def test_worker_probe_is_asked_once_and_explains_a_refusal() -> None:
         ).worker_kernel_timer_available()
 
 
-@_trace_test
+@trace_test
 def test_worker_job_times_a_kernel_window(monkeypatch) -> None:
     """A worker job asked for a ``kernel`` window times the candidate from the
     trace, under its arguments' device."""

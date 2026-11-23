@@ -636,6 +636,11 @@ class _Settings:
             _env_get_int, "HELION_AUTOTUNE_BENCHMARK_INPUT_BANKS", 1
         )
     )
+    autotune_l2_flush_sweep: bool = dataclasses.field(
+        default_factory=functools.partial(
+            _env_get_bool, "HELION_AUTOTUNE_L2_FLUSH_SWEEP", False
+        )
+    )
     autotune_best_available_max_configs: int = dataclasses.field(
         default_factory=functools.partial(
             _env_get_int, "HELION_BEST_AVAILABLE_MAX_CONFIGS", 20
@@ -1196,6 +1201,16 @@ class Settings(_Settings):
             "cycle cold; off primes a complete untimed bank cycle before the timed one. "
             "In off mode both cycles retain outputs and count toward the memory budget. "
             "Cloning occurs before timing and scores remain milliseconds per call."
+        ),
+        "autotune_l2_flush_sweep": (
+            "Follow every L2 flush of the autotuner's timers, in the search and "
+            "in the final selection, with a sweep that displaces the L2 lines "
+            "earlier calls loaded or stored with an evict-last hint, which "
+            "survive the flush. Without it a candidate whose loads carry such "
+            "hints reads part of its operands warm from its second timed call "
+            "on, which a kernel running between other kernels does not. "
+            "Readings leave the sweep out as they leave the flush out. "
+            "Default False. Set HELION_AUTOTUNE_L2_FLUSH_SWEEP=1 to enable."
         ),
         "autotune_benchmark_fn": (
             "Custom benchmark function for rebenchmarking during autotuning. "
