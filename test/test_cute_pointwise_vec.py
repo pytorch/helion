@@ -31,6 +31,11 @@ from helion._testing import DEVICE
 from helion._testing import TestCase
 from helion._testing import code_and_output
 from helion._testing import onlyBackends
+from helion._testing.cute_flat_row_kernels import cast_copy
+from helion._testing.cute_flat_row_kernels import cast_into
+from helion._testing.cute_flat_row_kernels import scale_between_views
+from helion._testing.cute_flat_row_kernels import scale_in_place
+from helion._testing.cute_flat_row_kernels import scale_into
 from helion._testing.sink_softmax_kernels import sink_normalize
 import helion.language as hl
 
@@ -203,6 +208,17 @@ def _unsigned_to_f32_and_flag(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         out[tk, tn] = v.to(torch.float32)
         big[tk, tn] = (v > 100).to(torch.int32)
     return out, big
+
+
+# Flattened 4-D tiles on permuted views; the CPU render tests of
+# test_cute_flat_row_packets.py bind the same functions.
+_cast_copy4d = helion.kernel(cast_copy, backend="cute", static_shapes=True)
+_cast_into4d = helion.kernel(cast_into, backend="cute", static_shapes=True)
+_scale_into4d = helion.kernel(scale_into, backend="cute", static_shapes=True)
+_scale_in_place4d = helion.kernel(scale_in_place, backend="cute", static_shapes=True)
+_scale_between_views4d = helion.kernel(
+    scale_between_views, backend="cute", static_shapes=True
+)
 
 
 @onlyBackends(["cute"])
@@ -463,6 +479,301 @@ class TestCutePointwiseVec(TestCase):
         )
         self.assertNotIn("ir.VectorType.get([8]", code)
         torch.testing.assert_close(out, x + y)
+
+    def test_flat_multi_row_packets_on_permuted_views(self) -> None:
+        """A flattened tile loads a split-heads view (``[b, s, h, d]`` seen as
+        ``[b, h, s, d]``) in packets at the row each lane base decodes to.
+        Adversarial layouts, all bitwise equal to eager: a partial last tile,
+        strided and blocked lanes with several packets per thread, a view at
+        an aligned storage offset, a stride-0 expanded dim, a strided outer
+        dim, a load hint with streaming stores, and the layouts the proof
+        declines (a view one element into its storage, rows that hold no
+        whole packet, another loop order), which keep per-element loads."""
+        row_packet = "cutlass.Uint32(lane_base_0_1_2_3) // cutlass.Uint32("
+        base = torch.randn(4, 24, 2, 32, device=DEVICE, dtype=torch.bfloat16)
+        storage = torch.randn(4 * 24 * 2 * 32 + 8, device=DEVICE, dtype=torch.bfloat16)
+        offset_8 = storage[8:].view(4, 24, 2, 32).permute(0, 2, 1, 3)
+        offset_1 = storage[1:-7].view(4, 24, 2, 32).permute(0, 2, 1, 3)
+        expanded = base[:, :, :1].permute(0, 2, 1, 3).expand(4, 2, 24, 32)
+        split = base.permute(0, 2, 1, 3)
+        # Every other row of a wider activation: the row stride doubles.
+        wide = torch.randn(4, 48, 2, 32, device=DEVICE, dtype=torch.bfloat16)
+        every_other = wide[:, ::2].permute(0, 2, 1, 3)
+        # Rows of six elements hold no whole V4 packet.
+        ragged = torch.randn(4, 24, 2, 6, device=DEVICE, dtype=torch.bfloat16)
+        ragged = ragged.permute(0, 2, 1, 3)
+        # Rows of 12 elements, 16 apart: the base and the outer strides sit
+        # on the V8 grid, the rows do not hold whole V8 packets (the 16-byte
+        # load of a chunk that straddles two rows would fault).
+        pitch_16 = torch.randn(4, 2, 6, 16, device=DEVICE, dtype=torch.bfloat16)
+        pitch_16 = pitch_16[..., :12]
+        strided = ["blocked", "blocked", "blocked", "strided"]
+        # 6144 elements; tiles of 1024 (exact) and 4096 (half of the last
+        # tile masked off).
+        cases: list[tuple[str, torch.Tensor, dict[str, object], bool]] = [
+            (
+                "exact_strided_v8",
+                split,
+                {
+                    "block_sizes": [1, 1, 32, 32],
+                    "num_threads": [1, 1, 1, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                    "cute_lane_layouts": strided,
+                },
+                True,
+            ),
+            (
+                "masked_tail_blocked_v4",
+                split,
+                {
+                    "block_sizes": [4, 1, 32, 32],
+                    "num_threads": [1, 1, 4, 32],
+                    "cute_vector_widths": [1, 1, 1, 4],
+                },
+                True,
+            ),
+            (
+                "masked_tail_hint_streaming",
+                split,
+                {
+                    "block_sizes": [4, 1, 32, 32],
+                    "num_threads": [1, 1, 2, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                    "cute_lane_layouts": strided,
+                    "load_eviction_policies": ["l2_last"],
+                    "cute_store_policy": "streaming",
+                },
+                True,
+            ),
+            (
+                "aligned_offset",
+                offset_8,
+                {
+                    "block_sizes": [1, 1, 32, 32],
+                    "num_threads": [1, 1, 2, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                },
+                True,
+            ),
+            (
+                "expanded_dim",
+                expanded,
+                {
+                    "block_sizes": [1, 1, 32, 32],
+                    "num_threads": [1, 1, 2, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                    "cute_lane_layouts": strided,
+                },
+                True,
+            ),
+            (
+                "strided_rows",
+                every_other,
+                {
+                    "block_sizes": [1, 1, 32, 32],
+                    "num_threads": [1, 1, 2, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                    "cute_lane_layouts": strided,
+                },
+                True,
+            ),
+            (
+                "rows_of_partial_packets",
+                ragged,
+                {
+                    "block_sizes": [2, 1, 16, 4],
+                    "num_threads": [1, 1, 4, 4],
+                    "cute_vector_widths": [1, 1, 1, 4],
+                },
+                False,
+            ),
+            (
+                "rows_of_12_at_pitch_16",
+                pitch_16,
+                {
+                    "block_sizes": [1, 2, 8, 16],
+                    "num_threads": [1, 1, 2, 16],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                    "cute_lane_layouts": strided,
+                },
+                False,
+            ),
+            (
+                "unaligned_offset",
+                offset_1,
+                {
+                    "block_sizes": [1, 1, 32, 32],
+                    "num_threads": [1, 1, 2, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                },
+                False,
+            ),
+            (
+                "reordered_loops",
+                split,
+                {
+                    "block_sizes": [1, 1, 32, 32],
+                    "num_threads": [1, 1, 2, 32],
+                    "cute_vector_widths": [1, 1, 1, 8],
+                    "loop_orders": [[0, 2, 1, 3]],
+                },
+                False,
+            ),
+        ]
+        for name, x, config, packets in cases:
+            with self.subTest(case=name):
+                code, out = code_and_output(
+                    _cast_copy4d, (x,), flatten_loops=[True], **config
+                )
+                self.assertEqual(row_packet in code, packets)
+                self.assertTrue(torch.equal(out, x.to(torch.float32)))
+
+    def test_flat_multi_row_packets_per_input_dtype(self) -> None:
+        """The row packets of the other dtypes a tile has a packet for, each
+        bitwise equal to eager at a tile whose last half is masked off: the
+        one-byte dtypes, which load four or eight bytes in one word, and the
+        four-byte dtypes."""
+        row_packet = "cutlass.Uint32(lane_base_0_1_2_3) // cutlass.Uint32("
+        shape = (4, 24, 2, 32)
+        values = torch.randn(shape, device=DEVICE)
+        inputs = {
+            "int8": torch.randint(-128, 128, shape, device=DEVICE, dtype=torch.int8),
+            "bool": values > 0,
+            "fp8": values.to(torch.float8_e4m3fn),
+            "int32": torch.randint(-(1 << 20), 1 << 20, shape, device=DEVICE).int(),
+            "fp32": values,
+        }
+        for name, base in inputs.items():
+            x = base.permute(0, 2, 1, 3)
+            # Eight-byte packets of the one-byte dtypes, sixteen-byte packets
+            # of the four-byte ones.
+            width = 8 if base.dtype.itemsize == 1 else 4
+            with self.subTest(dtype=name):
+                code, out = code_and_output(
+                    _cast_copy4d,
+                    (x,),
+                    flatten_loops=[True],
+                    block_sizes=[4, 1, 32, 32],
+                    num_threads=[1, 1, 2, 32],
+                    cute_vector_widths=[1, 1, 1, width],
+                    cute_lane_layouts=["blocked", "blocked", "blocked", "strided"],
+                )
+                self.assertIn(row_packet, code)
+                self.assertTrue(torch.equal(out, x.to(torch.float32)))
+
+    def test_flat_multi_row_packets_decline_a_larger_tensor(self) -> None:
+        """A tile over the output's shape reads the leading part of a wider
+        and of a longer permuted input: the flat offset decoded by the tile's
+        extents is another element of those, so they load per element."""
+        row_packet = "cutlass.Uint32(lane_base_0_1_2_3) // cutlass.Uint32("
+        config: dict[str, object] = {
+            "flatten_loops": [True],
+            "block_sizes": [1, 2, 8, 16],
+            "num_threads": [1, 1, 2, 16],
+            "cute_vector_widths": [1, 1, 1, 4],
+            "cute_lane_layouts": ["blocked", "blocked", "blocked", "strided"],
+        }
+        wider = torch.randn(4, 6, 2, 16, device=DEVICE, dtype=torch.bfloat16)
+        wider = wider.permute(0, 2, 1, 3)
+        longer = torch.randn(4, 9, 2, 16, device=DEVICE, dtype=torch.bfloat16)
+        longer = longer.permute(0, 2, 1, 3)
+        for name, x, shape in (
+            ("wider", wider, (4, 2, 6, 12)),
+            ("longer", longer, (4, 2, 6, 16)),
+        ):
+            with self.subTest(case=name):
+                out = torch.zeros(shape, device=DEVICE)
+                code, result = code_and_output(_cast_into4d, (x, out), **config)
+                self.assertNotIn(row_packet, code)
+                expected = x[:, :, : shape[2], : shape[3]].to(torch.float32)
+                self.assertTrue(torch.equal(result, expected))
+
+    def test_flat_multi_in_place_update_of_a_permuted_view(self) -> None:
+        """A kernel that loads and stores one permuted view keeps compiling
+        at a flattened tile with several packets per thread: the barrier
+        pass cannot confine row packets of one tensor to their lane, so
+        both accesses stay per element (with the barrier between them)."""
+        base = torch.randn(4, 24, 2, 32, device=DEVICE, dtype=torch.bfloat16)
+        x = base.permute(0, 2, 1, 3)
+        expected = x * 2 + 1
+        code, out = code_and_output(
+            _scale_in_place4d,
+            (x,),
+            flatten_loops=[True],
+            block_sizes=[1, 1, 8, 32],
+            num_threads=[1, 1, 1, 16],
+            cute_vector_widths=[1, 1, 1, 4],
+        )
+        self.assertNotIn("cutlass.Uint32(lane_base_0_1_2_3)", code)
+        self.assertNotIn("_cute_store_u16_vec(x.iterator", code)
+        self.assertTrue(torch.equal(out, expected))
+        self.assertTrue(torch.equal(base.permute(0, 2, 1, 3), expected))
+
+    def test_flat_multi_update_through_two_views_of_one_storage(self) -> None:
+        """The same update with the load and the store on two host views of
+        one storage: one tensor to the barrier pass, so it keeps compiling
+        with per-element accesses too."""
+        base = torch.randn(4, 24, 2, 32, device=DEVICE, dtype=torch.bfloat16)
+        expected = base.permute(0, 2, 1, 3) * 2 + 1
+        code, out = code_and_output(
+            _scale_between_views4d,
+            (base,),
+            flatten_loops=[True],
+            block_sizes=[1, 1, 8, 32],
+            num_threads=[1, 1, 1, 16],
+            cute_vector_widths=[1, 1, 1, 4],
+        )
+        self.assertNotIn("cutlass.Uint32(lane_base_0_1_2_3)", code)
+        self.assertNotIn("_cute_store_u16_vec(", code)
+        self.assertTrue(torch.equal(out, expected))
+        self.assertTrue(torch.equal(base.permute(0, 2, 1, 3), expected))
+
+    def test_flat_multi_row_packet_stores_and_aliasing(self) -> None:
+        """Packet stores into a permuted output, and one permuted view passed
+        as input and output, whose packets each thread loads before it
+        stores them."""
+        row_store = "_cute_store_u16_vec(out.iterator + cutlass.Int32(cutlass.Uint32("
+        config: dict[str, object] = {
+            "flatten_loops": [True],
+            "block_sizes": [4, 1, 32, 32],
+            "num_threads": [1, 1, 2, 32],
+            "cute_vector_widths": [1, 1, 1, 8],
+            "cute_lane_layouts": ["blocked", "blocked", "blocked", "strided"],
+        }
+        x = torch.randn(4, 2, 24, 32, device=DEVICE, dtype=torch.bfloat16)
+        target = torch.zeros(4, 24, 2, 32, device=DEVICE, dtype=torch.bfloat16)
+        code, out = code_and_output(
+            _scale_into4d, (x, target.permute(0, 2, 1, 3)), **config
+        )
+        self.assertIn(row_store, code)
+        self.assertTrue(torch.equal(out, x * 2))
+        self.assertTrue(torch.equal(target, (x * 2).permute(0, 2, 1, 3)))
+        shared = torch.randn(4, 24, 2, 32, device=DEVICE, dtype=torch.bfloat16)
+        expected = shared.permute(0, 2, 1, 3) * 2
+        view = shared.permute(0, 2, 1, 3)
+        code, out = code_and_output(_scale_into4d, (view, view), **config)
+        self.assertIn(row_store, code)
+        self.assertTrue(torch.equal(out, expected))
+
+    def test_flat_multi_row_packets_rebind_on_a_misaligned_view(self) -> None:
+        """The packet rests on the bound base residue: a later call with the
+        same shape and strides one element off must not reuse the code."""
+        storage = torch.randn(4 * 24 * 2 * 32 + 8, device=DEVICE, dtype=torch.bfloat16)
+        kernel = helion.kernel(
+            _cast_copy4d.fn,
+            backend="cute",
+            static_shapes=True,
+            config=helion.Config(
+                flatten_loops=[True],
+                block_sizes=[1, 1, 32, 32],
+                num_threads=[1, 1, 2, 32],
+                cute_vector_widths=[1, 1, 1, 8],
+            ),
+        )
+        for start in (0, 1, 8):
+            with self.subTest(start=start):
+                x = storage[start : start + 6144].view(4, 24, 2, 32).permute(0, 2, 1, 3)
+                self.assertTrue(torch.equal(kernel(x), x.to(torch.float32)))
 
     def test_tile_index_disables_flatten_reregistration(self) -> None:
         """Regression: hl.tile_index only disabled flatten at CODEGEN time,

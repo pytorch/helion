@@ -848,10 +848,19 @@ class DeviceGridState(DeviceLoopOrGridState):
     pending_relocations: list[CuteLaneRelocation] = dataclasses.field(
         default_factory=list
     )
-    # Synthetic reduction lanes materialized as ``cutlass.range_constexpr``
-    # loops OUTSIDE the one-vector tile wrappers (register-tile reductions,
-    # see ``nest_reduction_lane_outside_vector_tiles``).
+    # Lane loops materialized as ``cutlass.range_constexpr`` loops: the
+    # synthetic reduction lanes OUTSIDE the one-vector tile wrappers
+    # (register-tile reductions, see
+    # ``nest_reduction_lane_outside_vector_tiles``) and the component loops
+    # INSIDE a vectorized lane (``component_lane_vars`` below).
     constexpr_lane_vars: set[str] = dataclasses.field(default_factory=set)
+    # Trace-time lane loops that walk the components of each element of the
+    # vectorized lane enclosing them (a backend marks a tile axis it has made
+    # one).  They do not end that lane's vector operations: ``wrap_body``
+    # looks past them for the innermost vectorized lane, and the backend
+    # checks where the operations ended up once the body is placed
+    # (``Backend.demote_grid_tile_vec_stores``).
+    component_lane_vars: set[str] = dataclasses.field(default_factory=set)
     # The thread extents of the root tile's own axes when the grid became
     # active, before the body's reductions added theirs to
     # ``thread_axis_sizes`` (``GenerateAST.set_active_loops``).
@@ -984,6 +993,8 @@ class DeviceGridState(DeviceLoopOrGridState):
             # the innermost live lane only after the entire body is available.
             innermost = None
             for lane_var, _extent in self.lane_loops:
+                if lane_var in self.component_lane_vars:
+                    continue
                 wrapper = self.vec_lane_wrappers.get(lane_var)
                 names = {lane_var}
                 if wrapper is not None:
@@ -4309,7 +4320,9 @@ class PerThreadFlattenedTileStrategy(_LaneContextOwner, FlattenedTileStrategy):
         # (flattened N-D) form ``flat_multi`` is set and the hoist emits FLAT
         # base pointers (``t.iterator + lane_base``) -- valid only for
         # contiguous tensors covering the whole iteration space, which
-        # ``_cute_vector_load_ctx`` gates per tensor.
+        # ``_cute_vector_load_ctx`` gates per tensor: any other tensor's
+        # packet sits at the element the lane base decodes to, or its
+        # accesses stay per element.
         for block_id in block_ids:
             fn.register_lane(block_id, flat_multi=len(block_ids) > 1)
         self._cute_lane_layout: str = "blocked"

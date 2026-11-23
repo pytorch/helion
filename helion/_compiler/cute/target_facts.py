@@ -154,6 +154,22 @@ DEFAULT_MAX_SMEM_PER_BLOCK = SM100_SMEM_PER_BLOCK_OPTIN_BYTES
 SM12X_MAX_SMEM_PER_BLOCK = 101376
 
 
+def widest_packet_bytes(capability: tuple[int, int] | None) -> int:
+    """The bytes of the widest packet one vector load or store moves on a
+    device of ``capability``: 32 from sm_100 on, 16 before (or when the
+    capability is unknown)."""
+    return 32 if capability is not None and capability >= (10, 0) else 16
+
+
+# The dtypes whose elements a component packet stores
+# (``emitters.lane_packets.CuteComponentGroup``).  Like the width limit
+# above, the lowering's proof (``memory_ops._cute_component_store_ctx``) and
+# the seeds that plant its thread layout
+# (``CutePointwiseVecHeuristic._component_packet_seeds``) read it here, so
+# the two cannot drift apart.
+COMPONENT_PACKET_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
 def static_smem_limit(capability: tuple[int, int] | None) -> int | None:
     """The cap libNVVM puts on a kernel of ``capability``'s static shared
     memory (bytes) below the per-block maximum: 48 KiB below sm_90, none

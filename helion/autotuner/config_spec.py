@@ -1099,6 +1099,15 @@ class ConfigSpec:
         # ``cute_defer_tile_reduce`` is tunable when there are any
         # (``carried_tile_sum_blocks``).
         self.cute_carried_tile_sum_blocks: frozenset[int] = frozenset()
+        # Set by DeviceIR analysis: a flattened gather whose lane tile
+        # (``index = row + tile.index``) is a tile of a store but not the one
+        # on the stored tensor's last dimension, both tensors of a dtype with
+        # 16-byte packets, in a kernel with static shapes and without a
+        # matmul: no thread layout makes both the loads and the stores
+        # contiguous, so ``cute_staged_store`` is tunable, and
+        # ``cute_vloop_sink`` and ``cute_lane_unroll`` (the gather's packet
+        # loads) at every extent (``lane_gather_stores``).
+        self.cute_lane_gather_store_sites = False
         # Set by DeviceIR analysis under ``Settings.cute_exact_division``: an
         # fp32 quotient whose divisor is a scalar or a broadcast row value
         # (``hoist_loop_invariant_recip``'s exact hoist can apply), so

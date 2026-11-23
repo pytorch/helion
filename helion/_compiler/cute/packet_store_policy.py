@@ -46,7 +46,8 @@ def _global_pointer(pointer: ast.expr, tensor_names: AbstractSet[str]) -> bool:
     return len(tensors) == 1 and tensors <= tensor_names
 
 
-def _collector_widths(loop: ast.For, widths: dict[str, int]) -> dict[str, int]:
+def _constexpr_trips(loop: ast.For) -> int | None:
+    """The trip count of a straight ``cutlass.range_constexpr(N)`` loop."""
     if not (
         isinstance(loop.iter, ast.Call)
         and ast.unparse(loop.iter.func) == "cutlass.range_constexpr"
@@ -61,11 +62,26 @@ def _collector_widths(loop: ast.For, widths: dict[str, int]) -> dict[str, int]:
             for node in ast.walk(loop)
         )
     ):
-        return {}
-    count = loop.iter.args[0].value
-    names = Counter(node.id for node in ast.walk(loop) if isinstance(node, ast.Name))
-    collected = {}
-    for statement in loop.body:
+        return None
+    return loop.iter.args[0].value
+
+
+def _count_appends(
+    statements: list[ast.stmt],
+    trips: int,
+    lanes: Counter[str],
+    sites: Counter[str],
+) -> None:
+    """Add to ``lanes`` the values the ``name.append(value)`` statements of
+    ``statements`` collect per list when the statements run ``trips`` times,
+    and to ``sites`` the number of those statements.  The statements of a
+    nested ``cutlass.range_constexpr`` loop count once per trip of it."""
+    for statement in statements:
+        if isinstance(statement, ast.For):
+            nested = _constexpr_trips(statement)
+            if nested is not None:
+                _count_appends(statement.body, trips * nested, lanes, sites)
+            continue
         if not isinstance(statement, ast.Expr) or not isinstance(
             statement.value, ast.Call
         ):
@@ -78,10 +94,30 @@ def _collector_widths(loop: ast.For, widths: dict[str, int]) -> dict[str, int]:
             and len(call.args) == 1
             and not call.keywords
         ):
-            name = call.func.value.id
-            if widths.get(name) == 0 and names[name] == 1:
-                collected[name] = count
-    return collected
+            lanes[call.func.value.id] += trips
+            sites[call.func.value.id] += 1
+
+
+def _collector_widths(loop: ast.For, widths: dict[str, int]) -> dict[str, int]:
+    """The lanes each fresh list of ``widths`` holds after ``loop``.
+
+    A plain packet appends one value per iteration; a component packet's
+    sibling stores append one each (``CuteComponentGroup``), directly or in a
+    nested constexpr loop over the components.  A list the loop names in any
+    other way has no known width.
+    """
+    trips = _constexpr_trips(loop)
+    if trips is None:
+        return {}
+    names = Counter(node.id for node in ast.walk(loop) if isinstance(node, ast.Name))
+    lanes: Counter[str] = Counter()
+    sites: Counter[str] = Counter()
+    _count_appends(loop.body, trips, lanes, sites)
+    return {
+        name: count
+        for name, count in lanes.items()
+        if widths.get(name) == 0 and names[name] == sites[name]
+    }
 
 
 def lower_packet_store_policy(
@@ -96,11 +132,13 @@ def lower_packet_store_policy(
 
     The packet emitters already proved alignment, coverage and the scalar
     tail; this only swaps the final helper.  A flush's width comes from a
-    fresh ``[]`` appended once per ``cutlass.range_constexpr(N)`` iteration
-    in the same statement list (or a constant slice of such a list, the
-    wide-lane emitter's several packets per site); any other use of the list
-    keeps the default store.  Flushes the async-store policy already renamed
-    are left alone.
+    fresh ``[]`` filled by the ``cutlass.range_constexpr(N)`` loop of the
+    same statement list, which appends to it once per iteration, or several
+    times for a component packet: one append per sibling store, or one in a
+    nested constexpr loop over the components (``_collector_widths``).  It
+    may also be a constant slice of such a list, the wide-lane emitter's
+    several packets per site.  Any other use of the list keeps the default
+    store.  Flushes the async-store policy already renamed are left alone.
     """
     helpers = PACKET_FLUSH_BY_POLICY.get(policy)
     if helpers is None or (

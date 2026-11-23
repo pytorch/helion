@@ -2678,6 +2678,18 @@ def normalize_knobs(
     )
     _normalize_gated_boolean(
         config,
+        "cute_staged_store",
+        enabled=config_spec.cute_lane_gather_store_sites,
+        requirement=(
+            "a flattened gather along one hl.tile (index = row + tile.index) "
+            "stored along another, both tensors bf16, fp16, fp32, int16 or "
+            "int32, in a kernel with static shapes and without a matmul"
+        ),
+        fix_invalid=fix_invalid,
+        fill=False,
+    )
+    _normalize_gated_boolean(
+        config,
         "cute_defer_tile_reduce",
         enabled=bool(config_spec.cute_carried_tile_sum_blocks),
         requirement=(
@@ -3920,6 +3932,18 @@ def cute_flat_fields(
             # packet and no proven predicate, a shared-memory reduce in a loop
             # with a partial tile) the loop stays whole (``peel_vector_tails``).
             fields["cute_tail_peel"] = BooleanFragment()
+        if config_spec.cute_lane_gather_store_sites:
+            # A CTA's scalar stores staged in shared memory and flushed as
+            # 16-byte packets, each warp writing 32 consecutive ones; the
+            # values and elements written are unchanged.  Offered where a
+            # flattened gather runs along one tile and its store along
+            # another (``lane_gather_stores``), the layouts where packet
+            # loads leave the stores scattered, in a kernel with static
+            # shapes.  Where the generated kernel is not proven to write one
+            # aligned span per block (several tiles on the stored tensor's
+            # last dimension, an unaligned output view) the code stays as it
+            # is (``staged_stores``).
+            fields["cute_staged_store"] = BooleanFragment()
         if config_spec.cute_carried_tile_sum_blocks:
             # A carried tile sum's threads combined once after the device
             # loop instead of once per tile; changes the summation order
@@ -4168,7 +4192,13 @@ def cute_flat_fields(
             # extent: the strided seeds that sink it fit only some extents,
             # and a knob only they opened would change the search space
             # (``structural_fingerprint``) between shapes.
-            sink_open = sink_seeded or config_spec.cute_strided_reduction_sites
+            # So does a flattened gather along one tile stored along another
+            # (its register-tile seeds fit only some aligned shapes).
+            sink_open = (
+                sink_seeded
+                or config_spec.cute_strided_reduction_sites
+                or config_spec.cute_lane_gather_store_sites
+            )
             fields["cute_vloop_sink"] = EnumFragment(
                 (False, True),
                 search_choices=(False, True) if sink_open else (False,),

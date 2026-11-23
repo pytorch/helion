@@ -219,6 +219,7 @@ CUTE_MISC_SCHEDULE_KEYS: tuple[str, ...] = (
     "cute_uniform_lane_compares",
     "cute_tail_peel",
     "cute_defer_tile_reduce",
+    "cute_staged_store",
     "cute_dot_fragment_mma",
     "cute_dot_ring_mma",
     "cute_dot_ring_stages",

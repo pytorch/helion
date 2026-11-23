@@ -44,7 +44,7 @@ pytestmark = pytest.mark.cpu_only
 
 # 8 threads of one 8-lane bf16 packet each on 64 flat elements, the 3 window
 # slots a per-thread lane loop over one 4-slot tile.
-_TILE = register_tile_config(threads=8, window_block=4)
+_TILE = register_tile_config(threads=8, window_block=4, staged=False)
 
 
 def _code(
@@ -147,7 +147,7 @@ def _launch(
             (3, 40, 16),
             torch.bfloat16,
             9,
-            register_tile_config(threads=32, window_block=16),
+            register_tile_config(threads=32, window_block=16, staged=False),
             True,
         ),
         # fp32: four-element packets, three slots of a four-slot tile.
@@ -155,7 +155,7 @@ def _launch(
             (2, 20, 16),
             torch.float32,
             3,
-            register_tile_config(threads=32, window_block=4, vec=4),
+            register_tile_config(threads=32, window_block=4, vec=4, staged=False),
             True,
         ),
         # 12 channels: the mask differs inside a packet, the loads stay
@@ -164,7 +164,7 @@ def _launch(
             (3, 40, 12),
             torch.bfloat16,
             9,
-            register_tile_config(threads=32, window_block=16),
+            register_tile_config(threads=32, window_block=16, staged=False),
             False,
         ),
     ],
@@ -207,7 +207,7 @@ def test_window_gathers_of_views_match_eager(flat_view: slice, packets: bool) ->
     flat = source[flat_view]
     # A value no window holds: an element the kernel did not write keeps it.
     out = torch.full((elements, window), 12345.0, device=DEVICE, dtype=torch.bfloat16)
-    config = register_tile_config(threads=32, window_block=16)
+    config = register_tile_config(threads=32, window_block=16, staged=False)
     code, _ = _launch(sliding_windows_into, (flat, out, seq, channels, pad), config)
     assert ("_cute_load_v16b_if(" in code) == packets
     assert torch.equal(out, sliding_windows_reference(flat, seq, channels, window, pad))
@@ -473,7 +473,7 @@ def _store_through_a_wrapping_cast(
 
 
 def test_a_store_through_a_wrapping_cast_keeps_its_own_address() -> None:
-    config = register_tile_config(threads=8, window_block=4, vec=4)
+    config = register_tile_config(threads=8, window_block=4, vec=4, staged=False)
     args = (torch.empty(1024), torch.empty(768))
     code = _code(_store_through_a_wrapping_cast, args, config)
     # The gather beside it still loads packets along the lane tile.
@@ -493,7 +493,7 @@ def test_a_store_through_a_wrapping_cast_matches_eager() -> None:
     flat = torch.randn(1024, device=DEVICE)
     # A value no input holds: an element the kernel did not write keeps it.
     out = torch.full((768,), 12345.0, device=DEVICE)
-    config = register_tile_config(threads=8, window_block=4, vec=4)
+    config = register_tile_config(threads=8, window_block=4, vec=4, staged=False)
     code, _ = _launch(_store_through_a_wrapping_cast, (flat, out), config)
     assert "_cute_load_v16b_if(flat.iterator" in code
     assert torch.equal(out, flat[256:])
@@ -566,7 +566,7 @@ def test_only_the_predicates_of_the_packet_loads_compare_the_chunk_base() -> Non
     """The fp32 gather sinks under its mask compared at the chunk base; the
     fp64 gather beside it stays a scalar load per lane, and its mask, the
     same comparisons, keeps comparing each lane's own index."""
-    config = register_tile_config(threads=8, window_block=4, vec=4)
+    config = register_tile_config(threads=8, window_block=4, vec=4, staged=False)
     args = (torch.empty(2, 8, 16), torch.empty(256, dtype=torch.float64), 3, 1)
     code = _code(_windows_plus_wide, args, config)
     assert code.count("_cute_load_v16b_if(flat.iterator") == 4

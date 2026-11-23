@@ -50,6 +50,7 @@ from ....autotuner_heuristics.common import dedupe_configs
 from ....autotuner_heuristics.common import is_canonical_row_reduction
 from ....autotuner_heuristics.common import op_name_parts
 from ....autotuner_heuristics.registry import AutotunerHeuristic
+from ....compile_environment import CompileEnvironment
 from ....compile_environment import ConfigValueExpression
 from ....compile_environment import FixedBlockSizeSource
 from ....compile_environment import _symint_sympy_expr
@@ -57,10 +58,13 @@ from ....compile_environment import _to_sympy
 from ....loop_dependency_checker import _storage_ids
 from ....loop_dependency_checker import graph_memory_access_storage_ids
 from ....loop_dependency_checker import intra_loop_raw_reread_block_ids
+from ....runtime_tensor_guards import tensor_pairs_with_proven_disjoint_storage
 from ....utils import compute_slice_size
 from ....utils import normalize_slice
+from ... import flat_gather_lane
 from ... import jam_grid_lanes
 from ... import target_facts
+from ...analysis.match_common import node_tensor
 from ...cutedsl_compat import cp_async_supported
 from ...cutedsl_compat import tcgen05_runtime_n_ptx_compatible
 from ...cutedsl_compat import warn_tcgen05_runtime_n_ptx_fallback
@@ -98,6 +102,8 @@ from ...pdl_release import CUTE_PDL_SPREAD_KEY
 from ...reduction_lanes import WARP_THREADS
 from ...reduction_lanes import walks_live_lanes
 from ...register_tile_admission import register_tile_reduction_levels
+from ...staged_stores import INDEX_LIMIT
+from ...staged_stores import PACKET_BYTES
 from ...strategies import TCGEN05_L2_SWIZZLE_SIZE_CONFIG_KEY
 from ...strategies import TCGEN05_PERSISTENCE_MODEL_CONFIG_KEY
 from ...strategies import TCGEN05_STRATEGY_CONFIG_KEY
@@ -191,7 +197,6 @@ if TYPE_CHECKING:
     from .....autotuner.config_spec import PointwiseElementwiseFact
     from .....autotuner.config_spec import ReductionLoopSpec
     from ....autotuner_heuristics.registry import CompilerHeuristicSpecializationFact
-    from ....compile_environment import CompileEnvironment
     from ....device_ir import DeviceIR
     from ...cute_mma import Tcgen05GroupedWorklistAnalysis
     from ...gdn_recurrence import GdnRecurrenceGeometry
@@ -10460,9 +10465,225 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
     def get_seed_configs(
         cls, env: CompileEnvironment, device_ir: DeviceIR
     ) -> list[Config]:
+        # The contiguous-axis family, complete and in its order, then the
+        # component-packet seeds (whether or not that family has any: its
+        # tiles follow the contiguous axis, which a component axis of two
+        # elements cannot fill).  A kernel of several root grids has its
+        # multi-root seeds alone.
+        seeds = cls._contiguous_axis_seed_configs(env, device_ir)
+        seeds.extend(
+            seed
+            for seed in cls._component_packet_seeds(env, device_ir)
+            if seed not in seeds
+        )
+        return seeds
+
+    @classmethod
+    def _contiguous_axis_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
         spec = env.config_spec
         if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
             return cls._multi_root_seed_configs(env)
+        # The tile seeds keep their order; a gather stored along another
+        # tile adds its register tiles after them.
+        seeds = cls._tile_seed_configs(env, device_ir)
+        seeds.extend(
+            seed
+            for seed in cls._lane_gather_seed_configs(env, device_ir)
+            if all(seed.config != previous.config for previous in seeds)
+        )
+        return seeds
+
+    # The register tile of a flattened gather stored along another tile: the
+    # threads per CTA of its seeds (its packets are the staged store's,
+    # ``PACKET_BYTES``).  The CTA's shared-memory image and its barrier grow
+    # with the threads, and with few threads a store instruction flushes few
+    # packets: on the ConvBert unfold (bf16, 9 slots) 64 and 128 threads
+    # measured fastest, 32 slightly and 256 clearly behind.
+    LANE_GATHER_THREADS = (64, 128)
+
+    @classmethod
+    def _lane_gather_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """Register tiles for a flattened gather along one tile stored along
+        another (``lane_gather_stores``: ``out[tile_n, tile_k] = x_flat[tile_n
+        .index[:, None] + C * tile_k.index[None, :]]``, an unfold).
+
+        A thread takes one packet of ``V`` consecutive lane elements for
+        every element of the other tiles: ``num_threads`` ``NT`` on the lane
+        tile with a block of ``V * NT``, and one tile on each other block,
+        walked as lane loops the thread unrolls.  With ``cute_vloop_sink``
+        each gather is then one predicated 16-byte packet load
+        (``uniform_load_predicates`` proves a window mask one value per
+        packet).  The thread's stores are ``V`` scalars a row apart per
+        packet, though, 16 times the L2 traffic of the scalar layout, so the
+        seed always carries ``cute_staged_store``, which flushes the CTA's
+        contiguous tile in packets (never plant the layout without it: with
+        direct stores it is the slowest form of the kernel, several times
+        slower than the scalar layout).
+
+        Planted only where the lowering proves the packets and the staged
+        store from static facts: static extents; for every flattened gather
+        along the lane tile, the row offset a static multiple of ``V`` and
+        the gathered tensor's base aligned for the packet; the lane tile's
+        extent a multiple of ``V``; a contiguous output with an aligned base
+        (an argument's is read from the example input, as a gathered
+        tensor's is) that no load of the kernel may alias and that is the
+        only tensor the kernel stores into (a kernel with an atomic never
+        gets here: it has no pointwise fact, so this heuristic does not
+        run); the lane tile on the output's first dimension; every tensor
+        below 2**31 elements (the staged store's proof holds every index to
+        32 bits); and an image within the static shared-memory budget.  Not
+        where every other extent of the output is 1: its stores are then
+        contiguous along the lane tile, and the tile seeds write them as
+        packets.  The knobs it sets are open on the kernel's structure
+        (``cute_lane_gather_store_sites``), so the search space does not
+        follow these conditions.
+        """
+        spec = env.config_spec
+        sites = (
+            flat_gather_lane.lane_gather_stores(env, device_ir)
+            if spec.cute_lane_gather_store_sites
+            else []
+        )
+        stores = {id(site.store) for site in sites}
+        lanes = {site.split.lane_block_id for site in sites}
+        if len(stores) != 1 or len(lanes) != 1:
+            return []
+        # One store and one lane tile, a site per flattened gather along it.
+        store_blocks = sites[0].store_blocks
+        blocks = [block_id for block_id in store_blocks if block_id is not None]
+        (lane,) = lanes
+        output = node_tensor(sites[0].store.args[0])
+        sources = [
+            source
+            for site in sites
+            if (source := node_tensor(site.gather.args[0])) is not None
+        ]
+        # The staged store declines a kernel that stores into anything but
+        # the one output, and without it this layout is the slowest: no seed
+        # for such a kernel.
+        if any(
+            node.op == "call_function"
+            and node.target is language_store
+            and node_tensor(node.args[0]) is not output
+            for graph_info in device_ir.graphs
+            for node in graph_info.graph.nodes
+        ):
+            return []
+        valid = set(spec.num_threads.valid_block_ids()) & set(
+            spec.cute_vector_widths.valid_block_ids()
+        )
+        if (
+            output is None
+            or len(sources) != len(sites)
+            or len(blocks) != len(store_blocks)
+            or blocks[0] != lane
+            or len(set(blocks)) != len(blocks)
+            or len(blocks) != output.ndim
+            or {spec_item.block_id for spec_item in spec.block_sizes} != set(blocks)
+            or not set(blocks) <= valid
+            or not all(isinstance(size, int) for size in output.shape)
+            or not output.is_contiguous()
+            or all(size == 1 for size in output.shape[1:])
+            or any(output.dtype.itemsize != source.dtype.itemsize for source in sources)
+            # The staged store's proof holds every index to 32 bits.
+            or max(output.numel(), *(source.numel() for source in sources))
+            >= INDEX_LIMIT
+        ):
+            return []
+        # The sites' dtypes have 2- or 4-byte elements (``lane_gather_stores``),
+        # every gathered tensor's those of the output.
+        vec = PACKET_BYTES // output.dtype.itemsize
+        fragments = {item.block_id: item._fragment(spec) for item in spec.block_sizes}
+        extents = [cast("int", size) for size in output.shape]
+        # One tile on every other block: the smallest block its extent fits.
+        inner = {
+            block_id: 1 << (extent - 1).bit_length()
+            for block_id, extent in zip(blocks[1:], extents[1:], strict=True)
+        }
+        host_function = device_ir.host_function
+        if (
+            host_function is None
+            or vec <= 1
+            or vec
+            not in spec.cute_vector_widths.block_id_lookup(lane)._fragment(spec).choices
+            or extents[0] % vec
+            or not all(
+                fragments[block_id].low <= size <= fragments[block_id].high
+                for block_id, size in inner.items()
+            )
+        ):
+            return []
+        environment = (
+            contextlib.nullcontext() if CompileEnvironment.has_current() else env
+        )
+        with environment, host_function:
+            # The packets of every gather, not only the first one's.
+            if not (
+                all(
+                    row_is_multiple_of(site.split.row, vec, env, static=True)
+                    and _packet_layout_aligned(env, source, site.gather_dim, vec)
+                    for site, source in zip(sites, sources, strict=True)
+                )
+                and flat_gather_lane.base_aligned_for_seed(env, output, PACKET_BYTES)
+            ):
+                return []
+            # The staged store waits for the end of the CTA, so it declines
+            # unless every tensor the kernel loads is proven apart from the
+            # output; the seed needs the same proof, from the example inputs.
+            loaded = {
+                id(tensor): tensor
+                for graph_info in device_ir.graphs
+                for node in graph_info.graph.nodes
+                if node.op == "call_function"
+                and node.target is language_load
+                and (tensor := node_tensor(node.args[0])) is not None
+                and tensor in host_function.tensor_to_origin
+            }
+            apart = tensor_pairs_with_proven_disjoint_storage(
+                env, {id(output): output, **loaded}, allow_unbound=True
+            )
+            if id(output) in loaded or any(
+                frozenset((id(output), other)) not in apart for other in loaded
+            ):
+                return []
+        row_bytes = math.prod(extents[1:]) * output.dtype.itemsize
+        seeds: list[Config] = []
+        for threads in cls.LANE_GATHER_THREADS:
+            block = vec * threads
+            if (
+                not fragments[lane].low <= block <= fragments[lane].high
+                or block > extents[0]
+                or block * row_bytes > target_facts.static_smem_budget()
+            ):
+                continue
+            seed: dict[str, Any] = {
+                "block_sizes": _seq_config_list(
+                    spec.block_sizes, {lane: block, **inner}
+                ),
+                "num_threads": _seq_config_list(
+                    spec.num_threads, {lane: threads, **dict.fromkeys(inner, 1)}
+                ),
+                "cute_vector_widths": _seq_config_list(
+                    spec.cute_vector_widths, {lane: vec}
+                ),
+                "cute_vloop_sink": True,
+                "cute_lane_unroll": _CUTE_LANE_UNROLL_CHOICES[-1],
+                "cute_staged_store": True,
+            }
+            if spec.cute_proven_bounds_enabled:
+                seed["cute_proven_bounds"] = True
+            seeds.append(Config.from_dict(seed))
+        return seeds
+
+    @classmethod
+    def _tile_seed_configs(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        spec = env.config_spec
         if not spec.pointwise_facts:
             return []
         fact = spec.pointwise_facts[0]
@@ -10724,6 +10945,171 @@ class CutePointwiseVecHeuristic(AutotunerHeuristic):
                 for seed in list(seeds)
                 if not seed.config.get("cute_rng_packet", False)
             )
+        return seeds
+
+    # Component-packet seeds: the threads per CTA of each.  Their dtypes are
+    # the lowering's own list (``target_facts.COMPONENT_PACKET_DTYPES``).
+    COMPONENT_PACKET_THREADS = (128, 256)
+
+    @classmethod
+    def _component_packet_seeds(
+        cls, env: CompileEnvironment, device_ir: DeviceIR
+    ) -> list[Config]:
+        """One component packet per thread for a store that a tile's last two
+        axes index along a lane dim and its components.
+
+        ``out[tile_e, tile_c]`` on a tensor with K contiguous elements per
+        element of ``tile_e``'s dim (``select_scatter`` into the real parts of
+        ``[elements, 2]`` pairs) stores scalars however the components are
+        laid out on threads, and a vector loop over the K components stores
+        one small packet per element.  The lowering stores one packet per V
+        elements when a thread walks all K components of its V-wide lanes
+        (``cute/memory_ops._cute_component_store_ctx``), a layout the
+        contiguous-axis seeds above never take: they tile and thread the
+        component axis.  These seeds give each of
+        ``COMPONENT_PACKET_THREADS`` threads one packet of the device's
+        widest store (V elements of K components), the component tile whole
+        on the thread and innermost in the loop order.  On B200 that layout
+        beat the best one a search found without the packet on
+        better-benchmark's sum_sum_sum_907cbb3d9f19 (12.6M fp32 pairs, timed
+        in its graph); that study's hand kernels read no better at 8
+        elements per thread and worse at 32 threads per CTA.
+
+        The store's layout decides: its last two subscripts are distinct
+        tiles of one loop order, the last on a unit-stride dim that its
+        largest block covers, the lane's stride that dim's extent, and the
+        components of one element fewer than a 16-byte packet (eight bf16
+        heads fill one: a vector loop over them already stores and loads
+        whole packets, which this layout would trade for scalar loads).
+
+        A seed is planted only where the store itself fits the packet: its
+        dtype is one the lowering packs (fp16, bf16, fp32), and the lane's
+        extent is a known multiple of the seed's vector width, the proof the
+        lowering asks of a chunk that must not straddle the extent
+        (``BlockSizeInfo.known_multiple``: a run-time extent proves nothing).
+        What the lowering proves on the kernel around the store is not
+        checked here.  A lane body that also reads the tensor
+        (``x[tile_e, tile_c] = x[tile_e, tile_c] * 2``) and a caller's view
+        whose base or rows are not aligned to the packet keep their scalar
+        stores (``component_group_refusal``, ``_cute_component_store_ctx``):
+        such a kernel's seeds are this thread layout with scalar stores.
+        The seeds set no key whose search choices follow from a seed, so the
+        structural fingerprint is the same with and without them.
+
+        A kernel of several root grids gets none: a seed sizes the store's
+        tile alone and would leave every other root at its default blocks,
+        where the multi-root seeds (``_multi_root_seed_configs``) size each
+        root.
+        """
+        spec = env.config_spec
+        if spec.matmul_facts or len(device_ir.phases) > 1:
+            return []
+        if spec.kernel_grid_fact is not None and len(spec.kernel_grid_fact.roots) > 1:
+            return []
+        tiled = (
+            set(spec.block_sizes.valid_block_ids())
+            & set(spec.num_threads.valid_block_ids())
+            & set(spec.cute_vector_widths.valid_block_ids())
+        )
+        # The lowering's limit on a component packet
+        # (``_cute_component_store_ctx``).
+        max_bytes = target_facts.widest_packet_bytes(spec.target_device_capability)
+        seeds: list[Config] = []
+        for fact in spec.memory_op_facts:
+            blocks = fact.subscript_block_ids
+            if (
+                fact.kind != "store"
+                or fact.dtype is None
+                or fact.dtype not in target_facts.COMPONENT_PACKET_DTYPES
+                or fact.ndim < 2
+                or len(blocks) != fact.ndim
+                or len(fact.subscript_strides) != fact.ndim
+                or len(fact.subscript_extents) != fact.ndim
+            ):
+                continue
+            lane, component = blocks[-2], blocks[-1]
+            components = fact.subscript_extents[-1]
+            if (
+                lane is None
+                or component is None
+                or lane == component
+                or not {lane, component} <= tiled
+                or fact.subscript_strides[-1] != 1
+                or fact.subscript_strides[-2] != components
+                or components < 2
+                or components * fact.dtype.itemsize >= 16
+            ):
+                continue
+            order = next(
+                (
+                    item
+                    for item in spec.loop_orders
+                    if {lane, component} <= set(item.block_ids)
+                ),
+                None,
+            )
+            component_sizes = spec.block_sizes.block_id_lookup(component)._fragment(
+                spec
+            )
+            lane_sizes = spec.block_sizes.block_id_lookup(lane)._fragment(spec)
+            width = max_bytes // (components * fact.dtype.itemsize)
+            choices = cast(
+                "tuple[int, ...]",
+                spec.cute_vector_widths.block_id_lookup(lane)._fragment(spec).choices,
+            )
+            lane_extent = env.block_sizes[lane].size
+            if (
+                order is None
+                or component_sizes.high != components
+                or width < 2
+                or width not in choices
+                # ``BlockSizeInfo.known_multiple``'s proof, asked of the
+                # environment the heuristic was given: the seeds are also
+                # read from a bound kernel, where no environment is current.
+                or not isinstance(lane_extent, (int, torch.SymInt))
+                or not env.known_multiple(_to_sympy(lane_extent), width)
+            ):
+                continue
+            # Lane and components innermost, in that order; the other axes
+            # of the tile keep their places.
+            positions = [
+                index
+                for index, block_id in enumerate(order.block_ids)
+                if block_id not in (lane, component)
+            ]
+            positions += [order.block_ids.index(lane), order.block_ids.index(component)]
+            for threads in cls.COMPONENT_PACKET_THREADS:
+                block = max(lane_sizes.low, min(lane_sizes.high, threads * width))
+                block = 1 << (block.bit_length() - 1)
+                if block % width or block // width < 2:
+                    continue
+                sizes = {
+                    block_id: cast(
+                        "int",
+                        spec.block_sizes.block_id_lookup(block_id)
+                        ._fragment(spec)
+                        .default(),
+                    )
+                    for block_id in spec.block_sizes.valid_block_ids()
+                }
+                sizes.update({lane: block, component: components})
+                seed = Config.from_dict(
+                    {
+                        "block_sizes": _seq_config_list(spec.block_sizes, sizes),
+                        "num_threads": _seq_config_list(
+                            spec.num_threads,
+                            {lane: min(threads, block // width), component: 1},
+                        ),
+                        "cute_vector_widths": _seq_config_list(
+                            spec.cute_vector_widths, {lane: width, component: 1}
+                        ),
+                        "loop_orders": _seq_config_list(
+                            spec.loop_orders, {order.block_id: positions}
+                        ),
+                    }
+                )
+                if seed not in seeds:
+                    seeds.append(seed)
         return seeds
 
     # Row-tile seed: the bytes of a lane's packet, the fewest lanes a row

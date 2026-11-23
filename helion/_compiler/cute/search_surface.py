@@ -261,6 +261,21 @@ def register_search_surface(device_ir: DeviceIR, config_spec: ConfigSpec) -> Non
     config_spec.cute_carried_tile_sum_blocks = (
         frozenset() if config_spec.matmul_facts else carried_tile_sum_blocks(device_ir)
     )
+    # A flattened gather along one tile stored along another, in dtypes that
+    # have packets: staging the stores in shared memory is tunable
+    # (``cute_staged_store``), and so are the gather's packet loads
+    # (``cute_vloop_sink``, ``cute_lane_unroll``).  Not in a kernel with a
+    # matmul, and not under dynamic shapes: the staged store needs a static
+    # launch grid, and packet loads without it are the layout's slowest
+    # form.  The setting decides, not an extent, so the search space is the
+    # same at every shape.
+    from .flat_gather_lane import lane_gather_stores
+
+    config_spec.cute_lane_gather_store_sites = (
+        env.settings.static_shapes
+        and not config_spec.matmul_facts
+        and bool(lane_gather_stores(env, device_ir))
+    )
     # A max, a min or an ``any`` whose warp reduction ``redux.sync`` takes on
     # this target: ``cute_warp_fp32_redux`` is tunable.
     from .native_warp_reduction import has_native_redux_reduction

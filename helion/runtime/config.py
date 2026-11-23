@@ -187,6 +187,7 @@ class Config(Mapping[str, object]):
         cute_uniform_lane_compares: bool | None = None,
         cute_tail_peel: bool | None = None,
         cute_defer_tile_reduce: bool | None = None,
+        cute_staged_store: bool | None = None,
         cute_wide_packet_hints: bool | None = None,
         cute_pdl: bool | None = None,
         cute_pdl_capture_overlap: bool | None = None,
@@ -252,6 +253,8 @@ class Config(Mapping[str, object]):
             cute_store_policy: Cache policy for proven full aligned 16-byte CuTe
                 global store packets ("default", "streaming" = evict-first
                 ``st.global.cs`` for outputs written once, or "l2_evict_last").
+                The packets ``cute_staged_store`` flushes are not covered:
+                they keep the default policy.
             cute_compiler_pipeline: CuTe compiler optimization pipeline. "default"
                 leaves SDK options unchanged; "opt2" requests optimization level 2.
                 Explicit SDK compiler environment overrides still take precedence.
@@ -438,6 +441,31 @@ class Config(Mapping[str, object]):
                 gives each thread one element of the tile (as many threads as
                 the tile is long) or folds the tile's lanes as vector lanes,
                 the knob leaves the code as it is.
+            cute_staged_store: Write a pointwise kernel's output through a
+                shared-memory image of each block's tile: the threads store
+                their elements into the image, meet at one barrier, and
+                flush it as 16-byte packets, each warp writing 32 consecutive
+                packets, so that every 32-byte sector of the output is sent
+                to L2 once however the threads' own elements lie in it.  For
+                a kernel whose loads are contiguous along one tile and whose
+                stores along another (an unfold or sliding window, ``out[n,
+                k] = x[n + c * k]``) this is what lets the loads be packets.
+                The values and the elements written are those of the
+                knob-off code; the flushed packets take the default cache
+                policy whatever ``cute_store_policy`` says, so on a staged
+                kernel that option changes nothing.  Applied only where the
+                generated kernel is proven to write one contiguous,
+                16-byte-aligned span of a single output per block, each
+                element once, into a tensor no load can alias, at static
+                shapes; a block with a partial tile keeps its direct stores,
+                and where the proof fails the code is the knob-off code.
+                One barrier and ``tile elements x element size`` bytes of
+                shared memory per block (at most 48 KiB).  Off by default;
+                offered to the autotuner on kernels with static shapes that
+                gather a flattened tensor along one tile and store along
+                another (bf16, fp16, fp32, int16 or int32 tensors), without
+                a matmul, and elsewhere rejected (an explicit False is
+                dropped).
             cute_wide_packet_hints: Carry the ``l2_last`` / ``l1_l2_first`` /
                 ``l1_l2_last`` load eviction policies onto 32-byte CuTe packets
                 (``cute_vector_widths`` 8 for fp32, 16 for bf16/fp16) through
@@ -648,6 +676,7 @@ class Config(Mapping[str, object]):
             "cute_uniform_lane_compares": cute_uniform_lane_compares,
             "cute_tail_peel": cute_tail_peel,
             "cute_defer_tile_reduce": cute_defer_tile_reduce,
+            "cute_staged_store": cute_staged_store,
             "cute_wide_packet_hints": cute_wide_packet_hints,
             "cute_pdl": cute_pdl,
             "cute_pdl_capture_overlap": cute_pdl_capture_overlap,

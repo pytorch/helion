@@ -1054,6 +1054,118 @@ def test_a_guarded_row_store_lets_the_row_loads_sink(cpu_only: None) -> None:
     assert len(_vector_loads(rows.body)) == 1, code
 
 
+@helion.kernel(backend="cute", static_shapes=True, autotune_effort="none")
+def _transposed_copy(xt: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    # ``xt`` is contiguous along the grid's first axis and ``out`` along its
+    # second.
+    n, m = xt.shape
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = xt[tile_n, tile_m].transpose(0, 1)
+    return out
+
+
+_TRANSPOSED_COPY_CONFIGS: list[dict[str, object]] = [
+    {"block_sizes": [64, 64], "num_threads": [4, 4], "cute_vector_widths": [4, 2]},
+    {"block_sizes": [64, 64], "num_threads": [4, 4], "cute_vector_widths": [4, 4]},
+    {"block_sizes": [16, 256], "num_threads": [1, 64], "cute_vector_widths": [4, 4]},
+]
+
+
+@pytest.mark.parametrize("config", _TRANSPOSED_COPY_CONFIGS)
+def test_a_packet_list_of_the_inner_axis_keeps_the_vector_loop_unsunk(
+    cpu_only: None, config: dict[str, object]
+) -> None:
+    """The second axis's lanes collect ``out``'s packet in a trace-time list
+    that is created, filled and flushed once per lane of the first axis's
+    vector loop, and ``xt``'s rows are contiguous along that loop.  Sinking
+    it into the second axis's lanes would create the list once, fill it with
+    every lane's values and flush it once per lane: a store four times as
+    wide as the packet, at each lane's address.  The pass declines a body
+    that creates a trace-time list, and the knob-off code runs."""
+    args = (torch.empty(256, 64), torch.empty(64, 256))
+    code = _both(_transposed_copy, args, **config)
+    # Each lane of the first axis creates the list, fills it with the second
+    # axis's lanes and flushes it.
+    (lanes,) = (
+        node
+        for node in ast.walk(_loop(code, "vec_lane_0"))
+        if isinstance(node, ast.For) and ast.unparse(node.target) == "lane_1"
+    )
+    statements = [ast.unparse(statement) for statement in lanes.body]
+    (created,) = (
+        index
+        for index, statement in enumerate(statements)
+        if statement == "_tile_store_vals_1_0 = []"
+    )
+    (filled,) = (
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("for vec_lane_1 in cutlass.range_constexpr(")
+    )
+    (flushed,) = (
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("_cute_store_u32_vec(out.iterator")
+    )
+    assert created < filled < flushed
+    assert statements[filled].count("_tile_store_vals_1_0.append(") == 1
+
+
+def test_trace_list_appends_outside_one_segment_are_unsupported() -> None:
+    """``_check_trace_list_order`` on the bodies of a vector loop: a
+    collector created outside the loop may take its appends in one segment
+    of the body; an append inside a loop of the body, appends in two
+    segments and a list the body creates are refused."""
+
+    def check(body: str, *, lists: tuple[str, ...] = ("vals",)) -> bool:
+        loop = ast.parse(f"for vec_lane in cutlass.range_constexpr(4):\n{body}")
+        sinker = sink_vector_loops._Sinker(
+            cast("ast.For", loop.body[0]),
+            cast("Any", SimpleNamespace(vec_lane_var="vec_lane", vec_width=4)),
+            {},
+            {},
+            lambda *args, **kwargs: "unused",
+            1,
+            {},
+            trace_lists=frozenset(lists),
+        )
+        try:
+            sinker._check_trace_list_order(sinker.body)
+        except sink_vector_loops._Unsupported:
+            return False
+        return True
+
+    def body(*lines: str) -> str:
+        return "".join(f"    {line}\n" for line in lines)
+
+    # The loop's own collector: its lanes append one after another, also
+    # with two sibling appends per lane and under a guard.
+    assert check(body("a = f(vec_lane)", "vals.append(a)"))
+    assert check(body("a = f(vec_lane)", "vals.append(a)", "vals.append(a + 1)"))
+    assert check(body("if mask:", "    vals.append(f(vec_lane))"))
+    # A reduction loop before the append leaves it in one segment.
+    assert check(body("for row in range(8):", "    acc = acc + 1", "vals.append(acc)"))
+    # Appends in a loop of the body: the interchange would make them
+    # loop-major.
+    assert not check(
+        body("for component in cutlass.range_constexpr(2):", "    vals.append(1)")
+    )
+    # Sibling appends on both sides of a loop: each segment would run all
+    # the lanes before the next.
+    assert not check(
+        body("vals.append(1)", "for row in range(8):", "    acc = acc + 1")
+        + body("vals.append(acc)")
+    )
+    # A list the body creates, at its top level or inside a loop.
+    assert not check(body("inner = []", "inner.append(1)", "flush(pointer, inner)"))
+    assert not check(
+        body("for lane in range(8):", "    inner = []", "    inner.append(1)"),
+        lists=("vals", "inner"),
+    )
+    # An append to a name that is no trace-time list is not judged here.
+    assert check(body("for lane in range(8):", "    other.append(1)"), lists=("vals",))
+
+
 def test_knob_off_keeps_the_original_nest(cpu_only: None) -> None:
     x = torch.empty(4096, 4096, dtype=torch.bfloat16)
     code = _cpu_code(
@@ -3770,6 +3882,22 @@ class TestCuteVloopSink(TestCase):
         torch.testing.assert_close(outputs[True], outputs[False], atol=0, rtol=0)
         expected = (x.float() * w.float()).to(x.dtype)
         torch.testing.assert_close(outputs[True], expected, atol=0, rtol=0)
+
+    def test_a_packet_list_of_the_inner_axis_matches_eager_under_the_knob(self) -> None:
+        """``test_a_packet_list_of_the_inner_axis_keeps_the_vector_loop_unsunk``
+        on the GPU: the sunk form stored every lane's values at each lane's
+        address (a misaligned-address fault at widths [4, 2]); the knob-off
+        code runs instead.  NaN marks a missed store."""
+        xt = torch.randn(256, 64, device=DEVICE)
+        for config in _TRANSPOSED_COPY_CONFIGS:
+            with self.subTest(config=config):
+                out = torch.full((64, 256), float("nan"), device=DEVICE)
+                code, result = code_and_output(
+                    _transposed_copy, (xt, out), **config, cute_vloop_sink=True
+                )
+                self.assertNotIn("_vsink", code)
+                self.assertIn("_cute_store_u32_vec(out.iterator", code)
+                torch.testing.assert_close(result, xt.t(), atol=0, rtol=0)
 
     def test_nonzero_grid_origin_declines_and_stays_correct(self) -> None:
         """``hl.tile(8, n)`` keeps per-element column masks: the pass declines

@@ -1615,6 +1615,46 @@ def _lower_packet_store_policy(s: _KernelDefState) -> None:
     )
 
 
+def _stage_cta_stores(s: _KernelDefState) -> None:
+    from ..memory_ops import cute_tensor_base_is_aligned
+    from ..staged_stores import PACKET_BYTES
+    from ..staged_stores import stage_cta_stores
+    from ..target_facts import static_smem_budget
+
+    ctx = s.ctx
+    renamed = ctx.rename_groups
+    stage_cta_stores(
+        s.definition.body,
+        tensors={
+            renamed.get(argument.name, argument.name): argument.fake_value
+            for argument in s.param_args
+            if isinstance(argument, TensorArg)
+            and not isinstance(argument, TensorDescriptorArg)
+        },
+        base_aligned=lambda tensor: cute_tensor_base_is_aligned(
+            ctx.env, tensor, PACKET_BYTES
+        ),
+        proven_disjoint_tensor_pairs={
+            frozenset(renamed.get(name, name) for name in pair)
+            for pair in ctx.proven_disjoint_tensor_pairs
+        },
+        proven_tensor_stride_values={
+            (renamed.get(name, name), dim): value
+            for (name, dim), value in ctx.proven_tensor_stride_values.items()
+        },
+        constexpr_values=ctx.constexpr_values,
+        thread_block_dims=ctx.exact_thread_block_dims,
+        # The launch's block grid, when every extent of it is proven.
+        block_grid_dims=cast("tuple[int, int, int]", ctx.block_grid_dims)
+        if ctx.exact_grid and None not in ctx.block_grid_dims
+        else None,
+        index_type=ctx.env.index_type(),
+        dtype_str=ctx.env.backend.dtype_str,
+        smem_budget=static_smem_budget(),
+        new_var=ctx.new_var,
+    )
+
+
 def _validate_shared_arenas(s: _KernelDefState) -> None:
     for request in s.fn.cute_state.shared_arena_requests:
         request.validate(s.definition.body, s.ctx.rename_groups)
@@ -2032,7 +2072,16 @@ KERNEL_DEF_PASSES: tuple[KernelDefPass, ...] = (
         "select_native_warp_reductions",
         _config_flag("cute_warp_fp32_redux"),
         _select_native_warp_reductions,
-        # Last: every earlier pass recognizes the shuffle reductions by name.
+        # Last of the lowerings: every earlier pass recognizes the shuffle
+        # reductions by name.
+        requires=(RENAMED,),
+    ),
+    KernelDefPass(
+        "stage_cta_stores",
+        _config_flag("cute_staged_store"),
+        _stage_cta_stores,
+        # After every pass that reads the kernel's stores: its proof runs the
+        # final body, and the image's stores name no tensor.
         requires=(RENAMED,),
     ),
 )
